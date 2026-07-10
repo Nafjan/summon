@@ -55,6 +55,10 @@ def _probe_version(path: str) -> str | None:
                            stdin=subprocess.DEVNULL)
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
+    if r.returncode != 0:
+        # A binary that errors on --version is not a working backend, no matter
+        # what it prints (impostor/broken-install guard).
+        return None
     lines = [ln.strip() for ln in (r.stdout or r.stderr or "").splitlines() if ln.strip()]
     return lines[0][:120] if lines else None
 

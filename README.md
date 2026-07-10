@@ -9,9 +9,9 @@ no daemon.
 ```
                           ┌──────────────────────┐
    any host CLI ────────► │       summon         │ ────► claude        (Anthropic)
-   (claude, codex,        │  one Python script   │ ────► codex         (OpenAI)
+   (claude, codex,        │  stdlib dispatcher   │ ────► codex         (OpenAI)
    cursor, gemini,        │  one JSON contract   │ ────► cursor-agent  (Cursor)
-   or your terminal)      │  no server, no deps  │ ────► gemini        (Google)
+   or your terminal)      │  no server, no pip   │ ────► gemini        (Google)
                           └──────────────────────┘ ────► agy           (Antigravity)
 ```
 

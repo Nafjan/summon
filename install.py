@@ -15,12 +15,16 @@ What it does:
      an agent file you already have is never touched, even under races.
   3. Prints next steps (run --doctor).
 
-Safety model:
-  - Refuses to replace or remove a skills/summon dir that has no ownership
-    manifest (i.e. anything summon did not itself install).
-  - Refreshes are staged: the new tree is built beside the old one and swapped
-    in with rename, so a failed copy never leaves a half-updated skill. Stale
-    files from prior versions are gone after the swap (true refresh).
+Safety model (every destructive operation is ownership-gated):
+  - A directory counts as summon-owned ONLY if its manifest parses as JSON and
+    says {"installed_by": "summon"}. Corrupt or foreign manifests fail closed.
+  - Refuses to replace or remove anything it does not own — including stale
+    staging/backup artifacts: those are only cleaned when they carry a valid
+    manifest of their own.
+  - Refreshes are staged in a unique temp dir and swapped in by rename; the old
+    tree is kept as an owned backup until the swap succeeds, and restored on
+    failure (or on the next run after a crash). A per-host lock file prevents
+    concurrent installers from fighting over the swap.
 
 Exit codes: 0 = all requested work done; 2 = one or more hosts refused/failed.
 """
@@ -32,6 +36,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -49,6 +54,7 @@ HOSTS = {
 
 SKILL_PAYLOAD = ["SKILL.md", "scripts", "references"]
 MANIFEST = ".summon-install.json"
+LOCK_STALE_SEC = 600
 AGENTS_DIR = os.path.join(HOME, ".agents")
 
 
@@ -56,9 +62,43 @@ def detect_hosts() -> list:
     return [name for name, root in HOSTS.items() if os.path.isdir(root)]
 
 
-def _owned(dest: str) -> bool:
-    """True only for a directory summon itself installed (manifest present)."""
-    return os.path.isfile(os.path.join(dest, MANIFEST))
+def _owned(path: str) -> bool:
+    """True ONLY for a directory whose manifest parses and identifies summon.
+    Anything else — missing, unreadable, corrupt, foreign — fails closed."""
+    try:
+        with open(os.path.join(path, MANIFEST), encoding="utf-8") as fh:
+            return json.load(fh).get("installed_by") == "summon"
+    except (OSError, ValueError):
+        return False
+
+
+def _write_manifest(dst: str, files: list) -> None:
+    with open(os.path.join(dst, MANIFEST), "w", encoding="utf-8") as fh:
+        json.dump({"installed_by": "summon", "installed_at": int(time.time()),
+                   "files": sorted(files)}, fh, indent=1)
+
+
+def _acquire_lock(parent: str) -> str | None:
+    """O_EXCL lock file so two installers can't race the same host. A lock older
+    than LOCK_STALE_SEC is presumed crashed and broken once."""
+    lock = os.path.join(parent, "summon.install.lock")
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return lock
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock) > LOCK_STALE_SEC:
+                    os.unlink(lock)
+                    continue
+            except OSError:
+                pass
+            return None
+        except OSError:
+            return None
+    return None
 
 
 def _build_tree(dst: str) -> list:
@@ -79,41 +119,73 @@ def _build_tree(dst: str) -> list:
 
 
 def install_skill(host: str, dry: bool) -> tuple:
-    """Returns (message, ok). Staged install: build beside, swap in, keep the
-    old tree until the new one is fully in place."""
+    """Returns (message, ok). Staged install: build in a unique temp dir, keep
+    the old tree as an owned backup, swap by rename, restore on failure."""
     dest = os.path.join(HOSTS[host], "skills", "summon")
+    parent = os.path.dirname(dest)
+    backup = dest + ".previous"
+
+    # Crash recovery FIRST: a previous run may have moved the good tree aside
+    # and died before the swap. If so, put it back before judging anything.
+    if not os.path.isdir(dest) and os.path.isdir(backup) and _owned(backup):
+        try:
+            os.rename(backup, dest)
+        except OSError:
+            pass
+
     if os.path.isdir(dest) and not _owned(dest):
         return (f"[!!]  {dest} exists but was NOT installed by summon "
-                f"(no {MANIFEST}); refusing to replace it - move it aside first", False)
+                f"(no valid {MANIFEST}); refusing to replace it - move it aside first", False)
     if dry:
         verb = "refresh" if os.path.isdir(dest) else "install"
         return (f"[dry] would {verb} skill -> {dest}", True)
 
-    staging = dest + ".staging"
-    backup = dest + ".previous"
-    for leftover in (staging, backup):  # from an interrupted earlier run
-        shutil.rmtree(leftover, ignore_errors=True)
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    os.makedirs(parent, exist_ok=True)
+    lock = _acquire_lock(parent)
+    if lock is None:
+        return (f"[!!]  {host}: another summon install appears to be running "
+                f"(lock: {os.path.join(parent, 'summon.install.lock')}); retry shortly", False)
+
+    staging = None
     try:
-        os.makedirs(staging)
+        # Clean OUR stale artifacts only — anything without a valid summon
+        # manifest is not ours to delete, no matter what it is named.
+        for name in os.listdir(parent):
+            p = os.path.join(parent, name)
+            if name.startswith("summon.staging-") and os.path.isdir(p) and _owned(p):
+                shutil.rmtree(p, ignore_errors=True)
+        if os.path.isdir(backup) and _owned(backup):
+            shutil.rmtree(backup, ignore_errors=True)
+
+        staging = tempfile.mkdtemp(prefix="summon.staging-", dir=parent)
+        # Manifest goes in FIRST: even a half-copied staging dir is then
+        # recognizably ours, so a crashed run's leftovers can be reaped later.
+        _write_manifest(staging, [])
         files = _build_tree(staging)
-        with open(os.path.join(staging, MANIFEST), "w", encoding="utf-8") as fh:
-            json.dump({"installed_by": "summon", "installed_at": int(time.time()),
-                       "files": sorted(files)}, fh, indent=1)
+        _write_manifest(staging, files)
+
         if os.path.isdir(dest):
-            os.rename(dest, backup)  # backup slot was cleared above on both OSes
+            os.rename(dest, backup)   # owned (checked above); becomes rollback copy
         os.rename(staging, dest)
-        shutil.rmtree(backup, ignore_errors=True)
+        staging = None
+        if os.path.isdir(backup) and _owned(backup):
+            shutil.rmtree(backup, ignore_errors=True)
         return (f"[ok]  skill installed -> {dest}", True)
     except OSError as e:
-        # Roll back: restore the previous tree if we had moved it aside.
-        if not os.path.isdir(dest) and os.path.isdir(backup):
+        # Roll back: if the swap half-happened, restore the owned backup.
+        if not os.path.isdir(dest) and os.path.isdir(backup) and _owned(backup):
             try:
                 os.rename(backup, dest)
             except OSError:
                 pass
-        shutil.rmtree(staging, ignore_errors=True)
+        if staging and os.path.isdir(staging):
+            shutil.rmtree(staging, ignore_errors=True)  # mkdtemp'd by us this run
         return (f"[!!]  {host}: install failed ({e}); previous copy left in place", False)
+    finally:
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
 
 
 def uninstall_skill(host: str, dry: bool) -> tuple:
@@ -121,7 +193,7 @@ def uninstall_skill(host: str, dry: bool) -> tuple:
     if not os.path.isdir(dest):
         return (f"[--]  nothing at {dest}", True)
     if not _owned(dest):
-        return (f"[!!]  {dest} has no {MANIFEST} - summon did not install it; "
+        return (f"[!!]  {dest} has no valid {MANIFEST} - summon did not install it; "
                 f"refusing to delete", False)
     if dry:
         return (f"[dry] would remove {dest}", True)
@@ -131,14 +203,15 @@ def uninstall_skill(host: str, dry: bool) -> tuple:
 
 def install_agents(dry: bool) -> list:
     """Copy starter agents into ~/.agents with O_EXCL creation - an existing
-    file is never opened, truncated, or replaced (race-safe, not just checked)."""
+    file is never opened, truncated, or replaced (race-safe, not just checked).
+    A failed copy removes its partial file so the next run can retry it."""
     src_dir = os.path.join(HERE, "agents")
     out = []
     if not os.path.isdir(src_dir):
         return ["[--]  no bundled agents/ dir; skipping"]
     if not dry:
         os.makedirs(AGENTS_DIR, exist_ok=True)
-    added = skipped = 0
+    added = skipped = failed = 0
     for f in sorted(os.listdir(src_dir)):
         if not f.endswith(".md"):
             continue
@@ -152,12 +225,27 @@ def install_agents(dry: bool) -> list:
         except FileExistsError:
             skipped += 1
             continue
-        with os.fdopen(fd, "wb") as fout, open(os.path.join(src_dir, f), "rb") as fin:
-            shutil.copyfileobj(fin, fout)
-        added += 1
+        except OSError:
+            failed += 1
+            continue
+        try:
+            with os.fdopen(fd, "wb") as fout, open(os.path.join(src_dir, f), "rb") as fin:
+                shutil.copyfileobj(fin, fout)
+            added += 1
+        except OSError:
+            # Never leave a partial agent behind - it would read as user-owned
+            # and block this starter agent forever.
+            try:
+                os.unlink(dst)
+            except OSError:
+                pass
+            failed += 1
     verb = "[dry] would add" if dry else "[ok]  added"
-    out.append(f"{verb} {added} starter agents -> {AGENTS_DIR} "
-               f"({skipped} already present, left untouched)")
+    line = (f"{verb} {added} starter agents -> {AGENTS_DIR} "
+            f"({skipped} already present, left untouched)")
+    if failed:
+        line += f"  [!!] {failed} failed to copy (partials removed; re-run to retry)"
+    out.append(line)
     return out
 
 

@@ -22,8 +22,11 @@ jobs:
       - name: Compile all modules
         run: python -m py_compile scripts/run_subagent.py scripts/_loader.py scripts/_resolver.py scripts/_builder.py scripts/_executor.py scripts/_stream.py scripts/_doctor.py summon.py install.py
 
-      - name: Unit tests
+      - name: Unit tests (dispatcher)
         run: python scripts/test_discovery.py
+
+      - name: Unit tests (installer safety, isolated fake homes)
+        run: python tests/test_install.py
 
       - name: Doctor runs clean on a bare machine (exit 1 = no backends, still valid JSON)
         shell: bash
@@ -50,36 +53,29 @@ jobs:
           mkdir -p "$HOME/.claude"
           python install.py --dry-run
 
-      - name: Installer safety - refuses to touch what it did not install
+      - name: Installer safety - unowned dir refused with EXACT exit 2
         shell: bash
         run: |
-          # An unowned skills/summon dir (no manifest) must survive both
-          # --uninstall and a reinstall attempt, and the run must exit 2.
+          # Refusal must be the specific exit code 2 (not just "nonzero").
           mkdir -p "$HOME/.claude/skills/summon"
           touch "$HOME/.claude/skills/summon/USER_FILE"
-          if python install.py --hosts claude --uninstall; then echo "expected exit 2"; exit 1; fi
-          test -f "$HOME/.claude/skills/summon/USER_FILE"
-          if python install.py --hosts claude --no-agents; then echo "expected exit 2"; exit 1; fi
+          set +e
+          python install.py --hosts claude --uninstall; rc1=$?
+          python install.py --hosts claude --no-agents; rc2=$?
+          set -e
+          [ "$rc1" -eq 2 ] || { echo "uninstall refusal: expected 2, got $rc1"; exit 1; }
+          [ "$rc2" -eq 2 ] || { echo "reinstall refusal: expected 2, got $rc2"; exit 1; }
           test -f "$HOME/.claude/skills/summon/USER_FILE"
           rm -rf "$HOME/.claude/skills/summon"
-          echo "ownership guard holds"
+          echo "ownership guard holds (exit 2 exactly)"
 
-      - name: Installer real run, true refresh, agent non-overwrite, clean uninstall
+      - name: Installed copy end-to-end (real host dir on the runner)
         shell: bash
         run: |
           python install.py --hosts claude
           test -f "$HOME/.claude/skills/summon/SKILL.md"
           test -f "$HOME/.claude/skills/summon/.summon-install.json"
           python "$HOME/.claude/skills/summon/scripts/run_subagent.py" --list --agents-dir agents > /dev/null
-          # true refresh: a stale file from a previous version disappears on reinstall
-          touch "$HOME/.claude/skills/summon/scripts/OBSOLETE.py"
-          python install.py --hosts claude --no-agents
-          test ! -f "$HOME/.claude/skills/summon/scripts/OBSOLETE.py"
-          # starter agents never clobber an existing definition
-          echo "MINE" > "$HOME/.agents/reviewer.md" 2>/dev/null || { mkdir -p "$HOME/.agents"; echo "MINE" > "$HOME/.agents/reviewer.md"; }
-          python install.py --hosts claude
-          grep -q "MINE" "$HOME/.agents/reviewer.md"
-          # owned copies uninstall cleanly
           python install.py --hosts claude --uninstall
           test ! -d "$HOME/.claude/skills/summon"
-          echo "install lifecycle verified"
+          echo "installed copy dispatch path + clean uninstall verified"
