@@ -163,6 +163,73 @@ def test_lock_blocks_concurrent_install():
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_manifest_non_object_json_fails_closed():
+    # Valid JSON of the wrong shape ([]) must refuse cleanly - exit 2, no traceback.
+    home = _fake_home()
+    try:
+        d = _dest(home)
+        os.makedirs(d)
+        open(os.path.join(d, ".summon-install.json"), "w").write("[]")
+        open(os.path.join(d, "USER_FILE"), "w").write("precious")
+        r = _run(home, "--hosts", "claude", "--uninstall")
+        assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+        assert "Traceback" not in r.stderr, r.stderr
+        assert os.path.isfile(os.path.join(d, "USER_FILE"))
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_stale_unowned_lock_never_deleted():
+    # A user file named summon.install.lock - even an OLD one - is not summon's
+    # to delete. Install must refuse (exit 2) and leave it byte-identical.
+    import time as _t
+    home = _fake_home()
+    try:
+        parent = os.path.join(home, ".claude", "skills")
+        os.makedirs(parent)
+        lock = os.path.join(parent, "summon.install.lock")
+        open(lock, "w").write("user data, not a summon marker")
+        old = _t.time() - 700
+        os.utime(lock, (old, old))  # stale by the 600s policy
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 2, (r.returncode, r.stdout)
+        assert open(lock).read() == "user data, not a summon marker"
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_uninstall_blocked_by_held_lock():
+    # Uninstall participates in the same lock protocol as install.
+    home = _fake_home()
+    try:
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0, r.stdout + r.stderr
+        parent = os.path.join(home, ".claude", "skills")
+        with open(os.path.join(parent, "summon.install.lock"), "w") as fh:
+            json.dump({"installed_by": "summon", "pid": 99999}, fh)
+        r = _run(home, "--hosts", "claude", "--uninstall")
+        assert r.returncode == 2, (r.returncode, r.stdout)
+        assert os.path.isdir(_dest(home))  # nothing was removed
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_dry_run_is_mutation_free_even_during_crash_recovery():
+    # --dry-run must not perform the crash-recovery rename it reports.
+    home = _fake_home()
+    try:
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0
+        d = _dest(home)
+        os.rename(d, d + ".previous")  # crash state
+        r = _run(home, "--hosts", "claude", "--no-agents", "--dry-run")
+        assert r.returncode == 0, (r.returncode, r.stdout)
+        assert os.path.isdir(d + ".previous") and not os.path.isdir(d)
+        assert "restore" in r.stdout.lower(), r.stdout
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_doctor_rejects_nonzero_version_probe():
     # A CLI that errors on --version must not be verified/usable.
     import types

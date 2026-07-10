@@ -63,11 +63,13 @@ def detect_hosts() -> list:
 
 
 def _owned(path: str) -> bool:
-    """True ONLY for a directory whose manifest parses and identifies summon.
-    Anything else — missing, unreadable, corrupt, foreign — fails closed."""
+    """True ONLY for a directory whose manifest parses to a dict that identifies
+    summon. Anything else — missing, unreadable, corrupt, foreign, or valid JSON
+    of the wrong shape (e.g. []) — fails closed."""
     try:
         with open(os.path.join(path, MANIFEST), encoding="utf-8") as fh:
-            return json.load(fh).get("installed_by") == "summon"
+            data = json.load(fh)
+        return isinstance(data, dict) and data.get("installed_by") == "summon"
     except (OSError, ValueError):
         return False
 
@@ -78,23 +80,43 @@ def _write_manifest(dst: str, files: list) -> None:
                    "files": sorted(files)}, fh, indent=1)
 
 
+def _lock_owned(lock: str) -> bool:
+    """A lock we may break must itself carry a validated summon marker —
+    a random user file that happens to share the name is never deleted."""
+    try:
+        with open(lock, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return isinstance(data, dict) and data.get("installed_by") == "summon"
+    except (OSError, ValueError):
+        return False
+
+
 def _acquire_lock(parent: str) -> str | None:
-    """O_EXCL lock file so two installers can't race the same host. A lock older
-    than LOCK_STALE_SEC is presumed crashed and broken once."""
+    """O_EXCL lock file so two installers (or an installer and an uninstaller)
+    can't race the same host. A stale lock (> LOCK_STALE_SEC) is broken once,
+    and ONLY if it is summon's own marker with an unchanged mtime — an unowned
+    or freshly-replaced file is left alone."""
     lock = os.path.join(parent, "summon.install.lock")
     for _ in range(2):
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"installed_by": "summon", "pid": os.getpid()}, fh)
             return lock
         except FileExistsError:
             try:
-                if time.time() - os.path.getmtime(lock) > LOCK_STALE_SEC:
-                    os.unlink(lock)
-                    continue
+                observed_mtime = os.path.getmtime(lock)
             except OSError:
-                pass
+                continue  # vanished under us -> retry the O_EXCL create
+            if time.time() - observed_mtime > LOCK_STALE_SEC and _lock_owned(lock):
+                try:
+                    # Re-check mtime right before unlink: if another process
+                    # just replaced the lock, its file is NOT ours to break.
+                    if os.path.getmtime(lock) == observed_mtime:
+                        os.unlink(lock)
+                except OSError:
+                    pass
+                continue
             return None
         except OSError:
             return None
@@ -125,18 +147,14 @@ def install_skill(host: str, dry: bool) -> tuple:
     parent = os.path.dirname(dest)
     backup = dest + ".previous"
 
-    # Crash recovery FIRST: a previous run may have moved the good tree aside
-    # and died before the swap. If so, put it back before judging anything.
-    if not os.path.isdir(dest) and os.path.isdir(backup) and _owned(backup):
-        try:
-            os.rename(backup, dest)
-        except OSError:
-            pass
-
-    if os.path.isdir(dest) and not _owned(dest):
-        return (f"[!!]  {dest} exists but was NOT installed by summon "
-                f"(no valid {MANIFEST}); refusing to replace it - move it aside first", False)
     if dry:
+        # Mutation-free by contract: report what WOULD happen, including a
+        # pending crash recovery, without renaming or creating anything.
+        if not os.path.isdir(dest) and os.path.isdir(backup) and _owned(backup):
+            return (f"[dry] would restore crashed backup then refresh -> {dest}", True)
+        if os.path.isdir(dest) and not _owned(dest):
+            return (f"[!!]  {dest} exists but was NOT installed by summon "
+                    f"(no valid {MANIFEST}); refusing to replace it - move it aside first", False)
         verb = "refresh" if os.path.isdir(dest) else "install"
         return (f"[dry] would {verb} skill -> {dest}", True)
 
@@ -148,6 +166,18 @@ def install_skill(host: str, dry: bool) -> tuple:
 
     staging = None
     try:
+        # Crash recovery (under the lock): a previous run may have moved the
+        # good tree aside and died before the swap. Put it back first.
+        if not os.path.isdir(dest) and os.path.isdir(backup) and _owned(backup):
+            try:
+                os.rename(backup, dest)
+            except OSError:
+                pass
+
+        if os.path.isdir(dest) and not _owned(dest):
+            return (f"[!!]  {dest} exists but was NOT installed by summon "
+                    f"(no valid {MANIFEST}); refusing to replace it - move it aside first", False)
+
         # Clean OUR stale artifacts only — anything without a valid summon
         # manifest is not ours to delete, no matter what it is named.
         for name in os.listdir(parent):
@@ -197,8 +227,22 @@ def uninstall_skill(host: str, dry: bool) -> tuple:
                 f"refusing to delete", False)
     if dry:
         return (f"[dry] would remove {dest}", True)
-    shutil.rmtree(dest)
-    return (f"[ok]  removed {dest}", True)
+    # Same lock as install: an uninstall must not race a concurrent installer
+    # (which could otherwise recreate the tree mid-removal, or vice versa).
+    lock = _acquire_lock(os.path.dirname(dest))
+    if lock is None:
+        return (f"[!!]  {host}: another summon install/uninstall appears to be "
+                f"running; retry shortly", False)
+    try:
+        if not _owned(dest):  # re-check under the lock
+            return (f"[!!]  {dest} changed while acquiring the lock; refusing", False)
+        shutil.rmtree(dest)
+        return (f"[ok]  removed {dest}", True)
+    finally:
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
 
 
 def install_agents(dry: bool) -> list:
