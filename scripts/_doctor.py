@@ -13,8 +13,9 @@ import platform
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
-_VERSION_TIMEOUT = 20
+_VERSION_TIMEOUT = 10
 
 # Install/auth hints are static strings shown to humans; they never execute.
 _BACKENDS = {
@@ -59,15 +60,25 @@ def _probe_version(path: str) -> str | None:
 
 
 def _check_backends() -> dict:
+    """Probe all backends CONCURRENTLY (a hostile/hung PATH entry costs one
+    timeout, not five in sequence). A CLI that is on PATH but fails its
+    --version probe is reported found-but-unverified and NOT counted usable —
+    a random binary shadowing a backend name must not read as ready."""
+    names = list(_BACKENDS)
+    paths = {n: shutil.which(n) for n in names}
+    with ThreadPoolExecutor(max_workers=len(names)) as pool:
+        versions = dict(zip(names, pool.map(
+            lambda n: _probe_version(paths[n]) if paths[n] else None, names)))
     out: dict = {}
-    for name, hints in _BACKENDS.items():
-        path = shutil.which(name)
+    for name in names:
+        path = paths[name]
         entry: dict = {"found": bool(path), "path": path}
         if path:
-            entry["version"] = _probe_version(path)
+            entry["version"] = versions[name]
+            entry["verified"] = versions[name] is not None
         else:
-            entry["install"] = hints["install"]
-        entry["auth_hint"] = hints["auth"]
+            entry["install"] = _BACKENDS[name]["install"]
+        entry["auth_hint"] = _BACKENDS[name]["auth"]
         out[name] = entry
     return out
 
@@ -127,7 +138,7 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None) -> dict:
                     "unless SUBAGENTS_ALLOW_OPENAI_KEY=1",
         },
     }
-    usable = [n for n, b in backends.items() if b["found"]]
+    usable = [n for n, b in backends.items() if b["found"] and b.get("verified")]
     if "agy" in usable and not (
         report["agy_extras"].get("platform_ok")
         and report["agy_extras"].get("wrapper_found")
@@ -152,7 +163,10 @@ def render(report: dict) -> str:
         if b["found"]:
             ver = b.get("version") or "version unknown"
             mark, detail = "[OK]", f"{ver}  ({b['path']})"
-            if name == "agy":
+            if not b.get("verified"):
+                mark, detail = "[!!]", (f"on PATH but --version probe failed "
+                                        f"({b['path']}) - broken install or impostor binary")
+            if name == "agy" and b.get("verified"):
                 ex = report["agy_extras"]
                 if not ex.get("platform_ok"):
                     mark, detail = "[!!]", "CLI found but backend needs Windows or AGY_PTY_WRAPPER"

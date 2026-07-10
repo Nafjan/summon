@@ -50,10 +50,36 @@ jobs:
           mkdir -p "$HOME/.claude"
           python install.py --dry-run
 
-      - name: Installer real run + doctor sees the skill
+      - name: Installer safety - refuses to touch what it did not install
+        shell: bash
+        run: |
+          # An unowned skills/summon dir (no manifest) must survive both
+          # --uninstall and a reinstall attempt, and the run must exit 2.
+          mkdir -p "$HOME/.claude/skills/summon"
+          touch "$HOME/.claude/skills/summon/USER_FILE"
+          if python install.py --hosts claude --uninstall; then echo "expected exit 2"; exit 1; fi
+          test -f "$HOME/.claude/skills/summon/USER_FILE"
+          if python install.py --hosts claude --no-agents; then echo "expected exit 2"; exit 1; fi
+          test -f "$HOME/.claude/skills/summon/USER_FILE"
+          rm -rf "$HOME/.claude/skills/summon"
+          echo "ownership guard holds"
+
+      - name: Installer real run, true refresh, agent non-overwrite, clean uninstall
         shell: bash
         run: |
           python install.py --hosts claude
           test -f "$HOME/.claude/skills/summon/SKILL.md"
+          test -f "$HOME/.claude/skills/summon/.summon-install.json"
           python "$HOME/.claude/skills/summon/scripts/run_subagent.py" --list --agents-dir agents > /dev/null
-          echo "installed copy dispatch-path works"
+          # true refresh: a stale file from a previous version disappears on reinstall
+          touch "$HOME/.claude/skills/summon/scripts/OBSOLETE.py"
+          python install.py --hosts claude --no-agents
+          test ! -f "$HOME/.claude/skills/summon/scripts/OBSOLETE.py"
+          # starter agents never clobber an existing definition
+          echo "MINE" > "$HOME/.agents/reviewer.md" 2>/dev/null || { mkdir -p "$HOME/.agents"; echo "MINE" > "$HOME/.agents/reviewer.md"; }
+          python install.py --hosts claude
+          grep -q "MINE" "$HOME/.agents/reviewer.md"
+          # owned copies uninstall cleanly
+          python install.py --hosts claude --uninstall
+          test ! -d "$HOME/.claude/skills/summon"
+          echo "install lifecycle verified"

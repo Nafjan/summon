@@ -3,7 +3,7 @@
 **Summon any AI from any CLI.**
 
 One command that lets Claude Code, Codex, Cursor, Gemini CLI — or a plain terminal —
-dispatch work to *all* the others. Five vendors, one JSON contract, zero dependencies,
+dispatch work to *all* the others. Five vendors, one JSON contract, stdlib-only Python,
 no daemon.
 
 ```
@@ -28,10 +28,11 @@ python install.py          # copies the skill into every AI CLI on your machine
 python summon.py --doctor  # which backends are ready? what's missing?
 ```
 
-Then, from any directory:
+Then point it at any project (absolute `--cwd`; run the shim from the repo, or use
+the copy the installer placed in each host's `skills/summon/`):
 
 ```bash
-python summon.py --agent reviewer --prompt "Review the diff on this branch" --cwd "$(pwd)"
+python summon.py --agent reviewer --prompt "Review the diff on this branch" --cwd "$PWD"
 ```
 
 Or just ask your AI CLI — the installed skill triggers on natural language:
@@ -47,7 +48,7 @@ Or just ask your AI CLI — the installed skill triggers on natural language:
 | **Session resume** | `--resume <session_id>` continues a sub-agent's conversation without re-sending its whole definition. Follow-ups cost a fraction of fresh calls. |
 | **Fan-out from anywhere** | `--background` + `--worktree` give *every* host the parallel-agents primitive only Claude Code has natively: N agents, N branches, no collisions. |
 | **Honest model discovery** | `--list-models` reports what each backend can run — live-queried where the CLI exposes it, config-read or clearly marked `static` where it doesn't. New models need zero code changes. |
-| **No daemon, no deps** | Pure Python stdlib. No server, no MCP, no pip install. Auditable in an afternoon — which matters for a tool that can run with permissions bypassed. |
+| **No daemon, no deps** | The dispatcher is pure Python stdlib — no server, no MCP, no pip install. (One exception: the optional agy backend's PTY wrapper needs `pip install pywinpty pyte`; the other four backends need nothing.) Auditable in an afternoon — which matters for a tool that can run with permissions bypassed. |
 | **Billing guard** | Codex children get `OPENAI_API_KEY` stripped by default, so delegations bill your ChatGPT subscription — a stray env key can't silently flip you to metered API pricing. |
 
 ## What a dispatch returns
@@ -100,9 +101,9 @@ permission: safe-edit   # read-only | safe-edit | yolo
 
 ```bash
 # three implementations racing, each isolated, none blocking your session
-python summon.py --agent implementer --prompt "$SPEC" --cwd . --worktree try-codex  --background
-python summon.py --agent coder       --prompt "$SPEC" --cwd . --worktree try-cursor --background
-python summon.py --agent pair        --prompt "$SPEC" --cwd . --worktree try-claude --background
+python summon.py --agent implementer --prompt "$SPEC" --cwd "$PWD" --worktree try-codex  --background
+python summon.py --agent coder       --prompt "$SPEC" --cwd "$PWD" --worktree try-cursor --background
+python summon.py --agent pair        --prompt "$SPEC" --cwd "$PWD" --worktree try-claude --background
 # each returns {"job_id", "result_file", "pid"} immediately; poll the result files,
 # diff the three branches, merge the winner
 ```
@@ -118,10 +119,10 @@ competing hypotheses, consensus review).
 | Vendors | **5** (incl. Antigravity headless — nobody else drives it) | 2–3 | Claude only | 2–3 |
 | Any CLI as host | **yes** | mostly Claude-hosted | no | no |
 | Structured report + lie-detection | **yes** | partial | no | no |
-| Cost/usage telemetry | **yes** | partial | no | no |
+| Cost/usage telemetry | **yes** (where the backend emits it) | partial | no | no |
 | Session resume | **yes** (claude/codex/cursor/agy) | some | n/a | no |
 | Worktree + background fan-out | **yes, from any host** | no | yes (Claude-hosted) | no |
-| Runtime footprint | **one Python script** | daemon / MCP server / npm tree | plugin | server |
+| Runtime footprint | **a folder of stdlib Python** | daemon / MCP server / npm tree | plugin | server |
 
 (Honest caveats: those tools have better streaming UIs and bigger communities; summon
 is a dispatcher, not a dashboard. Gemini resume isn't supported — its CLI can't
@@ -143,9 +144,12 @@ re-target a specific headless session.)
   `safe-edit` (default), or `yolo` (bypasses approvals: use only in repos you trust).
 - The agy backend copies OAuth tokens into a per-invocation profile locked to your
   user (icacls on Windows, `0700` on POSIX) and isolated from your real profile.
-- `--doctor` shows exactly which credentials and CLIs each backend would use.
-- No network calls of its own, no telemetry phoned home — the only processes spawned
-  are the CLIs you configured.
+- `--doctor` shows which CLI binaries would be dispatched to (path + version) and how
+  each backend authenticates; it verifies presence, not credential validity.
+- No network calls of its own, no telemetry phoned home. Processes it spawns: the
+  backend CLIs, plus supporting tools where a feature needs them (`git` for
+  `--worktree`, `icacls`/`chmod` for agy profile lockdown, a Python PTY wrapper for
+  agy, and a detached copy of itself for `--background`).
 
 ## FAQ
 
@@ -157,6 +161,11 @@ tells you what's available; `--model` invokes it.
 **Does it need API keys?**
 No — it drives the CLIs you already log into (subscriptions). It deliberately
 *strips* `OPENAI_API_KEY` from codex children (see billing guard).
+
+**Truly zero pip installs?**
+For claude/codex/cursor/gemini: yes, stdlib only. The optional agy backend needs
+`pip install pywinpty pyte` for its PTY wrapper (Windows) — `--doctor` tells you if
+that's missing.
 
 **Why not MCP?**
 MCP would add a server and a session dependency for what is fundamentally a

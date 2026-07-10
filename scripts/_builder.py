@@ -245,7 +245,7 @@ def _has_pty_modules(python: str) -> bool:
     Quick probe subprocess; fail-soft False on any error."""
     try:
         r = subprocess.run([python, "-c", "import pyte, winpty"],
-                           capture_output=True, timeout=15, stdin=subprocess.DEVNULL)
+                           capture_output=True, timeout=8, stdin=subprocess.DEVNULL)
         return r.returncode == 0
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
@@ -404,18 +404,30 @@ def _ensure_agy_profile(cwd: str) -> str:
         for fn in _AGY_AUTH_FILES:
             src = os.path.join(real, fn)
             if os.path.isfile(src):
-                shutil.copy2(src, os.path.join(g, fn))
+                dst = os.path.join(g, fn)
+                shutil.copy2(src, dst)
+                if os.name != "nt":
+                    # copy2 preserves SOURCE modes; re-tighten so a 0644 source
+                    # can't yield a world-readable token copy (dirs are already
+                    # 0700, this makes the file contract explicit too).
+                    os.chmod(dst, 0o600)
             elif fn == "oauth_creds.json":  # required -> fail closed
                 raise ValueError(f"agy profile: required auth file missing: {src}")
 
+        # Windows agy expects backslash paths in trustedWorkspaces; POSIX must
+        # keep forward slashes (a blanket replace would corrupt /tmp/x -> \tmp\x).
+        trusted = cwd.replace("/", "\\") if os.name == "nt" else cwd
         with open(os.path.join(g, "settings.json"), "w", encoding="utf-8") as fh:
             json.dump({"mcpServers": {}}, fh)
         with open(os.path.join(acli, "settings.json"), "w", encoding="utf-8") as fh:
             json.dump({
                 "toolPermission": "always-proceed",
-                "trustedWorkspaces": [cwd.replace("/", "\\")],
+                "trustedWorkspaces": [trusted],
                 "mcpServers": {},
             }, fh, indent=2)
+        if os.name != "nt":
+            os.chmod(os.path.join(g, "settings.json"), 0o600)
+            os.chmod(os.path.join(acli, "settings.json"), 0o600)
     except ValueError:
         shutil.rmtree(prof, ignore_errors=True)  # never leave a partial profile
         raise
