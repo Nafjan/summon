@@ -230,6 +230,34 @@ def test_dry_run_is_mutation_free_even_during_crash_recovery():
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_uninstall_with_absent_dest_still_respects_held_lock():
+    # dest missing + a held lock = a concurrent install may be mid-flight;
+    # uninstall must refuse (exit 2), not report "nothing to do".
+    home = _fake_home()
+    try:
+        parent = os.path.join(home, ".claude", "skills")
+        os.makedirs(parent)
+        with open(os.path.join(parent, "summon.install.lock"), "w") as fh:
+            json.dump({"installed_by": "summon", "pid": 99999}, fh)
+        r = _run(home, "--hosts", "claude", "--uninstall")
+        assert r.returncode == 2, (r.returncode, r.stdout)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_lock_owned_rejects_non_object_json():
+    sys.path.insert(0, REPO)
+    import importlib
+    install = importlib.import_module("install")
+    with tempfile.NamedTemporaryFile("w", suffix=".lock", delete=False) as fh:
+        fh.write("[]")
+        p = fh.name
+    try:
+        assert install._lock_owned(p) is False
+    finally:
+        os.unlink(p)
+
+
 def test_doctor_rejects_nonzero_version_probe():
     # A CLI that errors on --version must not be verified/usable.
     import types

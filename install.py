@@ -220,22 +220,31 @@ def install_skill(host: str, dry: bool) -> tuple:
 
 def uninstall_skill(host: str, dry: bool) -> tuple:
     dest = os.path.join(HOSTS[host], "skills", "summon")
-    if not os.path.isdir(dest):
-        return (f"[--]  nothing at {dest}", True)
-    if not _owned(dest):
-        return (f"[!!]  {dest} has no valid {MANIFEST} - summon did not install it; "
-                f"refusing to delete", False)
     if dry:
+        # Mutation-free advisory view (state may differ at real run time).
+        if not os.path.isdir(dest):
+            return (f"[--]  nothing at {dest}", True)
+        if not _owned(dest):
+            return (f"[!!]  {dest} has no valid {MANIFEST} - summon did not install "
+                    f"it; refusing to delete", False)
         return (f"[dry] would remove {dest}", True)
-    # Same lock as install: an uninstall must not race a concurrent installer
-    # (which could otherwise recreate the tree mid-removal, or vice versa).
-    lock = _acquire_lock(os.path.dirname(dest))
+
+    # Lock FIRST, judge state under the lock: an early "nothing there" return
+    # taken outside the lock could interleave with a concurrent install that is
+    # about to create the tree (uninstall reports done, installer resurrects it).
+    parent = os.path.dirname(dest)
+    if not os.path.isdir(parent):
+        return (f"[--]  nothing at {dest}", True)  # no skills dir -> nothing to lock or remove
+    lock = _acquire_lock(parent)
     if lock is None:
         return (f"[!!]  {host}: another summon install/uninstall appears to be "
                 f"running; retry shortly", False)
     try:
-        if not _owned(dest):  # re-check under the lock
-            return (f"[!!]  {dest} changed while acquiring the lock; refusing", False)
+        if not os.path.isdir(dest):
+            return (f"[--]  nothing at {dest}", True)
+        if not _owned(dest):
+            return (f"[!!]  {dest} has no valid {MANIFEST} - summon did not install "
+                    f"it; refusing to delete", False)
         shutil.rmtree(dest)
         return (f"[ok]  removed {dest}", True)
     finally:
