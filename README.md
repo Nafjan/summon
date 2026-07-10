@@ -23,7 +23,7 @@ all five at once — each in its own git worktree, in the background.
 ## 60-second quickstart
 
 ```bash
-git clone https://github.com/nsider/summon && cd summon
+git clone https://github.com/Nafjan/summon && cd summon
 python install.py          # copies the skill into every AI CLI on your machine
 python summon.py --doctor  # which backends are ready? what's missing?
 ```
