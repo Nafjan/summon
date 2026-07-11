@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -71,17 +72,60 @@ def _round1_prompt(question: str) -> str:
         "supporting analysis in the work-product field.")
 
 
-def _round2_prompt(question: str, peers: list) -> str:
-    peer_text = "\n\n".join(f"[Advisor {chr(65+i)}]: {p}" for i, p in enumerate(peers))
+def _round2_prompt(question: str, all_positions: list) -> str:
+    # All positions, anonymized in a CONSISTENT global order (members order) so
+    # every member ranks the same lettered set and the votes aggregate cleanly.
+    # The member can't tell which position is their own -> no self-favoritism.
+    n = len(all_positions)
+    labeled = "\n\n".join(f"[Advisor {chr(65+i)}]: {p}" for i, p in enumerate(all_positions))
+    letters = ", ".join(chr(65+i) for i in range(n))
     return (
-        "Council round 2. You have now seen the other advisors' positions "
-        "(anonymized). Reconsider yours: defend it, refine it, or change it — and "
-        "say explicitly where you now AGREE and where you still DISAGREE, with why.\n\n"
-        f"QUESTION:\n{question}\n\n{_UNTRUSTED_NOTE}\nOTHER ADVISORS' POSITIONS:\n"
-        f"{peer_text}\n\nEnd with your Final report block; SUMMARY = your final position.")
+        f"Council round 2. Below are ALL {n} advisors' positions, anonymized — you "
+        "cannot tell which is yours, so judge purely on merit. Do TWO things:\n"
+        "1) Reconsider your own stance given the others (refine, defend, or change).\n"
+        f"2) RANK all {n} positions best-to-worst by how well-reasoned and correct "
+        "they are.\n\n"
+        f"QUESTION:\n{question}\n\n{_UNTRUSTED_NOTE}\nPOSITIONS:\n{labeled}\n\n"
+        "End with your Final report block. SUMMARY = your refined one-line position. "
+        f"Add a line 'RANKING: <letters best-first>' using {letters} "
+        "(e.g. 'RANKING: C, A, B').")
 
 
-def _chairman_prompt(question: str, members: list) -> str:
+def _parse_ranking(text: str, n: int) -> list | None:
+    """Extract a member's ranking as position indices (best-first) from a
+    'RANKING: C, A, B' line. Robust: ignores invalid/duplicate letters; None if
+    no usable ranking. (Ranking is advisory — a member that skips it isn't fatal.)"""
+    m = re.search(r"(?im)^\s*RANKING:\s*(.+)$", text or "")
+    if not m:
+        return None
+    valid = {chr(65 + i) for i in range(n)}
+    seen: set = set()
+    order: list = []
+    for tok in re.findall(r"[A-Za-z]", m.group(1)):
+        t = tok.upper()
+        if t in valid and t not in seen:
+            seen.add(t)
+            order.append(ord(t) - 65)
+    return order or None
+
+
+def _aggregate_rankings(rankings: list, n: int) -> list:
+    """Borda count over members' rankings. rankings = list of index-lists
+    (best-first). Returns [{index, score, votes}] sorted best-first; score is the
+    average Borda points (n-1 for a 1st-place vote ... 0 for last)."""
+    points = [0] * n
+    votes = [0] * n
+    for r in rankings:
+        for rank_pos, idx in enumerate(r):
+            points[idx] += (n - 1 - rank_pos)
+            votes[idx] += 1
+    scored = [{"index": i, "score": round(points[i] / votes[i], 2) if votes[i] else None,
+               "votes": votes[i]} for i in range(n)]
+    scored.sort(key=lambda s: (s["score"] is not None, s["score"] or 0), reverse=True)
+    return scored
+
+
+def _chairman_prompt(question: str, members: list, ranking_note: str = "") -> str:
     # Failed members are labelled so the chairman weighs them as non-answers, not
     # as ordinary positions.
     positions = "\n\n".join(
@@ -95,11 +139,12 @@ def _chairman_prompt(question: str, members: list) -> str:
         "the council is split. (Advisors marked FAILED did not answer; don't count "
         "them.)\n\n"
         f"QUESTION:\n{question}\n\n{_UNTRUSTED_NOTE}\nADVISORS' FINAL POSITIONS:\n"
-        f"{positions}\n\n"
+        f"{positions}\n{ranking_note}\n"
         "Deliver: (1) the DECISION you recommend, (2) your CONFIDENCE 0.0-1.0, "
         "(3) the points of AGREEMENT across advisors, (4) the points of DISSENT — "
-        "name who dissented and why, (5) a concrete NEXT ACTION. Be decisive. End "
-        "with your Final report block; put the decision + confidence in SUMMARY.")
+        "name who dissented and why, (5) a concrete NEXT ACTION. Weigh the peer "
+        "ranking as one signal, not the verdict. Be decisive. End with your Final "
+        "report block; put the decision + confidence in SUMMARY.")
 
 
 def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
@@ -191,7 +236,8 @@ def run_council(args) -> int:
         return {"agent": agent, "backend": b,
                 "model": (env.get("model") or {}).get("resolved"),
                 "status": env.get("status"), "position": _position(env, cap),
-                "elapsed_ms": env.get("elapsed_ms")}
+                "elapsed_ms": env.get("elapsed_ms"),
+                "_raw": env.get("result") or ""}   # kept only to parse RANKING
 
     try:
         # ---- round 1: independent positions ---------------------------------
@@ -199,19 +245,34 @@ def run_council(args) -> int:
         with ThreadPoolExecutor(max_workers=len(members)) as pool:
             results = list(pool.map(lambda m: run_member(m, p1, f"r1-{m}"), members))
 
-        # ---- round 2 (optional): cross-examination --------------------------
+        # ---- round 2 (optional): cross-examination + peer RANKING -----------
+        consensus_ranking = None
         if rounds >= 2:
             done["n"] = 0
+            # Same anonymized set (members order) for everyone -> comparable votes.
+            all_positions = [r.get("position") or "(no position)" for r in results]
             def refine(agent):
-                peers = [r["position"] for r in results
-                         if r["agent"] != agent and r.get("position")]
-                return run_member(agent, _round2_prompt(question, peers), f"r2-{agent}")
+                return run_member(agent, _round2_prompt(question, all_positions), f"r2-{agent}")
             with ThreadPoolExecutor(max_workers=len(members)) as pool:
                 results = list(pool.map(refine, members))
+            # Aggregate each member's ranking (Borda) into a consensus order.
+            n = len(members)
+            votes = [r for r in (_parse_ranking(m.get("_raw", ""), n) for m in results) if r]
+            if votes:
+                agg = _aggregate_rankings(votes, n)
+                consensus_ranking = [{"agent": members[a["index"]], "score": a["score"],
+                                      "votes": a["votes"]} for a in agg]
+
+        for m in results:                # drop the raw text kept only for ranking
+            m.pop("_raw", None)
 
         # ---- synthesis: the chairman calls it -------------------------------
+        rnote = ""
+        if consensus_ranking:
+            rnote = ("\nPEER RANKING (advisors ranked each other, best-first): "
+                     + ", ".join(f"{c['agent']}={c['score']}" for c in consensus_ranking) + "\n")
         print(f"[council] chairman {chairman} synthesizing…", file=sys.stderr, flush=True)
-        chair_env = _dispatch(chairman, _chairman_prompt(question, results),
+        chair_env = _dispatch(chairman, _chairman_prompt(question, results, rnote),
                               cwd, agents_dir, timeout_ms, out_dir, "chairman")
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)  # never leak the temp dir
@@ -228,6 +289,7 @@ def run_council(args) -> int:
         "rounds": rounds,
         "members": results,
         "failed_members": failed,
+        "consensus_ranking": consensus_ranking,   # None unless --rounds 2 produced votes
         "synthesis": {
             "chairman": chairman,
             "backend": backend_of(chairman),

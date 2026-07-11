@@ -1015,6 +1015,20 @@ def test_billing_inference():
         os.environ.clear(); os.environ.update(orig)
 
 
+def test_council_ranking_parse_and_aggregate():
+    from _council import _parse_ranking, _aggregate_rankings
+    assert _parse_ranking("stuff\nRANKING: C, A, B\nmore", 3) == [2, 0, 1]
+    assert _parse_ranking("RANKING: a,b,a,c,z", 3) == [0, 1, 2]   # dedup + ignore invalid
+    assert _parse_ranking("no ranking here", 3) is None
+    # Borda: two voters both rank [0,1,2] -> index 0 best (score 2), index 2 worst (0)
+    agg = _aggregate_rankings([[0, 1, 2], [0, 1, 2]], 3)
+    assert agg[0]["index"] == 0 and agg[0]["score"] == 2.0
+    assert agg[-1]["index"] == 2 and agg[-1]["score"] == 0.0
+    # a member with no vote -> None score, sorts last
+    agg2 = _aggregate_rankings([[1, 0]], 3)   # index 2 never voted on
+    assert agg2[-1]["index"] == 2 and agg2[-1]["score"] is None
+
+
 def test_council_prompts_and_position_extraction():
     import _council
     # position = report summary (+findings) when present, else result tail
@@ -1048,7 +1062,9 @@ def test_council_run_structure_with_stubbed_dispatch():
                 return {"status": "success", "result": "DECISION: X, CONFIDENCE 0.9",
                         "model": {"resolved": "claude-fable-5"},
                         "report": {"summary": "X wins"}}
-            return {"status": "success", "result": f"{agent} says go",
+            # round-2 dispatches (tag r2-*) emit a RANKING so consensus aggregates
+            rank = "\nRANKING: A, B" if tag.startswith("r2-") else ""
+            return {"status": "success", "result": f"{agent} says go{rank}",
                     "model": {"resolved": "claude-sonnet-5"},
                     "report": {"summary": f"{agent}: pick X"}}
         orig = _council._dispatch
@@ -1070,6 +1086,10 @@ def test_council_run_structure_with_stubbed_dispatch():
         assert "DECISION" in env["synthesis"]["recommendation"]
         assert calls["n"] == 5, calls["n"]           # 2 members x 2 rounds + chairman
         assert all(t == 90000 for t in calls["timeouts"])  # --timeout ms plumbed, not dropped
+        # peer ranking aggregated (both voted A,B -> m1 outranks m2), no _raw leak
+        cr = env["consensus_ranking"]
+        assert cr and cr[0]["agent"] == "m1" and cr[0]["score"] == 1.0
+        assert all("_raw" not in m for m in env["members"])
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
