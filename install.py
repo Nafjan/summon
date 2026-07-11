@@ -332,7 +332,15 @@ def _is_our_alias(skill_md: str) -> bool:
     if end == -1:
         return False
     front = content[3:end]
-    return _ALIAS_MARKER in front and "name: sub-agents" in front
+    if _ALIAS_MARKER not in front:
+        return False
+    # EXACT name match, not substring: `name: sub-agents-plus` (a real foreign
+    # skill) must NOT qualify. Parse the frontmatter `name:` value and compare.
+    for line in front.splitlines():
+        s = line.strip()
+        if s.startswith("name:"):
+            return s[len("name:"):].strip().strip("\"'") == "sub-agents"
+    return False
 
 
 def install_alias(host: str, dry: bool) -> tuple:

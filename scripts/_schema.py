@@ -245,7 +245,9 @@ def attach_parsed(response: dict, schema: dict) -> None:
     if warns:
         response["parse_warnings"] = warns
     value, why = extract_json(response.get("result") or "")
-    if value is None:
+    # Key on the ERROR reason, not `value is None` — a valid JSON `null` extracts
+    # as (None, None) and must flow through to validation, not read as a failure.
+    if why is not None:
         response["parsed"] = None
         response["parse_ok"] = False
         response["parse_errors"] = [why]

@@ -320,7 +320,7 @@ def test_elapsed_ms_present_even_on_spawn_failure():
     import _executor
     from _builder import AgentInvocation
     orig = _executor.build_invocation_args
-    _executor.build_invocation_args = lambda inv: ("definitely-not-a-real-cli-xyz", [], None)
+    _executor.build_invocation_args = lambda inv, timeout_ms=None: ("definitely-not-a-real-cli-xyz", [], None)
     try:
         out = _executor.execute_agent(
             AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(),
@@ -460,7 +460,7 @@ def test_envelope_model_and_permission_echo():
     import _executor
     from _builder import AgentInvocation
     orig = _executor.build_invocation_args
-    _executor.build_invocation_args = lambda inv: ("definitely-not-a-real-cli-xyz", [], None)
+    _executor.build_invocation_args = lambda inv, timeout_ms=None: ("definitely-not-a-real-cli-xyz", [], None)
     try:
         out = _executor.execute_agent(
             AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), system_context="s",
@@ -1269,8 +1269,8 @@ def test_timeout_does_not_hang_on_grandchild_holding_stdout():
     # communicate). Guards the wall-clock-timeout guarantee.
     import time as _t, subprocess as _sp, _executor
     child = ("import subprocess,sys,time;"
-             "subprocess.Popen([sys.executable,'-c','import time;time.sleep(15)']);"
-             "time.sleep(0.3)")  # child spawns a 15s grandchild (inherits stdout), then exits
+             "subprocess.Popen([sys.executable,'-c','import time;time.sleep(20)']);"
+             "time.sleep(0.3)")  # child spawns a 20s grandchild (inherits stdout), then exits
     extra = {"start_new_session": True} if os.name != "nt" else {}
     proc = _sp.Popen([sys.executable, "-c", child], stdin=_sp.DEVNULL,
                      stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
@@ -1278,7 +1278,9 @@ def test_timeout_does_not_hang_on_grandchild_holding_stdout():
     t0 = _t.monotonic()
     resp = _executor._drive_process(proc, "claude", timeout_ms=1000)
     elapsed = _t.monotonic() - t0
-    assert elapsed < 12, f"timeout path took {elapsed:.1f}s (regression: unbounded communicate)"
+    # Fixed path (tree-kill + bounded _safe_communicate) returns in a few seconds;
+    # the old unbounded communicate() would block ~20s until the grandchild exits.
+    assert elapsed < 15, f"timeout path took {elapsed:.1f}s (regression: unbounded communicate)"
     assert resp["status"] != "success", resp["status"]
 
 
@@ -1370,6 +1372,45 @@ def test_child_out_does_not_skip_on_non_success_envelope():
             os.remove(out)
         except OSError:
             pass
+
+
+# --- Regression tests for cross-vendor review of the fixes (round 2) ---------
+
+def test_schema_null_value_parses_ok():
+    # W2: a valid JSON `null` must validate, not read as an extraction failure.
+    import _schema
+    resp = {"result": "null"}
+    _schema.attach_parsed(resp, {"type": "null"})
+    assert resp["parse_ok"] is True and resp["parsed"] is None, resp
+    # a genuinely absent value still fails
+    resp2 = {"result": "no json here at all"}
+    _schema.attach_parsed(resp2, {"type": "object"})
+    assert resp2["parse_ok"] is False, resp2
+
+
+def test_manifest_timeout_grammar_matches_child():
+    # W3: bare number is MILLISECONDS (like the child), suffixes ms/s/m; no 'h'.
+    import _manifest
+    assert _manifest._timeout_seconds("600000") == 600.0      # bare == ms
+    assert _manifest._timeout_seconds("30s") == 30.0
+    assert _manifest._timeout_seconds("2m") == 120.0
+    assert _manifest._timeout_seconds("500ms") == 1.0         # floored to >=1s
+    assert _manifest._timeout_seconds("2h") == 600.0          # 'h' unsupported -> default
+    # parent watchdog stays comfortably above the child's own budget
+    assert _manifest._parent_timeout({"timeout": "30s"}) >= 90.0
+
+
+def test_parse_report_keeps_real_status_with_pipe():
+    # GF5: a real status containing " | " (not a template) must NOT be skipped.
+    import _executor
+    rep = _executor.parse_report(
+        "STATUS: BLOCKED | waiting on approval\nSUMMARY: s\nFOLLOW-UP: none\nHANDOFF: none")
+    assert rep and rep.get("status", "").startswith("BLOCKED |"), rep
+    # the pure template (all pipe tokens are status words) is still skipped
+    rep2 = _executor.parse_report(
+        "STATUS: DONE\nSUMMARY: real\nFOLLOW-UP: none\nHANDOFF: none\n"
+        "STATUS: DONE | PARTIAL | BLOCKED")
+    assert rep2 and rep2.get("summary") == "real", rep2
 
 
 if __name__ == "__main__":

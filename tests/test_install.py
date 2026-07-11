@@ -364,6 +364,12 @@ def test_alias_ownership_is_frontmatter_not_body_substring():
             fh.write('---\nname: my-real-skill\n---\n'
                      'This doc quotes \'Legacy alias for the "summon" skill\' in prose.\n')
         assert install._is_our_alias(md) is False, "foreign body-mention wrongly claimed as ours"
+        # A DIFFERENT skill whose name merely STARTS WITH 'sub-agents' and quotes the
+        # marker in its frontmatter must NOT qualify (exact-name match, not substring).
+        with open(md, "w", encoding="utf-8") as fh:
+            fh.write('---\nname: sub-agents-plus\n'
+                     'description: Legacy alias for the "summon" skill and then some\n---\nbody\n')
+        assert install._is_our_alias(md) is False, "sub-agents-plus wrongly claimed as our alias"
         # our actual generated alias IS recognized
         with open(md, "w", encoding="utf-8") as fh:
             fh.write(install.ALIAS_SKILL)
