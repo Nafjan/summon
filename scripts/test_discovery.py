@@ -163,6 +163,22 @@ def test_full_has_all_backends_without_real_agy():
     assert out["agy"]["models"] == ["StubModel"]
 
 
+def test_report_captures_custom_third_party_fields():
+    from _executor import parse_report
+    # A community agent's custom ALL-CAPS field must be captured as its own key,
+    # not folded into the previous field (which used to corrupt HANDOFF).
+    text = ("STATUS: DONE\nSUMMARY: reviewed\nSCORE: 8\nRUBRIC: clarity, depth\n"
+            "FOLLOW-UP: none\nHANDOFF: pass the score to the next call")
+    rep = parse_report(text)
+    assert rep["score"] == "8" and rep["rubric"] == "clarity, depth"
+    assert rep["handoff"] == "pass the score to the next call"  # NOT swallowing SCORE
+    # lowercase narration + a URL line still fold into the current value
+    text2 = ("STATUS: DONE\nSUMMARY: s\nFOLLOW-UP: none\n"
+             "HANDOFF: see notes below\nsome lowercase detail\nhttp://example.com/x")
+    rep2 = parse_report(text2)
+    assert "lowercase detail" in rep2["handoff"] and "example.com" in rep2["handoff"]
+
+
 def test_blocked_approval_downgrades_success():
     # A run that ENDS asking for interactive approval with no report contract
     # must become status:blocked (a 0 exit is not task completion).

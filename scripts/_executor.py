@@ -33,6 +33,16 @@ _REPORT_FIELDS = frozenset({
 # rather than a quoted "STATUS: DONE | PARTIAL | BLOCKED" contract example.
 _STATUS_VALUES = frozenset({"DONE", "PARTIAL", "BLOCKED", "SUCCESS", "ERROR"})
 _REPORT_FIELD_RE = re.compile(r"^([A-Z][A-Z0-9_-]{1,}):[ \t]?(.*)$")
+# A line begins a NEW field when its key is either a known field OR a well-formed
+# all-caps identifier (letters/digits/underscore, 2-30 chars) — so a third-party
+# agent's CUSTOM field (SCORE:, RUBRIC:, ...) is captured, not silently folded
+# into the previous value (which corrupts HANDOFF). Excludes hyphens/`://` so a
+# stray `http://` or a lowercase narration line stays part of the current value.
+_CUSTOM_FIELD_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,29}$")
+
+
+def _is_field_key(key: str) -> bool:
+    return key in _REPORT_FIELDS or bool(_CUSTOM_FIELD_RE.fullmatch(key))
 
 # Approval-request phrasings the backend CLIs emit when a sandboxed tool call
 # needs interactive consent. In one-shot mode a sub-agent that ENDS on one of
@@ -81,9 +91,10 @@ def parse_report(text: str) -> dict | None:
 
     Anchors on the LAST ``STATUS:`` line whose value begins with a real status
     token (DONE/PARTIAL/BLOCKED/...) — so a quoted contract example or narration
-    that merely mentions ``STATUS:`` can't spoof or displace the real block. Only
-    KNOWN field names (``_REPORT_FIELDS``) begin a new field; any other line is
-    treated as a continuation of the current value (multi-line safe). Keys are
+    that merely mentions ``STATUS:`` can't spoof or displace the real block. A line
+    begins a new field when its key is a known field OR a well-formed all-caps
+    identifier (so third-party agents' custom fields are captured, not folded);
+    any other line continues the current value (multi-line safe). Keys are
     lowercased with ``-`` mapped to ``_`` (e.g. ``follow_up``).
 
     Returns None when no genuine ``STATUS:`` line exists.
@@ -106,7 +117,7 @@ def parse_report(text: str) -> dict | None:
     current_key = None
     for line in lines[start:]:
         m = _REPORT_FIELD_RE.match(line)
-        if m and m.group(1) in _REPORT_FIELDS:
+        if m and _is_field_key(m.group(1)):
             current_key = m.group(1).lower().replace("-", "_")
             fields[current_key] = m.group(2).strip()
         elif current_key is not None:
