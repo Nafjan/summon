@@ -23,11 +23,19 @@ dir (or ``~/.agents/providers.json``): { "myprovider": {"base_url": "...",
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
-import time
 import urllib.error
 import urllib.request
+
+
+def _redact(text: str, secret: str | None) -> str:
+    """Strip the API key value from any text that might reach the envelope/log —
+    some endpoints reflect the Authorization header in error bodies."""
+    if secret and text:
+        return text.replace(secret, "***REDACTED***")
+    return text
 
 # Sensible defaults so common providers work with just `provider:` + `model:`.
 BUILTIN_PROVIDERS = {
@@ -110,6 +118,8 @@ def call(inv, timeout_ms: int) -> dict:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(inv.base_url + "/chat/completions", data=body,
                                  headers=headers, method="POST")
+    # Every error string below is _redact()ed with the key before returning, so a
+    # reflected Authorization header can never reach the envelope or --debug-dir.
     try:
         with urllib.request.urlopen(req, timeout=max(1, timeout_ms / 1000)) as r:
             payload = json.loads(r.read().decode("utf-8", errors="replace"))
@@ -119,16 +129,25 @@ def call(inv, timeout_ms: int) -> dict:
             detail = e.read().decode("utf-8", errors="replace")[:500]
         except Exception:  # noqa: BLE001
             pass
-        return _err(cli, f"HTTP {e.code} from {inv.base_url}: {detail or e.reason}")
+        return _err(cli, _redact(f"HTTP {e.code} from {inv.base_url}: {detail or e.reason}", api_key))
     except (urllib.error.URLError, TimeoutError) as e:
-        return _err(cli, f"request failed ({inv.base_url}): {e}")
-    except ValueError as e:
-        return _err(cli, f"non-JSON response from {inv.base_url}: {e}")
+        return _err(cli, _redact(f"request failed ({inv.base_url}): {e}", api_key))
+    except (ValueError, http.client.HTTPException, OSError) as e:
+        # ValueError = bad JSON; HTTPException = IncompleteRead etc.; OSError =
+        # mid-read socket failure. All become a clean error envelope.
+        return _err(cli, _redact(f"bad/failed response from {inv.base_url}: "
+                                 f"{type(e).__name__}: {e}", api_key))
 
     try:
-        text = payload["choices"][0]["message"]["content"] or ""
+        text = payload["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
-        return _err(cli, f"unexpected response shape: {json.dumps(payload)[:300]}")
+        return _err(cli, _redact(f"unexpected response shape: {json.dumps(payload)[:300]}", api_key))
+    if text is None:
+        text = ""
+    if not isinstance(text, str):
+        # non-string content (e.g. a tool-call array) — stringify so downstream
+        # report parsing (which does .splitlines()) never crashes.
+        text = json.dumps(text)
 
     resp = {"result": text, "exit_code": 0, "status": "success", "cli": cli}
     if isinstance(payload.get("usage"), dict):
