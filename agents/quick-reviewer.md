@@ -1,6 +1,6 @@
 ---
 run-agent: claude
-model: sonnet
+model: claude-sonnet-5
 permission: safe-edit
 ---
 

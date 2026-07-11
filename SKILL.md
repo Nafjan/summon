@@ -193,10 +193,19 @@ reaches an agent depends only on how that agent names its model:
 
 | How the model is named | Example | When a new model ships |
 |---|---|---|
-| **Alias** (claude only) | `opus`, `sonnet` | **Auto-floats** — the CLI resolves the alias to the latest release. No action. |
+| **Alias** (claude only) | `opus`, `sonnet` | Floats to whatever the CLI *currently maps the alias to* — but that mapping can **LAG the newest release** (the CLI vendor controls it). Verify, don't assume. |
 | **Unpinned** | (no `model:`) | Floats with the CLI's own default (agy, gemini). |
 | **CLI-config default** | codex | Uses `~/.codex/config.toml` `model`; move the default there or pass `--model`. |
-| **Version ID** | `claude-fable-5`, `composer-2.5` | **Frozen** — bump the agent's `model:` (or `CURSOR_DEFAULT_MODEL` in `_builder.py`). |
+| **Version ID** | `claude-sonnet-5`, `claude-fable-5` | **Frozen** — exactly this model until you bump the agent's `model:` (or `CURSOR_DEFAULT_MODEL` in `_builder.py`). |
+
+> **Aliases lag — verify with `model.resolved`.** An alias resolves to whatever the CLI
+> maps it to *today*, which is not always the newest model. Observed: `--model sonnet`
+> resolved to `claude-sonnet-4-6` while `claude-sonnet-5` was already available. Every
+> dispatch envelope reports `model.resolved` (the model the backend *actually served*) —
+> check it. For **guaranteed-latest**, pin the explicit version ID (`claude-sonnet-5`,
+> `claude-opus-4-8`) and re-verify when a new model ships; for **auto-float-when-it-works**,
+> use the alias but confirm `model.resolved` is what you expect. This roster pins Sonnet
+> explicitly (its alias lagged) and leaves `opus` as an alias (verified serving 4.8).
 
 `--list-models` answers "what can each backend run *right now*" live where the CLI
 exposes it. Each entry is tagged with a `source` so you know how much to trust it:
@@ -205,9 +214,42 @@ exposes it. Each entry is tagged with a `source` so you know how much to trust i
 - `static` — documented aliases/defaults to pass via `--model` (CLI has no list)
 - `unavailable` — a live query was attempted and failed (reason in `note`)
 
-Prefer floating aliases (`opus`/`sonnet`) over pinned IDs unless an agent deliberately
-needs a fixed model (e.g. `fable` = the escalation tier). Discover with `--list-models`,
-invoke with `--model` — new models never require editing the skill itself.
+Discover with `--list-models`, invoke with `--model`, verify with `model.resolved` —
+using a new model never requires editing the skill code itself.
+
+## Customizing agents (you, the calling agent, are expected to)
+
+The bundled roster is a starting point, not a fixed menu. As the orchestrator you
+have two levers — use them freely:
+
+**1. Per-dispatch, no files touched** — override an agent's model, reasoning effort,
+and backend flags for a single call:
+```bash
+run_subagent.py --agent reviewer --model claude-sonnet-5 --effort high \
+  --prompt "…" --cwd <abs>
+```
+`--model` accepts any model the backend supports (see the per-CLI table above);
+`--effort` is `low|medium|high|xhigh|max` (claude). The prompt itself is your main
+customization — the agent definition sets the role, the prompt sets the task.
+
+**2. Durably — create or edit an agent definition.** Agent definitions are plain
+`.md` files in the agents dir (`--agents-dir`, `$SUB_AGENTS_DIR`, or `{cwd}/.agents/`).
+Write a new one or edit an existing one and it registers **instantly** — no reload,
+no restart; the next `--list`/dispatch sees it. Set in frontmatter:
+- `run-agent` — which CLI (claude/codex/cursor-agent/gemini/agy)
+- `model` — pin a model (verify with `model.resolved`)
+- `permission` — `read-only`/`safe-edit`/`yolo`
+- `args` — arbitrary extra backend flags (e.g. `args: -c model_reasoning_effort="high"`)
+
+…and write the role, rubric, and output contract in the body. Authoring a
+task-specific persona (e.g. a custom reviewer with your own rubric) is a single file
+write — do it whenever the standing roster doesn't fit the job.
+
+**Different models per role is the whole point.** Give planning/architecture agents a
+deep model (`opus`, `claude-fable-5`), balanced work a `claude-sonnet-5` agent, cheap
+mechanical passes a lighter one, and fan a task across several models at once with
+`--manifest` (per-job `model:`). Nothing here is baked into the skill — it's all in the
+`.md` files and the flags you pass.
 
 ## Fan-out (swarms)
 
