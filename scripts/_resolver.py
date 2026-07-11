@@ -12,7 +12,17 @@ import re
 import shutil
 import subprocess
 
-_VALID_CLIS = ("claude", "cursor-agent", "codex", "gemini", "agy", "openai-compat")
+# Valid backends come from the single registry in _builder (imported lazily to
+# avoid an import cycle: _builder imports _loader, not _resolver).
+def _valid_clis() -> tuple:
+    try:
+        from _builder import BACKEND_CLIS
+        return BACKEND_CLIS
+    except ImportError:
+        return ("claude", "cursor-agent", "codex", "gemini", "agy", "openai-compat")
+
+
+_VALID_CLIS = _valid_clis()
 
 
 def detect_caller_cli() -> str | None:
