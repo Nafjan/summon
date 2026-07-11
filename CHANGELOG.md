@@ -6,12 +6,26 @@ it bumps only on a breaking change to the response shape, never on added fields.
 
 ## [0.9.0] — unreleased (pre-1.0)
 
-Cross-vendor sub-agent dispatcher over Claude, Codex, Cursor, Gemini, and Antigravity.
+Cross-vendor sub-agent dispatcher over Claude, Codex, Cursor, Gemini, Antigravity, and
+any OpenAI-compatible API.
+
+### Command surface
+- Git-style subcommands (`dispatch`, `list`, `models`, `doctor`, `manifest`, `council`,
+  `agent new|set`, `version`) with the legacy flat `--flag` form kept working.
+
+### Backends
+- Six backends behind one registry (`BACKENDS` in `_builder.py`, the single place to add
+  one — see `references/adding-a-backend.md`).
+- **`openai-compat`** — call any OpenAI-compatible `/chat/completions` endpoint
+  (OpenRouter, OpenAI, Anthropic, Google, Groq, DeepSeek, Together, local Ollama/LM
+  Studio/vLLM) via stdlib HTTP; providers from built-ins + `providers.json`.
+- **Council mode** (`council`) — vendor-diverse members answer, cross-examine, and rank
+  each other anonymously (Borda `consensus_ranking`); a chairman synthesizes the decision.
 
 ### Core
 - One stdlib-Python dispatcher; structured JSON envelope (`status`, parsed `report`,
   `report_ok`, `model.{requested,resolved}`, `permission`/`permission_flags`, `usage`,
-  `cost_usd`, `elapsed_ms`, `envelope` schema version).
+  `cost_usd`, `billing.{source,note}`, `elapsed_ms`, `envelope` schema version).
 - Envelope-status reconciliation: a self-reported `STATUS: BLOCKED/PARTIAL/ERROR` (or an
   interactive-approval request with no report) never surfaces as a false `success`.
 - Session resume (`--resume`) for claude/codex/cursor/agy; per-call `--model`/`--effort`.
