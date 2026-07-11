@@ -175,7 +175,8 @@ Every response carries structured fields for programmatic orchestration:
 | `report` | Parsed report contract as a dict (`status`, `summary`, `handoff`, `follow_up`, plus work-product fields). Paste `report["handoff"]` into the next `--prompt`; branch on `report["status"]`. |
 | `report_ok` | `true` when the full contract block is present. If `status:"success"` but `report_ok:false`, the response also has `suspect:true` — re-dispatch rather than trusting it. |
 | `resume` | `{cli, session_id, profile?}`. Feed `session_id` to `--resume` (or `profile` to `--resume-profile` for agy) for a cheap follow-up that skips re-sending the agent definition. |
-| `session_id`, `usage`, `cost_usd` | Telemetry (claude/codex expose all; agy exposes none). Track spend/tokens across a chain. |
+| `session_id`, `usage`, `cost_usd` | Telemetry (claude/codex expose all; agy exposes none; openai-compat returns the API's `usage`). Track spend/tokens across a chain. |
+| `billing` | `{source, note}` — did this run draw from a vendor **subscription** (CLI login) or metered **api** credits? Pairs with `usage`/`cost_usd` to attribute spend. Advisory (the vendor's billing is truth). |
 | `elapsed_ms` | Wall-clock for the dispatch — on every DISPATCH envelope (success/blocked/partial/error/timeout, incl. spawn failures). Not on the `--background` handle or pre-dispatch validation errors. Use it to tune swarm concurrency. |
 | `model` | `{requested, resolved}` — what was asked for vs what the backend REPORTED serving (claude resolves aliases to full IDs, e.g. `sonnet` → `claude-sonnet-4-6`). `resolved: null` = the backend didn't say (agy never does): absence of proof, not proof of the requested model. |
 | `permission`, `permission_flags` | The permission level and the EXACT CLI flags it mapped to for this run — no more black box. |
@@ -258,6 +259,40 @@ serving via `model.resolved` at snapshot time:
 Cross-vendor routing rule of thumb: never have an agent's work reviewed by its own
 vendor — send claude/cursor-written code to a codex reviewer and codex-written code to
 a claude reviewer (see docs/PROTOCOL.md).
+
+## Custom & API backends (`openai-compat`) — add any model
+
+Beyond the five CLIs, an agent can run against **any OpenAI-compatible
+`/chat/completions` API** — OpenRouter, OpenAI, Anthropic, Google (Gemini compat),
+Groq, DeepSeek, Together, or a LOCAL server (Ollama, LM Studio, vLLM, llama.cpp).
+Pure stdlib HTTP, no SDK. This bills your **API key/credits**, not a subscription
+(cleaner for commercial/high-volume — see [TERMS.md](TERMS.md)).
+
+```markdown
+---
+run-agent: openai-compat
+provider: openrouter                 # or: openai / anthropic / google / groq / ollama / lmstudio / <your provider>
+model: anthropic/claude-3.5-sonnet   # the API's model id
+---
+```
+or point anywhere directly (no provider needed):
+```markdown
+---
+run-agent: openai-compat
+base_url: http://localhost:11434/v1  # local Ollama
+api_key_env: ""                       # empty = no auth header
+model: llama3.1
+---
+```
+
+**Providers** resolve from built-ins + an optional `providers.json` in the agents
+dir (or `~/.agents/providers.json`) — `{ "myprov": {"base_url": "...", "api_key_env":
+"MY_KEY"} }` (see `providers.json.example`). The API key is read from the named env
+var at dispatch (never stored). Everything else is identical: same envelope, same
+`--manifest`/`--council`/`--json-schema`. Create these agents by hand or with
+`--new-agent NAME --set run-agent=openai-compat --set model=...`. Resume isn't
+supported (the API call is stateless). This is how you add local AI and multi-model
+API access — and it makes `--council` a true multi-vendor board (à la OpenRouter).
 
 ## Customizing agents (you, the calling agent, are expected to)
 
@@ -425,7 +460,7 @@ permissions.
 
 | Field | Values | Description |
 |-------|--------|-------------|
-| `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `agy` | Which CLI executes this agent |
+| `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `agy`, `openai-compat` | Which backend executes this agent (`openai-compat` = any OpenAI-compatible API — see "Custom & API backends") |
 | `permission` | `read-only`, `safe-edit` (default), `yolo` | Approval/sandbox level the sub-agent runs with |
 | `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.resolved` |
 | `args` | shell-style string (optional) | Arbitrary extra backend flags passed verbatim, e.g. `args: -c model_reasoning_effort="high"` (codex). Model pinning stops being a special case |

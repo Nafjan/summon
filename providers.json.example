@@ -1,0 +1,16 @@
+{
+  "_comment": "Copy to your agents dir as providers.json (or ~/.agents/providers.json) to add OpenAI-compatible endpoints. Built-ins already include openrouter, openai, anthropic, google, groq, together, deepseek, ollama, lmstudio — you only need entries here for custom/self-hosted endpoints or to override a built-in.",
+
+  "my-vllm": {
+    "base_url": "http://192.168.1.50:8000/v1",
+    "api_key_env": "VLLM_API_KEY"
+  },
+  "my-openrouter": {
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key_env": "OPENROUTER_API_KEY"
+  },
+  "local-ollama": {
+    "base_url": "http://localhost:11434/v1",
+    "api_key_env": ""
+  }
+}

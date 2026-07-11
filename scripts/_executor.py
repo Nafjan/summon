@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 
-from _builder import AgentInvocation, build_invocation_args, permission_flags
+from _builder import AgentInvocation, build_invocation_args, infer_billing, permission_flags
 from _stream import StreamProcessor
 
 _SUCCESS_EXIT_CODES = (0, 143, -15)  # 0 ok, 143/-15 = SIGTERM (we asked it to stop)
@@ -140,10 +140,12 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     happen. An orchestrator trusting ``status`` must not collect that as a win.
     """
     response["envelope"] = ENVELOPE_VERSION
-    response["session_id"] = processor.session_id if processor else None
-    response["usage"] = processor.usage if processor else None
-    response["cost_usd"] = processor.cost_usd if processor else None
-    response["model_resolved"] = processor.model if processor else None
+    # setdefault (not =) so a non-stream backend (openai-compat) that already
+    # populated these from its HTTP response isn't clobbered with None.
+    response.setdefault("session_id", processor.session_id if processor else None)
+    response.setdefault("usage", processor.usage if processor else None)
+    response.setdefault("cost_usd", processor.cost_usd if processor else None)
+    response.setdefault("model_resolved", processor.model if processor else None)
     # Baseline resume handle on EVERY path (incl. spawn-failure) so orchestrators
     # can read response["resume"] unconditionally. execute_agent enriches it with
     # the agy profile on the normal path.
@@ -508,9 +510,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     elapsed_ms, ...).
     """
     started = time.monotonic()
-    command, args, env_override = build_invocation_args(inv)
-    command, args = _resolve_launch(command, args)
-    proc_env = _merge_env(env_override)
+    debug_argv = [inv.cli]  # what --debug-dir records; each path refines it
 
     def _stamp(resp: dict) -> dict:
         # Wall-clock per dispatch — orchestrators need this for concurrency
@@ -525,12 +525,29 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             resp["permission_flags"] = permission_flags(inv.cli, inv.permission)
         except ValueError:
             resp["permission_flags"] = None
+        # Which billing source this run drew from (subscription vs API credits) —
+        # pairs with usage/cost_usd so an orchestrator can attribute spend.
+        resp.setdefault("billing", infer_billing(inv.cli))
         raw = resp.pop("_debug_raw", None)
         if debug_dir:
-            dbg = _write_debug(debug_dir, [command, *args], raw or "", resp)
+            dbg = _write_debug(debug_dir, debug_argv, raw or "", resp)
             if dbg:
                 resp["debug_file"] = dbg
         return resp
+
+    # openai-compat: a NON-subprocess backend (HTTP to an OpenAI-compatible API).
+    # Flows through the same _enrich/_stamp so the envelope shape is identical.
+    if inv.cli == "openai-compat":
+        from _apibackend import call as _api_call
+        debug_argv = ["openai-compat", inv.base_url or "?", inv.model or "?"]
+        resp = _enrich(_api_call(inv, timeout_ms), None)
+        resp["resume"] = {"cli": inv.cli, "session_id": None}  # stateless: no resume
+        return _stamp(resp)
+
+    command, args, env_override = build_invocation_args(inv)
+    command, args = _resolve_launch(command, args)
+    proc_env = _merge_env(env_override)
+    debug_argv = [command, *args]
 
     try:
         # stdin=DEVNULL: sub-agent CLIs (notably codex) probe stdin for "additional

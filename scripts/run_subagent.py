@@ -306,9 +306,9 @@ def main() -> None:
     # fan out or detach would otherwise slip past the dry-run exit and run real
     # work (a detached --background child never even inherits --dry-run). Refuse
     # loudly instead of silently executing.
-    if args.dry_run and (args.background or args.manifest):
-        _print_error("--dry-run cannot be combined with --background or --manifest "
-                     "(it previews one resolved dispatch and never executes)")
+    if args.dry_run and (args.background or args.manifest or args.council):
+        _print_error("--dry-run cannot be combined with --background, --manifest, or "
+                     "--council (it previews one resolved dispatch and never executes)")
         sys.exit(1)
 
     # --background and --out are two DIFFERENT completion contracts: background
@@ -418,6 +418,21 @@ def main() -> None:
         args.cwd = worktree_info["path"]
 
     cli = args.cli or resolve_cli(run_agent_cli)
+
+    # openai-compat: resolve the API endpoint (provider -> base_url/api_key_env)
+    # from the agent's frontmatter now, while we still have the agents dir.
+    base_url = api_key_env = None
+    if cli == "openai-compat":
+        from _apibackend import resolve_endpoint
+        from _loader import parse_frontmatter
+        try:
+            with open(agent_file, encoding="utf-8") as fh:
+                fm, _ = parse_frontmatter(fh.read())
+            base_url, api_key_env = resolve_endpoint(fm, agents_dir)
+        except (OSError, ValueError) as e:
+            _print_error(f"openai-compat agent {args.agent!r}: {e}")
+            sys.exit(1)
+
     invocation = AgentInvocation(
         cli=cli,
         prompt=args.prompt,
@@ -430,6 +445,8 @@ def main() -> None:
         resume_id=args.resume,
         resume_profile=args.resume_profile,
         extra_args=tuple(extra_args),
+        base_url=base_url,
+        api_key_env=api_key_env,
     )
 
     if args.dry_run:
@@ -477,7 +494,14 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
         "worktree": ("would create" if args.worktree is not None else None),
         "system_context_chars": len(invocation.system_context),
     }
-    if invocation.cli == "agy":
+    if invocation.cli == "openai-compat":
+        view["command"] = "POST (openai-compat)"
+        view["base_url"] = invocation.base_url
+        view["endpoint"] = (invocation.base_url or "?") + "/chat/completions"
+        view["api_key_env"] = invocation.api_key_env
+        view["api_key_present"] = bool(invocation.api_key_env and os.environ.get(invocation.api_key_env))
+        view["billing"] = {"source": "api"}
+    elif invocation.cli == "agy":
         try:
             view["command"] = "python <wrapper>"
             view["wrapper"] = _agy_wrapper()
