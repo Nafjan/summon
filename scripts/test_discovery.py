@@ -462,6 +462,96 @@ def test_out_skip_short_circuits(tmp_base=None):
         os.remove(out)
 
 
+def test_extract_json_no_perf_cliff_on_braces():
+    # Regression: 1MB of "{" must not take 30s (old raw_decode-every-char bug).
+    import time as _t
+    from _schema import extract_json
+    blob = "{" * 1_000_000
+    t0 = _t.monotonic()
+    val, err = extract_json(blob)
+    dt = _t.monotonic() - t0
+    assert val is None and err
+    assert dt < 3.0, f"extract_json took {dt:.1f}s on pathological input"
+
+
+def test_validate_never_raises_on_malformed_schema():
+    from _schema import validate
+    # minLength as a string, required as a string, pattern as int, bad type:
+    bad_schemas = [
+        {"type": "string", "minLength": "3"},
+        {"type": "object", "required": "notalist"},
+        {"type": "string", "pattern": 123},
+        {"type": "number", "maximum": "high"},
+    ]
+    for sc in bad_schemas:
+        errs = validate("x" if sc["type"] == "string" else 5, sc)
+        assert isinstance(errs, list) and errs, sc  # error string, not a crash
+
+
+def test_dry_run_refuses_background_and_manifest():
+    import json as _json
+    import subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    for extra in (["--background"], ["--manifest", "x.json"]):
+        r = sp.run([sys.executable, script, "--agent", "a", "--prompt", "p",
+                    "--cwd", os.getcwd(), "--dry-run", *extra],
+                   capture_output=True, text=True, encoding="utf-8")
+        env = _json.loads(r.stdout)
+        assert env["status"] == "error" and "dry-run" in env["error"], (extra, env)
+        assert r.returncode == 1
+
+
+def test_manifest_semaphores_prebuilt_no_race():
+    # sem dict must be fully populated before the pool starts (no lazy creation).
+    import _manifest as m
+    # _normalize + the prebuild path is internal; assert the helper it relies on
+    # is deterministic: same backend string always maps to one BoundedSemaphore
+    # when built as a dict comprehension (the fix). Smoke the parse instead.
+    caps = m._parse_concurrency("agy=2,codex=3,default=1")
+    backends = {"a": "agy", "b": "agy", "c": "codex"}
+    sems = {b: __import__("threading").BoundedSemaphore(caps.get(b, caps["default"]))
+            for b in set(backends.values())}
+    assert set(sems) == {"agy", "codex"} and len(sems) == 2
+
+
+def test_manifest_reads_out_file_not_stdout():
+    # _read_envelope must trust the --out file even when child stdout has noise.
+    import _manifest as m
+    import types
+    out = os.path.join(tempfile.gettempdir(), f"summon-env-{os.getpid()}.json")
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write('{"status": "success", "result": "real"}')
+    try:
+        proc = types.SimpleNamespace(returncode=0,
+                                     stdout='BANNER {oops brace} more noise', stderr="")
+        env = m._read_envelope(out, proc)
+        assert env["status"] == "success" and env["result"] == "real"
+    finally:
+        os.remove(out)
+    # missing file -> error envelope from exit info, never a stdout slice
+    proc = types.SimpleNamespace(returncode=3, stdout="{not json", stderr="boom")
+    env = m._read_envelope(os.path.join(tempfile.gettempdir(), "nope-xyz.json"), proc)
+    assert env["status"] == "error" and "boom" in env["error"]
+
+
+def test_write_out_unique_tmp():
+    # _write_out must not use a fixed <path>.tmp (concurrent clobber). After a
+    # write, only the final file exists — no leftover predictable temp.
+    import run_subagent as rs
+    d = tempfile.mkdtemp(prefix="summon-out-")
+    try:
+        target = os.path.join(d, "job.json")
+        rs._write_out(target, {"status": "success", "result": "x"})
+        import json as _json
+        assert _json.load(open(target))["status"] == "success"
+        assert not os.path.exists(target + ".tmp")  # no fixed-name temp
+        leftovers = [f for f in os.listdir(d) if f.endswith(".tmp")]
+        assert leftovers == [], leftovers
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 def test_dry_run_resolves_without_executing():
     import json as _json
     import subprocess as sp

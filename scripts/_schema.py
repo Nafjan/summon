@@ -32,32 +32,47 @@ _TYPE_CHECKS = {
 }
 
 
+_EXTRACT_MAX = 2_000_000    # chars scanned; agent JSON payloads are far smaller
+_EXTRACT_MAX_ATTEMPTS = 5000  # failed decode attempts before giving up
+_OPENER = re.compile(r"[{\[]")
+
+
 def extract_json(text: str):
     """Return ``(value, None)`` for the LAST complete top-level JSON object or
     array in ``text``, or ``(None, reason)`` when none parses.
 
-    Scans forward with ``JSONDecoder.raw_decode`` and jumps over each parsed
-    span, so nested values inside an already-consumed object are never
-    mistaken for the final answer, and code fences / surrounding prose are
-    ignored naturally.
+    Finds each ``{``/``[`` with a single regex scan and attempts ``raw_decode``
+    there, jumping past whatever it decodes. Two guards keep pathological input
+    cheap (a 1 MB string of ``{`` otherwise costs 1 M raise/catch cycles — the
+    expensive part is the exceptions, not the scan): the input is capped to
+    ``_EXTRACT_MAX`` chars from the END (where the answer is), and FAILED decode
+    attempts are capped at ``_EXTRACT_MAX_ATTEMPTS`` — real agent output has a
+    handful of top-level openers, never thousands.
     """
     if not text:
         return None, "empty text"
+    if len(text) > _EXTRACT_MAX:
+        text = text[-_EXTRACT_MAX:]
     dec = json.JSONDecoder()
     last = None
-    i = 0
-    n = len(text)
+    fails = 0
+    i, n = 0, len(text)
     while i < n:
-        ch = text[i]
-        if ch in "{[":
-            try:
-                obj, end = dec.raw_decode(text, i)
-            except ValueError:
-                i += 1
-                continue
+        m = _OPENER.search(text, i)
+        if not m:
+            break
+        i = m.start()
+        try:
+            obj, end = dec.raw_decode(text, i)
             last = obj
             i = end
-        else:
+        except ValueError:
+            fails += 1
+            if fails > _EXTRACT_MAX_ATTEMPTS:
+                if last is not None:
+                    break  # already have a candidate; stop burning cycles
+                return None, ("no JSON object/array decoded in the first "
+                              f"{_EXTRACT_MAX_ATTEMPTS} openers (input looks malformed)")
             i += 1
     if last is None:
         return None, "no complete JSON object/array found in the agent's result"
@@ -94,30 +109,53 @@ def validate(instance, schema: dict, path: str = "$") -> list:
         elif instance not in enum:
             errors.append(f"{path}: {instance!r} not in enum {enum!r}")
 
+    # Numeric-bound helpers: a malformed schema (e.g. minLength: "3") must yield
+    # a validation error, never a TypeError out of this function.
+    def _num(key):
+        if key not in schema:
+            return None, False
+        v = schema[key]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            errors.append(f"{path}: schema {key} is not a number ({v!r})")
+            return None, True
+        return v, False
+
     if isinstance(instance, str):
-        if "minLength" in schema and len(instance) < schema["minLength"]:
-            errors.append(f"{path}: string shorter than minLength {schema['minLength']}")
-        if "maxLength" in schema and len(instance) > schema["maxLength"]:
-            errors.append(f"{path}: string longer than maxLength {schema['maxLength']}")
+        lo, bad = _num("minLength")
+        if lo is not None and len(instance) < lo:
+            errors.append(f"{path}: string shorter than minLength {lo}")
+        hi, bad = _num("maxLength")
+        if hi is not None and len(instance) > hi:
+            errors.append(f"{path}: string longer than maxLength {hi}")
         if "pattern" in schema:
-            try:
-                if not re.search(schema["pattern"], instance):
-                    errors.append(f"{path}: does not match pattern {schema['pattern']!r}")
-            except re.error as e:
-                errors.append(f"{path}: schema pattern invalid ({e})")
+            pat = schema["pattern"]
+            if not isinstance(pat, str):
+                errors.append(f"{path}: schema pattern is not a string")
+            else:
+                try:
+                    if not re.search(pat, instance):
+                        errors.append(f"{path}: does not match pattern {pat!r}")
+                except re.error as e:
+                    errors.append(f"{path}: schema pattern invalid ({e})")
 
     if isinstance(instance, (int, float)) and not isinstance(instance, bool):
-        if "minimum" in schema and instance < schema["minimum"]:
-            errors.append(f"{path}: {instance} < minimum {schema['minimum']}")
-        if "maximum" in schema and instance > schema["maximum"]:
-            errors.append(f"{path}: {instance} > maximum {schema['maximum']}")
+        lo, _ = _num("minimum")
+        if lo is not None and instance < lo:
+            errors.append(f"{path}: {instance} < minimum {lo}")
+        hi, _ = _num("maximum")
+        if hi is not None and instance > hi:
+            errors.append(f"{path}: {instance} > maximum {hi}")
 
     if isinstance(instance, dict):
         props = schema.get("properties", {})
         if not isinstance(props, dict):
             errors.append(f"{path}: schema properties is not an object")
             props = {}
-        for req in schema.get("required", []):
+        required = schema.get("required", [])
+        if not isinstance(required, list):
+            errors.append(f"{path}: schema required is not a list")
+            required = []
+        for req in required:
             if req not in instance:
                 errors.append(f"{path}: missing required property {req!r}")
         for key, sub in props.items():
@@ -129,10 +167,12 @@ def validate(instance, schema: dict, path: str = "$") -> list:
                 errors.append(f"{path}: unexpected properties {sorted(extra)!r}")
 
     if isinstance(instance, list):
-        if "minItems" in schema and len(instance) < schema["minItems"]:
-            errors.append(f"{path}: fewer than minItems {schema['minItems']}")
-        if "maxItems" in schema and len(instance) > schema["maxItems"]:
-            errors.append(f"{path}: more than maxItems {schema['maxItems']}")
+        lo, _ = _num("minItems")
+        if lo is not None and len(instance) < lo:
+            errors.append(f"{path}: fewer than minItems {lo}")
+        hi, _ = _num("maxItems")
+        if hi is not None and len(instance) > hi:
+            errors.append(f"{path}: more than maxItems {hi}")
         items = schema.get("items")
         if isinstance(items, dict):
             for idx, item in enumerate(instance):

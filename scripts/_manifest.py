@@ -18,6 +18,12 @@ re-running a crashed swarm resumes where it stopped).
 
 Progress goes to STDERR (one line per completion); STDOUT carries exactly one
 summary JSON object, keeping the stdout-purity contract.
+
+Trust model: a manifest is operator-owned local input and runs with the
+operator's own filesystem authority. ``prompt_file`` paths are therefore NOT
+sandboxed to the manifest directory (an absolute or ``../`` path is honored) —
+the same trust you already grant by choosing to run the manifest. Do not feed
+this an untrusted third-party manifest.
 """
 
 from __future__ import annotations
@@ -117,6 +123,22 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
     return jobs, None
 
 
+def _read_envelope(out_file: str, proc) -> dict:
+    """The child's --out file is the authoritative envelope. Fall back to the
+    child's exit info only if the file is missing/corrupt (child crashed before
+    writing) — NEVER slice stdout, which host banners can pollute."""
+    try:
+        with open(out_file, encoding="utf-8") as fh:
+            env = json.load(fh)
+        if isinstance(env, dict) and env.get("status"):
+            return env
+    except (OSError, ValueError):
+        pass
+    tail = (proc.stderr or proc.stdout or "").strip()[-500:]
+    return {"status": "error",
+            "error": f"child produced no valid envelope (exit {proc.returncode}): {tail}"}
+
+
 def _child_cmd(job: dict, args, out_file: str) -> list:
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
     cmd = [sys.executable, script,
@@ -157,11 +179,12 @@ def run_manifest(args) -> int:
     os.makedirs(results_dir, exist_ok=True)
     agents_dir = args.agents_dir or os.path.join(base_cwd, ".agents")
 
-    sems: dict = {}
-    def sem_for(backend: str) -> threading.Semaphore:
-        if backend not in sems:
-            sems[backend] = threading.BoundedSemaphore(caps.get(backend, caps["default"]))
-        return sems[backend]
+    # Pre-build one semaphore per backend BEFORE the pool starts — lazy creation
+    # from multiple worker threads is a check-then-act race that can exceed a
+    # backend's cap. Resolve each job's backend once here (also reused below).
+    job_backends = {j["id"]: _job_backend(j, agents_dir) for j in jobs}
+    sems: dict = {b: threading.BoundedSemaphore(caps.get(b, caps["default"]))
+                  for b in set(job_backends.values())}
 
     lock = threading.Lock()
     done_count = {"n": 0}
@@ -169,18 +192,19 @@ def run_manifest(args) -> int:
 
     def run_job(job: dict) -> dict:
         out_file = os.path.join(results_dir, f"{job['id']}.json")
-        backend = _job_backend(job, agents_dir)
-        with sem_for(backend):
+        backend = job_backends[job["id"]]
+        with sems[backend]:
             t0 = time.monotonic()
             try:
                 proc = subprocess.run(_child_cmd(job, args, out_file),
                                       capture_output=True, text=True,
                                       encoding="utf-8", errors="replace",
                                       stdin=subprocess.DEVNULL)
-                envelope = json.loads(proc.stdout[proc.stdout.index("{"):]) \
-                    if "{" in proc.stdout else {"status": "error",
-                                                "error": f"no envelope on stdout (exit {proc.returncode})"}
-            except (OSError, ValueError) as e:
+                # The child wrote its envelope to --out (atomic). That file is
+                # AUTHORITATIVE — never parse the child's stdout, which a shell
+                # profile / hook banner can pollute with brace-containing noise.
+                envelope = _read_envelope(out_file, proc)
+            except OSError as e:
                 envelope = {"status": "error", "error": f"{type(e).__name__}: {e}"}
         status = envelope.get("status", "error")
         with lock:
@@ -196,7 +220,7 @@ def run_manifest(args) -> int:
                 "suspect": envelope.get("suspect", False)}
 
     workers = min(len(jobs), sum(caps.get(b, caps["default"])
-                                 for b in {_job_backend(j, agents_dir) for j in jobs}) or 1)
+                                 for b in set(job_backends.values())) or 1)
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         outcomes = list(pool.map(run_job, jobs))
 

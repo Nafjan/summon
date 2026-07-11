@@ -251,6 +251,15 @@ def main() -> None:
                      "original project dir, not a fresh worktree")
         sys.exit(1)
 
+    # --dry-run is a SINGLE-dispatch preview only. Combining it with modes that
+    # fan out or detach would otherwise slip past the dry-run exit and run real
+    # work (a detached --background child never even inherits --dry-run). Refuse
+    # loudly instead of silently executing.
+    if args.dry_run and (args.background or args.manifest):
+        _print_error("--dry-run cannot be combined with --background or --manifest "
+                     "(it previews one resolved dispatch and never executes)")
+        sys.exit(1)
+
     # --manifest: batch fan-out. Delegates to _manifest and exits.
     if args.manifest:
         from _manifest import run_manifest
@@ -464,18 +473,25 @@ def _apply_schema(result: dict, schema: dict, invocation, args) -> dict:
         return result  # resume unsupported on this backend: keep the first verdict
     retry["parse_retry"] = True
     attach_parsed(retry, schema)
-    # keep whichever attempt satisfied the schema; prefer the retry only if it
-    # actually improved things.
-    return retry if retry.get("parse_ok") or retry.get("status") == "success" else result
+    # Only accept the retry if it STRICTLY improved things: the corrective run
+    # both completed successfully AND now satisfies the schema. A retry that
+    # errored, timed out, or is still schema-invalid must never replace the
+    # original successful (if invalid) envelope.
+    if retry.get("status") == "success" and retry.get("parse_ok"):
+        return retry
+    return result
 
 
 def _write_out(path: str, result: dict) -> None:
-    """Atomic envelope write (tmp+rename): a present file is a COMPLETE file,
-    which is what makes --out usable as a swarm's skip-if-done marker."""
+    """Atomic envelope write: a present file is a COMPLETE file, which is what
+    makes --out usable as a swarm's skip-if-done marker. The temp file is
+    per-process-unique (mkstemp) so two processes writing the same --out never
+    clobber each other's partial temp; the final rename is atomic."""
     try:
-        tmp = path + ".tmp"
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as fh:
+        d = os.path.dirname(os.path.abspath(path))
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".summon-out-", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(result, fh, ensure_ascii=False)
         os.replace(tmp, path)
     except OSError as e:
