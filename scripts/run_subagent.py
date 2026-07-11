@@ -66,19 +66,28 @@ _MEMORY_CAP = 8000  # chars; keeps the injected block well under agy's 28 KB arg
 
 def _parse_timeout(value: str) -> int:
     """--timeout accepts bare milliseconds (backward compatible) or a human
-    suffix: '90s', '10m', '600000ms'. Returns milliseconds."""
+    suffix: '90s', '10m', '600000ms'. Returns whole milliseconds (>= 1;
+    fractional input rounds). Zero, negative, and non-finite durations are
+    rejected here so they fail as argparse errors, not as instantly-killed
+    agents or an OverflowError from the executor."""
+    import math
     s = str(value).strip().lower()
     try:
         if s.endswith("ms"):
-            return int(float(s[:-2]))
-        if s.endswith("s"):
-            return int(float(s[:-1]) * 1000)
-        if s.endswith("m"):
-            return int(float(s[:-1]) * 60_000)
-        return int(s)
+            ms = float(s[:-2])
+        elif s.endswith("s"):
+            ms = float(s[:-1]) * 1000
+        elif s.endswith("m"):
+            ms = float(s[:-1]) * 60_000
+        else:
+            ms = float(s)
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"invalid --timeout {value!r}: use milliseconds or a suffix, e.g. 600000, 600s, 10m")
+    if not math.isfinite(ms) or ms <= 0:
+        raise argparse.ArgumentTypeError(
+            f"invalid --timeout {value!r}: must be a positive finite duration")
+    return max(1, int(round(ms)))
 
 
 def _inject_memory(system_context: str, cwd: str) -> str:

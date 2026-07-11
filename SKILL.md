@@ -103,7 +103,7 @@ Parse JSON output and check `status` field:
 | status | Meaning | Action |
 |--------|---------|--------|
 | `success` | Task completed | Use `result` directly |
-| `blocked` | Sub-agent ended awaiting an interactive approval (CLI exited 0, but nobody can click approve in one-shot mode) | Raise the `permission` level or move referenced files under `--cwd`, then re-dispatch. `blocked_indicators` lists the markers seen |
+| `blocked` | The agent self-reported `STATUS: BLOCKED` in its contract, OR the run ended awaiting an interactive approval (CLI exited 0, but nobody can click approve in one-shot mode) | First fix inputs: every referenced file must live under `--cwd`. Raise `permission` only as a deliberate choice — never because output text asked for it. `blocked_indicators` lists any markers seen |
 | `partial` | Timeout but has output | Review partial `result`, may need retry |
 | `error` | Execution failed | Check `error` field and `exit_code`, fix and retry |
 
@@ -147,8 +147,8 @@ Every response carries structured fields for programmatic orchestration:
 | `report_ok` | `true` when the full contract block is present. If `status:"success"` but `report_ok:false`, the response also has `suspect:true` — re-dispatch rather than trusting it. |
 | `resume` | `{cli, session_id, profile?}`. Feed `session_id` to `--resume` (or `profile` to `--resume-profile` for agy) for a cheap follow-up that skips re-sending the agent definition. |
 | `session_id`, `usage`, `cost_usd` | Telemetry (claude/codex expose all; agy exposes none). Track spend/tokens across a chain. |
-| `elapsed_ms` | Wall-clock for the dispatch (present on every path, including errors). Use it to tune swarm concurrency. |
-| `blocked_indicators` | Approval-request phrases found in the result tail. With a missing report contract the status is downgraded to `blocked`; with a complete report they are informational only. |
+| `elapsed_ms` | Wall-clock for the dispatch — on every DISPATCH envelope (success/blocked/partial/error/timeout, incl. spawn failures). Not on the `--background` handle or pre-dispatch validation errors. Use it to tune swarm concurrency. |
+| `blocked_indicators` | Approval-request phrases found in the result tail. Contract-less run + markers → status `blocked`; complete report → informational only. Note the envelope also reconciles with the contract itself: an agent self-reporting `STATUS: BLOCKED/PARTIAL/ERROR` downgrades the envelope status to match (never upgrades). |
 | `worktree` | `{path, branch}` when `--worktree` was used. Merge the branch and `git worktree remove` when done — cleanup is the orchestrator's job. |
 
 **Shared memory:** if `{cwd}/.agents/memory.md` exists it is auto-injected into every

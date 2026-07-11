@@ -38,9 +38,9 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
 
 
 def extract_description(body: str) -> str:
-    """First non-heading line of the body. Capped at 240 chars on a WORD
-    boundary with an explicit ellipsis (mid-word truncation made --list output
-    look broken and hid the tail of longer descriptions)."""
+    """First non-heading line of the body, capped at 240 chars with an explicit
+    ellipsis — on a word boundary when the line has spaces; a single unbroken
+    240+ char token is cut hard at 240 (nothing better exists for it)."""
     for line in body.strip().split("\n"):
         line = line.strip()
         if line and not line.startswith("#"):

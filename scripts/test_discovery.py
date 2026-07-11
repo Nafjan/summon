@@ -197,6 +197,69 @@ def test_clean_success_untouched_by_blocked_scan():
     assert out["status"] == "success" and "blocked_indicators" not in out
 
 
+def test_report_blocked_is_authoritative_over_exit0():
+    # The MOST contract-compliant blocked path: agent self-reports STATUS:
+    # BLOCKED with a full report. The envelope must not say success.
+    from _executor import _enrich
+    resp = {"result": "Could not proceed.\n\nSTATUS: BLOCKED\nSUMMARY: needs the API "
+                      "schema file which is outside cwd\nFOLLOW-UP: provide the file\n"
+                      "HANDOFF: blocked on missing input",
+            "exit_code": 0, "status": "success", "cli": "codex"}
+    out = _enrich(resp, None)
+    assert out["status"] == "blocked", out["status"]
+    assert out["report_ok"] is True
+    assert "self-reported BLOCKED" in out["error"]
+
+
+def test_report_partial_and_error_map_to_envelope():
+    from _executor import _enrich
+    for rs, expected in (("PARTIAL", "partial"), ("ERROR", "error")):
+        resp = {"result": f"...\n\nSTATUS: {rs}\nSUMMARY: s\nFOLLOW-UP: f\nHANDOFF: h",
+                "exit_code": 0, "status": "success", "cli": "claude"}
+        out = _enrich(resp, None)
+        assert out["status"] == expected, (rs, out["status"])
+
+
+def test_report_done_never_upgrades_executor_error():
+    # Reconciliation only downgrades: an executor-detected error stays an error
+    # even if the text contains a cheerful STATUS: DONE block.
+    from _executor import _enrich
+    resp = {"result": "STATUS: DONE\nSUMMARY: s\nFOLLOW-UP: f\nHANDOFF: h",
+            "exit_code": 1, "status": "error", "cli": "claude", "error": "CLI exited 1"}
+    out = _enrich(resp, None)
+    assert out["status"] == "error"
+
+
+def test_blocked_error_text_never_recommends_escalation():
+    from _executor import _enrich
+    resp = {"result": "The tool call was blocked. Please approve.",
+            "exit_code": 0, "status": "success", "cli": "claude"}
+    out = _enrich(resp, None)
+    assert out["status"] == "blocked"
+    assert "NOT raise the permission" in out["error"]
+
+
+def test_timeout_rejects_bad_domains():
+    import argparse as ap
+    import run_subagent as rs
+    for bad in ("0", "-5s", "1e999", "nan", "0.0001"):  # 0.0001ms rounds to 0 -> min 1? see below
+        if bad == "0.0001":
+            assert rs._parse_timeout(bad) == 1  # sub-ms rounds up to the 1ms floor
+            continue
+        try:
+            rs._parse_timeout(bad)
+            raise AssertionError(f"expected rejection for {bad!r}")
+        except ap.ArgumentTypeError:
+            pass
+
+
+def test_description_unbroken_token_hard_cut():
+    from _loader import extract_description
+    token = "x" * 300
+    d = extract_description(token)
+    assert len(d) == 244 and d.endswith(" ...")  # documented hard-cut fallback
+
+
 def test_timeout_suffix_parsing():
     import run_subagent as rs
     assert rs._parse_timeout("600000") == 600000   # bare ms (backward compatible)
