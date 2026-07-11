@@ -189,7 +189,7 @@ def test_stale_unowned_lock_never_deleted():
         os.makedirs(parent)
         lock = os.path.join(home, ".claude", "summon.install.lock")
         open(lock, "w").write("user data, not a summon marker")
-        old = _t.time() - 700
+        old = _t.time() - 4000  # > LOCK_STALE_SEC (3600)
         os.utime(lock, (old, old))  # stale by the 600s policy
         r = _run(home, "--hosts", "claude", "--no-agents")
         assert r.returncode == 2, (r.returncode, r.stdout)
