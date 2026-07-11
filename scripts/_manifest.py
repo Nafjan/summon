@@ -131,24 +131,29 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
 
 
 def _timeout_seconds(spec, default: float = 600.0) -> float:
-    """Parse a job timeout ('900s', '10m', '2h', '500ms', or a bare number of
-    seconds) to seconds. Falls back to the dispatcher default on anything odd —
-    this only sizes the parent watchdog, the child enforces the real deadline."""
+    """Parse a job timeout the SAME way the child ``--timeout`` does — a bare
+    number is MILLISECONDS, suffixes are ms/s/m — and return seconds. (The old
+    version read a bare number as seconds and accepted 'h', disagreeing with the
+    child and sizing the watchdog 1000x too large.) Only sizes the parent
+    watchdog; the child enforces the real deadline, so odd input falls back to
+    the default rather than raising."""
     if spec is None:
         return default
     s = str(spec).strip().lower()
     try:
         if s.endswith("ms"):
-            return max(1.0, float(s[:-2]) / 1000)
-        if s.endswith("s"):
-            return max(1.0, float(s[:-1]))
-        if s.endswith("m"):
-            return max(1.0, float(s[:-1]) * 60)
-        if s.endswith("h"):
-            return max(1.0, float(s[:-1]) * 3600)
-        return max(1.0, float(s))
+            ms = float(s[:-2])
+        elif s.endswith("s"):
+            ms = float(s[:-1]) * 1000
+        elif s.endswith("m"):
+            ms = float(s[:-1]) * 60_000
+        else:
+            ms = float(s)  # bare number == milliseconds, matching the child
     except ValueError:
         return default
+    if ms <= 0:
+        return default
+    return max(1.0, ms / 1000)
 
 
 def _parent_timeout(job: dict, floor: float = 90.0) -> float:
@@ -156,6 +161,43 @@ def _parent_timeout(job: dict, floor: float = 90.0) -> float:
     slack, kept well above the child's ``--timeout`` (which does the real
     enforcement) so a wedged child can't hold a concurrency slot forever."""
     return max(floor, _timeout_seconds(job.get("timeout")) * 1.5 + 60)
+
+
+class _ChildResult:
+    """Duck-typed like a CompletedProcess for _read_envelope (returncode/
+    stdout/stderr) plus a timed_out flag."""
+    __slots__ = ("returncode", "stdout", "stderr", "timed_out")
+
+    def __init__(self, returncode, stdout, stderr, timed_out):
+        self.returncode, self.stdout, self.stderr, self.timed_out = (
+            returncode, stdout, stderr, timed_out)
+
+
+def _dispatch_child(cmd: list, timeout_sec: float):
+    """Run a child dispatch with a REAL parent watchdog. Returns
+    ``(_ChildResult|None, error|None)``.
+
+    ``subprocess.run(timeout=...)`` would kill only the immediate child on
+    timeout and then block in an UNBOUNDED ``communicate()`` if a backend
+    descendant still holds stdout — the same hang the executor fix removes. So we
+    Popen, bound ``communicate()``, and on timeout kill the whole PROCESS TREE
+    (``_kill_tree``) and drain with a bounded ``_safe_communicate``."""
+    from _executor import _kill_tree, _safe_communicate
+    popen_extra = {"start_new_session": True} if os.name != "nt" else {}
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL, text=True,
+                                encoding="utf-8", errors="replace", **popen_extra)
+    except OSError as e:
+        return None, f"{type(e).__name__}: {e}"
+    timed_out = False
+    try:
+        out, err = proc.communicate(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_tree(proc)
+        out, err = _safe_communicate(proc)
+    return _ChildResult(proc.returncode, out, err, timed_out), None
 
 
 def _existing_envelope(out_file: str) -> dict | None:
@@ -255,23 +297,26 @@ def run_manifest(args) -> int:
             skipped = False
             with sems[backend]:
                 try:
-                    proc = subprocess.run(_child_cmd(job, args, out_file),
-                                          capture_output=True, text=True,
-                                          encoding="utf-8", errors="replace",
-                                          stdin=subprocess.DEVNULL,
-                                          timeout=_parent_timeout(job))
-                    # The child wrote its envelope to --out (atomic). That file is
-                    # AUTHORITATIVE — never parse the child's stdout, which a shell
-                    # profile / hook banner can pollute with brace-containing noise.
-                    envelope = _read_envelope(out_file, proc)
-                except subprocess.TimeoutExpired:
-                    # Parent watchdog: the child blew far past its own --timeout
-                    # (a wedged child would otherwise hold this backend's slot and
-                    # stall the whole swarm). subprocess.run already killed it;
-                    # prefer any partial envelope it wrote before dying.
-                    envelope = _existing_envelope(out_file) or {
-                        "status": "error",
-                        "error": f"child exceeded parent watchdog ({int(_parent_timeout(job))}s)"}
+                    # Clear any stale envelope from a prior failed run FIRST, so
+                    # that after a watchdog kill the absence of a fresh file means
+                    # "this run failed" — not a masking re-read of the old result.
+                    try:
+                        os.remove(out_file)
+                    except OSError:
+                        pass
+                    proc, spawn_err = _dispatch_child(_child_cmd(job, args, out_file),
+                                                      _parent_timeout(job))
+                    if spawn_err:
+                        envelope = {"status": "error", "error": spawn_err}
+                    elif proc.timed_out and _existing_envelope(out_file) is None:
+                        # Watchdog fired and the child wrote nothing (tree killed).
+                        envelope = {"status": "error",
+                                    "error": f"child exceeded parent watchdog "
+                                             f"({int(_parent_timeout(job))}s); process tree killed"}
+                    else:
+                        # The child's --out file is AUTHORITATIVE — never parse the
+                        # child's stdout, which a shell/hook banner can pollute.
+                        envelope = _read_envelope(out_file, proc)
                 except Exception as e:  # noqa: BLE001 — one job must never crash the pool
                     envelope = {"status": "error", "error": f"{type(e).__name__}: {e}"}
         status = envelope.get("status", "error")

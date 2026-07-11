@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 
 
-def _terminal_is_error(data: dict) -> bool:
+def _terminal_is_error(data) -> bool:
     """True when a terminal result object reports failure. Claude sets
     ``is_error: true`` and an ``error_*`` subtype on API/turn failures; some
     CLIs put ``status`` of ``error``/``failed`` on the result. Guards the
-    no-false-success contract at the stream layer."""
+    no-false-success contract at the stream layer. Non-dict input (defensive —
+    ``result_json`` is always a dict today) is treated as not-an-error."""
+    if not isinstance(data, dict):
+        return False
     if data.get("is_error") is True:
         return True
     subtype = data.get("subtype")
@@ -121,6 +124,8 @@ class StreamProcessor:
                     "result": "".join(self.gemini_parts),
                     "status": "error" if self.is_error else status,
                 }
+                if data.get("error"):  # keep the terminal error for a precise message
+                    self.result_json["error"] = data["error"]
             else:
                 self.result_json = data
             return True

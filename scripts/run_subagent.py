@@ -139,10 +139,14 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
     if r2.returncode != 0:
         raise ValueError(f"git worktree add failed: {(r2.stderr or r2.stdout).strip()}")
     # If --cwd was a SUBDIRECTORY of the repo, run inside the matching subdir of
-    # the worktree (it exists in the fresh checkout) rather than snapping to the
-    # worktree root — preserves the caller's intended working directory.
+    # the worktree to preserve the caller's intended working directory — BUT only
+    # if it actually exists in the fresh checkout. An untracked/ignored/empty
+    # subdir isn't checked out, so fall back to the worktree root rather than
+    # handing the executor a nonexistent cwd (which would fail after we've already
+    # created a persistent branch + worktree).
     rel = os.path.relpath(os.path.abspath(cwd), repo)
-    effective = wt if rel in (".", "") or rel.startswith("..") else os.path.join(wt, rel)
+    sub = os.path.join(wt, rel)
+    effective = sub if rel not in (".", "") and not rel.startswith("..") and os.path.isdir(sub) else wt
     return {"path": wt, "cwd": effective, "branch": branch}
 
 

@@ -109,12 +109,16 @@ def parse_report(text: str) -> dict | None:
         if lines[i].startswith("STATUS:"):
             value = lines[i][len("STATUS:"):].strip()
             first = value.split()[0].rstrip("|,").upper() if value else ""
-            # A value like "DONE | PARTIAL | BLOCKED" is the CONTRACT TEMPLATE an
-            # agent may echo verbatim (unindented), not a real status — skip it so
-            # it can't displace the genuine block above it.
-            if first in _STATUS_VALUES and " | " not in value:
-                start = i
-                break
+            # Skip ONLY the echoed contract TEMPLATE ("DONE | PARTIAL | BLOCKED"):
+            # a value whose pipe-separated tokens are ALL status keywords. A real
+            # status like "BLOCKED | waiting on approval" is kept (its second token
+            # isn't a status word), so the guard can't swallow a genuine block.
+            if first in _STATUS_VALUES:
+                parts = [p.strip().split()[0].upper() for p in value.split("|") if p.strip()]
+                is_template = len(parts) > 1 and all(p in _STATUS_VALUES for p in parts)
+                if not is_template:
+                    start = i
+                    break
     if start is None:
         return None
 
@@ -256,8 +260,10 @@ def build_final_response(
     }
     if status == "error":
         if result_errored:
+            # str() each part: a backend could put a non-string in result/error,
+            # and `dict[:200]` would raise TypeError and crash the driver.
             detail = (result.get("subtype") or result.get("error")
-                      or (result.get("result", "")[:200]) or "backend reported an error")
+                      or str(result.get("result", ""))[:200] or "backend reported an error")
             response["error"] = f"backend reported an error result: {detail}"
         else:
             msg = f"CLI exited with code {exit_code}"
@@ -351,12 +357,19 @@ def _kill_tree(process: subprocess.Popen) -> None:
     launched with ``start_new_session`` so the child leads its own group)."""
     try:
         if os.name == "nt":
+            # Popen keeps the process handle open, so Windows will NOT recycle
+            # this PID mid-teardown — taskkill /T targets the right tree.
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
                            capture_output=True, timeout=10)
         else:
+            # start_new_session=True makes the child its own group leader, so the
+            # PGID equals the child PID. Signal the group by PID directly instead
+            # of os.getpgid(pid) — getpgid raises if the child was already reaped
+            # (child exited but a grandchild still holds stdout), which would skip
+            # the kill and orphan the grandchild.
             try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
                 pass
     except Exception:  # noqa: BLE001 — best-effort teardown must never raise
         pass
@@ -366,10 +379,11 @@ def _kill_tree(process: subprocess.Popen) -> None:
         pass
 
 
-def _safe_communicate(process: subprocess.Popen, timeout: float = 5.0):
+def _safe_communicate(process: subprocess.Popen, timeout: float = 3.0):
     """``communicate()`` bounded by a timeout so a descendant still holding stdout
     cannot hang the driver indefinitely after we've already blown the deadline.
-    On expiry, kill the whole tree and try once more, then give up cleanly."""
+    On expiry, kill the whole tree and try once more, then give up cleanly.
+    Kept short (two brief waits) since the tree-kill already ran before we call."""
     try:
         return process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -474,6 +488,12 @@ def _drive_process_loop(
         return build_final_response(
             cli, process.returncode, processor.get_result(), stdout_lines, stderr
         )
+    except KeyboardInterrupt:
+        # start_new_session detaches the child from the terminal's signal group,
+        # so a Ctrl+C on the parent won't reach it — tree-kill it ourselves so an
+        # interrupt doesn't leave an orphaned backend running.
+        _kill_tree(process)
+        raise
     except (OSError, ValueError) as e:
         # OSError covers I/O failures on the pipe; ValueError covers reading
         # from a closed file. Anything else propagates so it's not silently
@@ -608,14 +628,11 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         resp["resume"] = {"cli": inv.cli, "session_id": None}  # stateless: no resume
         return _stamp(resp)
 
-    command, args, env_override = build_invocation_args(inv)
+    # timeout_ms is threaded to the builder so agy's wrapper deadline AND its
+    # profile-TTL cleanup (which runs during build) both reflect the real request.
+    command, args, env_override = build_invocation_args(inv, timeout_ms)
     command, args = _resolve_launch(command, args)
     proc_env = _merge_env(env_override)
-    # agy honors its deadline via AGY_PTY_DEADLINE (the ConPTY wrapper self-stops
-    # agy at that many seconds). It was pinned to 300s regardless of --timeout, so
-    # a longer agy dispatch was truncated. Align it with the real request here.
-    if inv.cli == "agy" and proc_env is not None:
-        proc_env["AGY_PTY_DEADLINE"] = str(max(1, int(timeout_ms / 1000)))
     debug_argv = [command, *args]
 
     # POSIX: put the child in its own session so _kill_tree can signal the whole
