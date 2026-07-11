@@ -18,6 +18,13 @@ dispatch, structured report parsing, and cost/usage telemetry — see Parameters
 
 **Script Path**: Use absolute path `{SKILL_DIR}/scripts/run_subagent.py` where `{SKILL_DIR}` is the directory containing this SKILL.md file.
 
+**Command surface**: the script accepts git-style **subcommands** — `dispatch` (the
+default action), `list`, `models`, `doctor`, `manifest FILE`, `council`, `agent
+new|set NAME`, `version` — e.g. `run_subagent.py council --question "…" --cwd DIR`. The
+**legacy flat form still works unchanged** (`run_subagent.py --agent … --prompt …`,
+`--list`, `--manifest FILE`, …), and every flag below is valid in both. Bare
+`run_subagent.py` (or `help`) prints the command list.
+
 ## CLI-Specific Notes
 
 Check the corresponding reference for your environment:
