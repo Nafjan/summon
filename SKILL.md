@@ -14,6 +14,7 @@ dispatch, structured report parsing, and cost/usage telemetry — see Parameters
 
 - **[run_subagent.py](scripts/run_subagent.py)** - Main execution script
 - **[codex.md](references/codex.md)** - Codex-specific setup (permissions, timeout)
+- **[references/](references/)** - deep-dive docs: models, backends, customizing agents, fan-out & council (read on demand)
 
 **Script Path**: Use absolute path `{SKILL_DIR}/scripts/run_subagent.py` where `{SKILL_DIR}` is the directory containing this SKILL.md file.
 
@@ -143,7 +144,7 @@ Parse JSON output and check `status` field:
 | `--retries N` | No | Re-dispatch up to N times on `error`/`partial` (exponential backoff; `blocked` is never retried — its cause is structural). Envelope gains `attempts` |
 | `--json-schema FILE` | No | Structured output contract: extract the agent's final JSON, validate against the schema, attach `parsed`/`parse_ok`/`parse_errors`; ONE corrective retry via resume on mismatch |
 | `--debug-dir DIR` | No | Dump per-run argv + raw captured output + final envelope to DIR (adds `debug_file` to the envelope) |
-| `--manifest FILE` | - | Batch fan-out: run all jobs in a JSON manifest (see "Fan-out" below). Combine with `--concurrency` and `--results-dir` |
+| `--manifest FILE` | - | Batch fan-out: run all jobs in a JSON manifest (see [references/fan-out.md](references/fan-out.md)). Combine with `--concurrency` and `--results-dir` |
 | `--concurrency` | No | With `--manifest`: per-backend caps, e.g. `agy=2,codex=3,default=3` |
 | `--results-dir` | No | With `--manifest`: where job envelopes land (default `{cwd}/.agents/results`) |
 | `--council` | - | Consensus deliberation: dispatch `--question` to diverse members, chairman synthesizes. See "Council mode" |
@@ -200,219 +201,21 @@ Enforced keywords: `type`, `properties`, `required`, `items`, `enum`, `const`,
 enforced** and is reported in the envelope's `parse_warnings` — so `parse_ok: true`
 never silently hides an unchecked constraint. Keep schemas within the subset.
 
-## Model discovery (`--list-models`)
+## Advanced capabilities (see references/)
 
-The skill never hardcodes a model allowlist — a `model:` string (frontmatter) or
-`--model` (override) is passed through to the CLI verbatim, so **any model a backend
-supports is invocable the moment it ships, with zero code changes.** How a *new* model
-reaches an agent depends only on how that agent names its model:
+The dispatch essentials are above. Deeper capabilities live in focused reference files
+(read the one you need — they're not loaded into every call):
 
-| How the model is named | Example | When a new model ships |
-|---|---|---|
-| **Alias** (claude only) | `opus`, `sonnet` | Floats to whatever the CLI *currently maps the alias to* — but that mapping can **LAG the newest release** (the CLI vendor controls it). Verify, don't assume. |
-| **Unpinned** | (no `model:`) | Floats with the CLI's own default (agy, gemini). |
-| **CLI-config default** | codex | Uses `~/.codex/config.toml` `model`; move the default there or pass `--model`. |
-| **Version ID** | `claude-sonnet-5`, `claude-fable-5` | **Frozen** — exactly this model until you bump the agent's `model:` (or `CURSOR_DEFAULT_MODEL` in `_builder.py`). |
-
-> **Aliases lag — verify with `model.resolved`.** An alias resolves to whatever the CLI
-> maps it to *today*, which is not always the newest model. Observed: `--model sonnet`
-> resolved to `claude-sonnet-4-6` while `claude-sonnet-5` was already available. Every
-> dispatch envelope reports `model.resolved` (the model the backend *actually served*) —
-> check it. For **guaranteed-latest**, pin the explicit version ID (`claude-sonnet-5`,
-> `claude-opus-4-8`) and re-verify when a new model ships; for **auto-float-when-it-works**,
-> use the alias but confirm `model.resolved` is what you expect. This roster pins Sonnet
-> explicitly (its alias lagged) and leaves `opus` as an alias (verified serving 4.8).
-
-`--list-models` answers "what can each backend run *right now*" live where the CLI
-exposes it. Each entry is tagged with a `source` so you know how much to trust it:
-- `live` — queried just now (`agy models` — the only backend with a real list)
-- `config` — read from the CLI's own default config (`codex` → config.toml)
-- `static` — documented aliases/defaults to pass via `--model` (CLI has no list)
-- `unavailable` — a live query was attempted and failed (reason in `note`)
-
-Discover with `--list-models`, invoke with `--model`, verify with `model.resolved` —
-using a new model never requires editing the skill code itself.
-
-**Models newer than this document almost certainly exist.** These docs are a snapshot;
-model strings pass through to the CLIs verbatim, so you can — and should — try IDs
-that postdate anything written here (a future `claude-sonnet-6`, a new codex id, a new
-agy display name) without waiting for a skill update. Cheap probe: dispatch a trivial
-prompt with the candidate `--model` and check the envelope's `model.resolved`; an
-unsupported ID fails fast with the CLI's own error, costing nothing but the attempt.
-Never assume an alias has caught up to a launch — probe or pin.
-
-## Bundled roster snapshot (2026-07 — `--list` is the live truth)
-
-The definitive list is always `--list` (definitions register/edit instantly, so the
-roster may have changed since this table). Models below were verified actually
-serving via `model.resolved` at snapshot time:
-
-| Agents | Backend | Model (verified) | Use for |
-|---|---|---|---|
-| `planner`, `architect`, `deep-debugger`, `security-auditor` | claude | `opus` → claude-opus-4-8 | planning, architecture, gnarly debugging, security audits |
-| `fable` | claude | `claude-fable-5` | escalation tier: hardest problems, highest-stakes calls |
-| `pair`, `editor`, `quick-reviewer`, `pr-prep` | claude | `claude-sonnet-5` | balanced general work, prose, fast reviews, PR prep |
-| `reviewer`, `adversarial-reviewer`, `implementer`, `debugger`, `test-author` | codex | config default (gpt-5.6-sol at snapshot) | code review, adversarial passes, implementation, tests |
-| `coder`, `bug-fixer` | cursor-agent | composer-2.5 | multi-step coding, bug fixing |
-| `researcher`, `docs-writer`, `frontend`, `antigravity` | agy | Gemini default (pin via `model:`) | research, docs, frontend |
-
-Cross-vendor routing rule of thumb: never have an agent's work reviewed by its own
-vendor — send claude/cursor-written code to a codex reviewer and codex-written code to
-a claude reviewer (see docs/PROTOCOL.md).
-
-## Custom & API backends (`openai-compat`) — add any model
-
-Beyond the five CLIs, an agent can run against **any OpenAI-compatible
-`/chat/completions` API** — OpenRouter, OpenAI, Anthropic, Google (Gemini compat),
-Groq, DeepSeek, Together, or a LOCAL server (Ollama, LM Studio, vLLM, llama.cpp).
-Pure stdlib HTTP, no SDK. This bills your **API key/credits**, not a subscription
-(cleaner for commercial/high-volume — see [TERMS.md](TERMS.md)).
-
-```markdown
----
-run-agent: openai-compat
-provider: openrouter                 # or: openai / anthropic / google / groq / ollama / lmstudio / <your provider>
-model: anthropic/claude-3.5-sonnet   # the API's model id
----
-```
-or point anywhere directly (no provider needed):
-```markdown
----
-run-agent: openai-compat
-base_url: http://localhost:11434/v1  # local Ollama
-api_key_env: ""                       # empty = no auth header
-model: llama3.1
----
-```
-
-**Providers** resolve from built-ins + an optional `providers.json` in the agents
-dir (or `~/.agents/providers.json`) — `{ "myprov": {"base_url": "...", "api_key_env":
-"MY_KEY"} }` (see `providers.json.example`). The API key is read from the named env
-var at dispatch (never stored). Everything else is identical: same envelope, same
-`--manifest`/`--council`/`--json-schema`. Create these agents by hand or with
-`--new-agent NAME --set run-agent=openai-compat --set model=...`. Resume isn't
-supported (the API call is stateless). This is how you add local AI and multi-model
-API access — and it makes `--council` a true multi-vendor board (à la OpenRouter).
-
-## Customizing agents (you, the calling agent, are expected to)
-
-The bundled roster is a starting point, not a fixed menu. As the orchestrator you
-have two levers — use them freely:
-
-**1. Per-dispatch, no files touched** — override an agent's model, reasoning effort,
-and backend flags for a single call:
-```bash
-run_subagent.py --agent reviewer --model claude-sonnet-5 --effort high \
-  --prompt "…" --cwd <abs>
-```
-`--model` accepts any model the backend supports (see the per-CLI table above);
-`--effort` is `low|medium|high|xhigh|max` (claude). The prompt itself is your main
-customization — the agent definition sets the role, the prompt sets the task.
-
-**2. Durably — manage the roster from the CLI** (no hand-authored markdown needed):
-
-```bash
-# scaffold a new agent (house template: report contract + untrusted-content guard)
-run_subagent.py --new-agent fact-checker \
-  --set run-agent=codex --set permission=read-only --set model=gpt-5.6-sol
-# then edit the body (purpose, Role, rubric) in the printed path
-
-# retune an existing agent's frontmatter — body untouched, validated, atomic
-run_subagent.py --set-agent pair --set model=claude-sonnet-5
-run_subagent.py --set-agent reviewer --set 'args=-c model_reasoning_effort="high"'
-run_subagent.py --set-agent probe --set model=        # empty value REMOVES the key
-```
-
-Settable keys: `run-agent` (claude/codex/cursor-agent/gemini/agy), `model`,
-`permission` (`read-only`/`safe-edit`/`yolo`), `args` (extra backend flags) —
-values are validated before anything is written. `--new-agent` never overwrites;
-`--set-agent` edits frontmatter only, leaving the body byte-identical.
-
-Definitions are plain `.md` files in the agents dir (`--agents-dir`,
-`$SUB_AGENTS_DIR`, or `{cwd}/.agents/`) and register **instantly** — no reload; the
-next `--list`/dispatch sees them. You can still write or edit the files directly
-(the scaffold exists because a hand-written definition tends to miss the
-Final-report contract the dispatcher parses). Authoring a task-specific persona is
-one `--new-agent` plus a body edit — do it whenever the standing roster doesn't fit.
-
-**Different models per role is the whole point.** Give planning/architecture agents a
-deep model (`opus`, `claude-fable-5`), balanced work a `claude-sonnet-5` agent, cheap
-mechanical passes a lighter one, and fan a task across several models at once with
-`--manifest` (per-job `model:`). Nothing here is baked into the skill — it's all in the
-`.md` files and the flags you pass.
-
-## Fan-out (swarms)
-
-**Native path — `--manifest`** (built from a real 80-run workload's orchestrator):
-
-```bash
-run_subagent.py --manifest jobs.json --concurrency agy=2,codex=3 --results-dir out/ --cwd <abs>
-```
-
-```json
-{
-  "defaults": {"timeout": "600s", "retries": 1},
-  "jobs": [
-    {"id": "rev-07", "agent": "reviewer", "prompt_file": "packets/07.md"},
-    {"id": "rev-08", "agent": "reviewer", "prompt_file": "packets/08.md", "model": "gpt-5.6-sol"}
-  ]
-}
-```
-
-What you get: per-backend concurrency semaphores, one atomic envelope per job in
-`--results-dir/<id>.json`, **skip-if-done resume** (re-running a crashed swarm
-re-dispatches only the missing jobs), per-job retries, progress lines on stderr,
-and a single summary JSON on stdout (`total/succeeded/failed/skipped/suspect`).
-Job keys: `id, agent, prompt|prompt_file, cwd, cli, model, effort, timeout,
-retries, json_schema, debug_dir` (defaults apply to all, per-job overrides win).
-
-Rules that still apply (manifest or manual):
-
-1. **Payload in files, not prompts.** Write packets under `--cwd` and use
-   `prompt_file` (or a short "Read X and follow it" prompt). Hard numbers: agy
-   rejects prompts over ~28,000 chars (Windows argv limit); other CLIs degrade
-   before they fail. Files under cwd also avoid `blocked` reads.
-2. **Throttle per backend, not globally.** Safe starting points: 3-4 concurrent
-   claude/codex/cursor; 2 concurrent agy (each run gets its own isolated
-   profile, so concurrency is safe — the cap is for machine load, not
-   correctness). Use `elapsed_ms` from completed envelopes to tune.
-3. **Editing swarms get `--worktree`** (one per agent — manual dispatch, since
-   manifest jobs share the cwd). Read-only swarms don't need it.
-4. **Judge with the envelope**: branch on `status` and `report.status`, treat
-   `blocked` and `suspect: true` as re-dispatch signals, use `--json-schema`
-   for machine-readable verdicts, and sum `usage`/`cost_usd` for the bill.
-
-**Manual path** (when you need per-job worktrees or custom scheduling): dispatch
-each job with `--background`, which returns `{job_id, pid, result_file}` at once;
-completion = its `result_file` exists (atomically written = complete). Poll those.
-(`--background` and `--out` are separate mechanisms and can't be combined — use
-`--manifest` when you want per-job result files at chosen paths.)
-
-## Council mode (`--council`) — decide by consensus
-
-For a DECISION (not a task), convene a council of diverse models/personas, then a
-chairman synthesizes a consensus recommendation:
-
-```bash
-run_subagent.py --council --question "SQL or NoSQL for this workload?" --cwd <abs>
-run_subagent.py --council --question-file q.md \
-  --members planner,reviewer,researcher,pair --chairman fable --rounds 2 --cwd <abs>
-```
-
-- **Members** are agents (each encodes a model + persona); the default set is
-  deliberately vendor-diverse (`planner`/opus, `reviewer`/codex, `researcher`/agy,
-  `pair`/sonnet-5). Override with `--members`; author custom-persona members with
-  `--new-agent`. A council of clones is pointless — keep it diverse.
-- **`--rounds 2`** adds a cross-examination round: each member sees the others'
-  anonymized positions and refines. `--rounds 1` (default) = independent positions.
-- **The chairman** (`--chairman`, default `fable`) reads all final positions and
-  returns the decision, a confidence, the points of agreement, the dissents (named),
-  and a next action — making the call even when the council is split.
-
-Returns one council envelope: `{question, rounds, members:[{agent, model, position}],
-synthesis:{chairman, recommendation, report}, elapsed_ms}`. Progress → stderr.
-Use it for architecture calls, tech-selection, risk judgments — anything where one
-model's blind spot is real and consensus (or named dissent) is the deliverable.
+- **[Model discovery & roster](references/models.md)** — `--list-models`, alias-lag vs
+  `model.resolved`, the bundled agent roster, and the cross-vendor review rule.
+- **[Custom & API backends](references/backends.md)** — `run-agent: openai-compat` to
+  reach any OpenAI-compatible API (OpenRouter, OpenAI, Anthropic, Google, Groq, local
+  Ollama/LM Studio) and `providers.json`.
+- **[Customizing agents & the roster](references/customizing.md)** — override model/
+  effort per call, and `--new-agent`/`--set-agent` to scaffold and retune definitions.
+- **[Fan-out & council](references/fan-out.md)** — `--manifest` swarms (per-backend
+  concurrency, skip-if-done resume) and `--council` (decide by consensus of diverse
+  models, chairman synthesis).
 
 ## Agent Definition Location
 
