@@ -21,8 +21,10 @@ run_subagent.py --manifest jobs.json --concurrency agy=2,codex=3 --results-dir o
 ```
 
 What you get: per-backend concurrency semaphores, one atomic envelope per job in
-`--results-dir/<id>.json`, **skip-if-done resume** (re-running a crashed swarm
-re-dispatches only the missing jobs), per-job retries, progress lines on stderr,
+`--results-dir/<id>.json`, **skip-if-done resume** (re-running a swarm skips only
+jobs whose prior envelope was `success`, and **re-dispatches** any that ended
+`error`/`blocked`/`partial` — so a re-run retries the failures; delete a result
+file to force a clean re-run), per-job retries, progress lines on stderr,
 and a single summary JSON on stdout (`total/succeeded/failed/skipped/suspect`).
 Job keys: `id, agent, prompt|prompt_file, cwd, cli, model, effort, timeout,
 retries, json_schema, debug_dir` (defaults apply to all, per-job overrides win).

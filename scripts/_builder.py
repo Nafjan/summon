@@ -267,6 +267,15 @@ def _build_cursor_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
 # process exits, so we NEVER reuse or scrub a profile in place — old run dirs are
 # cleaned best-effort on a later call once that sidecar has released them.
 
+# The MINIMAL set copied from the real agy config into the fresh per-call
+# profile so agy can run headless without prompting: OAuth creds + account,
+# install id + integrity (agy refuses to start otherwise), and the two
+# operational files it needs to skip interactive gates — `state.json`
+# (onboarding/first-run flags) and `trustedFolders.json` (workspace trust, so
+# agy doesn't block on a "trust this folder?" prompt). What is deliberately NOT
+# copied: conversation history / the SQLite DB, MCP server config, and any
+# roaming memory — so the isolation claim is "no inherited conversation or MCP
+# state", not "an empty $HOME".
 _AGY_AUTH_FILES = (
     "oauth_creds.json", "google_accounts.json", "installation_id",
     "state.json", "trustedFolders.json", "extension_integrity.json",

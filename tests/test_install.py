@@ -351,6 +351,25 @@ def test_doctor_rejects_nonzero_version_probe():
         assert b["found"] is True and b["verified"] is False
 
 
+def test_alias_ownership_is_frontmatter_not_body_substring():
+    # F13: a foreign skill that merely mentions the marker string in its BODY must
+    # NOT be treated as our alias (the old substring test would rmtree it on
+    # uninstall). Only our generated frontmatter counts.
+    import tempfile as _tf, os as _os
+    sys.path.insert(0, REPO)  # install.py lives at the repo root, not scripts/
+    import install
+    with _tf.TemporaryDirectory() as d:
+        md = _os.path.join(d, "SKILL.md")
+        with open(md, "w", encoding="utf-8") as fh:
+            fh.write('---\nname: my-real-skill\n---\n'
+                     'This doc quotes \'Legacy alias for the "summon" skill\' in prose.\n')
+        assert install._is_our_alias(md) is False, "foreign body-mention wrongly claimed as ours"
+        # our actual generated alias IS recognized
+        with open(md, "w", encoding="utf-8") as fh:
+            fh.write(install.ALIAS_SKILL)
+        assert install._is_our_alias(md) is True, "own alias not recognized"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

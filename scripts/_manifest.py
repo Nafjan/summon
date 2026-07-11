@@ -112,6 +112,13 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
                 return None, f"job #{i}: cannot read prompt_file {pf}: {e}"
         if not job.get("prompt"):
             return None, f"job #{i}: needs 'prompt' or 'prompt_file'"
+        # json_schema is forwarded as --json-schema, which the child reads as a
+        # FILE PATH. A JSON object here would be str()-coerced into a Python repr
+        # (single quotes -> invalid JSON) and fail opaquely in the child; reject
+        # it up front with a clear message.
+        if job.get("json_schema") is not None and not isinstance(job["json_schema"], str):
+            return None, (f"job #{i}: json_schema must be a file path (string), "
+                          f"got {type(job['json_schema']).__name__}")
         job_id = str(job.get("id") or f"{job['agent']}-{i:03d}")
         if not _ID_RE.match(job_id) or ".." in job_id:
             return None, f"job #{i}: invalid id {job_id!r} (letters/digits/._-)"
@@ -121,6 +128,34 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
         job["id"] = job_id
         jobs.append(job)
     return jobs, None
+
+
+def _timeout_seconds(spec, default: float = 600.0) -> float:
+    """Parse a job timeout ('900s', '10m', '2h', '500ms', or a bare number of
+    seconds) to seconds. Falls back to the dispatcher default on anything odd —
+    this only sizes the parent watchdog, the child enforces the real deadline."""
+    if spec is None:
+        return default
+    s = str(spec).strip().lower()
+    try:
+        if s.endswith("ms"):
+            return max(1.0, float(s[:-2]) / 1000)
+        if s.endswith("s"):
+            return max(1.0, float(s[:-1]))
+        if s.endswith("m"):
+            return max(1.0, float(s[:-1]) * 60)
+        if s.endswith("h"):
+            return max(1.0, float(s[:-1]) * 3600)
+        return max(1.0, float(s))
+    except ValueError:
+        return default
+
+
+def _parent_timeout(job: dict, floor: float = 90.0) -> float:
+    """Backstop deadline for a child dispatch: the job's own budget + generous
+    slack, kept well above the child's ``--timeout`` (which does the real
+    enforcement) so a wedged child can't hold a concurrency slot forever."""
+    return max(floor, _timeout_seconds(job.get("timeout")) * 1.5 + 60)
 
 
 def _existing_envelope(out_file: str) -> dict | None:
@@ -142,9 +177,12 @@ def _read_envelope(out_file: str, proc) -> dict:
     env = _existing_envelope(out_file)
     if env is not None:
         return env
-    tail = (proc.stderr or proc.stdout or "").strip()[-500:]
+    # Combine BOTH streams: the real traceback often goes to stdout while stderr
+    # only carries a shell/hook banner. `stderr or stdout` would surface just the
+    # banner and lose the actual error, so concatenate (stdout first).
+    combined = ((proc.stdout or "") + (proc.stderr or "")).strip()[-500:]
     return {"status": "error",
-            "error": f"child produced no valid envelope (exit {proc.returncode}): {tail}"}
+            "error": f"child produced no valid envelope (exit {proc.returncode}): {combined}"}
 
 
 def _child_cmd(job: dict, args, out_file: str) -> list:
@@ -207,8 +245,11 @@ def run_manifest(args) -> int:
         # spawning a child) so the skip is both accurate AND free — the child's
         # own --out skip would have marked it, but only in stdout the parent no
         # longer reads.
+        # Resume: only a SUCCESS envelope means "done". A prior error/blocked/
+        # partial envelope is re-run, so re-launching a swarm RETRIES its
+        # failures (what users expect) instead of skipping them permanently.
         prior = _existing_envelope(out_file)
-        if prior is not None:
+        if prior is not None and prior.get("status") == "success":
             envelope, skipped = prior, True
         else:
             skipped = False
@@ -217,12 +258,21 @@ def run_manifest(args) -> int:
                     proc = subprocess.run(_child_cmd(job, args, out_file),
                                           capture_output=True, text=True,
                                           encoding="utf-8", errors="replace",
-                                          stdin=subprocess.DEVNULL)
+                                          stdin=subprocess.DEVNULL,
+                                          timeout=_parent_timeout(job))
                     # The child wrote its envelope to --out (atomic). That file is
                     # AUTHORITATIVE — never parse the child's stdout, which a shell
                     # profile / hook banner can pollute with brace-containing noise.
                     envelope = _read_envelope(out_file, proc)
-                except OSError as e:
+                except subprocess.TimeoutExpired:
+                    # Parent watchdog: the child blew far past its own --timeout
+                    # (a wedged child would otherwise hold this backend's slot and
+                    # stall the whole swarm). subprocess.run already killed it;
+                    # prefer any partial envelope it wrote before dying.
+                    envelope = _existing_envelope(out_file) or {
+                        "status": "error",
+                        "error": f"child exceeded parent watchdog ({int(_parent_timeout(job))}s)"}
+                except Exception as e:  # noqa: BLE001 — one job must never crash the pool
                     envelope = {"status": "error", "error": f"{type(e).__name__}: {e}"}
         status = envelope.get("status", "error")
         with lock:
@@ -237,8 +287,8 @@ def run_manifest(args) -> int:
                 "report_status": (envelope.get("report") or {}).get("status"),
                 "suspect": envelope.get("suspect", False)}
 
-    workers = min(len(jobs), sum(caps.get(b, caps["default"])
-                                 for b in set(job_backends.values())) or 1)
+    workers = min(len(jobs), max(1, sum(caps.get(b, caps["default"])
+                                        for b in set(job_backends.values()))))
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         outcomes = list(pool.map(run_job, jobs))
 
