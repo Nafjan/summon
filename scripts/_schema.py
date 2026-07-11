@@ -93,12 +93,18 @@ def validate(instance, schema: dict, path: str = "$") -> list:
     stype = schema.get("type")
     if stype is not None:
         types = stype if isinstance(stype, list) else [stype]
-        checks = [_TYPE_CHECKS.get(t) for t in types]
-        if any(c is None for c in checks):
-            errors.append(f"{path}: schema has unknown type {stype!r}")
-        elif not any(c(instance) for c in checks):
-            errors.append(f"{path}: expected type {stype}, got {type(instance).__name__}")
-            return errors  # type mismatch makes deeper checks meaningless
+        if not all(isinstance(t, str) for t in types):
+            # A non-string type member (e.g. {"type": [{}]}) is a malformed
+            # schema. Report it — never let it reach _TYPE_CHECKS.get (which
+            # would raise TypeError on an unhashable dict/list member).
+            errors.append(f"{path}: schema type members must be strings, got {stype!r}")
+        else:
+            checks = [_TYPE_CHECKS.get(t) for t in types]
+            if any(c is None for c in checks):
+                errors.append(f"{path}: schema has unknown type {stype!r}")
+            elif not any(c(instance) for c in checks):
+                errors.append(f"{path}: expected type {stype}, got {type(instance).__name__}")
+                return errors  # type mismatch makes deeper checks meaningless
 
     if "const" in schema and instance != schema["const"]:
         errors.append(f"{path}: expected const {schema['const']!r}")
@@ -156,7 +162,11 @@ def validate(instance, schema: dict, path: str = "$") -> list:
             errors.append(f"{path}: schema required is not a list")
             required = []
         for req in required:
-            if req not in instance:
+            if not isinstance(req, str):
+                # {"required": [[]]} — a non-string member would raise TypeError
+                # on `req not in instance` (unhashable). Report, don't crash.
+                errors.append(f"{path}: schema required members must be strings, got {req!r}")
+            elif req not in instance:
                 errors.append(f"{path}: missing required property {req!r}")
         for key, sub in props.items():
             if key in instance:

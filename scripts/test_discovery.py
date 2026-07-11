@@ -488,6 +488,16 @@ def test_validate_never_raises_on_malformed_schema():
         assert isinstance(errs, list) and errs, sc  # error string, not a crash
 
 
+def test_validate_unhashable_schema_members_no_typeerror():
+    # JSON-representable but malformed: a non-string type member and a non-string
+    # required member must NOT raise TypeError (unhashable dict/list).
+    from _schema import validate
+    errs = validate({"a": 1}, {"type": [{}]})            # {"type": [{}]}
+    assert any("type members must be strings" in e for e in errs), errs
+    errs = validate({"a": 1}, {"type": "object", "required": [[]]})  # {"required": [[]]}
+    assert any("required members must be strings" in e for e in errs), errs
+
+
 def test_dry_run_refuses_background_and_manifest():
     import json as _json
     import subprocess as sp
@@ -512,6 +522,25 @@ def test_manifest_semaphores_prebuilt_no_race():
     sems = {b: __import__("threading").BoundedSemaphore(caps.get(b, caps["default"]))
             for b in set(backends.values())}
     assert set(sems) == {"agy", "codex"} and len(sems) == 2
+
+
+def test_manifest_skip_telemetry_from_existing_file():
+    # A cached job (valid envelope already in results-dir) must report
+    # skipped=true from the FILE, not depend on child stdout.
+    import _manifest as m
+    d = tempfile.mkdtemp(prefix="summon-mani-")
+    try:
+        results = os.path.join(d, "results")
+        os.makedirs(results)
+        with open(os.path.join(results, "cached.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"status": "success", "result": "done earlier", "report": {"status": "DONE"}}')
+        # _existing_envelope is what run_job consults before spawning.
+        env = m._existing_envelope(os.path.join(results, "cached.json"))
+        assert env is not None and env["status"] == "success"
+        assert m._existing_envelope(os.path.join(results, "missing.json")) is None
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
 
 
 def test_manifest_reads_out_file_not_stdout():

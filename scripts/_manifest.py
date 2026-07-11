@@ -123,10 +123,8 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
     return jobs, None
 
 
-def _read_envelope(out_file: str, proc) -> dict:
-    """The child's --out file is the authoritative envelope. Fall back to the
-    child's exit info only if the file is missing/corrupt (child crashed before
-    writing) — NEVER slice stdout, which host banners can pollute."""
+def _existing_envelope(out_file: str) -> dict | None:
+    """A valid envelope already on disk for this job (swarm resume), else None."""
     try:
         with open(out_file, encoding="utf-8") as fh:
             env = json.load(fh)
@@ -134,6 +132,16 @@ def _read_envelope(out_file: str, proc) -> dict:
             return env
     except (OSError, ValueError):
         pass
+    return None
+
+
+def _read_envelope(out_file: str, proc) -> dict:
+    """The child's --out file is the authoritative envelope. Fall back to the
+    child's exit info only if the file is missing/corrupt (child crashed before
+    writing) — NEVER slice stdout, which host banners can pollute."""
+    env = _existing_envelope(out_file)
+    if env is not None:
+        return env
     tail = (proc.stderr or proc.stdout or "").strip()[-500:]
     return {"status": "error",
             "error": f"child produced no valid envelope (exit {proc.returncode}): {tail}"}
@@ -193,28 +201,38 @@ def run_manifest(args) -> int:
     def run_job(job: dict) -> dict:
         out_file = os.path.join(results_dir, f"{job['id']}.json")
         backend = job_backends[job["id"]]
-        with sems[backend]:
-            t0 = time.monotonic()
-            try:
-                proc = subprocess.run(_child_cmd(job, args, out_file),
-                                      capture_output=True, text=True,
-                                      encoding="utf-8", errors="replace",
-                                      stdin=subprocess.DEVNULL)
-                # The child wrote its envelope to --out (atomic). That file is
-                # AUTHORITATIVE — never parse the child's stdout, which a shell
-                # profile / hook banner can pollute with brace-containing noise.
-                envelope = _read_envelope(out_file, proc)
-            except OSError as e:
-                envelope = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        t0 = time.monotonic()
+        # Resume: a valid envelope already on disk means this job completed on a
+        # prior run. Short-circuit HERE (before taking a semaphore slot or
+        # spawning a child) so the skip is both accurate AND free — the child's
+        # own --out skip would have marked it, but only in stdout the parent no
+        # longer reads.
+        prior = _existing_envelope(out_file)
+        if prior is not None:
+            envelope, skipped = prior, True
+        else:
+            skipped = False
+            with sems[backend]:
+                try:
+                    proc = subprocess.run(_child_cmd(job, args, out_file),
+                                          capture_output=True, text=True,
+                                          encoding="utf-8", errors="replace",
+                                          stdin=subprocess.DEVNULL)
+                    # The child wrote its envelope to --out (atomic). That file is
+                    # AUTHORITATIVE — never parse the child's stdout, which a shell
+                    # profile / hook banner can pollute with brace-containing noise.
+                    envelope = _read_envelope(out_file, proc)
+                except OSError as e:
+                    envelope = {"status": "error", "error": f"{type(e).__name__}: {e}"}
         status = envelope.get("status", "error")
         with lock:
             done_count["n"] += 1
             print(f"[{done_count['n']}/{len(jobs)}] {job['id']} "
                   f"backend={backend} status={status}"
-                  f"{' (skipped)' if envelope.get('skipped') else ''} "
+                  f"{' (skipped)' if skipped else ''} "
                   f"elapsed={int(time.monotonic() - t0)}s", file=sys.stderr, flush=True)
         return {"id": job["id"], "backend": backend, "status": status,
-                "skipped": bool(envelope.get("skipped")),
+                "skipped": skipped,
                 "result_file": out_file,
                 "report_status": (envelope.get("report") or {}).get("status"),
                 "suspect": envelope.get("suspect", False)}
