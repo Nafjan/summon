@@ -700,6 +700,86 @@ def test_background_and_out_rejected():
     assert env["status"] == "error" and "incompatible" in env["error"] and r.returncode == 1
 
 
+def test_roster_new_agent_scaffolds_house_format():
+    import json as _json
+    import subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-roster-")
+    try:
+        r = sp.run([sys.executable, script, "--new-agent", "fact-checker",
+                    "--set", "run-agent=codex", "--set", "permission=read-only",
+                    "--set", "model=gpt-5.6-sol", "--agents-dir", d],
+                   capture_output=True, text=True, encoding="utf-8")
+        info = _json.loads(r.stdout)
+        assert r.returncode == 0 and info["status"] == "success", info
+        body = open(info["path"], encoding="utf-8").read()
+        # house structure the dispatcher depends on:
+        for must in ("STATUS: DONE | PARTIAL | BLOCKED", "HANDOFF:", "SUMMARY:",
+                     "## Untrusted content", "run-agent: codex",
+                     "permission: read-only", "model: gpt-5.6-sol"):
+            assert must in body, must
+        # registers instantly
+        r2 = sp.run([sys.executable, script, "--list", "--agents-dir", d],
+                    capture_output=True, text=True, encoding="utf-8")
+        agents = _json.loads(r2.stdout)["agents"]
+        assert any(a["name"] == "fact-checker" for a in agents)
+        # and is dispatch-ready (dry-run resolves it)
+        r3 = sp.run([sys.executable, script, "--agent", "fact-checker", "--prompt", "x",
+                     "--cwd", os.getcwd(), "--agents-dir", d, "--dry-run"],
+                    capture_output=True, text=True, encoding="utf-8")
+        view = _json.loads(r3.stdout)
+        assert view["cli"] == "codex" and view["permission"] == "read-only"
+        # never overwrites
+        r4 = sp.run([sys.executable, script, "--new-agent", "fact-checker",
+                     "--agents-dir", d], capture_output=True, text=True, encoding="utf-8")
+        assert r4.returncode == 1 and "already exists" in _json.loads(r4.stdout)["error"]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_roster_set_agent_edits_frontmatter_only():
+    import json as _json
+    import subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-roster-")
+    try:
+        sp.run([sys.executable, script, "--new-agent", "probe", "--agents-dir", d],
+               capture_output=True, text=True, encoding="utf-8")
+        path = os.path.join(d, "probe.md")
+        body_before = open(path, encoding="utf-8").read().split("---", 2)[2]
+        # update model + permission, add args
+        r = sp.run([sys.executable, script, "--set-agent", "probe",
+                    "--set", "model=claude-sonnet-5", "--set", "permission=yolo",
+                    "--set", 'args=--flag', "--agents-dir", d],
+                   capture_output=True, text=True, encoding="utf-8")
+        info = _json.loads(r.stdout)
+        assert info["frontmatter"]["model"] == "claude-sonnet-5"
+        assert info["frontmatter"]["permission"] == "yolo"
+        assert open(path, encoding="utf-8").read().split("---", 2)[2] == body_before
+        # empty value removes the key
+        r = sp.run([sys.executable, script, "--set-agent", "probe", "--set", "model=",
+                    "--agents-dir", d], capture_output=True, text=True, encoding="utf-8")
+        assert "model" not in _json.loads(r.stdout)["frontmatter"]
+        # invalid enum rejected, file untouched
+        r = sp.run([sys.executable, script, "--set-agent", "probe",
+                    "--set", "permission=godmode", "--agents-dir", d],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 1 and "permission" in _json.loads(r.stdout)["error"]
+        # unknown key rejected
+        r = sp.run([sys.executable, script, "--set-agent", "probe",
+                    "--set", "prompt=evil", "--agents-dir", d],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 1 and "unknown key" in _json.loads(r.stdout)["error"]
+        # path-traversal name rejected
+        r = sp.run([sys.executable, script, "--new-agent", "../evil", "--agents-dir", d],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 1
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 def test_dry_run_resolves_without_executing():
     import json as _json
     import subprocess as sp

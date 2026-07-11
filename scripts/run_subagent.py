@@ -192,6 +192,15 @@ def main() -> None:
     parser.add_argument("--doctor", action="store_true",
                         help="Check backend CLIs, agy wrapper deps, agents dir, and git; "
                              "human-readable (add --json for machines)")
+    parser.add_argument("--new-agent", dest="new_agent", metavar="NAME",
+                        help="Scaffold a new agent definition (house template: report "
+                             "contract + untrusted-content guard); customize with --set")
+    parser.add_argument("--set-agent", dest="set_agent", metavar="NAME",
+                        help="Edit an existing agent's frontmatter via --set KEY=VALUE "
+                             "(KEY= removes); body untouched")
+    parser.add_argument("--set", dest="sets", action="append", default=[],
+                        metavar="KEY=VALUE",
+                        help="With --new-agent/--set-agent: run-agent, model, permission, args")
     parser.add_argument("--json", action="store_true",
                         help="With --doctor: emit machine-readable JSON instead of the table")
     parser.add_argument("--agent", help="Agent definition name")
@@ -245,6 +254,29 @@ def main() -> None:
         report = doctor(args.agents_dir, args.cwd)
         print(json.dumps(report, ensure_ascii=False) if args.json else render(report))
         sys.exit(0 if report["ok"] else 1)
+
+    # --new-agent / --set-agent: local roster management, no dispatch involved.
+    if args.new_agent or args.set_agent:
+        from _roster import new_agent, parse_sets, set_agent
+        try:
+            sets = parse_sets(args.sets)
+            roster_dir = get_agents_dir(args.agents_dir, args.cwd)
+            if args.new_agent:
+                info = new_agent(roster_dir, args.new_agent, sets)
+                info["status"] = "success"
+                info["note"] = ("scaffolded from the house template - edit the body "
+                                "(purpose, Role, rubric) before first dispatch")
+            else:
+                info = set_agent(roster_dir, args.set_agent, sets)
+                info["status"] = "success"
+            print(json.dumps(info, ensure_ascii=False))
+            sys.exit(0)
+        except FileExistsError:
+            _print_error(f"agent {args.new_agent!r} already exists; use --set-agent to modify it")
+            sys.exit(1)
+        except (ValueError, FileNotFoundError, OSError) as e:
+            _print_error(str(e))
+            sys.exit(1)
 
     if args.resume and args.worktree is not None:
         _print_error("--resume and --worktree are incompatible: a session lives in the "

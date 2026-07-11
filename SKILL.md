@@ -122,6 +122,9 @@ Parse JSON output and check `status` field:
 | `--list` | - | List available agents (no other params needed) |
 | `--list-models` | - | Report invocable models per backend (no other params needed; add `--cli` to filter). See "Model discovery" below |
 | `--doctor` | - | Check backend CLIs, wrapper deps, agents dir, git; add `--json` for machines. Run this FIRST on a new machine |
+| `--new-agent NAME` | - | Scaffold a new agent definition (house template); customize frontmatter with `--set`. Never overwrites |
+| `--set-agent NAME` | - | Edit an existing agent's frontmatter via `--set KEY=VALUE` (`KEY=` removes); body untouched, values validated |
+| `--set KEY=VALUE` | No | With the two above: `run-agent`, `model`, `permission`, `args` (repeatable) |
 | `--agent` | Yes* | Agent definition name from --list |
 | `--prompt` | Yes* | Task description to delegate |
 | `--cwd` | Yes* | Working directory (absolute path) |
@@ -259,18 +262,31 @@ run_subagent.py --agent reviewer --model claude-sonnet-5 --effort high \
 `--effort` is `low|medium|high|xhigh|max` (claude). The prompt itself is your main
 customization — the agent definition sets the role, the prompt sets the task.
 
-**2. Durably — create or edit an agent definition.** Agent definitions are plain
-`.md` files in the agents dir (`--agents-dir`, `$SUB_AGENTS_DIR`, or `{cwd}/.agents/`).
-Write a new one or edit an existing one and it registers **instantly** — no reload,
-no restart; the next `--list`/dispatch sees it. Set in frontmatter:
-- `run-agent` — which CLI (claude/codex/cursor-agent/gemini/agy)
-- `model` — pin a model (verify with `model.resolved`)
-- `permission` — `read-only`/`safe-edit`/`yolo`
-- `args` — arbitrary extra backend flags (e.g. `args: -c model_reasoning_effort="high"`)
+**2. Durably — manage the roster from the CLI** (no hand-authored markdown needed):
 
-…and write the role, rubric, and output contract in the body. Authoring a
-task-specific persona (e.g. a custom reviewer with your own rubric) is a single file
-write — do it whenever the standing roster doesn't fit the job.
+```bash
+# scaffold a new agent (house template: report contract + untrusted-content guard)
+run_subagent.py --new-agent fact-checker \
+  --set run-agent=codex --set permission=read-only --set model=gpt-5.6-sol
+# then edit the body (purpose, Role, rubric) in the printed path
+
+# retune an existing agent's frontmatter — body untouched, validated, atomic
+run_subagent.py --set-agent pair --set model=claude-sonnet-5
+run_subagent.py --set-agent reviewer --set 'args=-c model_reasoning_effort="high"'
+run_subagent.py --set-agent probe --set model=        # empty value REMOVES the key
+```
+
+Settable keys: `run-agent` (claude/codex/cursor-agent/gemini/agy), `model`,
+`permission` (`read-only`/`safe-edit`/`yolo`), `args` (extra backend flags) —
+values are validated before anything is written. `--new-agent` never overwrites;
+`--set-agent` edits frontmatter only, leaving the body byte-identical.
+
+Definitions are plain `.md` files in the agents dir (`--agents-dir`,
+`$SUB_AGENTS_DIR`, or `{cwd}/.agents/`) and register **instantly** — no reload; the
+next `--list`/dispatch sees them. You can still write or edit the files directly
+(the scaffold exists because a hand-written definition tends to miss the
+Final-report contract the dispatcher parses). Authoring a task-specific persona is
+one `--new-agent` plus a body edit — do it whenever the standing roster doesn't fit.
 
 **Different models per role is the whole point.** Give planning/architecture agents a
 deep model (`opus`, `claude-fable-5`), balanced work a `claude-sonnet-5` agent, cheap
