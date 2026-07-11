@@ -69,10 +69,24 @@ def validate_permission(value: str | None) -> str:
     return value
 
 
-def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str, str, str, str, str | None]:
+def parse_extra_args(value: str | None) -> list:
+    """`args:` frontmatter — arbitrary backend CLI flags, shlex-split so quoted
+    values survive (e.g. args: -c model_reasoning_effort="high"). Returns []
+    for missing/empty. Raises ValueError on unbalanced quotes."""
+    if not value:
+        return []
+    import shlex
+    try:
+        return shlex.split(value)
+    except ValueError as e:
+        raise ValueError(f"invalid args: frontmatter ({e}): {value!r}") from e
+
+
+def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str, str, str, str, str | None, list]:
     """Load agent definition file and extract run-agent and permission settings.
 
-    Returns (run_agent_cli, system_context, description, file_path, permission, model).
+    Returns (run_agent_cli, system_context, description, file_path, permission,
+    model, extra_args).
     """
     validate_agent_name(agent_name)
     agents_path = Path(agents_dir)
@@ -92,7 +106,8 @@ def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str, str, 
             run_agent = frontmatter.get("run-agent")
             permission = validate_permission(frontmatter.get("permission"))
             description = extract_description(body)
-            return run_agent, body.strip(), description, str(resolved), permission, frontmatter.get("model") or None
+            return (run_agent, body.strip(), description, str(resolved), permission,
+                    frontmatter.get("model") or None, parse_extra_args(frontmatter.get("args")))
 
     raise FileNotFoundError(f"Agent definition not found: {agent_name}")
 

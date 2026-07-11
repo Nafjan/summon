@@ -24,6 +24,7 @@ class StreamProcessor:
         self.session_id = None  # claude session_id / codex thread_id / cursor chat id
         self.usage = None       # token usage dict
         self.cost_usd = None    # claude total_cost_usd
+        self.model = None       # the model that actually SERVED the run, when reported
 
     def process_line(self, line: str) -> bool:
         """Process one line. Returns True when a terminal event is reached."""
@@ -48,6 +49,8 @@ class StreamProcessor:
         if data.get("type") == "system" and data.get("subtype") == "init":
             if data.get("session_id"):
                 self.session_id = data["session_id"]
+            if data.get("model"):
+                self.model = data["model"]
             return False
 
         if data.get("type") == "init":
@@ -60,6 +63,8 @@ class StreamProcessor:
             self.is_codex = True
             if data.get("thread_id"):
                 self.session_id = data["thread_id"]
+            if data.get("model"):
+                self.model = data["model"]
             return False
 
         if self.is_gemini and data.get("type") == "message" and data.get("role") == "assistant":
@@ -118,6 +123,15 @@ class StreamProcessor:
             if data.get(key):
                 self.session_id = data[key]
                 break
+        # Served model: claude's result carries modelUsage (a dict keyed by
+        # model id); some CLIs put a flat "model" field on the result object.
+        if isinstance(data.get("model"), str) and data["model"]:
+            self.model = data["model"]
+        elif isinstance(data.get("modelUsage"), dict) and data["modelUsage"]:
+            # The dominant model of the session = the one with the most output.
+            def _out(v):
+                return v.get("outputTokens", 0) if isinstance(v, dict) else 0
+            self.model = max(data["modelUsage"], key=lambda k: _out(data["modelUsage"][k]))
 
     def get_result(self):
         return self.result_json

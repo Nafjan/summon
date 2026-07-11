@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 
-from _builder import AgentInvocation, build_invocation_args
+from _builder import AgentInvocation, build_invocation_args, permission_flags
 from _stream import StreamProcessor
 
 _SUCCESS_EXIT_CODES = (0, 143, -15)  # 0 ok, 143/-15 = SIGTERM (we asked it to stop)
@@ -127,6 +127,7 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     response["session_id"] = processor.session_id if processor else None
     response["usage"] = processor.usage if processor else None
     response["cost_usd"] = processor.cost_usd if processor else None
+    response["model_resolved"] = processor.model if processor else None
     # Baseline resume handle on EVERY path (incl. spawn-failure) so orchestrators
     # can read response["resume"] unconditionally. execute_agent enriches it with
     # the agy profile on the normal path.
@@ -226,6 +227,11 @@ def build_final_response(
         if stderr and stderr.strip():
             msg += f": {stderr.strip()}"
         response["error"] = msg
+    if status != "success":
+        # Diagnosability: the tail of the RAW captured output (stdout+stderr are
+        # merged at spawn), so a failure is inspectable without a re-run.
+        response["output_tail"] = "".join(stdout_lines)[-2000:]
+    response["_debug_raw"] = "".join(stdout_lines)[-200_000:]
     return response
 
 
@@ -262,8 +268,13 @@ def _spawn_reader(process: subprocess.Popen) -> queue.Queue:
     return line_q
 
 
-def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int) -> dict:
-    return _partial_response(cli, processor.get_result(), 124, f"Timeout after {timeout_ms}ms")
+def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
+                     stdout_lines: list | None = None) -> dict:
+    resp = _partial_response(cli, processor.get_result(), 124, f"Timeout after {timeout_ms}ms")
+    raw = "".join(stdout_lines or [])
+    resp["output_tail"] = raw[-2000:]
+    resp["_debug_raw"] = raw[-200_000:]
+    return resp
 
 
 def _drain_to_eof(line_q: queue.Queue, budget_sec: float = 0.5) -> None:
@@ -328,7 +339,7 @@ def _drive_process_loop(
                 process.kill()
                 _drain_to_eof(line_q)
                 process.communicate()
-                return _timeout_payload(cli, processor, timeout_ms)
+                return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
 
             try:
                 kind, line = line_q.get(timeout=remaining)
@@ -336,7 +347,7 @@ def _drive_process_loop(
                 process.kill()
                 _drain_to_eof(line_q)
                 process.communicate()
-                return _timeout_payload(cli, processor, timeout_ms)
+                return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
 
             if kind == _EOF:
                 break
@@ -370,7 +381,7 @@ def _drive_process_loop(
         except subprocess.TimeoutExpired:
             process.kill()
             _, stderr = process.communicate()
-            return _timeout_payload(cli, processor, timeout_ms)
+            return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
 
         return build_final_response(
             cli, process.returncode, processor.get_result(), stdout_lines, stderr
@@ -441,10 +452,34 @@ def _resolve_launch(command, args):
     return resolved, args
 
 
-def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000) -> dict:
+def _write_debug(debug_dir: str, argv: list, raw: str, response: dict) -> str | None:
+    """Dump the raw captured output + argv + final envelope for one run.
+    Fail-soft: diagnostics must never break the dispatch itself."""
+    import json as _json
+    try:
+        os.makedirs(debug_dir, exist_ok=True)
+        name = f"{int(time.time())}-{response.get('cli')}-{os.getpid()}.log"
+        path = os.path.join(debug_dir, name)
+        nl = "\n"
+        with open(path, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write("# argv (prompt truncated to 2000 chars per token)" + nl)
+            fh.write(" ".join(a if len(a) <= 2000 else a[:2000] + "...[truncated]" for a in argv))
+            fh.write(nl + nl + "# raw captured output (stdout+stderr merged)" + nl)
+            fh.write(raw or "(none)")
+            fh.write(nl + nl + "# final envelope" + nl)
+            fh.write(_json.dumps(response, ensure_ascii=False, indent=1))
+        return path
+    except OSError:
+        return None
+
+
+def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
+                  debug_dir: str | None = None) -> dict:
     """Execute agent CLI for the given invocation. Returns a response dict.
 
-    Response shape: ``{result, exit_code, status, cli, error?}``.
+    Response shape: ``{result, exit_code, status, cli, error?}`` plus the
+    telemetry/trust fields documented in SKILL.md (report, model, permission,
+    elapsed_ms, ...).
     """
     started = time.monotonic()
     command, args, env_override = build_invocation_args(inv)
@@ -455,6 +490,20 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000) -> dict:
         # Wall-clock per dispatch — orchestrators need this for concurrency
         # tuning and it costs nothing to provide.
         resp["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+        # Trust fields: what was ASKED FOR vs what the backend REPORTED serving.
+        # resolved=None means the backend didn't say (agy never does) — absence
+        # of proof, not proof of the requested model.
+        resp["model"] = {"requested": inv.model, "resolved": resp.pop("model_resolved", None)}
+        resp["permission"] = inv.permission
+        try:
+            resp["permission_flags"] = permission_flags(inv.cli, inv.permission)
+        except ValueError:
+            resp["permission_flags"] = None
+        raw = resp.pop("_debug_raw", None)
+        if debug_dir:
+            dbg = _write_debug(debug_dir, [command, *args], raw or "", resp)
+            if dbg:
+                resp["debug_file"] = dbg
         return resp
 
     try:

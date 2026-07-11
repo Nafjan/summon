@@ -358,6 +358,133 @@ def test_agy_posix_fence():
         assert "AGY_PTY_WRAPPER" in str(e)
 
 
+def test_extract_json_last_toplevel_wins():
+    from _schema import extract_json
+    text = ('Here is my thinking {"draft": 1} and some prose.\n'
+            '```json\n{"verdict": "keep", "score": 8, "notes": {"a": [1, 2]}}\n```\n'
+            "STATUS: DONE\nSUMMARY: s\nFOLLOW-UP: f\nHANDOFF: h")
+    val, err = extract_json(text)
+    assert err is None and val["verdict"] == "keep" and val["notes"]["a"] == [1, 2]
+    val, err = extract_json("no json here at all")
+    assert val is None and "no complete JSON" in err
+
+
+def test_schema_validator_subset():
+    from _schema import validate
+    schema = {"type": "object",
+              "required": ["verdict", "score"],
+              "additionalProperties": False,
+              "properties": {
+                  "verdict": {"type": "string", "enum": ["keep", "cut"]},
+                  "score": {"type": "integer", "minimum": 0, "maximum": 10},
+                  "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 3}}}
+    assert validate({"verdict": "keep", "score": 8}, schema) == []
+    errs = validate({"verdict": "meh", "score": 11, "tags": ["a", 2], "x": 1}, schema)
+    joined = " | ".join(errs)
+    for expected in ("enum", "maximum", "$.tags[1]", "unexpected properties"):
+        assert expected in joined, (expected, joined)
+    assert validate({"score": True, "verdict": "keep"}, schema)  # bool is not integer
+
+
+def test_manifest_normalize_and_concurrency():
+    import _manifest as m
+    caps = m._parse_concurrency("agy=2, codex=3")
+    assert caps == {"default": 3, "agy": 2, "codex": 3}
+    jobs, err = m._normalize_jobs(
+        {"defaults": {"retries": 1},
+         "jobs": [{"agent": "reviewer", "prompt": "p1"},
+                  {"id": "j2", "agent": "pair", "prompt": "p2"}]}, ".")
+    assert err is None and jobs[0]["id"] == "reviewer-000" and jobs[0]["retries"] == 1
+    _, err = m._normalize_jobs([{"agent": "a", "prompt": "p", "bogus": 1}], ".")
+    assert "unknown keys" in err
+    _, err = m._normalize_jobs([{"agent": "a"}], ".")
+    assert "prompt" in err
+    _, err = m._normalize_jobs(
+        [{"id": "x", "agent": "a", "prompt": "p"}, {"id": "x", "agent": "b", "prompt": "p"}], ".")
+    assert "duplicate" in err
+
+
+def test_loader_extra_args_parsing():
+    from _loader import parse_extra_args
+    assert parse_extra_args(None) == []
+    assert parse_extra_args('-c model_reasoning_effort="high" --flag') == \
+        ["-c", "model_reasoning_effort=high", "--flag"]
+    try:
+        parse_extra_args('"unbalanced')
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+
+def test_builder_extra_args_reach_argv():
+    from _builder import AgentInvocation, build_invocation_args
+    inv = AgentInvocation(cli="claude", prompt="hi", cwd=".", system_context="x",
+                          permission="yolo", extra_args=("--betas", "foo"))
+    _, argv, _ = build_invocation_args(inv)
+    assert "--betas" in argv and "foo" in argv
+    inv2 = AgentInvocation(cli="codex", prompt="hi", cwd=".", system_context="x",
+                           permission="yolo", extra_args=("-c", "k=v"))
+    _, argv2, _ = build_invocation_args(inv2)
+    assert argv2.index("-c") < argv2.index("exec")  # global flag precedes subcommand
+
+
+def test_envelope_model_and_permission_echo():
+    import _executor
+    from _builder import AgentInvocation
+    orig = _executor.build_invocation_args
+    _executor.build_invocation_args = lambda inv: ("definitely-not-a-real-cli-xyz", [], None)
+    try:
+        out = _executor.execute_agent(
+            AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), system_context="s",
+                            permission="read-only", model="opus"), timeout_ms=1000)
+    finally:
+        _executor.build_invocation_args = orig
+    assert out["model"] == {"requested": "opus", "resolved": None}
+    assert out["permission"] == "read-only"
+    assert out["permission_flags"] == ["--permission-mode", "plan"]
+    assert "_debug_raw" not in out  # internal key never leaks into the envelope
+
+
+def test_out_skip_short_circuits(tmp_base=None):
+    import json as _json
+    import subprocess as sp
+    out = os.path.join(tempfile.gettempdir(), f"summon-out-{os.getpid()}.json")
+    with open(out, "w", encoding="utf-8") as fh:
+        _json.dump({"status": "success", "result": "prior run"}, fh)
+    try:
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+        r = sp.run([sys.executable, script, "--agent", "whatever", "--prompt", "p",
+                    "--cwd", os.getcwd(), "--out", out],
+                   capture_output=True, text=True, encoding="utf-8")
+        env = _json.loads(r.stdout)
+        assert env["skipped"] is True and env["status"] == "success" and r.returncode == 0
+    finally:
+        os.remove(out)
+
+
+def test_dry_run_resolves_without_executing():
+    import json as _json
+    import subprocess as sp
+    agents = tempfile.mkdtemp(prefix="summon-dryrun-agents-")
+    try:
+        with open(os.path.join(agents, "probe.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: read-only\nmodel: opus\n"
+                     "args: --betas foo\n---\n# Probe\nA test agent.\n")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+        r = sp.run([sys.executable, script, "--agent", "probe", "--prompt", "hello",
+                    "--cwd", os.getcwd(), "--agents-dir", agents, "--dry-run"],
+                   capture_output=True, text=True, encoding="utf-8")
+        view = _json.loads(r.stdout)
+        assert view["dry_run"] is True and r.returncode == 0
+        assert view["cli"] == "claude" and view["model_requested"] == "opus"
+        assert view["permission_flags"] == ["--permission-mode", "plan"]
+        assert "--betas" in view["extra_args"]
+        assert any("--append-system-prompt" in a for a in view["args"])
+    finally:
+        import shutil as _sh
+        _sh.rmtree(agents, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

@@ -38,6 +38,7 @@ class AgentInvocation:
     effort: str | None = None          # reasoning effort (claude only): low..max
     resume_id: str | None = None       # backend session/thread/chat id to resume
     resume_profile: str | None = None  # agy only: profile dir of the session to resume
+    extra_args: tuple = ()             # arbitrary backend flags (agent `args:` frontmatter)
 
 
 # Short report-contract nudge appended to RESUME prompts. On resume the session
@@ -147,7 +148,8 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         # or it hangs on an approval prompt). Just point at the session + new task.
         command, base_args = build_command(inv.cli, _resume_prompt(inv))
         return (command,
-                perm + model_flag + effort_flag + ["--resume", inv.resume_id] + base_args,
+                perm + model_flag + effort_flag + list(inv.extra_args)
+                + ["--resume", inv.resume_id] + base_args,
                 None)
 
     system_prompt = (
@@ -158,7 +160,8 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     )
     command, base_args = build_command(inv.cli, inv.prompt)
     return (command,
-            perm + model_flag + effort_flag + ["--append-system-prompt", system_prompt] + base_args,
+            perm + model_flag + effort_flag + list(inv.extra_args)
+            + ["--append-system-prompt", system_prompt] + base_args,
             None)
 
 
@@ -173,8 +176,8 @@ def _build_gemini_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     model_flag = ["--model", inv.model] if inv.model else []
     if inv.agent_file:
         command, base_args = build_command(inv.cli, inv.prompt)
-        return command, perm + model_flag + base_args, {"GEMINI_SYSTEM_MD": inv.agent_file}
-    return _concatenated_args(inv, perm + model_flag, env=None)
+        return command, perm + model_flag + list(inv.extra_args) + base_args, {"GEMINI_SYSTEM_MD": inv.agent_file}
+    return _concatenated_args(inv, perm + model_flag + list(inv.extra_args), env=None)
 
 
 def _codex_env_override() -> dict | None:
@@ -195,11 +198,11 @@ def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         # `codex exec resume <id>`: the thread holds the agent definition, so send
         # only the task + reminder (no [System Context] prefix). Permission/model
         # flags are global codex flags and still precede the subcommand.
-        return "codex", perm + model_flag + [
+        return "codex", perm + model_flag + list(inv.extra_args) + [
             "exec", "resume", inv.resume_id, "--json", "--skip-git-repo-check",
             _resume_prompt(inv)], env
     command, base_args = build_command(inv.cli, _concatenated_prompt(inv))
-    return command, perm + model_flag + base_args, env
+    return command, perm + model_flag + list(inv.extra_args) + base_args, env
 
 
 def _build_cursor_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
@@ -210,10 +213,10 @@ def _build_cursor_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     env_override = {"CURSOR_API_KEY": api_key} if api_key else None
     model = inv.model or CURSOR_DEFAULT_MODEL
     if inv.resume_id:
-        return "cursor-agent", perm + [
+        return "cursor-agent", perm + list(inv.extra_args) + [
             "--model", model, "--resume", inv.resume_id, "--output-format", "json",
             "-p", _resume_prompt(inv)], env_override
-    return "cursor-agent", perm + [
+    return "cursor-agent", perm + list(inv.extra_args) + [
         "--model", model, "--output-format", "json", "-p", _concatenated_prompt(inv)], env_override
 
 
@@ -494,7 +497,7 @@ def _build_agy_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     # Launch the wrapper, NOT agy directly. Arg order matters: agy's --print
     # consumes the NEXT token as the prompt, so flags (perm, --continue, --model)
     # precede it.
-    args = [wrapper, *perm, *cont, *model_flag, "--print", prompt]
+    args = [wrapper, *perm, *inv.extra_args, *cont, *model_flag, "--print", prompt]
     env = {
         "USERPROFILE": profile,
         "HOME": profile,

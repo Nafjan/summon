@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "required": ["verdict", "confidence", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "verdict": { "type": "string", "enum": ["approve", "concerns", "block"] },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "summary"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["critical", "warning", "note"] },
+          "summary": { "type": "string", "minLength": 1 },
+          "file": { "type": "string" }
+        }
+      }
+    }
+  }
+}

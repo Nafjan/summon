@@ -47,6 +47,29 @@ jobs:
           python summon.py --list-models > models.json
           python -c "import json; m=json.load(open('models.json'))['models']; assert set(m) == {'claude','codex','agy','cursor-agent','gemini'}; print({k: v['source'] for k, v in m.items()})"
 
+      - name: Dry-run resolves without executing (no backend needed)
+        shell: bash
+        run: |
+          python summon.py --agent reviewer --prompt "x" --cwd "$PWD" --agents-dir agents --dry-run > dry.json
+          python -c "import json; d=json.load(open('dry.json')); assert d['dry_run'] and d['cli']=='codex' and d['permission_flags'], d"
+
+      - name: Manifest + schema examples parse and validate
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, sys
+          sys.path.insert(0, "scripts")
+          import _schema
+          json.load(open("examples/jobs.json"))
+          schema = json.load(open("examples/verdict.schema.json"))
+          good = {"verdict": "block", "confidence": 0.9,
+                  "findings": [{"severity": "critical", "summary": "x"}]}
+          assert _schema.validate(good, schema) == []
+          bad = {"verdict": "maybe", "confidence": 2, "findings": []}
+          assert _schema.validate(bad, schema)  # enum + maximum violations
+          print("examples valid; schema validator agrees")
+          PY
+
       - name: Installer dry-run
         shell: bash
         run: |

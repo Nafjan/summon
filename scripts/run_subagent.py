@@ -144,9 +144,13 @@ def _child_argv(args: argparse.Namespace, result_file: str) -> list:
     if args.timeout:
         out += ["--timeout", str(args.timeout)]
     for flag, val in (("--cli", args.cli), ("--model", args.model), ("--effort", args.effort),
-                      ("--resume", args.resume), ("--resume-profile", args.resume_profile)):
+                      ("--resume", args.resume), ("--resume-profile", args.resume_profile),
+                      ("--out", args.out), ("--json-schema", args.json_schema),
+                      ("--debug-dir", args.debug_dir)):
         if val:
             out += [flag, val]
+    if args.retries:
+        out += ["--retries", str(args.retries)]
     if args.worktree is not None:
         out += [f"--worktree={args.worktree}"]  # =form is unambiguous for the bare case
     return out + ["--job-file", result_file]
@@ -207,7 +211,23 @@ def main() -> None:
                         help="Run in an isolated git worktree (optional name; auto-named if bare)")
     parser.add_argument("--background", action="store_true",
                         help="Dispatch detached; return a job handle immediately")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true",
+                        help="Print the fully resolved dispatch (command, model, permission "
+                             "flags, cwd) WITHOUT executing anything")
+    parser.add_argument("--out", help="Write the envelope atomically to FILE; if FILE already "
+                                      "holds a valid envelope, skip the run (swarm resume)")
+    parser.add_argument("--retries", type=int, default=0,
+                        help="Re-dispatch up to N times on error/partial, exponential backoff")
+    parser.add_argument("--json-schema", dest="json_schema",
+                        help="Validate the agent's final JSON against this schema file; attach "
+                             "parsed/parse_ok; one corrective retry via resume on mismatch")
+    parser.add_argument("--debug-dir", dest="debug_dir",
+                        help="Dump per-run argv + raw output + envelope into this dir")
     parser.add_argument("--job-file", dest="job_file", help=argparse.SUPPRESS)  # internal
+    parser.add_argument("--manifest", help="Run a batch of jobs from a JSON manifest (see SKILL.md)")
+    parser.add_argument("--concurrency", help="With --manifest: per-backend caps, e.g. agy=2,codex=3,default=3")
+    parser.add_argument("--results-dir", dest="results_dir",
+                        help="With --manifest: envelope dir (default {cwd}/.agents/results)")
 
     args = parser.parse_args()
 
@@ -230,6 +250,36 @@ def main() -> None:
         _print_error("--resume and --worktree are incompatible: a session lives in the "
                      "original project dir, not a fresh worktree")
         sys.exit(1)
+
+    # --manifest: batch fan-out. Delegates to _manifest and exits.
+    if args.manifest:
+        from _manifest import run_manifest
+        sys.exit(run_manifest(args))
+
+    # --out resume behavior: a pre-existing valid envelope means this job is
+    # already done — emit it (marked skipped) and exit without dispatching.
+    if args.out and os.path.isfile(args.out) and not args.dry_run:
+        try:
+            with open(args.out, encoding="utf-8") as fh:
+                prior = json.load(fh)
+        except (OSError, ValueError):
+            prior = None
+        if isinstance(prior, dict) and prior.get("status"):
+            prior["skipped"] = True
+            _emit(prior)
+            sys.exit(0 if prior.get("status") == "success" else 1)
+
+    # --json-schema: fail fast on an unloadable schema BEFORE paying for a run.
+    schema = None
+    if args.json_schema:
+        try:
+            with open(args.json_schema, encoding="utf-8") as fh:
+                schema = json.load(fh)
+            if not isinstance(schema, dict):
+                raise ValueError("schema root must be a JSON object")
+        except (OSError, ValueError) as e:
+            _print_error(f"--json-schema: cannot load {args.json_schema}: {e}")
+            sys.exit(1)
 
     # --background: hand off to a detached copy of ourselves and return at once.
     if args.background and not args.list:
@@ -265,7 +315,7 @@ def main() -> None:
     agents_dir = get_agents_dir(args.agents_dir, args.cwd)
 
     try:
-        run_agent_cli, system_context, _, agent_file, permission, model = load_agent(
+        run_agent_cli, system_context, _, agent_file, permission, model, extra_args = load_agent(
             agents_dir, args.agent
         )
     except (FileNotFoundError, ValueError) as e:
@@ -280,8 +330,9 @@ def main() -> None:
         system_context = _inject_memory(system_context, args.cwd)
 
     # --worktree: run the agent in an isolated git worktree instead of the cwd.
+    # NEVER created under --dry-run (dry-run is mutation-free by contract).
     worktree_info = None
-    if args.worktree is not None:
+    if args.worktree is not None and not args.dry_run:
         try:
             worktree_info = _setup_worktree(args.cwd, args.worktree, args.agent)
         except ValueError as e:
@@ -301,22 +352,134 @@ def main() -> None:
         effort=args.effort,
         resume_id=args.resume,
         resume_profile=args.resume_profile,
+        extra_args=tuple(extra_args),
     )
+
+    if args.dry_run:
+        _emit(_dry_run_view(invocation, args, agents_dir))
+        sys.exit(0)
 
     # Catch ValueError from build_invocation_args / permission_flags / TOML
     # escaping so unknown --cli values or unsafe agent paths surface as JSON
     # errors rather than tracebacks. All other CLI-side failures are already
     # shaped into the response by execute_agent.
     try:
-        result = execute_agent(invocation, timeout_ms=args.timeout)
+        result = _dispatch_with_retries(invocation, args)
     except ValueError as e:
         _print_error(str(e))
         sys.exit(1)
 
+    # --json-schema: structured-output contract with ONE corrective retry.
+    if schema is not None and result.get("status") == "success":
+        result = _apply_schema(result, schema, invocation, args)
+
     if worktree_info:
         result["worktree"] = worktree_info
+    if args.out:
+        _write_out(args.out, result)
     _emit(result)
     sys.exit(0 if result["status"] == "success" else 1)
+
+
+def _dry_run_view(invocation, args, agents_dir: str) -> dict:
+    """The fully resolved dispatch, without executing. For agy the per-call
+    profile is NOT built (that copies OAuth tokens = a mutation); the wrapper
+    path is shown instead."""
+    from _builder import build_invocation_args, permission_flags as _pf, _agy_wrapper
+    view = {
+        "dry_run": True,
+        "agent": args.agent,
+        "cli": invocation.cli,
+        "cwd": invocation.cwd,
+        "agents_dir": agents_dir,
+        "model_requested": invocation.model,
+        "permission": invocation.permission,
+        "permission_flags": _pf(invocation.cli, invocation.permission),
+        "extra_args": list(invocation.extra_args),
+        "timeout_ms": args.timeout,
+        "worktree": ("would create" if args.worktree is not None else None),
+        "system_context_chars": len(invocation.system_context),
+    }
+    if invocation.cli == "agy":
+        try:
+            view["command"] = "python <wrapper>"
+            view["wrapper"] = _agy_wrapper()
+            view["note"] = ("agy dry-run does not build the per-call profile (token copy "
+                            "is a mutation); at dispatch a fresh isolated profile is created")
+        except ValueError as e:
+            view["error"] = str(e)
+    else:
+        try:
+            cmd, argv, env = build_invocation_args(invocation)
+            view["command"] = cmd
+            view["args"] = [a if len(a) <= 400 else a[:400] + f"...[+{len(a)-400} chars]" for a in argv]
+            view["env_overrides"] = sorted(env) if env else []
+        except ValueError as e:
+            view["error"] = str(e)
+    return view
+
+
+def _dispatch_with_retries(invocation, args) -> dict:
+    """execute_agent with --retries: exponential backoff on error/partial only
+    (blocked won't improve by retrying — its cause is structural)."""
+    attempt = 0
+    while True:
+        result = execute_agent(invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir)
+        attempt += 1
+        if result.get("status") not in ("error", "partial") or attempt > max(0, args.retries):
+            break
+        time.sleep(min(30, 2 ** attempt))
+    result["attempts"] = attempt
+    return result
+
+
+def _apply_schema(result: dict, schema: dict, invocation, args) -> dict:
+    """Validate the agent's final JSON; on mismatch, ONE corrective follow-up
+    through --resume (claude/codex/cursor via session_id; agy via profile)."""
+    from _schema import attach_parsed, correction_prompt
+    from _builder import AgentInvocation as _AI
+    attach_parsed(result, schema)
+    if result["parse_ok"]:
+        return result
+    resume = result.get("resume") or {}
+    sid, profile = resume.get("session_id"), resume.get("profile")
+    if not sid and not profile:
+        return result  # no resume lane (e.g. gemini) — return the verdict as-is
+    retry_inv = _AI(
+        cli=invocation.cli,
+        prompt=correction_prompt(schema, result.get("parse_errors") or []),
+        cwd=invocation.cwd,
+        system_context="",  # resume: session already holds the definition
+        agent_file=invocation.agent_file,
+        permission=invocation.permission,
+        model=invocation.model,
+        effort=invocation.effort,
+        resume_id=sid or "latest",
+        resume_profile=profile,
+        extra_args=invocation.extra_args,
+    )
+    try:
+        retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir)
+    except ValueError:
+        return result  # resume unsupported on this backend: keep the first verdict
+    retry["parse_retry"] = True
+    attach_parsed(retry, schema)
+    # keep whichever attempt satisfied the schema; prefer the retry only if it
+    # actually improved things.
+    return retry if retry.get("parse_ok") or retry.get("status") == "success" else result
+
+
+def _write_out(path: str, result: dict) -> None:
+    """Atomic envelope write (tmp+rename): a present file is a COMPLETE file,
+    which is what makes --out usable as a swarm's skip-if-done marker."""
+    try:
+        tmp = path + ".tmp"
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(result, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError as e:
+        result["out_error"] = f"failed to write --out {path}: {e}"
 
 
 def _resolve_job_file() -> str | None:
