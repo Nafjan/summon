@@ -171,10 +171,16 @@ def validate(instance, schema: dict, path: str = "$") -> list:
         for key, sub in props.items():
             if key in instance:
                 errors += validate(instance[key], sub, f"{path}.{key}")
-        if schema.get("additionalProperties") is False:
-            extra = set(instance) - set(props)
+        addl = schema.get("additionalProperties")
+        extra = set(instance) - set(props)
+        if addl is False:
             if extra:
                 errors.append(f"{path}: unexpected properties {sorted(extra)!r}")
+        elif isinstance(addl, dict):
+            # additionalProperties as a SCHEMA: every not-listed property must
+            # satisfy it (was previously ignored -> parse_ok on unchecked data).
+            for k in sorted(extra):
+                errors += validate(instance[k], addl, f"{path}.{k}")
 
     if isinstance(instance, list):
         lo, _ = _num("minItems")
@@ -206,6 +212,8 @@ def unsupported_keywords(schema, path: str = "$") -> list:
                     found += unsupported_keywords(pv, f"{path}.{pk}")
             elif k == "items":
                 found += unsupported_keywords(v, f"{path}[]")
+            elif k == "additionalProperties" and isinstance(v, dict):
+                found += unsupported_keywords(v, f"{path}.*")
     return found
 
 

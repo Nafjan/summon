@@ -248,6 +248,18 @@ def test_lock_release_only_removes_own_token():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_uninstall_absent_host_root_is_nothing_not_contention():
+    # --uninstall against a host whose root dir doesn't exist must report
+    # "nothing", not a false "another install running".
+    home = tempfile.mkdtemp(prefix="summon-nohost-")  # NO .claude created
+    try:
+        r = _run(home, "--hosts", "claude", "--uninstall")
+        assert r.returncode == 0, (r.returncode, r.stdout)
+        assert "nothing at" in r.stdout and "running" not in r.stdout, r.stdout
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_install_agents_returns_ok_tuple():
     # install_agents now returns (lines, ok); main() folds ok into the exit code
     # so a failed starter-agent copy can't exit 0. Verify the tuple contract on

@@ -330,8 +330,10 @@ Caveats worth knowing:
 - `read-only` sandboxes differ: claude's plan mode can block even *reads* the
   prompt depends on (a blocked run now returns `status: blocked` — see the
   status table). If a read-only agent must read files, keep them under `--cwd`.
-- agy has no true read-only: `--sandbox` is its closest mode, and `safe-edit`
-  already maps to skip-permissions there (constrain by instruction instead).
+- **agy has no workspace-write tier**: `read-only` maps to `--sandbox`, but BOTH
+  `safe-edit` and `yolo` map to `--dangerously-skip-permissions` — so a `safe-edit`
+  agy agent runs with a FULL permission bypass, identical to `yolo`. Constrain agy
+  agents by instruction, and treat any repo you point them at as trusted.
 - For investigation agents that only need to *read*, `yolo` +
   "do not modify files" in the agent body is often more reliable than
   `read-only` — several CLIs' plan modes end turns asking for approval.

@@ -666,6 +666,18 @@ def test_schema_unsupported_keywords_warned():
     assert resp["parse_ok"] is True and resp.get("parse_warnings")
 
 
+def test_schema_additional_properties_as_schema_enforced():
+    # additionalProperties: {schema} must VALIDATE extra props (was ignored ->
+    # parse_ok on unchecked data), and unsupported keywords under it must warn.
+    from _schema import validate, unsupported_keywords
+    sc = {"type": "object", "additionalProperties": {"type": "string"}}
+    assert validate({"n": 123}, sc)            # 123 is not a string -> error
+    assert validate({"n": "ok"}, sc) == []     # string extra prop passes
+    sc2 = {"type": "object", "additionalProperties": {"type": "string", "format": "email"}}
+    kws = {k for _, k in unsupported_keywords(sc2)}
+    assert "format" in kws
+
+
 def test_doctor_reads_version_from_stderr():
     import _doctor, types
     orig = _doctor.subprocess.run

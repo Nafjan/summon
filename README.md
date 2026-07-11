@@ -143,16 +143,21 @@ re-target a specific headless session.)
 ## Security model
 
 - Agent `permission:` maps to each CLI's own sandbox flags — `read-only`,
-  `safe-edit`, or `yolo` (bypasses approvals). **Every bundled agent ships as
-  `safe-edit`** (auto-approve edits in the workspace, no sandbox bypass); raising
-  one to `yolo` is a deliberate per-agent choice, not the default.
-- **Untrusted content:** summon runs in a cwd *you* choose, and treats files under
-  it — plus `.agents/memory.md` (auto-injected into agent context) and manifest
-  `prompt_file`s — as trusted operator input. Every bundled agent also carries an
-  "Untrusted content" instruction (data is not instructions) as defense-in-depth.
-  **Do not run summon against a repository you don't trust** while any agent is set
-  to `yolo`: a malicious repo could commit files or memory that steer a sandbox-
-  bypassed agent. This is the same trust you extend to any tool you run in a repo.
+  `safe-edit`, or `yolo`. **Every bundled agent ships as `safe-edit`**, which
+  auto-approves edits without prompting. Note what that means per backend
+  (the mapping is the CLI's, not summon's): claude/codex/cursor/gemini `safe-edit`
+  is workspace-scoped auto-edit, while **agy has no workspace-write tier — its
+  `safe-edit` maps to a full permission bypass, the same as `yolo`.** So the four
+  agy agents effectively run unsandboxed even at the default.
+- **Untrusted content — treat the whole cwd as trusted:** summon runs in a cwd
+  *you* choose and treats everything under it — files, `.agents/memory.md`
+  (auto-injected into agent context), and manifest `prompt_file`s — as trusted
+  operator input. Every bundled agent also carries an "Untrusted content"
+  instruction (data is not instructions) as defense-in-depth. **Do not run summon
+  in a repository you don't fully trust**: a malicious repo could commit files or
+  memory that steer an agent, and at `safe-edit` that agent can already write your
+  workspace (or, on agy, do anything). This is the same trust you extend to any
+  build tool or dev script you run in a checkout.
 - The agy backend copies OAuth tokens into a per-invocation profile locked to your
   user (icacls on Windows, `0700` on POSIX) and isolated from your real profile.
 - `--doctor` shows which CLI binaries would be dispatched to (path + version) and how

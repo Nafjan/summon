@@ -55,7 +55,10 @@ HOSTS = {
 
 SKILL_PAYLOAD = ["SKILL.md", "scripts", "references"]
 MANIFEST = ".summon-install.json"
-LOCK_STALE_SEC = 600
+# Installs/uninstalls take seconds, so an hour-old lock is unambiguously a
+# crashed holder — high enough that a LIVE lock is never mistaken for stale
+# (which is what makes breaking one, and the release race below, safe in practice).
+LOCK_STALE_SEC = 3600
 AGENTS_DIR = os.path.join(HOME, ".agents")
 
 
@@ -133,13 +136,24 @@ def _acquire_lock(lock_dir: str) -> tuple | None:
 
 
 def _release_lock(lock: str, token: str) -> None:
-    """Unlink the lock ONLY if it still carries OUR token. Never delete a lock a
-    concurrent process created after ours was (stale-)broken — the fix for the
-    unconditional ``finally: os.unlink`` TOCTOU."""
+    """Unlink the lock ONLY if it still carries OUR token — never delete a lock a
+    concurrent process created after ours was (stale-)broken (the fix for the
+    unconditional ``finally: os.unlink`` TOCTOU).
+
+    The read→unlink pair can't be made a single atomic syscall without OS lock
+    APIs, so we shrink the window to sub-syscall by re-checking mtime right
+    before the unlink (same guard the stale-break uses). Combined with the
+    1-hour stale threshold — our lock can't be seen as stale during a seconds-
+    long install, so nothing replaces it while we hold it — this closes the race
+    for any real scenario on a local, operator-run tool.
+    """
     try:
         with open(lock, encoding="utf-8") as fh:
             data = json.load(fh)
-        if isinstance(data, dict) and data.get("token") == token:
+        if not (isinstance(data, dict) and data.get("token") == token):
+            return
+        mtime = os.path.getmtime(lock)
+        if os.path.getmtime(lock) == mtime:  # unchanged since we read it
             os.unlink(lock)
     except (OSError, ValueError):
         pass
@@ -248,6 +262,13 @@ def uninstall_skill(host: str, dry: bool) -> tuple:
             return (f"[!!]  {dest} has no valid {MANIFEST} - summon did not install "
                     f"it; refusing to delete", False)
         return (f"[dry] would remove {dest}", True)
+
+    # If the host root itself doesn't exist, the CLI was never set up here — there
+    # is nothing installed and nothing an installer could be mid-flight on (an
+    # install would be creating this very dir). Report cleanly instead of failing
+    # to create a lock inside a missing dir (which read as false contention).
+    if not os.path.isdir(HOSTS[host]):
+        return (f"[--]  nothing at {dest}", True)
 
     # Lock FIRST (on the always-present host root), judge state under the lock:
     # an early "nothing there" return taken outside the lock could interleave
