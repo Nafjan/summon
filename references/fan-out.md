@@ -64,8 +64,11 @@ run_subagent.py --council --question-file q.md \
   deliberately vendor-diverse (`planner`/opus, `reviewer`/codex, `researcher`/agy,
   `pair`/sonnet-5). Override with `--members`; author custom-persona members with
   `--new-agent`. A council of clones is pointless — keep it diverse.
-- **`--rounds 2`** adds a cross-examination round: each member sees the others'
-  anonymized positions and refines. `--rounds 1` (default) = independent positions.
+- **`--rounds 2`** adds a cross-examination + peer-ranking round (à la Karpathy's
+  llm-council): each member sees ALL positions anonymized (can't tell which is
+  theirs → no favoritism), refines their stance, and **ranks** them best-to-worst.
+  Votes aggregate (Borda) into `consensus_ranking` in the envelope, which the
+  chairman weighs as one signal. `--rounds 1` (default) = independent positions only.
 - **The chairman** (`--chairman`, default `fable`) reads all final positions and
   returns the decision, a confidence, the points of agreement, the dissents (named),
   and a next action — making the call even when the council is split.
