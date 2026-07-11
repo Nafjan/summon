@@ -32,9 +32,19 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
         line = line.strip()
         if ":" in line and not line.startswith("#"):
             key, value = line.split(":", 1)
-            frontmatter[key.strip()] = value.strip().strip("\"'")
+            frontmatter[key.strip()] = _unquote(value.strip())
 
     return frontmatter, body
+
+
+def _unquote(value: str) -> str:
+    """Strip only a MATCHED pair of surrounding quotes. The old blanket
+    ``strip("\\"'")`` chewed characters off any value that merely ended in a
+    quote — e.g. ``args: --label "two words"`` lost its trailing ``"`` and became
+    an unterminated string that then failed ``shlex.split``."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
 
 
 def extract_description(body: str) -> str:

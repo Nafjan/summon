@@ -267,6 +267,15 @@ def _build_cursor_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
 # process exits, so we NEVER reuse or scrub a profile in place — old run dirs are
 # cleaned best-effort on a later call once that sidecar has released them.
 
+# The MINIMAL set copied from the real agy config into the fresh per-call
+# profile so agy can run headless without prompting: OAuth creds + account,
+# install id + integrity (agy refuses to start otherwise), and the two
+# operational files it needs to skip interactive gates — `state.json`
+# (onboarding/first-run flags) and `trustedFolders.json` (workspace trust, so
+# agy doesn't block on a "trust this folder?" prompt). What is deliberately NOT
+# copied: conversation history / the SQLite DB, MCP server config, and any
+# roaming memory — so the isolation claim is "no inherited conversation or MCP
+# state", not "an empty $HOME".
 _AGY_AUTH_FILES = (
     "oauth_creds.json", "google_accounts.json", "installation_id",
     "state.json", "trustedFolders.json", "extension_integrity.json",
@@ -331,30 +340,41 @@ def _agy_wrapper() -> str:
     return os.path.join(os.path.expanduser("~"), ".agents", "scripts", "agy_pty_pyte.py")
 
 
-def _agy_cleanup_old_runs(runs_dir: str) -> None:
+def _agy_cleanup_old_runs(runs_dir: str, deadline_sec: float | None = None) -> None:
     """Best-effort removal of prior per-invocation profiles.
 
-    Only touches dirs older than the TTL so an in-flight call's profile (or one
-    whose sidecar still holds the conversation DB) is left alone and reaped on a
-    later call. The TTL floors at _AGY_RUN_TTL_SEC but always exceeds twice the
-    current run deadline + sidecar-linger margin, so even a long-deadline run can
-    never be deleted while still in flight. Correctness never depends on this —
-    every run uses a brand-new dir regardless of whether old ones were cleaned.
+    Each profile carries a ``.summon_expiry`` timestamp (its OWN deadline +
+    sidecar margin); a dir is reaped only once past its own expiry, so a SHORT
+    call's cleanup can't delete a concurrent LONG call's still-valid profile.
+    Dirs without a marker (legacy/partial) fall back to mtime + a TTL sized by
+    this call's deadline. Correctness never depends on this — every run uses a
+    brand-new dir regardless of whether old ones were cleaned.
     """
     try:
         names = os.listdir(runs_dir)
     except OSError:
         return
-    try:
-        deadline = float(os.environ.get("AGY_PTY_DEADLINE", "300"))
-    except ValueError:
-        deadline = 300.0
-    ttl = max(_AGY_RUN_TTL_SEC, deadline * 2 + 300)
-    cutoff = time.time() - ttl
+    if deadline_sec is None:
+        try:
+            deadline_sec = float(os.environ.get("AGY_PTY_DEADLINE", "300"))
+        except ValueError:
+            deadline_sec = 300.0
+    ttl = max(_AGY_RUN_TTL_SEC, deadline_sec * 2 + 300)
+    now = time.time()
+    cutoff = now - ttl
     for name in names:
         p = os.path.join(runs_dir, name)
         try:
-            if os.path.isdir(p) and os.path.getmtime(p) < cutoff:
+            if not os.path.isdir(p):
+                continue
+            # Honor the dir's OWN expiry marker if present (concurrency-safe).
+            try:
+                with open(os.path.join(p, ".summon_expiry"), encoding="utf-8") as _fh:
+                    if now < float(_fh.read().strip()):
+                        continue  # still within its own validity window
+            except (OSError, ValueError):
+                pass
+            if os.path.getmtime(p) < cutoff:
                 shutil.rmtree(p, ignore_errors=True)
         except OSError:
             pass
@@ -408,7 +428,7 @@ def _agy_lock_down(prof: str) -> None:
         raise ValueError(f"agy profile: failed to secure token ACLs on {prof}: " + " | ".join(fails))
 
 
-def _ensure_agy_profile(cwd: str) -> str:
+def _ensure_agy_profile(cwd: str, deadline_sec: float = 300.0) -> str:
     """Create a FRESH, token-locked, isolated agy home dir for ONE invocation.
 
     Copies only the auth needed to reach the model (fresh from ~/.gemini each
@@ -422,11 +442,20 @@ def _ensure_agy_profile(cwd: str) -> str:
     real = os.path.join(os.path.expanduser("~"), ".gemini")
     runs = os.path.join(base, "runs")
     os.makedirs(runs, exist_ok=True)
-    _agy_cleanup_old_runs(runs)
+    _agy_cleanup_old_runs(runs, deadline_sec)
 
     # mkdtemp gives an ATOMICALLY-unique dir (no <pid>-<ms> collision when two
     # same-process calls land in the same millisecond).
     prof = tempfile.mkdtemp(prefix="run-", dir=runs)
+    # Self-describe when THIS profile becomes safe to reap (own deadline + sidecar
+    # margin). A concurrent SHORT call's cleanup reads this and leaves a long
+    # call's still-valid profile alone — the reaping no longer depends on the
+    # cleaner's own deadline.
+    try:
+        with open(os.path.join(prof, ".summon_expiry"), "w", encoding="utf-8") as _fh:
+            _fh.write(repr(time.time() + deadline_sec * 2 + 300))
+    except OSError:
+        pass
     try:
         g = os.path.join(prof, ".gemini")
         acli = os.path.join(g, "antigravity-cli")
@@ -494,7 +523,18 @@ def _resume_agy_profile(profile: str | None) -> str:
     return profile
 
 
-def _build_agy_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
+def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
+                    ) -> tuple[str, list, dict | None]:
+    # Effective wrapper deadline in seconds: the real request if provided (don't
+    # floor to int — keep sub-second precision), else the env/default. Used both
+    # for the wrapper (AGY_PTY_DEADLINE) and for sizing the profile-TTL cleanup.
+    if timeout_ms:
+        deadline_sec = max(1.0, timeout_ms / 1000)
+    else:
+        try:
+            deadline_sec = float(os.environ.get("AGY_PTY_DEADLINE", "300"))
+        except ValueError:
+            deadline_sec = 300.0
     wrapper = _agy_wrapper()  # FIRST: fails fast on POSIX before any profile is built
     perm = permission_flags(inv.cli, inv.permission)  # --dangerously-skip-permissions
     # Optional model pin from agent frontmatter (`model:`). agy accepts display
@@ -517,7 +557,7 @@ def _build_agy_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
             "block from your agent definition above, with every field present "
             "(use \"none\" where it does not apply). Do not skip it, even for tiny tasks."
         )
-        profile = _ensure_agy_profile(inv.cwd)
+        profile = _ensure_agy_profile(inv.cwd, deadline_sec)
         cont = []
 
     if len(prompt) > _AGY_MAX_PROMPT:
@@ -533,7 +573,9 @@ def _build_agy_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     env = {
         "USERPROFILE": profile,
         "HOME": profile,
-        "AGY_PTY_DEADLINE": os.environ.get("AGY_PTY_DEADLINE", "300"),
+        # The real request deadline (agy was previously pinned to 300s here so a
+        # longer --timeout was truncated). Kept as a string the wrapper float()s.
+        "AGY_PTY_DEADLINE": repr(deadline_sec),
         "AGY_PTY_QUIET": os.environ.get("AGY_PTY_QUIET", "20"),
     }
     return _agy_python(), args, env
@@ -576,16 +618,21 @@ def backend_kind(cli: str) -> str | None:
     return b["kind"] if b else None
 
 
-def build_invocation_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
+def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None
+                          ) -> tuple[str, list, dict | None]:
     """Dispatch to a SUBPROCESS backend's argument builder.
 
     Returns ``(command, args, env_override_or_None)``. Raises ValueError for an
     unknown backend or an api-kind backend (which has no argv — the executor
-    calls it directly; see ``backend_kind``).
+    calls it directly; see ``backend_kind``). ``timeout_ms`` is threaded to agy
+    so its wrapper deadline AND its profile-TTL cleanup (which runs at build
+    time) reflect the real request; the other builders don't need it.
     """
     b = BACKENDS.get(inv.cli)
     if b is None:
         raise ValueError(f"Unknown backend: {inv.cli}")
     if b["kind"] != "subprocess":
         raise ValueError(f"backend {inv.cli!r} is {b['kind']}-kind; no argv to build")
+    if inv.cli == "agy":
+        return _build_agy_args(inv, timeout_ms)
     return b["build"](inv)
