@@ -825,6 +825,26 @@ def test_roster_preserves_crlf_body_and_dedups_keys():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_roster_rejects_non_utf8_value_no_squatter():
+    # An unpaired surrogate (model-generated garbage) must be rejected up front,
+    # never leave a zero-byte file squatting the agent name.
+    import _roster
+    d = tempfile.mkdtemp(prefix="summon-surr-")
+    try:
+        try:
+            _roster.new_agent(d, "s", {"model": "x\ud800y"})  # lone high surrogate
+            raise AssertionError("non-UTF-8 value not rejected")
+        except ValueError as e:
+            assert "UTF-8" in str(e)
+        assert not os.path.exists(os.path.join(d, "s.md"))  # name still free
+        # a clean retry then succeeds
+        _roster.new_agent(d, "s", {"model": "claude-sonnet-5"})
+        assert os.path.isfile(os.path.join(d, "s.md"))
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 def test_roster_modes_mutually_exclusive():
     import json as _json, subprocess as sp
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")

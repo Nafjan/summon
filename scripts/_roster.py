@@ -87,6 +87,13 @@ def _validate_values(sets: dict, allow_empty: bool) -> None:
         if any(ord(c) < 0x20 for c in value):
             raise ValueError(f"--set {key}: value contains a control character "
                              "(newline/CR/etc.) — not allowed")
+        # Reject anything not cleanly UTF-8 encodable (e.g. an unpaired surrogate
+        # from model-generated input): otherwise the encode fails mid-write,
+        # after O_EXCL already created the file, leaving a squatter.
+        try:
+            value.encode("utf-8")
+        except UnicodeError:
+            raise ValueError(f"--set {key}: value is not valid UTF-8 text") from None
         if value == "":
             if not allow_empty:
                 raise ValueError(f"--set {key}= (empty) is only valid with --set-agent (removes the key)")
@@ -131,9 +138,9 @@ def new_agent(agents_dir: str, name: str, sets: dict) -> dict:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
-    except OSError:
+    except Exception:  # noqa: BLE001 — ANY write failure (incl. UnicodeEncodeError)
         try:
-            os.unlink(path)  # don't leave a partial file squatting the name forever
+            os.unlink(path)  # don't leave a partial/empty file squatting the name
         except OSError:
             pass
         raise
