@@ -55,6 +55,29 @@ HOSTS = {
 
 SKILL_PAYLOAD = ["SKILL.md", "scripts", "references"]
 MANIFEST = ".summon-install.json"
+
+# Optional backward-compat alias: a thin `sub-agents` skill that points at the
+# sibling `summon` skill's scripts (no duplication). Off by default for new
+# installs; enable with --with-alias. Carries a marker line so uninstall can
+# recognize (and only then remove) its own alias.
+_ALIAS_MARKER = "Legacy alias for the \"summon\" skill"
+ALIAS_SKILL = """---
+name: sub-agents
+description: Legacy alias for the "summon" skill — a cross-vendor sub-agent dispatcher (Claude, Codex, Cursor, Gemini, Antigravity). Prefer /summon; this name is kept for backward compatibility and runs the exact same dispatcher.
+allowed-tools: Bash Read
+---
+
+# sub-agents -> summon (alias)
+
+`sub-agents` is the former name of the **summon** skill. Prefer invoking **`/summon`**,
+which carries the full, current documentation.
+
+This alias runs the same dispatcher, which lives in the sibling `summon` skill:
+
+**Script Path**: `{SKILL_DIR}/../summon/scripts/run_subagent.py` (where `{SKILL_DIR}` is
+the directory containing this SKILL.md). All parameters, agents, and behavior are
+identical to `/summon` — see that skill for the complete reference.
+"""
 # Installs/uninstalls take seconds, so an hour-old lock is unambiguously a
 # crashed holder — high enough that a LIVE lock is never mistaken for stale
 # (which is what makes breaking one, and the release race below, safe in practice).
@@ -292,6 +315,46 @@ def uninstall_skill(host: str, dry: bool) -> tuple:
         _release_lock(lock, token)
 
 
+def _is_our_alias(skill_md: str) -> bool:
+    try:
+        with open(skill_md, encoding="utf-8") as fh:
+            return _ALIAS_MARKER in fh.read()
+    except OSError:
+        return False
+
+
+def install_alias(host: str, dry: bool) -> str:
+    """Write the thin sub-agents alias next to the summon skill. Refuses to
+    clobber a real (non-alias) sub-agents skill."""
+    dest = os.path.join(HOSTS[host], "skills", "sub-agents")
+    md = os.path.join(dest, "SKILL.md")
+    if os.path.exists(md) and not _is_our_alias(md):
+        return f"[!!]  {md} exists and is not a summon alias; leaving it alone"
+    if dry:
+        return f"[dry] would install sub-agents alias -> {dest}"
+    try:
+        os.makedirs(dest, exist_ok=True)
+        with open(md, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(ALIAS_SKILL)
+        return f"[ok]  sub-agents alias installed -> {dest}"
+    except OSError as e:
+        return f"[!!]  {host}: alias install failed ({e})"
+
+
+def uninstall_alias(host: str, dry: bool) -> str | None:
+    dest = os.path.join(HOSTS[host], "skills", "sub-agents")
+    md = os.path.join(dest, "SKILL.md")
+    if not os.path.isfile(md) or not _is_our_alias(md):
+        return None  # nothing of ours here
+    if dry:
+        return f"[dry] would remove sub-agents alias -> {dest}"
+    try:
+        shutil.rmtree(dest)
+        return f"[ok]  removed sub-agents alias -> {dest}"
+    except OSError as e:
+        return f"[!!]  {host}: alias removal failed ({e})"
+
+
 def install_agents(dry: bool) -> list:
     """Copy starter agents into ~/.agents with O_EXCL creation - an existing
     file is never opened, truncated, or replaced (race-safe, not just checked).
@@ -345,6 +408,9 @@ def main() -> int:
     ap.add_argument("--hosts", help="comma-separated subset (default: all detected)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-agents", action="store_true", help="skip the starter agent roster")
+    ap.add_argument("--with-alias", dest="with_alias", action="store_true",
+                    help="also install a thin `sub-agents` alias skill (backward compat; "
+                         "off by default — /summon is the primary name)")
     ap.add_argument("--uninstall", action="store_true")
     args = ap.parse_args()
 
@@ -369,6 +435,13 @@ def main() -> int:
                    else install_skill(h, args.dry_run))
         all_ok &= ok
         print(msg)
+        # The sub-agents alias is a single sibling SKILL.md (points at summon's
+        # scripts). Written on --with-alias; on --uninstall always removed IF it
+        # is recognizably our alias (never a user's real sub-agents skill).
+        amsg = (uninstall_alias(h, args.dry_run) if args.uninstall
+                else (install_alias(h, args.dry_run) if args.with_alias else None))
+        if amsg:
+            print(amsg)
 
     if not args.uninstall and not args.no_agents:
         lines, agents_ok = install_agents(args.dry_run)

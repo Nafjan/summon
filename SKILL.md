@@ -1,10 +1,10 @@
 ---
 name: summon
-description: Summon other AI CLIs (claude, codex, cursor-agent, gemini, agy) as sub-agents. Use when the user names an agent or sub-agent to run, references an agent definition, or delegates a task to another AI/agent.
+description: Summon another AI CLI — Claude, Codex, Cursor, Gemini, or Antigravity — as a sub-agent to run a task, in parallel when useful. Use whenever the user names an agent or sub-agent to run, asks to delegate work to another AI or a specific model, wants a second opinion or a cross-vendor code review, wants to fan several models out over a task, or references an agent definition. One dispatcher over five backends returns a structured JSON result (status, parsed report, token cost, the model actually served) and supports session resume, isolated git worktrees, background and manifest-driven swarms, JSON-schema-validated output, model discovery, and per-agent model/permission config. Formerly named "sub-agents".
 allowed-tools: Bash Read
 ---
 
-# Summon - Cross-Vendor Sub-Agents for Any AI CLI
+# Summon — Cross-Vendor Sub-Agents for Any AI CLI
 
 Spawns external CLI AIs (claude, cursor-agent, codex, gemini, agy) as isolated sub-agents with dedicated
 context. Supports session resume, per-call model/effort overrides, isolated git worktrees, background
@@ -60,7 +60,8 @@ If you are running on Codex, read [references/codex.md](references/codex.md) fir
 
 ### Step 1: Check Health (first run) and List Agents
 
-On a machine you haven't dispatched from before, run `--doctor` once.
+On a machine you haven't dispatched from before, run `--doctor` once — it reports which
+backends are installed/usable and how to finish setting up the rest.
 
 ### Step 1b: List Available Agents
 

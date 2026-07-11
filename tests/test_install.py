@@ -260,6 +260,40 @@ def test_uninstall_absent_host_root_is_nothing_not_contention():
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_alias_off_by_default_and_optional():
+    home = _fake_home()
+    try:
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert os.path.isfile(os.path.join(_dest(home), "SKILL.md"))
+        alias = os.path.join(home, ".claude", "skills", "sub-agents")
+        assert not os.path.exists(alias), "alias must be OFF by default"
+        # opt in
+        r = _run(home, "--hosts", "claude", "--no-agents", "--with-alias")
+        md = os.path.join(alias, "SKILL.md")
+        assert os.path.isfile(md) and "Legacy alias" in open(md, encoding="utf-8").read()
+        # points at the sibling summon scripts (no duplication)
+        assert "/../summon/scripts/run_subagent.py" in open(md, encoding="utf-8").read()
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_alias_never_clobbers_real_subagents_skill():
+    home = _fake_home()
+    try:
+        real = os.path.join(home, ".claude", "skills", "sub-agents")
+        os.makedirs(real)
+        open(os.path.join(real, "SKILL.md"), "w").write("name: sub-agents\nMY REAL SKILL")
+        r = _run(home, "--hosts", "claude", "--no-agents", "--with-alias")
+        assert "not a summon alias" in r.stdout, r.stdout
+        assert "MY REAL SKILL" in open(os.path.join(real, "SKILL.md")).read()
+        # uninstall leaves the user's real skill alone too
+        _run(home, "--hosts", "claude", "--uninstall")
+        assert os.path.isfile(os.path.join(real, "SKILL.md"))
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_install_agents_returns_ok_tuple():
     # install_agents now returns (lines, ok); main() folds ok into the exit code
     # so a failed starter-agent copy can't exit 0. Verify the tuple contract on

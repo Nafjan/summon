@@ -24,9 +24,14 @@ all five at once — each in its own git worktree, in the background.
 
 ```bash
 git clone https://github.com/Nafjan/summon && cd summon
-python install.py          # copies the skill into every AI CLI on your machine
+python install.py          # installs the `summon` skill into every AI CLI on your machine
 python summon.py --doctor  # which backends are ready? what's missing?
 ```
+
+The skill installs under the name **`summon`** (invoke it as `/summon`, or just describe
+what you want — it triggers on natural language). Migrating from the old `sub-agents`
+name? Add `python install.py --with-alias` to also install a thin `sub-agents` alias that
+points at the same dispatcher.
 
 Then point it at any project (absolute `--cwd`; run the shim from the repo, or use
 the copy the installer placed in each host's `skills/summon/`):
