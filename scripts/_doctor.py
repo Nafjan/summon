@@ -59,7 +59,10 @@ def _probe_version(path: str) -> str | None:
         # A binary that errors on --version is not a working backend, no matter
         # what it prints (impostor/broken-install guard).
         return None
-    lines = [ln.strip() for ln in (r.stdout or r.stderr or "").splitlines() if ln.strip()]
+    # Combine BOTH streams: some CLIs print the version to stderr, and a
+    # whitespace-only stdout must not mask a real version on stderr.
+    combined = f"{r.stdout or ''}\n{r.stderr or ''}"
+    lines = [ln.strip() for ln in combined.splitlines() if ln.strip()]
     return lines[0][:120] if lines else None
 
 

@@ -143,7 +143,16 @@ re-target a specific headless session.)
 ## Security model
 
 - Agent `permission:` maps to each CLI's own sandbox flags — `read-only`,
-  `safe-edit` (default), or `yolo` (bypasses approvals: use only in repos you trust).
+  `safe-edit`, or `yolo` (bypasses approvals). **Every bundled agent ships as
+  `safe-edit`** (auto-approve edits in the workspace, no sandbox bypass); raising
+  one to `yolo` is a deliberate per-agent choice, not the default.
+- **Untrusted content:** summon runs in a cwd *you* choose, and treats files under
+  it — plus `.agents/memory.md` (auto-injected into agent context) and manifest
+  `prompt_file`s — as trusted operator input. Every bundled agent also carries an
+  "Untrusted content" instruction (data is not instructions) as defense-in-depth.
+  **Do not run summon against a repository you don't trust** while any agent is set
+  to `yolo`: a malicious repo could commit files or memory that steer a sandbox-
+  bypassed agent. This is the same trust you extend to any tool you run in a repo.
 - The agy backend copies OAuth tokens into a per-invocation profile locked to your
   user (icacls on Windows, `0700` on POSIX) and isolated from your real profile.
 - `--doctor` shows which CLI binaries would be dispatched to (path + version) and how

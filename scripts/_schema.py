@@ -191,9 +191,35 @@ def validate(instance, schema: dict, path: str = "$") -> list:
     return errors
 
 
+def unsupported_keywords(schema, path: str = "$") -> list:
+    """Walk ``schema`` and collect keywords the validator does NOT enforce, so a
+    caller isn't misled by ``parse_ok: true`` on a schema using ``oneOf`` /
+    ``$ref`` / ``format`` / etc. that were silently ignored. Returns ``[(path,
+    keyword), ...]``."""
+    found: list = []
+    if isinstance(schema, dict):
+        for k, v in schema.items():
+            if k not in SUPPORTED_KEYWORDS:
+                found.append((path, k))
+            if k == "properties" and isinstance(v, dict):
+                for pk, pv in v.items():
+                    found += unsupported_keywords(pv, f"{path}.{pk}")
+            elif k == "items":
+                found += unsupported_keywords(v, f"{path}[]")
+    return found
+
+
 def attach_parsed(response: dict, schema: dict) -> None:
     """Extract + validate the agent's final JSON against ``schema`` and attach
-    ``parsed`` / ``parse_ok`` / ``parse_errors`` to the envelope in place."""
+    ``parsed`` / ``parse_ok`` / ``parse_errors`` to the envelope in place.
+
+    Any schema keyword outside :data:`SUPPORTED_KEYWORDS` is surfaced in
+    ``parse_warnings`` (it was NOT enforced) — never silently ignored.
+    """
+    warns = [f"{p}: unsupported schema keyword {k!r} (not enforced)"
+             for p, k in unsupported_keywords(schema)]
+    if warns:
+        response["parse_warnings"] = warns
     value, why = extract_json(response.get("result") or "")
     if value is None:
         response["parsed"] = None

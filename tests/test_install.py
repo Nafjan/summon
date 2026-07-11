@@ -156,7 +156,7 @@ def test_lock_blocks_concurrent_install():
     try:
         parent = os.path.join(home, ".claude", "skills")
         os.makedirs(parent)
-        open(os.path.join(parent, "summon.install.lock"), "w").write("12345")
+        open(os.path.join(home, ".claude", "summon.install.lock"), "w").write("12345")
         r = _run(home, "--hosts", "claude", "--no-agents")
         assert r.returncode == 2 and "lock" in r.stdout.lower(), (r.returncode, r.stdout)
     finally:
@@ -187,7 +187,7 @@ def test_stale_unowned_lock_never_deleted():
     try:
         parent = os.path.join(home, ".claude", "skills")
         os.makedirs(parent)
-        lock = os.path.join(parent, "summon.install.lock")
+        lock = os.path.join(home, ".claude", "summon.install.lock")
         open(lock, "w").write("user data, not a summon marker")
         old = _t.time() - 700
         os.utime(lock, (old, old))  # stale by the 600s policy
@@ -205,7 +205,7 @@ def test_uninstall_blocked_by_held_lock():
         r = _run(home, "--hosts", "claude", "--no-agents")
         assert r.returncode == 0, r.stdout + r.stderr
         parent = os.path.join(home, ".claude", "skills")
-        with open(os.path.join(parent, "summon.install.lock"), "w") as fh:
+        with open(os.path.join(home, ".claude", "summon.install.lock"), "w") as fh:
             json.dump({"installed_by": "summon", "pid": 99999}, fh)
         r = _run(home, "--hosts", "claude", "--uninstall")
         assert r.returncode == 2, (r.returncode, r.stdout)
@@ -230,6 +230,35 @@ def test_dry_run_is_mutation_free_even_during_crash_recovery():
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_lock_release_only_removes_own_token():
+    sys.path.insert(0, REPO)
+    import importlib
+    install = importlib.import_module("install")
+    d = tempfile.mkdtemp(prefix="summon-lock-")
+    try:
+        acq = install._acquire_lock(d)
+        assert acq is not None
+        lock, token = acq
+        assert os.path.isfile(lock)
+        install._release_lock(lock, "not-our-token")   # wrong token: must NOT remove
+        assert os.path.isfile(lock), "lock removed by wrong token!"
+        install._release_lock(lock, token)             # our token: removes
+        assert not os.path.isfile(lock)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_install_agents_returns_ok_tuple():
+    # install_agents now returns (lines, ok); main() folds ok into the exit code
+    # so a failed starter-agent copy can't exit 0. Verify the tuple contract on
+    # both the no-dir and normal paths.
+    sys.path.insert(0, REPO)
+    import importlib
+    install = importlib.import_module("install")
+    lines, ok = install.install_agents(dry=True)
+    assert isinstance(lines, list) and ok is True
+
+
 def test_uninstall_with_absent_dest_still_respects_held_lock():
     # dest missing + a held lock = a concurrent install may be mid-flight;
     # uninstall must refuse (exit 2), not report "nothing to do".
@@ -237,7 +266,7 @@ def test_uninstall_with_absent_dest_still_respects_held_lock():
     try:
         parent = os.path.join(home, ".claude", "skills")
         os.makedirs(parent)
-        with open(os.path.join(parent, "summon.install.lock"), "w") as fh:
+        with open(os.path.join(home, ".claude", "summon.install.lock"), "w") as fh:
             json.dump({"installed_by": "summon", "pid": 99999}, fh)
         r = _run(home, "--hosts", "claude", "--uninstall")
         assert r.returncode == 2, (r.returncode, r.stdout)

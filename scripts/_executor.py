@@ -268,13 +268,20 @@ def _spawn_reader(process: subprocess.Popen) -> queue.Queue:
     return line_q
 
 
-def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
-                     stdout_lines: list | None = None) -> dict:
-    resp = _partial_response(cli, processor.get_result(), 124, f"Timeout after {timeout_ms}ms")
+def _attach_raw(resp: dict, stdout_lines: list | None) -> dict:
+    """Attach the captured-output tail (+ full raw for --debug-dir) to a
+    non-success response, so EVERY failure path is diagnosable per the contract.
+    build_final_response does this inline; the timeout/cap/IO paths call here."""
     raw = "".join(stdout_lines or [])
     resp["output_tail"] = raw[-2000:]
     resp["_debug_raw"] = raw[-200_000:]
     return resp
+
+
+def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
+                     stdout_lines: list | None = None) -> dict:
+    resp = _partial_response(cli, processor.get_result(), 124, f"Timeout after {timeout_ms}ms")
+    return _attach_raw(resp, stdout_lines)
 
 
 def _drain_to_eof(line_q: queue.Queue, budget_sec: float = 0.5) -> None:
@@ -360,12 +367,12 @@ def _drive_process_loop(
                 process.kill()
                 _drain_to_eof(line_q)
                 process.communicate()
-                return _error_response(
+                return _attach_raw(_error_response(
                     cli,
                     1,
                     f"Sub-agent stdout exceeded {_MAX_STDOUT_CHARS} characters; aborted",
                     partial_result=processor.get_result(),
-                )
+                ), stdout_lines)
             if parse_stream and not saw_terminal and processor.process_line(line):
                 # Processor saw a terminal event; ask the CLI to exit cleanly,
                 # but keep looping so the reader thread can drain stdout to EOF.
@@ -391,9 +398,9 @@ def _drive_process_loop(
         # from a closed file. Anything else propagates so it's not silently
         # swallowed.
         process.kill()
-        return _error_response(
+        return _attach_raw(_error_response(
             cli, 1, f"{type(e).__name__}: {e}", partial_result=processor.get_result()
-        )
+        ), stdout_lines)
 
 
 def _resolve_launch(command, args):
@@ -456,9 +463,12 @@ def _write_debug(debug_dir: str, argv: list, raw: str, response: dict) -> str | 
     """Dump the raw captured output + argv + final envelope for one run.
     Fail-soft: diagnostics must never break the dispatch itself."""
     import json as _json
+    import uuid as _uuid
     try:
         os.makedirs(debug_dir, exist_ok=True)
-        name = f"{int(time.time())}-{response.get('cli')}-{os.getpid()}.log"
+        # uuid suffix so a same-second same-pid schema-correction retry can't
+        # overwrite the first dispatch's transcript.
+        name = f"{int(time.time())}-{response.get('cli')}-{os.getpid()}-{_uuid.uuid4().hex[:8]}.log"
         path = os.path.join(debug_dir, name)
         nl = "\n"
         with open(path, "w", encoding="utf-8", errors="replace") as fh:

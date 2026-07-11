@@ -38,6 +38,7 @@ import shutil
 import sys
 import tempfile
 import time
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~")
@@ -91,18 +92,26 @@ def _lock_owned(lock: str) -> bool:
         return False
 
 
-def _acquire_lock(parent: str) -> str | None:
-    """O_EXCL lock file so two installers (or an installer and an uninstaller)
-    can't race the same host. A stale lock (> LOCK_STALE_SEC) is broken once,
-    and ONLY if it is summon's own marker with an unchanged mtime — an unowned
-    or freshly-replaced file is left alone."""
-    lock = os.path.join(parent, "summon.install.lock")
+def _acquire_lock(lock_dir: str) -> tuple | None:
+    """O_EXCL lock so two installers (or an installer and an uninstaller) can't
+    race the same host. ``lock_dir`` is the host ROOT (always present), so an
+    uninstall whose skills/ dir doesn't exist yet still takes the lock.
+
+    Each lock carries a unique ``token``; the holder passes it to
+    :func:`_release_lock`, which unlinks ONLY if the on-disk token still matches
+    — so we can never delete a lock a different process created after ours was
+    stale-broken. A stale lock (> LOCK_STALE_SEC) is broken once, and only if it
+    is summon's own marker with an unchanged mtime. Returns ``(lock, token)`` or
+    None if the lock is held.
+    """
+    lock = os.path.join(lock_dir, "summon.install.lock")
+    token = uuid.uuid4().hex
     for _ in range(2):
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"installed_by": "summon", "pid": os.getpid()}, fh)
-            return lock
+                json.dump({"installed_by": "summon", "pid": os.getpid(), "token": token}, fh)
+            return lock, token
         except FileExistsError:
             try:
                 observed_mtime = os.path.getmtime(lock)
@@ -121,6 +130,19 @@ def _acquire_lock(parent: str) -> str | None:
         except OSError:
             return None
     return None
+
+
+def _release_lock(lock: str, token: str) -> None:
+    """Unlink the lock ONLY if it still carries OUR token. Never delete a lock a
+    concurrent process created after ours was (stale-)broken — the fix for the
+    unconditional ``finally: os.unlink`` TOCTOU."""
+    try:
+        with open(lock, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and data.get("token") == token:
+            os.unlink(lock)
+    except (OSError, ValueError):
+        pass
 
 
 def _build_tree(dst: str) -> list:
@@ -159,10 +181,11 @@ def install_skill(host: str, dry: bool) -> tuple:
         return (f"[dry] would {verb} skill -> {dest}", True)
 
     os.makedirs(parent, exist_ok=True)
-    lock = _acquire_lock(parent)
-    if lock is None:
+    acq = _acquire_lock(HOSTS[host])   # lock the always-present host root
+    if acq is None:
         return (f"[!!]  {host}: another summon install appears to be running "
-                f"(lock: {os.path.join(parent, 'summon.install.lock')}); retry shortly", False)
+                f"(lock: {os.path.join(HOSTS[host], 'summon.install.lock')}); retry shortly", False)
+    lock, token = acq
 
     staging = None
     try:
@@ -212,10 +235,7 @@ def install_skill(host: str, dry: bool) -> tuple:
             shutil.rmtree(staging, ignore_errors=True)  # mkdtemp'd by us this run
         return (f"[!!]  {host}: install failed ({e}); previous copy left in place", False)
     finally:
-        try:
-            os.unlink(lock)
-        except OSError:
-            pass
+        _release_lock(lock, token)
 
 
 def uninstall_skill(host: str, dry: bool) -> tuple:
@@ -229,16 +249,16 @@ def uninstall_skill(host: str, dry: bool) -> tuple:
                     f"it; refusing to delete", False)
         return (f"[dry] would remove {dest}", True)
 
-    # Lock FIRST, judge state under the lock: an early "nothing there" return
-    # taken outside the lock could interleave with a concurrent install that is
-    # about to create the tree (uninstall reports done, installer resurrects it).
-    parent = os.path.dirname(dest)
-    if not os.path.isdir(parent):
-        return (f"[--]  nothing at {dest}", True)  # no skills dir -> nothing to lock or remove
-    lock = _acquire_lock(parent)
-    if lock is None:
+    # Lock FIRST (on the always-present host root), judge state under the lock:
+    # an early "nothing there" return taken outside the lock could interleave
+    # with a concurrent install about to create the tree (uninstall reports done,
+    # installer resurrects it). Locking the host root works even when skills/
+    # doesn't exist yet.
+    acq = _acquire_lock(HOSTS[host])
+    if acq is None:
         return (f"[!!]  {host}: another summon install/uninstall appears to be "
                 f"running; retry shortly", False)
+    lock, token = acq
     try:
         if not os.path.isdir(dest):
             return (f"[--]  nothing at {dest}", True)
@@ -248,10 +268,7 @@ def uninstall_skill(host: str, dry: bool) -> tuple:
         shutil.rmtree(dest)
         return (f"[ok]  removed {dest}", True)
     finally:
-        try:
-            os.unlink(lock)
-        except OSError:
-            pass
+        _release_lock(lock, token)
 
 
 def install_agents(dry: bool) -> list:
@@ -261,7 +278,7 @@ def install_agents(dry: bool) -> list:
     src_dir = os.path.join(HERE, "agents")
     out = []
     if not os.path.isdir(src_dir):
-        return ["[--]  no bundled agents/ dir; skipping"]
+        return ["[--]  no bundled agents/ dir; skipping"], True
     if not dry:
         os.makedirs(AGENTS_DIR, exist_ok=True)
     added = skipped = failed = 0
@@ -299,7 +316,7 @@ def install_agents(dry: bool) -> list:
     if failed:
         line += f"  [!!] {failed} failed to copy (partials removed; re-run to retry)"
     out.append(line)
-    return out
+    return out, failed == 0
 
 
 def main() -> int:
@@ -333,8 +350,10 @@ def main() -> int:
         print(msg)
 
     if not args.uninstall and not args.no_agents:
-        for line in install_agents(args.dry_run):
+        lines, agents_ok = install_agents(args.dry_run)
+        for line in lines:
             print(line)
+        all_ok &= agents_ok  # a failed starter-agent copy must not exit 0
 
     if not args.uninstall:
         shim = os.path.join(HERE, "summon.py")

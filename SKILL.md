@@ -126,6 +126,7 @@ Parse JSON output and check `status` field:
 | `--prompt` | Yes* | Task description to delegate |
 | `--cwd` | Yes* | Working directory (absolute path) |
 | `--timeout` | No | Bare ms or with suffix: `600s`, `10m` (default: 600000 = 10m). Set your host tool's own timeout ABOVE this value — the script needs a few seconds of overhead beyond the CLI deadline |
+| `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
 | `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `gemini`, `agy` |
 | `--model` | No | Override the agent's frontmatter model for this call |
 | `--effort` | No | Reasoning effort (claude only): `low`\|`medium`\|`high`\|`xhigh`\|`max` |
@@ -164,7 +165,7 @@ Every response carries structured fields for programmatic orchestration:
 | `model` | `{requested, resolved}` — what was asked for vs what the backend REPORTED serving (claude resolves aliases to full IDs, e.g. `sonnet` → `claude-sonnet-4-6`). `resolved: null` = the backend didn't say (agy never does): absence of proof, not proof of the requested model. |
 | `permission`, `permission_flags` | The permission level and the EXACT CLI flags it mapped to for this run — no more black box. |
 | `attempts` | How many dispatches this envelope took (`--retries`). |
-| `parsed`, `parse_ok`, `parse_errors` | With `--json-schema`: the agent's final JSON (validated), whether it satisfied the schema, and the specific violations. `parse_retry: true` marks the corrective follow-up. |
+| `parsed`, `parse_ok`, `parse_errors` | With `--json-schema`: the agent's final JSON (validated), whether it satisfied the schema, and the specific violations. `parse_retry: true` marks the corrective follow-up. `parse_warnings` lists any schema keywords that were NOT enforced (see below). |
 | `output_tail` | On non-success: the tail of the RAW captured output (stdout+stderr merged) so failures are diagnosable without a re-run. `--debug-dir` captures the full transcript. |
 | `skipped` | `true` when `--out` found a prior valid envelope and did not dispatch. |
 | `blocked_indicators` | Approval-request phrases found in the result tail. Contract-less run + markers → status `blocked`; complete report → informational only. Note the envelope also reconciles with the contract itself: an agent self-reporting `STATUS: BLOCKED/PARTIAL/ERROR` downgrades the envelope status to match (never upgrades). |
@@ -172,7 +173,16 @@ Every response carries structured fields for programmatic orchestration:
 
 **Shared memory:** if `{cwd}/.agents/memory.md` exists it is auto-injected into every
 agent's context (project conventions, standing constraints, durable decisions) — put
-things there once instead of re-explaining them in each `--prompt`.
+things there once instead of re-explaining them in each `--prompt`. `memory.md` and
+files under `--cwd` are treated as **trusted operator input** — don't run summon in a
+repo you don't trust while an agent is set to `yolo` (a hostile file could steer it).
+
+**`--json-schema` validates a documented SUBSET of JSON Schema**, not the whole spec.
+Enforced keywords: `type`, `properties`, `required`, `items`, `enum`, `const`,
+`additionalProperties`, `minItems`/`maxItems`, `minLength`/`maxLength`,
+`minimum`/`maximum`, `pattern`. Anything else (`oneOf`, `$ref`, `format`, …) is **not
+enforced** and is reported in the envelope's `parse_warnings` — so `parse_ok: true`
+never silently hides an unchecked constraint. Keep schemas within the subset.
 
 ## Model discovery (`--list-models`)
 

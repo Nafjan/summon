@@ -260,6 +260,18 @@ def main() -> None:
                      "(it previews one resolved dispatch and never executes)")
         sys.exit(1)
 
+    # --background and --out are two DIFFERENT completion contracts: background
+    # signals done via its own result_file (job handle), while --out means
+    # "write the envelope here, skip if it already exists". Mixing them is
+    # ambiguous (skip returns a cached envelope with no job handle; a pre-dispatch
+    # error never creates --out). For fan-out with per-job result files, use
+    # --manifest. Reject the combination rather than pick a surprising winner.
+    if args.background and args.out:
+        _print_error("--background and --out are incompatible: background reports "
+                     "completion via its own result_file; --out is the (manifest) "
+                     "result-file mechanism. Use --manifest for fan-out with result files.")
+        sys.exit(1)
+
     # --manifest: batch fan-out. Delegates to _manifest and exits.
     if args.manifest:
         from _manifest import run_manifest
@@ -478,6 +490,9 @@ def _apply_schema(result: dict, schema: dict, invocation, args) -> dict:
     # errored, timed out, or is still schema-invalid must never replace the
     # original successful (if invalid) envelope.
     if retry.get("status") == "success" and retry.get("parse_ok"):
+        # Preserve the total dispatch count across the correction (the retry is
+        # additional work, not a reset) so cost accounting stays honest.
+        retry["attempts"] = result.get("attempts", 1) + retry.get("attempts", 1)
         return retry
     return result
 
