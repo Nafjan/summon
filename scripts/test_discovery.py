@@ -1014,10 +1014,16 @@ def test_subcommand_rewrite():
     assert rs._rewrite_subcommand(["dispatch", "--agent", "a"]) == (["--agent", "a"], None)
     # legacy flat passes through untouched
     assert rs._rewrite_subcommand(["--agent", "a", "--prompt", "p"]) == (["--agent", "a", "--prompt", "p"], None)
-    # help / empty / bad agent-subcommand -> usage
+    # help / empty / bare-agent -> usage
     assert rs._rewrite_subcommand([])[1] == "help"
     assert rs._rewrite_subcommand(["help"])[1] == "help"
     assert rs._rewrite_subcommand(["agent"])[1] == "help"
+    # an INVALID agent action is an error (exit 2), NOT success
+    _, m = rs._rewrite_subcommand(["agent", "delete", "x"])
+    assert m.startswith("error:") and "delete" in m
+    # <subcommand> --help -> general usage (facade has no per-command parser)
+    assert rs._rewrite_subcommand(["manifest", "--help"])[1] == "help"
+    assert rs._rewrite_subcommand(["agent", "new", "--help"])[1] == "help"
     # an unknown leading token is left for the flat parser to reject
     assert rs._rewrite_subcommand(["bogus", "x"]) == (["bogus", "x"], None)
 
@@ -1074,15 +1080,18 @@ def test_billing_inference():
 def test_council_ranking_parse_and_aggregate():
     from _council import _parse_ranking, _aggregate_rankings
     assert _parse_ranking("stuff\nRANKING: C, A, B\nmore", 3) == [2, 0, 1]
-    assert _parse_ranking("RANKING: a,b,a,c,z", 3) == [0, 1, 2]   # dedup + ignore invalid
+    assert _parse_ranking("RANKING: a,b,a,c", 3) == [0, 1, 2]   # dedup, complete perm
+    # INCOMPLETE ballots are rejected (no partial first-place credit)
+    assert _parse_ranking("RANKING: BAD", 3) is None            # B,A,D -> D invalid -> B,A incomplete
+    assert _parse_ranking("RANKING: A, B", 3) is None           # missing C
     assert _parse_ranking("no ranking here", 3) is None
+    # the LAST complete RANKING line wins (models restate)
+    assert _parse_ranking("RANKING: A,B,C\nthinking...\nRANKING: C,B,A", 3) == [2, 1, 0]
+    assert _parse_ranking("RANKING: A,B", 30) is None           # >26 candidates unrankable
     # Borda: two voters both rank [0,1,2] -> index 0 best (score 2), index 2 worst (0)
     agg = _aggregate_rankings([[0, 1, 2], [0, 1, 2]], 3)
     assert agg[0]["index"] == 0 and agg[0]["score"] == 2.0
     assert agg[-1]["index"] == 2 and agg[-1]["score"] == 0.0
-    # a member with no vote -> None score, sorts last
-    agg2 = _aggregate_rankings([[1, 0]], 3)   # index 2 never voted on
-    assert agg2[-1]["index"] == 2 and agg2[-1]["score"] is None
 
 
 def test_council_prompts_and_position_extraction():
