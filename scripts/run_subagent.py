@@ -479,7 +479,8 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     """The fully resolved dispatch, without executing. For agy the per-call
     profile is NOT built (that copies OAuth tokens = a mutation); the wrapper
     path is shown instead."""
-    from _builder import build_invocation_args, permission_flags as _pf, _agy_wrapper
+    from _builder import (build_invocation_args, permission_flags as _pf,
+                          _PERMISSION_MAPPING, _agy_wrapper)
     view = {
         "dry_run": True,
         "agent": args.agent,
@@ -488,7 +489,10 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
         "agents_dir": agents_dir,
         "model_requested": invocation.model,
         "permission": invocation.permission,
-        "permission_flags": _pf(invocation.cli, invocation.permission),
+        # openai-compat (and any future non-sandbox backend) has no permission
+        # mapping — report None instead of raising.
+        "permission_flags": (_pf(invocation.cli, invocation.permission)
+                             if invocation.cli in _PERMISSION_MAPPING else None),
         "extra_args": list(invocation.extra_args),
         "timeout_ms": args.timeout,
         "worktree": ("would create" if args.worktree is not None else None),

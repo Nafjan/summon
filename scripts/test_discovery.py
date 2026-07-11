@@ -919,6 +919,70 @@ def test_openai_compat_http_roundtrip():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_openai_compat_redacts_key_and_survives_errors():
+    # A reflected API key in an error body must be REDACTED; malformed responses
+    # (bad shape, non-string content, non-JSON) must return clean error envelopes.
+    import http.server, threading, os as _os, tempfile, subprocess as sp, json as _json
+    SECRET = "sk-secret-key-12345"
+    class H(http.server.BaseHTTPRequestHandler):
+        mode = "reflect"
+        def log_message(self, *a): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            if H.mode == "reflect":                    # error body echoes the auth header
+                body = _json.dumps({"error": f"invalid key: {self.headers.get('Authorization')}"}).encode()
+                self.send_response(401)
+            elif H.mode == "badshape":
+                body = _json.dumps({"nope": 1}).encode(); self.send_response(200)
+            else:                                       # non-string content
+                body = _json.dumps({"choices": [{"message": {"content": {"tool": "x"}}}]}).encode()
+                self.send_response(200)
+            self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H); port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    d = tempfile.mkdtemp(prefix="summon-apierr-")
+    try:
+        open(_os.path.join(d, "b.md"), "w", encoding="utf-8").write(
+            f"---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:{port}/v1\n"
+            f"api_key_env: MY_SECRET\nmodel: m\n---\n# B\n")
+        script = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "run_subagent.py")
+        env_with_key = {**_os.environ, "MY_SECRET": SECRET}
+        # reflect: error envelope must NOT contain the secret
+        H.mode = "reflect"
+        r = sp.run([sys.executable, script, "--agent", "b", "--prompt", "x", "--cwd", d,
+                    "--agents-dir", d, "--timeout", "20s"], capture_output=True, text=True, env=env_with_key)
+        assert SECRET not in r.stdout and "REDACTED" in r.stdout, r.stdout[:300]
+        assert _json.loads(r.stdout)["status"] == "error"
+        # bad shape + non-string content: clean error / no crash
+        for mode in ("badshape", "nonstr"):
+            H.mode = mode
+            r = sp.run([sys.executable, script, "--agent", "b", "--prompt", "x", "--cwd", d,
+                        "--agents-dir", d, "--timeout", "20s"], capture_output=True, text=True, env=env_with_key)
+            env = _json.loads(r.stdout)
+            assert "Traceback" not in r.stderr and env["status"] in ("error", "success"), mode
+    finally:
+        srv.shutdown()
+        import shutil as _sh; _sh.rmtree(d, ignore_errors=True)
+
+
+def test_openai_compat_dry_run_no_crash():
+    import json as _json, subprocess as sp, tempfile
+    d = tempfile.mkdtemp(prefix="summon-apidry-")
+    try:
+        open(os.path.join(d, "b.md"), "w", encoding="utf-8").write(
+            '---\nrun-agent: openai-compat\nprovider: ollama\nmodel: llama3.1\n---\n# B\n')
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+        r = sp.run([sys.executable, script, "--agent", "b", "--prompt", "x", "--cwd", d,
+                    "--agents-dir", d, "--dry-run"], capture_output=True, text=True)
+        view = _json.loads(r.stdout)
+        assert view["dry_run"] is True and view["cli"] == "openai-compat"
+        assert view["permission_flags"] is None and "11434" in view["base_url"]
+        # the dry-run must never surface a key value
+        assert "api_key_present" in view and "api_key_env" in view
+    finally:
+        import shutil as _sh; _sh.rmtree(d, ignore_errors=True)
+
+
 def test_openai_compat_provider_resolution():
     import _apibackend
     # inline base_url wins; a known provider resolves; unknown raises
