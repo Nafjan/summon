@@ -179,6 +179,70 @@ def _spawn_background(args: argparse.Namespace) -> dict:
     return {"status": "background", "job_id": job_id, "pid": proc.pid, "result_file": result_file}
 
 
+# --- Subcommand front-end -----------------------------------------------------
+# summon presents git-style subcommands (dispatch/manifest/council/doctor/models/
+# agent/list/version) that translate to the underlying flat flags. The flat form
+# still works unchanged (legacy compat) — anything starting with '-' skips the
+# rewrite. This keeps one battle-tested parser + all logic while giving a clean,
+# discoverable command surface.
+_SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
+                "manifest", "council", "agent", "version", "help", "--help", "-h"}
+
+_USAGE = """summon — cross-vendor sub-agents for any AI CLI
+
+Usage: summon <command> [options]
+
+Commands:
+  dispatch  --agent NAME --prompt "…" --cwd DIR   run an agent (the default action)
+  list                                            list available agents
+  models    [--cli BACKEND]                       what each backend can run now
+  doctor    [--json]                              check backends / setup health
+  manifest  FILE [--concurrency …] [--results-dir D]   run a batch swarm
+  council   --question "…" [--members …] [--rounds 2]  decide by consensus
+  agent new NAME [--set k=v …]                    scaffold an agent definition
+  agent set NAME  --set k=v …                     retune an agent's frontmatter
+  version                                         print version
+
+Legacy flat flags still work: `summon --agent NAME --prompt … --cwd …`,
+`summon --list`, `summon --manifest FILE`, etc. Run any command with --help for
+its options. Full docs: SKILL.md.
+"""
+
+
+def _rewrite_subcommand(argv: list) -> tuple:
+    """Translate a leading subcommand into equivalent flat flags. Returns
+    ``(argv, mode)`` where mode is 'help' to print usage, or None. Legacy flat
+    invocations (argv starts with '-') pass through untouched."""
+    if not argv:
+        return argv, "help"
+    head = argv[0]
+    if head.startswith("-") or head not in _SUBCOMMANDS:
+        return argv, None  # legacy flat (or a stray token the flat parser reports)
+    rest = argv[1:]
+    if head in ("help", "--help", "-h"):
+        return argv, "help"
+    if head in ("dispatch", "run"):
+        return rest, None
+    if head in ("list", "agents", "ls"):
+        return ["--list", *rest], None
+    if head == "models":
+        return ["--list-models", *rest], None
+    if head == "doctor":
+        return ["--doctor", *rest], None
+    if head == "council":
+        return ["--council", *rest], None
+    if head == "version":
+        return ["--version", *rest], None
+    if head == "manifest":            # first positional is the manifest file
+        return (["--manifest", *rest], None)
+    if head == "agent":
+        if not rest or rest[0] not in ("new", "set"):
+            return argv, "help"
+        flag = "--new-agent" if rest[0] == "new" else "--set-agent"
+        return ([flag, *rest[1:]], None)
+    return argv, None
+
+
 def main() -> None:
     # Windows consoles default to cp1252; sub-agent results often contain
     # non-ASCII (arrows, em-dashes, emoji). Emit UTF-8 so json.dumps never
@@ -187,6 +251,14 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+    # Subcommand front-end: translate `summon <command> …` to flat flags; `summon`
+    # / `summon help` prints usage. Legacy flat invocations pass through.
+    argv, mode = _rewrite_subcommand(sys.argv[1:])
+    if mode == "help":
+        print(_USAGE)
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(description="Execute external CLI AIs as sub-agents")
     parser.add_argument("--version", action="version",
                         version=f"summon {__version__} (envelope schema v{_ENVELOPE_VERSION})")
@@ -254,7 +326,7 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=1,
                         help="With --council: 1 (independent) or 2 (adds cross-examination)")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     global _JOB_FILE
     _JOB_FILE = args.job_file

@@ -1000,6 +1000,41 @@ def test_openai_compat_provider_resolution():
         pass
 
 
+def test_subcommand_rewrite():
+    import run_subagent as rs
+    # subcommands translate to flat flags
+    assert rs._rewrite_subcommand(["list"]) == (["--list"], None)
+    assert rs._rewrite_subcommand(["agents", "--agents-dir", "x"]) == (["--list", "--agents-dir", "x"], None)
+    assert rs._rewrite_subcommand(["models", "--cli", "codex"]) == (["--list-models", "--cli", "codex"], None)
+    assert rs._rewrite_subcommand(["doctor", "--json"]) == (["--doctor", "--json"], None)
+    assert rs._rewrite_subcommand(["manifest", "jobs.json"]) == (["--manifest", "jobs.json"], None)
+    assert rs._rewrite_subcommand(["council", "--question", "q"]) == (["--council", "--question", "q"], None)
+    assert rs._rewrite_subcommand(["agent", "new", "n", "--set", "k=v"]) == (["--new-agent", "n", "--set", "k=v"], None)
+    assert rs._rewrite_subcommand(["agent", "set", "n"]) == (["--set-agent", "n"], None)
+    assert rs._rewrite_subcommand(["dispatch", "--agent", "a"]) == (["--agent", "a"], None)
+    # legacy flat passes through untouched
+    assert rs._rewrite_subcommand(["--agent", "a", "--prompt", "p"]) == (["--agent", "a", "--prompt", "p"], None)
+    # help / empty / bad agent-subcommand -> usage
+    assert rs._rewrite_subcommand([])[1] == "help"
+    assert rs._rewrite_subcommand(["help"])[1] == "help"
+    assert rs._rewrite_subcommand(["agent"])[1] == "help"
+    # an unknown leading token is left for the flat parser to reject
+    assert rs._rewrite_subcommand(["bogus", "x"]) == (["bogus", "x"], None)
+
+
+def test_subcommand_and_flat_equivalent_live():
+    import json as _json, subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    a = sp.run([sys.executable, script, "list", "--agents-dir",
+                os.path.dirname(script)], capture_output=True, text=True)  # scripts/ has no .md -> 0
+    b = sp.run([sys.executable, script, "--list", "--agents-dir",
+                os.path.dirname(script)], capture_output=True, text=True)
+    assert _json.loads(a.stdout)["agents"] == _json.loads(b.stdout)["agents"]
+    # `summon` with no args prints usage and exits 0
+    u = sp.run([sys.executable, script], capture_output=True, text=True)
+    assert u.returncode == 0 and "summon" in u.stdout and "Commands:" in u.stdout
+
+
 def test_backend_registry_is_single_source_of_truth():
     from _builder import BACKENDS, BACKEND_CLIS, backend_kind, build_invocation_args, AgentInvocation
     from _resolver import _VALID_CLIS
