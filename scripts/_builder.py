@@ -539,22 +539,53 @@ def _build_agy_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     return _agy_python(), args, env
 
 
-_BUILDERS = {
-    "claude": _build_claude_args,
-    "gemini": _build_gemini_args,
-    "codex": _build_codex_args,
-    "cursor-agent": _build_cursor_args,
-    "agy": _build_agy_args,
+# --- Backend registry --------------------------------------------------------
+# The ONE place that knows every backend and how it runs. Two kinds:
+#   "subprocess" — build() returns (command, args, env_override) for the executor
+#                  to spawn (claude/codex/cursor/gemini/agy).
+#   "api"        — the executor calls the backend's own request function instead
+#                  of spawning a process (openai-compat: an HTTP call).
+# Adding a backend = add ONE entry here (+ its build/call fn). ``side_effects``
+# flags a build that mutates the filesystem (agy creates a per-call profile), so
+# callers like --dry-run know not to invoke build() as a pure preview.
+# See references/adding-a-backend.md.
+
+
+def _api_call(inv: AgentInvocation, timeout_ms: int) -> dict:
+    from _apibackend import call as _call   # lazy: keep _builder import-light
+    return _call(inv, timeout_ms)
+
+
+BACKENDS: dict = {
+    "claude":       {"kind": "subprocess", "build": _build_claude_args},
+    "codex":        {"kind": "subprocess", "build": _build_codex_args},
+    "cursor-agent": {"kind": "subprocess", "build": _build_cursor_args},
+    "gemini":       {"kind": "subprocess", "build": _build_gemini_args},
+    "agy":          {"kind": "subprocess", "build": _build_agy_args, "side_effects": True},
+    "openai-compat": {"kind": "api", "call": _api_call},
 }
+BACKEND_CLIS = tuple(BACKENDS)
+
+# Back-compat alias (was the subprocess-only dispatch table).
+_BUILDERS = {k: v["build"] for k, v in BACKENDS.items() if v["kind"] == "subprocess"}
+
+
+def backend_kind(cli: str) -> str | None:
+    """'subprocess' | 'api' | None (unknown backend)."""
+    b = BACKENDS.get(cli)
+    return b["kind"] if b else None
 
 
 def build_invocation_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
-    """Dispatch to the per-CLI argument builder.
+    """Dispatch to a SUBPROCESS backend's argument builder.
 
-    Returns ``(command, args, env_override_or_None)``.
+    Returns ``(command, args, env_override_or_None)``. Raises ValueError for an
+    unknown backend or an api-kind backend (which has no argv — the executor
+    calls it directly; see ``backend_kind``).
     """
-    try:
-        builder = _BUILDERS[inv.cli]
-    except KeyError as e:
-        raise ValueError(f"Unknown CLI: {inv.cli}") from e
-    return builder(inv)
+    b = BACKENDS.get(inv.cli)
+    if b is None:
+        raise ValueError(f"Unknown backend: {inv.cli}")
+    if b["kind"] != "subprocess":
+        raise ValueError(f"backend {inv.cli!r} is {b['kind']}-kind; no argv to build")
+    return b["build"](inv)

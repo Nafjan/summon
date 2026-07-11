@@ -11,7 +11,8 @@ import subprocess
 import threading
 import time
 
-from _builder import AgentInvocation, build_invocation_args, infer_billing, permission_flags
+from _builder import (AgentInvocation, BACKENDS, backend_kind, build_invocation_args,
+                      infer_billing, permission_flags)
 from _stream import StreamProcessor
 
 _SUCCESS_EXIT_CODES = (0, 143, -15)  # 0 ok, 143/-15 = SIGTERM (we asked it to stop)
@@ -535,12 +536,12 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 resp["debug_file"] = dbg
         return resp
 
-    # openai-compat: a NON-subprocess backend (HTTP to an OpenAI-compatible API).
-    # Flows through the same _enrich/_stamp so the envelope shape is identical.
-    if inv.cli == "openai-compat":
-        from _apibackend import call as _api_call
-        debug_argv = ["openai-compat", inv.base_url or "?", inv.model or "?"]
-        resp = _enrich(_api_call(inv, timeout_ms), None)
+    # API-kind backends (e.g. openai-compat): the backend performs the request
+    # itself instead of spawning a process. Flows through the same _enrich/_stamp
+    # so the envelope shape is identical to a subprocess backend's.
+    if backend_kind(inv.cli) == "api":
+        debug_argv = [inv.cli, inv.base_url or "?", inv.model or "?"]
+        resp = _enrich(BACKENDS[inv.cli]["call"](inv, timeout_ms), None)
         resp["resume"] = {"cli": inv.cli, "session_id": None}  # stateless: no resume
         return _stamp(resp)
 

@@ -1000,6 +1000,27 @@ def test_openai_compat_provider_resolution():
         pass
 
 
+def test_backend_registry_is_single_source_of_truth():
+    from _builder import BACKENDS, BACKEND_CLIS, backend_kind, build_invocation_args, AgentInvocation
+    from _resolver import _VALID_CLIS
+    # registry drives the valid-CLI list
+    assert tuple(_VALID_CLIS) == BACKEND_CLIS == tuple(BACKENDS)
+    # every entry is well-formed
+    for cli, b in BACKENDS.items():
+        assert b["kind"] in ("subprocess", "api")
+        assert ("build" in b) if b["kind"] == "subprocess" else ("call" in b)
+    assert backend_kind("openai-compat") == "api"
+    assert backend_kind("claude") == "subprocess" and backend_kind("nope") is None
+    # build_invocation_args refuses an api-kind backend (no argv to build)
+    inv = AgentInvocation(cli="openai-compat", prompt="x", cwd=".", system_context="s",
+                          permission="safe-edit", model="m", base_url="http://x/v1")
+    try:
+        build_invocation_args(inv)
+        raise AssertionError("expected ValueError for api-kind build")
+    except ValueError as e:
+        assert "api-kind" in str(e)
+
+
 def test_billing_inference():
     from _builder import infer_billing
     assert infer_billing("agy")["source"] == "subscription"
