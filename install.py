@@ -316,43 +316,65 @@ def uninstall_skill(host: str, dry: bool) -> tuple:
 
 
 def _is_our_alias(skill_md: str) -> bool:
+    """True ONLY for OUR generated alias. The marker must appear inside the YAML
+    frontmatter (between the first two ``---``) alongside ``name: sub-agents`` —
+    NOT merely somewhere in a file's prose. The old substring-anywhere test would
+    recursively delete any unrelated skill whose body happened to quote the
+    marker string (e.g. a doc explaining the alias)."""
     try:
         with open(skill_md, encoding="utf-8") as fh:
-            return _ALIAS_MARKER in fh.read()
+            content = fh.read()
     except OSError:
         return False
+    if not content.startswith("---"):
+        return False
+    end = content.find("\n---", 3)
+    if end == -1:
+        return False
+    front = content[3:end]
+    if _ALIAS_MARKER not in front:
+        return False
+    # EXACT name match, not substring: `name: sub-agents-plus` (a real foreign
+    # skill) must NOT qualify. Parse the frontmatter `name:` value and compare.
+    for line in front.splitlines():
+        s = line.strip()
+        if s.startswith("name:"):
+            return s[len("name:"):].strip().strip("\"'") == "sub-agents"
+    return False
 
 
-def install_alias(host: str, dry: bool) -> str:
+def install_alias(host: str, dry: bool) -> tuple:
     """Write the thin sub-agents alias next to the summon skill. Refuses to
-    clobber a real (non-alias) sub-agents skill."""
+    clobber a real (non-alias) sub-agents skill. Returns (message, ok)."""
     dest = os.path.join(HOSTS[host], "skills", "sub-agents")
     md = os.path.join(dest, "SKILL.md")
     if os.path.exists(md) and not _is_our_alias(md):
-        return f"[!!]  {md} exists and is not a summon alias; leaving it alone"
+        # Requested but can't honor it without clobbering a foreign skill -> not ok.
+        return (f"[!!]  {md} exists and is not a summon alias; leaving it alone", False)
     if dry:
-        return f"[dry] would install sub-agents alias -> {dest}"
+        return (f"[dry] would install sub-agents alias -> {dest}", True)
     try:
         os.makedirs(dest, exist_ok=True)
         with open(md, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(ALIAS_SKILL)
-        return f"[ok]  sub-agents alias installed -> {dest}"
+        return (f"[ok]  sub-agents alias installed -> {dest}", True)
     except OSError as e:
-        return f"[!!]  {host}: alias install failed ({e})"
+        return (f"[!!]  {host}: alias install failed ({e})", False)
 
 
-def uninstall_alias(host: str, dry: bool) -> str | None:
+def uninstall_alias(host: str, dry: bool) -> tuple:
+    """Remove OUR sub-agents alias if present. Returns (message|None, ok)."""
     dest = os.path.join(HOSTS[host], "skills", "sub-agents")
     md = os.path.join(dest, "SKILL.md")
     if not os.path.isfile(md) or not _is_our_alias(md):
-        return None  # nothing of ours here
+        return (None, True)  # nothing of ours here — not a failure
     if dry:
-        return f"[dry] would remove sub-agents alias -> {dest}"
+        return (f"[dry] would remove sub-agents alias -> {dest}", True)
     try:
         shutil.rmtree(dest)
-        return f"[ok]  removed sub-agents alias -> {dest}"
+        return (f"[ok]  removed sub-agents alias -> {dest}", True)
     except OSError as e:
-        return f"[!!]  {host}: alias removal failed ({e})"
+        return (f"[!!]  {host}: alias removal failed ({e})", False)
 
 
 def install_agents(dry: bool) -> list:
@@ -438,8 +460,13 @@ def main() -> int:
         # The sub-agents alias is a single sibling SKILL.md (points at summon's
         # scripts). Written on --with-alias; on --uninstall always removed IF it
         # is recognizably our alias (never a user's real sub-agents skill).
-        amsg = (uninstall_alias(h, args.dry_run) if args.uninstall
-                else (install_alias(h, args.dry_run) if args.with_alias else None))
+        if args.uninstall:
+            amsg, aok = uninstall_alias(h, args.dry_run)
+        elif args.with_alias:
+            amsg, aok = install_alias(h, args.dry_run)
+        else:
+            amsg, aok = None, True
+        all_ok &= aok  # an alias install/removal failure must be reflected in the exit code
         if amsg:
             print(amsg)
 

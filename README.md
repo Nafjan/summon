@@ -292,9 +292,11 @@ You bring the model access; summon just orchestrates the CLIs and APIs you alrea
   build a product on subscription auth, or hammer parallel volume; use API-key backends for
   commercial/high-volume. Providers can change programmatic-billing rules. Full guidance in
   **[TERMS.md](TERMS.md)**.
-- **No phone-home.** Summon makes no network calls of its own and sends no telemetry. It
-  spawns the backend CLIs plus supporting tools only where a feature needs them (`git`,
-  `icacls`/`chmod`, the agy PTY wrapper, a detached copy of itself for `--background`).
+- **No phone-home.** Summon sends no telemetry and makes no network calls of its own for
+  the five CLI backends — it just spawns the backend CLIs plus supporting tools where a
+  feature needs them (`git`, `icacls`/`chmod`, the agy PTY wrapper, a detached copy of
+  itself for `--background`). The **one** exception is the `openai-compat` backend, whose
+  whole job is a direct HTTPS call to the `base_url` you configure.
 
 ---
 
@@ -311,7 +313,7 @@ rates. The `openai-compat` backend uses your API key by design.
 
 **Is it safe to let an agent install it for me?** Yes — the agent-led prompt just clones
 the repo, runs `doctor` (read-only) and `install.py` (which never overwrites your files),
-and reports. Read `install.py` first if you like; it's ~250 lines of stdlib.
+and reports. Read `install.py` first if you like; it's ~460 lines of stdlib.
 
 **Why not MCP?** MCP adds a server and a session dependency for what is fundamentally a
 one-shot subprocess/HTTP dispatch. A script you can read beats a protocol you must trust.

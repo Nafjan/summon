@@ -186,7 +186,7 @@ Every response carries structured fields for programmatic orchestration:
 | `session_id`, `usage`, `cost_usd` | Telemetry (claude/codex expose all; agy exposes none; openai-compat returns the API's `usage`). Track spend/tokens across a chain. |
 | `billing` | `{source, note}` — did this run draw from a vendor **subscription** (CLI login) or metered **api** credits? Pairs with `usage`/`cost_usd` to attribute spend. Advisory (the vendor's billing is truth). |
 | `elapsed_ms` | Wall-clock for the dispatch — on every DISPATCH envelope (success/blocked/partial/error/timeout, incl. spawn failures). Not on the `--background` handle or pre-dispatch validation errors. Use it to tune swarm concurrency. |
-| `model` | `{requested, resolved}` — what was asked for vs what the backend REPORTED serving (claude resolves aliases to full IDs, e.g. `sonnet` → `claude-sonnet-4-6`). `resolved: null` = the backend didn't say (agy never does): absence of proof, not proof of the requested model. |
+| `model` | `{requested, resolved, models_used}` — what was asked for vs what the backend REPORTED serving. `resolved` is the **dominant** model (most output tokens); a claude session often also runs a cheap auxiliary model, so `models_used` lists **every** model id seen — don't read `resolved` as "the one model that served this run". `resolved: null` = the backend didn't say (agy never does): absence of proof, not proof of the requested model. Aliases (`opus`/`sonnet`) can lag a launch — pin the explicit ID for a guaranteed-latest run. |
 | `permission`, `permission_flags` | The permission level and the EXACT CLI flags it mapped to for this run — no more black box. |
 | `attempts` | How many dispatches this envelope took (`--retries`). |
 | `parsed`, `parse_ok`, `parse_errors` | With `--json-schema`: the agent's final JSON (validated), whether it satisfied the schema, and the specific violations. `parse_retry: true` marks the corrective follow-up. `parse_warnings` lists any schema keywords that were NOT enforced (see below). |
@@ -207,6 +207,32 @@ Enforced keywords: `type`, `properties`, `required`, `items`, `enum`, `const`,
 `minimum`/`maximum`, `pattern`. Anything else (`oneOf`, `$ref`, `format`, …) is **not
 enforced** and is reported in the envelope's `parse_warnings` — so `parse_ok: true`
 never silently hides an unchecked constraint. Keep schemas within the subset.
+
+## Known limitations & caveats
+
+Honest edges — plan around these, don't be surprised by them:
+
+- **agy has no `--cwd` file access.** The agy (Antigravity) backend runs in a fresh,
+  isolated per-invocation profile, so the agent **cannot read files under `--cwd`** — it
+  only sees the prompt. Use agy for generate/research/reason tasks; for anything that must
+  read the caller's repo (a code review, a refactor), use claude/codex/cursor, or inline
+  the relevant content into the prompt. (agy also never reports token usage or a resolved
+  model.)
+- **`status` reflects the backend's own signal.** The envelope downgrades a self-reported
+  `STATUS: BLOCKED/PARTIAL/ERROR`, an approval-marker tail, and a backend error result to a
+  non-success status — but a compliant-looking report block is taken at face value. Under a
+  genuinely adversarial agent, treat `status` as advisory and read `result`/`report`.
+- **`--manifest` resume retries failures.** A prior job envelope is only "done" when its
+  `status` is `success`; re-running a manifest re-dispatches `error`/`blocked`/`partial`
+  jobs. Delete a result file to force a clean re-run. Two manifest *processes* pointed at
+  the same results dir can each start a job before the other's file lands (wasteful
+  duplicate, not corruption — final writes are atomic); don't run two on one results dir.
+- **`openai-compat` makes a real network call** to the `base_url` you configure and sends
+  your API key in the `Authorization` header. Never point an `openai-compat` agent (or a
+  manifest that inlines `base_url`) at an untrusted host — that beams your key to it. Its
+  timeout is per-socket-operation, so a slow-drip server can exceed the nominal deadline.
+- **`doctor` probes the CLI backends only** (install + login), not `openai-compat` API
+  endpoints — an API-only setup reads as "no usable backends" even when it works.
 
 ## Advanced capabilities (see references/)
 

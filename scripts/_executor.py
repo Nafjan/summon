@@ -7,13 +7,14 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
 
 from _builder import (AgentInvocation, BACKENDS, backend_kind, build_invocation_args,
                       infer_billing, permission_flags)
-from _stream import StreamProcessor
+from _stream import StreamProcessor, _terminal_is_error
 
 _SUCCESS_EXIT_CODES = (0, 143, -15)  # 0 ok, 143/-15 = SIGTERM (we asked it to stop)
 
@@ -108,9 +109,16 @@ def parse_report(text: str) -> dict | None:
         if lines[i].startswith("STATUS:"):
             value = lines[i][len("STATUS:"):].strip()
             first = value.split()[0].rstrip("|,").upper() if value else ""
+            # Skip ONLY the echoed contract TEMPLATE ("DONE | PARTIAL | BLOCKED"):
+            # a value whose pipe-separated tokens are ALL status keywords. A real
+            # status like "BLOCKED | waiting on approval" is kept (its second token
+            # isn't a status word), so the guard can't swallow a genuine block.
             if first in _STATUS_VALUES:
-                start = i
-                break
+                parts = [p.strip().split()[0].upper() for p in value.split("|") if p.strip()]
+                is_template = len(parts) > 1 and all(p in _STATUS_VALUES for p in parts)
+                if not is_template:
+                    start = i
+                    break
     if start is None:
         return None
 
@@ -147,6 +155,7 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     response.setdefault("usage", processor.usage if processor else None)
     response.setdefault("cost_usd", processor.cost_usd if processor else None)
     response.setdefault("model_resolved", processor.model if processor else None)
+    response.setdefault("models_used", processor.models_used if processor else [])
     # Baseline resume handle on EVERY path (incl. spawn-failure) so orchestrators
     # can read response["resume"] unconditionally. execute_agent enriches it with
     # the agy profile on the normal path.
@@ -225,10 +234,18 @@ def build_final_response(
     """
     exit_code = returncode if returncode is not None else 1
 
-    if result:
-        # Terminal event parsed -> task completed. A non-zero exit (e.g. from
-        # terminate() of a Windows .cmd shim after we got the result) is not a failure.
+    result_errored = bool(result) and _terminal_is_error(result)
+    if result and not result_errored:
+        # Terminal event parsed AND it did not self-report an error -> task
+        # completed. A non-zero exit (e.g. from terminate() of a Windows .cmd
+        # shim after we got the result) is not a failure.
         status = "success"
+    elif result_errored:
+        # The backend's OWN terminal event reported failure (claude is_error /
+        # error subtype, gemini/cursor status error). This must surface as an
+        # error even though a result object was parsed and the exit may be 0 —
+        # otherwise a model/API error would leak through as a false success.
+        status = "error"
     elif exit_code in _SUCCESS_EXIT_CODES and "".join(stdout_lines).strip():
         # Plain-text backend that exited cleanly WITH output (no parsed terminal event).
         status = "success"
@@ -242,10 +259,17 @@ def build_final_response(
         "cli": cli,
     }
     if status == "error":
-        msg = f"CLI exited with code {exit_code}"
-        if stderr and stderr.strip():
-            msg += f": {stderr.strip()}"
-        response["error"] = msg
+        if result_errored:
+            # str() each part: a backend could put a non-string in result/error,
+            # and `dict[:200]` would raise TypeError and crash the driver.
+            detail = (result.get("subtype") or result.get("error")
+                      or str(result.get("result", ""))[:200] or "backend reported an error")
+            response["error"] = f"backend reported an error result: {detail}"
+        else:
+            msg = f"CLI exited with code {exit_code}"
+            if stderr and stderr.strip():
+                msg += f": {stderr.strip()}"
+            response["error"] = msg
     if status != "success":
         # Diagnosability: the tail of the RAW captured output (stdout+stderr are
         # merged at spawn), so a failure is inspectable without a re-run.
@@ -274,7 +298,11 @@ def _spawn_reader(process: subprocess.Popen) -> queue.Queue:
     waits, so the reader thread could otherwise outlive the parent's timeout
     deadline. ``daemon=True`` ensures the thread dies with the interpreter.
     """
-    line_q: queue.Queue = queue.Queue()
+    # Bounded so a firehose producer applies backpressure to the reader instead
+    # of letting the queue itself balloon before the main loop enforces the
+    # char cap. The main loop drains continuously (and on abort via _drain_to_eof),
+    # so a blocked put() always frees — no deadlock.
+    line_q: queue.Queue = queue.Queue(maxsize=4096)
 
     def reader() -> None:
         try:
@@ -320,6 +348,54 @@ def _drain_to_eof(line_q: queue.Queue, budget_sec: float = 0.5) -> None:
             return
 
 
+def _kill_tree(process: subprocess.Popen) -> None:
+    """Kill the child AND its descendants. ``process.kill()`` alone reaps only the
+    immediate child; a grandchild (the real backend behind a .cmd/node/powershell
+    shim) can keep the stdout pipe open, so ``communicate()`` blocks past the
+    deadline — the observed way the wall-clock timeout was defeated. Windows:
+    ``taskkill /T`` walks the tree. POSIX: signal the session group (Popen is
+    launched with ``start_new_session`` so the child leads its own group)."""
+    try:
+        if os.name == "nt":
+            # Popen keeps the process handle open, so Windows will NOT recycle
+            # this PID mid-teardown — taskkill /T targets the right tree.
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                           capture_output=True, timeout=10)
+        else:
+            # start_new_session=True makes the child its own group leader, so the
+            # PGID equals the child PID. Signal the group by PID directly instead
+            # of os.getpgid(pid) — getpgid raises if the child was already reaped
+            # (child exited but a grandchild still holds stdout), which would skip
+            # the kill and orphan the grandchild.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+    except Exception:  # noqa: BLE001 — best-effort teardown must never raise
+        pass
+    try:
+        process.kill()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _safe_communicate(process: subprocess.Popen, timeout: float = 3.0):
+    """``communicate()`` bounded by a timeout so a descendant still holding stdout
+    cannot hang the driver indefinitely after we've already blown the deadline.
+    On expiry, kill the whole tree and try once more, then give up cleanly.
+    Kept short (two brief waits) since the tree-kill already ran before we call."""
+    try:
+        return process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(process)
+        try:
+            return process.communicate(timeout=timeout)
+        except Exception:  # noqa: BLE001
+            return (None, None)
+    except (OSError, ValueError):
+        return (None, None)
+
+
 def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int) -> dict:
     """Drive the subprocess and enrich whatever response path it takes.
 
@@ -362,17 +438,17 @@ def _drive_process_loop(
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                process.kill()
+                _kill_tree(process)
                 _drain_to_eof(line_q)
-                process.communicate()
+                _safe_communicate(process)
                 return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
 
             try:
                 kind, line = line_q.get(timeout=remaining)
             except queue.Empty:
-                process.kill()
+                _kill_tree(process)
                 _drain_to_eof(line_q)
-                process.communicate()
+                _safe_communicate(process)
                 return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
 
             if kind == _EOF:
@@ -383,9 +459,9 @@ def _drive_process_loop(
                 # Defensive cap: a sub-agent emitting unbounded non-terminal
                 # output would otherwise grow stdout_lines until the wall-clock
                 # deadline (default 10 min). Kill it and report partial.
-                process.kill()
+                _kill_tree(process)
                 _drain_to_eof(line_q)
-                process.communicate()
+                _safe_communicate(process)
                 return _attach_raw(_error_response(
                     cli,
                     1,
@@ -405,18 +481,24 @@ def _drive_process_loop(
         try:
             _, stderr = process.communicate(timeout=wait_remaining)
         except subprocess.TimeoutExpired:
-            process.kill()
-            _, stderr = process.communicate()
+            _kill_tree(process)
+            _, stderr = _safe_communicate(process)
             return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
 
         return build_final_response(
             cli, process.returncode, processor.get_result(), stdout_lines, stderr
         )
+    except KeyboardInterrupt:
+        # start_new_session detaches the child from the terminal's signal group,
+        # so a Ctrl+C on the parent won't reach it — tree-kill it ourselves so an
+        # interrupt doesn't leave an orphaned backend running.
+        _kill_tree(process)
+        raise
     except (OSError, ValueError) as e:
         # OSError covers I/O failures on the pipe; ValueError covers reading
         # from a closed file. Anything else propagates so it's not silently
         # swallowed.
-        process.kill()
+        _kill_tree(process)
         return _attach_raw(_error_response(
             cli, 1, f"{type(e).__name__}: {e}", partial_result=processor.get_result()
         ), stdout_lines)
@@ -520,7 +602,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # Trust fields: what was ASKED FOR vs what the backend REPORTED serving.
         # resolved=None means the backend didn't say (agy never does) — absence
         # of proof, not proof of the requested model.
-        resp["model"] = {"requested": inv.model, "resolved": resp.pop("model_resolved", None)}
+        resp["model"] = {"requested": inv.model, "resolved": resp.pop("model_resolved", None),
+                         "models_used": resp.pop("models_used", [])}
         resp["permission"] = inv.permission
         try:
             resp["permission_flags"] = permission_flags(inv.cli, inv.permission)
@@ -545,11 +628,17 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         resp["resume"] = {"cli": inv.cli, "session_id": None}  # stateless: no resume
         return _stamp(resp)
 
-    command, args, env_override = build_invocation_args(inv)
+    # timeout_ms is threaded to the builder so agy's wrapper deadline AND its
+    # profile-TTL cleanup (which runs during build) both reflect the real request.
+    command, args, env_override = build_invocation_args(inv, timeout_ms)
     command, args = _resolve_launch(command, args)
     proc_env = _merge_env(env_override)
     debug_argv = [command, *args]
 
+    # POSIX: put the child in its own session so _kill_tree can signal the whole
+    # group (a shim's grandchild otherwise survives process.kill() and keeps
+    # stdout open, defeating the timeout). Windows walks the tree via taskkill /T.
+    popen_extra = {"start_new_session": True} if os.name != "nt" else {}
     try:
         # stdin=DEVNULL: sub-agent CLIs (notably codex) probe stdin for "additional
         # input" and block reading from a TTY inherited from the parent. We never
@@ -565,6 +654,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             errors="replace",
             bufsize=1,
             env=proc_env,
+            **popen_extra,
         )
     except FileNotFoundError:
         return _stamp(_enrich(_error_response(inv.cli, 127, f"CLI not found: {command}"), None))
