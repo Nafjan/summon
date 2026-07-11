@@ -217,6 +217,33 @@ exposes it. Each entry is tagged with a `source` so you know how much to trust i
 Discover with `--list-models`, invoke with `--model`, verify with `model.resolved` —
 using a new model never requires editing the skill code itself.
 
+**Models newer than this document almost certainly exist.** These docs are a snapshot;
+model strings pass through to the CLIs verbatim, so you can — and should — try IDs
+that postdate anything written here (a future `claude-sonnet-6`, a new codex id, a new
+agy display name) without waiting for a skill update. Cheap probe: dispatch a trivial
+prompt with the candidate `--model` and check the envelope's `model.resolved`; an
+unsupported ID fails fast with the CLI's own error, costing nothing but the attempt.
+Never assume an alias has caught up to a launch — probe or pin.
+
+## Bundled roster snapshot (2026-07 — `--list` is the live truth)
+
+The definitive list is always `--list` (definitions register/edit instantly, so the
+roster may have changed since this table). Models below were verified actually
+serving via `model.resolved` at snapshot time:
+
+| Agents | Backend | Model (verified) | Use for |
+|---|---|---|---|
+| `planner`, `architect`, `deep-debugger`, `security-auditor` | claude | `opus` → claude-opus-4-8 | planning, architecture, gnarly debugging, security audits |
+| `fable` | claude | `claude-fable-5` | escalation tier: hardest problems, highest-stakes calls |
+| `pair`, `editor`, `quick-reviewer`, `pr-prep` | claude | `claude-sonnet-5` | balanced general work, prose, fast reviews, PR prep |
+| `reviewer`, `adversarial-reviewer`, `implementer`, `debugger`, `test-author` | codex | config default (gpt-5.6-sol at snapshot) | code review, adversarial passes, implementation, tests |
+| `coder`, `bug-fixer` | cursor-agent | composer-2.5 | multi-step coding, bug fixing |
+| `researcher`, `docs-writer`, `frontend`, `antigravity` | agy | Gemini default (pin via `model:`) | research, docs, frontend |
+
+Cross-vendor routing rule of thumb: never have an agent's work reviewed by its own
+vendor — send claude/cursor-written code to a codex reviewer and codex-written code to
+a claude reviewer (see docs/PROTOCOL.md).
+
 ## Customizing agents (you, the calling agent, are expected to)
 
 The bundled roster is a starting point, not a fixed menu. As the orchestrator you
