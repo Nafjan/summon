@@ -467,7 +467,7 @@ def test_envelope_model_and_permission_echo():
                             permission="read-only", model="opus"), timeout_ms=1000)
     finally:
         _executor.build_invocation_args = orig
-    assert out["model"] == {"requested": "opus", "resolved": None}
+    assert out["model"] == {"requested": "opus", "resolved": None, "models_used": []}
     assert out["permission"] == "read-only"
     assert out["permission_flags"] == ["--permission-mode", "plan"]
     assert "_debug_raw" not in out  # internal key never leaks into the envelope
@@ -910,7 +910,7 @@ def test_openai_compat_http_roundtrip():
                    capture_output=True, text=True, encoding="utf-8")
         env = _json.loads(r.stdout)
         assert env["status"] == "success" and env["result"].startswith("PONG")
-        assert env["model"] == {"requested": "test-model", "resolved": "test-model"}
+        assert env["model"] == {"requested": "test-model", "resolved": "test-model", "models_used": []}
         assert env["usage"]["total_tokens"] == 9 and env["billing"]["source"] == "api"
         assert env["envelope"] == 1
     finally:
@@ -1229,6 +1229,147 @@ def test_dry_run_resolves_without_executing():
     finally:
         import shutil as _sh
         _sh.rmtree(agents, ignore_errors=True)
+
+
+# --- Regression tests for ultrareview findings (F1-F25) ----------------------
+
+def test_no_false_success_on_backend_error_result():
+    # F1: a claude terminal result with is_error must NOT surface as success.
+    import _executor
+    from _stream import StreamProcessor
+    sp = StreamProcessor()
+    sp.process_line('{"type":"result","subtype":"error_during_execution",'
+                    '"is_error":true,"result":"model errored"}')
+    out = _executor._enrich(
+        _executor.build_final_response("claude", 0, sp.get_result(),
+                                       ['{"type":"result"}\n'], None), sp)
+    assert out["status"] == "error", out["status"]
+    assert "error" in out and out["error"]
+    # a clean success result is still success
+    sp2 = StreamProcessor()
+    sp2.process_line('{"type":"result","subtype":"success","is_error":false,"result":"ok"}')
+    out2 = _executor.build_final_response("claude", 0, sp2.get_result(), [], None)
+    assert out2["status"] == "success", out2["status"]
+
+
+def test_stream_exposes_all_models_used():
+    # F17: models_used lists every model, resolved is only the dominant one.
+    from _stream import StreamProcessor
+    sp = StreamProcessor()
+    sp.process_line('{"type":"result","result":"x","modelUsage":'
+                    '{"claude-sonnet-5":{"outputTokens":900},'
+                    '"claude-haiku-4-5":{"outputTokens":50}}}')
+    assert sp.model == "claude-sonnet-5", sp.model
+    assert sp.models_used == ["claude-haiku-4-5", "claude-sonnet-5"], sp.models_used
+
+
+def test_timeout_does_not_hang_on_grandchild_holding_stdout():
+    # F2: a grandchild inheriting stdout must not let communicate() block past the
+    # deadline. Old code hung ~15s; fixed code returns fast (tree-kill + bounded
+    # communicate). Guards the wall-clock-timeout guarantee.
+    import time as _t, subprocess as _sp, _executor
+    child = ("import subprocess,sys,time;"
+             "subprocess.Popen([sys.executable,'-c','import time;time.sleep(15)']);"
+             "time.sleep(0.3)")  # child spawns a 15s grandchild (inherits stdout), then exits
+    extra = {"start_new_session": True} if os.name != "nt" else {}
+    proc = _sp.Popen([sys.executable, "-c", child], stdin=_sp.DEVNULL,
+                     stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
+                     encoding="utf-8", errors="replace", bufsize=1, **extra)
+    t0 = _t.monotonic()
+    resp = _executor._drive_process(proc, "claude", timeout_ms=1000)
+    elapsed = _t.monotonic() - t0
+    assert elapsed < 12, f"timeout path took {elapsed:.1f}s (regression: unbounded communicate)"
+    assert resp["status"] != "success", resp["status"]
+
+
+def test_manifest_rejects_non_string_json_schema():
+    # F6: an inline dict json_schema would be str()-mangled; reject up front.
+    import _manifest
+    jobs, err = _manifest._normalize_jobs(
+        {"jobs": [{"id": "j", "agent": "reviewer", "prompt": "p",
+                   "json_schema": {"type": "object"}}]}, ".")
+    assert jobs is None and err and "json_schema must be a file path" in err, err
+    # a string path is accepted
+    jobs2, err2 = _manifest._normalize_jobs(
+        {"jobs": [{"id": "j", "agent": "reviewer", "prompt": "p",
+                   "json_schema": "schema.json"}]}, ".")
+    assert err2 is None and jobs2, err2
+
+
+def test_resolve_cli_fails_closed_on_unknown_backend():
+    # F8: a typo'd run-agent must raise, not silently run under codex.
+    import _resolver
+    try:
+        _resolver.resolve_cli("claude-typo")
+        assert False, "expected ValueError for unknown run-agent"
+    except ValueError:
+        pass
+    assert _resolver.resolve_cli("openai-compat") == "openai-compat"
+
+
+def test_extract_json_handles_primitives():
+    # F9: bare top-level primitives must extract (schema layer supports them).
+    from _schema import extract_json
+    for text, want in (("true", True), ("42", 42), ('"ok"', "ok"), ("null", None)):
+        val, err = extract_json(text)
+        assert err is None and val == want, (text, val, err)
+    # objects still win when present
+    assert extract_json('note\n{"a":1}')[0] == {"a": 1}
+
+
+def test_frontmatter_preserves_value_ending_in_quote():
+    # F10: args ending in a quoted token must survive (no blanket quote-strip).
+    from _loader import parse_frontmatter, parse_extra_args
+    fm, _ = parse_frontmatter('---\nrun-agent: codex\nargs: --label "two words"\n---\nbody')
+    assert fm["args"] == '--label "two words"', fm["args"]
+    assert parse_extra_args(fm["args"]) == ["--label", "two words"]
+    # a fully-quoted value is still unquoted
+    fm2, _ = parse_frontmatter('---\nname: "quoted"\n---\nb')
+    assert fm2["name"] == "quoted"
+
+
+def test_parse_report_ignores_unindented_template_line():
+    # F20: an echoed "STATUS: DONE | PARTIAL | BLOCKED" template must not displace
+    # the real block above it.
+    import _executor
+    rep = _executor.parse_report(
+        "STATUS: DONE\nSUMMARY: real\nFOLLOW-UP: none\nHANDOFF: none\n"
+        "STATUS: DONE | PARTIAL | BLOCKED")
+    assert rep and rep.get("summary") == "real", rep
+
+
+def test_council_rejects_too_many_members():
+    # F25: council size is bounded (thread + argv-budget safety).
+    import _council, io, contextlib
+    ns = type("N", (), {})()
+    ns.question = "q"; ns.question_file = None; ns.members = ",".join(f"m{i}" for i in range(11))
+    ns.chairman = "fable"; ns.rounds = 1; ns.cwd = os.getcwd(); ns.agents_dir = None
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = _council.run_council(ns)
+    assert rc != 0 and "too many council members" in buf.getvalue(), buf.getvalue()
+
+
+def test_child_out_does_not_skip_on_non_success_envelope():
+    # F3: a prior error/blocked envelope must NOT short-circuit as "done".
+    import json as _json, subprocess as _sp
+    out = os.path.join(tempfile.gettempdir(), f"summon-f3-{os.getpid()}.json")
+    with open(out, "w", encoding="utf-8") as fh:
+        _json.dump({"status": "error", "result": "prior failure"}, fh)
+    try:
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+        r = _sp.run([sys.executable, script, "--agent", "definitely-missing-agent",
+                     "--prompt", "p", "--cwd", os.getcwd(), "--out", out],
+                    capture_output=True, text=True, encoding="utf-8")
+        env = _json.loads(r.stdout)
+        # It re-dispatched (and failed on the missing agent) rather than emitting
+        # the prior envelope with skipped=True.
+        assert env.get("skipped") is not True, env
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

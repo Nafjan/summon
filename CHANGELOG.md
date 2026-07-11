@@ -6,6 +6,29 @@ it bumps only on a breaking change to the response shape, never on added fields.
 
 ## [0.9.0] — unreleased (pre-1.0)
 
+### Fixed (multi-model ultrareview pass)
+- **No false success on a backend error.** A claude `is_error` result (and gemini/
+  cursor `status:error`) now surfaces as `status:"error"` instead of `success`
+  (`_stream`/`_executor`) — the no-false-success guarantee now holds on the terminal
+  event too, not just the report contract.
+- **Timeouts can no longer be defeated by a grandchild holding stdout.** The driver
+  kills the whole process tree (`taskkill /T` / `killpg`) and bounds `communicate()`;
+  `--manifest` gains a parent-side watchdog so one wedged child can't stall the swarm.
+- **Manifest/`--out` resume retries failures** — only a `success` envelope is terminal;
+  `error`/`blocked`/`partial` jobs re-dispatch on a re-run.
+- **Fail-closed on an unknown `run-agent`** (was a silent fall-through to codex — wrong
+  vendor/permissions/billing). `extract_json` now handles primitive values; frontmatter
+  no longer corrupts a value ending in a quote; the alias uninstall matches OUR
+  frontmatter, not any file mentioning the marker (data-loss fix); the `openai-compat`
+  key is redacted on the success path too; agy honors `--timeout`; auto worktree names
+  can't collide under parallel fan-out; council size is bounded; `model.models_used`
+  exposes every model a session touched (`resolved` is only the dominant one).
+- Bounded reader queue, `run_job` catch-all, `json_schema` type-check, honest README
+  ("no network calls" now excepts `openai-compat`; installer line count), plus SKILL.md
+  caveats (agy has no `--cwd` file access, `status` is advisory under adversarial agents).
+
+
+
 Cross-vendor sub-agent dispatcher over Claude, Codex, Cursor, Gemini, Antigravity, and
 any OpenAI-compatible API.
 

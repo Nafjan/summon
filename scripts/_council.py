@@ -32,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 # Opus, Codex, Antigravity/Gemini, and Claude Sonnet — override with --members.
 DEFAULT_MEMBERS = ["planner", "reviewer", "researcher", "pair"]
 DEFAULT_CHAIRMAN = "fable"          # the escalation/synthesis tier
+_MAX_MEMBERS = 10                   # bound fan-out: 1 thread/member + argv-safe position budget
 _POSITION_CAP = 4000                # max chars of any single position
 _TOTAL_POSITIONS_BUDGET = 20000     # cap on ALL positions in one prompt (argv-safe;
                                     # Windows CreateProcess ~32 KB per token)
@@ -200,6 +201,11 @@ def run_council(args) -> int:
         return _fail("--rounds must be 1 or 2")
     if len(members) < 2:
         return _fail("a council needs at least 2 members")
+    if len(members) > _MAX_MEMBERS:
+        # Bound the fan-out: one OS thread per member, and the per-member position
+        # budget (_TOTAL_POSITIONS_BUDGET // n) collapses below the 400-char floor
+        # past ~50 members, blowing the argv-safe total. A useful council is small.
+        return _fail(f"too many council members ({len(members)}); max is {_MAX_MEMBERS}")
     if len(set(members)) != len(members):
         return _fail(f"duplicate council members: {[m for m in members if members.count(m) > 1]}")
 

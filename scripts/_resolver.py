@@ -66,11 +66,17 @@ def detect_caller_cli() -> str | None:
 def resolve_cli(frontmatter_cli: str | None, default: str = "codex") -> str:
     """Resolve which CLI to use.
 
-    Priority: frontmatter > caller detection > default.
-    Invalid frontmatter values fall through to caller detection (lenient).
+    Priority: frontmatter > caller detection > default. A frontmatter
+    ``run-agent`` that is set but UNKNOWN is an authoring error and fails closed
+    (raises ValueError) — silently falling through to the caller/codex would run
+    the agent under the wrong vendor, permission model, and billing account.
     """
-    if frontmatter_cli and frontmatter_cli in _VALID_CLIS:
-        return frontmatter_cli
+    if frontmatter_cli:
+        if frontmatter_cli in _VALID_CLIS:
+            return frontmatter_cli
+        raise ValueError(
+            f"unknown run-agent {frontmatter_cli!r} "
+            f"(valid: {', '.join(sorted(_VALID_CLIS))})")
 
     detected = detect_caller_cli()
     if detected:

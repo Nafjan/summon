@@ -75,7 +75,23 @@ def extract_json(text: str):
                               f"{_EXTRACT_MAX_ATTEMPTS} openers (input looks malformed)")
             i += 1
     if last is None:
-        return None, "no complete JSON object/array found in the agent's result"
+        # No object/array — try a bare top-level JSON primitive (null / bool /
+        # number / string). The schema layer legitimately supports primitive
+        # types, so an agent that answers with just `42` or `true` must extract.
+        # Try the whole trimmed text, then the last non-empty line, to avoid
+        # picking a stray number out of prose.
+        candidates = [text.strip()]
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            candidates.append(lines[-1])
+        for cand in candidates:
+            try:
+                val = json.loads(cand)
+            except ValueError:
+                continue
+            if not isinstance(val, (dict, list)):  # objects/arrays handled above
+                return val, None
+        return None, "no complete JSON value found in the agent's result"
     return last, None
 
 

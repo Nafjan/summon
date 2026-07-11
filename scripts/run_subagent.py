@@ -97,7 +97,8 @@ def _inject_memory(system_context: str, cwd: str) -> str:
     """Append {cwd}/.agents/memory.md to the agent's system context (capped)."""
     mem_path = os.path.join(cwd, ".agents", "memory.md")
     try:
-        mem = open(mem_path, encoding="utf-8", errors="replace").read()
+        with open(mem_path, encoding="utf-8", errors="replace") as fh:
+            mem = fh.read()
     except OSError:
         return system_context
     if not mem.strip():
@@ -116,7 +117,10 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
     if r.returncode != 0:
         raise ValueError(f"--worktree requires a git repo; {cwd} is not inside one")
     repo = r.stdout.strip()
-    name = name_arg or f"{agent}-{int(time.time())}"
+    # Auto-name includes a random suffix: two same-agent dispatches in the same
+    # whole second would otherwise generate an identical name and one would fail
+    # the "path already exists" guard below (a real collision under parallel fan-out).
+    name = name_arg or f"{agent}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
     # Reject path-traversal / dotfile names BEFORE building the path.
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name) or ".." in name:
         raise ValueError(f"invalid worktree name: {name!r} (letters/digits/._- , no '..', no leading dot)")
@@ -134,7 +138,12 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
                         capture_output=True, text=True)
     if r2.returncode != 0:
         raise ValueError(f"git worktree add failed: {(r2.stderr or r2.stdout).strip()}")
-    return {"path": wt, "branch": branch}
+    # If --cwd was a SUBDIRECTORY of the repo, run inside the matching subdir of
+    # the worktree (it exists in the fresh checkout) rather than snapping to the
+    # worktree root — preserves the caller's intended working directory.
+    rel = os.path.relpath(os.path.abspath(cwd), repo)
+    effective = wt if rel in (".", "") or rel.startswith("..") else os.path.join(wt, rel)
+    return {"path": wt, "cwd": effective, "branch": branch}
 
 
 def _child_argv(args: argparse.Namespace, result_file: str) -> list:
@@ -417,18 +426,20 @@ def main() -> None:
         from _council import run_council
         sys.exit(run_council(args))
 
-    # --out resume behavior: a pre-existing valid envelope means this job is
-    # already done — emit it (marked skipped) and exit without dispatching.
+    # --out resume behavior: a pre-existing SUCCESS envelope means this job is
+    # already done — emit it (marked skipped) and exit without dispatching. A
+    # prior error/blocked/partial envelope is NOT terminal: re-running retries
+    # it (matches the manifest's resume semantics — failures get another shot).
     if args.out and os.path.isfile(args.out) and not args.dry_run:
         try:
             with open(args.out, encoding="utf-8") as fh:
                 prior = json.load(fh)
         except (OSError, ValueError):
             prior = None
-        if isinstance(prior, dict) and prior.get("status"):
+        if isinstance(prior, dict) and prior.get("status") == "success":
             prior["skipped"] = True
             _emit(prior)
-            sys.exit(0 if prior.get("status") == "success" else 1)
+            sys.exit(0)
 
     # --json-schema: fail fast on an unloadable schema BEFORE paying for a run.
     schema = None
@@ -499,9 +510,19 @@ def main() -> None:
         except ValueError as e:
             _print_error(str(e))
             sys.exit(1)
-        args.cwd = worktree_info["path"]
+        args.cwd = worktree_info["cwd"]
 
-    cli = args.cli or resolve_cli(run_agent_cli)
+    try:
+        cli = args.cli or resolve_cli(run_agent_cli)
+    except ValueError as e:
+        _print_error(f"agent {args.agent!r}: {e}")
+        sys.exit(1)
+
+    # --effort is a claude-only knob; warn instead of silently dropping it so a
+    # user doesn't believe a non-claude run was tuned when it wasn't.
+    if args.effort and cli != "claude":
+        print(f"note: --effort is only honored by the claude backend; ignored for {cli}",
+              file=sys.stderr)
 
     # openai-compat: resolve the API endpoint (provider -> base_url/api_key_env)
     # from the agent's frontmatter now, while we still have the agents dir.

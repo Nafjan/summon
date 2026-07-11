@@ -148,6 +148,10 @@ def call(inv, timeout_ms: int) -> dict:
         # non-string content (e.g. a tool-call array) — stringify so downstream
         # report parsing (which does .splitlines()) never crashes.
         text = json.dumps(text)
+    # Redact on the SUCCESS path too: a misbehaving/hostile endpoint can echo the
+    # Authorization value back in the completion content, which would otherwise
+    # land verbatim in the envelope and --debug-dir. Error paths already redact.
+    text = _redact(text, api_key)
 
     resp = {"result": text, "exit_code": 0, "status": "success", "cli": cli}
     if isinstance(payload.get("usage"), dict):

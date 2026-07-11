@@ -5,6 +5,19 @@ from __future__ import annotations
 import json
 
 
+def _terminal_is_error(data: dict) -> bool:
+    """True when a terminal result object reports failure. Claude sets
+    ``is_error: true`` and an ``error_*`` subtype on API/turn failures; some
+    CLIs put ``status`` of ``error``/``failed`` on the result. Guards the
+    no-false-success contract at the stream layer."""
+    if data.get("is_error") is True:
+        return True
+    subtype = data.get("subtype")
+    if isinstance(subtype, str) and subtype.startswith("error"):
+        return True
+    return data.get("status") in ("error", "failed")
+
+
 class StreamProcessor:
     """Process streaming JSON output from various CLIs.
 
@@ -25,6 +38,8 @@ class StreamProcessor:
         self.usage = None       # token usage dict
         self.cost_usd = None    # claude total_cost_usd
         self.model = None       # the model that actually SERVED the run, when reported
+        self.models_used = []   # every model id seen in modelUsage (resolved is only the dominant one)
+        self.is_error = False   # the terminal event itself reported an error (claude is_error / result status)
 
     def process_line(self, line: str) -> bool:
         """Process one line. Returns True when a terminal event is reached."""
@@ -93,11 +108,18 @@ class StreamProcessor:
         # Result type signals completion
         if data.get("type") == "result":
             self._capture_telemetry(data)
+            # A terminal result can itself report failure: claude sets is_error /
+            # subtype "error_*"; gemini/cursor may carry status "error"/"failed".
+            # Record it so build_final_response never stamps such a run "success"
+            # (the no-false-success guarantee must hold on the terminal event too).
+            self.is_error = _terminal_is_error(data)
             if self.is_gemini:
+                status = data.get("status", "success")
+                self.is_error = self.is_error or status in ("error", "failed")
                 self.result_json = {
                     "type": "result",
                     "result": "".join(self.gemini_parts),
-                    "status": data.get("status", "success"),
+                    "status": "error" if self.is_error else status,
                 }
             else:
                 self.result_json = data
@@ -128,9 +150,14 @@ class StreamProcessor:
         if isinstance(data.get("model"), str) and data["model"]:
             self.model = data["model"]
         elif isinstance(data.get("modelUsage"), dict) and data["modelUsage"]:
-            # The dominant model of the session = the one with the most output.
+            # `resolved` is only the DOMINANT model (most output tokens). A claude
+            # session often also uses a cheap auxiliary model (e.g. haiku for a
+            # background step), so exposing every model id in `models_used` keeps
+            # the telemetry honest — an orchestrator must not read `resolved` as
+            # "the one model that served this run".
             def _out(v):
                 return v.get("outputTokens", 0) if isinstance(v, dict) else 0
+            self.models_used = sorted(data["modelUsage"])
             self.model = max(data["modelUsage"], key=lambda k: _out(data["modelUsage"][k]))
 
     def get_result(self):
