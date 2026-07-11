@@ -64,6 +64,23 @@ def _print_error(error: str, exit_code: int = 1) -> None:
 _MEMORY_CAP = 8000  # chars; keeps the injected block well under agy's 28 KB argv guard
 
 
+def _parse_timeout(value: str) -> int:
+    """--timeout accepts bare milliseconds (backward compatible) or a human
+    suffix: '90s', '10m', '600000ms'. Returns milliseconds."""
+    s = str(value).strip().lower()
+    try:
+        if s.endswith("ms"):
+            return int(float(s[:-2]))
+        if s.endswith("s"):
+            return int(float(s[:-1]) * 1000)
+        if s.endswith("m"):
+            return int(float(s[:-1]) * 60_000)
+        return int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid --timeout {value!r}: use milliseconds or a suffix, e.g. 600000, 600s, 10m")
+
+
 def _inject_memory(system_context: str, cwd: str) -> str:
     """Append {cwd}/.agents/memory.md to the agent's system context (capped)."""
     mem_path = os.path.join(cwd, ".agents", "memory.md")
@@ -169,7 +186,8 @@ def main() -> None:
     parser.add_argument("--cwd", help="Working directory (absolute path)")
     parser.add_argument("--agents-dir", help="Directory containing agent definitions")
     parser.add_argument(
-        "--timeout", type=int, default=600000, help="Timeout in ms (default: 600000)"
+        "--timeout", type=_parse_timeout, default=600000,
+        help="Timeout: bare ms, or with suffix — 600s, 10m (default: 600000 ms = 10m)"
     )
     parser.add_argument("--cli", help="Force specific CLI (claude, cursor-agent, codex, gemini)")
     parser.add_argument("--model", help="Override the agent's frontmatter model for this call")

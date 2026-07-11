@@ -163,6 +163,79 @@ def test_full_has_all_backends_without_real_agy():
     assert out["agy"]["models"] == ["StubModel"]
 
 
+def test_blocked_approval_downgrades_success():
+    # A run that ENDS asking for interactive approval with no report contract
+    # must become status:blocked (a 0 exit is not task completion).
+    from _executor import _enrich
+    resp = {"result": "I tried to read the file.\nThe tool call was blocked. "
+                      "Please approve the permission request to continue.",
+            "exit_code": 0, "status": "success", "cli": "claude"}
+    out = _enrich(resp, None)
+    assert out["status"] == "blocked", out["status"]
+    assert out["blocked_indicators"]
+    assert "approval" in out["error"]
+
+
+def test_blocked_markers_with_full_report_stay_success():
+    # A COMPLETED report that merely quotes approval phrasing is a real result.
+    from _executor import _enrich
+    resp = {"result": "Review of the consent flow.\n\nSTATUS: DONE\nSUMMARY: reviewed "
+                      "the dialog\nFOLLOW-UP: none\nHANDOFF: the dialog text says "
+                      "'please approve' which needs a UX pass",
+            "exit_code": 0, "status": "success", "cli": "claude"}
+    out = _enrich(resp, None)
+    assert out["status"] == "success"
+    assert out["blocked_indicators"]          # surfaced for the orchestrator
+    assert "suspect" not in out               # but not treated as a lie
+
+
+def test_clean_success_untouched_by_blocked_scan():
+    from _executor import _enrich
+    resp = {"result": "All good.\n\nSTATUS: DONE\nSUMMARY: ok\nFOLLOW-UP: none\nHANDOFF: none",
+            "exit_code": 0, "status": "success", "cli": "codex"}
+    out = _enrich(resp, None)
+    assert out["status"] == "success" and "blocked_indicators" not in out
+
+
+def test_timeout_suffix_parsing():
+    import run_subagent as rs
+    assert rs._parse_timeout("600000") == 600000   # bare ms (backward compatible)
+    assert rs._parse_timeout("600s") == 600000
+    assert rs._parse_timeout("10m") == 600000
+    assert rs._parse_timeout("1500ms") == 1500
+    assert rs._parse_timeout("2.5m") == 150000
+    import argparse as ap
+    try:
+        rs._parse_timeout("tenminutes")
+        raise AssertionError("expected ArgumentTypeError")
+    except ap.ArgumentTypeError:
+        pass
+
+
+def test_elapsed_ms_present_even_on_spawn_failure():
+    import _executor
+    from _builder import AgentInvocation
+    orig = _executor.build_invocation_args
+    _executor.build_invocation_args = lambda inv: ("definitely-not-a-real-cli-xyz", [], None)
+    try:
+        out = _executor.execute_agent(
+            AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(),
+                            system_context="s", permission="yolo"), timeout_ms=1000)
+    finally:
+        _executor.build_invocation_args = orig
+    assert out["status"] == "error" and out["exit_code"] == 127
+    assert isinstance(out["elapsed_ms"], int) and out["elapsed_ms"] >= 0
+
+
+def test_description_word_boundary_cap():
+    from _loader import extract_description
+    long = "word " * 100  # 500 chars of clean words
+    d = extract_description(long)
+    assert d.endswith(" ...") and len(d) <= 245
+    assert not d[:-4].endswith("wor")  # no mid-word cut
+    assert extract_description("short line") == "short line"
+
+
 def test_doctor_all_missing_is_fail_soft():
     # With every CLI absent, doctor must still return a full report (ok=False),
     # never raise. Simulate by stubbing shutil.which inside _doctor.

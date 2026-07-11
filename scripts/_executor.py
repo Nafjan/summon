@@ -34,6 +34,32 @@ _REPORT_FIELDS = frozenset({
 _STATUS_VALUES = frozenset({"DONE", "PARTIAL", "BLOCKED", "SUCCESS", "ERROR"})
 _REPORT_FIELD_RE = re.compile(r"^([A-Z][A-Z0-9_-]{1,}):[ \t]?(.*)$")
 
+# Approval-request phrasings the backend CLIs emit when a sandboxed tool call
+# needs interactive consent. In one-shot mode a sub-agent that ENDS on one of
+# these did not complete its task, even though the CLI exits 0 — the envelope
+# must not report success. Tail-scanned (last _BLOCKED_TAIL chars) so a run
+# that merely *mentions* approvals mid-result doesn't false-positive.
+_BLOCKED_MARKERS = (
+    "tool call was blocked",
+    "tool use was blocked",
+    "please approve",
+    "requires approval",
+    "approval required",
+    "waiting for approval",
+    "needs your approval",
+    "permission to use",
+    "requested permissions",
+    "permission prompt",
+    "grant permission",
+)
+_BLOCKED_TAIL = 800
+
+
+def _detect_blocked(text: str) -> list:
+    """Approval markers present in the TAIL of the result (case-insensitive)."""
+    tail = (text or "")[-_BLOCKED_TAIL:].lower()
+    return [m for m in _BLOCKED_MARKERS if m in tail]
+
 
 def parse_report(text: str) -> dict | None:
     """Extract the trailing report-contract block from an agent's result text.
@@ -80,7 +106,12 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     where the backend doesn't emit them), ``report`` (parsed contract block or
     None), ``report_ok`` (all bookend fields present), and ``suspect: true``
     when a run claims success but the contract block is missing/incomplete.
-    The parser only annotates — it never changes ``status``.
+
+    One exception to "the parser never changes status": a run whose result ENDS
+    on an interactive-approval request (see ``_BLOCKED_MARKERS``) with no report
+    contract is downgraded from ``success`` to ``blocked`` — the CLI exited 0,
+    but in one-shot mode nobody is there to click approve, so the task did not
+    happen. An orchestrator trusting ``status`` must not collect that as a win.
     """
     response["session_id"] = processor.session_id if processor else None
     response["usage"] = processor.usage if processor else None
@@ -94,6 +125,21 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     response["report_ok"] = bool(
         report and all(b.lower().replace("-", "_") in report for b in _REPORT_BOOKENDS)
     )
+    if response.get("status") == "success":
+        blocked = _detect_blocked(response.get("result") or "")
+        if blocked:
+            # Always surface what was seen; only DOWNGRADE when the report
+            # contract is also missing (a completed report + a quoted approval
+            # phrase in the tail is a legitimate result, not a stuck run).
+            response["blocked_indicators"] = blocked
+            if not response["report_ok"]:
+                response["status"] = "blocked"
+                response["error"] = (
+                    "sub-agent ended awaiting interactive approval "
+                    f"(markers: {', '.join(blocked)}). Likely causes: permission "
+                    "level too low for the task, or the prompt references files "
+                    "outside --cwd (sandboxed reads). Fix the cause and re-dispatch."
+                )
     if response.get("status") == "success" and not response["report_ok"]:
         response["suspect"] = True
     return response
@@ -376,9 +422,16 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000) -> dict:
 
     Response shape: ``{result, exit_code, status, cli, error?}``.
     """
+    started = time.monotonic()
     command, args, env_override = build_invocation_args(inv)
     command, args = _resolve_launch(command, args)
     proc_env = _merge_env(env_override)
+
+    def _stamp(resp: dict) -> dict:
+        # Wall-clock per dispatch — orchestrators need this for concurrency
+        # tuning and it costs nothing to provide.
+        resp["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+        return resp
 
     try:
         # stdin=DEVNULL: sub-agent CLIs (notably codex) probe stdin for "additional
@@ -397,9 +450,9 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000) -> dict:
             env=proc_env,
         )
     except FileNotFoundError:
-        return _enrich(_error_response(inv.cli, 127, f"CLI not found: {command}"), None)
+        return _stamp(_enrich(_error_response(inv.cli, 127, f"CLI not found: {command}"), None))
     except OSError as e:
-        return _enrich(_error_response(inv.cli, 1, f"{type(e).__name__}: {e}"), None)
+        return _stamp(_enrich(_error_response(inv.cli, 1, f"{type(e).__name__}: {e}"), None))
 
     response = _drive_process(process, inv.cli, timeout_ms)
     # Resume handle: what the orchestrator passes to a follow-up `--resume`.
@@ -409,7 +462,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000) -> dict:
     if inv.cli == "agy" and env_override:
         resume["profile"] = env_override.get("USERPROFILE")
     response["resume"] = resume
-    return response
+    return _stamp(response)
 
 
 def _merge_env(env_override: dict | None) -> dict | None:

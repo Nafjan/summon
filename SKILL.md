@@ -103,6 +103,7 @@ Parse JSON output and check `status` field:
 | status | Meaning | Action |
 |--------|---------|--------|
 | `success` | Task completed | Use `result` directly |
+| `blocked` | Sub-agent ended awaiting an interactive approval (CLI exited 0, but nobody can click approve in one-shot mode) | Raise the `permission` level or move referenced files under `--cwd`, then re-dispatch. `blocked_indicators` lists the markers seen |
 | `partial` | Timeout but has output | Review partial `result`, may need retry |
 | `error` | Execution failed | Check `error` field and `exit_code`, fix and retry |
 
@@ -125,7 +126,7 @@ Parse JSON output and check `status` field:
 | `--agent` | Yes* | Agent definition name from --list |
 | `--prompt` | Yes* | Task description to delegate |
 | `--cwd` | Yes* | Working directory (absolute path) |
-| `--timeout` | No | Timeout ms (default: 600000) |
+| `--timeout` | No | Bare ms or with suffix: `600s`, `10m` (default: 600000 = 10m). Set your host tool's own timeout ABOVE this value — the script needs a few seconds of overhead beyond the CLI deadline |
 | `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `gemini`, `agy` |
 | `--model` | No | Override the agent's frontmatter model for this call |
 | `--effort` | No | Reasoning effort (claude only): `low`\|`medium`\|`high`\|`xhigh`\|`max` |
@@ -146,6 +147,8 @@ Every response carries structured fields for programmatic orchestration:
 | `report_ok` | `true` when the full contract block is present. If `status:"success"` but `report_ok:false`, the response also has `suspect:true` — re-dispatch rather than trusting it. |
 | `resume` | `{cli, session_id, profile?}`. Feed `session_id` to `--resume` (or `profile` to `--resume-profile` for agy) for a cheap follow-up that skips re-sending the agent definition. |
 | `session_id`, `usage`, `cost_usd` | Telemetry (claude/codex expose all; agy exposes none). Track spend/tokens across a chain. |
+| `elapsed_ms` | Wall-clock for the dispatch (present on every path, including errors). Use it to tune swarm concurrency. |
+| `blocked_indicators` | Approval-request phrases found in the result tail. With a missing report contract the status is downgraded to `blocked`; with a complete report they are informational only. |
 | `worktree` | `{path, branch}` when `--worktree` was used. Merge the branch and `git worktree remove` when done — cleanup is the orchestrator's job. |
 
 **Shared memory:** if `{cwd}/.agents/memory.md` exists it is auto-injected into every
@@ -176,6 +179,29 @@ exposes it. Each entry is tagged with a `source` so you know how much to trust i
 Prefer floating aliases (`opus`/`sonnet`) over pinned IDs unless an agent deliberately
 needs a fixed model (e.g. `fable` = the escalation tier). Discover with `--list-models`,
 invoke with `--model` — new models never require editing the skill itself.
+
+## Fan-out (swarms) — the blessed pattern
+
+The script is deliberately single-shot; swarms are built by composing `--background`.
+The pattern that works (verified on 40-run workloads):
+
+1. **Payload in files, not prompts.** Write each work packet under `--cwd`
+   (e.g. `.agents/packets/job-07.md`) and keep the `--prompt` short: "Read
+   .agents/packets/job-07.md and follow it." Hard numbers: agy rejects prompts
+   over ~28,000 chars (Windows argv limit); other CLIs degrade before they fail.
+   Files under cwd also avoid `blocked` reads.
+2. **Dispatch with `--background`** — each call returns
+   `{job_id, pid, result_file}` immediately. Completion = the `result_file`
+   exists (the write is atomic; a present file is a complete JSON envelope).
+3. **Throttle per backend, not globally.** Safe starting points: 3-4 concurrent
+   claude/codex/cursor; 2 concurrent agy (each run gets its own isolated
+   profile, so concurrency is safe — the cap is for machine load, not
+   correctness). Use `elapsed_ms` from completed envelopes to tune.
+4. **Editing swarms get `--worktree`** (one per agent, branches never collide).
+   Read-only swarms don't need it.
+5. **Judge with the envelope**: collect `report.status` / `report.handoff`,
+   treat `blocked` and `suspect: true` as re-dispatch signals, and sum
+   `usage`/`cost_usd` for the bill.
 
 ## Agent Definition Location
 
@@ -213,14 +239,40 @@ How results should be structured.
 
 | Field | Values | Description |
 |-------|--------|-------------|
-| `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini` | Which CLI executes this agent |
+| `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `agy` | Which CLI executes this agent |
 | `permission` | `read-only`, `safe-edit` (default), `yolo` | Approval/sandbox level the sub-agent runs with |
+| `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it |
 
-`permission` levels (mapped per-CLI by the skill):
+**`model:` per-CLI semantics** (the string is passed to the CLI verbatim):
 
-- `read-only` — investigation only, no edits/writes
-- `safe-edit` — auto-approve edits in workspace, suppress prompts (default)
-- `yolo` — bypass all approvals and sandboxing
+| CLI | Accepts | Example | Unpinned default |
+|-----|---------|---------|------------------|
+| claude | alias (floats to latest) or full ID | `opus`, `sonnet`, `claude-fable-5` | CLI's default |
+| codex | any codex model id (`-m`) | `gpt-5.6-sol` | `~/.codex/config.toml` `model` |
+| cursor-agent | cursor model ids | `composer-2.5` | `composer-2.5` |
+| gemini | gemini model ids (`-m`) | `gemini-3.1-pro` | CLI's default |
+| agy | display name or slug (see `agy models`) | `Claude Opus 4.6 (Thinking)`, `gemini-3.1-pro` | Gemini Flash tier |
+
+Run `--list-models` to see what each backend can run right now.
+
+**`permission` → exact per-CLI flags** (what the script actually passes — the
+levels are NOT identical across CLIs; when behavior surprises you, check this table):
+
+| Level | claude | codex | cursor-agent | gemini | agy |
+|-------|--------|-------|--------------|--------|-----|
+| `read-only` | `--permission-mode plan` | `-s read-only` | `--mode plan` | `--approval-mode plan` | `--sandbox` |
+| `safe-edit` | `--permission-mode acceptEdits` | `-s workspace-write -c approval_policy=never` | `--trust` | `--approval-mode auto_edit` | `--dangerously-skip-permissions` |
+| `yolo` | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `-f --trust` | `-y` | `--dangerously-skip-permissions` |
+
+Caveats worth knowing:
+- `read-only` sandboxes differ: claude's plan mode can block even *reads* the
+  prompt depends on (a blocked run now returns `status: blocked` — see the
+  status table). If a read-only agent must read files, keep them under `--cwd`.
+- agy has no true read-only: `--sandbox` is its closest mode, and `safe-edit`
+  already maps to skip-permissions there (constrain by instruction instead).
+- For investigation agents that only need to *read*, `yolo` +
+  "do not modify files" in the agent body is often more reliable than
+  `read-only` — several CLIs' plan modes end turns asking for approval.
 
 ## CLI Selection Priority
 
@@ -236,4 +288,7 @@ How results should be structured.
 | Skip `--list` before execution | Agent not found error | Always run `--list` first |
 | Use relative path for `--cwd` | Validation fails | Use absolute path |
 | Ignore `status` field in response | Undetected errors | Always check `status` before using `result` |
-| Very long prompts | May exceed CLI limits | Break into smaller tasks |
+| Prompt references files OUTSIDE `--cwd` | Sandboxed reads → run ends awaiting approval (`status: blocked`) | Put every input file under `--cwd` before dispatching |
+| Very long prompts | agy hard-fails over ~28,000 chars; others degrade | File-based payload: write the packet under `--cwd`, prompt = "Read <file> and follow it" |
+| `run-agent: gemini` on a deprecated/ineligible account | Multi-layer auth error (IneligibleTierError buried under warnings) | Run `--doctor` first; prefer `agy` for the Google lane |
+| Host tool timeout ≤ `--timeout` | Host kills the script before it can report | Set the host's timeout above `--timeout` + a few seconds of overhead |
