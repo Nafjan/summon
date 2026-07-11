@@ -882,6 +882,75 @@ def test_roster_modes_mutually_exclusive():
     assert r.returncode == 1 and "mutually exclusive" in _json.loads(r.stdout)["error"]
 
 
+def test_openai_compat_http_roundtrip():
+    # Full openai-compat path against a stdlib mock server: result, usage,
+    # model.resolved, billing=api, envelope — all through _enrich/_stamp.
+    import http.server, threading, subprocess as sp, json as _json
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_POST(self):
+            req = _json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            out = {"model": req["model"],
+                   "choices": [{"message": {"content": "PONG " + req["messages"][-1]["content"][:10]}}],
+                   "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}}
+            body = _json.dumps(out).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers()
+            self.wfile.write(body)
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    d = tempfile.mkdtemp(prefix="summon-apitest-")
+    try:
+        open(os.path.join(d, "bot.md"), "w", encoding="utf-8").write(
+            f"---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:{port}/v1\n"
+            f'api_key_env: ""\nmodel: test-model\n---\n# Bot\nrole.\n')
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+        r = sp.run([sys.executable, script, "--agent", "bot", "--prompt", "ping",
+                    "--cwd", d, "--agents-dir", d, "--timeout", "30s"],
+                   capture_output=True, text=True, encoding="utf-8")
+        env = _json.loads(r.stdout)
+        assert env["status"] == "success" and env["result"].startswith("PONG")
+        assert env["model"] == {"requested": "test-model", "resolved": "test-model"}
+        assert env["usage"]["total_tokens"] == 9 and env["billing"]["source"] == "api"
+        assert env["envelope"] == 1
+    finally:
+        srv.shutdown()
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_openai_compat_provider_resolution():
+    import _apibackend
+    # inline base_url wins; a known provider resolves; unknown raises
+    bu, key = _apibackend.resolve_endpoint(
+        {"base_url": "http://x/v1/", "api_key_env": "MY_KEY"}, None)
+    assert bu == "http://x/v1" and key == "MY_KEY"
+    bu, key = _apibackend.resolve_endpoint({"provider": "openrouter", "model": "m"}, None)
+    assert bu == "https://openrouter.ai/api/v1" and key == "OPENROUTER_API_KEY"
+    bu, key = _apibackend.resolve_endpoint({"provider": "ollama"}, None)
+    assert "11434" in bu and key == ""   # local, no key
+    try:
+        _apibackend.resolve_endpoint({"provider": "nope"}, None)
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+
+def test_billing_inference():
+    from _builder import infer_billing
+    assert infer_billing("agy")["source"] == "subscription"
+    assert infer_billing("openai-compat")["source"] == "api"
+    # codex is subscription unless the guard is opted out with a key present
+    orig = dict(os.environ)
+    try:
+        os.environ.pop("OPENAI_API_KEY", None); os.environ.pop("SUBAGENTS_ALLOW_OPENAI_KEY", None)
+        assert infer_billing("codex")["source"] == "subscription"
+        os.environ["OPENAI_API_KEY"] = "x"; os.environ["SUBAGENTS_ALLOW_OPENAI_KEY"] = "1"
+        assert infer_billing("codex")["source"] == "api"
+    finally:
+        os.environ.clear(); os.environ.update(orig)
+
+
 def test_council_prompts_and_position_extraction():
     import _council
     # position = report summary (+findings) when present, else result tail
@@ -907,9 +976,10 @@ def test_council_run_structure_with_stubbed_dispatch():
         for a in ("m1", "m2", "chair"):
             open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
                 "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\nrole.\n")
-        calls = {"n": 0}
-        def fake_dispatch(agent, prompt, cwd, agents_dir, timeout, out_dir, tag):
+        calls = {"n": 0, "timeouts": []}
+        def fake_dispatch(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
             calls["n"] += 1
+            calls["timeouts"].append(timeout_ms)
             if agent == "chair":
                 return {"status": "success", "result": "DECISION: X, CONFIDENCE 0.9",
                         "model": {"resolved": "claude-fable-5"},
@@ -922,7 +992,7 @@ def test_council_run_structure_with_stubbed_dispatch():
         try:
             args = argparse.Namespace(question="X or Y?", question_file=None,
                                       members="m1,m2", chairman="chair", rounds=2,
-                                      cwd=os.getcwd(), agents_dir=d, timeout="60s")
+                                      cwd=os.getcwd(), agents_dir=d, timeout=90000)
             import io, contextlib
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
@@ -932,13 +1002,61 @@ def test_council_run_structure_with_stubbed_dispatch():
         env = __import__("json").loads(buf.getvalue())
         assert rc == 0 and env["mode"] == "council" and env["rounds"] == 2
         assert len(env["members"]) == 2 and {m["agent"] for m in env["members"]} == {"m1", "m2"}
-        assert env["synthesis"]["chairman"] == "chair"
+        assert env["synthesis"]["chairman"] == "chair" and env["failed_members"] == []
         assert "DECISION" in env["synthesis"]["recommendation"]
-        # 2 members x 2 rounds + 1 chairman = 5 dispatches
-        assert calls["n"] == 5, calls["n"]
+        assert calls["n"] == 5, calls["n"]           # 2 members x 2 rounds + chairman
+        assert all(t == 90000 for t in calls["timeouts"])  # --timeout ms plumbed, not dropped
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
+
+
+def test_council_validation_and_member_status():
+    import _council, argparse, io, contextlib, tempfile, json as _json
+    def run(ns):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = _council.run_council(ns)
+        return rc, _json.loads(buf.getvalue())
+    base = dict(question="q", question_file=None, chairman="chair",
+                cwd=os.getcwd(), timeout=60000, rounds=1)
+    d = tempfile.mkdtemp(prefix="summon-cval-")
+    try:
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+        # duplicate members rejected
+        rc, env = run(argparse.Namespace(**base, members="m1,m1", agents_dir=d))
+        assert rc == 1 and "duplicate" in env["error"]
+        # invalid rounds rejected
+        rc, env = run(argparse.Namespace(**{**base, "rounds": 5}, members="m1,m2", agents_dir=d))
+        assert rc == 1 and "rounds" in env["error"]
+        # a FAILED member -> status partial (not success), listed in failed_members
+        orig = _council._dispatch
+        def fake(agent, *a, **k):
+            if agent == "chair":
+                return {"status": "success", "result": "DECISION", "report": {"summary": "s"}}
+            if agent == "m2":
+                return {"status": "error", "error": "boom"}
+            return {"status": "success", "result": "ok", "report": {"summary": "ok"}}
+        _council._dispatch = fake
+        try:
+            rc, env = run(argparse.Namespace(**base, members="m1,m2", agents_dir=d))
+        finally:
+            _council._dispatch = orig
+        assert rc == 1 and env["status"] == "partial" and env["failed_members"] == ["m2"]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_council_dry_run_rejected():
+    import json as _json, subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    r = sp.run([sys.executable, script, "--council", "--question", "x",
+                "--cwd", os.getcwd(), "--dry-run"], capture_output=True, text=True)
+    env = _json.loads(r.stdout)
+    assert env["status"] == "error" and "council" in env["error"] and r.returncode == 1
 
 
 def test_dry_run_resolves_without_executing():

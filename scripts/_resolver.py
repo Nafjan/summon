@@ -12,7 +12,7 @@ import re
 import shutil
 import subprocess
 
-_VALID_CLIS = ("claude", "cursor-agent", "codex", "gemini", "agy")
+_VALID_CLIS = ("claude", "cursor-agent", "codex", "gemini", "agy", "openai-compat")
 
 
 def detect_caller_cli() -> str | None:

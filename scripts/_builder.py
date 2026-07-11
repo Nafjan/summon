@@ -39,6 +39,8 @@ class AgentInvocation:
     resume_id: str | None = None       # backend session/thread/chat id to resume
     resume_profile: str | None = None  # agy only: profile dir of the session to resume
     extra_args: tuple = ()             # arbitrary backend flags (agent `args:` frontmatter)
+    base_url: str | None = None        # openai-compat only: resolved API base url
+    api_key_env: str | None = None     # openai-compat only: env var holding the API key
 
 
 # Short report-contract nudge appended to RESUME prompts. On resume the session
@@ -178,6 +180,36 @@ def _build_gemini_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         command, base_args = build_command(inv.cli, inv.prompt)
         return command, perm + model_flag + list(inv.extra_args) + base_args, {"GEMINI_SYSTEM_MD": inv.agent_file}
     return _concatenated_args(inv, perm + model_flag + list(inv.extra_args), env=None)
+
+
+# Which env var flips each CLI from subscription (login) to metered API billing.
+_API_KEY_ENV = {
+    "claude": "ANTHROPIC_API_KEY",
+    "codex": "OPENAI_API_KEY",
+    "cursor-agent": "CURSOR_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+}
+
+
+def infer_billing(cli: str) -> dict:
+    """Best-effort ``{source, note}`` — does this run draw from the vendor
+    SUBSCRIPTION (CLI login) or metered API credits (an API key in the env)?
+    Reflects summon's own env handling (codex has OPENAI_API_KEY stripped by
+    default). Advisory only; the vendor's billing is the source of truth."""
+    if cli == "openai-compat":
+        return {"source": "api", "note": "OpenAI-compatible endpoint (API key / credits)"}
+    if cli == "agy":
+        return {"source": "subscription", "note": "Google login (no API-key path)"}
+    if cli == "codex":
+        if os.environ.get("OPENAI_API_KEY") and os.environ.get("SUBAGENTS_ALLOW_OPENAI_KEY") == "1":
+            return {"source": "api", "note": "OPENAI_API_KEY present (billing guard opted out)"}
+        return {"source": "subscription", "note": "ChatGPT login (OPENAI_API_KEY stripped)"}
+    key = _API_KEY_ENV.get(cli)
+    if key and os.environ.get(key):
+        return {"source": "api", "note": f"{key} set in env"}
+    if key:
+        return {"source": "subscription", "note": f"CLI login (no {key})"}
+    return {"source": "unknown", "note": ""}
 
 
 def _codex_env_override() -> dict | None:
