@@ -36,9 +36,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _builder import AgentInvocation  # noqa: E402
+from _executor import ENVELOPE_VERSION as _ENVELOPE_VERSION  # noqa: E402
 from _executor import execute_agent  # noqa: E402
 from _loader import get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
+
+__version__ = "0.9.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -185,6 +188,8 @@ def main() -> None:
     except Exception:
         pass
     parser = argparse.ArgumentParser(description="Execute external CLI AIs as sub-agents")
+    parser.add_argument("--version", action="version",
+                        version=f"summon {__version__} (envelope schema v{_ENVELOPE_VERSION})")
     parser.add_argument("--list", action="store_true", help="List available agents")
     parser.add_argument("--list-models", dest="list_models", action="store_true",
                         help="Report invocable models per backend (live where the CLI exposes it; "

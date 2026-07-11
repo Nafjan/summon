@@ -65,6 +65,10 @@ _BLOCKED_TAIL = 800
 # success leak again, on the MOST compliant path). Only ever downgrades.
 _REPORT_TO_ENVELOPE = {"BLOCKED": "blocked", "PARTIAL": "partial", "ERROR": "error"}
 
+# Envelope schema version — bumped only on a breaking change to the response
+# shape, so an orchestrator can branch on it. Adding fields does NOT bump it.
+ENVELOPE_VERSION = 1
+
 
 def _detect_blocked(text: str) -> list:
     """Approval markers present in the TAIL of the result (case-insensitive)."""
@@ -124,6 +128,7 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     but in one-shot mode nobody is there to click approve, so the task did not
     happen. An orchestrator trusting ``status`` must not collect that as a win.
     """
+    response["envelope"] = ENVELOPE_VERSION
     response["session_id"] = processor.session_id if processor else None
     response["usage"] = processor.usage if processor else None
     response["cost_usd"] = processor.cost_usd if processor else None

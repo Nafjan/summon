@@ -153,7 +153,15 @@ errors) go to stderr. If you see noise ahead of the envelope, it is coming from 
 shell profile or host wrapper, not the dispatcher; `--out FILE` sidesteps parsing
 stdout entirely.
 
-*Required when not using --list
+\*Required for a **dispatch** (running an agent). Not needed for the query/management
+modes — `--list`, `--list-models`, `--doctor`, `--new-agent`, `--set-agent`, `--version`,
+or `--manifest` (which carries its own jobs).
+
+**Mode-scoped flags** (ignored/invalid outside their mode): `--json` → `--doctor` only;
+`--set` → `--new-agent`/`--set-agent` only; `--concurrency`/`--results-dir` → `--manifest`
+only; `--resume-profile` → agy resume only. Mutually exclusive: `--dry-run` with
+`--background`/`--manifest`; `--background` with `--out` (background reports completion
+via its own `result_file` — use `--manifest` for fan-out with result files).
 
 ## Chaining & continuity (response fields)
 
@@ -337,8 +345,10 @@ Rules that still apply (manifest or manual):
    for machine-readable verdicts, and sum `usage`/`cost_usd` for the bill.
 
 **Manual path** (when you need per-job worktrees or custom scheduling): dispatch
-each job with `--background --out <file>`; completion = the file exists; the
-rest is the same envelope contract.
+each job with `--background`, which returns `{job_id, pid, result_file}` at once;
+completion = its `result_file` exists (atomically written = complete). Poll those.
+(`--background` and `--out` are separate mechanisms and can't be combined — use
+`--manifest` when you want per-job result files at chosen paths.)
 
 ## Agent Definition Location
 

@@ -288,6 +288,18 @@ def test_timeout_suffix_parsing():
         pass
 
 
+def test_envelope_version_and_cli_version():
+    import _executor
+    from _executor import _enrich, ENVELOPE_VERSION
+    out = _enrich({"result": "x", "status": "success", "cli": "claude"}, None)
+    assert out["envelope"] == ENVELOPE_VERSION == 1
+    # --version flag prints and exits 0
+    import subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    r = sp.run([sys.executable, script, "--version"], capture_output=True, text=True)
+    assert r.returncode == 0 and "summon" in r.stdout and "envelope schema" in r.stdout
+
+
 def test_elapsed_ms_present_even_on_spawn_failure():
     import _executor
     from _builder import AgentInvocation
