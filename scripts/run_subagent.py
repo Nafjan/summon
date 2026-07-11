@@ -242,6 +242,17 @@ def main() -> None:
     parser.add_argument("--concurrency", help="With --manifest: per-backend caps, e.g. agy=2,codex=3,default=3")
     parser.add_argument("--results-dir", dest="results_dir",
                         help="With --manifest: envelope dir (default {cwd}/.agents/results)")
+    parser.add_argument("--council", action="store_true",
+                        help="Decide by consensus: dispatch --question to diverse members, "
+                             "then a chairman synthesizes. See SKILL.md")
+    parser.add_argument("--question", help="With --council: the decision/question to deliberate")
+    parser.add_argument("--question-file", dest="question_file",
+                        help="With --council: read the question from a file")
+    parser.add_argument("--members", help="With --council: comma-separated member agents "
+                                          "(default: a vendor-diverse set)")
+    parser.add_argument("--chairman", help="With --council: the synthesizer agent (default: fable)")
+    parser.add_argument("--rounds", type=int, default=1,
+                        help="With --council: 1 (independent) or 2 (adds cross-examination)")
 
     args = parser.parse_args()
 
@@ -316,6 +327,11 @@ def main() -> None:
     if args.manifest:
         from _manifest import run_manifest
         sys.exit(run_manifest(args))
+
+    # --council: consensus deliberation. Delegates to _council and exits.
+    if args.council:
+        from _council import run_council
+        sys.exit(run_council(args))
 
     # --out resume behavior: a pre-existing valid envelope means this job is
     # already done — emit it (marked skipped) and exit without dispatching.

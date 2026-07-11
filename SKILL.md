@@ -146,6 +146,9 @@ Parse JSON output and check `status` field:
 | `--manifest FILE` | - | Batch fan-out: run all jobs in a JSON manifest (see "Fan-out" below). Combine with `--concurrency` and `--results-dir` |
 | `--concurrency` | No | With `--manifest`: per-backend caps, e.g. `agy=2,codex=3,default=3` |
 | `--results-dir` | No | With `--manifest`: where job envelopes land (default `{cwd}/.agents/results`) |
+| `--council` | - | Consensus deliberation: dispatch `--question` to diverse members, chairman synthesizes. See "Council mode" |
+| `--question` / `--question-file` | With `--council` | The decision to deliberate |
+| `--members` / `--chairman` / `--rounds` | No | With `--council`: member agents (default diverse set), synthesizer (default `fable`), 1 or 2 rounds |
 
 **Stdout contract:** for dispatch commands, stdout carries **exactly one JSON object** —
 nothing before it, nothing after. All diagnostics (manifest progress lines, argparse
@@ -349,6 +352,32 @@ each job with `--background`, which returns `{job_id, pid, result_file}` at once
 completion = its `result_file` exists (atomically written = complete). Poll those.
 (`--background` and `--out` are separate mechanisms and can't be combined — use
 `--manifest` when you want per-job result files at chosen paths.)
+
+## Council mode (`--council`) — decide by consensus
+
+For a DECISION (not a task), convene a council of diverse models/personas, then a
+chairman synthesizes a consensus recommendation:
+
+```bash
+run_subagent.py --council --question "SQL or NoSQL for this workload?" --cwd <abs>
+run_subagent.py --council --question-file q.md \
+  --members planner,reviewer,researcher,pair --chairman fable --rounds 2 --cwd <abs>
+```
+
+- **Members** are agents (each encodes a model + persona); the default set is
+  deliberately vendor-diverse (`planner`/opus, `reviewer`/codex, `researcher`/agy,
+  `pair`/sonnet-5). Override with `--members`; author custom-persona members with
+  `--new-agent`. A council of clones is pointless — keep it diverse.
+- **`--rounds 2`** adds a cross-examination round: each member sees the others'
+  anonymized positions and refines. `--rounds 1` (default) = independent positions.
+- **The chairman** (`--chairman`, default `fable`) reads all final positions and
+  returns the decision, a confidence, the points of agreement, the dissents (named),
+  and a next action — making the call even when the council is split.
+
+Returns one council envelope: `{question, rounds, members:[{agent, model, position}],
+synthesis:{chairman, recommendation, report}, elapsed_ms}`. Progress → stderr.
+Use it for architecture calls, tech-selection, risk judgments — anything where one
+model's blind spot is real and consensus (or named dissent) is the deliverable.
 
 ## Agent Definition Location
 

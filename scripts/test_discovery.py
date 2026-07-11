@@ -866,6 +866,65 @@ def test_roster_modes_mutually_exclusive():
     assert r.returncode == 1 and "mutually exclusive" in _json.loads(r.stdout)["error"]
 
 
+def test_council_prompts_and_position_extraction():
+    import _council
+    # position = report summary (+findings) when present, else result tail
+    assert _council._position({"report": {"summary": "use X", "findings": "because Y"}}) \
+        .startswith("use X")
+    assert _council._position({"result": "raw answer"}) == "raw answer"
+    q = "SQL or NoSQL?"
+    assert "QUESTION" in _council._round1_prompt(q) and q in _council._round1_prompt(q)
+    p2 = _council._round2_prompt(q, ["pos A", "pos B"])
+    assert "round 2" in p2 and "Advisor A" in p2 and "Advisor B" in p2
+    ch = _council._chairman_prompt(q, [{"agent": "planner", "backend": "claude",
+                                        "model": "opus", "position": "go SQL"}])
+    assert "CHAIRMAN" in ch and "CONFIDENCE" in ch and "go SQL" in ch
+
+
+def test_council_run_structure_with_stubbed_dispatch():
+    # Full run_council flow with dispatch stubbed (no live models). Verifies the
+    # envelope shape, parallel member collection, and chairman synthesis.
+    import _council, argparse, tempfile, types
+    d = tempfile.mkdtemp(prefix="summon-council-test-")
+    try:
+        # two real agent files so validation passes
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\nrole.\n")
+        calls = {"n": 0}
+        def fake_dispatch(agent, prompt, cwd, agents_dir, timeout, out_dir, tag):
+            calls["n"] += 1
+            if agent == "chair":
+                return {"status": "success", "result": "DECISION: X, CONFIDENCE 0.9",
+                        "model": {"resolved": "claude-fable-5"},
+                        "report": {"summary": "X wins"}}
+            return {"status": "success", "result": f"{agent} says go",
+                    "model": {"resolved": "claude-sonnet-5"},
+                    "report": {"summary": f"{agent}: pick X"}}
+        orig = _council._dispatch
+        _council._dispatch = fake_dispatch
+        try:
+            args = argparse.Namespace(question="X or Y?", question_file=None,
+                                      members="m1,m2", chairman="chair", rounds=2,
+                                      cwd=os.getcwd(), agents_dir=d, timeout="60s")
+            import io, contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = _council.run_council(args)
+        finally:
+            _council._dispatch = orig
+        env = __import__("json").loads(buf.getvalue())
+        assert rc == 0 and env["mode"] == "council" and env["rounds"] == 2
+        assert len(env["members"]) == 2 and {m["agent"] for m in env["members"]} == {"m1", "m2"}
+        assert env["synthesis"]["chairman"] == "chair"
+        assert "DECISION" in env["synthesis"]["recommendation"]
+        # 2 members x 2 rounds + 1 chairman = 5 dispatches
+        assert calls["n"] == 5, calls["n"]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 def test_dry_run_resolves_without_executing():
     import json as _json
     import subprocess as sp
