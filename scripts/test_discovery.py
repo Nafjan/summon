@@ -780,6 +780,60 @@ def test_roster_set_agent_edits_frontmatter_only():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_roster_rejects_newline_injection():
+    # A newline in a --set value must NOT smuggle a second frontmatter key.
+    import _roster
+    d = tempfile.mkdtemp(prefix="summon-inj-")
+    try:
+        _roster.new_agent(d, "victim", {"permission": "read-only"})
+        path = os.path.join(d, "victim.md")
+        for evil in ("plain\npermission: yolo", "x\n---\nowned", "a\rpermission: yolo"):
+            try:
+                _roster.set_agent(d, "victim", {"model": evil})
+                raise AssertionError(f"injection not rejected: {evil!r}")
+            except ValueError as e:
+                assert "control character" in str(e)
+        # the victim's permission is untouched
+        from _loader import load_agent
+        assert load_agent(d, "victim")[4] == "read-only"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_roster_preserves_crlf_body_and_dedups_keys():
+    import _roster
+    from _loader import load_agent
+    d = tempfile.mkdtemp(prefix="summon-crlf-")
+    try:
+        # hand-build a CRLF file with a duplicate key and a body containing '---'
+        path = os.path.join(d, "raw.md")
+        body = b"\r\n# Raw\r\nline with --- inside\r\nmodel: not-a-key-here\r\n"
+        with open(path, "wb") as fh:
+            fh.write(b"---\r\nrun-agent: claude\r\npermission: safe-edit\r\n"
+                     b"permission: safe-edit\r\n---\r\n" + body)
+        _roster.set_agent(d, "raw", {"model": "claude-sonnet-5", "permission": "yolo"})
+        raw = open(path, "rb").read()
+        # body bytes preserved exactly (CRLF intact, the '---' body line survives)
+        assert raw.endswith(body), "body not byte-preserved"
+        # duplicate permission collapsed to the single new value
+        assert raw.count(b"permission:") == 1
+        ra, _, _, _, perm, model, _ = load_agent(d, "raw")
+        assert perm == "yolo" and model == "claude-sonnet-5" and ra == "claude"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_roster_modes_mutually_exclusive():
+    import json as _json, subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    r = sp.run([sys.executable, script, "--new-agent", "a", "--set-agent", "b",
+                "--agents-dir", tempfile.gettempdir()],
+               capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 1 and "mutually exclusive" in _json.loads(r.stdout)["error"]
+
+
 def test_dry_run_resolves_without_executing():
     import json as _json
     import subprocess as sp

@@ -79,6 +79,14 @@ def parse_sets(pairs: list) -> dict:
 
 def _validate_values(sets: dict, allow_empty: bool) -> None:
     for key, value in sets.items():
+        # SECURITY: a CR/LF (or other control char) in a value would, when
+        # written as `key: value`, inject a SECOND frontmatter line — smuggling
+        # an unintended key (e.g. escalating permission to yolo) or an injected
+        # `---` that terminates the frontmatter early and poisons the body.
+        # Reject outright; a legitimate model id / flag never contains one.
+        if any(ord(c) < 0x20 for c in value):
+            raise ValueError(f"--set {key}: value contains a control character "
+                             "(newline/CR/etc.) — not allowed")
         if value == "":
             if not allow_empty:
                 raise ValueError(f"--set {key}= (empty) is only valid with --set-agent (removes the key)")
@@ -91,12 +99,19 @@ def _validate_values(sets: dict, allow_empty: bool) -> None:
             parse_extra_args(value)  # raises ValueError on unbalanced quoting
 
 
-def _atomic_write(path: str, text: str) -> None:
+def _atomic_write_bytes(path: str, data: bytes) -> None:
     d = os.path.dirname(os.path.abspath(path))
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".roster-", suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)  # never leave an orphan temp on failure
+        except OSError:
+            pass
+        raise
 
 
 def new_agent(agents_dir: str, name: str, sets: dict) -> dict:
@@ -113,8 +128,15 @@ def new_agent(agents_dir: str, name: str, sets: dict) -> dict:
         title=title,
     )
     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)  # FileExistsError if taken
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(text)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+    except OSError:
+        try:
+            os.unlink(path)  # don't leave a partial file squatting the name forever
+        except OSError:
+            pass
+        raise
     return {"path": path, "frontmatter": fm}
 
 
@@ -129,30 +151,31 @@ def set_agent(agents_dir: str, name: str, sets: dict) -> dict:
     path = os.path.join(agents_dir, f"{name}.md")
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Agent definition not found: {name}")
-    with open(path, encoding="utf-8") as fh:
-        content = fh.read()
-    # Match the delimiter TIGHTLY (one newline, not \s*\n): a greedy whitespace
-    # match would swallow the body's leading blank line and the rebuild would
-    # drop it — body must stay byte-identical.
-    m = re.match(r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", content, re.DOTALL)
+    # BINARY read/write: the body must stay byte-identical, so we never let text
+    # mode normalize its CRLFs to LF. Only the frontmatter block (which we are
+    # editing) is decoded/re-encoded; the body bytes are copied through verbatim.
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    # Tight delimiter match (one newline, not \s*\n) so a body leading-blank-line
+    # isn't swallowed. body starts exactly after the closing '---\n'.
+    m = re.match(rb"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", raw, re.DOTALL)
     if not m:
         raise ValueError(f"{name}: no frontmatter block to edit (file is not ----delimited)")
-    fm_lines, body = m.group(1).split("\n"), content[m.end():]
+    fm_text = m.group(1).decode("utf-8", errors="replace")
+    body = raw[m.end():]
+    # Frontmatter lines may carry a trailing \r on a CRLF file — strip it for the
+    # key test; we re-emit the (edited) frontmatter block as LF regardless.
+    fm_lines = [ln.rstrip("\r") for ln in fm_text.split("\n")]
 
-    remaining = dict(sets)
-    out_lines = []
-    for line in fm_lines:
-        key = line.split(":", 1)[0].strip() if ":" in line else None
-        if key in remaining:
-            value = remaining.pop(key)
-            if value != "":                      # empty value -> drop the line
-                out_lines.append(f"{key}: {value}")
-        else:
-            out_lines.append(line)
-    for key, value in remaining.items():         # keys not previously present
-        if value != "":
+    targets = set(sets)  # every occurrence of a target key is dropped, then re-added
+    out_lines = [ln for ln in fm_lines
+                 if (ln.split(":", 1)[0].strip() if ":" in ln else None) not in targets]
+    for key, value in sets.items():
+        if value != "":                          # empty value -> key removed
             out_lines.append(f"{key}: {value}")
 
-    _atomic_write(path, f"---\n" + "\n".join(out_lines) + "\n---\n" + body)
-    final_fm, _ = parse_frontmatter(open(path, encoding="utf-8").read())
+    new_fm = "\n".join(out_lines).encode("utf-8")
+    _atomic_write_bytes(path, b"---\n" + new_fm + b"\n---\n" + body)
+    with open(path, encoding="utf-8") as fh:
+        final_fm, _ = parse_frontmatter(fh.read())
     return {"path": path, "frontmatter": final_fm}

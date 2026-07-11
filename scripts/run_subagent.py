@@ -257,6 +257,9 @@ def main() -> None:
 
     # --new-agent / --set-agent: local roster management, no dispatch involved.
     if args.new_agent or args.set_agent:
+        if args.new_agent and args.set_agent:
+            _print_error("--new-agent and --set-agent are mutually exclusive; run one at a time")
+            sys.exit(1)
         from _roster import new_agent, parse_sets, set_agent
         try:
             sets = parse_sets(args.sets)
