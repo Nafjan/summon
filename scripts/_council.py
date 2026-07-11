@@ -93,20 +93,26 @@ def _round2_prompt(question: str, all_positions: list) -> str:
 
 def _parse_ranking(text: str, n: int) -> list | None:
     """Extract a member's ranking as position indices (best-first) from a
-    'RANKING: C, A, B' line. Robust: ignores invalid/duplicate letters; None if
-    no usable ranking. (Ranking is advisory — a member that skips it isn't fatal.)"""
-    m = re.search(r"(?im)^\s*RANKING:\s*(.+)$", text or "")
-    if not m:
+    'RANKING: C, A, B' line. Accepts ONLY a COMPLETE permutation of all n
+    candidates (an incomplete/garbage ballot is rejected, not silently given
+    partial first-place credit); the LAST valid RANKING line wins (models often
+    restate). Returns None if there's no complete ballot. Councils use A-Z labels,
+    so n>26 can't be ranked (returns None)."""
+    if n > 26:
         return None
     valid = {chr(65 + i) for i in range(n)}
-    seen: set = set()
-    order: list = []
-    for tok in re.findall(r"[A-Za-z]", m.group(1)):
-        t = tok.upper()
-        if t in valid and t not in seen:
-            seen.add(t)
-            order.append(ord(t) - 65)
-    return order or None
+    best = None
+    for m in re.finditer(r"(?im)^\s*RANKING:\s*(.+)$", text or ""):
+        seen: set = set()
+        order: list = []
+        for tok in re.findall(r"[A-Za-z]", m.group(1)):
+            t = tok.upper()
+            if t in valid and t not in seen:
+                seen.add(t)
+                order.append(ord(t) - 65)
+        if len(order) == n:            # complete permutation only
+            best = order
+    return best
 
 
 def _aggregate_rankings(rankings: list, n: int) -> list:
@@ -255,9 +261,11 @@ def run_council(args) -> int:
                 return run_member(agent, _round2_prompt(question, all_positions), f"r2-{agent}")
             with ThreadPoolExecutor(max_workers=len(members)) as pool:
                 results = list(pool.map(refine, members))
-            # Aggregate each member's ranking (Borda) into a consensus order.
+            # Aggregate each SUCCESSFUL member's ranking (Borda) into a consensus
+            # order — a failed/partial member's stray RANKING must not count.
             n = len(members)
-            votes = [r for r in (_parse_ranking(m.get("_raw", ""), n) for m in results) if r]
+            votes = [r for r in (_parse_ranking(m.get("_raw", ""), n)
+                                 for m in results if m.get("status") == "success") if r]
             if votes:
                 agg = _aggregate_rankings(votes, n)
                 consensus_ranking = [{"agent": members[a["index"]], "score": a["score"],

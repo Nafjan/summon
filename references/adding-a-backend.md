@@ -16,8 +16,18 @@ BACKENDS = {
 }
 ```
 
-`BACKEND_CLIS` (and the resolver's `_VALID_CLIS`, `--doctor`, `--list-models`) all derive
-from this dict — add an entry and the rest follows.
+`BACKEND_CLIS` and the resolver's `_VALID_CLIS` derive from this dict, and the executor
+dispatches by `backend_kind()` — so **dispatch and validity follow automatically**. A few
+things are NOT auto-wired and need a deliberate touch (they're per-backend by nature):
+
+- **`--doctor`** (`_doctor.py`) — checks CLI presence/version and shows install/auth hints.
+  A CLI backend should add an entry to `_BACKENDS` there; an `api` backend has no CLI to
+  probe, so it's fine to leave out (doctor checks machines, not per-agent endpoints).
+- **`--list-models`** (`_resolver.discover_models`) — add a branch if your backend can
+  report models; otherwise it simply won't appear there.
+- **api-backend config** — if `kind: "api"`, resolve your endpoint/frontmatter fields in
+  `run_subagent` (like `openai-compat`'s `provider`/`base_url`) and add any fields to
+  `AgentInvocation`. `--dry-run` renders any `api` backend generically.
 
 ## Kind 1 — `subprocess` (drive a CLI)
 

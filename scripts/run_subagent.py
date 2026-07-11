@@ -211,15 +211,20 @@ its options. Full docs: SKILL.md.
 
 def _rewrite_subcommand(argv: list) -> tuple:
     """Translate a leading subcommand into equivalent flat flags. Returns
-    ``(argv, mode)`` where mode is 'help' to print usage, or None. Legacy flat
-    invocations (argv starts with '-') pass through untouched."""
+    ``(argv, mode)`` where mode is 'help' (print usage, exit 0), a string
+    'error: …' (print error, exit 2), or None. Legacy flat invocations (argv
+    starts with '-') pass through untouched."""
     if not argv:
         return argv, "help"
     head = argv[0]
     if head.startswith("-") or head not in _SUBCOMMANDS:
         return argv, None  # legacy flat (or a stray token the flat parser reports)
-    rest = argv[1:]
     if head in ("help", "--help", "-h"):
+        return argv, "help"
+    rest = argv[1:]
+    # `<subcommand> --help/-h`: the argv-rewrite facade has no per-command parser,
+    # so show the general usage rather than argparse erroring on a missing positional.
+    if any(a in ("--help", "-h") for a in rest):
         return argv, "help"
     if head in ("dispatch", "run"):
         return rest, None
@@ -236,8 +241,12 @@ def _rewrite_subcommand(argv: list) -> tuple:
     if head == "manifest":            # first positional is the manifest file
         return (["--manifest", *rest], None)
     if head == "agent":
-        if not rest or rest[0] not in ("new", "set"):
-            return argv, "help"
+        if not rest:
+            return argv, "help"       # `summon agent` -> usage
+        if rest[0] not in ("new", "set"):
+            # an invalid action (e.g. `agent delete`) is an ERROR, not success —
+            # automation must not read exit 0 for a bogus command.
+            return argv, f"error: unknown 'agent' action {rest[0]!r} (use 'new' or 'set')"
         flag = "--new-agent" if rest[0] == "new" else "--set-agent"
         return ([flag, *rest[1:]], None)
     return argv, None
@@ -258,6 +267,9 @@ def main() -> None:
     if mode == "help":
         print(_USAGE)
         sys.exit(0)
+    if mode and mode.startswith("error:"):
+        _print_error(mode[len("error:"):].strip())
+        sys.exit(2)
 
     parser = argparse.ArgumentParser(description="Execute external CLI AIs as sub-agents")
     parser.add_argument("--version", action="version",
@@ -551,8 +563,8 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     """The fully resolved dispatch, without executing. For agy the per-call
     profile is NOT built (that copies OAuth tokens = a mutation); the wrapper
     path is shown instead."""
-    from _builder import (build_invocation_args, permission_flags as _pf,
-                          _PERMISSION_MAPPING, _agy_wrapper)
+    from _builder import (BACKENDS, backend_kind, build_invocation_args,
+                          permission_flags as _pf, _PERMISSION_MAPPING, _agy_wrapper)
     view = {
         "dry_run": True,
         "agent": args.agent,
@@ -570,21 +582,24 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
         "worktree": ("would create" if args.worktree is not None else None),
         "system_context_chars": len(invocation.system_context),
     }
-    if invocation.cli == "openai-compat":
-        view["command"] = "POST (openai-compat)"
+    if backend_kind(invocation.cli) == "api":
+        view["command"] = f"POST ({invocation.cli})"
         view["base_url"] = invocation.base_url
         view["endpoint"] = (invocation.base_url or "?") + "/chat/completions"
         view["api_key_env"] = invocation.api_key_env
         view["api_key_present"] = bool(invocation.api_key_env and os.environ.get(invocation.api_key_env))
         view["billing"] = {"source": "api"}
-    elif invocation.cli == "agy":
-        try:
-            view["command"] = "python <wrapper>"
-            view["wrapper"] = _agy_wrapper()
-            view["note"] = ("agy dry-run does not build the per-call profile (token copy "
-                            "is a mutation); at dispatch a fresh isolated profile is created")
-        except ValueError as e:
-            view["error"] = str(e)
+    elif BACKENDS.get(invocation.cli, {}).get("side_effects"):
+        # A side-effecting build (agy builds a per-call profile) must NOT run
+        # under --dry-run. Generic for any such backend; agy adds wrapper detail.
+        view["note"] = ("this backend's build has filesystem side-effects and is NOT "
+                        "invoked in --dry-run; the real dispatch performs them")
+        if invocation.cli == "agy":
+            try:
+                view["command"] = "python <wrapper>"
+                view["wrapper"] = _agy_wrapper()
+            except ValueError as e:
+                view["error"] = str(e)
     else:
         try:
             cmd, argv, env = build_invocation_args(invocation)
