@@ -211,6 +211,19 @@ def test_report_blocked_is_authoritative_over_exit0():
     assert "self-reported BLOCKED" in out["error"]
 
 
+def test_indicators_attached_even_when_report_downgraded():
+    # Markers + a full STATUS: BLOCKED report: status comes from the report,
+    # but the marker telemetry must still be attached (APPROVE-pass follow-up).
+    from _executor import _enrich
+    resp = {"result": "The tool call was blocked. Please approve.\n\nSTATUS: BLOCKED\n"
+                      "SUMMARY: sandboxed read\nFOLLOW-UP: move file under cwd\nHANDOFF: blocked",
+            "exit_code": 0, "status": "success", "cli": "claude"}
+    out = _enrich(resp, None)
+    assert out["status"] == "blocked"
+    assert out["blocked_indicators"], "markers must be attached despite report downgrade"
+    assert "self-reported BLOCKED" in out["error"]  # report reconciliation won the status
+
+
 def test_report_partial_and_error_map_to_envelope():
     from _executor import _enrich
     for rs, expected in (("PARTIAL", "partial"), ("ERROR", "error")):
