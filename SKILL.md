@@ -141,7 +141,7 @@ Parse JSON output and check `status` field:
 | `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
 | `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `gemini`, `agy` |
 | `--model` | No | Override the agent's frontmatter model for this call |
-| `--effort` | No | Reasoning effort (claude only): `low`\|`medium`\|`high`\|`xhigh`\|`max` |
+| `--effort` | No | Reasoning effort (claude + codex): `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none` = the backend's own default). Precedence: `--effort` > agent `effort:` frontmatter > `SUMMON_DEFAULT_EFFORT` env > built-in default **`high`** (summon delegates hard problems, so it reasons deeply by default; set `none`/lower to speed up). Surfaced in the envelope's `effort` field |
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy |
 | `--resume-profile` | No | agy only: the `resume.profile` path returned by the prior agy call |
 | `--worktree` | No | Run in an isolated git worktree (optional name; auto-named if bare) |
@@ -192,6 +192,7 @@ Every response carries structured fields for programmatic orchestration:
 | `elapsed_ms` | Wall-clock for the dispatch — on every DISPATCH envelope (success/blocked/partial/error/timeout, incl. spawn failures). Not on the `--background` handle or pre-dispatch validation errors. Use it to tune swarm concurrency. |
 | `model` | `{requested, resolved, models_used}` — what was asked for vs what the backend REPORTED serving. `resolved` is the **dominant** model (most output tokens); a claude session often also runs a cheap auxiliary model, so `models_used` lists **every** model id seen — don't read `resolved` as "the one model that served this run". `resolved: null` = the backend didn't say (agy never does): absence of proof, not proof of the requested model. Aliases (`opus`/`sonnet`) can lag a launch — pin the explicit ID for a guaranteed-latest run. |
 | `permission`, `permission_flags` | The permission level and the EXACT CLI flags it mapped to for this run — no more black box. |
+| `effort` | The reasoning effort actually applied (claude/codex; `null` = the backend's own default) — so an orchestrator knows how hard it thought and can re-dispatch at a different level. |
 | `attempts` | How many dispatches this envelope took (`--retries`). |
 | `parsed`, `parse_ok`, `parse_errors` | With `--json-schema`: the agent's final JSON (validated), whether it satisfied the schema, and the specific violations. `parse_retry: true` marks the corrective follow-up. `parse_warnings` lists any schema keywords that were NOT enforced (see below). |
 | `output_tail` | On non-success: the tail of the RAW captured output (stdout+stderr merged) so failures are diagnosable without a re-run. `--debug-dir` captures the full transcript. |
@@ -303,6 +304,7 @@ permissions.
 | `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `agy`, `openai-compat` | Which backend executes this agent (`openai-compat` = any OpenAI-compatible API — see "Custom & API backends") |
 | `permission` | `read-only`, `safe-edit` (default), `yolo` | Approval/sandbox level the sub-agent runs with |
 | `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.resolved` |
+| `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning effort for this agent (claude + codex); overrides the default `high`. `--effort` at dispatch overrides it |
 | `args` | shell-style string (optional) | Arbitrary extra backend flags passed verbatim, e.g. `args: -c model_reasoning_effort="high"` (codex). Model pinning stops being a special case |
 
 **`model:` per-CLI semantics** (the string is passed to the CLI verbatim):
