@@ -164,7 +164,7 @@ def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
     # bounded communicate on timeout (plain subprocess.run(timeout=) would kill
     # only the immediate child and then block in an unbounded communicate() if a
     # backend descendant holds stdout — the same hang fixed in the manifest).
-    from _manifest import _read_envelope, _dispatch_child
+    from _manifest import _read_envelope, _dispatch_child, _existing_envelope
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
     out_file = os.path.join(out_dir, f"{tag}.json")
     cmd = [sys.executable, script, "--agent", agent, "--prompt", prompt,
@@ -176,7 +176,10 @@ def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
         proc, spawn_err = _dispatch_child(cmd, watchdog)
         if spawn_err:
             return {"status": "error", "error": spawn_err}
-        if proc.timed_out:
+        # Mirror the manifest: a watchdog timeout is only an error when the child
+        # wrote NO valid envelope. If it wrote its result then hung on shutdown or
+        # a descendant-held pipe, keep that authoritative envelope.
+        if proc.timed_out and _existing_envelope(out_file) is None:
             return {"status": "error", "error": f"council member {agent} exceeded watchdog "
                     f"({int(watchdog)}s); process tree killed"}
         return _read_envelope(out_file, proc)
@@ -253,6 +256,8 @@ def run_council(args) -> int:
                 "model": (env.get("model") or {}).get("resolved"),
                 "status": env.get("status"), "position": _position(env, cap),
                 "elapsed_ms": env.get("elapsed_ms"),
+                "billing": env.get("billing"),      # so credit/api spend isn't hidden
+                "warnings": env.get("warnings"),    # e.g. a Fable -> Opus fallback
                 "_raw": env.get("result") or ""}   # kept only to parse RANKING
 
     try:
@@ -295,6 +300,19 @@ def run_council(args) -> int:
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)  # never leak the temp dir
 
+    # Aggregate billing/warnings across the whole council so the caller sees any
+    # credit/api spend or Fable fallback WITHOUT digging into members (the temp
+    # child envelopes are deleted just above).
+    council_warnings = []
+    for m in results:
+        council_warnings += [f"{m['agent']}: {w}" for w in (m.get("warnings") or [])]
+    council_warnings += [f"{chairman}: {w}" for w in (chair_env.get("warnings") or [])]
+    billing_sources = sorted({(m.get("billing") or {}).get("source")
+                              for m in results if m.get("billing")}
+                             | ({(chair_env.get("billing") or {}).get("source")}
+                                if chair_env.get("billing") else set())
+                             - {None})
+
     failed = [m["agent"] for m in results if m.get("status") != "success"]
     # Status reflects the WHOLE council: success only if the chairman synthesized
     # AND every member answered; otherwise partial (the recommendation may still
@@ -315,7 +333,11 @@ def run_council(args) -> int:
             "status": chair_env.get("status"),
             "recommendation": chair_env.get("result") or chair_env.get("error"),
             "report": chair_env.get("report"),
+            "billing": chair_env.get("billing"),
+            "warnings": chair_env.get("warnings"),
         },
+        "billing_sources": billing_sources,   # e.g. ["subscription"] or ["credit","subscription"]
+        "warnings": council_warnings or None,  # member/chairman warnings, agent-tagged
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "status": status,
     }
