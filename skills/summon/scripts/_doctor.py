@@ -117,13 +117,22 @@ def _check_agy_extras(backends: dict) -> dict:
 
 
 def _check_agents_dir(agents_dir: str | None, cwd: str | None) -> dict:
-    from _loader import get_agents_dir, list_agents
+    from _loader import bundled_roster_dir, get_agents_dir, list_agents
     try:
         resolved = get_agents_dir(agents_dir, cwd or os.getcwd())
         agents = list_agents(resolved)
-        return {"path": resolved, "found": os.path.isdir(resolved),
-                "agent_count": len(agents),
-                "agents": sorted(a.get("name", "?") for a in agents)[:50]}
+        found = os.path.isdir(resolved)
+        entry = {"path": resolved, "found": found,
+                 "agent_count": len(agents),
+                 "agents": sorted(a.get("name", "?") for a in agents)[:50]}
+        # list_agents falls back to the skill's bundled starter roster, so a
+        # fresh install lists agents even when the project dir is absent. Say so
+        # explicitly rather than emitting a contradictory found:false + count>0.
+        bundled = bundled_roster_dir()
+        if not found and bundled and agents:
+            entry["note"] = (f"project roster {resolved} not present — dispatching "
+                             f"the skill's bundled starter roster ({bundled})")
+        return entry
     except Exception as e:  # noqa: BLE001 - doctor never raises
         return {"path": agents_dir, "found": False, "agent_count": 0,
                 "note": f"{type(e).__name__}: {e}"}

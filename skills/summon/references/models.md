@@ -60,4 +60,4 @@ serving via `model.resolved` at snapshot time:
 
 Cross-vendor routing rule of thumb: never have an agent's work reviewed by its own
 vendor — send claude/cursor-written code to a codex reviewer and codex-written code to
-a claude reviewer (see docs/PROTOCOL.md).
+a claude reviewer (see [docs/PROTOCOL.md](https://github.com/Nafjan/summon/blob/main/docs/PROTOCOL.md)).

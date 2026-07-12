@@ -53,14 +53,16 @@ An OpenAI-compatible endpoint: add to `providers.json` (or a built-in in
 ## Layout
 
 ```
-summon.py            entry-point shim -> scripts/run_subagent.py
+skills/summon/       the self-contained skill that `npx skills add Nafjan/summon`
+                     installs — everything the dispatcher needs lives here:
+  SKILL.md             the loaded skill instructions (agent-facing)
+  scripts/             the dispatcher (run_subagent + _* helper modules)
+  agents/              starter agent definitions (.md) — the bundled roster
+  references/          on-demand deep-dive docs (models, backends, fan-out, …)
+summon.py            entry-point shim -> skills/summon/scripts/run_subagent.py
 install.py           install the skill into host CLIs (ownership-safe)
-scripts/             the dispatcher (run_subagent + _* helper modules)
-agents/              starter agent definitions (.md)
-references/          on-demand deep-dive docs (models, backends, fan-out, …)
 docs/PROTOCOL.md     the orchestration playbook
 examples/            manifest + json-schema examples
-tests/               installer safety tests (dispatcher tests live in scripts/)
-SKILL.md             the loaded skill instructions (agent-facing)
+tests/               installer safety tests (dispatcher tests live in skills/summon/scripts/)
 TERMS.md             terms-of-service guidance
 ```

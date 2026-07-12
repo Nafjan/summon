@@ -8,7 +8,7 @@
     python install.py --uninstall     # remove ONLY copies summon installed
 
 What it does:
-  1. Copies SKILL.md + scripts/ + references/ into <host>/skills/summon/ for each
+  1. Copies SKILL.md + scripts/ + references/ + agents/ into <host>/skills/summon/ for each
      detected host (~/.claude, ~/.codex, ~/.cursor, ~/.gemini, ~/.copilot), writing
      an ownership manifest (.summon-install.json) into each copy.
   2. Copies the starter agent roster into ~/.agents/ with EXCLUSIVE creation —
@@ -53,7 +53,13 @@ HOSTS = {
     "copilot": os.path.join(HOME, ".copilot"),
 }
 
-SKILL_PAYLOAD = ["SKILL.md", "scripts", "references"]
+# The skill lives in skills/summon/ in the repo, so `npx skills add Nafjan/summon`
+# installs a self-contained, working skill. install.py sources the same folder.
+SKILL_SRC = os.path.join(HERE, "skills", "summon")
+# agents/ ships INSIDE the skill too, so a copied skill carries a working starter
+# roster (the read-only fallback in _loader.bundled_roster_dir()); install_agents
+# ALSO seeds an editable copy into ~/.agents.
+SKILL_PAYLOAD = ["SKILL.md", "scripts", "references", "agents"]
 MANIFEST = ".summon-install.json"
 
 # Optional backward-compat alias: a thin `sub-agents` skill that points at the
@@ -186,7 +192,7 @@ def _build_tree(dst: str) -> list:
     """Copy the payload into dst; return the manifest file list."""
     files = []
     for item in SKILL_PAYLOAD:
-        src = os.path.join(HERE, item)
+        src = os.path.join(SKILL_SRC, item)
         out = os.path.join(dst, item)
         if os.path.isdir(src):
             shutil.copytree(src, out,
@@ -381,7 +387,7 @@ def install_agents(dry: bool) -> list:
     """Copy starter agents into ~/.agents with O_EXCL creation - an existing
     file is never opened, truncated, or replaced (race-safe, not just checked).
     A failed copy removes its partial file so the next run can retry it."""
-    src_dir = os.path.join(HERE, "agents")
+    src_dir = os.path.join(SKILL_SRC, "agents")
     out = []
     if not os.path.isdir(src_dir):
         return ["[--]  no bundled agents/ dir; skipping"], True

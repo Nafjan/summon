@@ -808,6 +808,35 @@ def test_roster_set_agent_edits_frontmatter_only():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_new_agent_refuses_to_write_into_bundled_roster():
+    """--new-agent / --set-agent must REFUSE when the resolved roster dir IS the
+    skill's bundled starter roster — enforcing bundled_roster_dir() as read-only
+    in practice, not just by convention (a write there corrupts an installed
+    skill and desyncs its ownership manifest)."""
+    import subprocess as sp
+
+    import _loader
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    bundled = _loader.bundled_roster_dir()
+    assert bundled and os.path.isdir(bundled), "bundled roster should exist in a checkout"
+    cwd = tempfile.mkdtemp(prefix="summon-guard-")
+    victim = os.path.join(bundled, "guardtest_zzz.md")
+    try:
+        r = sp.run([sys.executable, script, "--new-agent", "guardtest_zzz",
+                    "--agents-dir", bundled, "--cwd", cwd],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+        assert "bundled" in (r.stdout + r.stderr).lower(), (r.stdout, r.stderr)
+        assert not os.path.exists(victim), "guard failed: wrote INTO the bundled roster"
+    finally:
+        try:
+            os.remove(victim)  # defensive: never leave an artifact in the repo roster
+        except OSError:
+            pass
+        import shutil as _sh
+        _sh.rmtree(cwd, ignore_errors=True)
+
+
 def test_roster_rejects_newline_injection():
     # A newline in a --set value must NOT smuggle a second frontmatter key.
     import _roster
@@ -851,6 +880,52 @@ def test_roster_preserves_crlf_body_and_dedups_keys():
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
+
+
+def test_bundled_roster_fallback_precedence_and_read_only():
+    """A fresh install (empty project roster) still dispatches the bundled
+    starter agents, the project roster always shadows the bundled one, and a
+    name in neither still raises — the fallback is a lookup path, not a catch-all
+    and never a write target."""
+    from pathlib import Path as _P
+
+    import _loader
+    from _loader import list_agents, load_agent
+    primary = tempfile.mkdtemp(prefix="summon-primary-")
+    bundled = tempfile.mkdtemp(prefix="summon-bundled-")
+    orig = _loader.bundled_roster_dir
+    try:
+        with open(os.path.join(bundled, "planner.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: safe-edit\n---\n# Planner (bundled)\n")
+        with open(os.path.join(bundled, "reviewer.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: codex\n---\n# Reviewer (bundled)\n")
+        _loader.bundled_roster_dir = lambda: bundled
+
+        # (1) empty primary -> falls back to the bundled file
+        ra, _, _, fpath, _, _, _, _ = load_agent(primary, "planner")
+        assert ra == "claude" and _P(fpath).resolve().parent == _P(bundled).resolve()
+
+        # (2) a project agent of the same name shadows the bundled one
+        with open(os.path.join(primary, "planner.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: cursor-agent\n---\n# Planner (project)\n")
+        ra2, _, _, fpath2, _, _, _, _ = load_agent(primary, "planner")
+        assert ra2 == "cursor-agent" and _P(fpath2).resolve().parent == _P(primary).resolve()
+
+        # (3) list merges both, no duplicate on the shadowed name, bundled-only kept
+        names = [a["name"] for a in list_agents(primary)]
+        assert names.count("planner") == 1 and "reviewer" in names
+
+        # (4) a name in neither dir still raises (not silently satisfied)
+        try:
+            load_agent(primary, "no_such_agent_zzz")
+            raise AssertionError("expected FileNotFoundError")
+        except FileNotFoundError:
+            pass
+    finally:
+        _loader.bundled_roster_dir = orig
+        import shutil as _sh
+        _sh.rmtree(primary, ignore_errors=True)
+        _sh.rmtree(bundled, ignore_errors=True)
 
 
 def test_roster_rejects_non_utf8_value_no_squatter():

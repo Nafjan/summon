@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from _builder import AgentInvocation  # noqa: E402
 from _executor import ENVELOPE_VERSION as _ENVELOPE_VERSION  # noqa: E402
 from _executor import execute_agent  # noqa: E402
-from _loader import get_agents_dir, list_agents, load_agent  # noqa: E402
+from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
 __version__ = "0.9.0"  # summon dispatcher version (see CHANGELOG.md)
@@ -391,6 +391,17 @@ def main() -> None:
         try:
             sets = parse_sets(args.sets)
             roster_dir = get_agents_dir(args.agents_dir, args.cwd)
+            # The skill's bundled starter roster is READ-ONLY. Refuse to scaffold
+            # or mutate an agent inside it (whether reached by default resolution
+            # or an explicit --agents-dir / $SUB_AGENTS_DIR pointed at the installed
+            # skill's agents/): that would corrupt the installed skill and desync
+            # its ownership manifest. Writable rosters only.
+            _bundled = bundled_roster_dir()
+            if _bundled and Path(roster_dir).resolve() == Path(_bundled).resolve():
+                _print_error(
+                    f"refusing to modify the skill's bundled starter roster ({roster_dir}); "
+                    "use a project .agents/ dir or point --agents-dir at a writable location")
+                sys.exit(1)
             if args.new_agent:
                 info = new_agent(roster_dir, args.new_agent, sets)
                 info["status"] = "success"
