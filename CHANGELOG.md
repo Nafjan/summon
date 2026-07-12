@@ -71,6 +71,12 @@ any OpenAI-compatible API.
   locking; installs the skill as `summon` (`--with-alias` adds a thin `sub-agents` alias).
 - agy backend runs in a fresh per-invocation, token-locked profile.
 - Bundled agents default to `safe-edit` and carry an untrusted-content guard.
+- **Credit-only model guard (Fable):** `claude-fable-5` left the Claude Max
+  subscription and bills account credit, so a `claude` dispatch requesting it
+  falls back to the latest Opus (`claude-opus-4-8`) with a `warnings` entry —
+  unless `SUMMON_ALLOW_FABLE=1` (or `SUMMON_ALLOW_CREDIT=1`), which runs it on
+  credit and marks `billing.source: "credit"`. The bundled `fable-api` agent
+  runs Fable metered via `ANTHROPIC_API_KEY` (openai-compat, unaffected).
 
 ### Naming
 - Skill renamed `sub-agents` → **`summon`**; `sub-agents` retained as an optional alias.

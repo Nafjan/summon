@@ -589,7 +589,9 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     profile is NOT built (that copies OAuth tokens = a mutation); the wrapper
     path is shown instead."""
     from _builder import (BACKENDS, backend_kind, build_invocation_args,
-                          permission_flags as _pf, _PERMISSION_MAPPING, _agy_wrapper)
+                          permission_flags as _pf, _PERMISSION_MAPPING, _agy_wrapper,
+                          resolve_billing_model)
+    _eff_model, _fable_note = resolve_billing_model(invocation.model, invocation.cli)
     view = {
         "dry_run": True,
         "agent": args.agent,
@@ -597,6 +599,7 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
         "cwd": invocation.cwd,
         "agents_dir": agents_dir,
         "model_requested": invocation.model,
+        "model_effective": _eff_model,  # after the credit-only (Fable) fallback
         "permission": invocation.permission,
         # openai-compat (and any future non-sandbox backend) has no permission
         # mapping — report None instead of raising.
@@ -607,6 +610,8 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
         "worktree": ("would create" if args.worktree is not None else None),
         "system_context_chars": len(invocation.system_context),
     }
+    if _fable_note:  # credit-only model would fall back — surface it in the preview
+        view.setdefault("warnings", []).append(_fable_note)
     if backend_kind(invocation.cli) == "api":
         view["command"] = f"POST ({invocation.cli})"
         view["base_url"] = invocation.base_url
