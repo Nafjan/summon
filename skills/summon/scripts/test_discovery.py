@@ -808,6 +808,35 @@ def test_roster_set_agent_edits_frontmatter_only():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_new_agent_refuses_to_write_into_bundled_roster():
+    """--new-agent / --set-agent must REFUSE when the resolved roster dir IS the
+    skill's bundled starter roster — enforcing bundled_roster_dir() as read-only
+    in practice, not just by convention (a write there corrupts an installed
+    skill and desyncs its ownership manifest)."""
+    import subprocess as sp
+
+    import _loader
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    bundled = _loader.bundled_roster_dir()
+    assert bundled and os.path.isdir(bundled), "bundled roster should exist in a checkout"
+    cwd = tempfile.mkdtemp(prefix="summon-guard-")
+    victim = os.path.join(bundled, "guardtest_zzz.md")
+    try:
+        r = sp.run([sys.executable, script, "--new-agent", "guardtest_zzz",
+                    "--agents-dir", bundled, "--cwd", cwd],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+        assert "bundled" in (r.stdout + r.stderr).lower(), (r.stdout, r.stderr)
+        assert not os.path.exists(victim), "guard failed: wrote INTO the bundled roster"
+    finally:
+        try:
+            os.remove(victim)  # defensive: never leave an artifact in the repo roster
+        except OSError:
+            pass
+        import shutil as _sh
+        _sh.rmtree(cwd, ignore_errors=True)
+
+
 def test_roster_rejects_newline_injection():
     # A newline in a --set value must NOT smuggle a second frontmatter key.
     import _roster
