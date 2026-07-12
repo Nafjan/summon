@@ -1508,6 +1508,34 @@ def test_effort_frontmatter_backends_and_envelope():
     assert r.get("effort") == "high", r.get("effort")
 
 
+def test_manifest_path_resolution_and_agy_codex_telemetry():
+    import _manifest, _executor
+    from _builder import AgentInvocation
+    # #1b: relative json_schema/debug_dir resolve against the MANIFEST dir
+    with tempfile.TemporaryDirectory() as d:
+        jobs, err = _manifest._normalize_jobs(
+            {"jobs": [{"id": "j", "agent": "reviewer", "prompt": "p",
+                       "json_schema": "s.json", "debug_dir": "dbg"}]}, d)
+        assert err is None, err
+        assert jobs[0]["json_schema"] == os.path.join(d, "s.json"), jobs[0]["json_schema"]
+        assert jobs[0]["debug_dir"] == os.path.join(d, "dbg"), jobs[0]["debug_dir"]
+    orig = _executor.build_invocation_args
+    _executor.build_invocation_args = lambda inv, timeout_ms=None: ("nope", [], None)
+    try:
+        ra = _executor.execute_agent(
+            AgentInvocation(cli="agy", prompt="Read seat_ar_editor.md and review", cwd=os.getcwd()), timeout_ms=500)
+        rc = _executor.execute_agent(AgentInvocation(cli="codex", prompt="x", cwd=os.getcwd()), timeout_ms=500)
+    finally:
+        _executor.build_invocation_args = orig
+    # #3: agy "read <file>" prompt surfaces a can't-read-files warning
+    assert any("CANNOT read files" in w for w in ra.get("warnings", [])), ra.get("warnings")
+    # #4: codex model.resolved falls back to the config default (when one is configured)
+    from _resolver import _codex_default_model
+    dflt = _codex_default_model()
+    if dflt:
+        assert rc["model"]["resolved"] == dflt, rc["model"]
+
+
 def test_council_model_label_and_repo_capable_defaults():
     import _council as c
     # never blank: falls back to the requested model when the backend didn't resolve one
