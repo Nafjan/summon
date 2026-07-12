@@ -221,7 +221,15 @@ def infer_billing(cli: str) -> dict:
 # never silently draws down credit. The API-key path (an openai-compat anthropic
 # agent) is unaffected: that is metered by design.
 _CREDIT_ONLY_MODELS = {"claude-fable-5"}
-_OPUS_FALLBACK = "claude-opus-4-8"  # latest subscription-covered Opus (bump point)
+# The `opus` ALIAS (not a pinned id) is the fallback: it always resolves to the
+# user's latest subscription-covered Opus, so there's no version to bump and no
+# risk of a hardcoded id the CLI rejects. Safe because the guard also strips
+# ANTHROPIC_* aliases that could remap `opus` -> a credit-only model.
+_OPUS_FALLBACK = "opus"
+# Flags that select a model — the guard scrubs credit-only values from any of
+# these in an agent's `args:` passthrough (incl. --fallback-model, which Claude
+# uses on primary-model overload).
+_MODEL_FLAG_NAMES = ("--model", "-m", "--fallback-model")
 
 
 def credit_spend_allowed() -> bool:
@@ -231,18 +239,77 @@ def credit_spend_allowed() -> bool:
 
 
 def resolve_billing_model(model: str | None, cli: str) -> tuple[str | None, str | None]:
-    """Apply the credit-only guard. Returns ``(effective_model, fallback_note)``.
-
-    A credit-only model requested on the SUBSCRIPTION ``claude`` CLI falls back to
-    the latest Opus unless credit spend is authorized; ``fallback_note`` explains
-    the substitution (None when nothing changed / when credit is authorized)."""
+    """The MODEL half of the credit-only guard. Returns ``(effective_model,
+    fallback_note)`` — a credit-only model on the ``claude`` CLI falls back to
+    Opus unless credit spend is authorized (None note when unchanged/authorized)."""
     if cli == "claude" and model in _CREDIT_ONLY_MODELS and not credit_spend_allowed():
         return _OPUS_FALLBACK, (
             f"{model} is no longer covered by the Claude Max subscription (it bills "
-            f"account credit); summon fell back to {_OPUS_FALLBACK}. To run it on "
-            f"credit set SUMMON_ALLOW_FABLE=1, or use an ANTHROPIC_API_KEY "
-            f"(openai-compat) agent to run it metered.")
+            f"account credit); summon fell back to Opus. To run it on credit set "
+            f"SUMMON_ALLOW_FABLE=1, or use an ANTHROPIC_API_KEY (openai-compat) agent.")
     return model, None
+
+
+def _scrub_credit_args(extra_args: list) -> tuple[list, bool]:
+    """Drop credit-only model selections from an agent's `args:` passthrough
+    (``--model``/``-m``/``--fallback-model`` in flag-value or ``flag=value``
+    form). Returns ``(args, scrubbed?)``; the original list is returned unchanged
+    when nothing matched."""
+    if not extra_args:
+        return extra_args, False
+    out, scrubbed, i, n = [], False, 0, len(extra_args)
+    while i < n:
+        a = extra_args[i]
+        if a in _MODEL_FLAG_NAMES and i + 1 < n and extra_args[i + 1] in _CREDIT_ONLY_MODELS:
+            scrubbed = True
+            i += 2
+            continue
+        if "=" in a:
+            k, v = a.split("=", 1)
+            if k in _MODEL_FLAG_NAMES and v in _CREDIT_ONLY_MODELS:
+                scrubbed = True
+                i += 1
+                continue
+        out.append(a)
+        i += 1
+    return (out, True) if scrubbed else (extra_args, False)
+
+
+def _credit_env_override() -> dict:
+    """Env keys to STRIP (value ``None``) from the claude child: any ANTHROPIC_*
+    model-selection var whose value is a credit-only model, so an alias like
+    ``opus`` can't be silently remapped to Fable (e.g. ANTHROPIC_DEFAULT_OPUS_MODEL,
+    ANTHROPIC_MODEL)."""
+    return {k: None for k, v in os.environ.items()
+            if k.startswith("ANTHROPIC_") and "MODEL" in k and v in _CREDIT_ONLY_MODELS}
+
+
+def apply_credit_guard(inv) -> tuple:
+    """Full credit-only guard for a claude dispatch. Returns
+    ``(guarded_inv, env_override, warnings)``. No-op for non-claude backends or
+    when credit spend is authorized. Otherwise: substitute a credit-only model
+    with Opus, scrub credit-only model flags from `args:`, strip ANTHROPIC_* env
+    aliases that remap to one, and warn that a resume can't be re-pinned."""
+    warnings: list = []
+    if inv.cli != "claude" or credit_spend_allowed():
+        return inv, {}, warnings
+    model, note = resolve_billing_model(inv.model, inv.cli)
+    if note:
+        warnings.append(note)
+    args, scrubbed = _scrub_credit_args(inv.extra_args)
+    if scrubbed:
+        warnings.append("summon stripped a credit-only model flag from this agent's `args:` "
+                        "(it would have run Fable on account credit without opt-in)")
+    env = _credit_env_override()
+    if env:
+        warnings.append(f"summon stripped env var(s) {sorted(env)} that remap a model alias "
+                        "to a credit-only model for this run")
+    if inv.resume_id:
+        warnings.append("resuming a claude session keeps its ORIGINAL model — summon cannot "
+                        "re-pin it to Opus, so if that session was Fable it bills account credit")
+    if model != inv.model or args is not inv.extra_args:
+        inv = replace(inv, model=model, extra_args=args)
+    return inv, env, warnings
 
 
 def _codex_env_override() -> dict | None:
@@ -666,12 +733,14 @@ def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None
         raise ValueError(f"Unknown backend: {inv.cli}")
     if b["kind"] != "subprocess":
         raise ValueError(f"backend {inv.cli!r} is {b['kind']}-kind; no argv to build")
-    # Credit-only guard (Fable): substitute the model HERE so both real dispatch
-    # and --dry-run enforce the fallback identically. The executor separately
-    # surfaces the note/billing on the envelope (this only shapes the argv).
-    eff_model, _ = resolve_billing_model(inv.model, inv.cli)
-    if eff_model != inv.model:
-        inv = replace(inv, model=eff_model)
+    # Credit-only guard (Fable): substitute the model, scrub credit-only model
+    # flags from `args:`, and strip ANTHROPIC_* alias remaps HERE so real dispatch
+    # and --dry-run enforce it identically. The executor surfaces the notes/billing.
+    inv, credit_env, _ = apply_credit_guard(inv)
     if inv.cli == "agy":
-        return _build_agy_args(inv, timeout_ms)
-    return b["build"](inv)
+        cmd, args, env = _build_agy_args(inv, timeout_ms)
+    else:
+        cmd, args, env = b["build"](inv)
+    if credit_env:
+        env = {**(env or {}), **credit_env}
+    return cmd, args, env
