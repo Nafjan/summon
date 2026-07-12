@@ -30,7 +30,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 # A deliberately vendor-DIVERSE default (a council of clones is pointless): Claude
 # Opus, Codex, Antigravity/Gemini, and Claude Sonnet — override with --members.
-DEFAULT_MEMBERS = ["planner", "reviewer", "researcher", "pair"]
+# Vendor-diverse AND repo-capable by default: claude + codex + cursor all read
+# files under --cwd. `researcher` (agy) was removed from the defaults because the
+# agy backend runs in an isolated profile and CANNOT read --cwd — it errors out
+# of any repo-inspection council (use it only for pure-reasoning councils).
+DEFAULT_MEMBERS = ["planner", "reviewer", "coder", "pair"]
 DEFAULT_CHAIRMAN = "fable"          # the escalation/synthesis tier
 _MAX_MEMBERS = 10                   # bound fan-out: 1 thread/member + argv-safe position budget
 _POSITION_CAP = 4000                # max chars of any single position
@@ -187,6 +191,17 @@ def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
 
+def _model_label(env: dict) -> str | None:
+    """A never-blank model label. Prefer the RESOLVED model; fall back to what was
+    REQUESTED when the backend didn't report one (codex often doesn't); show
+    ``requested -> resolved`` when they differ (e.g. the `opus` alias -> a version)."""
+    m = env.get("model") or {}
+    req, res = m.get("requested"), m.get("resolved")
+    if res and req and res != req:
+        return f"{req} -> {res}"
+    return res or req
+
+
 def run_council(args) -> int:
     """Entry point for ``--council``. Returns the process exit code."""
     if args.question_file:
@@ -253,7 +268,7 @@ def run_council(args) -> int:
             print(f"[council {done['n']}/{len(members)}] {agent} ({b}) "
                   f"status={env.get('status')}", file=sys.stderr, flush=True)
         return {"agent": agent, "backend": b,
-                "model": (env.get("model") or {}).get("resolved"),
+                "model": _model_label(env),   # resolved, else requested (never blank)
                 "status": env.get("status"), "position": _position(env, cap),
                 "elapsed_ms": env.get("elapsed_ms"),
                 "billing": env.get("billing"),      # so credit/api spend isn't hidden
@@ -304,6 +319,13 @@ def run_council(args) -> int:
     # credit/api spend or Fable fallback WITHOUT digging into members (the temp
     # child envelopes are deleted just above).
     council_warnings = []
+    # agy members can't read --cwd (isolated profile) — call it out, since it's
+    # the usual reason an agy member errors/excludes in a repo council.
+    for mem, bk in member_backend.items():
+        if bk == "agy":
+            council_warnings.append(f"{mem}: the agy backend runs in an isolated profile and "
+                                    "cannot read files under --cwd (it only sees the prompt) — "
+                                    "avoid agy members in a repo-inspection council")
     for m in results:
         council_warnings += [f"{m['agent']}: {w}" for w in (m.get("warnings") or [])]
     council_warnings += [f"{chairman}: {w}" for w in (chair_env.get("warnings") or [])]
@@ -329,7 +351,7 @@ def run_council(args) -> int:
         "synthesis": {
             "chairman": chairman,
             "backend": backend_of(chairman),
-            "model": (chair_env.get("model") or {}).get("resolved"),
+            "model": _model_label(chair_env),
             "status": chair_env.get("status"),
             "recommendation": chair_env.get("result") or chair_env.get("error"),
             "report": chair_env.get("report"),
