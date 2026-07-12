@@ -49,10 +49,17 @@ session can summon Codex for an adversarial pass. Your terminal can summon a who
 to decide something. Each runs in its own git worktree, in parallel, and every result comes
 back as one JSON envelope you can branch on.
 
+And because each backend runs on its own login, the subscriptions you already pay for
+finally pull together: Claude Max, ChatGPT, Cursor, Gemini, and Antigravity on the same
+task, each billed to its own plan, instead of paying for four and using one at a time.
+
 ---
 
 ## Who it's for
 
+- **Anyone stacking AI subscriptions.** Paying for Claude Max, ChatGPT, Cursor, or Gemini
+  and only ever using one at a time? summon puts them on the same task together, each billed
+  to its own plan, so you get the full value of what you already pay for.
 - **Developers who live in Claude Code, Codex, or Cursor** (or any other AI coding tool)
   and want the *other* models one command away, without leaving the one they're in.
 - **Anyone who wants a real second opinion.** Cross-vendor review, where no model grades
