@@ -611,6 +611,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         resp["model"] = {"requested": _requested_model, "resolved": resp.pop("model_resolved", None),
                          "models_used": resp.pop("models_used", [])}
         resp["permission"] = inv.permission
+        resp["effort"] = inv.effort   # reasoning effort actually applied (None = backend default)
         try:
             resp["permission_flags"] = permission_flags(inv.cli, inv.permission)
         except ValueError:

@@ -92,11 +92,11 @@ def parse_extra_args(value: str | None) -> list:
         raise ValueError(f"invalid args: frontmatter ({e}): {value!r}") from e
 
 
-def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str, str, str, str, str | None, list]:
+def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str, str, str, str, str | None, list, str | None]:
     """Load agent definition file and extract run-agent and permission settings.
 
     Returns (run_agent_cli, system_context, description, file_path, permission,
-    model, extra_args).
+    model, extra_args, effort).
     """
     validate_agent_name(agent_name)
     agents_path = Path(agents_dir)
@@ -117,7 +117,8 @@ def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str, str, 
             permission = validate_permission(frontmatter.get("permission"))
             description = extract_description(body)
             return (run_agent, body.strip(), description, str(resolved), permission,
-                    frontmatter.get("model") or None, parse_extra_args(frontmatter.get("args")))
+                    frontmatter.get("model") or None, parse_extra_args(frontmatter.get("args")),
+                    frontmatter.get("effort") or None)
 
     raise FileNotFoundError(f"Agent definition not found: {agent_name}")
 
