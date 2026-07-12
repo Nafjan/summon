@@ -1477,6 +1477,18 @@ def test_fable_credit_only_guard():
     assert r_args["billing"]["source"] == "credit", r_args["billing"]
 
 
+def test_council_model_label_and_repo_capable_defaults():
+    import _council as c
+    # never blank: falls back to the requested model when the backend didn't resolve one
+    assert c._model_label({"model": {"requested": "gpt-5.6-sol", "resolved": None}}) == "gpt-5.6-sol"
+    # alias -> version made explicit
+    assert c._model_label({"model": {"requested": "opus", "resolved": "claude-opus-4-7"}}) == "opus -> claude-opus-4-7"
+    assert c._model_label({"model": {"requested": "m", "resolved": "m"}}) == "m"
+    assert c._model_label({}) is None
+    # default council is repo-capable — no agy member (agy can't read --cwd)
+    assert "researcher" not in c.DEFAULT_MEMBERS, c.DEFAULT_MEMBERS
+
+
 def test_parse_report_keeps_real_status_with_pipe():
     # GF5: a real status containing " | " (not a template) must NOT be skipped.
     import _executor

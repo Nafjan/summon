@@ -59,13 +59,17 @@ chairman synthesizes a consensus recommendation:
 ```bash
 run_subagent.py --council --question "SQL or NoSQL for this workload?" --cwd <abs>
 run_subagent.py --council --question-file q.md \
-  --members planner,reviewer,researcher,pair --chairman fable --rounds 2 --cwd <abs>
+  --members planner,reviewer,coder,pair --chairman fable --rounds 2 --cwd <abs>
 ```
 
 - **Members** are agents (each encodes a model + persona); the default set is
-  deliberately vendor-diverse (`planner`/opus, `reviewer`/codex, `researcher`/agy,
-  `pair`/sonnet-5). Override with `--members`; author custom-persona members with
-  `--new-agent`. A council of clones is pointless — keep it diverse.
+  deliberately vendor-diverse AND **repo-capable** (`planner`/opus, `reviewer`/codex,
+  `coder`/cursor, `pair`/sonnet-5) — all can read files under `--cwd`. Override with
+  `--members`; author custom-persona members with `--new-agent`. A council of clones
+  is pointless — keep it diverse.
+  > **Note:** `agy` members (e.g. `researcher`) run in an isolated profile and can't
+  > read `--cwd`, so they error out of a repo-inspection council (fine only for a
+  > pure-reasoning question). The council envelope surfaces a warning when one is used.
 - **`--rounds 2`** adds a cross-examination + peer-ranking round (à la Karpathy's
   llm-council): each member sees ALL positions anonymized (can't tell which is
   theirs → no favoritism), refines their stance, and **ranks** them best-to-worst.
