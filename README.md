@@ -53,8 +53,8 @@ back as one JSON envelope you can branch on.
 
 ## Who it's for
 
-- **Developers who live in an AI coding tool** (a CLI, an AI IDE, or a desktop agent app)
-  and want the *other* models one command away, without switching tools.
+- **Developers who live in Claude Code, Codex, or Cursor** (or any other AI coding tool)
+  and want the *other* models one command away, without leaving the one they're in.
 - **Anyone who wants a real second opinion.** Cross-vendor review, where no model grades
   its own homework, is built in rather than bolted on.
 - **People making decisions with AI** who want more than one model's take: council mode
