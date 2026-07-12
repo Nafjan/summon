@@ -1,12 +1,21 @@
-# Summon
+<p align="center">
+  <img src="assets/banner.svg" alt="summon — Summon any AI, from any CLI" width="860">
+</p>
 
-**Summon any AI from any CLI.**
+<h1 align="center">Summon</h1>
 
-[![CI](https://github.com/Nafjan/summon/actions/workflows/ci.yml/badge.svg)](https://github.com/Nafjan/summon/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-![stdlib only](https://img.shields.io/badge/deps-stdlib_only-brightgreen.svg)
-![backends](https://img.shields.io/badge/backends-6-brightgreen.svg)
+<p align="center"><b>Summon any AI, from any CLI.</b> One skill, every model as a sub-agent.</p>
+
+<p align="center">
+  <a href="https://github.com/Nafjan/summon/actions/workflows/ci.yml"><img src="https://github.com/Nafjan/summon/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/deps-stdlib_only-brightgreen.svg" alt="stdlib only">
+  <img src="https://img.shields.io/badge/backends-6-brightgreen.svg" alt="6 backends">
+  <img src="https://img.shields.io/badge/install-npx_skills_add-8B5CF6.svg" alt="npx skills add">
+</p>
+
+<p align="center"><b>Install:</b> <code>npx skills add Nafjan/summon</code> — then just ask your agent.</p>
 
 Summon is a tiny, dependency-free tool that turns **one** AI agent into a conductor for
 **all** of them. It runs wherever your agent can execute a shell command:
@@ -79,14 +88,35 @@ driven by you or by another AI agent, returning structured results rather than a
 
 ## Install
 
-Summon installs as a **skill** into each AI CLI you have, so you can invoke it as `/summon`
-(or just describe what you want and the CLI triggers it). Two ways to set it up.
+**One command. The skill installs itself into your agent:**
 
-### Option A — let your AI agent install it (recommended)
+```bash
+npx skills add Nafjan/summon
+```
 
-Open your favorite AI CLI (Claude Code, Codex, Cursor, Gemini CLI, …) in a scratch folder
-and paste this prompt. The agent discovers what you actually have installed and wires
-everything up:
+That's the whole thing. Your AI agent now has the `summon` skill and knows how to drive it,
+so you never learn a flag. Just ask it: *"summon a cross-vendor review of my last commit,"*
+or *"convene a council on monorepo vs polyrepo."* Add `-g` to install globally (every
+project), or `-a <agent>` to target a specific one. Works with any skills-compatible agent:
+Claude Code, Codex, Cursor, Gemini, Antigravity, and claw-likes like openclaw and hermes.
+Powered by the open [`skills`](https://www.skills.sh) registry.
+
+**Or install into every AI CLI on your machine at once** (multi-host, ownership-safe):
+
+```bash
+git clone https://github.com/Nafjan/summon && cd summon
+python summon.py doctor      # which backends are ready? what's missing?
+python install.py            # install the skill into every detected AI CLI
+```
+
+`install.py` stages atomically, never touches an agent file you already have, and uninstalls
+cleanly (`python install.py --uninstall`). Migrating from the old name? `--with-alias` adds a
+thin `/sub-agents` alias.
+
+<details>
+<summary><b>Or let your AI agent set it up for you</b> — adapts to your exact machine</summary>
+
+<br>Paste this into your favorite AI CLI (Claude Code, Codex, Cursor, Gemini, …) in a scratch folder:
 
 ```text
 Set up "summon" for me (github.com/Nafjan/summon), a cross-vendor AI sub-agent dispatcher.
@@ -102,28 +132,13 @@ Set up "summon" for me (github.com/Nafjan/summon), a cross-vendor AI sub-agent d
    using a backend I actually have. If a backend I want is missing, tell me exactly how to
    install and log into its CLI.
 6. Offer to add the "Delegating to summon" snippet from README.md to my host config
-   (CLAUDE.md / AGENTS.md / GEMINI.md / .cursor/rules) so you'll reach for summon on
-   purpose — cross-vendor review before merge, --council for decisions, --manifest for
-   fan-out. Only add it if I say yes.
+   (CLAUDE.md / AGENTS.md / GEMINI.md / .cursor/rules) so you reach for summon on purpose:
+   cross-vendor review before merge, --council for decisions, --manifest for fan-out. Only
+   add it if I say yes.
 ```
+</details>
 
-The agent will report which of your subscriptions/CLIs are ready and hand you a working
-first command. This is the friendliest path — it adapts to *your* machine.
-
-### Option B — do it yourself
-
-```bash
-git clone https://github.com/Nafjan/summon && cd summon
-python summon.py doctor      # which backends are ready? what's missing?
-python install.py            # install the summon skill into every detected AI CLI
-python summon.py doctor      # confirm
-```
-
-`install.py` is ownership-safe: it stages installs atomically, never touches an agent file
-you already have, and cleanly uninstalls (`python install.py --uninstall`). Migrating from
-the old name? `python install.py --with-alias` adds a thin `/sub-agents` alias.
-
-You can also run summon **without installing the skill** — it's just a script:
+You can also run summon **without installing the skill** at all — it's just a script:
 `python summon.py dispatch --agent reviewer --prompt "…" --cwd "$PWD"`.
 
 ---
@@ -158,7 +173,7 @@ Git-style subcommands (the legacy flat `--flag` form still works — nothing bre
 | `summon version` · `summon help` | version · usage |
 
 `summon` (no args) prints the command list. Everything below is documented in
-[SKILL.md](SKILL.md).
+[skills/summon/SKILL.md](skills/summon/SKILL.md).
 
 ---
 
@@ -420,8 +435,8 @@ one-shot subprocess/HTTP dispatch. A script you can read beats a protocol you mu
 
 Contributions are very welcome — new backends, agents, and providers are the easy wins.
 A new backend is one entry in a registry
-([references/adding-a-backend.md](references/adding-a-backend.md)); a new agent is a `.md`
-file. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for dev setup, ground rules (stdlib only,
+([skills/summon/references/adding-a-backend.md](skills/summon/references/adding-a-backend.md));
+a new agent is a `.md` file. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for dev setup, ground rules (stdlib only,
 every change tested, secrets redacted), and the PR checklist. Run
 `python skills/summon/scripts/test_discovery.py` and `python tests/test_install.py` before a PR.
 
@@ -435,8 +450,10 @@ every change tested, secrets redacted), and the PR checklist. Run
 ## Credits
 
 Sharpened against the ecosystem: agent-bridge, CCB, claude-codex-collab, cc-fleet, MCO,
-swarms, Omnigent, and Karpathy's llm-council. Summon began as a private skill dispatching
-real work across many CLIs daily; this repo is that tool, generalized and hardened.
+swarms, Omnigent, and Karpathy's llm-council. I've run summon privately for months,
+dispatching real work across many CLIs every day, and sharpened it hard over the last few
+weeks. The results have been good enough that it was worth generalizing and hardening into
+this public repo.
 
 ## License
 
