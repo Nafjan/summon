@@ -194,6 +194,8 @@ Full playbook: **[docs/PROTOCOL.md](docs/PROTOCOL.md)**.
 - `billing.source` → did this draw from a **subscription** or metered **api** credits.
 - `resume.session_id` → `--resume` for a cheap follow-up.
 
+> **Costs are estimates.** `cost_usd`/`usage` are the CLI's own list-price figures, not a bill — on a subscription they don't equal money spent, and `billing.source` is a best-effort guess. Know your plan's inclusions and limits, and check your provider's latest billing/model notices directly.
+
 ---
 
 ## Council mode — decide by consensus
