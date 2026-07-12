@@ -12,9 +12,9 @@ import subprocess
 import threading
 import time
 
-from _builder import (AgentInvocation, BACKENDS, _CREDIT_ONLY_MODELS, backend_kind,
-                      build_invocation_args, infer_billing, permission_flags,
-                      resolve_billing_model)
+from _builder import (AgentInvocation, BACKENDS, _CREDIT_ONLY_MODELS, apply_credit_guard,
+                      backend_kind, build_invocation_args, credit_spend_allowed,
+                      infer_billing, permission_flags)
 from _stream import StreamProcessor, _terminal_is_error
 
 _SUCCESS_EXIT_CODES = (0, 143, -15)  # 0 ok, 143/-15 = SIGTERM (we asked it to stop)
@@ -594,11 +594,11 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     elapsed_ms, ...).
     """
     started = time.monotonic()
-    # Credit-only model guard (Fable): build_invocation_args substitutes the model
-    # in the argv (so --dry-run and real dispatch agree); here we only keep the
-    # ORIGINAL request + the fallback note for the envelope's transparency fields.
+    # Credit-only model guard (Fable): build_invocation_args enforces it in the
+    # argv/env (so --dry-run and real dispatch agree); here we keep the ORIGINAL
+    # request and re-derive the guard warnings for the envelope's transparency.
     _requested_model = inv.model
-    _, _fable_note = resolve_billing_model(inv.model, inv.cli)
+    _, _, _guard_warnings = apply_credit_guard(inv)
     debug_argv = [inv.cli]  # what --debug-dir records; each path refines it
 
     def _stamp(resp: dict) -> dict:
@@ -618,14 +618,18 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # Which billing source this run drew from (subscription vs API credits) —
         # pairs with usage/cost_usd so an orchestrator can attribute spend.
         resp.setdefault("billing", infer_billing(inv.cli))
-        # Fable / credit-only transparency: warn on fallback, or mark the run as
-        # account-credit when the operator authorized it.
-        if inv.cli == "claude" and _requested_model in _CREDIT_ONLY_MODELS:
-            if _fable_note:  # fell back to Opus (credit not authorized)
-                resp.setdefault("warnings", []).append(_fable_note)
-            else:            # authorized -> actually ran on account credit
-                resp["billing"] = {
-                    "source": "credit",
+        # Fable / credit-only transparency: surface every guard warning (model
+        # fallback, scrubbed args, stripped env alias, resume caveat) …
+        for w in _guard_warnings:
+            resp.setdefault("warnings", []).append(w)
+        # … and when the operator AUTHORIZED credit spend, mark the true billing
+        # source — an ANTHROPIC_API_KEY makes the CLI meter the API, not credit.
+        if inv.cli == "claude" and _requested_model in _CREDIT_ONLY_MODELS and credit_spend_allowed():
+            if os.environ.get("ANTHROPIC_API_KEY"):
+                resp["billing"] = {"source": "api",
+                    "note": f"{_requested_model} via ANTHROPIC_API_KEY (metered API, not credit)"}
+            else:
+                resp["billing"] = {"source": "credit",
                     "note": f"{_requested_model} billed to account credit "
                             f"(no longer on the Claude Max subscription)"}
         raw = resp.pop("_debug_raw", None)

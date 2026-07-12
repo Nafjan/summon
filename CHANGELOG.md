@@ -73,10 +73,15 @@ any OpenAI-compatible API.
 - Bundled agents default to `safe-edit` and carry an untrusted-content guard.
 - **Credit-only model guard (Fable):** `claude-fable-5` left the Claude Max
   subscription and bills account credit, so a `claude` dispatch requesting it
-  falls back to the latest Opus (`claude-opus-4-8`) with a `warnings` entry —
-  unless `SUMMON_ALLOW_FABLE=1` (or `SUMMON_ALLOW_CREDIT=1`), which runs it on
-  credit and marks `billing.source: "credit"`. The bundled `fable-api` agent
-  runs Fable metered via `ANTHROPIC_API_KEY` (openai-compat, unaffected).
+  falls back to the `opus` alias (latest subscription Opus) with a `warnings`
+  entry — unless `SUMMON_ALLOW_FABLE=1` (or `SUMMON_ALLOW_CREDIT=1`), which runs
+  it on credit and marks `billing.source: "credit"` (or `"api"` if an
+  `ANTHROPIC_API_KEY` is present). The guard is hardened against silent bypass:
+  it also scrubs credit-only `--model`/`--fallback-model` values from an agent's
+  `args:`, strips `ANTHROPIC_*` env vars that remap an alias to a credit-only
+  model, and warns that a `--resume` keeps the session's original model. The
+  bundled `fable-api` agent runs Fable metered via `ANTHROPIC_API_KEY`
+  (openai-compat, unaffected).
 
 ### Naming
 - Skill renamed `sub-agents` → **`summon`**; `sub-agents` retained as an optional alias.

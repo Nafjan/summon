@@ -1402,24 +1402,49 @@ def test_manifest_timeout_grammar_matches_child():
 
 def test_fable_credit_only_guard():
     # Fable (claude-fable-5) is credit-only: on the claude CLI it falls back to
-    # Opus unless SUMMON_ALLOW_FABLE=1; the API path is never rewritten.
+    # the `opus` alias unless SUMMON_ALLOW_FABLE=1; the API path is never rewritten.
     import _builder, _executor
-    from _builder import AgentInvocation
-    os.environ.pop("SUMMON_ALLOW_FABLE", None); os.environ.pop("SUMMON_ALLOW_CREDIT", None)
+    from _builder import AgentInvocation, build_invocation_args as _bia, apply_credit_guard
+
+    def _models(args):
+        return [args[i + 1] for i, x in enumerate(args) if x in ("--model", "-m", "--fallback-model")]
+
+    for k in ("SUMMON_ALLOW_FABLE", "SUMMON_ALLOW_CREDIT", "ANTHROPIC_API_KEY",
+              "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL"):
+        os.environ.pop(k, None)
     eff, note = _builder.resolve_billing_model("claude-fable-5", "claude")
-    assert eff == "claude-opus-4-8" and note, (eff, note)
-    # argv actually carries the fallback
-    _, args, _ = _builder.build_invocation_args(
-        AgentInvocation(cli="claude", prompt="x", cwd=".", model="claude-fable-5"))
-    assert args[args.index("--model") + 1] == "claude-opus-4-8"
-    # authorized -> real Fable, no note
+    assert eff == "opus" and note, (eff, note)
+    # argv carries the fallback alias, not fable
+    _, args, _ = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="claude-fable-5"))
+    assert _models(args) == ["opus"], _models(args)
+
+    # CC3: credit-only model flags in `args:` are scrubbed (both forms)
+    _, a1, _ = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="opus",
+                                    extra_args=["--fallback-model", "claude-fable-5"]))
+    assert "claude-fable-5" not in a1
+    _, a2, _ = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="claude-fable-5",
+                                    extra_args=["--model", "claude-fable-5"]))
+    assert _models(a2) == ["opus"], _models(a2)
+
+    # CC2: an ANTHROPIC_* alias remap to a credit-only model is stripped from the child env
+    os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL"] = "claude-fable-5"
+    try:
+        _, _, env = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="opus"))
+        assert env and env.get("ANTHROPIC_DEFAULT_OPUS_MODEL") is None, env
+    finally:
+        del os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL"]
+
+    # CC1: a claude resume can't be re-pinned -> warns
+    _, _, w = apply_credit_guard(AgentInvocation(cli="claude", prompt="x", cwd=".",
+                                                 model="claude-fable-5", resume_id="s1"))
+    assert any("resuming" in x for x in w), w
+
+    # authorized -> real Fable, no substitution; API path never rewritten
     os.environ["SUMMON_ALLOW_FABLE"] = "1"
     try:
-        eff2, note2 = _builder.resolve_billing_model("claude-fable-5", "claude")
-        assert eff2 == "claude-fable-5" and note2 is None
+        assert _builder.resolve_billing_model("claude-fable-5", "claude") == ("claude-fable-5", None)
     finally:
         del os.environ["SUMMON_ALLOW_FABLE"]
-    # the API/openai-compat path is untouched (metered by design)
     assert _builder.resolve_billing_model("claude-fable-5", "openai-compat") == ("claude-fable-5", None)
 
     # envelope transparency: fallback preserves requested + warns; opus billing stays subscription
@@ -1429,11 +1454,18 @@ def test_fable_credit_only_guard():
         r = _executor.execute_agent(
             AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), model="claude-fable-5"),
             timeout_ms=800)
+        # CC4: authorized WITH an API key bills api, not credit
+        os.environ["SUMMON_ALLOW_FABLE"] = "1"; os.environ["ANTHROPIC_API_KEY"] = "sk-x"
+        r2 = _executor.execute_agent(
+            AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), model="claude-fable-5"),
+            timeout_ms=800)
     finally:
         _executor.build_invocation_args = orig
+        os.environ.pop("SUMMON_ALLOW_FABLE", None); os.environ.pop("ANTHROPIC_API_KEY", None)
     assert r["model"]["requested"] == "claude-fable-5", r["model"]
-    assert any("account credit" in w for w in r.get("warnings", [])), r.get("warnings")
+    assert any("account credit" in x for x in r.get("warnings", [])), r.get("warnings")
     assert r["billing"]["source"] == "subscription", r["billing"]
+    assert r2["billing"]["source"] == "api", r2["billing"]
 
 
 def test_parse_report_keeps_real_status_with_pipe():
