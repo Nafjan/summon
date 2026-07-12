@@ -52,6 +52,13 @@ any OpenAI-compatible API.
 - Envelope-status reconciliation: a self-reported `STATUS: BLOCKED/PARTIAL/ERROR` (or an
   interactive-approval request with no report) never surfaces as a false `success`.
 - Session resume (`--resume`) for claude/codex/cursor/agy; per-call `--model`/`--effort`.
+- **Reasoning effort** works across **claude + codex** (codex maps to
+  `model_reasoning_effort`), takes an `effort:` frontmatter field, defaults to
+  **`high`** (precedence: `--effort` > frontmatter > `SUMMON_DEFAULT_EFFORT` >
+  high; `none` = backend default), and is surfaced in the envelope's `effort`.
+- Opus agents + the Fable fallback pin the explicit **`claude-opus-4-8`** (the
+  `opus` alias currently lags to 4-7); council model labels never show blank
+  (fall back to the requested model, show `alias -> version`).
 
 ### Fan-out & structured output
 - `--manifest jobs.json --concurrency agy=2,codex=3 --results-dir` — per-backend

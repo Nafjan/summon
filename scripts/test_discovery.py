@@ -846,7 +846,7 @@ def test_roster_preserves_crlf_body_and_dedups_keys():
         assert raw.endswith(body), "body not byte-preserved"
         # duplicate permission collapsed to the single new value
         assert raw.count(b"permission:") == 1
-        ra, _, _, _, perm, model, _ = load_agent(d, "raw")
+        ra, _, _, _, perm, model, _, _ = load_agent(d, "raw")
         assert perm == "yolo" and model == "claude-sonnet-5" and ra == "claude"
     finally:
         import shutil as _sh
@@ -1413,10 +1413,10 @@ def test_fable_credit_only_guard():
               "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL"):
         os.environ.pop(k, None)
     eff, note = _builder.resolve_billing_model("claude-fable-5", "claude")
-    assert eff == "opus" and note, (eff, note)
+    assert eff == "claude-opus-4-8" and note, (eff, note)
     # argv carries the fallback alias, not fable
     _, args, _ = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="claude-fable-5"))
-    assert _models(args) == ["opus"], _models(args)
+    assert _models(args) == ["claude-opus-4-8"], _models(args)
 
     # CC3: credit-only model flags in `args:` are scrubbed (both forms)
     _, a1, _ = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="opus",
@@ -1424,7 +1424,7 @@ def test_fable_credit_only_guard():
     assert "claude-fable-5" not in a1
     _, a2, _ = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="claude-fable-5",
                                     extra_args=["--model", "claude-fable-5"]))
-    assert _models(a2) == ["opus"], _models(a2)
+    assert _models(a2) == ["claude-opus-4-8"], _models(a2)
 
     # CC2: an ANTHROPIC_* alias remap to a credit-only model is stripped from the child env
     os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL"] = "claude-fable-5"
@@ -1475,6 +1475,33 @@ def test_fable_credit_only_guard():
     assert r2["billing"]["source"] == "api", r2["billing"]
     assert r_res["billing"]["source"] == "unknown", r_res["billing"]
     assert r_args["billing"]["source"] == "credit", r_args["billing"]
+
+
+def test_effort_frontmatter_backends_and_envelope():
+    import _builder, _executor
+    from _builder import AgentInvocation, build_invocation_args
+    from _loader import load_agent
+    # `effort:` frontmatter is parsed (the 8th load_agent field)
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "e.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\neffort: high\n---\nbody")
+        assert load_agent(d, "e")[7] == "high"
+    # codex maps effort -> model_reasoning_effort, clamping claude's xhigh/max to high
+    _, a, _ = build_invocation_args(AgentInvocation(cli="codex", prompt="x", cwd=".", effort="max"))
+    assert "model_reasoning_effort=high" in " ".join(a), a
+    _, a, _ = build_invocation_args(AgentInvocation(cli="codex", prompt="x", cwd=".", effort="low"))
+    assert "model_reasoning_effort=low" in " ".join(a)
+    # claude passes --effort verbatim
+    _, a, _ = build_invocation_args(AgentInvocation(cli="claude", prompt="x", cwd=".", effort="xhigh"))
+    assert "--effort" in a and a[a.index("--effort") + 1] == "xhigh"
+    # envelope surfaces the applied effort
+    orig = _executor.build_invocation_args
+    _executor.build_invocation_args = lambda inv, timeout_ms=None: ("nope", [], None)
+    try:
+        r = _executor.execute_agent(AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), effort="high"), timeout_ms=500)
+    finally:
+        _executor.build_invocation_args = orig
+    assert r.get("effort") == "high", r.get("effort")
 
 
 def test_council_model_label_and_repo_capable_defaults():
