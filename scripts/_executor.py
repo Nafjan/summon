@@ -12,9 +12,9 @@ import subprocess
 import threading
 import time
 
-from _builder import (AgentInvocation, BACKENDS, _CREDIT_ONLY_MODELS, apply_credit_guard,
-                      backend_kind, build_invocation_args, credit_spend_allowed,
-                      infer_billing, permission_flags)
+from _builder import (AgentInvocation, BACKENDS, apply_credit_guard, backend_kind,
+                      build_invocation_args, credit_spend_allowed, infer_billing,
+                      permission_flags, selects_credit_only)
 from _stream import StreamProcessor, _terminal_is_error
 
 _SUCCESS_EXIT_CODES = (0, 143, -15)  # 0 ok, 143/-15 = SIGTERM (we asked it to stop)
@@ -622,16 +622,26 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # fallback, scrubbed args, stripped env alias, resume caveat) …
         for w in _guard_warnings:
             resp.setdefault("warnings", []).append(w)
-        # … and when the operator AUTHORIZED credit spend, mark the true billing
-        # source — an ANTHROPIC_API_KEY makes the CLI meter the API, not credit.
-        if inv.cli == "claude" and _requested_model in _CREDIT_ONLY_MODELS and credit_spend_allowed():
-            if os.environ.get("ANTHROPIC_API_KEY"):
-                resp["billing"] = {"source": "api",
-                    "note": f"{_requested_model} via ANTHROPIC_API_KEY (metered API, not credit)"}
-            else:
-                resp["billing"] = {"source": "credit",
-                    "note": f"{_requested_model} billed to account credit "
-                            f"(no longer on the Claude Max subscription)"}
+        # … and correct the billing source for a Fable run. The effective model
+        # can come from --model OR an `args:` selector, so key off that (not just
+        # inv.model). An ANTHROPIC_API_KEY meters the API instead of account credit.
+        if inv.cli == "claude":
+            _picks_credit = selects_credit_only(_requested_model, inv.extra_args)
+            if credit_spend_allowed() and _picks_credit:
+                if os.environ.get("ANTHROPIC_API_KEY"):
+                    resp["billing"] = {"source": "api",
+                        "note": "credit-only model (Fable) via ANTHROPIC_API_KEY (metered API, not credit)"}
+                else:
+                    resp["billing"] = {"source": "credit",
+                        "note": "credit-only model (Fable) billed to account credit "
+                                "(no longer on the Claude Max subscription)"}
+            elif inv.resume_id and _picks_credit:
+                # Unauthorized resume of a Fable request: --resume keeps the
+                # session's original model (the guard can't re-pin it), so the
+                # billing source is genuinely not determinable here.
+                resp["billing"] = {"source": "unknown",
+                    "note": "resumed claude session runs its original model (guard can't re-pin "
+                            "on --resume); if it was Fable this bills account credit"}
         raw = resp.pop("_debug_raw", None)
         if debug_dir:
             dbg = _write_debug(debug_dir, debug_argv, raw or "", resp)
