@@ -1636,6 +1636,116 @@ def test_parse_report_keeps_real_status_with_pipe():
     assert rep2 and rep2.get("summary") == "real", rep2
 
 
+def test_preflight_openai_compat_skipped():
+    # openai-compat has no binary; its HTTP errors are already structured.
+    import run_subagent as r
+    assert r._preflight_backend("openai-compat") is None
+
+
+def test_preflight_present_backend_passes():
+    # A backend on PATH pre-flights clean; real auth/runtime errors surface later.
+    import run_subagent as r
+    orig = r.shutil.which
+    try:
+        r.shutil.which = lambda name: "/usr/local/bin/" + name
+        assert r._preflight_backend("codex") is None
+    finally:
+        r.shutil.which = orig
+
+
+def test_preflight_missing_backend_returns_setup_error():
+    # A missing CLI becomes an actionable setup error, not a raw spawn failure.
+    import run_subagent as r
+    import _doctor
+    ow, od = r.shutil.which, _doctor.doctor
+    try:
+        r.shutil.which = lambda name: None
+        _doctor.doctor = lambda a=None, b=None: {"usable_backends": ["claude"]}
+        err = r._preflight_backend("codex")
+        assert err is not None
+        assert err["status"] == "error"
+        assert err["cli"] == "codex"
+        assert err["setup"]["backend"] == "codex"
+        assert err["setup"]["usable_backends"] == ["claude"]
+        assert err["warnings"]
+        assert err["envelope"] == r._ENVELOPE_VERSION
+        # documented error-envelope contract: result + exit_code 127 (CLI not found)
+        assert err["result"] == ""
+        assert err["exit_code"] == 127
+        # actionable: names the install command AND the usable pivot backend
+        assert "install" in err["error"].lower()
+        assert "claude" in err["error"]
+    finally:
+        r.shutil.which, _doctor.doctor = ow, od
+
+
+def test_preflight_unknown_backend_deferred():
+    # A typo'd/unsupported backend name is NOT mislabeled "not installed"; it
+    # returns None so downstream validation raises a proper "unknown backend".
+    import run_subagent as r
+    ow = r.shutil.which
+    try:
+        r.shutil.which = lambda name: None
+        assert r._preflight_backend("totally-not-a-backend") is None
+    finally:
+        r.shutil.which = ow
+
+
+def test_preflight_survives_missing_doctor():
+    # An incomplete install missing _doctor.py must still yield a setup message,
+    # never an uncaught ImportError from the pre-flight.
+    import sys as _sys
+    import run_subagent as r
+    ow = r.shutil.which
+    saved = _sys.modules.get("_doctor")
+    try:
+        r.shutil.which = lambda name: None
+        _sys.modules["_doctor"] = None  # forces `from _doctor import ...` to raise
+        err = r._preflight_backend("codex")
+        assert err is not None and err["status"] == "error"
+        assert err["exit_code"] == 127
+        assert err["setup"]["usable_backends"] == []
+    finally:
+        r.shutil.which = ow
+        if saved is not None:
+            _sys.modules["_doctor"] = saved
+        else:
+            _sys.modules.pop("_doctor", None)
+
+
+def test_preflight_no_usable_backend_points_to_doctor():
+    # With nothing usable, steer the user to the full `doctor` checklist.
+    import run_subagent as r
+    import _doctor
+    ow, od = r.shutil.which, _doctor.doctor
+    try:
+        r.shutil.which = lambda name: None
+        _doctor.doctor = lambda a=None, b=None: {"usable_backends": []}
+        err = r._preflight_backend("agy")
+        assert err is not None and "doctor" in err["error"]
+    finally:
+        r.shutil.which, _doctor.doctor = ow, od
+
+
+def test_preflight_doctor_failure_is_soft():
+    # If the enrichment probe itself raises, still return a clean error envelope.
+    import run_subagent as r
+    import _doctor
+    ow, od = r.shutil.which, _doctor.doctor
+    try:
+        r.shutil.which = lambda name: None
+
+        def _boom(a=None, b=None):
+            raise RuntimeError("probe exploded")
+
+        _doctor.doctor = _boom
+        err = r._preflight_backend("gemini")
+        assert err is not None and err["status"] == "error"
+        assert err["setup"]["usable_backends"] == []
+    finally:
+        r.shutil.which, _doctor.doctor = ow, od
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
