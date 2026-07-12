@@ -16,7 +16,9 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO, "scripts"))
+# The dispatcher modules live under skills/summon/scripts/ (the self-contained
+# skill folder that `npx skills add` installs); install.py itself is at the root.
+sys.path.insert(0, os.path.join(REPO, "skills", "summon", "scripts"))
 
 
 def _run(home: str, *args: str) -> subprocess.CompletedProcess:
