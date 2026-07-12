@@ -147,7 +147,7 @@ Parse JSON output and check `status` field:
 | `--worktree` | No | Run in an isolated git worktree (optional name; auto-named if bare) |
 | `--background` | No | Dispatch detached; returns `{status:"background", job_id, result_file}` at once |
 | `--dry-run` | No | Print the fully resolved dispatch (command, model, permission flags) WITHOUT executing — catches wrong models/permissions/dead backends in zero paid runs |
-| `--out FILE` | No | Write the envelope atomically to FILE; if FILE already holds a valid envelope the run is SKIPPED (`skipped: true`) — swarm resume for free |
+| `--out FILE` | No | Write the envelope atomically to FILE; if FILE already holds a **`status: success`** envelope the run is SKIPPED (`skipped: true`) — swarm resume for free. A prior error/blocked/partial is re-run (re-launching retries failures) |
 | `--retries N` | No | Re-dispatch up to N times on `error`/`partial` (exponential backoff; `blocked` is never retried — its cause is structural). Envelope gains `attempts` |
 | `--json-schema FILE` | No | Structured output contract: extract the agent's final JSON, validate against the schema, attach `parsed`/`parse_ok`/`parse_errors`; ONE corrective retry via resume on mismatch |
 | `--debug-dir DIR` | No | Dump per-run argv + raw captured output + final envelope to DIR (adds `debug_file` to the envelope) |
@@ -196,7 +196,7 @@ Every response carries structured fields for programmatic orchestration:
 | `attempts` | How many dispatches this envelope took (`--retries`). |
 | `parsed`, `parse_ok`, `parse_errors` | With `--json-schema`: the agent's final JSON (validated), whether it satisfied the schema, and the specific violations. `parse_retry: true` marks the corrective follow-up. `parse_warnings` lists any schema keywords that were NOT enforced (see below). |
 | `output_tail` | On non-success: the tail of the RAW captured output (stdout+stderr merged) so failures are diagnosable without a re-run. `--debug-dir` captures the full transcript. |
-| `skipped` | `true` when `--out` found a prior valid envelope and did not dispatch. |
+| `skipped` | `true` when `--out` found a prior **success** envelope and did not dispatch (a prior failure is re-run). |
 | `blocked_indicators` | Approval-request phrases found in the result tail. Contract-less run + markers → status `blocked`; complete report → informational only. Note the envelope also reconciles with the contract itself: an agent self-reporting `STATUS: BLOCKED/PARTIAL/ERROR` downgrades the envelope status to match (never upgrades). |
 | `worktree` | `{path, branch}` when `--worktree` was used. Merge the branch and `git worktree remove` when done — cleanup is the orchestrator's job. |
 
