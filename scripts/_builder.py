@@ -250,6 +250,23 @@ def resolve_billing_model(model: str | None, cli: str) -> tuple[str | None, str 
     return model, None
 
 
+def selects_credit_only(model: str | None, extra_args: list) -> bool:
+    """Would this dispatch run a credit-only model, considering BOTH the model
+    field AND a --model/-m/--fallback-model selector in ``args:``? Used for
+    accurate billing/warning telemetry (Fable can be picked either way)."""
+    if model in _CREDIT_ONLY_MODELS:
+        return True
+    ea = extra_args or []
+    for i, a in enumerate(ea):
+        if a in _MODEL_FLAG_NAMES and i + 1 < len(ea) and ea[i + 1] in _CREDIT_ONLY_MODELS:
+            return True
+        if "=" in a:
+            k, v = a.split("=", 1)
+            if k in _MODEL_FLAG_NAMES and v in _CREDIT_ONLY_MODELS:
+                return True
+    return False
+
+
 def _scrub_credit_args(extra_args: list) -> tuple[list, bool]:
     """Drop credit-only model selections from an agent's `args:` passthrough
     (``--model``/``-m``/``--fallback-model`` in flag-value or ``flag=value``
@@ -304,9 +321,9 @@ def apply_credit_guard(inv) -> tuple:
     if env:
         warnings.append(f"summon stripped env var(s) {sorted(env)} that remap a model alias "
                         "to a credit-only model for this run")
-    if inv.resume_id:
+    if inv.resume_id and selects_credit_only(inv.model, inv.extra_args):
         warnings.append("resuming a claude session keeps its ORIGINAL model — summon cannot "
-                        "re-pin it to Opus, so if that session was Fable it bills account credit")
+                        "re-pin it to Opus, so this Fable session bills account credit")
     if model != inv.model or args is not inv.extra_args:
         inv = replace(inv, model=model, extra_args=args)
     return inv, env, warnings
