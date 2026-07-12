@@ -1450,15 +1450,22 @@ def test_fable_credit_only_guard():
     # envelope transparency: fallback preserves requested + warns; opus billing stays subscription
     orig = _executor.build_invocation_args
     _executor.build_invocation_args = lambda inv, timeout_ms=None: ("definitely-not-a-real-cli-xyz", [], None)
+    def _run(inv):
+        return _executor.execute_agent(inv, timeout_ms=800)
     try:
-        r = _executor.execute_agent(
-            AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), model="claude-fable-5"),
-            timeout_ms=800)
+        r = _run(AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), model="claude-fable-5"))
+        # DC4: unauthorized resume of a Fable request -> billing 'unknown' (guard
+        # can't re-pin on --resume) with the resume warning
+        r_res = _run(AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(),
+                                     model="claude-fable-5", resume_id="s1"))
+        os.environ["SUMMON_ALLOW_FABLE"] = "1"
         # CC4: authorized WITH an API key bills api, not credit
-        os.environ["SUMMON_ALLOW_FABLE"] = "1"; os.environ["ANTHROPIC_API_KEY"] = "sk-x"
-        r2 = _executor.execute_agent(
-            AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), model="claude-fable-5"),
-            timeout_ms=800)
+        os.environ["ANTHROPIC_API_KEY"] = "sk-x"
+        r2 = _run(AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), model="claude-fable-5"))
+        del os.environ["ANTHROPIC_API_KEY"]
+        # DC1: authorized Fable selected only via args: still bills credit
+        r_args = _run(AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), model=None,
+                                      extra_args=["--model", "claude-fable-5"]))
     finally:
         _executor.build_invocation_args = orig
         os.environ.pop("SUMMON_ALLOW_FABLE", None); os.environ.pop("ANTHROPIC_API_KEY", None)
@@ -1466,6 +1473,8 @@ def test_fable_credit_only_guard():
     assert any("account credit" in x for x in r.get("warnings", [])), r.get("warnings")
     assert r["billing"]["source"] == "subscription", r["billing"]
     assert r2["billing"]["source"] == "api", r2["billing"]
+    assert r_res["billing"]["source"] == "unknown", r_res["billing"]
+    assert r_args["billing"]["source"] == "credit", r_args["billing"]
 
 
 def test_parse_report_keeps_real_status_with_pipe():

@@ -590,9 +590,18 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     path is shown instead."""
     from _builder import (BACKENDS, backend_kind, build_invocation_args,
                           permission_flags as _pf, _PERMISSION_MAPPING, _agy_wrapper,
-                          apply_credit_guard)
+                          apply_credit_guard, infer_billing, credit_spend_allowed,
+                          selects_credit_only)
     _guarded, _, _guard_warnings = apply_credit_guard(invocation)
     _eff_model = _guarded.model
+    # Predict the billing source so preflight can reveal a charge (mirrors _stamp).
+    _bill = infer_billing(invocation.cli)
+    if invocation.cli == "claude" and selects_credit_only(invocation.model, invocation.extra_args):
+        if credit_spend_allowed():
+            _bill = {"source": "api" if os.environ.get("ANTHROPIC_API_KEY") else "credit",
+                     "note": "credit-only model (Fable) authorized"}
+        elif invocation.resume_id:
+            _bill = {"source": "unknown", "note": "resume keeps the session's original model"}
     view = {
         "dry_run": True,
         "agent": args.agent,
@@ -601,6 +610,7 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
         "agents_dir": agents_dir,
         "model_requested": invocation.model,
         "model_effective": _eff_model,  # after the credit-only (Fable) fallback
+        "billing_predicted": _bill,     # subscription / credit / api / unknown
         "permission": invocation.permission,
         # openai-compat (and any future non-sandbox backend) has no permission
         # mapping — report None instead of raising.
