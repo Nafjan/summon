@@ -17,8 +17,9 @@
 
 <p align="center"><b>Install:</b> <code>npx skills add Nafjan/summon</code>, then just ask your agent.</p>
 
-Summon is a tiny, dependency-free tool that turns one AI agent into a conductor for all of
-them. It runs wherever your agent can execute a shell command:
+Summon is a skill that turns one AI agent into a conductor for all of them. Under the hood
+it's a tiny, dependency-free dispatcher, and it runs wherever your agent can execute a shell
+command:
 
 - **Coding CLIs:** Claude Code, Codex, Cursor CLI, Gemini CLI, Antigravity.
 - **AI IDEs:** Cursor, Antigravity, or VS Code with an agent extension. The skill installs
