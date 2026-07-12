@@ -68,8 +68,13 @@ If you are running on Codex, read [references/codex.md](references/codex.md) fir
 
 ### Step 1: Check Health (first run) and List Agents
 
-On a machine you haven't dispatched from before, run `--doctor` once — it reports which
-backends are installed/usable and how to finish setting up the rest.
+**On first use on a machine, run the `doctor` command before anything else.** It reports
+the Python version, which backend CLIs are installed and usable, and the exact install +
+sign-in command for each one that isn't. If it shows no usable backend, do NOT dispatch:
+show the user what `doctor` says to install and sign into, then stop. (A dispatch to a
+backend that isn't set up already returns a clear `error` carrying the same install/sign-in
+guidance plus the list of backends that ARE ready, never a crash, so relay that to the user
+instead of retrying.)
 
 ### Step 1b: List Available Agents
 

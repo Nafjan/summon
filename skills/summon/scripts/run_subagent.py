@@ -25,12 +25,34 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
 from pathlib import Path
+
+# Fail early and clearly on an unsupported interpreter: summon targets Python
+# 3.10+, and the sibling modules imported below use 3.10 syntax that would
+# otherwise raise an opaque SyntaxError. This entry file stays parseable on
+# 3.7-3.9 (the realistic "slightly old Python" range, thanks to `from __future__
+# import annotations`) so this guard runs and emits a proper JSON envelope. EOL
+# interpreters (2.x, 3.6) may still fail to parse first; that is out of scope.
+if sys.version_info < (3, 10):
+    _found = sys.version.split()[0]
+    sys.stdout.write(json.dumps({
+        "status": "error",
+        "result": "",
+        "exit_code": 1,
+        "error": ("summon needs Python 3.10 or newer, but this interpreter is "
+                  + _found + ". Install a newer Python (python.org or your package "
+                  "manager), make it the `python` on your PATH, and retry. "
+                  "Check with: python --version"),
+        "setup": {"needs": "python>=3.10", "found": _found},
+        "envelope": 1,
+    }) + "\n")
+    sys.exit(1)
 
 # Ensure sibling modules import correctly when invoked via absolute path.
 sys.path.insert(0, str(Path(__file__).parent))
@@ -62,6 +84,59 @@ def _emit(obj: dict) -> None:
 
 def _print_error(error: str, exit_code: int = 1) -> None:
     _emit({"result": "", "exit_code": exit_code, "status": "error", "error": error})
+
+
+def _preflight_backend(cli: str) -> dict | None:
+    """Confirm the resolved backend is actually invocable before spawning it.
+
+    A missing backend CLI becomes a clear setup message (the install and sign-in
+    commands, plus which backends ARE ready so the agent can pivot) instead of a
+    raw "command not found". Returns None when the CLI is on PATH -- real
+    auth/runtime errors then surface in the normal envelope; for openai-compat,
+    which has no binary and whose HTTP errors are already structured; or for an
+    UNKNOWN backend name (e.g. a typo'd --cli), which is deferred to downstream
+    validation to reject as unsupported rather than mislabel as "not installed".
+    The `doctor` probe runs ONLY on the missing-backend path, so a normal
+    dispatch pays just one PATH lookup.
+    """
+    if cli == "openai-compat" or shutil.which(cli):
+        return None
+    # Enrichment is best-effort: an incomplete install missing _doctor.py must
+    # still yield a setup message, never an uncaught ImportError from this guard.
+    try:
+        from _doctor import _BACKENDS, doctor
+    except Exception:  # noqa: BLE001
+        _BACKENDS, doctor = {}, None
+    # Only a real, supported backend earns "install it"; an unknown name defers to
+    # downstream (build_invocation_args raises a proper "unknown backend" error).
+    if _BACKENDS and cli not in _BACKENDS:
+        return None
+    hint = _BACKENDS.get(cli, {})
+    usable = []
+    if doctor is not None:
+        try:
+            usable = doctor(None, None).get("usable_backends", [])
+        except Exception:  # noqa: BLE001 - a diagnostic must never mask the real failure
+            usable = []
+    msg = (f"The '{cli}' CLI isn't installed or isn't on your PATH, so this agent "
+           f"can't run. Install it: {hint.get('install', 'see the vendor docs')}. "
+           f"Then sign in: {hint.get('auth', 'log in to the CLI')}.")
+    if usable:
+        msg += (f" Backends ready right now: {', '.join(usable)} - or pick an agent on "
+                "one of those (run the `list` command).")
+    else:
+        msg += " No backend is set up yet; run the `doctor` command for the full checklist."
+    return {
+        "status": "error",
+        "result": "",
+        "exit_code": 127,   # documented contract: 127 == CLI not found (SKILL.md)
+        "error": msg,
+        "cli": cli,
+        "setup": {"backend": cli, "install": hint.get("install"),
+                  "auth": hint.get("auth"), "usable_backends": usable},
+        "warnings": [f"backend '{cli}' is not installed or not on PATH"],
+        "envelope": _ENVELOPE_VERSION,
+    }
 
 
 _MEMORY_CAP = 8000  # chars; keeps the injected block well under agy's 28 KB argv guard
@@ -530,6 +605,23 @@ def main() -> None:
     if not args.resume:
         system_context = _inject_memory(system_context, args.cwd)
 
+    try:
+        cli = args.cli or resolve_cli(run_agent_cli)
+    except ValueError as e:
+        _print_error(f"agent {args.agent!r}: {e}")
+        sys.exit(1)
+
+    # Pre-flight the backend BEFORE any side effects (e.g. creating a worktree):
+    # a missing CLI becomes a clear setup message (install + sign-in + what IS
+    # ready) instead of a raw spawn failure, so a first-time user, or an agent
+    # that skipped `doctor`, is told exactly what to do. Skipped under --dry-run,
+    # which must preview a dispatch even when the backend isn't installed yet.
+    if not args.dry_run:
+        setup_error = _preflight_backend(cli)
+        if setup_error is not None:
+            _emit(setup_error)
+            sys.exit(setup_error.get("exit_code", 1))
+
     # --worktree: run the agent in an isolated git worktree instead of the cwd.
     # NEVER created under --dry-run (dry-run is mutation-free by contract).
     worktree_info = None
@@ -540,12 +632,6 @@ def main() -> None:
             _print_error(str(e))
             sys.exit(1)
         args.cwd = worktree_info["cwd"]
-
-    try:
-        cli = args.cli or resolve_cli(run_agent_cli)
-    except ValueError as e:
-        _print_error(f"agent {args.agent!r}: {e}")
-        sys.exit(1)
 
     # Reasoning-effort precedence: --effort > agent `effort:` frontmatter >
     # SUMMON_DEFAULT_EFFORT env > the built-in default (high — summon delegates the
