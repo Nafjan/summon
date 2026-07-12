@@ -141,7 +141,7 @@ Parse JSON output and check `status` field:
 | `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
 | `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `gemini`, `agy` |
 | `--model` | No | Override the agent's frontmatter model for this call |
-| `--effort` | No | Reasoning effort (claude + codex): `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none` = the backend's own default). Precedence: `--effort` > agent `effort:` frontmatter > `SUMMON_DEFAULT_EFFORT` env > built-in default **`high`** (summon delegates hard problems, so it reasons deeply by default; set `none`/lower to speed up). Surfaced in the envelope's `effort` field |
+| `--effort` | No | Reasoning effort `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none` = the backend's own default). **claude** → `--effort`; **codex** → `-c model_reasoning_effort` (xhigh/max clamp to high); **agy** → a Gemini model's thinking suffix (`Gemini 3.1 Pro (High)`), applied only when set explicitly (not all models have all levels). Precedence: `--effort` > agent `effort:` frontmatter > `SUMMON_DEFAULT_EFFORT` env > built-in default **`high`**. Surfaced in the envelope's `effort` field (claude/codex) or `model.requested` (agy) |
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy |
 | `--resume-profile` | No | agy only: the `resume.profile` path returned by the prior agy call |
 | `--worktree` | No | Run in an isolated git worktree (optional name; auto-named if bare) |
