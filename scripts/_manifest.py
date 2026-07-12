@@ -119,6 +119,14 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
         if job.get("json_schema") is not None and not isinstance(job["json_schema"], str):
             return None, (f"job #{i}: json_schema must be a file path (string), "
                           f"got {type(job['json_schema']).__name__}")
+        # prompt_file is resolved above; json_schema / debug_dir are also passed to
+        # the child, which resolves relative paths against ITS cwd (the job's cwd,
+        # NOT the manifest dir). Anchor them to the manifest dir here so a relative
+        # path in the manifest works the way the docs' examples imply.
+        for _key in ("json_schema", "debug_dir"):
+            _v = job.get(_key)
+            if isinstance(_v, str) and _v and not os.path.isabs(_v):
+                job[_key] = os.path.join(manifest_dir, _v)
         job_id = str(job.get("id") or f"{job['agent']}-{i:03d}")
         if not _ID_RE.match(job_id) or ".." in job_id:
             return None, f"job #{i}: invalid id {job_id!r} (letters/digits/._-)"
@@ -265,7 +273,11 @@ def run_manifest(args) -> int:
     base_cwd = os.path.abspath(args.cwd or os.getcwd())
     results_dir = os.path.abspath(args.results_dir or os.path.join(base_cwd, ".agents", "results"))
     os.makedirs(results_dir, exist_ok=True)
-    agents_dir = args.agents_dir or os.path.join(base_cwd, ".agents")
+    # Use the SAME agent discovery as a direct dispatch (get_agents_dir), not a bare
+    # <cwd>/.agents — otherwise a manifest without --agents-dir couldn't find the
+    # roster and every job silently fell back to the default backend.
+    from _loader import get_agents_dir
+    agents_dir = get_agents_dir(args.agents_dir, base_cwd)
 
     # Pre-build one semaphore per backend BEFORE the pool starts — lazy creation
     # from multiple worker threads is a check-then-act race that can exceed a
@@ -319,6 +331,16 @@ def run_manifest(args) -> int:
                         envelope = _read_envelope(out_file, proc)
                 except Exception as e:  # noqa: BLE001 — one job must never crash the pool
                     envelope = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        # Always leave forensics: if the job ran (not skipped) but the child wrote
+        # NO --out envelope (early validation error, spawn failure, watchdog kill),
+        # persist the error envelope ourselves — so `result_file` in the summary
+        # actually exists and a failed job is never zero-forensics.
+        if not skipped and not os.path.exists(out_file):
+            try:
+                with open(out_file, "w", encoding="utf-8") as fh:
+                    json.dump(envelope, fh, ensure_ascii=False)
+            except OSError:
+                pass
         status = envelope.get("status", "error")
         with lock:
             done_count["n"] += 1

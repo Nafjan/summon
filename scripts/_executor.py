@@ -585,6 +585,18 @@ def _write_debug(debug_dir: str, argv: list, raw: str, response: dict) -> str | 
         return None
 
 
+# agy can't read files under --cwd (isolated profile), so a "read <file>" prompt
+# makes it review the pointer sentence and return a confident-but-empty verdict.
+_AGY_FILE_READ_RE = re.compile(
+    r"(?i)\b(read|open|review|inspect|check|see|look\s+at)\b[^\n]{0,80}?"
+    r"[\w./\\-]+\.(md|txt|py|js|ts|tsx|jsx|json|ya?ml|toml|docx?|pdf|csv|html?|xml|"
+    r"rs|go|java|c|cpp|h|hpp|sh|ps1|sql|rb|php)\b")
+
+
+def _agy_prompt_references_file(prompt: str | None) -> bool:
+    return bool(prompt and _AGY_FILE_READ_RE.search(prompt))
+
+
 def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                   debug_dir: str | None = None) -> dict:
     """Execute agent CLI for the given invocation. Returns a response dict.
@@ -610,8 +622,24 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # of proof, not proof of the requested model.
         resp["model"] = {"requested": _requested_model, "resolved": resp.pop("model_resolved", None),
                          "models_used": resp.pop("models_used", [])}
+        # codex rarely reports the served model in its stream — fall back to the
+        # config default so model.resolved isn't null (proves Sol-vs-not-Sol).
+        if inv.cli == "codex" and not resp["model"]["resolved"]:
+            try:
+                from _resolver import _codex_default_model
+                resp["model"]["resolved"] = _codex_default_model()
+            except Exception:  # noqa: BLE001 — telemetry best-effort, never fatal
+                pass
         resp["permission"] = inv.permission
         resp["effort"] = inv.effort   # reasoning effort actually applied (None = backend default)
+        # agy can't read --cwd files; a "read <file>" prompt makes it review the
+        # pointer sentence and return a confident-but-empty verdict. Warn so a
+        # schema-valid result isn't trusted blindly.
+        if inv.cli == "agy" and _agy_prompt_references_file(inv.prompt):
+            resp.setdefault("warnings", []).append(
+                "agy runs in an isolated profile and CANNOT read files under --cwd — this "
+                "prompt appears to reference a file to read; agy sees only the prompt text, "
+                "so inline the file's content instead of pointing at a path")
         try:
             resp["permission_flags"] = permission_flags(inv.cli, inv.permission)
         except ValueError:
