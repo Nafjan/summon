@@ -8,12 +8,20 @@
 ![stdlib only](https://img.shields.io/badge/deps-stdlib_only-brightgreen.svg)
 ![backends](https://img.shields.io/badge/backends-6-brightgreen.svg)
 
-Summon is a tiny, dependency-free tool that turns **one** AI coding CLI into a conductor
-for **all** of them. From inside Claude Code, Codex, Cursor, Gemini CLI, Antigravity — or a
-plain terminal — you can hand a task to any other model, run several at once, or convene a
-**council** of them to make a decision. It also reaches any OpenAI-compatible API, so
-OpenRouter, OpenAI, Anthropic, Google, and **local** models (Ollama, LM Studio) all become
-first-class agents too.
+Summon is a tiny, dependency-free tool that turns **one** AI agent into a conductor for
+**all** of them. It runs wherever your agent can execute a shell command:
+
+- **Coding CLIs** — Claude Code, Codex, Cursor CLI, Gemini CLI, Antigravity.
+- **AI-powered IDEs** — Cursor, Antigravity, or VS Code with an agent extension (the skill
+  installs as a slash command / skill, or the agent just shells out to the dispatcher).
+- **Desktop agent apps** — the **Claude app** and the **ChatGPT app** (formerly the Codex
+  app), whose agent modes can run the dispatcher and read the skill.
+- **A plain terminal** — you drive it yourself.
+
+From any of those you can hand a task to another model, run several at once, or convene a
+**council** to make a decision. It also reaches any OpenAI-compatible API, so OpenRouter,
+OpenAI, Anthropic, Google, and **local** models (Ollama, LM Studio) become first-class
+agents too.
 
 ```
                           ┌──────────────────────┐
@@ -36,8 +44,10 @@ back as one clean JSON envelope you can branch on.
 
 ## Who it's for
 
-- **Developers who live in an AI coding CLI** (Claude Code / Codex / Cursor / Gemini /
-  Antigravity) and want the *other* models one command away — without switching tools.
+- **Developers who live in an AI coding tool** — a CLI (Claude Code / Codex / Cursor /
+  Gemini / Antigravity), an AI IDE (Cursor, Antigravity, VS Code + an agent extension), or a
+  desktop agent app (the Claude app, the ChatGPT app) — and want the *other* models one
+  command away, without switching tools.
 - **Anyone who wants a real second opinion.** Cross-vendor review — no model grading its
   own homework — is a first-class workflow here, not a hack.
 - **People making decisions with AI** who want more than one model's take: council mode
@@ -91,6 +101,10 @@ Set up "summon" for me (github.com/Nafjan/summon), a cross-vendor AI sub-agent d
 5. Read README.md and SKILL.md, then summarize: what I can do now, and ONE example command
    using a backend I actually have. If a backend I want is missing, tell me exactly how to
    install and log into its CLI.
+6. Offer to add the "Delegating to summon" snippet from README.md to my host config
+   (CLAUDE.md / AGENTS.md / GEMINI.md / .cursor/rules) so you'll reach for summon on
+   purpose — cross-vendor review before merge, --council for decisions, --manifest for
+   fan-out. Only add it if I say yes.
 ```
 
 The agent will report which of your subscriptions/CLIs are ready and hand you a working
@@ -167,6 +181,81 @@ Git-style subcommands (the legacy flat `--flag` form still works — nothing bre
    swarm; a judgment call → a council.
 
 Full playbook: **[docs/PROTOCOL.md](docs/PROTOCOL.md)**.
+
+---
+
+## Teach your agent to reach for it (`CLAUDE.md` / `AGENTS.md`)
+
+summon is invoked *by* your coding agent — so it only gets used well if the agent
+knows *when* to reach for it. The skill's description triggers it, but a few lines in
+your host config make the agent orchestrate on purpose. Drop this into your
+`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, or `.cursor/rules` (whatever your CLI reads):
+
+```md
+## Delegating to summon (cross-vendor sub-agents)
+
+When a task is heavy, parallelizable, or would benefit from another vendor's eyes,
+dispatch it with the **summon** skill instead of doing everything yourself:
+
+- **Cross-vendor review before merge (house rule).** Never merge a substantive change
+  reviewed only by the model that wrote it — that shares its own blind spots. Route
+  claude/cursor-written code to codex (`reviewer` / `adversarial-reviewer`); route
+  codex-written code to a claude reviewer (`quick-reviewer`).
+- **High-stakes decisions → `--council`.** Convene a vendor-diverse council and let a
+  chairman synthesize. Disagreement that survives round 2 is signal, not noise.
+- **Independent work → `--manifest`.** Fan several jobs out with per-backend
+  concurrency; each writes its own result envelope you can inspect.
+- **Escalate the hardest problems** to the top tier (`fable`, or an opus agent). Keep
+  councils and swarms diverse — a council of clones is pointless.
+
+Verify, don't trust: branch on the returned `status`; a `report_ok:false` or
+`suspect:true` "success" means re-dispatch. Read `warnings` (model fell back, agy
+can't read `--cwd` files, credit spend). `model.resolved` proves what actually ran.
+Preview a paid fan-out with `--dry-run`, pass `--json-schema` when you need structured
+output, and chain via `report.handoff` into the next call.
+```
+
+Tune it to your workflow — the point is that your agent treats summon as a first-class
+tool (delegate, review across vendors, decide by council) rather than an afterthought.
+The **agent-led installer** above can also offer to add a snippet like this for you.
+
+### Orchestration practices that hold up
+
+A few habits that keep multi-agent work fast, cheap, and trustworthy:
+
+- **Verify across vendors, not within.** A model reviewing its own output shares its blind
+  spots — the single most valuable habit. summon makes the *other* vendor one command away.
+- **Adversarial-verify findings before you act on them.** Have a second (ideally different)
+  model try to *refute* a claim; a finding that survives is signal. Don't merge on one pass.
+- **Decide by council, converge by chairman.** For a judgment call, N diverse positions +
+  anonymized peer ranking + a synthesis beats one model iterated — `--council` does this.
+- **Keep the orchestrator's context clean.** Delegate the heavy reading/searching to
+  sub-agents and keep only their `report.handoff` — that's how long chains stay affordable.
+- **Prefer structured output for anything you branch on.** `--json-schema` + `parse_ok`
+  removes brittle "find the JSON" heuristics from your side entirely.
+- **Isolate parallel edits.** `--worktree` gives each concurrent agent its own branch so a
+  fan-out can't collide; you diff and merge the winner.
+
+### Pairs well with your other skills
+
+summon does *dispatch* — it deliberately doesn't reimplement the thinking-discipline that
+dedicated skills already do well. It composes with whatever your CLI has installed. The
+highest-leverage companions (categories, not endorsements — use what your ecosystem offers):
+
+- **Adversarial / hostile code review** — a review skill that forces genuine perspective
+  shifts pairs perfectly with cross-vendor dispatch: summon sends the diff to a *different*
+  vendor, the review skill makes that vendor actually critical.
+- **Coding discipline** — Karpathy-style guidelines (surface assumptions, keep it simple,
+  surgical changes) applied by each sub-agent keep a swarm from over-building.
+- **Deep-research harnesses** — fan-out + fetch + verify for the *findings*, with summon
+  running the cross-vendor verification pass.
+- **Planning / spec-driven workflows** — a plan/spec skill decomposes the work; summon fans
+  the pieces out (`--manifest`) and reviews them across vendors before merge.
+- **Project memory / knowledge graph** — a durable-memory skill writes `.agents/memory.md`,
+  which summon **auto-injects** into every sub-agent so they never re-learn your conventions.
+
+Rule of thumb: let specialist skills *think*, and let summon *route the thinking across
+vendors*.
 
 ---
 
@@ -269,6 +358,10 @@ headless session).
   `openai-compat` provider (or a local Ollama/LM Studio server). `summon doctor` tells you
   exactly what you have and what's missing.
 - **`git`** if you use `--worktree`.
+- **A host that can run a shell command** — a coding CLI, an AI IDE (Cursor, Antigravity,
+  VS Code + an agent extension), a desktop agent app (the Claude app, the ChatGPT app), or
+  a plain terminal. summon is a CLI + a skill; anything that can invoke `python` and read
+  the skill can drive it.
 - **OS**: Windows (all backends, battle-tested daily), Linux/macOS (all except agy out of
   the box; CI runs the suite on Ubuntu + Windows).
 
