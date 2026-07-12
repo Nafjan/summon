@@ -423,7 +423,7 @@ A new backend is one entry in a registry
 ([references/adding-a-backend.md](references/adding-a-backend.md)); a new agent is a `.md`
 file. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for dev setup, ground rules (stdlib only,
 every change tested, secrets redacted), and the PR checklist. Run
-`python scripts/test_discovery.py` and `python tests/test_install.py` before a PR.
+`python skills/summon/scripts/test_discovery.py` and `python tests/test_install.py` before a PR.
 
 ## Roadmap
 

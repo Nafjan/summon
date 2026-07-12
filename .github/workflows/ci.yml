@@ -92,13 +92,22 @@ jobs:
           rm -rf "$HOME/.claude/skills/summon"
           echo "ownership guard holds (exit 2 exactly)"
 
-      - name: Installed copy end-to-end (real host dir on the runner)
+      - name: Installed copy end-to-end + bundled-roster fallback (real host dir)
         shell: bash
         run: |
           python install.py --hosts claude
           test -f "$HOME/.claude/skills/summon/SKILL.md"
           test -f "$HOME/.claude/skills/summon/.summon-install.json"
-          python "$HOME/.claude/skills/summon/scripts/run_subagent.py" --list --agents-dir skills/summon/agents > /dev/null
+          # agents/ MUST ship inside the installed skill — it is the bundled-fallback
+          # source. (Guards against a regression that drops it from SKILL_PAYLOAD.)
+          test -d "$HOME/.claude/skills/summon/agents"
+          ls "$HOME/.claude/skills/summon/agents"/*.md >/dev/null
+          # Cold dispatch: no --agents-dir, no SUB_AGENTS_DIR, empty project dir ->
+          # the installed skill must still list its bundled roster via the fallback.
+          mkdir -p "$RUNNER_TEMP/emptyproj"
+          env -u SUB_AGENTS_DIR python "$HOME/.claude/skills/summon/scripts/run_subagent.py" \
+            --list --cwd "$RUNNER_TEMP/emptyproj" > listed.json
+          python -c "import json; d=json.load(open('listed.json')); assert len(d['agents']) >= 20, d; print('bundled fallback lists', len(d['agents']), 'agents')"
           python install.py --hosts claude --uninstall
           test ! -d "$HOME/.claude/skills/summon"
-          echo "installed copy dispatch path + clean uninstall verified"
+          echo "installed copy: bundled agents present + cold fallback dispatch + clean uninstall"
