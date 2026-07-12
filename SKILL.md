@@ -156,7 +156,7 @@ Parse JSON output and check `status` field:
 | `--results-dir` | No | With `--manifest`: where job envelopes land (default `{cwd}/.agents/results`) |
 | `--council` | - | Consensus deliberation: dispatch `--question` to diverse members, chairman synthesizes. See "Council mode" |
 | `--question` / `--question-file` | With `--council` | The decision to deliberate |
-| `--members` / `--chairman` / `--rounds` | No | With `--council`: member agents (default diverse set), synthesizer (default `fable`), 1 or 2 rounds |
+| `--members` / `--chairman` / `--rounds` | No | With `--council`: member agents (default is a vendor-diverse, **repo-capable** set — claude+codex+cursor; `agy` members can't read `--cwd`, so avoid them for repo councils), synthesizer (default `fable`), 1 or 2 rounds |
 
 **Stdout contract:** for dispatch commands, stdout carries **exactly one JSON object** —
 nothing before it, nothing after. All diagnostics (manifest progress lines, argparse
