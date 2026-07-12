@@ -99,6 +99,11 @@ project), or `-a <agent>` to target a specific one. Works with any skills-compat
 Claude Code, Codex, Cursor, Gemini, Antigravity, and claw-likes like openclaw and hermes.
 Powered by the open [`skills`](https://www.skills.sh) registry.
 
+You need **Node** (for `npx`), **Python 3.10+** on your PATH, and at least one AI CLI you're
+logged into. After installing, ask your agent to run summon's `doctor` check and it lists what's
+ready and what's missing. On Windows, if the install hits a symlink permission error, re-run
+with `--copy`. No Node? Use the `install.py` path below, which needs only Python.
+
 **Or install into every AI CLI on your machine at once** (multi-host, ownership-safe):
 
 ```bash
