@@ -1494,6 +1494,10 @@ def test_effort_frontmatter_backends_and_envelope():
     # claude passes --effort verbatim
     _, a, _ = build_invocation_args(AgentInvocation(cli="claude", prompt="x", cwd=".", effort="xhigh"))
     assert "--effort" in a and a[a.index("--effort") + 1] == "xhigh"
+    # agy: thinking is a model-name suffix (Gemini Low/Medium/High), clamped for xhigh/max
+    import run_subagent as _R
+    assert _R._apply_gemini_thinking("Gemini 3.1 Pro (High)", "low") == "Gemini 3.1 Pro (Low)"
+    assert _R._apply_gemini_thinking("Gemini 3.5 Flash", "max") == "Gemini 3.5 Flash (High)"
     # envelope surfaces the applied effort
     orig = _executor.build_invocation_args
     _executor.build_invocation_args = lambda inv, timeout_ms=None: ("nope", [], None)

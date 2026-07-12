@@ -93,6 +93,20 @@ def _parse_timeout(value: str) -> int:
     return max(1, int(round(ms)))
 
 
+def _apply_gemini_thinking(model: str, effort: str) -> str:
+    """Map summon effort -> an agy Gemini thinking-mode suffix on the model name
+    (agy's thinking is a model variant, not a flag). Strips any existing ``(...)``
+    and applies the mapped level. NOTE: not every Gemini model has every level
+    (e.g. 3.1 Pro has no Medium) — an unavailable variant will fail at agy, and the
+    envelope's model.requested shows exactly what was asked so it's diagnosable."""
+    suffix = {"low": "Low", "medium": "Medium", "high": "High",
+              "xhigh": "High", "max": "High"}.get(effort)
+    if not suffix:
+        return model
+    base = re.sub(r"\s*\([^)]*\)\s*$", "", model).strip()
+    return f"{base} ({suffix})"
+
+
 def _inject_memory(system_context: str, cwd: str) -> str:
     """Append {cwd}/.agents/memory.md to the agent's system context (capped)."""
     mem_path = os.path.join(cwd, ".agents", "memory.md")
@@ -524,10 +538,11 @@ def main() -> None:
 
     # Reasoning-effort precedence: --effort > agent `effort:` frontmatter >
     # SUMMON_DEFAULT_EFFORT env > the built-in default (high — summon delegates the
-    # hard problems, so it defaults to deep reasoning). Honored by backends with an
-    # effort knob (claude, codex); `none`/`default`/`off` means "use the CLI's own
-    # default". Others ignore it (noted only if it was set EXPLICITLY).
+    # hard problems, so it defaults to deep reasoning). `none`/`default`/`off` = the
+    # backend's own default. claude/codex take an effort flag; agy encodes thinking
+    # in the model NAME (Gemini Low/Medium/High); others don't have the knob.
     _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+    final_model = args.model or model       # dispatch-time override wins over frontmatter
     effort = (args.effort or effort_fm or os.environ.get("SUMMON_DEFAULT_EFFORT") or "high")
     if effort in ("none", "default", "off"):
         effort = None
@@ -535,9 +550,21 @@ def main() -> None:
         _print_error(f"invalid effort {effort!r}: use one of {', '.join(_EFFORT_LEVELS)} "
                      "(or none/default to use the backend's own default)")
         sys.exit(1)
-    if effort and cli not in ("claude", "codex"):
-        if args.effort or effort_fm:
-            print(f"note: effort is only honored by claude/codex; ignored for {cli}",
+    _explicit_effort = bool(args.effort or effort_fm)
+    if cli == "agy":
+        # agy has no --effort flag; thinking is the model-name suffix. Apply an
+        # EXPLICIT effort to a Gemini model; the global default never rewrites an
+        # agy model (respects the variant chosen in `model:`).
+        if effort and _explicit_effort and final_model and final_model.strip().lower().startswith("gemini"):
+            final_model = _apply_gemini_thinking(final_model, effort)
+        elif _explicit_effort:
+            print("note: agy thinking is a model-name suffix (e.g. 'Gemini 3.1 Pro (High)'); "
+                  "--effort maps only Gemini agy models — set it in `model:` / see --list-models",
+                  file=sys.stderr)
+        effort = None
+    elif effort and cli not in ("claude", "codex"):
+        if _explicit_effort:
+            print(f"note: effort is only honored by claude/codex/agy; ignored for {cli}",
                   file=sys.stderr)
         effort = None
 
@@ -562,7 +589,7 @@ def main() -> None:
         system_context=system_context,
         agent_file=agent_file,
         permission=permission,
-        model=args.model or model,       # dispatch-time override wins over frontmatter
+        model=final_model,               # incl. agy Gemini thinking-mode suffix
         effort=effort,                    # --effort > frontmatter > env > default(high)
         resume_id=args.resume,
         resume_profile=args.resume_profile,
