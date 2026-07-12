@@ -160,8 +160,11 @@ def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
     envelope). Returns the parsed envelope (or an error envelope). A parent
     watchdog (child deadline + margin) guarantees the council can't hang on a
     wedged child."""
-    import subprocess
-    from _manifest import _read_envelope   # reuse the robust file-first reader
+    # Reuse the manifest's robust child dispatch: Popen + PROCESS-TREE kill +
+    # bounded communicate on timeout (plain subprocess.run(timeout=) would kill
+    # only the immediate child and then block in an unbounded communicate() if a
+    # backend descendant holds stdout — the same hang fixed in the manifest).
+    from _manifest import _read_envelope, _dispatch_child
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
     out_file = os.path.join(out_dir, f"{tag}.json")
     cmd = [sys.executable, script, "--agent", agent, "--prompt", prompt,
@@ -170,13 +173,14 @@ def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
         cmd += ["--agents-dir", agents_dir]
     watchdog = max(1.0, (timeout_ms + _CHILD_MARGIN_MS) / 1000)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", stdin=subprocess.DEVNULL, timeout=watchdog)
+        proc, spawn_err = _dispatch_child(cmd, watchdog)
+        if spawn_err:
+            return {"status": "error", "error": spawn_err}
+        if proc.timed_out:
+            return {"status": "error", "error": f"council member {agent} exceeded watchdog "
+                    f"({int(watchdog)}s); process tree killed"}
         return _read_envelope(out_file, proc)
-    except subprocess.TimeoutExpired:
-        return {"status": "error", "error": f"council member {agent} exceeded watchdog "
-                f"({int(watchdog)}s); killed"}
-    except OSError as e:
+    except Exception as e:  # noqa: BLE001 — one member must never crash the council
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
 

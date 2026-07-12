@@ -590,8 +590,9 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     path is shown instead."""
     from _builder import (BACKENDS, backend_kind, build_invocation_args,
                           permission_flags as _pf, _PERMISSION_MAPPING, _agy_wrapper,
-                          resolve_billing_model)
-    _eff_model, _fable_note = resolve_billing_model(invocation.model, invocation.cli)
+                          apply_credit_guard)
+    _guarded, _, _guard_warnings = apply_credit_guard(invocation)
+    _eff_model = _guarded.model
     view = {
         "dry_run": True,
         "agent": args.agent,
@@ -610,8 +611,8 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
         "worktree": ("would create" if args.worktree is not None else None),
         "system_context_chars": len(invocation.system_context),
     }
-    if _fable_note:  # credit-only model would fall back — surface it in the preview
-        view.setdefault("warnings", []).append(_fable_note)
+    for _w in _guard_warnings:  # credit-only guard actions surfaced in the preview
+        view.setdefault("warnings", []).append(_w)
     if backend_kind(invocation.cli) == "api":
         view["command"] = f"POST ({invocation.cli})"
         view["base_url"] = invocation.base_url
