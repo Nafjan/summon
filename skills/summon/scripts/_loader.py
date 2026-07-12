@@ -92,13 +92,23 @@ def parse_extra_args(value: str | None) -> list:
         raise ValueError(f"invalid args: frontmatter ({e}): {value!r}") from e
 
 
-def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str, str, str, str, str | None, list, str | None]:
-    """Load agent definition file and extract run-agent and permission settings.
+def bundled_roster_dir() -> str | None:
+    """The starter roster shipped INSIDE the skill (``<skill>/agents``), resolved
+    relative to this module (``<skill>/scripts/_loader.py`` -> ``../agents``).
 
-    Returns (run_agent_cli, system_context, description, file_path, permission,
-    model, extra_args, effort).
-    """
-    validate_agent_name(agent_name)
+    Present in an installed skill (``npx skills add`` / ``install.py`` copy the
+    ``agents/`` dir alongside ``scripts/``); absent in a bare dev checkout, where
+    it is simply a no-op. Used ONLY as a READ-ONLY lookup fallback so a fresh
+    install with no project ``.agents/`` can still dispatch the bundled agents.
+    Never a write target — ``--new-agent`` writes to the project roster returned
+    by :func:`get_agents_dir`, not here."""
+    d = Path(__file__).resolve().parent.parent / "agents"
+    return str(d) if d.is_dir() else None
+
+
+def _load_agent_from(agents_dir: str, agent_name: str):
+    """Load ``agent_name`` from ONE directory. Returns the result tuple, or None
+    if no ``.md``/``.txt`` file is there. Raises ValueError on an escaping name."""
     agents_path = Path(agents_dir)
     agents_root = agents_path.resolve()
 
@@ -119,18 +129,38 @@ def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str, str, 
             return (run_agent, body.strip(), description, str(resolved), permission,
                     frontmatter.get("model") or None, parse_extra_args(frontmatter.get("args")),
                     frontmatter.get("effort") or None)
+    return None
+
+
+def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str, str, str, str, str | None, list, str | None]:
+    """Load agent definition file and extract run-agent and permission settings.
+
+    Looks in ``agents_dir`` first; if not found there, falls back to the starter
+    roster bundled inside the skill (read-only), so a fresh install works before
+    the user has set up a project ``.agents/`` roster.
+
+    Returns (run_agent_cli, system_context, description, file_path, permission,
+    model, extra_args, effort).
+    """
+    validate_agent_name(agent_name)
+
+    result = _load_agent_from(agents_dir, agent_name)
+    if result is not None:
+        return result
+
+    bundled = bundled_roster_dir()
+    if bundled and Path(bundled).resolve() != Path(agents_dir).resolve():
+        result = _load_agent_from(bundled, agent_name)
+        if result is not None:
+            return result
 
     raise FileNotFoundError(f"Agent definition not found: {agent_name}")
 
 
-def list_agents(agents_dir: str) -> list[dict]:
-    """List all available agents in the directory.
-
-    Returns list of {"name": str, "description": str}, sorted by name.
-    Files that fail to parse are still listed with an empty description.
-    """
+def _list_agents_in(agents_dir: str) -> list[dict]:
+    """List agents in ONE directory (unsorted). ``.md`` wins over ``.txt``."""
     agents_path = Path(agents_dir)
-    agents = []
+    agents: list[dict] = []
     seen_names: set[str] = set()
 
     if not agents_path.exists():
@@ -152,6 +182,27 @@ def list_agents(agents_dir: str) -> list[dict]:
             except (OSError, UnicodeDecodeError):
                 # Unreadable / binary file: still list it so caller sees it exists.
                 agents.append({"name": name, "description": ""})
+
+    return agents
+
+
+def list_agents(agents_dir: str) -> list[dict]:
+    """List all available agents, sorted by name.
+
+    Returns {"name", "description"} for every agent in ``agents_dir``, plus any
+    from the skill's bundled starter roster that aren't already present (the
+    project dir wins on a name collision). Files that fail to parse are still
+    listed with an empty description.
+    """
+    agents = _list_agents_in(agents_dir)
+    seen = {a["name"] for a in agents}
+
+    bundled = bundled_roster_dir()
+    if bundled and Path(bundled).resolve() != Path(agents_dir).resolve():
+        for a in _list_agents_in(bundled):
+            if a["name"] not in seen:
+                seen.add(a["name"])
+                agents.append(a)
 
     return sorted(agents, key=lambda a: a["name"])
 

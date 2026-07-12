@@ -20,10 +20,10 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: Compile all modules
-        run: python -m py_compile scripts/run_subagent.py scripts/_loader.py scripts/_resolver.py scripts/_builder.py scripts/_executor.py scripts/_stream.py scripts/_doctor.py summon.py install.py
+        run: python -m py_compile skills/summon/scripts/run_subagent.py skills/summon/scripts/_loader.py skills/summon/scripts/_resolver.py skills/summon/scripts/_builder.py skills/summon/scripts/_executor.py skills/summon/scripts/_stream.py skills/summon/scripts/_doctor.py summon.py install.py
 
       - name: Unit tests (dispatcher)
-        run: python scripts/test_discovery.py
+        run: python skills/summon/scripts/test_discovery.py
 
       - name: Unit tests (installer safety, isolated fake homes)
         run: python tests/test_install.py
@@ -38,7 +38,7 @@ jobs:
       - name: List bundled agents
         shell: bash
         run: |
-          python summon.py --list --agents-dir agents > agents.json
+          python summon.py --list --agents-dir skills/summon/agents > agents.json
           python -c "import json; d=json.load(open('agents.json')); assert len(d['agents']) >= 20, d; print(len(d['agents']), 'agents')"
 
       - name: Model discovery (static sources only on CI)
@@ -50,7 +50,7 @@ jobs:
       - name: Dry-run resolves without executing (no backend needed)
         shell: bash
         run: |
-          python summon.py --agent reviewer --prompt "x" --cwd "$PWD" --agents-dir agents --dry-run > dry.json
+          python summon.py --agent reviewer --prompt "x" --cwd "$PWD" --agents-dir skills/summon/agents --dry-run > dry.json
           python -c "import json; d=json.load(open('dry.json')); assert d['dry_run'] and d['cli']=='codex' and d['permission_flags'], d"
 
       - name: Manifest + schema examples parse and validate
@@ -58,7 +58,7 @@ jobs:
         run: |
           python - <<'PY'
           import json, sys
-          sys.path.insert(0, "scripts")
+          sys.path.insert(0, "skills/summon/scripts")
           import _schema
           json.load(open("examples/jobs.json"))
           schema = json.load(open("examples/verdict.schema.json"))
@@ -98,7 +98,7 @@ jobs:
           python install.py --hosts claude
           test -f "$HOME/.claude/skills/summon/SKILL.md"
           test -f "$HOME/.claude/skills/summon/.summon-install.json"
-          python "$HOME/.claude/skills/summon/scripts/run_subagent.py" --list --agents-dir agents > /dev/null
+          python "$HOME/.claude/skills/summon/scripts/run_subagent.py" --list --agents-dir skills/summon/agents > /dev/null
           python install.py --hosts claude --uninstall
           test ! -d "$HOME/.claude/skills/summon"
           echo "installed copy dispatch path + clean uninstall verified"
