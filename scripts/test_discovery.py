@@ -1400,6 +1400,42 @@ def test_manifest_timeout_grammar_matches_child():
     assert _manifest._parent_timeout({"timeout": "30s"}) >= 90.0
 
 
+def test_fable_credit_only_guard():
+    # Fable (claude-fable-5) is credit-only: on the claude CLI it falls back to
+    # Opus unless SUMMON_ALLOW_FABLE=1; the API path is never rewritten.
+    import _builder, _executor
+    from _builder import AgentInvocation
+    os.environ.pop("SUMMON_ALLOW_FABLE", None); os.environ.pop("SUMMON_ALLOW_CREDIT", None)
+    eff, note = _builder.resolve_billing_model("claude-fable-5", "claude")
+    assert eff == "claude-opus-4-8" and note, (eff, note)
+    # argv actually carries the fallback
+    _, args, _ = _builder.build_invocation_args(
+        AgentInvocation(cli="claude", prompt="x", cwd=".", model="claude-fable-5"))
+    assert args[args.index("--model") + 1] == "claude-opus-4-8"
+    # authorized -> real Fable, no note
+    os.environ["SUMMON_ALLOW_FABLE"] = "1"
+    try:
+        eff2, note2 = _builder.resolve_billing_model("claude-fable-5", "claude")
+        assert eff2 == "claude-fable-5" and note2 is None
+    finally:
+        del os.environ["SUMMON_ALLOW_FABLE"]
+    # the API/openai-compat path is untouched (metered by design)
+    assert _builder.resolve_billing_model("claude-fable-5", "openai-compat") == ("claude-fable-5", None)
+
+    # envelope transparency: fallback preserves requested + warns; opus billing stays subscription
+    orig = _executor.build_invocation_args
+    _executor.build_invocation_args = lambda inv, timeout_ms=None: ("definitely-not-a-real-cli-xyz", [], None)
+    try:
+        r = _executor.execute_agent(
+            AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), model="claude-fable-5"),
+            timeout_ms=800)
+    finally:
+        _executor.build_invocation_args = orig
+    assert r["model"]["requested"] == "claude-fable-5", r["model"]
+    assert any("account credit" in w for w in r.get("warnings", [])), r.get("warnings")
+    assert r["billing"]["source"] == "subscription", r["billing"]
+
+
 def test_parse_report_keeps_real_status_with_pipe():
     # GF5: a real status containing " | " (not a template) must NOT be skipped.
     import _executor

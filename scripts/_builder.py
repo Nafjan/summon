@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from _loader import DEFAULT_PERMISSION
 
@@ -210,6 +210,39 @@ def infer_billing(cli: str) -> dict:
     if key:
         return {"source": "subscription", "note": f"CLI login (no {key})"}
     return {"source": "unknown", "note": ""}
+
+
+# --- Credit-only model guard (Fable) -----------------------------------------
+# Some models are NOT covered by the vendor's flat subscription and bill account
+# CREDIT (API-style) even through the subscription CLI. Fable (claude-fable-5)
+# left the Claude Max subscription and is now credit-only. Mirroring the
+# OPENAI_API_KEY guard, we DEFAULT to the latest subscription-covered model
+# (Opus) and require an explicit opt-in to spend credit — so a `fable` dispatch
+# never silently draws down credit. The API-key path (an openai-compat anthropic
+# agent) is unaffected: that is metered by design.
+_CREDIT_ONLY_MODELS = {"claude-fable-5"}
+_OPUS_FALLBACK = "claude-opus-4-8"  # latest subscription-covered Opus (bump point)
+
+
+def credit_spend_allowed() -> bool:
+    """The operator opted in to spending account credit on a credit-only model."""
+    return (os.environ.get("SUMMON_ALLOW_FABLE") == "1"
+            or os.environ.get("SUMMON_ALLOW_CREDIT") == "1")
+
+
+def resolve_billing_model(model: str | None, cli: str) -> tuple[str | None, str | None]:
+    """Apply the credit-only guard. Returns ``(effective_model, fallback_note)``.
+
+    A credit-only model requested on the SUBSCRIPTION ``claude`` CLI falls back to
+    the latest Opus unless credit spend is authorized; ``fallback_note`` explains
+    the substitution (None when nothing changed / when credit is authorized)."""
+    if cli == "claude" and model in _CREDIT_ONLY_MODELS and not credit_spend_allowed():
+        return _OPUS_FALLBACK, (
+            f"{model} is no longer covered by the Claude Max subscription (it bills "
+            f"account credit); summon fell back to {_OPUS_FALLBACK}. To run it on "
+            f"credit set SUMMON_ALLOW_FABLE=1, or use an ANTHROPIC_API_KEY "
+            f"(openai-compat) agent to run it metered.")
+    return model, None
 
 
 def _codex_env_override() -> dict | None:
@@ -633,6 +666,12 @@ def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None
         raise ValueError(f"Unknown backend: {inv.cli}")
     if b["kind"] != "subprocess":
         raise ValueError(f"backend {inv.cli!r} is {b['kind']}-kind; no argv to build")
+    # Credit-only guard (Fable): substitute the model HERE so both real dispatch
+    # and --dry-run enforce the fallback identically. The executor separately
+    # surfaces the note/billing on the envelope (this only shapes the argv).
+    eff_model, _ = resolve_billing_model(inv.model, inv.cli)
+    if eff_model != inv.model:
+        inv = replace(inv, model=eff_model)
     if inv.cli == "agy":
         return _build_agy_args(inv, timeout_ms)
     return b["build"](inv)
