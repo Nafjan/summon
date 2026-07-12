@@ -491,7 +491,7 @@ def main() -> None:
     agents_dir = get_agents_dir(args.agents_dir, args.cwd)
 
     try:
-        run_agent_cli, system_context, _, agent_file, permission, model, extra_args = load_agent(
+        run_agent_cli, system_context, _, agent_file, permission, model, extra_args, effort_fm = load_agent(
             agents_dir, args.agent
         )
     except (FileNotFoundError, ValueError) as e:
@@ -522,11 +522,24 @@ def main() -> None:
         _print_error(f"agent {args.agent!r}: {e}")
         sys.exit(1)
 
-    # --effort is a claude-only knob; warn instead of silently dropping it so a
-    # user doesn't believe a non-claude run was tuned when it wasn't.
-    if args.effort and cli != "claude":
-        print(f"note: --effort is only honored by the claude backend; ignored for {cli}",
-              file=sys.stderr)
+    # Reasoning-effort precedence: --effort > agent `effort:` frontmatter >
+    # SUMMON_DEFAULT_EFFORT env > the built-in default (high — summon delegates the
+    # hard problems, so it defaults to deep reasoning). Honored by backends with an
+    # effort knob (claude, codex); `none`/`default`/`off` means "use the CLI's own
+    # default". Others ignore it (noted only if it was set EXPLICITLY).
+    _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+    effort = (args.effort or effort_fm or os.environ.get("SUMMON_DEFAULT_EFFORT") or "high")
+    if effort in ("none", "default", "off"):
+        effort = None
+    elif effort not in _EFFORT_LEVELS:
+        _print_error(f"invalid effort {effort!r}: use one of {', '.join(_EFFORT_LEVELS)} "
+                     "(or none/default to use the backend's own default)")
+        sys.exit(1)
+    if effort and cli not in ("claude", "codex"):
+        if args.effort or effort_fm:
+            print(f"note: effort is only honored by claude/codex; ignored for {cli}",
+                  file=sys.stderr)
+        effort = None
 
     # openai-compat: resolve the API endpoint (provider -> base_url/api_key_env)
     # from the agent's frontmatter now, while we still have the agents dir.
@@ -550,7 +563,7 @@ def main() -> None:
         agent_file=agent_file,
         permission=permission,
         model=args.model or model,       # dispatch-time override wins over frontmatter
-        effort=args.effort,
+        effort=effort,                    # --effort > frontmatter > env > default(high)
         resume_id=args.resume,
         resume_profile=args.resume_profile,
         extra_args=tuple(extra_args),

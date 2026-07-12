@@ -221,11 +221,12 @@ def infer_billing(cli: str) -> dict:
 # never silently draws down credit. The API-key path (an openai-compat anthropic
 # agent) is unaffected: that is metered by design.
 _CREDIT_ONLY_MODELS = {"claude-fable-5"}
-# The `opus` ALIAS (not a pinned id) is the fallback: it always resolves to the
-# user's latest subscription-covered Opus, so there's no version to bump and no
-# risk of a hardcoded id the CLI rejects. Safe because the guard also strips
-# ANTHROPIC_* aliases that could remap `opus` -> a credit-only model.
-_OPUS_FALLBACK = "opus"
+# The latest subscription-covered Opus, PINNED (not the `opus` alias). The alias
+# currently LAGS — it resolves to claude-opus-4-7 while 4-8 is the latest — so a
+# pin gives the actual latest (verified available on the CLI). Bump this line when
+# a newer Opus ships. The credit-env strip still covers an `opus`-alias remap for
+# any agent that uses the alias directly.
+_OPUS_FALLBACK = "claude-opus-4-8"
 # Flags that select a model — the guard scrubs credit-only values from any of
 # these in an agent's `args:` passthrough (incl. --fallback-model, which Claude
 # uses on primary-model overload).
@@ -342,16 +343,23 @@ def _codex_env_override() -> dict | None:
 def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     perm = permission_flags(inv.cli, inv.permission)
     model_flag = ["-m", inv.model] if inv.model else []
+    # Reasoning effort -> codex config override. gpt supports low|medium|high, so
+    # clamp claude's xhigh/max down to high. Global `-c` flags precede the subcommand.
+    effort_flag = []
+    if inv.effort:
+        _e = "high" if inv.effort in ("xhigh", "max") else inv.effort
+        effort_flag = ["-c", f"model_reasoning_effort={_e}"]
     env = _codex_env_override()
+    head = perm + model_flag + effort_flag + list(inv.extra_args)
     if inv.resume_id:
         # `codex exec resume <id>`: the thread holds the agent definition, so send
         # only the task + reminder (no [System Context] prefix). Permission/model
         # flags are global codex flags and still precede the subcommand.
-        return "codex", perm + model_flag + list(inv.extra_args) + [
+        return "codex", head + [
             "exec", "resume", inv.resume_id, "--json", "--skip-git-repo-check",
             _resume_prompt(inv)], env
     command, base_args = build_command(inv.cli, _concatenated_prompt(inv))
-    return command, perm + model_flag + list(inv.extra_args) + base_args, env
+    return command, head + base_args, env
 
 
 def _build_cursor_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
