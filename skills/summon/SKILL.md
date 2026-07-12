@@ -42,7 +42,7 @@ Extract parameters from user's natural language request:
 
 **Agent Selection Rules** (when user doesn't specify agent name):
 1. Run `--list` to get available agents
-2. **0 agents**: Inform user no agents available, show setup instructions (see [Agent Definition Format](#agent-definition-format))
+2. **0 agents** (rare — a starter roster ships bundled): only if even the bundled roster is missing, show setup instructions (see [Agent Definition Format](#agent-definition-format))
 3. **1 agent**: Auto-select without asking
 4. **2+ agents**: Show list with descriptions, ask user to choose
 
@@ -84,9 +84,14 @@ Output:
 {"agents": [{"name": "code-reviewer", "description": "Reviews code..."}], "agents_dir": "/path/.agents"}
 ```
 
-**If agents list is empty**:
-1. Create `{cwd}/.agents/` directory
-2. Add agent definition file (see [Agent Definition Format](#agent-definition-format))
+A starter roster (planner, reviewer, coder, pair, …) ships bundled inside the
+skill, so `--list` is normally populated even in a brand-new project — you do
+not need to create anything to start dispatching. A project `.agents/` dir (or
+`--agents-dir`) only *adds to / overrides* that bundled roster.
+
+**If the agents list is genuinely empty** (bundled roster missing):
+1. Create a `{cwd}/.agents/` directory, or point `--agents-dir` at one
+2. Add an agent definition file, or scaffold one with `--new-agent <name>`
 3. Re-run `--list` to verify
 
 ### Step 2: Execute Agent
