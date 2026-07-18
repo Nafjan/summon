@@ -95,7 +95,7 @@ run_subagent.py --council --question-file q.md \
 - **Council consumes a fixed flag set** (`--question`/`--question-file`, `--members`,
   `--chairman`, `--rounds`, `--cwd`, `--agents-dir`, `--timeout`, `--out`). Anything
   else (`--model`, `--json-schema`, `--worktree`, `--background`, `--retries`, ...)
-  is rejected up front rather than silently ignored — member model/effort/permission
+  is rejected up front rather than silently ignored; member model/effort/permission
   come from each member agent's own definition.
 
 Returns one council envelope: `{question, rounds, members:[{agent, model, position}],

@@ -31,13 +31,13 @@ it bumps only on a breaking change to the response shape, never on added fields.
   dispatch reporting `resolved: claude-fable-5` with all-zero usage. `resolved`
   keeps its legacy v1 behavior until envelope v2.
 - **`--prompt-file`** for direct dispatch (UTF-8, BOM-stripped, strict decoding;
-  background children re-read the file). Quoting/encoding ergonomics — backend argv
+  background children re-read the file). Quoting/encoding ergonomics; backend argv
   limits still apply.
 - **`--allow-credit`**: per-dispatch flag form of `SUMMON_ALLOW_CREDIT=1`; rejected
   for fan-out modes (env inheritance would authorize every child silently).
 - **agy safe-edit warning**: every agy dispatch at `safe-edit` (and its `--dry-run`)
   carries a warning that this level is a FULL bypass identical to `yolo` on agy.
-- Docs: fixed the self-contradicting host-timeout guidance ("match" vs "above" —
+- Docs: fixed the self-contradicting host-timeout guidance ("match" vs "above";
   above is canonical).
 
 ### Fixed (multi-model ultrareview pass)
