@@ -101,9 +101,10 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
             return None, f"job #{i}: unknown keys {sorted(unknown)}"
         if not job.get("agent"):
             return None, f"job #{i}: 'agent' is required"
-        if job.get("prompt") and job.get("prompt_file"):
-            # Both present used to mean prompt silently won (a defaults-level
-            # prompt_file was ignored wholesale). Ambiguous -> reject.
+        if job.get("prompt") is not None and job.get("prompt_file") is not None:
+            # Both PRESENT (even prompt: "") used to mean prompt silently won
+            # (a defaults-level prompt_file was ignored wholesale). Ambiguous ->
+            # rejected on presence, not truthiness.
             return None, f"job #{i}: give 'prompt' or 'prompt_file', not both"
         if job.get("prompt_file") and not job.get("prompt"):
             pf = job["prompt_file"]

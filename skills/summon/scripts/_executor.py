@@ -652,7 +652,10 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 _v = resp["usage"].get(_k)
                 if isinstance(_v, (int, float)) and not isinstance(_v, bool):
                     _out_tokens = max(_out_tokens, _v)
-        _targeted = _handshake or _terminal_model or _effective
+        # STRICTLY handshake-then-effective: the terminal model is SERVED
+        # evidence and must never pollute what the session was pointed at
+        # (they can legitimately differ, and that difference is the signal).
+        _targeted = _handshake or _effective
         if _terminal_model:
             _served = _terminal_model
         elif _out_tokens > 0 and _targeted:
