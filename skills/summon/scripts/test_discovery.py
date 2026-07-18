@@ -2625,6 +2625,47 @@ def test_council_renews_lease_after_every_stage():
         _sh.rmtree(root, ignore_errors=True)
 
 
+def test_council_facade_subcommands_and_matrix():
+    # The B1 command surface: subcommand rewrites, the per-operation flag
+    # matrix, and the read-only status path, all end-to-end via subprocess.
+    import json as _json
+    import subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    # council resume needs an id
+    r = sp.run([sys.executable, script, "council", "resume"],
+               capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode != 0 and "needs a run id" in (r.stdout + r.stderr)
+    # resume rejects the flags that would change the run's identity
+    r2 = sp.run([sys.executable, script, "--council", "--resume-run", "x",
+                 "--members", "a,b", "--cwd", os.getcwd()],
+                capture_output=True, text=True, encoding="utf-8")
+    env2 = _json.loads(r2.stdout)
+    assert env2["status"] == "error" and "--members" in env2["error"]
+    assert "silently ignored" in env2["error"]
+    # status is read-only and rejects run flags; unknown id -> exit 1, no --council leak
+    d = tempfile.mkdtemp(prefix="summon-facade-")
+    try:
+        r3 = sp.run([sys.executable, script, "council", "status", "missing-run",
+                     "--run-dir", d, "--json"],
+                    capture_output=True, text=True, encoding="utf-8")
+        env3 = _json.loads(r3.stdout)
+        assert r3.returncode == 1 and env3["mode"] == "council-status"
+        assert "unknown council run" in env3["error"]
+        # status rejects a dispatch flag
+        r4 = sp.run([sys.executable, script, "--council-status", "x", "--members", "a,b"],
+                    capture_output=True, text=True, encoding="utf-8")
+        env4 = _json.loads(r4.stdout)
+        assert env4["status"] == "error" and "--members" in env4["error"]
+        # a bogus run id is rejected before any filesystem access
+        r5 = sp.run([sys.executable, script, "--council-status", "../evil", "--run-dir", d],
+                    capture_output=True, text=True, encoding="utf-8")
+        env5 = _json.loads(r5.stdout)
+        assert env5["status"] == "error" and "invalid run id" in env5["error"]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 def test_rundir_id_validation_and_containment():
     import _rundir as rd
     for good in ("council-20260718-1200-ab12", "a", "run.1_x-Y"):

@@ -80,7 +80,9 @@ instead of retrying.)
 
 ### Step 1b: List Available Agents
 
-**Always list agents first** to discover available definitions:
+**List agents once per session** (or whenever the roster may have changed) to discover
+available definitions — the roster is stable within a session, so re-listing before
+every single dispatch is unnecessary ceremony. Dispatch directly once you know it.
 
 ```bash
 scripts/run_subagent.py --list
@@ -171,6 +173,9 @@ Parse JSON output and check `status` field:
 | `--council` | - | Consensus deliberation: dispatch `--question` to diverse members, chairman synthesizes. See "Council mode" |
 | `--question` / `--question-file` | With `--council` | The decision to deliberate |
 | `--members` / `--chairman` / `--rounds` | No | With `--council`: member agents (default is a vendor-diverse, **repo-capable** set — claude+codex+cursor; `agy` members can't read `--cwd`, so avoid them for repo councils), synthesizer (default `fable`), 1 or 2 rounds |
+| `--run-dir` | No | With `--council`: root for the durable run directory (default `{cwd}/.agents/runs`; env `SUMMON_RUNS_DIR`) |
+| `--resume-run RUN_ID` | - | Resume a council run: re-run only missing/failed/changed stages (question and members come from the run's `receipt.json`). Subcommand form: `council resume <run-id>` |
+| `--council-status RUN_ID` | - | Print a council run's durable state, read-only (add `--json`). Subcommand form: `council status <run-id>` |
 
 **Stdout contract:** for dispatch commands, stdout carries **exactly one JSON object** —
 nothing before it, nothing after. All diagnostics (manifest progress lines, argparse
@@ -206,6 +211,15 @@ at most 3 concurrent per backend, so the worst case is about
 `waves = ceil(same-backend members / 3)`; the dispatcher prints this estimate to stderr
 before dispatching. Set your host tool's timeout above it, and pass `--out` on any
 council you cannot afford to lose.
+
+**Councils are durable and resumable.** Every council writes a persistent run directory
+(`{cwd}/.agents/runs/<run-id>/`, or `--run-dir` / `SUMMON_RUNS_DIR`), returned as
+`run_id`/`generation`. If a council dies, `council resume <run-id>` re-runs only the
+missing, failed, or input-changed stages and **carries the rest forward without
+re-paying**; `council status <run-id>` shows its state read-only. This is the durable
+path for expensive councils — prefer it over re-running from scratch. See
+[references/fan-out.md](references/fan-out.md) for the run-directory layout, the
+carry-forward/invalidation rules, and the one documented single-machine lock limitation.
 
 ## Chaining & continuity (response fields)
 

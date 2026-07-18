@@ -93,12 +93,45 @@ run_subagent.py --council --question-file q.md \
   `rounds x waves x (timeout + 60s) + (timeout + 60s)`. The dispatcher prints this
   estimate to stderr before dispatching; set your host tool's timeout above it.
 - **Council consumes a fixed flag set** (`--question`/`--question-file`, `--members`,
-  `--chairman`, `--rounds`, `--cwd`, `--agents-dir`, `--timeout`, `--out`). Anything
-  else (`--model`, `--json-schema`, `--worktree`, `--background`, `--retries`, ...)
+  `--chairman`, `--rounds`, `--cwd`, `--agents-dir`, `--timeout`, `--out`, `--run-dir`).
+  Anything else (`--model`, `--json-schema`, `--worktree`, `--background`, `--retries`, ...)
   is rejected up front rather than silently ignored; member model/effort/permission
   come from each member agent's own definition.
 
-Returns one council envelope: `{question, rounds, members:[{agent, model, position}],
-synthesis:{chairman, recommendation, report}, elapsed_ms}`. Progress → stderr.
-Use it for architecture calls, tech-selection, risk judgments — anything where one
-model's blind spot is real and consensus (or named dissent) is the deliverable.
+Returns one council envelope: `{run_id, generation, question, rounds,
+members:[{agent, model, position}], synthesis:{chairman, recommendation, report},
+elapsed_ms}`. Progress → stderr. Use it for architecture calls, tech-selection, risk
+judgments — anything where one model's blind spot is real and consensus (or named
+dissent) is the deliverable.
+
+## Durable, resumable council runs
+
+Every council writes a **persistent run directory** (`{cwd}/.agents/runs/<run-id>/`;
+override with `--run-dir` or `SUMMON_RUNS_DIR`), printed to stderr at the start and
+returned as `run_id`/`run_dir`/`generation` in the envelope. It holds one atomic
+envelope per stage (`g<N>-r1-<member>.json`, `g<N>-rankings.json`, `g<N>-chairman.json`),
+a `receipt.json` binding the run's inputs, and an append-only `journal-g<N>.jsonl`.
+Nothing is deleted on completion, so a council that dies mid-run leaves a complete,
+inspectable record.
+
+- **Resume:** `summon council resume <run-id>` re-runs only the stages that are
+  missing, failed, or whose upstream inputs changed; every unchanged stage is
+  **carried forward and never re-paid**. The question, members, chairman, and rounds
+  come from the run's `receipt.json` (changing them means starting a fresh council, so
+  those flags are rejected on a resume). A changed repo (`--cwd`), a retuned agent
+  definition, or an edited earlier-stage output all invalidate the affected stage and
+  everything downstream of it; stale files move to `superseded/` with their spend
+  evidence intact.
+- **Status:** `summon council status <run-id>` prints the run's derived state
+  (per-stage status, generation, attempts, abandoned work) read-only; add `--json` for
+  machines. It takes a generation-stable snapshot and reports `consistent: false` if
+  the run changed mid-read.
+- **How it stays correct:** one owner holds a leased lock per run (renewed after every
+  stage), and each ownership period claims a fresh **generation** so a suspended-then-
+  resumed process can never overwrite a successor's work; journal and state are
+  segmented per generation. One documented limitation: the owner-lock stale-break has a
+  sub-millisecond unlink window that pure-stdlib cross-platform file operations cannot
+  fully close; because stage outputs are generation-namespaced, the worst case if it
+  ever fired is one duplicate stage dispatch (wasted spend), never corrupted output.
+  It requires a process suspended past its (600s+) lease resuming inside that exact
+  window; single-machine use never hits it in practice.
