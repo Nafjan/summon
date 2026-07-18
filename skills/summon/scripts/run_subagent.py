@@ -649,19 +649,32 @@ def main() -> None:
             _print_error(str(e))
             sys.exit(1)
 
+    # Provenance receipt, built PROGRESSIVELY: summon identity from here on, so
+    # EVERY single-dispatch-path envelope (combo rejections, prompt-file errors,
+    # missing agent, invalid effort, bad endpoint, preflight, real results)
+    # names the install that produced it. The prompt hash joins as soon as the
+    # prompt is resolved; agent identity after load; git HEAD once the cwd is
+    # validated. Cheap (one hash over the scripts dir), so computing it even for
+    # runs that turn out to be fan-out modes is fine.
+    receipt: dict = _receipt_base()
+
+    def _die(msg: str, exit_code: int = 1) -> None:
+        env = {"result": "", "exit_code": exit_code, "status": "error", "error": msg}
+        env.update(receipt)
+        _emit(env)
+        sys.exit(exit_code)
+
     if args.resume and args.worktree is not None:
-        _print_error("--resume and --worktree are incompatible: a session lives in the "
-                     "original project dir, not a fresh worktree")
-        sys.exit(1)
+        _die("--resume and --worktree are incompatible: a session lives in the "
+             "original project dir, not a fresh worktree")
 
     # --dry-run is a SINGLE-dispatch preview only. Combining it with modes that
     # fan out or detach would otherwise slip past the dry-run exit and run real
     # work (a detached --background child never even inherits --dry-run). Refuse
     # loudly instead of silently executing.
     if args.dry_run and (args.background or args.manifest or args.council):
-        _print_error("--dry-run cannot be combined with --background, --manifest, or "
-                     "--council (it previews one resolved dispatch and never executes)")
-        sys.exit(1)
+        _die("--dry-run cannot be combined with --background, --manifest, or "
+             "--council (it previews one resolved dispatch and never executes)")
 
     # --background and --out are two DIFFERENT completion contracts: background
     # signals done via its own result_file (job handle), while --out means
@@ -670,10 +683,9 @@ def main() -> None:
     # error never creates --out). For fan-out with per-job result files, use
     # --manifest. Reject the combination rather than pick a surprising winner.
     if args.background and args.out:
-        _print_error("--background and --out are incompatible: background reports "
-                     "completion via its own result_file; --out is the (manifest) "
-                     "result-file mechanism. Use --manifest for fan-out with result files.")
-        sys.exit(1)
+        _die("--background and --out are incompatible: background reports "
+             "completion via its own result_file; --out is the (manifest) "
+             "result-file mechanism. Use --manifest for fan-out with result files.")
 
     # --manifest: batch fan-out. Delegates to _manifest and exits.
     if args.manifest:
@@ -700,36 +712,28 @@ def main() -> None:
             _emit(prior)
             sys.exit(0)
 
-    # Provenance receipt, built PROGRESSIVELY: summon identity now, agent
-    # identity after load, git HEAD once the cwd is validated. Every envelope
-    # the single-dispatch path emits (validation error, preflight error, real
-    # result) carries whatever provenance exists at that point -- "which
-    # install failed to find the agent" is exactly when provenance matters.
-    receipt: dict = _receipt_base()
-
-    def _die(msg: str, exit_code: int = 1) -> None:
-        env = {"result": "", "exit_code": exit_code, "status": "error", "error": msg}
-        env.update(receipt)
-        _emit(env)
-        sys.exit(exit_code)
-
     # --prompt-file: resolve to a prompt BEFORE the background handler (its
     # validation needs args.prompt). utf-8-sig strips a BOM; strict decoding so
     # mojibake fails loudly instead of reaching a paid model. NOTE: this is
     # quoting/encoding ergonomics, not argv-limit relief -- builders still pass
     # the prompt as one argv token (agy's ~28k guard still applies). Presence
-    # check (is not None), not truthiness: --prompt "" plus --prompt-file is
-    # still two competing inputs.
-    if args.prompt is not None and args.prompt_file:
+    # checks (is not None) on BOTH sides, not truthiness: --prompt "" plus
+    # --prompt-file, and --prompt plus --prompt-file "", are each two competing
+    # inputs (and an empty filename then fails the open loudly, never silently).
+    if args.prompt is not None and args.prompt_file is not None:
         _die("give --prompt or --prompt-file, not both")
-    if args.prompt_file:
+    if args.prompt_file is not None:
         try:
             with open(args.prompt_file, encoding="utf-8-sig") as fh:
                 args.prompt = fh.read()
-        except (OSError, UnicodeDecodeError) as e:
+        except (OSError, UnicodeDecodeError, ValueError) as e:
             _die(f"cannot read --prompt-file {args.prompt_file}: {e}")
         if not args.prompt.strip():
             _die(f"--prompt-file {args.prompt_file} is empty")
+
+    # Root-prompt hash joins the receipt HERE, as soon as the prompt is final,
+    # so even a missing-agent error downstream carries it.
+    receipt.update(_receipt_prompt(args.prompt))
 
     # --allow-credit: per-dispatch credit authorization. Env form of the same
     # switch, set process-local so the credit guard and any --background child
@@ -789,7 +793,6 @@ def main() -> None:
         _die(str(e))
 
     receipt.update(_receipt_agent(args, agent_file))
-    receipt.update(_receipt_prompt(args.prompt))
 
     # Shared project memory: inject {cwd}/.agents/memory.md (standing conventions,
     # constraints, durable decisions) so callers don't re-explain project context
@@ -836,9 +839,8 @@ def main() -> None:
     if effort in ("none", "default", "off"):
         effort = None
     elif effort not in _EFFORT_LEVELS:
-        _print_error(f"invalid effort {effort!r}: use one of {', '.join(_EFFORT_LEVELS)} "
-                     "(or none/default to use the backend's own default)")
-        sys.exit(1)
+        _die(f"invalid effort {effort!r}: use one of {', '.join(_EFFORT_LEVELS)} "
+             "(or none/default to use the backend's own default)")
     _explicit_effort = bool(args.effort or effort_fm)
     if cli == "agy":
         # agy has no --effort flag; thinking is the model-name suffix. Apply an
@@ -868,8 +870,7 @@ def main() -> None:
                 fm, _ = parse_frontmatter(fh.read())
             base_url, api_key_env = resolve_endpoint(fm, agents_dir)
         except (OSError, ValueError) as e:
-            _print_error(f"openai-compat agent {args.agent!r}: {e}")
-            sys.exit(1)
+            _die(f"openai-compat agent {args.agent!r}: {e}")
 
     invocation = AgentInvocation(
         cli=cli,

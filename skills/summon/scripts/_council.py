@@ -233,15 +233,15 @@ def run_council(args) -> int:
     """Entry point for ``--council``. Returns the process exit code."""
     # getattr: direct callers (tests) build a Namespace without `out`.
     out_path = getattr(args, "out", None)
-    if args.question_file and args.question is not None:
-        # Both inputs PRESENT (even --question "") used to mean the FILE
-        # silently won -- ambiguous, so rejected on presence, not truthiness.
+    if args.question_file is not None and args.question is not None:
+        # Both inputs PRESENT (even as empty strings, on either side) used to
+        # mean one silently won -- ambiguous, so rejected on presence.
         return _fail("give --question OR --question-file, not both", out_path)
-    if args.question_file:
+    if args.question_file is not None:
         try:
             with open(args.question_file, encoding="utf-8") as fh:
                 question = fh.read().strip()
-        except OSError as e:
+        except (OSError, ValueError) as e:
             return _fail(f"cannot read --question-file: {e}", out_path)
     else:
         question = (args.question or "").strip()

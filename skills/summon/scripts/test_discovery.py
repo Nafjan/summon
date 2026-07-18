@@ -1874,6 +1874,17 @@ def test_council_out_written_on_fail_and_question_conflict():
             rc2 = _council.run_council(args2)
         env2 = _json.loads(buf2.getvalue())
         assert rc2 == 1 and "not both" in env2["error"], env2
+        # reverse-empty escape: an EMPTY --question-file with --question is
+        # still two competing inputs (presence on both sides)
+        args3 = argparse.Namespace(question="q", question_file="",
+                                   members=None, chairman=None, rounds=1,
+                                   cwd=os.getcwd(), agents_dir=d, timeout=60000,
+                                   out=None)
+        buf3 = io.StringIO()
+        with contextlib.redirect_stdout(buf3):
+            rc3 = _council.run_council(args3)
+        env3 = _json.loads(buf3.getvalue())
+        assert rc3 == 1 and "not both" in env3["error"], env3
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
@@ -2124,6 +2135,18 @@ def test_receipt_and_model_evidence_on_error_dispatch():
                     cwd=os.getcwd())
         head = gh.stdout.strip() if gh.returncode == 0 else ""
         assert env.get("git_head_before") == (head or None), (env.get("git_head_before"), head)
+        # a different cwd: the key is present and matches git's OWN answer for
+        # that directory (None where git finds no repo; a tempdir can legally
+        # sit under an enclosing repo, e.g. a dotfiles-managed home, and git's
+        # walk-up semantics are the correct provenance there)
+        r5 = sp.run([sys.executable, script, "--agent", "dead-api", "--prompt", "hello",
+                     "--cwd", d, "--agents-dir", d, "--timeout", "8s"],
+                    capture_output=True, text=True, encoding="utf-8")
+        env5 = _json.loads(r5.stdout)
+        gh5 = sp.run(["git", "-C", d, "rev-parse", "HEAD"], capture_output=True, text=True)
+        head5 = gh5.stdout.strip() if gh5.returncode == 0 else ""
+        assert "git_head_before" in env5, env5
+        assert env5["git_head_before"] == (head5 or None), (env5["git_head_before"], head5)
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
@@ -2181,12 +2204,17 @@ def test_mode_matrix_default_values_and_early_combos():
         env = _json.loads(r.stdout)
         assert env["status"] == "error" and flag in env["error"], (argv, env)
         assert r.returncode == 1, (argv, r.returncode)
-    # empty --prompt plus --prompt-file is still two competing inputs
+    # empty values on EITHER side are still two competing inputs (presence)
     r2 = sp.run([sys.executable, script, "--agent", "a", "--prompt", "",
                  "--prompt-file", "x.md", "--cwd", os.getcwd()],
                 capture_output=True, text=True, encoding="utf-8")
     env2 = _json.loads(r2.stdout)
     assert env2["status"] == "error" and "not both" in env2["error"], env2
+    r3 = sp.run([sys.executable, script, "--agent", "a", "--prompt", "x",
+                 "--prompt-file", "", "--cwd", os.getcwd()],
+                capture_output=True, text=True, encoding="utf-8")
+    env3 = _json.loads(r3.stdout)
+    assert env3["status"] == "error" and "not both" in env3["error"], env3
 
 
 def test_receipt_on_missing_agent_and_preflight():
@@ -2206,6 +2234,9 @@ def test_receipt_on_missing_agent_and_preflight():
         assert env["status"] == "error" and "not found" in env["error"], env
         assert len(env["summon"]["scripts_sha256"]) == 64, env.get("summon")
         assert "git_head_before" in env and "agent_def" not in env, env
+        # the ROOT prompt hash is already known and must be present here too
+        import hashlib as _hl
+        assert env["prompt_sha256"] == _hl.sha256(b"p").hexdigest(), env
         # missing backend (PATH emptied) -> preflight setup error with FULL receipt
         open(os.path.join(d, "gm.md"), "w", encoding="utf-8").write(
             "---\nrun-agent: gemini\npermission: read-only\n---\n# gm\nrole.\n")
@@ -2219,6 +2250,14 @@ def test_receipt_on_missing_agent_and_preflight():
         assert len(env2["summon"]["scripts_sha256"]) == 64, env2.get("summon")
         assert env2["agent_def"]["file"].endswith("gm.md"), env2.get("agent_def")
         assert "prompt_sha256" in env2 and "git_head_before" in env2, env2
+        # invalid effort (a post-load validation error) also carries the receipt
+        r3 = sp.run([sys.executable, script, "--agent", "gm", "--prompt", "p",
+                     "--cwd", os.getcwd(), "--agents-dir", d, "--effort", "bogus"],
+                    capture_output=True, text=True, encoding="utf-8")
+        env3 = _json.loads(r3.stdout)
+        assert env3["status"] == "error" and "invalid effort" in env3["error"], env3
+        assert len(env3["summon"]["scripts_sha256"]) == 64, env3
+        assert env3["agent_def"]["file"].endswith("gm.md"), env3
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)

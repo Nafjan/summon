@@ -313,8 +313,8 @@ vendors.
 - `report.handoff` → the context to pass to the next call.
 - `report_ok: false` on a "success" → also gets `suspect: true`. Agents that skip their
   contract don't get believed.
-- `model.served` → the model that actually did the work (evidence-based; `null` on a
-  failed run). `targeted` = what the session was pointed at.
+- `model.served` → the model that actually did the work (evidence-based; `null` = no
+  service evidence observed). `targeted` = what the session was pointed at.
 - `summon.scripts_sha256` + `agent_def.sha256` → provenance: which dispatcher build and
   which agent definition produced this envelope.
 - `billing.source` → did this draw from a **subscription** or metered **api** credits.
