@@ -2327,6 +2327,159 @@ def test_council_out_write_failure_surfaces_out_error():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_rundir_id_validation_and_containment():
+    import _rundir as rd
+    for good in ("council-20260718-1200-ab12", "a", "run.1_x-Y"):
+        assert rd.validate_run_id(good) == good
+    for bad in ("", "..", "a..b", "-lead", ".lead", "x" * 65, "a/b", "a\\b",
+                "trailing.", "CON", "con", "NUL.txt", "com7", "LPT9.log", "prn.a.b"):
+        try:
+            rd.validate_run_id(bad)
+            raise AssertionError(f"accepted bad id: {bad!r}")
+        except ValueError:
+            pass
+    root = tempfile.mkdtemp(prefix="summon-runsroot-")
+    try:
+        p = rd.run_path(root, "ok-run")
+        import pathlib
+        assert pathlib.Path(p).parent == pathlib.Path(root).resolve()
+        assert rd.stage_path("/r", 3, "r1-m1").endswith("g3-r1-m1.json")
+        try:
+            rd.stage_path("/r", 1, "bad/stage")
+            raise AssertionError("accepted bad stage")
+        except ValueError:
+            pass
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_rundir_owner_lifecycle_generations():
+    import _rundir as rd
+    d = tempfile.mkdtemp(prefix="summon-own-")
+    try:
+        o1 = rd.acquire_owner(d, lease_sec=600)
+        assert o1.generation == 1
+        # held -> clean error naming the owner
+        try:
+            rd.acquire_owner(d, lease_sec=600)
+            raise AssertionError("second acquire should have failed")
+        except rd.OwnerHeldError as e:
+            assert e.pid == os.getpid()
+        rd.renew_owner(o1)  # lease advances without error while ours
+        rd.release_owner(o1)
+        # clean-release resume claims generation max+1 (persisted outside the lock)
+        o2 = rd.acquire_owner(d, lease_sec=600)
+        assert o2.generation == 2, o2.generation
+        rd.release_owner(o2)
+        rd.release_owner(o2)  # double release is a no-op
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_rundir_takeover_fencing_and_foreign_lock():
+    import json as _json
+    import time
+    import _rundir as rd
+    d = tempfile.mkdtemp(prefix="summon-take-")
+    try:
+        o1 = rd.acquire_owner(d, lease_sec=600)
+        # force-expire the lease on disk (simulates a suspended owner)
+        lock = os.path.join(d, rd.OWNER_LOCK)
+        data = _json.loads(open(lock, encoding="utf-8").read())
+        data["lease_expires"] = time.time() - 5
+        open(lock, "w", encoding="utf-8").write(_json.dumps(data))
+        o2 = rd.acquire_owner(d, lease_sec=600)     # takeover
+        assert o2.generation == o1.generation + 1
+        # the deposed owner cannot renew, and its release must NOT remove the
+        # successor's lock
+        try:
+            rd.renew_owner(o1)
+            raise AssertionError("deposed owner renewed")
+        except rd.OwnershipLostError:
+            pass
+        rd.release_owner(o1)
+        assert rd.read_owner(d) and rd.read_owner(d)["nonce"] == o2.nonce
+        rd.release_owner(o2)
+        # foreign/malformed lock is NEVER auto-broken
+        open(lock, "w", encoding="utf-8").write("{malformed")
+        try:
+            rd.acquire_owner(d, lease_sec=600)
+            raise AssertionError("broke a foreign lock")
+        except rd.OwnerLockForeignError:
+            pass
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_rundir_journal_checksums_torn_tail_and_repair():
+    import _rundir as rd
+    d = tempfile.mkdtemp(prefix="summon-jrnl-")
+    try:
+        o = rd.acquire_owner(d, lease_sec=600)
+        rd.journal_append(d, {"event": "started", "stage": "r1-m1", "n": 1})
+        rd.journal_append(d, {"event": "finished", "stage": "r1-m1", "n": 1,
+                              "status": "success", "note": "unicode → ok"})
+        recs, torn = rd.journal_read(d)
+        assert len(recs) == 2 and not torn
+        assert recs[0]["event"] == "started" and "ts" in recs[0]
+        # torn tail: a partial line is repairable, and repair records itself
+        with open(os.path.join(d, rd.JOURNAL_FILE), "a", encoding="utf-8") as fh:
+            fh.write('{"event":"finis')
+        recs2, torn2 = rd.journal_read(d)
+        assert torn2 and len(recs2) == 2
+        assert rd.journal_repair(d, o) is True
+        recs3, torn3 = rd.journal_read(d)
+        assert not torn3 and recs3[-1]["event"] == "journal_repaired"
+        # mid-file corruption raises, never auto-repairs
+        lines = open(os.path.join(d, rd.JOURNAL_FILE), encoding="utf-8").read().splitlines()
+        lines[0] = lines[0].replace("started", "sabotag")
+        open(os.path.join(d, rd.JOURNAL_FILE), "w", encoding="utf-8").write("\n".join(lines) + "\n")
+        try:
+            rd.journal_read(d)
+            raise AssertionError("mid-file corruption not detected")
+        except rd.JournalCorruptError:
+            pass
+        rd.release_owner(o)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_rundir_carry_forward_validation():
+    import _rundir as rd
+    d = tempfile.mkdtemp(prefix="summon-carry-")
+    try:
+        o1 = rd.acquire_owner(d, lease_sec=600)
+        sha = rd.content_sha256({"question": "q", "positions": ["a"]})
+        rd.atomic_write_json(rd.stage_path(d, 1, "r1-m1"),
+                             {"status": "success", "result": "pos", "input_sha256": sha})
+        rd.atomic_write_json(rd.stage_path(d, 1, "r1-m2"),
+                             {"status": "error", "input_sha256": sha})
+        rd.release_owner(o1)
+        o2 = rd.acquire_owner(d, lease_sec=600)
+        # valid stage carries forward with provenance + journal record
+        assert rd.carry_forward(d, o2, "r1-m1", 1, sha) is True
+        copied = rd.read_json(rd.stage_path(d, 2, "r1-m1"))
+        assert copied["carried_from_generation"] == 1 and copied["result"] == "pos"
+        recs, _ = rd.journal_read(d)
+        assert recs[-1]["event"] == "carried_forward"
+        # non-success never carries; upstream-hash mismatch never carries
+        assert rd.carry_forward(d, o2, "r1-m2", 1, sha) is False
+        assert rd.carry_forward(d, o2, "r1-m1", 1, "0" * 64) is False
+        # generation fallback scan: delete generation.txt, files imply max=2
+        os.unlink(os.path.join(d, rd.GENERATION_FILE))
+        rd.release_owner(o2)
+        o3 = rd.acquire_owner(d, lease_sec=600)
+        assert o3.generation == 3, o3.generation
+        rd.release_owner(o3)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
