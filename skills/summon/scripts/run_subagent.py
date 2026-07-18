@@ -384,7 +384,9 @@ _MODE_FLAGS = {
                 "rounds", "cwd", "agents_dir", "timeout", "out", "run_dir", "job_file"},
     "council-resume": {"council", "resume_run", "cwd", "agents_dir", "timeout",
                        "out", "run_dir", "job_file"},
-    "council-status": {"council_status", "run_dir", "json", "cwd", "job_file"},
+    # Status takes ONLY its id, where to look, and the output format -- it never
+    # dispatches, so it has no working directory (use --run-dir to point it).
+    "council-status": {"council_status", "run_dir", "json", "job_file"},
 }
 _MODE_HINTS = {
     "manifest": ("Put per-job settings (model, effort, timeout, json_schema, "

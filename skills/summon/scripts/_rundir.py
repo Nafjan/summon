@@ -508,11 +508,22 @@ def journal_read(run_dir: str):
 
 
 def journal_repair(run_dir: str, owner: Owner) -> bool:
-    """Owner-only: truncate a torn final line in the OWNER'S OWN segment and
-    record the repair. Returns whether a repair happened. Never called without
-    holding the lock; status reads NEVER repair. Only the owner's generation
-    segment is ever rewritten, so this cannot touch a concurrent owner's file."""
-    path = _journal_path(run_dir, owner.generation)
+    """Owner-only: truncate a torn final line in the NEWEST EXISTING segment and
+    record the repair. Returns whether a repair happened.
+
+    Called at acquisition BEFORE the new owner writes its own segment, so the
+    newest existing segment is the PREDECESSOR'S (a crash mid-write leaves its
+    tail torn). Repairing the new owner's own (not-yet-created) generation would
+    be a no-op and leave the predecessor's tail to be reclassified as fatal
+    corruption once this owner appends -- the segmentation bug this fixes. Only
+    the lock holder repairs; status reads never do. The invariant this
+    maintains: at any acquisition at most the single newest segment is torn (an
+    older torn segment IS corruption, and journal_read raises on it)."""
+    gens = _segment_generations(run_dir)
+    if not gens:
+        return False
+    newest = max(gens)
+    path = _journal_path(run_dir, newest)
     records, torn = _read_segment(path)
     if not torn:
         return False
@@ -524,8 +535,11 @@ def journal_repair(run_dir: str, owner: Owner) -> bool:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+    # The repair record goes to the OWNER'S own segment (created here if needed),
+    # noting which predecessor segment was healed.
     journal_append(run_dir, {"event": "journal_repaired",
-                             "generation": owner.generation}, owner=owner)
+                             "generation": owner.generation,
+                             "repaired_generation": newest}, owner=owner)
     return True
 
 

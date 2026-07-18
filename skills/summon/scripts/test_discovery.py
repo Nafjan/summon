@@ -2852,6 +2852,45 @@ def test_rundir_review_races_lock_fencing_and_journal():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_rundir_predecessor_torn_tail_repaired_on_takeover():
+    # Regression for the segmentation blocker: g1 crashes mid-write (torn tail),
+    # g2 takes over. The takeover must repair the PREDECESSOR's segment before
+    # writing its own, or g1's tail is later reclassified as fatal corruption.
+    import _rundir as rd
+    import json as _json, time as _t
+    d = tempfile.mkdtemp(prefix="summon-tornseg-")
+    try:
+        o1 = rd.acquire_owner(d, lease_sec=600)
+        rd.journal_append(d, {"event": "attempt_started", "stage": "r1-m1"}, owner=o1)
+        # simulate a crash mid-write: a partial line at the end of g1's segment
+        with open(rd._journal_path(d, 1), "a", encoding="utf-8") as fh:
+            fh.write('{"event":"attempt_fin')
+        # force-expire g1 and take over as g2 (the real acquisition path)
+        lock = os.path.join(d, rd.OWNER_LOCK)
+        data = _json.loads(open(lock, encoding="utf-8").read())
+        data["lease_expires"] = _t.time() - 5
+        open(lock, "w", encoding="utf-8").write(_json.dumps(data))
+        o2 = rd.acquire_owner(d, lease_sec=600)
+        assert o2.generation == 2
+        # takeover flow: read (torn), repair the predecessor, then write our own
+        recs, torn = rd.journal_read(d)
+        assert torn and len(recs) == 1
+        assert rd.journal_repair(d, o2) is True
+        rd.journal_append(d, {"event": "attempt_started", "stage": "r1-m1"}, owner=o2)
+        # g1 is now clean and g2 has records; a merged read must NOT raise
+        recs2, torn2 = rd.journal_read(d)
+        assert not torn2
+        events = [r["event"] for r in recs2]
+        assert events.count("attempt_started") == 2 and "journal_repaired" in events
+        # the repair record names which predecessor segment it healed
+        rep = [r for r in recs2 if r["event"] == "journal_repaired"][0]
+        assert rep["repaired_generation"] == 1 and rep["generation"] == 2
+        rd.release_owner(o2)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 def test_rundir_toctou_windows_hook_injected():
     # Finding 9: exercise the ACTUAL check-then-mutate windows with a takeover
     # injected BETWEEN the ownership check and the mutation, not before the call.
