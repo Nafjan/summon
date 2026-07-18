@@ -310,21 +310,27 @@ def acquire_owner(run_dir: str, lease_sec: float) -> Owner:
         expiry = _effective_expiry(run_dir, data)   # incl. the lease sidecar
         if time.time() < expiry:
             raise OwnerHeldError(data.get("pid"), expiry)
-        # Expired: break it, but only if BOTH content and mtime are unchanged
-        # since we judged it (never delete a lock somebody just replaced).
+        # Expired: break it, but only after re-confirming, as close to the
+        # unlink as possible, that (a) the bytes+mtime are unchanged since we
+        # judged it and (b) the EFFECTIVE expiry (incl. a lease sidecar that
+        # may have just landed) is still past. This shrinks the stale-break
+        # window to the final re-read->unlink gap; closing it to zero needs OS
+        # advisory locks, a documented residual for this single-machine tool.
         try:
             with open(lock, "rb") as fh:
                 raw2 = fh.read()
-            if raw2 == raw and os.path.getmtime(lock) == observed_mtime:
-                # Persist the broken lock's generation BEFORE unlinking, so the
-                # next loop iteration's _last_generation (which can no longer
-                # read the deleted lock) still advances past it -- a stale lock
-                # broken at generation N must never let us re-claim <= N.
+            data2 = _parse_owner(raw2)
+            fresh_expiry = _effective_expiry(run_dir, data2) if data2 else 0
+            if (raw2 == raw and os.path.getmtime(lock) == observed_mtime
+                    and time.time() >= fresh_expiry):
+                # Persist the broken lock's generation BEFORE unlinking. If that
+                # FAILS we must NOT unlink (finding 7): losing the generation
+                # would let the next claim regress. Leave the lock; report held.
                 try:
                     _write_generation(run_dir, max(_last_generation(run_dir),
                                                    data["generation"]))
                 except OSError:
-                    pass
+                    raise OwnerHeldError(data.get("pid"), fresh_expiry)
                 os.unlink(lock)
                 try:  # the deposed owner's lease sidecar is dead weight now
                     os.unlink(_lease_path(run_dir, data["nonce"]))
@@ -392,6 +398,11 @@ class JournalCorruptError(Exception):
     auto-repaired (the torn-tail rule covers only the final line)."""
 
 
+class CarryResidueError(Exception):
+    """A failed carry-forward left an un-removable success file whose presence
+    would make a re-dispatch silently skip. Fatal: never dispatch past it."""
+
+
 def _journal_line(record: dict) -> str:
     ser = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     digest = hashlib.sha256(ser.encode("utf-8")).hexdigest()
@@ -399,31 +410,18 @@ def _journal_line(record: dict) -> str:
                       separators=(",", ":"), ensure_ascii=False)
 
 
-def journal_append(run_dir: str, record: dict, owner: Owner | None = None) -> None:
-    """Append one checksummed line and FSYNC it. When ``owner`` is given the
-    write is FENCED: the lock must still carry the owner's exact bytes, or
-    OwnershipLostError raises and nothing is written -- a suspended parent that
-    resumes after a takeover cannot corrupt the successor's single-writer
-    journal. ``ts`` is stamped here. fsync BEFORE returning is the durability
-    contract: an ``attempt started`` record must hit disk before the paid
-    dispatch it announces."""
-    rec = {**record, "ts": time.time()}
-    line = _journal_line(rec)
-    path = os.path.join(run_dir, JOURNAL_FILE)
-    with _JOURNAL_LOCK:
-        if owner is not None and not owner_still_current(owner):
-            raise OwnershipLostError("journal write refused: ownership changed")
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+def _journal_path(run_dir: str, generation: int) -> str:
+    """Per-GENERATION journal segment. This is the real single-writer fix: an
+    owner at generation N only ever appends to ``journal-gN.jsonl``, and a
+    deposed owner and its successor hold DIFFERENT generations, so they write
+    different files by construction -- interleaving is impossible, no lock
+    needed. Readers merge all segments in generation order."""
+    return os.path.join(run_dir, f"journal-g{int(generation)}.jsonl")
 
 
-def journal_read(run_dir: str):
-    """``(records, torn_tail)``. Verifies every line's checksum. A final line
-    that is torn or checksum-invalid sets ``torn_tail=True`` (the acquisition
-    path repairs it); an earlier invalid line raises JournalCorruptError."""
-    path = os.path.join(run_dir, JOURNAL_FILE)
+def _read_segment(path: str):
+    """``(records, torn_tail)`` for one segment file. A checksum-failing FINAL
+    line is a repairable torn tail; an earlier one is real corruption."""
     try:
         with open(path, encoding="utf-8") as fh:
             lines = fh.read().split("\n")
@@ -446,24 +444,79 @@ def journal_read(run_dir: str):
         if ok:
             records.append(data)
         elif i == len(lines) - 1:
-            return records, True   # torn tail: repairable
+            return records, True
         else:
             raise JournalCorruptError(
-                f"journal line {i + 1} failed its checksum (mid-file corruption)")
+                f"{os.path.basename(path)} line {i + 1} failed its checksum")
     return records, False
 
 
+def _segment_generations(run_dir: str):
+    """Generations that have a journal segment, ascending."""
+    gens = []
+    try:
+        for name in os.listdir(run_dir):
+            m = re.match(r"^journal-g(\d+)\.jsonl$", name)
+            if m:
+                gens.append(int(m.group(1)))
+    except OSError:
+        pass
+    return sorted(gens)
+
+
+def journal_append(run_dir: str, record: dict, owner: Owner) -> None:
+    """Append one checksummed line to the OWNER'S generation segment and FSYNC
+    it. ``owner`` is required: the segment path is derived from its generation,
+    which is what guarantees a single writer per file. The fence
+    (owner_still_current) is kept as defense so a deposed owner also STOPS
+    writing, but even without it a deposed owner could only ever touch its own
+    (now-abandoned) segment, never the successor's. ``ts`` is stamped here;
+    fsync before returning is the durability contract (an ``attempt started``
+    record must hit disk before the paid dispatch it announces)."""
+    rec = {**record, "ts": time.time()}
+    line = _journal_line(rec)
+    path = _journal_path(run_dir, owner.generation)
+    with _JOURNAL_LOCK:
+        if not owner_still_current(owner):
+            raise OwnershipLostError("journal write refused: ownership changed")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
+
+def journal_read(run_dir: str):
+    """``(records, torn_tail)`` merged across ALL generation segments in order.
+    ``torn_tail`` is True if the HIGHEST-generation segment has a torn tail (the
+    only one a resume will repair); a mid-file checksum failure in any segment
+    raises JournalCorruptError."""
+    gens = _segment_generations(run_dir)
+    all_records: list = []
+    torn = False
+    for i, g in enumerate(gens):
+        recs, seg_torn = _read_segment(_journal_path(run_dir, g))
+        all_records.extend(recs)
+        if seg_torn:
+            # A torn tail is only expected on the newest segment (a crash mid-
+            # write). An older segment with a torn tail is corruption.
+            if i == len(gens) - 1:
+                torn = True
+            else:
+                raise JournalCorruptError(
+                    f"journal-g{g}.jsonl has a torn tail below the newest generation")
+    return all_records, torn
+
+
 def journal_repair(run_dir: str, owner: Owner) -> bool:
-    """Owner-only: truncate a torn final line and record the repair. Returns
-    whether a repair happened. Never called without holding the lock; status
-    reads NEVER repair."""
-    records, torn = journal_read(run_dir)
+    """Owner-only: truncate a torn final line in the OWNER'S OWN segment and
+    record the repair. Returns whether a repair happened. Never called without
+    holding the lock; status reads NEVER repair. Only the owner's generation
+    segment is ever rewritten, so this cannot touch a concurrent owner's file."""
+    path = _journal_path(run_dir, owner.generation)
+    records, torn = _read_segment(path)
     if not torn:
         return False
-    path = os.path.join(run_dir, JOURNAL_FILE)
     good = "".join(_journal_line(r) + "\n" for r in records)
-    # Rewrite atomically: the journal is small relative to envelopes, and this
-    # runs once, at acquisition, under the lock.
     import tempfile
     fd, tmp = tempfile.mkstemp(dir=run_dir, prefix=".summon-journal-", suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -505,11 +558,17 @@ def carry_forward(run_dir: str, owner: Owner, stage: str, prior_generation: int,
             expected_input_sha is not None and check.get("input_sha256") != expected_input_sha):
         # A failed copy must leave NO current-generation residue: the child's
         # --out skip-if-success would otherwise reuse the bad file instead of
-        # the promised re-run.
+        # the promised re-run. If the deletion itself FAILS and a success
+        # residue remains, raise (finding 4): the caller must NOT dispatch to a
+        # path that would be skipped, so a stuck file is fatal, not ignored.
         try:
             os.unlink(dst)
-        except OSError:
-            pass
+        except OSError as e:
+            leftover = read_json(dst)
+            if leftover and leftover.get("status") == "success":
+                raise CarryResidueError(
+                    f"carry-forward left an unusable success residue at {dst} "
+                    f"that could not be removed ({e}); refusing to skip a re-run") from e
         return False
     try:
         journal_append(run_dir, {"event": "carried_forward", "stage": stage,
