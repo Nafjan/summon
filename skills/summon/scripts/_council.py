@@ -239,25 +239,50 @@ def run_council(args) -> int:
     """Entry point for ``--council``. Returns the process exit code."""
     # getattr: direct callers (tests) build a Namespace without `out`.
     out_path = getattr(args, "out", None)
-    if args.question_file is not None and args.question is not None:
-        # Both inputs PRESENT (even as empty strings, on either side) used to
-        # mean one silently won -- ambiguous, so rejected on presence.
-        return _fail("give --question OR --question-file, not both", out_path)
-    if args.question_file is not None:
+    import _rundir as _rd
+    cwd = os.path.abspath(args.cwd or os.getcwd())
+    runs_root = _runs_root(args, cwd)
+    resume_run = getattr(args, "resume_run", None)
+    receipt_doc = None
+    if resume_run:
+        # RESUME: the run's receipt is authoritative for question/members/
+        # chairman/rounds (the mode matrix rejects those flags on resume --
+        # changing them is a NEW run, not a resume).
         try:
-            with open(args.question_file, encoding="utf-8") as fh:
-                question = fh.read().strip()
-        except (OSError, ValueError) as e:
-            return _fail(f"cannot read --question-file: {e}", out_path)
+            _rd.validate_run_id(resume_run)
+            rd_path = _rd.run_path(runs_root, resume_run)
+        except ValueError as e:
+            return _fail(str(e), out_path)
+        if not os.path.isdir(rd_path):
+            return _fail(f"unknown council run {resume_run!r} under {runs_root}", out_path)
+        receipt_doc = _rd.read_json(os.path.join(rd_path, "receipt.json"))
+        if (not receipt_doc or receipt_doc.get("mode") != "council"
+                or not receipt_doc.get("question")):
+            return _fail(f"run {resume_run!r} has no valid council receipt.json", out_path)
+        question = receipt_doc["question"]
+        members = list(receipt_doc.get("members") or [])
+        chairman = receipt_doc.get("chairman") or DEFAULT_CHAIRMAN
+        rounds = receipt_doc.get("rounds") or 1
+        run_id = resume_run
     else:
-        question = (args.question or "").strip()
-    if not question:
-        return _fail("--council needs --question or --question-file", out_path)
-
-    members = ([m.strip() for m in args.members.split(",") if m.strip()]
-               if args.members else list(DEFAULT_MEMBERS))
-    chairman = args.chairman or DEFAULT_CHAIRMAN
-    rounds = args.rounds or 1
+        if args.question_file is not None and args.question is not None:
+            # Both inputs PRESENT (even as empty strings, on either side) used to
+            # mean one silently won -- ambiguous, so rejected on presence.
+            return _fail("give --question OR --question-file, not both", out_path)
+        if args.question_file is not None:
+            try:
+                with open(args.question_file, encoding="utf-8") as fh:
+                    question = fh.read().strip()
+            except (OSError, ValueError) as e:
+                return _fail(f"cannot read --question-file: {e}", out_path)
+        else:
+            question = (args.question or "").strip()
+        if not question:
+            return _fail("--council needs --question or --question-file", out_path)
+        members = ([m.strip() for m in args.members.split(",") if m.strip()]
+                   if args.members else list(DEFAULT_MEMBERS))
+        chairman = args.chairman or DEFAULT_CHAIRMAN
+        rounds = args.rounds or 1
     if rounds not in (1, 2):
         return _fail("--rounds must be 1 or 2", out_path)
     if len(members) < 2:
@@ -273,8 +298,8 @@ def run_council(args) -> int:
                      out_path)
 
     from _loader import get_agents_dir, load_agent
-    cwd = os.path.abspath(args.cwd or os.getcwd())
-    agents_dir = args.agents_dir or get_agents_dir(None, cwd)
+    agents_dir = (args.agents_dir or (receipt_doc or {}).get("agents_dir")
+                  or get_agents_dir(None, cwd))
     for who in dict.fromkeys(members + [chairman]):  # validate before any paid dispatch
         try:
             load_agent(agents_dir, who)
@@ -289,26 +314,36 @@ def run_council(args) -> int:
     # The PERSISTENT run directory replaces the old throwaway mkdtemp (which
     # soft paths deleted and hard kills orphaned -- the field failure). One
     # owner, one generation, journaled attempts; see _rundir.py.
-    import _rundir as _rd
-    runs_root = _runs_root(args, cwd)
-    run_id = _rd.new_run_id("council")
+    if not resume_run:
+        run_id = _rd.new_run_id("council")
+        try:
+            rd_path = _rd.run_path(runs_root, run_id)
+        except ValueError as e:
+            return _fail(str(e), out_path)
     try:
-        rd_path = _rd.run_path(runs_root, run_id)
         owner = _rd.acquire_owner(rd_path, _rd.default_lease_sec(timeout_ms / 1000))
-    except (_rd.OwnerHeldError, _rd.OwnerLockForeignError, ValueError, OSError) as e:
-        return _fail(f"cannot open run dir for {run_id}: {e}", out_path)
-    print(f"[council] run {run_id} (generation {owner.generation}) -> {rd_path}",
-          file=sys.stderr, flush=True)
-    try:
-        _rd.atomic_write_json(os.path.join(rd_path, "receipt.json"), {
-            "mode": "council", "run_id": run_id, "question": question,
-            "question_sha256": _rd.content_sha256(question), "members": members,
-            "chairman": chairman, "rounds": rounds, "cwd": cwd,
-            "agents_dir": agents_dir, "created_at": time.time(),
-        })
-    except OSError as e:
+    except (_rd.OwnerHeldError, _rd.OwnerLockForeignError, OSError) as e:
+        return _fail(f"cannot own run {run_id}: {e}", out_path)
+    try:  # a torn journal tail (crashed prior owner) is repaired ONLY here, under the lock
+        _recs, _torn = _rd.journal_read(rd_path)
+        if _torn:
+            _rd.journal_repair(rd_path, owner)
+    except _rd.JournalCorruptError as e:
         _rd.release_owner(owner)
-        return _fail(f"cannot write run receipt: {e}", out_path)
+        return _fail(f"run {run_id}: {e}", out_path)
+    print(f"[council] {'resume of' if resume_run else 'run'} {run_id} "
+          f"(generation {owner.generation}) -> {rd_path}", file=sys.stderr, flush=True)
+    if not resume_run:
+        try:
+            _rd.atomic_write_json(os.path.join(rd_path, "receipt.json"), {
+                "mode": "council", "run_id": run_id, "question": question,
+                "question_sha256": _rd.content_sha256(question), "members": members,
+                "chairman": chairman, "rounds": rounds, "cwd": cwd,
+                "agents_dir": agents_dir, "created_at": time.time(),
+            })
+        except OSError as e:
+            _rd.release_owner(owner)
+            return _fail(f"cannot write run receipt: {e}", out_path)
 
     started = time.monotonic()
     lock = threading.Lock()
@@ -363,15 +398,23 @@ def run_council(args) -> int:
                                      "elapsed_ms": env.get("elapsed_ms")})
         return env
 
-    def run_member(agent: str, prompt: str, tag: str, input_sha: str) -> dict:
-        b = member_backend[agent]
-        with sems[b]:
-            env = run_stage(agent, prompt, tag, input_sha)
-        with lock:
-            done["n"] += 1
-            print(f"[council {done['n']}/{len(members)}] {agent} ({b}) "
-                  f"status={env.get('status')}", file=sys.stderr, flush=True)
-        return {"agent": agent, "backend": b,
+    fresh_stages: set = set()   # stages DISPATCHED (or recomputed) this generation;
+                                # their stale prior-generation files get superseded
+
+    def _prior_generation(stage: str) -> int:
+        """Highest generation below ours holding this stage's file (0 = none)."""
+        best = 0
+        try:
+            for name in os.listdir(rd_path):
+                m = re.match(rf"^g(\d+)-{re.escape(stage)}\.json$", name)
+                if m and int(m.group(1)) < owner.generation:
+                    best = max(best, int(m.group(1)))
+        except OSError:
+            pass
+        return best
+
+    def _member_view(agent: str, env: dict) -> dict:
+        return {"agent": agent, "backend": member_backend[agent],
                 "model": _model_label(env),   # served/resolved, else requested (never blank)
                 "status": env.get("status"), "position": _position(env, cap),
                 "elapsed_ms": env.get("elapsed_ms"),
@@ -379,6 +422,52 @@ def run_council(args) -> int:
                 "warnings": env.get("warnings"),    # e.g. a Fable -> Opus fallback
                 "_raw": env.get("result") or "",   # kept only to parse RANKING
                 "_env": env}   # full child envelope: checkpoints persist it
+
+    def run_member(agent: str, prompt: str, stage: str, input_sha: str) -> dict:
+        # Resume economics: a prior-generation stage whose upstream inputs are
+        # unchanged (input_sha match) is carried forward, never re-paid.
+        pg = _prior_generation(stage)
+        if pg and _rd.carry_forward(rd_path, owner, stage, pg, input_sha):
+            env = _rd.read_json(_rd.stage_path(rd_path, owner.generation, stage)) or {}
+            with lock:
+                done["n"] += 1
+                print(f"[council {done['n']}/{len(members)}] {agent} carried forward "
+                      f"from generation {pg}", file=sys.stderr, flush=True)
+            return _member_view(agent, env)
+        fresh_stages.add(stage)
+        b = member_backend[agent]
+        with sems[b]:
+            env = run_stage(agent, prompt, stage, input_sha)
+        with lock:
+            done["n"] += 1
+            print(f"[council {done['n']}/{len(members)}] {agent} ({b}) "
+                  f"status={env.get('status')}", file=sys.stderr, flush=True)
+        return _member_view(agent, env)
+
+    def _supersede_stale() -> None:
+        """Move RE-RUN stages' stale prior-generation files to superseded/g<N>/
+        (spend evidence preserved, never deleted; carried-forward originals stay
+        in place as the produced artifacts)."""
+        try:
+            names = os.listdir(rd_path)
+        except OSError:
+            return
+        for name in names:
+            m = re.match(r"^g(\d+)-(.+)\.json$", name)
+            if not m:
+                continue
+            gen, stage = int(m.group(1)), m.group(2)
+            if gen >= owner.generation or stage not in fresh_stages:
+                continue
+            dest_dir = os.path.join(rd_path, "superseded", f"g{gen}")
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                os.replace(os.path.join(rd_path, name), os.path.join(dest_dir, name))
+                _rd.journal_append(rd_path, {"event": "superseded", "stage": stage,
+                                             "from_generation": gen,
+                                             "generation": owner.generation})
+            except OSError:
+                pass
 
     def _write_state(phase: str, chair_status=None) -> None:
         """Derived display index (envelopes + journal stay authoritative)."""
@@ -442,28 +531,37 @@ def run_council(args) -> int:
                                   f"r2-{agent}", r2_sha)
             with ThreadPoolExecutor(max_workers=len(members)) as pool:
                 results = list(pool.map(refine, members))
-            # Aggregate each SUCCESSFUL member's ranking (Borda) into a consensus
-            # order — a failed/partial member's stray RANKING must not count.
-            n = len(members)
-            votes = [r for r in (_parse_ranking(m.get("_raw", ""), n)
-                                 for m in results if m.get("status") == "success") if r]
-            if votes:
-                agg = _aggregate_rankings(votes, n)
-                consensus_ranking = [{"agent": members[a["index"]], "score": a["score"],
-                                      "votes": a["votes"]} for a in agg]
-            # rankings are an owner-computed STAGE (carry-forwardable on resume)
-            try:
-                _rd.atomic_write_json(
-                    _rd.stage_path(rd_path, owner.generation, "rankings"),
-                    {"status": "success", "stage": "rankings",
-                     "consensus_ranking": consensus_ranking, "votes": len(votes),
-                     "input_sha256": _rd.content_sha256(
-                         [m.get("_raw", "") for m in results])})
-                _rd.journal_append(rd_path, {"event": "stage_computed",
-                                             "stage": "rankings",
-                                             "generation": owner.generation})
-            except OSError:
-                pass
+            # Rankings are an owner-computed STAGE: carried forward when the r2
+            # outputs are unchanged, recomputed (and journaled) otherwise.
+            rankings_sha = _rd.content_sha256([m.get("_raw", "") for m in results])
+            _rank_pg = _prior_generation("rankings")
+            if _rank_pg and _rd.carry_forward(rd_path, owner, "rankings",
+                                              _rank_pg, rankings_sha):
+                consensus_ranking = (_rd.read_json(_rd.stage_path(
+                    rd_path, owner.generation, "rankings")) or {}).get("consensus_ranking")
+            else:
+                # Aggregate each SUCCESSFUL member's ranking (Borda) into a
+                # consensus order — a failed/partial member's stray RANKING must
+                # not count.
+                n = len(members)
+                votes = [r for r in (_parse_ranking(m.get("_raw", ""), n)
+                                     for m in results if m.get("status") == "success") if r]
+                if votes:
+                    agg = _aggregate_rankings(votes, n)
+                    consensus_ranking = [{"agent": members[a["index"]], "score": a["score"],
+                                          "votes": a["votes"]} for a in agg]
+                try:
+                    fresh_stages.add("rankings")
+                    _rd.atomic_write_json(
+                        _rd.stage_path(rd_path, owner.generation, "rankings"),
+                        {"status": "success", "stage": "rankings",
+                         "consensus_ranking": consensus_ranking, "votes": len(votes),
+                         "input_sha256": rankings_sha})
+                    _rd.journal_append(rd_path, {"event": "stage_computed",
+                                                 "stage": "rankings",
+                                                 "generation": owner.generation})
+                except OSError:
+                    pass
             _ckpt("round2_complete")
             _write_state("round2_complete")
             try:
@@ -480,12 +578,20 @@ def run_council(args) -> int:
         if consensus_ranking:
             rnote = ("\nPEER RANKING (advisors ranked each other, best-first): "
                      + ", ".join(f"{c['agent']}={c['score']}" for c in consensus_ranking) + "\n")
-        print(f"[council] chairman {chairman} synthesizing…", file=sys.stderr, flush=True)
         chair_sha = _rd.content_sha256({"question": question, "rnote": rnote,
                                         "positions": [m.get("position") for m in results]})
-        chair_env = run_stage(chairman, _chairman_prompt(question, results, rnote),
-                              "chairman", chair_sha)
+        _chair_pg = _prior_generation("chairman")
+        if _chair_pg and _rd.carry_forward(rd_path, owner, "chairman", _chair_pg, chair_sha):
+            chair_env = _rd.read_json(_rd.stage_path(rd_path, owner.generation, "chairman")) or {}
+            print(f"[council] chairman carried forward from generation {_chair_pg}",
+                  file=sys.stderr, flush=True)
+        else:
+            fresh_stages.add("chairman")
+            print(f"[council] chairman {chairman} synthesizing…", file=sys.stderr, flush=True)
+            chair_env = run_stage(chairman, _chairman_prompt(question, results, rnote),
+                                  "chairman", chair_sha)
         _write_state("synthesized", chair_status=chair_env.get("status"))
+        _supersede_stale()
     finally:
         # The run dir PERSISTS (that is the whole point); only our ownership ends.
         _rd.release_owner(owner)
@@ -554,3 +660,104 @@ def run_council(args) -> int:
             envelope["out_error"] = "; ".join(out_errors)
     print(json.dumps(envelope, ensure_ascii=False))
     return 0 if status == "success" else 1
+
+
+def run_council_status(args) -> int:
+    """``council status <run-id>``: read-only, LOCK-FREE, generation-stable.
+
+    Reads the owner record before and after the scan; on any change it retries
+    once, then reports ``consistent: false``. Never mutates the run dir and
+    never repairs the journal (repair happens only under ownership)."""
+    import _rundir as _rd
+    run_id = args.council_status
+    cwd = os.path.abspath(getattr(args, "cwd", None) or os.getcwd())
+    runs_root = _runs_root(args, cwd)
+    try:
+        _rd.validate_run_id(run_id)
+        rd_path = _rd.run_path(runs_root, run_id)
+    except ValueError as e:
+        print(json.dumps({"mode": "council-status", "status": "error",
+                          "error": str(e)}, ensure_ascii=False))
+        return 1
+    if not os.path.isdir(rd_path):
+        print(json.dumps({"mode": "council-status", "status": "error",
+                          "error": f"unknown council run {run_id!r} under {runs_root}"},
+                         ensure_ascii=False))
+        return 1
+
+    view: dict = {}
+    for _attempt in (1, 2):
+        before = _rd.read_owner(rd_path)
+        stages: dict = {}
+        try:
+            names = sorted(os.listdir(rd_path))
+        except OSError:
+            names = []
+        for name in names:
+            m = re.match(r"^g(\d+)-(.+)\.json$", name)
+            if not m:
+                continue
+            gen, stage = int(m.group(1)), m.group(2)
+            cur = stages.get(stage)
+            if cur is None or gen >= cur["generation"]:
+                env = _rd.read_json(os.path.join(rd_path, name)) or {}
+                stages[stage] = {"generation": gen, "status": env.get("status"),
+                                 "carried_from": env.get("carried_from_generation")}
+        attempts = {"started": 0, "finished": 0}
+        journal_note = None
+        try:
+            recs, torn = _rd.journal_read(rd_path)
+            for r in recs:
+                if r.get("event") == "attempt_started":
+                    attempts["started"] += 1
+                elif r.get("event") == "attempt_finished":
+                    attempts["finished"] += 1
+            if torn:
+                journal_note = ("torn journal tail (repaired by the next OWNED "
+                                "resume; status never repairs)")
+        except _rd.JournalCorruptError as e:
+            journal_note = f"journal corrupt: {e}"
+        receipt = _rd.read_json(os.path.join(rd_path, "receipt.json")) or {}
+        state = _rd.read_json(os.path.join(rd_path, "state.json")) or {}
+        after = _rd.read_owner(rd_path)
+        consistent = ((before or {}).get("nonce") == (after or {}).get("nonce")
+                      and (before or {}).get("generation") == (after or {}).get("generation"))
+        view = {"mode": "council-status", "run_id": run_id, "run_dir": rd_path,
+                "owner": None if after is None else {
+                    "pid": after.get("pid"), "generation": after.get("generation"),
+                    "lease_expires": after.get("lease_expires")},
+                "phase": state.get("phase"),
+                "members": receipt.get("members"), "chairman": receipt.get("chairman"),
+                "rounds": receipt.get("rounds"), "stages": stages,
+                "attempts": attempts,
+                "abandoned_attempts": max(0, attempts["started"] - attempts["finished"]),
+                "journal_note": journal_note, "consistent": consistent}
+        if consistent:
+            break
+    if getattr(args, "json", False):
+        print(json.dumps(view, ensure_ascii=False))
+    else:
+        print(_render_status(view))
+    return 0
+
+
+def _render_status(view: dict) -> str:
+    """Human status lines. ASCII-only (Windows consoles default to cp1252)."""
+    owner = view.get("owner")
+    lines = [
+        f"council run : {view['run_id']}   phase: {view.get('phase') or '?'}"
+        + ("" if view.get("consistent") else "   [inconsistent snapshot: run changed mid-read]"),
+        f"run dir     : {view['run_dir']}",
+        "owner       : " + ("none (released)" if not owner else
+                            f"pid {owner.get('pid')} at generation {owner.get('generation')}"),
+    ]
+    for stage, info in sorted((view.get("stages") or {}).items()):
+        src = (f" (carried from g{info['carried_from']})"
+               if info.get("carried_from") else "")
+        lines.append(f"  stage {stage:<14} g{info['generation']}  "
+                     f"{info.get('status') or '?'}{src}")
+    a = view.get("attempts") or {}
+    tail = f"  [{view['journal_note']}]" if view.get("journal_note") else ""
+    lines.append(f"attempts    : {a.get('finished', 0)}/{a.get('started', 0)} finished, "
+                 f"{view.get('abandoned_attempts', 0)} abandoned{tail}")
+    return "\n".join(lines)

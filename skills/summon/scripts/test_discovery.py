@@ -2389,6 +2389,183 @@ def test_council_fresh_run_persists_run_dir_artifacts():
         _sh.rmtree(root, ignore_errors=True)
 
 
+def _council_stub_and_runner():
+    """Shared fixture for resume tests: a counting stub + a run() helper."""
+    import _council, argparse, io, contextlib, json as _json
+    calls = {"n": 0}
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+        calls["n"] += 1
+        if agent == "chair":
+            return {"status": "success", "result": "DECISION: X", "report": {"summary": "X"}}
+        rank = "\nRANKING: A, B" if "-r2-" in tag else ""
+        return {"status": "success", "result": f"{agent} ok{rank}",
+                "report": {"summary": agent}}
+    def run(ns):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = _council.run_council(ns)
+        return rc, _json.loads(buf.getvalue())
+    return _council, argparse, calls, fake, run
+
+
+def test_council_resume_full_carry_then_selective_rerun():
+    # The resume economics contract: unchanged work is NEVER re-paid; only the
+    # missing stage re-runs, and its unchanged downstream still carries.
+    _council, argparse, calls, fake, run = _council_stub_and_runner()
+    root = tempfile.mkdtemp(prefix="summon-cres-")
+    try:
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(root, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            rc1, env1 = run(argparse.Namespace(
+                question="X or Y?", question_file=None, members="m1,m2",
+                chairman="chair", rounds=2, cwd=os.getcwd(), agents_dir=root,
+                timeout=90000, out=None, run_dir=root))
+            assert rc1 == 0 and calls["n"] == 5, calls["n"]
+            run_id = env1["run_id"]
+            resume_ns = argparse.Namespace(
+                question=None, question_file=None, members=None, chairman=None,
+                rounds=None, cwd=os.getcwd(), agents_dir=root, timeout=90000,
+                out=None, run_dir=root, resume_run=run_id)
+            # resume with nothing changed: EVERYTHING carries, zero dispatches
+            calls["n"] = 0
+            rc2, env2 = run(resume_ns)
+            assert rc2 == 0 and calls["n"] == 0, calls["n"]
+            assert env2["run_id"] == run_id and env2["generation"] == 2
+            assert env2["status"] == "success" and env2["consensus_ranking"], env2["status"]
+            assert {m["agent"] for m in env2["members"]} == {"m1", "m2"}
+            # drop every generation of ONE member's r1 -> exactly that re-runs
+            for g in (1, 2):
+                p = os.path.join(env2["run_dir"], f"g{g}-r1-m2.json")
+                if os.path.isfile(p):
+                    os.unlink(p)
+            calls["n"] = 0
+            rc3, env3 = run(resume_ns)
+            assert rc3 == 0 and env3["generation"] == 3
+            assert calls["n"] == 1, calls["n"]  # r1-m2 only; r2/rankings/chair carried
+        finally:
+            _council._dispatch = orig
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_resume_upstream_change_invalidates_downstream():
+    # Generation hashes: a changed r1 OUTPUT flows into r2's INPUT sha, so r2,
+    # rankings, and the chairman all re-run; their stale files get superseded.
+    _council, argparse, calls, _unused_fake, run = _council_stub_and_runner()
+    import _rundir as rd
+    root = tempfile.mkdtemp(prefix="summon-cinv-")
+    try:
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(root, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+
+        # An INPUT-SENSITIVE stub: round-2 output must actually reflect the
+        # tampered upstream position, or the chairman's inputs would be
+        # genuinely unchanged and a carry would be the CORRECT outcome.
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+            calls["n"] += 1
+            if agent == "chair":
+                return {"status": "success", "result": "DECISION: X",
+                        "report": {"summary": "X"}}
+            mark = "X" if "m1C" in prompt else ""
+            rank = "\nRANKING: A, B" if "-r2-" in tag else ""
+            return {"status": "success", "result": f"{agent}{mark} ok{rank}",
+                    "report": {"summary": f"{agent}{mark}"}}
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            rc1, env1 = run(argparse.Namespace(
+                question="X or Y?", question_file=None, members="m1,m2",
+                chairman="chair", rounds=2, cwd=os.getcwd(), agents_dir=root,
+                timeout=90000, out=None, run_dir=root))
+            assert rc1 == 0
+            rdir = env1["run_dir"]
+            # tamper the r1-m1 OUTPUT (envelopes are authoritative; the tampered
+            # position must invalidate everything downstream on resume)
+            p = os.path.join(rdir, "g1-r1-m1.json")
+            env = rd.read_json(p)
+            env["result"] = "m1 CHANGED"
+            env["report"] = {"summary": "m1C"}
+            rd.atomic_write_json(p, env)
+            calls["n"] = 0
+            rc2, env2 = run(argparse.Namespace(
+                question=None, question_file=None, members=None, chairman=None,
+                rounds=None, cwd=os.getcwd(), agents_dir=root, timeout=90000,
+                out=None, run_dir=root, resume_run=env1["run_id"]))
+            assert rc2 == 0 and env2["generation"] == 2
+            assert calls["n"] == 3, calls["n"]   # r2-m1 + r2-m2 + chairman
+            # the changed upstream really propagated into round 2's outputs
+            assert any(m["position"].endswith("X") for m in env2["members"]), env2["members"]
+            # stale downstream files moved to superseded/, spend evidence intact
+            sup = os.path.join(rdir, "superseded", "g1")
+            assert os.path.isfile(os.path.join(sup, "g1-r2-m1.json")), os.listdir(rdir)
+            assert os.path.isfile(os.path.join(sup, "g1-chairman.json"))
+            assert not os.path.isfile(os.path.join(rdir, "g1-r2-m1.json"))
+            # the CARRIED r1 originals stay in place
+            assert os.path.isfile(os.path.join(rdir, "g1-r1-m1.json"))
+            recs, _ = rd.journal_read(rdir)
+            assert any(r["event"] == "superseded" for r in recs)
+        finally:
+            _council._dispatch = orig
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_status_snapshot():
+    import _council, argparse, io, contextlib, json as _json
+    _c, _a, calls, fake, run = _council_stub_and_runner()
+    root = tempfile.mkdtemp(prefix="summon-cstat-")
+    try:
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(root, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            rc1, env1 = run(_a.Namespace(
+                question="q", question_file=None, members="m1,m2", chairman="chair",
+                rounds=1, cwd=os.getcwd(), agents_dir=root, timeout=60000,
+                out=None, run_dir=root))
+        finally:
+            _council._dispatch = orig
+        assert rc1 == 0
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = _council.run_council_status(_a.Namespace(
+                council_status=env1["run_id"], run_dir=root, json=True,
+                cwd=os.getcwd()))
+        view = _json.loads(buf.getvalue())
+        assert rc == 0 and view["consistent"] is True and view["owner"] is None
+        assert view["phase"] == "synthesized"
+        assert view["stages"]["chairman"]["status"] == "success"
+        assert view["attempts"]["started"] == view["attempts"]["finished"] == 3
+        assert view["abandoned_attempts"] == 0
+        # human rendering is ASCII and mentions the run id
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            rc2 = _council.run_council_status(_a.Namespace(
+                council_status=env1["run_id"], run_dir=root, json=False,
+                cwd=os.getcwd()))
+        text = buf2.getvalue()
+        assert rc2 == 0 and env1["run_id"] in text and text.isascii(), text[:200]
+        # unknown id -> exit 1
+        buf3 = io.StringIO()
+        with contextlib.redirect_stdout(buf3):
+            rc3 = _council.run_council_status(_a.Namespace(
+                council_status="council-00000000-000000-dead", run_dir=root,
+                json=True, cwd=os.getcwd()))
+        assert rc3 == 1 and "unknown" in _json.loads(buf3.getvalue())["error"]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
 def test_rundir_id_validation_and_containment():
     import _rundir as rd
     for good in ("council-20260718-1200-ab12", "a", "run.1_x-Y"):
