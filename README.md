@@ -151,6 +151,12 @@ Set up "summon" for me (github.com/Nafjan/summon), a cross-vendor AI sub-agent d
 You can also skip the skill install entirely and run the script directly:
 `python summon.py dispatch --agent reviewer --prompt "…" --cwd "$PWD"`.
 
+**Staying current:** the installed skill is a copy and never self-updates. Run
+`npx skills update` (for `skills add` installs) or re-run `python install.py` after a
+`git pull` (for installer installs). Every dispatch envelope carries
+`summon.scripts_sha256`, so a stale or divergent copy is detectable from any single
+result; the version string alone is not enough.
+
 ---
 
 ## Your first run

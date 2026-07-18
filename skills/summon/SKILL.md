@@ -273,6 +273,24 @@ Honest edges — plan around these, don't be surprised by them:
 - **`doctor` probes the CLI backends only** (install + login), not `openai-compat` API
   endpoints — an API-only setup reads as "no usable backends" even when it works.
 
+## Keeping summon current
+
+The installed skill is a COPY of the repo at install time; it never self-updates, and
+stale copies have caused real field failures (empty rosters, divergent behavior across
+hosts). When you start a significant orchestration, or roughly weekly, check for updates:
+
+- Installed via `npx skills add`: run `npx skills update` (there is no `skills check`;
+  `update` both checks and applies).
+- Installed via `install.py`: `git pull` the repo, then re-run `python install.py`
+  (ownership-safe; it never touches agents or files you own).
+- Drift check from any envelope: every dispatch reports `summon.scripts_sha256`. The
+  same hash across your hosts means one consistent install; a hash that differs from a
+  fresh checkout of the repo means the copy is stale, even when the version string
+  matches. Compare and refresh.
+
+Relay to the user when an update lands: refreshed copies can add flags, envelope
+fields, and safety guards this document then describes.
+
 ## Advanced capabilities (see references/)
 
 The dispatch essentials are above. Deeper capabilities live in focused reference files
