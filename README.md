@@ -468,10 +468,54 @@ every change tested, secrets redacted), and the PR checklist. Run
 
 ## Roadmap
 
-- POSIX PTY wrapper for the agy backend
-- Gemini resume when its CLI grows a stable session id
-- True argparse subcommands (structural mode-enforcement) once the flat form can be dropped
-- Explicit numeric peer-ranking display and an optional MCP facade
+Shaped by two extended field reports (a GTM-materials agent and a complex-coding-project
+agent). Every validated request is either shipped, scheduled below, or declined with a
+reason. Ordering is roughly by priority, not a commitment.
+
+**Next (scoped):**
+- **Council quorum + chairman fallback**: synthesize on an explicit quorum when members
+  fail on resume (top-level status stays `partial`; a separate `decision_status` reports
+  usability), and a `--chairman-fallback` agent when the primary chairman fails. Adds
+  `--member-timeout` / `--chair-timeout`.
+- **Background job registry (read path)**: `--job-dir` / `SUMMON_JOBS_DIR`, two-phase
+  launch records written before spawn, and `jobs list` / `jobs status` / `jobs wait`, so a
+  detached job that dies before writing a result is never zero-forensics.
+- **Honest fan-out rollups**: a durable attempt journal (already present for councils)
+  extended to manifests, so `usage`/`cost_usd` totals count every round, retry, and
+  correction instead of undercounting after a crash.
+- **Destructive job registry**: `jobs cancel` / `jobs reap` + heartbeats + orphan
+  envelopes, gated on real OS process identity (start-time via ctypes / `/proc`) so a
+  reused PID is never killed by mistake.
+
+**Later:**
+- **Error taxonomy + `doctor --live`**: distinct statuses (`transport_unreachable`,
+  `sandbox_network_denied`, `authentication_failed`, `quota_exhausted`, …) that fail fast
+  instead of retrying, plus a live doctor that probes reachability/auth and warns when a
+  sibling install has drifted (using the envelope's `summon.scripts_sha256`).
+- **Layered roster resolution**: merge `--agents-dir` / `SUB_AGENTS_DIR` > project
+  `.agents` > user `~/.agents` > bundled, with a `source` per agent, plus neutral
+  model-tier agents (e.g. a Sol reviewer, an Opus architect) to layer task personas on.
+- **Spend governance**: `--max-cost-usd` / `--max-tokens` accumulated caps with
+  stop-before-chair behavior. (Pre-dispatch cost *estimates* are declined: summon has no
+  pricing table and won't guess a bill.)
+- **`--verify-no-mutations`**: hash git status/diff before and after a read-only agent and
+  fail the envelope if it changed anything, backstopping the `yolo` + "do not modify" pattern.
+- **Capability-aware rosters**: declare `repo-read` / `vision` / `web` capabilities so a
+  council can reject an agy member from a repo-reading task before spending time.
+- **Session forking**: `--fork-session` / `--resume-if-compatible` so resuming a failed
+  Fable session can fall back to Opus instead of re-pinning the unavailable model.
+- **Multi-root input bundles** and a **`--spec` request file** for work spanning several
+  repos and for reproducible, Windows-friendly invocations.
+- **POSIX PTY wrapper** for the agy backend; **Gemini resume** once its CLI exposes a
+  stable session id; an optional **MCP facade** (the envelope won't change); **envelope
+  v2** to retire the legacy `model.resolved` in favor of `targeted`/`served`.
+
+**Known limitation:** the durable-run owner lock has a sub-millisecond stale-break/release
+window that pure-stdlib cross-platform file operations cannot fully close. Generation
+namespacing bounds the worst case to a single duplicate stage dispatch (wasted spend, never
+corrupted output), and it requires a process suspended past its lease resuming inside that
+exact window; single-machine use does not hit it. Closing it fully would need OS advisory
+locks (with their own NFS / suspended-process gaps).
 
 ## Credits
 

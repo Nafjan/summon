@@ -376,8 +376,17 @@ def _git_head(cwd: str) -> str | None:
 _MODE_FLAGS = {
     "manifest": {"manifest", "concurrency", "results_dir", "cwd", "agents_dir",
                  "retries", "job_file"},
+    # Operation-level rows: a fresh council, a resume, and a read-only status
+    # each consume a DIFFERENT set (v3.1). Changing members/rounds/question on a
+    # resume would be a new run, so they are rejected there; status takes only
+    # its id + where to look.
     "council": {"council", "question", "question_file", "members", "chairman",
-                "rounds", "cwd", "agents_dir", "timeout", "out", "job_file"},
+                "rounds", "cwd", "agents_dir", "timeout", "out", "run_dir", "job_file"},
+    "council-resume": {"council", "resume_run", "cwd", "agents_dir", "timeout",
+                       "out", "run_dir", "job_file"},
+    # Status takes ONLY its id, where to look, and the output format -- it never
+    # dispatches, so it has no working directory (use --run-dir to point it).
+    "council-status": {"council_status", "run_dir", "json", "job_file"},
 }
 _MODE_HINTS = {
     "manifest": ("Put per-job settings (model, effort, timeout, json_schema, "
@@ -386,9 +395,25 @@ _MODE_HINTS = {
     "council": ("--out IS supported (the council envelope, checkpointed at each "
                 "phase); member model/effort/permission come from each member "
                 "agent's own definition."),
+    "council-resume": ("a resume re-runs the SAME run: question, members, chairman, "
+                       "and rounds come from the run's receipt.json, so they cannot "
+                       "be changed here -- start a fresh council to change them."),
+    "council-status": ("status is read-only: it takes only the run id, --run-dir, "
+                       "and --json."),
 }
 _FLAG_NAMES = {"sets": "--set"}  # dests whose flag spelling isn't dest.replace('_','-')
 _TOKEN_DESTS = {"set": "sets"}   # the reverse mapping, for raw-argv presence detection
+
+
+def _fanout_mode(args: argparse.Namespace) -> str | None:
+    """Which fixed-flag mode this invocation is, for the whitelist below."""
+    if args.manifest:
+        return "manifest"
+    if getattr(args, "council_status", None):
+        return "council-status"
+    if args.council:
+        return "council-resume" if getattr(args, "resume_run", None) else "council"
+    return None
 
 
 def _unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
@@ -396,7 +421,7 @@ def _unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
     None. Presence is detected from the RAW (post-subcommand-rewrite) argv, not
     by comparing parsed values to defaults -- a value equal to its default
     (e.g. ``--timeout 600000``) is still an explicit flag and still rejected."""
-    mode = "manifest" if args.manifest else ("council" if args.council else None)
+    mode = _fanout_mode(args)
     if mode is None:
         return None
     allowed = _MODE_FLAGS[mode]
@@ -412,7 +437,9 @@ def _unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
     )
     if not offending:
         return None
-    return (f"--{mode} does not support {', '.join(offending)}: these flags would "
+    label = {"council-resume": "council resume", "council-status": "council status"
+             }.get(mode, f"--{mode}")
+    return (f"{label} does not support {', '.join(offending)}: these flags would "
             f"have been silently ignored, so they are rejected instead. "
             f"{_MODE_HINTS[mode]}")
 
@@ -473,6 +500,18 @@ def _rewrite_subcommand(argv: list) -> tuple:
     if head == "doctor":
         return ["--doctor", *rest], None
     if head == "council":
+        # `council resume <id>` and `council status <id>` are nested actions;
+        # a bare `council …` stays the fresh-run form.
+        if rest and rest[0] == "resume":
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, "error: 'council resume' needs a run id"
+            return ["--council", "--resume-run", rest[1], *rest[2:]], None
+        if rest and rest[0] == "status":
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, "error: 'council status' needs a run id"
+            # NO --council: status dispatches on --council-status alone (and its
+            # whitelist would reject a stray --council).
+            return ["--council-status", rest[1], *rest[2:]], None
         return ["--council", *rest], None
     if head == "version":
         return ["--version", *rest], None
@@ -586,6 +625,14 @@ def main() -> None:
     parser.add_argument("--chairman", help="With --council: the synthesizer agent (default: fable)")
     parser.add_argument("--rounds", type=int, default=1,
                         help="With --council: 1 (independent) or 2 (adds cross-examination)")
+    parser.add_argument("--run-dir", dest="run_dir",
+                        help="With --council: root for the durable run directory "
+                             "(default {cwd}/.agents/runs; env SUMMON_RUNS_DIR)")
+    parser.add_argument("--resume-run", dest="resume_run", metavar="RUN_ID",
+                        help="Resume a council run by id: re-run only missing/failed/"
+                             "changed stages (question/members come from its receipt)")
+    parser.add_argument("--council-status", dest="council_status", metavar="RUN_ID",
+                        help="Print a council run's durable state (read-only; add --json)")
 
     args = parser.parse_args(argv)
 
@@ -692,7 +739,13 @@ def main() -> None:
         from _manifest import run_manifest
         sys.exit(run_manifest(args))
 
-    # --council: consensus deliberation. Delegates to _council and exits.
+    # council status: read-only durable-state view. No dispatch, no lock.
+    if args.council_status:
+        from _council import run_council_status
+        sys.exit(run_council_status(args))
+
+    # --council: consensus deliberation (fresh run or --resume-run). Delegates
+    # to _council and exits.
     if args.council:
         from _council import run_council
         sys.exit(run_council(args))

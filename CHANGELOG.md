@@ -6,6 +6,31 @@ it bumps only on a breaking change to the response shape, never on added fields.
 
 ## [0.9.0] — unreleased (pre-1.0)
 
+### Added (durable, resumable councils — B1)
+- **Councils now run on a persistent run directory** (`{cwd}/.agents/runs/<run-id>/`;
+  `--run-dir` / `SUMMON_RUNS_DIR`), replacing the throwaway temp dir that soft paths
+  deleted and hard kills orphaned. Each stage envelope, a `receipt.json`, and an
+  append-only per-generation journal persist; the envelope gains `run_id`/`generation`.
+- **`council resume <run-id>`** re-runs only missing, failed, or input-changed stages
+  and carries every unchanged stage forward without re-paying; question/members/chairman/
+  rounds come from the run's receipt. Upstream changes (edited stage output, changed
+  `--cwd`, retuned agent) invalidate downstream stages transitively; superseded files
+  are preserved under `superseded/`.
+- **`council status <run-id>`** prints a read-only, generation-stable snapshot of a run
+  (per-stage status, attempts, abandoned work; `--json` for machines).
+- Concurrency protocol (hardened across four codex adversarial review rounds, two of
+  which caught real blockers the test suites missed): one leased owner lock per run
+  renewed after every stage; a fresh **generation** per ownership period namespaces all
+  outputs so a suspended-then-resumed process cannot overwrite a successor's work;
+  journal and state are segmented per generation (single writer by construction), with
+  torn-tail recovery of a crashed predecessor's segment on takeover. Known limitation:
+  the owner-lock stale-break has a sub-millisecond unlink window that pure-stdlib
+  cross-platform file ops cannot fully close; generation namespacing bounds the worst
+  case to one duplicate stage dispatch (wasted spend, never corrupted output), and
+  single-machine use does not hit it.
+- Docs: the "always list agents first" workflow softened to once-per-session (re-listing
+  before every dispatch was ceremony).
+
 ### Added (field-feedback hardening: flag matrix, council checkpoints, provenance)
 - **Fan-out flag matrix.** `--manifest`/`--council` used to silently ignore most
   dispatch flags (`--out`, `--background`, `--worktree`, `--json-schema`, `--model`,
@@ -48,7 +73,7 @@ it bumps only on a breaking change to the response shape, never on added fields.
 - **Timeouts can no longer be defeated by a grandchild holding stdout.** The driver
   kills the whole process tree (`taskkill /T` / `killpg`) and bounds `communicate()`;
   `--manifest` gains a parent-side watchdog so one wedged child can't stall the swarm.
-- **Manifest/`--out` resume retries failures** — only a `success` envelope is terminal;
+- **Manifest/`--out` resume retries failures**: only a `success` envelope is terminal;
   `error`/`blocked`/`partial` jobs re-dispatch on a re-run.
 - **Fail-closed on an unknown `run-agent`** (was a silent fall-through to codex — wrong
   vendor/permissions/billing). `extract_json` now handles primitive values; frontmatter
@@ -73,7 +98,7 @@ any OpenAI-compatible API.
 ### Backends
 - Six backends behind one registry (`BACKENDS` in `_builder.py`, the single place to add
   one — see `references/adding-a-backend.md`).
-- **`openai-compat`** — call any OpenAI-compatible `/chat/completions` endpoint
+- **`openai-compat`**: call any OpenAI-compatible `/chat/completions` endpoint
   (OpenRouter, OpenAI, Anthropic, Google, Groq, DeepSeek, Together, local Ollama/LM
   Studio/vLLM) via stdlib HTTP; providers from built-ins + `providers.json`.
 - **Council mode** (`council`) — vendor-diverse members answer, cross-examine, and rank
