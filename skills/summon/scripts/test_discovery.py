@@ -3326,6 +3326,130 @@ def test_council_failed_primary_resume_reruns_then_falls_back():
         _sh.rmtree(root, ignore_errors=True)
 
 
+def test_council_fallback_eligibility_and_billing_aggregation():
+    # Fallback fires on ANY authoritative non-success primary (error/blocked/
+    # partial), and BOTH chairman envelopes' billing/warnings are aggregated.
+    import _council, argparse, io, contextlib, json as _json
+    root = tempfile.mkdtemp(prefix="summon-fbelig-")
+    try:
+        _mk_agents(root, ("m1", "m2", "chair", "backup"))
+        for primary_status in ("blocked", "partial", "error"):
+            def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+                if agent == "chair":
+                    return {"status": primary_status, "error": "p",
+                            "billing": {"source": "credit"}, "warnings": ["primary warn"],
+                            "result": ""}
+                if agent == "backup":
+                    return {"status": "success", "result": "DECIDE",
+                            "billing": {"source": "subscription"}, "report": {"summary": "s"}}
+                return {"status": "success", "result": f"{agent} ok",
+                        "billing": {"source": "api"}, "report": {"summary": agent}}
+            ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
+                                    chairman="chair", rounds=1, cwd=os.getcwd(),
+                                    agents_dir=root, timeout=60000, out=None, run_dir=root,
+                                    chairman_fallback="backup")
+            orig = _council._dispatch
+            _council._dispatch = fake
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                    _council.run_council(ns)
+            finally:
+                _council._dispatch = orig
+            env = _json.loads(buf.getvalue())
+            assert env["synthesis"]["fallback_used"] is True, primary_status
+            assert env["synthesis"]["primary"]["status"] == primary_status
+            # both chairman billings surface at the council level
+            assert "credit" in env["billing_sources"] and "subscription" in env["billing_sources"], \
+                (primary_status, env["billing_sources"])
+            # the primary's warning is aggregated even though the fallback was chosen
+            assert any("primary warn" in w for w in (env["warnings"] or [])), env["warnings"]
+            # legacy synthesis fields describe the CHOSEN producer (the fallback)
+            assert env["synthesis"]["chairman"] == "backup"
+            assert env["synthesis"]["configured_chairman"] == "chair"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_rounds2_quorum_counts_final_stage():
+    # Quorum counts the FINAL member stage (r2 for a 2-round council). A member
+    # who passed r1 but fails r2 does not count toward quorum.
+    root = tempfile.mkdtemp(prefix="summon-r2q-")
+    try:
+        _mk_agents(root, ("m1", "m2", "chair"))
+        import _council, argparse, io, contextlib, json as _json
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+            # m2 succeeds in r1 but FAILS in r2
+            if agent == "m2" and "-r2-" in tag:
+                return {"status": "error", "error": "r2 boom", "result": ""}
+            rank = "\nRANKING: A, B" if "-r2-" in tag else ""
+            return {"status": "success", "result": f"{agent} ok{rank}",
+                    "report": {"summary": agent}}
+        ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
+                                chairman="chair", rounds=2, cwd=os.getcwd(),
+                                agents_dir=root, timeout=60000, out=None, run_dir=root,
+                                quorum=2)
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = _council.run_council(ns)
+        finally:
+            _council._dispatch = orig
+        env = _json.loads(buf.getvalue())
+        # only m1 succeeded at the FINAL (r2) stage -> 1 success < quorum 2 -> skipped
+        assert env["synthesis"]["members_succeeded"] == 1, env["synthesis"]["members_succeeded"]
+        assert env["synthesis"]["decision_status"] == "quorum_not_met"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_status_flags_stale_synthesis_generation():
+    # Generation coherence: a synthesis stage below the run's newest generation
+    # is flagged current:false, not shown as if live.
+    import _council, _rundir as rd, argparse, io, contextlib, json as _json
+    root = tempfile.mkdtemp(prefix="summon-stale-")
+    try:
+        # gen 1 with a chairman, then hand-create a gen-2 member file only (as if
+        # gen 2 was deposed before synthesis) so the chairman lags the run.
+        _mk_agents(root, ("m1", "m2", "chair"))
+        rc1, env1 = _b2_council(root, ["m1", "m2"])
+        run_id, rdir = env1["run_id"], env1["run_dir"]
+        rd.atomic_write_json(os.path.join(rdir, "g2-r1-m1.json"),
+                             {"status": "success", "input_sha256": "x" * 64})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _council.run_council_status(argparse.Namespace(
+                council_status=run_id, run_dir=root, json=True, cwd=os.getcwd()))
+        view = _json.loads(buf.getvalue())
+        assert view["current_generation"] == 2
+        assert view["stages"]["chairman"]["current"] is False   # g1 lags g2
+        assert view["stages"]["r1-m1"]["current"] is True
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_b2_flags_matrix():
+    # The new B2 flags are accepted on council + council-resume, rejected on status.
+    import json as _json, subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    # accepted on a fresh council (fails later on missing question, NOT on the flag)
+    r = sp.run([sys.executable, script, "--council", "--cwd", os.getcwd(),
+                "--quorum", "2", "--chairman-fallback", "x", "--member-timeout", "30s",
+                "--chair-timeout", "2m"], capture_output=True, text=True, encoding="utf-8")
+    env = _json.loads(r.stdout)
+    assert "silently ignored" not in (env.get("error") or ""), env
+    # rejected on status
+    r2 = sp.run([sys.executable, script, "--council-status", "x", "--quorum", "2"],
+                capture_output=True, text=True, encoding="utf-8")
+    env2 = _json.loads(r2.stdout)
+    assert env2["status"] == "error" and "--quorum" in env2["error"], env2
+
+
 def test_council_per_stage_timeouts_and_lease():
     # B2.1: member stages use --member-timeout, chairman uses --chair-timeout;
     # the owner lease is sized on the LARGER of the two so a long chair stage

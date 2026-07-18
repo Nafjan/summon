@@ -692,14 +692,27 @@ def run_council(args) -> int:
                          "stage": "chairman", "result": None,
                          "note": (f"{members_succeeded}/{len(members)} members succeeded; "
                                   f"quorum {quorum} not met")}
-            try:
-                _rd.atomic_write_json(_rd.stage_path(rd_path, owner.generation, "chairman"),
-                                      {**chair_env, "input_sha256": None})
-                _rd.journal_append(rd_path, {"event": "attempt_skipped", "stage": "chairman",
-                                             "generation": owner.generation,
-                                             "reason": "quorum_not_met"}, owner=owner)
-            except OSError:
-                pass
+            _tomb = _rd.stage_path(rd_path, owner.generation, "chairman")
+            # FENCED like every owner mutation: a deposed owner must not leave a
+            # stale tombstone. Write only while current; if the fenced journal
+            # write then reveals a takeover, withdraw the tombstone.
+            if not _rd.owner_still_current(owner):
+                lost["err"] = lost["err"] or "ownership changed (quorum tombstone refused)"
+            else:
+                try:
+                    _rd.atomic_write_json(_tomb, {**chair_env, "input_sha256": None})
+                except OSError:
+                    pass
+                try:
+                    _rd.journal_append(rd_path, {"event": "attempt_skipped", "stage": "chairman",
+                                                 "generation": owner.generation,
+                                                 "reason": "quorum_not_met"}, owner=owner)
+                except _rd.OwnershipLostError:
+                    try:
+                        os.unlink(_tomb)
+                    except OSError:
+                        pass
+                    lost["err"] = lost["err"] or "ownership changed (quorum tombstone withdrawn)"
             print(f"[council] chairman skipped: quorum {quorum} not met "
                   f"({members_succeeded}/{len(members)} members)", file=sys.stderr, flush=True)
             _write_state("quorum_not_met")
@@ -816,9 +829,15 @@ def run_council(args) -> int:
     else:
         selection_reason = None
 
+    # The legacy top-level synthesis fields describe the CHOSEN producer
+    # consistently (agent, backend, model, recommendation all match). When the
+    # fallback was chosen, `chairman` is the fallback; the configured primary
+    # stays discoverable via `configured_chairman` and `synthesis.primary`.
+    chosen_agent = chairman_fallback if fallback_used else chairman
     synthesis = {
-        "chairman": chairman,
-        "backend": backend_of(chairman),
+        "chairman": chosen_agent,
+        "configured_chairman": chairman,
+        "backend": backend_of(chosen_agent),
         "model": _model_label(chair_env),
         "status": chair_env.get("status"),
         "recommendation": chair_env.get("result") or chair_env.get("error"),
@@ -902,16 +921,24 @@ def run_council_status(args) -> int:
             names = sorted(os.listdir(rd_path))
         except OSError:
             names = []
+        current_generation = 0
         for name in names:
             m = re.match(r"^g(\d+)-(.+)\.json$", name)
             if not m:
                 continue
             gen, stage = int(m.group(1)), m.group(2)
+            current_generation = max(current_generation, gen)
             cur = stages.get(stage)
             if cur is None or gen >= cur["generation"]:
                 env = _rd.read_json(os.path.join(rd_path, name)) or {}
                 stages[stage] = {"generation": gen, "status": env.get("status"),
                                  "carried_from": env.get("carried_from_generation")}
+        # Generation coherence: a stage whose newest file lags the run's newest
+        # generation is NOT current (e.g. a synthesis stage left behind when a
+        # later generation was deposed before it could run/supersede). Flag it
+        # rather than letting a stale prior-generation synthesis read as live.
+        for _st in stages.values():
+            _st["current"] = _st["generation"] == current_generation
         attempts = {"started": 0, "finished": 0}
         started_ids: set = set()
         finished_ids: set = set()
@@ -945,6 +972,7 @@ def run_council_status(args) -> int:
         consistent = ((before or {}).get("nonce") == (after or {}).get("nonce")
                       and (before or {}).get("generation") == (after or {}).get("generation"))
         view = {"mode": "council-status", "run_id": run_id, "run_dir": rd_path,
+                "current_generation": current_generation,
                 "owner": None if after is None else {
                     "pid": after.get("pid"), "generation": after.get("generation"),
                     "lease_expires": after.get("lease_expires")},
@@ -977,8 +1005,9 @@ def _render_status(view: dict) -> str:
     for stage, info in sorted((view.get("stages") or {}).items()):
         src = (f" (carried from g{info['carried_from']})"
                if info.get("carried_from") else "")
-        lines.append(f"  stage {stage:<14} g{info['generation']}  "
-                     f"{info.get('status') or '?'}{src}")
+        stale = "" if info.get("current", True) else "  [stale: below current generation]"
+        lines.append(f"  stage {stage:<16} g{info['generation']}  "
+                     f"{info.get('status') or '?'}{src}{stale}")
     a = view.get("attempts") or {}
     tail = f"  [{view['journal_note']}]" if view.get("journal_note") else ""
     lines.append(f"attempts    : {a.get('finished', 0)}/{a.get('started', 0)} finished, "
