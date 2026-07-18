@@ -381,9 +381,14 @@ _MODE_FLAGS = {
     # resume would be a new run, so they are rejected there; status takes only
     # its id + where to look.
     "council": {"council", "question", "question_file", "members", "chairman",
-                "rounds", "cwd", "agents_dir", "timeout", "out", "run_dir", "job_file"},
+                "rounds", "cwd", "agents_dir", "timeout", "out", "run_dir", "job_file",
+                "quorum", "chairman_fallback", "member_timeout", "chair_timeout"},
+    # A resume may change how the SAME run's stages are gated/timed (quorum,
+    # fallback, per-stage timeouts) without changing its identity; question,
+    # members, chairman, and rounds still come from the receipt.
     "council-resume": {"council", "resume_run", "cwd", "agents_dir", "timeout",
-                       "out", "run_dir", "job_file"},
+                       "out", "run_dir", "job_file",
+                       "quorum", "chairman_fallback", "member_timeout", "chair_timeout"},
     # Status takes ONLY its id, where to look, and the output format -- it never
     # dispatches, so it has no working directory (use --run-dir to point it).
     "council-status": {"council_status", "run_dir", "json", "job_file"},
@@ -633,6 +638,18 @@ def main() -> None:
                              "changed stages (question/members come from its receipt)")
     parser.add_argument("--council-status", dest="council_status", metavar="RUN_ID",
                         help="Print a council run's durable state (read-only; add --json)")
+    parser.add_argument("--quorum", type=int, metavar="N",
+                        help="With --council: synthesize only if at least N members "
+                             "succeeded (2..member-count); below N the chairman is skipped. "
+                             "Never changes the top-level status, only synthesis")
+    parser.add_argument("--chairman-fallback", dest="chairman_fallback", metavar="AGENT",
+                        help="With --council: a fallback synthesizer to run once if the "
+                             "primary chairman ends non-success")
+    parser.add_argument("--member-timeout", dest="member_timeout", type=_parse_timeout,
+                        help="With --council: per-member stage timeout (default: --timeout)")
+    parser.add_argument("--chair-timeout", dest="chair_timeout", type=_parse_timeout,
+                        help="With --council: chairman (and fallback) stage timeout "
+                             "(default: --timeout)")
 
     args = parser.parse_args(argv)
 
