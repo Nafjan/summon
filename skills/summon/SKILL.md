@@ -176,6 +176,9 @@ Parse JSON output and check `status` field:
 | `--run-dir` | No | With `--council`: root for the durable run directory (default `{cwd}/.agents/runs`; env `SUMMON_RUNS_DIR`) |
 | `--resume-run RUN_ID` | - | Resume a council run: re-run only missing/failed/changed stages (question and members come from the run's `receipt.json`). Subcommand form: `council resume <run-id>` |
 | `--council-status RUN_ID` | - | Print a council run's durable state, read-only (add `--json`). Subcommand form: `council status <run-id>` |
+| `--quorum N` | No | With `--council`: synthesize only if at least N members (2..member-count) succeeded; below N the chairman is skipped (a `skipped` tombstone is recorded). Never changes the top-level `status`, only whether synthesis runs; the result is in `synthesis.quorum` and `synthesis.decision_status` |
+| `--chairman-fallback AGENT` | No | With `--council`: a fallback synthesizer run once if the primary chairman ends non-success. Both outcomes appear in `synthesis.primary` / `synthesis.fallback` |
+| `--member-timeout` / `--chair-timeout` | No | With `--council`: per-stage timeouts for members and the chairman (same grammar as `--timeout`; each defaults to `--timeout`) |
 
 **Stdout contract:** for dispatch commands, stdout carries **exactly one JSON object** —
 nothing before it, nothing after. All diagnostics (manifest progress lines, argparse
