@@ -70,6 +70,12 @@ def _atomic_write_json(path: str, obj: dict) -> str | None:
 
 
 
+def _runs_root(args, cwd: str) -> str:
+    """--run-dir > SUMMON_RUNS_DIR > {cwd}/.agents/runs."""
+    return (getattr(args, "run_dir", None) or os.environ.get("SUMMON_RUNS_DIR")
+            or os.path.join(cwd, ".agents", "runs"))
+
+
 def _fail(msg: str, out_path: str | None = None) -> int:
     env = {"mode": "council", "status": "error", "error": msg,
            "council_state": "failed"}
@@ -279,9 +285,31 @@ def run_council(args) -> int:
     # ms to the children; never silently substitute a default.
     timeout_ms = args.timeout if isinstance(args.timeout, int) else 600000
     cap = _per_member_cap(len(members))
-    import shutil
-    import tempfile
-    out_dir = tempfile.mkdtemp(prefix="summon-council-")
+
+    # The PERSISTENT run directory replaces the old throwaway mkdtemp (which
+    # soft paths deleted and hard kills orphaned -- the field failure). One
+    # owner, one generation, journaled attempts; see _rundir.py.
+    import _rundir as _rd
+    runs_root = _runs_root(args, cwd)
+    run_id = _rd.new_run_id("council")
+    try:
+        rd_path = _rd.run_path(runs_root, run_id)
+        owner = _rd.acquire_owner(rd_path, _rd.default_lease_sec(timeout_ms / 1000))
+    except (_rd.OwnerHeldError, _rd.OwnerLockForeignError, ValueError, OSError) as e:
+        return _fail(f"cannot open run dir for {run_id}: {e}", out_path)
+    print(f"[council] run {run_id} (generation {owner.generation}) -> {rd_path}",
+          file=sys.stderr, flush=True)
+    try:
+        _rd.atomic_write_json(os.path.join(rd_path, "receipt.json"), {
+            "mode": "council", "run_id": run_id, "question": question,
+            "question_sha256": _rd.content_sha256(question), "members": members,
+            "chairman": chairman, "rounds": rounds, "cwd": cwd,
+            "agents_dir": agents_dir, "created_at": time.time(),
+        })
+    except OSError as e:
+        _rd.release_owner(owner)
+        return _fail(f"cannot write run receipt: {e}", out_path)
+
     started = time.monotonic()
     lock = threading.Lock()
     done = {"n": 0}
@@ -311,10 +339,34 @@ def run_council(args) -> int:
           "- set your host tool's timeout ABOVE this",
           file=sys.stderr, flush=True)
 
-    def run_member(agent: str, prompt: str, tag: str) -> dict:
+    def run_stage(agent: str, prompt: str, stage: str, input_sha: str) -> dict:
+        """Dispatch ONE journaled, generation-namespaced stage and return the
+        child envelope. The file tag is `g<generation>-<stage>` so a deposed
+        owner's late child can never write into a successor's namespace."""
+        _rd.journal_append(rd_path, {"event": "attempt_started", "stage": stage,
+                                     "generation": owner.generation, "kind": "initial"})
+        env = _dispatch(agent, prompt, cwd, agents_dir, timeout_ms, rd_path,
+                        f"g{owner.generation}-{stage}")
+        if isinstance(env, dict):
+            # Owner-side annotation: the upstream-input hash is what makes this
+            # stage carry-forwardable on a later resume.
+            try:
+                _rd.atomic_write_json(_rd.stage_path(rd_path, owner.generation, stage),
+                                      {**env, "stage": stage, "input_sha256": input_sha})
+            except OSError:
+                pass  # the envelope itself was already read; carry-forward just won't reuse it
+        _rd.journal_append(rd_path, {"event": "attempt_finished", "stage": stage,
+                                     "generation": owner.generation,
+                                     "status": env.get("status"),
+                                     "usage": env.get("usage"),
+                                     "cost_usd": env.get("cost_usd"),
+                                     "elapsed_ms": env.get("elapsed_ms")})
+        return env
+
+    def run_member(agent: str, prompt: str, tag: str, input_sha: str) -> dict:
         b = member_backend[agent]
         with sems[b]:
-            env = _dispatch(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag)
+            env = run_stage(agent, prompt, tag, input_sha)
         with lock:
             done["n"] += 1
             print(f"[council {done['n']}/{len(members)}] {agent} ({b}) "
@@ -328,11 +380,23 @@ def run_council(args) -> int:
                 "_raw": env.get("result") or "",   # kept only to parse RANKING
                 "_env": env}   # full child envelope: checkpoints persist it
 
+    def _write_state(phase: str, chair_status=None) -> None:
+        """Derived display index (envelopes + journal stay authoritative)."""
+        try:
+            _rd.atomic_write_json(os.path.join(rd_path, "state.json"), {
+                "run_id": run_id, "generation": owner.generation, "phase": phase,
+                "stages": {m["agent"]: m.get("status") for m in results}
+                          | ({"chairman": chair_status} if chair_status else {}),
+                "updated_at": time.time()})
+        except (OSError, NameError):
+            pass  # display-only; never fatal
+
     try:
         # ---- round 1: independent positions ---------------------------------
         p1 = _round1_prompt(question)
+        r1_sha = _rd.content_sha256({"question": question})
         with ThreadPoolExecutor(max_workers=len(members)) as pool:
-            results = list(pool.map(lambda m: run_member(m, p1, f"r1-{m}"), members))
+            results = list(pool.map(lambda m: run_member(m, p1, f"r1-{m}", r1_sha), members))
 
         # ---- round 2 (optional): cross-examination + peer RANKING -----------
         consensus_ranking = None
@@ -363,12 +427,19 @@ def run_council(args) -> int:
                     out_errors.append(err)
 
         _ckpt("round1_complete")
+        _write_state("round1_complete")
+        try:
+            _rd.renew_owner(owner)   # a live council renews after every phase
+        except _rd.OwnershipLostError as e:
+            return _fail(f"run ownership lost after round 1: {e}", out_path)
         if rounds >= 2:
             done["n"] = 0
             # Same anonymized set (members order) for everyone -> comparable votes.
             all_positions = [r.get("position") or "(no position)" for r in results]
+            r2_sha = _rd.content_sha256({"question": question, "positions": all_positions})
             def refine(agent):
-                return run_member(agent, _round2_prompt(question, all_positions), f"r2-{agent}")
+                return run_member(agent, _round2_prompt(question, all_positions),
+                                  f"r2-{agent}", r2_sha)
             with ThreadPoolExecutor(max_workers=len(members)) as pool:
                 results = list(pool.map(refine, members))
             # Aggregate each SUCCESSFUL member's ranking (Borda) into a consensus
@@ -380,7 +451,25 @@ def run_council(args) -> int:
                 agg = _aggregate_rankings(votes, n)
                 consensus_ranking = [{"agent": members[a["index"]], "score": a["score"],
                                       "votes": a["votes"]} for a in agg]
+            # rankings are an owner-computed STAGE (carry-forwardable on resume)
+            try:
+                _rd.atomic_write_json(
+                    _rd.stage_path(rd_path, owner.generation, "rankings"),
+                    {"status": "success", "stage": "rankings",
+                     "consensus_ranking": consensus_ranking, "votes": len(votes),
+                     "input_sha256": _rd.content_sha256(
+                         [m.get("_raw", "") for m in results])})
+                _rd.journal_append(rd_path, {"event": "stage_computed",
+                                             "stage": "rankings",
+                                             "generation": owner.generation})
+            except OSError:
+                pass
             _ckpt("round2_complete")
+            _write_state("round2_complete")
+            try:
+                _rd.renew_owner(owner)
+            except _rd.OwnershipLostError as e:
+                return _fail(f"run ownership lost after round 2: {e}", out_path)
 
         for m in results:    # drop the raw text and envelope carried for checkpoints
             m.pop("_raw", None)
@@ -392,14 +481,18 @@ def run_council(args) -> int:
             rnote = ("\nPEER RANKING (advisors ranked each other, best-first): "
                      + ", ".join(f"{c['agent']}={c['score']}" for c in consensus_ranking) + "\n")
         print(f"[council] chairman {chairman} synthesizing…", file=sys.stderr, flush=True)
-        chair_env = _dispatch(chairman, _chairman_prompt(question, results, rnote),
-                              cwd, agents_dir, timeout_ms, out_dir, "chairman")
+        chair_sha = _rd.content_sha256({"question": question, "rnote": rnote,
+                                        "positions": [m.get("position") for m in results]})
+        chair_env = run_stage(chairman, _chairman_prompt(question, results, rnote),
+                              "chairman", chair_sha)
+        _write_state("synthesized", chair_status=chair_env.get("status"))
     finally:
-        shutil.rmtree(out_dir, ignore_errors=True)  # never leak the temp dir
+        # The run dir PERSISTS (that is the whole point); only our ownership ends.
+        _rd.release_owner(owner)
 
     # Aggregate billing/warnings across the whole council so the caller sees any
-    # credit/api spend or Fable fallback WITHOUT digging into members (the temp
-    # child envelopes are deleted just above).
+    # credit/api spend or Fable fallback WITHOUT digging into members (full
+    # member envelopes persist in the run dir).
     council_warnings = []
     # agy members can't read --cwd (isolated profile) — call it out, since it's
     # the usual reason an agy member errors/excludes in a repo council.
@@ -425,6 +518,9 @@ def run_council(args) -> int:
     envelope = {
         "mode": "council",
         "envelope": 1,
+        "run_id": run_id,
+        "run_dir": rd_path,
+        "generation": owner.generation,
         "question": question,
         "rounds": rounds,
         "council_state": "final",

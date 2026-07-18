@@ -1209,8 +1209,8 @@ def test_council_run_structure_with_stubbed_dispatch():
                 return {"status": "success", "result": "DECISION: X, CONFIDENCE 0.9",
                         "model": {"resolved": "claude-fable-5"},
                         "report": {"summary": "X wins"}}
-            # round-2 dispatches (tag r2-*) emit a RANKING so consensus aggregates
-            rank = "\nRANKING: A, B" if tag.startswith("r2-") else ""
+            # round-2 dispatches (tag g<N>-r2-*) emit a RANKING so consensus aggregates
+            rank = "\nRANKING: A, B" if "-r2-" in tag else ""
             return {"status": "success", "result": f"{agent} says go{rank}",
                     "model": {"resolved": "claude-sonnet-5"},
                     "report": {"summary": f"{agent}: pick X"}}
@@ -1219,7 +1219,8 @@ def test_council_run_structure_with_stubbed_dispatch():
         try:
             args = argparse.Namespace(question="X or Y?", question_file=None,
                                       members="m1,m2", chairman="chair", rounds=2,
-                                      cwd=os.getcwd(), agents_dir=d, timeout=90000)
+                                      cwd=os.getcwd(), agents_dir=d, timeout=90000,
+                                      run_dir=d)
             import io, contextlib
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
@@ -1252,6 +1253,7 @@ def test_council_validation_and_member_status():
     base = dict(question="q", question_file=None, chairman="chair",
                 cwd=os.getcwd(), timeout=60000, rounds=1)
     d = tempfile.mkdtemp(prefix="summon-cval-")
+    base["run_dir"] = d
     try:
         for a in ("m1", "m2", "chair"):
             open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
@@ -1821,7 +1823,7 @@ def test_council_out_checkpoints_and_final():
             args = argparse.Namespace(question="X or Y?", question_file=None,
                                       members="m1,m2", chairman="chair", rounds=1,
                                       cwd=os.getcwd(), agents_dir=d, timeout=90000,
-                                      out=out)
+                                      out=out, run_dir=d)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
                 rc = _council.run_council(args)
@@ -1907,7 +1909,7 @@ def test_council_ceiling_estimate_on_stderr():
             args = argparse.Namespace(question="q", question_file=None,
                                       members="m1,m2", chairman="chair", rounds=2,
                                       cwd=os.getcwd(), agents_dir=d, timeout=90000,
-                                      out=None)
+                                      out=None, run_dir=d)
             err = io.StringIO()
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                 _council.run_council(args)
@@ -1925,7 +1927,7 @@ def test_council_ceiling_estimate_on_stderr():
             args4 = argparse.Namespace(question="q", question_file=None,
                                        members="m1,m2,m3,m4", chairman="chair",
                                        rounds=1, cwd=os.getcwd(), agents_dir=d,
-                                       timeout=90000, out=None)
+                                       timeout=90000, out=None, run_dir=d)
             err4 = io.StringIO()
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err4):
                 _council.run_council(args4)
@@ -2313,7 +2315,7 @@ def test_council_out_write_failure_surfaces_out_error():
             args = argparse.Namespace(question="q", question_file=None,
                                       members="m1,m2", chairman="chair", rounds=1,
                                       cwd=os.getcwd(), agents_dir=d, timeout=60000,
-                                      out=blocked)
+                                      out=blocked, run_dir=d)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
                 rc = _council.run_council(args)
@@ -2325,6 +2327,66 @@ def test_council_out_write_failure_surfaces_out_error():
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
+
+
+def test_council_fresh_run_persists_run_dir_artifacts():
+    # The whole point of B1: a council run leaves a complete, resumable record.
+    import _council, _rundir as rd, argparse, io, contextlib, json as _json, glob as _glob
+    root = tempfile.mkdtemp(prefix="summon-cfresh-")
+    try:
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(root, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+            if agent == "chair":
+                return {"status": "success", "result": "DECISION: X",
+                        "usage": {"output_tokens": 3}, "report": {"summary": "X"}}
+            rank = "\nRANKING: A, B" if tag.startswith("g1-r2-") else ""
+            return {"status": "success", "result": f"{agent} ok{rank}",
+                    "usage": {"output_tokens": 2}, "report": {"summary": agent}}
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            args = argparse.Namespace(question="X or Y?", question_file=None,
+                                      members="m1,m2", chairman="chair", rounds=2,
+                                      cwd=os.getcwd(), agents_dir=root, timeout=90000,
+                                      out=None, run_dir=root)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = _council.run_council(args)
+        finally:
+            _council._dispatch = orig
+        env = _json.loads(buf.getvalue())
+        assert rc == 0 and env["run_id"].startswith("council-") and env["generation"] == 1
+        run = env["run_dir"]
+        assert os.path.isdir(run), run
+        # receipt binds the run's inputs
+        receipt = rd.read_json(os.path.join(run, "receipt.json"))
+        assert receipt["question"] == "X or Y?" and receipt["members"] == ["m1", "m2"]
+        # generation persisted; ownership released cleanly
+        assert open(os.path.join(run, rd.GENERATION_FILE), encoding="utf-8").read().strip() == "1"
+        assert rd.read_owner(run) is None
+        # every stage landed generation-namespaced with its input hash
+        names = {os.path.basename(p) for p in _glob.glob(os.path.join(run, "g1-*.json"))}
+        assert {"g1-r1-m1.json", "g1-r1-m2.json", "g1-r2-m1.json", "g1-r2-m2.json",
+                "g1-rankings.json", "g1-chairman.json"} <= names, names
+        st = rd.read_json(os.path.join(run, "g1-r1-m1.json"))
+        assert st["status"] == "success" and len(st["input_sha256"]) == 64
+        # journal: started/finished per dispatch (5) + rankings computed
+        recs, torn = rd.journal_read(run)
+        assert not torn
+        events = [r["event"] for r in recs]
+        assert events.count("attempt_started") == 5, events
+        assert events.count("attempt_finished") == 5, events
+        assert "stage_computed" in events
+        fin = [r for r in recs if r["event"] == "attempt_finished"]
+        assert all(f["status"] == "success" and f["usage"] for f in fin)
+        # derived state reached synthesis
+        state = rd.read_json(os.path.join(run, "state.json"))
+        assert state["phase"] == "synthesized" and state["stages"]["chairman"] == "success"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
 
 
 def test_rundir_id_validation_and_containment():

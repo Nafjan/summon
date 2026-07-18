@@ -26,9 +26,15 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
+
+# Single WRITER means single PROCESS (the owner); within that process the
+# council fans member work across threads, so intra-process appends serialize
+# here. Cross-process exclusion is the owner lock's job, not this lock's.
+_JOURNAL_LOCK = threading.Lock()
 
 # --- Identifiers ---------------------------------------------------------------
 
@@ -331,10 +337,11 @@ def journal_append(run_dir: str, record: dict) -> None:
     rec = {**record, "ts": time.time()}
     line = _journal_line(rec)
     path = os.path.join(run_dir, JOURNAL_FILE)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
+    with _JOURNAL_LOCK:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
 
 
 def journal_read(run_dir: str):
