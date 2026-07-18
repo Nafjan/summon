@@ -1908,6 +1908,130 @@ def test_manifest_rejects_prompt_and_prompt_file():
     assert jobs2 is None and "not both" in err2, (jobs2, err2)
 
 
+def test_prompt_file_load_conflicts_and_bom():
+    import json as _json
+    import subprocess as sp
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-pf-")
+    try:
+        # A tiny probe agent: the dry-run view truncates argv tokens at 400
+        # chars, so the user prompt must land inside that window to be assertable.
+        agents = os.path.join(d, "roster")
+        os.makedirs(agents)
+        open(os.path.join(agents, "pf-probe.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: codex\npermission: read-only\n---\n# probe\ntiny.\n")
+        pf = os.path.join(d, "task.md")
+        with open(pf, "w", encoding="utf-8-sig") as fh:  # utf-8 WITH BOM on purpose
+            fh.write("Review THE-MAGIC-TOKEN please → carefully")
+        # happy path via --dry-run: prompt content reaches the resolved argv,
+        # BOM stripped, no dispatch executed
+        r = sp.run([sys.executable, script, "--agent", "pf-probe", "--prompt-file", pf,
+                    "--cwd", os.getcwd(), "--agents-dir", agents, "--dry-run"],
+                   capture_output=True, text=True, encoding="utf-8")
+        view = _json.loads(r.stdout)
+        assert view.get("dry_run") is True, view
+        assert any("THE-MAGIC-TOKEN" in a for a in view["args"]), view["args"]
+        assert not any("﻿" in a for a in view["args"])
+        # --prompt + --prompt-file -> rejected
+        r2 = sp.run([sys.executable, script, "--agent", "pf-probe", "--prompt", "x",
+                     "--prompt-file", pf, "--cwd", os.getcwd(), "--agents-dir", agents],
+                    capture_output=True, text=True, encoding="utf-8")
+        env2 = _json.loads(r2.stdout)
+        assert env2["status"] == "error" and "not both" in env2["error"], env2
+        # missing file -> clean error, no traceback
+        r3 = sp.run([sys.executable, script, "--agent", "pf-probe",
+                     "--prompt-file", os.path.join(d, "nope.md"),
+                     "--cwd", os.getcwd(), "--agents-dir", agents],
+                    capture_output=True, text=True, encoding="utf-8")
+        env3 = _json.loads(r3.stdout)
+        assert env3["status"] == "error" and "cannot read --prompt-file" in env3["error"], env3
+        # empty file -> clean error
+        ef = os.path.join(d, "empty.md")
+        open(ef, "w", encoding="utf-8").close()
+        r4 = sp.run([sys.executable, script, "--agent", "pf-probe", "--prompt-file", ef,
+                     "--cwd", os.getcwd(), "--agents-dir", agents],
+                    capture_output=True, text=True, encoding="utf-8")
+        env4 = _json.loads(r4.stdout)
+        assert env4["status"] == "error" and "is empty" in env4["error"], env4
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_prompt_file_and_allow_credit_in_child_argv():
+    # A --background child re-reads the FILE (small argv, no mojibake) and
+    # keeps the credit authorization.
+    import argparse
+    import run_subagent as r
+    ns = argparse.Namespace(agent="a", prompt="LOADED-TEXT", prompt_file="C:/t/p.md",
+                            allow_credit=True, cwd="C:/w", agents_dir=None,
+                            timeout=600000, cli=None, model=None, effort=None,
+                            resume=None, resume_profile=None, out=None,
+                            json_schema=None, debug_dir=None, retries=0, worktree=None)
+    argv = r._child_argv(ns, "res.json")
+    assert "--prompt-file" in argv and "C:/t/p.md" in argv, argv
+    assert "LOADED-TEXT" not in argv, argv
+    assert "--allow-credit" in argv, argv
+    ns.prompt_file, ns.allow_credit = None, False
+    argv2 = r._child_argv(ns, "res.json")
+    assert "--prompt" in argv2 and "LOADED-TEXT" in argv2 and "--allow-credit" not in argv2
+
+
+def test_allow_credit_flag_dry_run_and_fanout_rejection():
+    import json as _json
+    import subprocess as sp
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "run_subagent.py")
+    agents = os.path.join(here, "..", "agents")
+    # env scrubbed of any ambient authorization so the test is deterministic
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SUMMON_ALLOW_FABLE", "SUMMON_ALLOW_CREDIT", "ANTHROPIC_API_KEY")}
+    base = [sys.executable, script, "--agent", "planner", "--prompt", "x",
+            "--cwd", os.getcwd(), "--agents-dir", agents,
+            "--model", "claude-fable-5", "--dry-run"]
+    r = sp.run(base, capture_output=True, text=True, encoding="utf-8", env=env)
+    view = _json.loads(r.stdout)
+    assert view["model_effective"] == "claude-opus-4-8", view  # guard fell back
+    r2 = sp.run(base + ["--allow-credit"], capture_output=True, text=True,
+                encoding="utf-8", env=env)
+    view2 = _json.loads(r2.stdout)
+    assert view2["model_effective"] == "claude-fable-5", view2   # authorized
+    assert view2["billing_predicted"]["source"] == "credit", view2
+    # fan-out modes must REJECT the flag (env inheritance would silently
+    # authorize every child)
+    r3 = sp.run([sys.executable, script, "--council", "--question", "q",
+                 "--cwd", os.getcwd(), "--allow-credit"],
+                capture_output=True, text=True, encoding="utf-8", env=env)
+    env3 = _json.loads(r3.stdout)
+    assert env3["status"] == "error" and "--allow-credit" in env3["error"], env3
+
+
+def test_agy_safe_edit_warning_helper_and_dry_run():
+    from _builder import agy_permission_warning
+    assert agy_permission_warning("agy", "safe-edit")
+    assert agy_permission_warning("agy", "yolo") is None
+    assert agy_permission_warning("agy", "read-only") is None
+    assert agy_permission_warning("claude", "safe-edit") is None
+    import json as _json
+    import subprocess as sp
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-agyw-")
+    try:
+        open(os.path.join(d, "agy-agent.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: agy\npermission: safe-edit\n---\n# agy agent\nrole.\n")
+        r = sp.run([sys.executable, script, "--agent", "agy-agent", "--prompt", "x",
+                    "--cwd", os.getcwd(), "--agents-dir", d, "--dry-run"],
+                   capture_output=True, text=True, encoding="utf-8")
+        view = _json.loads(r.stdout)
+        warns = view.get("warnings") or []
+        assert sum("workspace-write tier" in w for w in warns) == 1, warns
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

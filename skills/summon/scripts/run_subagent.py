@@ -243,7 +243,14 @@ def _child_argv(args: argparse.Namespace, result_file: str) -> list:
     """Reconstruct the child argv from PARSED args (not by filtering sys.argv,
     which would wrongly drop a token that is another option's *value*). Drops
     --background, adds --job-file."""
-    out = ["--agent", args.agent, "--prompt", args.prompt, "--cwd", args.cwd]
+    # A file-sourced prompt is re-passed AS THE FILE (not the loaded text): the
+    # child re-reads it, keeping the detached argv small and mojibake-free.
+    if getattr(args, "prompt_file", None):
+        out = ["--agent", args.agent, "--prompt-file", args.prompt_file, "--cwd", args.cwd]
+    else:
+        out = ["--agent", args.agent, "--prompt", args.prompt, "--cwd", args.cwd]
+    if getattr(args, "allow_credit", False):
+        out += ["--allow-credit"]
     if args.agents_dir:
         out += ["--agents-dir", args.agents_dir]
     if args.timeout:
@@ -443,6 +450,11 @@ def main() -> None:
                         help="With --doctor: emit machine-readable JSON instead of the table")
     parser.add_argument("--agent", help="Agent definition name")
     parser.add_argument("--prompt", help="Task prompt")
+    parser.add_argument("--prompt-file", dest="prompt_file",
+                        help="Read the task prompt from FILE (UTF-8; BOM tolerated). "
+                             "Mutually exclusive with --prompt. Ergonomics for long/"
+                             "quoted prompts -- backends still receive the prompt via "
+                             "argv, so backend argv limits (e.g. agy ~28k chars) apply")
     parser.add_argument("--cwd", help="Working directory (absolute path)")
     parser.add_argument("--agents-dir", help="Directory containing agent definitions")
     parser.add_argument(
@@ -465,6 +477,12 @@ def main() -> None:
                                       "holds a valid envelope, skip the run (swarm resume)")
     parser.add_argument("--retries", type=int, default=0,
                         help="Re-dispatch up to N times on error/partial, exponential backoff")
+    parser.add_argument("--allow-credit", dest="allow_credit", action="store_true",
+                        help="Authorize spending ACCOUNT CREDIT on a credit-only model "
+                             "(Fable) for this one dispatch — flag form of "
+                             "SUMMON_ALLOW_CREDIT=1. Single dispatch only: rejected for "
+                             "--manifest/--council (set the env var deliberately for "
+                             "fan-out spend)")
     parser.add_argument("--json-schema", dest="json_schema",
                         help="Validate the agent's final JSON against this schema file; attach "
                              "parsed/parse_ok; one corrective retry via resume on mismatch")
@@ -598,6 +616,32 @@ def main() -> None:
             prior["skipped"] = True
             _emit(prior)
             sys.exit(0)
+
+    # --prompt-file: resolve to a prompt BEFORE the background handler (its
+    # validation needs args.prompt). utf-8-sig strips a BOM; strict decoding so
+    # mojibake fails loudly instead of reaching a paid model. NOTE: this is
+    # quoting/encoding ergonomics, not argv-limit relief -- builders still pass
+    # the prompt as one argv token (agy's ~28k guard still applies).
+    if args.prompt and args.prompt_file:
+        _print_error("give --prompt or --prompt-file, not both")
+        sys.exit(1)
+    if args.prompt_file:
+        try:
+            with open(args.prompt_file, encoding="utf-8-sig") as fh:
+                args.prompt = fh.read()
+        except (OSError, UnicodeDecodeError) as e:
+            _print_error(f"cannot read --prompt-file {args.prompt_file}: {e}")
+            sys.exit(1)
+        if not args.prompt.strip():
+            _print_error(f"--prompt-file {args.prompt_file} is empty")
+            sys.exit(1)
+
+    # --allow-credit: per-dispatch credit authorization. Env form of the same
+    # switch, set process-local so the credit guard and any --background child
+    # (env-inherited AND argv-propagated) see it. Fan-out modes never reach
+    # here -- the mode-flag matrix rejects the flag for them.
+    if args.allow_credit:
+        os.environ["SUMMON_ALLOW_CREDIT"] = "1"
 
     # --json-schema: fail fast on an unloadable schema BEFORE paying for a run.
     schema = None
@@ -781,8 +825,8 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     path is shown instead."""
     from _builder import (BACKENDS, backend_kind, build_invocation_args,
                           permission_flags as _pf, _PERMISSION_MAPPING, _agy_wrapper,
-                          apply_credit_guard, infer_billing, credit_spend_allowed,
-                          selects_credit_only)
+                          agy_permission_warning, apply_credit_guard, infer_billing,
+                          credit_spend_allowed, selects_credit_only)
     _guarded, _, _guard_warnings = apply_credit_guard(invocation)
     _eff_model = _guarded.model
     # Predict the billing source so preflight can reveal a charge (mirrors _stamp).
@@ -814,6 +858,9 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     }
     for _w in _guard_warnings:  # credit-only guard actions surfaced in the preview
         view.setdefault("warnings", []).append(_w)
+    _pw = agy_permission_warning(invocation.cli, invocation.permission)
+    if _pw:  # same helper as the real envelope -> identical warning, exactly once
+        view.setdefault("warnings", []).append(_pw)
     if backend_kind(invocation.cli) == "api":
         view["command"] = f"POST ({invocation.cli})"
         view["base_url"] = invocation.base_url
