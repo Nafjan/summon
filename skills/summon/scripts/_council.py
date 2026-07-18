@@ -68,15 +68,6 @@ def _atomic_write_json(path: str, obj: dict) -> str | None:
         return f"failed to write council envelope to {path}: {e}"
 
 
-def _checkpoint(envelope: dict, out_path: str | None) -> None:
-    """Persist an IN-PROGRESS council envelope to --out (file only, never
-    stdout -- the stdout contract stays exactly-one-envelope). Best-effort by
-    design: the phase results it snapshots also still flow into the final
-    envelope. This is what makes a host-tool kill recoverable: the field
-    failure was a council killed between the member phase and synthesis, with
-    nothing on disk."""
-    if out_path:
-        _atomic_write_json(out_path, envelope)
 
 
 def _fail(msg: str, out_path: str | None = None) -> int:
@@ -242,8 +233,9 @@ def run_council(args) -> int:
     """Entry point for ``--council``. Returns the process exit code."""
     # getattr: direct callers (tests) build a Namespace without `out`.
     out_path = getattr(args, "out", None)
-    if args.question_file and (args.question or "").strip():
-        # Both inputs present used to mean the FILE silently won -- ambiguous.
+    if args.question_file and args.question is not None:
+        # Both inputs PRESENT (even --question "") used to mean the FILE
+        # silently won -- ambiguous, so rejected on presence, not truthiness.
         return _fail("give --question OR --question-file, not both", out_path)
     if args.question_file:
         try:
@@ -328,12 +320,13 @@ def run_council(args) -> int:
             print(f"[council {done['n']}/{len(members)}] {agent} ({b}) "
                   f"status={env.get('status')}", file=sys.stderr, flush=True)
         return {"agent": agent, "backend": b,
-                "model": _model_label(env),   # resolved, else requested (never blank)
+                "model": _model_label(env),   # served/resolved, else requested (never blank)
                 "status": env.get("status"), "position": _position(env, cap),
                 "elapsed_ms": env.get("elapsed_ms"),
                 "billing": env.get("billing"),      # so credit/api spend isn't hidden
                 "warnings": env.get("warnings"),    # e.g. a Fable -> Opus fallback
-                "_raw": env.get("result") or ""}   # kept only to parse RANKING
+                "_raw": env.get("result") or "",   # kept only to parse RANKING
+                "_env": env}   # full child envelope: checkpoints persist it
 
     try:
         # ---- round 1: independent positions ---------------------------------
@@ -343,19 +336,33 @@ def run_council(args) -> int:
 
         # ---- round 2 (optional): cross-examination + peer RANKING -----------
         consensus_ranking = None
+        out_errors: list = []
 
         def _partial_env(state: str) -> dict:
             """A checkpoint snapshot of the council so far. Reads `results` /
-            `consensus_ranking` at call time (they are rebound per round)."""
+            `consensus_ranking` at call time (they are rebound per round).
+            Carries the FULL completed member envelopes (receipts, usage,
+            resume handles, precise errors) -- a hard kill must not reduce
+            member work to capped summaries."""
             return {"mode": "council", "envelope": 1, "question": question,
                     "rounds": rounds, "council_state": state,
-                    "members": [{k: v for k, v in m.items() if k != "_raw"}
+                    "members": [{k: v for k, v in m.items() if k not in ("_raw", "_env")}
                                 for m in results],
+                    "member_envelopes": [m["_env"] for m in results
+                                         if isinstance(m.get("_env"), dict)],
                     "consensus_ranking": consensus_ranking,
                     "status": "in_progress",
                     "elapsed_ms": int((time.monotonic() - started) * 1000)}
 
-        _checkpoint(_partial_env("round1_complete"), out_path)
+        def _ckpt(state: str) -> None:
+            """Write a phase checkpoint to --out. A write failure never kills a
+            running council, but it is CARRIED FORWARD as out_error."""
+            if out_path:
+                err = _atomic_write_json(out_path, _partial_env(state))
+                if err:
+                    out_errors.append(err)
+
+        _ckpt("round1_complete")
         if rounds >= 2:
             done["n"] = 0
             # Same anonymized set (members order) for everyone -> comparable votes.
@@ -373,10 +380,11 @@ def run_council(args) -> int:
                 agg = _aggregate_rankings(votes, n)
                 consensus_ranking = [{"agent": members[a["index"]], "score": a["score"],
                                       "votes": a["votes"]} for a in agg]
-            _checkpoint(_partial_env("round2_complete"), out_path)
+            _ckpt("round2_complete")
 
-        for m in results:                # drop the raw text kept only for ranking
+        for m in results:    # drop the raw text and envelope carried for checkpoints
             m.pop("_raw", None)
+            m.pop("_env", None)
 
         # ---- synthesis: the chairman calls it -------------------------------
         rnote = ""
@@ -438,11 +446,15 @@ def run_council(args) -> int:
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "status": status,
     }
-    # --out: the final envelope replaces the last checkpoint atomically. A write
-    # failure is surfaced (out_error) but never demotes the council itself.
+    # --out: the final envelope replaces the last checkpoint atomically. Any
+    # write failure (checkpoint or final) is surfaced as out_error but never
+    # demotes the council itself.
+    if out_errors:
+        envelope["out_error"] = "; ".join(out_errors)
     if out_path:
         _werr = _atomic_write_json(out_path, envelope)
         if _werr:
-            envelope["out_error"] = _werr
+            out_errors.append(_werr)
+            envelope["out_error"] = "; ".join(out_errors)
     print(json.dumps(envelope, ensure_ascii=False))
     return 0 if status == "success" else 1

@@ -196,8 +196,9 @@ Git-style subcommands. The old flat `--flag` form still works too:
    next dispatch instead of re-explaining; that's how multi-step work stays cheap.
 3. **Trust the envelope, not the prose.** Branch on `status`; a run that ends asking for
    approval or self-reports `BLOCKED` comes back `blocked`, never a false `success`. Check
-   `model.served` to confirm which model actually did the work (`served: null` on a failed
-   run means no inference happened, even when `targeted` names a model).
+   `model.served` to confirm which model actually did the work (`served: null` means
+   summon saw no service evidence: no terminal model report and no output tokens, even
+   when `targeted` names a model).
 4. **Review across vendors.** Send code written by one vendor to a reviewer on another.
    `docs/PROTOCOL.md` has the rule and the named patterns (debate, async build, competing
    hypotheses, consensus).
@@ -432,8 +433,9 @@ You bring the model access; summon just orchestrates the CLIs and APIs you alrea
 
 **What happens when a vendor ships a new model?** Nothing breaks. Model strings pass
 through verbatim; aliases like `opus` and `sonnet` float, `summon models` shows what's
-available, and the envelope's `model.resolved` confirms what ran. Aliases can lag a launch
-by a day or two, so pin the explicit ID when you need the newest.
+available, and the envelope's `model.served` confirms what ran (`resolved` is the legacy
+field). Aliases can lag a launch by a day or two, so pin the explicit ID when you need
+the newest.
 
 **Does it need API keys?** For the five CLI backends, no. It drives the logins you already
 have, and it strips `OPENAI_API_KEY` from codex children so you're not silently billed at
