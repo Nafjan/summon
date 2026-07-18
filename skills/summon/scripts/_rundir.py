@@ -148,17 +148,51 @@ class OwnershipLostError(Exception):
 
 
 class Owner:
-    """A held run ownership: the lock's identity plus this period's generation."""
+    """A held run ownership: the lock's identity plus this period's generation.
 
-    __slots__ = ("run_dir", "nonce", "generation", "lease_sec", "pid")
+    ``payload`` is the EXACT bytes we wrote to owner.lock; the lock is
+    immutable for its whole ownership period (renewals go to a nonce-named
+    SIDECAR), so byte-equality is the ownership test for every fenced
+    operation -- a successor's lock can never be byte-identical (fresh nonce)."""
 
-    def __init__(self, run_dir: str, nonce: str, generation: int, lease_sec: float):
+    __slots__ = ("run_dir", "nonce", "generation", "lease_sec", "pid", "payload")
+
+    def __init__(self, run_dir: str, nonce: str, generation: int,
+                 lease_sec: float, payload: bytes):
         self.run_dir, self.nonce, self.generation = run_dir, nonce, generation
-        self.lease_sec, self.pid = lease_sec, os.getpid()
+        self.lease_sec, self.pid, self.payload = lease_sec, os.getpid(), payload
 
 
 def _lock_path(run_dir: str) -> str:
     return os.path.join(run_dir, OWNER_LOCK)
+
+
+def _lease_path(run_dir: str, nonce: str) -> str:
+    """Renewals live in a NONCE-NAMED sidecar: an owner can only ever write its
+    own lease file, so renewal physically cannot clobber a successor's lock or
+    lease (the same fencing-by-namespace trick as generation-named stages)."""
+    return os.path.join(run_dir, f"lease-{nonce}.json")
+
+
+def _effective_expiry(run_dir: str, lock_data: dict) -> float:
+    """The lock's lease, extended by its owner's lease sidecar when valid."""
+    exp = float(lock_data["lease_expires"])
+    side = read_json(_lease_path(run_dir, lock_data["nonce"]))
+    if (isinstance(side, dict) and side.get("summon_owner_lease") is True
+            and side.get("nonce") == lock_data["nonce"]):
+        s = side.get("lease_expires")
+        if isinstance(s, (int, float)) and not isinstance(s, bool) and s == s:
+            exp = max(exp, float(s))
+    return exp
+
+
+def owner_still_current(owner: Owner) -> bool:
+    """Byte-exact ownership test against the immutable lock file."""
+    try:
+        with open(_lock_path(owner.run_dir), "rb") as fh:
+            return fh.read() == owner.payload
+    except OSError:
+        return False
 
 
 def _parse_owner(raw: bytes):
@@ -193,15 +227,18 @@ def read_owner(run_dir: str):
 
 
 def _last_generation(run_dir: str) -> int:
-    """Highest generation ever claimed: generation.txt, else a g<N>-* scan."""
+    """Highest generation ever claimed. Consults ALL evidence and takes the max:
+    generation.txt, the g<N>-* filename scan, AND a parseable owner.lock's own
+    generation (a crash between lock creation and any other write must never
+    let a successor reuse the same generation)."""
+    best = 0
     try:
         with open(os.path.join(run_dir, GENERATION_FILE), encoding="utf-8") as fh:
             n = int(fh.read().strip())
-            if n >= 0:
-                return n
+            if n > best:
+                best = n
     except (OSError, ValueError):
         pass
-    best = 0
     try:
         for name in os.listdir(run_dir):
             m = re.match(r"^g(\d+)-", name)
@@ -209,6 +246,9 @@ def _last_generation(run_dir: str) -> int:
                 best = max(best, int(m.group(1)))
     except OSError:
         pass
+    data = read_owner(run_dir)
+    if data:
+        best = max(best, data["generation"])
     return best
 
 
@@ -222,6 +262,14 @@ def _write_generation(run_dir: str, generation: int) -> None:
 
 def acquire_owner(run_dir: str, lease_sec: float) -> Owner:
     """Become the run's single owner at a fresh generation.
+
+    Crash-safe generation claim: the lock itself CARRIES its generation and
+    _last_generation reads it, so a crash between lock creation and the
+    generation.txt write cannot let a successor reuse a generation (and a
+    failed acquisition attempt never inflates the persisted counter). The lock
+    file is IMMUTABLE for its whole ownership period (renewals go to the
+    nonce-named lease sidecar), which is what makes byte-equality a sound
+    ownership test.
 
     Raises OwnerHeldError (live lease), OwnerLockForeignError (fail-closed on a
     non-summon lock), or OSError (filesystem).
@@ -241,8 +289,10 @@ def acquire_owner(run_dir: str, lease_sec: float) -> Owner:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "wb") as fh:
                 fh.write(payload)
+            # AFTER the lock: a crash before this write is covered by the
+            # lock-aware _last_generation (the lock names its generation).
             _write_generation(run_dir, generation)
-            return Owner(run_dir, nonce, generation, lease_sec)
+            return Owner(run_dir, nonce, generation, lease_sec, payload)
         except FileExistsError:
             pass
         # Somebody holds (or held) it. Judge the existing lock.
@@ -257,14 +307,29 @@ def acquire_owner(run_dir: str, lease_sec: float) -> Owner:
             raise OwnerLockForeignError(
                 f"{lock} exists but is not a summon owner record; refusing to break it. "
                 "Remove it manually if you are sure no owner is alive.")
-        if time.time() < data["lease_expires"]:
-            raise OwnerHeldError(data.get("pid"), data["lease_expires"])
-        # Expired: break it, but only if it is byte-identical to what we judged
-        # (the install.py stale-lock pattern -- never delete a lock somebody
-        # just replaced).
+        expiry = _effective_expiry(run_dir, data)   # incl. the lease sidecar
+        if time.time() < expiry:
+            raise OwnerHeldError(data.get("pid"), expiry)
+        # Expired: break it, but only if BOTH content and mtime are unchanged
+        # since we judged it (never delete a lock somebody just replaced).
         try:
-            if os.path.getmtime(lock) == observed_mtime:
+            with open(lock, "rb") as fh:
+                raw2 = fh.read()
+            if raw2 == raw and os.path.getmtime(lock) == observed_mtime:
+                # Persist the broken lock's generation BEFORE unlinking, so the
+                # next loop iteration's _last_generation (which can no longer
+                # read the deleted lock) still advances past it -- a stale lock
+                # broken at generation N must never let us re-claim <= N.
+                try:
+                    _write_generation(run_dir, max(_last_generation(run_dir),
+                                                   data["generation"]))
+                except OSError:
+                    pass
                 os.unlink(lock)
+                try:  # the deposed owner's lease sidecar is dead weight now
+                    os.unlink(_lease_path(run_dir, data["nonce"]))
+                except OSError:
+                    pass
         except OSError:
             pass
         # loop: retry the O_EXCL create at a re-read generation
@@ -272,38 +337,44 @@ def acquire_owner(run_dir: str, lease_sec: float) -> Owner:
 
 
 def renew_owner(owner: Owner) -> None:
-    """Extend the lease. Called after every completed stage, so a live council
-    renews naturally and only a truly suspended owner ever expires.
+    """Extend the lease by writing OUR nonce-named lease sidecar. Called after
+    every completed stage, so a live council renews naturally and only a truly
+    suspended owner ever expires.
 
-    Verifies the lock still carries OUR nonce and our lease is still unexpired
-    before rewriting; a takeover requires an EXPIRED lease, so under sane local
-    clocks the two cannot both hold. Raises OwnershipLostError otherwise.
-    """
-    data = read_owner(owner.run_dir)
-    if data is None or data.get("nonce") != owner.nonce:
-        raise OwnershipLostError("owner.lock no longer carries our nonce")
-    now = time.time()
-    if now >= data["lease_expires"]:
-        raise OwnershipLostError("our lease already expired; a successor may own the run")
-    atomic_write_json(_lock_path(owner.run_dir), {
-        "summon_owner": True, "nonce": owner.nonce, "pid": owner.pid,
-        "generation": owner.generation, "acquired_at": data["acquired_at"],
-        "lease_expires": now + owner.lease_sec,
+    Structurally race-free against a successor: this never touches owner.lock
+    (immutable) and the sidecar name embeds our nonce, so there is no shared
+    file a successor and a deposed owner could both write. Raises
+    OwnershipLostError when the lock no longer carries our exact bytes
+    (before AND after the write, so a mid-renew takeover is also caught)."""
+    if not owner_still_current(owner):
+        raise OwnershipLostError("owner.lock no longer carries our bytes")
+    atomic_write_json(_lease_path(owner.run_dir, owner.nonce), {
+        "summon_owner_lease": True, "nonce": owner.nonce,
+        "lease_expires": time.time() + owner.lease_sec,
     })
+    if not owner_still_current(owner):
+        # A successor appeared mid-renew (our lease must have been expired).
+        # Our orphan sidecar is harmless: it is keyed to OUR nonce, which no
+        # longer matches the lock, so _effective_expiry ignores it.
+        raise OwnershipLostError("ownership changed during renewal")
 
 
 def release_owner(owner: Owner) -> None:
-    """Remove OUR lock only (nonce-checked, mtime re-verified). A successor's
-    lock is never touched; releasing twice is a no-op."""
+    """Remove OUR lock only: byte-exact compare, then unlink. A successor's
+    lock (fresh nonce, different bytes) is never touched; releasing twice is a
+    no-op. The residual compare-then-unlink window is closed in practice by
+    the lease discipline: a successor can only exist if our lease expired, and
+    a releasing owner is by definition still live."""
     lock = _lock_path(owner.run_dir)
     try:
         with open(lock, "rb") as fh:
-            data = _parse_owner(fh.read())
-        if not data or data.get("nonce") != owner.nonce:
-            return
-        mtime = os.path.getmtime(lock)
-        if os.path.getmtime(lock) == mtime:
-            os.unlink(lock)
+            if fh.read() != owner.payload:
+                return
+        os.unlink(lock)
+    except OSError:
+        pass
+    try:
+        os.unlink(_lease_path(owner.run_dir, owner.nonce))
     except OSError:
         pass
 
@@ -328,16 +399,20 @@ def _journal_line(record: dict) -> str:
                       separators=(",", ":"), ensure_ascii=False)
 
 
-def journal_append(run_dir: str, record: dict) -> None:
-    """Append one checksummed line and FSYNC it. Owner-only by convention (the
-    protocol has a single writer; this function does not re-verify the lock --
-    callers hold it). ``ts`` is stamped here. fsync BEFORE returning is the
-    durability contract: an ``attempt started`` record must hit disk before the
-    paid dispatch it announces."""
+def journal_append(run_dir: str, record: dict, owner: Owner | None = None) -> None:
+    """Append one checksummed line and FSYNC it. When ``owner`` is given the
+    write is FENCED: the lock must still carry the owner's exact bytes, or
+    OwnershipLostError raises and nothing is written -- a suspended parent that
+    resumes after a takeover cannot corrupt the successor's single-writer
+    journal. ``ts`` is stamped here. fsync BEFORE returning is the durability
+    contract: an ``attempt started`` record must hit disk before the paid
+    dispatch it announces."""
     rec = {**record, "ts": time.time()}
     line = _journal_line(rec)
     path = os.path.join(run_dir, JOURNAL_FILE)
     with _JOURNAL_LOCK:
+        if owner is not None and not owner_still_current(owner):
+            raise OwnershipLostError("journal write refused: ownership changed")
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
             fh.flush()
@@ -397,7 +472,7 @@ def journal_repair(run_dir: str, owner: Owner) -> bool:
         os.fsync(fh.fileno())
     os.replace(tmp, path)
     journal_append(run_dir, {"event": "journal_repaired",
-                             "generation": owner.generation})
+                             "generation": owner.generation}, owner=owner)
     return True
 
 
@@ -428,8 +503,22 @@ def carry_forward(run_dir: str, owner: Owner, stage: str, prior_generation: int,
     check = read_json(dst)  # post-copy validation: parse + hash agreement
     if not check or check.get("status") != "success" or (
             expected_input_sha is not None and check.get("input_sha256") != expected_input_sha):
+        # A failed copy must leave NO current-generation residue: the child's
+        # --out skip-if-success would otherwise reuse the bad file instead of
+        # the promised re-run.
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
         return False
-    journal_append(run_dir, {"event": "carried_forward", "stage": stage,
-                             "generation": owner.generation,
-                             "from_generation": prior_generation})
+    try:
+        journal_append(run_dir, {"event": "carried_forward", "stage": stage,
+                                 "generation": owner.generation,
+                                 "from_generation": prior_generation}, owner=owner)
+    except OwnershipLostError:
+        try:
+            os.unlink(dst)   # deposed mid-carry: withdraw our copy entirely
+        except OSError:
+            pass
+        raise
     return True

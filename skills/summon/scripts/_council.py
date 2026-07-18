@@ -300,11 +300,22 @@ def run_council(args) -> int:
     from _loader import get_agents_dir, load_agent
     agents_dir = (args.agents_dir or (receipt_doc or {}).get("agents_dir")
                   or get_agents_dir(None, cwd))
+    import _rundir as _rd
+    _agent_shas: dict = {}
     for who in dict.fromkeys(members + [chairman]):  # validate before any paid dispatch
         try:
-            load_agent(agents_dir, who)
+            loaded = load_agent(agents_dir, who)
+            # Definition-identity hash: a changed agent definition (or a
+            # different roster/repo) must invalidate carry-forward -- the field
+            # rule that a stage's EXECUTION CONTEXT is part of its inputs.
+            try:
+                with open(loaded[3], "rb") as _fh:
+                    _agent_shas[who] = _rd.content_sha256(_fh.read().decode("utf-8", "replace"))
+            except OSError:
+                _agent_shas[who] = None
         except Exception as e:  # noqa: BLE001
             return _fail(f"council member/chairman {who!r} not found: {e}", out_path)
+    _exec_ctx = {"cwd": cwd, "agents_dir": os.path.abspath(agents_dir)}
 
     # --timeout arrives as whole milliseconds (argparse type). Pass it through as
     # ms to the children; never silently substitute a default.
@@ -314,6 +325,7 @@ def run_council(args) -> int:
     # The PERSISTENT run directory replaces the old throwaway mkdtemp (which
     # soft paths deleted and hard kills orphaned -- the field failure). One
     # owner, one generation, journaled attempts; see _rundir.py.
+    lost = {"err": None}   # ownership loss detected by any fenced write/renew
     if not resume_run:
         run_id = _rd.new_run_id("council")
         try:
@@ -374,28 +386,51 @@ def run_council(args) -> int:
           "- set your host tool's timeout ABOVE this",
           file=sys.stderr, flush=True)
 
+    def _renew_soft() -> None:
+        """Per-stage lease renewal (v3.1: renew after EVERY stage, so a long
+        multi-wave round cannot expire a live owner). Thread-safe: renewal only
+        writes our nonce-named lease sidecar. A loss is recorded, not raised,
+        so pool threads finish their bookkeeping; phase boundaries abort."""
+        try:
+            _rd.renew_owner(owner)
+        except _rd.OwnershipLostError as e:
+            lost["err"] = lost["err"] or str(e)
+
     def run_stage(agent: str, prompt: str, stage: str, input_sha: str) -> dict:
         """Dispatch ONE journaled, generation-namespaced stage and return the
         child envelope. The file tag is `g<generation>-<stage>` so a deposed
-        owner's late child can never write into a successor's namespace."""
+        owner's late child can never write into a successor's namespace. Every
+        journal write is FENCED (owner=): a deposed parent aborts instead of
+        corrupting the successor's single-writer journal."""
+        attempt_id = f"g{owner.generation}-{stage}-1"
+        out_file = _rd.stage_path(rd_path, owner.generation, stage)
+        try:  # a stale current-generation leftover (failed carry residue,
+              # crashed prior write) must not satisfy the child's --out skip
+            os.unlink(out_file)
+        except OSError:
+            pass
         _rd.journal_append(rd_path, {"event": "attempt_started", "stage": stage,
-                                     "generation": owner.generation, "kind": "initial"})
+                                     "attempt_id": attempt_id,
+                                     "generation": owner.generation,
+                                     "kind": "initial"}, owner=owner)
         env = _dispatch(agent, prompt, cwd, agents_dir, timeout_ms, rd_path,
                         f"g{owner.generation}-{stage}")
-        if isinstance(env, dict):
-            # Owner-side annotation: the upstream-input hash is what makes this
-            # stage carry-forwardable on a later resume.
+        if isinstance(env, dict) and _rd.owner_still_current(owner):
+            # Owner-side annotation (fenced): the upstream-input hash is what
+            # makes this stage carry-forwardable on a later resume.
             try:
-                _rd.atomic_write_json(_rd.stage_path(rd_path, owner.generation, stage),
+                _rd.atomic_write_json(out_file,
                                       {**env, "stage": stage, "input_sha256": input_sha})
             except OSError:
                 pass  # the envelope itself was already read; carry-forward just won't reuse it
         _rd.journal_append(rd_path, {"event": "attempt_finished", "stage": stage,
+                                     "attempt_id": attempt_id,
                                      "generation": owner.generation,
                                      "status": env.get("status"),
                                      "usage": env.get("usage"),
                                      "cost_usd": env.get("cost_usd"),
-                                     "elapsed_ms": env.get("elapsed_ms")})
+                                     "elapsed_ms": env.get("elapsed_ms")}, owner=owner)
+        _renew_soft()
         return env
 
     fresh_stages: set = set()   # stages DISPATCHED (or recomputed) this generation;
@@ -459,18 +494,26 @@ def run_council(args) -> int:
             gen, stage = int(m.group(1)), m.group(2)
             if gen >= owner.generation or stage not in fresh_stages:
                 continue
+            if not _rd.owner_still_current(owner):
+                lost["err"] = lost["err"] or "ownership changed (supersede refused)"
+                return
             dest_dir = os.path.join(rd_path, "superseded", f"g{gen}")
             try:
                 os.makedirs(dest_dir, exist_ok=True)
                 os.replace(os.path.join(rd_path, name), os.path.join(dest_dir, name))
                 _rd.journal_append(rd_path, {"event": "superseded", "stage": stage,
                                              "from_generation": gen,
-                                             "generation": owner.generation})
+                                             "generation": owner.generation},
+                                   owner=owner)
             except OSError:
                 pass
 
     def _write_state(phase: str, chair_status=None) -> None:
-        """Derived display index (envelopes + journal stay authoritative)."""
+        """Derived display index (envelopes + journal stay authoritative).
+        Fenced: a deposed owner must not overwrite the successor's index."""
+        if not _rd.owner_still_current(owner):
+            lost["err"] = lost["err"] or "ownership changed (state write refused)"
+            return
         try:
             _rd.atomic_write_json(os.path.join(rd_path, "state.json"), {
                 "run_id": run_id, "generation": owner.generation, "phase": phase,
@@ -482,10 +525,18 @@ def run_council(args) -> int:
 
     try:
         # ---- round 1: independent positions ---------------------------------
+        # Stage-input hashes cover the EXACT prompt plus execution identity
+        # (member, its definition hash, cwd, roster dir): a changed repo, a
+        # retuned agent, or a different question all invalidate carry-forward.
         p1 = _round1_prompt(question)
-        r1_sha = _rd.content_sha256({"question": question})
+
+        def _r1_sha(m: str) -> str:
+            return _rd.content_sha256({"prompt": p1, "member": m,
+                                       "agent_sha": _agent_shas.get(m), **_exec_ctx})
+
         with ThreadPoolExecutor(max_workers=len(members)) as pool:
-            results = list(pool.map(lambda m: run_member(m, p1, f"r1-{m}", r1_sha), members))
+            results = list(pool.map(lambda m: run_member(m, p1, f"r1-{m}", _r1_sha(m)),
+                                    members))
 
         # ---- round 2 (optional): cross-examination + peer RANKING -----------
         consensus_ranking = None
@@ -517,23 +568,29 @@ def run_council(args) -> int:
 
         _ckpt("round1_complete")
         _write_state("round1_complete")
-        try:
-            _rd.renew_owner(owner)   # a live council renews after every phase
-        except _rd.OwnershipLostError as e:
-            return _fail(f"run ownership lost after round 1: {e}", out_path)
+        if lost["err"]:
+            return _fail(f"run ownership lost during round 1: {lost['err']}", out_path)
         if rounds >= 2:
             done["n"] = 0
             # Same anonymized set (members order) for everyone -> comparable votes.
             all_positions = [r.get("position") or "(no position)" for r in results]
-            r2_sha = _rd.content_sha256({"question": question, "positions": all_positions})
+            p2 = _round2_prompt(question, all_positions)
+
+            def _r2_sha(m: str) -> str:
+                return _rd.content_sha256({"prompt": p2, "member": m,
+                                           "agent_sha": _agent_shas.get(m), **_exec_ctx})
+
             def refine(agent):
-                return run_member(agent, _round2_prompt(question, all_positions),
-                                  f"r2-{agent}", r2_sha)
+                return run_member(agent, p2, f"r2-{agent}", _r2_sha(agent))
             with ThreadPoolExecutor(max_workers=len(members)) as pool:
                 results = list(pool.map(refine, members))
             # Rankings are an owner-computed STAGE: carried forward when the r2
-            # outputs are unchanged, recomputed (and journaled) otherwise.
-            rankings_sha = _rd.content_sha256([m.get("_raw", "") for m in results])
+            # outputs are unchanged, recomputed (and journaled) otherwise. The
+            # hash covers raws AND statuses: status gates vote eligibility, so
+            # it is a semantic input of the computation.
+            rankings_sha = _rd.content_sha256(
+                {"raws": [m.get("_raw", "") for m in results],
+                 "statuses": [m.get("status") for m in results]})
             _rank_pg = _prior_generation("rankings")
             if _rank_pg and _rd.carry_forward(rd_path, owner, "rankings",
                                               _rank_pg, rankings_sha):
@@ -552,22 +609,22 @@ def run_council(args) -> int:
                                           "votes": a["votes"]} for a in agg]
                 try:
                     fresh_stages.add("rankings")
-                    _rd.atomic_write_json(
-                        _rd.stage_path(rd_path, owner.generation, "rankings"),
-                        {"status": "success", "stage": "rankings",
-                         "consensus_ranking": consensus_ranking, "votes": len(votes),
-                         "input_sha256": rankings_sha})
-                    _rd.journal_append(rd_path, {"event": "stage_computed",
-                                                 "stage": "rankings",
-                                                 "generation": owner.generation})
+                    if _rd.owner_still_current(owner):
+                        _rd.atomic_write_json(
+                            _rd.stage_path(rd_path, owner.generation, "rankings"),
+                            {"status": "success", "stage": "rankings",
+                             "consensus_ranking": consensus_ranking, "votes": len(votes),
+                             "input_sha256": rankings_sha})
+                        _rd.journal_append(rd_path, {"event": "stage_computed",
+                                                     "stage": "rankings",
+                                                     "generation": owner.generation},
+                                           owner=owner)
                 except OSError:
                     pass
             _ckpt("round2_complete")
             _write_state("round2_complete")
-            try:
-                _rd.renew_owner(owner)
-            except _rd.OwnershipLostError as e:
-                return _fail(f"run ownership lost after round 2: {e}", out_path)
+            if lost["err"]:
+                return _fail(f"run ownership lost during round 2: {lost['err']}", out_path)
 
         for m in results:    # drop the raw text and envelope carried for checkpoints
             m.pop("_raw", None)
@@ -578,8 +635,13 @@ def run_council(args) -> int:
         if consensus_ranking:
             rnote = ("\nPEER RANKING (advisors ranked each other, best-first): "
                      + ", ".join(f"{c['agent']}={c['score']}" for c in consensus_ranking) + "\n")
-        chair_sha = _rd.content_sha256({"question": question, "rnote": rnote,
-                                        "positions": [m.get("position") for m in results]})
+        # The chairman hash covers the EXACT prompt (which already encodes every
+        # advisor's agent, model/backend label, FAILED flag, and position) plus
+        # the chairman's own definition hash and execution identity.
+        chair_prompt = _chairman_prompt(question, results, rnote)
+        chair_sha = _rd.content_sha256({"prompt": chair_prompt,
+                                        "agent_sha": _agent_shas.get(chairman),
+                                        **_exec_ctx})
         _chair_pg = _prior_generation("chairman")
         if _chair_pg and _rd.carry_forward(rd_path, owner, "chairman", _chair_pg, chair_sha):
             chair_env = _rd.read_json(_rd.stage_path(rd_path, owner.generation, "chairman")) or {}
@@ -587,11 +649,17 @@ def run_council(args) -> int:
                   file=sys.stderr, flush=True)
         else:
             fresh_stages.add("chairman")
-            print(f"[council] chairman {chairman} synthesizing…", file=sys.stderr, flush=True)
-            chair_env = run_stage(chairman, _chairman_prompt(question, results, rnote),
-                                  "chairman", chair_sha)
+            print(f"[council] chairman {chairman} synthesizing...", file=sys.stderr, flush=True)
+            chair_env = run_stage(chairman, chair_prompt, "chairman", chair_sha)
         _write_state("synthesized", chair_status=chair_env.get("status"))
         _supersede_stale()
+        if lost["err"]:
+            return _fail(f"run ownership lost during synthesis: {lost['err']}", out_path)
+    except _rd.OwnershipLostError as e:
+        # A fenced write raised mid-flight (successor took over): abort cleanly
+        # with an envelope instead of a traceback; nothing of ours corrupted
+        # the successor's namespace.
+        return _fail(f"run ownership lost (a successor took over): {e}", out_path)
     finally:
         # The run dir PERSISTS (that is the whole point); only our ownership ends.
         _rd.release_owner(owner)
@@ -704,19 +772,25 @@ def run_council_status(args) -> int:
                 stages[stage] = {"generation": gen, "status": env.get("status"),
                                  "carried_from": env.get("carried_from_generation")}
         attempts = {"started": 0, "finished": 0}
+        started_ids: set = set()
+        finished_ids: set = set()
         journal_note = None
         try:
             recs, torn = _rd.journal_read(rd_path)
             for r in recs:
+                aid = r.get("attempt_id") or f"g{r.get('generation')}-{r.get('stage')}"
                 if r.get("event") == "attempt_started":
                     attempts["started"] += 1
+                    started_ids.add(aid)
                 elif r.get("event") == "attempt_finished":
                     attempts["finished"] += 1
+                    finished_ids.add(aid)
             if torn:
                 journal_note = ("torn journal tail (repaired by the next OWNED "
                                 "resume; status never repairs)")
         except _rd.JournalCorruptError as e:
             journal_note = f"journal corrupt: {e}"
+        abandoned_ids = sorted(started_ids - finished_ids)
         receipt = _rd.read_json(os.path.join(rd_path, "receipt.json")) or {}
         state = _rd.read_json(os.path.join(rd_path, "state.json")) or {}
         after = _rd.read_owner(rd_path)
@@ -730,7 +804,8 @@ def run_council_status(args) -> int:
                 "members": receipt.get("members"), "chairman": receipt.get("chairman"),
                 "rounds": receipt.get("rounds"), "stages": stages,
                 "attempts": attempts,
-                "abandoned_attempts": max(0, attempts["started"] - attempts["finished"]),
+                "abandoned_attempts": len(abandoned_ids),
+                "abandoned_ids": abandoned_ids,
                 "journal_note": journal_note, "consistent": consistent}
         if consistent:
             break
