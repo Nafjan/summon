@@ -6,6 +6,29 @@ it bumps only on a breaking change to the response shape, never on added fields.
 
 ## [0.9.0] — unreleased (pre-1.0)
 
+### Added (durable, resumable councils — B1)
+- **Councils now run on a persistent run directory** (`{cwd}/.agents/runs/<run-id>/`;
+  `--run-dir` / `SUMMON_RUNS_DIR`), replacing the throwaway temp dir that soft paths
+  deleted and hard kills orphaned. Each stage envelope, a `receipt.json`, and an
+  append-only per-generation journal persist; the envelope gains `run_id`/`generation`.
+- **`council resume <run-id>`** re-runs only missing, failed, or input-changed stages
+  and carries every unchanged stage forward without re-paying; question/members/chairman/
+  rounds come from the run's receipt. Upstream changes (edited stage output, changed
+  `--cwd`, retuned agent) invalidate downstream stages transitively; superseded files
+  are preserved under `superseded/`.
+- **`council status <run-id>`** prints a read-only, generation-stable snapshot of a run
+  (per-stage status, attempts, abandoned work; `--json` for machines).
+- Concurrency protocol (three codex adversarial rounds): one leased owner lock per run
+  renewed after every stage; a fresh **generation** per ownership period namespaces all
+  outputs so a suspended-then-resumed process cannot overwrite a successor's work;
+  journal and state are segmented per generation (single writer by construction). Known
+  limitation: the owner-lock stale-break has a sub-millisecond unlink window that
+  pure-stdlib cross-platform file ops cannot fully close — generation namespacing bounds
+  the worst case to one duplicate stage dispatch (wasted spend, never corrupted output),
+  and single-machine use does not hit it.
+- Docs: the "always list agents first" workflow softened to once-per-session (re-listing
+  before every dispatch was ceremony).
+
 ### Added (field-feedback hardening: flag matrix, council checkpoints, provenance)
 - **Fan-out flag matrix.** `--manifest`/`--council` used to silently ignore most
   dispatch flags (`--out`, `--background`, `--worktree`, `--json-schema`, `--model`,
