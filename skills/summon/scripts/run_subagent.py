@@ -288,6 +288,73 @@ def _spawn_background(args: argparse.Namespace) -> dict:
     return {"status": "background", "job_id": job_id, "pid": proc.pid, "result_file": result_file}
 
 
+# --- Provenance receipt --------------------------------------------------------
+# Three divergent installed copies of this dispatcher (one hand-patched) all
+# self-reported "0.9.0" while their scripts differed, making envelopes
+# unattributable. Every dispatch envelope now carries the dispatcher's identity,
+# the agent definition actually loaded, and the root prompt hash, so drift is
+# diagnosable from any single envelope. Paths are absolute local-operator data
+# (documented in SKILL.md); no prompt text or secrets, hashes only.
+
+def _build_receipt(args: argparse.Namespace, agents_dir: str,
+                   agent_file: str | None) -> dict:
+    """The base receipt: summon identity + agent identity + prompt hash.
+    ``git_head_before`` is appended separately, post-worktree, pre-dispatch."""
+    import hashlib
+    here = Path(__file__).resolve().parent
+    h = hashlib.sha256()
+    # One SHA over EVERY production module (incl. agy_pty_pyte.py -- drift lives
+    # in siblings, not just the entry file). Length-prefixed framing so
+    # (name, content) boundaries are unambiguous. test_discovery.py is excluded:
+    # it never executes at dispatch time.
+    for name in sorted(p.name for p in here.glob("*.py") if p.name != "test_discovery.py"):
+        try:
+            data = (here / name).read_bytes()
+        except OSError:
+            data = b""
+        nb = name.encode("utf-8")
+        h.update(len(nb).to_bytes(8, "big"))
+        h.update(nb)
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    rec: dict = {"summon": {"version": __version__,
+                            "script": str(Path(__file__).resolve()),
+                            "scripts_sha256": h.hexdigest()}}
+    if agent_file:
+        try:
+            fsha = hashlib.sha256(Path(agent_file).read_bytes()).hexdigest()
+        except OSError:
+            fsha = None  # hashed as read-back; a vanished file stays diagnosable
+        _bundled = bundled_roster_dir()
+        if _bundled and Path(agent_file).resolve().parent == Path(_bundled).resolve():
+            source = "bundled"
+        elif args.agents_dir:
+            source = "explicit"
+        elif os.environ.get("SUB_AGENTS_DIR"):
+            source = "env"
+        else:
+            source = "project"
+        rec["agent_def"] = {"file": agent_file, "sha256": fsha,
+                            "agents_dir": agents_dir, "source": source}
+    if args.prompt is not None:
+        rec["prompt_sha256"] = hashlib.sha256(args.prompt.encode("utf-8")).hexdigest()
+    return rec
+
+
+def _git_head(cwd: str) -> str | None:
+    """HEAD of the EFFECTIVE dispatch cwd, captured BEFORE the agent runs (input
+    provenance -- hence `git_head_before` in the envelope; an editing agent may
+    commit during the run). Best-effort: None outside a repo or without git."""
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=2,
+                           stdin=subprocess.DEVNULL)
+        head = (r.stdout or "").strip()
+        return head if r.returncode == 0 and head else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 # --- Fan-out mode flag matrix --------------------------------------------------
 # The flags each fan-out mode actually CONSUMES. --manifest and --council branch
 # out of main() before most dispatch flags are read, so anything outside these
@@ -696,6 +763,10 @@ def main() -> None:
         _print_error(str(e))
         sys.exit(1)
 
+    # Provenance receipt (base): attached to every envelope this dispatch emits.
+    # Built as soon as the agent is loaded so even a preflight error carries it.
+    receipt = _build_receipt(args, agents_dir, agent_file)
+
     # Shared project memory: inject {cwd}/.agents/memory.md (standing conventions,
     # constraints, durable decisions) so callers don't re-explain project context
     # every prompt. Read from the ORIGINAL cwd (before any worktree rewrite).
@@ -717,6 +788,7 @@ def main() -> None:
     if not args.dry_run:
         setup_error = _preflight_backend(cli)
         if setup_error is not None:
+            setup_error.update(receipt)   # provenance even on the no-backend path
             _emit(setup_error)
             sys.exit(setup_error.get("exit_code", 1))
 
@@ -797,6 +869,10 @@ def main() -> None:
         _emit(_dry_run_view(invocation, args, agents_dir))
         sys.exit(0)
 
+    # Input provenance: HEAD of the effective cwd (post-worktree), captured
+    # BEFORE the agent can commit anything.
+    receipt["git_head_before"] = _git_head(args.cwd)
+
     # Catch ValueError from build_invocation_args / permission_flags / TOML
     # escaping so unknown --cli values or unsafe agent paths surface as JSON
     # errors rather than tracebacks. All other CLI-side failures are already
@@ -810,6 +886,11 @@ def main() -> None:
     # --json-schema: structured-output contract with ONE corrective retry.
     if schema is not None and result.get("status") == "success":
         result = _apply_schema(result, schema, invocation, args)
+
+    # Receipt LAST, from main()-scope values: a schema-correction retry replaces
+    # the envelope, and this keeps prompt_sha256 bound to the ROOT prompt (the
+    # correction prompt must never restamp it).
+    result.update(receipt)
 
     if worktree_info:
         result["worktree"] = worktree_info
