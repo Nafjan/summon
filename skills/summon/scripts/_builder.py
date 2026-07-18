@@ -121,6 +121,19 @@ def permission_flags(cli: str, permission: str) -> list:
         raise ValueError(f"No permission mapping for cli={cli!r}, permission={permission!r}") from e
 
 
+def agy_permission_warning(cli: str, permission: str) -> str | None:
+    """The agy safe-edit surprise, surfaced per dispatch: agy has no
+    workspace-write tier, so 'safe-edit' maps to the same full bypass as
+    'yolo'. One shared helper so the real envelope and --dry-run emit the
+    identical warning (and emit it exactly once each)."""
+    if cli == "agy" and permission == "safe-edit":
+        return ("agy has no workspace-write tier: permission 'safe-edit' runs with a "
+                "FULL permission bypass (--dangerously-skip-permissions), identical to "
+                "'yolo'. Constrain the agent by instruction and only point it at repos "
+                "you trust.")
+    return None
+
+
 def _concatenated_prompt(inv: AgentInvocation) -> str:
     """The prompt for CLIs with no native system-prompt slot: the agent's system
     context concatenated ahead of the user task."""

@@ -56,7 +56,9 @@ This script executes external CLIs that require elevated permissions.
 
 **Before first execution:**
 1. Request elevated permissions via your CLI's tool parameters
-2. Set tool timeout to match `--timeout` argument (default: 600000ms)
+2. Set your host tool's timeout ABOVE `--timeout` (default: 600000ms) plus a few
+   seconds of overhead. A host timeout at or below the child's deadline kills the
+   script before it can report (see Common Mistakes)
 
 **For Codex CLI** (most common permission issues): See [references/codex.md](references/codex.md) for exact JSON parameter format.
 
@@ -145,7 +147,8 @@ Parse JSON output and check `status` field:
 | `--set-agent NAME` | - | Edit an existing agent's frontmatter via `--set KEY=VALUE` (`KEY=` removes); body untouched, values validated |
 | `--set KEY=VALUE` | No | With the two above: `run-agent`, `model`, `permission`, `args` (repeatable) |
 | `--agent` | Yes* | Agent definition name from --list |
-| `--prompt` | Yes* | Task description to delegate |
+| `--prompt` | Yes* | Task description to delegate (or `--prompt-file`) |
+| `--prompt-file FILE` | Yes* | Read the prompt from a UTF-8 file (BOM tolerated; strict decoding). Mutually exclusive with `--prompt`. Quoting/encoding ergonomics for long prompts; backends still receive the prompt via argv, so backend argv limits (agy ~28k chars) still apply. A `--background` child re-reads the file |
 | `--cwd` | Yes* | Working directory (absolute path) |
 | `--timeout` | No | Bare ms or with suffix: `600s`, `10m` (default: 600000 = 10m). Set your host tool's own timeout ABOVE this value — the script needs a few seconds of overhead beyond the CLI deadline |
 | `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
@@ -159,6 +162,7 @@ Parse JSON output and check `status` field:
 | `--dry-run` | No | Print the fully resolved dispatch (command, model, permission flags) WITHOUT executing — catches wrong models/permissions/dead backends in zero paid runs |
 | `--out FILE` | No | Write the envelope atomically to FILE; if FILE already holds a **`status: success`** envelope the run is SKIPPED (`skipped: true`) — swarm resume for free. A prior error/blocked/partial is re-run (re-launching retries failures) |
 | `--retries N` | No | Re-dispatch up to N times on `error`/`partial` (exponential backoff; `blocked` is never retried — its cause is structural). Envelope gains `attempts` |
+| `--allow-credit` | No | Authorize spending ACCOUNT CREDIT on a credit-only model (Fable) for this one dispatch; flag form of `SUMMON_ALLOW_CREDIT=1`. Single dispatch only: rejected for `--manifest`/`--council`, where env inheritance would silently authorize every child (set the env var deliberately for fan-out spend) |
 | `--json-schema FILE` | No | Structured output contract: extract the agent's final JSON, validate against the schema, attach `parsed`/`parse_ok`/`parse_errors`; ONE corrective retry via resume on mismatch |
 | `--debug-dir DIR` | No | Dump per-run argv + raw captured output + final envelope to DIR (adds `debug_file` to the envelope) |
 | `--manifest FILE` | - | Batch fan-out: run all jobs in a JSON manifest (see [references/fan-out.md](references/fan-out.md)). Combine with `--concurrency` and `--results-dir` |
@@ -182,7 +186,26 @@ or `--manifest` (which carries its own jobs).
 `--set` → `--new-agent`/`--set-agent` only; `--concurrency`/`--results-dir` → `--manifest`
 only; `--resume-profile` → agy resume only. Mutually exclusive: `--dry-run` with
 `--background`/`--manifest`; `--background` with `--out` (background reports completion
-via its own `result_file` — use `--manifest` for fan-out with result files).
+via its own `result_file`; use `--manifest` for fan-out with result files); `--prompt`
+with `--prompt-file`; `--question` with `--question-file`; manifest job `prompt` with
+`prompt_file`.
+
+**Fan-out flag matrix (rejected, never silently dropped):** `--manifest` consumes only
+`--concurrency`, `--results-dir`, `--cwd`, `--agents-dir`, `--retries`; `--council`
+consumes only `--question`/`--question-file`, `--members`, `--chairman`, `--rounds`,
+`--cwd`, `--agents-dir`, `--timeout`, `--out`. Any other dispatch flag passed to these
+modes is rejected up front with a pointer to where the capability lives (per-job manifest
+keys, or the member agent's own definition).
+
+**Council `--out` is checkpointed.** The council envelope is written atomically to
+`--out` after every phase (`council_state`: `round1_complete` / `round2_complete` /
+`final`; `failed` on validation errors), so a host-tool kill mid-synthesis still leaves
+all completed member positions on disk. **Council wall clock is additive:** members run
+at most 3 concurrent per backend, so the worst case is about
+`rounds x waves x (timeout + 60s) + (timeout + 60s)` with
+`waves = ceil(same-backend members / 3)`; the dispatcher prints this estimate to stderr
+before dispatching. Set your host tool's timeout above it, and pass `--out` on any
+council you cannot afford to lose.
 
 ## Chaining & continuity (response fields)
 
@@ -200,7 +223,8 @@ Every response carries structured fields for programmatic orchestration:
 
 **Credit-only models (Fable).** `claude-fable-5` is no longer on the Claude Max subscription — it bills account credit. A `claude` dispatch that asks for it is transparently run on the `opus` alias (latest subscription Opus) instead, with the substitution surfaced in `warnings` and `model.requested` preserved. The guard also scrubs credit-only `--model`/`--fallback-model` values from an agent's `args:`, strips `ANTHROPIC_*` env vars that remap an alias to a credit-only model, and warns that `--resume` keeps the session's original model. To actually run Fable: set `SUMMON_ALLOW_FABLE=1` (or `SUMMON_ALLOW_CREDIT=1`) to spend credit on the CLI (`billing.source` becomes `"credit"`, or `"api"` if `ANTHROPIC_API_KEY` is set), or dispatch the `fable-api` agent with an `ANTHROPIC_API_KEY` to run it metered over the API.
 | `elapsed_ms` | Wall-clock for the dispatch — on every DISPATCH envelope (success/blocked/partial/error/timeout, incl. spawn failures). Not on the `--background` handle or pre-dispatch validation errors. Use it to tune swarm concurrency. |
-| `model` | `{requested, resolved, models_used}` — what was asked for vs what the backend REPORTED serving. `resolved` is the **dominant** model (most output tokens); a claude session often also runs a cheap auxiliary model, so `models_used` lists **every** model id seen — don't read `resolved` as "the one model that served this run". `resolved: null` = the backend didn't say (agy never does): absence of proof, not proof of the requested model. Aliases (`opus`/`sonnet`) can lag a launch — pin the explicit ID for a guaranteed-latest run. |
+| `model` | `{requested, targeted, served, resolved, models_used}`, split by EVIDENCE. `requested` = what the caller asked for. `targeted` = what the session was POINTED AT (init handshake, else the post-credit-guard effective model, else the backend's knowable default). `served` = the model that actually did work, set ONLY on service evidence (a terminal-event model report, or output tokens with a known target). `served` is null whenever no service evidence was observed (typical for failed runs) even when `targeted` names a model, and task status is never used as evidence in either direction (a served run can be legitimately downgraded to `blocked`). `resolved` = LEGACY v1 semantics (handshake-or-terminal + codex config backfill), kept for compatibility; migrate to `targeted`/`served`. `models_used` lists every model id seen (a claude session often also runs a cheap auxiliary model). agy reports none of these beyond `targeted`. Aliases (`opus`/`sonnet`) can lag a launch; pin the explicit ID for a guaranteed-latest run. |
+| `summon`, `agent_def`, `prompt_sha256`, `git_head_before` | Provenance receipt, built progressively on the dispatch path: `summon` identity is on EVERY envelope the path emits (validation errors, missing agent, preflight, results); the other fields join as they become known. `summon` = `{version, script, scripts_sha256}` (one SHA-256, length-prefixed framing, over every production module, so divergent installs become diagnosable from any envelope). `agent_def` = `{file, sha256, agents_dir, source: project\|bundled\|explicit\|env}`, where `agents_dir` is the absolute roster directory the definition was ACTUALLY loaded from (a bundled-fallback hit records the bundled dir, not the project dir that missed). `prompt_sha256` = SHA-256 of the ROOT prompt text (a schema-correction retry never restamps it). `git_head_before` = HEAD captured before the run: the effective cwd for dispatches, the original cwd on pre-worktree failures; null outside a repo. Hashes and paths only, never content or secrets; paths are absolute local-operator data. |
 | `permission`, `permission_flags` | The permission level and the EXACT CLI flags it mapped to for this run — no more black box. |
 | `effort` | The reasoning effort actually applied (claude/codex; `null` = the backend's own default) — so an orchestrator knows how hard it thought and can re-dispatch at a different level. |
 | `attempts` | How many dispatches this envelope took (`--retries`). |
@@ -313,7 +337,7 @@ permissions.
 |-------|--------|-------------|
 | `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `agy`, `openai-compat` | Which backend executes this agent (`openai-compat` = any OpenAI-compatible API — see "Custom & API backends") |
 | `permission` | `read-only`, `safe-edit` (default), `yolo` | Approval/sandbox level the sub-agent runs with |
-| `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.resolved` |
+| `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.served` |
 | `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning effort for this agent (claude + codex); overrides the default `high`. `--effort` at dispatch overrides it |
 | `args` | shell-style string (optional) | Arbitrary extra backend flags passed verbatim, e.g. `args: -c model_reasoning_effort="high"` (codex). Model pinning stops being a special case |
 
@@ -345,7 +369,9 @@ Caveats worth knowing:
 - **agy has no workspace-write tier**: `read-only` maps to `--sandbox`, but BOTH
   `safe-edit` and `yolo` map to `--dangerously-skip-permissions` — so a `safe-edit`
   agy agent runs with a FULL permission bypass, identical to `yolo`. Constrain agy
-  agents by instruction, and treat any repo you point them at as trusted.
+  agents by instruction, and treat any repo you point them at as trusted. Every agy
+  `safe-edit` dispatch (and its `--dry-run`) carries a `warnings` entry saying exactly
+  this, so the level name can never read as a real sandbox.
 - For investigation agents that only need to *read*, `yolo` +
   "do not modify files" in the agent body is often more reliable than
   `read-only` — several CLIs' plan modes end turns asking for approval.

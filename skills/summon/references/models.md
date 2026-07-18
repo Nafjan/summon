@@ -16,14 +16,16 @@ reaches an agent depends only on how that agent names its model:
 | **CLI-config default** | codex | Uses `~/.codex/config.toml` `model`; move the default there or pass `--model`. |
 | **Version ID** | `claude-sonnet-5`, `claude-fable-5` | **Frozen** — exactly this model until you bump the agent's `model:` (or `CURSOR_DEFAULT_MODEL` in `_builder.py`). |
 
-> **Aliases lag — verify with `model.resolved`.** An alias resolves to whatever the CLI
+> **Aliases lag — verify with `model.served`.** An alias resolves to whatever the CLI
 > maps it to *today*, which is not always the newest model. Observed: `--model sonnet`
 > resolved to `claude-sonnet-4-6` while `claude-sonnet-5` was already available. Every
-> dispatch envelope reports `model.resolved` (the model the backend *actually served*) —
-> check it. For **guaranteed-latest**, pin the explicit version ID (`claude-sonnet-5`,
-> `claude-opus-4-8`) and re-verify when a new model ships; for **auto-float-when-it-works**,
-> use the alias but confirm `model.resolved` is what you expect. This roster pins Sonnet
-> explicitly (its alias lagged) and leaves `opus` as an alias (verified serving 4.8).
+> dispatch envelope reports `model.served` (the model that actually did the work, on
+> evidence; `model.targeted` is what the session was pointed at, and `resolved` is the
+> legacy field) — check it. For **guaranteed-latest**, pin the explicit version ID
+> (`claude-sonnet-5`, `claude-opus-4-8`) and re-verify when a new model ships; for
+> **auto-float-when-it-works**, use the alias but confirm `model.served` is what you
+> expect. This roster pins Sonnet explicitly (its alias lagged) and leaves `opus` as an
+> alias (verified serving 4.8).
 
 `--list-models` answers "what can each backend run *right now*" live where the CLI
 exposes it. Each entry is tagged with a `source` so you know how much to trust it:
@@ -32,14 +34,14 @@ exposes it. Each entry is tagged with a `source` so you know how much to trust i
 - `static` — documented aliases/defaults to pass via `--model` (CLI has no list)
 - `unavailable` — a live query was attempted and failed (reason in `note`)
 
-Discover with `--list-models`, invoke with `--model`, verify with `model.resolved` —
+Discover with `--list-models`, invoke with `--model`, verify with `model.served` —
 using a new model never requires editing the skill code itself.
 
 **Models newer than this document almost certainly exist.** These docs are a snapshot;
 model strings pass through to the CLIs verbatim, so you can — and should — try IDs
 that postdate anything written here (a future `claude-sonnet-6`, a new codex id, a new
 agy display name) without waiting for a skill update. Cheap probe: dispatch a trivial
-prompt with the candidate `--model` and check the envelope's `model.resolved`; an
+prompt with the candidate `--model` and check the envelope's `model.served`; an
 unsupported ID fails fast with the CLI's own error, costing nothing but the attempt.
 Never assume an alias has caught up to a launch — probe or pin.
 
