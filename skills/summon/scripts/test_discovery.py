@@ -2250,14 +2250,19 @@ def test_receipt_on_missing_agent_and_preflight():
         assert len(env2["summon"]["scripts_sha256"]) == 64, env2.get("summon")
         assert env2["agent_def"]["file"].endswith("gm.md"), env2.get("agent_def")
         assert "prompt_sha256" in env2 and "git_head_before" in env2, env2
-        # invalid effort (a post-load validation error) also carries the receipt
-        r3 = sp.run([sys.executable, script, "--agent", "gm", "--prompt", "p",
+        # invalid effort (a post-load validation error) also carries the receipt.
+        # Probed via openai-compat, which SKIPS backend preflight -- a CLI agent
+        # would 127 on machines without that CLI before effort validation runs.
+        open(os.path.join(d, "oc.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:9\n"
+            "api_key_env:\nmodel: m\n---\n# oc\nrole.\n")
+        r3 = sp.run([sys.executable, script, "--agent", "oc", "--prompt", "p",
                      "--cwd", os.getcwd(), "--agents-dir", d, "--effort", "bogus"],
                     capture_output=True, text=True, encoding="utf-8")
         env3 = _json.loads(r3.stdout)
         assert env3["status"] == "error" and "invalid effort" in env3["error"], env3
         assert len(env3["summon"]["scripts_sha256"]) == 64, env3
-        assert env3["agent_def"]["file"].endswith("gm.md"), env3
+        assert env3["agent_def"]["file"].endswith("oc.md"), env3
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
