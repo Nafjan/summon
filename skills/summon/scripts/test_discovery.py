@@ -2561,6 +2561,64 @@ def test_council_status_snapshot():
                 council_status="council-00000000-000000-dead", run_dir=root,
                 json=True, cwd=os.getcwd()))
         assert rc3 == 1 and "unknown" in _json.loads(buf3.getvalue())["error"]
+        # takeover DURING a status scan -> consistent:false (owner nonce/gen
+        # changes between the before-scan and after-scan reads, twice)
+        import _rundir as rd
+        seq = iter([{"nonce": "x" * 32, "generation": 1, "pid": 1, "lease_expires": 9e11},
+                    {"nonce": "y" * 32, "generation": 2, "pid": 2, "lease_expires": 9e11},
+                    {"nonce": "z" * 32, "generation": 3, "pid": 3, "lease_expires": 9e11},
+                    {"nonce": "w" * 32, "generation": 4, "pid": 4, "lease_expires": 9e11}])
+        orig_ro = rd.read_owner
+        rd.read_owner = lambda run_dir: next(seq, None)
+        try:
+            buf4 = io.StringIO()
+            with contextlib.redirect_stdout(buf4):
+                _council.run_council_status(_a.Namespace(
+                    council_status=env1["run_id"], run_dir=root, json=True, cwd=os.getcwd()))
+            assert _json.loads(buf4.getvalue())["consistent"] is False
+        finally:
+            rd.read_owner = orig_ro
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_renews_lease_after_every_stage():
+    # v3.1: renewal is PER STAGE, not per round, so a multi-wave round cannot
+    # expire a live owner. The stub records the lease sidecar's expiry seen
+    # before each dispatch; it must strictly advance.
+    import _council, _rundir as rd, argparse, io, contextlib, json as _json
+    root = tempfile.mkdtemp(prefix="summon-renew-")
+    try:
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(root, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+        seen = []
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+            # out_dir is the run dir; find the single lease-*.json sidecar
+            import glob as _g
+            for lp in _g.glob(os.path.join(out_dir, "lease-*.json")):
+                s = rd.read_json(lp)
+                if s:
+                    seen.append(s["lease_expires"])
+            return {"status": "success", "result": f"{agent} ok"
+                    + ("\nRANKING: A, B" if "-r2-" in tag else ""),
+                    "report": {"summary": agent}}
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            args = argparse.Namespace(question="q", question_file=None, members="m1,m2",
+                                      chairman="chair", rounds=2, cwd=os.getcwd(),
+                                      agents_dir=root, timeout=90000, out=None, run_dir=root)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = _council.run_council(args)
+        finally:
+            _council._dispatch = orig
+        assert rc == 0
+        # at least the r2 + chairman dispatches saw a sidecar; those values are
+        # non-decreasing (renew after every stage only extends)
+        assert len(seen) >= 2, seen
+        assert seen == sorted(seen), seen
     finally:
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
@@ -2687,6 +2745,63 @@ def test_rundir_journal_checksums_torn_tail_and_repair():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_rundir_review_races_lock_fencing_and_journal():
+    # The five interleavings the adversarial review REPRODUCED against the
+    # first design, pinned forever.
+    import json as _json
+    import time
+    import _rundir as rd
+    d = tempfile.mkdtemp(prefix="summon-race-")
+    try:
+        # (1) crash between lock creation and generation.txt: the lock itself
+        # names its generation, so a successor never reuses it
+        lock = os.path.join(d, rd.OWNER_LOCK)
+        now = time.time()
+        open(lock, "w", encoding="utf-8").write(_json.dumps({
+            "summon_owner": True, "nonce": "a" * 32, "pid": 1,
+            "generation": 5, "acquired_at": now - 100, "lease_expires": now - 5}))
+        o = rd.acquire_owner(d, lease_sec=600)
+        assert o.generation == 6, o.generation
+        # (2) renewal goes to the NONCE-NAMED sidecar and extends the effective
+        # expiry without ever touching owner.lock (immutable => byte-testable)
+        before = open(lock, "rb").read()
+        base_exp = rd.read_owner(d)["lease_expires"]
+        rd.renew_owner(o)
+        assert open(lock, "rb").read() == before          # lock untouched
+        side = rd.read_json(os.path.join(d, f"lease-{o.nonce}.json"))
+        assert side and side["lease_expires"] > base_exp - 1
+        assert rd._effective_expiry(d, rd.read_owner(d)) >= side["lease_expires"]
+        # (3) release racing a successor: replace the lock with a successor's
+        # record; the deposed owner's release must leave it in place
+        succ = {"summon_owner": True, "nonce": "b" * 32, "pid": 2,
+                "generation": 7, "acquired_at": now, "lease_expires": now + 600}
+        open(lock, "w", encoding="utf-8").write(_json.dumps(succ))
+        rd.release_owner(o)
+        assert rd.read_owner(d)["nonce"] == "b" * 32     # successor intact
+        # (4) journal fencing: the deposed owner's append RAISES and writes
+        # nothing (single-writer guarantee survives a suspended parent)
+        rd.journal_append(d, {"event": "probe"})          # unfenced write, baseline
+        n_before = len(rd.journal_read(d)[0])
+        try:
+            rd.journal_append(d, {"event": "evil"}, owner=o)
+            raise AssertionError("deposed owner journaled")
+        except rd.OwnershipLostError:
+            pass
+        assert len(rd.journal_read(d)[0]) == n_before
+        # (5) deposed carry-forward withdraws its copy and raises
+        rd.atomic_write_json(rd.stage_path(d, 6, "r1-x"),
+                             {"status": "success", "input_sha256": "c" * 64})
+        try:
+            rd.carry_forward(d, o, "r1-x", 6, "c" * 64)
+            raise AssertionError("deposed owner carried forward")
+        except rd.OwnershipLostError:
+            pass
+        assert not os.path.isfile(rd.stage_path(d, o.generation, "r1-x"))
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 def test_rundir_carry_forward_validation():
     import _rundir as rd
     d = tempfile.mkdtemp(prefix="summon-carry-")
@@ -2705,8 +2820,11 @@ def test_rundir_carry_forward_validation():
         assert copied["carried_from_generation"] == 1 and copied["result"] == "pos"
         recs, _ = rd.journal_read(d)
         assert recs[-1]["event"] == "carried_forward"
-        # non-success never carries; upstream-hash mismatch never carries
+        # non-success never carries; upstream-hash mismatch never carries AND
+        # leaves NO current-generation residue (else the child --out skip reuses
+        # the stale file instead of re-running)
         assert rd.carry_forward(d, o2, "r1-m2", 1, sha) is False
+        assert not os.path.isfile(rd.stage_path(d, 2, "r1-m2"))
         assert rd.carry_forward(d, o2, "r1-m1", 1, "0" * 64) is False
         # generation fallback scan: delete generation.txt, files imply max=2
         os.unlink(os.path.join(d, rd.GENERATION_FILE))
