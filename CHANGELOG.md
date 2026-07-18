@@ -6,6 +6,40 @@ it bumps only on a breaking change to the response shape, never on added fields.
 
 ## [0.9.0] — unreleased (pre-1.0)
 
+### Added (field-feedback hardening: flag matrix, council checkpoints, provenance)
+- **Fan-out flag matrix.** `--manifest`/`--council` used to silently ignore most
+  dispatch flags (`--out`, `--background`, `--worktree`, `--json-schema`, `--model`,
+  `--retries`, ...); anything a mode does not consume is now rejected before any paid
+  work, with a pointer to where the capability lives. Ambiguous input pairs rejected
+  too: `--prompt`+`--prompt-file`, `--question`+`--question-file`, manifest job
+  `prompt`+`prompt_file`.
+- **Council `--out`, checkpointed.** The council envelope is written atomically after
+  every phase (`council_state`: `round1_complete`/`round2_complete`/`final`/`failed`),
+  so a host-tool kill mid-synthesis leaves all completed member positions on disk
+  (field case: a 4-member council died at a 700s host ceiling with zero artifacts).
+  A worst-case wall-clock estimate (per-backend 3-concurrent waves + chairman) prints
+  to stderr before dispatching.
+- **Provenance receipt** on every dispatch envelope (incl. preflight errors):
+  `summon.{version, script, scripts_sha256}` (one SHA-256 over all production
+  modules), `agent_def.{file, sha256, agents_dir, source}`, `prompt_sha256` (root
+  prompt; never restamped by a schema retry), `git_head_before` (effective cwd HEAD,
+  captured pre-dispatch). Divergent installs become diagnosable from any envelope.
+- **`model.targeted` / `model.served`** split by evidence: `targeted` = what the
+  session was pointed at (handshake, else the guard-effective model, else the
+  backend's knowable default); `served` = only with service evidence (terminal model
+  report, or output tokens), never inferred from task status. Fixes a failed Fable
+  dispatch reporting `resolved: claude-fable-5` with all-zero usage. `resolved`
+  keeps its legacy v1 behavior until envelope v2.
+- **`--prompt-file`** for direct dispatch (UTF-8, BOM-stripped, strict decoding;
+  background children re-read the file). Quoting/encoding ergonomics — backend argv
+  limits still apply.
+- **`--allow-credit`**: per-dispatch flag form of `SUMMON_ALLOW_CREDIT=1`; rejected
+  for fan-out modes (env inheritance would authorize every child silently).
+- **agy safe-edit warning**: every agy dispatch at `safe-edit` (and its `--dry-run`)
+  carries a warning that this level is a FULL bypass identical to `yolo` on agy.
+- Docs: fixed the self-contradicting host-timeout guidance ("match" vs "above" —
+  above is canonical).
+
 ### Fixed (multi-model ultrareview pass)
 - **No false success on a backend error.** A claude `is_error` result (and gemini/
   cursor `status:error`) now surfaces as `status:"error"` instead of `success`
