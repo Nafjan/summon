@@ -12,9 +12,10 @@ import subprocess
 import threading
 import time
 
-from _builder import (AgentInvocation, BACKENDS, apply_credit_guard, backend_kind,
-                      build_invocation_args, credit_spend_allowed, infer_billing,
-                      permission_flags, selects_credit_only)
+from _builder import (AgentInvocation, BACKENDS, agy_permission_warning,
+                      apply_credit_guard, backend_kind, build_invocation_args,
+                      credit_spend_allowed, infer_billing, permission_flags,
+                      selects_credit_only)
 from _stream import StreamProcessor, _terminal_is_error
 
 _SUCCESS_EXIT_CODES = (0, 143, -15)  # 0 ok, 143/-15 = SIGTERM (we asked it to stop)
@@ -640,6 +641,9 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 "agy runs in an isolated profile and CANNOT read files under --cwd — this "
                 "prompt appears to reference a file to read; agy sees only the prompt text, "
                 "so inline the file's content instead of pointing at a path")
+        _pw = agy_permission_warning(inv.cli, inv.permission)
+        if _pw:
+            resp.setdefault("warnings", []).append(_pw)
         try:
             resp["permission_flags"] = permission_flags(inv.cli, inv.permission)
         except ValueError:
