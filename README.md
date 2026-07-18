@@ -196,7 +196,8 @@ Git-style subcommands. The old flat `--flag` form still works too:
    next dispatch instead of re-explaining; that's how multi-step work stays cheap.
 3. **Trust the envelope, not the prose.** Branch on `status`; a run that ends asking for
    approval or self-reports `BLOCKED` comes back `blocked`, never a false `success`. Check
-   `model.resolved` to confirm which model actually served you.
+   `model.served` to confirm which model actually did the work (`served: null` on a failed
+   run means no inference happened, even when `targeted` names a model).
 4. **Review across vendors.** Send code written by one vendor to a reviewer on another.
    `docs/PROTOCOL.md` has the rule and the named patterns (debate, async build, competing
    hypotheses, consensus).
@@ -235,9 +236,10 @@ dispatch it with the **summon** skill instead of doing everything yourself:
 
 Verify, don't trust: branch on the returned `status`; a `report_ok:false` or
 `suspect:true` "success" means re-dispatch. Read `warnings` (model fell back, agy
-can't read `--cwd` files, credit spend). `model.resolved` proves what actually ran.
+can't read `--cwd` files, credit spend). `model.served` proves what actually ran.
 Preview a paid fan-out with `--dry-run`, pass `--json-schema` when you need structured
-output, and chain via `report.handoff` into the next call.
+output, chain via `report.handoff` into the next call, and pass `--out` on any
+council you cannot afford to lose (the envelope is checkpointed each phase).
 ```
 
 Tune it to your workflow. The point is that your agent reaches for summon on purpose
@@ -296,7 +298,9 @@ vendors.
   "report": { "status": "DONE", "summary": "Reviewed 4 files; 2 findings",
               "handoff": "Fix the race in poller.py:88 first" },
   "report_ok": true,
-  "model":   { "requested": "sonnet", "resolved": "claude-sonnet-5" },
+  "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
+               "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
+  "summon":  { "version": "0.9.0", "scripts_sha256": "9f2c…" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -308,6 +312,10 @@ vendors.
 - `report.handoff` → the context to pass to the next call.
 - `report_ok: false` on a "success" → also gets `suspect: true`. Agents that skip their
   contract don't get believed.
+- `model.served` → the model that actually did the work (evidence-based; `null` on a
+  failed run). `targeted` = what the session was pointed at.
+- `summon.scripts_sha256` + `agent_def.sha256` → provenance: which dispatcher build and
+  which agent definition produced this envelope.
 - `billing.source` → did this draw from a **subscription** or metered **api** credits.
 - `resume.session_id` → `--resume` for a cheap follow-up.
 

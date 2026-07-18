@@ -84,6 +84,19 @@ run_subagent.py --council --question-file q.md \
 - **The chairman** (`--chairman`, default `fable`) reads all final positions and
   returns the decision, a confidence, the points of agreement, the dissents (named),
   and a next action — making the call even when the council is split.
+- **Pass `--out` on any council you cannot afford to lose.** The council envelope is
+  written atomically to `--out` after every phase (`council_state`: `round1_complete`
+  / `round2_complete` / `final`, `failed` on validation errors), so a host-tool kill
+  mid-synthesis still leaves every completed member position on disk.
+- **The wall clock is additive.** Members run at most 3 concurrent per backend
+  (waves), then the chairman runs after ALL members: worst case is about
+  `rounds x waves x (timeout + 60s) + (timeout + 60s)`. The dispatcher prints this
+  estimate to stderr before dispatching; set your host tool's timeout above it.
+- **Council consumes a fixed flag set** (`--question`/`--question-file`, `--members`,
+  `--chairman`, `--rounds`, `--cwd`, `--agents-dir`, `--timeout`, `--out`). Anything
+  else (`--model`, `--json-schema`, `--worktree`, `--background`, `--retries`, ...)
+  is rejected up front rather than silently ignored — member model/effort/permission
+  come from each member agent's own definition.
 
 Returns one council envelope: `{question, rounds, members:[{agent, model, position}],
 synthesis:{chairman, recommendation, report}, elapsed_ms}`. Progress → stderr.
