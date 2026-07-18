@@ -51,8 +51,33 @@ def _per_member_cap(n: int) -> int:
     return max(400, min(_POSITION_CAP, _TOTAL_POSITIONS_BUDGET // max(1, n)))
 
 
-def _fail(msg: str) -> int:
-    print(json.dumps({"mode": "council", "status": "error", "error": msg}, ensure_ascii=False))
+def _atomic_write_json(path: str, obj: dict) -> str | None:
+    """Atomic JSON write (unique temp + rename). Returns an error string on
+    failure, None on success -- a checkpoint write failure must never kill a
+    running council, so callers surface it instead of raising."""
+    import tempfile
+    try:
+        d = os.path.dirname(os.path.abspath(path))
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".summon-council-", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+        return None
+    except OSError as e:
+        return f"failed to write council envelope to {path}: {e}"
+
+
+
+
+def _fail(msg: str, out_path: str | None = None) -> int:
+    env = {"mode": "council", "status": "error", "error": msg,
+           "council_state": "failed"}
+    if out_path:
+        werr = _atomic_write_json(out_path, env)
+        if werr:
+            env["out_error"] = werr
+    print(json.dumps(env, ensure_ascii=False))
     return 1
 
 
@@ -192,11 +217,13 @@ def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
 
 
 def _model_label(env: dict) -> str | None:
-    """A never-blank model label. Prefer the RESOLVED model; fall back to what was
-    REQUESTED when the backend didn't report one (codex often doesn't); show
-    ``requested -> resolved`` when they differ (e.g. the `opus` alias -> a version)."""
+    """A never-blank model label. Prefer evidence (served), then the legacy
+    resolved, then targeted; fall back to what was REQUESTED when the backend
+    didn't report one (codex often doesn't); show ``requested -> effective``
+    when they differ (e.g. the `opus` alias -> a version)."""
     m = env.get("model") or {}
-    req, res = m.get("requested"), m.get("resolved")
+    req = m.get("requested")
+    res = m.get("served") or m.get("resolved") or m.get("targeted")
     if res and req and res != req:
         return f"{req} -> {res}"
     return res or req
@@ -204,32 +231,40 @@ def _model_label(env: dict) -> str | None:
 
 def run_council(args) -> int:
     """Entry point for ``--council``. Returns the process exit code."""
-    if args.question_file:
+    # getattr: direct callers (tests) build a Namespace without `out`.
+    out_path = getattr(args, "out", None)
+    if args.question_file is not None and args.question is not None:
+        # Both inputs PRESENT (even as empty strings, on either side) used to
+        # mean one silently won -- ambiguous, so rejected on presence.
+        return _fail("give --question OR --question-file, not both", out_path)
+    if args.question_file is not None:
         try:
             with open(args.question_file, encoding="utf-8") as fh:
                 question = fh.read().strip()
-        except OSError as e:
-            return _fail(f"cannot read --question-file: {e}")
+        except (OSError, ValueError) as e:
+            return _fail(f"cannot read --question-file: {e}", out_path)
     else:
         question = (args.question or "").strip()
     if not question:
-        return _fail("--council needs --question or --question-file")
+        return _fail("--council needs --question or --question-file", out_path)
 
     members = ([m.strip() for m in args.members.split(",") if m.strip()]
                if args.members else list(DEFAULT_MEMBERS))
     chairman = args.chairman or DEFAULT_CHAIRMAN
     rounds = args.rounds or 1
     if rounds not in (1, 2):
-        return _fail("--rounds must be 1 or 2")
+        return _fail("--rounds must be 1 or 2", out_path)
     if len(members) < 2:
-        return _fail("a council needs at least 2 members")
+        return _fail("a council needs at least 2 members", out_path)
     if len(members) > _MAX_MEMBERS:
         # Bound the fan-out: one OS thread per member, and the per-member position
         # budget (_TOTAL_POSITIONS_BUDGET // n) collapses below the 400-char floor
         # past ~50 members, blowing the argv-safe total. A useful council is small.
-        return _fail(f"too many council members ({len(members)}); max is {_MAX_MEMBERS}")
+        return _fail(f"too many council members ({len(members)}); max is {_MAX_MEMBERS}",
+                     out_path)
     if len(set(members)) != len(members):
-        return _fail(f"duplicate council members: {[m for m in members if members.count(m) > 1]}")
+        return _fail(f"duplicate council members: {[m for m in members if members.count(m) > 1]}",
+                     out_path)
 
     from _loader import get_agents_dir, load_agent
     cwd = os.path.abspath(args.cwd or os.getcwd())
@@ -238,7 +273,7 @@ def run_council(args) -> int:
         try:
             load_agent(agents_dir, who)
         except Exception as e:  # noqa: BLE001
-            return _fail(f"council member/chairman {who!r} not found: {e}")
+            return _fail(f"council member/chairman {who!r} not found: {e}", out_path)
 
     # --timeout arrives as whole milliseconds (argparse type). Pass it through as
     # ms to the children; never silently substitute a default.
@@ -259,6 +294,23 @@ def run_council(args) -> int:
     sems = {b: threading.BoundedSemaphore(_PER_BACKEND_CAP)
             for b in set(member_backend.values())}
 
+    # Preflight ceiling: members run at most _PER_BACKEND_CAP concurrent PER
+    # BACKEND, so a homogeneous council runs in serial WAVES -- each round costs
+    # waves * (child timeout + watchdog margin), plus the chairman's own phase.
+    # Printed BEFORE paying so the additive clocks are visible: the field
+    # failure was a 4-member council under a 700s host ceiling, killed at 704s
+    # just before synthesis began.
+    _counts: dict = {}
+    for _b in member_backend.values():
+        _counts[_b] = _counts.get(_b, 0) + 1
+    _waves = max(-(-c // _PER_BACKEND_CAP) for c in _counts.values())
+    _phase = timeout_ms / 1000 + _CHILD_MARGIN_MS / 1000
+    _worst = int(rounds * _waves * _phase + _phase)
+    print(f"[council] worst-case wall clock ~{_worst}s ({_waves} wave(s)/round x "
+          f"{rounds} round(s) + chairman; child timeout {int(timeout_ms / 1000)}s) "
+          "- set your host tool's timeout ABOVE this",
+          file=sys.stderr, flush=True)
+
     def run_member(agent: str, prompt: str, tag: str) -> dict:
         b = member_backend[agent]
         with sems[b]:
@@ -268,12 +320,13 @@ def run_council(args) -> int:
             print(f"[council {done['n']}/{len(members)}] {agent} ({b}) "
                   f"status={env.get('status')}", file=sys.stderr, flush=True)
         return {"agent": agent, "backend": b,
-                "model": _model_label(env),   # resolved, else requested (never blank)
+                "model": _model_label(env),   # served/resolved, else requested (never blank)
                 "status": env.get("status"), "position": _position(env, cap),
                 "elapsed_ms": env.get("elapsed_ms"),
                 "billing": env.get("billing"),      # so credit/api spend isn't hidden
                 "warnings": env.get("warnings"),    # e.g. a Fable -> Opus fallback
-                "_raw": env.get("result") or ""}   # kept only to parse RANKING
+                "_raw": env.get("result") or "",   # kept only to parse RANKING
+                "_env": env}   # full child envelope: checkpoints persist it
 
     try:
         # ---- round 1: independent positions ---------------------------------
@@ -283,6 +336,33 @@ def run_council(args) -> int:
 
         # ---- round 2 (optional): cross-examination + peer RANKING -----------
         consensus_ranking = None
+        out_errors: list = []
+
+        def _partial_env(state: str) -> dict:
+            """A checkpoint snapshot of the council so far. Reads `results` /
+            `consensus_ranking` at call time (they are rebound per round).
+            Carries the FULL completed member envelopes (receipts, usage,
+            resume handles, precise errors) -- a hard kill must not reduce
+            member work to capped summaries."""
+            return {"mode": "council", "envelope": 1, "question": question,
+                    "rounds": rounds, "council_state": state,
+                    "members": [{k: v for k, v in m.items() if k not in ("_raw", "_env")}
+                                for m in results],
+                    "member_envelopes": [m["_env"] for m in results
+                                         if isinstance(m.get("_env"), dict)],
+                    "consensus_ranking": consensus_ranking,
+                    "status": "in_progress",
+                    "elapsed_ms": int((time.monotonic() - started) * 1000)}
+
+        def _ckpt(state: str) -> None:
+            """Write a phase checkpoint to --out. A write failure never kills a
+            running council, but it is CARRIED FORWARD as out_error."""
+            if out_path:
+                err = _atomic_write_json(out_path, _partial_env(state))
+                if err:
+                    out_errors.append(err)
+
+        _ckpt("round1_complete")
         if rounds >= 2:
             done["n"] = 0
             # Same anonymized set (members order) for everyone -> comparable votes.
@@ -300,9 +380,11 @@ def run_council(args) -> int:
                 agg = _aggregate_rankings(votes, n)
                 consensus_ranking = [{"agent": members[a["index"]], "score": a["score"],
                                       "votes": a["votes"]} for a in agg]
+            _ckpt("round2_complete")
 
-        for m in results:                # drop the raw text kept only for ranking
+        for m in results:    # drop the raw text and envelope carried for checkpoints
             m.pop("_raw", None)
+            m.pop("_env", None)
 
         # ---- synthesis: the chairman calls it -------------------------------
         rnote = ""
@@ -345,6 +427,7 @@ def run_council(args) -> int:
         "envelope": 1,
         "question": question,
         "rounds": rounds,
+        "council_state": "final",
         "members": results,
         "failed_members": failed,
         "consensus_ranking": consensus_ranking,   # None unless --rounds 2 produced votes
@@ -363,5 +446,15 @@ def run_council(args) -> int:
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "status": status,
     }
+    # --out: the final envelope replaces the last checkpoint atomically. Any
+    # write failure (checkpoint or final) is surfaced as out_error but never
+    # demotes the council itself.
+    if out_errors:
+        envelope["out_error"] = "; ".join(out_errors)
+    if out_path:
+        _werr = _atomic_write_json(out_path, envelope)
+        if _werr:
+            out_errors.append(_werr)
+            envelope["out_error"] = "; ".join(out_errors)
     print(json.dumps(envelope, ensure_ascii=False))
     return 0 if status == "success" else 1

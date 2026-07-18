@@ -243,7 +243,14 @@ def _child_argv(args: argparse.Namespace, result_file: str) -> list:
     """Reconstruct the child argv from PARSED args (not by filtering sys.argv,
     which would wrongly drop a token that is another option's *value*). Drops
     --background, adds --job-file."""
-    out = ["--agent", args.agent, "--prompt", args.prompt, "--cwd", args.cwd]
+    # A file-sourced prompt is re-passed AS THE FILE (not the loaded text): the
+    # child re-reads it, keeping the detached argv small and mojibake-free.
+    if getattr(args, "prompt_file", None):
+        out = ["--agent", args.agent, "--prompt-file", args.prompt_file, "--cwd", args.cwd]
+    else:
+        out = ["--agent", args.agent, "--prompt", args.prompt, "--cwd", args.cwd]
+    if getattr(args, "allow_credit", False):
+        out += ["--allow-credit"]
     if args.agents_dir:
         out += ["--agents-dir", args.agents_dir]
     if args.timeout:
@@ -279,6 +286,135 @@ def _spawn_background(args: argparse.Namespace) -> dict:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(cmd, **kwargs)
     return {"status": "background", "job_id": job_id, "pid": proc.pid, "result_file": result_file}
+
+
+# --- Provenance receipt --------------------------------------------------------
+# Three divergent installed copies of this dispatcher (one hand-patched) all
+# self-reported "0.9.0" while their scripts differed, making envelopes
+# unattributable. Every dispatch envelope now carries the dispatcher's identity,
+# the agent definition actually loaded, and the root prompt hash, so drift is
+# diagnosable from any single envelope. Paths are absolute local-operator data
+# (documented in SKILL.md); no prompt text or secrets, hashes only.
+
+def _receipt_base() -> dict:
+    """summon identity: available before ANY validation, so even a missing-agent
+    or unknown-backend error names the install that produced it."""
+    import hashlib
+    here = Path(__file__).resolve().parent
+    h = hashlib.sha256()
+    # One SHA over EVERY production module (incl. agy_pty_pyte.py -- drift lives
+    # in siblings, not just the entry file). Length-prefixed framing so
+    # (name, content) boundaries are unambiguous. test_discovery.py is excluded:
+    # it never executes at dispatch time.
+    for name in sorted(p.name for p in here.glob("*.py") if p.name != "test_discovery.py"):
+        try:
+            data = (here / name).read_bytes()
+        except OSError:
+            data = b""
+        nb = name.encode("utf-8")
+        h.update(len(nb).to_bytes(8, "big"))
+        h.update(nb)
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return {"summon": {"version": __version__,
+                       "script": str(Path(__file__).resolve()),
+                       "scripts_sha256": h.hexdigest()}}
+
+
+def _receipt_agent(args: argparse.Namespace, agent_file: str) -> dict:
+    """Agent-definition provenance. ``agents_dir`` records the ABSOLUTE roster
+    directory the definition was ACTUALLY loaded from (a bundled-fallback hit
+    must not record the project dir that failed the lookup)."""
+    import hashlib
+    try:
+        fsha = hashlib.sha256(Path(agent_file).read_bytes()).hexdigest()
+    except OSError:
+        fsha = None  # hashed as read-back; a vanished file stays diagnosable
+    served_dir = str(Path(agent_file).resolve().parent)
+    _bundled = bundled_roster_dir()
+    if _bundled and Path(served_dir) == Path(_bundled).resolve():
+        source = "bundled"
+    elif args.agents_dir:
+        source = "explicit"
+    elif os.environ.get("SUB_AGENTS_DIR"):
+        source = "env"
+    else:
+        source = "project"
+    return {"agent_def": {"file": agent_file, "sha256": fsha,
+                          "agents_dir": served_dir, "source": source}}
+
+
+def _receipt_prompt(prompt: str | None) -> dict:
+    import hashlib
+    if prompt is None:
+        return {}
+    return {"prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest()}
+
+
+def _git_head(cwd: str) -> str | None:
+    """HEAD of the EFFECTIVE dispatch cwd, captured BEFORE the agent runs (input
+    provenance -- hence `git_head_before` in the envelope; an editing agent may
+    commit during the run). Best-effort: None outside a repo or without git."""
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=2,
+                           stdin=subprocess.DEVNULL)
+        head = (r.stdout or "").strip()
+        return head if r.returncode == 0 and head else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+# --- Fan-out mode flag matrix --------------------------------------------------
+# The flags each fan-out mode actually CONSUMES. --manifest and --council branch
+# out of main() before most dispatch flags are read, so anything outside these
+# sets used to be SILENTLY IGNORED -- field case: a council run passed --out
+# expecting an artifact and never got one. A flag that would be dropped is now
+# rejected loudly BEFORE any paid dispatch. Whitelist, not blacklist: a flag
+# added to the parser later is rejected-by-default in these modes until a mode
+# explicitly supports it.
+_MODE_FLAGS = {
+    "manifest": {"manifest", "concurrency", "results_dir", "cwd", "agents_dir",
+                 "retries", "job_file"},
+    "council": {"council", "question", "question_file", "members", "chairman",
+                "rounds", "cwd", "agents_dir", "timeout", "out", "job_file"},
+}
+_MODE_HINTS = {
+    "manifest": ("Put per-job settings (model, effort, timeout, json_schema, "
+                 "debug_dir, prompt/prompt_file) in the manifest's jobs/defaults; "
+                 "per-job envelopes land under --results-dir."),
+    "council": ("--out IS supported (the council envelope, checkpointed at each "
+                "phase); member model/effort/permission come from each member "
+                "agent's own definition."),
+}
+_FLAG_NAMES = {"sets": "--set"}  # dests whose flag spelling isn't dest.replace('_','-')
+_TOKEN_DESTS = {"set": "sets"}   # the reverse mapping, for raw-argv presence detection
+
+
+def _unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
+    """Error text when a fan-out mode received flags it does not consume, else
+    None. Presence is detected from the RAW (post-subcommand-rewrite) argv, not
+    by comparing parsed values to defaults -- a value equal to its default
+    (e.g. ``--timeout 600000``) is still an explicit flag and still rejected."""
+    mode = "manifest" if args.manifest else ("council" if args.council else None)
+    if mode is None:
+        return None
+    allowed = _MODE_FLAGS[mode]
+    present = set()
+    for tok in argv:
+        if tok.startswith("--"):
+            name = tok[2:].split("=", 1)[0]
+            present.add(_TOKEN_DESTS.get(name, name.replace("-", "_")))
+    offending = sorted(
+        _FLAG_NAMES.get(dest, "--" + dest.replace("_", "-"))
+        for dest in vars(args)
+        if dest not in allowed and dest in present
+    )
+    if not offending:
+        return None
+    return (f"--{mode} does not support {', '.join(offending)}: these flags would "
+            f"have been silently ignored, so they are rejected instead. "
+            f"{_MODE_HINTS[mode]}")
 
 
 # --- Subcommand front-end -----------------------------------------------------
@@ -396,6 +532,11 @@ def main() -> None:
                         help="With --doctor: emit machine-readable JSON instead of the table")
     parser.add_argument("--agent", help="Agent definition name")
     parser.add_argument("--prompt", help="Task prompt")
+    parser.add_argument("--prompt-file", dest="prompt_file",
+                        help="Read the task prompt from FILE (UTF-8; BOM tolerated). "
+                             "Mutually exclusive with --prompt. Ergonomics for long/"
+                             "quoted prompts -- backends still receive the prompt via "
+                             "argv, so backend argv limits (e.g. agy ~28k chars) apply")
     parser.add_argument("--cwd", help="Working directory (absolute path)")
     parser.add_argument("--agents-dir", help="Directory containing agent definitions")
     parser.add_argument(
@@ -418,6 +559,12 @@ def main() -> None:
                                       "holds a valid envelope, skip the run (swarm resume)")
     parser.add_argument("--retries", type=int, default=0,
                         help="Re-dispatch up to N times on error/partial, exponential backoff")
+    parser.add_argument("--allow-credit", dest="allow_credit", action="store_true",
+                        help="Authorize spending ACCOUNT CREDIT on a credit-only model "
+                             "(Fable) for this one dispatch — flag form of "
+                             "SUMMON_ALLOW_CREDIT=1. Single dispatch only: rejected for "
+                             "--manifest/--council (set the env var deliberately for "
+                             "fan-out spend)")
     parser.add_argument("--json-schema", dest="json_schema",
                         help="Validate the agent's final JSON against this schema file; attach "
                              "parsed/parse_ok; one corrective retry via resume on mismatch")
@@ -444,6 +591,14 @@ def main() -> None:
 
     global _JOB_FILE
     _JOB_FILE = args.job_file
+
+    # Fan-out modes consume a fixed flag set; anything else present in argv is
+    # rejected FIRST -- before the query handlers below, so `--manifest --doctor`
+    # can't run doctor while silently dropping the manifest (see _MODE_FLAGS).
+    _bad_mode_flags = _unsupported_mode_flags(argv, args)
+    if _bad_mode_flags:
+        _print_error(_bad_mode_flags)
+        sys.exit(1)
 
     # --list-models / --doctor: pure discovery queries. Need no agent/prompt/cwd —
     # answer and exit before any of those are validated.
@@ -494,19 +649,32 @@ def main() -> None:
             _print_error(str(e))
             sys.exit(1)
 
+    # Provenance receipt, built PROGRESSIVELY: summon identity from here on, so
+    # EVERY single-dispatch-path envelope (combo rejections, prompt-file errors,
+    # missing agent, invalid effort, bad endpoint, preflight, real results)
+    # names the install that produced it. The prompt hash joins as soon as the
+    # prompt is resolved; agent identity after load; git HEAD once the cwd is
+    # validated. Cheap (one hash over the scripts dir), so computing it even for
+    # runs that turn out to be fan-out modes is fine.
+    receipt: dict = _receipt_base()
+
+    def _die(msg: str, exit_code: int = 1) -> None:
+        env = {"result": "", "exit_code": exit_code, "status": "error", "error": msg}
+        env.update(receipt)
+        _emit(env)
+        sys.exit(exit_code)
+
     if args.resume and args.worktree is not None:
-        _print_error("--resume and --worktree are incompatible: a session lives in the "
-                     "original project dir, not a fresh worktree")
-        sys.exit(1)
+        _die("--resume and --worktree are incompatible: a session lives in the "
+             "original project dir, not a fresh worktree")
 
     # --dry-run is a SINGLE-dispatch preview only. Combining it with modes that
     # fan out or detach would otherwise slip past the dry-run exit and run real
     # work (a detached --background child never even inherits --dry-run). Refuse
     # loudly instead of silently executing.
     if args.dry_run and (args.background or args.manifest or args.council):
-        _print_error("--dry-run cannot be combined with --background, --manifest, or "
-                     "--council (it previews one resolved dispatch and never executes)")
-        sys.exit(1)
+        _die("--dry-run cannot be combined with --background, --manifest, or "
+             "--council (it previews one resolved dispatch and never executes)")
 
     # --background and --out are two DIFFERENT completion contracts: background
     # signals done via its own result_file (job handle), while --out means
@@ -515,10 +683,9 @@ def main() -> None:
     # error never creates --out). For fan-out with per-job result files, use
     # --manifest. Reject the combination rather than pick a surprising winner.
     if args.background and args.out:
-        _print_error("--background and --out are incompatible: background reports "
-                     "completion via its own result_file; --out is the (manifest) "
-                     "result-file mechanism. Use --manifest for fan-out with result files.")
-        sys.exit(1)
+        _die("--background and --out are incompatible: background reports "
+             "completion via its own result_file; --out is the (manifest) "
+             "result-file mechanism. Use --manifest for fan-out with result files.")
 
     # --manifest: batch fan-out. Delegates to _manifest and exits.
     if args.manifest:
@@ -545,6 +712,36 @@ def main() -> None:
             _emit(prior)
             sys.exit(0)
 
+    # --prompt-file: resolve to a prompt BEFORE the background handler (its
+    # validation needs args.prompt). utf-8-sig strips a BOM; strict decoding so
+    # mojibake fails loudly instead of reaching a paid model. NOTE: this is
+    # quoting/encoding ergonomics, not argv-limit relief -- builders still pass
+    # the prompt as one argv token (agy's ~28k guard still applies). Presence
+    # checks (is not None) on BOTH sides, not truthiness: --prompt "" plus
+    # --prompt-file, and --prompt plus --prompt-file "", are each two competing
+    # inputs (and an empty filename then fails the open loudly, never silently).
+    if args.prompt is not None and args.prompt_file is not None:
+        _die("give --prompt or --prompt-file, not both")
+    if args.prompt_file is not None:
+        try:
+            with open(args.prompt_file, encoding="utf-8-sig") as fh:
+                args.prompt = fh.read()
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            _die(f"cannot read --prompt-file {args.prompt_file}: {e}")
+        if not args.prompt.strip():
+            _die(f"--prompt-file {args.prompt_file} is empty")
+
+    # Root-prompt hash joins the receipt HERE, as soon as the prompt is final,
+    # so even a missing-agent error downstream carries it.
+    receipt.update(_receipt_prompt(args.prompt))
+
+    # --allow-credit: per-dispatch credit authorization. Env form of the same
+    # switch, set process-local so the credit guard and any --background child
+    # (env-inherited AND argv-propagated) see it. Fan-out modes never reach
+    # here -- the mode-flag matrix rejects the flag for them.
+    if args.allow_credit:
+        os.environ["SUMMON_ALLOW_CREDIT"] = "1"
+
     # --json-schema: fail fast on an unloadable schema BEFORE paying for a run.
     schema = None
     if args.json_schema:
@@ -554,14 +751,12 @@ def main() -> None:
             if not isinstance(schema, dict):
                 raise ValueError("schema root must be a JSON object")
         except (OSError, ValueError) as e:
-            _print_error(f"--json-schema: cannot load {args.json_schema}: {e}")
-            sys.exit(1)
+            _die(f"--json-schema: cannot load {args.json_schema}: {e}")
 
     # --background: hand off to a detached copy of ourselves and return at once.
     if args.background and not args.list:
         if not (args.agent and args.prompt and args.cwd):
-            _print_error("--background requires --agent, --prompt, and --cwd")
-            sys.exit(1)
+            _die("--background requires --agent, --prompt, and --cwd")
         print(json.dumps(_spawn_background(args), ensure_ascii=False))
         sys.exit(0)
 
@@ -573,20 +768,20 @@ def main() -> None:
 
     # Validate required args for execution
     if not args.agent:
-        _print_error("--agent is required")
-        sys.exit(1)
+        _die("--agent is required")
     if not args.prompt:
-        _print_error("--prompt is required")
-        sys.exit(1)
+        _die("--prompt is required")
     if not args.cwd:
-        _print_error("--cwd is required")
-        sys.exit(1)
+        _die("--cwd is required")
     if not os.path.isabs(args.cwd):
-        _print_error("cwd must be an absolute path")
-        sys.exit(1)
+        _die("cwd must be an absolute path")
     if not os.path.isdir(args.cwd):
-        _print_error(f"cwd does not exist: {args.cwd}")
-        sys.exit(1)
+        _die(f"cwd does not exist: {args.cwd}")
+
+    # Input provenance: HEAD of the (validated) cwd. Recomputed after a
+    # --worktree rewrite so the dispatched value names the effective tree;
+    # pre-worktree failures (incl. preflight) carry the original cwd's HEAD.
+    receipt["git_head_before"] = _git_head(args.cwd)
 
     agents_dir = get_agents_dir(args.agents_dir, args.cwd)
 
@@ -595,8 +790,9 @@ def main() -> None:
             agents_dir, args.agent
         )
     except (FileNotFoundError, ValueError) as e:
-        _print_error(str(e))
-        sys.exit(1)
+        _die(str(e))
+
+    receipt.update(_receipt_agent(args, agent_file))
 
     # Shared project memory: inject {cwd}/.agents/memory.md (standing conventions,
     # constraints, durable decisions) so callers don't re-explain project context
@@ -608,8 +804,7 @@ def main() -> None:
     try:
         cli = args.cli or resolve_cli(run_agent_cli)
     except ValueError as e:
-        _print_error(f"agent {args.agent!r}: {e}")
-        sys.exit(1)
+        _die(f"agent {args.agent!r}: {e}")
 
     # Pre-flight the backend BEFORE any side effects (e.g. creating a worktree):
     # a missing CLI becomes a clear setup message (install + sign-in + what IS
@@ -619,6 +814,7 @@ def main() -> None:
     if not args.dry_run:
         setup_error = _preflight_backend(cli)
         if setup_error is not None:
+            setup_error.update(receipt)   # provenance even on the no-backend path
             _emit(setup_error)
             sys.exit(setup_error.get("exit_code", 1))
 
@@ -629,8 +825,7 @@ def main() -> None:
         try:
             worktree_info = _setup_worktree(args.cwd, args.worktree, args.agent)
         except ValueError as e:
-            _print_error(str(e))
-            sys.exit(1)
+            _die(str(e))
         args.cwd = worktree_info["cwd"]
 
     # Reasoning-effort precedence: --effort > agent `effort:` frontmatter >
@@ -644,9 +839,8 @@ def main() -> None:
     if effort in ("none", "default", "off"):
         effort = None
     elif effort not in _EFFORT_LEVELS:
-        _print_error(f"invalid effort {effort!r}: use one of {', '.join(_EFFORT_LEVELS)} "
-                     "(or none/default to use the backend's own default)")
-        sys.exit(1)
+        _die(f"invalid effort {effort!r}: use one of {', '.join(_EFFORT_LEVELS)} "
+             "(or none/default to use the backend's own default)")
     _explicit_effort = bool(args.effort or effort_fm)
     if cli == "agy":
         # agy has no --effort flag; thinking is the model-name suffix. Apply an
@@ -676,8 +870,7 @@ def main() -> None:
                 fm, _ = parse_frontmatter(fh.read())
             base_url, api_key_env = resolve_endpoint(fm, agents_dir)
         except (OSError, ValueError) as e:
-            _print_error(f"openai-compat agent {args.agent!r}: {e}")
-            sys.exit(1)
+            _die(f"openai-compat agent {args.agent!r}: {e}")
 
     invocation = AgentInvocation(
         cli=cli,
@@ -699,6 +892,10 @@ def main() -> None:
         _emit(_dry_run_view(invocation, args, agents_dir))
         sys.exit(0)
 
+    # Effective-tree provenance: recompute HEAD after any worktree rewrite,
+    # BEFORE the agent can commit anything.
+    receipt["git_head_before"] = _git_head(args.cwd)
+
     # Catch ValueError from build_invocation_args / permission_flags / TOML
     # escaping so unknown --cli values or unsafe agent paths surface as JSON
     # errors rather than tracebacks. All other CLI-side failures are already
@@ -706,12 +903,16 @@ def main() -> None:
     try:
         result = _dispatch_with_retries(invocation, args)
     except ValueError as e:
-        _print_error(str(e))
-        sys.exit(1)
+        _die(str(e))
 
     # --json-schema: structured-output contract with ONE corrective retry.
     if schema is not None and result.get("status") == "success":
         result = _apply_schema(result, schema, invocation, args)
+
+    # Receipt LAST, from main()-scope values: a schema-correction retry replaces
+    # the envelope, and this keeps prompt_sha256 bound to the ROOT prompt (the
+    # correction prompt must never restamp it).
+    result.update(receipt)
 
     if worktree_info:
         result["worktree"] = worktree_info
@@ -727,8 +928,8 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     path is shown instead."""
     from _builder import (BACKENDS, backend_kind, build_invocation_args,
                           permission_flags as _pf, _PERMISSION_MAPPING, _agy_wrapper,
-                          apply_credit_guard, infer_billing, credit_spend_allowed,
-                          selects_credit_only)
+                          agy_permission_warning, apply_credit_guard, infer_billing,
+                          credit_spend_allowed, selects_credit_only)
     _guarded, _, _guard_warnings = apply_credit_guard(invocation)
     _eff_model = _guarded.model
     # Predict the billing source so preflight can reveal a charge (mirrors _stamp).
@@ -760,6 +961,9 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     }
     for _w in _guard_warnings:  # credit-only guard actions surfaced in the preview
         view.setdefault("warnings", []).append(_w)
+    _pw = agy_permission_warning(invocation.cli, invocation.permission)
+    if _pw:  # same helper as the real envelope -> identical warning, exactly once
+        view.setdefault("warnings", []).append(_pw)
     if backend_kind(invocation.cli) == "api":
         view["command"] = f"POST ({invocation.cli})"
         view["base_url"] = invocation.base_url

@@ -467,7 +467,11 @@ def test_envelope_model_and_permission_echo():
                             permission="read-only", model="opus"), timeout_ms=1000)
     finally:
         _executor.build_invocation_args = orig
-    assert out["model"] == {"requested": "opus", "resolved": None, "models_used": []}
+    # Spawn failure: no handshake, no terminal event -> targeted falls back to
+    # the guard-effective request; served stays None (no evidence); resolved
+    # keeps legacy v1 semantics (None here).
+    assert out["model"] == {"requested": "opus", "targeted": "opus", "served": None,
+                            "resolved": None, "models_used": []}
     assert out["permission"] == "read-only"
     assert out["permission_flags"] == ["--permission-mode", "plan"]
     assert "_debug_raw" not in out  # internal key never leaks into the envelope
@@ -985,7 +989,10 @@ def test_openai_compat_http_roundtrip():
                    capture_output=True, text=True, encoding="utf-8")
         env = _json.loads(r.stdout)
         assert env["status"] == "success" and env["result"].startswith("PONG")
-        assert env["model"] == {"requested": "test-model", "resolved": "test-model", "models_used": []}
+        # API reported the model on the terminal response -> served evidence
+        assert env["model"] == {"requested": "test-model", "targeted": "test-model",
+                                "served": "test-model", "resolved": "test-model",
+                                "models_used": []}
         assert env["usage"]["total_tokens"] == 9 and env["billing"]["source"] == "api"
         assert env["envelope"] == 1
     finally:
@@ -1744,6 +1751,580 @@ def test_preflight_doctor_failure_is_soft():
         assert err["setup"]["usable_backends"] == []
     finally:
         r.shutil.which, _doctor.doctor = ow, od
+
+
+def test_mode_flag_matrix_rejects_swallowed_flags():
+    # Flags a fan-out mode does not consume must be REJECTED, not silently
+    # dropped (field case: council --out never written). Zero paid dispatches:
+    # rejection happens before any backend work, so these run fast.
+    import json as _json
+    import subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    cases = [
+        (["--council", "--question", "x", "--cwd", os.getcwd(), "--model", "opus"],
+         "--model"),
+        (["--council", "--question", "x", "--cwd", os.getcwd(), "--worktree"],
+         "--worktree"),
+        (["--council", "--question", "x", "--cwd", os.getcwd(), "--json-schema", "s.json"],
+         "--json-schema"),
+        (["--council", "--question", "x", "--cwd", os.getcwd(), "--background"],
+         "--background"),
+        (["--council", "--question", "x", "--cwd", os.getcwd(), "--retries", "2"],
+         "--retries"),
+        (["--manifest", "jobs.json", "--out", "o.json"], "--out"),
+        (["--manifest", "jobs.json", "--worktree", "w"], "--worktree"),
+        (["--manifest", "jobs.json", "--background"], "--background"),
+        (["--manifest", "jobs.json", "--list"], "--list"),
+    ]
+    for argv, flag in cases:
+        r = sp.run([sys.executable, script, *argv], capture_output=True, text=True,
+                   encoding="utf-8")
+        env = _json.loads(r.stdout)
+        assert env["status"] == "error" and flag in env["error"], (argv, env)
+        assert "silently ignored" in env["error"], env["error"]
+        assert r.returncode == 1, (argv, r.returncode)
+    # Supported flags still pass the matrix: council --out reaches council
+    # validation (fails on the missing question, NOT on the flag matrix).
+    r = sp.run([sys.executable, script, "--council", "--cwd", os.getcwd(),
+                "--out", os.path.join(tempfile.gettempdir(), "cx.json")],
+               capture_output=True, text=True, encoding="utf-8")
+    env = _json.loads(r.stdout)
+    assert "silently ignored" not in (env.get("error") or ""), env
+    assert "--question" in env["error"], env
+
+
+def test_council_out_checkpoints_and_final():
+    # --out must hold a round1_complete checkpoint BY THE TIME the chairman
+    # runs (that snapshot is what survives a host-tool kill mid-synthesis),
+    # then be replaced by the final envelope.
+    import _council, argparse, io, contextlib, json as _json
+    d = tempfile.mkdtemp(prefix="summon-cout-")
+    out = os.path.join(d, "council.json")
+    seen = {}
+    try:
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\nrole.\n")
+
+        def fake_dispatch(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+            if agent == "chair":
+                with open(out, encoding="utf-8") as fh:  # checkpoint must already exist
+                    seen["at_chair"] = _json.load(fh)
+                return {"status": "success", "result": "DECISION: X",
+                        "report": {"summary": "X"}}
+            return {"status": "success", "result": f"{agent} ok",
+                    "report": {"summary": f"{agent} pos"}}
+
+        orig = _council._dispatch
+        _council._dispatch = fake_dispatch
+        try:
+            args = argparse.Namespace(question="X or Y?", question_file=None,
+                                      members="m1,m2", chairman="chair", rounds=1,
+                                      cwd=os.getcwd(), agents_dir=d, timeout=90000,
+                                      out=out)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = _council.run_council(args)
+        finally:
+            _council._dispatch = orig
+        assert rc == 0
+        cp = seen["at_chair"]
+        assert cp["council_state"] == "round1_complete" and cp["status"] == "in_progress"
+        assert len(cp["members"]) == 2 and all("_raw" not in m and "_env" not in m
+                                               for m in cp["members"])
+        # checkpoints carry the FULL member envelopes, not just capped summaries
+        assert len(cp["member_envelopes"]) == 2, cp.get("member_envelopes")
+        assert all("result" in e and e.get("status") == "success"
+                   for e in cp["member_envelopes"]), cp["member_envelopes"]
+        final = _json.loads(open(out, encoding="utf-8").read())
+        assert final["council_state"] == "final" and final["status"] == "success"
+        assert "member_envelopes" not in final  # final keeps the v1 shape
+        assert all("_env" not in m for m in final["members"])
+        stdout_env = _json.loads(buf.getvalue())
+        assert stdout_env == final  # file and stdout agree
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_council_out_written_on_fail_and_question_conflict():
+    import _council, argparse, io, contextlib, json as _json
+    d = tempfile.mkdtemp(prefix="summon-cfail-")
+    try:
+        out = os.path.join(d, "fail.json")
+        # validation failure -> error envelope lands in --out too
+        args = argparse.Namespace(question="", question_file=None, members=None,
+                                  chairman=None, rounds=1, cwd=os.getcwd(),
+                                  agents_dir=d, timeout=60000, out=out)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = _council.run_council(args)
+        assert rc == 1
+        env = _json.loads(open(out, encoding="utf-8").read())
+        assert env["status"] == "error" and env["council_state"] == "failed"
+        # question + question-file together is ambiguous -> rejected
+        qf = os.path.join(d, "q.md")
+        open(qf, "w", encoding="utf-8").write("file question")
+        args2 = argparse.Namespace(question="inline too", question_file=qf,
+                                   members=None, chairman=None, rounds=1,
+                                   cwd=os.getcwd(), agents_dir=d, timeout=60000,
+                                   out=None)
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            rc2 = _council.run_council(args2)
+        env2 = _json.loads(buf2.getvalue())
+        assert rc2 == 1 and "not both" in env2["error"], env2
+        # reverse-empty escape: an EMPTY --question-file with --question is
+        # still two competing inputs (presence on both sides)
+        args3 = argparse.Namespace(question="q", question_file="",
+                                   members=None, chairman=None, rounds=1,
+                                   cwd=os.getcwd(), agents_dir=d, timeout=60000,
+                                   out=None)
+        buf3 = io.StringIO()
+        with contextlib.redirect_stdout(buf3):
+            rc3 = _council.run_council(args3)
+        env3 = _json.loads(buf3.getvalue())
+        assert rc3 == 1 and "not both" in env3["error"], env3
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_council_ceiling_estimate_on_stderr():
+    # The additive-clock preflight line: 2 claude members = 1 wave/round; with
+    # rounds=2 and timeout 90s (+60s margin) -> 2*1*150 + 150 = 450s.
+    import _council, argparse, io, contextlib
+    d = tempfile.mkdtemp(prefix="summon-ceil-")
+    try:
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+        def fake(agent, *a, **k):
+            return {"status": "success", "result": "ok", "report": {"summary": "s"}}
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            args = argparse.Namespace(question="q", question_file=None,
+                                      members="m1,m2", chairman="chair", rounds=2,
+                                      cwd=os.getcwd(), agents_dir=d, timeout=90000,
+                                      out=None)
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                _council.run_council(args)
+        finally:
+            _council._dispatch = orig
+        text = err.getvalue()
+        assert "worst-case wall clock ~450s" in text, text
+        assert "ABOVE" in text, text
+        # homogeneous 4-member council: ceil(4/3)=2 waves -> 1x2x150 + 150 = 450s
+        for a in ("m3", "m4"):
+            open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+        _council._dispatch = fake
+        try:
+            args4 = argparse.Namespace(question="q", question_file=None,
+                                       members="m1,m2,m3,m4", chairman="chair",
+                                       rounds=1, cwd=os.getcwd(), agents_dir=d,
+                                       timeout=90000, out=None)
+            err4 = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err4):
+                _council.run_council(args4)
+        finally:
+            _council._dispatch = orig
+        text4 = err4.getvalue()
+        assert "worst-case wall clock ~450s" in text4 and "2 wave(s)" in text4, text4
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_manifest_rejects_prompt_and_prompt_file():
+    import _manifest as m
+    jobs, err = m._normalize_jobs(
+        {"jobs": [{"agent": "a", "prompt": "p", "prompt_file": "f.md"}]}, os.getcwd())
+    assert jobs is None and "not both" in err, (jobs, err)
+    # defaults-level prompt_file + per-job prompt is the sneaky variant
+    jobs2, err2 = m._normalize_jobs(
+        {"defaults": {"prompt_file": "f.md"}, "jobs": [{"agent": "a", "prompt": "p"}]},
+        os.getcwd())
+    assert jobs2 is None and "not both" in err2, (jobs2, err2)
+    # presence, not truthiness: an EMPTY prompt plus prompt_file is still ambiguous
+    jobs3, err3 = m._normalize_jobs(
+        {"jobs": [{"agent": "a", "prompt": "", "prompt_file": "f.md"}]}, os.getcwd())
+    assert jobs3 is None and "not both" in err3, (jobs3, err3)
+
+
+def test_prompt_file_load_conflicts_and_bom():
+    import json as _json
+    import subprocess as sp
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-pf-")
+    try:
+        # A tiny probe agent: the dry-run view truncates argv tokens at 400
+        # chars, so the user prompt must land inside that window to be assertable.
+        agents = os.path.join(d, "roster")
+        os.makedirs(agents)
+        open(os.path.join(agents, "pf-probe.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: codex\npermission: read-only\n---\n# probe\ntiny.\n")
+        pf = os.path.join(d, "task.md")
+        with open(pf, "w", encoding="utf-8-sig") as fh:  # utf-8 WITH BOM on purpose
+            fh.write("Review THE-MAGIC-TOKEN please → carefully")
+        # happy path via --dry-run: prompt content reaches the resolved argv,
+        # BOM stripped, no dispatch executed
+        r = sp.run([sys.executable, script, "--agent", "pf-probe", "--prompt-file", pf,
+                    "--cwd", os.getcwd(), "--agents-dir", agents, "--dry-run"],
+                   capture_output=True, text=True, encoding="utf-8")
+        view = _json.loads(r.stdout)
+        assert view.get("dry_run") is True, view
+        assert any("THE-MAGIC-TOKEN" in a for a in view["args"]), view["args"]
+        assert not any("﻿" in a for a in view["args"])
+        # --prompt + --prompt-file -> rejected
+        r2 = sp.run([sys.executable, script, "--agent", "pf-probe", "--prompt", "x",
+                     "--prompt-file", pf, "--cwd", os.getcwd(), "--agents-dir", agents],
+                    capture_output=True, text=True, encoding="utf-8")
+        env2 = _json.loads(r2.stdout)
+        assert env2["status"] == "error" and "not both" in env2["error"], env2
+        # missing file -> clean error, no traceback
+        r3 = sp.run([sys.executable, script, "--agent", "pf-probe",
+                     "--prompt-file", os.path.join(d, "nope.md"),
+                     "--cwd", os.getcwd(), "--agents-dir", agents],
+                    capture_output=True, text=True, encoding="utf-8")
+        env3 = _json.loads(r3.stdout)
+        assert env3["status"] == "error" and "cannot read --prompt-file" in env3["error"], env3
+        # empty file -> clean error
+        ef = os.path.join(d, "empty.md")
+        open(ef, "w", encoding="utf-8").close()
+        r4 = sp.run([sys.executable, script, "--agent", "pf-probe", "--prompt-file", ef,
+                     "--cwd", os.getcwd(), "--agents-dir", agents],
+                    capture_output=True, text=True, encoding="utf-8")
+        env4 = _json.loads(r4.stdout)
+        assert env4["status"] == "error" and "is empty" in env4["error"], env4
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_prompt_file_and_allow_credit_in_child_argv():
+    # A --background child re-reads the FILE (small argv, no mojibake) and
+    # keeps the credit authorization.
+    import argparse
+    import run_subagent as r
+    ns = argparse.Namespace(agent="a", prompt="LOADED-TEXT", prompt_file="C:/t/p.md",
+                            allow_credit=True, cwd="C:/w", agents_dir=None,
+                            timeout=600000, cli=None, model=None, effort=None,
+                            resume=None, resume_profile=None, out=None,
+                            json_schema=None, debug_dir=None, retries=0, worktree=None)
+    argv = r._child_argv(ns, "res.json")
+    assert "--prompt-file" in argv and "C:/t/p.md" in argv, argv
+    assert "LOADED-TEXT" not in argv, argv
+    assert "--allow-credit" in argv, argv
+    ns.prompt_file, ns.allow_credit = None, False
+    argv2 = r._child_argv(ns, "res.json")
+    assert "--prompt" in argv2 and "LOADED-TEXT" in argv2 and "--allow-credit" not in argv2
+
+
+def test_allow_credit_flag_dry_run_and_fanout_rejection():
+    import json as _json
+    import subprocess as sp
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "run_subagent.py")
+    agents = os.path.join(here, "..", "agents")
+    # env scrubbed of any ambient authorization so the test is deterministic
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SUMMON_ALLOW_FABLE", "SUMMON_ALLOW_CREDIT", "ANTHROPIC_API_KEY")}
+    base = [sys.executable, script, "--agent", "planner", "--prompt", "x",
+            "--cwd", os.getcwd(), "--agents-dir", agents,
+            "--model", "claude-fable-5", "--dry-run"]
+    r = sp.run(base, capture_output=True, text=True, encoding="utf-8", env=env)
+    view = _json.loads(r.stdout)
+    assert view["model_effective"] == "claude-opus-4-8", view  # guard fell back
+    r2 = sp.run(base + ["--allow-credit"], capture_output=True, text=True,
+                encoding="utf-8", env=env)
+    view2 = _json.loads(r2.stdout)
+    assert view2["model_effective"] == "claude-fable-5", view2   # authorized
+    assert view2["billing_predicted"]["source"] == "credit", view2
+    # fan-out modes must REJECT the flag (env inheritance would silently
+    # authorize every child)
+    r3 = sp.run([sys.executable, script, "--council", "--question", "q",
+                 "--cwd", os.getcwd(), "--allow-credit"],
+                capture_output=True, text=True, encoding="utf-8", env=env)
+    env3 = _json.loads(r3.stdout)
+    assert env3["status"] == "error" and "--allow-credit" in env3["error"], env3
+
+
+def test_agy_safe_edit_warning_helper_and_dry_run():
+    from _builder import agy_permission_warning
+    assert agy_permission_warning("agy", "safe-edit")
+    assert agy_permission_warning("agy", "yolo") is None
+    assert agy_permission_warning("agy", "read-only") is None
+    assert agy_permission_warning("claude", "safe-edit") is None
+    import json as _json
+    import subprocess as sp
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-agyw-")
+    try:
+        open(os.path.join(d, "agy-agent.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: agy\npermission: safe-edit\n---\n# agy agent\nrole.\n")
+        r = sp.run([sys.executable, script, "--agent", "agy-agent", "--prompt", "x",
+                    "--cwd", os.getcwd(), "--agents-dir", d, "--dry-run"],
+                   capture_output=True, text=True, encoding="utf-8")
+        view = _json.loads(r.stdout)
+        warns = view.get("warnings") or []
+        assert sum("workspace-write tier" in w for w in warns) == 1, warns
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_stream_handshake_separate_from_terminal_model():
+    # The init handshake announces the TARGETED model before any inference; it
+    # must never fill the terminal/served slot (field case: a failed Fable run
+    # reported resolved: claude-fable-5 with all-zero usage).
+    from _stream import StreamProcessor
+    p = StreamProcessor()
+    p.process_line('{"type":"system","subtype":"init","session_id":"s1","model":"claude-fable-5"}')
+    assert p.handshake_model == "claude-fable-5" and p.model is None
+    p.process_line('{"type":"result","is_error":true,"result":"","usage":{"output_tokens":0}}')
+    assert p.model is None and p.handshake_model == "claude-fable-5"
+    p2 = StreamProcessor()
+    p2.process_line('{"type":"thread.started","thread_id":"t1","model":"gpt-x"}')
+    assert p2.handshake_model == "gpt-x" and p2.model is None
+    # a terminal event that DOES name a model still lands in .model (served lane)
+    p3 = StreamProcessor()
+    p3.process_line('{"type":"system","subtype":"init","model":"claude-h"}')
+    p3.process_line('{"type":"result","result":"ok","model":"claude-t"}')
+    assert p3.handshake_model == "claude-h" and p3.model == "claude-t"
+
+
+def test_receipt_and_model_evidence_on_error_dispatch():
+    # One real (unpaid) dispatch to a dead local endpoint: the error envelope
+    # must carry the full provenance receipt AND honest model evidence.
+    import hashlib
+    import json as _json
+    import subprocess as sp
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-rcpt-")
+    try:
+        af = os.path.join(d, "dead-api.md")
+        open(af, "w", encoding="utf-8").write(
+            "---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:9\n"
+            "api_key_env:\nmodel: probe-model\n---\n# dead api\nrole.\n")
+        r = sp.run([sys.executable, script, "--agent", "dead-api", "--prompt", "hello",
+                    "--cwd", os.getcwd(), "--agents-dir", d, "--timeout", "8s"],
+                   capture_output=True, text=True, encoding="utf-8")
+        env = _json.loads(r.stdout)
+        assert env["status"] == "error", env
+        # model honesty: pointed at probe-model, nothing served
+        assert env["model"]["targeted"] == "probe-model", env["model"]
+        assert env["model"]["served"] is None, env["model"]
+        # receipt: dispatcher identity + agent identity + prompt hash + git head
+        s = env["summon"]
+        assert s["version"] and len(s["scripts_sha256"]) == 64, s
+        assert os.path.basename(s["script"]) == "run_subagent.py", s
+        ad = env["agent_def"]
+        assert ad["file"].endswith("dead-api.md") and ad["source"] == "explicit", ad
+        import pathlib
+        assert pathlib.Path(ad["agents_dir"]) == pathlib.Path(d).resolve(), ad
+        with open(af, "rb") as fh:
+            assert ad["sha256"] == hashlib.sha256(fh.read()).hexdigest(), ad
+        assert env["prompt_sha256"] == hashlib.sha256(b"hello").hexdigest(), env
+        gh = sp.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                    cwd=os.getcwd())
+        head = gh.stdout.strip() if gh.returncode == 0 else ""
+        assert env.get("git_head_before") == (head or None), (env.get("git_head_before"), head)
+        # a different cwd: the key is present and matches git's OWN answer for
+        # that directory (None where git finds no repo; a tempdir can legally
+        # sit under an enclosing repo, e.g. a dotfiles-managed home, and git's
+        # walk-up semantics are the correct provenance there)
+        r5 = sp.run([sys.executable, script, "--agent", "dead-api", "--prompt", "hello",
+                     "--cwd", d, "--agents-dir", d, "--timeout", "8s"],
+                    capture_output=True, text=True, encoding="utf-8")
+        env5 = _json.loads(r5.stdout)
+        gh5 = sp.run(["git", "-C", d, "rev-parse", "HEAD"], capture_output=True, text=True)
+        head5 = gh5.stdout.strip() if gh5.returncode == 0 else ""
+        assert "git_head_before" in env5, env5
+        assert env5["git_head_before"] == (head5 or None), (env5["git_head_before"], head5)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_receipt_helper_deterministic_and_sources():
+    import argparse
+    import run_subagent as r
+    here = os.path.dirname(os.path.abspath(__file__))
+    bundled = os.path.abspath(os.path.join(here, "..", "agents"))
+    planner = os.path.join(bundled, "planner.md")
+    saved = os.environ.pop("SUB_AGENTS_DIR", None)
+    try:
+        assert r._receipt_base() == r._receipt_base()  # deterministic
+        ns = argparse.Namespace(agents_dir=None, prompt="p")
+        a1 = r._receipt_agent(ns, planner)
+        assert a1["agent_def"]["source"] == "bundled", a1["agent_def"]
+        # agents_dir records the dir that ACTUALLY served the file, absolute
+        import pathlib
+        assert pathlib.Path(a1["agent_def"]["agents_dir"]) == pathlib.Path(bundled).resolve()
+        # explicit --agents-dir wins the label when the file is not bundled
+        ns2 = argparse.Namespace(agents_dir="rel/dir", prompt="p")
+        a2 = r._receipt_agent(ns2, os.path.join(here, "run_subagent.py"))
+        assert a2["agent_def"]["source"] == "explicit", a2["agent_def"]
+        assert os.path.isabs(a2["agent_def"]["agents_dir"])  # never relative
+        # default chain -> project; env tier -> env; prompt hash only when given
+        ns3 = argparse.Namespace(agents_dir=None, prompt=None)
+        a3 = r._receipt_agent(ns3, os.path.join(here, "run_subagent.py"))
+        assert a3["agent_def"]["source"] == "project", a3["agent_def"]
+        os.environ["SUB_AGENTS_DIR"] = "/e"
+        a4 = r._receipt_agent(ns3, os.path.join(here, "run_subagent.py"))
+        assert a4["agent_def"]["source"] == "env", a4["agent_def"]
+        assert r._receipt_prompt(None) == {} and "prompt_sha256" in r._receipt_prompt("x")
+    finally:
+        os.environ.pop("SUB_AGENTS_DIR", None)
+        if saved is not None:
+            os.environ["SUB_AGENTS_DIR"] = saved
+
+
+def test_mode_matrix_default_values_and_early_combos():
+    # Presence-based detection: a flag equal to its default is still explicit;
+    # and query modes must not run while silently dropping the fan-out mode.
+    import json as _json
+    import subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    cases = [
+        (["--manifest", "jobs.json", "--timeout", "600000"], "--timeout"),  # == default
+        (["--manifest", "jobs.json", "--doctor"], "--doctor"),
+        (["--manifest", "jobs.json", "--list-models"], "--list-models"),
+        (["--council", "--question", "x", "--cwd", os.getcwd(), "--doctor"], "--doctor"),
+    ]
+    for argv, flag in cases:
+        r = sp.run([sys.executable, script, *argv], capture_output=True, text=True,
+                   encoding="utf-8")
+        env = _json.loads(r.stdout)
+        assert env["status"] == "error" and flag in env["error"], (argv, env)
+        assert r.returncode == 1, (argv, r.returncode)
+    # empty values on EITHER side are still two competing inputs (presence)
+    r2 = sp.run([sys.executable, script, "--agent", "a", "--prompt", "",
+                 "--prompt-file", "x.md", "--cwd", os.getcwd()],
+                capture_output=True, text=True, encoding="utf-8")
+    env2 = _json.loads(r2.stdout)
+    assert env2["status"] == "error" and "not both" in env2["error"], env2
+    r3 = sp.run([sys.executable, script, "--agent", "a", "--prompt", "x",
+                 "--prompt-file", "", "--cwd", os.getcwd()],
+                capture_output=True, text=True, encoding="utf-8")
+    env3 = _json.loads(r3.stdout)
+    assert env3["status"] == "error" and "not both" in env3["error"], env3
+
+
+def test_receipt_on_missing_agent_and_preflight():
+    # Provenance matters MOST when the dispatch fails early: a missing agent
+    # (which install / roster looked?) and a missing backend must both carry
+    # the receipt; preflight also carries git_head_before.
+    import json as _json
+    import subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-rmiss-")
+    try:
+        # missing agent -> error envelope with summon identity, no agent_def
+        r = sp.run([sys.executable, script, "--agent", "nope-agent-xyz", "--prompt", "p",
+                    "--cwd", os.getcwd(), "--agents-dir", d],
+                   capture_output=True, text=True, encoding="utf-8")
+        env = _json.loads(r.stdout)
+        assert env["status"] == "error" and "not found" in env["error"], env
+        assert len(env["summon"]["scripts_sha256"]) == 64, env.get("summon")
+        assert "git_head_before" in env and "agent_def" not in env, env
+        # the ROOT prompt hash is already known and must be present here too
+        import hashlib as _hl
+        assert env["prompt_sha256"] == _hl.sha256(b"p").hexdigest(), env
+        # missing backend (PATH emptied) -> preflight setup error with FULL receipt
+        open(os.path.join(d, "gm.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: gemini\npermission: read-only\n---\n# gm\nrole.\n")
+        env_clean = {k: v for k, v in os.environ.items() if k.upper() != "PATH"}
+        env_clean["PATH"] = ""
+        r2 = sp.run([sys.executable, script, "--agent", "gm", "--prompt", "p",
+                     "--cwd", os.getcwd(), "--agents-dir", d],
+                    capture_output=True, text=True, encoding="utf-8", env=env_clean)
+        env2 = _json.loads(r2.stdout)
+        assert env2["status"] == "error" and env2["exit_code"] == 127, env2
+        assert len(env2["summon"]["scripts_sha256"]) == 64, env2.get("summon")
+        assert env2["agent_def"]["file"].endswith("gm.md"), env2.get("agent_def")
+        assert "prompt_sha256" in env2 and "git_head_before" in env2, env2
+        # invalid effort (a post-load validation error) also carries the receipt.
+        # Probed via openai-compat, which SKIPS backend preflight -- a CLI agent
+        # would 127 on machines without that CLI before effort validation runs.
+        open(os.path.join(d, "oc.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:9\n"
+            "api_key_env:\nmodel: m\n---\n# oc\nrole.\n")
+        r3 = sp.run([sys.executable, script, "--agent", "oc", "--prompt", "p",
+                     "--cwd", os.getcwd(), "--agents-dir", d, "--effort", "bogus"],
+                    capture_output=True, text=True, encoding="utf-8")
+        env3 = _json.loads(r3.stdout)
+        assert env3["status"] == "error" and "invalid effort" in env3["error"], env3
+        assert len(env3["summon"]["scripts_sha256"]) == 64, env3
+        assert env3["agent_def"]["file"].endswith("oc.md"), env3
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_model_targeted_from_handshake_not_terminal():
+    # targeted = handshake else guard-effective; the TERMINAL model is served
+    # evidence and must never pollute targeted (their difference is the signal).
+    import json as _json
+    import _executor
+    from _builder import AgentInvocation
+    line1 = _json.dumps({"type": "system", "subtype": "init",
+                         "model": "hand-A", "session_id": "s"})
+    line2 = _json.dumps({"type": "result", "result": "ok", "model": "served-B",
+                         "usage": {"output_tokens": 5}})
+    py = f"print({line1!r});print({line2!r})"
+    orig = _executor.build_invocation_args
+    _executor.build_invocation_args = lambda inv, timeout_ms=None: (sys.executable, ["-c", py], None)
+    try:
+        out = _executor.execute_agent(
+            AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(),
+                            system_context="s", model="req-C"), timeout_ms=30000)
+    finally:
+        _executor.build_invocation_args = orig
+    m = out["model"]
+    assert m["requested"] == "req-C", m
+    assert m["targeted"] == "hand-A", m       # handshake, NOT the terminal model
+    assert m["served"] == "served-B", m       # terminal report = service evidence
+    assert m["resolved"] == "served-B", m     # legacy v1: handshake-or-terminal
+
+
+def test_council_out_write_failure_surfaces_out_error():
+    # A checkpoint/final write failure never kills the council but must be
+    # carried forward as out_error on the stdout envelope.
+    import _council, argparse, io, contextlib, json as _json
+    d = tempfile.mkdtemp(prefix="summon-cwerr-")
+    try:
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+        blocked = os.path.join(d, "iamadir")   # a DIRECTORY at the --out path:
+        os.makedirs(blocked)                   # os.replace onto it fails on Windows+POSIX
+        def fake(agent, *a, **k):
+            return {"status": "success", "result": "ok", "report": {"summary": "s"}}
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            args = argparse.Namespace(question="q", question_file=None,
+                                      members="m1,m2", chairman="chair", rounds=1,
+                                      cwd=os.getcwd(), agents_dir=d, timeout=60000,
+                                      out=blocked)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = _council.run_council(args)
+        finally:
+            _council._dispatch = orig
+        env = _json.loads(buf.getvalue())
+        assert rc == 0 and env["status"] == "success", env.get("status")
+        assert "out_error" in env and "failed to write" in env["out_error"], env.get("out_error")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

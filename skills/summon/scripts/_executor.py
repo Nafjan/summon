@@ -12,9 +12,10 @@ import subprocess
 import threading
 import time
 
-from _builder import (AgentInvocation, BACKENDS, apply_credit_guard, backend_kind,
-                      build_invocation_args, credit_spend_allowed, infer_billing,
-                      permission_flags, selects_credit_only)
+from _builder import (AgentInvocation, BACKENDS, agy_permission_warning,
+                      apply_credit_guard, backend_kind, build_invocation_args,
+                      credit_spend_allowed, infer_billing, permission_flags,
+                      selects_credit_only)
 from _stream import StreamProcessor, _terminal_is_error
 
 _SUCCESS_EXIT_CODES = (0, 143, -15)  # 0 ok, 143/-15 = SIGTERM (we asked it to stop)
@@ -156,6 +157,7 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     response.setdefault("usage", processor.usage if processor else None)
     response.setdefault("cost_usd", processor.cost_usd if processor else None)
     response.setdefault("model_resolved", processor.model if processor else None)
+    response.setdefault("model_targeted", processor.handshake_model if processor else None)
     response.setdefault("models_used", processor.models_used if processor else [])
     # Baseline resume handle on EVERY path (incl. spawn-failure) so orchestrators
     # can read response["resume"] unconditionally. execute_agent enriches it with
@@ -608,28 +610,67 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     started = time.monotonic()
     # Credit-only model guard (Fable): build_invocation_args enforces it in the
     # argv/env (so --dry-run and real dispatch agree); here we keep the ORIGINAL
-    # request and re-derive the guard warnings for the envelope's transparency.
+    # request, the GUARDED effective model (feeds model.targeted), and the guard
+    # warnings for the envelope's transparency.
     _requested_model = inv.model
-    _, _, _guard_warnings = apply_credit_guard(inv)
+    _guarded_inv, _, _guard_warnings = apply_credit_guard(inv)
     debug_argv = [inv.cli]  # what --debug-dir records; each path refines it
 
     def _stamp(resp: dict) -> dict:
         # Wall-clock per dispatch — orchestrators need this for concurrency
         # tuning and it costs nothing to provide.
         resp["elapsed_ms"] = int((time.monotonic() - started) * 1000)
-        # Trust fields: what was ASKED FOR vs what the backend REPORTED serving.
-        # resolved=None means the backend didn't say (agy never does) — absence
-        # of proof, not proof of the requested model.
-        resp["model"] = {"requested": _requested_model, "resolved": resp.pop("model_resolved", None),
-                         "models_used": resp.pop("models_used", [])}
-        # codex rarely reports the served model in its stream — fall back to the
-        # config default so model.resolved isn't null (proves Sol-vs-not-Sol).
-        if inv.cli == "codex" and not resp["model"]["resolved"]:
+        # Trust fields, split by EVIDENCE (field case: a failed Fable dispatch
+        # reported the handshake model as `resolved` with all-zero usage):
+        #   requested  what the caller asked for (unchanged).
+        #   targeted   what the session was POINTED AT: the init handshake, else
+        #              the post-credit-guard effective model, else the backend's
+        #              knowable default (cursor pin, codex config).
+        #   served     ONLY on service evidence — a terminal-event model report,
+        #              or output tokens with a known target. Task status is NOT
+        #              evidence (a served run can be downgraded to blocked).
+        #   resolved   LEGACY v1 semantics, byte-for-byte unchanged (handshake-
+        #              or-terminal + the codex config backfill); consumers
+        #              migrate to targeted/served; retired in envelope v2.
+        _terminal_model = resp.pop("model_resolved", None)
+        _handshake = resp.pop("model_targeted", None)
+        _mu = resp.pop("models_used", [])
+        _effective = _guarded_inv.model
+        if not _effective:
+            if inv.cli == "cursor-agent":
+                from _builder import CURSOR_DEFAULT_MODEL as _cursor_default
+                _effective = _cursor_default
+            elif inv.cli == "codex":
+                try:
+                    from _resolver import _codex_default_model
+                    _effective = _codex_default_model()
+                except Exception:  # noqa: BLE001 — telemetry best-effort, never fatal
+                    _effective = None
+        _out_tokens = 0
+        if isinstance(resp.get("usage"), dict):
+            for _k in ("output_tokens", "completion_tokens"):
+                _v = resp["usage"].get(_k)
+                if isinstance(_v, (int, float)) and not isinstance(_v, bool):
+                    _out_tokens = max(_out_tokens, _v)
+        # STRICTLY handshake-then-effective: the terminal model is SERVED
+        # evidence and must never pollute what the session was pointed at
+        # (they can legitimately differ, and that difference is the signal).
+        _targeted = _handshake or _effective
+        if _terminal_model:
+            _served = _terminal_model
+        elif _out_tokens > 0 and _targeted:
+            _served = _targeted
+        else:
+            _served = None
+        _legacy = _terminal_model or _handshake
+        if inv.cli == "codex" and not _legacy:
             try:
                 from _resolver import _codex_default_model
-                resp["model"]["resolved"] = _codex_default_model()
+                _legacy = _codex_default_model()
             except Exception:  # noqa: BLE001 — telemetry best-effort, never fatal
                 pass
+        resp["model"] = {"requested": _requested_model, "targeted": _targeted,
+                         "served": _served, "resolved": _legacy, "models_used": _mu}
         resp["permission"] = inv.permission
         resp["effort"] = inv.effort   # reasoning effort actually applied (None = backend default)
         # agy can't read --cwd files; a "read <file>" prompt makes it review the
@@ -640,6 +681,9 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 "agy runs in an isolated profile and CANNOT read files under --cwd — this "
                 "prompt appears to reference a file to read; agy sees only the prompt text, "
                 "so inline the file's content instead of pointing at a path")
+        _pw = agy_permission_warning(inv.cli, inv.permission)
+        if _pw:
+            resp.setdefault("warnings", []).append(_pw)
         try:
             resp["permission_flags"] = permission_flags(inv.cli, inv.permission)
         except ValueError:
