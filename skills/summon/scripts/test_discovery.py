@@ -3072,6 +3072,80 @@ def test_rundir_carry_forward_validation():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_council_per_stage_timeouts_and_lease():
+    # B2.1: member stages use --member-timeout, chairman uses --chair-timeout;
+    # the owner lease is sized on the LARGER of the two so a long chair stage
+    # cannot outlive it.
+    import _council, _rundir as rd, argparse, io, contextlib, json as _json
+    d = tempfile.mkdtemp(prefix="summon-b2to-")
+    try:
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+        seen = {}
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+            seen[agent] = timeout_ms
+            return {"status": "success", "result": f"{agent} ok"
+                    + ("\nRANKING: A, B" if "-r2-" in tag else ""),
+                    "report": {"summary": agent}}
+        leases = []
+        orig_lease = rd.default_lease_sec
+        rd.default_lease_sec = lambda s: leases.append(s) or orig_lease(s)
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            args = argparse.Namespace(
+                question="q", question_file=None, members="m1,m2", chairman="chair",
+                rounds=1, cwd=os.getcwd(), agents_dir=d, timeout=90000, out=None,
+                run_dir=d, member_timeout=30000, chair_timeout=120000)
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = _council.run_council(args)
+        finally:
+            _council._dispatch = orig
+            rd.default_lease_sec = orig_lease
+        assert rc == 0
+        assert seen["m1"] == 30000 and seen["m2"] == 30000, seen  # member clock
+        assert seen["chair"] == 120000, seen                       # chair clock
+        assert leases and leases[0] == 120000 / 1000, leases       # lease on the max
+        # ceiling line reflects the split
+        assert "member timeout 30s, chair timeout 120s" in err.getvalue(), err.getvalue()
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_council_ceiling_doubles_chairman_under_fallback():
+    import _council, argparse, io, contextlib
+    d = tempfile.mkdtemp(prefix="summon-b2ceil-")
+    try:
+        for a in ("m1", "m2", "chair", "backup"):
+            open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+        def fake(agent, *a, **k):
+            return {"status": "success", "result": f"{agent} ok", "report": {"summary": agent}}
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            # rounds=1, 2 members (1 wave), timeout 90s (+60 margin = 150 each):
+            # with fallback -> 1*1*150 + 150*2 = 450s
+            args = argparse.Namespace(
+                question="q", question_file=None, members="m1,m2", chairman="chair",
+                rounds=1, cwd=os.getcwd(), agents_dir=d, timeout=90000, out=None,
+                run_dir=d, chairman_fallback="backup")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                _council.run_council(args)
+        finally:
+            _council._dispatch = orig
+        text = err.getvalue()
+        assert "2 chairman phase(s)" in text, text
+        assert "~450s" in text, text
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

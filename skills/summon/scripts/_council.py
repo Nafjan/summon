@@ -297,12 +297,21 @@ def run_council(args) -> int:
         return _fail(f"duplicate council members: {[m for m in members if members.count(m) > 1]}",
                      out_path)
 
+    # B2 knobs (all opt-in; unset preserves v1 behavior exactly).
+    quorum = getattr(args, "quorum", None)
+    if quorum is not None and not (isinstance(quorum, int) and 2 <= quorum <= len(members)):
+        return _fail(f"--quorum must be an integer in 2..{len(members)} (the member count)",
+                     out_path)
+    chairman_fallback = getattr(args, "chairman_fallback", None) or None
+
     from _loader import get_agents_dir, load_agent
     agents_dir = (args.agents_dir or (receipt_doc or {}).get("agents_dir")
                   or get_agents_dir(None, cwd))
     import _rundir as _rd
     _agent_shas: dict = {}
-    for who in dict.fromkeys(members + [chairman]):  # validate before any paid dispatch
+    # The fallback chairman (if any) is validated and hashed like every other agent.
+    _to_validate = members + [chairman] + ([chairman_fallback] if chairman_fallback else [])
+    for who in dict.fromkeys(_to_validate):  # validate before any paid dispatch
         try:
             loaded = load_agent(agents_dir, who)
             # Definition-identity hash: a changed agent definition (or a
@@ -318,8 +327,11 @@ def run_council(args) -> int:
     _exec_ctx = {"cwd": cwd, "agents_dir": os.path.abspath(agents_dir)}
 
     # --timeout arrives as whole milliseconds (argparse type). Pass it through as
-    # ms to the children; never silently substitute a default.
+    # ms to the children; never silently substitute a default. Member and
+    # chairman stages can carry their own clocks (default to --timeout when unset).
     timeout_ms = args.timeout if isinstance(args.timeout, int) else 600000
+    member_timeout_ms = getattr(args, "member_timeout", None) or timeout_ms
+    chair_timeout_ms = getattr(args, "chair_timeout", None) or timeout_ms
     cap = _per_member_cap(len(members))
 
     # The PERSISTENT run directory replaces the old throwaway mkdtemp (which
@@ -333,7 +345,11 @@ def run_council(args) -> int:
         except ValueError as e:
             return _fail(str(e), out_path)
     try:
-        owner = _rd.acquire_owner(rd_path, _rd.default_lease_sec(timeout_ms / 1000))
+        # Lease on the LONGER of the two stage clocks: a long chair stage must
+        # not outlive a lease sized on a short member timeout (would lose the
+        # lock mid-synthesis).
+        owner = _rd.acquire_owner(
+            rd_path, _rd.default_lease_sec(max(member_timeout_ms, chair_timeout_ms) / 1000))
     except (_rd.OwnerHeldError, _rd.OwnerLockForeignError, OSError) as e:
         return _fail(f"cannot own run {run_id}: {e}", out_path)
     try:  # a torn journal tail (crashed prior owner) is repaired ONLY here, under the lock
@@ -379,10 +395,14 @@ def run_council(args) -> int:
     for _b in member_backend.values():
         _counts[_b] = _counts.get(_b, 0) + 1
     _waves = max(-(-c // _PER_BACKEND_CAP) for c in _counts.values())
-    _phase = timeout_ms / 1000 + _CHILD_MARGIN_MS / 1000
-    _worst = int(rounds * _waves * _phase + _phase)
+    _margin = _CHILD_MARGIN_MS / 1000
+    _mphase = member_timeout_ms / 1000 + _margin
+    _cphase = chair_timeout_ms / 1000 + _margin
+    _chair_phases = 2 if chairman_fallback else 1   # primary + fallback in the worst case
+    _worst = int(rounds * _waves * _mphase + _cphase * _chair_phases)
     print(f"[council] worst-case wall clock ~{_worst}s ({_waves} wave(s)/round x "
-          f"{rounds} round(s) + chairman; child timeout {int(timeout_ms / 1000)}s) "
+          f"{rounds} round(s) + {_chair_phases} chairman phase(s); member timeout "
+          f"{int(member_timeout_ms / 1000)}s, chair timeout {int(chair_timeout_ms / 1000)}s) "
           "- set your host tool's timeout ABOVE this",
           file=sys.stderr, flush=True)
 
@@ -396,12 +416,14 @@ def run_council(args) -> int:
         except _rd.OwnershipLostError as e:
             lost["err"] = lost["err"] or str(e)
 
-    def run_stage(agent: str, prompt: str, stage: str, input_sha: str) -> dict:
+    def run_stage(agent: str, prompt: str, stage: str, input_sha: str,
+                  stage_timeout_ms: int) -> dict:
         """Dispatch ONE journaled, generation-namespaced stage and return the
         child envelope. The file tag is `g<generation>-<stage>` so a deposed
         owner's late child can never write into a successor's namespace. Every
         journal write is FENCED (owner=): a deposed parent aborts instead of
-        corrupting the successor's single-writer journal."""
+        corrupting the successor's single-writer journal. ``stage_timeout_ms``
+        is the member or chair clock for this stage type."""
         attempt_id = f"g{owner.generation}-{stage}-1"
         out_file = _rd.stage_path(rd_path, owner.generation, stage)
         try:  # a stale current-generation leftover (failed carry residue,
@@ -419,7 +441,7 @@ def run_council(args) -> int:
                                      "attempt_id": attempt_id,
                                      "generation": owner.generation,
                                      "kind": "initial"}, owner=owner)
-        env = _dispatch(agent, prompt, cwd, agents_dir, timeout_ms, rd_path,
+        env = _dispatch(agent, prompt, cwd, agents_dir, stage_timeout_ms, rd_path,
                         f"g{owner.generation}-{stage}")
         if isinstance(env, dict) and _rd.owner_still_current(owner):
             # Owner-side annotation (fenced): the upstream-input hash is what
@@ -478,7 +500,7 @@ def run_council(args) -> int:
         fresh_stages.add(stage)
         b = member_backend[agent]
         with sems[b]:
-            env = run_stage(agent, prompt, stage, input_sha)
+            env = run_stage(agent, prompt, stage, input_sha, member_timeout_ms)
         with lock:
             done["n"] += 1
             print(f"[council {done['n']}/{len(members)}] {agent} ({b}) "
@@ -658,7 +680,7 @@ def run_council(args) -> int:
         else:
             fresh_stages.add("chairman")
             print(f"[council] chairman {chairman} synthesizing...", file=sys.stderr, flush=True)
-            chair_env = run_stage(chairman, chair_prompt, "chairman", chair_sha)
+            chair_env = run_stage(chairman, chair_prompt, "chairman", chair_sha, chair_timeout_ms)
         _write_state("synthesized", chair_status=chair_env.get("status"))
         _supersede_stale()
         if lost["err"]:
