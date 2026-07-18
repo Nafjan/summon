@@ -408,7 +408,13 @@ def run_council(args) -> int:
               # crashed prior write) must not satisfy the child's --out skip
             os.unlink(out_file)
         except OSError:
-            pass
+            # If a success residue survives, dispatching would be SKIPPED by the
+            # child's --out logic -- never silently reuse it; abort the stage.
+            _left = _rd.read_json(out_file)
+            if _left and _left.get("status") == "success":
+                raise _rd.CarryResidueError(
+                    f"stale success file at {out_file} could not be removed; "
+                    "refusing to skip a fresh dispatch")
         _rd.journal_append(rd_path, {"event": "attempt_started", "stage": stage,
                                      "attempt_id": attempt_id,
                                      "generation": owner.generation,
@@ -509,13 +515,15 @@ def run_council(args) -> int:
                 pass
 
     def _write_state(phase: str, chair_status=None) -> None:
-        """Derived display index (envelopes + journal stay authoritative).
-        Fenced: a deposed owner must not overwrite the successor's index."""
+        """Derived display index, written to the OWNER'S generation segment
+        (state-g<N>.json) so a deposed owner and its successor never share the
+        file -- the same segmentation that makes the journal single-writer.
+        The fence is kept as belt-and-suspenders."""
         if not _rd.owner_still_current(owner):
             lost["err"] = lost["err"] or "ownership changed (state write refused)"
             return
         try:
-            _rd.atomic_write_json(os.path.join(rd_path, "state.json"), {
+            _rd.atomic_write_json(os.path.join(rd_path, f"state-g{owner.generation}.json"), {
                 "run_id": run_id, "generation": owner.generation, "phase": phase,
                 "stages": {m["agent"]: m.get("status") for m in results}
                           | ({"chairman": chair_status} if chair_status else {}),
@@ -660,6 +668,10 @@ def run_council(args) -> int:
         # with an envelope instead of a traceback; nothing of ours corrupted
         # the successor's namespace.
         return _fail(f"run ownership lost (a successor took over): {e}", out_path)
+    except _rd.CarryResidueError as e:
+        # A stale success file could not be removed, so a fresh dispatch would
+        # be silently skipped. Fail loudly rather than trust the stale result.
+        return _fail(f"run {run_id}: {e}", out_path)
     finally:
         # The run dir PERSISTS (that is the whole point); only our ownership ends.
         _rd.release_owner(owner)
@@ -792,7 +804,14 @@ def run_council_status(args) -> int:
             journal_note = f"journal corrupt: {e}"
         abandoned_ids = sorted(started_ids - finished_ids)
         receipt = _rd.read_json(os.path.join(rd_path, "receipt.json")) or {}
-        state = _rd.read_json(os.path.join(rd_path, "state.json")) or {}
+        # Derived state is segmented per generation; the newest wins for display.
+        _state_gens = []
+        for _name in names:
+            _sm = re.match(r"^state-g(\d+)\.json$", _name)
+            if _sm:
+                _state_gens.append(int(_sm.group(1)))
+        state = ({} if not _state_gens else
+                 _rd.read_json(os.path.join(rd_path, f"state-g{max(_state_gens)}.json")) or {})
         after = _rd.read_owner(rd_path)
         consistent = ((before or {}).get("nonce") == (after or {}).get("nonce")
                       and (before or {}).get("generation") == (after or {}).get("generation"))

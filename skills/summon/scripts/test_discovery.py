@@ -2381,8 +2381,8 @@ def test_council_fresh_run_persists_run_dir_artifacts():
         assert "stage_computed" in events
         fin = [r for r in recs if r["event"] == "attempt_finished"]
         assert all(f["status"] == "success" and f["usage"] for f in fin)
-        # derived state reached synthesis
-        state = rd.read_json(os.path.join(run, "state.json"))
+        # derived state (segmented per generation) reached synthesis
+        state = rd.read_json(os.path.join(run, "state-g1.json"))
         assert state["phase"] == "synthesized" and state["stages"]["chairman"] == "success"
     finally:
         import shutil as _sh
@@ -2593,14 +2593,16 @@ def test_council_renews_lease_after_every_stage():
         for a in ("m1", "m2", "chair"):
             open(os.path.join(root, a + ".md"), "w", encoding="utf-8").write(
                 "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
-        seen = []
+        # Count renewals directly by hooking renew_owner: v3.1 requires ONE per
+        # completed stage (5 dispatched stages for a 2-round, 2-member council:
+        # r1x2 + r2x2 + chairman). A per-ROUND design would renew only ~2-3x.
+        renews = {"n": 0}
+        orig_renew = rd.renew_owner
+        def counting_renew(owner):
+            renews["n"] += 1
+            return orig_renew(owner)
+        rd.renew_owner = counting_renew
         def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
-            # out_dir is the run dir; find the single lease-*.json sidecar
-            import glob as _g
-            for lp in _g.glob(os.path.join(out_dir, "lease-*.json")):
-                s = rd.read_json(lp)
-                if s:
-                    seen.append(s["lease_expires"])
             return {"status": "success", "result": f"{agent} ok"
                     + ("\nRANKING: A, B" if "-r2-" in tag else ""),
                     "report": {"summary": agent}}
@@ -2614,11 +2616,10 @@ def test_council_renews_lease_after_every_stage():
                 rc = _council.run_council(args)
         finally:
             _council._dispatch = orig
+            rd.renew_owner = orig_renew
         assert rc == 0
-        # at least the r2 + chairman dispatches saw a sidecar; those values are
-        # non-decreasing (renew after every stage only extends)
-        assert len(seen) >= 2, seen
-        assert seen == sorted(seen), seen
+        # exactly one renewal per dispatched stage (5), not per round
+        assert renews["n"] == 5, renews["n"]
     finally:
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
@@ -2716,14 +2717,15 @@ def test_rundir_journal_checksums_torn_tail_and_repair():
     d = tempfile.mkdtemp(prefix="summon-jrnl-")
     try:
         o = rd.acquire_owner(d, lease_sec=600)
-        rd.journal_append(d, {"event": "started", "stage": "r1-m1", "n": 1})
+        seg = rd._journal_path(d, o.generation)
+        rd.journal_append(d, {"event": "started", "stage": "r1-m1", "n": 1}, owner=o)
         rd.journal_append(d, {"event": "finished", "stage": "r1-m1", "n": 1,
-                              "status": "success", "note": "unicode → ok"})
+                              "status": "success", "note": "unicode → ok"}, owner=o)
         recs, torn = rd.journal_read(d)
         assert len(recs) == 2 and not torn
         assert recs[0]["event"] == "started" and "ts" in recs[0]
         # torn tail: a partial line is repairable, and repair records itself
-        with open(os.path.join(d, rd.JOURNAL_FILE), "a", encoding="utf-8") as fh:
+        with open(seg, "a", encoding="utf-8") as fh:
             fh.write('{"event":"finis')
         recs2, torn2 = rd.journal_read(d)
         assert torn2 and len(recs2) == 2
@@ -2731,9 +2733,9 @@ def test_rundir_journal_checksums_torn_tail_and_repair():
         recs3, torn3 = rd.journal_read(d)
         assert not torn3 and recs3[-1]["event"] == "journal_repaired"
         # mid-file corruption raises, never auto-repairs
-        lines = open(os.path.join(d, rd.JOURNAL_FILE), encoding="utf-8").read().splitlines()
+        lines = open(seg, encoding="utf-8").read().splitlines()
         lines[0] = lines[0].replace("started", "sabotag")
-        open(os.path.join(d, rd.JOURNAL_FILE), "w", encoding="utf-8").write("\n".join(lines) + "\n")
+        open(seg, "w", encoding="utf-8").write("\n".join(lines) + "\n")
         try:
             rd.journal_read(d)
             raise AssertionError("mid-file corruption not detected")
@@ -2778,16 +2780,23 @@ def test_rundir_review_races_lock_fencing_and_journal():
         open(lock, "w", encoding="utf-8").write(_json.dumps(succ))
         rd.release_owner(o)
         assert rd.read_owner(d)["nonce"] == "b" * 32     # successor intact
-        # (4) journal fencing: the deposed owner's append RAISES and writes
-        # nothing (single-writer guarantee survives a suspended parent)
-        rd.journal_append(d, {"event": "probe"})          # unfenced write, baseline
+        # (4) journal SEGMENTATION: even setting the fence aside, a deposed
+        # owner (generation 6) and its successor (generation 7) write DIFFERENT
+        # segment files, so interleaving is structurally impossible; and the
+        # fence still makes the deposed owner stop. Prove both.
+        succ_owner = rd.Owner(d, "b" * 32, 7, 600, open(lock, "rb").read())
+        rd.journal_append(d, {"event": "successor-writes"}, owner=succ_owner)
         n_before = len(rd.journal_read(d)[0])
         try:
-            rd.journal_append(d, {"event": "evil"}, owner=o)
+            rd.journal_append(d, {"event": "evil"}, owner=o)   # deposed gen-6 owner
             raise AssertionError("deposed owner journaled")
         except rd.OwnershipLostError:
             pass
         assert len(rd.journal_read(d)[0]) == n_before
+        # segments are per-generation and never shared
+        import glob as _g
+        segs = {os.path.basename(p) for p in _g.glob(os.path.join(d, "journal-g*.jsonl"))}
+        assert "journal-g7.jsonl" in segs and "journal-g6.jsonl" not in segs, segs
         # (5) deposed carry-forward withdraws its copy and raises
         rd.atomic_write_json(rd.stage_path(d, 6, "r1-x"),
                              {"status": "success", "input_sha256": "c" * 64})
@@ -2797,6 +2806,152 @@ def test_rundir_review_races_lock_fencing_and_journal():
         except rd.OwnershipLostError:
             pass
         assert not os.path.isfile(rd.stage_path(d, o.generation, "r1-x"))
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_rundir_toctou_windows_hook_injected():
+    # Finding 9: exercise the ACTUAL check-then-mutate windows with a takeover
+    # injected BETWEEN the ownership check and the mutation, not before the call.
+    import _rundir as rd
+    d = tempfile.mkdtemp(prefix="summon-toctou-")
+    try:
+        o = rd.acquire_owner(d, lease_sec=600)
+        lock = os.path.join(d, rd.OWNER_LOCK)
+        # A successor's bytes we will swap in DURING o's operations.
+        import json as _json, time as _t
+        succ = _json.dumps({"summon_owner": True, "nonce": "f" * 32, "pid": 999,
+                            "generation": o.generation + 1, "acquired_at": _t.time(),
+                            "lease_expires": _t.time() + 600}).encode("utf-8")
+
+        # (a) journal_append: takeover lands after owner_still_current passes but
+        # before the write. Segmentation saves us -> the deposed write goes to
+        # o's OWN abandoned segment, NEVER the successor's, so the successor's
+        # journal is untouched regardless of the fence timing.
+        orig = rd.owner_still_current
+        state = {"fire": False}
+        def hooked(owner):
+            ok = orig(owner)
+            if state["fire"]:
+                state["fire"] = False
+                with open(lock, "wb") as fh:   # successor takes over mid-window
+                    fh.write(succ)
+            return ok
+        rd.owner_still_current = hooked
+        try:
+            succ_owner = rd.Owner(d, "f" * 32, o.generation + 1, 600, succ)
+            state["fire"] = True
+            try:
+                rd.journal_append(d, {"event": "late"}, owner=o)
+            except rd.OwnershipLostError:
+                pass
+            # whatever happened, the successor's segment is intact/empty and o
+            # could only have touched its own generation's file
+            succ_recs, _ = rd._read_segment(rd._journal_path(d, o.generation + 1))
+            assert succ_recs == []
+        finally:
+            rd.owner_still_current = orig
+        # reset the lock to o for the release check
+        with open(lock, "wb") as fh:
+            fh.write(o.payload)
+
+        # (b) release_owner never deletes a successor's lock: swap in the
+        # successor right before release re-reads.
+        with open(lock, "wb") as fh:
+            fh.write(succ)
+        rd.release_owner(o)   # o's bytes != lock bytes -> no unlink
+        assert os.path.isfile(lock) and open(lock, "rb").read() == succ
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_rundir_stale_break_rejects_on_persist_failure_and_fresh_lease():
+    # Findings 2 + 7: a lease renewal that lands before the break must abort the
+    # break; a generation-persist failure must abort the break (never regress).
+    import _rundir as rd
+    import json as _json, time as _t
+    d = tempfile.mkdtemp(prefix="summon-break-")
+    try:
+        os.makedirs(d, exist_ok=True)
+        lock = os.path.join(d, rd.OWNER_LOCK)
+        expired = _json.dumps({"summon_owner": True, "nonce": "a" * 32, "pid": 1,
+                               "generation": 4, "acquired_at": _t.time() - 100,
+                               "lease_expires": _t.time() - 5}).encode("utf-8")
+        # (2) a fresh lease sidecar (owner renewed just in time) blocks the break
+        open(lock, "wb").write(expired)
+        rd.atomic_write_json(rd._lease_path(d, "a" * 32),
+                             {"summon_owner_lease": True, "nonce": "a" * 32,
+                              "lease_expires": _t.time() + 600})
+        try:
+            rd.acquire_owner(d, lease_sec=600)
+            raise AssertionError("broke a freshly-renewed lock")
+        except rd.OwnerHeldError:
+            pass
+        assert os.path.isfile(lock)  # untouched
+        os.unlink(rd._lease_path(d, "a" * 32))
+        # (7) a generation-persist failure aborts the break
+        orig = rd._write_generation
+        def boom(run_dir, generation):
+            raise OSError("disk full")
+        rd._write_generation = boom
+        try:
+            rd.acquire_owner(d, lease_sec=600)
+            raise AssertionError("broke a lock without persisting the generation")
+        except rd.OwnerHeldError:
+            pass
+        finally:
+            rd._write_generation = orig
+        assert os.path.isfile(lock)  # stale lock NOT unlinked -> no generation regression
+        # with persistence working, the break proceeds at generation 5
+        o = rd.acquire_owner(d, lease_sec=600)
+        assert o.generation == 5, o.generation
+        rd.release_owner(o)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_rundir_carry_residue_fatal_when_undeletable():
+    # Finding 4: a post-copy validation failure whose residue cannot be removed
+    # must raise, not silently leave a skippable success file. Force the failure
+    # by making the post-copy re-read disagree with the (matching) source, and
+    # make the cleanup unlink fail.
+    import _rundir as rd
+    d = tempfile.mkdtemp(prefix="summon-resid-")
+    try:
+        o1 = rd.acquire_owner(d, lease_sec=600)
+        sha = "a" * 64
+        rd.atomic_write_json(rd.stage_path(d, 1, "chairman"),
+                             {"status": "success", "input_sha256": sha})
+        rd.release_owner(o1)
+        o2 = rd.acquire_owner(d, lease_sec=600)   # generation 2
+        dst = rd.stage_path(d, o2.generation, "chairman")
+        # post-copy read returns a NON-success -> validation fails -> cleanup
+        real_read = rd.read_json
+        calls = {"n": 0}
+        def hooked_read(p):
+            if os.path.abspath(p) == os.path.abspath(dst):
+                calls["n"] += 1
+                if calls["n"] == 1:   # ONLY the post-copy validation read fails;
+                    return {"status": "error"}   # the leftover check sees the real
+            return real_read(p)                  # (success) residue on disk -> fatal
+        real_unlink = os.unlink
+        def failing_unlink(p):
+            if os.path.abspath(p) == os.path.abspath(dst):
+                raise OSError("sharing violation")
+            return real_unlink(p)
+        rd.read_json = hooked_read
+        os.unlink = failing_unlink
+        try:
+            rd.carry_forward(d, o2, "chairman", 1, sha)
+            raise AssertionError("undeletable residue was not fatal")
+        except rd.CarryResidueError:
+            pass
+        finally:
+            rd.read_json, os.unlink = real_read, real_unlink
+        rd.release_owner(o2)
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
