@@ -122,6 +122,20 @@ inspectable record.
   definition, or an edited earlier-stage output all invalidate the affected stage and
   everything downstream of it; stale files move to `superseded/` with their spend
   evidence intact.
+- **Quorum:** `--quorum N` synthesizes only when at least N members' final stage
+  succeeded (2..member-count). Below N the chairman is not dispatched (a `skipped`
+  tombstone is recorded and superseded on a later run). Quorum never changes the
+  top-level `status` (still `success` only if the synthesis succeeded and no member
+  failed); the outcome is reported in `synthesis.quorum` and `synthesis.decision_status`
+  (`full_participation` / `partial_participation` / `quorum_not_met` / `synthesis_failed`).
+- **Chairman fallback:** `--chairman-fallback AGENT` runs a second synthesizer once if the
+  primary chairman ends on any non-success outcome (only success suppresses it). Both
+  results persist and appear as `synthesis.primary` and `synthesis.fallback`; the chosen
+  recommendation is the fallback when it succeeded, else the primary. On a resume, a failed
+  primary re-runs before the fallback (a non-success stage is never carried forward).
+- **Per-stage timeouts:** `--member-timeout` and `--chair-timeout` give members and the
+  chairman their own clocks (default: `--timeout`). The wall-clock estimate uses both and
+  doubles the chairman phase when a fallback is configured.
 - **Status:** `summon council status <run-id>` prints the run's derived state
   (per-stage status, generation, attempts, abandoned work) read-only; add `--json` for
   machines. It takes a generation-stable snapshot and reports `consistent: false` if

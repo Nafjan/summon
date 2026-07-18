@@ -41,6 +41,19 @@ baseline and the iterative hardening on top of it.
   OpenAI, Anthropic, Google, Groq, DeepSeek, Together, local Ollama/LM Studio/vLLM) over
   stdlib HTTP, with providers from built-ins plus `providers.json`.
 
+**Council synthesis controls**
+- `--quorum N` gates whether the chairman runs: synthesis proceeds only when at least N
+  members (2..member-count) succeeded; below N the chairman is skipped and a `skipped`
+  tombstone is recorded. Quorum never changes the top-level `status` (which still requires
+  the synthesis to succeed with no failed members); the outcome is reported in
+  `synthesis.quorum` and `synthesis.decision_status`.
+- `--chairman-fallback AGENT` runs a second synthesizer once when the primary chairman
+  ends on any non-success outcome (only success suppresses it). Both outcomes persist as
+  `synthesis.primary` / `synthesis.fallback`, with council warnings and billing aggregated
+  across both.
+- `--member-timeout` / `--chair-timeout` give member and chairman stages their own clocks
+  (default: `--timeout`); the owner lease is sized on the longer of the two.
+
 **Durable, resumable councils**
 - Councils run on a persistent run directory (`{cwd}/.agents/runs/<run-id>/`; override with
   `--run-dir` or `SUMMON_RUNS_DIR`), replacing the throwaway temp dir that soft exits
