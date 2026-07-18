@@ -467,7 +467,11 @@ def test_envelope_model_and_permission_echo():
                             permission="read-only", model="opus"), timeout_ms=1000)
     finally:
         _executor.build_invocation_args = orig
-    assert out["model"] == {"requested": "opus", "resolved": None, "models_used": []}
+    # Spawn failure: no handshake, no terminal event -> targeted falls back to
+    # the guard-effective request; served stays None (no evidence); resolved
+    # keeps legacy v1 semantics (None here).
+    assert out["model"] == {"requested": "opus", "targeted": "opus", "served": None,
+                            "resolved": None, "models_used": []}
     assert out["permission"] == "read-only"
     assert out["permission_flags"] == ["--permission-mode", "plan"]
     assert "_debug_raw" not in out  # internal key never leaks into the envelope
@@ -985,7 +989,10 @@ def test_openai_compat_http_roundtrip():
                    capture_output=True, text=True, encoding="utf-8")
         env = _json.loads(r.stdout)
         assert env["status"] == "success" and env["result"].startswith("PONG")
-        assert env["model"] == {"requested": "test-model", "resolved": "test-model", "models_used": []}
+        # API reported the model on the terminal response -> served evidence
+        assert env["model"] == {"requested": "test-model", "targeted": "test-model",
+                                "served": "test-model", "resolved": "test-model",
+                                "models_used": []}
         assert env["usage"]["total_tokens"] == 9 and env["billing"]["source"] == "api"
         assert env["envelope"] == 1
     finally:
@@ -2030,6 +2037,98 @@ def test_agy_safe_edit_warning_helper_and_dry_run():
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
+
+
+def test_stream_handshake_separate_from_terminal_model():
+    # The init handshake announces the TARGETED model before any inference; it
+    # must never fill the terminal/served slot (field case: a failed Fable run
+    # reported resolved: claude-fable-5 with all-zero usage).
+    from _stream import StreamProcessor
+    p = StreamProcessor()
+    p.process_line('{"type":"system","subtype":"init","session_id":"s1","model":"claude-fable-5"}')
+    assert p.handshake_model == "claude-fable-5" and p.model is None
+    p.process_line('{"type":"result","is_error":true,"result":"","usage":{"output_tokens":0}}')
+    assert p.model is None and p.handshake_model == "claude-fable-5"
+    p2 = StreamProcessor()
+    p2.process_line('{"type":"thread.started","thread_id":"t1","model":"gpt-x"}')
+    assert p2.handshake_model == "gpt-x" and p2.model is None
+    # a terminal event that DOES name a model still lands in .model (served lane)
+    p3 = StreamProcessor()
+    p3.process_line('{"type":"system","subtype":"init","model":"claude-h"}')
+    p3.process_line('{"type":"result","result":"ok","model":"claude-t"}')
+    assert p3.handshake_model == "claude-h" and p3.model == "claude-t"
+
+
+def test_receipt_and_model_evidence_on_error_dispatch():
+    # One real (unpaid) dispatch to a dead local endpoint: the error envelope
+    # must carry the full provenance receipt AND honest model evidence.
+    import hashlib
+    import json as _json
+    import subprocess as sp
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-rcpt-")
+    try:
+        af = os.path.join(d, "dead-api.md")
+        open(af, "w", encoding="utf-8").write(
+            "---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:9\n"
+            "api_key_env:\nmodel: probe-model\n---\n# dead api\nrole.\n")
+        r = sp.run([sys.executable, script, "--agent", "dead-api", "--prompt", "hello",
+                    "--cwd", os.getcwd(), "--agents-dir", d, "--timeout", "8s"],
+                   capture_output=True, text=True, encoding="utf-8")
+        env = _json.loads(r.stdout)
+        assert env["status"] == "error", env
+        # model honesty: pointed at probe-model, nothing served
+        assert env["model"]["targeted"] == "probe-model", env["model"]
+        assert env["model"]["served"] is None, env["model"]
+        # receipt: dispatcher identity + agent identity + prompt hash + git head
+        s = env["summon"]
+        assert s["version"] and len(s["scripts_sha256"]) == 64, s
+        assert os.path.basename(s["script"]) == "run_subagent.py", s
+        ad = env["agent_def"]
+        assert ad["file"].endswith("dead-api.md") and ad["source"] == "explicit", ad
+        with open(af, "rb") as fh:
+            assert ad["sha256"] == hashlib.sha256(fh.read()).hexdigest(), ad
+        assert env["prompt_sha256"] == hashlib.sha256(b"hello").hexdigest(), env
+        gh = sp.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                    cwd=os.getcwd())
+        head = gh.stdout.strip() if gh.returncode == 0 else ""
+        assert env.get("git_head_before") == (head or None), (env.get("git_head_before"), head)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_receipt_helper_deterministic_and_sources():
+    import argparse
+    import run_subagent as r
+    here = os.path.dirname(os.path.abspath(__file__))
+    bundled = os.path.abspath(os.path.join(here, "..", "agents"))
+    planner = os.path.join(bundled, "planner.md")
+    saved = os.environ.pop("SUB_AGENTS_DIR", None)
+    try:
+        ns = argparse.Namespace(agents_dir=None, prompt="p")
+        r1 = r._build_receipt(ns, bundled, planner)
+        r2 = r._build_receipt(ns, bundled, planner)
+        assert r1 == r2  # deterministic
+        assert r1["agent_def"]["source"] == "bundled", r1["agent_def"]
+        assert r1["summon"]["scripts_sha256"] != r1["agent_def"]["sha256"]
+        # explicit --agents-dir wins the label when the file is not bundled
+        ns2 = argparse.Namespace(agents_dir="/x", prompt="p")
+        r3 = r._build_receipt(ns2, "/x", os.path.join(here, "run_subagent.py"))
+        assert r3["agent_def"]["source"] == "explicit", r3["agent_def"]
+        # default chain -> project; no prompt -> no prompt hash
+        ns3 = argparse.Namespace(agents_dir=None, prompt=None)
+        r4 = r._build_receipt(ns3, "/p", os.path.join(here, "run_subagent.py"))
+        assert r4["agent_def"]["source"] == "project" and "prompt_sha256" not in r4
+        # env tier labels as env
+        os.environ["SUB_AGENTS_DIR"] = "/e"
+        r5 = r._build_receipt(ns3, "/e", os.path.join(here, "run_subagent.py"))
+        assert r5["agent_def"]["source"] == "env", r5["agent_def"]
+    finally:
+        os.environ.pop("SUB_AGENTS_DIR", None)
+        if saved is not None:
+            os.environ["SUB_AGENTS_DIR"] = saved
 
 
 if __name__ == "__main__":

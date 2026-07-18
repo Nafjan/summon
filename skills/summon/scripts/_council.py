@@ -226,11 +226,13 @@ def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
 
 
 def _model_label(env: dict) -> str | None:
-    """A never-blank model label. Prefer the RESOLVED model; fall back to what was
-    REQUESTED when the backend didn't report one (codex often doesn't); show
-    ``requested -> resolved`` when they differ (e.g. the `opus` alias -> a version)."""
+    """A never-blank model label. Prefer evidence (served), then the legacy
+    resolved, then targeted; fall back to what was REQUESTED when the backend
+    didn't report one (codex often doesn't); show ``requested -> effective``
+    when they differ (e.g. the `opus` alias -> a version)."""
     m = env.get("model") or {}
-    req, res = m.get("requested"), m.get("resolved")
+    req = m.get("requested")
+    res = m.get("served") or m.get("resolved") or m.get("targeted")
     if res and req and res != req:
         return f"{req} -> {res}"
     return res or req
