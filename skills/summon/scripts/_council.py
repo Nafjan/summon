@@ -660,28 +660,87 @@ def run_council(args) -> int:
             m.pop("_raw", None)
             m.pop("_env", None)
 
-        # ---- synthesis: the chairman calls it -------------------------------
+        # ---- synthesis: quorum gate, chairman, optional fallback ------------
+        # Quorum is defined against the FINAL member stage (`results` holds r2's
+        # views for a 2-round council, r1's for a 1-round one).
+        members_succeeded = sum(1 for m in results if m.get("status") == "success")
+        absent_members = [m["agent"] for m in results if m.get("status") != "success"]
+
+        # Mark BOTH synthesis stages fresh at the decision point, so the sweep
+        # supersedes any prior generation's chairman AND fallback -- a stale
+        # prior-gen synthesis must never show through on status (a carried-forward
+        # chairman's current-generation copy survives; only the older file moves).
+        fresh_stages.add("chairman")
+        fresh_stages.add("chairman-fallback")
+
         rnote = ""
         if consensus_ranking:
             rnote = ("\nPEER RANKING (advisors ranked each other, best-first): "
                      + ", ".join(f"{c['agent']}={c['score']}" for c in consensus_ranking) + "\n")
-        # The chairman hash covers the EXACT prompt (which already encodes every
-        # advisor's agent, model/backend label, FAILED flag, and position) plus
-        # the chairman's own definition hash and execution identity.
         chair_prompt = _chairman_prompt(question, results, rnote)
-        chair_sha = _rd.content_sha256({"prompt": chair_prompt,
-                                        "agent_sha": _agent_shas.get(chairman),
-                                        **_exec_ctx})
-        _chair_pg = _prior_generation("chairman")
-        if _chair_pg and _rd.carry_forward(rd_path, owner, "chairman", _chair_pg, chair_sha):
-            chair_env = _rd.read_json(_rd.stage_path(rd_path, owner.generation, "chairman")) or {}
-            print(f"[council] chairman carried forward from generation {_chair_pg}",
-                  file=sys.stderr, flush=True)
+
+        primary_env = None
+        fallback_env = None
+        quorum_skipped = False
+
+        if quorum is not None and members_succeeded < quorum:
+            # Not enough members to make the decision worth paying for. Write a
+            # current-generation tombstone so status/resume see a definitive
+            # skipped chairman rather than a stale prior-generation success.
+            quorum_skipped = True
+            chair_env = {"status": "skipped", "reason": "quorum_not_met",
+                         "stage": "chairman", "result": None,
+                         "note": (f"{members_succeeded}/{len(members)} members succeeded; "
+                                  f"quorum {quorum} not met")}
+            try:
+                _rd.atomic_write_json(_rd.stage_path(rd_path, owner.generation, "chairman"),
+                                      {**chair_env, "input_sha256": None})
+                _rd.journal_append(rd_path, {"event": "attempt_skipped", "stage": "chairman",
+                                             "generation": owner.generation,
+                                             "reason": "quorum_not_met"}, owner=owner)
+            except OSError:
+                pass
+            print(f"[council] chairman skipped: quorum {quorum} not met "
+                  f"({members_succeeded}/{len(members)} members)", file=sys.stderr, flush=True)
+            _write_state("quorum_not_met")
         else:
-            fresh_stages.add("chairman")
-            print(f"[council] chairman {chairman} synthesizing...", file=sys.stderr, flush=True)
-            chair_env = run_stage(chairman, chair_prompt, "chairman", chair_sha, chair_timeout_ms)
-        _write_state("synthesized", chair_status=chair_env.get("status"))
+            # The chairman hash covers the EXACT prompt (which encodes every
+            # advisor's agent/model/FAILED flag/position) plus the chairman's own
+            # definition hash and execution identity.
+            chair_sha = _rd.content_sha256({"prompt": chair_prompt,
+                                            "agent_sha": _agent_shas.get(chairman),
+                                            **_exec_ctx})
+            _chair_pg = _prior_generation("chairman")
+            if _chair_pg and _rd.carry_forward(rd_path, owner, "chairman", _chair_pg, chair_sha):
+                primary_env = _rd.read_json(_rd.stage_path(rd_path, owner.generation, "chairman")) or {}
+                print(f"[council] chairman carried forward from generation {_chair_pg}",
+                      file=sys.stderr, flush=True)
+            else:
+                print(f"[council] chairman {chairman} synthesizing...", file=sys.stderr, flush=True)
+                primary_env = run_stage(chairman, chair_prompt, "chairman", chair_sha, chair_timeout_ms)
+            chair_env = primary_env
+            # Fallback runs ONLY on an authoritative non-success primary. Its own
+            # stage, its own hash (incl. the fallback agent NAME so switching
+            # fallbacks never carries the wrong result), carry-forwardable too.
+            if chairman_fallback and primary_env.get("status") != "success":
+                fb_sha = _rd.content_sha256({"prompt": chair_prompt,
+                                             "fallback_agent": chairman_fallback,
+                                             "agent_sha": _agent_shas.get(chairman_fallback),
+                                             **_exec_ctx})
+                _fb_pg = _prior_generation("chairman-fallback")
+                if _fb_pg and _rd.carry_forward(rd_path, owner, "chairman-fallback", _fb_pg, fb_sha):
+                    fallback_env = _rd.read_json(
+                        _rd.stage_path(rd_path, owner.generation, "chairman-fallback")) or {}
+                    print(f"[council] fallback chairman carried forward from generation {_fb_pg}",
+                          file=sys.stderr, flush=True)
+                else:
+                    print(f"[council] primary chairman {primary_env.get('status')}; fallback "
+                          f"{chairman_fallback} synthesizing...", file=sys.stderr, flush=True)
+                    fallback_env = run_stage(chairman_fallback, chair_prompt,
+                                             "chairman-fallback", fb_sha, chair_timeout_ms)
+                # The CHOSEN synthesis is the fallback when it succeeded, else the primary.
+                chair_env = fallback_env if fallback_env.get("status") == "success" else primary_env
+            _write_state("synthesized", chair_status=chair_env.get("status"))
         _supersede_stale()
         if lost["err"]:
             return _fail(f"run ownership lost during synthesis: {lost['err']}", out_path)
@@ -711,18 +770,75 @@ def run_council(args) -> int:
                                     "avoid agy members in a repo-inspection council")
     for m in results:
         council_warnings += [f"{m['agent']}: {w}" for w in (m.get("warnings") or [])]
-    council_warnings += [f"{chairman}: {w}" for w in (chair_env.get("warnings") or [])]
-    billing_sources = sorted({(m.get("billing") or {}).get("source")
-                              for m in results if m.get("billing")}
-                             | ({(chair_env.get("billing") or {}).get("source")}
-                                if chair_env.get("billing") else set())
-                             - {None})
+    # Aggregate BOTH chairman envelopes (primary + fallback) so a fallback's
+    # warnings/billing are never hidden. On a quorum-skip both are None.
+    for _cenv, _who in ((primary_env, chairman), (fallback_env, chairman_fallback)):
+        if _cenv:
+            council_warnings += [f"{_who}: {w}" for w in (_cenv.get("warnings") or [])]
+    billing_sources = sorted(
+        {(m.get("billing") or {}).get("source") for m in results if m.get("billing")}
+        | {(e.get("billing") or {}).get("source")
+           for e in (primary_env, fallback_env) if e and e.get("billing")}
+        - {None})
 
     failed = [m["agent"] for m in results if m.get("status") != "success"]
-    # Status reflects the WHOLE council: success only if the chairman synthesized
-    # AND every member answered; otherwise partial (the recommendation may still
-    # be usable, but the caller must know the council wasn't whole).
-    status = "success" if (chair_env.get("status") == "success" and not failed) else "partial"
+    synth_ok = chair_env.get("status") == "success"
+    # Status reflects the WHOLE council: success only if the SYNTHESIS succeeded
+    # (primary or fallback) AND every member answered; otherwise partial. Quorum
+    # NEVER promotes this to success -- it only gates whether synthesis ran.
+    status = "success" if (synth_ok and not failed) else "partial"
+
+    if quorum_skipped:
+        decision_status = "quorum_not_met"
+    elif not synth_ok:
+        decision_status = "synthesis_failed"
+    elif failed:
+        decision_status = "partial_participation"
+    else:
+        decision_status = "full_participation"
+
+    def _outcome(env: dict | None, agent: str) -> dict | None:
+        if not env:
+            return None
+        return {"agent": agent, "model": _model_label(env), "status": env.get("status"),
+                "error": env.get("error"), "billing": env.get("billing"),
+                "warnings": env.get("warnings")}
+
+    fallback_used = bool(fallback_env is not None and chair_env is fallback_env)
+    if quorum_skipped:
+        selection_reason = "chairman skipped (quorum not met)"
+    elif fallback_used:
+        selection_reason = f"primary chairman {primary_env.get('status')}; fallback synthesized"
+    elif fallback_env is not None:
+        selection_reason = "primary and fallback both failed; kept primary"
+    elif chairman_fallback:
+        selection_reason = "primary chairman succeeded; fallback not needed"
+    else:
+        selection_reason = None
+
+    synthesis = {
+        "chairman": chairman,
+        "backend": backend_of(chairman),
+        "model": _model_label(chair_env),
+        "status": chair_env.get("status"),
+        "recommendation": chair_env.get("result") or chair_env.get("error"),
+        "report": chair_env.get("report"),
+        "billing": chair_env.get("billing"),
+        "warnings": chair_env.get("warnings"),
+        "decision_status": decision_status,
+        "members_succeeded": members_succeeded,
+        "members_total": len(members),
+        "absent_members": absent_members,
+        "quorum": None if quorum is None else {"required": quorum,
+                                               "met": members_succeeded >= quorum},
+        "fallback_used": fallback_used,
+        "selection_reason": selection_reason,
+    }
+    if not quorum_skipped:
+        synthesis["primary"] = _outcome(primary_env, chairman)
+    if fallback_env is not None:
+        synthesis["fallback"] = _outcome(fallback_env, chairman_fallback)
+
     envelope = {
         "mode": "council",
         "envelope": 1,
@@ -735,16 +851,7 @@ def run_council(args) -> int:
         "members": results,
         "failed_members": failed,
         "consensus_ranking": consensus_ranking,   # None unless --rounds 2 produced votes
-        "synthesis": {
-            "chairman": chairman,
-            "backend": backend_of(chairman),
-            "model": _model_label(chair_env),
-            "status": chair_env.get("status"),
-            "recommendation": chair_env.get("result") or chair_env.get("error"),
-            "report": chair_env.get("report"),
-            "billing": chair_env.get("billing"),
-            "warnings": chair_env.get("warnings"),
-        },
+        "synthesis": synthesis,
         "billing_sources": billing_sources,   # e.g. ["subscription"] or ["credit","subscription"]
         "warnings": council_warnings or None,  # member/chairman warnings, agent-tagged
         "elapsed_ms": int((time.monotonic() - started) * 1000),
