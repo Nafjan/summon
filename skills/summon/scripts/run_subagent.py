@@ -281,6 +281,53 @@ def _spawn_background(args: argparse.Namespace) -> dict:
     return {"status": "background", "job_id": job_id, "pid": proc.pid, "result_file": result_file}
 
 
+# --- Fan-out mode flag matrix --------------------------------------------------
+# The flags each fan-out mode actually CONSUMES. --manifest and --council branch
+# out of main() before most dispatch flags are read, so anything outside these
+# sets used to be SILENTLY IGNORED -- field case: a council run passed --out
+# expecting an artifact and never got one. A flag that would be dropped is now
+# rejected loudly BEFORE any paid dispatch. Whitelist, not blacklist: a flag
+# added to the parser later is rejected-by-default in these modes until a mode
+# explicitly supports it.
+_MODE_FLAGS = {
+    "manifest": {"manifest", "concurrency", "results_dir", "cwd", "agents_dir",
+                 "retries", "job_file"},
+    "council": {"council", "question", "question_file", "members", "chairman",
+                "rounds", "cwd", "agents_dir", "timeout", "out", "job_file"},
+}
+_MODE_HINTS = {
+    "manifest": ("Put per-job settings (model, effort, timeout, json_schema, "
+                 "debug_dir, prompt/prompt_file) in the manifest's jobs/defaults; "
+                 "per-job envelopes land under --results-dir."),
+    "council": ("--out IS supported (the council envelope, checkpointed at each "
+                "phase); member model/effort/permission come from each member "
+                "agent's own definition."),
+}
+_FLAG_NAMES = {"sets": "--set"}  # dests whose flag spelling isn't dest.replace('_','-')
+
+
+def _unsupported_mode_flags(parser: argparse.ArgumentParser,
+                            args: argparse.Namespace) -> str | None:
+    """Error text when a fan-out mode received flags it does not consume, else
+    None. 'Explicitly set' is detected as differing from the argparse default
+    (a value equal to its default is indistinguishable from unset -- harmless,
+    since the default is what the mode does anyway)."""
+    mode = "manifest" if args.manifest else ("council" if args.council else None)
+    if mode is None:
+        return None
+    allowed = _MODE_FLAGS[mode]
+    offending = sorted(
+        _FLAG_NAMES.get(dest, "--" + dest.replace("_", "-"))
+        for dest in vars(args)
+        if dest not in allowed and getattr(args, dest) != parser.get_default(dest)
+    )
+    if not offending:
+        return None
+    return (f"--{mode} does not support {', '.join(offending)}: these flags would "
+            f"have been silently ignored, so they are rejected instead. "
+            f"{_MODE_HINTS[mode]}")
+
+
 # --- Subcommand front-end -----------------------------------------------------
 # summon presents git-style subcommands (dispatch/manifest/council/doctor/models/
 # agent/list/version) that translate to the underlying flat flags. The flat form
@@ -518,6 +565,13 @@ def main() -> None:
         _print_error("--background and --out are incompatible: background reports "
                      "completion via its own result_file; --out is the (manifest) "
                      "result-file mechanism. Use --manifest for fan-out with result files.")
+        sys.exit(1)
+
+    # Fan-out modes consume a fixed flag set; anything else explicitly set is
+    # rejected up front (see _MODE_FLAGS -- silent drops burned real runs).
+    _bad_mode_flags = _unsupported_mode_flags(parser, args)
+    if _bad_mode_flags:
+        _print_error(_bad_mode_flags)
         sys.exit(1)
 
     # --manifest: batch fan-out. Delegates to _manifest and exits.

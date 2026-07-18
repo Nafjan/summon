@@ -1746,6 +1746,168 @@ def test_preflight_doctor_failure_is_soft():
         r.shutil.which, _doctor.doctor = ow, od
 
 
+def test_mode_flag_matrix_rejects_swallowed_flags():
+    # Flags a fan-out mode does not consume must be REJECTED, not silently
+    # dropped (field case: council --out never written). Zero paid dispatches:
+    # rejection happens before any backend work, so these run fast.
+    import json as _json
+    import subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    cases = [
+        (["--council", "--question", "x", "--cwd", os.getcwd(), "--model", "opus"],
+         "--model"),
+        (["--council", "--question", "x", "--cwd", os.getcwd(), "--worktree"],
+         "--worktree"),
+        (["--council", "--question", "x", "--cwd", os.getcwd(), "--json-schema", "s.json"],
+         "--json-schema"),
+        (["--council", "--question", "x", "--cwd", os.getcwd(), "--background"],
+         "--background"),
+        (["--council", "--question", "x", "--cwd", os.getcwd(), "--retries", "2"],
+         "--retries"),
+        (["--manifest", "jobs.json", "--out", "o.json"], "--out"),
+        (["--manifest", "jobs.json", "--worktree", "w"], "--worktree"),
+        (["--manifest", "jobs.json", "--background"], "--background"),
+        (["--manifest", "jobs.json", "--list"], "--list"),
+    ]
+    for argv, flag in cases:
+        r = sp.run([sys.executable, script, *argv], capture_output=True, text=True,
+                   encoding="utf-8")
+        env = _json.loads(r.stdout)
+        assert env["status"] == "error" and flag in env["error"], (argv, env)
+        assert "silently ignored" in env["error"], env["error"]
+        assert r.returncode == 1, (argv, r.returncode)
+    # Supported flags still pass the matrix: council --out reaches council
+    # validation (fails on the missing question, NOT on the flag matrix).
+    r = sp.run([sys.executable, script, "--council", "--cwd", os.getcwd(),
+                "--out", os.path.join(tempfile.gettempdir(), "cx.json")],
+               capture_output=True, text=True, encoding="utf-8")
+    env = _json.loads(r.stdout)
+    assert "silently ignored" not in (env.get("error") or ""), env
+    assert "--question" in env["error"], env
+
+
+def test_council_out_checkpoints_and_final():
+    # --out must hold a round1_complete checkpoint BY THE TIME the chairman
+    # runs (that snapshot is what survives a host-tool kill mid-synthesis),
+    # then be replaced by the final envelope.
+    import _council, argparse, io, contextlib, json as _json
+    d = tempfile.mkdtemp(prefix="summon-cout-")
+    out = os.path.join(d, "council.json")
+    seen = {}
+    try:
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\nrole.\n")
+
+        def fake_dispatch(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+            if agent == "chair":
+                with open(out, encoding="utf-8") as fh:  # checkpoint must already exist
+                    seen["at_chair"] = _json.load(fh)
+                return {"status": "success", "result": "DECISION: X",
+                        "report": {"summary": "X"}}
+            return {"status": "success", "result": f"{agent} ok",
+                    "report": {"summary": f"{agent} pos"}}
+
+        orig = _council._dispatch
+        _council._dispatch = fake_dispatch
+        try:
+            args = argparse.Namespace(question="X or Y?", question_file=None,
+                                      members="m1,m2", chairman="chair", rounds=1,
+                                      cwd=os.getcwd(), agents_dir=d, timeout=90000,
+                                      out=out)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = _council.run_council(args)
+        finally:
+            _council._dispatch = orig
+        assert rc == 0
+        cp = seen["at_chair"]
+        assert cp["council_state"] == "round1_complete" and cp["status"] == "in_progress"
+        assert len(cp["members"]) == 2 and all("_raw" not in m for m in cp["members"])
+        final = _json.loads(open(out, encoding="utf-8").read())
+        assert final["council_state"] == "final" and final["status"] == "success"
+        stdout_env = _json.loads(buf.getvalue())
+        assert stdout_env == final  # file and stdout agree
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_council_out_written_on_fail_and_question_conflict():
+    import _council, argparse, io, contextlib, json as _json
+    d = tempfile.mkdtemp(prefix="summon-cfail-")
+    try:
+        out = os.path.join(d, "fail.json")
+        # validation failure -> error envelope lands in --out too
+        args = argparse.Namespace(question="", question_file=None, members=None,
+                                  chairman=None, rounds=1, cwd=os.getcwd(),
+                                  agents_dir=d, timeout=60000, out=out)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = _council.run_council(args)
+        assert rc == 1
+        env = _json.loads(open(out, encoding="utf-8").read())
+        assert env["status"] == "error" and env["council_state"] == "failed"
+        # question + question-file together is ambiguous -> rejected
+        qf = os.path.join(d, "q.md")
+        open(qf, "w", encoding="utf-8").write("file question")
+        args2 = argparse.Namespace(question="inline too", question_file=qf,
+                                   members=None, chairman=None, rounds=1,
+                                   cwd=os.getcwd(), agents_dir=d, timeout=60000,
+                                   out=None)
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            rc2 = _council.run_council(args2)
+        env2 = _json.loads(buf2.getvalue())
+        assert rc2 == 1 and "not both" in env2["error"], env2
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_council_ceiling_estimate_on_stderr():
+    # The additive-clock preflight line: 2 claude members = 1 wave/round; with
+    # rounds=2 and timeout 90s (+60s margin) -> 2*1*150 + 150 = 450s.
+    import _council, argparse, io, contextlib
+    d = tempfile.mkdtemp(prefix="summon-ceil-")
+    try:
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+        def fake(agent, *a, **k):
+            return {"status": "success", "result": "ok", "report": {"summary": "s"}}
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            args = argparse.Namespace(question="q", question_file=None,
+                                      members="m1,m2", chairman="chair", rounds=2,
+                                      cwd=os.getcwd(), agents_dir=d, timeout=90000,
+                                      out=None)
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                _council.run_council(args)
+        finally:
+            _council._dispatch = orig
+        text = err.getvalue()
+        assert "worst-case wall clock ~450s" in text, text
+        assert "ABOVE" in text, text
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_manifest_rejects_prompt_and_prompt_file():
+    import _manifest as m
+    jobs, err = m._normalize_jobs(
+        {"jobs": [{"agent": "a", "prompt": "p", "prompt_file": "f.md"}]}, os.getcwd())
+    assert jobs is None and "not both" in err, (jobs, err)
+    # defaults-level prompt_file + per-job prompt is the sneaky variant
+    jobs2, err2 = m._normalize_jobs(
+        {"defaults": {"prompt_file": "f.md"}, "jobs": [{"agent": "a", "prompt": "p"}]},
+        os.getcwd())
+    assert jobs2 is None and "not both" in err2, (jobs2, err2)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
