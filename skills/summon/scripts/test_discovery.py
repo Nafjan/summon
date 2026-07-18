@@ -3433,21 +3433,57 @@ def test_council_status_flags_stale_synthesis_generation():
         _sh.rmtree(root, ignore_errors=True)
 
 
+def test_council_status_generation_from_owner_not_only_files():
+    # NEW-finding regression: a live owner at generation 2 with NO gen-2 stage
+    # file yet must still make a surviving gen-1 tombstone read as stale. The
+    # run's current generation comes from the durable generation claim (owner /
+    # generation.txt), not stage filenames alone.
+    import _council, _rundir as rd, argparse, io, contextlib, json as _json
+    root = tempfile.mkdtemp(prefix="summon-genown-")
+    try:
+        _mk_agents(root, ("m1", "m2", "chair"))
+        rc1, env1 = _b2_council(root, ["m1", "m2"])   # gen 1, released
+        rdir = env1["run_dir"]
+        # a live gen-2 owner takes the lock but writes no stage file yet
+        o2 = rd.acquire_owner(rdir, lease_sec=600)
+        try:
+            assert o2.generation == 2
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                _council.run_council_status(argparse.Namespace(
+                    council_status=env1["run_id"], run_dir=root, json=True, cwd=os.getcwd()))
+            view = _json.loads(buf.getvalue())
+            assert view["current_generation"] == 2, view["current_generation"]
+            assert view["stages"]["chairman"]["current"] is False   # g1 chairman is stale
+        finally:
+            rd.release_owner(o2)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
 def test_council_b2_flags_matrix():
-    # The new B2 flags are accepted on council + council-resume, rejected on status.
+    # All four B2 flags are accepted on council AND council-resume, rejected on status.
     import json as _json, subprocess as sp
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
-    # accepted on a fresh council (fails later on missing question, NOT on the flag)
-    r = sp.run([sys.executable, script, "--council", "--cwd", os.getcwd(),
-                "--quorum", "2", "--chairman-fallback", "x", "--member-timeout", "30s",
-                "--chair-timeout", "2m"], capture_output=True, text=True, encoding="utf-8")
-    env = _json.loads(r.stdout)
-    assert "silently ignored" not in (env.get("error") or ""), env
-    # rejected on status
-    r2 = sp.run([sys.executable, script, "--council-status", "x", "--quorum", "2"],
-                capture_output=True, text=True, encoding="utf-8")
-    env2 = _json.loads(r2.stdout)
-    assert env2["status"] == "error" and "--quorum" in env2["error"], env2
+    b2 = ["--quorum", "2", "--chairman-fallback", "x",
+          "--member-timeout", "30s", "--chair-timeout", "2m"]
+    # accepted on a fresh council (fails later on missing question, NOT on a flag)
+    r = sp.run([sys.executable, script, "--council", "--cwd", os.getcwd(), *b2],
+               capture_output=True, text=True, encoding="utf-8")
+    assert "silently ignored" not in (_json.loads(r.stdout).get("error") or ""), r.stdout
+    # accepted on a resume (fails on the unknown run, NOT on a flag)
+    r2 = sp.run([sys.executable, script, "--council", "--resume-run", "nope-run",
+                 "--cwd", os.getcwd(), *b2], capture_output=True, text=True, encoding="utf-8")
+    err2 = _json.loads(r2.stdout).get("error") or ""
+    assert "silently ignored" not in err2 and "unknown council run" in err2, r2.stdout
+    # each of the four rejected on status
+    for flag, val in (("--quorum", "2"), ("--chairman-fallback", "x"),
+                      ("--member-timeout", "30s"), ("--chair-timeout", "2m")):
+        r3 = sp.run([sys.executable, script, "--council-status", "x", flag, val],
+                    capture_output=True, text=True, encoding="utf-8")
+        env3 = _json.loads(r3.stdout)
+        assert env3["status"] == "error" and flag in env3["error"], (flag, env3)
 
 
 def test_council_per_stage_timeouts_and_lease():

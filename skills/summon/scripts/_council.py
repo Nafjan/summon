@@ -708,11 +708,15 @@ def run_council(args) -> int:
                                                  "generation": owner.generation,
                                                  "reason": "quorum_not_met"}, owner=owner)
                 except _rd.OwnershipLostError:
+                    _removed = True
                     try:
                         os.unlink(_tomb)
                     except OSError:
-                        pass
-                    lost["err"] = lost["err"] or "ownership changed (quorum tombstone withdrawn)"
+                        _removed = False   # surfaced below; readers mark it stale
+                    lost["err"] = lost["err"] or (
+                        "ownership changed (quorum tombstone withdrawn)" if _removed else
+                        "ownership changed; a stale quorum tombstone could not be removed "
+                        "(status treats it as below the current generation)")
             print(f"[council] chairman skipped: quorum {quorum} not met "
                   f"({members_succeeded}/{len(members)} members)", file=sys.stderr, flush=True)
             _write_state("quorum_not_met")
@@ -921,22 +925,27 @@ def run_council_status(args) -> int:
             names = sorted(os.listdir(rd_path))
         except OSError:
             names = []
-        current_generation = 0
+        file_max_gen = 0
         for name in names:
             m = re.match(r"^g(\d+)-(.+)\.json$", name)
             if not m:
                 continue
             gen, stage = int(m.group(1)), m.group(2)
-            current_generation = max(current_generation, gen)
+            file_max_gen = max(file_max_gen, gen)
             cur = stages.get(stage)
             if cur is None or gen >= cur["generation"]:
                 env = _rd.read_json(os.path.join(rd_path, name)) or {}
                 stages[stage] = {"generation": gen, "status": env.get("status"),
                                  "carried_from": env.get("carried_from_generation")}
-        # Generation coherence: a stage whose newest file lags the run's newest
-        # generation is NOT current (e.g. a synthesis stage left behind when a
-        # later generation was deposed before it could run/supersede). Flag it
-        # rather than letting a stale prior-generation synthesis read as live.
+        # The run's current generation is the MAX durable generation claim:
+        # stage files, the generation.txt counter, AND a live owner's generation.
+        # (A live owner at gen N+1 that has not written any stage yet still means
+        # a surviving gen-N tombstone -- e.g. one whose fenced withdrawal failed
+        # on OSError -- is stale, not current.)
+        current_generation = max(file_max_gen, _rd._last_generation(rd_path))
+        # Generation coherence: a stage whose newest file lags the run's current
+        # generation is NOT live (a synthesis stage left behind when a later
+        # generation was deposed, or a stale tombstone that could not be removed).
         for _st in stages.values():
             _st["current"] = _st["generation"] == current_generation
         attempts = {"started": 0, "finished": 0}
