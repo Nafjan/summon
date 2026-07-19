@@ -160,7 +160,9 @@ Parse JSON output and check `status` field:
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy |
 | `--resume-profile` | No | agy only: the `resume.profile` path returned by the prior agy call |
 | `--worktree` | No | Run in an isolated git worktree (optional name; auto-named if bare) |
-| `--background` | No | Dispatch detached; returns `{status:"background", job_id, result_file}` at once |
+| `--background` | No | Dispatch detached; returns `{status:"background", job_id, result_file, job_dir, record_file}` at once. A launch record is written (fsynced) before the child spawns, so a job that dies before its result is still traceable |
+| `--job-dir DIR` | No | Where `--background` writes job records and results (default `{tempdir}/subagents_jobs`; env `SUMMON_JOBS_DIR`). Point it at a durable, private path. Single-user model: summon does not defend the registry against other local users on a shared host |
+| `jobs list` / `jobs status ID` / `jobs wait ID` | - | Read-only registry commands (flat: `--jobs-list` / `--jobs-status ID` / `--jobs-wait ID`; add `--job-dir`, `--json`, and `--timeout` for `wait`). `list` shows every job's state (`prepared` / `running` / a terminal status / `unverified`); `status` prints one job's record + result; `wait` polls for a nonce-verified result. A result is `trusted` only when its `job_nonce` matches the launch record; a job with a pid is reported `running` but not asserted alive (liveness and reaping arrive later) |
 | `--dry-run` | No | Print the fully resolved dispatch (command, model, permission flags) WITHOUT executing — catches wrong models/permissions/dead backends in zero paid runs |
 | `--out FILE` | No | Write the envelope atomically to FILE; if FILE already holds a **`status: success`** envelope the run is SKIPPED (`skipped: true`) — swarm resume for free. A prior error/blocked/partial is re-run (re-launching retries failures) |
 | `--retries N` | No | Re-dispatch up to N times on `error`/`partial` (exponential backoff; `blocked` is never retried — its cause is structural). Envelope gains `attempts` |

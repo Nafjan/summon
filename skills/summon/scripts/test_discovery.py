@@ -3560,6 +3560,183 @@ def test_council_ceiling_doubles_chairman_under_fallback():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_jobs_dir_resolution_and_id_validation():
+    import _jobs
+    saved = os.environ.pop("SUMMON_JOBS_DIR", None)
+    try:
+        import tempfile as _tf
+        assert _jobs.resolve_jobs_dir("/explicit").endswith("explicit")
+        os.environ["SUMMON_JOBS_DIR"] = "/from-env"
+        assert _jobs.resolve_jobs_dir(None).endswith("from-env")
+        assert _jobs.resolve_jobs_dir("/explicit").endswith("explicit")  # flag wins
+        del os.environ["SUMMON_JOBS_DIR"]
+        assert _jobs.resolve_jobs_dir(None).endswith("subagents_jobs")  # default unchanged
+        assert _jobs.valid_job_id("a" * 32) and not _jobs.valid_job_id("nothex")
+        assert not _jobs.valid_job_id("../evil") and not _jobs.valid_job_id("a" * 31)
+        # a traversal id is rejected before any path is built
+        for bad in ("../x", "a/b", "A" * 32, "x" * 33):
+            try:
+                _jobs.record_path("/root", bad); raise AssertionError(bad)
+            except ValueError:
+                pass
+    finally:
+        os.environ.pop("SUMMON_JOBS_DIR", None)
+        if saved is not None:
+            os.environ["SUMMON_JOBS_DIR"] = saved
+
+
+def test_jobs_launch_record_and_state_machine():
+    import _jobs, hashlib, json
+    root = tempfile.mkdtemp(prefix="summon-jobsrec-")
+    try:
+        jid = _jobs.new_job_id()
+        nonce = "n" * 32
+        psha = hashlib.sha256(b"hi").hexdigest()
+        # a fake args namespace for the allowlist projection: prompt is NOT a flag
+        import argparse
+        ns = argparse.Namespace(agent="rev", cli="codex", model="m", effort=None,
+                                timeout=600000, cwd="/w", agents_dir=None, worktree=None,
+                                prompt="secret prompt", resume="sess-1",
+                                json_schema="/schema.json", debug_dir="/dbg")
+        flags = _jobs.flags_projection(ns)
+        assert set(flags) == {"agent", "cli", "model", "timeout", "cwd"}, flags
+        # never leaks prompt text, resume id, or schema/debug paths
+        blob = json.dumps(flags)
+        assert "secret" not in blob and "sess-1" not in blob and "schema" not in blob
+        # prepared record before spawn: state 'prepared' (no pid)
+        _jobs.write_prepared(root, jid, nonce=nonce, agent="rev", prompt_sha256=psha,
+                             cwd="/w", flags=flags, summon={"version": "0.9.0"})
+        assert os.path.isfile(_jobs.record_path(root, jid))
+        st = _jobs.job_status(root, jid)
+        assert st["state"] == "prepared" and st["trusted"] is False
+        # after spawn: state 'running' (pid known, liveness NOT asserted)
+        _jobs.update_spawned(root, jid, 4242)
+        st = _jobs.job_status(root, jid)
+        assert st["state"] == "running" and st["pid"] == 4242
+        # a TRUSTED terminal result (nonce matches)
+        _jobs._atomic_write_json(_jobs.result_path(root, jid),
+                                 {"status": "success", "job_nonce": nonce})
+        st = _jobs.job_status(root, jid)
+        assert st["state"] == "success" and st["trusted"] is True
+        # a MISMATCHED nonce -> unverified, never trusted
+        _jobs._atomic_write_json(_jobs.result_path(root, jid),
+                                 {"status": "success", "job_nonce": "WRONG"})
+        st = _jobs.job_status(root, jid)
+        assert st["state"] == "unverified" and st["trusted"] is False
+        # a legacy result-only job (no record) -> unverified
+        legacy = _jobs.new_job_id()
+        _jobs._atomic_write_json(_jobs.result_path(root, legacy), {"status": "success"})
+        stl = _jobs.job_status(root, legacy)
+        assert stl["state"] == "unverified" and stl["trusted"] is False
+        # metadata is isolated from a <root>/*.json result glob (compat)
+        import glob
+        top = {os.path.basename(p) for p in glob.glob(os.path.join(root, "*.json"))}
+        assert f"{jid}.json" in top and _jobs._RECORDS not in " ".join(top)
+        assert os.path.isdir(os.path.join(root, _jobs._RECORDS))
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_jobs_wait_deadline_and_nonce():
+    import _jobs, threading, time as _t
+    root = tempfile.mkdtemp(prefix="summon-jobswait-")
+    try:
+        jid = _jobs.new_job_id()
+        _jobs.write_prepared(root, jid, nonce="k" * 32, agent="a", prompt_sha256=None,
+                             cwd="/w", flags={}, summon={})
+        # a stale/foreign file is present; wait must SKIP it and keep polling
+        _jobs._atomic_write_json(_jobs.result_path(root, jid),
+                                 {"status": "success", "job_nonce": "STALE"})
+        def land_real():
+            _t.sleep(0.6)
+            _jobs._atomic_write_json(_jobs.result_path(root, jid),
+                                     {"status": "success", "job_nonce": "k" * 32})
+        threading.Thread(target=land_real, daemon=True).start()
+        result, outcome = _jobs.wait_job(root, jid, timeout_ms=5000, poll_sec=0.1)
+        assert outcome == "done" and result["job_nonce"] == "k" * 32
+        # clean timeout when only a foreign file is ever present
+        jid2 = _jobs.new_job_id()
+        _jobs.write_prepared(root, jid2, nonce="z" * 32, agent="a", prompt_sha256=None,
+                             cwd="/w", flags={}, summon={})
+        _jobs._atomic_write_json(_jobs.result_path(root, jid2),
+                                 {"status": "success", "job_nonce": "OTHER"})
+        r2, o2 = _jobs.wait_job(root, jid2, timeout_ms=300, poll_sec=0.1)
+        assert o2 == "timeout" and r2 is None
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_jobs_facade_and_matrix():
+    import json as _json, subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-jobsfac-")
+    try:
+        # jobs list on an empty dir: ok, empty
+        r = sp.run([sys.executable, script, "jobs", "list", "--job-dir", d, "--json"],
+                   capture_output=True, text=True, encoding="utf-8")
+        env = _json.loads(r.stdout)
+        assert r.returncode == 0 and env["jobs"] == []
+        # jobs status needs an id
+        r2 = sp.run([sys.executable, script, "jobs", "status"], capture_output=True,
+                    text=True, encoding="utf-8")
+        assert r2.returncode != 0 and "needs a job id" in (r2.stdout + r2.stderr)
+        # unknown 'jobs' action is an error
+        r3 = sp.run([sys.executable, script, "jobs", "bogus"], capture_output=True,
+                    text=True, encoding="utf-8")
+        assert r3.returncode != 0
+        # bad id rejected; unknown id -> exit 1
+        r4 = sp.run([sys.executable, script, "--jobs-status", "nothex", "--job-dir", d],
+                    capture_output=True, text=True, encoding="utf-8")
+        assert _json.loads(r4.stdout)["status"] == "error" and "invalid job id" in _json.loads(r4.stdout)["error"]
+        r5 = sp.run([sys.executable, script, "--jobs-status", "a" * 32, "--job-dir", d],
+                    capture_output=True, text=True, encoding="utf-8")
+        assert r5.returncode == 1 and "no such job" in _json.loads(r5.stdout)["error"]
+        # matrix: a stray dispatch flag on a jobs query is rejected
+        r6 = sp.run([sys.executable, script, "--jobs-list", "--model", "x"],
+                    capture_output=True, text=True, encoding="utf-8")
+        env6 = _json.loads(r6.stdout)
+        assert env6["status"] == "error" and "--model" in env6["error"]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_jobs_background_end_to_end():
+    # A real detached dispatch to a dead openai-compat endpoint: the record is
+    # written before spawn, the child stamps a matching job_nonce, and
+    # jobs wait/status see a TRUSTED terminal result.
+    import json as _json, subprocess as sp, _jobs
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-jobse2e-")
+    jobs = os.path.join(d, "jobs")
+    try:
+        open(os.path.join(d, "dead.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:9\n"
+            "api_key_env:\nmodel: probe\n---\n# dead\nrole.\n")
+        r = sp.run([sys.executable, script, "--agent", "dead", "--prompt", "hello",
+                    "--cwd", d, "--agents-dir", d, "--job-dir", jobs,
+                    "--background", "--timeout", "8s"],
+                   capture_output=True, text=True, encoding="utf-8")
+        handle = _json.loads(r.stdout)
+        assert handle["status"] == "background" and os.path.isfile(handle["record_file"])
+        jid = handle["job_id"]
+        assert _jobs.valid_job_id(jid)
+        # wait for the (error) result; exit 1 because the endpoint fails
+        r2 = sp.run([sys.executable, script, "jobs", "wait", jid, "--job-dir", jobs,
+                     "--timeout", "20s"], capture_output=True, text=True, encoding="utf-8")
+        waited = _json.loads(r2.stdout)
+        assert waited["status"] == "error" and "job_nonce" in waited
+        st = _jobs.job_status(jobs, jid)
+        assert st["trusted"] is True and st["result"]["job_nonce"] == st["record"]["nonce"]
+        assert "prompt" not in st["record"] and st["record"]["prompt_sha256"]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
