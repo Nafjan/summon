@@ -73,9 +73,13 @@ _JOB_FILE: str | None = None
 def _stamp_job(env: dict) -> dict:
     """Stamp a background child's result envelope with its job identity so a
     result at a job's path can be authenticated against the launch record. Fires
-    ONLY when a job file is resolved (i.e. we are a `--background` child), so a
-    foreground run with a stray SUMMON_JOB_* env var can never carry a
-    `job_nonce`. Best-effort integrity, not a security boundary."""
+    ONLY when the internal ``--job-file`` is present -- that flag is how the
+    parent spawns a background child, so a NORMAL foreground run (which never
+    passes it) cannot carry a `job_nonce` from a stray SUMMON_JOB_* env var. A
+    caller that deliberately passes the internal flag AND sets SUMMON_JOB_NONCE
+    can hand-stamp one, but on a single-user machine that is self-inflicted: the
+    nonce is best-effort integrity against stale/mismatched result files, not a
+    security boundary."""
     if _resolve_job_file() is None:
         return env
     nonce = os.environ.get("SUMMON_JOB_NONCE")
@@ -296,7 +300,7 @@ def _spawn_background(args: argparse.Namespace) -> dict:
     result envelope. Returns the {status, job_id, pid, result_file, job_dir}
     handle."""
     import hashlib
-    from _jobs import (ensure_jobs_dir, flags_projection, new_job_id, record_path,
+    from _jobs import (ensure_jobs_dir, flags_projection, new_job_id,
                        resolve_jobs_dir, result_path, update_spawned, write_prepared)
     root = resolve_jobs_dir(args.job_dir)
     ensure_jobs_dir(root)
@@ -306,11 +310,14 @@ def _spawn_background(args: argparse.Namespace) -> dict:
     prompt_sha = (hashlib.sha256(args.prompt.encode("utf-8")).hexdigest()
                   if args.prompt is not None else None)
     # Launch record BEFORE spawn (fail-closed: a record we cannot write aborts
-    # the dispatch rather than launching an untraceable job).
+    # the dispatch rather than launching an untraceable job). Keep the path it
+    # returns: every value the handle needs is now computed BEFORE Popen, so
+    # nothing fallible runs between a successful spawn and returning the handle.
     try:
-        write_prepared(root, job_id, nonce=nonce, agent=args.agent,
-                       prompt_sha256=prompt_sha, cwd=args.cwd,
-                       flags=flags_projection(args), summon=_receipt_base()["summon"])
+        record_file = write_prepared(
+            root, job_id, nonce=nonce, agent=args.agent,
+            prompt_sha256=prompt_sha, cwd=args.cwd,
+            flags=flags_projection(args), summon=_receipt_base()["summon"])
     except OSError as e:
         raise ValueError(f"cannot write the background launch record: {e}") from e
     cmd = [sys.executable, os.path.abspath(__file__), *_child_argv(args, result_file)]
@@ -326,10 +333,20 @@ def _spawn_background(args: argparse.Namespace) -> dict:
     else:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(cmd, **kwargs)
-    update_spawned(root, job_id, proc.pid)      # record the pid post-spawn
-    return {"status": "background", "job_id": job_id, "pid": proc.pid,
-            "result_file": result_file, "job_dir": root,
-            "record_file": record_path(root, job_id)}
+    # Handle built from ONLY pre-Popen values (no path recompute, no fs call), so
+    # it cannot throw here and strand the live child.
+    handle = {"status": "background", "job_id": job_id, "pid": proc.pid,
+              "result_file": result_file, "job_dir": root,
+              "record_file": record_file}
+    # The child is ALREADY running. A failure to stamp the pid onto the record
+    # must never sink the handle -- that would strand a live job with no way for
+    # the caller to find its result. Surface the metadata failure as a warning
+    # and return the handle regardless.
+    try:
+        update_spawned(root, job_id, proc.pid)  # record the pid post-spawn
+    except OSError as e:
+        handle["warnings"] = [f"launch record pid update failed (job is running): {e}"]
+    return handle
 
 
 # --- Provenance receipt --------------------------------------------------------
@@ -530,6 +547,7 @@ Commands:
   council   --question "…" [--members …] [--rounds 2]  decide by consensus
   agent new NAME [--set k=v …]                    scaffold an agent definition
   agent set NAME  --set k=v …                     retune an agent's frontmatter
+  jobs list|status|wait [ID] [--job-dir D] [--json]   inspect background jobs
   version                                         print version
 
 Legacy flat flags still work: `summon --agent NAME --prompt … --cwd …`,
@@ -578,7 +596,9 @@ def _rewrite_subcommand(argv: list) -> tuple:
             return ["--council-status", rest[1], *rest[2:]], None
         return ["--council", *rest], None
     if head == "jobs":
-        if not rest or rest[0] == "list":
+        if not rest:
+            return argv, "help"       # bare `summon jobs` -> usage, not a silent list
+        if rest[0] == "list":
             return ["--jobs-list", *rest[1:]], None
         if rest[0] in ("status", "wait"):
             if len(rest) < 2 or rest[1].startswith("-"):

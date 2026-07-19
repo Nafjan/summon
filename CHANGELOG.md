@@ -79,11 +79,15 @@ baseline and the iterative hardening on top of it.
   over them.
 - `jobs list` / `jobs status <id>` / `jobs wait <id>` are read-only registry commands
   (flat `--jobs-list` / `--jobs-status` / `--jobs-wait`). State machine: `prepared`,
-  `running` (pid known, not asserted alive), a terminal status, or `unverified` (nonce
-  mismatch or a legacy result); an unverifiable result is never reported `trusted`. The
-  registry is single-user and single-machine (documented; it does not defend against
-  other local users on a shared host). Liveness verification, cancel, and reaping are a
-  later addition.
+  `running` (pid known, not asserted alive), a terminal status, `unverified` (nonce
+  mismatch or a legacy result), or `corrupt` (a record or result that exists but is
+  unreadable, or an authenticated result with a malformed envelope). An unverifiable or
+  corrupt result is never reported `trusted`, and a corrupt job still enumerates in
+  `list` rather than vanishing. The registry is single-user and single-machine
+  (documented; it does not defend against other local users on a shared host). Records
+  and results are written whole (never a zero-byte window) and a symlink planted at a
+  record/result path is refused rather than followed. Liveness verification, cancel, and
+  reaping are a later addition.
 
 **Provenance and telemetry**
 - Provenance receipt on every dispatch envelope, including preflight errors:

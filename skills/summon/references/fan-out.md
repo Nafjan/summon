@@ -66,9 +66,11 @@ durable path if the default temp location is volatile for you. Instead of pollin
 result path yourself:
 
 - `summon jobs list [--job-dir D] [--json]`: every job's state: `prepared` (launched,
-  spawn unconfirmed), `running` (pid known, not asserted alive), a terminal status, or
+  spawn unconfirmed), `running` (pid known, not asserted alive), a terminal status,
   `unverified` (a result whose `job_nonce` does not match its record, or a legacy
-  result with no record).
+  result with no record), or `corrupt` (a record/result present but unreadable, or an
+  authenticated result with a malformed envelope). A corrupt job still lists (it does
+  not silently disappear).
 - `summon jobs status <id>`: one job's launch record + result envelope + derived state.
 - `summon jobs wait <id> [--timeout]`: poll for a nonce-verified result; a stale file
   at the path is skipped until the real child writes, then the envelope is printed.
