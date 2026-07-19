@@ -3737,6 +3737,320 @@ def test_jobs_background_end_to_end():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_jobs_corrupt_and_symlink_classification():
+    # A record/result that EXISTS but is unreadable must classify `corrupt`
+    # (reachable state), never silently read as missing/running/success. A
+    # symlinked leaf is refused, never followed to a trusted result.
+    import _jobs, json
+    root = tempfile.mkdtemp(prefix="summon-jobscorrupt-")
+    try:
+        _jobs.ensure_jobs_dir(root)
+        nonce = "c" * 32
+        # (1) corrupt RECORD (garbage bytes) -> corrupt, not "no such job"
+        jid = _jobs.new_job_id()
+        with open(_jobs.record_path(root, jid), "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        st = _jobs.job_status(root, jid)
+        assert st is not None and st["state"] == "corrupt" and st["trusted"] is False, st
+        # (2) valid record + corrupt RESULT beside it -> corrupt, not "running"
+        jid2 = _jobs.new_job_id()
+        _jobs.write_prepared(root, jid2, nonce=nonce, agent="a", prompt_sha256=None,
+                             cwd="/w", flags={}, summon={})
+        _jobs.update_spawned(root, jid2, 111)
+        with open(_jobs.result_path(root, jid2), "w", encoding="utf-8") as fh:
+            fh.write("")                      # empty file -> json.loads raises
+        st2 = _jobs.job_status(root, jid2)
+        assert st2["state"] == "corrupt", st2
+        # (3) non-object JSON (a list) -> corrupt
+        jid3 = _jobs.new_job_id()
+        with open(_jobs.record_path(root, jid3), "w", encoding="utf-8") as fh:
+            json.dump([1, 2, 3], fh)
+        assert _jobs.job_status(root, jid3)["state"] == "corrupt"
+        # (4) authenticated result but a non-string status -> corrupt (malformed)
+        jid4 = _jobs.new_job_id()
+        _jobs.write_prepared(root, jid4, nonce=nonce, agent="a", prompt_sha256=None,
+                             cwd="/w", flags={}, summon={})
+        _jobs._atomic_write_json(_jobs.result_path(root, jid4),
+                                 {"job_nonce": nonce, "status": 123})
+        assert _jobs.job_status(root, jid4)["state"] == "corrupt"
+        # (5) authenticated result with NO status key -> corrupt
+        jid5 = _jobs.new_job_id()
+        _jobs.write_prepared(root, jid5, nonce=nonce, agent="a", prompt_sha256=None,
+                             cwd="/w", flags={}, summon={})
+        _jobs._atomic_write_json(_jobs.result_path(root, jid5), {"job_nonce": nonce})
+        assert _jobs.job_status(root, jid5)["state"] == "corrupt"
+        # (6) a corrupt row still ENUMERATES in list_jobs (no silent gap)
+        states = {r["job_id"]: r["state"] for r in _jobs.list_jobs(root)}
+        assert states.get(jid) == "corrupt" and states.get(jid3) == "corrupt", states
+        # (7) a symlinked result leaf is refused (never followed/trusted). The
+        # symlink target carries a MATCHING nonce, so following it WOULD classify
+        # trusted -> the corrupt verdict proves it was not followed. Run this
+        # wherever os.symlink actually works (POSIX, and Windows with Developer
+        # Mode / SeCreateSymbolicLink) so a Windows regression can't hide; skip
+        # ONLY when the OS genuinely refuses to create the link.
+        victim = _jobs.result_path(root, _jobs.new_job_id())
+        _jobs._atomic_write_json(victim, {"status": "success", "job_nonce": nonce})
+        sjid = _jobs.new_job_id()
+        _jobs.write_prepared(root, sjid, nonce=nonce, agent="a", prompt_sha256=None,
+                             cwd="/w", flags={}, summon={})
+        try:
+            os.symlink(victim, _jobs.result_path(root, sjid))
+        except (OSError, NotImplementedError):
+            pass                              # OS refuses symlink creation: skip this leg
+        else:
+            sst = _jobs.job_status(root, sjid)
+            assert sst["state"] == "corrupt", sst
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_jobs_write_reuse_and_update_faults():
+    # write_prepared never leaves a zero-byte record and refuses id reuse;
+    # update_spawned refuses to resurrect a missing/corrupt record; a directory
+    # fsync failure is fatal (fail-closed launch record) on POSIX.
+    import _jobs, json, stat as _stat
+    root = tempfile.mkdtemp(prefix="summon-jobswrite-")
+    try:
+        jid = _jobs.new_job_id()
+        _jobs.write_prepared(root, jid, nonce="w" * 32, agent="a", prompt_sha256=None,
+                             cwd="/w", flags={}, summon={})
+        # the record is a COMPLETE object the instant it exists (no O_EXCL 0-byte window)
+        with open(_jobs.record_path(root, jid), encoding="utf-8") as fh:
+            assert json.load(fh)["job_id"] == jid
+        # reuse of the same id is refused, not clobbered
+        try:
+            _jobs.write_prepared(root, jid, nonce="x" * 32, agent="b", prompt_sha256=None,
+                                 cwd="/w", flags={}, summon={})
+            raise AssertionError("reuse should raise")
+        except FileExistsError:
+            pass
+        # update_spawned on a MISSING record raises (never recreates it)
+        try:
+            _jobs.update_spawned(root, _jobs.new_job_id(), 999)
+            raise AssertionError("missing record update should raise")
+        except FileNotFoundError:
+            pass
+        # update_spawned on a CORRUPT record raises too
+        cjid = _jobs.new_job_id()
+        with open(_jobs.record_path(root, cjid), "w", encoding="utf-8") as fh:
+            fh.write("garbage")
+        try:
+            _jobs.update_spawned(root, cjid, 999)
+            raise AssertionError("corrupt record update should raise")
+        except FileNotFoundError:
+            pass
+        # POSIX: a directory-fsync failure aborts write_prepared (fail-closed).
+        if os.name != "nt":
+            orig = _jobs.os.fsync
+            def fsync_dirfail(fd):
+                if _stat.S_ISDIR(os.fstat(fd).st_mode):
+                    raise OSError("simulated dir fsync failure")
+                return orig(fd)
+            _jobs.os.fsync = fsync_dirfail
+            try:
+                raised = False
+                try:
+                    _jobs.write_prepared(root, _jobs.new_job_id(), nonce="d" * 32,
+                                         agent="a", prompt_sha256=None, cwd="/w",
+                                         flags={}, summon={})
+                except OSError:
+                    raised = True
+                assert raised, "dir fsync failure must propagate"
+            finally:
+                _jobs.os.fsync = orig
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_jobs_spawn_handle_survives_update_fault():
+    # Fix #3: after a successful Popen, NO fallible fs/path call runs before the
+    # handle is returned, and a metadata-update failure never strands the live
+    # child -- the handle is built from pre-spawn values and always returned.
+    import run_subagent as rs, _jobs, argparse
+    d = tempfile.mkdtemp(prefix="summon-spawnfault-")
+    class FakeProc:
+        pid = 4242
+    orig_popen, orig_update = rs.subprocess.Popen, _jobs.update_spawned
+    try:
+        rs.subprocess.Popen = lambda *a, **k: FakeProc()
+        def boom(*a, **k):
+            raise OSError("simulated post-spawn metadata failure")
+        _jobs.update_spawned = boom     # re-fetched by the call-time import in _spawn_background
+        args = argparse.Namespace(
+            job_dir=os.path.join(d, "jobs"), prompt="x", prompt_file=None, agent="a",
+            cwd=d, cli=None, model=None, effort=None, timeout=None, agents_dir=None,
+            worktree=None, allow_credit=False, resume=None, resume_profile=None,
+            out=None, json_schema=None, debug_dir=None, retries=0)
+        handle = rs._spawn_background(args)
+        assert handle["status"] == "background" and handle["pid"] == 4242, handle
+        assert "warnings" in handle, handle          # the fault is surfaced, not hidden
+        # record_file is write_prepared's returned path (computed before the spawn)
+        # and the record exists on disk
+        assert os.path.isfile(handle["record_file"]) and handle["job_id"] in handle["record_file"]
+    finally:
+        rs.subprocess.Popen, _jobs.update_spawned = orig_popen, orig_update
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_jobs_record_reader_never_sees_partial():
+    # The absent-or-complete invariant: a reader polling the record path while it
+    # is rewritten many times concurrently must never observe a TORN record. The
+    # reader reads bytes itself so it can DISTINGUISH a torn read (empty /
+    # truncated JSON / incomplete schema) from a benign Windows concurrent-open
+    # denial (WinError 5/32). To prove the test actually has teeth, a second leg
+    # runs the SAME reader against a deliberately NON-atomic writer and asserts
+    # the reader catches it -- otherwise leg (a) would prove nothing.
+    import _jobs, threading, json as _json, time as _t
+    # Derive the completeness set from an ACTUAL prepared record rather than
+    # hardcoding it, so the test cannot drift from the record schema (review note).
+    root = tempfile.mkdtemp(prefix="summon-jobsrace-")
+    _jobs.ensure_jobs_dir(root)
+    _probe = _jobs.new_job_id()
+    _jobs.write_prepared(root, _probe, nonce="p" * 32, agent="a", prompt_sha256=None,
+                         cwd="/w", flags={}, summon={})
+    _EXPECT = frozenset(_jobs.read_json(_jobs.record_path(root, _probe)))
+    assert "job_id" in _EXPECT and "nonce" in _EXPECT and len(_EXPECT) >= 8, _EXPECT
+
+    def run_reader_while(writer, jid, path):
+        torn, saw_ok, stop = [], [], threading.Event()
+        def reader():
+            while not stop.is_set():
+                _t.sleep(0.0005)                   # poll like production (jobs wait),
+                #                                    not a tight loop that starves the
+                #                                    writer's atomic rename on Windows
+                try:
+                    with open(path, "rb") as fh:
+                        raw = fh.read()
+                except FileNotFoundError:
+                    continue                       # before first write: fine
+                except OSError:
+                    # a failed OPEN (Windows locks the file briefly during a
+                    # concurrent rename) is never a torn read -- only truncated
+                    # CONTENT is. Skip and retry.
+                    continue
+                if raw == b"":
+                    torn.append("empty"); continue
+                try:
+                    obj = _json.loads(raw.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    torn.append("truncated"); continue
+                if not isinstance(obj, dict):
+                    torn.append("non-object"); continue
+                saw_ok.append(1)
+                if obj.get("job_id") != jid or (_EXPECT - set(obj)):
+                    torn.append(("incomplete", sorted(_EXPECT - set(obj))))
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        writer()
+        _t.sleep(0.05)          # let the reader observe the final stable record
+        stop.set()
+        t.join(timeout=3)
+        return torn, saw_ok
+
+    try:
+        # (a) the PRODUCTION atomic writer: a reader NEVER sees a torn record
+        jid = _jobs.new_job_id()
+        path = _jobs.record_path(root, jid)
+        def atomic_writer():
+            _jobs.write_prepared(root, jid, nonce="r" * 32, agent="a", prompt_sha256=None,
+                                 cwd="/w", flags={}, summon={})
+            for pid in range(1, 120):
+                _jobs.update_spawned(root, jid, pid)
+        torn, saw_ok = run_reader_while(atomic_writer, jid, path)
+        assert not torn, ("atomic writer exposed torn reads", torn[:5])
+        assert saw_ok, "reader never observed a complete record"
+        # (b) DISCRIMINATION: a non-atomic writer (visible truncated state) MUST be
+        # caught, proving leg (a)'s clean result is meaningful, not vacuous.
+        jid2 = _jobs.new_job_id()
+        path2 = _jobs.record_path(root, jid2)
+        full = {k: 0 for k in _EXPECT}
+        full["job_id"] = jid2
+        blob = _json.dumps(full).encode("utf-8")
+        def broken_writer():
+            for _ in range(80):
+                with open(path2, "wb") as fh:      # non-atomic: visible truncated record
+                    fh.write(blob[:12])
+                _t.sleep(0.001)
+                with open(path2, "wb") as fh:      # then complete, in place
+                    fh.write(blob)
+                _t.sleep(0.001)
+        torn2, _saw = run_reader_while(broken_writer, jid2, path2)
+        assert torn2, "reader failed to detect a deliberately non-atomic writer"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_jobs_nonce_gate_and_projection():
+    # flags_projection records a bare --worktree; _stamp_job fires only for a
+    # background child (has --job-file), never a stray-env foreground run.
+    import _jobs, argparse
+    # (a) worktree tri-state: absent / bare(auto) / named
+    base = dict(agent="a", cli=None, model=None, effort=None, timeout=None, cwd=None,
+                agents_dir=None)
+    assert "worktree" not in _jobs.flags_projection(argparse.Namespace(worktree=None, **base))
+    proj_bare = _jobs.flags_projection(argparse.Namespace(worktree="", **base))
+    assert proj_bare["worktree"] == "(auto)", proj_bare
+    proj_named = _jobs.flags_projection(argparse.Namespace(worktree="wt1", **base))
+    assert proj_named["worktree"] == "wt1", proj_named
+    # (b) the nonce gate
+    import run_subagent as rs
+    saved_argv, saved_job = sys.argv, rs._JOB_FILE
+    saved_nonce = os.environ.get("SUMMON_JOB_NONCE")
+    saved_psha = os.environ.get("SUMMON_JOB_PROMPT_SHA")
+    try:
+        os.environ["SUMMON_JOB_NONCE"] = "g" * 32
+        os.environ["SUMMON_JOB_PROMPT_SHA"] = "h" * 64
+        # foreground (no --job-file, stray env): MUST NOT stamp a job_nonce
+        rs._JOB_FILE = None
+        sys.argv = ["run_subagent.py", "--agent", "a", "--prompt", "x"]
+        assert "job_nonce" not in rs._stamp_job({"prompt_sha256": "orig"})
+        # background child (--job-file present): stamps nonce; fills prompt sha
+        # only when absent, never overwriting a receipt-computed one
+        sys.argv = ["run_subagent.py", "--job-file", "/tmp/j.json"]
+        e1 = rs._stamp_job({"prompt_sha256": None})
+        assert e1["job_nonce"] == "g" * 32 and e1["prompt_sha256"] == "h" * 64
+        e2 = rs._stamp_job({"prompt_sha256": "receipt-sha"})
+        assert e2["prompt_sha256"] == "receipt-sha"      # not overwritten
+        # crash path: _JOB_FILE set directly (argv already gone) still stamps
+        rs._JOB_FILE = "/tmp/j.json"
+        sys.argv = ["run_subagent.py"]
+        assert rs._stamp_job({})["job_nonce"] == "g" * 32
+    finally:
+        sys.argv, rs._JOB_FILE = saved_argv, saved_job
+        for k, v in (("SUMMON_JOB_NONCE", saved_nonce),
+                     ("SUMMON_JOB_PROMPT_SHA", saved_psha)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_jobs_cli_wait_timeout_and_bare():
+    # CLI: `jobs wait` on a never-arriving result exits 124; bare `jobs` prints
+    # usage (exit 0), not a silent list.
+    import subprocess as sp, _jobs
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-jobscli-")
+    try:
+        jid = _jobs.new_job_id()
+        _jobs.write_prepared(d, jid, nonce="t" * 32, agent="a", prompt_sha256=None,
+                             cwd="/w", flags={}, summon={})   # prepared, no result ever
+        r = sp.run([sys.executable, script, "jobs", "wait", jid, "--job-dir", d,
+                    "--timeout", "300"], capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 124, (r.returncode, r.stdout, r.stderr)
+        # bare `jobs` -> usage, exit 0
+        rb = sp.run([sys.executable, script, "jobs"], capture_output=True, text=True,
+                    encoding="utf-8")
+        assert rb.returncode == 0 and "Usage:" in rb.stdout and "jobs list" in rb.stdout
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
