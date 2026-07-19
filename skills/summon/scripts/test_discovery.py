@@ -3072,6 +3072,494 @@ def test_rundir_carry_forward_validation():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def _b2_council(root, members, chairman="chair", **extra):
+    """Run a stubbed council and return (rc, envelope). extra overrides
+    Namespace fields (quorum, chairman_fallback, member statuses via _statuses)."""
+    import _council, argparse, io, contextlib, json as _json
+    statuses = extra.pop("_statuses", {})   # {agent: "error"} to force failures
+    calls = extra.pop("_calls", None)
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+        if calls is not None:
+            calls.append(agent)
+        st = statuses.get(agent, "success")
+        if st != "success":
+            return {"status": st, "error": f"{agent} boom", "result": ""}
+        rank = "\nRANKING: A, B" if "-r2-" in tag else ""
+        return {"status": "success", "result": f"{agent} ok{rank}",
+                "report": {"summary": agent}}
+    ns = argparse.Namespace(question="q", question_file=None, members=",".join(members),
+                            chairman=chairman, rounds=1, cwd=os.getcwd(), agents_dir=root,
+                            timeout=60000, out=None, run_dir=root)
+    for k, v in extra.items():
+        setattr(ns, k, v)
+    orig = _council._dispatch
+    _council._dispatch = fake
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = _council.run_council(ns)
+    finally:
+        _council._dispatch = orig
+    return rc, _json.loads(buf.getvalue())
+
+
+def _mk_agents(root, names):
+    for a in names:
+        open(os.path.join(root, a + ".md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+
+
+def test_council_quorum_gate():
+    import _rundir as rd
+    root = tempfile.mkdtemp(prefix="summon-quorum-")
+    try:
+        _mk_agents(root, ("m1", "m2", "m3", "chair"))
+        # default (no quorum): synthesis.quorum null, full participation
+        rc, env = _b2_council(root, ["m1", "m2", "m3"])
+        assert rc == 0 and env["synthesis"]["quorum"] is None
+        assert env["synthesis"]["decision_status"] == "full_participation"
+        # quorum MET with a failure: partial top-level, quorum.met true, partial_participation
+        calls = []
+        rc2, env2 = _b2_council(root, ["m1", "m2", "m3"], quorum=2,
+                                _statuses={"m3": "error"}, _calls=calls)
+        assert env2["status"] == "partial", env2["status"]   # a member failed -> never success
+        assert env2["synthesis"]["quorum"] == {"required": 2, "met": True}
+        assert env2["synthesis"]["decision_status"] == "partial_participation"
+        assert env2["synthesis"]["members_succeeded"] == 2 and "m3" in env2["synthesis"]["absent_members"]
+        assert "chair" in calls  # chairman DID run
+        # quorum NOT met: chairman skipped, tombstone written, status partial
+        calls3 = []
+        rc3, env3 = _b2_council(root, ["m1", "m2", "m3"], quorum=3,
+                                _statuses={"m2": "error", "m3": "error"}, _calls=calls3)
+        assert env3["status"] == "partial"
+        assert env3["synthesis"]["decision_status"] == "quorum_not_met"
+        assert env3["synthesis"]["status"] == "skipped"
+        assert env3["synthesis"]["quorum"] == {"required": 3, "met": False}
+        assert "chair" not in calls3, calls3  # chairman NOT dispatched
+        # a current-generation tombstone exists so status is not stale
+        tomb = rd.read_json(os.path.join(env3["run_dir"], "g1-chairman.json"))
+        assert tomb["status"] == "skipped" and tomb["reason"] == "quorum_not_met"
+        # invalid quorum rejected
+        rc4, env4 = _b2_council(root, ["m1", "m2"], quorum=5)
+        assert rc4 == 1 and "--quorum" in env4["error"]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_synthesis_supersedes_prior_fallback():
+    # Coherence fix (v2 review): when the chairman re-runs and now succeeds, a
+    # prior generation's successful fallback must be superseded, or status would
+    # show a stale fallback alongside the fresh chairman. Both synthesis stages
+    # are marked fresh at the decision point precisely so the sweep clears them.
+    import _council, _rundir as rd, argparse, io, contextlib, json as _json
+    root = tempfile.mkdtemp(prefix="summon-fbsup-")
+    try:
+        _mk_agents(root, ("m1", "m2", "chair", "backup"))
+        # gen 1: primary chair FAILS, fallback succeeds -> g1-chairman (error) +
+        # g1-chairman-fallback (success)
+        rc1, env1 = _b2_council(root, ["m1", "m2"], chairman_fallback="backup",
+                                _statuses={"chair": "error"})
+        run_id = env1["run_id"]
+        assert os.path.isfile(os.path.join(env1["run_dir"], "g1-chairman-fallback.json"))
+        # gen 2 resume: chair now SUCCEEDS. The gen-1 chairman was error (not
+        # carried) so it re-runs and succeeds; no fallback is attempted this time.
+        def fake(agent, *a, **k):
+            return {"status": "success", "result": f"{agent} ok", "report": {"summary": agent}}
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            ns = argparse.Namespace(question=None, question_file=None, members=None,
+                                    chairman=None, rounds=None, cwd=os.getcwd(),
+                                    agents_dir=root, timeout=60000, out=None, run_dir=root,
+                                    resume_run=run_id, chairman_fallback="backup")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc2 = _council.run_council(ns)
+        finally:
+            _council._dispatch = orig
+        env2 = _json.loads(buf.getvalue())
+        assert rc2 == 0 and env2["generation"] == 2 and env2["status"] == "success"
+        assert env2["synthesis"]["fallback_used"] is False and "fallback" not in env2["synthesis"]
+        rdir = env2["run_dir"]
+        # the stale gen-1 fallback is superseded, NOT left to show through
+        assert os.path.isfile(os.path.join(rdir, "superseded", "g1", "g1-chairman-fallback.json"))
+        assert not os.path.isfile(os.path.join(rdir, "g2-chairman-fallback.json"))
+        assert rd.read_json(os.path.join(rdir, "g2-chairman.json"))["status"] == "success"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_quorum_skip_writes_tombstone():
+    # Quorum not met on a FRESH run writes a current-generation skipped tombstone.
+    import _rundir as rd
+    root = tempfile.mkdtemp(prefix="summon-qtomb-")
+    try:
+        _mk_agents(root, ("m1", "m2", "m3", "chair"))
+        rc, env = _b2_council(root, ["m1", "m2", "m3"], quorum=3,
+                              _statuses={"m2": "error", "m3": "error"})
+        assert rc == 1 and env["synthesis"]["decision_status"] == "quorum_not_met"
+        tomb = rd.read_json(os.path.join(env["run_dir"], "g1-chairman.json"))
+        assert tomb["status"] == "skipped" and tomb["reason"] == "quorum_not_met"
+        # the skip is journaled
+        recs, _ = rd.journal_read(env["run_dir"])
+        assert any(r["event"] == "attempt_skipped" and r["stage"] == "chairman" for r in recs)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_chairman_fallback():
+    import _rundir as rd
+    root = tempfile.mkdtemp(prefix="summon-fb-")
+    try:
+        _mk_agents(root, ("m1", "m2", "chair", "backup"))
+        # primary succeeds -> fallback suppressed, not attempted
+        rc, env = _b2_council(root, ["m1", "m2"], chairman_fallback="backup")
+        assert env["synthesis"]["fallback_used"] is False
+        assert "fallback" not in env["synthesis"]  # not attempted
+        assert env["synthesis"]["selection_reason"] == "primary chairman succeeded; fallback not needed"
+        # primary fails, fallback succeeds -> fallback chosen, both recorded
+        calls = []
+        rc2, env2 = _b2_council(root, ["m1", "m2"], chairman_fallback="backup",
+                                _statuses={"chair": "error"}, _calls=calls)
+        assert rc2 == 0 and env2["status"] == "success"   # synthesis (fallback) ok, no member failed
+        assert env2["synthesis"]["fallback_used"] is True
+        assert env2["synthesis"]["primary"]["status"] == "error"
+        assert env2["synthesis"]["fallback"]["status"] == "success"
+        assert "backup" in calls and "chair" in calls
+        assert os.path.isfile(os.path.join(env2["run_dir"], "g1-chairman.json"))
+        assert os.path.isfile(os.path.join(env2["run_dir"], "g1-chairman-fallback.json"))
+        # both fail -> partial, synthesis_failed, both outcomes + both billings present
+        rc3, env3 = _b2_council(root, ["m1", "m2"], chairman_fallback="backup",
+                                _statuses={"chair": "error", "backup": "error"})
+        assert env3["status"] == "partial"
+        assert env3["synthesis"]["decision_status"] == "synthesis_failed"
+        assert env3["synthesis"]["primary"]["status"] == "error"
+        assert env3["synthesis"]["fallback"]["status"] == "error"
+        assert env3["synthesis"]["fallback_used"] is False  # neither succeeded, kept primary
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_fallback_switch_does_not_carry_wrong_result():
+    # Switching --chairman-fallback A -> B (identical files) on resume must NOT
+    # reuse A's stage as B's, because the fallback hash includes the agent name.
+    import _council, _rundir as rd, argparse, io, contextlib, json as _json
+    root = tempfile.mkdtemp(prefix="summon-fbswap-")
+    try:
+        # A and B have byte-identical definitions
+        for a in ("m1", "m2", "chair", "fbA", "fbB"):
+            open(os.path.join(root, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# fallback\n")
+        # gen 1: chair fails, fallback A runs
+        calls1 = []
+        rc1, env1 = _b2_council(root, ["m1", "m2"], chairman_fallback="fbA",
+                                _statuses={"chair": "error"}, _calls=calls1)
+        run_id = env1["run_id"]
+        assert "fbA" in calls1 and env1["synthesis"]["fallback"]["agent"] == "fbA"
+        # gen 2 resume with fallback B: B must actually run (not carry A's file)
+        def fake(agent, *a, **k):
+            if agent == "chair":
+                return {"status": "error", "error": "boom", "result": ""}
+            return {"status": "success", "result": f"{agent} ok", "report": {"summary": agent}}
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            ns = argparse.Namespace(question=None, question_file=None, members=None,
+                                    chairman=None, rounds=None, cwd=os.getcwd(),
+                                    agents_dir=root, timeout=60000, out=None, run_dir=root,
+                                    resume_run=run_id, chairman_fallback="fbB")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                _council.run_council(ns)
+        finally:
+            _council._dispatch = orig
+        env2 = _json.loads(buf.getvalue())
+        assert env2["synthesis"]["fallback"]["agent"] == "fbB", env2["synthesis"]["fallback"]
+        # the fallback envelope is its own stage in gen 2
+        fb = rd.read_json(os.path.join(env2["run_dir"], "g2-chairman-fallback.json"))
+        assert fb and fb["status"] == "success"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_failed_primary_resume_reruns_then_falls_back():
+    # A resume after a failed primary re-runs the primary (non-success is never
+    # carried) and then runs the fallback if it fails again.
+    import _council, argparse, io, contextlib, json as _json
+    root = tempfile.mkdtemp(prefix="summon-fpr-")
+    try:
+        _mk_agents(root, ("m1", "m2", "chair", "backup"))
+        # gen 1: chair fails, no fallback configured -> primary error, status partial
+        rc1, env1 = _b2_council(root, ["m1", "m2"], _statuses={"chair": "error"})
+        assert env1["synthesis"]["status"] == "error"
+        run_id = env1["run_id"]
+        # gen 2 resume WITH a fallback now: primary re-runs (still fails), fallback runs
+        calls = []
+        def fake(agent, *a, **k):
+            calls.append(agent)
+            if agent == "chair":
+                return {"status": "error", "error": "boom", "result": ""}
+            return {"status": "success", "result": f"{agent} ok", "report": {"summary": agent}}
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            ns = argparse.Namespace(question=None, question_file=None, members=None,
+                                    chairman=None, rounds=None, cwd=os.getcwd(),
+                                    agents_dir=root, timeout=60000, out=None, run_dir=root,
+                                    resume_run=run_id, chairman_fallback="backup")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc2 = _council.run_council(ns)
+        finally:
+            _council._dispatch = orig
+        env2 = _json.loads(buf.getvalue())
+        assert rc2 == 0 and env2["status"] == "success"  # members carried (success), fallback synthesized
+        assert calls.count("chair") == 1 and "backup" in calls  # primary re-ran, fallback ran
+        assert env2["synthesis"]["fallback_used"] is True
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_fallback_eligibility_and_billing_aggregation():
+    # Fallback fires on ANY authoritative non-success primary (error/blocked/
+    # partial), and BOTH chairman envelopes' billing/warnings are aggregated.
+    import _council, argparse, io, contextlib, json as _json
+    root = tempfile.mkdtemp(prefix="summon-fbelig-")
+    try:
+        _mk_agents(root, ("m1", "m2", "chair", "backup"))
+        for primary_status in ("blocked", "partial", "error"):
+            def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+                if agent == "chair":
+                    return {"status": primary_status, "error": "p",
+                            "billing": {"source": "credit"}, "warnings": ["primary warn"],
+                            "result": ""}
+                if agent == "backup":
+                    return {"status": "success", "result": "DECIDE",
+                            "billing": {"source": "subscription"}, "report": {"summary": "s"}}
+                return {"status": "success", "result": f"{agent} ok",
+                        "billing": {"source": "api"}, "report": {"summary": agent}}
+            ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
+                                    chairman="chair", rounds=1, cwd=os.getcwd(),
+                                    agents_dir=root, timeout=60000, out=None, run_dir=root,
+                                    chairman_fallback="backup")
+            orig = _council._dispatch
+            _council._dispatch = fake
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                    _council.run_council(ns)
+            finally:
+                _council._dispatch = orig
+            env = _json.loads(buf.getvalue())
+            assert env["synthesis"]["fallback_used"] is True, primary_status
+            assert env["synthesis"]["primary"]["status"] == primary_status
+            # both chairman billings surface at the council level
+            assert "credit" in env["billing_sources"] and "subscription" in env["billing_sources"], \
+                (primary_status, env["billing_sources"])
+            # the primary's warning is aggregated even though the fallback was chosen
+            assert any("primary warn" in w for w in (env["warnings"] or [])), env["warnings"]
+            # legacy synthesis fields describe the CHOSEN producer (the fallback)
+            assert env["synthesis"]["chairman"] == "backup"
+            assert env["synthesis"]["configured_chairman"] == "chair"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_rounds2_quorum_counts_final_stage():
+    # Quorum counts the FINAL member stage (r2 for a 2-round council). A member
+    # who passed r1 but fails r2 does not count toward quorum.
+    root = tempfile.mkdtemp(prefix="summon-r2q-")
+    try:
+        _mk_agents(root, ("m1", "m2", "chair"))
+        import _council, argparse, io, contextlib, json as _json
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+            # m2 succeeds in r1 but FAILS in r2
+            if agent == "m2" and "-r2-" in tag:
+                return {"status": "error", "error": "r2 boom", "result": ""}
+            rank = "\nRANKING: A, B" if "-r2-" in tag else ""
+            return {"status": "success", "result": f"{agent} ok{rank}",
+                    "report": {"summary": agent}}
+        ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
+                                chairman="chair", rounds=2, cwd=os.getcwd(),
+                                agents_dir=root, timeout=60000, out=None, run_dir=root,
+                                quorum=2)
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = _council.run_council(ns)
+        finally:
+            _council._dispatch = orig
+        env = _json.loads(buf.getvalue())
+        # only m1 succeeded at the FINAL (r2) stage -> 1 success < quorum 2 -> skipped
+        assert env["synthesis"]["members_succeeded"] == 1, env["synthesis"]["members_succeeded"]
+        assert env["synthesis"]["decision_status"] == "quorum_not_met"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_status_flags_stale_synthesis_generation():
+    # Generation coherence: a synthesis stage below the run's newest generation
+    # is flagged current:false, not shown as if live.
+    import _council, _rundir as rd, argparse, io, contextlib, json as _json
+    root = tempfile.mkdtemp(prefix="summon-stale-")
+    try:
+        # gen 1 with a chairman, then hand-create a gen-2 member file only (as if
+        # gen 2 was deposed before synthesis) so the chairman lags the run.
+        _mk_agents(root, ("m1", "m2", "chair"))
+        rc1, env1 = _b2_council(root, ["m1", "m2"])
+        run_id, rdir = env1["run_id"], env1["run_dir"]
+        rd.atomic_write_json(os.path.join(rdir, "g2-r1-m1.json"),
+                             {"status": "success", "input_sha256": "x" * 64})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _council.run_council_status(argparse.Namespace(
+                council_status=run_id, run_dir=root, json=True, cwd=os.getcwd()))
+        view = _json.loads(buf.getvalue())
+        assert view["current_generation"] == 2
+        assert view["stages"]["chairman"]["current"] is False   # g1 lags g2
+        assert view["stages"]["r1-m1"]["current"] is True
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_status_generation_from_owner_not_only_files():
+    # NEW-finding regression: a live owner at generation 2 with NO gen-2 stage
+    # file yet must still make a surviving gen-1 tombstone read as stale. The
+    # run's current generation comes from the durable generation claim (owner /
+    # generation.txt), not stage filenames alone.
+    import _council, _rundir as rd, argparse, io, contextlib, json as _json
+    root = tempfile.mkdtemp(prefix="summon-genown-")
+    try:
+        _mk_agents(root, ("m1", "m2", "chair"))
+        rc1, env1 = _b2_council(root, ["m1", "m2"])   # gen 1, released
+        rdir = env1["run_dir"]
+        # a live gen-2 owner takes the lock but writes no stage file yet
+        o2 = rd.acquire_owner(rdir, lease_sec=600)
+        try:
+            assert o2.generation == 2
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                _council.run_council_status(argparse.Namespace(
+                    council_status=env1["run_id"], run_dir=root, json=True, cwd=os.getcwd()))
+            view = _json.loads(buf.getvalue())
+            assert view["current_generation"] == 2, view["current_generation"]
+            assert view["stages"]["chairman"]["current"] is False   # g1 chairman is stale
+        finally:
+            rd.release_owner(o2)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_council_b2_flags_matrix():
+    # All four B2 flags are accepted on council AND council-resume, rejected on status.
+    import json as _json, subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    b2 = ["--quorum", "2", "--chairman-fallback", "x",
+          "--member-timeout", "30s", "--chair-timeout", "2m"]
+    # accepted on a fresh council (fails later on missing question, NOT on a flag)
+    r = sp.run([sys.executable, script, "--council", "--cwd", os.getcwd(), *b2],
+               capture_output=True, text=True, encoding="utf-8")
+    assert "silently ignored" not in (_json.loads(r.stdout).get("error") or ""), r.stdout
+    # accepted on a resume (fails on the unknown run, NOT on a flag)
+    r2 = sp.run([sys.executable, script, "--council", "--resume-run", "nope-run",
+                 "--cwd", os.getcwd(), *b2], capture_output=True, text=True, encoding="utf-8")
+    err2 = _json.loads(r2.stdout).get("error") or ""
+    assert "silently ignored" not in err2 and "unknown council run" in err2, r2.stdout
+    # each of the four rejected on status
+    for flag, val in (("--quorum", "2"), ("--chairman-fallback", "x"),
+                      ("--member-timeout", "30s"), ("--chair-timeout", "2m")):
+        r3 = sp.run([sys.executable, script, "--council-status", "x", flag, val],
+                    capture_output=True, text=True, encoding="utf-8")
+        env3 = _json.loads(r3.stdout)
+        assert env3["status"] == "error" and flag in env3["error"], (flag, env3)
+
+
+def test_council_per_stage_timeouts_and_lease():
+    # B2.1: member stages use --member-timeout, chairman uses --chair-timeout;
+    # the owner lease is sized on the LARGER of the two so a long chair stage
+    # cannot outlive it.
+    import _council, _rundir as rd, argparse, io, contextlib, json as _json
+    d = tempfile.mkdtemp(prefix="summon-b2to-")
+    try:
+        for a in ("m1", "m2", "chair"):
+            open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+        seen = {}
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+            seen[agent] = timeout_ms
+            return {"status": "success", "result": f"{agent} ok"
+                    + ("\nRANKING: A, B" if "-r2-" in tag else ""),
+                    "report": {"summary": agent}}
+        leases = []
+        orig_lease = rd.default_lease_sec
+        rd.default_lease_sec = lambda s: leases.append(s) or orig_lease(s)
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            args = argparse.Namespace(
+                question="q", question_file=None, members="m1,m2", chairman="chair",
+                rounds=1, cwd=os.getcwd(), agents_dir=d, timeout=90000, out=None,
+                run_dir=d, member_timeout=30000, chair_timeout=120000)
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = _council.run_council(args)
+        finally:
+            _council._dispatch = orig
+            rd.default_lease_sec = orig_lease
+        assert rc == 0
+        assert seen["m1"] == 30000 and seen["m2"] == 30000, seen  # member clock
+        assert seen["chair"] == 120000, seen                       # chair clock
+        assert leases and leases[0] == 120000 / 1000, leases       # lease on the max
+        # ceiling line reflects the split
+        assert "member timeout 30s, chair timeout 120s" in err.getvalue(), err.getvalue()
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_council_ceiling_doubles_chairman_under_fallback():
+    import _council, argparse, io, contextlib
+    d = tempfile.mkdtemp(prefix="summon-b2ceil-")
+    try:
+        for a in ("m1", "m2", "chair", "backup"):
+            open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
+                "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+        def fake(agent, *a, **k):
+            return {"status": "success", "result": f"{agent} ok", "report": {"summary": agent}}
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            # rounds=1, 2 members (1 wave), timeout 90s (+60 margin = 150 each):
+            # with fallback -> 1*1*150 + 150*2 = 450s
+            args = argparse.Namespace(
+                question="q", question_file=None, members="m1,m2", chairman="chair",
+                rounds=1, cwd=os.getcwd(), agents_dir=d, timeout=90000, out=None,
+                run_dir=d, chairman_fallback="backup")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                _council.run_council(args)
+        finally:
+            _council._dispatch = orig
+        text = err.getvalue()
+        assert "2 chairman phase(s)" in text, text
+        assert "~450s" in text, text
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
