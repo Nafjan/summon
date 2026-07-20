@@ -10,6 +10,7 @@ patching ``run_subagent.subprocess.Popen`` -- the same cached module -- is seen.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -20,7 +21,7 @@ import uuid
 import _jobs
 
 
-def child_argv(args, result_file: str) -> list:
+def child_argv(args: argparse.Namespace, result_file: str) -> list:
     """Reconstruct the child argv from PARSED args (not by filtering sys.argv,
     which would wrongly drop a token that is another option's *value*). Drops
     --background, adds --job-file."""
@@ -49,14 +50,19 @@ def child_argv(args, result_file: str) -> list:
     return out + ["--job-file", result_file]
 
 
-def spawn_background(args, entry_path: str, summon: dict) -> dict:
+def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict) -> dict:
     """Re-exec the dispatcher detached, streaming its result to a job file. Writes
     a durable launch RECORD (fsynced) BEFORE the spawn so a child that dies before
     its result is still traceable, and hands the child a nonce it stamps into its
     result envelope. ``entry_path`` is the dispatcher script to re-exec and
     ``summon`` is the receipt identity dict -- both injected by the hub, so this
     module needs no __file__ or _receipt import. Returns the
-    {status, job_id, pid, result_file, job_dir, record_file} handle."""
+    {status, job_id, pid, result_file, job_dir, record_file} handle.
+
+    ``entry_path`` is an EXECUTION-CAPABILITY parameter (it becomes argv[1] of a
+    spawned interpreter): it must be a trusted internal path. The only caller
+    injects ``os.path.abspath(__file__)`` of the entry script; never route
+    user/agent-controlled input here."""
     root = _jobs.resolve_jobs_dir(args.job_dir)
     _jobs.ensure_jobs_dir(root)
     job_id = _jobs.new_job_id()                  # full uuid4 hex

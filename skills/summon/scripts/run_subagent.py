@@ -243,9 +243,11 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
 
 # --- Background dispatch + jobs queries (moved to _background.py) ---------------
 # child_argv/spawn_background/run_jobs_query/render_jobs live in _background.py.
-# _child_argv re-exports unchanged. _spawn_background stays a thin wrapper that
-# injects THIS entry script's path (the child re-execs run_subagent.py, not
-# _background.py) and the summon receipt, so nothing there imports the hub back.
+# _child_argv is a CALL re-export (a test calls it); spawn_background uses the
+# _background.child_argv directly, so this binding is not a patch-through seam.
+# _spawn_background stays a thin wrapper that injects THIS entry script's path
+# (the child re-execs run_subagent.py, not _background.py) and the summon receipt,
+# so nothing in _background imports the hub back.
 _child_argv = _background.child_argv
 
 
@@ -280,8 +282,11 @@ def _receipt_base() -> dict:
 
 # --- Command-line surface (moved to _cli.py) -----------------------------------
 # The argparse spec, the git-style subcommand front-end, and the fan-out mode
-# flag matrix live in _cli.py. These bindings keep the historical names the tests
-# and main() use (the parser is built via _cli.build_parser in main()).
+# flag matrix live in _cli.py. These are CALL re-exports: they keep the historical
+# names the tests and main() invoke (the parser is built via _cli.build_parser in
+# main()). They are not patch-through seams -- internal callers use the _cli.*
+# functions directly, so reassigning e.g. run_subagent._parse_timeout no longer
+# affects internals (an incidental co-location property nothing relied on).
 _parse_timeout = _cli.parse_timeout
 _rewrite_subcommand = _cli.rewrite_subcommand
 _unsupported_mode_flags = _cli.unsupported_mode_flags
@@ -315,7 +320,7 @@ def main() -> None:
 
     # Fan-out modes consume a fixed flag set; anything else present in argv is
     # rejected FIRST -- before the query handlers below, so `--manifest --doctor`
-    # can't run doctor while silently dropping the manifest (see _MODE_FLAGS).
+    # can't run doctor while silently dropping the manifest (see _cli.MODE_FLAGS).
     _bad_mode_flags = _unsupported_mode_flags(argv, args)
     if _bad_mode_flags:
         _print_error(_bad_mode_flags)
