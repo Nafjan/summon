@@ -266,10 +266,11 @@ def _spawn_background(args: argparse.Namespace) -> dict:
 # diagnosable from any single envelope. Paths are absolute local-operator data
 # (documented in SKILL.md); no prompt text or secrets, hashes only.
 
-# Bodies live in _receipt.py; these thin bindings keep the historical names the
-# tests + call sites use. Only _receipt_base needs a real wrapper: it binds THIS
-# entry script's path + version so the receipt's `script`/`version` name
-# run_subagent.py, not _receipt.py (a sibling). The rest re-export unchanged.
+# Bodies live in _receipt.py. _receipt_agent/_receipt_prompt/_git_head are CALL
+# re-exports for the tests (which invoke run_subagent._receipt_*); main() calls
+# _receipt.* directly, so these are not patch-through seams. _receipt_base is the
+# one real wrapper: it binds THIS entry script's path + version so the receipt's
+# `script`/`version` name run_subagent.py, not _receipt.py (a sibling).
 _receipt_agent = _receipt.receipt_agent
 _receipt_prompt = _receipt.receipt_prompt
 _git_head = _receipt.git_head
@@ -304,9 +305,9 @@ def main() -> None:
 
     # Subcommand front-end: translate `summon <command> …` to flat flags; `summon`
     # / `summon help` prints usage. Legacy flat invocations pass through.
-    argv, mode = _rewrite_subcommand(sys.argv[1:])
+    argv, mode = _cli.rewrite_subcommand(sys.argv[1:])
     if mode == "help":
-        print(_USAGE)
+        print(_cli.USAGE)
         sys.exit(0)
     if mode and mode.startswith("error:"):
         _print_error(mode[len("error:"):].strip())
@@ -321,7 +322,7 @@ def main() -> None:
     # Fan-out modes consume a fixed flag set; anything else present in argv is
     # rejected FIRST -- before the query handlers below, so `--manifest --doctor`
     # can't run doctor while silently dropping the manifest (see _cli.MODE_FLAGS).
-    _bad_mode_flags = _unsupported_mode_flags(argv, args)
+    _bad_mode_flags = _cli.unsupported_mode_flags(argv, args)
     if _bad_mode_flags:
         _print_error(_bad_mode_flags)
         sys.exit(1)
@@ -470,7 +471,7 @@ def main() -> None:
 
     # Root-prompt hash joins the receipt HERE, as soon as the prompt is final,
     # so even a missing-agent error downstream carries it.
-    receipt.update(_receipt_prompt(args.prompt))
+    receipt.update(_receipt.receipt_prompt(args.prompt))
 
     # --allow-credit: per-dispatch credit authorization. Env form of the same
     # switch, set process-local so the credit guard and any --background child
@@ -518,7 +519,7 @@ def main() -> None:
     # Input provenance: HEAD of the (validated) cwd. Recomputed after a
     # --worktree rewrite so the dispatched value names the effective tree;
     # pre-worktree failures (incl. preflight) carry the original cwd's HEAD.
-    receipt["git_head_before"] = _git_head(args.cwd)
+    receipt["git_head_before"] = _receipt.git_head(args.cwd)
 
     agents_dir = get_agents_dir(args.agents_dir, args.cwd)
 
@@ -529,7 +530,7 @@ def main() -> None:
     except (FileNotFoundError, ValueError) as e:
         _die(str(e))
 
-    receipt.update(_receipt_agent(args, agent_file))
+    receipt.update(_receipt.receipt_agent(args, agent_file))
 
     # Shared project memory: inject {cwd}/.agents/memory.md (standing conventions,
     # constraints, durable decisions) so callers don't re-explain project context
@@ -631,7 +632,7 @@ def main() -> None:
 
     # Effective-tree provenance: recompute HEAD after any worktree rewrite,
     # BEFORE the agent can commit anything.
-    receipt["git_head_before"] = _git_head(args.cwd)
+    receipt["git_head_before"] = _receipt.git_head(args.cwd)
 
     # Catch ValueError from build_invocation_args / permission_flags / TOML
     # escaping so unknown --cli values or unsafe agent paths surface as JSON
