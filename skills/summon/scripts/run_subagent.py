@@ -57,6 +57,9 @@ if sys.version_info < (3, 10):
 # Ensure sibling modules import correctly when invoked via absolute path.
 sys.path.insert(0, str(Path(__file__).parent))
 
+import _background  # noqa: E402
+import _cli  # noqa: E402
+import _receipt  # noqa: E402
 from _builder import AgentInvocation  # noqa: E402
 from _executor import ENVELOPE_VERSION as _ENVELOPE_VERSION  # noqa: E402
 from _executor import execute_agent  # noqa: E402
@@ -167,32 +170,6 @@ def _preflight_backend(cli: str) -> dict | None:
 _MEMORY_CAP = 8000  # chars; keeps the injected block well under agy's 28 KB argv guard
 
 
-def _parse_timeout(value: str) -> int:
-    """--timeout accepts bare milliseconds (backward compatible) or a human
-    suffix: '90s', '10m', '600000ms'. Returns whole milliseconds (>= 1;
-    fractional input rounds). Zero, negative, and non-finite durations are
-    rejected here so they fail as argparse errors, not as instantly-killed
-    agents or an OverflowError from the executor."""
-    import math
-    s = str(value).strip().lower()
-    try:
-        if s.endswith("ms"):
-            ms = float(s[:-2])
-        elif s.endswith("s"):
-            ms = float(s[:-1]) * 1000
-        elif s.endswith("m"):
-            ms = float(s[:-1]) * 60_000
-        else:
-            ms = float(s)
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"invalid --timeout {value!r}: use milliseconds or a suffix, e.g. 600000, 600s, 10m")
-    if not math.isfinite(ms) or ms <= 0:
-        raise argparse.ArgumentTypeError(
-            f"invalid --timeout {value!r}: must be a positive finite duration")
-    return max(1, int(round(ms)))
-
-
 def _apply_gemini_thinking(model: str, effort: str) -> str:
     """Map summon effort -> an agy Gemini thinking-mode suffix on the model name
     (agy's thinking is a model variant, not a flag). Strips any existing ``(...)``
@@ -264,89 +241,21 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
     return {"path": wt, "cwd": effective, "branch": branch}
 
 
-def _child_argv(args: argparse.Namespace, result_file: str) -> list:
-    """Reconstruct the child argv from PARSED args (not by filtering sys.argv,
-    which would wrongly drop a token that is another option's *value*). Drops
-    --background, adds --job-file."""
-    # A file-sourced prompt is re-passed AS THE FILE (not the loaded text): the
-    # child re-reads it, keeping the detached argv small and mojibake-free.
-    if getattr(args, "prompt_file", None):
-        out = ["--agent", args.agent, "--prompt-file", args.prompt_file, "--cwd", args.cwd]
-    else:
-        out = ["--agent", args.agent, "--prompt", args.prompt, "--cwd", args.cwd]
-    if getattr(args, "allow_credit", False):
-        out += ["--allow-credit"]
-    if args.agents_dir:
-        out += ["--agents-dir", args.agents_dir]
-    if args.timeout:
-        out += ["--timeout", str(args.timeout)]
-    for flag, val in (("--cli", args.cli), ("--model", args.model), ("--effort", args.effort),
-                      ("--resume", args.resume), ("--resume-profile", args.resume_profile),
-                      ("--out", args.out), ("--json-schema", args.json_schema),
-                      ("--debug-dir", args.debug_dir)):
-        if val:
-            out += [flag, val]
-    if args.retries:
-        out += ["--retries", str(args.retries)]
-    if args.worktree is not None:
-        out += [f"--worktree={args.worktree}"]  # =form is unambiguous for the bare case
-    return out + ["--job-file", result_file]
+# --- Background dispatch + jobs queries (moved to _background.py) ---------------
+# child_argv/spawn_background/run_jobs_query/render_jobs live in _background.py.
+# _child_argv is a CALL re-export (a test calls it); spawn_background uses the
+# _background.child_argv directly, so this binding is not a patch-through seam.
+# _spawn_background stays a thin wrapper that injects THIS entry script's path
+# (the child re-execs run_subagent.py, not _background.py) and the summon receipt,
+# so nothing in _background imports the hub back.
+_child_argv = _background.child_argv
 
 
 def _spawn_background(args: argparse.Namespace) -> dict:
-    """Re-exec this script detached, streaming its result to a job file. Writes a
-    durable launch RECORD (fsynced) BEFORE the spawn so a child that dies before
-    its result is still traceable, and hands the child a nonce it stamps into its
-    result envelope. Returns the {status, job_id, pid, result_file, job_dir}
-    handle."""
-    import hashlib
-    from _jobs import (ensure_jobs_dir, flags_projection, new_job_id,
-                       resolve_jobs_dir, result_path, update_spawned, write_prepared)
-    root = resolve_jobs_dir(args.job_dir)
-    ensure_jobs_dir(root)
-    job_id = new_job_id()                       # full uuid4 hex
-    result_file = result_path(root, job_id)
-    nonce = uuid.uuid4().hex
-    prompt_sha = (hashlib.sha256(args.prompt.encode("utf-8")).hexdigest()
-                  if args.prompt is not None else None)
-    # Launch record BEFORE spawn (fail-closed: a record we cannot write aborts
-    # the dispatch rather than launching an untraceable job). Keep the path it
-    # returns: every value the handle needs is now computed BEFORE Popen, so
-    # nothing fallible runs between a successful spawn and returning the handle.
-    try:
-        record_file = write_prepared(
-            root, job_id, nonce=nonce, agent=args.agent,
-            prompt_sha256=prompt_sha, cwd=args.cwd,
-            flags=flags_projection(args), summon=_receipt_base()["summon"])
-    except OSError as e:
-        raise ValueError(f"cannot write the background launch record: {e}") from e
-    cmd = [sys.executable, os.path.abspath(__file__), *_child_argv(args, result_file)]
-    kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
-                    "stderr": subprocess.DEVNULL}
-    child_env = {**os.environ, "SUMMON_JOB_NONCE": nonce}
-    if prompt_sha:
-        child_env["SUMMON_JOB_PROMPT_SHA"] = prompt_sha   # lets the crash path verify
-    kwargs["env"] = child_env
-    if os.name == "nt":
-        kwargs["creationflags"] = (
-            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
-    else:
-        kwargs["start_new_session"] = True
-    proc = subprocess.Popen(cmd, **kwargs)
-    # Handle built from ONLY pre-Popen values (no path recompute, no fs call), so
-    # it cannot throw here and strand the live child.
-    handle = {"status": "background", "job_id": job_id, "pid": proc.pid,
-              "result_file": result_file, "job_dir": root,
-              "record_file": record_file}
-    # The child is ALREADY running. A failure to stamp the pid onto the record
-    # must never sink the handle -- that would strand a live job with no way for
-    # the caller to find its result. Surface the metadata failure as a warning
-    # and return the handle regardless.
-    try:
-        update_spawned(root, job_id, proc.pid)  # record the pid post-spawn
-    except OSError as e:
-        handle["warnings"] = [f"launch record pid update failed (job is running): {e}"]
-    return handle
+    """Dispatch detached. See _background.spawn_background; the entry-script path
+    and summon receipt are injected here."""
+    return _background.spawn_background(
+        args, os.path.abspath(__file__), _receipt_base()["summon"])
 
 
 # --- Provenance receipt --------------------------------------------------------
@@ -357,269 +266,32 @@ def _spawn_background(args: argparse.Namespace) -> dict:
 # diagnosable from any single envelope. Paths are absolute local-operator data
 # (documented in SKILL.md); no prompt text or secrets, hashes only.
 
+# Bodies live in _receipt.py. _receipt_agent/_receipt_prompt/_git_head are CALL
+# re-exports for the tests (which invoke run_subagent._receipt_*); main() calls
+# _receipt.* directly, so these are not patch-through seams. _receipt_base is the
+# one real wrapper: it binds THIS entry script's path + version so the receipt's
+# `script`/`version` name run_subagent.py, not _receipt.py (a sibling).
+_receipt_agent = _receipt.receipt_agent
+_receipt_prompt = _receipt.receipt_prompt
+_git_head = _receipt.git_head
+
+
 def _receipt_base() -> dict:
-    """summon identity: available before ANY validation, so even a missing-agent
-    or unknown-backend error names the install that produced it."""
-    import hashlib
-    here = Path(__file__).resolve().parent
-    h = hashlib.sha256()
-    # One SHA over EVERY production module (incl. agy_pty_pyte.py -- drift lives
-    # in siblings, not just the entry file). Length-prefixed framing so
-    # (name, content) boundaries are unambiguous. test_discovery.py is excluded:
-    # it never executes at dispatch time.
-    for name in sorted(p.name for p in here.glob("*.py") if p.name != "test_discovery.py"):
-        try:
-            data = (here / name).read_bytes()
-        except OSError:
-            data = b""
-        nb = name.encode("utf-8")
-        h.update(len(nb).to_bytes(8, "big"))
-        h.update(nb)
-        h.update(len(data).to_bytes(8, "big"))
-        h.update(data)
-    return {"summon": {"version": __version__,
-                       "script": str(Path(__file__).resolve()),
-                       "scripts_sha256": h.hexdigest()}}
+    """summon identity, bound to THIS entry script. See _receipt.receipt_base."""
+    return _receipt.receipt_base(os.path.abspath(__file__), __version__)
 
 
-def _receipt_agent(args: argparse.Namespace, agent_file: str) -> dict:
-    """Agent-definition provenance. ``agents_dir`` records the ABSOLUTE roster
-    directory the definition was ACTUALLY loaded from (a bundled-fallback hit
-    must not record the project dir that failed the lookup)."""
-    import hashlib
-    try:
-        fsha = hashlib.sha256(Path(agent_file).read_bytes()).hexdigest()
-    except OSError:
-        fsha = None  # hashed as read-back; a vanished file stays diagnosable
-    served_dir = str(Path(agent_file).resolve().parent)
-    _bundled = bundled_roster_dir()
-    if _bundled and Path(served_dir) == Path(_bundled).resolve():
-        source = "bundled"
-    elif args.agents_dir:
-        source = "explicit"
-    elif os.environ.get("SUB_AGENTS_DIR"):
-        source = "env"
-    else:
-        source = "project"
-    return {"agent_def": {"file": agent_file, "sha256": fsha,
-                          "agents_dir": served_dir, "source": source}}
-
-
-def _receipt_prompt(prompt: str | None) -> dict:
-    import hashlib
-    if prompt is None:
-        return {}
-    return {"prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest()}
-
-
-def _git_head(cwd: str) -> str | None:
-    """HEAD of the EFFECTIVE dispatch cwd, captured BEFORE the agent runs (input
-    provenance -- hence `git_head_before` in the envelope; an editing agent may
-    commit during the run). Best-effort: None outside a repo or without git."""
-    try:
-        r = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
-                           capture_output=True, text=True, timeout=2,
-                           stdin=subprocess.DEVNULL)
-        head = (r.stdout or "").strip()
-        return head if r.returncode == 0 and head else None
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-# --- Fan-out mode flag matrix --------------------------------------------------
-# The flags each fan-out mode actually CONSUMES. --manifest and --council branch
-# out of main() before most dispatch flags are read, so anything outside these
-# sets used to be SILENTLY IGNORED -- field case: a council run passed --out
-# expecting an artifact and never got one. A flag that would be dropped is now
-# rejected loudly BEFORE any paid dispatch. Whitelist, not blacklist: a flag
-# added to the parser later is rejected-by-default in these modes until a mode
-# explicitly supports it.
-_MODE_FLAGS = {
-    "manifest": {"manifest", "concurrency", "results_dir", "cwd", "agents_dir",
-                 "retries", "job_file"},
-    # Operation-level rows: a fresh council, a resume, and a read-only status
-    # each consume a DIFFERENT set (v3.1). Changing members/rounds/question on a
-    # resume would be a new run, so they are rejected there; status takes only
-    # its id + where to look.
-    "council": {"council", "question", "question_file", "members", "chairman",
-                "rounds", "cwd", "agents_dir", "timeout", "out", "run_dir", "job_file",
-                "quorum", "chairman_fallback", "member_timeout", "chair_timeout"},
-    # A resume may change how the SAME run's stages are gated/timed (quorum,
-    # fallback, per-stage timeouts) without changing its identity; question,
-    # members, chairman, and rounds still come from the receipt.
-    "council-resume": {"council", "resume_run", "cwd", "agents_dir", "timeout",
-                       "out", "run_dir", "job_file",
-                       "quorum", "chairman_fallback", "member_timeout", "chair_timeout"},
-    # Status takes ONLY its id, where to look, and the output format -- it never
-    # dispatches, so it has no working directory (use --run-dir to point it).
-    "council-status": {"council_status", "run_dir", "json", "job_file"},
-    # jobs read commands: registry query only.
-    "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
-    "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
-    "jobs-wait": {"jobs_wait", "job_dir", "timeout", "job_file"},
-}
-_MODE_HINTS = {
-    "manifest": ("Put per-job settings (model, effort, timeout, json_schema, "
-                 "debug_dir, prompt/prompt_file) in the manifest's jobs/defaults; "
-                 "per-job envelopes land under --results-dir."),
-    "council": ("--out IS supported (the council envelope, checkpointed at each "
-                "phase); member model/effort/permission come from each member "
-                "agent's own definition."),
-    "council-resume": ("a resume re-runs the SAME run: question, members, chairman, "
-                       "and rounds come from the run's receipt.json, so they cannot "
-                       "be changed here -- start a fresh council to change them."),
-    "council-status": ("status is read-only: it takes only the run id, --run-dir, "
-                       "and --json."),
-    "jobs-list": ("jobs list is read-only: it takes only --job-dir and --json."),
-    "jobs-status": ("jobs status is read-only: it takes only the job id, --job-dir, "
-                    "and --json."),
-    "jobs-wait": ("jobs wait is read-only: it takes only the job id, --job-dir, "
-                  "and --timeout."),
-}
-_FLAG_NAMES = {"sets": "--set"}  # dests whose flag spelling isn't dest.replace('_','-')
-_TOKEN_DESTS = {"set": "sets"}   # the reverse mapping, for raw-argv presence detection
-
-
-def _fanout_mode(args: argparse.Namespace) -> str | None:
-    """Which fixed-flag mode this invocation is, for the whitelist below."""
-    if args.manifest:
-        return "manifest"
-    if getattr(args, "jobs_list", None):
-        return "jobs-list"
-    if getattr(args, "jobs_status", None):
-        return "jobs-status"
-    if getattr(args, "jobs_wait", None):
-        return "jobs-wait"
-    if getattr(args, "council_status", None):
-        return "council-status"
-    if args.council:
-        return "council-resume" if getattr(args, "resume_run", None) else "council"
-    return None
-
-
-def _unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
-    """Error text when a fan-out mode received flags it does not consume, else
-    None. Presence is detected from the RAW (post-subcommand-rewrite) argv, not
-    by comparing parsed values to defaults -- a value equal to its default
-    (e.g. ``--timeout 600000``) is still an explicit flag and still rejected."""
-    mode = _fanout_mode(args)
-    if mode is None:
-        return None
-    allowed = _MODE_FLAGS[mode]
-    present = set()
-    for tok in argv:
-        if tok.startswith("--"):
-            name = tok[2:].split("=", 1)[0]
-            present.add(_TOKEN_DESTS.get(name, name.replace("-", "_")))
-    offending = sorted(
-        _FLAG_NAMES.get(dest, "--" + dest.replace("_", "-"))
-        for dest in vars(args)
-        if dest not in allowed and dest in present
-    )
-    if not offending:
-        return None
-    label = {"council-resume": "council resume", "council-status": "council status"
-             }.get(mode, f"--{mode}")
-    return (f"{label} does not support {', '.join(offending)}: these flags would "
-            f"have been silently ignored, so they are rejected instead. "
-            f"{_MODE_HINTS[mode]}")
-
-
-# --- Subcommand front-end -----------------------------------------------------
-# summon presents git-style subcommands (dispatch/manifest/council/doctor/models/
-# agent/list/version) that translate to the underlying flat flags. The flat form
-# still works unchanged (legacy compat) — anything starting with '-' skips the
-# rewrite. This keeps one battle-tested parser + all logic while giving a clean,
-# discoverable command surface.
-_SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
-                "manifest", "council", "agent", "jobs", "version", "help", "--help", "-h"}
-
-_USAGE = """summon — cross-vendor sub-agents for any AI CLI
-
-Usage: summon <command> [options]
-
-Commands:
-  dispatch  --agent NAME --prompt "…" --cwd DIR   run an agent (the default action)
-  list                                            list available agents
-  models    [--cli BACKEND]                       what each backend can run now
-  doctor    [--json]                              check backends / setup health
-  manifest  FILE [--concurrency …] [--results-dir D]   run a batch swarm
-  council   --question "…" [--members …] [--rounds 2]  decide by consensus
-  agent new NAME [--set k=v …]                    scaffold an agent definition
-  agent set NAME  --set k=v …                     retune an agent's frontmatter
-  jobs list|status|wait [ID] [--job-dir D] [--json]   inspect background jobs
-  version                                         print version
-
-Legacy flat flags still work: `summon --agent NAME --prompt … --cwd …`,
-`summon --list`, `summon --manifest FILE`, etc. Run any command with --help for
-its options. Full docs: SKILL.md.
-"""
-
-
-def _rewrite_subcommand(argv: list) -> tuple:
-    """Translate a leading subcommand into equivalent flat flags. Returns
-    ``(argv, mode)`` where mode is 'help' (print usage, exit 0), a string
-    'error: …' (print error, exit 2), or None. Legacy flat invocations (argv
-    starts with '-') pass through untouched."""
-    if not argv:
-        return argv, "help"
-    head = argv[0]
-    if head.startswith("-") or head not in _SUBCOMMANDS:
-        return argv, None  # legacy flat (or a stray token the flat parser reports)
-    if head in ("help", "--help", "-h"):
-        return argv, "help"
-    rest = argv[1:]
-    # `<subcommand> --help/-h`: the argv-rewrite facade has no per-command parser,
-    # so show the general usage rather than argparse erroring on a missing positional.
-    if any(a in ("--help", "-h") for a in rest):
-        return argv, "help"
-    if head in ("dispatch", "run"):
-        return rest, None
-    if head in ("list", "agents", "ls"):
-        return ["--list", *rest], None
-    if head == "models":
-        return ["--list-models", *rest], None
-    if head == "doctor":
-        return ["--doctor", *rest], None
-    if head == "council":
-        # `council resume <id>` and `council status <id>` are nested actions;
-        # a bare `council …` stays the fresh-run form.
-        if rest and rest[0] == "resume":
-            if len(rest) < 2 or rest[1].startswith("-"):
-                return argv, "error: 'council resume' needs a run id"
-            return ["--council", "--resume-run", rest[1], *rest[2:]], None
-        if rest and rest[0] == "status":
-            if len(rest) < 2 or rest[1].startswith("-"):
-                return argv, "error: 'council status' needs a run id"
-            # NO --council: status dispatches on --council-status alone (and its
-            # whitelist would reject a stray --council).
-            return ["--council-status", rest[1], *rest[2:]], None
-        return ["--council", *rest], None
-    if head == "jobs":
-        if not rest:
-            return argv, "help"       # bare `summon jobs` -> usage, not a silent list
-        if rest[0] == "list":
-            return ["--jobs-list", *rest[1:]], None
-        if rest[0] in ("status", "wait"):
-            if len(rest) < 2 or rest[1].startswith("-"):
-                return argv, f"error: 'jobs {rest[0]}' needs a job id"
-            flag = "--jobs-status" if rest[0] == "status" else "--jobs-wait"
-            return [flag, rest[1], *rest[2:]], None
-        return argv, f"error: unknown 'jobs' action {rest[0]!r} (use list/status/wait)"
-    if head == "version":
-        return ["--version", *rest], None
-    if head == "manifest":            # first positional is the manifest file
-        return (["--manifest", *rest], None)
-    if head == "agent":
-        if not rest:
-            return argv, "help"       # `summon agent` -> usage
-        if rest[0] not in ("new", "set"):
-            # an invalid action (e.g. `agent delete`) is an ERROR, not success —
-            # automation must not read exit 0 for a bogus command.
-            return argv, f"error: unknown 'agent' action {rest[0]!r} (use 'new' or 'set')"
-        flag = "--new-agent" if rest[0] == "new" else "--set-agent"
-        return ([flag, *rest[1:]], None)
-    return argv, None
+# --- Command-line surface (moved to _cli.py) -----------------------------------
+# The argparse spec, the git-style subcommand front-end, and the fan-out mode
+# flag matrix live in _cli.py. These are CALL re-exports: they keep the historical
+# names the tests and main() invoke (the parser is built via _cli.build_parser in
+# main()). They are not patch-through seams -- internal callers use the _cli.*
+# functions directly, so reassigning e.g. run_subagent._parse_timeout no longer
+# affects internals (an incidental co-location property nothing relied on).
+_parse_timeout = _cli.parse_timeout
+_rewrite_subcommand = _cli.rewrite_subcommand
+_unsupported_mode_flags = _cli.unsupported_mode_flags
+_USAGE = _cli.USAGE
 
 
 def main() -> None:
@@ -633,121 +305,15 @@ def main() -> None:
 
     # Subcommand front-end: translate `summon <command> …` to flat flags; `summon`
     # / `summon help` prints usage. Legacy flat invocations pass through.
-    argv, mode = _rewrite_subcommand(sys.argv[1:])
+    argv, mode = _cli.rewrite_subcommand(sys.argv[1:])
     if mode == "help":
-        print(_USAGE)
+        print(_cli.USAGE)
         sys.exit(0)
     if mode and mode.startswith("error:"):
         _print_error(mode[len("error:"):].strip())
         sys.exit(2)
 
-    parser = argparse.ArgumentParser(description="Execute external CLI AIs as sub-agents")
-    parser.add_argument("--version", action="version",
-                        version=f"summon {__version__} (envelope schema v{_ENVELOPE_VERSION})")
-    parser.add_argument("--list", action="store_true", help="List available agents")
-    parser.add_argument("--list-models", dest="list_models", action="store_true",
-                        help="Report invocable models per backend (live where the CLI exposes it; "
-                             "filter with --cli)")
-    parser.add_argument("--doctor", action="store_true",
-                        help="Check backend CLIs, agy wrapper deps, agents dir, and git; "
-                             "human-readable (add --json for machines)")
-    parser.add_argument("--new-agent", dest="new_agent", metavar="NAME",
-                        help="Scaffold a new agent definition (house template: report "
-                             "contract + untrusted-content guard); customize with --set")
-    parser.add_argument("--set-agent", dest="set_agent", metavar="NAME",
-                        help="Edit an existing agent's frontmatter via --set KEY=VALUE "
-                             "(KEY= removes); body untouched")
-    parser.add_argument("--set", dest="sets", action="append", default=[],
-                        metavar="KEY=VALUE",
-                        help="With --new-agent/--set-agent: run-agent, model, permission, args")
-    parser.add_argument("--json", action="store_true",
-                        help="With --doctor: emit machine-readable JSON instead of the table")
-    parser.add_argument("--agent", help="Agent definition name")
-    parser.add_argument("--prompt", help="Task prompt")
-    parser.add_argument("--prompt-file", dest="prompt_file",
-                        help="Read the task prompt from FILE (UTF-8; BOM tolerated). "
-                             "Mutually exclusive with --prompt. Ergonomics for long/"
-                             "quoted prompts -- backends still receive the prompt via "
-                             "argv, so backend argv limits (e.g. agy ~28k chars) apply")
-    parser.add_argument("--cwd", help="Working directory (absolute path)")
-    parser.add_argument("--agents-dir", help="Directory containing agent definitions")
-    parser.add_argument(
-        "--timeout", type=_parse_timeout, default=600000,
-        help="Timeout: bare ms, or with suffix — 600s, 10m (default: 600000 ms = 10m)"
-    )
-    parser.add_argument("--cli", help="Force specific CLI (claude, cursor-agent, codex, gemini)")
-    parser.add_argument("--model", help="Override the agent's frontmatter model for this call")
-    parser.add_argument("--effort", help="Reasoning effort (claude): low|medium|high|xhigh|max")
-    parser.add_argument("--resume", dest="resume", help="Backend session/thread/chat id to resume")
-    parser.add_argument("--resume-profile", help="agy only: profile dir of the session being resumed")
-    parser.add_argument("--worktree", nargs="?", const="", default=None,
-                        help="Run in an isolated git worktree (optional name; auto-named if bare)")
-    parser.add_argument("--background", action="store_true",
-                        help="Dispatch detached; return a job handle immediately")
-    parser.add_argument("--dry-run", dest="dry_run", action="store_true",
-                        help="Print the fully resolved dispatch (command, model, permission "
-                             "flags, cwd) WITHOUT executing anything")
-    parser.add_argument("--out", help="Write the envelope atomically to FILE; if FILE already "
-                                      "holds a valid envelope, skip the run (swarm resume)")
-    parser.add_argument("--retries", type=int, default=0,
-                        help="Re-dispatch up to N times on error/partial, exponential backoff")
-    parser.add_argument("--allow-credit", dest="allow_credit", action="store_true",
-                        help="Authorize spending ACCOUNT CREDIT on a credit-only model "
-                             "(Fable) for this one dispatch — flag form of "
-                             "SUMMON_ALLOW_CREDIT=1. Single dispatch only: rejected for "
-                             "--manifest/--council (set the env var deliberately for "
-                             "fan-out spend)")
-    parser.add_argument("--json-schema", dest="json_schema",
-                        help="Validate the agent's final JSON against this schema file; attach "
-                             "parsed/parse_ok; one corrective retry via resume on mismatch")
-    parser.add_argument("--debug-dir", dest="debug_dir",
-                        help="Dump per-run argv + raw output + envelope into this dir")
-    parser.add_argument("--job-file", dest="job_file", help=argparse.SUPPRESS)  # internal
-    parser.add_argument("--manifest", help="Run a batch of jobs from a JSON manifest (see SKILL.md)")
-    parser.add_argument("--concurrency", help="With --manifest: per-backend caps, e.g. agy=2,codex=3,default=3")
-    parser.add_argument("--results-dir", dest="results_dir",
-                        help="With --manifest: envelope dir (default {cwd}/.agents/results)")
-    parser.add_argument("--council", action="store_true",
-                        help="Decide by consensus: dispatch --question to diverse members, "
-                             "then a chairman synthesizes. See SKILL.md")
-    parser.add_argument("--question", help="With --council: the decision/question to deliberate")
-    parser.add_argument("--question-file", dest="question_file",
-                        help="With --council: read the question from a file")
-    parser.add_argument("--members", help="With --council: comma-separated member agents "
-                                          "(default: a vendor-diverse set)")
-    parser.add_argument("--chairman", help="With --council: the synthesizer agent (default: fable)")
-    parser.add_argument("--rounds", type=int, default=1,
-                        help="With --council: 1 (independent) or 2 (adds cross-examination)")
-    parser.add_argument("--run-dir", dest="run_dir",
-                        help="With --council: root for the durable run directory "
-                             "(default {cwd}/.agents/runs; env SUMMON_RUNS_DIR)")
-    parser.add_argument("--resume-run", dest="resume_run", metavar="RUN_ID",
-                        help="Resume a council run by id: re-run only missing/failed/"
-                             "changed stages (question/members come from its receipt)")
-    parser.add_argument("--council-status", dest="council_status", metavar="RUN_ID",
-                        help="Print a council run's durable state (read-only; add --json)")
-    parser.add_argument("--quorum", type=int, metavar="N",
-                        help="With --council: synthesize only if at least N members "
-                             "succeeded (2..member-count); below N the chairman is skipped. "
-                             "Never changes the top-level status, only synthesis")
-    parser.add_argument("--chairman-fallback", dest="chairman_fallback", metavar="AGENT",
-                        help="With --council: a fallback synthesizer to run once if the "
-                             "primary chairman ends non-success")
-    parser.add_argument("--member-timeout", dest="member_timeout", type=_parse_timeout,
-                        help="With --council: per-member stage timeout (default: --timeout)")
-    parser.add_argument("--chair-timeout", dest="chair_timeout", type=_parse_timeout,
-                        help="With --council: chairman (and fallback) stage timeout "
-                             "(default: --timeout)")
-    parser.add_argument("--job-dir", dest="job_dir",
-                        help="Root for --background job records/results "
-                             "(default {tempdir}/subagents_jobs; env SUMMON_JOBS_DIR)")
-    parser.add_argument("--jobs-list", dest="jobs_list", action="store_true",
-                        help="List background jobs in the job dir (read-only; add --json)")
-    parser.add_argument("--jobs-status", dest="jobs_status", metavar="JOB_ID",
-                        help="Print one background job's record + result (read-only)")
-    parser.add_argument("--jobs-wait", dest="jobs_wait", metavar="JOB_ID",
-                        help="Wait for a background job's result (read-only poll; --timeout)")
-
+    parser = _cli.build_parser(__version__, _ENVELOPE_VERSION)
     args = parser.parse_args(argv)
 
     global _JOB_FILE
@@ -755,8 +321,8 @@ def main() -> None:
 
     # Fan-out modes consume a fixed flag set; anything else present in argv is
     # rejected FIRST -- before the query handlers below, so `--manifest --doctor`
-    # can't run doctor while silently dropping the manifest (see _MODE_FLAGS).
-    _bad_mode_flags = _unsupported_mode_flags(argv, args)
+    # can't run doctor while silently dropping the manifest (see _cli.MODE_FLAGS).
+    _bad_mode_flags = _cli.unsupported_mode_flags(argv, args)
     if _bad_mode_flags:
         _print_error(_bad_mode_flags)
         sys.exit(1)
@@ -776,7 +342,7 @@ def main() -> None:
     # jobs list/status/wait: read-only registry queries; no dispatch. Answer and
     # exit before any agent/prompt/cwd validation.
     if args.jobs_list or args.jobs_status or args.jobs_wait:
-        sys.exit(_run_jobs_query(args))
+        sys.exit(_background.run_jobs_query(args, _print_error))
 
     # --new-agent / --set-agent: local roster management, no dispatch involved.
     if args.new_agent or args.set_agent:
@@ -905,7 +471,7 @@ def main() -> None:
 
     # Root-prompt hash joins the receipt HERE, as soon as the prompt is final,
     # so even a missing-agent error downstream carries it.
-    receipt.update(_receipt_prompt(args.prompt))
+    receipt.update(_receipt.receipt_prompt(args.prompt))
 
     # --allow-credit: per-dispatch credit authorization. Env form of the same
     # switch, set process-local so the credit guard and any --background child
@@ -953,7 +519,7 @@ def main() -> None:
     # Input provenance: HEAD of the (validated) cwd. Recomputed after a
     # --worktree rewrite so the dispatched value names the effective tree;
     # pre-worktree failures (incl. preflight) carry the original cwd's HEAD.
-    receipt["git_head_before"] = _git_head(args.cwd)
+    receipt["git_head_before"] = _receipt.git_head(args.cwd)
 
     agents_dir = get_agents_dir(args.agents_dir, args.cwd)
 
@@ -964,7 +530,7 @@ def main() -> None:
     except (FileNotFoundError, ValueError) as e:
         _die(str(e))
 
-    receipt.update(_receipt_agent(args, agent_file))
+    receipt.update(_receipt.receipt_agent(args, agent_file))
 
     # Shared project memory: inject {cwd}/.agents/memory.md (standing conventions,
     # constraints, durable decisions) so callers don't re-explain project context
@@ -1066,7 +632,7 @@ def main() -> None:
 
     # Effective-tree provenance: recompute HEAD after any worktree rewrite,
     # BEFORE the agent can commit anything.
-    receipt["git_head_before"] = _git_head(args.cwd)
+    receipt["git_head_before"] = _receipt.git_head(args.cwd)
 
     # Catch ValueError from build_invocation_args / permission_flags / TOML
     # escaping so unknown --cli values or unsafe agent paths surface as JSON
@@ -1163,51 +729,6 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
         except ValueError as e:
             view["error"] = str(e)
     return view
-
-
-def _run_jobs_query(args) -> int:
-    """`jobs list/status/wait`: read-only registry queries. Returns exit code."""
-    import _jobs
-    root = _jobs.resolve_jobs_dir(args.job_dir)
-    if args.jobs_list:
-        rows = _jobs.list_jobs(root)
-        if args.json:
-            print(json.dumps({"job_dir": root, "jobs": rows}, ensure_ascii=False))
-        else:
-            print(_render_jobs(root, rows))
-        return 0
-    if args.jobs_status:
-        try:
-            st = _jobs.job_status(root, args.jobs_status)
-        except ValueError as e:
-            _print_error(str(e)); return 1
-        if st is None:
-            _print_error(f"no such job {args.jobs_status!r} under {root}"); return 1
-        print(json.dumps(st, ensure_ascii=False))
-        return 0
-    # jobs wait
-    try:
-        result, outcome = _jobs.wait_job(root, args.jobs_wait, args.timeout)
-    except ValueError as e:
-        _print_error(str(e)); return 1
-    if outcome == "timeout":
-        _print_error(f"timed out waiting for job {args.jobs_wait!r} (no verified result yet)",
-                     exit_code=124)
-        return 124
-    print(json.dumps(result, ensure_ascii=False))
-    return 0 if result.get("status") == "success" else 1
-
-
-def _render_jobs(root: str, rows: list) -> str:
-    """ASCII table of jobs. Windows consoles default to cp1252 -> ASCII only."""
-    lines = [f"job dir: {root}", f"jobs: {len(rows)}"]
-    for r in rows:
-        rid = r["job_id"][:12]
-        trust = "" if r.get("trusted") else "  [unverified]" if r["state"] == "unverified" else ""
-        pid = f" pid={r['pid']}" if r.get("pid") else ""
-        lines.append(f"  {rid}  {r['state']:<14} {r.get('agent') or '?':<16}"
-                     f"{pid}{trust}")
-    return "\n".join(lines)
 
 
 def _dispatch_with_retries(invocation, args) -> dict:
