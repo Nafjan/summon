@@ -9,6 +9,7 @@ receipt's ``script``/``version`` always name run_subagent.py, never THIS module
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
 import subprocess
@@ -44,7 +45,7 @@ def receipt_base(entry_path: str, version: str) -> dict:
                        "scripts_sha256": h.hexdigest()}}
 
 
-def receipt_agent(args, agent_file: str) -> dict:
+def receipt_agent(args: argparse.Namespace, agent_file: str) -> dict:
     """Agent-definition provenance. ``agents_dir`` records the ABSOLUTE roster
     directory the definition was ACTUALLY loaded from (a bundled-fallback hit
     must not record the project dir that failed the lookup)."""
