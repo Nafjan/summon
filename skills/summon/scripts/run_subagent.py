@@ -57,6 +57,7 @@ if sys.version_info < (3, 10):
 # Ensure sibling modules import correctly when invoked via absolute path.
 sys.path.insert(0, str(Path(__file__).parent))
 
+import _background  # noqa: E402
 import _cli  # noqa: E402
 import _receipt  # noqa: E402
 from _builder import AgentInvocation  # noqa: E402
@@ -240,89 +241,19 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
     return {"path": wt, "cwd": effective, "branch": branch}
 
 
-def _child_argv(args: argparse.Namespace, result_file: str) -> list:
-    """Reconstruct the child argv from PARSED args (not by filtering sys.argv,
-    which would wrongly drop a token that is another option's *value*). Drops
-    --background, adds --job-file."""
-    # A file-sourced prompt is re-passed AS THE FILE (not the loaded text): the
-    # child re-reads it, keeping the detached argv small and mojibake-free.
-    if getattr(args, "prompt_file", None):
-        out = ["--agent", args.agent, "--prompt-file", args.prompt_file, "--cwd", args.cwd]
-    else:
-        out = ["--agent", args.agent, "--prompt", args.prompt, "--cwd", args.cwd]
-    if getattr(args, "allow_credit", False):
-        out += ["--allow-credit"]
-    if args.agents_dir:
-        out += ["--agents-dir", args.agents_dir]
-    if args.timeout:
-        out += ["--timeout", str(args.timeout)]
-    for flag, val in (("--cli", args.cli), ("--model", args.model), ("--effort", args.effort),
-                      ("--resume", args.resume), ("--resume-profile", args.resume_profile),
-                      ("--out", args.out), ("--json-schema", args.json_schema),
-                      ("--debug-dir", args.debug_dir)):
-        if val:
-            out += [flag, val]
-    if args.retries:
-        out += ["--retries", str(args.retries)]
-    if args.worktree is not None:
-        out += [f"--worktree={args.worktree}"]  # =form is unambiguous for the bare case
-    return out + ["--job-file", result_file]
+# --- Background dispatch + jobs queries (moved to _background.py) ---------------
+# child_argv/spawn_background/run_jobs_query/render_jobs live in _background.py.
+# _child_argv re-exports unchanged. _spawn_background stays a thin wrapper that
+# injects THIS entry script's path (the child re-execs run_subagent.py, not
+# _background.py) and the summon receipt, so nothing there imports the hub back.
+_child_argv = _background.child_argv
 
 
 def _spawn_background(args: argparse.Namespace) -> dict:
-    """Re-exec this script detached, streaming its result to a job file. Writes a
-    durable launch RECORD (fsynced) BEFORE the spawn so a child that dies before
-    its result is still traceable, and hands the child a nonce it stamps into its
-    result envelope. Returns the {status, job_id, pid, result_file, job_dir}
-    handle."""
-    import hashlib
-    from _jobs import (ensure_jobs_dir, flags_projection, new_job_id,
-                       resolve_jobs_dir, result_path, update_spawned, write_prepared)
-    root = resolve_jobs_dir(args.job_dir)
-    ensure_jobs_dir(root)
-    job_id = new_job_id()                       # full uuid4 hex
-    result_file = result_path(root, job_id)
-    nonce = uuid.uuid4().hex
-    prompt_sha = (hashlib.sha256(args.prompt.encode("utf-8")).hexdigest()
-                  if args.prompt is not None else None)
-    # Launch record BEFORE spawn (fail-closed: a record we cannot write aborts
-    # the dispatch rather than launching an untraceable job). Keep the path it
-    # returns: every value the handle needs is now computed BEFORE Popen, so
-    # nothing fallible runs between a successful spawn and returning the handle.
-    try:
-        record_file = write_prepared(
-            root, job_id, nonce=nonce, agent=args.agent,
-            prompt_sha256=prompt_sha, cwd=args.cwd,
-            flags=flags_projection(args), summon=_receipt_base()["summon"])
-    except OSError as e:
-        raise ValueError(f"cannot write the background launch record: {e}") from e
-    cmd = [sys.executable, os.path.abspath(__file__), *_child_argv(args, result_file)]
-    kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
-                    "stderr": subprocess.DEVNULL}
-    child_env = {**os.environ, "SUMMON_JOB_NONCE": nonce}
-    if prompt_sha:
-        child_env["SUMMON_JOB_PROMPT_SHA"] = prompt_sha   # lets the crash path verify
-    kwargs["env"] = child_env
-    if os.name == "nt":
-        kwargs["creationflags"] = (
-            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
-    else:
-        kwargs["start_new_session"] = True
-    proc = subprocess.Popen(cmd, **kwargs)
-    # Handle built from ONLY pre-Popen values (no path recompute, no fs call), so
-    # it cannot throw here and strand the live child.
-    handle = {"status": "background", "job_id": job_id, "pid": proc.pid,
-              "result_file": result_file, "job_dir": root,
-              "record_file": record_file}
-    # The child is ALREADY running. A failure to stamp the pid onto the record
-    # must never sink the handle -- that would strand a live job with no way for
-    # the caller to find its result. Surface the metadata failure as a warning
-    # and return the handle regardless.
-    try:
-        update_spawned(root, job_id, proc.pid)  # record the pid post-spawn
-    except OSError as e:
-        handle["warnings"] = [f"launch record pid update failed (job is running): {e}"]
-    return handle
+    """Dispatch detached. See _background.spawn_background; the entry-script path
+    and summon receipt are injected here."""
+    return _background.spawn_background(
+        args, os.path.abspath(__file__), _receipt_base()["summon"])
 
 
 # --- Provenance receipt --------------------------------------------------------
@@ -405,7 +336,7 @@ def main() -> None:
     # jobs list/status/wait: read-only registry queries; no dispatch. Answer and
     # exit before any agent/prompt/cwd validation.
     if args.jobs_list or args.jobs_status or args.jobs_wait:
-        sys.exit(_run_jobs_query(args))
+        sys.exit(_background.run_jobs_query(args, _print_error))
 
     # --new-agent / --set-agent: local roster management, no dispatch involved.
     if args.new_agent or args.set_agent:
@@ -792,51 +723,6 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
         except ValueError as e:
             view["error"] = str(e)
     return view
-
-
-def _run_jobs_query(args) -> int:
-    """`jobs list/status/wait`: read-only registry queries. Returns exit code."""
-    import _jobs
-    root = _jobs.resolve_jobs_dir(args.job_dir)
-    if args.jobs_list:
-        rows = _jobs.list_jobs(root)
-        if args.json:
-            print(json.dumps({"job_dir": root, "jobs": rows}, ensure_ascii=False))
-        else:
-            print(_render_jobs(root, rows))
-        return 0
-    if args.jobs_status:
-        try:
-            st = _jobs.job_status(root, args.jobs_status)
-        except ValueError as e:
-            _print_error(str(e)); return 1
-        if st is None:
-            _print_error(f"no such job {args.jobs_status!r} under {root}"); return 1
-        print(json.dumps(st, ensure_ascii=False))
-        return 0
-    # jobs wait
-    try:
-        result, outcome = _jobs.wait_job(root, args.jobs_wait, args.timeout)
-    except ValueError as e:
-        _print_error(str(e)); return 1
-    if outcome == "timeout":
-        _print_error(f"timed out waiting for job {args.jobs_wait!r} (no verified result yet)",
-                     exit_code=124)
-        return 124
-    print(json.dumps(result, ensure_ascii=False))
-    return 0 if result.get("status") == "success" else 1
-
-
-def _render_jobs(root: str, rows: list) -> str:
-    """ASCII table of jobs. Windows consoles default to cp1252 -> ASCII only."""
-    lines = [f"job dir: {root}", f"jobs: {len(rows)}"]
-    for r in rows:
-        rid = r["job_id"][:12]
-        trust = "" if r.get("trusted") else "  [unverified]" if r["state"] == "unverified" else ""
-        pid = f" pid={r['pid']}" if r.get("pid") else ""
-        lines.append(f"  {rid}  {r['state']:<14} {r.get('agent') or '?':<16}"
-                     f"{pid}{trust}")
-    return "\n".join(lines)
 
 
 def _dispatch_with_retries(invocation, args) -> dict:
