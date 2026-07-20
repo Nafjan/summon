@@ -52,10 +52,34 @@ Rules that still apply (manifest or manual):
    for machine-readable verdicts, and sum `usage`/`cost_usd` for the bill.
 
 **Manual path** (when you need per-job worktrees or custom scheduling): dispatch
-each job with `--background`, which returns `{job_id, pid, result_file}` at once;
-completion = its `result_file` exists (atomically written = complete). Poll those.
-(`--background` and `--out` are separate mechanisms and can't be combined — use
-`--manifest` when you want per-job result files at chosen paths.)
+each job with `--background`, which returns `{job_id, pid, result_file, job_dir,
+record_file}` at once; completion = its `result_file` exists (atomically written =
+complete). (`--background` and `--out` are separate mechanisms and can't be combined;
+use `--manifest` when you want per-job result files at chosen paths.)
+
+### The background job registry
+
+`--background` writes a durable launch record (fsynced) BEFORE the child spawns, so a
+job that dies before its result is never zero-forensics. Records and results live under
+`--job-dir` (or `SUMMON_JOBS_DIR`, default `{tempdir}/subagents_jobs`); point it at a
+durable path if the default temp location is volatile for you. Instead of polling the
+result path yourself:
+
+- `summon jobs list [--job-dir D] [--json]`: every job's state: `prepared` (launched,
+  spawn unconfirmed), `running` (pid known, not asserted alive), a terminal status,
+  `unverified` (a result whose `job_nonce` does not match its record, or a legacy
+  result with no record), or `corrupt` (a record/result present but unreadable, or an
+  authenticated result with a malformed envelope). A corrupt job still lists (it does
+  not silently disappear).
+- `summon jobs status <id>`: one job's launch record + result envelope + derived state.
+- `summon jobs wait <id> [--timeout]`: poll for a nonce-verified result; a stale file
+  at the path is skipped until the real child writes, then the envelope is printed.
+
+The child stamps a `job_nonce` into its result envelope so a result at a job's path can
+be authenticated against the record that launched it; `status`/`wait` never trust an
+unverifiable result. This is a single-user, single-machine registry (summon does not
+defend it against other local users on a shared host). Liveness verification, cancel,
+and reaping are a later addition.
 
 ## Council mode (`--council`) — decide by consensus
 

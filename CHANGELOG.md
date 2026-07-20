@@ -69,6 +69,26 @@ baseline and the iterative hardening on top of it.
 - `council status <run-id>` prints a read-only, generation-stable snapshot (per-stage
   status, generation, attempts, abandoned work; `--json` for machines).
 
+**Background job registry (read path)**
+- `--background` now writes a durable launch record (fsynced) BEFORE the child spawns, so
+  a job that dies before writing its result is still traceable to what was launched. The
+  child stamps a `job_nonce` into its result envelope (on the normal AND crash paths) so a
+  result at a job's path can be authenticated against its record.
+- `--job-dir` / `SUMMON_JOBS_DIR` control where records and results land (default
+  unchanged); records live in a `.summon-records/` subdir so a result glob never trips
+  over them.
+- `jobs list` / `jobs status <id>` / `jobs wait <id>` are read-only registry commands
+  (flat `--jobs-list` / `--jobs-status` / `--jobs-wait`). State machine: `prepared`,
+  `running` (pid known, not asserted alive), a terminal status, `unverified` (nonce
+  mismatch or a legacy result), or `corrupt` (a record or result that exists but is
+  unreadable, or an authenticated result with a malformed envelope). An unverifiable or
+  corrupt result is never reported `trusted`, and a corrupt job still enumerates in
+  `list` rather than vanishing. The registry is single-user and single-machine
+  (documented; it does not defend against other local users on a shared host). Records
+  and results are written whole (never a zero-byte window) and a symlink planted at a
+  record/result path is refused rather than followed. Liveness verification, cancel, and
+  reaping are a later addition.
+
 **Provenance and telemetry**
 - Provenance receipt on every dispatch envelope, including preflight errors:
   `summon.{version, script, scripts_sha256}` (one SHA-256 over all production modules),

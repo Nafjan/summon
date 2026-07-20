@@ -20,7 +20,7 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: Compile all modules
-        run: python -m py_compile skills/summon/scripts/run_subagent.py skills/summon/scripts/_loader.py skills/summon/scripts/_resolver.py skills/summon/scripts/_builder.py skills/summon/scripts/_executor.py skills/summon/scripts/_stream.py skills/summon/scripts/_doctor.py skills/summon/scripts/_rundir.py skills/summon/scripts/_council.py skills/summon/scripts/_manifest.py summon.py install.py
+        run: python -m py_compile skills/summon/scripts/run_subagent.py skills/summon/scripts/_loader.py skills/summon/scripts/_resolver.py skills/summon/scripts/_builder.py skills/summon/scripts/_executor.py skills/summon/scripts/_stream.py skills/summon/scripts/_doctor.py skills/summon/scripts/_rundir.py skills/summon/scripts/_council.py skills/summon/scripts/_manifest.py skills/summon/scripts/_jobs.py summon.py install.py
 
       - name: Unit tests (dispatcher)
         run: python skills/summon/scripts/test_discovery.py
