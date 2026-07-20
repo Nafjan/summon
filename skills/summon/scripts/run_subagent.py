@@ -70,8 +70,33 @@ __version__ = "0.9.0"  # summon dispatcher version (see CHANGELOG.md)
 _JOB_FILE: str | None = None
 
 
+def _stamp_job(env: dict) -> dict:
+    """Stamp a background child's result envelope with its job identity so a
+    result at a job's path can be authenticated against the launch record. Fires
+    ONLY when the internal ``--job-file`` is present -- that flag is how the
+    parent spawns a background child, so a NORMAL foreground run (which never
+    passes it) cannot carry a `job_nonce` from a stray SUMMON_JOB_* env var. A
+    caller that deliberately passes the internal flag AND sets SUMMON_JOB_NONCE
+    can hand-stamp one, but on a single-user machine that is self-inflicted: the
+    nonce is best-effort integrity against stale/mismatched result files, not a
+    security boundary."""
+    if _resolve_job_file() is None:
+        return env
+    nonce = os.environ.get("SUMMON_JOB_NONCE")
+    if nonce:
+        env["job_nonce"] = nonce
+    # Fill prompt_sha256 on paths that lack a full receipt (the crash writer);
+    # a normal envelope already carries the receipt-computed hash, kept as-is.
+    if env.get("prompt_sha256") is None:
+        _ph = os.environ.get("SUMMON_JOB_PROMPT_SHA")
+        if _ph:
+            env["prompt_sha256"] = _ph
+    return env
+
+
 def _emit(obj: dict) -> None:
     """Write the response as JSON — to the job file (background) or stdout."""
+    _stamp_job(obj)
     text = json.dumps(obj, ensure_ascii=False)
     if _JOB_FILE:
         tmp = _JOB_FILE + ".tmp"
@@ -269,23 +294,59 @@ def _child_argv(args: argparse.Namespace, result_file: str) -> list:
 
 
 def _spawn_background(args: argparse.Namespace) -> dict:
-    """Re-exec this script detached, streaming its result to a job file. Returns
-    the immediate {status, job_id, pid, result_file} handle (pid lets the poller
-    tell 'still running' from 'died')."""
-    jobs_dir = os.path.join(tempfile.gettempdir(), "subagents_jobs")
-    os.makedirs(jobs_dir, exist_ok=True)
-    job_id = uuid.uuid4().hex[:12]
-    result_file = os.path.join(jobs_dir, f"{job_id}.json")
+    """Re-exec this script detached, streaming its result to a job file. Writes a
+    durable launch RECORD (fsynced) BEFORE the spawn so a child that dies before
+    its result is still traceable, and hands the child a nonce it stamps into its
+    result envelope. Returns the {status, job_id, pid, result_file, job_dir}
+    handle."""
+    import hashlib
+    from _jobs import (ensure_jobs_dir, flags_projection, new_job_id,
+                       resolve_jobs_dir, result_path, update_spawned, write_prepared)
+    root = resolve_jobs_dir(args.job_dir)
+    ensure_jobs_dir(root)
+    job_id = new_job_id()                       # full uuid4 hex
+    result_file = result_path(root, job_id)
+    nonce = uuid.uuid4().hex
+    prompt_sha = (hashlib.sha256(args.prompt.encode("utf-8")).hexdigest()
+                  if args.prompt is not None else None)
+    # Launch record BEFORE spawn (fail-closed: a record we cannot write aborts
+    # the dispatch rather than launching an untraceable job). Keep the path it
+    # returns: every value the handle needs is now computed BEFORE Popen, so
+    # nothing fallible runs between a successful spawn and returning the handle.
+    try:
+        record_file = write_prepared(
+            root, job_id, nonce=nonce, agent=args.agent,
+            prompt_sha256=prompt_sha, cwd=args.cwd,
+            flags=flags_projection(args), summon=_receipt_base()["summon"])
+    except OSError as e:
+        raise ValueError(f"cannot write the background launch record: {e}") from e
     cmd = [sys.executable, os.path.abspath(__file__), *_child_argv(args, result_file)]
     kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
                     "stderr": subprocess.DEVNULL}
+    child_env = {**os.environ, "SUMMON_JOB_NONCE": nonce}
+    if prompt_sha:
+        child_env["SUMMON_JOB_PROMPT_SHA"] = prompt_sha   # lets the crash path verify
+    kwargs["env"] = child_env
     if os.name == "nt":
         kwargs["creationflags"] = (
             subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
     else:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(cmd, **kwargs)
-    return {"status": "background", "job_id": job_id, "pid": proc.pid, "result_file": result_file}
+    # Handle built from ONLY pre-Popen values (no path recompute, no fs call), so
+    # it cannot throw here and strand the live child.
+    handle = {"status": "background", "job_id": job_id, "pid": proc.pid,
+              "result_file": result_file, "job_dir": root,
+              "record_file": record_file}
+    # The child is ALREADY running. A failure to stamp the pid onto the record
+    # must never sink the handle -- that would strand a live job with no way for
+    # the caller to find its result. Surface the metadata failure as a warning
+    # and return the handle regardless.
+    try:
+        update_spawned(root, job_id, proc.pid)  # record the pid post-spawn
+    except OSError as e:
+        handle["warnings"] = [f"launch record pid update failed (job is running): {e}"]
+    return handle
 
 
 # --- Provenance receipt --------------------------------------------------------
@@ -392,6 +453,10 @@ _MODE_FLAGS = {
     # Status takes ONLY its id, where to look, and the output format -- it never
     # dispatches, so it has no working directory (use --run-dir to point it).
     "council-status": {"council_status", "run_dir", "json", "job_file"},
+    # jobs read commands: registry query only.
+    "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
+    "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
+    "jobs-wait": {"jobs_wait", "job_dir", "timeout", "job_file"},
 }
 _MODE_HINTS = {
     "manifest": ("Put per-job settings (model, effort, timeout, json_schema, "
@@ -405,6 +470,11 @@ _MODE_HINTS = {
                        "be changed here -- start a fresh council to change them."),
     "council-status": ("status is read-only: it takes only the run id, --run-dir, "
                        "and --json."),
+    "jobs-list": ("jobs list is read-only: it takes only --job-dir and --json."),
+    "jobs-status": ("jobs status is read-only: it takes only the job id, --job-dir, "
+                    "and --json."),
+    "jobs-wait": ("jobs wait is read-only: it takes only the job id, --job-dir, "
+                  "and --timeout."),
 }
 _FLAG_NAMES = {"sets": "--set"}  # dests whose flag spelling isn't dest.replace('_','-')
 _TOKEN_DESTS = {"set": "sets"}   # the reverse mapping, for raw-argv presence detection
@@ -414,6 +484,12 @@ def _fanout_mode(args: argparse.Namespace) -> str | None:
     """Which fixed-flag mode this invocation is, for the whitelist below."""
     if args.manifest:
         return "manifest"
+    if getattr(args, "jobs_list", None):
+        return "jobs-list"
+    if getattr(args, "jobs_status", None):
+        return "jobs-status"
+    if getattr(args, "jobs_wait", None):
+        return "jobs-wait"
     if getattr(args, "council_status", None):
         return "council-status"
     if args.council:
@@ -456,7 +532,7 @@ def _unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 # rewrite. This keeps one battle-tested parser + all logic while giving a clean,
 # discoverable command surface.
 _SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
-                "manifest", "council", "agent", "version", "help", "--help", "-h"}
+                "manifest", "council", "agent", "jobs", "version", "help", "--help", "-h"}
 
 _USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -471,6 +547,7 @@ Commands:
   council   --question "…" [--members …] [--rounds 2]  decide by consensus
   agent new NAME [--set k=v …]                    scaffold an agent definition
   agent set NAME  --set k=v …                     retune an agent's frontmatter
+  jobs list|status|wait [ID] [--job-dir D] [--json]   inspect background jobs
   version                                         print version
 
 Legacy flat flags still work: `summon --agent NAME --prompt … --cwd …`,
@@ -518,6 +595,17 @@ def _rewrite_subcommand(argv: list) -> tuple:
             # whitelist would reject a stray --council).
             return ["--council-status", rest[1], *rest[2:]], None
         return ["--council", *rest], None
+    if head == "jobs":
+        if not rest:
+            return argv, "help"       # bare `summon jobs` -> usage, not a silent list
+        if rest[0] == "list":
+            return ["--jobs-list", *rest[1:]], None
+        if rest[0] in ("status", "wait"):
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, f"error: 'jobs {rest[0]}' needs a job id"
+            flag = "--jobs-status" if rest[0] == "status" else "--jobs-wait"
+            return [flag, rest[1], *rest[2:]], None
+        return argv, f"error: unknown 'jobs' action {rest[0]!r} (use list/status/wait)"
     if head == "version":
         return ["--version", *rest], None
     if head == "manifest":            # first positional is the manifest file
@@ -650,6 +738,15 @@ def main() -> None:
     parser.add_argument("--chair-timeout", dest="chair_timeout", type=_parse_timeout,
                         help="With --council: chairman (and fallback) stage timeout "
                              "(default: --timeout)")
+    parser.add_argument("--job-dir", dest="job_dir",
+                        help="Root for --background job records/results "
+                             "(default {tempdir}/subagents_jobs; env SUMMON_JOBS_DIR)")
+    parser.add_argument("--jobs-list", dest="jobs_list", action="store_true",
+                        help="List background jobs in the job dir (read-only; add --json)")
+    parser.add_argument("--jobs-status", dest="jobs_status", metavar="JOB_ID",
+                        help="Print one background job's record + result (read-only)")
+    parser.add_argument("--jobs-wait", dest="jobs_wait", metavar="JOB_ID",
+                        help="Wait for a background job's result (read-only poll; --timeout)")
 
     args = parser.parse_args(argv)
 
@@ -675,6 +772,11 @@ def main() -> None:
         report = doctor(args.agents_dir, args.cwd)
         print(json.dumps(report, ensure_ascii=False) if args.json else render(report))
         sys.exit(0 if report["ok"] else 1)
+
+    # jobs list/status/wait: read-only registry queries; no dispatch. Answer and
+    # exit before any agent/prompt/cwd validation.
+    if args.jobs_list or args.jobs_status or args.jobs_wait:
+        sys.exit(_run_jobs_query(args))
 
     # --new-agent / --set-agent: local roster management, no dispatch involved.
     if args.new_agent or args.set_agent:
@@ -1063,6 +1165,51 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     return view
 
 
+def _run_jobs_query(args) -> int:
+    """`jobs list/status/wait`: read-only registry queries. Returns exit code."""
+    import _jobs
+    root = _jobs.resolve_jobs_dir(args.job_dir)
+    if args.jobs_list:
+        rows = _jobs.list_jobs(root)
+        if args.json:
+            print(json.dumps({"job_dir": root, "jobs": rows}, ensure_ascii=False))
+        else:
+            print(_render_jobs(root, rows))
+        return 0
+    if args.jobs_status:
+        try:
+            st = _jobs.job_status(root, args.jobs_status)
+        except ValueError as e:
+            _print_error(str(e)); return 1
+        if st is None:
+            _print_error(f"no such job {args.jobs_status!r} under {root}"); return 1
+        print(json.dumps(st, ensure_ascii=False))
+        return 0
+    # jobs wait
+    try:
+        result, outcome = _jobs.wait_job(root, args.jobs_wait, args.timeout)
+    except ValueError as e:
+        _print_error(str(e)); return 1
+    if outcome == "timeout":
+        _print_error(f"timed out waiting for job {args.jobs_wait!r} (no verified result yet)",
+                     exit_code=124)
+        return 124
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result.get("status") == "success" else 1
+
+
+def _render_jobs(root: str, rows: list) -> str:
+    """ASCII table of jobs. Windows consoles default to cp1252 -> ASCII only."""
+    lines = [f"job dir: {root}", f"jobs: {len(rows)}"]
+    for r in rows:
+        rid = r["job_id"][:12]
+        trust = "" if r.get("trusted") else "  [unverified]" if r["state"] == "unverified" else ""
+        pid = f" pid={r['pid']}" if r.get("pid") else ""
+        lines.append(f"  {rid}  {r['state']:<14} {r.get('agent') or '?':<16}"
+                     f"{pid}{trust}")
+    return "\n".join(lines)
+
+
 def _dispatch_with_retries(invocation, args) -> dict:
     """execute_agent with --retries: exponential backoff on error/partial only
     (blocked won't improve by retrying — its cause is structural)."""
@@ -1162,6 +1309,7 @@ if __name__ == "__main__":
         jf = _resolve_job_file()
         if jf:
             try:
+                _stamp_job(err)   # even a crash envelope carries its job identity
                 with open(jf + ".tmp", "w", encoding="utf-8") as fh:
                     json.dump(err, fh, ensure_ascii=False)
                 os.replace(jf + ".tmp", jf)
