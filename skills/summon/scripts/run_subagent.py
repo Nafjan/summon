@@ -57,6 +57,7 @@ if sys.version_info < (3, 10):
 # Ensure sibling modules import correctly when invoked via absolute path.
 sys.path.insert(0, str(Path(__file__).parent))
 
+import _receipt  # noqa: E402
 from _builder import AgentInvocation  # noqa: E402
 from _executor import ENVELOPE_VERSION as _ENVELOPE_VERSION  # noqa: E402
 from _executor import execute_agent  # noqa: E402
@@ -357,73 +358,18 @@ def _spawn_background(args: argparse.Namespace) -> dict:
 # diagnosable from any single envelope. Paths are absolute local-operator data
 # (documented in SKILL.md); no prompt text or secrets, hashes only.
 
+# Bodies live in _receipt.py; these thin bindings keep the historical names the
+# tests + call sites use. Only _receipt_base needs a real wrapper: it binds THIS
+# entry script's path + version so the receipt's `script`/`version` name
+# run_subagent.py, not _receipt.py (a sibling). The rest re-export unchanged.
+_receipt_agent = _receipt.receipt_agent
+_receipt_prompt = _receipt.receipt_prompt
+_git_head = _receipt.git_head
+
+
 def _receipt_base() -> dict:
-    """summon identity: available before ANY validation, so even a missing-agent
-    or unknown-backend error names the install that produced it."""
-    import hashlib
-    here = Path(__file__).resolve().parent
-    h = hashlib.sha256()
-    # One SHA over EVERY production module (incl. agy_pty_pyte.py -- drift lives
-    # in siblings, not just the entry file). Length-prefixed framing so
-    # (name, content) boundaries are unambiguous. test_discovery.py is excluded:
-    # it never executes at dispatch time.
-    for name in sorted(p.name for p in here.glob("*.py") if p.name != "test_discovery.py"):
-        try:
-            data = (here / name).read_bytes()
-        except OSError:
-            data = b""
-        nb = name.encode("utf-8")
-        h.update(len(nb).to_bytes(8, "big"))
-        h.update(nb)
-        h.update(len(data).to_bytes(8, "big"))
-        h.update(data)
-    return {"summon": {"version": __version__,
-                       "script": str(Path(__file__).resolve()),
-                       "scripts_sha256": h.hexdigest()}}
-
-
-def _receipt_agent(args: argparse.Namespace, agent_file: str) -> dict:
-    """Agent-definition provenance. ``agents_dir`` records the ABSOLUTE roster
-    directory the definition was ACTUALLY loaded from (a bundled-fallback hit
-    must not record the project dir that failed the lookup)."""
-    import hashlib
-    try:
-        fsha = hashlib.sha256(Path(agent_file).read_bytes()).hexdigest()
-    except OSError:
-        fsha = None  # hashed as read-back; a vanished file stays diagnosable
-    served_dir = str(Path(agent_file).resolve().parent)
-    _bundled = bundled_roster_dir()
-    if _bundled and Path(served_dir) == Path(_bundled).resolve():
-        source = "bundled"
-    elif args.agents_dir:
-        source = "explicit"
-    elif os.environ.get("SUB_AGENTS_DIR"):
-        source = "env"
-    else:
-        source = "project"
-    return {"agent_def": {"file": agent_file, "sha256": fsha,
-                          "agents_dir": served_dir, "source": source}}
-
-
-def _receipt_prompt(prompt: str | None) -> dict:
-    import hashlib
-    if prompt is None:
-        return {}
-    return {"prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest()}
-
-
-def _git_head(cwd: str) -> str | None:
-    """HEAD of the EFFECTIVE dispatch cwd, captured BEFORE the agent runs (input
-    provenance -- hence `git_head_before` in the envelope; an editing agent may
-    commit during the run). Best-effort: None outside a repo or without git."""
-    try:
-        r = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
-                           capture_output=True, text=True, timeout=2,
-                           stdin=subprocess.DEVNULL)
-        head = (r.stdout or "").strip()
-        return head if r.returncode == 0 and head else None
-    except (OSError, subprocess.SubprocessError):
-        return None
+    """summon identity, bound to THIS entry script. See _receipt.receipt_base."""
+    return _receipt.receipt_base(os.path.abspath(__file__), __version__)
 
 
 # --- Fan-out mode flag matrix --------------------------------------------------
