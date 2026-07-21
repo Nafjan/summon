@@ -19,6 +19,35 @@ from pathlib import Path
 from _loader import bundled_roster_dir
 
 
+def _read_regular_bounded(path, max_bytes):
+    """Open ``path`` NON-BLOCKING (O_NONBLOCK on POSIX) so a FIFO/device named ``*.py``
+    cannot hang us at ``open()`` (opening a FIFO for read blocks until a writer appears),
+    fstat the HANDLE, and return one of:
+      - (bytes, None)           a regular file; content read up to ``max_bytes`` (+1 so a
+                                file that GREW past the bound on the handle is detectable)
+      - (None, 'nonfile')       not a regular file (FIFO/device/dir, incl. behind a symlink)
+      - (None, 'oversize:<N>')  a regular file larger than ``max_bytes``
+    Raises OSError on any open/read/stat failure; the fd is ALWAYS closed. Windows has no
+    O_NONBLOCK and no filesystem FIFOs on a scripts path, so it degrades to a normal open."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            return None, "nonfile"
+        if st.st_size > max_bytes:
+            return None, "oversize:" + str(st.st_size)
+        data = b""
+        while len(data) <= max_bytes:          # loop: os.read may short-read a regular file
+            chunk = os.read(fd, max_bytes + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data, None
+    finally:
+        os.close(fd)
+
+
 def scripts_sha256(scripts_dir, max_bytes=None) -> str:
     """One SHA-256 over EVERY production module in ``scripts_dir`` (all ``*.py``
     except test_discovery.py, which never executes at dispatch time). Length-prefixed
@@ -46,21 +75,19 @@ def scripts_sha256(scripts_dir, max_bytes=None) -> str:
             if max_bytes is None:
                 data = target.read_bytes()        # RECEIPT path: EXACT legacy behavior
             else:
-                # BOUNDED path (enumerating OTHER copies): open ONCE, fstat the HANDLE
-                # (not the path), and read from that same handle -- so a check/read swap
-                # (a path repointed to a device or huge file between validation and read)
-                # can't defeat the bound. A non-regular file (device/FIFO behind a symlink)
-                # is marked, never read; an oversize regular file is marked by size.
-                with open(target, "rb") as fh:
-                    st = os.fstat(fh.fileno())
-                    if not _stat.S_ISREG(st.st_mode):
-                        data = b"\x00__nonfile__"
-                    elif st.st_size > max_bytes:
-                        data = b"\x00__oversize__:" + str(st.st_size).encode("ascii")
-                    else:
-                        data = fh.read(max_bytes + 1)
-                        if len(data) > max_bytes:     # grew past the bound on this handle
-                            data = b"\x00__oversize__:racy"
+                # BOUNDED path (enumerating OTHER copies): non-blocking open + fstat the
+                # HANDLE + bounded read from that same handle -- so neither a FIFO/device
+                # named *.py (blocking open), nor a path repointed to a huge file between a
+                # stat and the read (TOCTOU), nor an unbounded read, can hang or blow memory.
+                payload, note = _read_regular_bounded(str(target), max_bytes)
+                if note == "nonfile":
+                    data = b"\x00__nonfile__"
+                elif note is not None:            # "oversize:<N>"
+                    data = b"\x00__" + note.encode("ascii")
+                elif len(payload) > max_bytes:    # grew past the bound on this handle
+                    data = b"\x00__oversize__:racy"
+                else:
+                    data = payload
         except OSError:
             data = b""
         nb = name.encode("utf-8")

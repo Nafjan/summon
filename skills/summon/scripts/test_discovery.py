@@ -4698,8 +4698,19 @@ def test_v6_read_version_parser_robustness():
         assert ver('x = 1\n') is None                                  # absent
         assert ver('def f():\n    __version__ = "9.9.9"\n    return 1\n') is None  # nested, not module-level
         assert ver('__version__ = "1.0.0"\n__version__ = "2.0.0"\n') == "2.0.0"  # LAST wins
-        # deeply nested expression: an ast RecursionError must be caught -> None, never raised
-        assert ver('__version__ = ' + '-' * 80000 + '1\n') is None
+        # annotated assignment (AnnAssign) is honored and wins over a prior plain Assign
+        assert ver('__version__ = "1.0.0"\n__version__: str = "2.0.0"\n') == "2.0.0"
+        assert ver('__version__: str\n') is None                       # bare annotation, no value
+        assert ver('__version__ = "1.0.0"\n__version__ += "x"\n') is None  # AugAssign invalidates
+        # an ast RecursionError must be caught deterministically -> None, never raised
+        def _raise_rec(*a, **k):
+            raise RecursionError("deep")
+        _orig_parse = _installs.ast.parse
+        _installs.ast.parse = _raise_rec
+        try:
+            assert ver('__version__ = "1.2.3"\n') is None
+        finally:
+            _installs.ast.parse = _orig_parse
         # non-UTF-8 bytes: strict decode -> None, must NOT raise
         with open(os.path.join(d, "run_subagent.py"), "wb") as fh:
             fh.write(b'__version__ = "\xff\xfe bad"\n')
@@ -4785,6 +4796,52 @@ def test_v6_enumerate_dedups_symlink_aliases():
         assert merged["running"] is True and merged["managed"] is True
         dr = _installs.drift_report(recs)
         assert dr["converged"] is True and dr["drifted"] == []
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_fifo_in_scripts_dir_does_not_hang():
+    # review CRITICAL: a FIFO named *.py in an enumerated copy must NOT block open() (which
+    # would hang doctor/install indefinitely on POSIX). The non-blocking open + fstat classify
+    # it as non-regular without reading. Skipped where os.mkfifo is unavailable (Windows); the
+    # Linux CI matrix exercises it.
+    import _installs
+    import _receipt
+    if not hasattr(os, "mkfifo"):
+        print("  [v6-skip] os.mkfifo unavailable (non-POSIX); FIFO hang test not applicable")
+        return
+    import threading
+    home = tempfile.mkdtemp(prefix="summon-v6fifo-")
+    try:
+        scripts = _mk_summon_install(home, ".claude",
+                                     {"run_subagent.py": '__version__ = "1.0.0"\n', "_x.py": "x=1\n"})
+        os.mkfifo(os.path.join(scripts, "evil.py"))            # a FIFO *.py with NO writer
+        result = {}
+
+        def run():
+            result["sha"] = _receipt.scripts_sha256(scripts, max_bytes=_installs._ENUM_MAX_BYTES)
+            result["ver"] = _installs._read_version(scripts)
+
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+        th.join(timeout=10)
+        assert not th.is_alive(), "a FIFO *.py HUNG enumeration (blocking open)"
+        assert isinstance(result.get("sha"), str) and len(result["sha"]) == 64, result
+        assert result.get("ver") == "1.0.0", result
+        # a FIFO run_subagent.py itself must not hang _read_version either
+        os.unlink(os.path.join(scripts, "run_subagent.py"))
+        os.mkfifo(os.path.join(scripts, "run_subagent.py"))
+        r2 = {}
+
+        def run2():
+            r2["ver"] = _installs._read_version(scripts)
+
+        th2 = threading.Thread(target=run2, daemon=True)
+        th2.start()
+        th2.join(timeout=10)
+        assert not th2.is_alive(), "a FIFO run_subagent.py HUNG _read_version"
+        assert r2.get("ver") is None, r2   # non-regular -> None
     finally:
         import shutil as _sh
         _sh.rmtree(home, ignore_errors=True)
