@@ -460,8 +460,10 @@ def _drift_check() -> None:
                   "refused or failed; re-run, or move a foreign copy aside")
         elif ok:
             print(f"\n[ok] install-drift: all {len(ok)} installed host copy(ies) match the source")
-    except Exception:  # noqa: BLE001 - advisory ONLY; never break a successful install (a
-        pass           # non-ASCII console, a closed pipe, a foreign copy -> silently skip)
+    except Exception:  # noqa: BLE001 - swallow any ORDINARY error (a non-ASCII console, a
+        pass           # closed pipe, a foreign copy) so drift-checking never breaks a
+        #                successful install; KeyboardInterrupt/SystemExit deliberately still
+        #                propagate (a user's Ctrl-C must not be eaten by an advisory check).
 
 
 def main() -> int:

@@ -18,10 +18,9 @@ from __future__ import annotations
 import ast
 import json
 import os
-import stat as _stat
 from pathlib import Path
 
-from _receipt import scripts_sha256
+from _receipt import scripts_sha256, _read_regular_bounded
 
 # Canonical host roots (dir name under HOME) that summon installs into. Public so
 # install.py's convergence check and the tests share ONE list. MUST match install.py's
@@ -75,12 +74,10 @@ def _read_version(scripts_dir: str):
     module-level ``__version__`` assignments exist, the LAST wins (Python's own semantics)."""
     path = os.path.join(scripts_dir, "run_subagent.py")
     try:
-        with open(path, "rb") as fh:
-            st = os.fstat(fh.fileno())
-            if not _stat.S_ISREG(st.st_mode) or st.st_size > _ENUM_MAX_BYTES:
-                return None                      # non-regular (device/FIFO) or oversize
-            raw = fh.read(_ENUM_MAX_BYTES + 1)
-        if len(raw) > _ENUM_MAX_BYTES:           # grew past the bound between fstat and read
+        raw, note = _read_regular_bounded(path, _ENUM_MAX_BYTES)   # non-blocking; FIFO-safe
+        if note is not None or raw is None:      # non-regular (FIFO/device) or oversize
+            return None
+        if len(raw) > _ENUM_MAX_BYTES:           # grew past the bound on the handle
             return None
         tree = ast.parse(raw.decode("utf-8"))    # strict: non-UTF-8 -> UnicodeDecodeError
     except (OSError, ValueError, SyntaxError, RecursionError, MemoryError):
@@ -93,7 +90,15 @@ def _read_version(scripts_dir: str):
                     v = node.value
                     found = (v.value if isinstance(v, ast.Constant)
                              and isinstance(v.value, str) else None)
-    return found   # last module-level assignment wins; a computed value -> None (not garbage)
+        elif isinstance(node, ast.AnnAssign):    # __version__: str = "x"
+            if isinstance(node.target, ast.Name) and node.target.id == "__version__":
+                v = node.value                   # may be None (a bare annotation)
+                found = (v.value if v is not None and isinstance(v, ast.Constant)
+                         and isinstance(v.value, str) else None)
+        elif isinstance(node, ast.AugAssign):    # __version__ += "x": no longer a known literal
+            if isinstance(node.target, ast.Name) and node.target.id == "__version__":
+                found = None
+    return found   # last module-level assignment wins; a computed/mutated value -> None
 
 
 def _probe(label: str, scripts_dir: str, managed: bool) -> dict:
