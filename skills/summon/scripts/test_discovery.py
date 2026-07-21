@@ -1004,6 +1004,87 @@ def test_apply_schema_sums_attempts_on_successful_correction():
         rs.execute_agent = rs_exec
 
 
+def test_v3_contract_repair_fixes_suspect_success():
+    # rec #5 / regression test 7: a suspect success (STATUS: APPROVE -> report_ok
+    # false) gets ONE corrective resume producing a valid contract (STATUS: DONE)
+    # with the decision preserved in SUMMARY.
+    import run_subagent as rs
+    from _builder import AgentInvocation
+    import argparse
+    original = {"status": "success", "report_ok": False, "suspect": True,
+                "result": "The change is sound.\nSTATUS: APPROVE",
+                "resume": {"cli": "codex", "session_id": "sess-1"}, "attempts": 1}
+    repaired = ("Review complete.\nSTATUS: DONE\nSUMMARY: APPROVE - the change is sound\n"
+                "FOLLOW-UP: none\nHANDOFF: none")
+    def fake(inv, timeout_ms=0, debug_dir=None, **kwargs):
+        assert "execution status" in inv.prompt.lower()  # the repair prompt was used
+        return {"status": "success", "result": repaired, "report_ok": True,
+                "report": {"status": "DONE", "summary": "APPROVE - the change is sound"},
+                "resume": {}, "attempts": 1}
+    rs_exec = rs.execute_agent
+    rs.execute_agent = fake
+    try:
+        inv = AgentInvocation(cli="codex", prompt="review", cwd=os.getcwd(),
+                              system_context="s", permission="read-only")
+        out = rs._apply_contract_repair(dict(original), inv,
+                                        argparse.Namespace(timeout=1000, debug_dir=None))
+    finally:
+        rs.execute_agent = rs_exec
+    assert out["report_ok"] is True and out.get("suspect") is not True
+    assert out["contract_repaired"] is True
+    assert "APPROVE" in out["result"]         # decision preserved
+    assert out["attempts"] == 2               # 1 + 1 (correction is additional work)
+
+
+def test_v3_contract_repair_keeps_original_when_no_improvement():
+    # a retry that is STILL malformed (or errored) must NOT replace the original
+    # successful-but-suspect envelope.
+    import run_subagent as rs
+    from _builder import AgentInvocation
+    import argparse
+    original = {"status": "success", "report_ok": False, "suspect": True,
+                "result": "STATUS: APPROVE",
+                "resume": {"cli": "codex", "session_id": "s"}, "attempts": 1}
+    def fake(inv, timeout_ms=0, debug_dir=None, **kwargs):
+        return {"status": "success", "result": "STATUS: APPROVE still",
+                "report_ok": False, "resume": {}}
+    rs_exec = rs.execute_agent
+    rs.execute_agent = fake
+    try:
+        inv = AgentInvocation(cli="codex", prompt="p", cwd=os.getcwd(),
+                              system_context="s", permission="read-only")
+        out = rs._apply_contract_repair(dict(original), inv,
+                                        argparse.Namespace(timeout=1000, debug_dir=None))
+    finally:
+        rs.execute_agent = rs_exec
+    assert out["result"] == "STATUS: APPROVE" and out["report_ok"] is False  # kept original
+
+
+def test_v3_contract_repair_noops_without_resume_or_when_ok():
+    # no resume lane -> no-op; a clean (report_ok true) success -> no-op; neither
+    # spends a corrective call.
+    import run_subagent as rs
+    from _builder import AgentInvocation
+    import argparse
+    inv = AgentInvocation(cli="gemini", prompt="p", cwd=os.getcwd(),
+                          system_context="s", permission="read-only")
+    args = argparse.Namespace(timeout=1000, debug_dir=None)
+    called = []
+    rs_exec = rs.execute_agent
+    rs.execute_agent = lambda *a, **k: (called.append(1),
+                                        {"status": "success", "report_ok": True, "resume": {}})[1]
+    try:
+        no_resume = {"status": "success", "report_ok": False, "suspect": True,
+                     "result": "x", "resume": {}}
+        assert rs._apply_contract_repair(dict(no_resume), inv, args)["report_ok"] is False
+        clean = {"status": "success", "report_ok": True, "result": "ok",
+                 "resume": {"session_id": "s"}}
+        assert rs._apply_contract_repair(dict(clean), inv, args)["report_ok"] is True
+        assert not called  # execute_agent never invoked in either no-op
+    finally:
+        rs.execute_agent = rs_exec
+
+
 def test_output_tail_on_error_paths():
     # A spawn failure has no stdout, but a real error envelope from the executor
     # must carry output_tail. Exercise the output-cap path via a tiny stub is
