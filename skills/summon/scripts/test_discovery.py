@@ -1004,6 +1004,177 @@ def test_apply_schema_sums_attempts_on_successful_correction():
         rs.execute_agent = rs_exec
 
 
+def test_apply_schema_aggregates_spend_across_correction():
+    # a schema correction is a second paid call; the accepted envelope must reflect
+    # the TOTAL spend (both calls), not just the retry's -- otherwise a schema repair
+    # preceding a contract repair silently under-reports cost.
+    import run_subagent as rs
+    from _builder import AgentInvocation
+    import argparse
+    schema = {"type": "object", "required": ["k"]}
+    original = {"status": "success", "result": "bad", "attempts": 1,
+                "cost_usd": 0.10, "usage": {"output_tokens": 100},
+                "resume": {"cli": "claude", "session_id": "s"}}
+    def fake(inv, timeout_ms=0, debug_dir=None, **kwargs):
+        return {"status": "success", "result": '{"k": 1}', "attempts": 1,
+                "cost_usd": 0.03, "usage": {"output_tokens": 20}, "resume": {}}
+    rs_exec = rs.execute_agent
+    rs.execute_agent = fake
+    try:
+        inv = AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                              system_context="s", permission="safe-edit")
+        out = rs._apply_schema(dict(original), schema, inv,
+                               argparse.Namespace(timeout=1000, debug_dir=None))
+    finally:
+        rs.execute_agent = rs_exec
+    assert out["parse_ok"] is True and out["attempts"] == 2
+    assert abs(out["cost_usd"] - 0.13) < 1e-9        # 0.10 + 0.03 both counted
+    assert out["usage"]["output_tokens"] == 120      # 100 + 20
+
+
+def test_v3_contract_repair_fixes_and_preserves_telemetry():
+    # rec #5 / regression test 7: a suspect success (STATUS: APPROVE -> report_ok
+    # false) gets ONE corrective resume producing a valid contract (STATUS: DONE)
+    # with the decision preserved. CRITICAL: the original's telemetry (schema output,
+    # model, warnings) is PRESERVED and spend AGGREGATES; the retry runs READ-ONLY.
+    import run_subagent as rs
+    from _builder import AgentInvocation
+    import argparse
+    original = {"status": "success", "report_ok": False, "suspect": True,
+                "result": "UNIQUE-ORIGINAL-ANALYSIS-x7f3 detailed reasoning.\nSTATUS: APPROVE",
+                "resume": {"cli": "codex", "session_id": "sess-1"}, "attempts": 1,
+                "cost_usd": 0.10, "usage": {"input_tokens": 100, "output_tokens": 50},
+                "parsed": {"k": 1}, "parse_ok": True, "warnings": ["w1"],
+                "model": {"served": "m"}}
+    # a TERSE corrective re-emit -- contains ONLY the contract, no analysis. The
+    # original's unique analysis must survive regardless.
+    repaired = "STATUS: DONE\nSUMMARY: APPROVE - sound\nFOLLOW-UP: none\nHANDOFF: none"
+    captured = {}
+    def fake(inv, timeout_ms=0, debug_dir=None, **kwargs):
+        captured["permission"] = inv.permission
+        captured["extra_args"] = list(inv.extra_args)
+        assert "execution status" in inv.prompt.lower()  # the repair prompt was used
+        return {"status": "success", "result": repaired, "report_ok": True,
+                "report": {"status": "DONE", "summary": "APPROVE - sound"},
+                "resume": {"cli": "codex", "session_id": "sess-2"}, "attempts": 1,
+                "cost_usd": 0.04, "usage": {"input_tokens": 20, "output_tokens": 10},
+                "warnings": ["w2"]}
+    rs_exec = rs.execute_agent
+    rs.execute_agent = fake
+    try:
+        inv = AgentInvocation(cli="codex", prompt="review", cwd=os.getcwd(),
+                              system_context="s", permission="yolo",
+                              extra_args=["--dangerously-bypass-approvals-and-sandbox"])
+        out = rs._apply_contract_repair(dict(original), inv,
+                                        argparse.Namespace(timeout=1000, debug_dir=None))
+    finally:
+        rs.execute_agent = rs_exec
+    assert out["report_ok"] is True and out.get("suspect") is not True
+    assert out["contract_repaired"] is True and out["report"]["status"] == "DONE"
+    # the ORIGINAL unique analysis SURVIVES (not replaced by the terse retry)
+    assert "UNIQUE-ORIGINAL-ANALYSIS-x7f3" in out["result"] and "APPROVE" in out["result"]
+    assert out.get("repaired_report_text") == repaired   # corrected block kept for reference
+    assert out["parsed"] == {"k": 1} and out["parse_ok"] is True   # schema output kept
+    assert out["model"] == {"served": "m"}               # original model kept
+    assert abs(out["cost_usd"] - 0.14) < 1e-9            # 0.10 + 0.04 aggregated
+    assert out["usage"]["input_tokens"] == 120 and out["usage"]["output_tokens"] == 60
+    assert "w1" in out["warnings"] and "w2" in out["warnings"]      # warnings merged
+    assert out["attempts"] == 2 and out["resume"]["session_id"] == "sess-2"
+    # the formatting retry is READ-ONLY and carries NO inherited extra_args, so a
+    # permission-override flag can never sneak through and defeat read-only.
+    assert captured["permission"] == "read-only" and captured["extra_args"] == []
+
+
+def test_v3_contract_repair_reject_still_accounts_spend():
+    # a retry that errored (or is still malformed) must NOT replace the original,
+    # but its wasted call must still be counted (attempts + spend).
+    import run_subagent as rs
+    from _builder import AgentInvocation
+    import argparse
+    original = {"status": "success", "report_ok": False, "suspect": True,
+                "result": "STATUS: APPROVE", "resume": {"cli": "codex", "session_id": "s"},
+                "attempts": 1, "cost_usd": 0.10}
+    def fake(inv, timeout_ms=0, debug_dir=None, **kwargs):
+        return {"status": "error", "result": "boom", "report_ok": False,
+                "cost_usd": 0.03, "resume": {}}
+    rs_exec = rs.execute_agent
+    rs.execute_agent = fake
+    try:
+        inv = AgentInvocation(cli="codex", prompt="p", cwd=os.getcwd(),
+                              system_context="s", permission="read-only")
+        out = rs._apply_contract_repair(dict(original), inv,
+                                        argparse.Namespace(timeout=1000, debug_dir=None))
+    finally:
+        rs.execute_agent = rs_exec
+    assert out["result"] == "STATUS: APPROVE" and out["report_ok"] is False  # kept original
+    assert out["contract_repair_attempted"] is True
+    assert out["attempts"] == 2 and abs(out["cost_usd"] - 0.13) < 1e-9       # spend accounted
+
+
+def test_v3_contract_repair_accepts_truthful_partial():
+    # a corrective contract that self-reports PARTIAL/BLOCKED (report_ok true) is
+    # MORE truthful than the suspect success and must be accepted (not rejected for
+    # not being status=success).
+    import run_subagent as rs
+    from _builder import AgentInvocation
+    import argparse
+    original = {"status": "success", "report_ok": False, "suspect": True,
+                "result": "STATUS: APPROVE", "resume": {"session_id": "s"}, "attempts": 1}
+    partial = "STATUS: PARTIAL\nSUMMARY: got halfway\nFOLLOW-UP: finish X\nHANDOFF: none"
+    def fake(inv, timeout_ms=0, debug_dir=None, **kwargs):
+        return {"status": "partial", "result": partial, "report_ok": True,
+                "report": {"status": "PARTIAL"}, "resume": {}}
+    rs_exec = rs.execute_agent
+    rs.execute_agent = fake
+    try:
+        inv = AgentInvocation(cli="codex", prompt="p", cwd=os.getcwd(),
+                              system_context="s", permission="read-only")
+        out = rs._apply_contract_repair(dict(original), inv,
+                                        argparse.Namespace(timeout=1000, debug_dir=None))
+    finally:
+        rs.execute_agent = rs_exec
+    assert out["status"] == "partial" and out["report_ok"] is True
+    assert out["contract_repaired"] is True
+
+
+def test_v3_no_contract_repair_propagates_to_child_argv():
+    # rec #5: the --no-contract-repair opt-out must reach a detached --background child.
+    import _background
+    import argparse
+    base = dict(agent="a", prompt="p", cwd="/w", prompt_file=None, allow_credit=False,
+                agents_dir=None, timeout=None, cli=None, model=None, effort=None,
+                resume=None, resume_profile=None, out=None, json_schema=None,
+                debug_dir=None, retries=0, worktree=None)
+    on = _background.child_argv(argparse.Namespace(no_contract_repair=True, **base), "/tmp/r.json")
+    off = _background.child_argv(argparse.Namespace(no_contract_repair=False, **base), "/tmp/r.json")
+    assert "--no-contract-repair" in on and "--no-contract-repair" not in off
+
+
+def test_v3_contract_repair_noops_without_resume_or_when_ok():
+    # no resume lane -> no-op; a clean (report_ok true) success -> no-op; neither
+    # spends a corrective call.
+    import run_subagent as rs
+    from _builder import AgentInvocation
+    import argparse
+    inv = AgentInvocation(cli="gemini", prompt="p", cwd=os.getcwd(),
+                          system_context="s", permission="read-only")
+    args = argparse.Namespace(timeout=1000, debug_dir=None)
+    called = []
+    rs_exec = rs.execute_agent
+    rs.execute_agent = lambda *a, **k: (called.append(1),
+                                        {"status": "success", "report_ok": True, "resume": {}})[1]
+    try:
+        no_resume = {"status": "success", "report_ok": False, "suspect": True,
+                     "result": "x", "resume": {}}
+        assert rs._apply_contract_repair(dict(no_resume), inv, args)["report_ok"] is False
+        clean = {"status": "success", "report_ok": True, "result": "ok",
+                 "resume": {"session_id": "s"}}
+        assert rs._apply_contract_repair(dict(clean), inv, args)["report_ok"] is True
+        assert not called  # execute_agent never invoked in either no-op
+    finally:
+        rs.execute_agent = rs_exec
+
+
 def test_output_tail_on_error_paths():
     # A spawn failure has no stdout, but a real error envelope from the executor
     # must carry output_tail. Exercise the output-cap path via a tiny stub is
