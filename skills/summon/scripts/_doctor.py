@@ -291,6 +291,17 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None,
         and report["agy_extras"].get("pty_modules") in (True, None)
     ):
         usable.remove("agy")
+    # Install-drift: enumerate every summon copy on this box and flag divergence from
+    # the RUNNING one (the code that produced THIS report). A stale host copy running an
+    # ancient dispatcher was the field-incident failure mode; surfacing it here retires
+    # the manual hash hunt. Never let drift detection crash the doctor.
+    try:
+        from _installs import enumerate_installs, drift_report
+        _recs = enumerate_installs(
+            running_scripts_dir=os.path.dirname(os.path.abspath(__file__)))
+        report["installs"] = {"records": _recs, "drift": drift_report(_recs)}
+    except Exception:  # noqa: BLE001 — advisory section; must never break doctor
+        report["installs"] = None
     report["eligibility_probed"] = bool(probe)
     report["usable_backends"] = usable
     report["ineligible_backends"] = [n for n, b in backends.items()
@@ -355,6 +366,32 @@ def render(report: dict) -> str:
         lines.append("billing  : OPENAI_API_KEY is set - "
                      + ("guard ACTIVE (stripped for codex children)" if bg["guard_active"]
                         else "guard DISABLED (SUBAGENTS_ALLOW_OPENAI_KEY=1)"))
+    inst = report.get("installs")
+    if inst and inst.get("records"):
+        dr = inst["drift"]
+        ref = dr.get("reference_sha")
+        lines += ["", "installs (this machine):"]
+        for r in inst["records"]:
+            run = " (running)" if r.get("running") else ""
+            if not r["present"]:
+                lines.append(f"  [--] {r['label']:<9} not installed")
+                continue
+            sha = (r["sha256"] or "unhashable")[:12]
+            ver = r.get("version") or "?"
+            if ref and r["sha256"] == ref:
+                mark, note = "[OK]", "current"
+            elif ref:
+                mark, note = "[~?]", "DRIFT - stale copy; re-run install.py to converge"
+            else:
+                mark, note = "[~?]", "unverified (no running reference to compare)"
+            lines.append(f"  {mark} {r['label']:<9} {sha}  v{ver:<7} {note}{run}")
+            lines.append(f"       {r['scripts_dir']}")
+        if ref and dr.get("drifted"):
+            names = ", ".join(d["label"] for d in dr["drifted"])
+            lines.append(f"  drift    : {len(dr['drifted'])} copy(ies) DIFFER from the running "
+                         f"install ({names}) - run  python install.py  to converge them")
+        elif ref and len([r for r in inst["records"] if r["present"]]) > 1:
+            lines.append("  drift    : all installed copies match the running install")
     lines += [
         "",
         f"usable backends: {', '.join(report['usable_backends']) or 'NONE'}",

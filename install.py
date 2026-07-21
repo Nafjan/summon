@@ -431,6 +431,34 @@ def install_agents(dry: bool) -> list:
     return out, failed == 0
 
 
+def _drift_check() -> None:
+    """After a real install, confirm every managed host copy now hashes identically to
+    the source we just deployed -- via the skill's own ``_installs`` detector, so it uses
+    the SAME hash as dispatch receipts and ``doctor``. Advisory only (never fails the
+    install): a lingering mismatch means a host was left stale (a refresh refused or
+    failed), caught here at install time instead of in the field."""
+    scripts = os.path.join(SKILL_SRC, "scripts")
+    try:
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import _installs  # noqa: E402 — the skill's own detector, sourced from what we install
+    except Exception as e:  # noqa: BLE001 — advisory; never break the install over it
+        print(f"\n[--] install-drift check unavailable ({type(e).__name__}: {e})")
+        return
+    recs = _installs.enumerate_installs(running_scripts_dir=scripts)
+    ref = _installs.drift_report(recs)["reference_sha"]
+    if not ref:
+        return
+    managed = [r for r in recs if r["label"] in _installs.HOST_DIRS and r["present"]]
+    stale = [r for r in managed if r["sha256"] != ref]
+    if stale:
+        print(f"\n[~?] install-drift: {len(stale)} host copy(ies) still differ from the source "
+              f"({', '.join(s['label'] for s in stale)}) - a refresh was refused or failed; "
+              "re-run, or move a foreign copy aside")
+    elif managed:
+        print(f"\n[ok] install-drift: all {len(managed)} installed host copy(ies) match the source")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--hosts", help="comma-separated subset (default: all detected)")
@@ -481,6 +509,9 @@ def main() -> int:
         for line in lines:
             print(line)
         all_ok &= agents_ok  # a failed starter-agent copy must not exit 0
+
+    if not args.uninstall and not args.dry_run:
+        _drift_check()   # confirm the just-installed host copies all converged
 
     if not args.uninstall:
         shim = os.path.join(HERE, "summon.py")
