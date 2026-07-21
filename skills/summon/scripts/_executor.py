@@ -212,8 +212,13 @@ _DEFAULT_MAX_TOOL_OUTPUT_BYTES = 2048
 # threshold and no super-linear CPU on a near-threshold run.
 _B64_SCAN = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_=")
-# A data:<mime>;base64, prefix ending exactly at the blob start (bounded lookback).
-_DATA_URI_PREFIX_RE = re.compile(r"data:([\w.+-]+/[\w.+-]+)?;base64,$")
+# A data:<mime>(;param=val)*;base64, prefix ending exactly at the blob start.
+# Case-insensitive, tolerates extra parameters (e.g. ;charset=utf-8), used ONLY
+# to pull the mime for the marker -- payload DETECTION is the fixed ';base64,'
+# suffix check below, so a prefix longer than this lookback still elides.
+_DATA_URI_PREFIX_RE = re.compile(
+    r"(?i)data:([\w.+-]+/[\w.+-]+)?(?:;[\w.+-]+=[^;,]*)*;base64,$")
+_B64_MARKER = ";base64,"
 # Provider startup noise: ONLY the unambiguously non-task skill-loader notices are
 # stripped. Generic PowerShell error frames (ParserError, `At line:`, CategoryInfo,
 # `at ...ps1:`) are NOT matched -- they are indistinguishable from a real TASK error
@@ -239,10 +244,13 @@ def _elide_payloads(raw: str, thresh: int) -> str:
             while j < n and raw[j] in _B64_SCAN:
                 j += 1
             run = raw[i:j]
-            lo = max(0, i - 120)                           # bounded mime lookback
-            m = _DATA_URI_PREFIX_RE.search(raw[lo:i])
-            if m is not None:                              # data: URI -> always elided
-                out.append(_blob_marker(m.group(1), run))
+            # A run immediately preceded by ';base64,' (any case) is an encoded
+            # payload -- a data: URI or similar -- ALWAYS elided regardless of
+            # length. This 8-char detection is independent of prefix length; the
+            # mime is a best-effort bonus from a generous bounded lookback.
+            if raw[max(0, i - len(_B64_MARKER)):i].lower().endswith(_B64_MARKER):
+                m = _DATA_URI_PREFIX_RE.search(raw[max(0, i - 600):i])
+                out.append(_blob_marker(m.group(1) if m else None, run))
             elif j - i >= thresh:                          # bare run -> threshold
                 out.append(_blob_marker(None, run))
             else:

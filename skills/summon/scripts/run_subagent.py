@@ -837,18 +837,23 @@ def _resolve_job_file() -> str | None:
     return None
 
 
+def _crash_envelope(e: BaseException) -> dict:
+    """The last-resort crash envelope. The exit-code-clarity fields are inlined
+    (not via finalize_exit_fields) so a crash in the executor import path can't
+    sink the net. A module-level function so the shape stays testable."""
+    return {"result": "", "status": "error", "exit_code": 1,
+            "error": f"uncaught {type(e).__name__}: {e}",
+            "backend_exit_code": 1, "dispatcher_status": "error",
+            "normalization_reason": f"uncaught {type(e).__name__} before completion"}
+
+
 if __name__ == "__main__":
     try:
         main()
     except SystemExit:
         raise  # intentional exits (validation, normal completion) pass through
     except BaseException as e:  # noqa: BLE001 — last-resort net so a bg job never orphans
-        err = {"result": "", "status": "error", "exit_code": 1,
-               "error": f"uncaught {type(e).__name__}: {e}",
-               # inlined (not via finalize_exit_fields) so a crash in the executor
-               # import path can't sink the last-resort net
-               "backend_exit_code": 1, "dispatcher_status": "error",
-               "normalization_reason": f"uncaught {type(e).__name__} before completion"}
+        err = _crash_envelope(e)
         jf = _resolve_job_file()
         if jf:
             try:

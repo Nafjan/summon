@@ -524,9 +524,19 @@ def test_v1_output_tail_elides_base64_payload():
     s = _executor._sanitize_tail(f"log start\ndata:image/png;base64,{blob}\nlog end")
     assert "payload omitted: image/png" in s and "bytes, sha256" in s, s
     assert blob not in s
-    # a SHORT data: URI is elided regardless of length (finding #1: always elided)
-    short_uri = _executor._sanitize_tail("x data:image/gif;base64,R0lGODlhAQAB y")
-    assert "payload omitted: image/gif" in short_uri and "R0lGODlhAQAB" not in short_uri
+    # data: URI variants ALL elided regardless of length: uppercase scheme, extra
+    # parameters, svg+xml mime, and a prefix longer than the mime-lookback window
+    # (detection is the ;base64, suffix, independent of prefix length).
+    for uri in ("DATA:image/gif;base64,R0lGODlhAQAB",
+                "data:image/svg+xml;charset=utf-8;base64,PHN2Zz4=",
+                "data:application/octet-stream;" + ("x=1;" * 200) + "base64,QUJDRA=="):
+        out = _executor._sanitize_tail("pre " + uri + " post")
+        payload = uri.split("base64,", 1)[1]
+        assert "payload omitted" in out and payload not in out, uri
+    # mime is recovered for the common (in-window) forms
+    assert "image/gif" in _executor._sanitize_tail("DATA:image/gif;base64,R0lGODlhAQAB")
+    assert "image/svg+xml" in _executor._sanitize_tail(
+        "data:image/svg+xml;charset=utf-8;base64,PHN2Zz4=")
     # a bare base64 run at/above the threshold is elided; short tokens survive
     bare = "Z" * 4096
     s2 = _executor._sanitize_tail("head " + bare + " tail")
@@ -586,6 +596,27 @@ def test_v1_normalized_success_exit_fields():
     assert keep["normalization_reason"] == "PINNED"
     # query-shaped envelopes (no exit_code) are left untouched
     assert "backend_exit_code" not in _executor.finalize_exit_fields({"agents": []})
+
+
+def test_v1_debug_and_crash_emission_paths():
+    # The two edge paths reopened by the review: a failed debug write must not make
+    # the tail advertise a debug_file, and the last-resort crash envelope must
+    # still carry the exit-code-clarity fields.
+    import _executor
+    import run_subagent
+    # _write_debug returns None when the dir can't be created (path under a file),
+    # so _stamp passes debug_available=False -> marker advises --debug-dir.
+    f = os.path.join(tempfile.gettempdir(), f"summon-notadir-{os.getpid()}")
+    with open(f, "w", encoding="utf-8") as fh:
+        fh.write("x")
+    try:
+        assert _executor._write_debug(os.path.join(f, "sub"), ["cli"], "raw", {"cli": "x"}) is None
+    finally:
+        os.remove(f)
+    # crash envelope (bypass-emission path) carries the fields inline
+    env = run_subagent._crash_envelope(RuntimeError("boom"))
+    assert env["status"] == "error" and env["backend_exit_code"] == 1
+    assert env["dispatcher_status"] == "error" and "RuntimeError" in env["normalization_reason"]
 
 
 def test_v1_is_terminal_success_shared_gate():
