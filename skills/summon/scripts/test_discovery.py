@@ -3934,6 +3934,111 @@ def test_v4_overall_timeout_setup_overrun():
     assert elapsed < 10, elapsed
 
 
+def test_v4_monotonic_gate_without_watchdog():
+    # Re-review round-3 CRITICAL: dispatch guards must consult the AUTHORITATIVE
+    # monotonic deadline, not just the watchdog's async `overall["hit"]` flag -- a
+    # delayed/starved watchdog thread must not wave paid work through past the deadline.
+    # Here we DISABLE the watchdog entirely (patch threading.Thread) so `overall["hit"]`
+    # can only be set by a guard reading the clock. Members sleep past a tiny budget and
+    # are NOT killed (no watchdog); the council must still cut short before the chairman
+    # via the monotonic gate and emit a partial.
+    import _council
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import time as _t
+    root = tempfile.mkdtemp(prefix="summon-v4mono-")
+    _mk_agents(root, ["m1", "m2", "chair"])
+    dispatched = []
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        dispatched.append(agent)
+        _t.sleep(0.25)                         # outlive the 100ms budget (NOT killed here)
+        return {"status": "success", "result": agent, "report": {"summary": agent}}
+
+    # Neuter ONLY the overall-timeout watchdog. `_council.threading` IS the global
+    # threading module, so replacing threading.Thread wholesale would also no-op the
+    # ThreadPoolExecutor worker threads (target=_worker) and deadlock the pool. A
+    # selective factory stubs the watchdog by target name and passes everything else
+    # through to the real Thread.
+    real_thread = _council.threading.Thread
+
+    class _Stub:
+        def start(self):
+            pass
+
+        def join(self, *a, **k):
+            pass
+
+    def _sel_thread(*a, **k):
+        if getattr(k.get("target"), "__name__", "") == "_overall_watchdog":
+            return _Stub()
+        return real_thread(*a, **k)
+
+    ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
+                            chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
+                            timeout=30000, out=None, run_dir=root, overall_timeout=100)
+    orig_d, orig_thread = _council._dispatch, _council.threading.Thread
+    _council._dispatch = fake
+    _council.threading.Thread = _sel_thread
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._dispatch, _council.threading.Thread = orig_d, orig_thread
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    # partial emitted by the MONOTONIC gate, with the watchdog disabled the whole time
+    assert env["status"] == "partial", env["status"]
+    assert env.get("council_state") == "overall_timeout", env.get("council_state")
+    # members ran to completion (not killed -- no watchdog); the chairman was gated OUT
+    assert "chair" not in dispatched, dispatched
+    assert {"m1", "m2"} <= set(dispatched), dispatched
+
+
+def test_v4_dispatch_child_on_reap_skips_a_still_live_child():
+    # Re-review round-3 WARNING: _dispatch_child must invoke on_reap only after PROVEN
+    # termination. If bounded communication gives up while the child is still alive
+    # (returncode None), on_reap must NOT fire -- dropping a live child from the kill
+    # registry would leak a paid process. Simulate a wedged child that survives the kill.
+    import _manifest
+    import _executor
+    import subprocess as _sp
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = 4321
+            self.returncode = None            # never exits -> poll() stays None
+
+        def communicate(self, timeout=None):
+            raise _sp.TimeoutExpired(cmd="x", timeout=timeout)
+
+        def poll(self):
+            return None                        # still alive
+
+    reaped = {"called": False}
+
+    def on_reap(p):
+        reaped["called"] = True
+
+    orig_popen = _manifest.subprocess.Popen
+    orig_kill, orig_safe = _executor._kill_tree, _executor._safe_communicate
+    _manifest.subprocess.Popen = lambda *a, **k: FakeProc()
+    _executor._kill_tree = lambda p: None                     # kill fails to land
+    _executor._safe_communicate = lambda p, timeout=3.0: (None, None)
+    try:
+        res, err = _manifest._dispatch_child(["x"], 1, on_reap=on_reap)
+    finally:
+        _manifest.subprocess.Popen = orig_popen
+        _executor._kill_tree, _executor._safe_communicate = orig_kill, orig_safe
+    assert err is None, err
+    assert res is not None and res.timed_out is True, res
+    assert reaped["called"] is False, "on_reap fired on a still-live child (would leak it)"
+
+
 def test_v4_dispatch_child_on_reap_fires_after_communicate():
     # Re-review finding #3: the fix unregisters a member ADJACENT to its reap via an
     # on_reap callback threaded into _dispatch_child (before the caller's envelope
