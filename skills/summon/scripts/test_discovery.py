@@ -4697,14 +4697,48 @@ def test_v6_read_version_parser_robustness():
         assert ver('__version__ = VERSION\n') is None                  # computed -> unknown, not garbage
         assert ver('x = 1\n') is None                                  # absent
         assert ver('def f():\n    __version__ = "9.9.9"\n    return 1\n') is None  # nested, not module-level
-        # non-UTF-8 bytes: must NOT raise (errors=replace); value is whatever parses out
+        assert ver('__version__ = "1.0.0"\n__version__ = "2.0.0"\n') == "2.0.0"  # LAST wins
+        # deeply nested expression: an ast RecursionError must be caught -> None, never raised
+        assert ver('__version__ = ' + '-' * 80000 + '1\n') is None
+        # non-UTF-8 bytes: strict decode -> None, must NOT raise
         with open(os.path.join(d, "run_subagent.py"), "wb") as fh:
             fh.write(b'__version__ = "\xff\xfe bad"\n')
-        got = _installs._read_version(d)
-        assert isinstance(got, (str, type(None)))   # no exception escaped
+        assert _installs._read_version(d) is None
+        # oversize file: REJECTED (not parsed from a truncated prefix) -> None
+        orig_cap = _installs._ENUM_MAX_BYTES
+        _installs._ENUM_MAX_BYTES = 40
+        try:
+            assert ver('__version__ = "1.2.3"  # pad ' + 'x' * 200 + '\n') is None
+        finally:
+            _installs._ENUM_MAX_BYTES = orig_cap
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v6_enumerate_dedups_by_canonical_key():
+    # De-dup is driven by _canonical; force two REAL host copies to share a canonical key
+    # (without needing symlink privilege) so the collapse + running-tag logic is ALWAYS
+    # covered, even where the live-symlink test below has to skip.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-v6can-")
+    orig = _installs._canonical
+    files = {"run_subagent.py": '__version__ = "3.0.0"\n', "_x.py": "x = 1\n"}
+    try:
+        c_scripts = _mk_summon_install(home, ".claude", files)
+        x_scripts = _mk_summon_install(home, ".codex", files)
+        shared = {c_scripts: "SHARED", x_scripts: "SHARED"}
+        _installs._canonical = lambda p: shared.get(p, orig(p))
+        recs = _installs.enumerate_installs(running_scripts_dir=x_scripts, home=home)
+        present = [r for r in recs if r["present"]]
+        merged = [r for r in present if "+" in r["label"]]
+        assert len(merged) == 1 and len(present) == 1, [r["label"] for r in present]
+        assert "claude" in merged[0]["label"] and "codex" in merged[0]["label"], merged[0]["label"]
+        assert merged[0]["running"] is True and merged[0]["managed"] is True
+    finally:
+        _installs._canonical = orig
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
 
 
 def test_v6_drift_report_unhashable_forces_not_converged():
@@ -4737,7 +4771,11 @@ def test_v6_enumerate_dedups_symlink_aliases():
             os.symlink(os.path.join(home, ".claude", "skills", "summon"), codex_summon,
                        target_is_directory=True)
         except (OSError, NotImplementedError, AttributeError):
-            return   # symlinks not permitted (e.g. Windows without privilege) -> skip
+            # symlinks not permitted (e.g. Windows without privilege): announce a REAL skip
+            # (not a silent pass) -- the canonical de-dup logic is still covered
+            # deterministically by test_v6_enumerate_dedups_by_canonical_key.
+            print("  [v6-skip] live symlinks unavailable; de-dup covered by canonical-key test")
+            return
         run = os.path.join(codex_summon, "scripts")   # invoke THROUGH the .codex alias
         recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
         present = [r for r in recs if r["present"]]

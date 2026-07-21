@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import stat as _stat
 import subprocess
 from pathlib import Path
 
@@ -42,12 +43,24 @@ def scripts_sha256(scripts_dir, max_bytes=None) -> str:
     for name in sorted(p.name for p in here.glob("*.py") if p.name != "test_discovery.py"):
         target = here / name
         try:
-            if max_bytes is not None and not target.is_file():
-                data = b"\x00__nonfile__"          # symlink to a device/dir/FIFO: never read
-            elif max_bytes is not None and target.stat().st_size > max_bytes:
-                data = b"\x00__oversize__:" + str(target.stat().st_size).encode("ascii")
+            if max_bytes is None:
+                data = target.read_bytes()        # RECEIPT path: EXACT legacy behavior
             else:
-                data = target.read_bytes()
+                # BOUNDED path (enumerating OTHER copies): open ONCE, fstat the HANDLE
+                # (not the path), and read from that same handle -- so a check/read swap
+                # (a path repointed to a device or huge file between validation and read)
+                # can't defeat the bound. A non-regular file (device/FIFO behind a symlink)
+                # is marked, never read; an oversize regular file is marked by size.
+                with open(target, "rb") as fh:
+                    st = os.fstat(fh.fileno())
+                    if not _stat.S_ISREG(st.st_mode):
+                        data = b"\x00__nonfile__"
+                    elif st.st_size > max_bytes:
+                        data = b"\x00__oversize__:" + str(st.st_size).encode("ascii")
+                    else:
+                        data = fh.read(max_bytes + 1)
+                        if len(data) > max_bytes:     # grew past the bound on this handle
+                            data = b"\x00__oversize__:racy"
         except OSError:
             data = b""
         nb = name.encode("utf-8")

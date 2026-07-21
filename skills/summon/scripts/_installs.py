@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import stat as _stat
 from pathlib import Path
 
 from _receipt import scripts_sha256
@@ -66,25 +67,33 @@ def _read_version(scripts_dir: str):
     imported (a stale copy might not import under the current Python), NOT from the manifest
     (which omits it). None if absent, computed (non-literal), or unparseable.
 
-    TRULY never raises: a bad encoding, a syntax error, or an oversize file all yield None.
-    The read is BOUNDED (``_ENUM_MAX_BYTES``) so a foreign huge file can't exhaust memory --
-    the real ``__version__`` sits near the file head, well within the bound."""
+    TRULY never raises: a non-regular/oversize/non-UTF-8/syntactically-broken file, or even a
+    pathological deeply-nested expression (RecursionError from ast), all yield None. The file
+    is opened ONCE and fstat'd on the HANDLE, then read at most ``_ENUM_MAX_BYTES`` -- an
+    oversize file is REJECTED (not parsed from a truncated prefix, which could return a wrong
+    or stale value). Non-UTF-8 is strict (yields None), never silently replaced. When multiple
+    module-level ``__version__`` assignments exist, the LAST wins (Python's own semantics)."""
+    path = os.path.join(scripts_dir, "run_subagent.py")
     try:
-        with open(os.path.join(scripts_dir, "run_subagent.py"),
-                  encoding="utf-8", errors="replace") as fh:
-            src = fh.read(_ENUM_MAX_BYTES)
-        tree = ast.parse(src)
-    except (OSError, ValueError, SyntaxError, MemoryError):
+        with open(path, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not _stat.S_ISREG(st.st_mode) or st.st_size > _ENUM_MAX_BYTES:
+                return None                      # non-regular (device/FIFO) or oversize
+            raw = fh.read(_ENUM_MAX_BYTES + 1)
+        if len(raw) > _ENUM_MAX_BYTES:           # grew past the bound between fstat and read
+            return None
+        tree = ast.parse(raw.decode("utf-8"))    # strict: non-UTF-8 -> UnicodeDecodeError
+    except (OSError, ValueError, SyntaxError, RecursionError, MemoryError):
         return None
+    found = None
     for node in tree.body:   # MODULE level only -- ignore nested/conditional assigns
         if isinstance(node, ast.Assign):
             for t in node.targets:
                 if isinstance(t, ast.Name) and t.id == "__version__":
                     v = node.value
-                    if isinstance(v, ast.Constant) and isinstance(v.value, str):
-                        return v.value
-                    return None   # a computed __version__ = VERSION -> unknown, not garbage
-    return None
+                    found = (v.value if isinstance(v, ast.Constant)
+                             and isinstance(v.value, str) else None)
+    return found   # last module-level assignment wins; a computed value -> None (not garbage)
 
 
 def _probe(label: str, scripts_dir: str, managed: bool) -> dict:

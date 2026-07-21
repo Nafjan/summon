@@ -438,8 +438,8 @@ def _drift_check() -> None:
     foreign/corrupt copy on the box can never turn a successful install into a traceback. A
     lingering mismatch (a refresh refused or failed) is surfaced here at install time
     instead of in the field."""
-    scripts = os.path.join(SKILL_SRC, "scripts")
     try:
+        scripts = os.path.join(SKILL_SRC, "scripts")
         if scripts not in sys.path:
             sys.path.insert(0, scripts)
         import _installs  # noqa: E402 - the skill's own detector, sourced from what we install
@@ -450,19 +450,18 @@ def _drift_check() -> None:
         stale = [r for r in dr["drifted"] if r.get("managed")]
         unknown = [r for r in dr["unknown"] if r.get("managed")]
         ok = [r for r in dr["hashed"] if r.get("managed") and r["sha256"] == ref]
-    except Exception as e:  # noqa: BLE001 - advisory; never break a successful install
-        print(f"\n[--] install-drift check skipped ({type(e).__name__}: {e})")
-        return
-    if stale or unknown:
-        bits = []
-        if stale:
-            bits.append(f"{len(stale)} differ ({', '.join(s['label'] for s in stale)})")
-        if unknown:
-            bits.append(f"{len(unknown)} unhashable ({', '.join(u['label'] for u in unknown)})")
-        print(f"\n[~?] install-drift: {'; '.join(bits)} from the source - a refresh was refused "
-              "or failed; re-run, or move a foreign copy aside")
-    elif ok:
-        print(f"\n[ok] install-drift: all {len(ok)} installed host copy(ies) match the source")
+        if stale or unknown:
+            bits = []
+            if stale:
+                bits.append(f"{len(stale)} differ ({', '.join(s['label'] for s in stale)})")
+            if unknown:
+                bits.append(f"{len(unknown)} unhashable ({', '.join(u['label'] for u in unknown)})")
+            print(f"\n[~?] install-drift: {'; '.join(bits)} from the source - a refresh was "
+                  "refused or failed; re-run, or move a foreign copy aside")
+        elif ok:
+            print(f"\n[ok] install-drift: all {len(ok)} installed host copy(ies) match the source")
+    except Exception:  # noqa: BLE001 - advisory ONLY; never break a successful install (a
+        pass           # non-ASCII console, a closed pipe, a foreign copy -> silently skip)
 
 
 def main() -> int:
