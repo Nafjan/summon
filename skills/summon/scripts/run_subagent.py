@@ -862,12 +862,14 @@ def _apply_contract_repair(result: dict, invocation, args) -> dict:
     false -> suspect) gets ONE constrained corrective resume that re-emits the exact
     contract, teaching STATUS = execution state (not a decision verdict).
 
-    The original envelope's telemetry is PRESERVED: on accept, only the fixed
-    contract (result/report/report_ok/status) is overlaid onto the original, so its
-    schema output, warnings, model, and analysis survive; spend/attempts aggregate
-    across BOTH calls whether the retry is accepted or rejected. The corrective
-    resume runs READ-ONLY (a formatting re-emit needs no write/tool authority, and
-    it must not repeat the task's side effects). No resume lane -> no-op."""
+    The original envelope is PRESERVED: on accept, only the STRUCTURED contract
+    (report/report_ok/status) is overlaid; the original `result` text is kept
+    verbatim (so its full analysis survives a terse re-emit), and the corrected
+    block is stored in `repaired_report_text`. Schema output, warnings, and model
+    survive; spend/attempts aggregate across BOTH calls whether the retry is
+    accepted or rejected. The corrective resume runs READ-ONLY with no inherited
+    extra_args (a formatting re-emit needs no write/tool authority and must not
+    repeat the task's side effects). No resume lane -> no-op."""
     if not (result.get("status") == "success" and not result.get("report_ok")):
         return result
     resume = result.get("resume") or {}
