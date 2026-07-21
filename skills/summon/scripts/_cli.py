@@ -259,6 +259,10 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="With --new-agent/--set-agent: run-agent, model, permission, args")
     parser.add_argument("--json", action="store_true",
                         help="With --doctor: emit machine-readable JSON instead of the table")
+    parser.add_argument("--probe", action="store_true",
+                        help="With --doctor: run a minimal LIVE call per backend to verify "
+                             "account/client eligibility (catches e.g. Gemini IneligibleTierError "
+                             "that a --version check misses). Costs a tiny dispatch per backend")
     parser.add_argument("--agent", help="Agent definition name")
     parser.add_argument("--prompt", help="Task prompt")
     parser.add_argument("--prompt-file", dest="prompt_file",
