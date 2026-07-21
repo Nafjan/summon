@@ -45,6 +45,11 @@ if sys.version_info < (3, 10):
         "status": "error",
         "result": "",
         "exit_code": 1,
+        # Exit-code-clarity fields inlined: this guard runs before the sibling
+        # imports, so it cannot call finalize_exit_fields, but the contract holds.
+        "backend_exit_code": 1,
+        "dispatcher_status": "error",
+        "normalization_reason": "interpreter older than Python 3.10; summon did not run",
         "error": ("summon needs Python 3.10 or newer, but this interpreter is "
                   + _found + ". Install a newer Python (python.org or your package "
                   "manager), make it the `python` on your PATH, and retry. "
@@ -62,7 +67,7 @@ import _cli  # noqa: E402
 import _receipt  # noqa: E402
 from _builder import AgentInvocation  # noqa: E402
 from _executor import ENVELOPE_VERSION as _ENVELOPE_VERSION  # noqa: E402
-from _executor import execute_agent  # noqa: E402
+from _executor import execute_agent, finalize_exit_fields, is_terminal_success  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
@@ -99,6 +104,13 @@ def _stamp_job(env: dict) -> dict:
 
 def _emit(obj: dict) -> None:
     """Write the response as JSON — to the job file (background) or stdout."""
+    # Primary emission point: guarantee the exit-code-clarity fields on EVERY
+    # dispatch-shaped envelope routed here, including the pre-dispatch validation/
+    # preflight paths that never reach the executor's _stamp. (The two paths that
+    # can't route through here -- the pre-import Python-version guard and the
+    # last-resort crash handler -- inline the fields themselves.) Idempotent +
+    # no-op on query envelopes (list/doctor/version have no exit_code).
+    finalize_exit_fields(obj)
     _stamp_job(obj)
     text = json.dumps(obj, ensure_ascii=False)
     if _JOB_FILE:
@@ -439,13 +451,17 @@ def main() -> None:
     # already done — emit it (marked skipped) and exit without dispatching. A
     # prior error/blocked/partial envelope is NOT terminal: re-running retries
     # it (matches the manifest's resume semantics — failures get another shot).
+    # A SUSPECT success (status=success but report_ok=false -> suspect=true) is
+    # NOT terminal either: skipping it would strand a semantically-useful but
+    # unparseable envelope, forcing a manual delete/rename to re-run. Re-dispatch
+    # it instead (consistent with summon's existing "suspect => re-dispatch" stance).
     if args.out and os.path.isfile(args.out) and not args.dry_run:
         try:
             with open(args.out, encoding="utf-8") as fh:
                 prior = json.load(fh)
         except (OSError, ValueError):
             prior = None
-        if isinstance(prior, dict) and prior.get("status") == "success":
+        if is_terminal_success(prior):
             prior["skipped"] = True
             _emit(prior)
             sys.exit(0)
@@ -736,7 +752,8 @@ def _dispatch_with_retries(invocation, args) -> dict:
     (blocked won't improve by retrying — its cause is structural)."""
     attempt = 0
     while True:
-        result = execute_agent(invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir)
+        result = execute_agent(invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
+                               max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
         attempt += 1
         if result.get("status") not in ("error", "partial") or attempt > max(0, args.retries):
             break
@@ -771,7 +788,8 @@ def _apply_schema(result: dict, schema: dict, invocation, args) -> dict:
         extra_args=invocation.extra_args,
     )
     try:
-        retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir)
+        retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir,
+                              max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
     except ValueError:
         return result  # resume unsupported on this backend: keep the first verdict
     retry["parse_retry"] = True
@@ -819,14 +837,23 @@ def _resolve_job_file() -> str | None:
     return None
 
 
+def _crash_envelope(e: BaseException) -> dict:
+    """The last-resort crash envelope. The exit-code-clarity fields are inlined
+    (not via finalize_exit_fields) so a crash in the executor import path can't
+    sink the net. A module-level function so the shape stays testable."""
+    return {"result": "", "status": "error", "exit_code": 1,
+            "error": f"uncaught {type(e).__name__}: {e}",
+            "backend_exit_code": 1, "dispatcher_status": "error",
+            "normalization_reason": f"uncaught {type(e).__name__} before completion"}
+
+
 if __name__ == "__main__":
     try:
         main()
     except SystemExit:
         raise  # intentional exits (validation, normal completion) pass through
     except BaseException as e:  # noqa: BLE001 — last-resort net so a bg job never orphans
-        err = {"result": "", "status": "error", "exit_code": 1,
-               "error": f"uncaught {type(e).__name__}: {e}"}
+        err = _crash_envelope(e)
         jf = _resolve_job_file()
         if jf:
             try:

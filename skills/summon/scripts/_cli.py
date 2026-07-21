@@ -299,6 +299,13 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "parsed/parse_ok; one corrective retry via resume on mismatch")
     parser.add_argument("--debug-dir", dest="debug_dir",
                         help="Dump per-run argv + raw output + envelope into this dir")
+    parser.add_argument("--max-tool-output-bytes", dest="max_tool_output_bytes",
+                        type=int, default=None,
+                        help="Elision threshold for the output_tail: a base64/binary "
+                             "run this many bytes or longer is replaced by a bounded "
+                             "[payload omitted: type, N bytes, sha256 ...] marker "
+                             "(data: URIs are always elided; --debug-dir keeps the "
+                             "full transcript). Default ~2048")
     parser.add_argument("--job-file", dest="job_file", help=argparse.SUPPRESS)  # internal
     parser.add_argument("--manifest", help="Run a batch of jobs from a JSON manifest (see SKILL.md)")
     parser.add_argument("--concurrency", help="With --manifest: per-backend caps, e.g. agy=2,codex=3,default=3")
