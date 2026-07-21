@@ -439,13 +439,18 @@ def main() -> None:
     # already done — emit it (marked skipped) and exit without dispatching. A
     # prior error/blocked/partial envelope is NOT terminal: re-running retries
     # it (matches the manifest's resume semantics — failures get another shot).
+    # A SUSPECT success (status=success but report_ok=false -> suspect=true) is
+    # NOT terminal either: skipping it would strand a semantically-useful but
+    # unparseable envelope, forcing a manual delete/rename to re-run. Re-dispatch
+    # it instead (consistent with summon's existing "suspect => re-dispatch" stance).
     if args.out and os.path.isfile(args.out) and not args.dry_run:
         try:
             with open(args.out, encoding="utf-8") as fh:
                 prior = json.load(fh)
         except (OSError, ValueError):
             prior = None
-        if isinstance(prior, dict) and prior.get("status") == "success":
+        if (isinstance(prior, dict) and prior.get("status") == "success"
+                and not prior.get("suspect")):
             prior["skipped"] = True
             _emit(prior)
             sys.exit(0)
@@ -736,7 +741,8 @@ def _dispatch_with_retries(invocation, args) -> dict:
     (blocked won't improve by retrying — its cause is structural)."""
     attempt = 0
     while True:
-        result = execute_agent(invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir)
+        result = execute_agent(invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
+                               max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
         attempt += 1
         if result.get("status") not in ("error", "partial") or attempt > max(0, args.retries):
             break
@@ -771,7 +777,8 @@ def _apply_schema(result: dict, schema: dict, invocation, args) -> dict:
         extra_args=invocation.extra_args,
     )
     try:
-        retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir)
+        retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir,
+                              max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
     except ValueError:
         return result  # resume unsupported on this backend: keep the first verdict
     retry["parse_retry"] = True
