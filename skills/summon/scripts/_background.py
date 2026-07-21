@@ -33,6 +33,8 @@ def child_argv(args: argparse.Namespace, result_file: str) -> list:
         out = ["--agent", args.agent, "--prompt", args.prompt, "--cwd", args.cwd]
     if getattr(args, "allow_credit", False):
         out += ["--allow-credit"]
+    if getattr(args, "no_contract_repair", False):
+        out += ["--no-contract-repair"]     # honor the opt-out in the detached child
     if args.agents_dir:
         out += ["--agents-dir", args.agents_dir]
     if args.timeout:
