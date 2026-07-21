@@ -168,6 +168,7 @@ Parse JSON output and check `status` field:
 | `--retries N` | No | Re-dispatch up to N times on `error`/`partial` (exponential backoff; `blocked` is never retried — its cause is structural). Envelope gains `attempts` |
 | `--allow-credit` | No | Authorize spending ACCOUNT CREDIT on a credit-only model (Fable) for this one dispatch; flag form of `SUMMON_ALLOW_CREDIT=1`. Single dispatch only: rejected for `--manifest`/`--council`, where env inheritance would silently authorize every child (set the env var deliberately for fan-out spend) |
 | `--json-schema FILE` | No | Structured output contract: extract the agent's final JSON, validate against the schema, attach `parsed`/`parse_ok`/`parse_errors`; ONE corrective retry via resume on mismatch |
+| `--no-contract-repair` | No | Disable the automatic ONE-shot corrective resume that fixes a malformed report contract on a suspect success (`status:success` but `report_ok:false`). On by default; set this to save the extra call |
 | `--debug-dir DIR` | No | Dump per-run argv + raw captured output + final envelope to DIR (adds `debug_file` to the envelope) |
 | `--manifest FILE` | - | Batch fan-out: run all jobs in a JSON manifest (see [references/fan-out.md](references/fan-out.md)). Combine with `--concurrency` and `--results-dir` |
 | `--concurrency` | No | With `--manifest`: per-backend caps, e.g. `agy=2,codex=3,default=3` |
@@ -233,7 +234,7 @@ Every response carries structured fields for programmatic orchestration:
 | Field | Use |
 |-------|-----|
 | `report` | Parsed report contract as a dict (`status`, `summary`, `handoff`, `follow_up`, plus work-product fields). Paste `report["handoff"]` into the next `--prompt`; branch on `report["status"]`. |
-| `report_ok` | `true` when the full contract block is present. If `status:"success"` but `report_ok:false`, the response also has `suspect:true` — re-dispatch rather than trusting it. |
+| `report_ok` | `true` when the full contract block is present. If `status:"success"` but `report_ok:false`, the response also has `suspect:true` (re-dispatch rather than trusting it). summon first attempts ONE automatic corrective resume (unless `--no-contract-repair`); a successful repair sets `contract_repaired:true`, clears `suspect`, and bumps `attempts`. |
 | `resume` | `{cli, session_id, profile?}`. Feed `session_id` to `--resume` (or `profile` to `--resume-profile` for agy) for a cheap follow-up that skips re-sending the agent definition. |
 | `session_id`, `usage`, `cost_usd` | Telemetry (claude/codex expose all; agy exposes none; openai-compat returns the API's `usage`). Track spend/tokens across a chain. |
 | `billing` | `{source, note}` — did this run draw from a vendor **subscription** (CLI login), metered **api** credits, or account **credit** (a subscription-CLI model that bills like API)? Pairs with `usage`/`cost_usd` to attribute spend. Advisory (the vendor's billing is truth). |

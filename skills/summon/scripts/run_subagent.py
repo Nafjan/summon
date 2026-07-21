@@ -668,6 +668,13 @@ def main() -> None:
     if schema is not None and result.get("status") == "success":
         result = _apply_schema(result, schema, invocation, args)
 
+    # Report-contract auto-repair: a suspect success (status=success but the report
+    # block is malformed -> report_ok false) gets ONE constrained corrective resume,
+    # unless disabled. Cheaper and more targeted than the caller re-dispatching the
+    # whole task. Runs after --json-schema so a still-suspect envelope gets one shot.
+    if not getattr(args, "no_contract_repair", False):
+        result = _apply_contract_repair(result, invocation, args)
+
     # Receipt LAST, from main()-scope values: a schema-correction retry replaces
     # the envelope, and this keeps prompt_sha256 bound to the ROOT prompt (the
     # correction prompt must never restamp it).
@@ -806,6 +813,63 @@ def _apply_schema(result: dict, schema: dict, invocation, args) -> dict:
     if retry.get("status") == "success" and retry.get("parse_ok"):
         # Preserve the total dispatch count across the correction (the retry is
         # additional work, not a reset) so cost accounting stays honest.
+        retry["attempts"] = result.get("attempts", 1) + retry.get("attempts", 1)
+        return retry
+    return result
+
+
+_CONTRACT_REPAIR_PROMPT = (
+    "Your previous reply was accepted but did NOT include a valid report contract, "
+    "so it is flagged as unverifiable. Re-emit your report, ending with EXACTLY this "
+    "block (all four fields, each on its own line):\n\n"
+    "STATUS: DONE | PARTIAL | BLOCKED\n"
+    "SUMMARY: <one line>\n"
+    "FOLLOW-UP: <the next step, or 'none'>\n"
+    "HANDOFF: <what the next agent needs, or 'none'>\n\n"
+    "IMPORTANT: STATUS is the EXECUTION status of the task (use DONE if you "
+    "finished), NOT your decision or verdict. If your decision was a verdict such as "
+    "APPROVE, BLOCK, or a recommendation, put it in SUMMARY (and in FINDINGS if you "
+    "use them) -- never in STATUS. Keep all of your analysis; just make sure the "
+    "exact block above is present."
+)
+
+
+def _apply_contract_repair(result: dict, invocation, args) -> dict:
+    """A dispatch that SUCCEEDED but whose report contract is malformed (report_ok
+    false -> suspect) gets ONE constrained corrective resume that re-emits the exact
+    contract, teaching STATUS = execution state (not a decision verdict). Modeled on
+    _apply_schema: accept the retry ONLY if it strictly improved (completed AND now
+    report_ok), else keep the original suspect envelope. No resume lane -> no-op."""
+    if not (result.get("status") == "success" and not result.get("report_ok")):
+        return result
+    resume = result.get("resume") or {}
+    sid, profile = resume.get("session_id"), resume.get("profile")
+    if not sid and not profile:
+        return result  # no resume lane (e.g. gemini) — leave the suspect verdict as-is
+    from _builder import AgentInvocation as _AI
+    retry_inv = _AI(
+        cli=invocation.cli,
+        prompt=_CONTRACT_REPAIR_PROMPT,
+        cwd=invocation.cwd,
+        system_context="",  # resume: session already holds the definition
+        agent_file=invocation.agent_file,
+        permission=invocation.permission,
+        model=invocation.model,
+        effort=invocation.effort,
+        resume_id=sid or "latest",
+        resume_profile=profile,
+        extra_args=invocation.extra_args,
+    )
+    try:
+        retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir,
+                              max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
+    except ValueError:
+        return result  # resume unsupported on this backend: keep the first verdict
+    retry["contract_repaired"] = True
+    # Accept ONLY a strict improvement: the corrective run completed AND now carries
+    # a valid contract. A retry that errored, timed out, or is still malformed must
+    # never replace the original (successful, if unverifiable) envelope.
+    if retry.get("status") == "success" and retry.get("report_ok"):
         retry["attempts"] = result.get("attempts", 1) + retry.get("attempts", 1)
         return retry
     return result
