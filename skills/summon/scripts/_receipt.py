@@ -18,18 +18,19 @@ from pathlib import Path
 from _loader import bundled_roster_dir
 
 
-def receipt_base(entry_path: str, version: str) -> dict:
-    """summon identity: available before ANY validation, so even a missing-agent
-    or unknown-backend error names the install that produced it. ``entry_path``
-    and ``version`` are injected by the entry script so ``script``/``version``
-    name run_subagent.py; ``here`` is that file's directory (this module is a
-    sibling, so the scripts dir is the same either way)."""
-    here = Path(entry_path).resolve().parent
+def scripts_sha256(scripts_dir) -> str:
+    """One SHA-256 over EVERY production module in ``scripts_dir`` (all ``*.py``
+    except test_discovery.py, which never executes at dispatch time). Length-prefixed
+    framing -- ``len(name)|name|len(data)|data``, names sorted -- so (name, content)
+    boundaries are unambiguous and drift in ANY sibling (incl. agy_pty_pyte.py), not
+    just the entry file, is detectable.
+
+    SINGLE source of truth for install identity: the dispatch receipt and the
+    install-drift detector both hash the same way, so a hash difference is always a
+    REAL code divergence, never an algorithm mismatch. A missing/unreadable module
+    hashes as empty content (kept diagnosable, never raises)."""
+    here = Path(scripts_dir)
     h = hashlib.sha256()
-    # One SHA over EVERY production module (incl. agy_pty_pyte.py -- drift lives
-    # in siblings, not just the entry file). Length-prefixed framing so
-    # (name, content) boundaries are unambiguous. test_discovery.py is excluded:
-    # it never executes at dispatch time.
     for name in sorted(p.name for p in here.glob("*.py") if p.name != "test_discovery.py"):
         try:
             data = (here / name).read_bytes()
@@ -40,9 +41,19 @@ def receipt_base(entry_path: str, version: str) -> dict:
         h.update(nb)
         h.update(len(data).to_bytes(8, "big"))
         h.update(data)
+    return h.hexdigest()
+
+
+def receipt_base(entry_path: str, version: str) -> dict:
+    """summon identity: available before ANY validation, so even a missing-agent
+    or unknown-backend error names the install that produced it. ``entry_path``
+    and ``version`` are injected by the entry script so ``script``/``version``
+    name run_subagent.py; ``here`` is that file's directory (this module is a
+    sibling, so the scripts dir is the same either way)."""
+    here = Path(entry_path).resolve().parent
     return {"summon": {"version": version,
                        "script": str(Path(entry_path).resolve()),
-                       "scripts_sha256": h.hexdigest()}}
+                       "scripts_sha256": scripts_sha256(here)}}
 
 
 def receipt_agent(args: argparse.Namespace, agent_file: str) -> dict:
