@@ -529,8 +529,13 @@ def test_v1_output_tail_elides_base64_payload():
     s2 = _executor._sanitize_tail("head " + bare + " tail")
     assert "payload omitted: base64" in s2 and bare not in s2
     assert "Zm9vYmFyYmF6" in _executor._sanitize_tail("token=Zm9vYmFyYmF6 done")  # short: kept
-    # --max-tool-output-bytes lowers the threshold
+    # base64URL alphabet (-, _) must NOT bypass elision (review finding #2)
+    url_blob = ("aB-_" * 1500)  # 6000 chars of base64url
+    s3 = _executor._sanitize_tail("x " + url_blob + " y")
+    assert "payload omitted" in s3 and url_blob not in s3
+    # --max-tool-output-bytes lowers the threshold; a huge value never crashes
     assert "payload omitted" in _executor._sanitize_tail("x" + ("Q" * 200) + "y", max_blob_bytes=100)
+    assert _executor._sanitize_tail("hello", max_blob_bytes=10 ** 15) == "hello"  # no OverflowError
 
 
 def test_v1_model_mismatch_detection():
@@ -542,6 +547,10 @@ def test_v1_model_mismatch_detection():
     assert _executor._model_mismatch("gpt-5.6-sol", "gpt-5.6-sol") is False
     assert _executor._model_mismatch("opus", "claude-opus-4-8") is False  # alias floats to latest
     assert _executor._model_mismatch("sonnet", "claude-sonnet-5") is False
+    # token-exact, not substring: a real reroute that merely CONTAINS the alias
+    # as a substring must still warn (review finding #4)
+    assert _executor._model_mismatch("opus", "notopus") is True
+    assert _executor._model_mismatch("opus", "opusling-2") is True
     assert _executor._model_mismatch(None, "x") is False
     assert _executor._model_mismatch("", "x") is False
     assert _executor._model_mismatch("x", None) is False
@@ -562,21 +571,49 @@ def test_v1_normalized_success_exit_fields():
     # a plain clean exit (0) states exit and status agree
     ok = _executor.build_final_response("codex", 0, {"is_error": False, "result": "d"}, ["d\n"], "")
     assert ok["backend_exit_code"] == 0 and ok["dispatcher_status"] == "success"
+    # finalize_exit_fields backfills a bare envelope but never overwrites a reason
+    env = _executor.finalize_exit_fields({"status": "error", "exit_code": 127})
+    assert env["backend_exit_code"] == 127 and env["dispatcher_status"] == "error"
+    assert env["normalization_reason"]
+    keep = _executor.finalize_exit_fields(
+        {"status": "success", "exit_code": 1, "normalization_reason": "PINNED"})
+    assert keep["normalization_reason"] == "PINNED"
+    # query-shaped envelopes (no exit_code) are left untouched
+    assert "backend_exit_code" not in _executor.finalize_exit_fields({"agents": []})
+
+
+def test_v1_is_terminal_success_shared_gate():
+    # rec #6: the predicate shared by --out skip and manifest resume. A suspect
+    # success is NOT terminal (must re-dispatch); a plain success is.
+    import _executor
+    assert _executor.is_terminal_success({"status": "success"}) is True
+    assert _executor.is_terminal_success({"status": "success", "suspect": True}) is False
+    assert _executor.is_terminal_success({"status": "success", "report_ok": True}) is True
+    assert _executor.is_terminal_success({"status": "error"}) is False
+    assert _executor.is_terminal_success(None) is False
 
 
 def test_v1_startup_noise_stripped_keeps_real_error():
     # rec #9 / regression test 11: provider startup noise is collapsed to a
-    # marker while the real provider error and normal output survive.
+    # marker while the real provider error and normal output survive. Anchored
+    # patterns only -- a legit error that merely mentions profile/hook survives
+    # (review finding #6: broad matching must not delete real diagnostics).
     import _executor
     raw = ("duplicate skill 'foo' already loaded\n"
            "at C:\\x\\profile.ps1:12\n"
            "CommandNotFoundException: bar\n"
+           "the user profile could not be updated: disk full\n"   # legit error, must survive
            "IneligibleTierError: this client is no longer supported\n"
            "another real line")
     s = _executor._sanitize_tail(raw)
-    assert "IneligibleTierError" in s and "another real line" in s  # real content kept
-    assert "duplicate skill" not in s and "profile.ps1" not in s    # noise stripped
-    assert "startup noise suppressed" in s and "debug_file" in s     # marker + pointer
+    assert "IneligibleTierError" in s and "another real line" in s        # real content kept
+    assert "the user profile could not be updated" in s                   # NOT a false positive
+    assert "duplicate skill" not in s and "profile.ps1" not in s          # anchored noise stripped
+    assert "startup noise suppressed" in s                                # marker present
+    # the marker points at debug_file ONLY when one was created
+    assert "re-run with --debug-dir" in s                                 # default: no debug file
+    s_dbg = _executor._sanitize_tail(raw, debug_available=True)
+    assert "see debug_file" in s_dbg
 
 
 def test_extract_json_no_perf_cliff_on_braces():

@@ -62,7 +62,7 @@ import _cli  # noqa: E402
 import _receipt  # noqa: E402
 from _builder import AgentInvocation  # noqa: E402
 from _executor import ENVELOPE_VERSION as _ENVELOPE_VERSION  # noqa: E402
-from _executor import execute_agent  # noqa: E402
+from _executor import execute_agent, finalize_exit_fields, is_terminal_success  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
@@ -99,6 +99,11 @@ def _stamp_job(env: dict) -> dict:
 
 def _emit(obj: dict) -> None:
     """Write the response as JSON — to the job file (background) or stdout."""
+    # Single emission point: guarantee the exit-code-clarity fields on EVERY
+    # dispatch-shaped envelope, including the pre-dispatch validation/preflight
+    # paths that never reach the executor's _stamp. Idempotent + no-op on query
+    # envelopes (list/doctor/version have no exit_code).
+    finalize_exit_fields(obj)
     _stamp_job(obj)
     text = json.dumps(obj, ensure_ascii=False)
     if _JOB_FILE:
@@ -449,8 +454,7 @@ def main() -> None:
                 prior = json.load(fh)
         except (OSError, ValueError):
             prior = None
-        if (isinstance(prior, dict) and prior.get("status") == "success"
-                and not prior.get("suspect")):
+        if is_terminal_success(prior):
             prior["skipped"] = True
             _emit(prior)
             sys.exit(0)

@@ -304,11 +304,14 @@ def run_manifest(args) -> int:
         # spawning a child) so the skip is both accurate AND free — the child's
         # own --out skip would have marked it, but only in stdout the parent no
         # longer reads.
-        # Resume: only a SUCCESS envelope means "done". A prior error/blocked/
-        # partial envelope is re-run, so re-launching a swarm RETRIES its
-        # failures (what users expect) instead of skipping them permanently.
+        # Resume: only a TERMINAL success means "done". A prior error/blocked/
+        # partial -- OR a SUSPECT success (status=success but report_ok=false) --
+        # is re-run, so re-launching a swarm RETRIES its failures AND its
+        # unparseable results instead of skipping them permanently. Shared with
+        # the direct --out skip via is_terminal_success so both agree.
+        from _executor import is_terminal_success
         prior = _existing_envelope(out_file)
-        if prior is not None and prior.get("status") == "success":
+        if is_terminal_success(prior):
             envelope, skipped = prior, True
         else:
             skipped = False
