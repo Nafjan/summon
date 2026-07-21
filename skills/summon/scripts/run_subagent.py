@@ -668,6 +668,13 @@ def main() -> None:
     if schema is not None and result.get("status") == "success":
         result = _apply_schema(result, schema, invocation, args)
 
+    # Report-contract auto-repair: a suspect success (status=success but the report
+    # block is malformed -> report_ok false) gets ONE constrained corrective resume,
+    # unless disabled. Cheaper and more targeted than the caller re-dispatching the
+    # whole task. Runs after --json-schema so a still-suspect envelope gets one shot.
+    if not getattr(args, "no_contract_repair", False):
+        result = _apply_contract_repair(result, invocation, args)
+
     # Receipt LAST, from main()-scope values: a schema-correction retry replaces
     # the envelope, and this keeps prompt_sha256 bound to the ROOT prompt (the
     # correction prompt must never restamp it).
@@ -805,9 +812,114 @@ def _apply_schema(result: dict, schema: dict, invocation, args) -> dict:
     # original successful (if invalid) envelope.
     if retry.get("status") == "success" and retry.get("parse_ok"):
         # Preserve the total dispatch count across the correction (the retry is
-        # additional work, not a reset) so cost accounting stays honest.
+        # additional work, not a reset) so cost accounting stays honest, and fold
+        # the ORIGINAL call's spend into the returned envelope (the first call was
+        # paid for too -- otherwise a schema repair silently under-reports spend).
         retry["attempts"] = result.get("attempts", 1) + retry.get("attempts", 1)
+        _aggregate_spend(retry, result)
         return retry
+    # Rejected: keep the original, but the failed corrective call was still spent.
+    result["attempts"] = result.get("attempts", 1) + retry.get("attempts", 1)
+    _aggregate_spend(result, retry)
+    return result
+
+
+_CONTRACT_REPAIR_PROMPT = (
+    "Your previous reply was accepted but did NOT include a valid report contract, "
+    "so it is flagged as unverifiable. Re-emit your report, ending with EXACTLY this "
+    "block (all four fields, each on its own line):\n\n"
+    "STATUS: DONE | PARTIAL | BLOCKED\n"
+    "SUMMARY: <one line>\n"
+    "FOLLOW-UP: <the next step, or 'none'>\n"
+    "HANDOFF: <what the next agent needs, or 'none'>\n\n"
+    "IMPORTANT: STATUS is the EXECUTION status of the task (use DONE if you "
+    "finished), NOT your decision or verdict. If your decision was a verdict such as "
+    "APPROVE, BLOCK, or a recommendation, put it in SUMMARY (and in FINDINGS if you "
+    "use them) -- never in STATUS. Keep all of your analysis; just make sure the "
+    "exact block above is present."
+)
+
+
+def _aggregate_spend(result: dict, retry: dict) -> None:
+    """Fold the corrective call's cost/usage into ``result`` so total spend stays
+    honest whether or not the retry is accepted (the call happened either way)."""
+    rc, tc = result.get("cost_usd"), retry.get("cost_usd")
+    if isinstance(rc, (int, float)) or isinstance(tc, (int, float)):
+        result["cost_usd"] = (rc or 0) + (tc or 0)
+    ru, tu = result.get("usage"), retry.get("usage")
+    if isinstance(ru, dict) or isinstance(tu, dict):
+        merged = dict(ru or {})
+        for k, v in (tu or {}).items():
+            if isinstance(v, (int, float)) and isinstance(merged.get(k), (int, float)):
+                merged[k] += v
+            else:
+                merged.setdefault(k, v)
+        result["usage"] = merged
+
+
+def _apply_contract_repair(result: dict, invocation, args) -> dict:
+    """A dispatch that SUCCEEDED but whose report contract is malformed (report_ok
+    false -> suspect) gets ONE constrained corrective resume that re-emits the exact
+    contract, teaching STATUS = execution state (not a decision verdict).
+
+    The original envelope is PRESERVED: on accept, only the STRUCTURED contract
+    (report/report_ok/status) is overlaid; the original `result` text is kept
+    verbatim (so its full analysis survives a terse re-emit), and the corrected
+    block is stored in `repaired_report_text`. Schema output, warnings, and model
+    survive; spend/attempts aggregate across BOTH calls whether the retry is
+    accepted or rejected. The corrective resume runs READ-ONLY with no inherited
+    extra_args (a formatting re-emit needs no write/tool authority and must not
+    repeat the task's side effects). No resume lane -> no-op."""
+    if not (result.get("status") == "success" and not result.get("report_ok")):
+        return result
+    resume = result.get("resume") or {}
+    sid, profile = resume.get("session_id"), resume.get("profile")
+    if not sid and not profile:
+        return result  # no resume lane (e.g. gemini) — leave the suspect verdict as-is
+    from _builder import AgentInvocation as _AI
+    retry_inv = _AI(
+        cli=invocation.cli,
+        prompt=_CONTRACT_REPAIR_PROMPT,
+        cwd=invocation.cwd,
+        system_context="",  # resume: session already holds the definition
+        agent_file=invocation.agent_file,
+        permission="read-only",   # formatting re-emit: no write/yolo/tool authority, no side effects
+        model=invocation.model,
+        effort=invocation.effort,
+        resume_id=sid or "latest",
+        resume_profile=profile,
+        extra_args=[],   # DROP extra_args: a resume keeps the session's model, and a
+                         # stray permission-override flag (--dangerously-bypass...,
+                         # --permission-mode bypassPermissions) would defeat read-only.
+    )
+    try:
+        retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir,
+                              max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
+    except ValueError:
+        return result  # resume unsupported on this backend: keep the first verdict, no call made
+    # A corrective call was spent EITHER WAY -> account for attempts + spend honestly.
+    result["attempts"] = result.get("attempts", 1) + retry.get("attempts", 1)
+    _aggregate_spend(result, retry)
+    # Accept a retry that produced a VALID contract and did not error/time out. A
+    # truthful DONE **or** PARTIAL/BLOCKED (report_ok true) is better than the
+    # original suspect success; only an errored/timed-out or still-malformed retry
+    # is rejected.
+    if retry.get("report_ok") and retry.get("status") in ("success", "partial", "blocked"):
+        # Overlay ONLY the structured contract; KEEP the original `result` text so
+        # the agent's full analysis is never lost to a terse corrective re-emit.
+        # `report`/`report_ok` are the authoritative parsed view.
+        result["report"] = retry.get("report")
+        result["report_ok"] = True
+        result["status"] = retry.get("status")    # DONE->success; PARTIAL/BLOCKED reflected
+        result.pop("suspect", None)
+        result["contract_repaired"] = True
+        result["repaired_report_text"] = retry.get("result")   # the corrected block, for reference
+        if retry.get("resume"):
+            result["resume"] = retry["resume"]     # latest session id for follow-ups
+        if retry.get("warnings"):
+            result["warnings"] = (result.get("warnings") or []) + retry["warnings"]
+    else:
+        result["contract_repair_attempted"] = True   # a call was spent; it did not improve
     return result
 
 

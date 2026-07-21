@@ -301,6 +301,10 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--json-schema", dest="json_schema",
                         help="Validate the agent's final JSON against this schema file; attach "
                              "parsed/parse_ok; one corrective retry via resume on mismatch")
+    parser.add_argument("--no-contract-repair", dest="no_contract_repair", action="store_true",
+                        help="Disable the automatic ONE-shot corrective resume that fixes a "
+                             "malformed report contract on a suspect success (status=success but "
+                             "report_ok=false). Off by default; set this to save the extra call")
     parser.add_argument("--debug-dir", dest="debug_dir",
                         help="Dump per-run argv + raw output + envelope into this dir")
     parser.add_argument("--max-tool-output-bytes", dest="max_tool_output_bytes",
