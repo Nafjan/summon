@@ -186,7 +186,7 @@ class _ChildResult:
             returncode, stdout, stderr, timed_out)
 
 
-def _dispatch_child(cmd: list, timeout_sec: float):
+def _dispatch_child(cmd: list, timeout_sec: float, on_spawn=None):
     """Run a child dispatch with a REAL parent watchdog. Returns
     ``(_ChildResult|None, error|None)``.
 
@@ -194,7 +194,12 @@ def _dispatch_child(cmd: list, timeout_sec: float):
     timeout and then block in an UNBOUNDED ``communicate()`` if a backend
     descendant still holds stdout — the same hang the executor fix removes. So we
     Popen, bound ``communicate()``, and on timeout kill the whole PROCESS TREE
-    (``_kill_tree``) and drain with a bounded ``_safe_communicate``."""
+    (``_kill_tree``) and drain with a bounded ``_safe_communicate``.
+
+    ``on_spawn(proc)``, if given, is called with the live Popen right after spawn
+    (before the blocking communicate) so a caller can register it for an external
+    process-tree kill (e.g. the council's overall-timeout / early-exit). A killed
+    child unblocks communicate() here and returns as a normal timed_out result."""
     from _executor import _kill_tree, _safe_communicate
     popen_extra = {"start_new_session": True} if os.name != "nt" else {}
     try:
@@ -203,6 +208,11 @@ def _dispatch_child(cmd: list, timeout_sec: float):
                                 encoding="utf-8", errors="replace", **popen_extra)
     except OSError as e:
         return None, f"{type(e).__name__}: {e}"
+    if on_spawn is not None:
+        try:
+            on_spawn(proc)
+        except Exception:  # noqa: BLE001 — registration must never break the dispatch
+            pass
     timed_out = False
     try:
         out, err = proc.communicate(timeout=timeout_sec)
