@@ -225,9 +225,15 @@ def _dispatch_child(cmd: list, timeout_sec: float, on_spawn=None, on_reap=None):
         timed_out = True
         _kill_tree(proc)
         out, err = _safe_communicate(proc)
-    if on_reap is not None:
+    if on_reap is not None and proc.poll() is not None:
+        # Deregister ADJACENT to reap (before the caller's file reads) -- but ONLY once
+        # the child is PROVEN terminated. If bounded _safe_communicate gave up while the
+        # process is somehow still alive (returncode None -- a kill that has not yet
+        # landed, or an unkillable proc), leave it REGISTERED so the council's kill loop
+        # keeps targeting it; the run_stage finally is the eventual backstop when this
+        # dispatch returns. Never drop a still-live child from enforcement.
         try:
-            on_reap(proc)   # unregister ADJACENT to reap (before the caller's file reads)
+            on_reap(proc)
         except Exception:  # noqa: BLE001 — deregistration must never break the dispatch
             pass
     return _ChildResult(proc.returncode, out, err, timed_out), None

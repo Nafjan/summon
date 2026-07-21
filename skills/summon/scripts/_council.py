@@ -433,20 +433,23 @@ def run_council(args) -> int:
     def _kill_inflight() -> None:
         from _executor import _kill_tree
         with lock:
-            procs = list(inflight.values())   # snapshot; do NOT clear (the watchdog
-                                              # re-sweeps, run_stage unregisters its own)
-        # No poll()/liveness gate here, on purpose: `inflight` membership IS the gate.
-        # A member is unregistered by its on_reap callback the instant communicate()
-        # reaps the leader (before any envelope file read), so a still-registered proc
-        # has NOT been reaped -- its leader may be alive, or a zombie whose GRANDCHILD
-        # still holds stdout (the observed way the wall clock was defeated), and only
-        # killpg reaches that grandchild. Calling poll() here would REAP the leader --
-        # skipping the grandchild kill AND freeing the pid for recycle -- so we kill
-        # unconditionally and let _kill_tree swallow ProcessLookupError. A POSIX
-        # pid-recycle residual remains (a leader reaped in the microseconds between
-        # communicate() returning and on_reap running, whose pid is then recycled to a
-        # NEW group leader before this sweep's killpg) -- documented in _kill_tree.
-        for p in procs:
+            tags = list(inflight.keys())   # snapshot TAGS, not Popen objects
+        # DEREGISTRATION INVALIDATES THE KILL: re-read inflight.get(tag) under the lock
+        # right before killing, so a child reaped + unregistered (by its on_reap, the
+        # instant communicate() returns -- before any envelope file read) since the
+        # snapshot is skipped, never killed on a stale reference. No poll()/liveness gate
+        # on the surviving proc, on purpose: a still-registered proc has NOT been reaped
+        # -- its leader may be alive, or a zombie whose GRANDCHILD still holds stdout (the
+        # observed way the wall clock was defeated), and only killpg reaches that
+        # grandchild; poll() would REAP the leader, skipping the grandchild kill AND
+        # freeing the pid for recycle. The POSIX pid-recycle residual is now bounded to
+        # the [re-read under lock -> _kill_tree entry] gap (a few instructions) AND only
+        # if the recycled pid re-becomes a group leader in it -- documented in _kill_tree.
+        for tag in tags:
+            with lock:
+                p = inflight.get(tag)
+            if p is None:
+                continue                       # reaped+unregistered since snapshot -> stale
             try:
                 _kill_tree(p)
             except Exception:  # noqa: BLE001 — best-effort kill, never fatal
@@ -463,6 +466,35 @@ def run_council(args) -> int:
         no child can run past the deadline (>=1s floor)."""
         rem = _remaining_ms()
         return base_ms if rem is None else max(1000, min(base_ms, rem))
+
+    def _breached() -> bool:
+        """True once the overall budget is spent -- by the AUTHORITATIVE monotonic
+        deadline, NOT merely the watchdog's async flag. A delayed/starved watchdog
+        thread must never let a dispatch guard wave a paid child through after the
+        deadline, so every gate consults the clock directly. Any observer publishes
+        overall["hit"] here (idempotent with the watchdog) so the downstream
+        partial-emission path treats the breach as seen."""
+        if overall["hit"]:
+            return True
+        if overall_deadline is not None and time.monotonic() >= overall_deadline:
+            overall["hit"] = True
+            return True
+        return False
+
+    def _register_and_gate(tag: str, proc) -> None:
+        """on_spawn hook: register the live child, then RE-CHECK the deadline. The
+        pre-dispatch gate can pass and the deadline expire DURING launch (Popen); a
+        child that spawned past the deadline is killed HERE, at spawn, instead of
+        waiting up to a ~150ms watchdog sweep -- making launch atomic with the budget
+        for this child (its registration is visible to any concurrent kill, and this
+        check catches the just-lost race)."""
+        _register_inflight(tag, proc)
+        if _breached():
+            from _executor import _kill_tree
+            try:
+                _kill_tree(proc)
+            except Exception:  # noqa: BLE001 — best-effort kill, never fatal
+                pass
 
     def _overall_watchdog() -> None:
         remaining = overall_deadline - time.monotonic()
@@ -554,7 +586,7 @@ def run_council(args) -> int:
         _tag = f"g{owner.generation}-{stage}"
         try:
             env = _dispatch(agent, prompt, cwd, agents_dir, stage_timeout_ms, rd_path,
-                            _tag, on_spawn=lambda p: _register_inflight(_tag, p),
+                            _tag, on_spawn=lambda p: _register_and_gate(_tag, p),
                             on_reap=lambda p: _unregister_inflight(_tag))
         finally:
             # on_reap already unregistered on the normal path (adjacent to the child's
@@ -608,7 +640,7 @@ def run_council(args) -> int:
         # Overall-timeout: if the deadline already breached (a later wave that
         # would start after the kill), EXCLUDE this member without dispatching --
         # no durable stage file is written, so a resume re-runs it cleanly.
-        if overall["hit"]:
+        if _breached():
             return _member_view(agent, {"status": "excluded",
                                         "error": "overall timeout reached before dispatch"})
         # Resume economics: a prior-generation stage whose upstream inputs are
@@ -627,7 +659,7 @@ def run_council(args) -> int:
             # Re-check AFTER acquiring the semaphore: a member that was QUEUED (a
             # later wave) when the deadline breached must be excluded here, or it
             # would spawn a child after the watchdog's sweep and outlive the budget.
-            if overall["hit"]:
+            if _breached():
                 return _member_view(agent, {"status": "excluded",
                                             "error": "overall timeout reached while queued"})
             env = run_stage(agent, prompt, stage, input_sha, member_timeout_ms)
@@ -784,7 +816,7 @@ def run_council(args) -> int:
         _write_state("round1_complete")
         if lost["err"]:
             return _fail(f"run ownership lost during round 1: {lost['err']}", out_path)
-        if overall["hit"]:
+        if _breached():
             return _overall_partial("cut short during/after round 1")
         if rounds >= 2:
             done["n"] = 0
@@ -841,13 +873,13 @@ def run_council(args) -> int:
             _write_state("round2_complete")
             if lost["err"]:
                 return _fail(f"run ownership lost during round 2: {lost['err']}", out_path)
-            if overall["hit"]:
+            if _breached():
                 return _overall_partial("cut short during/after round 2")
 
         # A breach that landed AFTER the last member round but BEFORE synthesis:
         # skip the (unaffordable) chairman and emit the partial with the members.
         # Checked BEFORE the pop below so the partial keeps the full member envelopes.
-        if overall["hit"]:
+        if _breached():
             return _overall_partial("cut short before synthesis")
 
         for m in results:    # drop the raw text and envelope carried for checkpoints
@@ -929,7 +961,7 @@ def run_council(args) -> int:
             else:
                 # A breach in the window between the pre-synthesis check and here
                 # must not start a paid chairman: emit the partial with the members.
-                if overall["hit"]:
+                if _breached():
                     return _overall_partial("cut short before chairman dispatch")
                 print(f"[council] chairman {chairman} synthesizing...", file=sys.stderr, flush=True)
                 primary_env = run_stage(chairman, chair_prompt, "chairman", chair_sha, chair_timeout_ms)
@@ -953,7 +985,7 @@ def run_council(args) -> int:
                     # (status != success because it was process-tree-killed). Do NOT
                     # start a fresh paid fallback after the budget is spent -- the whole
                     # point of the breach is to stop launching work.
-                    if overall["hit"]:
+                    if _breached():
                         return _overall_partial("cut short before fallback chairman dispatch")
                     print(f"[council] primary chairman {primary_env.get('status')}; fallback "
                           f"{chairman_fallback} synthesizing...", file=sys.stderr, flush=True)
@@ -968,7 +1000,7 @@ def run_council(args) -> int:
         # A breach that landed DURING the chairman: route through _overall_partial
         # (which writes the overall_timeout state and flushes) WHILE ownership is
         # still held -- the final-envelope path runs after the finally releases it.
-        if overall["hit"]:
+        if _breached():
             return _overall_partial("cut short during synthesis")
     except _rd.OwnershipLostError as e:
         # A fenced write raised mid-flight (successor took over): abort cleanly
