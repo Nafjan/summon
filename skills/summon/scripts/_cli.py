@@ -355,10 +355,14 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="With --council: chairman (and fallback) stage timeout "
                              "(default: --timeout)")
     parser.add_argument("--overall-timeout", dest="overall_timeout", type=parse_timeout,
-                        help="With --council: a HARD wall-clock budget for the whole run. "
-                             "On breach summon process-tree-kills in-flight members and emits "
-                             "a PARTIAL council envelope (status=partial) BEFORE the host's own "
-                             "timeout can kill it. Per-stage timeouts still apply within it")
+                        help="With --council: a HARD wall-clock budget for the DELIBERATION "
+                             "(every member and chairman dispatch, plus setup). On breach summon "
+                             "process-tree-kills in-flight members and emits a PARTIAL council "
+                             "envelope (status=partial) BEFORE the host's own timeout can kill it; "
+                             "once spent it launches no further dispatch (queued members and the "
+                             "fallback chairman are excluded). Per-stage timeouts still apply within "
+                             "it. The parent's own final envelope serialization (no child running) "
+                             "is not counted")
     parser.add_argument("--job-dir", dest="job_dir",
                         help="Root for --background job records/results "
                              "(default {tempdir}/subagents_jobs; env SUMMON_JOBS_DIR)")

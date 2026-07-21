@@ -192,12 +192,15 @@ def _chairman_prompt(question: str, members: list, ranking_note: str = "") -> st
 
 
 def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
-              timeout_ms: int, out_dir: str, tag: str, on_spawn=None) -> dict:
+              timeout_ms: int, out_dir: str, tag: str, on_spawn=None,
+              on_reap=None) -> dict:
     """Run one agent via a run_subagent subprocess with --out (authoritative
     envelope). Returns the parsed envelope (or an error envelope). A parent
     watchdog (child deadline + margin) guarantees the council can't hang on a
     wedged child. ``on_spawn(proc)`` registers the live child so an overall-timeout
-    breach can process-tree-kill it (see the council's kill registry)."""
+    breach can process-tree-kill it (see the council's kill registry); ``on_reap(proc)``
+    UNREGISTERS it the instant communicate() returns, before this function's envelope
+    file reads, so a stale snapshot-kill window shrinks to that callback."""
     # Reuse the manifest's robust child dispatch: Popen + PROCESS-TREE kill +
     # bounded communicate on timeout (plain subprocess.run(timeout=) would kill
     # only the immediate child and then block in an unbounded communicate() if a
@@ -211,7 +214,7 @@ def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
         cmd += ["--agents-dir", agents_dir]
     watchdog = max(1.0, (timeout_ms + _CHILD_MARGIN_MS) / 1000)
     try:
-        proc, spawn_err = _dispatch_child(cmd, watchdog, on_spawn=on_spawn)
+        proc, spawn_err = _dispatch_child(cmd, watchdog, on_spawn=on_spawn, on_reap=on_reap)
         if spawn_err:
             return {"status": "error", "error": spawn_err}
         # Mirror the manifest: a watchdog timeout is only an error when the child
@@ -433,14 +436,16 @@ def run_council(args) -> int:
             procs = list(inflight.values())   # snapshot; do NOT clear (the watchdog
                                               # re-sweeps, run_stage unregisters its own)
         # No poll()/liveness gate here, on purpose: `inflight` membership IS the gate.
-        # run_stage unregisters a member the instant its communicate() returns, so a
-        # still-registered proc has NOT completed -- its leader may be a zombie whose
-        # GRANDCHILD still holds stdout (the observed way the wall clock was defeated),
-        # and only killpg reaches that grandchild. Calling poll() here would REAP the
-        # leader -- skipping the grandchild kill AND freeing the pid for recycle -- so
-        # we kill unconditionally and let _kill_tree swallow ProcessLookupError. The
-        # POSIX pid-recycle residual is bounded to the adjacent [reap -> unregister]
-        # window (see _kill_tree) and accepted.
+        # A member is unregistered by its on_reap callback the instant communicate()
+        # reaps the leader (before any envelope file read), so a still-registered proc
+        # has NOT been reaped -- its leader may be alive, or a zombie whose GRANDCHILD
+        # still holds stdout (the observed way the wall clock was defeated), and only
+        # killpg reaches that grandchild. Calling poll() here would REAP the leader --
+        # skipping the grandchild kill AND freeing the pid for recycle -- so we kill
+        # unconditionally and let _kill_tree swallow ProcessLookupError. A POSIX
+        # pid-recycle residual remains (a leader reaped in the microseconds between
+        # communicate() returning and on_reap running, whose pid is then recycled to a
+        # NEW group leader before this sweep's killpg) -- documented in _kill_tree.
         for p in procs:
             try:
                 _kill_tree(p)
@@ -549,9 +554,13 @@ def run_council(args) -> int:
         _tag = f"g{owner.generation}-{stage}"
         try:
             env = _dispatch(agent, prompt, cwd, agents_dir, stage_timeout_ms, rd_path,
-                            _tag, on_spawn=lambda p: _register_inflight(_tag, p))
+                            _tag, on_spawn=lambda p: _register_inflight(_tag, p),
+                            on_reap=lambda p: _unregister_inflight(_tag))
         finally:
-            _unregister_inflight(_tag)   # no longer killable once it has returned
+            # on_reap already unregistered on the normal path (adjacent to the child's
+            # reap); this is the idempotent backstop for a spawn failure or an
+            # exception before reap. pop(default) makes the double-unregister a no-op.
+            _unregister_inflight(_tag)
         if isinstance(env, dict) and _rd.owner_still_current(owner):
             # Owner-side annotation (fenced): the upstream-input hash is what
             # makes this stage carry-forwardable on a later resume.
@@ -675,6 +684,31 @@ def run_council(args) -> int:
             pass  # display-only; never fatal
 
     try:
+        # Setup (agent loading, owner acquisition, journal repair, receipt write) is
+        # charged to the overall budget too -- start it BEFORE the watchdog exists.
+        # If setup ALONE already overran, dispatch nothing: emit a zero-member partial
+        # so no paid child is ever launched past the deadline. (The finally still
+        # releases ownership and stops the watchdog.)
+        if overall_deadline is not None and time.monotonic() >= overall_deadline:
+            overall["hit"] = True
+            _env = {"mode": "council", "envelope": 1, "run_id": run_id, "run_dir": rd_path,
+                    "generation": owner.generation, "question": question, "rounds": rounds,
+                    "council_state": "overall_timeout", "members": [], "member_envelopes": [],
+                    "consensus_ranking": None, "status": "partial",
+                    "overall_timeout": {"budget_ms": overall_timeout_ms,
+                                        "reason": "overall budget exhausted during setup; "
+                                                  "no members dispatched"},
+                    "summary": _council_summary([], run_id=run_id, results_dir=rd_path,
+                                                chair_status="not_run (overall timeout)",
+                                                quorum_met=None),
+                    "elapsed_ms": int((time.monotonic() - _run_start) * 1000)}
+            if out_path:
+                _werr = _atomic_write_json(out_path, _env)
+                if _werr:
+                    _env["out_error"] = _werr
+            print(json.dumps(_env, ensure_ascii=False))
+            sys.stdout.flush()
+            return 2
         # ---- round 1: independent positions ---------------------------------
         # Stage-input hashes cover the EXACT prompt plus execution identity
         # (member, its definition hash, cwd, roster dir): a changed repo, a
@@ -893,6 +927,10 @@ def run_council(args) -> int:
                 print(f"[council] chairman carried forward from generation {_chair_pg}",
                       file=sys.stderr, flush=True)
             else:
+                # A breach in the window between the pre-synthesis check and here
+                # must not start a paid chairman: emit the partial with the members.
+                if overall["hit"]:
+                    return _overall_partial("cut short before chairman dispatch")
                 print(f"[council] chairman {chairman} synthesizing...", file=sys.stderr, flush=True)
                 primary_env = run_stage(chairman, chair_prompt, "chairman", chair_sha, chair_timeout_ms)
             chair_env = primary_env
@@ -911,6 +949,12 @@ def run_council(args) -> int:
                     print(f"[council] fallback chairman carried forward from generation {_fb_pg}",
                           file=sys.stderr, flush=True)
                 else:
+                    # The primary chairman may have been KILLED by the overall-timeout
+                    # (status != success because it was process-tree-killed). Do NOT
+                    # start a fresh paid fallback after the budget is spent -- the whole
+                    # point of the breach is to stop launching work.
+                    if overall["hit"]:
+                        return _overall_partial("cut short before fallback chairman dispatch")
                     print(f"[council] primary chairman {primary_env.get('status')}; fallback "
                           f"{chairman_fallback} synthesizing...", file=sys.stderr, flush=True)
                     fallback_env = run_stage(chairman_fallback, chair_prompt,
