@@ -18,35 +18,45 @@ from concurrent.futures import ThreadPoolExecutor
 _VERSION_TIMEOUT = 10
 _PROBE_TIMEOUT = 25   # opt-in eligibility probe: a minimal real call, short leash
 
-# Known "the binary runs but the ACCOUNT/CLIENT cannot actually dispatch"
-# signatures. A --version probe passes for ALL of these; only a real call (or this
-# classifier over a failed dispatch's output) reveals them. Each maps to a concrete
-# migration path so the user is never left with a bare error. Matched lower-cased.
-_INELIGIBILITY_SIGNS = (
-    ("ineligibletiererror", "gemini",
+# Known "the binary runs but a real dispatch fails" signatures. A --version probe
+# passes for ALL of these. Each row: (signature, backend-or-None, kind, guidance).
+#   kind "eligibility": authenticated, but the ACCOUNT/CLIENT tier can't dispatch.
+#   kind "auth":        not authenticated (login needed) -- provider-agnostic.
+# A backend-SPECIFIC row (backend != None) only applies to THAT backend, so gemini's
+# tier error is never attributed to a codex dispatch that merely echoed the phrase.
+# Matched case-insensitively.
+_BACKEND_ISSUE_SIGNS = (
+    ("ineligibletiererror", "gemini", "eligibility",
      "this Gemini client/account tier can no longer use Gemini Code Assist for "
      "individuals; use the metered API (set GEMINI_API_KEY) or the agy (Antigravity) "
      "backend instead"),
-    ("no longer supported for gemini code assist", "gemini",
+    ("no longer supported for gemini code assist", "gemini", "eligibility",
      "Gemini Code Assist for individuals is unavailable for this client; use "
      "GEMINI_API_KEY (metered) or the agy (Antigravity) backend"),
-    ("this client is no longer supported", "gemini",
+    ("this client is no longer supported", "gemini", "eligibility",
      "this Gemini client version/tier is no longer accepted; update the CLI, use "
      "GEMINI_API_KEY (metered), or switch to the agy (Antigravity) backend"),
+    ("not authenticated", None, "auth", "run the backend's login/auth command"),
+    ("authentication failed", None, "auth", "re-run the backend's login/auth command"),
+    ("please log in", None, "auth", "run the backend's login/auth command"),
+    ("please login", None, "auth", "run the backend's login/auth command"),
+    ("login required", None, "auth", "run the backend's login/auth command"),
+    ("not logged in", None, "auth", "run the backend's login/auth command"),
 )
 
 
-def classify_ineligibility(text):
-    """Detect a known account/client-eligibility failure in probe or dispatch
-    output. Returns ``{eligible: False, backend, reason, guidance}`` or None when
-    no known ineligibility signature is present. Pure + side-effect-free so it can
-    run over a --doctor probe, a dispatch's output_tail, or a manual paste."""
+def classify_ineligibility(text, backend=None):
+    """Detect a known AUTH or ELIGIBILITY failure in probe/dispatch output. Returns
+    ``{kind, backend, reason, guidance}`` (kind is 'auth' or 'eligibility') or None.
+    When ``backend`` is given, a backend-specific signature matches ONLY that backend
+    (so an echoed/unrelated phrase can't manufacture a wrong verdict); generic auth
+    signatures match any backend. Pure + side-effect-free."""
     if not text or not isinstance(text, str):
         return None
     low = text.lower()
-    for sign, backend, guidance in _INELIGIBILITY_SIGNS:
-        if sign in low:
-            return {"eligible": False, "backend": backend,
+    for sign, sbk, kind, guidance in _BACKEND_ISSUE_SIGNS:
+        if sign in low and (sbk is None or backend is None or sbk == backend):
+            return {"kind": kind, "backend": sbk or backend or "?",
                     "reason": sign, "guidance": guidance}
     return None
 
@@ -131,12 +141,12 @@ def _check_backends() -> dict:
     return out
 
 
-def _default_probe_runner(name: str, path: str) -> str | None:
+def _default_probe_runner(name: str, path: str) -> dict | None:
     """A minimal real one-shot to reveal eligibility, reusing the dispatcher's own
-    invocation builder so backend flags/permissions are correct. Returns the
-    combined result/error text, or None if a cheap probe is not defined for this
-    backend. Best-effort and fail-soft: any error becomes text for the classifier,
-    never an exception."""
+    invocation builder so backend flags/permissions are correct. Returns
+    ``{status, text}`` (text = the richest error/output for the classifier), or
+    None if a probe cannot be built for this backend. Best-effort and fail-soft:
+    any exception becomes an error-status result, never a raise."""
     try:
         from _builder import AgentInvocation
         from _executor import execute_agent
@@ -147,35 +157,53 @@ def _default_probe_runner(name: str, path: str) -> str | None:
                               system_context="", permission="read-only")
         resp = execute_agent(inv, timeout_ms=_PROBE_TIMEOUT * 1000)
     except Exception as e:  # noqa: BLE001
-        return f"{type(e).__name__}: {e}"
-    # Feed the classifier the richest failure text available.
-    return " ".join(str(resp.get(k) or "") for k in ("error", "output_tail", "result"))
+        return {"status": "error", "text": f"{type(e).__name__}: {e}"}
+    text = " ".join(str(resp.get(k) or "") for k in ("error", "output_tail", "result"))
+    return {"status": resp.get("status"), "text": text}
+
+
+def _probe_one(name: str, b: dict, runner) -> None:
+    """Fill one backend's eligibility tiers from a live probe. ONLY a genuine
+    SUCCESS certifies eligibility; a timeout / auth error / unclassifiable failure
+    leaves the tiers unverified (None) with a note -- never certifies a broken
+    backend as eligible."""
+    b["probe_ran"] = True
+    result = runner(name, b.get("path"))
+    if result is None:
+        b["probe_note"] = "no eligibility probe defined for this backend"
+        return
+    status, text = result.get("status"), result.get("text") or ""
+    verdict = classify_ineligibility(text, backend=name)
+    if verdict and verdict["kind"] == "eligibility":
+        b["auth_ok"] = True              # authenticated far enough to learn the tier is out
+        b["account_eligible"] = False
+        b["model_access_verified"] = False
+        b["ineligible_reason"] = verdict["reason"]
+        b["guidance"] = verdict["guidance"]
+    elif verdict and verdict["kind"] == "auth":
+        b["auth_ok"] = False             # distinct tier: not authenticated
+        b["guidance"] = verdict["guidance"]
+    elif status == "success":
+        # A successful minimal call proves auth + account eligibility + a model
+        # actually responded -- the only state that certifies eligibility.
+        b["auth_ok"] = b["account_eligible"] = b["model_access_verified"] = True
+    else:
+        # timeout / error / blocked with no known signature: stays UNVERIFIED.
+        b["probe_note"] = f"probe did not confirm eligibility (status={status}): {text[:160]}"
 
 
 def _probe_eligibility(backends: dict, runner=None) -> None:
     """Opt-in: run a minimal live call per FOUND+verified backend and fill the
-    eligibility tiers. A known ineligibility signature marks account_eligible
-    False with guidance; a clean run marks the tiers True; an unclassifiable
-    failure leaves them None (still unverified) but records the probe error."""
+    eligibility tiers. Probes run CONCURRENTLY so doctor --probe isn't sum-of-
+    timeouts. NOTE: this SPENDS -- one real (minimal) dispatch per eligible-looking
+    backend."""
     runner = runner or _default_probe_runner
-    for name, b in backends.items():
-        if not (b.get("found") and b.get("verified")):
-            continue
-        text = runner(name, b.get("path"))
-        b["probe_ran"] = True
-        if text is None:
-            b["probe_note"] = "no cheap eligibility probe defined for this backend"
-            continue
-        verdict = classify_ineligibility(text)
-        if verdict is not None:
-            b["auth_ok"] = b["account_eligible"] = False
-            b["model_access_verified"] = False
-            b["ineligible_reason"] = verdict["reason"]
-            b["guidance"] = verdict["guidance"]
-        elif "error" in text.lower() or "not found" in text.lower():
-            b["probe_note"] = f"probe did not confirm eligibility: {text[:160]}"
-        else:
-            b["auth_ok"] = b["account_eligible"] = b["model_access_verified"] = True
+    targets = [(n, b) for n, b in backends.items()
+               if b.get("found") and b.get("verified")]
+    if not targets:
+        return
+    with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        list(pool.map(lambda nb: _probe_one(nb[0], nb[1], runner), targets))
 
 
 def _check_agy_extras(backends: dict) -> dict:
@@ -275,13 +303,19 @@ def render(report: dict) -> str:
         "backends:",
     ]
     for name, b in report["backends"].items():
-        if b["found"]:
-            ver = b.get("version") or "version unknown"
+        ver = b.get("version") or "version unknown"
+        if not b["found"]:
+            mark, detail = "[--]", f"not installed  ->  {b['install']}"
+        elif not b.get("verified"):
+            mark, detail = "[!!]", (f"on PATH but --version probe failed "
+                                    f"({b['path']}) - broken install or impostor binary")
+        elif b.get("account_eligible") is False:
+            # Confirmed ineligibility wins over any agy-prerequisite hint -- a
+            # real dispatch will fail, so that guidance must not be suppressed.
+            mark, detail = "[!!]", f"INELIGIBLE - {b.get('guidance', 'account/client not eligible')}"
+        else:
             mark, detail = "[OK]", f"{ver}  ({b['path']})"
-            if not b.get("verified"):
-                mark, detail = "[!!]", (f"on PATH but --version probe failed "
-                                        f"({b['path']}) - broken install or impostor binary")
-            if name == "agy" and b.get("verified"):
+            if name == "agy":
                 ex = report["agy_extras"]
                 if not ex.get("platform_ok"):
                     mark, detail = "[!!]", "CLI found but backend needs Windows or AGY_PTY_WRAPPER"
@@ -289,19 +323,14 @@ def render(report: dict) -> str:
                     mark, detail = "[!!]", f"CLI found but PTY wrapper missing ({ex.get('wrapper')})"
                 elif ex.get("pty_modules") is False:
                     mark, detail = "[!!]", f"CLI found but: {ex.get('note')}"
-            # Eligibility overlay for an otherwise-OK backend: a passing --version
-            # is NOT eligibility. Confirmed-ineligible -> [!!] + migration guidance;
-            # probe-verified -> [OK] eligible; unprobed -> [~?] eligibility unverified.
+            # Eligibility overlay: a passing --version is NOT eligibility.
+            # probe-verified -> [OK] eligible; unprobed -> [~?] unverified.
             if mark == "[OK]":
-                if b.get("account_eligible") is False:
-                    mark, detail = "[!!]", f"INELIGIBLE - {b.get('guidance', 'account/client not eligible')}"
-                elif b.get("account_eligible") is True:
+                if b.get("account_eligible") is True:
                     detail = f"{ver} - eligibility verified  ({b['path']})"
                 else:
                     mark = "[~?]"
                     detail = f"{ver} - installed; eligibility unverified  ({b['path']})"
-        else:
-            mark, detail = "[--]", f"not installed  ->  {b['install']}"
         lines.append(f"  {mark} {name:<13} {detail}")
         lines.append(f"       auth: {b['auth_hint']}")
     ad = report["agents_dir"]

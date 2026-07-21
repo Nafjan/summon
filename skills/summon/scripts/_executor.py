@@ -303,17 +303,23 @@ def _attach_eligibility(resp: dict) -> dict:
     live probe imports _executor). Advisory only, never fatal."""
     if not isinstance(resp, dict) or resp.get("status") == "success":
         return resp
+    # Include `result` too (some backends put the failure text there, not in
+    # error/output_tail), and BIND to this dispatch's actual backend so a gemini
+    # tier signature can't be attributed to a codex/claude envelope that merely
+    # echoed the phrase.
+    text = (f"{resp.get('error') or ''} {resp.get('output_tail') or ''} "
+            f"{resp.get('result') or ''}")
     try:
         from _doctor import classify_ineligibility
-        verdict = classify_ineligibility(
-            f"{resp.get('error') or ''} {resp.get('output_tail') or ''}")
+        verdict = classify_ineligibility(text, backend=resp.get("cli"))
     except Exception:  # noqa: BLE001
         verdict = None
     if verdict is not None:
         resp["eligibility"] = verdict
+        issue = ("is not eligible" if verdict["kind"] == "eligibility"
+                 else "is not authenticated")
         resp.setdefault("warnings", []).append(
-            f"backend '{verdict['backend']}' account/client is not eligible: "
-            f"{verdict['guidance']}")
+            f"backend '{verdict['backend']}' {issue}: {verdict['guidance']}")
     return resp
 
 
