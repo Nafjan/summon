@@ -225,13 +225,15 @@ def _dispatch_child(cmd: list, timeout_sec: float, on_spawn=None, on_reap=None):
         timed_out = True
         _kill_tree(proc)
         out, err = _safe_communicate(proc)
-    if on_reap is not None and proc.poll() is not None:
-        # Deregister ADJACENT to reap (before the caller's file reads) -- but ONLY once
-        # the child is PROVEN terminated. If bounded _safe_communicate gave up while the
-        # process is somehow still alive (returncode None -- a kill that has not yet
-        # landed, or an unkillable proc), leave it REGISTERED so the council's kill loop
-        # keeps targeting it; the run_stage finally is the eventual backstop when this
-        # dispatch returns. Never drop a still-live child from enforcement.
+    if on_reap is not None and not timed_out:
+        # Deregister ADJACENT to reap -- but ONLY on a CLEAN communicate() return, which
+        # is the sole reliable "whole tree is done" signal: communicate() returns only
+        # after stdout+stderr hit EOF, and a descendant still holding stdout would have
+        # BLOCKED it into the timeout path below. The leader's poll() is NOT a proxy for
+        # this: a leader can exit while a stdout-holding grandchild lives, and killpg
+        # needs the (now-registered) leader pid to reach that grandchild. So on the
+        # timed_out path we deliberately do NOT deregister -- the child stays registered
+        # for the council's kill loop / final teardown, which killpg the whole group.
         try:
             on_reap(proc)
         except Exception:  # noqa: BLE001 — deregistration must never break the dispatch

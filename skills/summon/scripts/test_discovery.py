@@ -4003,10 +4003,11 @@ def test_v4_monotonic_gate_without_watchdog():
 
 
 def test_v4_dispatch_child_on_reap_skips_a_still_live_child():
-    # Re-review round-3 WARNING: _dispatch_child must invoke on_reap only after PROVEN
-    # termination. If bounded communication gives up while the child is still alive
-    # (returncode None), on_reap must NOT fire -- dropping a live child from the kill
-    # registry would leak a paid process. Simulate a wedged child that survives the kill.
+    # _dispatch_child deregisters (on_reap) ONLY on a clean communicate() return -- the
+    # sole reliable "whole tree is done" signal (stdout hit EOF). On the TIMED-OUT path
+    # the tree's liveness is unproven (a descendant may hold stdout past a kill that did
+    # not land), and the leader's poll() is NOT a proxy for it, so on_reap must NOT fire.
+    # Here communicate() raises TimeoutExpired -> timed_out -> on_reap must be withheld.
     import _manifest
     import _executor
     import subprocess as _sp
@@ -4071,14 +4072,18 @@ def test_v4_live_child_stays_enforced_through_teardown():
             return None if self._alive else 0
 
     def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
-        # m2 simulates a wedged child: _kill_tree did not land, _safe_communicate gave up
-        # while poll() is still None, so _dispatch_child (correctly) never calls on_reap.
+        # m2 models the round-5 race the reviewer found: the LEADER has already EXITED
+        # (poll() == 0) but its tree is UNCONFIRMED -- a stdout-holding descendant may still
+        # be alive, and _dispatch_child (correctly) did not call on_reap because communicate
+        # timed out (not a clean EOF). Its poll() returns 0, so any poll()-based cleanup
+        # would WRONGLY drop it. Teardown must still killpg the group via the registered
+        # leader pid. m1 is the clean path: communicate returned -> on_reap deregistered it.
         wedged = agent == "m2"
-        proc = FakeProc(tag, alive=wedged)
+        proc = FakeProc(tag, alive=not wedged)   # m2 leader already dead (poll()==0)
         if on_spawn:
             on_spawn(proc)
         if not wedged and on_reap:
-            on_reap(proc)                      # normal path: reaped -> deregister adjacent
+            on_reap(proc)                      # clean communicate() return -> deregister
         return {"status": "success" if not wedged else "error",
                 "result": agent, "report": {"summary": agent}}
 
