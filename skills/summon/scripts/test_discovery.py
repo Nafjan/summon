@@ -1004,6 +1004,34 @@ def test_apply_schema_sums_attempts_on_successful_correction():
         rs.execute_agent = rs_exec
 
 
+def test_apply_schema_aggregates_spend_across_correction():
+    # a schema correction is a second paid call; the accepted envelope must reflect
+    # the TOTAL spend (both calls), not just the retry's -- otherwise a schema repair
+    # preceding a contract repair silently under-reports cost.
+    import run_subagent as rs
+    from _builder import AgentInvocation
+    import argparse
+    schema = {"type": "object", "required": ["k"]}
+    original = {"status": "success", "result": "bad", "attempts": 1,
+                "cost_usd": 0.10, "usage": {"output_tokens": 100},
+                "resume": {"cli": "claude", "session_id": "s"}}
+    def fake(inv, timeout_ms=0, debug_dir=None, **kwargs):
+        return {"status": "success", "result": '{"k": 1}', "attempts": 1,
+                "cost_usd": 0.03, "usage": {"output_tokens": 20}, "resume": {}}
+    rs_exec = rs.execute_agent
+    rs.execute_agent = fake
+    try:
+        inv = AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                              system_context="s", permission="safe-edit")
+        out = rs._apply_schema(dict(original), schema, inv,
+                               argparse.Namespace(timeout=1000, debug_dir=None))
+    finally:
+        rs.execute_agent = rs_exec
+    assert out["parse_ok"] is True and out["attempts"] == 2
+    assert abs(out["cost_usd"] - 0.13) < 1e-9        # 0.10 + 0.03 both counted
+    assert out["usage"]["output_tokens"] == 120      # 100 + 20
+
+
 def test_v3_contract_repair_fixes_and_preserves_telemetry():
     # rec #5 / regression test 7: a suspect success (STATUS: APPROVE -> report_ok
     # false) gets ONE corrective resume producing a valid contract (STATUS: DONE)
@@ -1013,16 +1041,18 @@ def test_v3_contract_repair_fixes_and_preserves_telemetry():
     from _builder import AgentInvocation
     import argparse
     original = {"status": "success", "report_ok": False, "suspect": True,
-                "result": "Full analysis here.\nSTATUS: APPROVE",
+                "result": "UNIQUE-ORIGINAL-ANALYSIS-x7f3 detailed reasoning.\nSTATUS: APPROVE",
                 "resume": {"cli": "codex", "session_id": "sess-1"}, "attempts": 1,
                 "cost_usd": 0.10, "usage": {"input_tokens": 100, "output_tokens": 50},
                 "parsed": {"k": 1}, "parse_ok": True, "warnings": ["w1"],
                 "model": {"served": "m"}}
-    repaired = ("Full analysis here.\nSTATUS: DONE\nSUMMARY: APPROVE - sound\n"
-                "FOLLOW-UP: none\nHANDOFF: none")
+    # a TERSE corrective re-emit -- contains ONLY the contract, no analysis. The
+    # original's unique analysis must survive regardless.
+    repaired = "STATUS: DONE\nSUMMARY: APPROVE - sound\nFOLLOW-UP: none\nHANDOFF: none"
     captured = {}
     def fake(inv, timeout_ms=0, debug_dir=None, **kwargs):
         captured["permission"] = inv.permission
+        captured["extra_args"] = list(inv.extra_args)
         assert "execution status" in inv.prompt.lower()  # the repair prompt was used
         return {"status": "success", "result": repaired, "report_ok": True,
                 "report": {"status": "DONE", "summary": "APPROVE - sound"},
@@ -1033,21 +1063,26 @@ def test_v3_contract_repair_fixes_and_preserves_telemetry():
     rs.execute_agent = fake
     try:
         inv = AgentInvocation(cli="codex", prompt="review", cwd=os.getcwd(),
-                              system_context="s", permission="yolo")   # privileged original
+                              system_context="s", permission="yolo",
+                              extra_args=["--dangerously-bypass-approvals-and-sandbox"])
         out = rs._apply_contract_repair(dict(original), inv,
                                         argparse.Namespace(timeout=1000, debug_dir=None))
     finally:
         rs.execute_agent = rs_exec
     assert out["report_ok"] is True and out.get("suspect") is not True
     assert out["contract_repaired"] is True and out["report"]["status"] == "DONE"
-    assert "APPROVE" in out["result"]                     # decision preserved
+    # the ORIGINAL unique analysis SURVIVES (not replaced by the terse retry)
+    assert "UNIQUE-ORIGINAL-ANALYSIS-x7f3" in out["result"] and "APPROVE" in out["result"]
+    assert out.get("repaired_report_text") == repaired   # corrected block kept for reference
     assert out["parsed"] == {"k": 1} and out["parse_ok"] is True   # schema output kept
     assert out["model"] == {"served": "m"}               # original model kept
     assert abs(out["cost_usd"] - 0.14) < 1e-9            # 0.10 + 0.04 aggregated
     assert out["usage"]["input_tokens"] == 120 and out["usage"]["output_tokens"] == 60
     assert "w1" in out["warnings"] and "w2" in out["warnings"]      # warnings merged
     assert out["attempts"] == 2 and out["resume"]["session_id"] == "sess-2"
-    assert captured["permission"] == "read-only"          # formatting retry is READ-ONLY
+    # the formatting retry is READ-ONLY and carries NO inherited extra_args, so a
+    # permission-override flag can never sneak through and defeat read-only.
+    assert captured["permission"] == "read-only" and captured["extra_args"] == []
 
 
 def test_v3_contract_repair_reject_still_accounts_spend():

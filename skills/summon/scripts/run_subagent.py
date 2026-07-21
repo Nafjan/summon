@@ -812,9 +812,15 @@ def _apply_schema(result: dict, schema: dict, invocation, args) -> dict:
     # original successful (if invalid) envelope.
     if retry.get("status") == "success" and retry.get("parse_ok"):
         # Preserve the total dispatch count across the correction (the retry is
-        # additional work, not a reset) so cost accounting stays honest.
+        # additional work, not a reset) so cost accounting stays honest, and fold
+        # the ORIGINAL call's spend into the returned envelope (the first call was
+        # paid for too -- otherwise a schema repair silently under-reports spend).
         retry["attempts"] = result.get("attempts", 1) + retry.get("attempts", 1)
+        _aggregate_spend(retry, result)
         return retry
+    # Rejected: keep the original, but the failed corrective call was still spent.
+    result["attempts"] = result.get("attempts", 1) + retry.get("attempts", 1)
+    _aggregate_spend(result, retry)
     return result
 
 
@@ -880,7 +886,9 @@ def _apply_contract_repair(result: dict, invocation, args) -> dict:
         effort=invocation.effort,
         resume_id=sid or "latest",
         resume_profile=profile,
-        extra_args=invocation.extra_args,
+        extra_args=[],   # DROP extra_args: a resume keeps the session's model, and a
+                         # stray permission-override flag (--dangerously-bypass...,
+                         # --permission-mode bypassPermissions) would defeat read-only.
     )
     try:
         retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir,
@@ -895,12 +903,15 @@ def _apply_contract_repair(result: dict, invocation, args) -> dict:
     # original suspect success; only an errored/timed-out or still-malformed retry
     # is rejected.
     if retry.get("report_ok") and retry.get("status") in ("success", "partial", "blocked"):
-        result["result"] = retry.get("result", result.get("result"))
+        # Overlay ONLY the structured contract; KEEP the original `result` text so
+        # the agent's full analysis is never lost to a terse corrective re-emit.
+        # `report`/`report_ok` are the authoritative parsed view.
         result["report"] = retry.get("report")
         result["report_ok"] = True
         result["status"] = retry.get("status")    # DONE->success; PARTIAL/BLOCKED reflected
         result.pop("suspect", None)
         result["contract_repaired"] = True
+        result["repaired_report_text"] = retry.get("result")   # the corrected block, for reference
         if retry.get("resume"):
             result["resume"] = retry["resume"]     # latest session id for follow-ups
         if retry.get("warnings"):
