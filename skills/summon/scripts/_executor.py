@@ -207,14 +207,21 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
 # without a base64 image blob or provider startup noise drowning the signal.
 _DEFAULT_MAX_TOOL_OUTPUT_BYTES = 2048
 
-# data:<mime>;base64,<blob> -- structured, never useful in a tail, elided any size.
-_DATA_URI_RE = re.compile(r"data:([\w.+-]+/[\w.+-]+)?;base64,[A-Za-z0-9+/]+={0,2}")
-# Known provider startup noise (PowerShell profile/hook errors, duplicate-skill
-# notices) -- non-task lines the tester saw drowning a real provider error.
+# base64 AND base64url alphabets (+/ and -_) plus '=' padding. A linear scan over
+# this set (not a regex {N,} quantifier) means no OverflowError on a huge
+# threshold and no super-linear CPU on a near-threshold run.
+_B64_SCAN = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_=")
+# A data:<mime>;base64, prefix ending exactly at the blob start (bounded lookback).
+_DATA_URI_PREFIX_RE = re.compile(r"data:([\w.+-]+/[\w.+-]+)?;base64,$")
+# Provider startup noise ANCHORED to unambiguous formats only -- a free-form
+# "...error..." match would eat legitimate provider errors, so those are gone.
 _STARTUP_NOISE_RE = re.compile(
-    r"(?i)(duplicate skill|skill .*already (registered|loaded)|"
-    r"CommandNotFoundException|ParserError|"
-    r"(powershell|profile|hook).*(error|failed|cannot)|^\s*at .+\.ps1:\d+)")
+    r"(?i)^\s*(?:"
+    r"duplicate skill\b|skill\s+\S+\s+already\s+(?:registered|loaded)\b|"
+    r"[\w.]*(?:CommandNotFoundException|ParserError|IncompleteParseException)\b|"
+    r"at\s+\S+\.ps1:\d+\b|At\s+line:\d+\s+char:\d+\b|\+\s+CategoryInfo\b|"
+    r"\+\s+FullyQualifiedErrorId\b)")
 
 
 def _blob_marker(mime, blob: str) -> str:
@@ -223,38 +230,91 @@ def _blob_marker(mime, blob: str) -> str:
     return f"[payload omitted: {mime or 'base64'}, {len(blob)} bytes, sha256 {digest}]"
 
 
-def _strip_startup_noise(text: str) -> str:
-    """Collapse runs of known provider startup-noise lines into one marker,
-    keeping a pointer to the full debug transcript. Conservative: only clearly
-    non-task lines match; anything else is preserved verbatim."""
+def _elide_payloads(raw: str, thresh: int) -> str:
+    """Replace base64/base64url runs of length >= ``thresh`` (data: URIs carry
+    their mime) with a bounded marker. One linear pass, no regex quantifier."""
+    out, i, n = [], 0, len(raw)
+    while i < n:
+        if raw[i] in _B64_SCAN:
+            j = i
+            while j < n and raw[j] in _B64_SCAN:
+                j += 1
+            run = raw[i:j]
+            if j - i >= thresh:
+                lo = max(0, i - 120)                       # bounded mime lookback
+                m = _DATA_URI_PREFIX_RE.search(raw[lo:i])
+                out.append(_blob_marker(m.group(1) if m else None, run))
+            else:
+                out.append(run)
+            i = j
+        else:
+            j = i
+            while j < n and raw[j] not in _B64_SCAN:
+                j += 1
+            out.append(raw[i:j])
+            i = j
+    return "".join(out)
+
+
+def _strip_startup_noise(text: str, debug_available: bool = False) -> str:
+    """Collapse runs of KNOWN provider startup-noise lines into one marker.
+    Conservative by design: only lines matching an anchored, unambiguous startup
+    format are dropped, so a real provider error is never removed. The marker
+    points at debug_file only when one was actually created."""
+    tail = (" see debug_file for the full transcript" if debug_available
+            else " (re-run with --debug-dir to capture the full transcript)")
     out, suppressed = [], 0
     for ln in text.splitlines():
         if _STARTUP_NOISE_RE.search(ln):
             suppressed += 1
             continue
         if suppressed:
-            out.append(f"[{suppressed} line(s) of provider startup noise suppressed; "
-                       f"see debug_file for the full transcript]")
+            out.append(f"[{suppressed} line(s) of provider startup noise suppressed;{tail}]")
             suppressed = 0
         out.append(ln)
     if suppressed:
-        out.append(f"[{suppressed} line(s) of provider startup noise suppressed; "
-                   f"see debug_file for the full transcript]")
+        out.append(f"[{suppressed} line(s) of provider startup noise suppressed;{tail}]")
     return "\n".join(out)
 
 
-def _sanitize_tail(raw: str, max_blob_bytes: int | None = None) -> str:
-    """Elide binary/base64 payloads (data: URIs any size; bare base64 runs at or
-    above ``max_blob_bytes``) into bounded markers, then strip provider startup
+def _sanitize_tail(raw: str, max_blob_bytes: int | None = None,
+                   debug_available: bool = False) -> str:
+    """Elide binary/base64 payloads (data: URIs and bare base64/base64url runs at
+    or above ``max_blob_bytes``) into bounded markers, then strip provider startup
     noise. Never touches the full transcript kept for --debug-dir."""
     if not raw:
         return raw
-    thresh = max(64, max_blob_bytes or _DEFAULT_MAX_TOOL_OUTPUT_BYTES)
-    text = _DATA_URI_RE.sub(lambda m: _blob_marker(m.group(1), m.group(0)), raw)
-    # bare base64 runs >= threshold (short tokens/hashes/JW* fall well below it)
-    text = re.compile(r"[A-Za-z0-9+/]{%d,}={0,2}" % thresh).sub(
-        lambda m: _blob_marker("base64", m.group(0)), text)
-    return _strip_startup_noise(text)
+    thresh = max(64, min(int(max_blob_bytes or _DEFAULT_MAX_TOOL_OUTPUT_BYTES),
+                         64 * 1024 * 1024))   # bound: a huge value can't wedge the scan
+    return _strip_startup_noise(_elide_payloads(raw, thresh), debug_available)
+
+
+def is_terminal_success(env) -> bool:
+    """A dispatch envelope is TERMINAL-done only when it succeeded AND is not
+    suspect (status=success but report_ok=false -> suspect: a semantically-useful
+    but unparseable result that should re-dispatch, not be skipped). Shared by the
+    --out skip and manifest resume so both agree."""
+    return bool(isinstance(env, dict) and env.get("status") == "success"
+                and not env.get("suspect"))
+
+
+def finalize_exit_fields(resp: dict) -> dict:
+    """Backfill the exit-code-clarity fields on any dispatch-shaped envelope
+    (has both status and exit_code). Idempotent: a builder that already set the
+    detailed reason keeps it. Used by _stamp AND the pre-dispatch emit paths."""
+    if not isinstance(resp, dict) or resp.get("exit_code") is None or not resp.get("status"):
+        return resp
+    resp.setdefault("backend_exit_code", resp.get("exit_code"))
+    resp.setdefault("dispatcher_status", resp.get("status"))
+    if "normalization_reason" not in resp:
+        _ec, _st = resp.get("exit_code"), resp.get("status")
+        if _st == "success" and _ec not in _SUCCESS_EXIT_CODES:
+            resp["normalization_reason"] = f"normalized to success (raw backend exit {_ec})"
+        elif _st == "success":
+            resp["normalization_reason"] = "exit and status agree"
+        else:
+            resp["normalization_reason"] = f"status {_st} (backend exit {_ec})"
+    return resp
 
 
 def _model_mismatch(requested, ran) -> bool:
@@ -271,7 +331,10 @@ def _model_mismatch(requested, ran) -> bool:
         from _resolver import _CLAUDE_ALIASES
     except Exception:  # noqa: BLE001 — telemetry best-effort, never fatal
         _CLAUDE_ALIASES = ("opus", "sonnet", "haiku")
-    if r in _CLAUDE_ALIASES and r in s:   # 'opus' floated into 'claude-opus-4-8'
+    # A floating alias expands to an id that carries the alias as a WHOLE TOKEN
+    # ('opus' -> 'claude-opus-4-8'); a substring test would wrongly hide a real
+    # reroute ('opus' -> 'notopus'), so split on id separators and match exactly.
+    if r in _CLAUDE_ALIASES and r in re.split(r"[-_/.:]+", s):
         return False
     return True
 
@@ -720,17 +783,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         resp["elapsed_ms"] = int((time.monotonic() - started) * 1000)
         # Exit-code clarity on EVERY envelope (api-kind backends and other paths
         # build their own response and never touch build_final_response). The
-        # response builders set the detailed reason first; setdefault preserves it.
-        resp.setdefault("backend_exit_code", resp.get("exit_code"))
-        resp.setdefault("dispatcher_status", resp.get("status"))
-        if "normalization_reason" not in resp:
-            _ec, _st = resp.get("exit_code"), resp.get("status")
-            if _st == "success" and _ec not in _SUCCESS_EXIT_CODES:
-                resp["normalization_reason"] = f"normalized to success (raw backend exit {_ec})"
-            elif _st == "success":
-                resp["normalization_reason"] = "exit and status agree"
-            else:
-                resp["normalization_reason"] = f"status {_st} (backend exit {_ec})"
+        # response builders set the detailed reason first; this preserves it.
+        finalize_exit_fields(resp)
         # Trust fields, split by EVIDENCE (field case: a failed Fable dispatch
         # reported the handshake model as `resolved` with all-zero usage):
         #   requested  what the caller asked for (unchanged).
@@ -844,7 +898,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # elided blob becomes a marker instead of a truncated smear. The debug
         # file below keeps the UNsanitized transcript (the full-detail pointer).
         if resp.get("output_tail") is not None and raw:
-            resp["output_tail"] = _sanitize_tail(raw, max_tool_output_bytes)[-2000:]
+            resp["output_tail"] = _sanitize_tail(
+                raw, max_tool_output_bytes, debug_available=bool(debug_dir))[-2000:]
         if debug_dir:
             dbg = _write_debug(debug_dir, debug_argv, raw or "", resp)
             if dbg:
