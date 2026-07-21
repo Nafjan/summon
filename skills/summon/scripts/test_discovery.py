@@ -391,7 +391,9 @@ def test_v2_probe_eligibility_tiers():
             "gemini": {"status": "error", "text": "IneligibleTierError: no longer supported"},
             "codex": {"status": "error", "text": "please log in first"},
             "cursor-agent": {"status": "partial", "text": "the run timed out with no result"},
-            "claude": {"status": "success", "text": "pong"},
+            # claude SUCCEEDS but the model echoed a "please log in" phrase in its
+            # reply -- success is authoritative, so this must NOT read as auth failure.
+            "claude": {"status": "success", "text": "sure, please log in to the demo app"},
         }[name]
     backends = {n: {"found": True, "verified": True, "path": "/x/" + n, "binary_ok": True,
                     "auth_ok": None, "account_eligible": None, "model_access_verified": None}
@@ -402,16 +404,38 @@ def test_v2_probe_eligibility_tiers():
     assert backends["gemini"]["guidance"]
     # codex: auth failure -> auth_ok False, eligibility still unknown
     assert backends["codex"]["auth_ok"] is False and backends["codex"]["account_eligible"] is None
-    # cursor: benign non-success -> UNVERIFIED, NOT certified eligible (the fix)
+    # cursor: benign non-success -> UNVERIFIED, NOT certified eligible
     assert backends["cursor-agent"]["account_eligible"] is None
     assert backends["cursor-agent"].get("probe_note")
-    # claude: clean success -> all three tiers True
+    # claude: SUCCESS is authoritative -> all True despite the echoed "please log in"
     assert (backends["claude"]["auth_ok"] and backends["claude"]["account_eligible"]
             and backends["claude"]["model_access_verified"])
     # a not-found/unverified backend is skipped by the probe (stays unverified)
     skip = {"z": {"found": False, "verified": False}}
     _doctor._probe_eligibility(skip, runner=fake)
     assert skip["z"].get("account_eligible") is None
+
+
+def test_v2_probe_failed_backend_not_usable():
+    # a probe-confirmed auth failure OR ineligibility must drop the backend from
+    # usable_backends -- doctor must never report [OK] ready through a backend it
+    # just proved cannot dispatch (even if it is the only one).
+    import _doctor
+    orig = _doctor._check_backends
+    _doctor._check_backends = lambda: {
+        "gemini": {"found": True, "verified": True, "path": "/x/gemini", "binary_ok": True,
+                   "version": "1.0", "auth_hint": "gemini login", "auth_ok": None,
+                   "account_eligible": None, "model_access_verified": None},
+    }
+    def fake(name, path):
+        return {"status": "error", "text": "please log in first"}   # auth failure
+    try:
+        rep = _doctor.doctor(probe=True, probe_runner=fake)
+    finally:
+        _doctor._check_backends = orig
+    assert rep["usable_backends"] == [] and rep["ok"] is False
+    assert "gemini" in rep["unauthenticated_backends"]
+    assert "NOT AUTHENTICATED" in _doctor.render(rep) and "[OK] ready" not in _doctor.render(rep)
 
 
 def test_v2_doctor_honest_labels_and_render():
