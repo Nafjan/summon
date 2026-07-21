@@ -212,13 +212,13 @@ _DEFAULT_MAX_TOOL_OUTPUT_BYTES = 2048
 # threshold and no super-linear CPU on a near-threshold run.
 _B64_SCAN = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_=")
-# A data:<mime>(;param=val)*;base64, prefix ending exactly at the blob start.
-# Case-insensitive, tolerates extra parameters (e.g. ;charset=utf-8), used ONLY
-# to pull the mime for the marker -- payload DETECTION is the fixed ';base64,'
-# suffix check below, so a prefix longer than this lookback still elides.
-_DATA_URI_PREFIX_RE = re.compile(
-    r"(?i)data:([\w.+-]+/[\w.+-]+)?(?:;[\w.+-]+=[^;,]*)*;base64,$")
-_B64_MARKER = ";base64,"
+# A full base64 data: URI: the `data:` SCHEME is required (so prose that merely
+# contains ";base64," is not falsely elided), extra parameters are tolerated,
+# whitespace between the comma and the payload is skipped (so it can't smuggle a
+# blob past detection), and the payload run is captured. `[A-Za-z0-9+/_=-]+` is a
+# plain char class with `+` (linear, no ReDoS / no {N,} OverflowError).
+_DATA_URI_RE = re.compile(
+    r"(?i)data:([\w.+-]*/[\w.+-]+)?(?:;[\w.+-]+=[^;,\s]*)*;base64,\s*([A-Za-z0-9+/_=-]+)")
 # Provider startup noise: ONLY the unambiguously non-task skill-loader notices are
 # stripped. Generic PowerShell error frames (ParserError, `At line:`, CategoryInfo,
 # `at ...ps1:`) are NOT matched -- they are indistinguishable from a real TASK error
@@ -234,33 +234,25 @@ def _blob_marker(mime, blob: str) -> str:
 
 
 def _elide_payloads(raw: str, thresh: int) -> str:
-    """Replace base64/base64url payloads with a bounded marker in one linear pass.
-    A data: URI is ALWAYS elided (structured, never useful in a tail, its mime
-    carried into the marker); a BARE run is elided only at length >= ``thresh``."""
-    out, i, n = [], 0, len(raw)
+    """Replace base64 payloads with a bounded marker. Two phases: (1) real data:
+    URIs are ALWAYS elided regardless of length (they require the `data:` scheme,
+    so prose containing ";base64," is safe); (2) any remaining BARE base64/base64url
+    run of length >= ``thresh`` is elided by a linear scan (no regex quantifier)."""
+    text = _DATA_URI_RE.sub(lambda m: _blob_marker(m.group(1), m.group(2)), raw)
+    out, i, n = [], 0, len(text)
     while i < n:
-        if raw[i] in _B64_SCAN:
+        if text[i] in _B64_SCAN:
             j = i
-            while j < n and raw[j] in _B64_SCAN:
+            while j < n and text[j] in _B64_SCAN:
                 j += 1
-            run = raw[i:j]
-            # A run immediately preceded by ';base64,' (any case) is an encoded
-            # payload -- a data: URI or similar -- ALWAYS elided regardless of
-            # length. This 8-char detection is independent of prefix length; the
-            # mime is a best-effort bonus from a generous bounded lookback.
-            if raw[max(0, i - len(_B64_MARKER)):i].lower().endswith(_B64_MARKER):
-                m = _DATA_URI_PREFIX_RE.search(raw[max(0, i - 600):i])
-                out.append(_blob_marker(m.group(1) if m else None, run))
-            elif j - i >= thresh:                          # bare run -> threshold
-                out.append(_blob_marker(None, run))
-            else:
-                out.append(run)
+            run = text[i:j]
+            out.append(_blob_marker(None, run) if j - i >= thresh else run)
             i = j
         else:
             j = i
-            while j < n and raw[j] not in _B64_SCAN:
+            while j < n and text[j] not in _B64_SCAN:
                 j += 1
-            out.append(raw[i:j])
+            out.append(text[i:j])
             i = j
     return "".join(out)
 
@@ -300,6 +292,22 @@ def _sanitize_tail(raw: str, max_blob_bytes: int | None = None,
     # threshold set above the window size.
     thresh = max(64, min(int(max_blob_bytes or _DEFAULT_MAX_TOOL_OUTPUT_BYTES), len(raw)))
     return _strip_startup_noise(_elide_payloads(raw, thresh), debug_available)
+
+
+def _finalize_diagnostics(resp: dict, raw, debug_dir, debug_argv,
+                          max_tool_output_bytes) -> dict:
+    """Write the debug transcript (if requested) then sanitize output_tail, with
+    the tail's ``debug_file`` reference reflecting whether the file was ACTUALLY
+    written. The debug file keeps the UNsanitized raw (the full-detail pointer);
+    a failed _write_debug returns None so the tail advises --debug-dir instead of
+    naming a nonexistent file. Extracted from _stamp so the wiring is testable."""
+    dbg = _write_debug(debug_dir, debug_argv, raw or "", resp) if debug_dir else None
+    if dbg:
+        resp["debug_file"] = dbg
+    if resp.get("output_tail") is not None and raw:
+        resp["output_tail"] = _sanitize_tail(
+            raw, max_tool_output_bytes, debug_available=bool(dbg))[-2000:]
+    return resp
 
 
 def is_terminal_success(env) -> bool:
@@ -906,19 +914,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                     "note": "resumed claude session runs its original model (guard can't re-pin "
                             "on --resume); if it was Fable this bills account credit"}
         raw = resp.pop("_debug_raw", None)
-        # Write the debug transcript FIRST (it keeps the UNsanitized raw, the
-        # full-detail pointer), so the tail's suppression marker can truthfully
-        # say "see debug_file" ONLY when the file was actually created (a failed
-        # _write_debug returns None -> no phantom reference).
-        dbg = _write_debug(debug_dir, debug_argv, raw or "", resp) if debug_dir else None
-        if dbg:
-            resp["debug_file"] = dbg
-        # Then sanitize the human-facing output_tail (elide base64/binary payloads,
-        # strip skill-loader noise) -- re-derived from the fuller raw so an elided
-        # blob becomes a marker instead of a truncated smear.
-        if resp.get("output_tail") is not None and raw:
-            resp["output_tail"] = _sanitize_tail(
-                raw, max_tool_output_bytes, debug_available=bool(dbg))[-2000:]
+        _finalize_diagnostics(resp, raw, debug_dir, debug_argv, max_tool_output_bytes)
         return resp
 
     # API-kind backends (e.g. openai-compat): the backend performs the request
