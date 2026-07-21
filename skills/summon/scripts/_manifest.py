@@ -186,7 +186,7 @@ class _ChildResult:
             returncode, stdout, stderr, timed_out)
 
 
-def _dispatch_child(cmd: list, timeout_sec: float, on_spawn=None):
+def _dispatch_child(cmd: list, timeout_sec: float, on_spawn=None, on_reap=None):
     """Run a child dispatch with a REAL parent watchdog. Returns
     ``(_ChildResult|None, error|None)``.
 
@@ -199,7 +199,12 @@ def _dispatch_child(cmd: list, timeout_sec: float, on_spawn=None):
     ``on_spawn(proc)``, if given, is called with the live Popen right after spawn
     (before the blocking communicate) so a caller can register it for an external
     process-tree kill (e.g. the council's overall-timeout / early-exit). A killed
-    child unblocks communicate() here and returns as a normal timed_out result."""
+    child unblocks communicate() here and returns as a normal timed_out result.
+
+    ``on_reap(proc)``, if given, is called the instant ``communicate()`` returns
+    (the leader is reaped) — BEFORE any envelope file read — so a caller can
+    UNREGISTER the child adjacent to its reap, shrinking the window in which an
+    external snapshot-kill could still target the (now reaping) pid."""
     from _executor import _kill_tree, _safe_communicate
     popen_extra = {"start_new_session": True} if os.name != "nt" else {}
     try:
@@ -220,6 +225,11 @@ def _dispatch_child(cmd: list, timeout_sec: float, on_spawn=None):
         timed_out = True
         _kill_tree(proc)
         out, err = _safe_communicate(proc)
+    if on_reap is not None:
+        try:
+            on_reap(proc)   # unregister ADJACENT to reap (before the caller's file reads)
+        except Exception:  # noqa: BLE001 — deregistration must never break the dispatch
+            pass
     return _ChildResult(proc.returncode, out, err, timed_out), None
 
 
