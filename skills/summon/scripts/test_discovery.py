@@ -494,6 +494,199 @@ def test_out_skip_short_circuits(tmp_base=None):
         os.remove(out)
 
 
+def test_v1_out_skip_respects_suspect():
+    # rec #6 / regression test 8: a prior SUSPECT success (status=success but
+    # report_ok=false -> suspect=true) must NOT be skipped by --out -- it must
+    # re-dispatch instead of stranding an unparseable-but-useful envelope.
+    import json as _json
+    import subprocess as sp
+    out = os.path.join(tempfile.gettempdir(), f"summon-suspout-{os.getpid()}.json")
+    with open(out, "w", encoding="utf-8") as fh:
+        _json.dump({"status": "success", "report_ok": False, "suspect": True,
+                    "result": "semantically useful but unparseable"}, fh)
+    try:
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+        r = sp.run([sys.executable, script, "--agent", "does-not-exist-xyz", "--prompt", "p",
+                    "--cwd", os.getcwd(), "--out", out],
+                   capture_output=True, text=True, encoding="utf-8")
+        env = _json.loads(r.stdout)
+        # it re-ran (agent missing -> error) rather than emitting the prior as skipped
+        assert env.get("skipped") is not True, env
+    finally:
+        os.remove(out)
+
+
+def test_v1_output_tail_elides_base64_payload():
+    # rec #4 / regression test 6: a base64/binary blob in the tail becomes a
+    # bounded marker (type, byte count, sha256), never raw base64.
+    import _executor
+    blob = "A" * 6000
+    s = _executor._sanitize_tail(f"log start\ndata:image/png;base64,{blob}\nlog end")
+    assert "payload omitted: image/png" in s and "bytes, sha256" in s, s
+    assert blob not in s
+    # data: URI variants ALL elided regardless of length: uppercase scheme, extra
+    # parameters, svg+xml mime, and a prefix longer than the mime-lookback window
+    # (detection is the ;base64, suffix, independent of prefix length).
+    for uri in ("DATA:image/gif;base64,R0lGODlhAQAB",
+                "data:image/svg+xml;charset=utf-8;base64,PHN2Zz4=",
+                "data:application/octet-stream;" + ("x=1;" * 200) + "base64,QUJDRA=="):
+        out = _executor._sanitize_tail("pre " + uri + " post")
+        payload = uri.split("base64,", 1)[1]
+        assert "payload omitted" in out and payload not in out, uri
+    # mime is recovered for the common forms
+    assert "image/gif" in _executor._sanitize_tail("DATA:image/gif;base64,R0lGODlhAQAB")
+    assert "image/svg+xml" in _executor._sanitize_tail(
+        "data:image/svg+xml;charset=utf-8;base64,PHN2Zz4=")
+    # whitespace after ;base64, must NOT smuggle a short payload past detection
+    ws = _executor._sanitize_tail("data:text/plain;base64, QUJDRA== end")
+    assert "payload omitted" in ws and "QUJDRA==" not in ws
+    # prose that merely CONTAINS ";base64," (no data: scheme) must SURVIVE verbatim
+    prose = "choose the diagnostic option;base64,QUJDRA== please"
+    assert _executor._sanitize_tail(prose) == prose
+    # `data:` INSIDE another word (metadata:, my-data:) must NOT match (left boundary)
+    assert _executor._sanitize_tail("metadata:image/png;base64,QUJDRA==") == \
+        "metadata:image/png;base64,QUJDRA=="
+    assert _executor._sanitize_tail("x-data:image/png;base64,QUJDRA==") == \
+        "x-data:image/png;base64,QUJDRA=="
+    # but a REAL data: URI after punctuation/space still elides
+    for ctx in ("(data:image/png;base64,QUJDRA==)", "see data:image/png;base64,QUJDRA== ok"):
+        assert "payload omitted" in _executor._sanitize_tail(ctx) and "QUJDRA==" not in \
+            _executor._sanitize_tail(ctx)
+    # a bare base64 run at/above the threshold is elided; short tokens survive
+    bare = "Z" * 4096
+    s2 = _executor._sanitize_tail("head " + bare + " tail")
+    assert "payload omitted: base64" in s2 and bare not in s2
+    assert "Zm9vYmFyYmF6" in _executor._sanitize_tail("token=Zm9vYmFyYmF6 done")  # short: kept
+    # base64URL alphabet (-, _) must NOT bypass elision (finding #2)
+    url_blob = ("aB-_" * 1500)  # 6000 chars of base64url
+    s3 = _executor._sanitize_tail("x " + url_blob + " y")
+    assert "payload omitted" in s3 and url_blob not in s3
+    # --max-tool-output-bytes lowers the threshold; a huge value never crashes
+    assert "payload omitted" in _executor._sanitize_tail("x" + ("Q" * 200) + "y", max_blob_bytes=100)
+    assert _executor._sanitize_tail("hello", max_blob_bytes=10 ** 15) == "hello"  # no OverflowError
+    # a threshold above the captured length still elides a window-filling run
+    # (finding #2: no leak when the tail is a truncated view of a longer payload)
+    assert "payload omitted" in _executor._sanitize_tail("Q" * 5000, max_blob_bytes=10 ** 9)
+
+
+def test_v1_model_mismatch_detection():
+    # rec #7 / regression test 9: explicit pinned mismatch warns; floating-alias
+    # expansion does not; None/empty request never warns.
+    import _executor
+    assert _executor._model_mismatch("gpt-5.6-terra", "gpt-5.6-sol") is True
+    assert _executor._model_mismatch("gpt-4", "gpt-4o") is True          # different non-alias models
+    assert _executor._model_mismatch("gpt-5.6-sol", "gpt-5.6-sol") is False
+    assert _executor._model_mismatch("opus", "claude-opus-4-8") is False  # alias floats to latest
+    assert _executor._model_mismatch("sonnet", "claude-sonnet-5") is False
+    # token-exact, not substring: a real reroute that merely CONTAINS the alias
+    # as a substring must still warn (review finding #4)
+    assert _executor._model_mismatch("opus", "notopus") is True
+    assert _executor._model_mismatch("opus", "opusling-2") is True
+    assert _executor._model_mismatch(None, "x") is False
+    assert _executor._model_mismatch("", "x") is False
+    assert _executor._model_mismatch("x", None) is False
+
+
+def test_v1_normalized_success_exit_fields():
+    # rec #8 / regression test 10: a backend that exited non-zero but produced a
+    # clean terminal result normalizes to success, with the raw code AND the
+    # normalization reason both explicit.
+    import _executor
+    resp = _executor.build_final_response(
+        "codex", 1, {"is_error": False, "result": "done"}, ["done\n"], "")
+    assert resp["status"] == "success"
+    assert resp["exit_code"] == 1 and resp["backend_exit_code"] == 1
+    assert resp["dispatcher_status"] == "success"
+    assert "normalized to success" in resp["normalization_reason"]
+    assert "raw backend exit 1" in resp["normalization_reason"]
+    # a plain clean exit (0) states exit and status agree
+    ok = _executor.build_final_response("codex", 0, {"is_error": False, "result": "d"}, ["d\n"], "")
+    assert ok["backend_exit_code"] == 0 and ok["dispatcher_status"] == "success"
+    # finalize_exit_fields backfills a bare envelope but never overwrites a reason
+    env = _executor.finalize_exit_fields({"status": "error", "exit_code": 127})
+    assert env["backend_exit_code"] == 127 and env["dispatcher_status"] == "error"
+    assert env["normalization_reason"]
+    keep = _executor.finalize_exit_fields(
+        {"status": "success", "exit_code": 1, "normalization_reason": "PINNED"})
+    assert keep["normalization_reason"] == "PINNED"
+    # query-shaped envelopes (no exit_code) are left untouched
+    assert "backend_exit_code" not in _executor.finalize_exit_fields({"agents": []})
+
+
+def test_v1_finalize_diagnostics_wiring():
+    # Exercises the ACTUAL _stamp wiring (via the extracted _finalize_diagnostics):
+    # debug_available is derived from whether _write_debug really wrote a file, so
+    # the tail's marker can never name a nonexistent debug_file.
+    import _executor
+    noise = "duplicate skill x already loaded\nreal diagnostic line"
+    # (a) a writable debug dir -> debug_file is set AND the marker names it
+    d = tempfile.mkdtemp(prefix="summon-dbg-")
+    resp = {"cli": "codex", "status": "error", "output_tail": noise}
+    _executor._finalize_diagnostics(resp, noise, d, ["codex"], None)
+    assert resp.get("debug_file") and "see debug_file" in resp["output_tail"]
+    assert "real diagnostic line" in resp["output_tail"]           # real content kept
+    # (b) an UNCREATABLE debug dir (under a regular file) -> no debug_file field,
+    #     marker advises --debug-dir (no phantom reference)
+    f = os.path.join(tempfile.gettempdir(), f"summon-nf-{os.getpid()}")
+    with open(f, "w", encoding="utf-8") as fh:
+        fh.write("x")
+    resp2 = {"cli": "codex", "status": "error", "output_tail": noise}
+    try:
+        _executor._finalize_diagnostics(resp2, noise, os.path.join(f, "sub"), ["codex"], None)
+    finally:
+        os.remove(f)
+    assert "debug_file" not in resp2 and "re-run with --debug-dir" in resp2["output_tail"]
+    # (c) no debug dir at all -> still sanitized, still advises --debug-dir
+    resp3 = {"cli": "codex", "status": "error", "output_tail": noise}
+    _executor._finalize_diagnostics(resp3, noise, None, ["codex"], None)
+    assert "debug_file" not in resp3 and "duplicate skill" not in resp3["output_tail"]
+
+
+def test_v1_crash_envelope_carries_exit_fields():
+    # The last-resort crash envelope (a bypass-emission path) must still carry the
+    # exit-code-clarity fields inline.
+    import run_subagent
+    env = run_subagent._crash_envelope(RuntimeError("boom"))
+    assert env["status"] == "error" and env["backend_exit_code"] == 1
+    assert env["dispatcher_status"] == "error" and "RuntimeError" in env["normalization_reason"]
+
+
+def test_v1_is_terminal_success_shared_gate():
+    # rec #6: the predicate shared by --out skip and manifest resume. A suspect
+    # success is NOT terminal (must re-dispatch); a plain success is.
+    import _executor
+    assert _executor.is_terminal_success({"status": "success"}) is True
+    assert _executor.is_terminal_success({"status": "success", "suspect": True}) is False
+    assert _executor.is_terminal_success({"status": "success", "report_ok": True}) is True
+    assert _executor.is_terminal_success({"status": "error"}) is False
+    assert _executor.is_terminal_success(None) is False
+
+
+def test_v1_startup_noise_stripped_keeps_real_error():
+    # rec #9 / regression test 11: ONLY the unambiguous skill-loader noise is
+    # collapsed. Generic PowerShell error frames are indistinguishable from a real
+    # TASK error, so they are NOT stripped (findings: broad/generic matching must
+    # never delete a real diagnostic -- the whole point of the tail).
+    import _executor
+    raw = ("duplicate skill 'foo' already loaded\n"
+           "skill bar already registered\n"
+           "at C:\\x\\profile.ps1:12\n"                            # generic PS frame -> SURVIVES
+           "CommandNotFoundException: baz\n"                       # generic -> SURVIVES
+           "the user profile could not be updated: disk full\n"   # legit error -> survives
+           "IneligibleTierError: this client is no longer supported\n"
+           "another real line")
+    s = _executor._sanitize_tail(raw)
+    assert "IneligibleTierError" in s and "another real line" in s        # real content kept
+    assert "the user profile could not be updated" in s                   # not a false positive
+    assert "profile.ps1" in s and "CommandNotFoundException" in s         # generic PS NOT stripped
+    assert "duplicate skill" not in s and "already registered" not in s   # skill-loader noise gone
+    assert "startup noise suppressed" in s                                # marker present
+    # the marker points at debug_file ONLY when one was created
+    assert "re-run with --debug-dir" in s                                 # default: no debug file
+    s_dbg = _executor._sanitize_tail(raw, debug_available=True)
+    assert "see debug_file" in s_dbg
+
+
 def test_extract_json_no_perf_cliff_on_braces():
     # Regression: 1MB of "{" must not take 30s (old raw_decode-every-char bug).
     import time as _t
@@ -643,7 +836,7 @@ def test_apply_schema_keeps_original_when_retry_not_better():
                 "resume": {"cli": "claude", "session_id": "sess1"}, "attempts": 1}
     orig_exec = _executor.execute_agent
     rs_exec = rs.execute_agent
-    def fake(inv, timeout_ms=0, debug_dir=None):
+    def fake(inv, timeout_ms=0, debug_dir=None, **kwargs):
         return {"status": "error", "result": "still bad", "resume": {}}
     rs.execute_agent = fake
     try:
@@ -663,7 +856,7 @@ def test_apply_schema_sums_attempts_on_successful_correction():
     schema = {"type": "object", "required": ["k"]}
     original = {"status": "success", "result": "bad", "attempts": 2,
                 "resume": {"cli": "claude", "session_id": "s"}}
-    def fake(inv, timeout_ms=0, debug_dir=None):
+    def fake(inv, timeout_ms=0, debug_dir=None, **kwargs):
         return {"status": "success", "result": '{"k": 1}', "attempts": 1, "resume": {}}
     rs_exec = rs.execute_agent
     rs.execute_agent = fake

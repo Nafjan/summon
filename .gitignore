@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .claude/
 .agents/memory.md
+
+# review scratch (prompts, diffs, sub-agent results)
+.agents/

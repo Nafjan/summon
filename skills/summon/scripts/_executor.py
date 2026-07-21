@@ -201,13 +201,178 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     return response
 
 
+# Payload elision + startup-noise filtering for the human-facing output_tail.
+# The FULL raw transcript is kept for --debug-dir (the debug_file pointer); only
+# the tail is sanitized so a failure stays diagnosable without a re-run and
+# without a base64 image blob or provider startup noise drowning the signal.
+_DEFAULT_MAX_TOOL_OUTPUT_BYTES = 2048
+
+# base64 AND base64url alphabets (+/ and -_) plus '=' padding. A linear scan over
+# this set (not a regex {N,} quantifier) means no OverflowError on a huge
+# threshold and no super-linear CPU on a near-threshold run.
+_B64_SCAN = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_=")
+# A full base64 data: URI: the `data:` SCHEME is required (so prose that merely
+# contains ";base64," is not falsely elided), at a LEFT WORD BOUNDARY (so the
+# `data:` inside `metadata:` does not match), extra parameters are tolerated,
+# whitespace between the comma and the payload is skipped (so it can't smuggle a
+# blob past detection), and the payload run is captured. `[A-Za-z0-9+/_=-]+` is a
+# plain char class with `+` (linear, no ReDoS / no {N,} OverflowError).
+_DATA_URI_RE = re.compile(
+    r"(?i)(?<![\w-])data:([\w.+-]*/[\w.+-]+)?(?:;[\w.+-]+=[^;,\s]*)*;base64,\s*([A-Za-z0-9+/_=-]+)")
+# Provider startup noise: ONLY the unambiguously non-task skill-loader notices are
+# stripped. Generic PowerShell error frames (ParserError, `At line:`, CategoryInfo,
+# `at ...ps1:`) are NOT matched -- they are indistinguishable from a real TASK error
+# and stripping them would delete a genuine diagnostic (the whole point of the tail).
+_STARTUP_NOISE_RE = re.compile(
+    r"(?i)^\s*(?:duplicate skill\b|skill\s+\S+\s+already\s+(?:registered|loaded)\b)")
+
+
+def _blob_marker(mime, blob: str) -> str:
+    import hashlib
+    digest = hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"[payload omitted: {mime or 'base64'}, {len(blob)} bytes, sha256 {digest}]"
+
+
+def _elide_payloads(raw: str, thresh: int) -> str:
+    """Replace base64 payloads with a bounded marker. Two phases: (1) real data:
+    URIs are ALWAYS elided regardless of length (they require the `data:` scheme,
+    so prose containing ";base64," is safe); (2) any remaining BARE base64/base64url
+    run of length >= ``thresh`` is elided by a linear scan (no regex quantifier)."""
+    text = _DATA_URI_RE.sub(lambda m: _blob_marker(m.group(1), m.group(2)), raw)
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] in _B64_SCAN:
+            j = i
+            while j < n and text[j] in _B64_SCAN:
+                j += 1
+            run = text[i:j]
+            out.append(_blob_marker(None, run) if j - i >= thresh else run)
+            i = j
+        else:
+            j = i
+            while j < n and text[j] not in _B64_SCAN:
+                j += 1
+            out.append(text[i:j])
+            i = j
+    return "".join(out)
+
+
+def _strip_startup_noise(text: str, debug_available: bool = False) -> str:
+    """Collapse runs of KNOWN provider startup-noise lines into one marker.
+    Conservative by design: only lines matching an anchored, unambiguous startup
+    format are dropped, so a real provider error is never removed. The marker
+    points at debug_file only when one was actually created."""
+    tail = (" see debug_file for the full transcript" if debug_available
+            else " (re-run with --debug-dir to capture the full transcript)")
+    out, suppressed = [], 0
+    for ln in text.splitlines():
+        if _STARTUP_NOISE_RE.search(ln):
+            suppressed += 1
+            continue
+        if suppressed:
+            out.append(f"[{suppressed} line(s) of provider startup noise suppressed;{tail}]")
+            suppressed = 0
+        out.append(ln)
+    if suppressed:
+        out.append(f"[{suppressed} line(s) of provider startup noise suppressed;{tail}]")
+    return "\n".join(out)
+
+
+def _sanitize_tail(raw: str, max_blob_bytes: int | None = None,
+                   debug_available: bool = False) -> str:
+    """Elide binary/base64 payloads (data: URIs and bare base64/base64url runs at
+    or above ``max_blob_bytes``) into bounded markers, then strip provider startup
+    noise. Never touches the full transcript kept for --debug-dir."""
+    if not raw:
+        return raw
+    # Clamp to the length of the text actually being scanned: you cannot ask to
+    # keep a run "longer than everything captured". This also closes the leak
+    # where the tail is derived from a truncated _debug_raw window -- a run that
+    # fills the whole window is always elided rather than slipping under a
+    # threshold set above the window size.
+    thresh = max(64, min(int(max_blob_bytes or _DEFAULT_MAX_TOOL_OUTPUT_BYTES), len(raw)))
+    return _strip_startup_noise(_elide_payloads(raw, thresh), debug_available)
+
+
+def _finalize_diagnostics(resp: dict, raw, debug_dir, debug_argv,
+                          max_tool_output_bytes) -> dict:
+    """Write the debug transcript (if requested) then sanitize output_tail, with
+    the tail's ``debug_file`` reference reflecting whether the file was ACTUALLY
+    written. The debug file keeps the UNsanitized raw (the full-detail pointer);
+    a failed _write_debug returns None so the tail advises --debug-dir instead of
+    naming a nonexistent file. Extracted from _stamp so the wiring is testable."""
+    dbg = _write_debug(debug_dir, debug_argv, raw or "", resp) if debug_dir else None
+    if dbg:
+        resp["debug_file"] = dbg
+    if resp.get("output_tail") is not None and raw:
+        resp["output_tail"] = _sanitize_tail(
+            raw, max_tool_output_bytes, debug_available=bool(dbg))[-2000:]
+    return resp
+
+
+def is_terminal_success(env) -> bool:
+    """A dispatch envelope is TERMINAL-done only when it succeeded AND is not
+    suspect (status=success but report_ok=false -> suspect: a semantically-useful
+    but unparseable result that should re-dispatch, not be skipped). Shared by the
+    --out skip and manifest resume so both agree."""
+    return bool(isinstance(env, dict) and env.get("status") == "success"
+                and not env.get("suspect"))
+
+
+def finalize_exit_fields(resp: dict) -> dict:
+    """Backfill the exit-code-clarity fields on any dispatch-shaped envelope
+    (has both status and exit_code). Idempotent: a builder that already set the
+    detailed reason keeps it. Used by _stamp AND the pre-dispatch emit paths."""
+    if not isinstance(resp, dict) or resp.get("exit_code") is None or not resp.get("status"):
+        return resp
+    resp.setdefault("backend_exit_code", resp.get("exit_code"))
+    resp.setdefault("dispatcher_status", resp.get("status"))
+    if "normalization_reason" not in resp:
+        _ec, _st = resp.get("exit_code"), resp.get("status")
+        if _st == "success" and _ec not in _SUCCESS_EXIT_CODES:
+            resp["normalization_reason"] = f"normalized to success (raw backend exit {_ec})"
+        elif _st == "success":
+            resp["normalization_reason"] = "exit and status agree"
+        else:
+            resp["normalization_reason"] = f"status {_st} (backend exit {_ec})"
+    return resp
+
+
+def _model_mismatch(requested, ran) -> bool:
+    """True when an EXPLICIT model request differs from the model that ran, EXCEPT
+    for a known floating-alias expansion (opus/sonnet/haiku -> their latest id).
+    Both must be non-empty strings; a None/empty request never warns."""
+    if not (isinstance(requested, str) and requested.strip()
+            and isinstance(ran, str) and ran.strip()):
+        return False
+    r, s = requested.strip().lower(), ran.strip().lower()
+    if r == s:
+        return False
+    try:
+        from _resolver import _CLAUDE_ALIASES
+    except Exception:  # noqa: BLE001 — telemetry best-effort, never fatal
+        _CLAUDE_ALIASES = ("opus", "sonnet", "haiku")
+    # A floating alias expands to an id that carries the alias as a WHOLE TOKEN
+    # ('opus' -> 'claude-opus-4-8'); a substring test would wrongly hide a real
+    # reroute ('opus' -> 'notopus'), so split on id separators and match exactly.
+    if r in _CLAUDE_ALIASES and r in re.split(r"[-_/.:]+", s):
+        return False
+    return True
+
+
 def _partial_response(cli: str, result: dict | None, exit_code: int, error: str) -> dict:
+    status = "partial" if result else "error"
     return {
         "result": result.get("result", "") if result else "",
         "exit_code": exit_code,
-        "status": "partial" if result else "error",
+        "status": status,
         "cli": cli,
         "error": error,
+        "backend_exit_code": exit_code,
+        "dispatcher_status": status,
+        "normalization_reason": ("timed out; partial output preserved" if result
+                                 else "timed out before any usable output"),
     }
 
 
@@ -220,6 +385,9 @@ def _error_response(
         "status": "error",
         "cli": cli,
         "error": error,
+        "backend_exit_code": exit_code,
+        "dispatcher_status": "error",
+        "normalization_reason": "execution failed before a usable terminal result",
     }
 
 
@@ -243,23 +411,36 @@ def build_final_response(
         # completed. A non-zero exit (e.g. from terminate() of a Windows .cmd
         # shim after we got the result) is not a failure.
         status = "success"
+        norm_reason = (f"parsed a clean terminal event; normalized to success "
+                       f"(raw backend exit {exit_code})") if exit_code not in _SUCCESS_EXIT_CODES \
+            else "parsed a clean terminal event (exit and status agree)"
     elif result_errored:
         # The backend's OWN terminal event reported failure (claude is_error /
         # error subtype, gemini/cursor status error). This must surface as an
         # error even though a result object was parsed and the exit may be 0 —
         # otherwise a model/API error would leak through as a false success.
         status = "error"
+        norm_reason = "backend terminal event self-reported an error"
     elif exit_code in _SUCCESS_EXIT_CODES and "".join(stdout_lines).strip():
         # Plain-text backend that exited cleanly WITH output (no parsed terminal event).
         status = "success"
+        norm_reason = "clean exit with output, no terminal event to parse"
     else:
         status = "error"
+        norm_reason = f"no usable terminal result and backend exit {exit_code} is not success"
 
     response = {
         "result": result.get("result", "") if result else "".join(stdout_lines),
         "exit_code": exit_code,
         "status": status,
         "cli": cli,
+        # Exit-code clarity: keep the raw backend code AND expose the normalized
+        # verdict + why they can differ, so a caller never mistakes a normalized
+        # success carrying a non-zero backend exit for a process failure (nor
+        # ignores a meaningful non-zero backend exit).
+        "backend_exit_code": exit_code,
+        "dispatcher_status": status,
+        "normalization_reason": norm_reason,
     }
     if status == "error":
         if result_errored:
@@ -600,12 +781,14 @@ def _agy_prompt_references_file(prompt: str | None) -> bool:
 
 
 def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
-                  debug_dir: str | None = None) -> dict:
+                  debug_dir: str | None = None,
+                  max_tool_output_bytes: int | None = None) -> dict:
     """Execute agent CLI for the given invocation. Returns a response dict.
 
     Response shape: ``{result, exit_code, status, cli, error?}`` plus the
     telemetry/trust fields documented in SKILL.md (report, model, permission,
-    elapsed_ms, ...).
+    elapsed_ms, ...). ``max_tool_output_bytes`` sets the bare-base64 elision
+    threshold for the human-facing output_tail (None -> the built-in default).
     """
     started = time.monotonic()
     # Credit-only model guard (Fable): build_invocation_args enforces it in the
@@ -620,6 +803,10 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # Wall-clock per dispatch — orchestrators need this for concurrency
         # tuning and it costs nothing to provide.
         resp["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+        # Exit-code clarity on EVERY envelope (api-kind backends and other paths
+        # build their own response and never touch build_final_response). The
+        # response builders set the detailed reason first; this preserves it.
+        finalize_exit_fields(resp)
         # Trust fields, split by EVIDENCE (field case: a failed Fable dispatch
         # reported the handshake model as `resolved` with all-zero usage):
         #   requested  what the caller asked for (unchanged).
@@ -671,6 +858,18 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 pass
         resp["model"] = {"requested": _requested_model, "targeted": _targeted,
                          "served": _served, "resolved": _legacy, "models_used": _mu}
+        # Model-mismatch warning: if an EXPLICIT request differs from what actually
+        # ran (served, else the legacy resolved), surface it prominently -- a pinned
+        # agent model silently downgraded/rerouted is a spend + fidelity surprise.
+        # Suppress only KNOWN alias expansions (opus/sonnet/haiku float to the
+        # latest release, so requested 'opus' vs served 'claude-opus-4-8' is not a
+        # mismatch); everything else warns.
+        _ran = _served or _legacy
+        if _model_mismatch(_requested_model, _ran):
+            resp.setdefault("warnings", []).append(
+                f"requested model {_requested_model!r} but the backend ran {_ran!r}; "
+                f"both are kept in the `model` field (a pinned agent model may have "
+                f"been rerouted or fallen back)")
         resp["permission"] = inv.permission
         resp["effort"] = inv.effort   # reasoning effort actually applied (None = backend default)
         # agy can't read --cwd files; a "read <file>" prompt makes it review the
@@ -716,10 +915,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                     "note": "resumed claude session runs its original model (guard can't re-pin "
                             "on --resume); if it was Fable this bills account credit"}
         raw = resp.pop("_debug_raw", None)
-        if debug_dir:
-            dbg = _write_debug(debug_dir, debug_argv, raw or "", resp)
-            if dbg:
-                resp["debug_file"] = dbg
+        _finalize_diagnostics(resp, raw, debug_dir, debug_argv, max_tool_output_bytes)
         return resp
 
     # API-kind backends (e.g. openai-compat): the backend performs the request
