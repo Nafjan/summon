@@ -579,6 +579,16 @@ def _kill_tree(process: subprocess.Popen) -> None:
             # of os.getpgid(pid) — getpgid raises if the child was already reaped
             # (child exited but a grandchild still holds stdout), which would skip
             # the kill and orphan the grandchild.
+            #
+            # POSIX residual (accepted): unlike Windows, which holds the process
+            # handle open and so blocks PID reuse mid-teardown, POSIX offers no group
+            # handle, so a reaped leader's PID could in principle be recycled to a new
+            # group leader before this killpg fires. The council's kill loop only ever
+            # snapshots procs that are still registered in `inflight`, which run_stage
+            # clears in the statement immediately after communicate() reaps the leader
+            # -- so the exposure is that sub-nanosecond [reap -> unregister] gap AND
+            # only if the recycled PID re-becomes a group leader within it. We accept
+            # that over skipping the kill (which would orphan a stdout-holding grandchild).
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):

@@ -3667,12 +3667,20 @@ def test_v4_overall_timeout_kills_and_partials():
         def __init__(self, tag):
             self.tag = tag
             self.pid = -1
+            self._alive = True
+
+        def poll(self):        # like a real Popen: None while running, 0 once killed
+            return None if self._alive else 0
+
+    procs = {}
 
     def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None):
         ev = threading.Event()
         killed[tag] = ev
         if on_spawn:
-            on_spawn(FakeProc(tag))
+            p = FakeProc(tag)
+            procs[tag] = p
+            on_spawn(p)
         # Wait FAR longer than the overall budget so the kill (not this wait) is
         # what stops an in-flight member -- a wide margin keeps the test robust even
         # when the watchdog thread is starved under suite load.
@@ -3682,7 +3690,10 @@ def test_v4_overall_timeout_kills_and_partials():
                 "report": {"summary": agent}}
 
     def fake_kill(proc):
-        ev = killed.get(getattr(proc, "tag", None))
+        tag = getattr(proc, "tag", None)
+        if hasattr(proc, "_alive"):
+            proc._alive = False
+        ev = killed.get(tag)
         if ev:
             ev.set()
 
@@ -3707,6 +3718,94 @@ def test_v4_overall_timeout_kills_and_partials():
     assert "summary" in env and env["summary"]["members_requested"] == 2, env.get("summary")
     assert elapsed < 20, elapsed          # returned near the 1s budget, NOT the 30s member wait
     # both members were process-tree-killed by the overall timeout (-> not success)
+    assert env["summary"]["members_succeeded"] == 0, env["summary"]
+    assert all(m.get("status") != "success" for m in env["members"]), \
+        [m.get("status") for m in env["members"]]
+
+
+def test_v4_overall_timeout_excludes_queued_wave():
+    # Finding #5 (queued-wave race, the review's CRITICAL): with MORE same-backend
+    # members than the per-backend concurrency cap, a second WAVE is queued on the
+    # semaphore while the first wave runs. When the overall deadline breaches, the
+    # watchdog kills the first wave; the queued members then acquire the freed
+    # semaphore and must be EXCLUDED at the post-semaphore re-check -- NEVER
+    # dispatched after the kill (which would spawn an unkillable straggler, hang the
+    # pool on it, and blow the budget). Proven by: no more than `cap` children ever
+    # spawned, and the surplus members are reported excluded with the queued reason.
+    import _council
+    import _executor
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    import time as _t
+    cap = _council._PER_BACKEND_CAP           # 3
+    n_members = cap + 2                        # 5 -> exactly 2 queued in a 2nd wave
+    names = ["m%d" % i for i in range(n_members)]
+    root = tempfile.mkdtemp(prefix="summon-v4qw-")
+    _mk_agents(root, names + ["chair"])       # all run-agent: claude -> ONE backend
+    killed = {}
+    dispatched = []                           # members whose child actually SPAWNED
+    dlock = threading.Lock()
+
+    class FakeProc:
+        def __init__(self, tag):
+            self.tag = tag
+            self.pid = -1
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None):
+        with dlock:
+            dispatched.append(agent)          # only reached PAST the re-check gate
+        ev = threading.Event()
+        killed[tag] = ev
+        if on_spawn:
+            on_spawn(FakeProc(tag))
+        stopped = ev.wait(15)                  # first wave blocks until the kill frees it
+        return {"status": "error" if stopped else "success",
+                "result": "%s %s" % (agent, "killed" if stopped else "done"),
+                "report": {"summary": agent}}
+
+    def fake_kill(proc):
+        if hasattr(proc, "_alive"):
+            proc._alive = False
+        ev = killed.get(getattr(proc, "tag", None))
+        if ev:
+            ev.set()
+
+    ns = argparse.Namespace(question="q", question_file=None,
+                            members=",".join(names), chairman="chair", rounds=1,
+                            cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
+                            run_dir=root, overall_timeout=1000)
+    orig_d, orig_k = _council._dispatch, _executor._kill_tree
+    _council._dispatch, _executor._kill_tree = fake, fake_kill
+    try:
+        t0 = _t.monotonic()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        elapsed = _t.monotonic() - t0
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    assert elapsed < 20, elapsed              # near the 1s budget, NOT the 30s member wait
+    assert env.get("council_state") == "overall_timeout", env.get("council_state")
+    assert env["status"] == "partial", env["status"]
+    # THE invariant: the queued wave never spawned -- at most `cap` children ever ran.
+    assert len(dispatched) <= cap, dispatched
+    # the surplus members are reported excluded (not dispatched, not success)...
+    excluded = [m for m in env["members"] if m.get("status") == "excluded"]
+    assert len(excluded) >= n_members - cap, [m.get("status") for m in env["members"]]
+    # ...and at least one was cut at the POST-SEMAPHORE gate (finding #5's exact fix)
+    envs = env.get("member_envelopes", [])
+    assert any("queued" in (e.get("error") or "") for e in envs), \
+        [e.get("error") for e in envs]
     assert env["summary"]["members_succeeded"] == 0, env["summary"]
     assert all(m.get("status") != "success" for m in env["members"]), \
         [m.get("status") for m in env["members"]]
