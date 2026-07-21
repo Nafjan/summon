@@ -1004,50 +1004,64 @@ def test_apply_schema_sums_attempts_on_successful_correction():
         rs.execute_agent = rs_exec
 
 
-def test_v3_contract_repair_fixes_suspect_success():
+def test_v3_contract_repair_fixes_and_preserves_telemetry():
     # rec #5 / regression test 7: a suspect success (STATUS: APPROVE -> report_ok
     # false) gets ONE corrective resume producing a valid contract (STATUS: DONE)
-    # with the decision preserved in SUMMARY.
+    # with the decision preserved. CRITICAL: the original's telemetry (schema output,
+    # model, warnings) is PRESERVED and spend AGGREGATES; the retry runs READ-ONLY.
     import run_subagent as rs
     from _builder import AgentInvocation
     import argparse
     original = {"status": "success", "report_ok": False, "suspect": True,
-                "result": "The change is sound.\nSTATUS: APPROVE",
-                "resume": {"cli": "codex", "session_id": "sess-1"}, "attempts": 1}
-    repaired = ("Review complete.\nSTATUS: DONE\nSUMMARY: APPROVE - the change is sound\n"
+                "result": "Full analysis here.\nSTATUS: APPROVE",
+                "resume": {"cli": "codex", "session_id": "sess-1"}, "attempts": 1,
+                "cost_usd": 0.10, "usage": {"input_tokens": 100, "output_tokens": 50},
+                "parsed": {"k": 1}, "parse_ok": True, "warnings": ["w1"],
+                "model": {"served": "m"}}
+    repaired = ("Full analysis here.\nSTATUS: DONE\nSUMMARY: APPROVE - sound\n"
                 "FOLLOW-UP: none\nHANDOFF: none")
+    captured = {}
     def fake(inv, timeout_ms=0, debug_dir=None, **kwargs):
+        captured["permission"] = inv.permission
         assert "execution status" in inv.prompt.lower()  # the repair prompt was used
         return {"status": "success", "result": repaired, "report_ok": True,
-                "report": {"status": "DONE", "summary": "APPROVE - the change is sound"},
-                "resume": {}, "attempts": 1}
+                "report": {"status": "DONE", "summary": "APPROVE - sound"},
+                "resume": {"cli": "codex", "session_id": "sess-2"}, "attempts": 1,
+                "cost_usd": 0.04, "usage": {"input_tokens": 20, "output_tokens": 10},
+                "warnings": ["w2"]}
     rs_exec = rs.execute_agent
     rs.execute_agent = fake
     try:
         inv = AgentInvocation(cli="codex", prompt="review", cwd=os.getcwd(),
-                              system_context="s", permission="read-only")
+                              system_context="s", permission="yolo")   # privileged original
         out = rs._apply_contract_repair(dict(original), inv,
                                         argparse.Namespace(timeout=1000, debug_dir=None))
     finally:
         rs.execute_agent = rs_exec
     assert out["report_ok"] is True and out.get("suspect") is not True
-    assert out["contract_repaired"] is True
-    assert "APPROVE" in out["result"]         # decision preserved
-    assert out["attempts"] == 2               # 1 + 1 (correction is additional work)
+    assert out["contract_repaired"] is True and out["report"]["status"] == "DONE"
+    assert "APPROVE" in out["result"]                     # decision preserved
+    assert out["parsed"] == {"k": 1} and out["parse_ok"] is True   # schema output kept
+    assert out["model"] == {"served": "m"}               # original model kept
+    assert abs(out["cost_usd"] - 0.14) < 1e-9            # 0.10 + 0.04 aggregated
+    assert out["usage"]["input_tokens"] == 120 and out["usage"]["output_tokens"] == 60
+    assert "w1" in out["warnings"] and "w2" in out["warnings"]      # warnings merged
+    assert out["attempts"] == 2 and out["resume"]["session_id"] == "sess-2"
+    assert captured["permission"] == "read-only"          # formatting retry is READ-ONLY
 
 
-def test_v3_contract_repair_keeps_original_when_no_improvement():
-    # a retry that is STILL malformed (or errored) must NOT replace the original
-    # successful-but-suspect envelope.
+def test_v3_contract_repair_reject_still_accounts_spend():
+    # a retry that errored (or is still malformed) must NOT replace the original,
+    # but its wasted call must still be counted (attempts + spend).
     import run_subagent as rs
     from _builder import AgentInvocation
     import argparse
     original = {"status": "success", "report_ok": False, "suspect": True,
-                "result": "STATUS: APPROVE",
-                "resume": {"cli": "codex", "session_id": "s"}, "attempts": 1}
+                "result": "STATUS: APPROVE", "resume": {"cli": "codex", "session_id": "s"},
+                "attempts": 1, "cost_usd": 0.10}
     def fake(inv, timeout_ms=0, debug_dir=None, **kwargs):
-        return {"status": "success", "result": "STATUS: APPROVE still",
-                "report_ok": False, "resume": {}}
+        return {"status": "error", "result": "boom", "report_ok": False,
+                "cost_usd": 0.03, "resume": {}}
     rs_exec = rs.execute_agent
     rs.execute_agent = fake
     try:
@@ -1058,6 +1072,47 @@ def test_v3_contract_repair_keeps_original_when_no_improvement():
     finally:
         rs.execute_agent = rs_exec
     assert out["result"] == "STATUS: APPROVE" and out["report_ok"] is False  # kept original
+    assert out["contract_repair_attempted"] is True
+    assert out["attempts"] == 2 and abs(out["cost_usd"] - 0.13) < 1e-9       # spend accounted
+
+
+def test_v3_contract_repair_accepts_truthful_partial():
+    # a corrective contract that self-reports PARTIAL/BLOCKED (report_ok true) is
+    # MORE truthful than the suspect success and must be accepted (not rejected for
+    # not being status=success).
+    import run_subagent as rs
+    from _builder import AgentInvocation
+    import argparse
+    original = {"status": "success", "report_ok": False, "suspect": True,
+                "result": "STATUS: APPROVE", "resume": {"session_id": "s"}, "attempts": 1}
+    partial = "STATUS: PARTIAL\nSUMMARY: got halfway\nFOLLOW-UP: finish X\nHANDOFF: none"
+    def fake(inv, timeout_ms=0, debug_dir=None, **kwargs):
+        return {"status": "partial", "result": partial, "report_ok": True,
+                "report": {"status": "PARTIAL"}, "resume": {}}
+    rs_exec = rs.execute_agent
+    rs.execute_agent = fake
+    try:
+        inv = AgentInvocation(cli="codex", prompt="p", cwd=os.getcwd(),
+                              system_context="s", permission="read-only")
+        out = rs._apply_contract_repair(dict(original), inv,
+                                        argparse.Namespace(timeout=1000, debug_dir=None))
+    finally:
+        rs.execute_agent = rs_exec
+    assert out["status"] == "partial" and out["report_ok"] is True
+    assert out["contract_repaired"] is True
+
+
+def test_v3_no_contract_repair_propagates_to_child_argv():
+    # rec #5: the --no-contract-repair opt-out must reach a detached --background child.
+    import _background
+    import argparse
+    base = dict(agent="a", prompt="p", cwd="/w", prompt_file=None, allow_credit=False,
+                agents_dir=None, timeout=None, cli=None, model=None, effort=None,
+                resume=None, resume_profile=None, out=None, json_schema=None,
+                debug_dir=None, retries=0, worktree=None)
+    on = _background.child_argv(argparse.Namespace(no_contract_repair=True, **base), "/tmp/r.json")
+    off = _background.child_argv(argparse.Namespace(no_contract_repair=False, **base), "/tmp/r.json")
+    assert "--no-contract-repair" in on and "--no-contract-repair" not in off
 
 
 def test_v3_contract_repair_noops_without_resume_or_when_ok():
