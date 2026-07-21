@@ -3953,8 +3953,11 @@ def test_v4_monotonic_gate_without_watchdog():
     dispatched = []
 
     def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        # WIDE margin: 0.9s >> the 300ms budget and well above any plausible setup time, so
+        # the POST-round monotonic gate (not the setup-overrun guard, not load timing) is
+        # deterministically what cuts the council short before the chairman.
         dispatched.append(agent)
-        _t.sleep(0.25)                         # outlive the 100ms budget (NOT killed here)
+        _t.sleep(0.9)
         return {"status": "success", "result": agent, "report": {"summary": agent}}
 
     # Neuter ONLY the overall-timeout watchdog. `_council.threading` IS the global
@@ -3978,7 +3981,7 @@ def test_v4_monotonic_gate_without_watchdog():
 
     ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
                             chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
-                            timeout=30000, out=None, run_dir=root, overall_timeout=100)
+                            timeout=30000, out=None, run_dir=root, overall_timeout=300)
     orig_d, orig_thread = _council._dispatch, _council.threading.Thread
     _council._dispatch = fake
     _council.threading.Thread = _sel_thread
@@ -4037,6 +4040,74 @@ def test_v4_dispatch_child_on_reap_skips_a_still_live_child():
     assert err is None, err
     assert res is not None and res.timed_out is True, res
     assert reaped["called"] is False, "on_reap fired on a still-live child (would leak it)"
+
+
+def test_v4_live_child_stays_enforced_through_teardown():
+    # Re-review round-4 CRITICAL: _dispatch_child correctly withholds on_reap for a
+    # still-live child (poll() None), but run_stage's finally must NOT then blindly drop
+    # it from `inflight` -- otherwise a kill-that-did-not-land leaves a paid child running
+    # after the council returns. Integration test through run_council: one member's child
+    # survives (on_reap never fires, poll() stays None); assert run_stage KEEPS it
+    # registered and the FINAL teardown sweep targets it (enforcement continues).
+    import _council
+    import _executor
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    root = tempfile.mkdtemp(prefix="summon-v4live-")
+    _mk_agents(root, ["m1", "m2", "chair"])
+    kills = []
+    klock = threading.Lock()
+
+    class FakeProc:
+        def __init__(self, tag, alive):
+            self.tag = tag
+            self.pid = -1
+            self._alive = alive
+
+        def poll(self):
+            return None if self._alive else 0
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        # m2 simulates a wedged child: _kill_tree did not land, _safe_communicate gave up
+        # while poll() is still None, so _dispatch_child (correctly) never calls on_reap.
+        wedged = agent == "m2"
+        proc = FakeProc(tag, alive=wedged)
+        if on_spawn:
+            on_spawn(proc)
+        if not wedged and on_reap:
+            on_reap(proc)                      # normal path: reaped -> deregister adjacent
+        return {"status": "success" if not wedged else "error",
+                "result": agent, "report": {"summary": agent}}
+
+    def fake_kill(proc):
+        with klock:
+            kills.append(getattr(proc, "tag", None))
+        if hasattr(proc, "_alive"):
+            proc._alive = False                # a landed teardown kill
+
+    ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
+                            chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
+                            timeout=30000, out=None, run_dir=root)
+    orig_d, orig_k = _council._dispatch, _executor._kill_tree
+    _council._dispatch, _executor._kill_tree = fake, fake_kill
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+    finally:
+        _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    # the wedged child (m2) was targeted by the final teardown sweep; the reaped one (m1)
+    # was deregistered by on_reap and must NOT have been killed.
+    m2_hits = [k for k in kills if k and k.endswith("r1-m2")]
+    m1_hits = [k for k in kills if k and k.endswith("r1-m1")]
+    assert m2_hits, ("live child dropped from enforcement -- teardown never targeted it; "
+                     "kills=%r" % kills)
+    assert not m1_hits, ("a reaped child was killed at teardown (stale): kills=%r" % kills)
 
 
 def test_v4_dispatch_child_on_reap_fires_after_communicate():
