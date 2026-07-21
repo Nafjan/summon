@@ -45,6 +45,11 @@ if sys.version_info < (3, 10):
         "status": "error",
         "result": "",
         "exit_code": 1,
+        # Exit-code-clarity fields inlined: this guard runs before the sibling
+        # imports, so it cannot call finalize_exit_fields, but the contract holds.
+        "backend_exit_code": 1,
+        "dispatcher_status": "error",
+        "normalization_reason": "interpreter older than Python 3.10; summon did not run",
         "error": ("summon needs Python 3.10 or newer, but this interpreter is "
                   + _found + ". Install a newer Python (python.org or your package "
                   "manager), make it the `python` on your PATH, and retry. "
@@ -99,10 +104,12 @@ def _stamp_job(env: dict) -> dict:
 
 def _emit(obj: dict) -> None:
     """Write the response as JSON — to the job file (background) or stdout."""
-    # Single emission point: guarantee the exit-code-clarity fields on EVERY
-    # dispatch-shaped envelope, including the pre-dispatch validation/preflight
-    # paths that never reach the executor's _stamp. Idempotent + no-op on query
-    # envelopes (list/doctor/version have no exit_code).
+    # Primary emission point: guarantee the exit-code-clarity fields on EVERY
+    # dispatch-shaped envelope routed here, including the pre-dispatch validation/
+    # preflight paths that never reach the executor's _stamp. (The two paths that
+    # can't route through here -- the pre-import Python-version guard and the
+    # last-resort crash handler -- inline the fields themselves.) Idempotent +
+    # no-op on query envelopes (list/doctor/version have no exit_code).
     finalize_exit_fields(obj)
     _stamp_job(obj)
     text = json.dumps(obj, ensure_ascii=False)
@@ -837,7 +844,11 @@ if __name__ == "__main__":
         raise  # intentional exits (validation, normal completion) pass through
     except BaseException as e:  # noqa: BLE001 — last-resort net so a bg job never orphans
         err = {"result": "", "status": "error", "exit_code": 1,
-               "error": f"uncaught {type(e).__name__}: {e}"}
+               "error": f"uncaught {type(e).__name__}: {e}",
+               # inlined (not via finalize_exit_fields) so a crash in the executor
+               # import path can't sink the last-resort net
+               "backend_exit_code": 1, "dispatcher_status": "error",
+               "normalization_reason": f"uncaught {type(e).__name__} before completion"}
         jf = _resolve_job_file()
         if jf:
             try:

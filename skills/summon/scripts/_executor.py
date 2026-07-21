@@ -214,14 +214,12 @@ _B64_SCAN = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_=")
 # A data:<mime>;base64, prefix ending exactly at the blob start (bounded lookback).
 _DATA_URI_PREFIX_RE = re.compile(r"data:([\w.+-]+/[\w.+-]+)?;base64,$")
-# Provider startup noise ANCHORED to unambiguous formats only -- a free-form
-# "...error..." match would eat legitimate provider errors, so those are gone.
+# Provider startup noise: ONLY the unambiguously non-task skill-loader notices are
+# stripped. Generic PowerShell error frames (ParserError, `At line:`, CategoryInfo,
+# `at ...ps1:`) are NOT matched -- they are indistinguishable from a real TASK error
+# and stripping them would delete a genuine diagnostic (the whole point of the tail).
 _STARTUP_NOISE_RE = re.compile(
-    r"(?i)^\s*(?:"
-    r"duplicate skill\b|skill\s+\S+\s+already\s+(?:registered|loaded)\b|"
-    r"[\w.]*(?:CommandNotFoundException|ParserError|IncompleteParseException)\b|"
-    r"at\s+\S+\.ps1:\d+\b|At\s+line:\d+\s+char:\d+\b|\+\s+CategoryInfo\b|"
-    r"\+\s+FullyQualifiedErrorId\b)")
+    r"(?i)^\s*(?:duplicate skill\b|skill\s+\S+\s+already\s+(?:registered|loaded)\b)")
 
 
 def _blob_marker(mime, blob: str) -> str:
@@ -231,8 +229,9 @@ def _blob_marker(mime, blob: str) -> str:
 
 
 def _elide_payloads(raw: str, thresh: int) -> str:
-    """Replace base64/base64url runs of length >= ``thresh`` (data: URIs carry
-    their mime) with a bounded marker. One linear pass, no regex quantifier."""
+    """Replace base64/base64url payloads with a bounded marker in one linear pass.
+    A data: URI is ALWAYS elided (structured, never useful in a tail, its mime
+    carried into the marker); a BARE run is elided only at length >= ``thresh``."""
     out, i, n = [], 0, len(raw)
     while i < n:
         if raw[i] in _B64_SCAN:
@@ -240,10 +239,12 @@ def _elide_payloads(raw: str, thresh: int) -> str:
             while j < n and raw[j] in _B64_SCAN:
                 j += 1
             run = raw[i:j]
-            if j - i >= thresh:
-                lo = max(0, i - 120)                       # bounded mime lookback
-                m = _DATA_URI_PREFIX_RE.search(raw[lo:i])
-                out.append(_blob_marker(m.group(1) if m else None, run))
+            lo = max(0, i - 120)                           # bounded mime lookback
+            m = _DATA_URI_PREFIX_RE.search(raw[lo:i])
+            if m is not None:                              # data: URI -> always elided
+                out.append(_blob_marker(m.group(1), run))
+            elif j - i >= thresh:                          # bare run -> threshold
+                out.append(_blob_marker(None, run))
             else:
                 out.append(run)
             i = j
@@ -284,8 +285,12 @@ def _sanitize_tail(raw: str, max_blob_bytes: int | None = None,
     noise. Never touches the full transcript kept for --debug-dir."""
     if not raw:
         return raw
-    thresh = max(64, min(int(max_blob_bytes or _DEFAULT_MAX_TOOL_OUTPUT_BYTES),
-                         64 * 1024 * 1024))   # bound: a huge value can't wedge the scan
+    # Clamp to the length of the text actually being scanned: you cannot ask to
+    # keep a run "longer than everything captured". This also closes the leak
+    # where the tail is derived from a truncated _debug_raw window -- a run that
+    # fills the whole window is always elided rather than slipping under a
+    # threshold set above the window size.
+    thresh = max(64, min(int(max_blob_bytes or _DEFAULT_MAX_TOOL_OUTPUT_BYTES), len(raw)))
     return _strip_startup_noise(_elide_payloads(raw, thresh), debug_available)
 
 
@@ -893,17 +898,19 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                     "note": "resumed claude session runs its original model (guard can't re-pin "
                             "on --resume); if it was Fable this bills account credit"}
         raw = resp.pop("_debug_raw", None)
-        # Sanitize the human-facing output_tail (elide base64/binary payloads,
-        # strip provider startup noise) -- re-derived from the fuller raw so an
-        # elided blob becomes a marker instead of a truncated smear. The debug
-        # file below keeps the UNsanitized transcript (the full-detail pointer).
+        # Write the debug transcript FIRST (it keeps the UNsanitized raw, the
+        # full-detail pointer), so the tail's suppression marker can truthfully
+        # say "see debug_file" ONLY when the file was actually created (a failed
+        # _write_debug returns None -> no phantom reference).
+        dbg = _write_debug(debug_dir, debug_argv, raw or "", resp) if debug_dir else None
+        if dbg:
+            resp["debug_file"] = dbg
+        # Then sanitize the human-facing output_tail (elide base64/binary payloads,
+        # strip skill-loader noise) -- re-derived from the fuller raw so an elided
+        # blob becomes a marker instead of a truncated smear.
         if resp.get("output_tail") is not None and raw:
             resp["output_tail"] = _sanitize_tail(
-                raw, max_tool_output_bytes, debug_available=bool(debug_dir))[-2000:]
-        if debug_dir:
-            dbg = _write_debug(debug_dir, debug_argv, raw or "", resp)
-            if dbg:
-                resp["debug_file"] = dbg
+                raw, max_tool_output_bytes, debug_available=bool(dbg))[-2000:]
         return resp
 
     # API-kind backends (e.g. openai-compat): the backend performs the request
