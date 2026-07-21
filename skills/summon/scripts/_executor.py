@@ -213,12 +213,13 @@ _DEFAULT_MAX_TOOL_OUTPUT_BYTES = 2048
 _B64_SCAN = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_=")
 # A full base64 data: URI: the `data:` SCHEME is required (so prose that merely
-# contains ";base64," is not falsely elided), extra parameters are tolerated,
+# contains ";base64," is not falsely elided), at a LEFT WORD BOUNDARY (so the
+# `data:` inside `metadata:` does not match), extra parameters are tolerated,
 # whitespace between the comma and the payload is skipped (so it can't smuggle a
 # blob past detection), and the payload run is captured. `[A-Za-z0-9+/_=-]+` is a
 # plain char class with `+` (linear, no ReDoS / no {N,} OverflowError).
 _DATA_URI_RE = re.compile(
-    r"(?i)data:([\w.+-]*/[\w.+-]+)?(?:;[\w.+-]+=[^;,\s]*)*;base64,\s*([A-Za-z0-9+/_=-]+)")
+    r"(?i)(?<![\w-])data:([\w.+-]*/[\w.+-]+)?(?:;[\w.+-]+=[^;,\s]*)*;base64,\s*([A-Za-z0-9+/_=-]+)")
 # Provider startup noise: ONLY the unambiguously non-task skill-loader notices are
 # stripped. Generic PowerShell error frames (ParserError, `At line:`, CategoryInfo,
 # `at ...ps1:`) are NOT matched -- they are indistinguishable from a real TASK error

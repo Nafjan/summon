@@ -543,6 +543,15 @@ def test_v1_output_tail_elides_base64_payload():
     # prose that merely CONTAINS ";base64," (no data: scheme) must SURVIVE verbatim
     prose = "choose the diagnostic option;base64,QUJDRA== please"
     assert _executor._sanitize_tail(prose) == prose
+    # `data:` INSIDE another word (metadata:, my-data:) must NOT match (left boundary)
+    assert _executor._sanitize_tail("metadata:image/png;base64,QUJDRA==") == \
+        "metadata:image/png;base64,QUJDRA=="
+    assert _executor._sanitize_tail("x-data:image/png;base64,QUJDRA==") == \
+        "x-data:image/png;base64,QUJDRA=="
+    # but a REAL data: URI after punctuation/space still elides
+    for ctx in ("(data:image/png;base64,QUJDRA==)", "see data:image/png;base64,QUJDRA== ok"):
+        assert "payload omitted" in _executor._sanitize_tail(ctx) and "QUJDRA==" not in \
+            _executor._sanitize_tail(ctx)
     # a bare base64 run at/above the threshold is elided; short tokens survive
     bare = "Z" * 4096
     s2 = _executor._sanitize_tail("head " + bare + " tail")
