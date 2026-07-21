@@ -342,12 +342,17 @@ def main() -> None:
     # --list-models / --doctor: pure discovery queries. Need no agent/prompt/cwd —
     # answer and exit before any of those are validated.
     if args.list_models:
-        print(json.dumps({"models": discover_models(args.cli)}, ensure_ascii=False))
+        print(json.dumps({
+            "models": discover_models(args.cli),
+            "note": "model lists are static/config- or live-endpoint-derived and do NOT verify "
+                    "ACCOUNT eligibility; a listed backend can still fail a real dispatch "
+                    "(e.g. an ineligible client tier). Run `doctor --probe` to confirm eligibility.",
+        }, ensure_ascii=False))
         sys.exit(0)
 
     if args.doctor:
         from _doctor import doctor, render  # local import: keeps dispatch path lean
-        report = doctor(args.agents_dir, args.cwd)
+        report = doctor(args.agents_dir, args.cwd, probe=getattr(args, "probe", False))
         print(json.dumps(report, ensure_ascii=False) if args.json else render(report))
         sys.exit(0 if report["ok"] else 1)
 
