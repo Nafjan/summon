@@ -173,6 +173,13 @@ def _probe_one(name: str, b: dict, runner) -> None:
         b["probe_note"] = "no eligibility probe defined for this backend"
         return
     status, text = result.get("status"), result.get("text") or ""
+    # SUCCESS is authoritative and checked FIRST: a genuine success proves auth +
+    # account eligibility + a model responded, so a model that merely ECHOED a
+    # phrase like "please log in ..." in a SUCCESSFUL reply must not be misread as
+    # an auth failure. Signatures are classified ONLY on a non-success probe.
+    if status == "success":
+        b["auth_ok"] = b["account_eligible"] = b["model_access_verified"] = True
+        return
     verdict = classify_ineligibility(text, backend=name)
     if verdict and verdict["kind"] == "eligibility":
         b["auth_ok"] = True              # authenticated far enough to learn the tier is out
@@ -181,12 +188,9 @@ def _probe_one(name: str, b: dict, runner) -> None:
         b["ineligible_reason"] = verdict["reason"]
         b["guidance"] = verdict["guidance"]
     elif verdict and verdict["kind"] == "auth":
-        b["auth_ok"] = False             # distinct tier: not authenticated
+        b["auth_ok"] = False             # distinct tier: not authenticated (eligibility unknown)
+        b["model_access_verified"] = False
         b["guidance"] = verdict["guidance"]
-    elif status == "success":
-        # A successful minimal call proves auth + account eligibility + a model
-        # actually responded -- the only state that certifies eligibility.
-        b["auth_ok"] = b["account_eligible"] = b["model_access_verified"] = True
     else:
         # timeout / error / blocked with no known signature: stays UNVERIFIED.
         b["probe_note"] = f"probe did not confirm eligibility (status={status}): {text[:160]}"
@@ -274,11 +278,13 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None,
         },
     }
     # Usable = on PATH + --version-verified, MINUS any the probe CONFIRMED
-    # ineligible (account_eligible is False). Without a probe, eligibility is
-    # merely UNVERIFIED (None) -- not disqualifying, since the backend may well
-    # work; the render says so honestly rather than over-promising "[OK] ready".
+    # ineligible (account_eligible False) OR unauthenticated (auth_ok False) -- a
+    # backend proven unable to authenticate must never read as "[OK] ready".
+    # Without a probe, both stay UNVERIFIED (None): not disqualifying, since the
+    # backend may well work; the render says so honestly, not "[OK] ready".
     usable = [n for n, b in backends.items()
-              if b["found"] and b.get("verified") and b.get("account_eligible") is not False]
+              if b["found"] and b.get("verified")
+              and b.get("account_eligible") is not False and b.get("auth_ok") is not False]
     if "agy" in usable and not (
         report["agy_extras"].get("platform_ok")
         and report["agy_extras"].get("wrapper_found")
@@ -289,6 +295,8 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None,
     report["usable_backends"] = usable
     report["ineligible_backends"] = [n for n, b in backends.items()
                                      if b.get("account_eligible") is False]
+    report["unauthenticated_backends"] = [n for n, b in backends.items()
+                                          if b.get("auth_ok") is False]
     report["ok"] = bool(usable)
     return report
 
@@ -313,6 +321,9 @@ def render(report: dict) -> str:
             # Confirmed ineligibility wins over any agy-prerequisite hint -- a
             # real dispatch will fail, so that guidance must not be suppressed.
             mark, detail = "[!!]", f"INELIGIBLE - {b.get('guidance', 'account/client not eligible')}"
+        elif b.get("auth_ok") is False:
+            # Probe-proven NOT authenticated: also disqualifying, never [OK] ready.
+            mark, detail = "[!!]", f"NOT AUTHENTICATED - {b.get('guidance', 'run the backend login command')}"
         else:
             mark, detail = "[OK]", f"{ver}  ({b['path']})"
             if name == "agy":
@@ -351,6 +362,9 @@ def render(report: dict) -> str:
     if report.get("ineligible_backends"):
         lines.append(f"ineligible     : {', '.join(report['ineligible_backends'])} "
                      "(binary runs but the account/client can't dispatch - see guidance above)")
+    if report.get("unauthenticated_backends"):
+        lines.append(f"unauthenticated: {', '.join(report['unauthenticated_backends'])} "
+                     "(binary runs but not logged in - see auth hint above)")
     if not report.get("eligibility_probed"):
         lines.append("note     : account eligibility is UNVERIFIED - a passing --version does "
                      "not prove a real dispatch will work; run `doctor --probe` to test a "
