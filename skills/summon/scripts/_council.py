@@ -71,8 +71,10 @@ def _atomic_write_json(path: str, obj: dict) -> str | None:
 
 
 def _runs_root(args, cwd: str) -> str:
-    """--run-dir > SUMMON_RUNS_DIR > {cwd}/.agents/runs."""
-    return (getattr(args, "run_dir", None) or os.environ.get("SUMMON_RUNS_DIR")
+    """--run-dir / --results-dir (aliases, same precedence) > SUMMON_RUNS_DIR >
+    {cwd}/.agents/runs. Honored on both a fresh run and a resume."""
+    return (getattr(args, "run_dir", None) or getattr(args, "results_dir", None)
+            or os.environ.get("SUMMON_RUNS_DIR")
             or os.path.join(cwd, ".agents", "runs"))
 
 
@@ -190,11 +192,12 @@ def _chairman_prompt(question: str, members: list, ranking_note: str = "") -> st
 
 
 def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
-              timeout_ms: int, out_dir: str, tag: str) -> dict:
+              timeout_ms: int, out_dir: str, tag: str, on_spawn=None) -> dict:
     """Run one agent via a run_subagent subprocess with --out (authoritative
     envelope). Returns the parsed envelope (or an error envelope). A parent
     watchdog (child deadline + margin) guarantees the council can't hang on a
-    wedged child."""
+    wedged child. ``on_spawn(proc)`` registers the live child so an overall-timeout
+    breach can process-tree-kill it (see the council's kill registry)."""
     # Reuse the manifest's robust child dispatch: Popen + PROCESS-TREE kill +
     # bounded communicate on timeout (plain subprocess.run(timeout=) would kill
     # only the immediate child and then block in an unbounded communicate() if a
@@ -208,7 +211,7 @@ def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
         cmd += ["--agents-dir", agents_dir]
     watchdog = max(1.0, (timeout_ms + _CHILD_MARGIN_MS) / 1000)
     try:
-        proc, spawn_err = _dispatch_child(cmd, watchdog)
+        proc, spawn_err = _dispatch_child(cmd, watchdog, on_spawn=on_spawn)
         if spawn_err:
             return {"status": "error", "error": spawn_err}
         # Mirror the manifest: a watchdog timeout is only an error when the child
@@ -233,6 +236,21 @@ def _model_label(env: dict) -> str | None:
     if res and req and res != req:
         return f"{req} -> {res}"
     return res or req
+
+
+def _council_summary(member_views: list, *, run_id, results_dir, chair_status,
+                     quorum_met) -> dict:
+    """The compact, at-a-glance council summary (field-feedback): who was
+    requested/succeeded/failed (with reasons), whether quorum held, the chair's
+    outcome, and where to resume. Pure + additive."""
+    succeeded = sum(1 for m in member_views if m.get("status") == "success")
+    failed = [{"agent": m.get("agent"), "reason": m.get("status"),
+               "elapsed_ms": m.get("elapsed_ms")}
+              for m in member_views if m.get("status") != "success"]
+    return {"members_requested": len(member_views), "members_succeeded": succeeded,
+            "members_failed": failed, "quorum_met": quorum_met,
+            "chair_status": chair_status, "results_dir": results_dir,
+            "resume_available": bool(run_id)}
 
 
 def run_council(args) -> int:
@@ -332,6 +350,15 @@ def run_council(args) -> int:
     timeout_ms = args.timeout if isinstance(args.timeout, int) else 600000
     member_timeout_ms = getattr(args, "member_timeout", None) or timeout_ms
     chair_timeout_ms = getattr(args, "chair_timeout", None) or timeout_ms
+    # --overall-timeout: a HARD wall-clock budget for the whole run (deadline set
+    # from `started`, below). On breach the in-flight member children are
+    # process-tree-killed and a PARTIAL envelope is emitted BEFORE the host's own
+    # ceiling can exit-124 us. None disables it (unbounded, prior behavior).
+    overall_timeout_ms = getattr(args, "overall_timeout", None)
+    if overall_timeout_ms and overall_timeout_ms < member_timeout_ms:
+        print(f"[council] note: --overall-timeout ({int(overall_timeout_ms/1000)}s) is below the "
+              f"member timeout ({int(member_timeout_ms/1000)}s); members will be clamped/cut short",
+              file=sys.stderr, flush=True)
     cap = _per_member_cap(len(members))
 
     # The PERSISTENT run directory replaces the old throwaway mkdtemp (which
@@ -376,6 +403,64 @@ def run_council(args) -> int:
     started = time.monotonic()
     lock = threading.Lock()
     done = {"n": 0}
+
+    # ---- overall-timeout kill machinery ---------------------------------------
+    # ThreadPoolExecutor worker threads are non-daemon and concurrent.futures
+    # atexit-joins them, so merely returning would STILL block until each in-flight
+    # child's own watchdog fires -- reintroducing the exact host exit-124 this
+    # feature prevents. So we register every in-flight member child and, on a
+    # deadline breach, PROCESS-TREE-KILL them (which unblocks their run_stage). A
+    # daemon watchdog fires the kill at the deadline; members that would start
+    # AFTER a breach are excluded without dispatching.
+    overall_deadline = (started + overall_timeout_ms / 1000) if overall_timeout_ms else None
+    inflight: dict = {}                 # tag -> Popen, guarded by `lock`
+    overall = {"hit": False}            # set once the deadline breaches
+    _overall_done = threading.Event()   # set on normal completion -> watchdog exits early
+
+    def _register_inflight(tag: str, proc) -> None:
+        with lock:
+            inflight[tag] = proc
+
+    def _unregister_inflight(tag: str) -> None:
+        with lock:
+            inflight.pop(tag, None)
+
+    def _kill_inflight() -> None:
+        from _executor import _kill_tree
+        with lock:
+            procs = list(inflight.values())
+            inflight.clear()
+        for p in procs:
+            try:
+                _kill_tree(p)
+            except Exception:  # noqa: BLE001 — best-effort kill, never fatal
+                pass
+
+    def _remaining_ms():
+        """Milliseconds left in the overall budget (None if no --overall-timeout)."""
+        if overall_deadline is None:
+            return None
+        return int(max(0, (overall_deadline - time.monotonic()) * 1000))
+
+    def _clamped_stage_ms(base_ms: int) -> int:
+        """A stage's effective timeout, clamped to the remaining overall budget so
+        no child can run past the deadline (>=1s floor)."""
+        rem = _remaining_ms()
+        return base_ms if rem is None else max(1000, min(base_ms, rem))
+
+    def _overall_watchdog() -> None:
+        remaining = overall_deadline - time.monotonic()
+        if remaining > 0:
+            _overall_done.wait(remaining)   # wake early if the council finishes first
+        if not _overall_done.is_set() and time.monotonic() >= overall_deadline:
+            overall["hit"] = True
+            print(f"[council] overall timeout ({int(overall_timeout_ms / 1000)}s) reached; "
+                  "killing in-flight members and emitting a partial council envelope",
+                  file=sys.stderr, flush=True)
+            _kill_inflight()
+
+    if overall_deadline is not None:
+        threading.Thread(target=_overall_watchdog, daemon=True).start()
 
     def backend_of(agent: str) -> str:
         from _manifest import _job_backend
@@ -423,7 +508,9 @@ def run_council(args) -> int:
         owner's late child can never write into a successor's namespace. Every
         journal write is FENCED (owner=): a deposed parent aborts instead of
         corrupting the successor's single-writer journal. ``stage_timeout_ms``
-        is the member or chair clock for this stage type."""
+        is the member or chair clock for this stage type, clamped to whatever
+        remains of the overall budget so no child can outlive the deadline."""
+        stage_timeout_ms = _clamped_stage_ms(stage_timeout_ms)
         attempt_id = f"g{owner.generation}-{stage}-1"
         out_file = _rd.stage_path(rd_path, owner.generation, stage)
         try:  # a stale current-generation leftover (failed carry residue,
@@ -441,8 +528,12 @@ def run_council(args) -> int:
                                      "attempt_id": attempt_id,
                                      "generation": owner.generation,
                                      "kind": "initial"}, owner=owner)
-        env = _dispatch(agent, prompt, cwd, agents_dir, stage_timeout_ms, rd_path,
-                        f"g{owner.generation}-{stage}")
+        _tag = f"g{owner.generation}-{stage}"
+        try:
+            env = _dispatch(agent, prompt, cwd, agents_dir, stage_timeout_ms, rd_path,
+                            _tag, on_spawn=lambda p: _register_inflight(_tag, p))
+        finally:
+            _unregister_inflight(_tag)   # no longer killable once it has returned
         if isinstance(env, dict) and _rd.owner_still_current(owner):
             # Owner-side annotation (fenced): the upstream-input hash is what
             # makes this stage carry-forwardable on a later resume.
@@ -487,6 +578,12 @@ def run_council(args) -> int:
                 "_env": env}   # full child envelope: checkpoints persist it
 
     def run_member(agent: str, prompt: str, stage: str, input_sha: str) -> dict:
+        # Overall-timeout: if the deadline already breached (a later wave that
+        # would start after the kill), EXCLUDE this member without dispatching --
+        # no durable stage file is written, so a resume re-runs it cleanly.
+        if overall["hit"]:
+            return _member_view(agent, {"status": "excluded",
+                                        "error": "overall timeout reached before dispatch"})
         # Resume economics: a prior-generation stage whose upstream inputs are
         # unchanged (input_sha match) is carried forward, never re-paid.
         pg = _prior_generation(stage)
@@ -596,10 +693,41 @@ def run_council(args) -> int:
                 if err:
                     out_errors.append(err)
 
+        def _overall_partial(reason: str) -> int:
+            """Emit a PARTIAL council envelope after an overall-timeout breach and
+            return the partial exit code. The budget is exhausted, so the chairman
+            is NOT run (chairing the surviving quorum belongs to the early-exit
+            path, which stops BEFORE the deadline). Killed members are already
+            unblocked; anything still registered is killed here. The envelope is
+            flushed BEFORE the finally releases ownership so the host sees it."""
+            _kill_inflight()
+            env = _partial_env("overall_timeout")
+            env["status"] = "partial"
+            env["run_id"] = run_id
+            env["run_dir"] = rd_path
+            env["generation"] = owner.generation
+            env["overall_timeout"] = {"budget_ms": overall_timeout_ms, "reason": reason}
+            env["summary"] = _council_summary(
+                results, run_id=run_id, results_dir=rd_path,
+                chair_status="not_run (overall timeout)", quorum_met=None)
+            if out_path:
+                werr = _atomic_write_json(out_path, env)
+                if werr:
+                    env["out_error"] = werr
+            try:
+                _write_state("overall_timeout")
+            except Exception:  # noqa: BLE001
+                pass
+            print(json.dumps(env, ensure_ascii=False))
+            sys.stdout.flush()
+            return 2
+
         _ckpt("round1_complete")
         _write_state("round1_complete")
         if lost["err"]:
             return _fail(f"run ownership lost during round 1: {lost['err']}", out_path)
+        if overall["hit"]:
+            return _overall_partial("cut short during/after round 1")
         if rounds >= 2:
             done["n"] = 0
             # Same anonymized set (members order) for everyone -> comparable votes.
@@ -655,6 +783,14 @@ def run_council(args) -> int:
             _write_state("round2_complete")
             if lost["err"]:
                 return _fail(f"run ownership lost during round 2: {lost['err']}", out_path)
+            if overall["hit"]:
+                return _overall_partial("cut short during/after round 2")
+
+        # A breach that landed AFTER the last member round but BEFORE synthesis:
+        # skip the (unaffordable) chairman and emit the partial with the members.
+        # Checked BEFORE the pop below so the partial keeps the full member envelopes.
+        if overall["hit"]:
+            return _overall_partial("cut short before synthesis")
 
         for m in results:    # drop the raw text and envelope carried for checkpoints
             m.pop("_raw", None)
@@ -771,6 +907,7 @@ def run_council(args) -> int:
         # be silently skipped. Fail loudly rather than trust the stale result.
         return _fail(f"run {run_id}: {e}", out_path)
     finally:
+        _overall_done.set()   # let the overall-timeout watchdog exit (no more killing)
         # The run dir PERSISTS (that is the whole point); only our ownership ends.
         _rd.release_owner(owner)
 
@@ -880,6 +1017,22 @@ def run_council(args) -> int:
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "status": status,
     }
+    # Compact at-a-glance summary (field-feedback) on every final envelope.
+    envelope["summary"] = _council_summary(
+        results, run_id=run_id, results_dir=rd_path,
+        chair_status=("skipped" if quorum_skipped else chair_env.get("status")),
+        quorum_met=(None if quorum is None else members_succeeded >= quorum))
+    # If the overall budget was hit, the run was CUT SHORT (members killed/excluded,
+    # the surviving quorum chaired): mark it and never report a clean success.
+    if overall["hit"]:
+        envelope["council_state"] = "overall_timeout"
+        envelope["overall_timeout"] = {
+            "budget_ms": overall_timeout_ms,
+            "note": "overall budget reached; in-flight members were process-tree-killed "
+                    "and any surviving quorum was chaired"}
+        if envelope["status"] == "success":
+            envelope["status"] = "partial"
+        status = envelope["status"]
     # --out: the final envelope replaces the last checkpoint atomically. Any
     # write failure (checkpoint or final) is surfaced as out_error but never
     # demotes the council itself.
@@ -891,6 +1044,7 @@ def run_council(args) -> int:
             out_errors.append(_werr)
             envelope["out_error"] = "; ".join(out_errors)
     print(json.dumps(envelope, ensure_ascii=False))
+    sys.stdout.flush()   # ensure the host sees the result even if teardown lingers
     return 0 if status == "success" else 1
 
 

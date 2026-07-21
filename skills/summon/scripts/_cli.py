@@ -55,14 +55,16 @@ MODE_FLAGS = {
     # resume would be a new run, so they are rejected there; status takes only
     # its id + where to look.
     "council": {"council", "question", "question_file", "members", "chairman",
-                "rounds", "cwd", "agents_dir", "timeout", "out", "run_dir", "job_file",
-                "quorum", "chairman_fallback", "member_timeout", "chair_timeout"},
+                "rounds", "cwd", "agents_dir", "timeout", "out", "run_dir", "results_dir",
+                "job_file", "quorum", "chairman_fallback", "member_timeout",
+                "chair_timeout", "overall_timeout"},
     # A resume may change how the SAME run's stages are gated/timed (quorum,
     # fallback, per-stage timeouts) without changing its identity; question,
     # members, chairman, and rounds still come from the receipt.
     "council-resume": {"council", "resume_run", "cwd", "agents_dir", "timeout",
-                       "out", "run_dir", "job_file",
-                       "quorum", "chairman_fallback", "member_timeout", "chair_timeout"},
+                       "out", "run_dir", "results_dir", "job_file",
+                       "quorum", "chairman_fallback", "member_timeout", "chair_timeout",
+                       "overall_timeout"},
     # Status takes ONLY its id, where to look, and the output format -- it never
     # dispatches, so it has no working directory (use --run-dir to point it).
     "council-status": {"council_status", "run_dir", "json", "job_file"},
@@ -318,7 +320,9 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--manifest", help="Run a batch of jobs from a JSON manifest (see SKILL.md)")
     parser.add_argument("--concurrency", help="With --manifest: per-backend caps, e.g. agy=2,codex=3,default=3")
     parser.add_argument("--results-dir", dest="results_dir",
-                        help="With --manifest: envelope dir (default {cwd}/.agents/results)")
+                        help="With --manifest: per-job envelope dir (default {cwd}/.agents/results). "
+                             "With --council: alias for --run-dir (same precedence, above "
+                             "SUMMON_RUNS_DIR)")
     parser.add_argument("--council", action="store_true",
                         help="Decide by consensus: dispatch --question to diverse members, "
                              "then a chairman synthesizes. See SKILL.md")
@@ -350,6 +354,11 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--chair-timeout", dest="chair_timeout", type=parse_timeout,
                         help="With --council: chairman (and fallback) stage timeout "
                              "(default: --timeout)")
+    parser.add_argument("--overall-timeout", dest="overall_timeout", type=parse_timeout,
+                        help="With --council: a HARD wall-clock budget for the whole run. "
+                             "On breach summon process-tree-kills in-flight members and emits "
+                             "a PARTIAL council envelope (status=partial) BEFORE the host's own "
+                             "timeout can kill it. Per-stage timeouts still apply within it")
     parser.add_argument("--job-dir", dest="job_dir",
                         help="Root for --background job records/results "
                              "(default {tempdir}/subagents_jobs; env SUMMON_JOBS_DIR)")
