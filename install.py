@@ -432,31 +432,37 @@ def install_agents(dry: bool) -> list:
 
 
 def _drift_check() -> None:
-    """After a real install, confirm every managed host copy now hashes identically to
-    the source we just deployed -- via the skill's own ``_installs`` detector, so it uses
-    the SAME hash as dispatch receipts and ``doctor``. Advisory only (never fails the
-    install): a lingering mismatch means a host was left stale (a refresh refused or
-    failed), caught here at install time instead of in the field."""
+    """After a real install, confirm every managed host copy now hashes identically to the
+    source we just deployed, via the skill's own ``_installs`` detector (SAME hash as the
+    dispatch receipt and ``doctor``). Purely advisory: the ENTIRE body is fail-soft, so a
+    foreign/corrupt copy on the box can never turn a successful install into a traceback. A
+    lingering mismatch (a refresh refused or failed) is surfaced here at install time
+    instead of in the field."""
     scripts = os.path.join(SKILL_SRC, "scripts")
     try:
         if scripts not in sys.path:
             sys.path.insert(0, scripts)
-        import _installs  # noqa: E402 — the skill's own detector, sourced from what we install
-    except Exception as e:  # noqa: BLE001 — advisory; never break the install over it
-        print(f"\n[--] install-drift check unavailable ({type(e).__name__}: {e})")
+        import _installs  # noqa: E402 - the skill's own detector, sourced from what we install
+        dr = _installs.drift_report(_installs.enumerate_installs(running_scripts_dir=scripts))
+        ref = dr["reference_sha"]
+        if not ref:
+            return
+        stale = [r for r in dr["drifted"] if r.get("managed")]
+        unknown = [r for r in dr["unknown"] if r.get("managed")]
+        ok = [r for r in dr["hashed"] if r.get("managed") and r["sha256"] == ref]
+    except Exception as e:  # noqa: BLE001 - advisory; never break a successful install
+        print(f"\n[--] install-drift check skipped ({type(e).__name__}: {e})")
         return
-    recs = _installs.enumerate_installs(running_scripts_dir=scripts)
-    ref = _installs.drift_report(recs)["reference_sha"]
-    if not ref:
-        return
-    managed = [r for r in recs if r["label"] in _installs.HOST_DIRS and r["present"]]
-    stale = [r for r in managed if r["sha256"] != ref]
-    if stale:
-        print(f"\n[~?] install-drift: {len(stale)} host copy(ies) still differ from the source "
-              f"({', '.join(s['label'] for s in stale)}) - a refresh was refused or failed; "
-              "re-run, or move a foreign copy aside")
-    elif managed:
-        print(f"\n[ok] install-drift: all {len(managed)} installed host copy(ies) match the source")
+    if stale or unknown:
+        bits = []
+        if stale:
+            bits.append(f"{len(stale)} differ ({', '.join(s['label'] for s in stale)})")
+        if unknown:
+            bits.append(f"{len(unknown)} unhashable ({', '.join(u['label'] for u in unknown)})")
+        print(f"\n[~?] install-drift: {'; '.join(bits)} from the source - a refresh was refused "
+              "or failed; re-run, or move a foreign copy aside")
+    elif ok:
+        print(f"\n[ok] install-drift: all {len(ok)} installed host copy(ies) match the source")
 
 
 def main() -> int:

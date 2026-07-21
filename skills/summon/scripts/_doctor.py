@@ -300,7 +300,7 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None,
         _recs = enumerate_installs(
             running_scripts_dir=os.path.dirname(os.path.abspath(__file__)))
         report["installs"] = {"records": _recs, "drift": drift_report(_recs)}
-    except Exception:  # noqa: BLE001 — advisory section; must never break doctor
+    except Exception:  # noqa: BLE001 - advisory section; must never break doctor
         report["installs"] = None
     report["eligibility_probed"] = bool(probe)
     report["usable_backends"] = usable
@@ -374,23 +374,29 @@ def render(report: dict) -> str:
         for r in inst["records"]:
             run = " (running)" if r.get("running") else ""
             if not r["present"]:
-                lines.append(f"  [--] {r['label']:<9} not installed")
+                lines.append(f"  [--] {r['label']:<10} not installed")
                 continue
-            sha = (r["sha256"] or "unhashable")[:12]
             ver = r.get("version") or "?"
-            if ref and r["sha256"] == ref:
-                mark, note = "[OK]", "current"
+            if not r["sha256"]:   # present but couldn't hash it (perm error / foreign file)
+                mark, sha, note = "[~?]", "unhashable  ", "present but could not be hashed"
+            elif ref and r["sha256"] == ref:
+                mark, sha, note = "[OK]", r["sha256"][:12], "current"
             elif ref:
-                mark, note = "[~?]", "DRIFT - stale copy; re-run install.py to converge"
+                mark, sha, note = "[~?]", r["sha256"][:12], "DRIFT: stale copy; re-run install.py"
             else:
-                mark, note = "[~?]", "unverified (no running reference to compare)"
-            lines.append(f"  {mark} {r['label']:<9} {sha}  v{ver:<7} {note}{run}")
+                mark, sha, note = "[~?]", r["sha256"][:12], "unverified (no running reference)"
+            lines.append(f"  {mark} {r['label']:<10} {sha}  v{ver:<7} {note}{run}")
             lines.append(f"       {r['scripts_dir']}")
-        if ref and dr.get("drifted"):
-            names = ", ".join(d["label"] for d in dr["drifted"])
-            lines.append(f"  drift    : {len(dr['drifted'])} copy(ies) DIFFER from the running "
-                         f"install ({names}) - run  python install.py  to converge them")
-        elif ref and len([r for r in inst["records"] if r["present"]]) > 1:
+        if ref and (dr.get("drifted") or dr.get("unknown")):
+            bits = []
+            if dr.get("drifted"):
+                bits.append(f"{len(dr['drifted'])} differ "
+                            f"({', '.join(d['label'] for d in dr['drifted'])})")
+            if dr.get("unknown"):
+                bits.append(f"{len(dr['unknown'])} unhashable "
+                            f"({', '.join(u['label'] for u in dr['unknown'])})")
+            lines.append(f"  drift    : {'; '.join(bits)} - run  python install.py  to converge")
+        elif dr.get("converged") and len(dr.get("present", [])) > 1:
             lines.append("  drift    : all installed copies match the running install")
     lines += [
         "",

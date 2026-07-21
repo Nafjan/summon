@@ -18,22 +18,36 @@ from pathlib import Path
 from _loader import bundled_roster_dir
 
 
-def scripts_sha256(scripts_dir) -> str:
+def scripts_sha256(scripts_dir, max_bytes=None) -> str:
     """One SHA-256 over EVERY production module in ``scripts_dir`` (all ``*.py``
     except test_discovery.py, which never executes at dispatch time). Length-prefixed
-    framing -- ``len(name)|name|len(data)|data``, names sorted -- so (name, content)
+    framing (``len(name)|name|len(data)|data``, names sorted) so (name, content)
     boundaries are unambiguous and drift in ANY sibling (incl. agy_pty_pyte.py), not
     just the entry file, is detectable.
 
     SINGLE source of truth for install identity: the dispatch receipt and the
     install-drift detector both hash the same way, so a hash difference is always a
     REAL code divergence, never an algorithm mismatch. A missing/unreadable module
-    hashes as empty content (kept diagnosable, never raises)."""
+    hashes as empty content (kept diagnosable, never raises).
+
+    ``max_bytes`` bounds the work per file so hashing a FOREIGN copy (drift enumeration
+    of OTHER installs) cannot exhaust memory: a non-regular file (a symlink to a device
+    or FIFO) is hashed by a marker instead of read, and a file larger than ``max_bytes``
+    is hashed by a name+size marker without reading its content. The dispatch receipt
+    passes ``max_bytes=None`` (EXACT legacy behavior, hashing the operator's OWN trusted
+    install); every real, small, regular module hashes identically under either, so drift
+    detection still matches the receipt for any genuine copy."""
     here = Path(scripts_dir)
     h = hashlib.sha256()
     for name in sorted(p.name for p in here.glob("*.py") if p.name != "test_discovery.py"):
+        target = here / name
         try:
-            data = (here / name).read_bytes()
+            if max_bytes is not None and not target.is_file():
+                data = b"\x00__nonfile__"          # symlink to a device/dir/FIFO: never read
+            elif max_bytes is not None and target.stat().st_size > max_bytes:
+                data = b"\x00__oversize__:" + str(target.stat().st_size).encode("ascii")
+            else:
+                data = target.read_bytes()
         except OSError:
             data = b""
         nb = name.encode("utf-8")

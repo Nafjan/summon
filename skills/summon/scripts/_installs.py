@@ -4,13 +4,18 @@ divergence. Powers ``doctor``'s installs section and install.py's post-install c
 check.
 
 Motivated by the field incident where a host ran an ancient ``run_subagent.py`` (no
-``summon`` receipt at all) while the other copies were current -- silent drift that took
-a manual hash hunt to diagnose. With this, any envelope's ``summon.scripts_sha256`` can be
+``summon`` receipt at all) while the other copies were current: silent drift that took a
+manual hash hunt to diagnose. With this, any envelope's ``summon.scripts_sha256`` can be
 matched against every install on the box, and ``doctor`` says which copy is stale.
+
+Every read here is BOUNDED and fail-soft: a foreign or corrupt copy (bad encoding, an
+oversize or non-regular ``*.py``, a permission error) is classified, never crashes the
+doctor or the installer, and never exhausts memory.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -24,13 +29,21 @@ from _receipt import scripts_sha256
 HOST_DIRS = {"claude": ".claude", "codex": ".codex", "cursor": ".cursor",
              "gemini": ".gemini", "copilot": ".copilot"}
 _MANIFEST = ".summon-install.json"
+# Per-file ceiling for hashing/parsing an install we do NOT own (drift enumeration of
+# other copies). Real production modules are well under 200 KB; this only bounds a
+# foreign/compromised copy so it cannot exhaust memory during doctor or install.
+_ENUM_MAX_BYTES = 4_000_000
 
 
-def _resolved(path: str) -> str:
+def _canonical(path: str) -> str:
+    """A comparison key that is stable across symlink aliases AND case-insensitive
+    filesystems: resolve symlinks (realpath) then normcase (lowercases on Windows). So
+    ``~/.claude`` and ``~/.codex`` symlinked to one physical copy collapse to one key,
+    and a Windows path never mismatches itself on case alone. Never raises."""
     try:
-        return str(Path(path).resolve())
+        return os.path.normcase(os.path.realpath(path))
     except OSError:
-        return os.path.abspath(path)
+        return os.path.normcase(os.path.abspath(path))
 
 
 def _read_installed_at(install_dir: str):
@@ -47,37 +60,46 @@ def _read_installed_at(install_dir: str):
 
 
 def _read_version(scripts_dir: str):
-    """A copy's dispatcher version, read straight from its ``run_subagent.py``
-    ``__version__ = "x.y.z"`` line -- NOT imported (a stale copy might not even import
-    under the current Python) and NOT from the manifest (which does not record it). None
-    if the line is absent. Scans only the file head; never raises."""
+    """A copy's dispatcher version, parsed from its ``run_subagent.py`` module-level
+    ``__version__ = "x.y.z"`` assignment via AST -- NOT a line scan (which would mistake a
+    ``__version__`` inside a docstring, or a trailing ``# "comment"``, for the value), NOT
+    imported (a stale copy might not import under the current Python), NOT from the manifest
+    (which omits it). None if absent, computed (non-literal), or unparseable.
+
+    TRULY never raises: a bad encoding, a syntax error, or an oversize file all yield None.
+    The read is BOUNDED (``_ENUM_MAX_BYTES``) so a foreign huge file can't exhaust memory --
+    the real ``__version__`` sits near the file head, well within the bound."""
     try:
-        with open(os.path.join(scripts_dir, "run_subagent.py"), encoding="utf-8") as fh:
-            for i, line in enumerate(fh):
-                if i > 300:
-                    break
-                s = line.strip()
-                if s.startswith("__version__") and "=" in s:
-                    rhs = s.split("=", 1)[1]
-                    for ch in ("\"", "'"):
-                        if ch in rhs:
-                            return rhs.split(ch)[1]
-                    return None
-    except OSError:
-        pass
+        with open(os.path.join(scripts_dir, "run_subagent.py"),
+                  encoding="utf-8", errors="replace") as fh:
+            src = fh.read(_ENUM_MAX_BYTES)
+        tree = ast.parse(src)
+    except (OSError, ValueError, SyntaxError, MemoryError):
+        return None
+    for node in tree.body:   # MODULE level only -- ignore nested/conditional assigns
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "__version__":
+                    v = node.value
+                    if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                        return v.value
+                    return None   # a computed __version__ = VERSION -> unknown, not garbage
     return None
 
 
-def _probe(label: str, scripts_dir: str) -> dict:
-    """One install record for a ``.../skills/summon/scripts`` directory. Absent copies
-    are reported (present=False) rather than dropped, so ``doctor`` can show what is NOT
-    installed. Hashing/manifest reads never raise."""
+def _probe(label: str, scripts_dir: str, managed: bool) -> dict:
+    """One install record for a ``.../skills/summon/scripts`` directory. Absent copies are
+    reported (present=False) rather than dropped, so ``doctor`` can show what is NOT
+    installed. A present copy that cannot be hashed (e.g. permission denied on the dir)
+    keeps ``sha256=None`` -- classified UNKNOWN downstream, never silently 'converged'.
+    Hashing/manifest/version reads never raise."""
     present = os.path.isdir(scripts_dir)
     rec = {"label": label, "scripts_dir": scripts_dir, "present": present,
-           "running": False, "sha256": None, "version": None, "installed_at": None}
+           "managed": managed, "running": False,
+           "sha256": None, "version": None, "installed_at": None}
     if present:
         try:
-            rec["sha256"] = scripts_sha256(scripts_dir)
+            rec["sha256"] = scripts_sha256(scripts_dir, max_bytes=_ENUM_MAX_BYTES)
         except OSError:
             rec["sha256"] = None
         rec["version"] = _read_version(scripts_dir)
@@ -87,24 +109,43 @@ def _probe(label: str, scripts_dir: str) -> dict:
 
 def enumerate_installs(running_scripts_dir: str | None = None,
                        home: str | None = None) -> list:
-    """Every summon install we can locate: the five host copies, the ``~/.agents``
-    third-party-clone location from the incident, and the RUNNING copy. If the running
-    copy resolves to one of the enumerated locations it is TAGGED there (``running:
-    True``), not listed twice; if it lives elsewhere (a repo/worktree checkout) it is
-    appended as its own record. ``home`` is injectable for tests."""
+    """Every summon install we can locate: the five host copies (``managed``), the
+    ``~/.agents`` third-party-clone location from the incident, and the RUNNING copy.
+
+    Present copies that are the SAME physical directory (symlink aliases) are COLLAPSED
+    into one record with merged labels (e.g. ``claude+codex``), so a shared copy is neither
+    double-counted nor mis-tagged. The running copy is matched by canonical path: if it is
+    one of the enumerated copies it is TAGGED there (``running: True``); if it lives
+    elsewhere (a repo/worktree checkout) it is appended as its own record. ``home`` is
+    injectable for tests."""
     home = home or os.path.expanduser("~")
-    records = [_probe(name, os.path.join(home, d, "skills", "summon", "scripts"))
-               for name, d in HOST_DIRS.items()]
-    records.append(_probe("agents",
-                          os.path.join(home, ".agents", "skills", "summon", "scripts")))
+    raw = [_probe(name, os.path.join(home, d, "skills", "summon", "scripts"), managed=True)
+           for name, d in HOST_DIRS.items()]
+    raw.append(_probe("agents",
+                      os.path.join(home, ".agents", "skills", "summon", "scripts"),
+                      managed=False))
+    records: list = []
+    by_key: dict = {}
+    for r in raw:
+        if not r["present"]:
+            records.append(r)          # absent: no physical path to collapse on
+            continue
+        key = _canonical(r["scripts_dir"])
+        if key in by_key:
+            first = by_key[key]
+            first["label"] = first["label"] + "+" + r["label"]
+            first["managed"] = first["managed"] or r["managed"]
+        else:
+            by_key[key] = r
+            records.append(r)
     if running_scripts_dir:
-        run_key = _resolved(running_scripts_dir)
+        run_key = _canonical(running_scripts_dir)
         for r in records:
-            if r["present"] and _resolved(r["scripts_dir"]) == run_key:
+            if r["present"] and _canonical(r["scripts_dir"]) == run_key:
                 r["running"] = True
                 break
         else:
-            rec = _probe("running", running_scripts_dir)
+            rec = _probe("running", running_scripts_dir, managed=False)
             rec["running"] = True
             records.append(rec)
     return records
@@ -112,15 +153,21 @@ def enumerate_installs(running_scripts_dir: str | None = None,
 
 def drift_report(records: list, reference_sha: str | None = None) -> dict:
     """Classify drift across enumerated records. The reference is the RUNNING copy's hash
-    (the code that actually answered) unless one is passed explicitly. Present installs
-    whose hash differs from the reference are DRIFTED. With no reference (e.g. the running
-    copy could not be hashed) nothing is called drifted -- we never cry drift we can't
-    anchor. Returns {reference_sha, converged, present, drifted}."""
+    (the code that actually answered) unless one is passed explicitly.
+
+    A PRESENT copy is HASHED (comparable), or UNKNOWN when its hash could not be computed
+    (a permission error, a foreign non-regular ``*.py``). ``drifted`` = hashed copies whose
+    hash differs from the reference. With no reference nothing is called drifted -- we never
+    cry drift we cannot anchor. ``converged`` requires a reference, NO drift, AND no unknown
+    copy (an uncheckable copy is never reported as 'all match'). Returns
+    {reference_sha, converged, present, hashed, drifted, unknown}."""
     if reference_sha is None:
         run = next((r for r in records if r.get("running") and r.get("sha256")), None)
         reference_sha = run["sha256"] if run else None
-    present = [r for r in records if r["present"] and r["sha256"]]
-    drifted = [r for r in present if reference_sha and r["sha256"] != reference_sha]
+    present = [r for r in records if r["present"]]
+    hashed = [r for r in present if r["sha256"]]
+    unknown = [r for r in present if not r["sha256"]]
+    drifted = [r for r in hashed if reference_sha and r["sha256"] != reference_sha]
     return {"reference_sha": reference_sha,
-            "converged": bool(reference_sha) and not drifted,
-            "present": present, "drifted": drifted}
+            "converged": bool(reference_sha) and not drifted and not unknown,
+            "present": present, "hashed": hashed, "drifted": drifted, "unknown": unknown}

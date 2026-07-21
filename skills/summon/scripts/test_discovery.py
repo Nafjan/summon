@@ -4680,6 +4680,104 @@ def test_v6_installs_hosts_match_installer():
     assert set(mod.HOSTS) == set(_installs.HOST_DIRS), (set(mod.HOSTS), set(_installs.HOST_DIRS))
 
 
+def test_v6_read_version_parser_robustness():
+    # AST-based _read_version (review WARNING): a __version__ inside a docstring or a
+    # trailing # "comment" must NOT be mistaken for the value; a computed value -> None;
+    # a bad encoding must NEVER raise (the documented contract).
+    import _installs
+    d = tempfile.mkdtemp(prefix="summon-v6ver-")
+    try:
+        def ver(src):
+            with open(os.path.join(d, "run_subagent.py"), "w", encoding="utf-8") as fh:
+                fh.write(src)
+            return _installs._read_version(d)
+        assert ver('__version__ = "1.2.3"\n') == "1.2.3"
+        assert ver('__version__ = "1.2.3"  # "9.9.9"\n') == "1.2.3"   # trailing comment ignored
+        assert ver('"""\n__version__ = "fake"\n"""\nx = 1\n') is None  # in a docstring -> not it
+        assert ver('__version__ = VERSION\n') is None                  # computed -> unknown, not garbage
+        assert ver('x = 1\n') is None                                  # absent
+        assert ver('def f():\n    __version__ = "9.9.9"\n    return 1\n') is None  # nested, not module-level
+        # non-UTF-8 bytes: must NOT raise (errors=replace); value is whatever parses out
+        with open(os.path.join(d, "run_subagent.py"), "wb") as fh:
+            fh.write(b'__version__ = "\xff\xfe bad"\n')
+        got = _installs._read_version(d)
+        assert isinstance(got, (str, type(None)))   # no exception escaped
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v6_drift_report_unhashable_forces_not_converged():
+    # review WARNING: a present-but-unhashable peer must NOT be silently dropped so the
+    # summary claims "all match". It is UNKNOWN and forces converged=False.
+    import _installs
+    recs = [
+        {"label": "claude", "present": True, "managed": True, "running": True, "sha256": "AAA"},
+        {"label": "codex", "present": True, "managed": True, "running": False, "sha256": None},
+        {"label": "cursor", "present": True, "managed": True, "running": False, "sha256": "AAA"},
+    ]
+    dr = _installs.drift_report(recs)
+    assert dr["reference_sha"] == "AAA"
+    assert dr["drifted"] == [], dr["drifted"]
+    assert [u["label"] for u in dr["unknown"]] == ["codex"], dr["unknown"]
+    assert dr["converged"] is False   # an uncheckable copy is never reported 'all match'
+
+
+def test_v6_enumerate_dedups_symlink_aliases():
+    # review WARNING: two host dirs symlinked to ONE physical copy must collapse to one
+    # record, and the running tag must land on it regardless of which alias we run through.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-v6sym-")
+    try:
+        _mk_summon_install(home, ".claude",
+                           {"run_subagent.py": '__version__ = "2.0.0"\n', "_x.py": "x = 1\n"})
+        codex_summon = os.path.join(home, ".codex", "skills", "summon")
+        os.makedirs(os.path.dirname(codex_summon), exist_ok=True)
+        try:
+            os.symlink(os.path.join(home, ".claude", "skills", "summon"), codex_summon,
+                       target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            return   # symlinks not permitted (e.g. Windows without privilege) -> skip
+        run = os.path.join(codex_summon, "scripts")   # invoke THROUGH the .codex alias
+        recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
+        present = [r for r in recs if r["present"]]
+        assert len(present) == 1, [(r["label"], r["scripts_dir"]) for r in present]
+        merged = present[0]
+        assert "claude" in merged["label"] and "codex" in merged["label"], merged["label"]
+        assert merged["running"] is True and merged["managed"] is True
+        dr = _installs.drift_report(recs)
+        assert dr["converged"] is True and dr["drifted"] == []
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_unhashable_running_copy_yields_no_reference():
+    # a present-but-unhashable RUNNING copy -> no reference -> nothing flagged as drift
+    # (never cry drift we can't anchor), and converged stays False.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-v6uh-")
+
+    def _boom(scripts_dir, max_bytes=None):
+        raise OSError("cannot hash")
+
+    orig = _installs.scripts_sha256
+    _installs.scripts_sha256 = _boom
+    try:
+        _mk_summon_install(home, ".claude", {"run_subagent.py": '__version__ = "1.0.0"\n'})
+        run = os.path.join(home, ".claude", "skills", "summon", "scripts")
+        recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
+        claude = next(r for r in recs if "claude" in r["label"])
+        assert claude["present"] and claude["sha256"] is None and claude["running"]
+        dr = _installs.drift_report(recs)
+        assert dr["reference_sha"] is None and dr["converged"] is False and dr["drifted"] == []
+        assert len(dr["unknown"]) == 1
+    finally:
+        _installs.scripts_sha256 = orig
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
