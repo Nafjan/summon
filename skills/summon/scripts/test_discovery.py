@@ -524,18 +524,24 @@ def test_v1_output_tail_elides_base64_payload():
     s = _executor._sanitize_tail(f"log start\ndata:image/png;base64,{blob}\nlog end")
     assert "payload omitted: image/png" in s and "bytes, sha256" in s, s
     assert blob not in s
+    # a SHORT data: URI is elided regardless of length (finding #1: always elided)
+    short_uri = _executor._sanitize_tail("x data:image/gif;base64,R0lGODlhAQAB y")
+    assert "payload omitted: image/gif" in short_uri and "R0lGODlhAQAB" not in short_uri
     # a bare base64 run at/above the threshold is elided; short tokens survive
     bare = "Z" * 4096
     s2 = _executor._sanitize_tail("head " + bare + " tail")
     assert "payload omitted: base64" in s2 and bare not in s2
     assert "Zm9vYmFyYmF6" in _executor._sanitize_tail("token=Zm9vYmFyYmF6 done")  # short: kept
-    # base64URL alphabet (-, _) must NOT bypass elision (review finding #2)
+    # base64URL alphabet (-, _) must NOT bypass elision (finding #2)
     url_blob = ("aB-_" * 1500)  # 6000 chars of base64url
     s3 = _executor._sanitize_tail("x " + url_blob + " y")
     assert "payload omitted" in s3 and url_blob not in s3
     # --max-tool-output-bytes lowers the threshold; a huge value never crashes
     assert "payload omitted" in _executor._sanitize_tail("x" + ("Q" * 200) + "y", max_blob_bytes=100)
     assert _executor._sanitize_tail("hello", max_blob_bytes=10 ** 15) == "hello"  # no OverflowError
+    # a threshold above the captured length still elides a window-filling run
+    # (finding #2: no leak when the tail is a truncated view of a longer payload)
+    assert "payload omitted" in _executor._sanitize_tail("Q" * 5000, max_blob_bytes=10 ** 9)
 
 
 def test_v1_model_mismatch_detection():
@@ -594,21 +600,23 @@ def test_v1_is_terminal_success_shared_gate():
 
 
 def test_v1_startup_noise_stripped_keeps_real_error():
-    # rec #9 / regression test 11: provider startup noise is collapsed to a
-    # marker while the real provider error and normal output survive. Anchored
-    # patterns only -- a legit error that merely mentions profile/hook survives
-    # (review finding #6: broad matching must not delete real diagnostics).
+    # rec #9 / regression test 11: ONLY the unambiguous skill-loader noise is
+    # collapsed. Generic PowerShell error frames are indistinguishable from a real
+    # TASK error, so they are NOT stripped (findings: broad/generic matching must
+    # never delete a real diagnostic -- the whole point of the tail).
     import _executor
     raw = ("duplicate skill 'foo' already loaded\n"
-           "at C:\\x\\profile.ps1:12\n"
-           "CommandNotFoundException: bar\n"
-           "the user profile could not be updated: disk full\n"   # legit error, must survive
+           "skill bar already registered\n"
+           "at C:\\x\\profile.ps1:12\n"                            # generic PS frame -> SURVIVES
+           "CommandNotFoundException: baz\n"                       # generic -> SURVIVES
+           "the user profile could not be updated: disk full\n"   # legit error -> survives
            "IneligibleTierError: this client is no longer supported\n"
            "another real line")
     s = _executor._sanitize_tail(raw)
     assert "IneligibleTierError" in s and "another real line" in s        # real content kept
-    assert "the user profile could not be updated" in s                   # NOT a false positive
-    assert "duplicate skill" not in s and "profile.ps1" not in s          # anchored noise stripped
+    assert "the user profile could not be updated" in s                   # not a false positive
+    assert "profile.ps1" in s and "CommandNotFoundException" in s         # generic PS NOT stripped
+    assert "duplicate skill" not in s and "already registered" not in s   # skill-loader noise gone
     assert "startup noise suppressed" in s                                # marker present
     # the marker points at debug_file ONLY when one was created
     assert "re-run with --debug-dir" in s                                 # default: no debug file
