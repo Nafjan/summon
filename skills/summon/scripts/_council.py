@@ -589,10 +589,22 @@ def run_council(args) -> int:
                             _tag, on_spawn=lambda p: _register_and_gate(_tag, p),
                             on_reap=lambda p: _unregister_inflight(_tag))
         finally:
-            # on_reap already unregistered on the normal path (adjacent to the child's
-            # reap); this is the idempotent backstop for a spawn failure or an
-            # exception before reap. pop(default) makes the double-unregister a no-op.
-            _unregister_inflight(_tag)
+            # on_reap unregistered the child adjacent to its reap on the normal path,
+            # so it is already gone from `inflight` here. If it is STILL registered, its
+            # death was NOT proven -- a _kill_tree that did not land while a descendant
+            # held stdout. Do NOT blindly drop such a child: leave a still-LIVE one in the
+            # registry so the overall-timeout loop and the final-teardown sweep keep
+            # targeting it (never nullify the on_reap liveness guard here). Only reap a
+            # registered-but-now-dead straggler. poll() on a proc we own is safe.
+            with lock:
+                _leftover = inflight.get(_tag)
+            if _leftover is not None:
+                try:
+                    _still_alive = _leftover.poll() is None
+                except Exception:  # noqa: BLE001 — can't inspect -> keep it registered
+                    _still_alive = True
+                if not _still_alive:
+                    _unregister_inflight(_tag)
         if isinstance(env, dict) and _rd.owner_still_current(owner):
             # Owner-side annotation (fenced): the upstream-input hash is what
             # makes this stage carry-forwardable on a later resume.
@@ -1012,7 +1024,19 @@ def run_council(args) -> int:
         # be silently skipped. Fail loudly rather than trust the stale result.
         return _fail(f"run {run_id}: {e}", out_path)
     finally:
-        _overall_done.set()   # let the overall-timeout watchdog exit (no more killing)
+        # FINAL teardown sweep, BEFORE stopping the watchdog: any child still registered
+        # is one whose death run_stage could not confirm (a kill that did not land). Make
+        # a last, bounded effort to tear it down so we never return leaving a paid,
+        # filesystem-capable child running behind a "deliberation ended" envelope. Bounded
+        # to a few passes -- a genuinely unkillable proc is beyond our reach, but we retry
+        # rather than abandon it silently.
+        for _ in range(3):
+            with lock:
+                _remaining = bool(inflight)
+            if not _remaining:
+                break
+            _kill_inflight()
+        _overall_done.set()   # NOW let the overall-timeout watchdog exit (no more sweeps)
         # The run dir PERSISTS (that is the whole point); only our ownership ends.
         _rd.release_owner(owner)
 
