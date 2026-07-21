@@ -533,10 +533,16 @@ def test_v1_output_tail_elides_base64_payload():
         out = _executor._sanitize_tail("pre " + uri + " post")
         payload = uri.split("base64,", 1)[1]
         assert "payload omitted" in out and payload not in out, uri
-    # mime is recovered for the common (in-window) forms
+    # mime is recovered for the common forms
     assert "image/gif" in _executor._sanitize_tail("DATA:image/gif;base64,R0lGODlhAQAB")
     assert "image/svg+xml" in _executor._sanitize_tail(
         "data:image/svg+xml;charset=utf-8;base64,PHN2Zz4=")
+    # whitespace after ;base64, must NOT smuggle a short payload past detection
+    ws = _executor._sanitize_tail("data:text/plain;base64, QUJDRA== end")
+    assert "payload omitted" in ws and "QUJDRA==" not in ws
+    # prose that merely CONTAINS ";base64," (no data: scheme) must SURVIVE verbatim
+    prose = "choose the diagnostic option;base64,QUJDRA== please"
+    assert _executor._sanitize_tail(prose) == prose
     # a bare base64 run at/above the threshold is elided; short tokens survive
     bare = "Z" * 4096
     s2 = _executor._sanitize_tail("head " + bare + " tail")
@@ -598,22 +604,39 @@ def test_v1_normalized_success_exit_fields():
     assert "backend_exit_code" not in _executor.finalize_exit_fields({"agents": []})
 
 
-def test_v1_debug_and_crash_emission_paths():
-    # The two edge paths reopened by the review: a failed debug write must not make
-    # the tail advertise a debug_file, and the last-resort crash envelope must
-    # still carry the exit-code-clarity fields.
+def test_v1_finalize_diagnostics_wiring():
+    # Exercises the ACTUAL _stamp wiring (via the extracted _finalize_diagnostics):
+    # debug_available is derived from whether _write_debug really wrote a file, so
+    # the tail's marker can never name a nonexistent debug_file.
     import _executor
-    import run_subagent
-    # _write_debug returns None when the dir can't be created (path under a file),
-    # so _stamp passes debug_available=False -> marker advises --debug-dir.
-    f = os.path.join(tempfile.gettempdir(), f"summon-notadir-{os.getpid()}")
+    noise = "duplicate skill x already loaded\nreal diagnostic line"
+    # (a) a writable debug dir -> debug_file is set AND the marker names it
+    d = tempfile.mkdtemp(prefix="summon-dbg-")
+    resp = {"cli": "codex", "status": "error", "output_tail": noise}
+    _executor._finalize_diagnostics(resp, noise, d, ["codex"], None)
+    assert resp.get("debug_file") and "see debug_file" in resp["output_tail"]
+    assert "real diagnostic line" in resp["output_tail"]           # real content kept
+    # (b) an UNCREATABLE debug dir (under a regular file) -> no debug_file field,
+    #     marker advises --debug-dir (no phantom reference)
+    f = os.path.join(tempfile.gettempdir(), f"summon-nf-{os.getpid()}")
     with open(f, "w", encoding="utf-8") as fh:
         fh.write("x")
+    resp2 = {"cli": "codex", "status": "error", "output_tail": noise}
     try:
-        assert _executor._write_debug(os.path.join(f, "sub"), ["cli"], "raw", {"cli": "x"}) is None
+        _executor._finalize_diagnostics(resp2, noise, os.path.join(f, "sub"), ["codex"], None)
     finally:
         os.remove(f)
-    # crash envelope (bypass-emission path) carries the fields inline
+    assert "debug_file" not in resp2 and "re-run with --debug-dir" in resp2["output_tail"]
+    # (c) no debug dir at all -> still sanitized, still advises --debug-dir
+    resp3 = {"cli": "codex", "status": "error", "output_tail": noise}
+    _executor._finalize_diagnostics(resp3, noise, None, ["codex"], None)
+    assert "debug_file" not in resp3 and "duplicate skill" not in resp3["output_tail"]
+
+
+def test_v1_crash_envelope_carries_exit_fields():
+    # The last-resort crash envelope (a bypass-emission path) must still carry the
+    # exit-code-clarity fields inline.
+    import run_subagent
     env = run_subagent._crash_envelope(RuntimeError("boom"))
     assert env["status"] == "error" and env["backend_exit_code"] == 1
     assert env["dispatcher_status"] == "error" and "RuntimeError" in env["normalization_reason"]
