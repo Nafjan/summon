@@ -361,6 +361,79 @@ def test_doctor_all_missing_is_fail_soft():
     text.encode("ascii")  # raises if any non-ASCII marker sneaks in
 
 
+def test_v2_classify_ineligibility():
+    # rec #3: recognize the known "binary runs but account/client can't dispatch"
+    # signatures a --version probe misses.
+    import _doctor
+    v = _doctor.classify_ineligibility(
+        "Error: IneligibleTierError: This client is no longer supported for "
+        "Gemini Code Assist for individuals")
+    assert v and v["eligible"] is False and v["backend"] == "gemini" and v["guidance"]
+    assert _doctor.classify_ineligibility("no longer supported for Gemini Code Assist") is not None
+    assert _doctor.classify_ineligibility("all good, ready to dispatch") is None
+    assert _doctor.classify_ineligibility("") is None
+    assert _doctor.classify_ineligibility(None) is None
+
+
+def test_v2_probe_eligibility_tiers():
+    # regression test 5: a simulated IneligibleTierError marks the backend
+    # ineligible with guidance; a clean probe marks it eligible.
+    import _doctor
+    def fake(name, path):
+        return "IneligibleTierError: no longer supported" if name == "gemini" else "pong ok"
+    backends = {n: {"found": True, "verified": True, "path": "/x/" + n, "binary_ok": True,
+                    "auth_ok": None, "account_eligible": None, "model_access_verified": None}
+                for n in ("gemini", "claude")}
+    _doctor._probe_eligibility(backends, runner=fake)
+    g = backends["gemini"]
+    assert g["account_eligible"] is False and g["auth_ok"] is False and g["guidance"]
+    c = backends["claude"]
+    assert c["account_eligible"] is True and c["model_access_verified"] is True
+    # a not-found/unverified backend is skipped by the probe (stays unverified)
+    skip = {"z": {"found": False, "verified": False}}
+    _doctor._probe_eligibility(skip, runner=fake)
+    assert skip["z"].get("account_eligible") is None
+
+
+def test_v2_doctor_honest_labels_and_render():
+    import _doctor
+    # default (no probe): eligibility is UNVERIFIED and never claimed; render says
+    # so honestly and points at --probe instead of over-promising [OK] ready.
+    rep = _doctor.doctor()
+    assert rep["eligibility_probed"] is False and rep["ineligible_backends"] == []
+    for b in rep["backends"].values():
+        assert b["binary_ok"] == b["found"] and b["account_eligible"] is None
+    text = _doctor.render(rep)
+    assert "eligibility unverified" in text and "doctor --probe" in text
+    text.encode("ascii")  # ASCII-safe markers
+    # a confirmed-ineligible backend renders with [!!] + migration guidance
+    rep["backends"]["gemini"] = {
+        "found": True, "verified": True, "path": "/x/gemini", "version": "1.0",
+        "auth_hint": "gemini login", "binary_ok": True, "account_eligible": False,
+        "guidance": "use GEMINI_API_KEY or the agy backend"}
+    rep["ineligible_backends"] = ["gemini"]
+    rep["eligibility_probed"] = True
+    text2 = _doctor.render(rep)
+    assert "INELIGIBLE" in text2 and "agy backend" in text2
+    text2.encode("ascii")
+
+
+def test_v2_dispatch_attaches_eligibility():
+    # the incident's actual failure moment: a dispatch that hits IneligibleTierError
+    # gets an eligibility field + migration warning, never a bare error.
+    import _executor
+    bad = {"status": "error",
+           "error": "IneligibleTierError: this client is no longer supported",
+           "output_tail": ""}
+    _executor._attach_eligibility(bad)
+    assert bad.get("eligibility", {}).get("backend") == "gemini"
+    assert any("not eligible" in w for w in bad.get("warnings", []))
+    # a SUCCESS envelope is never annotated, even if its text mentions the phrase
+    ok = {"status": "success", "error": None, "output_tail": "mentions IneligibleTierError"}
+    _executor._attach_eligibility(ok)
+    assert "eligibility" not in ok
+
+
 def test_doctor_json_roundtrip():
     import json as _json
     import _doctor

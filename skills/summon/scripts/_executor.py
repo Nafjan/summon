@@ -295,6 +295,28 @@ def _sanitize_tail(raw: str, max_blob_bytes: int | None = None,
     return _strip_startup_noise(_elide_payloads(raw, thresh), debug_available)
 
 
+def _attach_eligibility(resp: dict) -> dict:
+    """Account/client-eligibility failures (e.g. Gemini IneligibleTierError) look
+    like a generic error; recognize the known signatures in a NON-success envelope
+    and attach concrete migration guidance (an `eligibility` field + a warning) so
+    the caller is never left guessing. Lazy import avoids a module cycle (_doctor's
+    live probe imports _executor). Advisory only, never fatal."""
+    if not isinstance(resp, dict) or resp.get("status") == "success":
+        return resp
+    try:
+        from _doctor import classify_ineligibility
+        verdict = classify_ineligibility(
+            f"{resp.get('error') or ''} {resp.get('output_tail') or ''}")
+    except Exception:  # noqa: BLE001
+        verdict = None
+    if verdict is not None:
+        resp["eligibility"] = verdict
+        resp.setdefault("warnings", []).append(
+            f"backend '{verdict['backend']}' account/client is not eligible: "
+            f"{verdict['guidance']}")
+    return resp
+
+
 def _finalize_diagnostics(resp: dict, raw, debug_dir, debug_argv,
                           max_tool_output_bytes) -> dict:
     """Write the debug transcript (if requested) then sanitize output_tail, with
@@ -916,6 +938,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                             "on --resume); if it was Fable this bills account credit"}
         raw = resp.pop("_debug_raw", None)
         _finalize_diagnostics(resp, raw, debug_dir, debug_argv, max_tool_output_bytes)
+        _attach_eligibility(resp)
         return resp
 
     # API-kind backends (e.g. openai-compat): the backend performs the request
