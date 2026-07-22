@@ -63,3 +63,39 @@ serving via `model.resolved` at snapshot time:
 Cross-vendor routing rule of thumb: never have an agent's work reviewed by its own
 vendor — send claude/cursor-written code to a codex reviewer and codex-written code to
 a claude reviewer (see [docs/PROTOCOL.md](https://github.com/Nafjan/summon/blob/main/docs/PROTOCOL.md)).
+
+## Cursor as a cross-vendor model gateway (with a Cursor subscription)
+
+The `cursor-agent` backend is not limited to Composer. A Cursor subscription exposes a
+large, multi-vendor model roster through the SAME CLI: GPT-5.x (including the codex,
+sol, terra, and luna families), Claude (Opus 4.5-4.8, Sonnet 4-5, Fable 5), Gemini 3.x,
+Grok 4.5, GLM 5.2, and Kimi K2.7. Query the live list with `cursor-agent models` (it
+changes as Cursor adds models). Because summon passes `--model` through verbatim, any of
+them is reachable through summon with no code change:
+
+```
+run_subagent.py --agent coder --cli cursor-agent --model claude-opus-4-8-thinking-high --prompt "..."
+run_subagent.py --agent coder --cli cursor-agent --model gpt-5.6-sol-high --prompt "..."
+```
+
+Cursor's parameterized model syntax works too (the string is forwarded untouched):
+`--model 'claude-opus-4-8[context=1m,effort=high,fast=false]'`.
+
+**Why this matters:** for a user who already has a Cursor sub, the `cursor-agent` backend
+is a practical **cross-vendor fallback**: a way to reach GPT, Claude, Gemini, Grok, and
+more WITHOUT a separate API key or per-vendor subscription for each. It pairs well with
+the fan-out/council modes when a specific vendor's CLI is unavailable or rate-limited: point
+a member at `--cli cursor-agent --model <id>` instead.
+
+**Billing.** These draw from the Cursor subscription's own included usage (metered in
+dollars, but included in the plan, not a separate bill). A CLI-login cursor dispatch
+reports `billing.source: "subscription"` in the envelope. Note Cursor flags some models
+`NO ZDR` (e.g. Fable 5); mind data retention if that matters for your work. As always,
+`cost_usd`/`usage` are the CLI's list-price estimates, not your actual Cursor invoice.
+
+**Login is required: a logged-out `cursor-agent` fails dispatches.** If the CLI's auth
+expires, every cursor dispatch errors until you re-authenticate. Check with `cursor-agent
+status` and fix with `cursor-agent login`. The dispatch envelope surfaces this as an `auth`
+diagnostic when the CLI emits a recognized phrase; `--doctor` also probes backend
+eligibility. If cursor dispatches start failing for no obvious reason, verify the login
+first.
