@@ -120,7 +120,8 @@ def _owned_prerefresh_backups(parent: str) -> list:
     try:
         for name in os.listdir(parent):
             p = os.path.join(parent, name)
-            if name.startswith("summon.pre-refresh-") and os.path.isdir(p) and _owned(p):
+            if (name.startswith("summon.pre-refresh-") and os.path.isdir(p)
+                    and not os.path.islink(p) and _owned(p)):
                 out.append(name)
     except OSError:
         pass
@@ -276,12 +277,6 @@ def install_skill(host: str, dry: bool) -> tuple:
                 shutil.rmtree(p, ignore_errors=True)
         if os.path.isdir(backup) and _owned(backup):
             shutil.rmtree(backup, ignore_errors=True)
-        # Sweep OUR old-scheme pre-refresh backups: a pre-V6 installer left
-        # summon.pre-refresh-<ts> dirs here, each of which the host loads as a DUPLICATE
-        # 'summon' skill (field incident). Owned-only, so nothing foreign is ever touched.
-        swept_backups = _owned_prerefresh_backups(parent)
-        for _b in swept_backups:
-            shutil.rmtree(os.path.join(parent, _b), ignore_errors=True)
 
         staging = tempfile.mkdtemp(prefix="summon.staging-", dir=parent)
         # Manifest goes in FIRST: even a half-copied staging dir is then
@@ -296,9 +291,22 @@ def install_skill(host: str, dry: bool) -> tuple:
         staging = None
         if os.path.isdir(backup) and _owned(backup):
             shutil.rmtree(backup, ignore_errors=True)
+        # Sweep OUR old-scheme pre-refresh backups ONLY NOW -- after the new skill is safely
+        # in `dest`. A pre-V6 installer left summon.pre-refresh-<ts> dirs here, each loaded by
+        # the host as a DUPLICATE 'summon' (field incident). Post-swap means an owned backup is
+        # NEVER the only copy we deleted ahead of a build that then fails (data-loss). Each
+        # candidate is re-validated as OURS and not a symlink at the delete site (closes the
+        # check-then-delete window), and only a CONFIRMED removal is counted.
+        swept_backups = 0
+        for _b in _owned_prerefresh_backups(parent):
+            p = os.path.join(parent, _b)
+            if os.path.isdir(p) and not os.path.islink(p) and _owned(p):
+                shutil.rmtree(p, ignore_errors=True)
+                if not os.path.exists(p):
+                    swept_backups += 1
         msg = f"[ok]  skill installed -> {dest}"
         if swept_backups:
-            msg += f"; swept {len(swept_backups)} stale pre-refresh backup(s)"
+            msg += f"; swept {swept_backups} stale pre-refresh backup(s)"
         return (msg, True)
     except OSError as e:
         # Roll back: if the swap half-happened, restore the owned backup.

@@ -5155,21 +5155,65 @@ def _w_skill_md(skill_dir, name):
 
 
 def test_v6_skill_md_name_parsing():
-    # _skill_md_name reads the frontmatter name; fail-soft on no-frontmatter/missing.
+    # _skill_md_name honors ONLY a CLOSED top-level frontmatter name; fail-soft on every
+    # malformed/hostile shape a codex review reproduced (BOM, inline comment, nesting,
+    # unclosed block, oversize, missing file).
     import _installs
     d = tempfile.mkdtemp(prefix="summon-name-")
+    md = os.path.join(d, "SKILL.md")
+
+    def _w(text):
+        with open(md, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
     try:
-        with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as fh:
-            fh.write('---\nname: "summon"\ndescription: x\n---\nbody\n')
-        assert _installs._skill_md_name(d) == "summon"          # quotes stripped
-        with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as fh:
-            fh.write("no frontmatter here\nname: notinfrontmatter\n")
-        assert _installs._skill_md_name(d) is None              # no leading --- block
-        os.remove(os.path.join(d, "SKILL.md"))
-        assert _installs._skill_md_name(d) is None              # missing file
+        _w('---\nname: "summon"\ndescription: x\n---\nbody\n')
+        assert _installs._skill_md_name(d) == "summon"           # quotes stripped
+        _w('\ufeff---\nname: summon\n---\n')
+        assert _installs._skill_md_name(d) == "summon"           # UTF-8 BOM tolerated
+        _w('---\nname: summon # actually a comment\n---\n')
+        assert _installs._skill_md_name(d) == "summon"           # inline comment dropped
+        _w('---\nmetadata:\n  name: summon\ndescription: x\n---\n')
+        assert _installs._skill_md_name(d) is None               # nested key, not top-level
+        _w('---\nname: summon\nno closing delimiter\nname: other\n')
+        assert _installs._skill_md_name(d) is None               # unclosed block -> not valid
+        _w("no frontmatter here\nname: body\n")
+        assert _installs._skill_md_name(d) is None               # no leading --- block
+        with open(md, "wb") as fh:                               # oversize -> (None, note); no crash
+            fh.write(b"---\nname: summon\n---\n" + b"x" * (_installs._SKILL_MD_MAX + 16))
+        assert _installs._skill_md_name(d) is None
+        os.remove(md)
+        assert _installs._skill_md_name(d) is None               # missing file
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v6_duplicate_merge_survives_symlink_alias_collapse():
+    # Two hosts sharing ONE physical summon (symlink alias) can still have different skills
+    # dirs; a duplicate visible only from the aliased host must survive the record collapse,
+    # else `converged` is falsely True. Skips where symlinks need privilege (some Windows).
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-symdupe-")
+    try:
+        files = {"run_subagent.py": '__version__ = "1.0.0"\n', "_x.py": "x = 1\n"}
+        run = _mk_summon_install(home, ".claude", files)             # real copy under .claude
+        codex_summon = os.path.join(home, ".codex", "skills", "summon")
+        os.makedirs(os.path.dirname(codex_summon), exist_ok=True)
+        try:
+            os.symlink(os.path.join(home, ".claude", "skills", "summon"),
+                       codex_summon, target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            return                                                    # no symlink privilege -> skip
+        _w_skill_md(os.path.join(home, ".codex", "skills", "summon.pre-refresh-1"), "summon")
+        recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
+        dr = _installs.drift_report(recs)
+        all_dirs = [x for d in dr["duplicates"] for x in d["dirs"]]
+        assert any(p.endswith("summon.pre-refresh-1") for p in all_dirs), (dr["duplicates"], all_dirs)
+        assert dr["converged"] is False, dr
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
 
 
 def test_v6_duplicate_summon_skills_detects_dupe_not_alias():
