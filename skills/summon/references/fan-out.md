@@ -128,6 +128,62 @@ elapsed_ms}`. Progress → stderr. Use it for architecture calls, tech-selection
 judgments — anything where one model's blind spot is real and consensus (or named
 dissent) is the deliverable.
 
+## Large or multimodal reviews (PDF / XLSX / image-heavy): the robust pattern
+
+Convening one all-in-one `--council` directly over a big multimodal corpus (a slide deck,
+spreadsheets, raw images) is a known failure mode: a single member reading a full-resolution
+base64 image can blow its context or its timeout, and one member's stall drags the whole
+council. For heavy inputs, DECOMPOSE instead of convening directly:
+
+1. **Bounded, role-specific packets.** Split the corpus into small per-seat packets (one
+   reviewer gets the financial tables, another the GTM narrative, another the risk section)
+   and write each to a file under `--cwd`. Never inline a large payload into a `--prompt`; use
+   `prompt_file` (manifest) or `--question-file` so backend argv limits and per-member context
+   budgets are respected.
+2. **Manifest fan-out with independent envelopes.** Run the seats as a `--manifest` swarm, not
+   a single council: each job lands its OWN envelope under `--results-dir`, so one seat's
+   timeout or contract miss never discards another seat's completed report. Per-job `timeout`
+   and `--retries` isolate the flaky seats.
+3. **No full-resolution image reads unless the seat is explicitly visual.** Give only the
+   designated visual seat the raw images; text seats get extracted text or a downscaled
+   thumbnail. A text model handed a multi-megabyte base64 image wastes tokens and risks a
+   timeout for no analytical gain. (`output_tail` payload elision keeps such blobs out of the
+   diagnostics, but the real fix is to not feed them in the first place.)
+4. **A separate chair over the SAVED reports.** Once the seats have landed their envelopes, run
+   a second small step whose input is ONLY the persisted valid reports (the `--results-dir`
+   envelopes), never the raw corpus. Synthesizing from bounded text keeps this step fast and
+   cheap and free of the heavy inputs. Use `--council --question-file` (the question pointing at
+   the saved report paths) or a single `chairman`-agent dispatch.
+5. **Local verification of chair findings.** Before acting, spot-check the chair's cited lines
+   against the source locally. A synthesizer can misattribute; the saved per-seat envelopes
+   plus the raw source are the ground truth.
+
+This decomposition completed successfully in the field where a direct all-in-one council over
+the same corpus did not: it bounds every context, isolates failures to one seat, and keeps the
+synthesis step small.
+
+### Timeout budget: a worked example
+
+A council's wall clock is ADDITIVE (members in waves, then the chairman), so the single most
+common operational error is a HOST timeout at or below the run's real budget, which kills the
+dispatcher mid-report. Compute the budget, then set the host tool's own timeout ABOVE it.
+
+Example: 4 members on 4 distinct backends (so one wave), `--rounds 2`, a `--chairman` with a
+`--chairman-fallback`, `--member-timeout 300s`, `--chair-timeout 600s`:
+
+- waves per round = ceil(same-backend members / 3) = **1** (four distinct backends).
+- member phase = `member-timeout + 60s` watchdog margin = 360s, times `rounds x waves` (2 x 1)
+  = **720s**.
+- chairman phase = `chair-timeout + 60s` = 660s, doubled for the fallback = **1320s**.
+- worst case ~ 720 + 1320 = **2040s (~34 min)**. The dispatcher prints exactly this estimate to
+  stderr before dispatching.
+- **Set the host tool's own `timeout_ms` ABOVE that** (e.g. `2200000`), and pass `--out` so a
+  host kill still leaves every completed stage on disk (resume picks up the rest for free).
+
+Give members and the chairman SEPARATE clocks (`--member-timeout` / `--chair-timeout`) so a
+slow member can never eat the chairman's reserve, and prefer the decomposition above for heavy
+inputs so no single seat ever needs a large timeout in the first place.
+
 ## Durable, resumable council runs
 
 Every council writes a **persistent run directory** (`{cwd}/.agents/runs/<run-id>/`;
