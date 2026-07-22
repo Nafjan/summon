@@ -125,10 +125,19 @@ run_subagent.py --council --question-file q.md \
   kill the dispatcher mid-report. Queued members and the fallback chairman are excluded once the
   budget is spent, and setup counts against it. Use it as a safety net UNDER the host timeout on
   any council you must bound (one Windows caveat: see `KNOWN_ISSUES.md` / #10).
+- **`--min-successful-members N` is a PRE-deadline early exit** for "we have enough, go now".
+  Where `--overall-timeout` bounds the WORST case, this trims the BEST case: once N members
+  succeed in the final round, summon stops waiting for the rest -- it process-tree-kills the
+  in-flight stragglers and self-excludes the queued ones (via a repeated kill sweep + a
+  post-semaphore gate) and chairs the surviving quorum immediately. Returns
+  `council_state: early_exit`, `status: success` (the exclusions are intentional, not
+  failures), exit 0. Must be `2 <= N <= member count` and `>= --quorum` (if set). With
+  `--rounds 2` only the FINAL round early-exits -- round 1 runs in full so cross-examination
+  sees every position -- so a 2-round council still pays full price for round 1.
 - **Council consumes a fixed flag set** (`--question`/`--question-file`, `--members`,
   `--chairman`, `--chairman-fallback`, `--rounds`, `--quorum`, `--member-timeout`,
-  `--chair-timeout`, `--overall-timeout`, `--cwd`, `--agents-dir`, `--timeout`, `--out`,
-  `--run-dir`/`--results-dir`). Anything else (`--model`, `--json-schema`, `--worktree`,
+  `--chair-timeout`, `--overall-timeout`, `--min-successful-members`, `--cwd`, `--agents-dir`,
+  `--timeout`, `--out`, `--run-dir`/`--results-dir`). Anything else (`--model`, `--json-schema`, `--worktree`,
   `--background`, `--retries`, ...) is rejected up front rather than silently ignored; member
   model/effort/permission come from each member agent's own definition. (`--results-dir` here is
   an alias for the council `--run-dir`; in `--manifest` mode the same flag names the per-job
