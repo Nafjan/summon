@@ -431,6 +431,41 @@ def install_agents(dry: bool) -> list:
     return out, failed == 0
 
 
+def _drift_check() -> None:
+    """After a real install, confirm every managed host copy now hashes identically to the
+    source we just deployed, via the skill's own ``_installs`` detector (SAME hash as the
+    dispatch receipt and ``doctor``). Purely advisory: the ENTIRE body is fail-soft, so a
+    foreign/corrupt copy on the box can never turn a successful install into a traceback. A
+    lingering mismatch (a refresh refused or failed) is surfaced here at install time
+    instead of in the field."""
+    try:
+        scripts = os.path.join(SKILL_SRC, "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import _installs  # noqa: E402 - the skill's own detector, sourced from what we install
+        dr = _installs.drift_report(_installs.enumerate_installs(running_scripts_dir=scripts))
+        ref = dr["reference_sha"]
+        if not ref:
+            return
+        stale = [r for r in dr["drifted"] if r.get("managed")]
+        unknown = [r for r in dr["unknown"] if r.get("managed")]
+        ok = [r for r in dr["hashed"] if r.get("managed") and r["sha256"] == ref]
+        if stale or unknown:
+            bits = []
+            if stale:
+                bits.append(f"{len(stale)} differ ({', '.join(s['label'] for s in stale)})")
+            if unknown:
+                bits.append(f"{len(unknown)} unhashable ({', '.join(u['label'] for u in unknown)})")
+            print(f"\n[~?] install-drift: {'; '.join(bits)} from the source - a refresh was "
+                  "refused or failed; re-run, or move a foreign copy aside")
+        elif ok:
+            print(f"\n[ok] install-drift: all {len(ok)} installed host copy(ies) match the source")
+    except Exception:  # noqa: BLE001 - swallow any ORDINARY error (a non-ASCII console, a
+        pass           # closed pipe, a foreign copy) so drift-checking never breaks a
+        #                successful install; KeyboardInterrupt/SystemExit deliberately still
+        #                propagate (a user's Ctrl-C must not be eaten by an advisory check).
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--hosts", help="comma-separated subset (default: all detected)")
@@ -481,6 +516,9 @@ def main() -> int:
         for line in lines:
             print(line)
         all_ok &= agents_ok  # a failed starter-agent copy must not exit 0
+
+    if not args.uninstall and not args.dry_run:
+        _drift_check()   # confirm the just-installed host copies all converged
 
     if not args.uninstall:
         shim = os.path.join(HERE, "summon.py")

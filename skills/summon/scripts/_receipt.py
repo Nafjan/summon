@@ -12,10 +12,90 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import stat as _stat
 import subprocess
 from pathlib import Path
 
 from _loader import bundled_roster_dir
+
+
+def _read_regular_bounded(path, max_bytes):
+    """Open ``path`` NON-BLOCKING (O_NONBLOCK on POSIX) so a FIFO/device named ``*.py``
+    cannot hang us at ``open()`` (opening a FIFO for read blocks until a writer appears),
+    fstat the HANDLE, and return one of:
+      - (bytes, None)           a regular file; content read up to ``max_bytes`` (+1 so a
+                                file that GREW past the bound on the handle is detectable)
+      - (None, 'nonfile')       not a regular file (FIFO/device/dir, incl. behind a symlink)
+      - (None, 'oversize:<N>')  a regular file larger than ``max_bytes``
+    Raises OSError on any open/read/stat failure; the fd is ALWAYS closed. Windows has no
+    O_NONBLOCK and no filesystem FIFOs on a scripts path, so it degrades to a normal open."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            return None, "nonfile"
+        if st.st_size > max_bytes:
+            return None, "oversize:" + str(st.st_size)
+        data = b""
+        while len(data) <= max_bytes:          # loop: os.read may short-read a regular file
+            chunk = os.read(fd, max_bytes + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data, None
+    finally:
+        os.close(fd)
+
+
+def scripts_sha256(scripts_dir, max_bytes=None) -> str:
+    """One SHA-256 over EVERY production module in ``scripts_dir`` (all ``*.py``
+    except test_discovery.py, which never executes at dispatch time). Length-prefixed
+    framing (``len(name)|name|len(data)|data``, names sorted) so (name, content)
+    boundaries are unambiguous and drift in ANY sibling (incl. agy_pty_pyte.py), not
+    just the entry file, is detectable.
+
+    SINGLE source of truth for install identity: the dispatch receipt and the
+    install-drift detector both hash the same way, so a hash difference is always a
+    REAL code divergence, never an algorithm mismatch. A missing/unreadable module
+    hashes as empty content (kept diagnosable, never raises).
+
+    ``max_bytes`` bounds the work per file so hashing a FOREIGN copy (drift enumeration
+    of OTHER installs) cannot exhaust memory: a non-regular file (a symlink to a device
+    or FIFO) is hashed by a marker instead of read, and a file larger than ``max_bytes``
+    is hashed by a name+size marker without reading its content. The dispatch receipt
+    passes ``max_bytes=None`` (EXACT legacy behavior, hashing the operator's OWN trusted
+    install); every real, small, regular module hashes identically under either, so drift
+    detection still matches the receipt for any genuine copy."""
+    here = Path(scripts_dir)
+    h = hashlib.sha256()
+    for name in sorted(p.name for p in here.glob("*.py") if p.name != "test_discovery.py"):
+        target = here / name
+        try:
+            if max_bytes is None:
+                data = target.read_bytes()        # RECEIPT path: EXACT legacy behavior
+            else:
+                # BOUNDED path (enumerating OTHER copies): non-blocking open + fstat the
+                # HANDLE + bounded read from that same handle -- so neither a FIFO/device
+                # named *.py (blocking open), nor a path repointed to a huge file between a
+                # stat and the read (TOCTOU), nor an unbounded read, can hang or blow memory.
+                payload, note = _read_regular_bounded(str(target), max_bytes)
+                if note == "nonfile":
+                    data = b"\x00__nonfile__"
+                elif note is not None:            # "oversize:<N>"
+                    data = b"\x00__" + note.encode("ascii")
+                elif len(payload) > max_bytes:    # grew past the bound on this handle
+                    data = b"\x00__oversize__:racy"
+                else:
+                    data = payload
+        except OSError:
+            data = b""
+        nb = name.encode("utf-8")
+        h.update(len(nb).to_bytes(8, "big"))
+        h.update(nb)
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return h.hexdigest()
 
 
 def receipt_base(entry_path: str, version: str) -> dict:
@@ -25,24 +105,9 @@ def receipt_base(entry_path: str, version: str) -> dict:
     name run_subagent.py; ``here`` is that file's directory (this module is a
     sibling, so the scripts dir is the same either way)."""
     here = Path(entry_path).resolve().parent
-    h = hashlib.sha256()
-    # One SHA over EVERY production module (incl. agy_pty_pyte.py -- drift lives
-    # in siblings, not just the entry file). Length-prefixed framing so
-    # (name, content) boundaries are unambiguous. test_discovery.py is excluded:
-    # it never executes at dispatch time.
-    for name in sorted(p.name for p in here.glob("*.py") if p.name != "test_discovery.py"):
-        try:
-            data = (here / name).read_bytes()
-        except OSError:
-            data = b""
-        nb = name.encode("utf-8")
-        h.update(len(nb).to_bytes(8, "big"))
-        h.update(nb)
-        h.update(len(data).to_bytes(8, "big"))
-        h.update(data)
     return {"summon": {"version": version,
                        "script": str(Path(entry_path).resolve()),
-                       "scripts_sha256": h.hexdigest()}}
+                       "scripts_sha256": scripts_sha256(here)}}
 
 
 def receipt_agent(args: argparse.Namespace, agent_file: str) -> dict:
