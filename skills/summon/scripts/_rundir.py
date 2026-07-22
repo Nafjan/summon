@@ -115,9 +115,9 @@ def atomic_write_json(path: str, obj: dict) -> None:
                 if _attempt == 4:
                     raise
                 time.sleep(0.05 * (_attempt + 1))
-    except OSError:
-        try:
-            os.unlink(tmp)
+    except BaseException:   # noqa: BLE001 - clean up the temp on ANY failure, not just OSError:
+        try:                # a non-serializable obj raises TypeError from json.dump and would
+            os.unlink(tmp)  # otherwise leak a partially-written .summon-run-*.tmp. Re-raised below.
         except OSError:
             pass
         raise

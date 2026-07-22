@@ -3614,7 +3614,9 @@ def test_v4_council_summary():
     s = _council._council_summary(views, run_id="council-x", results_dir="/runs/x",
                                   chair_status="success", quorum_met=True)
     assert s["members_requested"] == 3 and s["members_succeeded"] == 1
-    assert {f["agent"] for f in s["members_failed"]} == {"b", "c"}
+    # genuine failures (error) and intentional exclusions (excluded) are kept apart
+    assert {f["agent"] for f in s["members_failed"]} == {"b"}
+    assert {f["agent"] for f in s["members_excluded"]} == {"c"}
     assert s["quorum_met"] is True and s["chair_status"] == "success"
     assert s["results_dir"] == "/runs/x" and s["resume_available"] is True
 
@@ -5876,6 +5878,102 @@ def test_v4b_resume_reruns_early_exit_killed_members():
         _council._dispatch, _executor._kill_tree = orig_d, orig_k
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
+
+
+def test_v4b_early_exit_sweep_does_not_kill_chairman():
+    # Codex CRITICAL: a sweep already PAST its _early_done check must not kill the CHAIRMAN
+    # after disarm. The chair registers via on_spawn (like a real dispatch) and sleeps to widen
+    # any stray-sweep window; because _early_disarm JOINS the sweeper before synthesis, the
+    # chair survives -> status success (early_exit), not a synthesis_failed partial.
+    import _council
+    import _executor
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    import time as _t
+    root = tempfile.mkdtemp(prefix="summon-v4bchair-")
+    _mk_agents(root, ["f0", "f1", "s0", "s1", "chair"])
+    killed = {}
+    chair_killed = {"v": False}
+
+    class FakeProc:
+        def __init__(self, tag):
+            self.tag = tag
+            self.pid = -1
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        if agent == "chair":
+            fp = FakeProc(tag)
+            if on_spawn:
+                on_spawn(fp)                 # register like a real dispatch: a stray sweep COULD hit it
+            _t.sleep(0.3)                    # widen the window for a stray early-exit sweep
+            if not fp._alive:
+                chair_killed["v"] = True
+                return {"status": "error", "result": "chair killed", "report": {"summary": "chair"}}
+            return {"status": "success", "result": "chair", "report": {"summary": "chair"}}
+        if agent in ("f0", "f1"):
+            return {"status": "success", "result": agent, "report": {"summary": agent}}
+        ev = threading.Event()               # s0, s1: block -> killed by the early-exit sweep
+        killed[tag] = ev
+        if on_spawn:
+            on_spawn(FakeProc(tag))
+        ev.wait(15)
+        return {"status": "error", "result": agent, "report": {"summary": agent}}
+
+    def fake_kill(proc):
+        if hasattr(proc, "_alive"):
+            proc._alive = False
+        ev = killed.get(getattr(proc, "tag", None))
+        if ev:
+            ev.set()
+
+    ns = argparse.Namespace(question="q", question_file=None, members="f0,f1,s0,s1",
+                            chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
+                            timeout=30000, out=None, run_dir=root, min_successful=2)
+    orig_cap = _council._PER_BACKEND_CAP
+    _council._PER_BACKEND_CAP = 10
+    orig_d, orig_k = _council._dispatch, _executor._kill_tree
+    _council._dispatch, _executor._kill_tree = fake, fake_kill
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._PER_BACKEND_CAP = orig_cap
+        _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    assert not chair_killed["v"], "the early-exit sweep killed the chairman (disarm did not join)"
+    assert env.get("council_state") == "early_exit", env.get("council_state")
+    assert env["status"] == "success", env["status"]
+    assert env["synthesis"].get("recommendation"), "chair did not succeed"
+
+
+def test_v4b_atomic_write_cleans_temp_on_non_oserror():
+    # Codex NOTE: atomic_write_json must clean up its .summon-run-*.tmp on ANY failure, not
+    # only OSError. A non-serializable value raises TypeError from json.dump; the temp must not
+    # leak partial content.
+    import _rundir
+    d = tempfile.mkdtemp(prefix="summon-atomic-")
+    try:
+        raised = False
+        try:
+            _rundir.atomic_write_json(os.path.join(d, "x.json"), {"bad": object()})
+        except TypeError:
+            raised = True
+        assert raised, "expected a TypeError from a non-serializable value"
+        leftover = [f for f in os.listdir(d) if f.startswith(".summon-run-")]
+        assert not leftover, f"leaked temp file(s): {leftover}"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":
