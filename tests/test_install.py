@@ -103,6 +103,67 @@ def test_unowned_sibling_artifacts_survive_install():
         shutil.rmtree(home, ignore_errors=True)
 
 
+def _mk_owned_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, ".summon-install.json"), "w") as fh:
+        json.dump({"installed_by": "summon", "installed_at": 1, "files": []}, fh)
+    with open(os.path.join(path, "SKILL.md"), "w", encoding="utf-8") as fh:
+        fh.write("---\nname: summon\n---\nold backup\n")
+
+
+def test_owned_prerefresh_backup_swept_on_refresh():
+    # A pre-V6 installer left summon.pre-refresh-<ts> backups beside the live skill; the host
+    # loads each as a DUPLICATE 'summon'. A refresh must sweep OUR owned ones and report it.
+    home = _fake_home()
+    try:
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0, r.stdout + r.stderr
+        parent = os.path.join(home, ".claude", "skills")
+        orphan = os.path.join(parent, "summon.pre-refresh-20260718-1732")
+        _mk_owned_dir(orphan)
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert not os.path.isdir(orphan), "owned pre-refresh backup was not swept"
+        assert "pre-refresh" in r.stdout, r.stdout
+        assert os.path.isfile(os.path.join(_dest(home), "SKILL.md")), "live skill lost"
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_unowned_prerefresh_backup_survives_refresh():
+    # A dir that merely LOOKS like a pre-refresh backup but is NOT ours (no valid manifest)
+    # must NEVER be swept -- same marker-gated discipline as staging/previous.
+    home = _fake_home()
+    try:
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0, r.stdout + r.stderr
+        parent = os.path.join(home, ".claude", "skills")
+        orphan = os.path.join(parent, "summon.pre-refresh-userthing")
+        os.makedirs(orphan)
+        open(os.path.join(orphan, "USER_FILE"), "w").write("precious")   # no manifest -> not owned
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert os.path.isfile(os.path.join(orphan, "USER_FILE")), "non-owned dir wrongly swept"
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_dry_run_reports_prerefresh_sweep_without_touching_it():
+    home = _fake_home()
+    try:
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0, r.stdout + r.stderr
+        parent = os.path.join(home, ".claude", "skills")
+        orphan = os.path.join(parent, "summon.pre-refresh-20260718-1732")
+        _mk_owned_dir(orphan)
+        r = _run(home, "--hosts", "claude", "--no-agents", "--dry-run")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "sweep" in r.stdout and "pre-refresh" in r.stdout, r.stdout
+        assert os.path.isdir(orphan), "dry-run must not delete anything"
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_crash_recovery_restores_owned_backup():
     # Simulate: a prior run moved the good tree to .previous and died. The next
     # run must restore it (and then refresh it), never build-from-nothing while

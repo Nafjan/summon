@@ -398,6 +398,12 @@ def render(report: dict) -> str:
             lines.append(f"  drift    : {'; '.join(bits)} - run  python install.py  to converge")
         elif dr.get("converged") and len(dr.get("present", [])) > 1:
             lines.append("  drift    : all installed copies match the running install")
+        for d in (dr.get("duplicates") or []):
+            for path in d["dirs"]:
+                lines.append(f"  [!!] {d['label']:<10} DUPLICATE 'summon' skill also loaded: {path}")
+        if dr.get("duplicates"):
+            lines.append("  dupes    : the host loads each of the above as a 2nd 'summon' - "
+                         "re-run  python install.py  to sweep summon-owned backups, else remove by hand")
     lines += [
         "",
         f"usable backends: {', '.join(report['usable_backends']) or 'NONE'}",
