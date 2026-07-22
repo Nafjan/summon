@@ -107,6 +107,26 @@ def _owned(path: str) -> bool:
         return False
 
 
+def _owned_prerefresh_backups(parent: str) -> list:
+    """OUR ``summon.pre-refresh-*`` backup dirs in ``parent`` (the host's skills dir).
+
+    A pre-V6 installer named its refresh backups ``summon.pre-refresh-<timestamp>`` and left
+    them beside the live skill, where the host loads each as a DUPLICATE 'summon' skill
+    (the current installer stages in a temp dir and keeps an auto-deleted ``summon.previous``
+    instead, so it no longer creates these -- but it must sweep the orphans the old scheme
+    left). ONLY manifest-owned dirs are returned, so a user's unrelated dir is never touched.
+    Fail-soft + sorted."""
+    out = []
+    try:
+        for name in os.listdir(parent):
+            p = os.path.join(parent, name)
+            if name.startswith("summon.pre-refresh-") and os.path.isdir(p) and _owned(p):
+                out.append(name)
+    except OSError:
+        pass
+    return sorted(out)
+
+
 def _write_manifest(dst: str, files: list) -> None:
     with open(os.path.join(dst, MANIFEST), "w", encoding="utf-8") as fh:
         json.dump({"installed_by": "summon", "installed_at": int(time.time()),
@@ -221,7 +241,11 @@ def install_skill(host: str, dry: bool) -> tuple:
             return (f"[!!]  {dest} exists but was NOT installed by summon "
                     f"(no valid {MANIFEST}); refusing to replace it - move it aside first", False)
         verb = "refresh" if os.path.isdir(dest) else "install"
-        return (f"[dry] would {verb} skill -> {dest}", True)
+        stale = _owned_prerefresh_backups(parent)
+        msg = f"[dry] would {verb} skill -> {dest}"
+        if stale:
+            msg += f" (+ sweep {len(stale)} stale pre-refresh backup(s))"
+        return (msg, True)
 
     os.makedirs(parent, exist_ok=True)
     acq = _acquire_lock(HOSTS[host])   # lock the always-present host root
@@ -252,6 +276,12 @@ def install_skill(host: str, dry: bool) -> tuple:
                 shutil.rmtree(p, ignore_errors=True)
         if os.path.isdir(backup) and _owned(backup):
             shutil.rmtree(backup, ignore_errors=True)
+        # Sweep OUR old-scheme pre-refresh backups: a pre-V6 installer left
+        # summon.pre-refresh-<ts> dirs here, each of which the host loads as a DUPLICATE
+        # 'summon' skill (field incident). Owned-only, so nothing foreign is ever touched.
+        swept_backups = _owned_prerefresh_backups(parent)
+        for _b in swept_backups:
+            shutil.rmtree(os.path.join(parent, _b), ignore_errors=True)
 
         staging = tempfile.mkdtemp(prefix="summon.staging-", dir=parent)
         # Manifest goes in FIRST: even a half-copied staging dir is then
@@ -266,7 +296,10 @@ def install_skill(host: str, dry: bool) -> tuple:
         staging = None
         if os.path.isdir(backup) and _owned(backup):
             shutil.rmtree(backup, ignore_errors=True)
-        return (f"[ok]  skill installed -> {dest}", True)
+        msg = f"[ok]  skill installed -> {dest}"
+        if swept_backups:
+            msg += f"; swept {len(swept_backups)} stale pre-refresh backup(s)"
+        return (msg, True)
     except OSError as e:
         # Roll back: if the swap half-happened, restore the owned backup.
         if not os.path.isdir(dest) and os.path.isdir(backup) and _owned(backup):
@@ -460,6 +493,13 @@ def _drift_check() -> None:
                   "refused or failed; re-run, or move a foreign copy aside")
         elif ok:
             print(f"\n[ok] install-drift: all {len(ok)} installed host copy(ies) match the source")
+        dups = dr.get("duplicates") or []
+        if dups:
+            n = sum(len(d["dirs"]) for d in dups)
+            where = ", ".join(d["label"] for d in dups)
+            print(f"[~?] install-drift: {n} duplicate 'summon' skill dir(s) still loaded "
+                  f"({where}) - each shows as a 2nd summon in that host; re-run install.py for "
+                  "that host to sweep owned backups, or remove a non-owned copy by hand")
     except Exception:  # noqa: BLE001 - swallow any ORDINARY error (a non-ASCII console, a
         pass           # closed pipe, a foreign copy) so drift-checking never breaks a
         #                successful install; KeyboardInterrupt/SystemExit deliberately still

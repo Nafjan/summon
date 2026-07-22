@@ -5148,6 +5148,70 @@ def test_v6_installs_drift_flags_the_odd_copy():
         _sh.rmtree(home, ignore_errors=True)
 
 
+def _w_skill_md(skill_dir, name):
+    os.makedirs(skill_dir, exist_ok=True)
+    with open(os.path.join(skill_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
+        fh.write(f"---\nname: {name}\ndescription: x\n---\nbody\n")
+
+
+def test_v6_skill_md_name_parsing():
+    # _skill_md_name reads the frontmatter name; fail-soft on no-frontmatter/missing.
+    import _installs
+    d = tempfile.mkdtemp(prefix="summon-name-")
+    try:
+        with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as fh:
+            fh.write('---\nname: "summon"\ndescription: x\n---\nbody\n')
+        assert _installs._skill_md_name(d) == "summon"          # quotes stripped
+        with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as fh:
+            fh.write("no frontmatter here\nname: notinfrontmatter\n")
+        assert _installs._skill_md_name(d) is None              # no leading --- block
+        os.remove(os.path.join(d, "SKILL.md"))
+        assert _installs._skill_md_name(d) is None              # missing file
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v6_duplicate_summon_skills_detects_dupe_not_alias():
+    # A sibling with SKILL.md `name: summon` (a stale pre-refresh backup) is a duplicate the
+    # host loads as a 2nd summon; the intentional `sub-agents` alias (name: sub-agents) is NOT.
+    import _installs
+    skills = tempfile.mkdtemp(prefix="summon-dupe-")
+    try:
+        _w_skill_md(os.path.join(skills, "summon"), "summon")                        # canonical
+        _w_skill_md(os.path.join(skills, "summon.pre-refresh-20260718-1732"), "summon")  # dupe
+        _w_skill_md(os.path.join(skills, "sub-agents"), "sub-agents")                # alias, NOT a dupe
+        dupes = _installs.duplicate_summon_skills(skills)
+        assert len(dupes) == 1, dupes
+        assert dupes[0].endswith("summon.pre-refresh-20260718-1732"), dupes
+        assert not any("sub-agents" in d for d in dupes), dupes
+    finally:
+        import shutil as _sh
+        _sh.rmtree(skills, ignore_errors=True)
+
+
+def test_v6_drift_blocks_converged_on_duplicate():
+    # Byte-identical canonical copy but a duplicate 'summon' skill dir beside it -> drift is
+    # NOT converged (the field symptom: a host shows two summon entries) and lists the dupe.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-dupeconv-")
+    try:
+        files = {"run_subagent.py": '__version__ = "1.0.0"\n', "_x.py": "x = 1\n"}
+        run = _mk_summon_install(home, ".claude", files)          # canonical, owned, hashable
+        base = os.path.join(home, ".claude", "skills")
+        _w_skill_md(os.path.join(base, "summon.pre-refresh-1"), "summon")   # the duplicate
+        _w_skill_md(os.path.join(base, "sub-agents"), "sub-agents")         # alias, ignored
+        recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
+        dr = _installs.drift_report(recs)
+        assert dr["drifted"] == [] and dr["reference_sha"], dr   # no HASH drift
+        assert dr["duplicates"] and dr["duplicates"][0]["label"] == "claude", dr["duplicates"]
+        assert dr["duplicates"][0]["dirs"][0].endswith("summon.pre-refresh-1"), dr["duplicates"]
+        assert dr["converged"] is False, dr                      # dupe alone blocks converged
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
 def test_v6_installs_no_reference_flags_nothing():
     # if the running copy cannot be hashed (no reference), never cry drift we can't anchor.
     import _installs

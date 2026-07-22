@@ -101,6 +101,54 @@ def _read_version(scripts_dir: str):
     return found   # last module-level assignment wins; a computed/mutated value -> None
 
 
+_SKILL_MD_MAX = 200_000   # a SKILL.md is small text; bound a foreign/corrupt one
+
+
+def _skill_md_name(skill_dir: str):
+    """The frontmatter ``name:`` of a skill dir's SKILL.md, or None. Bounded + fail-soft:
+    a missing / oversize / unreadable file yields None, never a raise. Only the leading
+    ``---`` frontmatter block is scanned (first ``name:`` key), matching how a host
+    identifies a skill by its declared name."""
+    md = os.path.join(skill_dir, "SKILL.md")
+    if not os.path.isfile(md):
+        return None
+    try:
+        raw, _note = _read_regular_bounded(md, _SKILL_MD_MAX)
+    except OSError:
+        return None
+    lines = raw.decode("utf-8", "replace").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for ln in lines[1:]:
+        s = ln.strip()
+        if s == "---":
+            break
+        if s.lower().startswith("name:"):
+            return s.split(":", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
+def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> list:
+    """Sibling dirs under ``skills_dir`` (other than the canonical ``skill_name`` dir) whose
+    SKILL.md declares ``name: <skill_name>`` -- dirs a host would load as a SECOND skill of
+    the same name (a stale ``summon.pre-refresh-*`` backup, a hand-copied dupe). This is what
+    makes a host show TWO 'summon' entries. Keyed on the DECLARED name, so the intentional
+    ``sub-agents`` alias (name: sub-agents) is NOT flagged. Absolute paths, sorted; fail-soft
+    on an unreadable skills dir."""
+    out = []
+    try:
+        names = os.listdir(skills_dir)
+    except OSError:
+        return out
+    for name in names:
+        if name == skill_name:
+            continue
+        d = os.path.join(skills_dir, name)
+        if os.path.isdir(d) and _skill_md_name(d) == skill_name:
+            out.append(_canonical(d))
+    return sorted(out)
+
+
 def _probe(label: str, scripts_dir: str, managed: bool) -> dict:
     """One install record for a ``.../skills/summon/scripts`` directory. Absent copies are
     reported (present=False) rather than dropped, so ``doctor`` can show what is NOT
@@ -110,7 +158,7 @@ def _probe(label: str, scripts_dir: str, managed: bool) -> dict:
     present = os.path.isdir(scripts_dir)
     rec = {"label": label, "scripts_dir": scripts_dir, "present": present,
            "managed": managed, "running": False,
-           "sha256": None, "version": None, "installed_at": None}
+           "sha256": None, "version": None, "installed_at": None, "duplicates": []}
     if present:
         try:
             rec["sha256"] = scripts_sha256(scripts_dir, max_bytes=_ENUM_MAX_BYTES)
@@ -118,6 +166,12 @@ def _probe(label: str, scripts_dir: str, managed: bool) -> dict:
             rec["sha256"] = None
         rec["version"] = _read_version(scripts_dir)
         rec["installed_at"] = _read_installed_at(os.path.dirname(scripts_dir))
+        # Sibling dirs the HOST would load as a SECOND 'summon' skill (a stale pre-refresh
+        # backup, a hand-copied dupe) -- invisible to the hash check above, which only
+        # inspects the canonical path. scripts_dir is <host>/skills/summon/scripts, so two
+        # dirnames up is the skills dir the host scans for skills.
+        rec["duplicates"] = duplicate_summon_skills(
+            os.path.dirname(os.path.dirname(scripts_dir)))
     return rec
 
 
@@ -172,9 +226,10 @@ def drift_report(records: list, reference_sha: str | None = None) -> dict:
     A PRESENT copy is HASHED (comparable), or UNKNOWN when its hash could not be computed
     (a permission error, a foreign non-regular ``*.py``). ``drifted`` = hashed copies whose
     hash differs from the reference. With no reference nothing is called drifted -- we never
-    cry drift we cannot anchor. ``converged`` requires a reference, NO drift, AND no unknown
-    copy (an uncheckable copy is never reported as 'all match'). Returns
-    {reference_sha, converged, present, hashed, drifted, unknown}."""
+    cry drift we cannot anchor. ``converged`` requires a reference, NO drift, no unknown
+    copy (an uncheckable copy is never reported as 'all match'), AND no host carrying a
+    duplicate 'summon' skill (a stale backup dir loaded beside the canonical copy). Returns
+    {reference_sha, converged, present, hashed, drifted, unknown, duplicates}."""
     if reference_sha is None:
         run = next((r for r in records if r.get("running") and r.get("sha256")), None)
         reference_sha = run["sha256"] if run else None
@@ -182,6 +237,13 @@ def drift_report(records: list, reference_sha: str | None = None) -> dict:
     hashed = [r for r in present if r["sha256"]]
     unknown = [r for r in present if not r["sha256"]]
     drifted = [r for r in hashed if reference_sha and r["sha256"] != reference_sha]
+    # Duplicate 'summon' skills a host loads beside its canonical copy. Hash-convergence
+    # says NOTHING about these: a host can be byte-identical on the canonical path yet still
+    # show TWO summon entries (the field symptom), so any duplicate blocks `converged`.
+    duplicates = [{"label": r["label"], "dirs": r["duplicates"]}
+                  for r in records if r.get("duplicates")]
     return {"reference_sha": reference_sha,
-            "converged": bool(reference_sha) and not drifted and not unknown,
-            "present": present, "hashed": hashed, "drifted": drifted, "unknown": unknown}
+            "converged": (bool(reference_sha) and not drifted and not unknown
+                          and not duplicates),
+            "present": present, "hashed": hashed, "drifted": drifted,
+            "unknown": unknown, "duplicates": duplicates}
