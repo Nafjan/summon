@@ -206,6 +206,65 @@ def test_symlinked_prerefresh_backup_not_followed():
         shutil.rmtree(home, ignore_errors=True)
 
 
+def _load_install_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("install_mod", os.path.join(REPO, "install.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_build_failure_preserves_owned_prerefresh_backup():
+    # CRITICAL regression: with the canonical summon absent, an owned pre-refresh backup can be
+    # the ONLY copy. A build failure must leave it intact -- the sweep runs only AFTER a
+    # successful swap. FAILS on the pre-fix (sweep-before-staging) implementation.
+    m = _load_install_module()
+    home = _fake_home()
+    try:
+        m.HOSTS = {**m.HOSTS, "claude": os.path.join(home, ".claude")}
+        parent = os.path.join(home, ".claude", "skills")
+        os.makedirs(parent)
+        backup = os.path.join(parent, "summon.pre-refresh-1")
+        _mk_owned_dir(backup)                                       # the only copy, no canonical
+        orig = m._build_tree
+        m._build_tree = lambda staging: (_ for _ in ()).throw(OSError("boom"))
+        try:
+            msg, ok = m.install_skill("claude", dry=False)
+        finally:
+            m._build_tree = orig
+        assert ok is False, (msg, ok)
+        assert os.path.isfile(os.path.join(backup, ".summon-install.json")), \
+            "owned backup destroyed by a failed build (sweep ran before the swap)"
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_sweep_deletes_via_quarantine_not_original_path():
+    # CRITICAL regression: the sweep renames each candidate to a private summon.staging-sweep-*
+    # name and deletes THAT, so a swap of the original path after validation cannot redirect the
+    # rmtree. On the pre-quarantine implementation rmtree hit the original pre-refresh path.
+    m = _load_install_module()
+    home = _fake_home()
+    try:
+        m.HOSTS = {**m.HOSTS, "claude": os.path.join(home, ".claude")}
+        assert m.install_skill("claude", dry=False)[1], "initial install failed"
+        parent = os.path.join(home, ".claude", "skills")
+        _mk_owned_dir(os.path.join(parent, "summon.pre-refresh-1"))
+        seen = []
+        orig_rmtree = m.shutil.rmtree
+        m.shutil.rmtree = lambda p, *a, **k: (seen.append(p), orig_rmtree(p, *a, **k))[1]
+        try:
+            assert m.install_skill("claude", dry=False)[1], "refresh failed"
+        finally:
+            m.shutil.rmtree = orig_rmtree
+        assert any("staging-sweep" in str(p) for p in seen), ("no quarantine rmtree seen", seen)
+        assert not any(os.path.basename(str(p)).startswith("summon.pre-refresh-") for p in seen), \
+            "rmtree hit the original pre-refresh path instead of the quarantine"
+        assert not os.path.isdir(os.path.join(parent, "summon.pre-refresh-1")), "backup not swept"
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_crash_recovery_restores_owned_backup():
     # Simulate: a prior run moved the good tree to .previous and died. The next
     # run must restore it (and then refresh it), never build-from-nothing while

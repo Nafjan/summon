@@ -123,11 +123,11 @@ def _skill_md_name(skill_dir: str):
         return None
     text = raw.decode("utf-8-sig", "replace")   # utf-8-sig strips a leading BOM
     lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
+    if not lines or lines[0].rstrip() != "---":   # opening fence at column 0 (no leading space)
         return None
     name, closed = None, False
     for ln in lines[1:]:
-        if ln.strip() == "---":          # end of the frontmatter block
+        if ln.rstrip() == "---":         # closing fence, column 0 (an indented `---` is NOT one)
             closed = True
             break
         if ln[:1] in (" ", "\t"):        # indented -> a NESTED key, not the top-level name
@@ -135,9 +135,11 @@ def _skill_md_name(skill_dir: str):
         s = ln.strip()
         if name is None and s.lower().startswith("name:"):
             val = s.split(":", 1)[1].strip()
-            if val[:1] in ('"', "'"):    # quoted: take the quoted span verbatim
-                end = val.find(val[0], 1)
-                val = val[1:end] if end > 0 else val[1:]
+            if val[:1] in ('"', "'"):    # quoted: take the quoted span; an UNTERMINATED quote is
+                end = val.find(val[0], 1)  # malformed -> skip it, never mint a false name
+                if end < 0:
+                    continue
+                val = val[1:end]
             else:                        # bare: a ' #' begins an inline comment
                 val = val.split(" #", 1)[0].strip()
             name = val
@@ -159,7 +161,14 @@ def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> list
         with os.scandir(skills_dir) as it:          # streaming, never materializes a huge dir
             for i, entry in enumerate(it):
                 if i >= _MAX_SKILLS_SCAN:
+                    # Do NOT silently treat the unscanned tail as clean: a duplicate past the cap
+                    # would otherwise let `converged` be True. Emit a sentinel that blocks it and
+                    # renders as an explicit "scan truncated" marker.
+                    out.append(os.path.join(
+                        skills_dir, "(summon-dup-scan-truncated-at-%d-entries)" % _MAX_SKILLS_SCAN))
                     break
+                if entry.name.startswith("summon.staging-"):
+                    continue                         # OUR transient install/sweep artifact, not a dupe
                 d = os.path.join(skills_dir, entry.name)
                 if _canonical(d) == canonical:       # the canonical dir itself (case/symlink-safe)
                     continue
@@ -192,12 +201,13 @@ def _probe(label: str, scripts_dir: str, managed: bool) -> dict:
             rec["sha256"] = None
         rec["version"] = _read_version(scripts_dir)
         rec["installed_at"] = _read_installed_at(os.path.dirname(scripts_dir))
-        # Sibling dirs the HOST would load as a SECOND 'summon' skill (a stale pre-refresh
-        # backup, a hand-copied dupe) -- invisible to the hash check above, which only
-        # inspects the canonical path. scripts_dir is <host>/skills/summon/scripts, so two
-        # dirnames up is the skills dir the host scans for skills.
-        rec["duplicates"] = duplicate_summon_skills(
-            os.path.dirname(os.path.dirname(scripts_dir)))
+    # Sibling dirs the HOST would load as a SECOND 'summon' skill (a stale pre-refresh backup, a
+    # hand-copied dupe) -- invisible to the hash check, which only inspects the canonical path.
+    # Computed even when the canonical is ABSENT: a host can carry a summon.pre-refresh-* copy
+    # with NO canonical `summon`, which still loads as a summon skill and must block converged.
+    # scripts_dir is <host>/skills/summon/scripts, so two dirnames up is the host's skills dir.
+    rec["duplicates"] = duplicate_summon_skills(
+        os.path.dirname(os.path.dirname(scripts_dir)))
     return rec
 
 
