@@ -5188,6 +5188,12 @@ def test_v6_skill_md_name_parsing():
         assert _installs._skill_md_name(d) is None               # no space -> a scalar, not a mapping
         _w('---\nname: "summon"junk\n---\n')
         assert _installs._skill_md_name(d) is None               # trailing junk after the close quote
+        _w('---\nname: "summon"#c\n---\n')
+        assert _installs._skill_md_name(d) is None               # `#` w/o a leading space is not a comment
+        _w('---\nname: summon\nname: other\n---\n')
+        assert _installs._skill_md_name(d) is None               # duplicate top-level name -> ambiguous
+        _w('---\nname: "summon" # real comment\n---\n')
+        assert _installs._skill_md_name(d) == "summon"           # space-separated comment IS allowed
         _w('---\nname: summon\n---\n')
         assert _installs._skill_md_name(d) == "summon"           # still accepts the real thing
         with open(md, "wb") as fh:                               # oversize -> (None, note); no crash
@@ -5359,6 +5365,67 @@ def test_v6_alias_collapse_preserves_truncation():
         assert dr["converged"] is False, dr
     finally:
         _installs._MAX_SKILLS_SCAN = orig
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_duplicate_symlink_reports_lexical_path_not_target():
+    # A duplicate that is a SYMLINK is reported by its LEXICAL path (the link), NEVER its resolved
+    # target -- else the doctor tells the user to delete unrelated data. A differently-named symlink
+    # to the canonical dir is still a 2nd loaded skill and IS flagged. Skips without symlinks.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-symlex-")
+    try:
+        skills = os.path.join(home, "skills")
+        _w_skill_md(os.path.join(skills, "summon"), "summon")               # canonical
+        target = os.path.join(home, "elsewhere")                            # target OUTSIDE skills
+        _w_skill_md(target, "summon")
+        try:
+            os.symlink(target, os.path.join(skills, "summon.pre-refresh-link"),
+                       target_is_directory=True)                            # a dupe that is a symlink
+            os.symlink(os.path.join(skills, "summon"),
+                       os.path.join(skills, "aliaslink"), target_is_directory=True)  # diff-named -> canonical
+        except (OSError, NotImplementedError, AttributeError):
+            return
+        dirs, trunc = _installs.duplicate_summon_skills(skills)
+        assert any(p.endswith("summon.pre-refresh-link") for p in dirs), dirs      # lexical link path
+        assert not any(os.path.basename(p) == "elsewhere" for p in dirs), dirs     # NOT the target
+        assert any(p.endswith("aliaslink") for p in dirs), dirs                    # diff-named symlink flagged
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_uninspectable_entry_marks_incomplete():
+    # An entry whose is_dir() raises (an OS error on that entry) could BE the duplicate, so the scan
+    # must report incomplete (truncated), never clean.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-direrr-")
+    try:
+        base = os.path.join(home, "skills")
+        os.makedirs(os.path.join(base, "summon"))
+
+        class _BadEntry:
+            name = "weird-entry"
+
+            def is_dir(self, *a, **k):
+                raise OSError("cannot stat this entry")
+
+        class _FakeScan:
+            def __enter__(self):
+                return iter([_BadEntry()])
+
+            def __exit__(self, *a):
+                return False
+
+        orig = _installs.os.scandir
+        _installs.os.scandir = lambda p: _FakeScan()
+        try:
+            dirs, trunc = _installs.duplicate_summon_skills(base)
+        finally:
+            _installs.os.scandir = orig
+        assert trunc is True and dirs == [], (dirs, trunc)
+    finally:
         import shutil as _sh
         _sh.rmtree(home, ignore_errors=True)
 

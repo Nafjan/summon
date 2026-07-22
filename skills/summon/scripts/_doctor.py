@@ -405,8 +405,8 @@ def render(report: dict) -> str:
             lines.append("  dupes    : the host loads each of the above as a 2nd 'summon'. summon "
                          "does NOT auto-delete them - remove each dir above by hand")
         if dr.get("scan_truncated"):
-            lines.append("  dupes    : skills dir(s) too large to fully scan for duplicates "
-                         f"({', '.join(dr['scan_truncated'])}) - convergence unverified there")
+            lines.append("  dupes    : could not fully scan for duplicates (size limit or read "
+                         f"error) in: {', '.join(dr['scan_truncated'])} - convergence unverified there")
     lines += [
         "",
         f"usable backends: {', '.join(report['usable_backends']) or 'NONE'}",
