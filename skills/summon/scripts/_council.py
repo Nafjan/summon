@@ -607,9 +607,12 @@ def run_council(args) -> int:
     _cphase = chair_timeout_ms / 1000 + _margin
     _chair_phases = 2 if chairman_fallback else 1   # primary + fallback in the worst case
     _worst = int(rounds * _waves * _mphase + _cphase * _chair_phases)
+    _ee = (f"; --min-successful-members {min_successful} can finish sooner if the quorum "
+           "lands early, but size the host timeout for THIS worst case (early-exit may not fire)"
+           if min_successful is not None else "")
     print(f"[council] worst-case wall clock ~{_worst}s ({_waves} wave(s)/round x "
           f"{rounds} round(s) + {_chair_phases} chairman phase(s); member timeout "
-          f"{int(member_timeout_ms / 1000)}s, chair timeout {int(chair_timeout_ms / 1000)}s) "
+          f"{int(member_timeout_ms / 1000)}s, chair timeout {int(chair_timeout_ms / 1000)}s{_ee}) "
           "- set your host tool's timeout ABOVE this",
           file=sys.stderr, flush=True)
 

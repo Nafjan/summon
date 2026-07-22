@@ -5432,6 +5432,7 @@ def test_v5_council_doc_has_large_file_pattern_and_timeout_budget():
     # the primary council doc must document the headline hard-budget flag AND list it in the
     # accepted flag set (a cross-batch gap the merge introduced: V5 docs predate V4a's flag).
     assert "--overall-timeout" in text, "primary council doc omits --overall-timeout"
+    assert "--min-successful-members" in text, "primary council doc omits --min-successful-members"
 
 
 def test_v5_codex_doc_timeout_is_consistent_with_skill():
@@ -5556,6 +5557,234 @@ def test_v4b_min_successful_validation():
     finally:
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
+
+
+def test_v4b_early_exit_excludes_queued_wave():
+    # The architect's GATE proof: with MORE blockers than the per-backend cap, a SECOND wave
+    # is queued. Early-exit is triggered by fast members on a SEPARATE backend, so the flag is
+    # set before any blocker-backend permit churn -- making it deterministic. The queued-wave
+    # blocker then self-excludes at the post-semaphore gate (never dispatched), and no straggler
+    # runs to its timeout. Proven by: at most `cap` blockers ever dispatch, only the fast pair
+    # succeeds, at least one member is excluded, and the council returns promptly.
+    import _council
+    import _executor
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    import time as _t
+    root = tempfile.mkdtemp(prefix="summon-v4bgate-")
+
+    def _mk(name, backend):
+        with open(os.path.join(root, name + ".md"), "w", encoding="utf-8") as fh:
+            fh.write(f"---\nrun-agent: {backend}\npermission: safe-edit\n---\n# {name}\n")
+    for n in ("f0", "f1", "chair"):
+        _mk(n, "claude")                 # fast trigger pair + chair on their own backend
+    for n in ("b0", "b1", "b2", "b3"):
+        _mk(n, "codex")                  # 4 blockers on codex (cap 3 -> wave1=3, wave2=1)
+    dispatched = []
+    dlock = threading.Lock()
+    killed = {}
+
+    class FakeProc:
+        def __init__(self, tag):
+            self.tag = tag
+            self.pid = -1
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        with dlock:
+            dispatched.append(agent)
+        if agent in ("f0", "f1", "chair"):
+            return {"status": "success", "result": agent, "report": {"summary": agent}}
+        ev = threading.Event()
+        killed[tag] = ev
+        if on_spawn:
+            on_spawn(FakeProc(tag))
+        stopped = ev.wait(15)
+        return {"status": "error" if stopped else "success",
+                "result": agent, "report": {"summary": agent}}
+
+    def fake_kill(proc):
+        if hasattr(proc, "_alive"):
+            proc._alive = False
+        ev = killed.get(getattr(proc, "tag", None))
+        if ev:
+            ev.set()
+
+    ns = argparse.Namespace(question="q", question_file=None, members="f0,f1,b0,b1,b2,b3",
+                            chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
+                            timeout=30000, out=None, run_dir=root, min_successful=2)
+    orig_d, orig_k = _council._dispatch, _executor._kill_tree
+    _council._dispatch, _executor._kill_tree = fake, fake_kill
+    try:
+        t0 = _t.monotonic()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        elapsed = _t.monotonic() - t0
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    assert elapsed < 12, elapsed
+    assert env.get("council_state") == "early_exit", env.get("council_state")
+    assert env["status"] == "success", env["status"]
+    # THE gate proof: the codex semaphore is 3, and the 4th blocker can only acquire a permit
+    # after early-exit fired (fast pair is on claude), so it self-excludes -> <= cap dispatched.
+    codex_dispatched = [a for a in dispatched if a.startswith("b")]
+    assert len(codex_dispatched) <= _council._PER_BACKEND_CAP, codex_dispatched
+    assert any(m.get("status") == "excluded" for m in env["members"]), "gate never excluded a member"
+    # only the fast pair succeeded; no blocker slipped through to a natural success
+    assert {m["agent"] for m in env["members"] if m.get("status") == "success"} == {"f0", "f1"}, \
+        [m.get("status") for m in env["members"]]
+
+
+def test_v4b_early_exit_does_not_double_emit_with_overall_timeout():
+    # early-exit must NOT set overall["hit"] (that would make the live watchdog kill the
+    # chairman and divert synthesis to a PARTIAL). With a GENEROUS --overall-timeout that is
+    # never breached, a firing early-exit yields council_state=early_exit + status success --
+    # NOT overall_timeout + partial. One emit, not two.
+    import _council
+    import _executor
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    import time as _t
+    root = tempfile.mkdtemp(prefix="summon-v4bboth-")
+    _mk_agents(root, ["f0", "f1", "s0", "s1", "chair"])
+    killed = {}
+
+    class FakeProc:
+        def __init__(self, tag):
+            self.tag = tag
+            self.pid = -1
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        if agent in ("f0", "f1", "chair"):
+            return {"status": "success", "result": agent, "report": {"summary": agent}}
+        ev = threading.Event()
+        killed[tag] = ev
+        if on_spawn:
+            on_spawn(FakeProc(tag))
+        ev.wait(15)
+        return {"status": "error", "result": agent, "report": {"summary": agent}}
+
+    def fake_kill(proc):
+        if hasattr(proc, "_alive"):
+            proc._alive = False
+        ev = killed.get(getattr(proc, "tag", None))
+        if ev:
+            ev.set()
+
+    ns = argparse.Namespace(question="q", question_file=None, members="f0,f1,s0,s1",
+                            chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
+                            timeout=30000, out=None, run_dir=root, min_successful=2,
+                            overall_timeout=30000)   # generous; never breached
+    orig_cap = _council._PER_BACKEND_CAP
+    _council._PER_BACKEND_CAP = 10
+    orig_d, orig_k = _council._dispatch, _executor._kill_tree
+    _council._dispatch, _executor._kill_tree = fake, fake_kill
+    try:
+        t0 = _t.monotonic()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        elapsed = _t.monotonic() - t0
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._PER_BACKEND_CAP = orig_cap
+        _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    assert elapsed < 12, elapsed
+    assert env.get("council_state") == "early_exit", env.get("council_state")   # NOT overall_timeout
+    assert env["status"] == "success", env["status"]                            # NOT partial
+    assert "overall_timeout" not in env, "early-exit wrongly emitted an overall_timeout block"
+
+
+def test_v4b_early_exit_last_round_only_under_rounds2():
+    # --rounds 2: round 1 must barrier FULLY (every position, for cross-examination); only the
+    # FINAL round (round 2) early-exits. Prove round 1 dispatched ALL members and round 2 exited.
+    import _council
+    import _executor
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    import time as _t
+    root = tempfile.mkdtemp(prefix="summon-v4br2-")
+    _mk_agents(root, ["f0", "f1", "s0", "s1", "chair"])
+    dispatched = []
+    dlock = threading.Lock()
+    killed = {}
+
+    class FakeProc:
+        def __init__(self, tag):
+            self.tag = tag
+            self.pid = -1
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        with dlock:
+            dispatched.append(tag)
+        if "-r1-" in tag or agent in ("f0", "f1", "chair"):
+            return {"status": "success", "result": agent, "report": {"summary": agent}}
+        ev = threading.Event()          # round-2 stragglers block until the early-exit sweep
+        killed[tag] = ev
+        if on_spawn:
+            on_spawn(FakeProc(tag))
+        ev.wait(15)
+        return {"status": "error", "result": agent, "report": {"summary": agent}}
+
+    def fake_kill(proc):
+        if hasattr(proc, "_alive"):
+            proc._alive = False
+        ev = killed.get(getattr(proc, "tag", None))
+        if ev:
+            ev.set()
+
+    ns = argparse.Namespace(question="q", question_file=None, members="f0,f1,s0,s1",
+                            chairman="chair", rounds=2, cwd=os.getcwd(), agents_dir=root,
+                            timeout=30000, out=None, run_dir=root, min_successful=2)
+    orig_cap = _council._PER_BACKEND_CAP
+    _council._PER_BACKEND_CAP = 10
+    orig_d, orig_k = _council._dispatch, _executor._kill_tree
+    _council._dispatch, _executor._kill_tree = fake, fake_kill
+    try:
+        t0 = _t.monotonic()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        elapsed = _t.monotonic() - t0
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._PER_BACKEND_CAP = orig_cap
+        _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    assert elapsed < 12, elapsed
+    # round 1 ran EVERY member (no early-exit): all four r1 stages dispatched
+    r1 = {t for t in dispatched if "-r1-" in t}
+    assert len(r1) == 4, r1
+    # round 2 early-exited and chaired the quorum
+    assert env.get("council_state") == "early_exit", env.get("council_state")
+    assert env["status"] == "success", env["status"]
 
 
 if __name__ == "__main__":
