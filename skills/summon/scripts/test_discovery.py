@@ -5148,6 +5148,339 @@ def test_v6_installs_drift_flags_the_odd_copy():
         _sh.rmtree(home, ignore_errors=True)
 
 
+def _w_skill_md(skill_dir, name):
+    os.makedirs(skill_dir, exist_ok=True)
+    with open(os.path.join(skill_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
+        fh.write(f"---\nname: {name}\ndescription: x\n---\nbody\n")
+
+
+def test_v6_skill_md_name_parsing():
+    # _skill_md_name honors ONLY a CLOSED top-level frontmatter name; fail-soft on every
+    # malformed/hostile shape a codex review reproduced (BOM, inline comment, nesting,
+    # unclosed block, oversize, missing file).
+    import _installs
+    d = tempfile.mkdtemp(prefix="summon-name-")
+    md = os.path.join(d, "SKILL.md")
+
+    def _w(text):
+        with open(md, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    try:
+        _w('---\nname: "summon"\ndescription: x\n---\nbody\n')
+        assert _installs._skill_md_name(d) == "summon"           # quotes stripped
+        _w('---\nname: "summon\ndescription: x\n---\n')
+        assert _installs._skill_md_name(d) is None               # UNTERMINATED quote -> no name
+        _w('\ufeff---\nname: summon\n---\n')
+        assert _installs._skill_md_name(d) == "summon"           # UTF-8 BOM tolerated
+        _w('---\nname: summon # actually a comment\n---\n')
+        assert _installs._skill_md_name(d) == "summon"           # inline comment dropped
+        _w('---\nmetadata:\n  name: summon\ndescription: x\n---\n')
+        assert _installs._skill_md_name(d) is None               # nested key, not top-level
+        _w('---\nname: summon\nno closing delimiter\nname: other\n')
+        assert _installs._skill_md_name(d) is None               # unclosed block -> not valid
+        _w("no frontmatter here\nname: body\n")
+        assert _installs._skill_md_name(d) is None               # no leading --- block
+        # false-POSITIVE guards (each would wrongly flag a dir as a duplicate to remove):
+        _w('---\nName: summon\n---\n')
+        assert _installs._skill_md_name(d) is None               # case-sensitive key: Name: != name:
+        _w('---\nname:summon\n---\n')
+        assert _installs._skill_md_name(d) is None               # no space -> a scalar, not a mapping
+        _w('---\nname: "summon"junk\n---\n')
+        assert _installs._skill_md_name(d) is None               # trailing junk after the close quote
+        _w('---\nname: "summon"#c\n---\n')
+        assert _installs._skill_md_name(d) is None               # `#` w/o a leading space is not a comment
+        _w('---\nname: summon\nname: other\n---\n')
+        assert _installs._skill_md_name(d) is None               # duplicate top-level name -> ambiguous
+        _w('---\nname:\nname: summon\n---\n')
+        assert _installs._skill_md_name(d) is None               # EMPTY first name key is still a dup key
+        _w('---\nname: "summon" # real comment\n---\n')
+        assert _installs._skill_md_name(d) == "summon"           # space-separated comment IS allowed
+        _w('---\nname: summon\n---\n')
+        assert _installs._skill_md_name(d) == "summon"           # still accepts the real thing
+        with open(md, "wb") as fh:                               # oversize -> (None, note); no crash
+            fh.write(b"---\nname: summon\n---\n" + b"x" * (_installs._SKILL_MD_MAX + 16))
+        assert _installs._skill_md_name(d) is None
+        os.remove(md)
+        assert _installs._skill_md_name(d) is None               # missing file
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v6_duplicate_merge_survives_symlink_alias_collapse():
+    # Two hosts sharing ONE physical summon (symlink alias) can still have different skills
+    # dirs; a duplicate visible only from the aliased host must survive the record collapse,
+    # else `converged` is falsely True. Skips where symlinks need privilege (some Windows).
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-symdupe-")
+    try:
+        files = {"run_subagent.py": '__version__ = "1.0.0"\n', "_x.py": "x = 1\n"}
+        run = _mk_summon_install(home, ".claude", files)             # real copy under .claude
+        codex_summon = os.path.join(home, ".codex", "skills", "summon")
+        os.makedirs(os.path.dirname(codex_summon), exist_ok=True)
+        try:
+            os.symlink(os.path.join(home, ".claude", "skills", "summon"),
+                       codex_summon, target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            return                                                    # no symlink privilege -> skip
+        _w_skill_md(os.path.join(home, ".codex", "skills", "summon.pre-refresh-1"), "summon")
+        recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
+        dr = _installs.drift_report(recs)
+        all_dirs = [x for d in dr["duplicates"] for x in d["dirs"]]
+        assert any(p.endswith("summon.pre-refresh-1") for p in all_dirs), (dr["duplicates"], all_dirs)
+        assert dr["converged"] is False, dr
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_duplicate_summon_skills_detects_dupe_not_alias():
+    # A sibling with SKILL.md `name: summon` (a stale pre-refresh backup) is a duplicate the
+    # host loads as a 2nd summon; the intentional `sub-agents` alias (name: sub-agents) is NOT.
+    import _installs
+    skills = tempfile.mkdtemp(prefix="summon-dupe-")
+    try:
+        _w_skill_md(os.path.join(skills, "summon"), "summon")                        # canonical
+        _w_skill_md(os.path.join(skills, "summon.pre-refresh-20260718-1732"), "summon")  # dupe
+        _w_skill_md(os.path.join(skills, "sub-agents"), "sub-agents")                # alias, NOT a dupe
+        _mk_owned_staging = os.path.join(skills, "summon.staging-xyz")
+        _w_skill_md(_mk_owned_staging, "summon")                                      # OUR staging...
+        import json as _json
+        _json.dump({"installed_by": "summon"}, open(os.path.join(_mk_owned_staging,
+                   ".summon-install.json"), "w", encoding="utf-8"))                   # ...verified ours
+        dupes, trunc = _installs.duplicate_summon_skills(skills)
+        assert len(dupes) == 1, dupes                                                 # only the pre-refresh
+        assert dupes[0].endswith("summon.pre-refresh-20260718-1732"), dupes
+        assert not any("sub-agents" in d for d in dupes), dupes                       # alias ignored
+        assert not any("staging" in d for d in dupes), dupes                          # owned staging skipped
+        assert trunc is False, trunc
+    finally:
+        import shutil as _sh
+        _sh.rmtree(skills, ignore_errors=True)
+
+
+def test_v6_drift_blocks_converged_on_duplicate():
+    # Byte-identical canonical copy but a duplicate 'summon' skill dir beside it -> drift is
+    # NOT converged (the field symptom: a host shows two summon entries) and lists the dupe.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-dupeconv-")
+    try:
+        files = {"run_subagent.py": '__version__ = "1.0.0"\n', "_x.py": "x = 1\n"}
+        run = _mk_summon_install(home, ".claude", files)          # canonical, owned, hashable
+        base = os.path.join(home, ".claude", "skills")
+        _w_skill_md(os.path.join(base, "summon.pre-refresh-1"), "summon")   # the duplicate
+        _w_skill_md(os.path.join(base, "sub-agents"), "sub-agents")         # alias, ignored
+        recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
+        dr = _installs.drift_report(recs)
+        assert dr["drifted"] == [] and dr["reference_sha"], dr   # no HASH drift
+        assert dr["duplicates"] and dr["duplicates"][0]["label"] == "claude", dr["duplicates"]
+        assert dr["duplicates"][0]["dirs"][0].endswith("summon.pre-refresh-1"), dr["duplicates"]
+        assert dr["converged"] is False, dr                      # dupe alone blocks converged
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_duplicate_detected_when_canonical_absent():
+    # A host with a summon.pre-refresh-* copy but NO canonical `summon` still loads a summon
+    # skill; it must be detected and block converged (was missed when the probe skipped an
+    # absent canonical).
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-dupnocanon-")
+    try:
+        run = _mk_summon_install(home, ".claude", {"run_subagent.py": '__version__ = "1.0.0"\n'})
+        _w_skill_md(os.path.join(home, ".codex", "skills", "summon.pre-refresh-1"), "summon")  # no canonical
+        recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
+        dr = _installs.drift_report(recs)
+        assert "codex" in [d["label"] for d in dr["duplicates"]], dr["duplicates"]
+        assert dr["converged"] is False, dr
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_duplicate_scan_truncation_blocks_converged():
+    # Hitting the scan cap must NOT silently report clean: `truncated` is flagged (SEPARATELY from
+    # real duplicate paths) and blocks converged, so a duplicate past the cap cannot pass.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-trunc-")
+    orig = _installs._MAX_SKILLS_SCAN
+    try:
+        _installs._MAX_SKILLS_SCAN = 3                         # tiny cap for the test
+        run = _mk_summon_install(home, ".claude", {"run_subagent.py": '__version__ = "1.0.0"\n'})
+        base = os.path.join(home, ".claude", "skills")
+        for i in range(6):
+            os.makedirs(os.path.join(base, "zzz-filler-%d" % i))
+        dirs, truncated = _installs.duplicate_summon_skills(base)
+        assert truncated is True and dirs == [], (dirs, truncated)   # flagged, no fake path in dirs
+        dr = _installs.drift_report(_installs.enumerate_installs(running_scripts_dir=run, home=home))
+        assert dr["scan_truncated"] and dr["converged"] is False, dr  # blocks converged, tracked apart
+    finally:
+        _installs._MAX_SKILLS_SCAN = orig
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_scan_read_error_marks_incomplete_not_clean():
+    # A skills dir that EXISTS but cannot be listed (a read error) is INCOMPLETE (truncated=True),
+    # never silently clean. An ABSENT dir is NOT truncated (a host is just not installed).
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-scanerr-")
+    try:
+        base = os.path.join(home, ".cursor", "skills")
+        os.makedirs(os.path.join(base, "summon"))
+        dirs, trunc = _installs.duplicate_summon_skills(os.path.join(home, "absent", "skills"))
+        assert dirs == [] and trunc is False, (dirs, trunc)          # absent -> not truncated
+        orig = _installs.os.scandir
+        _installs.os.scandir = lambda p: (_ for _ in ()).throw(PermissionError("denied"))
+        try:
+            dirs, trunc = _installs.duplicate_summon_skills(base)     # exists, but listing fails
+        finally:
+            _installs.os.scandir = orig
+        assert trunc is True, (dirs, trunc)                          # incomplete -> blocks converged
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_alias_collapse_preserves_truncation():
+    # When two hosts collapse onto one physical summon (symlink), an INCOMPLETE scan on the
+    # aliased host must survive the merge, else converged is falsely True. Skips w/o symlinks.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-symtrunc-")
+    orig = _installs._MAX_SKILLS_SCAN
+    try:
+        run = _mk_summon_install(home, ".claude", {"run_subagent.py": '__version__ = "1.0.0"\n'})
+        codex_summon = os.path.join(home, ".codex", "skills", "summon")
+        os.makedirs(os.path.dirname(codex_summon), exist_ok=True)
+        try:
+            os.symlink(os.path.join(home, ".claude", "skills", "summon"),
+                       codex_summon, target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            return
+        _installs._MAX_SKILLS_SCAN = 2                                # .codex/skills overflows this
+        for i in range(5):
+            os.makedirs(os.path.join(home, ".codex", "skills", "filler-%d" % i))
+        dr = _installs.drift_report(_installs.enumerate_installs(running_scripts_dir=run, home=home))
+        assert dr["scan_truncated"], dr                              # merged from the codex alias
+        assert dr["converged"] is False, dr
+    finally:
+        _installs._MAX_SKILLS_SCAN = orig
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_duplicate_symlink_reports_lexical_path_not_target():
+    # A duplicate that is a SYMLINK is reported by its LEXICAL path (the link), NEVER its resolved
+    # target -- else the doctor tells the user to delete unrelated data. A differently-named symlink
+    # to the canonical dir is still a 2nd loaded skill and IS flagged. Skips without symlinks.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-symlex-")
+    try:
+        skills = os.path.join(home, "skills")
+        _w_skill_md(os.path.join(skills, "summon"), "summon")               # canonical
+        target = os.path.join(home, "elsewhere")                            # target OUTSIDE skills
+        _w_skill_md(target, "summon")
+        try:
+            os.symlink(target, os.path.join(skills, "summon.pre-refresh-link"),
+                       target_is_directory=True)                            # a dupe that is a symlink
+            os.symlink(os.path.join(skills, "summon"),
+                       os.path.join(skills, "aliaslink"), target_is_directory=True)  # diff-named -> canonical
+        except (OSError, NotImplementedError, AttributeError):
+            return
+        dirs, trunc = _installs.duplicate_summon_skills(skills)
+        assert any(p.endswith("summon.pre-refresh-link") for p in dirs), dirs      # lexical link path
+        assert not any(os.path.basename(p) == "elsewhere" for p in dirs), dirs     # NOT the target
+        assert any(p.endswith("aliaslink") for p in dirs), dirs                    # diff-named symlink flagged
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_uninspectable_entry_marks_incomplete():
+    # An entry whose is_dir() raises (an OS error on that entry) could BE the duplicate, so the scan
+    # must report incomplete (truncated), never clean.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-direrr-")
+    try:
+        base = os.path.join(home, "skills")
+        os.makedirs(os.path.join(base, "summon"))
+
+        class _BadEntry:
+            name = "weird-entry"
+
+            def is_dir(self, *a, **k):
+                raise OSError("cannot stat this entry")
+
+        class _FakeScan:
+            def __enter__(self):
+                return iter([_BadEntry()])
+
+            def __exit__(self, *a):
+                return False
+
+        orig = _installs.os.scandir
+        _installs.os.scandir = lambda p: _FakeScan()
+        try:
+            dirs, trunc = _installs.duplicate_summon_skills(base)
+        finally:
+            _installs.os.scandir = orig
+        assert trunc is True and dirs == [], (dirs, trunc)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_staging_symlink_is_not_exempted():
+    # A summon.staging-* SYMLINK to the canonical owned dir inherits its manifest but the host
+    # loads it as a 2nd skill, so it must NOT be exempted -- only a REAL owned staging dir is.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-stagesym-")
+    try:
+        skills = os.path.join(home, "skills")
+        canon = os.path.join(skills, "summon")
+        _w_skill_md(canon, "summon")
+        import json as _json
+        _json.dump({"installed_by": "summon"},
+                   open(os.path.join(canon, ".summon-install.json"), "w", encoding="utf-8"))
+        try:
+            os.symlink(canon, os.path.join(skills, "summon.staging-link"), target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            return
+        dirs, trunc = _installs.duplicate_summon_skills(skills)
+        assert any(p.endswith("summon.staging-link") for p in dirs), dirs   # symlink NOT exempted
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_inaccessible_skills_dir_marks_incomplete():
+    # os.path.isdir conflates absent with inaccessible; duplicate_summon_skills must distinguish:
+    # a stat/access error on the skills dir is INCOMPLETE (truncated), absence is not.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-inacc-")
+    try:
+        base = os.path.join(home, "skills")
+        os.makedirs(base)
+        orig = _installs.os.stat
+        def boom(p, *a, **k):
+            if os.path.normcase(str(p)) == os.path.normcase(base):
+                raise PermissionError("denied")
+            return orig(p, *a, **k)
+        _installs.os.stat = boom
+        try:
+            dirs, trunc = _installs.duplicate_summon_skills(base)
+        finally:
+            _installs.os.stat = orig
+        assert trunc is True and dirs == [], (dirs, trunc)                  # inaccessible -> incomplete
+        dirs, trunc = _installs.duplicate_summon_skills(os.path.join(home, "absent"))
+        assert dirs == [] and trunc is False, (dirs, trunc)                 # absent -> NOT incomplete
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
 def test_v6_installs_no_reference_flags_nothing():
     # if the running copy cannot be hashed (no reference), never cry drift we can't anchor.
     import _installs
