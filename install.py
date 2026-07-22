@@ -266,14 +266,13 @@ def install_skill(host: str, dry: bool) -> tuple:
         staging = None
         if os.path.isdir(backup) and _owned(backup):
             shutil.rmtree(backup, ignore_errors=True)
-        # Sweep OUR old-scheme pre-refresh backups ONLY NOW -- after the new skill is safely in
-        # `dest`. A pre-V6 installer left summon.pre-refresh-<ts> dirs here, each loaded by the
+        # A pre-V6 installer left summon.pre-refresh-<ts> dirs beside the skill, each loaded by the
         # host as a DUPLICATE 'summon' (field incident). We DETECT these (doctor + _drift_check
-        # below) but deliberately do NOT auto-delete them: a portable, TOCTOU-free recursive
-        # delete of a dir another process could swap is not achievable in stdlib, and an install
-        # script must never risk destroying a user dir. The current installer no longer CREATES
-        # such backups (it stages in a temp dir + auto-removes `.previous`), so these are only
-        # legacy orphans -- the doctor prints the exact path to remove by hand.
+        # below) but deliberately do NOT auto-delete them: a portable, TOCTOU-free recursive delete
+        # of a dir another process could swap is not achievable in stdlib, and an install script
+        # must never risk destroying a user dir. The current installer no longer CREATES such
+        # backups (it stages in a temp dir + auto-removes `.previous`), so these are only legacy
+        # orphans -- the doctor prints the exact path to remove by hand.
         return (f"[ok]  skill installed -> {dest}", True)
     except OSError as e:
         # Roll back: if the swap half-happened, restore the owned backup.
