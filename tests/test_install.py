@@ -164,6 +164,48 @@ def test_dry_run_reports_prerefresh_sweep_without_touching_it():
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_prerefresh_swept_only_after_skill_is_in_place():
+    # A crashed legacy refresh can leave an owned pre-refresh backup with NO canonical summon.
+    # A fresh install must SUCCEED, install the skill, and sweep the backup. The sweep runs
+    # AFTER the swap, so an owned backup is never deleted ahead of a build that could fail --
+    # here we assert the end state (skill present, backup gone) for the absent-canonical case.
+    home = _fake_home()
+    try:
+        parent = os.path.join(home, ".claude", "skills")
+        os.makedirs(parent)
+        _mk_owned_dir(os.path.join(parent, "summon.pre-refresh-1"))   # only copy, no canonical
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert os.path.isfile(os.path.join(_dest(home), "SKILL.md")), "skill not installed"
+        assert not os.path.isdir(os.path.join(parent, "summon.pre-refresh-1")), "backup not swept"
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_symlinked_prerefresh_backup_not_followed():
+    # Even a pre-refresh-named SYMLINK pointing at an OWNED dir must NOT be swept: we never
+    # rmtree through a symlink (the islink guard), so its target survives. Skips where symlinks
+    # need privilege.
+    home = _fake_home()
+    try:
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0, r.stdout + r.stderr
+        parent = os.path.join(home, ".claude", "skills")
+        target = os.path.join(home, "owned-elsewhere")
+        _mk_owned_dir(target)                                  # valid manifest -> _owned True
+        link = os.path.join(parent, "summon.pre-refresh-evil")
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            return                                             # no symlink privilege -> skip
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert os.path.isdir(target) and os.path.isfile(os.path.join(target, "SKILL.md")), \
+            "an owned symlink target was deleted through the link"
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_crash_recovery_restores_owned_backup():
     # Simulate: a prior run moved the good tree to .previous and died. The next
     # run must restore it (and then refresh it), never build-from-nothing while

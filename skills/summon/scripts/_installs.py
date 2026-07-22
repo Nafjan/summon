@@ -102,13 +102,16 @@ def _read_version(scripts_dir: str):
 
 
 _SKILL_MD_MAX = 200_000   # a SKILL.md is small text; bound a foreign/corrupt one
+_MAX_SKILLS_SCAN = 10_000  # cap entries scanned in a skills dir (bound a hostile/huge one)
 
 
 def _skill_md_name(skill_dir: str):
     """The frontmatter ``name:`` of a skill dir's SKILL.md, or None. Bounded + fail-soft:
-    a missing / oversize / unreadable file yields None, never a raise. Only the leading
-    ``---`` frontmatter block is scanned (first ``name:`` key), matching how a host
-    identifies a skill by its declared name."""
+    a missing / oversize / non-regular / unreadable file yields None, never a raise. Only a
+    CLOSED leading ``---`` frontmatter block is honored, and only a TOP-LEVEL (column-0)
+    ``name:`` key -- so a body ``name:``, a nested ``metadata: {name: ...}``, or an unclosed
+    block never mints a false name (matching how a host identifies a skill by its declared
+    name). Tolerates a UTF-8 BOM, a quoted value, and a trailing ``# inline comment``."""
     md = os.path.join(skill_dir, "SKILL.md")
     if not os.path.isfile(md):
         return None
@@ -116,16 +119,29 @@ def _skill_md_name(skill_dir: str):
         raw, _note = _read_regular_bounded(md, _SKILL_MD_MAX)
     except OSError:
         return None
-    lines = raw.decode("utf-8", "replace").splitlines()
+    if raw is None:                      # oversize / non-regular: never .decode() on None
+        return None
+    text = raw.decode("utf-8-sig", "replace")   # utf-8-sig strips a leading BOM
+    lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         return None
+    name, closed = None, False
     for ln in lines[1:]:
-        s = ln.strip()
-        if s == "---":
+        if ln.strip() == "---":          # end of the frontmatter block
+            closed = True
             break
-        if s.lower().startswith("name:"):
-            return s.split(":", 1)[1].strip().strip('"').strip("'")
-    return None
+        if ln[:1] in (" ", "\t"):        # indented -> a NESTED key, not the top-level name
+            continue
+        s = ln.strip()
+        if name is None and s.lower().startswith("name:"):
+            val = s.split(":", 1)[1].strip()
+            if val[:1] in ('"', "'"):    # quoted: take the quoted span verbatim
+                end = val.find(val[0], 1)
+                val = val[1:end] if end > 0 else val[1:]
+            else:                        # bare: a ' #' begins an inline comment
+                val = val.split(" #", 1)[0].strip()
+            name = val
+    return name if closed else None      # an UNCLOSED block is not valid frontmatter
 
 
 def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> list:
@@ -133,19 +149,29 @@ def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> list
     SKILL.md declares ``name: <skill_name>`` -- dirs a host would load as a SECOND skill of
     the same name (a stale ``summon.pre-refresh-*`` backup, a hand-copied dupe). This is what
     makes a host show TWO 'summon' entries. Keyed on the DECLARED name, so the intentional
-    ``sub-agents`` alias (name: sub-agents) is NOT flagged. Absolute paths, sorted; fail-soft
-    on an unreadable skills dir."""
+    ``sub-agents`` alias (name: sub-agents) is NOT flagged. The canonical dir is skipped by
+    CANONICAL PATH (so a case-variant ``SUMMON`` on Windows, or a symlink to it, is recognized
+    as the canonical copy, never itself flagged). Bounded (``os.scandir`` iterator, first
+    ``_MAX_SKILLS_SCAN`` entries) and fail-soft. Absolute paths, sorted."""
+    canonical = _canonical(os.path.join(skills_dir, skill_name))
     out = []
     try:
-        names = os.listdir(skills_dir)
+        with os.scandir(skills_dir) as it:          # streaming, never materializes a huge dir
+            for i, entry in enumerate(it):
+                if i >= _MAX_SKILLS_SCAN:
+                    break
+                d = os.path.join(skills_dir, entry.name)
+                if _canonical(d) == canonical:       # the canonical dir itself (case/symlink-safe)
+                    continue
+                try:
+                    if not entry.is_dir():
+                        continue
+                except OSError:
+                    continue
+                if _skill_md_name(d) == skill_name:
+                    out.append(_canonical(d))
     except OSError:
         return out
-    for name in names:
-        if name == skill_name:
-            continue
-        d = os.path.join(skills_dir, name)
-        if os.path.isdir(d) and _skill_md_name(d) == skill_name:
-            out.append(_canonical(d))
     return sorted(out)
 
 
@@ -203,6 +229,11 @@ def enumerate_installs(running_scripts_dir: str | None = None,
             first = by_key[key]
             first["label"] = first["label"] + "+" + r["label"]
             first["managed"] = first["managed"] or r["managed"]
+            # MERGE duplicates: two hosts sharing one physical summon (symlink alias) may still
+            # have DIFFERENT skills dirs, so a duplicate visible only from the later host's dir
+            # must not be dropped on collapse (else converged is falsely True).
+            first["duplicates"] = sorted(set(first.get("duplicates", []))
+                                         | set(r.get("duplicates", [])))
         else:
             by_key[key] = r
             records.append(r)
