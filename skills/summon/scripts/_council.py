@@ -1166,19 +1166,22 @@ def run_council(args) -> int:
            for e in (primary_env, fallback_env) if e and e.get("billing")}
         - {None})
 
-    # `failed` = GENUINE failures only. An "excluded" member was intentionally stopped (an
-    # early-exit straggler, or a queued member dropped by --overall-timeout), not a failure, so
-    # it belongs in the run's exclusion accounting, never in failed_members (codex finding #2).
+    # `failed` = genuine failures PLUS in-flight members the early-exit sweep killed (they report
+    # their killed status honestly -- a registered proc cannot be causally told apart from a real
+    # timeout, so it is never relabeled). An "excluded" member is one gated BEFORE dispatch -- the
+    # quorum was already reached, or --overall-timeout had breached -- so it never ran; that is the
+    # sole source of "excluded", and it belongs in the exclusion accounting, not failed_members.
     failed = [m["agent"] for m in results if m.get("status") not in ("success", "excluded")]
     synth_ok = chair_env.get("status") == "success"
     # Status reflects the WHOLE council: success only if the SYNTHESIS succeeded
     # (primary or fallback) AND every member answered; otherwise partial. Quorum
     # NEVER promotes this to success -- it only gates whether synthesis ran.
     status = "success" if (synth_ok and not failed) else "partial"
-    # V4b: on an early exit the killed/excluded stragglers are INTENTIONAL (we had enough),
-    # not failures. When early-exit fired and the chair succeeded on the quorum, the council
-    # is a SUCCESS (marked early_exit below) -- NOT demoted to partial by those exclusions.
-    # (A real overall-timeout, which never sets early["fired"], still demotes to partial.)
+    # V4b: when early-exit fires, in-flight stragglers are process-tree-killed and land in `failed`
+    # above (their killed status), which alone would demote to partial -- but those "failures" were
+    # INTENTIONAL (we already had enough successes). So if early-exit fired and the chair succeeded
+    # on the quorum, re-promote to SUCCESS (marked early_exit below). A real overall-timeout, which
+    # never sets early["fired"], still demotes to partial.
     early_fired = early.get("fired", False)
     if early_fired and synth_ok and members_succeeded >= (min_successful or 0):
         status = "success"
