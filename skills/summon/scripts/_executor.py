@@ -570,7 +570,12 @@ def _kill_tree(process: subprocess.Popen) -> None:
     try:
         if os.name == "nt":
             # Popen keeps the process handle open, so Windows will NOT recycle
-            # this PID mid-teardown — taskkill /T targets the right tree.
+            # this PID mid-teardown — taskkill /T targets the right tree WHILE THE
+            # LEADER IS ALIVE. KNOWN GAP (see KNOWN_ISSUES.md / #10): taskkill walks
+            # parent->child PID links, so once this leader (run_subagent.py) has
+            # exited, a still-running backend grandchild is orphaned. The correct fix
+            # is a Windows Job Object (kill the tree independent of leader lifetime);
+            # POSIX's killpg below already reaches the group through a dead leader.
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
                            capture_output=True, timeout=10)
         else:
