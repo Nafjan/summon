@@ -264,6 +264,225 @@ def _council_summary(member_views: list, *, run_id, results_dir, chair_status,
             "resume_available": bool(run_id)}
 
 
+class _KillRegistry:
+    """Overall-timeout / kill / V4b early-exit machinery for run_council, as one cohesive unit.
+
+    ThreadPoolExecutor worker threads are non-daemon and concurrent.futures atexit-joins them, so
+    merely returning would STILL block until each in-flight child's own watchdog fires --
+    reintroducing the exact host exit-124 this feature prevents. So we register every in-flight
+    member child and, on a deadline breach, PROCESS-TREE-KILL them (which unblocks their run_stage).
+    A daemon watchdog fires the kill at the deadline; members that would start AFTER a breach are
+    excluded without dispatching. The V4b early-exit sweep reuses the same registry: once the quorum
+    lands it kills the in-flight stragglers and self-excludes queued ones.
+
+    The logic here is VERBATIM from the former run_council closures (11 adversarial review rounds);
+    this is a behavior-preserving extraction. `lock` is intentionally public: run_council's progress
+    counter shares it so `with reg.lock: done["n"] += 1; reg.tally_success(env)` stays ONE acquire.
+    """
+
+    def __init__(self, overall_timeout_ms, min_successful, run_start):
+        self.overall_timeout_ms = overall_timeout_ms
+        self.min_successful = min_successful
+        self.lock = threading.Lock()
+        self.inflight = {}                  # tag -> Popen, guarded by self.lock
+        self.overall = {"hit": False}       # set once the deadline breaches
+        self.overall_deadline = (run_start + overall_timeout_ms / 1000) if overall_timeout_ms else None
+        self._overall_done = threading.Event()   # set on normal completion -> watchdog exits early
+        # on = gate flag (active this round); armed = tally only the FINAL round; fired = it
+        # triggered at some point (persists, for the envelope); ok = successes THIS round.
+        self.early = {"on": False, "ok": 0, "armed": False, "thread": None, "fired": False}
+        self._early_done = threading.Event()
+
+    def register_inflight(self, tag, proc) -> None:
+        with self.lock:
+            self.inflight[tag] = proc
+
+    def unregister(self, tag) -> None:
+        with self.lock:
+            self.inflight.pop(tag, None)
+
+    def kill_inflight(self) -> None:
+        from _executor import _kill_tree
+        with self.lock:
+            tags = list(self.inflight.keys())   # snapshot TAGS, not Popen objects
+        # DEREGISTRATION INVALIDATES THE KILL: re-read inflight.get(tag) under the lock right before
+        # killing, so a child reaped + unregistered (by its on_reap, the instant communicate()
+        # returns -- before any envelope file read) since the snapshot is skipped, never killed on a
+        # stale reference. No poll()/liveness gate on the surviving proc, on purpose: a
+        # still-registered proc has NOT been reaped -- its leader may be alive, or a zombie whose
+        # GRANDCHILD still holds stdout (the observed way the wall clock was defeated), and only
+        # killpg reaches that grandchild; poll() would REAP the leader, skipping the grandchild kill
+        # AND freeing the pid for recycle. The POSIX pid-recycle residual is now bounded to the
+        # [re-read under lock -> _kill_tree entry] gap (a few instructions) AND only if the recycled
+        # pid re-becomes a group leader in it -- documented in _kill_tree.
+        for tag in tags:
+            with self.lock:
+                p = self.inflight.get(tag)
+            if p is None:
+                continue                        # reaped+unregistered since snapshot -> stale
+            try:
+                _kill_tree(p)
+            except Exception:  # noqa: BLE001 — best-effort kill, never fatal
+                pass
+
+    def remaining_ms(self):
+        """Milliseconds left in the overall budget (None if no --overall-timeout)."""
+        if self.overall_deadline is None:
+            return None
+        return int(max(0, (self.overall_deadline - time.monotonic()) * 1000))
+
+    def clamped_stage_ms(self, base_ms: int) -> int:
+        """A stage's effective timeout, clamped to the remaining overall budget so no child can
+        run past the deadline (>=1s floor)."""
+        rem = self.remaining_ms()
+        return base_ms if rem is None else max(1000, min(base_ms, rem))
+
+    def breached(self) -> bool:
+        """True once the overall budget is spent -- by the AUTHORITATIVE monotonic deadline, NOT
+        merely the watchdog's async flag. A delayed/starved watchdog thread must never let a
+        dispatch guard wave a paid child through after the deadline, so every gate consults the
+        clock directly. Any observer publishes overall["hit"] here (idempotent with the watchdog) so
+        the downstream partial-emission path treats the breach as seen."""
+        if self.overall["hit"]:
+            return True
+        if self.overall_deadline is not None and time.monotonic() >= self.overall_deadline:
+            self.overall["hit"] = True
+            return True
+        return False
+
+    def mark_breached(self) -> None:
+        """Publish a breach observed OUTSIDE breached() (the setup-overrun fast path), idempotent
+        with the watchdog and breached()."""
+        self.overall["hit"] = True
+
+    @property
+    def hit(self) -> bool:
+        """The RAW breach flag (does NOT re-check the clock) -- for the final envelope's
+        partial-vs-early_exit decision, which must read what actually fired, not re-evaluate."""
+        return self.overall["hit"]
+
+    def register_and_gate(self, tag, proc) -> None:
+        """on_spawn hook: register the live child, then RE-CHECK the deadline. The pre-dispatch gate
+        can pass and the deadline expire DURING launch (Popen); a child that spawned past the
+        deadline is killed HERE, at spawn, instead of waiting up to a ~150ms watchdog sweep -- making
+        launch atomic with the budget for this child (its registration is visible to any concurrent
+        kill, and this check catches the just-lost race)."""
+        self.register_inflight(tag, proc)
+        if self.breached():
+            from _executor import _kill_tree
+            try:
+                _kill_tree(proc)
+            except Exception:  # noqa: BLE001 — best-effort kill, never fatal
+                pass
+
+    def _overall_watchdog(self) -> None:
+        remaining = self.overall_deadline - time.monotonic()
+        if remaining > 0:
+            self._overall_done.wait(remaining)   # wake early if the council finishes first
+        if self._overall_done.is_set():
+            return
+        self.overall["hit"] = True
+        print(f"[council] overall timeout ({int(self.overall_timeout_ms / 1000)}s) reached; "
+              "killing in-flight members and emitting a partial council envelope",
+              file=sys.stderr, flush=True)
+        # KEEP enforcing: a stage that spawns in the tiny window between a member's hit-check and its
+        # registration (a queued wave freeing the semaphore, or a chairman) is killed on a later
+        # sweep, until the council tears down. A single snapshot-kill would let such a straggler run
+        # unkillable -> host kill.
+        while not self._overall_done.is_set():
+            self.kill_inflight()
+            self._overall_done.wait(0.15)
+
+    def start_watchdog(self) -> None:
+        if self.overall_deadline is not None:
+            threading.Thread(target=self._overall_watchdog, daemon=True).start()
+
+    def finish(self) -> None:
+        """Let the overall-timeout watchdog exit (no more sweeps) -- called once teardown is done."""
+        self._overall_done.set()
+
+    def teardown(self, budget_s: float) -> None:
+        """FINAL teardown, BEFORE stopping the watchdog: every child still registered is an
+        UNCONFIRMED process tree (a timed-out stage, or a descendant that outlived a kill) -- its
+        clean stdout-EOF was never observed. killpg via the leader pid reaches the whole group, so
+        make ONE best-effort kill per tree and PRUNE it (SIGKILL / taskkill /T is authoritative; a
+        re-kill would only chase a recycled pid). WALL-CLOCK bounded: a genuinely unkillable or
+        slow-taskkill child must not delay the partial envelope past the host timeout -- we return
+        rather than hang."""
+        from _executor import _kill_tree as _td_kill
+        _td_deadline = time.monotonic() + budget_s
+        while True:
+            with self.lock:
+                if not self.inflight:
+                    break
+                _td_tag, _td_proc = next(iter(self.inflight.items()))
+                self.inflight.pop(_td_tag, None)   # prune under the lock: one shot per tree
+            try:
+                _td_kill(_td_proc)
+            except Exception:  # noqa: BLE001 — best-effort teardown, never fatal
+                pass
+            if time.monotonic() >= _td_deadline:
+                break                              # time budget spent; stop chasing survivors
+
+    @property
+    def early_on(self) -> bool:
+        return self.early["on"]
+
+    @property
+    def early_fired(self) -> bool:
+        return self.early.get("fired", False)
+
+    def _early_sweeper(self) -> None:
+        # Mirror the overall-timeout watchdog's LOOP, not a one-shot kill: a straggler that registers
+        # in the window between its early-exit gate-check and its on_spawn registration is caught on a
+        # later sweep; a single kill would leak it (it would run to its full member timeout, defeating
+        # the point of exiting early).
+        while not self._early_done.is_set():
+            self.kill_inflight()
+            self._early_done.wait(0.15)
+
+    def tally_success(self, env) -> None:
+        # Called UNDER self.lock (the caller holds it): count a member SUCCESS toward the early-exit
+        # threshold and, on the Mth, flip the flag + start the repeated sweep. Only while ARMED (the
+        # final member round). Starting the daemon under the lock is safe: the sweeper's first
+        # kill_inflight just waits the microsecond until this lock releases.
+        if self.min_successful is None or not self.early["armed"] or self.early["on"]:
+            return
+        if (env or {}).get("status") == "success":
+            self.early["ok"] += 1
+            if self.early["ok"] >= self.min_successful:
+                self.early["on"] = True
+                self.early["fired"] = True
+                if self.early["thread"] is None:
+                    self.early["thread"] = threading.Thread(
+                        target=self._early_sweeper, name="summon-early-sweep", daemon=True)
+                    self.early["thread"].start()
+
+    def early_arm(self, active: bool) -> None:
+        # Arm early-exit for the round about to run (final round only, per the challenge: earlier
+        # rounds barrier fully so round-2 cross-examination sees a real set).
+        with self.lock:
+            self.early["armed"] = bool(active) and (self.min_successful is not None)
+            self.early["ok"] = 0
+            self.early["on"] = False
+            self.early["thread"] = None
+        self._early_done.clear()
+
+    def early_disarm(self) -> None:
+        # Round finished (its pool.map barrier returned): STOP the sweep AND JOIN it before synthesis,
+        # so a sweep already PAST its `_early_done` check (paused before its kill_inflight) can never
+        # resume and kill the CHAIRMAN we are about to register. Setting the event alone is NOT
+        # enough -- the join is the barrier (codex CRITICAL).
+        self._early_done.set()
+        with self.lock:
+            th = self.early["thread"]
+            self.early["thread"] = None
+            self.early["armed"] = False
+            self.early["on"] = False
+        if th is not None:
+            th.join()   # wait out any in-flight sweep iteration (bounded by one kill_inflight)
+
+
 def run_council(args) -> int:
     """Entry point for ``--council``. Returns the process exit code."""
     _run_start = time.monotonic()   # overall-timeout budget covers the WHOLE run
@@ -425,177 +644,12 @@ def run_council(args) -> int:
             return _fail(f"cannot write run receipt: {e}", out_path)
 
     started = time.monotonic()
-    lock = threading.Lock()
     done = {"n": 0}
-
-    # ---- overall-timeout kill machinery ---------------------------------------
-    # ThreadPoolExecutor worker threads are non-daemon and concurrent.futures
-    # atexit-joins them, so merely returning would STILL block until each in-flight
-    # child's own watchdog fires -- reintroducing the exact host exit-124 this
-    # feature prevents. So we register every in-flight member child and, on a
-    # deadline breach, PROCESS-TREE-KILL them (which unblocks their run_stage). A
-    # daemon watchdog fires the kill at the deadline; members that would start
-    # AFTER a breach are excluded without dispatching.
-    overall_deadline = (_run_start + overall_timeout_ms / 1000) if overall_timeout_ms else None
-    inflight: dict = {}                 # tag -> Popen, guarded by `lock`
-    overall = {"hit": False}            # set once the deadline breaches
-    _overall_done = threading.Event()   # set on normal completion -> watchdog exits early
-
-    def _register_inflight(tag: str, proc) -> None:
-        with lock:
-            inflight[tag] = proc
-
-    def _unregister_inflight(tag: str) -> None:
-        with lock:
-            inflight.pop(tag, None)
-
-    def _kill_inflight() -> None:
-        from _executor import _kill_tree
-        with lock:
-            tags = list(inflight.keys())   # snapshot TAGS, not Popen objects
-        # DEREGISTRATION INVALIDATES THE KILL: re-read inflight.get(tag) under the lock
-        # right before killing, so a child reaped + unregistered (by its on_reap, the
-        # instant communicate() returns -- before any envelope file read) since the
-        # snapshot is skipped, never killed on a stale reference. No poll()/liveness gate
-        # on the surviving proc, on purpose: a still-registered proc has NOT been reaped
-        # -- its leader may be alive, or a zombie whose GRANDCHILD still holds stdout (the
-        # observed way the wall clock was defeated), and only killpg reaches that
-        # grandchild; poll() would REAP the leader, skipping the grandchild kill AND
-        # freeing the pid for recycle. The POSIX pid-recycle residual is now bounded to
-        # the [re-read under lock -> _kill_tree entry] gap (a few instructions) AND only
-        # if the recycled pid re-becomes a group leader in it -- documented in _kill_tree.
-        for tag in tags:
-            with lock:
-                p = inflight.get(tag)
-            if p is None:
-                continue                       # reaped+unregistered since snapshot -> stale
-            try:
-                _kill_tree(p)
-            except Exception:  # noqa: BLE001 — best-effort kill, never fatal
-                pass
-
-    def _remaining_ms():
-        """Milliseconds left in the overall budget (None if no --overall-timeout)."""
-        if overall_deadline is None:
-            return None
-        return int(max(0, (overall_deadline - time.monotonic()) * 1000))
-
-    def _clamped_stage_ms(base_ms: int) -> int:
-        """A stage's effective timeout, clamped to the remaining overall budget so
-        no child can run past the deadline (>=1s floor)."""
-        rem = _remaining_ms()
-        return base_ms if rem is None else max(1000, min(base_ms, rem))
-
-    def _breached() -> bool:
-        """True once the overall budget is spent -- by the AUTHORITATIVE monotonic
-        deadline, NOT merely the watchdog's async flag. A delayed/starved watchdog
-        thread must never let a dispatch guard wave a paid child through after the
-        deadline, so every gate consults the clock directly. Any observer publishes
-        overall["hit"] here (idempotent with the watchdog) so the downstream
-        partial-emission path treats the breach as seen."""
-        if overall["hit"]:
-            return True
-        if overall_deadline is not None and time.monotonic() >= overall_deadline:
-            overall["hit"] = True
-            return True
-        return False
-
-    def _register_and_gate(tag: str, proc) -> None:
-        """on_spawn hook: register the live child, then RE-CHECK the deadline. The
-        pre-dispatch gate can pass and the deadline expire DURING launch (Popen); a
-        child that spawned past the deadline is killed HERE, at spawn, instead of
-        waiting up to a ~150ms watchdog sweep -- making launch atomic with the budget
-        for this child (its registration is visible to any concurrent kill, and this
-        check catches the just-lost race)."""
-        _register_inflight(tag, proc)
-        if _breached():
-            from _executor import _kill_tree
-            try:
-                _kill_tree(proc)
-            except Exception:  # noqa: BLE001 — best-effort kill, never fatal
-                pass
-
-    def _overall_watchdog() -> None:
-        remaining = overall_deadline - time.monotonic()
-        if remaining > 0:
-            _overall_done.wait(remaining)   # wake early if the council finishes first
-        if _overall_done.is_set():
-            return
-        overall["hit"] = True
-        print(f"[council] overall timeout ({int(overall_timeout_ms / 1000)}s) reached; "
-              "killing in-flight members and emitting a partial council envelope",
-              file=sys.stderr, flush=True)
-        # KEEP enforcing: a stage that spawns in the tiny window between a member's
-        # hit-check and its registration (a queued wave freeing the semaphore, or a
-        # chairman) is killed on a later sweep, until the council tears down. A
-        # single snapshot-kill would let such a straggler run unkillable -> host kill.
-        while not _overall_done.is_set():
-            _kill_inflight()
-            _overall_done.wait(0.15)
-
-    if overall_deadline is not None:
-        threading.Thread(target=_overall_watchdog, daemon=True).start()
-
-    # ---- V4b early-exit machinery ---------------------------------------------
-    # Once `min_successful` members SUCCEED in the FINAL round, stop waiting for the rest:
-    # kill the in-flight stragglers and self-exclude the queued ones, then chair the quorum.
-    # DELIBERATELY separate from the overall-timeout flag: early-exit must NOT set
-    # overall["hit"] -- that would make the still-live watchdog kill the chairman we are about
-    # to run and divert synthesis to a PARTIAL. It gets its own flag and its own repeated sweep.
-    # on = gate flag (active this round); armed = tally only the FINAL round; fired = it
-    # triggered at some point (persists, for the envelope); ok = successes THIS round.
-    early = {"on": False, "ok": 0, "armed": False, "thread": None, "fired": False}
-    _early_done = threading.Event()
-
-    def _early_sweeper() -> None:
-        # Mirror the overall-timeout watchdog's LOOP, not a one-shot kill: a straggler that
-        # registers in the window between its early-exit gate-check and its on_spawn
-        # registration is caught on a later sweep; a single kill would leak it (it would run
-        # to its full member timeout, defeating the point of exiting early).
-        while not _early_done.is_set():
-            _kill_inflight()
-            _early_done.wait(0.15)
-
-    def _tally_success(env) -> None:
-        # Called UNDER `lock`: count a member SUCCESS toward the early-exit threshold and, on
-        # the Mth, flip the flag + start the repeated sweep. Only while ARMED (the final member
-        # round). Starting the daemon under the lock is safe: the sweeper's first _kill_inflight
-        # just waits the microsecond until this lock releases.
-        if min_successful is None or not early["armed"] or early["on"]:
-            return
-        if (env or {}).get("status") == "success":
-            early["ok"] += 1
-            if early["ok"] >= min_successful:
-                early["on"] = True
-                early["fired"] = True
-                if early["thread"] is None:
-                    early["thread"] = threading.Thread(
-                        target=_early_sweeper, name="summon-early-sweep", daemon=True)
-                    early["thread"].start()
-
-    def _early_arm(active: bool) -> None:
-        # Arm early-exit for the round about to run (final round only, per the challenge:
-        # earlier rounds barrier fully so round-2 cross-examination sees a real set).
-        with lock:
-            early["armed"] = bool(active) and (min_successful is not None)
-            early["ok"] = 0
-            early["on"] = False
-            early["thread"] = None
-        _early_done.clear()
-
-    def _early_disarm() -> None:
-        # Round finished (its pool.map barrier returned): STOP the sweep AND JOIN it before
-        # synthesis, so a sweep already PAST its `_early_done` check (paused before its
-        # _kill_inflight) can never resume and kill the CHAIRMAN we are about to register.
-        # Setting the event alone is NOT enough -- the join is the barrier (codex CRITICAL).
-        _early_done.set()
-        with lock:
-            th = early["thread"]
-            early["thread"] = None
-            early["armed"] = False
-            early["on"] = False
-        if th is not None:
-            th.join()   # wait out any in-flight sweep iteration (bounded by one _kill_inflight)
+    # Overall-timeout / kill / V4b early-exit machinery lives in _KillRegistry (extracted
+    # for cohesion). `done` (a progress counter) stays here and SHARES reg.lock so the
+    # `with reg.lock: done["n"] += 1; reg.tally_success(env)` block remains ONE acquire.
+    reg = _KillRegistry(overall_timeout_ms, min_successful, _run_start)
+    reg.start_watchdog()
 
     def backend_of(agent: str) -> str:
         from _manifest import _job_backend
@@ -648,7 +702,7 @@ def run_council(args) -> int:
         corrupting the successor's single-writer journal. ``stage_timeout_ms``
         is the member or chair clock for this stage type, clamped to whatever
         remains of the overall budget so no child can outlive the deadline."""
-        stage_timeout_ms = _clamped_stage_ms(stage_timeout_ms)
+        stage_timeout_ms = reg.clamped_stage_ms(stage_timeout_ms)
         attempt_id = f"g{owner.generation}-{stage}-1"
         out_file = _rd.stage_path(rd_path, owner.generation, stage)
         try:  # a stale current-generation leftover (failed carry residue,
@@ -675,8 +729,8 @@ def run_council(args) -> int:
         # is gone. Leaving it registered lets the overall-timeout loop and the FINAL
         # teardown sweep killpg the whole group via the leader pid. No finally-deregister.
         env = _dispatch(agent, prompt, cwd, agents_dir, stage_timeout_ms, rd_path,
-                        _tag, on_spawn=lambda p: _register_and_gate(_tag, p),
-                        on_reap=lambda p: _unregister_inflight(_tag))
+                        _tag, on_spawn=lambda p: reg.register_and_gate(_tag, p),
+                        on_reap=lambda p: reg.unregister(_tag))
         if isinstance(env, dict) and _rd.owner_still_current(owner):
             # Owner-side annotation (fenced): the upstream-input hash is what
             # makes this stage carry-forwardable on a later resume.
@@ -724,10 +778,10 @@ def run_council(args) -> int:
         # Overall-timeout: if the deadline already breached (a later wave that
         # would start after the kill), EXCLUDE this member without dispatching --
         # no durable stage file is written, so a resume re-runs it cleanly.
-        if _breached():
+        if reg.breached():
             return _member_view(agent, {"status": "excluded",
                                         "error": "overall timeout reached before dispatch"})
-        if early["on"]:   # V4b: the quorum was reached before this member started -> skip it
+        if reg.early_on:   # V4b: the quorum was reached before this member started -> skip it
             return _member_view(agent, {"status": "excluded",
                                         "error": "early-exit: quorum reached before dispatch"})
         # Resume economics: a prior-generation stage whose upstream inputs are
@@ -735,11 +789,11 @@ def run_council(args) -> int:
         pg = _prior_generation(stage)
         if pg and _rd.carry_forward(rd_path, owner, stage, pg, input_sha):
             env = _rd.read_json(_rd.stage_path(rd_path, owner.generation, stage)) or {}
-            with lock:
+            with reg.lock:
                 done["n"] += 1
                 print(f"[council {done['n']}/{len(members)}] {agent} carried forward "
                       f"from generation {pg}", file=sys.stderr, flush=True)
-                _tally_success(env)   # a carried-forward stage is a success -> counts toward M
+                reg.tally_success(env)   # a carried-forward stage is a success -> counts toward M
             return _member_view(agent, env)
         fresh_stages.add(stage)
         b = member_backend[agent]
@@ -747,10 +801,10 @@ def run_council(args) -> int:
             # Re-check AFTER acquiring the semaphore: a member that was QUEUED (a
             # later wave) when the deadline breached must be excluded here, or it
             # would spawn a child after the watchdog's sweep and outlive the budget.
-            if _breached():
+            if reg.breached():
                 return _member_view(agent, {"status": "excluded",
                                             "error": "overall timeout reached while queued"})
-            if early["on"]:   # V4b: a queued wave freed after the quorum landed -> do not dispatch
+            if reg.early_on:   # V4b: a queued wave freed after the quorum landed -> do not dispatch
                 return _member_view(agent, {"status": "excluded",
                                             "error": "early-exit: quorum reached while queued"})
             env = run_stage(agent, prompt, stage, input_sha, member_timeout_ms)
@@ -758,16 +812,16 @@ def run_council(args) -> int:
             # in-flight member the early-exit sweep killed as `excluded`: a still-registered proc is
             # inherently ambiguous (a live straggler vs. a member that already TIMED OUT and left a
             # lingering stdout-holding grandchild -- both stay registered by the V4a kill design,
-            # which refuses poll()/liveness on purpose, _kill_inflight()). Distinguishing them would
+            # which refuses poll()/liveness on purpose, reg.kill_inflight()). Distinguishing them would
             # need causal termination state that proved race-prone (a delayed post-dispatch check
             # samples stale flags; recording != killing snapshots leak). So a killed straggler
             # honestly reports its killed error in members_failed, and only NEVER-DISPATCHED members
             # (gated below, atomically, before any dispatch) are `excluded`. (codex 3x: relabel race)
-        with lock:
+        with reg.lock:
             done["n"] += 1
             print(f"[council {done['n']}/{len(members)}] {agent} ({b}) "
                   f"status={env.get('status')}", file=sys.stderr, flush=True)
-            _tally_success(env)   # V4b: the Mth success here flips the flag + starts the sweep
+            reg.tally_success(env)   # V4b: the Mth success here flips the flag + starts the sweep
         return _member_view(agent, env)
 
     def _supersede_stale() -> None:
@@ -822,8 +876,8 @@ def run_council(args) -> int:
         # If setup ALONE already overran, dispatch nothing: emit a zero-member partial
         # so no paid child is ever launched past the deadline. (The finally still
         # releases ownership and stops the watchdog.)
-        if overall_deadline is not None and time.monotonic() >= overall_deadline:
-            overall["hit"] = True
+        if reg.overall_deadline is not None and time.monotonic() >= reg.overall_deadline:
+            reg.mark_breached()
             _env = {"mode": "council", "envelope": 1, "run_id": run_id, "run_dir": rd_path,
                     "generation": owner.generation, "question": question, "rounds": rounds,
                     "council_state": "overall_timeout", "members": [], "member_envelopes": [],
@@ -852,11 +906,11 @@ def run_council(args) -> int:
             return _rd.content_sha256({"prompt": p1, "member": m,
                                        "agent_sha": _agent_shas.get(m), **_exec_ctx})
 
-        _early_arm(rounds < 2)   # round 1 is the FINAL member round only when --rounds 1
+        reg.early_arm(rounds < 2)   # round 1 is the FINAL member round only when --rounds 1
         with ThreadPoolExecutor(max_workers=len(members)) as pool:
             results = list(pool.map(lambda m: run_member(m, p1, f"r1-{m}", _r1_sha(m)),
                                     members))
-        _early_disarm()
+        reg.early_disarm()
 
         # ---- round 2 (optional): cross-examination + peer RANKING -----------
         consensus_ranking = None
@@ -893,7 +947,7 @@ def run_council(args) -> int:
             path, which stops BEFORE the deadline). Killed members are already
             unblocked; anything still registered is killed here. The envelope is
             flushed BEFORE the finally releases ownership so the host sees it."""
-            _kill_inflight()
+            reg.kill_inflight()
             env = _partial_env("overall_timeout")
             env["status"] = "partial"
             env["run_id"] = run_id
@@ -919,7 +973,7 @@ def run_council(args) -> int:
         _write_state("round1_complete")
         if lost["err"]:
             return _fail(f"run ownership lost during round 1: {lost['err']}", out_path)
-        if _breached():
+        if reg.breached():
             return _overall_partial("cut short during/after round 1")
         if rounds >= 2:
             done["n"] = 0
@@ -933,10 +987,10 @@ def run_council(args) -> int:
 
             def refine(agent):
                 return run_member(agent, p2, f"r2-{agent}", _r2_sha(agent))
-            _early_arm(True)   # round 2 is the final member round -> early-exit active
+            reg.early_arm(True)   # round 2 is the final member round -> early-exit active
             with ThreadPoolExecutor(max_workers=len(members)) as pool:
                 results = list(pool.map(refine, members))
-            _early_disarm()
+            reg.early_disarm()
             # Rankings are an owner-computed STAGE: carried forward when the r2
             # outputs are unchanged, recomputed (and journaled) otherwise. The
             # hash covers raws AND statuses: status gates vote eligibility, so
@@ -978,13 +1032,13 @@ def run_council(args) -> int:
             _write_state("round2_complete")
             if lost["err"]:
                 return _fail(f"run ownership lost during round 2: {lost['err']}", out_path)
-            if _breached():
+            if reg.breached():
                 return _overall_partial("cut short during/after round 2")
 
         # A breach that landed AFTER the last member round but BEFORE synthesis:
         # skip the (unaffordable) chairman and emit the partial with the members.
         # Checked BEFORE the pop below so the partial keeps the full member envelopes.
-        if _breached():
+        if reg.breached():
             return _overall_partial("cut short before synthesis")
 
         for m in results:    # drop the raw text and envelope carried for checkpoints
@@ -1066,7 +1120,7 @@ def run_council(args) -> int:
             else:
                 # A breach in the window between the pre-synthesis check and here
                 # must not start a paid chairman: emit the partial with the members.
-                if _breached():
+                if reg.breached():
                     return _overall_partial("cut short before chairman dispatch")
                 print(f"[council] chairman {chairman} synthesizing...", file=sys.stderr, flush=True)
                 primary_env = run_stage(chairman, chair_prompt, "chairman", chair_sha, chair_timeout_ms)
@@ -1090,7 +1144,7 @@ def run_council(args) -> int:
                     # (status != success because it was process-tree-killed). Do NOT
                     # start a fresh paid fallback after the budget is spent -- the whole
                     # point of the breach is to stop launching work.
-                    if _breached():
+                    if reg.breached():
                         return _overall_partial("cut short before fallback chairman dispatch")
                     print(f"[council] primary chairman {primary_env.get('status')}; fallback "
                           f"{chairman_fallback} synthesizing...", file=sys.stderr, flush=True)
@@ -1105,7 +1159,7 @@ def run_council(args) -> int:
         # A breach that landed DURING the chairman: route through _overall_partial
         # (which writes the overall_timeout state and flushes) WHILE ownership is
         # still held -- the final-envelope path runs after the finally releases it.
-        if _breached():
+        if reg.breached():
             return _overall_partial("cut short during synthesis")
     except _rd.OwnershipLostError as e:
         # A fenced write raised mid-flight (successor took over): abort cleanly
@@ -1124,21 +1178,8 @@ def run_council(args) -> int:
         # (SIGKILL / taskkill /T is authoritative; a re-kill would only chase a recycled
         # pid). WALL-CLOCK bounded: a genuinely unkillable or slow-taskkill child must not
         # delay the partial envelope past the host timeout -- we return rather than hang.
-        from _executor import _kill_tree as _td_kill
-        _td_deadline = time.monotonic() + _TEARDOWN_BUDGET_S
-        while True:
-            with lock:
-                if not inflight:
-                    break
-                _td_tag, _td_proc = next(iter(inflight.items()))
-                inflight.pop(_td_tag, None)   # prune under the lock: one shot per tree
-            try:
-                _td_kill(_td_proc)
-            except Exception:  # noqa: BLE001 — best-effort teardown, never fatal
-                pass
-            if time.monotonic() >= _td_deadline:
-                break                          # time budget spent; stop chasing survivors
-        _overall_done.set()   # NOW let the overall-timeout watchdog exit (no more sweeps)
+        reg.teardown(_TEARDOWN_BUDGET_S)   # bounded best-effort kill of every unconfirmed tree
+        reg.finish()          # NOW let the overall-timeout watchdog exit (no more sweeps)
         # The run dir PERSISTS (that is the whole point); only our ownership ends.
         _rd.release_owner(owner)
 
@@ -1182,7 +1223,7 @@ def run_council(args) -> int:
     # INTENTIONAL (we already had enough successes). So if early-exit fired and the chair succeeded
     # on the quorum, re-promote to SUCCESS (marked early_exit below). A real overall-timeout, which
     # never sets early["fired"], still demotes to partial.
-    early_fired = early.get("fired", False)
+    early_fired = reg.early_fired
     if early_fired and synth_ok and members_succeeded >= (min_successful or 0):
         status = "success"
 
@@ -1272,8 +1313,8 @@ def run_council(args) -> int:
     # the surviving quorum chaired): mark it and never report a clean success.
     # V4b: a clean early exit (quorum reached + chaired, budget NOT breached) is a SUCCESS
     # marked early_exit -- distinct from an overall_timeout partial. If a real overall-timeout
-    # ALSO fired (overall["hit"]), it wins in the block below and demotes to partial.
-    if early_fired and not overall["hit"]:
+    # ALSO fired (reg.hit), it wins in the block below and demotes to partial.
+    if early_fired and not reg.hit:
         envelope["council_state"] = "early_exit"
         envelope["early_exit"] = {
             "min_successful": min_successful,
@@ -1287,7 +1328,7 @@ def run_council(args) -> int:
             "note": "quorum reached; members not yet dispatched were excluded, in-flight members "
                     "were process-tree-killed (they appear in members_failed), and the surviving "
                     "quorum was chaired"}
-    if overall["hit"]:
+    if reg.hit:
         envelope["council_state"] = "overall_timeout"
         envelope["overall_timeout"] = {
             "budget_ms": overall_timeout_ms,
