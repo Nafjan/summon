@@ -107,27 +107,6 @@ def _owned(path: str) -> bool:
         return False
 
 
-def _owned_prerefresh_backups(parent: str) -> list:
-    """OUR ``summon.pre-refresh-*`` backup dirs in ``parent`` (the host's skills dir).
-
-    A pre-V6 installer named its refresh backups ``summon.pre-refresh-<timestamp>`` and left
-    them beside the live skill, where the host loads each as a DUPLICATE 'summon' skill
-    (the current installer stages in a temp dir and keeps an auto-deleted ``summon.previous``
-    instead, so it no longer creates these -- but it must sweep the orphans the old scheme
-    left). ONLY manifest-owned dirs are returned, so a user's unrelated dir is never touched.
-    Fail-soft + sorted."""
-    out = []
-    try:
-        for name in os.listdir(parent):
-            p = os.path.join(parent, name)
-            if (name.startswith("summon.pre-refresh-") and os.path.isdir(p)
-                    and not os.path.islink(p) and _owned(p)):
-                out.append(name)
-    except OSError:
-        pass
-    return sorted(out)
-
-
 def _write_manifest(dst: str, files: list) -> None:
     with open(os.path.join(dst, MANIFEST), "w", encoding="utf-8") as fh:
         json.dump({"installed_by": "summon", "installed_at": int(time.time()),
@@ -242,11 +221,7 @@ def install_skill(host: str, dry: bool) -> tuple:
             return (f"[!!]  {dest} exists but was NOT installed by summon "
                     f"(no valid {MANIFEST}); refusing to replace it - move it aside first", False)
         verb = "refresh" if os.path.isdir(dest) else "install"
-        stale = _owned_prerefresh_backups(parent)
-        msg = f"[dry] would {verb} skill -> {dest}"
-        if stale:
-            msg += f" (+ sweep {len(stale)} stale pre-refresh backup(s))"
-        return (msg, True)
+        return (f"[dry] would {verb} skill -> {dest}", True)
 
     os.makedirs(parent, exist_ok=True)
     acq = _acquire_lock(HOSTS[host])   # lock the always-present host root
@@ -293,35 +268,13 @@ def install_skill(host: str, dry: bool) -> tuple:
             shutil.rmtree(backup, ignore_errors=True)
         # Sweep OUR old-scheme pre-refresh backups ONLY NOW -- after the new skill is safely in
         # `dest`. A pre-V6 installer left summon.pre-refresh-<ts> dirs here, each loaded by the
-        # host as a DUPLICATE 'summon' (field incident). Post-swap means an owned backup is NEVER
-        # the only copy we deleted ahead of a build that then fails (data loss). Deletion is
-        # ATOMIC via quarantine: rename the candidate to a private staging name FIRST, then
-        # validate + rmtree THAT -- a swap of the original path after the ownership check cannot
-        # redirect the rmtree at a non-owned replacement (the quarantine name is unguessable), and
-        # a non-owned dir that got renamed in is restored, never deleted.
-        swept_backups = 0
-        for _i, _b in enumerate(_owned_prerefresh_backups(parent)):
-            src = os.path.join(parent, _b)
-            if os.path.islink(src) or not os.path.isdir(src):
-                continue
-            quar = os.path.join(parent, f"summon.staging-sweep-{token}-{_i}")
-            try:
-                os.rename(src, quar)          # atomically claim whatever is at src RIGHT NOW
-            except OSError:
-                continue                      # vanished/busy -> nothing to sweep
-            if os.path.islink(quar) or not os.path.isdir(quar) or not _owned(quar):
-                try:
-                    os.rename(quar, src)      # not ours (swapped in before the rename) -> restore
-                except OSError:
-                    pass
-                continue
-            shutil.rmtree(quar, ignore_errors=True)
-            if not os.path.exists(quar):
-                swept_backups += 1
-        msg = f"[ok]  skill installed -> {dest}"
-        if swept_backups:
-            msg += f"; swept {swept_backups} stale pre-refresh backup(s)"
-        return (msg, True)
+        # host as a DUPLICATE 'summon' (field incident). We DETECT these (doctor + _drift_check
+        # below) but deliberately do NOT auto-delete them: a portable, TOCTOU-free recursive
+        # delete of a dir another process could swap is not achievable in stdlib, and an install
+        # script must never risk destroying a user dir. The current installer no longer CREATES
+        # such backups (it stages in a temp dir + auto-removes `.previous`), so these are only
+        # legacy orphans -- the doctor prints the exact path to remove by hand.
+        return (f"[ok]  skill installed -> {dest}", True)
     except OSError as e:
         # Roll back: if the swap half-happened, restore the owned backup.
         if not os.path.isdir(dest) and os.path.isdir(backup) and _owned(backup):
@@ -517,11 +470,16 @@ def _drift_check() -> None:
             print(f"\n[ok] install-drift: all {len(ok)} installed host copy(ies) match the source")
         dups = dr.get("duplicates") or []
         if dups:
-            n = sum(len(d["dirs"]) for d in dups)
+            paths = [p for d in dups for p in d["dirs"]]
             where = ", ".join(d["label"] for d in dups)
-            print(f"[~?] install-drift: {n} duplicate 'summon' skill dir(s) still loaded "
-                  f"({where}) - each shows as a 2nd summon in that host; re-run install.py for "
-                  "that host to sweep owned backups, or remove a non-owned copy by hand")
+            print(f"[~?] install-drift: {len(paths)} duplicate 'summon' skill dir(s) loaded "
+                  f"({where}) - each shows as a 2nd summon in that host. summon does NOT "
+                  "auto-delete them; remove each by hand:")
+            for p in paths:
+                print(f"       {p}")
+        if dr.get("scan_truncated"):
+            print(f"[~?] install-drift: skills dir(s) too large to fully scan for duplicates "
+                  f"({', '.join(dr['scan_truncated'])}); convergence is unverified there")
     except Exception:  # noqa: BLE001 - swallow any ORDINARY error (a non-ASCII console, a
         pass           # closed pipe, a foreign copy) so drift-checking never breaks a
         #                successful install; KeyboardInterrupt/SystemExit deliberately still

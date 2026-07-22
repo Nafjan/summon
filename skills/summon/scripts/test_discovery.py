@@ -5227,10 +5227,17 @@ def test_v6_duplicate_summon_skills_detects_dupe_not_alias():
         _w_skill_md(os.path.join(skills, "summon"), "summon")                        # canonical
         _w_skill_md(os.path.join(skills, "summon.pre-refresh-20260718-1732"), "summon")  # dupe
         _w_skill_md(os.path.join(skills, "sub-agents"), "sub-agents")                # alias, NOT a dupe
-        dupes = _installs.duplicate_summon_skills(skills)
-        assert len(dupes) == 1, dupes
+        _mk_owned_staging = os.path.join(skills, "summon.staging-xyz")
+        _w_skill_md(_mk_owned_staging, "summon")                                      # OUR staging...
+        import json as _json
+        _json.dump({"installed_by": "summon"}, open(os.path.join(_mk_owned_staging,
+                   ".summon-install.json"), "w", encoding="utf-8"))                   # ...verified ours
+        dupes, trunc = _installs.duplicate_summon_skills(skills)
+        assert len(dupes) == 1, dupes                                                 # only the pre-refresh
         assert dupes[0].endswith("summon.pre-refresh-20260718-1732"), dupes
-        assert not any("sub-agents" in d for d in dupes), dupes
+        assert not any("sub-agents" in d for d in dupes), dupes                       # alias ignored
+        assert not any("staging" in d for d in dupes), dupes                          # owned staging skipped
+        assert trunc is False, trunc
     finally:
         import shutil as _sh
         _sh.rmtree(skills, ignore_errors=True)
@@ -5277,19 +5284,21 @@ def test_v6_duplicate_detected_when_canonical_absent():
 
 
 def test_v6_duplicate_scan_truncation_blocks_converged():
-    # Hitting the scan cap must NOT silently report clean: a sentinel is emitted so a duplicate
-    # past the cap cannot let converged be True.
+    # Hitting the scan cap must NOT silently report clean: `truncated` is flagged (SEPARATELY from
+    # real duplicate paths) and blocks converged, so a duplicate past the cap cannot pass.
     import _installs
     home = tempfile.mkdtemp(prefix="summon-trunc-")
     orig = _installs._MAX_SKILLS_SCAN
     try:
         _installs._MAX_SKILLS_SCAN = 3                         # tiny cap for the test
-        base = os.path.join(home, ".cursor", "skills")
-        os.makedirs(os.path.join(base, "summon"))
+        run = _mk_summon_install(home, ".claude", {"run_subagent.py": '__version__ = "1.0.0"\n'})
+        base = os.path.join(home, ".claude", "skills")
         for i in range(6):
             os.makedirs(os.path.join(base, "zzz-filler-%d" % i))
-        dupes = _installs.duplicate_summon_skills(base)
-        assert any("truncated" in p for p in dupes), dupes     # sentinel present -> blocks converged
+        dirs, truncated = _installs.duplicate_summon_skills(base)
+        assert truncated is True and dirs == [], (dirs, truncated)   # flagged, no fake path in dirs
+        dr = _installs.drift_report(_installs.enumerate_installs(running_scripts_dir=run, home=home))
+        assert dr["scan_truncated"] and dr["converged"] is False, dr  # blocks converged, tracked apart
     finally:
         _installs._MAX_SKILLS_SCAN = orig
         import shutil as _sh

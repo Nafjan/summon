@@ -111,156 +111,21 @@ def _mk_owned_dir(path: str) -> None:
         fh.write("---\nname: summon\n---\nold backup\n")
 
 
-def test_owned_prerefresh_backup_swept_on_refresh():
-    # A pre-V6 installer left summon.pre-refresh-<ts> backups beside the live skill; the host
-    # loads each as a DUPLICATE 'summon'. A refresh must sweep OUR owned ones and report it.
+def test_installer_never_autodeletes_prerefresh_orphans():
+    # Detection-only contract: the installer NEVER auto-deletes a pre-refresh orphan. A portable,
+    # TOCTOU-free recursive delete of a dir another process could swap is not achievable in
+    # stdlib, and an install script must not risk destroying a user dir. The doctor DETECTS these
+    # (see test_discovery); removal is left to the user. Even an OWNED look-alike is left in place.
     home = _fake_home()
     try:
         r = _run(home, "--hosts", "claude", "--no-agents")
         assert r.returncode == 0, r.stdout + r.stderr
-        parent = os.path.join(home, ".claude", "skills")
-        orphan = os.path.join(parent, "summon.pre-refresh-20260718-1732")
+        orphan = os.path.join(home, ".claude", "skills", "summon.pre-refresh-20260718-1732")
         _mk_owned_dir(orphan)
-        r = _run(home, "--hosts", "claude", "--no-agents")
+        r = _run(home, "--hosts", "claude", "--no-agents")                 # a refresh
         assert r.returncode == 0, r.stdout + r.stderr
-        assert not os.path.isdir(orphan), "owned pre-refresh backup was not swept"
-        assert "pre-refresh" in r.stdout, r.stdout
-        assert os.path.isfile(os.path.join(_dest(home), "SKILL.md")), "live skill lost"
-    finally:
-        shutil.rmtree(home, ignore_errors=True)
-
-
-def test_unowned_prerefresh_backup_survives_refresh():
-    # A dir that merely LOOKS like a pre-refresh backup but is NOT ours (no valid manifest)
-    # must NEVER be swept -- same marker-gated discipline as staging/previous.
-    home = _fake_home()
-    try:
-        r = _run(home, "--hosts", "claude", "--no-agents")
-        assert r.returncode == 0, r.stdout + r.stderr
-        parent = os.path.join(home, ".claude", "skills")
-        orphan = os.path.join(parent, "summon.pre-refresh-userthing")
-        os.makedirs(orphan)
-        open(os.path.join(orphan, "USER_FILE"), "w").write("precious")   # no manifest -> not owned
-        r = _run(home, "--hosts", "claude", "--no-agents")
-        assert r.returncode == 0, r.stdout + r.stderr
-        assert os.path.isfile(os.path.join(orphan, "USER_FILE")), "non-owned dir wrongly swept"
-    finally:
-        shutil.rmtree(home, ignore_errors=True)
-
-
-def test_dry_run_reports_prerefresh_sweep_without_touching_it():
-    home = _fake_home()
-    try:
-        r = _run(home, "--hosts", "claude", "--no-agents")
-        assert r.returncode == 0, r.stdout + r.stderr
-        parent = os.path.join(home, ".claude", "skills")
-        orphan = os.path.join(parent, "summon.pre-refresh-20260718-1732")
-        _mk_owned_dir(orphan)
-        r = _run(home, "--hosts", "claude", "--no-agents", "--dry-run")
-        assert r.returncode == 0, r.stdout + r.stderr
-        assert "sweep" in r.stdout and "pre-refresh" in r.stdout, r.stdout
-        assert os.path.isdir(orphan), "dry-run must not delete anything"
-    finally:
-        shutil.rmtree(home, ignore_errors=True)
-
-
-def test_prerefresh_swept_only_after_skill_is_in_place():
-    # A crashed legacy refresh can leave an owned pre-refresh backup with NO canonical summon.
-    # A fresh install must SUCCEED, install the skill, and sweep the backup. The sweep runs
-    # AFTER the swap, so an owned backup is never deleted ahead of a build that could fail --
-    # here we assert the end state (skill present, backup gone) for the absent-canonical case.
-    home = _fake_home()
-    try:
-        parent = os.path.join(home, ".claude", "skills")
-        os.makedirs(parent)
-        _mk_owned_dir(os.path.join(parent, "summon.pre-refresh-1"))   # only copy, no canonical
-        r = _run(home, "--hosts", "claude", "--no-agents")
-        assert r.returncode == 0, r.stdout + r.stderr
-        assert os.path.isfile(os.path.join(_dest(home), "SKILL.md")), "skill not installed"
-        assert not os.path.isdir(os.path.join(parent, "summon.pre-refresh-1")), "backup not swept"
-    finally:
-        shutil.rmtree(home, ignore_errors=True)
-
-
-def test_symlinked_prerefresh_backup_not_followed():
-    # Even a pre-refresh-named SYMLINK pointing at an OWNED dir must NOT be swept: we never
-    # rmtree through a symlink (the islink guard), so its target survives. Skips where symlinks
-    # need privilege.
-    home = _fake_home()
-    try:
-        r = _run(home, "--hosts", "claude", "--no-agents")
-        assert r.returncode == 0, r.stdout + r.stderr
-        parent = os.path.join(home, ".claude", "skills")
-        target = os.path.join(home, "owned-elsewhere")
-        _mk_owned_dir(target)                                  # valid manifest -> _owned True
-        link = os.path.join(parent, "summon.pre-refresh-evil")
-        try:
-            os.symlink(target, link, target_is_directory=True)
-        except (OSError, NotImplementedError, AttributeError):
-            return                                             # no symlink privilege -> skip
-        r = _run(home, "--hosts", "claude", "--no-agents")
-        assert r.returncode == 0, r.stdout + r.stderr
-        assert os.path.isdir(target) and os.path.isfile(os.path.join(target, "SKILL.md")), \
-            "an owned symlink target was deleted through the link"
-    finally:
-        shutil.rmtree(home, ignore_errors=True)
-
-
-def _load_install_module():
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("install_mod", os.path.join(REPO, "install.py"))
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    return m
-
-
-def test_build_failure_preserves_owned_prerefresh_backup():
-    # CRITICAL regression: with the canonical summon absent, an owned pre-refresh backup can be
-    # the ONLY copy. A build failure must leave it intact -- the sweep runs only AFTER a
-    # successful swap. FAILS on the pre-fix (sweep-before-staging) implementation.
-    m = _load_install_module()
-    home = _fake_home()
-    try:
-        m.HOSTS = {**m.HOSTS, "claude": os.path.join(home, ".claude")}
-        parent = os.path.join(home, ".claude", "skills")
-        os.makedirs(parent)
-        backup = os.path.join(parent, "summon.pre-refresh-1")
-        _mk_owned_dir(backup)                                       # the only copy, no canonical
-        orig = m._build_tree
-        m._build_tree = lambda staging: (_ for _ in ()).throw(OSError("boom"))
-        try:
-            msg, ok = m.install_skill("claude", dry=False)
-        finally:
-            m._build_tree = orig
-        assert ok is False, (msg, ok)
-        assert os.path.isfile(os.path.join(backup, ".summon-install.json")), \
-            "owned backup destroyed by a failed build (sweep ran before the swap)"
-    finally:
-        shutil.rmtree(home, ignore_errors=True)
-
-
-def test_sweep_deletes_via_quarantine_not_original_path():
-    # CRITICAL regression: the sweep renames each candidate to a private summon.staging-sweep-*
-    # name and deletes THAT, so a swap of the original path after validation cannot redirect the
-    # rmtree. On the pre-quarantine implementation rmtree hit the original pre-refresh path.
-    m = _load_install_module()
-    home = _fake_home()
-    try:
-        m.HOSTS = {**m.HOSTS, "claude": os.path.join(home, ".claude")}
-        assert m.install_skill("claude", dry=False)[1], "initial install failed"
-        parent = os.path.join(home, ".claude", "skills")
-        _mk_owned_dir(os.path.join(parent, "summon.pre-refresh-1"))
-        seen = []
-        orig_rmtree = m.shutil.rmtree
-        m.shutil.rmtree = lambda p, *a, **k: (seen.append(p), orig_rmtree(p, *a, **k))[1]
-        try:
-            assert m.install_skill("claude", dry=False)[1], "refresh failed"
-        finally:
-            m.shutil.rmtree = orig_rmtree
-        assert any("staging-sweep" in str(p) for p in seen), ("no quarantine rmtree seen", seen)
-        assert not any(os.path.basename(str(p)).startswith("summon.pre-refresh-") for p in seen), \
-            "rmtree hit the original pre-refresh path instead of the quarantine"
-        assert not os.path.isdir(os.path.join(parent, "summon.pre-refresh-1")), "backup not swept"
+        assert os.path.isdir(orphan), "installer auto-deleted an orphan (must be detection-only)"
+        assert "swept" not in r.stdout.lower(), r.stdout                    # no sweep behavior/claims
     finally:
         shutil.rmtree(home, ignore_errors=True)
 
