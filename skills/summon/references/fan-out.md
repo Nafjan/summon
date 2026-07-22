@@ -119,12 +119,20 @@ run_subagent.py --council --question-file q.md \
   overrides both timeouts default to `--timeout`. The dispatcher prints this estimate to stderr
   before dispatching (council only; a `--manifest` swarm has no aggregate estimator, so budget
   it from its own waves, per-job `timeout`, and `--retries`). Set your host tool's timeout above it.
+- **`--overall-timeout` is a HARD wall-clock cap.** Where the estimate above is advisory, this is
+  enforced: on breach summon process-tree-kills the in-flight members and emits a PARTIAL council
+  envelope (`status: partial`, `council_state: overall_timeout`) BEFORE the host's own timeout can
+  kill the dispatcher mid-report. Queued members and the fallback chairman are excluded once the
+  budget is spent, and setup counts against it. Use it as a safety net UNDER the host timeout on
+  any council you must bound (one Windows caveat: see `KNOWN_ISSUES.md` / #10).
 - **Council consumes a fixed flag set** (`--question`/`--question-file`, `--members`,
   `--chairman`, `--chairman-fallback`, `--rounds`, `--quorum`, `--member-timeout`,
-  `--chair-timeout`, `--cwd`, `--agents-dir`, `--timeout`, `--out`, `--run-dir`). Anything else
-  (`--model`, `--json-schema`, `--worktree`, `--background`, `--retries`, ...) is rejected up
-  front rather than silently ignored; member model/effort/permission come from each member
-  agent's own definition.
+  `--chair-timeout`, `--overall-timeout`, `--cwd`, `--agents-dir`, `--timeout`, `--out`,
+  `--run-dir`/`--results-dir`). Anything else (`--model`, `--json-schema`, `--worktree`,
+  `--background`, `--retries`, ...) is rejected up front rather than silently ignored; member
+  model/effort/permission come from each member agent's own definition. (`--results-dir` here is
+  an alias for the council `--run-dir`; in `--manifest` mode the same flag names the per-job
+  envelope directory instead.)
 
 Returns one council envelope: `{run_id, generation, question, rounds,
 members:[{agent, model, position}], synthesis:{chairman, recommendation, report},

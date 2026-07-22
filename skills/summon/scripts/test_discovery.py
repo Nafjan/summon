@@ -5429,6 +5429,9 @@ def test_v5_council_doc_has_large_file_pattern_and_timeout_budget():
     for n in ("720", "1320", "2040"):
         assert n in text, f"timeout-budget arithmetic anchor {n}s missing"
     assert "--quorum" in text or "quorum" in low, "quorum behavior missing from council doc"
+    # the primary council doc must document the headline hard-budget flag AND list it in the
+    # accepted flag set (a cross-batch gap the merge introduced: V5 docs predate V4a's flag).
+    assert "--overall-timeout" in text, "primary council doc omits --overall-timeout"
 
 
 def test_v5_codex_doc_timeout_is_consistent_with_skill():
