@@ -5787,6 +5787,97 @@ def test_v4b_early_exit_last_round_only_under_rounds2():
     assert env["status"] == "success", env["status"]
 
 
+def test_v4b_resume_reruns_early_exit_killed_members():
+    # The architect's resume point: a member KILLED by early-exit leaves an ERROR stage file
+    # (run_stage persists it), which carry_forward REJECTS (its success-gate), so on a resume
+    # WITHOUT early-exit those members RE-RUN -- their stale error is never mistaken for a carried
+    # success. (With the same --min-successful-members, the carried successes re-trigger the exit
+    # and the killed ones stay excluded; turning early-exit off on resume runs them.)
+    import _council
+    import _executor
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    root = tempfile.mkdtemp(prefix="summon-v4bres-")
+    _mk_agents(root, ["m1", "m2", "m3", "m4", "chair"])
+    phase = {"run": 1}
+    dispatched = []
+    dlock = threading.Lock()
+    killed = {}
+
+    class FakeProc:
+        def __init__(self, tag):
+            self.tag = tag
+            self.pid = -1
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        with dlock:
+            dispatched.append(agent)
+        if agent in ("m1", "m2", "chair") or phase["run"] == 2:
+            return {"status": "success", "result": agent, "report": {"summary": agent}}
+        ev = threading.Event()          # run 1: m3, m4 block -> killed by the early-exit sweep
+        killed[tag] = ev
+        if on_spawn:
+            on_spawn(FakeProc(tag))
+        ev.wait(15)
+        return {"status": "error", "result": agent, "report": {"summary": agent}}
+
+    def fake_kill(proc):
+        if hasattr(proc, "_alive"):
+            proc._alive = False
+        ev = killed.get(getattr(proc, "tag", None))
+        if ev:
+            ev.set()
+
+    orig_cap = _council._PER_BACKEND_CAP
+    _council._PER_BACKEND_CAP = 10
+    orig_d, orig_k = _council._dispatch, _executor._kill_tree
+    _council._dispatch, _executor._kill_tree = fake, fake_kill
+
+    def run(ns):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        return _json.loads(buf.getvalue())
+
+    try:
+        env1 = run(argparse.Namespace(
+            question="q", question_file=None, members="m1,m2,m3,m4", chairman="chair",
+            rounds=1, cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
+            run_dir=root, min_successful=2))
+        assert env1.get("council_state") == "early_exit", env1.get("council_state")
+        run_id = env1["run_id"]
+        # m3/m4 were killed -> their generation-1 stage files exist and are status error
+        for m in ("m3", "m4"):
+            p = os.path.join(env1["run_dir"], f"g1-r1-{m}.json")
+            assert os.path.isfile(p) and (_json.load(open(p, encoding="utf-8")).get("status")
+                                          != "success"), f"{m} stage should be a non-success file"
+        # RESUME with early-exit OFF: m1/m2 carry (success files), m3/m4 re-run (error rejected)
+        phase["run"] = 2
+        with dlock:
+            dispatched.clear()
+        env2 = run(argparse.Namespace(
+            question=None, question_file=None, members=None, chairman=None, rounds=None,
+            cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None, run_dir=root,
+            resume_run=run_id))
+        assert env2["status"] == "success", env2["status"]
+        # exactly the two killed members re-ran (plus the chair); m1/m2 carried, not re-dispatched
+        assert set(dispatched) == {"m3", "m4", "chair"}, dispatched
+        assert {m["agent"] for m in env2["members"] if m.get("status") == "success"} == \
+            {"m1", "m2", "m3", "m4"}, [m.get("status") for m in env2["members"]]
+    finally:
+        _council._PER_BACKEND_CAP = orig_cap
+        _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
