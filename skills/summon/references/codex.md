@@ -17,9 +17,10 @@ mid-report, which is the "no output" failure in Common Errors below.
 - Script arg: `--timeout 600000` (the child deadline)
 - Tool param: `timeout_ms: 660000` (ABOVE it: ~60s of headroom for teardown + reporting)
 - Rule: **tool timeout > `--timeout`**, never equal. Scale the margin with the run: a
-  `--council` or `--manifest` fan-out runs many children in sequence, so it needs a much
-  larger host ceiling. The dispatcher prints its worst-case wall-clock estimate to stderr
-  before dispatching; set the host timeout above THAT.
+  `--council` or `--manifest` fan-out runs many children in sequence, so it needs a much larger
+  host ceiling. A `--council` prints its worst-case wall-clock estimate to stderr before
+  dispatching; set the host timeout above THAT. A `--manifest` swarm has no aggregate estimator,
+  so budget it from its own waves (per-backend concurrency), per-job `timeout`, and `--retries`.
 
 ## Sub-Agent Execution
 

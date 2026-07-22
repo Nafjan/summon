@@ -4567,6 +4567,9 @@ def test_v5_council_doc_has_large_file_pattern_and_timeout_budget():
                  "local verification"):
         assert step in low, f"large-file pattern step missing: {step!r}"
     assert "timeout budget" in low and "worst case" in low, "timeout-budget example missing"
+    # anchor the actual arithmetic so a silently-broken example is caught, not just its heading
+    for n in ("720", "1320", "2040"):
+        assert n in text, f"timeout-budget arithmetic anchor {n}s missing"
     assert "--quorum" in text or "quorum" in low, "quorum behavior missing from council doc"
 
 
@@ -4579,7 +4582,10 @@ def test_v5_codex_doc_timeout_is_consistent_with_skill():
         return
     with open(refs, encoding="utf-8") as fh:
         cx = fh.read().lower()
-    assert "above" in cx and "--timeout" in cx, "codex.md must say host timeout ABOVE --timeout"
+    # assert the RELATIONAL rule explicitly, not just that "above" appears somewhere (which a
+    # contradictory sentence could also contain)
+    assert "tool timeout > `--timeout`" in cx or "above the script's `--timeout`" in cx, \
+        "codex.md must state the relational rule: host tool timeout > --timeout"
     # the old contradictory guidance must be gone
     assert "both values must match" not in cx, "codex.md still says the timeouts must match"
     assert "align tool timeout with `--timeout`" not in cx, "codex.md still says to 'align' (== match)"
