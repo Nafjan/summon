@@ -250,11 +250,16 @@ def _council_summary(member_views: list, *, run_id, results_dir, chair_status,
     requested/succeeded/failed (with reasons), whether quorum held, the chair's
     outcome, and where to resume. Pure + additive."""
     succeeded = sum(1 for m in member_views if m.get("status") == "success")
+    # GENUINE failures vs INTENTIONAL exclusions are kept apart: an "excluded" member was
+    # stopped on purpose (early-exit straggler, or an --overall-timeout drop), not a failure.
     failed = [{"agent": m.get("agent"), "reason": m.get("status"),
                "elapsed_ms": m.get("elapsed_ms")}
-              for m in member_views if m.get("status") != "success"]
+              for m in member_views if m.get("status") not in ("success", "excluded")]
+    excluded = [{"agent": m.get("agent"), "reason": m.get("status"),
+                 "elapsed_ms": m.get("elapsed_ms")}
+                for m in member_views if m.get("status") == "excluded"]
     return {"members_requested": len(member_views), "members_succeeded": succeeded,
-            "members_failed": failed, "quorum_met": quorum_met,
+            "members_failed": failed, "members_excluded": excluded, "quorum_met": quorum_met,
             "chair_status": chair_status, "results_dir": results_dir,
             "resume_available": bool(run_id)}
 
@@ -539,7 +544,7 @@ def run_council(args) -> int:
     # to run and divert synthesis to a PARTIAL. It gets its own flag and its own repeated sweep.
     # on = gate flag (active this round); armed = tally only the FINAL round; fired = it
     # triggered at some point (persists, for the envelope); ok = successes THIS round.
-    early = {"on": False, "ok": 0, "armed": False, "sweeper": False, "fired": False}
+    early = {"on": False, "ok": 0, "armed": False, "thread": None, "fired": False}
     _early_done = threading.Event()
 
     def _early_sweeper() -> None:
@@ -563,9 +568,9 @@ def run_council(args) -> int:
             if early["ok"] >= min_successful:
                 early["on"] = True
                 early["fired"] = True
-                if not early["sweeper"]:
-                    early["sweeper"] = True
-                    threading.Thread(target=_early_sweeper, daemon=True).start()
+                if early["thread"] is None:
+                    early["thread"] = threading.Thread(target=_early_sweeper, daemon=True)
+                    early["thread"].start()
 
     def _early_arm(active: bool) -> None:
         # Arm early-exit for the round about to run (final round only, per the challenge:
@@ -574,15 +579,22 @@ def run_council(args) -> int:
             early["armed"] = bool(active) and (min_successful is not None)
             early["ok"] = 0
             early["on"] = False
+            early["thread"] = None
         _early_done.clear()
 
     def _early_disarm() -> None:
-        # Round finished (its pool.map barrier returned): STOP the sweep BEFORE synthesis so
-        # it can never target the chairman, and drop the gate. `fired` is left intact.
+        # Round finished (its pool.map barrier returned): STOP the sweep AND JOIN it before
+        # synthesis, so a sweep already PAST its `_early_done` check (paused before its
+        # _kill_inflight) can never resume and kill the CHAIRMAN we are about to register.
+        # Setting the event alone is NOT enough -- the join is the barrier (codex CRITICAL).
         _early_done.set()
         with lock:
+            th = early["thread"]
+            early["thread"] = None
             early["armed"] = False
             early["on"] = False
+        if th is not None:
+            th.join()   # wait out any in-flight sweep iteration (bounded by one _kill_inflight)
 
     def backend_of(agent: str) -> str:
         from _manifest import _job_backend
@@ -741,6 +753,13 @@ def run_council(args) -> int:
                 return _member_view(agent, {"status": "excluded",
                                             "error": "early-exit: quorum reached while queued"})
             env = run_stage(agent, prompt, stage, input_sha, member_timeout_ms)
+            if early["on"] and (env or {}).get("status") != "success":
+                # a straggler the early-exit sweep killed (or that self-failed after the quorum
+                # landed): an INTENTIONAL stop, NOT a genuine failure. Relabel to `excluded` so
+                # failed_members stays clean and downstream can tell it apart from a real error;
+                # keep the child's telemetry (usage/model/etc.).
+                env = {**(env or {}), "status": "excluded",
+                       "error": "early-exit: abandoned after quorum reached"}
         with lock:
             done["n"] += 1
             print(f"[council {done['n']}/{len(members)}] {agent} ({b}) "
@@ -1144,7 +1163,10 @@ def run_council(args) -> int:
            for e in (primary_env, fallback_env) if e and e.get("billing")}
         - {None})
 
-    failed = [m["agent"] for m in results if m.get("status") != "success"]
+    # `failed` = GENUINE failures only. An "excluded" member was intentionally stopped (an
+    # early-exit straggler, or a queued member dropped by --overall-timeout), not a failure, so
+    # it belongs in the run's exclusion accounting, never in failed_members (codex finding #2).
+    failed = [m["agent"] for m in results if m.get("status") not in ("success", "excluded")]
     synth_ok = chair_env.get("status") == "success"
     # Status reflects the WHOLE council: success only if the SYNTHESIS succeeded
     # (primary or fallback) AND every member answered; otherwise partial. Quorum
@@ -1250,7 +1272,9 @@ def run_council(args) -> int:
         envelope["early_exit"] = {
             "min_successful": min_successful,
             "succeeded": members_succeeded,
-            "excluded": [m["agent"] for m in results if (m.get("status") or "") != "success"],
+            # only the INTENTIONALLY-stopped members (status excluded); a genuine pre-quorum
+            # failure stays in failed_members, never conflated with an early-exit exclusion.
+            "excluded": [m["agent"] for m in results if m.get("status") == "excluded"],
             "note": "quorum reached; remaining members were process-tree-killed or excluded "
                     "and the surviving quorum was chaired"}
     if overall["hit"]:
