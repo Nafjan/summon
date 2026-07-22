@@ -136,9 +136,9 @@ def _skill_md_name(skill_dir: str):
         if name is None and s.lower().startswith("name:"):
             val = s.split(":", 1)[1].strip()
             if val[:1] in ('"', "'"):    # quoted: take the quoted span; an UNTERMINATED quote is
-                end = val.find(val[0], 1)  # malformed -> skip it, never mint a false name
-                if end < 0:
-                    continue
+                end = val.find(val[0], 1)  # malformed frontmatter -> reject the whole lookup, never
+                if end < 0:                # accept a later name after a broken one
+                    return None
                 val = val[1:end]
             else:                        # bare: a ' #' begins an inline comment
                 val = val.split(" #", 1)[0].strip()
@@ -146,32 +146,42 @@ def _skill_md_name(skill_dir: str):
     return name if closed else None      # an UNCLOSED block is not valid frontmatter
 
 
-def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> list:
-    """Sibling dirs under ``skills_dir`` (other than the canonical ``skill_name`` dir) whose
-    SKILL.md declares ``name: <skill_name>`` -- dirs a host would load as a SECOND skill of
-    the same name (a stale ``summon.pre-refresh-*`` backup, a hand-copied dupe). This is what
-    makes a host show TWO 'summon' entries. Keyed on the DECLARED name, so the intentional
-    ``sub-agents`` alias (name: sub-agents) is NOT flagged. The canonical dir is skipped by
-    CANONICAL PATH (so a case-variant ``SUMMON`` on Windows, or a symlink to it, is recognized
-    as the canonical copy, never itself flagged). Bounded (``os.scandir`` iterator, first
-    ``_MAX_SKILLS_SCAN`` entries) and fail-soft. Absolute paths, sorted."""
+def _dir_is_summon_owned(d: str) -> bool:
+    """True iff ``d`` carries a valid summon install manifest. Used to tell OUR transient
+    ``summon.staging-*`` artifacts (skip) from a foreign dir merely wearing that name (flag)."""
+    try:
+        with open(os.path.join(d, _MANIFEST), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return isinstance(data, dict) and data.get("installed_by") == "summon"
+    except (OSError, ValueError):
+        return False
+
+
+def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> tuple:
+    """Return ``(dirs, truncated)``. ``dirs`` = sibling dirs under ``skills_dir`` (other than the
+    canonical ``skill_name`` dir) whose SKILL.md declares ``name: <skill_name>`` -- dirs a host
+    would load as a SECOND skill of the same name (a stale ``summon.pre-refresh-*`` backup, a
+    hand-copied dupe): what makes a host show TWO 'summon' entries. Keyed on the DECLARED name,
+    so the intentional ``sub-agents`` alias (name: sub-agents) is NOT flagged. The canonical dir
+    is skipped by CANONICAL PATH (a case-variant ``SUMMON`` on Windows, or a symlink to it, is
+    the canonical copy, never itself flagged). OUR OWN transient ``summon.staging-*`` artifacts
+    are skipped ONLY when they carry a summon manifest -- a FOREIGN dir wearing that name is still
+    flagged. ``truncated`` is True iff the scan hit ``_MAX_SKILLS_SCAN`` (the tail is unscanned, so
+    convergence is unverified -- callers must treat it as blocking, not clean). Fail-soft; ``dirs``
+    are absolute paths, sorted."""
     canonical = _canonical(os.path.join(skills_dir, skill_name))
-    out = []
+    out, truncated = [], False
     try:
         with os.scandir(skills_dir) as it:          # streaming, never materializes a huge dir
             for i, entry in enumerate(it):
                 if i >= _MAX_SKILLS_SCAN:
-                    # Do NOT silently treat the unscanned tail as clean: a duplicate past the cap
-                    # would otherwise let `converged` be True. Emit a sentinel that blocks it and
-                    # renders as an explicit "scan truncated" marker.
-                    out.append(os.path.join(
-                        skills_dir, "(summon-dup-scan-truncated-at-%d-entries)" % _MAX_SKILLS_SCAN))
+                    truncated = True                 # unscanned tail -> convergence unverified
                     break
-                if entry.name.startswith("summon.staging-"):
-                    continue                         # OUR transient install/sweep artifact, not a dupe
                 d = os.path.join(skills_dir, entry.name)
                 if _canonical(d) == canonical:       # the canonical dir itself (case/symlink-safe)
                     continue
+                if entry.name.startswith("summon.staging-") and _dir_is_summon_owned(d):
+                    continue                         # OUR transient artifact (verified ours), not a dupe
                 try:
                     if not entry.is_dir():
                         continue
@@ -180,8 +190,8 @@ def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> list
                 if _skill_md_name(d) == skill_name:
                     out.append(_canonical(d))
     except OSError:
-        return out
-    return sorted(out)
+        return sorted(out), truncated
+    return sorted(out), truncated
 
 
 def _probe(label: str, scripts_dir: str, managed: bool) -> dict:
@@ -192,8 +202,8 @@ def _probe(label: str, scripts_dir: str, managed: bool) -> dict:
     Hashing/manifest/version reads never raise."""
     present = os.path.isdir(scripts_dir)
     rec = {"label": label, "scripts_dir": scripts_dir, "present": present,
-           "managed": managed, "running": False,
-           "sha256": None, "version": None, "installed_at": None, "duplicates": []}
+           "managed": managed, "running": False, "sha256": None, "version": None,
+           "installed_at": None, "duplicates": [], "duplicates_truncated": False}
     if present:
         try:
             rec["sha256"] = scripts_sha256(scripts_dir, max_bytes=_ENUM_MAX_BYTES)
@@ -206,7 +216,7 @@ def _probe(label: str, scripts_dir: str, managed: bool) -> dict:
     # Computed even when the canonical is ABSENT: a host can carry a summon.pre-refresh-* copy
     # with NO canonical `summon`, which still loads as a summon skill and must block converged.
     # scripts_dir is <host>/skills/summon/scripts, so two dirnames up is the host's skills dir.
-    rec["duplicates"] = duplicate_summon_skills(
+    rec["duplicates"], rec["duplicates_truncated"] = duplicate_summon_skills(
         os.path.dirname(os.path.dirname(scripts_dir)))
     return rec
 
@@ -278,13 +288,16 @@ def drift_report(records: list, reference_sha: str | None = None) -> dict:
     hashed = [r for r in present if r["sha256"]]
     unknown = [r for r in present if not r["sha256"]]
     drifted = [r for r in hashed if reference_sha and r["sha256"] != reference_sha]
-    # Duplicate 'summon' skills a host loads beside its canonical copy. Hash-convergence
-    # says NOTHING about these: a host can be byte-identical on the canonical path yet still
-    # show TWO summon entries (the field symptom), so any duplicate blocks `converged`.
+    # Duplicate 'summon' skills a host loads beside its canonical copy. Hash-convergence says
+    # NOTHING about these: a host can be byte-identical on the canonical path yet still show TWO
+    # summon entries (the field symptom), so any duplicate blocks `converged`. A truncated scan
+    # (a skills dir too large to fully scan) leaves duplicates UNVERIFIED, so it blocks too --
+    # tracked separately from real duplicate paths so consumers never render it as a deletable dir.
     duplicates = [{"label": r["label"], "dirs": r["duplicates"]}
                   for r in records if r.get("duplicates")]
+    truncated = [r["label"] for r in records if r.get("duplicates_truncated")]
     return {"reference_sha": reference_sha,
             "converged": (bool(reference_sha) and not drifted and not unknown
-                          and not duplicates),
+                          and not duplicates and not truncated),
             "present": present, "hashed": hashed, "drifted": drifted,
-            "unknown": unknown, "duplicates": duplicates}
+            "unknown": unknown, "duplicates": duplicates, "scan_truncated": truncated}
