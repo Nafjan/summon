@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import stat as _stat
 from pathlib import Path
 
 from _receipt import scripts_sha256, _read_regular_bounded
@@ -125,7 +126,7 @@ def _skill_md_name(skill_dir: str):
     lines = text.splitlines()
     if not lines or lines[0].rstrip() != "---":   # opening fence at column 0 (no leading space)
         return None
-    name, closed = None, False
+    name, seen_name, closed = None, False, False
     for ln in lines[1:]:
         if ln.rstrip() == "---":         # closing fence, column 0 (an indented `---` is NOT one)
             closed = True
@@ -134,11 +135,12 @@ def _skill_md_name(skill_dir: str):
             continue
         s = ln.strip()
         if s.startswith("name:"):        # CASE-SENSITIVE key (YAML keys are); `Name:` is not it
-            if name is not None:         # a SECOND top-level name -> ambiguous frontmatter, reject
-                return None
             after = s[5:]
             if after[:1] not in (" ", "\t", ""):      # require `name: value` / `name:` -- `name:summon`
                 continue                              # is a plain scalar, not a mapping key
+            if seen_name:                # a SECOND top-level `name:` KEY (even an empty one) ->
+                return None              # ambiguous frontmatter, reject (track KEY, not value)
+            seen_name = True
             val = after.strip()
             if not val:                               # `name:` with no value -> no name here
                 continue
@@ -175,17 +177,25 @@ def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> tupl
     canonical ``skill_name`` dir) whose SKILL.md declares ``name: <skill_name>`` -- dirs a host
     would load as a SECOND skill of the same name (a stale ``summon.pre-refresh-*`` backup, a
     hand-copied dupe): what makes a host show TWO 'summon' entries. Keyed on the DECLARED name,
-    so the intentional ``sub-agents`` alias (name: sub-agents) is NOT flagged. The canonical dir
-    is skipped by CANONICAL PATH (a case-variant ``SUMMON`` on Windows, or a symlink to it, is
-    the canonical copy, never itself flagged). OUR OWN transient ``summon.staging-*`` artifacts
-    are skipped ONLY when they carry a summon manifest -- a FOREIGN dir wearing that name is still
-    flagged. ``truncated`` is True iff the scan was INCOMPLETE -- it hit ``_MAX_SKILLS_SCAN`` OR a
+    so the intentional ``sub-agents`` alias (name: sub-agents) is NOT flagged. The canonical entry
+    is skipped by NAME (``os.path.normcase`` -- a case-variant ``SUMMON`` on Windows is the same
+    entry; on case-sensitive POSIX it is a distinct one and IS flagged). A DIFFERENTLY-named
+    symlink pointing at the canonical dir is a SECOND entry the host loads, so it is flagged. OUR
+    OWN transient ``summon.staging-*`` artifacts are skipped ONLY when they are a real directory
+    (not a symlink) carrying a summon manifest -- a FOREIGN or symlinked one wearing that name is
+    still flagged. ``truncated`` is True iff the scan was INCOMPLETE -- it hit ``_MAX_SKILLS_SCAN`` OR a
     read error on an EXISTING dir left siblings unscanned (convergence is then unverified; callers
     treat it as blocking, not clean). An ABSENT skills dir is NOT truncated (the host is simply not
     installed). ``dirs`` are the LEXICAL sibling paths (never resolved), so the guidance points at
     the entry the host loads -- removing a duplicate SYMLINK, never its target. Fail-soft; sorted."""
-    if not os.path.isdir(skills_dir):
-        return [], False                             # host not installed -> nothing, NOT incomplete
+    try:
+        mode = os.stat(skills_dir).st_mode           # distinguish ABSENT from INACCESSIBLE:
+    except FileNotFoundError:
+        return [], False                             # truly absent -> nothing, NOT incomplete
+    except OSError:
+        return [], True                              # exists but unstatable -> INCOMPLETE, block converged
+    if not _stat.S_ISDIR(mode):
+        return [], False                             # a file where a dir would be -> no skills here
     skill_lc = os.path.normcase(skill_name)
     out, truncated = [], False
     try:
@@ -200,8 +210,10 @@ def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> tupl
                 if os.path.normcase(entry.name) == skill_lc:
                     continue
                 d = os.path.join(skills_dir, entry.name)   # LEXICAL path -- the entry, not its target
-                if entry.name.startswith("summon.staging-") and _dir_is_summon_owned(d):
-                    continue                         # OUR transient artifact (verified ours), not a dupe
+                if (entry.name.startswith("summon.staging-") and not entry.is_symlink()
+                        and _dir_is_summon_owned(d)):
+                    continue                         # OUR transient artifact (verified real dir + ours);
+                    #                                  a SYMLINK wearing that name is NOT exempted
                 try:
                     if not entry.is_dir():           # follows symlinks: a symlink-to-dir counts
                         continue

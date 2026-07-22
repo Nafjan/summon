@@ -5192,6 +5192,8 @@ def test_v6_skill_md_name_parsing():
         assert _installs._skill_md_name(d) is None               # `#` w/o a leading space is not a comment
         _w('---\nname: summon\nname: other\n---\n')
         assert _installs._skill_md_name(d) is None               # duplicate top-level name -> ambiguous
+        _w('---\nname:\nname: summon\n---\n')
+        assert _installs._skill_md_name(d) is None               # EMPTY first name key is still a dup key
         _w('---\nname: "summon" # real comment\n---\n')
         assert _installs._skill_md_name(d) == "summon"           # space-separated comment IS allowed
         _w('---\nname: summon\n---\n')
@@ -5425,6 +5427,55 @@ def test_v6_uninspectable_entry_marks_incomplete():
         finally:
             _installs.os.scandir = orig
         assert trunc is True and dirs == [], (dirs, trunc)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_staging_symlink_is_not_exempted():
+    # A summon.staging-* SYMLINK to the canonical owned dir inherits its manifest but the host
+    # loads it as a 2nd skill, so it must NOT be exempted -- only a REAL owned staging dir is.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-stagesym-")
+    try:
+        skills = os.path.join(home, "skills")
+        canon = os.path.join(skills, "summon")
+        _w_skill_md(canon, "summon")
+        import json as _json
+        _json.dump({"installed_by": "summon"},
+                   open(os.path.join(canon, ".summon-install.json"), "w", encoding="utf-8"))
+        try:
+            os.symlink(canon, os.path.join(skills, "summon.staging-link"), target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            return
+        dirs, trunc = _installs.duplicate_summon_skills(skills)
+        assert any(p.endswith("summon.staging-link") for p in dirs), dirs   # symlink NOT exempted
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_inaccessible_skills_dir_marks_incomplete():
+    # os.path.isdir conflates absent with inaccessible; duplicate_summon_skills must distinguish:
+    # a stat/access error on the skills dir is INCOMPLETE (truncated), absence is not.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-inacc-")
+    try:
+        base = os.path.join(home, "skills")
+        os.makedirs(base)
+        orig = _installs.os.stat
+        def boom(p, *a, **k):
+            if os.path.normcase(str(p)) == os.path.normcase(base):
+                raise PermissionError("denied")
+            return orig(p, *a, **k)
+        _installs.os.stat = boom
+        try:
+            dirs, trunc = _installs.duplicate_summon_skills(base)
+        finally:
+            _installs.os.stat = orig
+        assert trunc is True and dirs == [], (dirs, trunc)                  # inaccessible -> incomplete
+        dirs, trunc = _installs.duplicate_summon_skills(os.path.join(home, "absent"))
+        assert dirs == [] and trunc is False, (dirs, trunc)                 # absent -> NOT incomplete
     finally:
         import shutil as _sh
         _sh.rmtree(home, ignore_errors=True)
