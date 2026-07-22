@@ -5406,6 +5406,49 @@ def test_v6_unhashable_running_copy_yields_no_reference():
         _sh.rmtree(home, ignore_errors=True)
 
 
+def test_v5_council_doc_has_large_file_pattern_and_timeout_budget():
+    # rec #10 acceptance ("documentation check 12"): the PRIMARY council doc (fan-out.md)
+    # must document the robust large-file pattern (its 5 steps), a timeout-budget worked
+    # example, and quorum behavior. This guards those sections against silent removal.
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    doc = os.path.join(os.path.dirname(scripts_dir), "references", "fan-out.md")
+    if not os.path.isfile(doc):
+        return   # references/ not present in this layout -> skip (never fail out of it)
+    with open(doc, encoding="utf-8") as fh:
+        text = fh.read()
+    low = text.lower()
+    assert "large or multimodal reviews" in low, "large-file pattern section missing"
+    for step in ("bounded, role-specific packets",
+                 "manifest fan-out with independent envelopes",
+                 "no full-resolution image reads",
+                 "separate chair over the saved reports",
+                 "local verification"):
+        assert step in low, f"large-file pattern step missing: {step!r}"
+    assert "timeout budget" in low and "worst case" in low, "timeout-budget example missing"
+    # anchor the actual arithmetic so a silently-broken example is caught, not just its heading
+    for n in ("720", "1320", "2040"):
+        assert n in text, f"timeout-budget arithmetic anchor {n}s missing"
+    assert "--quorum" in text or "quorum" in low, "quorum behavior missing from council doc"
+
+
+def test_v5_codex_doc_timeout_is_consistent_with_skill():
+    # the codex.md timeout guidance MUST agree with SKILL.md: host timeout ABOVE --timeout,
+    # never "match" it (equal kills the script mid-report). Guards the fixed contradiction.
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    refs = os.path.join(os.path.dirname(scripts_dir), "references", "codex.md")
+    if not os.path.isfile(refs):
+        return
+    with open(refs, encoding="utf-8") as fh:
+        cx = fh.read().lower()
+    # assert the RELATIONAL rule explicitly, not just that "above" appears somewhere (which a
+    # contradictory sentence could also contain)
+    assert "tool timeout > `--timeout`" in cx or "above the script's `--timeout`" in cx, \
+        "codex.md must state the relational rule: host tool timeout > --timeout"
+    # the old contradictory guidance must be gone
+    assert "both values must match" not in cx, "codex.md still says the timeouts must match"
+    assert "align tool timeout with `--timeout`" not in cx, "codex.md still says to 'align' (== match)"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
