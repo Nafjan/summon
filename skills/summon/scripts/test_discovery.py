@@ -1699,7 +1699,7 @@ def test_council_run_structure_with_stubbed_dispatch():
             open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
                 "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\nrole.\n")
         calls = {"n": 0, "timeouts": []}
-        def fake_dispatch(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+        def fake_dispatch(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
             calls["n"] += 1
             calls["timeouts"].append(timeout_ms)
             if agent == "chair":
@@ -2305,7 +2305,7 @@ def test_council_out_checkpoints_and_final():
             open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
                 "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\nrole.\n")
 
-        def fake_dispatch(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+        def fake_dispatch(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
             if agent == "chair":
                 with open(out, encoding="utf-8") as fh:  # checkpoint must already exist
                     seen["at_chair"] = _json.load(fh)
@@ -2834,7 +2834,7 @@ def test_council_fresh_run_persists_run_dir_artifacts():
         for a in ("m1", "m2", "chair"):
             open(os.path.join(root, a + ".md"), "w", encoding="utf-8").write(
                 "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
-        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
             if agent == "chair":
                 return {"status": "success", "result": "DECISION: X",
                         "usage": {"output_tokens": 3}, "report": {"summary": "X"}}
@@ -2890,7 +2890,7 @@ def _council_stub_and_runner():
     """Shared fixture for resume tests: a counting stub + a run() helper."""
     import _council, argparse, io, contextlib, json as _json
     calls = {"n": 0}
-    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
         calls["n"] += 1
         if agent == "chair":
             return {"status": "success", "result": "DECISION: X", "report": {"summary": "X"}}
@@ -2964,7 +2964,7 @@ def test_council_resume_upstream_change_invalidates_downstream():
         # An INPUT-SENSITIVE stub: round-2 output must actually reflect the
         # tampered upstream position, or the chairman's inputs would be
         # genuinely unchanged and a carry would be the CORRECT outcome.
-        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
             calls["n"] += 1
             if agent == "chair":
                 return {"status": "success", "result": "DECISION: X",
@@ -3099,7 +3099,7 @@ def test_council_renews_lease_after_every_stage():
             renews["n"] += 1
             return orig_renew(owner)
         rd.renew_owner = counting_renew
-        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
             return {"status": "success", "result": f"{agent} ok"
                     + ("\nRANKING: A, B" if "-r2-" in tag else ""),
                     "report": {"summary": agent}}
@@ -3575,7 +3575,7 @@ def _b2_council(root, members, chairman="chair", **extra):
     import _council, argparse, io, contextlib, json as _json
     statuses = extra.pop("_statuses", {})   # {agent: "error"} to force failures
     calls = extra.pop("_calls", None)
-    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
         if calls is not None:
             calls.append(agent)
         st = statuses.get(agent, "success")
@@ -3604,6 +3604,539 @@ def _mk_agents(root, names):
     for a in names:
         open(os.path.join(root, a + ".md"), "w", encoding="utf-8").write(
             "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
+
+
+def test_v4_council_summary():
+    import _council
+    views = [{"agent": "a", "status": "success", "elapsed_ms": 100},
+             {"agent": "b", "status": "error", "elapsed_ms": 50},
+             {"agent": "c", "status": "excluded", "elapsed_ms": None}]
+    s = _council._council_summary(views, run_id="council-x", results_dir="/runs/x",
+                                  chair_status="success", quorum_met=True)
+    assert s["members_requested"] == 3 and s["members_succeeded"] == 1
+    assert {f["agent"] for f in s["members_failed"]} == {"b", "c"}
+    assert s["quorum_met"] is True and s["chair_status"] == "success"
+    assert s["results_dir"] == "/runs/x" and s["resume_available"] is True
+
+
+def test_v4_runs_root_results_dir_alias():
+    import _council
+    import argparse
+    # --results-dir is an alias for --run-dir (same precedence)
+    a = argparse.Namespace(run_dir=None, results_dir="/rd")
+    assert _council._runs_root(a, "/cwd") == "/rd"
+    # --run-dir wins if both are set
+    b = argparse.Namespace(run_dir="/run", results_dir="/rd")
+    assert _council._runs_root(b, "/cwd") == "/run"
+    # neither -> default under cwd (env-independent shape check)
+    c = argparse.Namespace(run_dir=None, results_dir=None)
+    got = _council._runs_root(c, os.sep + "cwd")
+    assert got.endswith(os.path.join(".agents", "runs")) or "SUMMON_RUNS_DIR" in os.environ
+
+
+def test_v4_council_flags_parse_and_accepted():
+    import _cli
+    p = _cli.build_parser("0.9.0", 1)
+    ns = p.parse_args(["--council", "--question", "q", "--cwd", ".",
+                       "--overall-timeout", "5m", "--results-dir", "/rd"])
+    assert ns.overall_timeout == 300000 and ns.results_dir == "/rd"
+    # both flags are in the council mode whitelist (not rejected as unsupported)
+    assert "overall_timeout" in _cli.MODE_FLAGS["council"]
+    assert "results_dir" in _cli.MODE_FLAGS["council"]
+    assert _cli.unsupported_mode_flags(
+        ["--council", "--overall-timeout", "5m", "--results-dir", "/rd"], ns) is None
+
+
+def test_v4_overall_timeout_kills_and_partials():
+    # the field scenario: a member outlives the overall budget. summon must
+    # process-tree-kill it, emit a PARTIAL council envelope (marked overall_timeout,
+    # status partial), and return PROMPTLY -- not hang to the member timeout.
+    import _council
+    import _executor
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    import time as _t
+    root = tempfile.mkdtemp(prefix="summon-v4ot-")
+    _mk_agents(root, ["m1", "m2", "chair"])
+    killed = {}
+
+    class FakeProc:
+        def __init__(self, tag):
+            self.tag = tag
+            self.pid = -1
+            self._alive = True
+
+        def poll(self):        # like a real Popen: None while running, 0 once killed
+            return None if self._alive else 0
+
+    procs = {}
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        ev = threading.Event()
+        killed[tag] = ev
+        if on_spawn:
+            p = FakeProc(tag)
+            procs[tag] = p
+            on_spawn(p)
+        # Wait FAR longer than the overall budget so the kill (not this wait) is
+        # what stops an in-flight member -- a wide margin keeps the test robust even
+        # when the watchdog thread is starved under suite load.
+        stopped = ev.wait(15)
+        return {"status": "error" if stopped else "success",
+                "result": f"{agent} {'killed' if stopped else 'done'}",
+                "report": {"summary": agent}}
+
+    def fake_kill(proc):
+        tag = getattr(proc, "tag", None)
+        if hasattr(proc, "_alive"):
+            proc._alive = False
+        ev = killed.get(tag)
+        if ev:
+            ev.set()
+
+    ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
+                            chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
+                            timeout=30000, out=None, run_dir=root, overall_timeout=1000)
+    orig_d, orig_k = _council._dispatch, _executor._kill_tree
+    _council._dispatch, _executor._kill_tree = fake, fake_kill
+    try:
+        t0 = _t.monotonic()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        elapsed = _t.monotonic() - t0
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    assert env.get("council_state") == "overall_timeout", f"state={env.get('council_state')}"
+    assert env["status"] == "partial" and env.get("overall_timeout"), f"status={env.get('status')}"
+    assert "summary" in env and env["summary"]["members_requested"] == 2, env.get("summary")
+    assert elapsed < 20, elapsed          # returned near the 1s budget, NOT the 30s member wait
+    # both members were process-tree-killed by the overall timeout (-> not success)
+    assert env["summary"]["members_succeeded"] == 0, env["summary"]
+    assert all(m.get("status") != "success" for m in env["members"]), \
+        [m.get("status") for m in env["members"]]
+
+
+def test_v4_overall_timeout_excludes_queued_wave():
+    # Finding #5 (queued-wave race, the review's CRITICAL): with MORE same-backend
+    # members than the per-backend concurrency cap, a second WAVE is queued on the
+    # semaphore while the first wave runs. When the overall deadline breaches, the
+    # watchdog kills the first wave; the queued members then acquire the freed
+    # semaphore and must be EXCLUDED at the post-semaphore re-check -- NEVER
+    # dispatched after the kill (which would spawn an unkillable straggler, hang the
+    # pool on it, and blow the budget). Proven by: no more than `cap` children ever
+    # spawned, and the surplus members are reported excluded with the queued reason.
+    import _council
+    import _executor
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    import time as _t
+    cap = _council._PER_BACKEND_CAP           # 3
+    n_members = cap + 2                        # 5 -> exactly 2 queued in a 2nd wave
+    names = ["m%d" % i for i in range(n_members)]
+    root = tempfile.mkdtemp(prefix="summon-v4qw-")
+    _mk_agents(root, names + ["chair"])       # all run-agent: claude -> ONE backend
+    killed = {}
+    dispatched = []                           # members whose child actually SPAWNED
+    dlock = threading.Lock()
+
+    class FakeProc:
+        def __init__(self, tag):
+            self.tag = tag
+            self.pid = -1
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        with dlock:
+            dispatched.append(agent)          # only reached PAST the re-check gate
+        ev = threading.Event()
+        killed[tag] = ev
+        if on_spawn:
+            on_spawn(FakeProc(tag))
+        stopped = ev.wait(15)                  # first wave blocks until the kill frees it
+        return {"status": "error" if stopped else "success",
+                "result": "%s %s" % (agent, "killed" if stopped else "done"),
+                "report": {"summary": agent}}
+
+    def fake_kill(proc):
+        if hasattr(proc, "_alive"):
+            proc._alive = False
+        ev = killed.get(getattr(proc, "tag", None))
+        if ev:
+            ev.set()
+
+    ns = argparse.Namespace(question="q", question_file=None,
+                            members=",".join(names), chairman="chair", rounds=1,
+                            cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
+                            run_dir=root, overall_timeout=1000)
+    orig_d, orig_k = _council._dispatch, _executor._kill_tree
+    _council._dispatch, _executor._kill_tree = fake, fake_kill
+    try:
+        t0 = _t.monotonic()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        elapsed = _t.monotonic() - t0
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    assert elapsed < 20, elapsed              # near the 1s budget, NOT the 30s member wait
+    assert env.get("council_state") == "overall_timeout", env.get("council_state")
+    assert env["status"] == "partial", env["status"]
+    # THE invariant: the queued wave never spawned -- at most `cap` children ever ran.
+    assert len(dispatched) <= cap, dispatched
+    # the surplus members are reported excluded (not dispatched, not success)...
+    excluded = [m for m in env["members"] if m.get("status") == "excluded"]
+    assert len(excluded) >= n_members - cap, [m.get("status") for m in env["members"]]
+    # ...and at least one was cut at the POST-SEMAPHORE gate (finding #5's exact fix)
+    envs = env.get("member_envelopes", [])
+    assert any("queued" in (e.get("error") or "") for e in envs), \
+        [e.get("error") for e in envs]
+    assert env["summary"]["members_succeeded"] == 0, env["summary"]
+    assert all(m.get("status") != "success" for m in env["members"]), \
+        [m.get("status") for m in env["members"]]
+
+
+def test_v4_overall_timeout_skips_fallback_after_breach():
+    # Re-review WARNING: after the watchdog kills a timed-out PRIMARY chairman, the
+    # fallback path checked only `primary != success`, not `overall["hit"]`, so it
+    # dispatched a fresh PAID call AFTER the budget. The fix rechecks the breach
+    # before the fallback dispatch. Here the primary chairman is killed by the
+    # deadline; the fallback chairman must NEVER be dispatched.
+    import _council
+    import _executor
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    import time as _t
+    root = tempfile.mkdtemp(prefix="summon-v4fb-")
+    _mk_agents(root, ["m1", "m2", "chair", "chair2"])   # council needs >= 2 members
+    killed = {}
+    dispatched = []
+    dlock = threading.Lock()
+
+    class FakeProc:
+        def __init__(self, tag):
+            self.tag = tag
+            self.pid = -1
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        with dlock:
+            dispatched.append(agent)
+        if agent in ("m1", "m2"):             # members: instant success
+            return {"status": "success", "result": agent + " done", "report": {"summary": agent}}
+        if agent == "chair":                  # primary chairman: block until killed
+            ev = threading.Event()
+            killed[tag] = ev
+            if on_spawn:
+                on_spawn(FakeProc(tag))
+            stopped = ev.wait(15)
+            return {"status": "error" if stopped else "success",
+                    "result": "chair killed", "report": {"summary": "chair"}}
+        # fallback chairman -- reaching here is the bug under test
+        return {"status": "success", "result": "chair2 done", "report": {"summary": "chair2"}}
+
+    def fake_kill(proc):
+        if hasattr(proc, "_alive"):
+            proc._alive = False
+        ev = killed.get(getattr(proc, "tag", None))
+        if ev:
+            ev.set()
+
+    ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
+                            chairman="chair", chairman_fallback="chair2", rounds=1,
+                            cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
+                            run_dir=root, overall_timeout=1000)
+    orig_d, orig_k = _council._dispatch, _executor._kill_tree
+    _council._dispatch, _executor._kill_tree = fake, fake_kill
+    try:
+        t0 = _t.monotonic()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        elapsed = _t.monotonic() - t0
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    assert elapsed < 20, elapsed
+    assert env["status"] == "partial", env["status"]
+    assert env.get("council_state") == "overall_timeout", env.get("council_state")
+    # THE fix: the fallback chairman was never launched after the breach
+    assert "chair2" not in dispatched, dispatched
+    assert "chair" in dispatched and {"m1", "m2"} <= set(dispatched), dispatched
+
+
+def test_v4_overall_timeout_setup_overrun():
+    # Re-review finding #4: setup (owner acquisition, receipt write) runs BEFORE the
+    # watchdog exists, so a budget already spent by setup must not dispatch any paid
+    # member. A 1 ms budget is always exhausted by setup -> zero-member partial, no
+    # member ever dispatched.
+    import _council
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    import time as _t
+    root = tempfile.mkdtemp(prefix="summon-v4so-")
+    _mk_agents(root, ["m1", "m2", "chair"])
+    dispatched = []
+    dlock = threading.Lock()
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        with dlock:
+            dispatched.append(agent)          # must never be reached
+        return {"status": "success", "result": agent, "report": {"summary": agent}}
+
+    ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
+                            chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
+                            timeout=30000, out=None, run_dir=root, overall_timeout=1)
+    orig_d = _council._dispatch
+    _council._dispatch = fake
+    try:
+        t0 = _t.monotonic()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = _council.run_council(ns)
+        elapsed = _t.monotonic() - t0
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._dispatch = orig_d
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    assert rc == 2, rc
+    assert env["status"] == "partial" and env.get("council_state") == "overall_timeout", env
+    assert env["members"] == [], env["members"]
+    assert not dispatched, dispatched         # no paid member launched past the deadline
+    assert "setup" in (env.get("overall_timeout", {}).get("reason") or ""), env.get("overall_timeout")
+    assert elapsed < 10, elapsed
+
+
+def test_v4_monotonic_gate_without_watchdog():
+    # Re-review round-3 CRITICAL: dispatch guards must consult the AUTHORITATIVE
+    # monotonic deadline, not just the watchdog's async `overall["hit"]` flag -- a
+    # delayed/starved watchdog thread must not wave paid work through past the deadline.
+    # Here we DISABLE the watchdog entirely (patch threading.Thread) so `overall["hit"]`
+    # can only be set by a guard reading the clock. Members sleep past a tiny budget and
+    # are NOT killed (no watchdog); the council must still cut short before the chairman
+    # via the monotonic gate and emit a partial.
+    import _council
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import time as _t
+    root = tempfile.mkdtemp(prefix="summon-v4mono-")
+    _mk_agents(root, ["m1", "m2", "chair"])
+    dispatched = []
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        # WIDE margin: 0.9s >> the 300ms budget and well above any plausible setup time, so
+        # the POST-round monotonic gate (not the setup-overrun guard, not load timing) is
+        # deterministically what cuts the council short before the chairman.
+        dispatched.append(agent)
+        _t.sleep(0.9)
+        return {"status": "success", "result": agent, "report": {"summary": agent}}
+
+    # Neuter ONLY the overall-timeout watchdog. `_council.threading` IS the global
+    # threading module, so replacing threading.Thread wholesale would also no-op the
+    # ThreadPoolExecutor worker threads (target=_worker) and deadlock the pool. A
+    # selective factory stubs the watchdog by target name and passes everything else
+    # through to the real Thread.
+    real_thread = _council.threading.Thread
+
+    class _Stub:
+        def start(self):
+            pass
+
+        def join(self, *a, **k):
+            pass
+
+    def _sel_thread(*a, **k):
+        if getattr(k.get("target"), "__name__", "") == "_overall_watchdog":
+            return _Stub()
+        return real_thread(*a, **k)
+
+    ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
+                            chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
+                            timeout=30000, out=None, run_dir=root, overall_timeout=300)
+    orig_d, orig_thread = _council._dispatch, _council.threading.Thread
+    _council._dispatch = fake
+    _council.threading.Thread = _sel_thread
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._dispatch, _council.threading.Thread = orig_d, orig_thread
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    # partial emitted by the MONOTONIC gate, with the watchdog disabled the whole time
+    assert env["status"] == "partial", env["status"]
+    assert env.get("council_state") == "overall_timeout", env.get("council_state")
+    # members ran to completion (not killed -- no watchdog); the chairman was gated OUT
+    assert "chair" not in dispatched, dispatched
+    assert {"m1", "m2"} <= set(dispatched), dispatched
+
+
+def test_v4_dispatch_child_on_reap_skips_a_still_live_child():
+    # _dispatch_child deregisters (on_reap) ONLY on a clean communicate() return -- the
+    # sole reliable "whole tree is done" signal (stdout hit EOF). On the TIMED-OUT path
+    # the tree's liveness is unproven (a descendant may hold stdout past a kill that did
+    # not land), and the leader's poll() is NOT a proxy for it, so on_reap must NOT fire.
+    # Here communicate() raises TimeoutExpired -> timed_out -> on_reap must be withheld.
+    import _manifest
+    import _executor
+    import subprocess as _sp
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = 4321
+            self.returncode = None            # never exits -> poll() stays None
+
+        def communicate(self, timeout=None):
+            raise _sp.TimeoutExpired(cmd="x", timeout=timeout)
+
+        def poll(self):
+            return None                        # still alive
+
+    reaped = {"called": False}
+
+    def on_reap(p):
+        reaped["called"] = True
+
+    orig_popen = _manifest.subprocess.Popen
+    orig_kill, orig_safe = _executor._kill_tree, _executor._safe_communicate
+    _manifest.subprocess.Popen = lambda *a, **k: FakeProc()
+    _executor._kill_tree = lambda p: None                     # kill fails to land
+    _executor._safe_communicate = lambda p, timeout=3.0: (None, None)
+    try:
+        res, err = _manifest._dispatch_child(["x"], 1, on_reap=on_reap)
+    finally:
+        _manifest.subprocess.Popen = orig_popen
+        _executor._kill_tree, _executor._safe_communicate = orig_kill, orig_safe
+    assert err is None, err
+    assert res is not None and res.timed_out is True, res
+    assert reaped["called"] is False, "on_reap fired on a still-live child (would leak it)"
+
+
+def test_v4_live_child_stays_enforced_through_teardown():
+    # Re-review round-4 CRITICAL: _dispatch_child correctly withholds on_reap for a
+    # still-live child (poll() None), but run_stage's finally must NOT then blindly drop
+    # it from `inflight` -- otherwise a kill-that-did-not-land leaves a paid child running
+    # after the council returns. Integration test through run_council: one member's child
+    # survives (on_reap never fires, poll() stays None); assert run_stage KEEPS it
+    # registered and the FINAL teardown sweep targets it (enforcement continues).
+    import _council
+    import _executor
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    root = tempfile.mkdtemp(prefix="summon-v4live-")
+    _mk_agents(root, ["m1", "m2", "chair"])
+    kills = []
+    klock = threading.Lock()
+
+    class FakeProc:
+        def __init__(self, tag, alive):
+            self.tag = tag
+            self.pid = -1
+            self._alive = alive
+
+        def poll(self):
+            return None if self._alive else 0
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        # m2 models the round-5 race the reviewer found: the LEADER has already EXITED
+        # (poll() == 0) but its tree is UNCONFIRMED -- a stdout-holding descendant may still
+        # be alive, and _dispatch_child (correctly) did not call on_reap because communicate
+        # timed out (not a clean EOF). Its poll() returns 0, so any poll()-based cleanup
+        # would WRONGLY drop it. Teardown must still killpg the group via the registered
+        # leader pid. m1 is the clean path: communicate returned -> on_reap deregistered it.
+        wedged = agent == "m2"
+        proc = FakeProc(tag, alive=not wedged)   # m2 leader already dead (poll()==0)
+        if on_spawn:
+            on_spawn(proc)
+        if not wedged and on_reap:
+            on_reap(proc)                      # clean communicate() return -> deregister
+        return {"status": "success" if not wedged else "error",
+                "result": agent, "report": {"summary": agent}}
+
+    def fake_kill(proc):
+        with klock:
+            kills.append(getattr(proc, "tag", None))
+        if hasattr(proc, "_alive"):
+            proc._alive = False                # a landed teardown kill
+
+    ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
+                            chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
+                            timeout=30000, out=None, run_dir=root)
+    orig_d, orig_k = _council._dispatch, _executor._kill_tree
+    _council._dispatch, _executor._kill_tree = fake, fake_kill
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+    finally:
+        _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    # the wedged child (m2) was targeted by the final teardown sweep; the reaped one (m1)
+    # was deregistered by on_reap and must NOT have been killed.
+    m2_hits = [k for k in kills if k and k.endswith("r1-m2")]
+    m1_hits = [k for k in kills if k and k.endswith("r1-m1")]
+    assert m2_hits, ("live child dropped from enforcement -- teardown never targeted it; "
+                     "kills=%r" % kills)
+    assert not m1_hits, ("a reaped child was killed at teardown (stale): kills=%r" % kills)
+
+
+def test_v4_dispatch_child_on_reap_fires_after_communicate():
+    # Re-review finding #3: the fix unregisters a member ADJACENT to its reap via an
+    # on_reap callback threaded into _dispatch_child (before the caller's envelope
+    # file reads). Verify the callback fires, with the same proc, after communicate.
+    import _manifest
+    import sys as _sys
+    seen = {}
+
+    def on_spawn(p):
+        seen["spawn"] = p
+
+    def on_reap(p):
+        # communicate() has returned by now -> the child is no longer running
+        seen["reap"] = p
+        seen["reaped_returncode"] = p.returncode
+
+    res, err = _manifest._dispatch_child([_sys.executable, "-c", "pass"], 30,
+                                         on_spawn=on_spawn, on_reap=on_reap)
+    assert err is None, err
+    assert seen.get("spawn") is not None and seen.get("reap") is seen.get("spawn"), seen
+    assert seen.get("reaped_returncode") == 0, seen        # exited before on_reap ran
+    assert res is not None and res.timed_out is False, res
 
 
 def test_council_quorum_gate():
@@ -3831,7 +4364,7 @@ def test_council_fallback_eligibility_and_billing_aggregation():
     try:
         _mk_agents(root, ("m1", "m2", "chair", "backup"))
         for primary_status in ("blocked", "partial", "error"):
-            def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+            def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
                 if agent == "chair":
                     return {"status": primary_status, "error": "p",
                             "billing": {"source": "credit"}, "warnings": ["primary warn"],
@@ -3876,7 +4409,7 @@ def test_council_rounds2_quorum_counts_final_stage():
     try:
         _mk_agents(root, ("m1", "m2", "chair"))
         import _council, argparse, io, contextlib, json as _json
-        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
             # m2 succeeds in r1 but FAILS in r2
             if agent == "m2" and "-r2-" in tag:
                 return {"status": "error", "error": "r2 boom", "result": ""}
@@ -3994,7 +4527,7 @@ def test_council_per_stage_timeouts_and_lease():
             open(os.path.join(d, a + ".md"), "w", encoding="utf-8").write(
                 "---\nrun-agent: claude\npermission: safe-edit\n---\n# " + a + "\n")
         seen = {}
-        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag):
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
             seen[agent] = timeout_ms
             return {"status": "success", "result": f"{agent} ok"
                     + ("\nRANKING: A, B" if "-r2-" in tag else ""),

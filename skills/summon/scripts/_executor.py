@@ -570,7 +570,12 @@ def _kill_tree(process: subprocess.Popen) -> None:
     try:
         if os.name == "nt":
             # Popen keeps the process handle open, so Windows will NOT recycle
-            # this PID mid-teardown — taskkill /T targets the right tree.
+            # this PID mid-teardown — taskkill /T targets the right tree WHILE THE
+            # LEADER IS ALIVE. KNOWN GAP (see KNOWN_ISSUES.md / #10): taskkill walks
+            # parent->child PID links, so once this leader (run_subagent.py) has
+            # exited, a still-running backend grandchild is orphaned. The correct fix
+            # is a Windows Job Object (kill the tree independent of leader lifetime);
+            # POSIX's killpg below already reaches the group through a dead leader.
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
                            capture_output=True, timeout=10)
         else:
@@ -579,6 +584,17 @@ def _kill_tree(process: subprocess.Popen) -> None:
             # of os.getpgid(pid) — getpgid raises if the child was already reaped
             # (child exited but a grandchild still holds stdout), which would skip
             # the kill and orphan the grandchild.
+            #
+            # POSIX residual (accepted): unlike Windows, which holds the process
+            # handle open and so blocks PID reuse mid-teardown, POSIX offers no group
+            # handle, so a reaped leader's PID could in principle be recycled to a new
+            # group leader before this killpg fires. The council's kill loop only ever
+            # snapshots procs still registered in `inflight`; a member's on_reap callback
+            # unregisters it the instant communicate() reaps the leader (before any
+            # envelope file read), so the exposure is the MICROSECONDS between that reap
+            # and on_reap running, AND only if the recycled PID re-becomes a group leader
+            # within it. We accept that narrow window over skipping the kill (which would
+            # orphan a stdout-holding grandchild and re-open the wall-clock hang).
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):

@@ -186,7 +186,7 @@ class _ChildResult:
             returncode, stdout, stderr, timed_out)
 
 
-def _dispatch_child(cmd: list, timeout_sec: float):
+def _dispatch_child(cmd: list, timeout_sec: float, on_spawn=None, on_reap=None):
     """Run a child dispatch with a REAL parent watchdog. Returns
     ``(_ChildResult|None, error|None)``.
 
@@ -194,7 +194,17 @@ def _dispatch_child(cmd: list, timeout_sec: float):
     timeout and then block in an UNBOUNDED ``communicate()`` if a backend
     descendant still holds stdout — the same hang the executor fix removes. So we
     Popen, bound ``communicate()``, and on timeout kill the whole PROCESS TREE
-    (``_kill_tree``) and drain with a bounded ``_safe_communicate``."""
+    (``_kill_tree``) and drain with a bounded ``_safe_communicate``.
+
+    ``on_spawn(proc)``, if given, is called with the live Popen right after spawn
+    (before the blocking communicate) so a caller can register it for an external
+    process-tree kill (e.g. the council's overall-timeout / early-exit). A killed
+    child unblocks communicate() here and returns as a normal timed_out result.
+
+    ``on_reap(proc)``, if given, is called the instant ``communicate()`` returns
+    (the leader is reaped) — BEFORE any envelope file read — so a caller can
+    UNREGISTER the child adjacent to its reap, shrinking the window in which an
+    external snapshot-kill could still target the (now reaping) pid."""
     from _executor import _kill_tree, _safe_communicate
     popen_extra = {"start_new_session": True} if os.name != "nt" else {}
     try:
@@ -203,6 +213,11 @@ def _dispatch_child(cmd: list, timeout_sec: float):
                                 encoding="utf-8", errors="replace", **popen_extra)
     except OSError as e:
         return None, f"{type(e).__name__}: {e}"
+    if on_spawn is not None:
+        try:
+            on_spawn(proc)
+        except Exception:  # noqa: BLE001 — registration must never break the dispatch
+            pass
     timed_out = False
     try:
         out, err = proc.communicate(timeout=timeout_sec)
@@ -210,6 +225,19 @@ def _dispatch_child(cmd: list, timeout_sec: float):
         timed_out = True
         _kill_tree(proc)
         out, err = _safe_communicate(proc)
+    if on_reap is not None and not timed_out:
+        # Deregister ADJACENT to reap -- but ONLY on a CLEAN communicate() return, which
+        # is the sole reliable "whole tree is done" signal: communicate() returns only
+        # after stdout+stderr hit EOF, and a descendant still holding stdout would have
+        # BLOCKED it into the timeout path below. The leader's poll() is NOT a proxy for
+        # this: a leader can exit while a stdout-holding grandchild lives, and killpg
+        # needs the (now-registered) leader pid to reach that grandchild. So on the
+        # timed_out path we deliberately do NOT deregister -- the child stays registered
+        # for the council's kill loop / final teardown, which killpg the whole group.
+        try:
+            on_reap(proc)
+        except Exception:  # noqa: BLE001 — deregistration must never break the dispatch
+            pass
     return _ChildResult(proc.returncode, out, err, timed_out), None
 
 
