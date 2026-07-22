@@ -133,7 +133,9 @@ def _skill_md_name(skill_dir: str):
         if ln[:1] in (" ", "\t"):        # indented -> a NESTED key, not the top-level name
             continue
         s = ln.strip()
-        if name is None and s.startswith("name:"):   # CASE-SENSITIVE key (YAML keys are); `Name:` is not it
+        if s.startswith("name:"):        # CASE-SENSITIVE key (YAML keys are); `Name:` is not it
+            if name is not None:         # a SECOND top-level name -> ambiguous frontmatter, reject
+                return None
             after = s[5:]
             if after[:1] not in (" ", "\t", ""):      # require `name: value` / `name:` -- `name:summon`
                 continue                              # is a plain scalar, not a mapping key
@@ -144,8 +146,11 @@ def _skill_md_name(skill_dir: str):
                 end = val.find(val[0], 1)
                 if end < 0:                           # UNTERMINATED quote -> malformed, reject lookup
                     return None
-                rest = val[end + 1:].strip()          # trailing junk after the close quote (a lone
-                if rest and not rest.startswith("#"):  # `#comment` is allowed) -> malformed, reject
+                raw_rest = val[end + 1:]              # what follows the close quote
+                if raw_rest and not raw_rest[:1].isspace():   # glued junk / a `#` with no leading
+                    return None                               # space is not a YAML comment -> reject
+                rest = raw_rest.strip()
+                if rest and not rest.startswith("#"):         # non-comment trailing content -> reject
                     return None
                 val = val[1:end]
             else:                                     # bare: a ' #' begins an inline comment
@@ -177,10 +182,11 @@ def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> tupl
     flagged. ``truncated`` is True iff the scan was INCOMPLETE -- it hit ``_MAX_SKILLS_SCAN`` OR a
     read error on an EXISTING dir left siblings unscanned (convergence is then unverified; callers
     treat it as blocking, not clean). An ABSENT skills dir is NOT truncated (the host is simply not
-    installed). Fail-soft; ``dirs`` are absolute paths, sorted."""
+    installed). ``dirs`` are the LEXICAL sibling paths (never resolved), so the guidance points at
+    the entry the host loads -- removing a duplicate SYMLINK, never its target. Fail-soft; sorted."""
     if not os.path.isdir(skills_dir):
         return [], False                             # host not installed -> nothing, NOT incomplete
-    canonical = _canonical(os.path.join(skills_dir, skill_name))
+    skill_lc = os.path.normcase(skill_name)
     out, truncated = [], False
     try:
         with os.scandir(skills_dir) as it:          # streaming, never materializes a huge dir
@@ -188,18 +194,22 @@ def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> tupl
                 if i >= _MAX_SKILLS_SCAN:
                     truncated = True                 # unscanned tail -> convergence unverified
                     break
-                d = os.path.join(skills_dir, entry.name)
-                if _canonical(d) == canonical:       # the canonical dir itself (case/symlink-safe)
+                # Skip the canonical entry by NAME (case-insensitive on Windows via normcase), NOT
+                # by resolved path: a DIFFERENTLY-named symlink pointing at the canonical dir is a
+                # SECOND skill the host loads, and must still be flagged.
+                if os.path.normcase(entry.name) == skill_lc:
                     continue
+                d = os.path.join(skills_dir, entry.name)   # LEXICAL path -- the entry, not its target
                 if entry.name.startswith("summon.staging-") and _dir_is_summon_owned(d):
                     continue                         # OUR transient artifact (verified ours), not a dupe
                 try:
-                    if not entry.is_dir():
+                    if not entry.is_dir():           # follows symlinks: a symlink-to-dir counts
                         continue
                 except OSError:
+                    truncated = True                 # entry uninspectable -> could BE the dupe; incomplete
                     continue
                 if _skill_md_name(d) == skill_name:
-                    out.append(_canonical(d))
+                    out.append(d)                    # report the LEXICAL sibling, never _canonical(d)
     except OSError:
         truncated = True                             # the dir EXISTS but a read failed -> incomplete
         return sorted(out), truncated

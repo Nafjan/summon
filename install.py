@@ -477,8 +477,8 @@ def _drift_check() -> None:
             for p in paths:
                 print(f"       {p}")
         if dr.get("scan_truncated"):
-            print(f"[~?] install-drift: skills dir(s) too large to fully scan for duplicates "
-                  f"({', '.join(dr['scan_truncated'])}); convergence is unverified there")
+            print("[~?] install-drift: could not fully scan for duplicates (size limit or read "
+                  f"error) in: {', '.join(dr['scan_truncated'])}; convergence unverified there")
     except Exception:  # noqa: BLE001 - swallow any ORDINARY error (a non-ASCII console, a
         pass           # closed pipe, a foreign copy) so drift-checking never breaks a
         #                successful install; KeyboardInterrupt/SystemExit deliberately still
