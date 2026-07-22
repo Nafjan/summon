@@ -266,6 +266,13 @@ def install_skill(host: str, dry: bool) -> tuple:
         staging = None
         if os.path.isdir(backup) and _owned(backup):
             shutil.rmtree(backup, ignore_errors=True)
+        # A pre-V6 installer left summon.pre-refresh-<ts> dirs beside the skill, each loaded by the
+        # host as a DUPLICATE 'summon' (field incident). We DETECT these (doctor + _drift_check
+        # below) but deliberately do NOT auto-delete them: a portable, TOCTOU-free recursive delete
+        # of a dir another process could swap is not achievable in stdlib, and an install script
+        # must never risk destroying a user dir. The current installer no longer CREATES such
+        # backups (it stages in a temp dir + auto-removes `.previous`), so these are only legacy
+        # orphans -- the doctor prints the exact path to remove by hand.
         return (f"[ok]  skill installed -> {dest}", True)
     except OSError as e:
         # Roll back: if the swap half-happened, restore the owned backup.
@@ -460,6 +467,18 @@ def _drift_check() -> None:
                   "refused or failed; re-run, or move a foreign copy aside")
         elif ok:
             print(f"\n[ok] install-drift: all {len(ok)} installed host copy(ies) match the source")
+        dups = dr.get("duplicates") or []
+        if dups:
+            paths = [p for d in dups for p in d["dirs"]]
+            where = ", ".join(d["label"] for d in dups)
+            print(f"[~?] install-drift: {len(paths)} duplicate 'summon' skill dir(s) loaded "
+                  f"({where}) - each shows as a 2nd summon in that host. summon does NOT "
+                  "auto-delete them; remove each by hand:")
+            for p in paths:
+                print(f"       {p}")
+        if dr.get("scan_truncated"):
+            print("[~?] install-drift: could not fully scan for duplicates (size limit or read "
+                  f"error) in: {', '.join(dr['scan_truncated'])}; convergence unverified there")
     except Exception:  # noqa: BLE001 - swallow any ORDINARY error (a non-ASCII console, a
         pass           # closed pipe, a foreign copy) so drift-checking never breaks a
         #                successful install; KeyboardInterrupt/SystemExit deliberately still
