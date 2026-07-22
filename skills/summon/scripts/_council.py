@@ -544,7 +544,8 @@ def run_council(args) -> int:
     # to run and divert synthesis to a PARTIAL. It gets its own flag and its own repeated sweep.
     # on = gate flag (active this round); armed = tally only the FINAL round; fired = it
     # triggered at some point (persists, for the envelope); ok = successes THIS round.
-    early = {"on": False, "ok": 0, "armed": False, "thread": None, "fired": False}
+    early = {"on": False, "ok": 0, "armed": False, "thread": None, "fired": False,
+             "killed": set()}   # tags the early-exit sweep actually TARGETED (see the relabel)
     _early_done = threading.Event()
 
     def _early_sweeper() -> None:
@@ -553,6 +554,13 @@ def run_council(args) -> int:
         # registration is caught on a later sweep; a single kill would leak it (it would run
         # to its full member timeout, defeating the point of exiting early).
         while not _early_done.is_set():
+            with lock:
+                # Record the in-flight stragglers THIS sweep is abandoning. The relabel keys
+                # off this set, NOT the async early["on"] flag: a member that reaped + deregistered
+                # BEFORE the quorum landed is gone from `inflight` here, so it never gets marked
+                # -- closing the delayed-bookkeeping race where a genuine pre-quorum failure could
+                # be sampled as excluded after the flag flipped (codex CRITICAL #2).
+                early["killed"].update(inflight.keys())
             _kill_inflight()
             _early_done.wait(0.15)
 
@@ -569,7 +577,8 @@ def run_council(args) -> int:
                 early["on"] = True
                 early["fired"] = True
                 if early["thread"] is None:
-                    early["thread"] = threading.Thread(target=_early_sweeper, daemon=True)
+                    early["thread"] = threading.Thread(
+                        target=_early_sweeper, name="summon-early-sweep", daemon=True)
                     early["thread"].start()
 
     def _early_arm(active: bool) -> None:
@@ -580,6 +589,7 @@ def run_council(args) -> int:
             early["ok"] = 0
             early["on"] = False
             early["thread"] = None
+            early["killed"] = set()   # fresh sweep-target set per round
         _early_done.clear()
 
     def _early_disarm() -> None:
@@ -753,11 +763,16 @@ def run_council(args) -> int:
                 return _member_view(agent, {"status": "excluded",
                                             "error": "early-exit: quorum reached while queued"})
             env = run_stage(agent, prompt, stage, input_sha, member_timeout_ms)
-            if early["on"] and (env or {}).get("status") != "success":
-                # a straggler the early-exit sweep killed (or that self-failed after the quorum
-                # landed): an INTENTIONAL stop, NOT a genuine failure. Relabel to `excluded` so
-                # failed_members stays clean and downstream can tell it apart from a real error;
-                # keep the child's telemetry (usage/model/etc.).
+            _mtag = f"g{owner.generation}-{stage}"
+            with lock:
+                _swept = _mtag in early["killed"]
+            if _swept and (env or {}).get("status") != "success":
+                # ONLY a straggler the early-exit sweep actually TARGETED (it was still registered
+                # in `inflight` when the quorum landed) is relabeled `excluded` -- an INTENTIONAL
+                # stop. A member that genuinely FAILED on its own before the quorum was never swept
+                # (it had reaped + deregistered), so it stays a real failure. Keying off the
+                # sweep-target set instead of the async early["on"] flag closes the delayed-
+                # bookkeeping race (codex CRITICAL #2). Telemetry (usage/model) is preserved.
                 env = {**(env or {}), "status": "excluded",
                        "error": "early-exit: abandoned after quorum reached"}
         with lock:

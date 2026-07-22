@@ -5954,6 +5954,95 @@ def test_v4b_early_exit_sweep_does_not_kill_chairman():
     assert env.get("council_state") == "early_exit", env.get("council_state")
     assert env["status"] == "success", env["status"]
     assert env["synthesis"].get("recommendation"), "chair did not succeed"
+    # Hygiene: _early_disarm JOINS the named sweeper before synthesis, so no "summon-early-sweep"
+    # thread outlives the council. (The exact past-the-check-then-kill interleaving is a one-
+    # instruction window not deterministically forceable without a sweeper-internal seam; the
+    # join is a structural happens-before barrier -- after join() the thread has returned. This
+    # asserts the observable consequence: the sweeper is not leaked.)
+    assert not any(t.name == "summon-early-sweep" and t.is_alive()
+                   for t in threading.enumerate()), "early-exit sweeper leaked past the council"
+
+
+def test_v4b_early_exit_pre_quorum_failure_stays_failed():
+    # Codex CRITICAL #2 (this fix round's own regression guard): a member that GENUINELY fails
+    # BEFORE the quorum is reached must stay in members_failed even when its relabel bookkeeping is
+    # DELAYED until after the quorum flag flips. The relabel keys off the sweep-TARGET set (what was
+    # registered in `inflight` when the sweep ran), NOT the async early["on"] flag. `bad` reaped +
+    # deregistered before the sweep -- modeled here as: never registers, returns error only AFTER the
+    # sweep fired -- so it is NOT mislabeled `excluded`. `blk`, a real in-flight straggler the sweep
+    # killed, IS. (Under the pre-fix `early["on"]` relabel, `bad`'s delayed check would see the flag
+    # set and wrongly mark it excluded, hiding a genuine failure -- this test fails on that code.)
+    import _council
+    import _executor
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    import time as _t
+    root = tempfile.mkdtemp(prefix="summon-v4bpqf-")
+    _mk_agents(root, ["g0", "g1", "blk", "bad", "chair"])
+    killed = {}
+    quorum_ev = threading.Event()   # set when the sweep kills a straggler == the quorum has landed
+
+    class FakeProc:
+        def __init__(self, tag):
+            self.tag = tag
+            self.pid = -1
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        if agent in ("g0", "g1", "chair"):
+            return {"status": "success", "result": agent, "report": {"summary": agent}}
+        if agent == "blk":                       # a real in-flight straggler: registers, killed by the sweep
+            ev = threading.Event()
+            killed[tag] = ev
+            if on_spawn:
+                on_spawn(FakeProc(tag))
+            ev.wait(15)
+            return {"status": "error", "result": "blk killed", "report": {"summary": "blk"}}
+        # agent == "bad": a member that reaped + DEREGISTERED before the quorum (so it never
+        # registers here) whose relabel bookkeeping is DELAYED until after the quorum landed.
+        quorum_ev.wait(15)                        # return only AFTER the sweep fired (early["on"] True)
+        return {"status": "error", "result": "bad failed", "report": {"summary": "bad"}}
+
+    def fake_kill(proc):
+        if hasattr(proc, "_alive"):
+            proc._alive = False
+        ev = killed.get(getattr(proc, "tag", None))
+        if ev:
+            ev.set()
+        quorum_ev.set()                           # the sweep fired -> release `bad` into its delayed relabel
+
+    ns = argparse.Namespace(question="q", question_file=None, members="g0,g1,blk,bad",
+                            chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
+                            timeout=30000, out=None, run_dir=root, min_successful=2)
+    orig_cap = _council._PER_BACKEND_CAP
+    _council._PER_BACKEND_CAP = 10               # one wave: all four members dispatch at once
+    orig_d, orig_k = _council._dispatch, _executor._kill_tree
+    _council._dispatch, _executor._kill_tree = fake, fake_kill
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._PER_BACKEND_CAP = orig_cap
+        _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    assert env["status"] == "success", env["status"]
+    assert env.get("council_state") == "early_exit", env.get("council_state")
+    failed = {m["agent"] for m in env["summary"]["members_failed"]}
+    excluded = {m["agent"] for m in env["summary"]["members_excluded"]}
+    ee_excluded = set(env["early_exit"]["excluded"])
+    assert "bad" in failed, ("a genuine pre-quorum failure was hidden", failed, excluded)
+    assert "bad" not in excluded and "bad" not in ee_excluded, ("bad mislabeled excluded", excluded, ee_excluded)
+    assert "blk" in excluded and "blk" in ee_excluded, ("the swept straggler is not excluded", excluded, ee_excluded)
+    assert "blk" not in failed, ("the swept straggler leaked into failed", failed)
 
 
 def test_v4b_atomic_write_cleans_temp_on_non_oserror():
