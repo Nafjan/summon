@@ -5081,6 +5081,331 @@ def test_jobs_cli_wait_timeout_and_bare():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def _mk_summon_install(home, host_dir, py_files, *, installed_at=1000, manifest=True):
+    """Build a synthetic .../<host_dir>/skills/summon/{scripts/*.py, .summon-install.json}
+    under a temp HOME. Returns the scripts dir."""
+    import json as _json
+    scripts = os.path.join(home, host_dir, "skills", "summon", "scripts")
+    os.makedirs(scripts, exist_ok=True)
+    for name, content in py_files.items():
+        with open(os.path.join(scripts, name), "w", encoding="utf-8") as fh:
+            fh.write(content)
+    if manifest:
+        summon_dir = os.path.dirname(scripts)
+        with open(os.path.join(summon_dir, ".summon-install.json"), "w", encoding="utf-8") as fh:
+            _json.dump({"installed_by": "summon", "installed_at": installed_at,
+                        "files": sorted(py_files)}, fh)
+    return scripts
+
+
+def test_v6_installs_enumerate_and_converged():
+    # every host copy identical -> all present, versions read from run_subagent.py,
+    # drift converged, and the copy we "run from" is tagged (not double-listed).
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-v6conv-")
+    try:
+        files = {"run_subagent.py": '__version__ = "1.2.3"\n', "_x.py": "x = 1\n"}
+        for hd in _installs.HOST_DIRS.values():
+            _mk_summon_install(home, hd, files)
+        run = os.path.join(home, ".claude", "skills", "summon", "scripts")
+        recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
+        present = [r for r in recs if r["present"]]
+        assert len(present) == len(_installs.HOST_DIRS), [r["label"] for r in present]
+        assert all(r["version"] == "1.2.3" for r in present), present
+        assert all(r["installed_at"] == 1000 for r in present), present
+        # running tagged on the .claude copy, and it is NOT appended as a separate record
+        run_recs = [r for r in recs if r.get("running")]
+        assert len(run_recs) == 1 and run_recs[0]["label"] == "claude", run_recs
+        dr = _installs.drift_report(recs)
+        assert dr["converged"] is True and dr["drifted"] == [], dr
+        assert dr["reference_sha"] and all(r["sha256"] == dr["reference_sha"] for r in present)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_installs_drift_flags_the_odd_copy():
+    # one host carries divergent content -> drift_report flags exactly it, converged False.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-v6drift-")
+    try:
+        good = {"run_subagent.py": '__version__ = "1.0.0"\n', "_x.py": "x = 1\n"}
+        bad = {"run_subagent.py": '__version__ = "0.1.0"\n', "_x.py": "x = 999\n"}
+        items = list(_installs.HOST_DIRS.items())
+        for _name, hd in items[:-1]:
+            _mk_summon_install(home, hd, good)
+        odd_name, odd_hd = items[-1]
+        _mk_summon_install(home, odd_hd, bad)   # the stale/divergent one
+        run = os.path.join(home, ".claude", "skills", "summon", "scripts")   # a good copy runs
+        recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
+        dr = _installs.drift_report(recs)
+        assert dr["converged"] is False, dr
+        assert [d["label"] for d in dr["drifted"]] == [odd_name], dr["drifted"]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_installs_no_reference_flags_nothing():
+    # if the running copy cannot be hashed (no reference), never cry drift we can't anchor.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-v6noref-")
+    try:
+        files = {"run_subagent.py": '__version__ = "1.0.0"\n'}
+        for hd in _installs.HOST_DIRS.values():
+            _mk_summon_install(home, hd, files)
+        recs = _installs.enumerate_installs(running_scripts_dir=None, home=home)  # no running
+        dr = _installs.drift_report(recs)
+        assert dr["reference_sha"] is None and dr["converged"] is False and dr["drifted"] == []
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_scripts_sha256_excludes_test_discovery_and_catches_real_change():
+    # the shared primitive: test_discovery.py never counts; any production module does.
+    import _receipt
+    d = tempfile.mkdtemp(prefix="summon-v6sha-")
+    try:
+        with open(os.path.join(d, "run_subagent.py"), "w", encoding="utf-8") as fh:
+            fh.write("x = 1\n")
+        h1 = _receipt.scripts_sha256(d)
+        with open(os.path.join(d, "test_discovery.py"), "w", encoding="utf-8") as fh:
+            fh.write("# a big test file\n" * 200)   # excluded -> hash unchanged
+        assert _receipt.scripts_sha256(d) == h1, "test_discovery.py leaked into the hash"
+        with open(os.path.join(d, "_new.py"), "w", encoding="utf-8") as fh:
+            fh.write("y = 2\n")                       # a real module -> hash MUST change
+        assert _receipt.scripts_sha256(d) != h1
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v6_installs_hash_matches_receipt_primitive():
+    # _installs must hash EXACTLY like the dispatch receipt, or "drift" would be a lie.
+    import _installs, _receipt
+    home = tempfile.mkdtemp(prefix="summon-v6same-")
+    try:
+        _mk_summon_install(home, ".claude",
+                           {"run_subagent.py": '__version__ = "9.9.9"\n', "_a.py": "a = 1\n"})
+        recs = _installs.enumerate_installs(home=home)
+        claude = next(r for r in recs if r["label"] == "claude")
+        assert claude["present"] and claude["sha256"] == _receipt.scripts_sha256(claude["scripts_dir"])
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_installs_hosts_match_installer():
+    # the detector's host list and install.py's HOSTS must not silently diverge.
+    import _installs
+    import importlib.util
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    # scripts -> summon -> skills -> repo root (install.py lives there; absent in an
+    # installed copy, so skip gracefully rather than fail out of a repo checkout).
+    root = os.path.dirname(os.path.dirname(os.path.dirname(scripts_dir)))
+    install_py = os.path.join(root, "install.py")
+    if not os.path.isfile(install_py):
+        return
+    spec = importlib.util.spec_from_file_location("_summon_install_probe", install_py)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert set(mod.HOSTS) == set(_installs.HOST_DIRS), (set(mod.HOSTS), set(_installs.HOST_DIRS))
+
+
+def test_v6_read_version_parser_robustness():
+    # AST-based _read_version (review WARNING): a __version__ inside a docstring or a
+    # trailing # "comment" must NOT be mistaken for the value; a computed value -> None;
+    # a bad encoding must NEVER raise (the documented contract).
+    import _installs
+    d = tempfile.mkdtemp(prefix="summon-v6ver-")
+    try:
+        def ver(src):
+            with open(os.path.join(d, "run_subagent.py"), "w", encoding="utf-8") as fh:
+                fh.write(src)
+            return _installs._read_version(d)
+        assert ver('__version__ = "1.2.3"\n') == "1.2.3"
+        assert ver('__version__ = "1.2.3"  # "9.9.9"\n') == "1.2.3"   # trailing comment ignored
+        assert ver('"""\n__version__ = "fake"\n"""\nx = 1\n') is None  # in a docstring -> not it
+        assert ver('__version__ = VERSION\n') is None                  # computed -> unknown, not garbage
+        assert ver('x = 1\n') is None                                  # absent
+        assert ver('def f():\n    __version__ = "9.9.9"\n    return 1\n') is None  # nested, not module-level
+        assert ver('__version__ = "1.0.0"\n__version__ = "2.0.0"\n') == "2.0.0"  # LAST wins
+        # annotated assignment (AnnAssign) is honored and wins over a prior plain Assign
+        assert ver('__version__ = "1.0.0"\n__version__: str = "2.0.0"\n') == "2.0.0"
+        assert ver('__version__: str\n') is None                       # bare annotation, no value
+        assert ver('__version__ = "1.0.0"\n__version__ += "x"\n') is None  # AugAssign invalidates
+        # an ast RecursionError must be caught deterministically -> None, never raised
+        def _raise_rec(*a, **k):
+            raise RecursionError("deep")
+        _orig_parse = _installs.ast.parse
+        _installs.ast.parse = _raise_rec
+        try:
+            assert ver('__version__ = "1.2.3"\n') is None
+        finally:
+            _installs.ast.parse = _orig_parse
+        # non-UTF-8 bytes: strict decode -> None, must NOT raise
+        with open(os.path.join(d, "run_subagent.py"), "wb") as fh:
+            fh.write(b'__version__ = "\xff\xfe bad"\n')
+        assert _installs._read_version(d) is None
+        # oversize file: REJECTED (not parsed from a truncated prefix) -> None
+        orig_cap = _installs._ENUM_MAX_BYTES
+        _installs._ENUM_MAX_BYTES = 40
+        try:
+            assert ver('__version__ = "1.2.3"  # pad ' + 'x' * 200 + '\n') is None
+        finally:
+            _installs._ENUM_MAX_BYTES = orig_cap
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v6_enumerate_dedups_by_canonical_key():
+    # De-dup is driven by _canonical; force two REAL host copies to share a canonical key
+    # (without needing symlink privilege) so the collapse + running-tag logic is ALWAYS
+    # covered, even where the live-symlink test below has to skip.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-v6can-")
+    orig = _installs._canonical
+    files = {"run_subagent.py": '__version__ = "3.0.0"\n', "_x.py": "x = 1\n"}
+    try:
+        c_scripts = _mk_summon_install(home, ".claude", files)
+        x_scripts = _mk_summon_install(home, ".codex", files)
+        shared = {c_scripts: "SHARED", x_scripts: "SHARED"}
+        _installs._canonical = lambda p: shared.get(p, orig(p))
+        recs = _installs.enumerate_installs(running_scripts_dir=x_scripts, home=home)
+        present = [r for r in recs if r["present"]]
+        merged = [r for r in present if "+" in r["label"]]
+        assert len(merged) == 1 and len(present) == 1, [r["label"] for r in present]
+        assert "claude" in merged[0]["label"] and "codex" in merged[0]["label"], merged[0]["label"]
+        assert merged[0]["running"] is True and merged[0]["managed"] is True
+    finally:
+        _installs._canonical = orig
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_drift_report_unhashable_forces_not_converged():
+    # review WARNING: a present-but-unhashable peer must NOT be silently dropped so the
+    # summary claims "all match". It is UNKNOWN and forces converged=False.
+    import _installs
+    recs = [
+        {"label": "claude", "present": True, "managed": True, "running": True, "sha256": "AAA"},
+        {"label": "codex", "present": True, "managed": True, "running": False, "sha256": None},
+        {"label": "cursor", "present": True, "managed": True, "running": False, "sha256": "AAA"},
+    ]
+    dr = _installs.drift_report(recs)
+    assert dr["reference_sha"] == "AAA"
+    assert dr["drifted"] == [], dr["drifted"]
+    assert [u["label"] for u in dr["unknown"]] == ["codex"], dr["unknown"]
+    assert dr["converged"] is False   # an uncheckable copy is never reported 'all match'
+
+
+def test_v6_enumerate_dedups_symlink_aliases():
+    # review WARNING: two host dirs symlinked to ONE physical copy must collapse to one
+    # record, and the running tag must land on it regardless of which alias we run through.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-v6sym-")
+    try:
+        _mk_summon_install(home, ".claude",
+                           {"run_subagent.py": '__version__ = "2.0.0"\n', "_x.py": "x = 1\n"})
+        codex_summon = os.path.join(home, ".codex", "skills", "summon")
+        os.makedirs(os.path.dirname(codex_summon), exist_ok=True)
+        try:
+            os.symlink(os.path.join(home, ".claude", "skills", "summon"), codex_summon,
+                       target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            # symlinks not permitted (e.g. Windows without privilege): announce a REAL skip
+            # (not a silent pass) -- the canonical de-dup logic is still covered
+            # deterministically by test_v6_enumerate_dedups_by_canonical_key.
+            print("  [v6-skip] live symlinks unavailable; de-dup covered by canonical-key test")
+            return
+        run = os.path.join(codex_summon, "scripts")   # invoke THROUGH the .codex alias
+        recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
+        present = [r for r in recs if r["present"]]
+        assert len(present) == 1, [(r["label"], r["scripts_dir"]) for r in present]
+        merged = present[0]
+        assert "claude" in merged["label"] and "codex" in merged["label"], merged["label"]
+        assert merged["running"] is True and merged["managed"] is True
+        dr = _installs.drift_report(recs)
+        assert dr["converged"] is True and dr["drifted"] == []
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_fifo_in_scripts_dir_does_not_hang():
+    # review CRITICAL: a FIFO named *.py in an enumerated copy must NOT block open() (which
+    # would hang doctor/install indefinitely on POSIX). The non-blocking open + fstat classify
+    # it as non-regular without reading. Skipped where os.mkfifo is unavailable (Windows); the
+    # Linux CI matrix exercises it.
+    import _installs
+    import _receipt
+    if not hasattr(os, "mkfifo"):
+        print("  [v6-skip] os.mkfifo unavailable (non-POSIX); FIFO hang test not applicable")
+        return
+    import threading
+    home = tempfile.mkdtemp(prefix="summon-v6fifo-")
+    try:
+        scripts = _mk_summon_install(home, ".claude",
+                                     {"run_subagent.py": '__version__ = "1.0.0"\n', "_x.py": "x=1\n"})
+        os.mkfifo(os.path.join(scripts, "evil.py"))            # a FIFO *.py with NO writer
+        result = {}
+
+        def run():
+            result["sha"] = _receipt.scripts_sha256(scripts, max_bytes=_installs._ENUM_MAX_BYTES)
+            result["ver"] = _installs._read_version(scripts)
+
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+        th.join(timeout=10)
+        assert not th.is_alive(), "a FIFO *.py HUNG enumeration (blocking open)"
+        assert isinstance(result.get("sha"), str) and len(result["sha"]) == 64, result
+        assert result.get("ver") == "1.0.0", result
+        # a FIFO run_subagent.py itself must not hang _read_version either
+        os.unlink(os.path.join(scripts, "run_subagent.py"))
+        os.mkfifo(os.path.join(scripts, "run_subagent.py"))
+        r2 = {}
+
+        def run2():
+            r2["ver"] = _installs._read_version(scripts)
+
+        th2 = threading.Thread(target=run2, daemon=True)
+        th2.start()
+        th2.join(timeout=10)
+        assert not th2.is_alive(), "a FIFO run_subagent.py HUNG _read_version"
+        assert r2.get("ver") is None, r2   # non-regular -> None
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_unhashable_running_copy_yields_no_reference():
+    # a present-but-unhashable RUNNING copy -> no reference -> nothing flagged as drift
+    # (never cry drift we can't anchor), and converged stays False.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-v6uh-")
+
+    def _boom(scripts_dir, max_bytes=None):
+        raise OSError("cannot hash")
+
+    orig = _installs.scripts_sha256
+    _installs.scripts_sha256 = _boom
+    try:
+        _mk_summon_install(home, ".claude", {"run_subagent.py": '__version__ = "1.0.0"\n'})
+        run = os.path.join(home, ".claude", "skills", "summon", "scripts")
+        recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
+        claude = next(r for r in recs if "claude" in r["label"])
+        assert claude["present"] and claude["sha256"] is None and claude["running"]
+        dr = _installs.drift_report(recs)
+        assert dr["reference_sha"] is None and dr["converged"] is False and dr["drifted"] == []
+        assert len(dr["unknown"]) == 1
+    finally:
+        _installs.scripts_sha256 = orig
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

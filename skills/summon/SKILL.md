@@ -144,7 +144,7 @@ Parse JSON output and check `status` field:
 |-----------|----------|-------------|
 | `--list` | - | List available agents (no other params needed) |
 | `--list-models` | - | Report invocable models per backend (no other params needed; add `--cli` to filter). See "Model discovery" below |
-| `--doctor` | - | Check backend CLIs, wrapper deps, agents dir, git; add `--json` for machines. Run this FIRST on a new machine |
+| `--doctor` | - | Check backend CLIs, wrapper deps, agents dir, git, and **install drift** (every summon copy on the box, hashed with the same primitive the receipt uses; flags a stale host copy and points you at `install.py`); add `--json` for machines. Run this FIRST on a new machine |
 | `--new-agent NAME` | - | Scaffold a new agent definition (house template); customize frontmatter with `--set`. Never overwrites |
 | `--set-agent NAME` | - | Edit an existing agent's frontmatter via `--set KEY=VALUE` (`KEY=` removes); body untouched, values validated |
 | `--set KEY=VALUE` | No | With the two above: `run-agent`, `model`, `permission`, `args` (repeatable) |
