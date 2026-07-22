@@ -5452,6 +5452,112 @@ def test_v5_codex_doc_timeout_is_consistent_with_skill():
     assert "align tool timeout with `--timeout`" not in cx, "codex.md still says to 'align' (== match)"
 
 
+def test_v4b_early_exit_kills_inflight_and_chairs_quorum():
+    # M fast members SUCCEED -> early-exit: the in-flight slow stragglers are process-tree-
+    # killed (not run to their timeout), the quorum is chaired, council_state=early_exit,
+    # status success, and the council returns PROMPTLY. Single wave (cap patched high) so the
+    # fast members always dispatch -- no permit race, fully deterministic.
+    import _council
+    import _executor
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    import threading
+    import time as _t
+    root = tempfile.mkdtemp(prefix="summon-v4bkill-")
+    _mk_agents(root, ["f0", "f1", "s0", "s1", "chair"])
+    killed = {}
+
+    class FakeProc:
+        def __init__(self, tag):
+            self.tag = tag
+            self.pid = -1
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        if agent in ("f0", "f1", "chair"):
+            return {"status": "success", "result": agent, "report": {"summary": agent}}
+        ev = threading.Event()          # s0, s1: block until the early-exit sweep kills them
+        killed[tag] = ev
+        if on_spawn:
+            on_spawn(FakeProc(tag))
+        stopped = ev.wait(15)
+        return {"status": "error" if stopped else "success",
+                "result": agent + (" killed" if stopped else " done"),
+                "report": {"summary": agent}}
+
+    def fake_kill(proc):
+        if hasattr(proc, "_alive"):
+            proc._alive = False
+        ev = killed.get(getattr(proc, "tag", None))
+        if ev:
+            ev.set()
+
+    ns = argparse.Namespace(question="q", question_file=None, members="f0,f1,s0,s1",
+                            chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
+                            timeout=30000, out=None, run_dir=root, min_successful=2)
+    orig_cap = _council._PER_BACKEND_CAP
+    _council._PER_BACKEND_CAP = 10      # one wave: all 4 members dispatch at once (no permit race)
+    orig_d, orig_k = _council._dispatch, _executor._kill_tree
+    _council._dispatch, _executor._kill_tree = fake, fake_kill
+    try:
+        t0 = _t.monotonic()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        elapsed = _t.monotonic() - t0
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._PER_BACKEND_CAP = orig_cap
+        _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    assert elapsed < 12, elapsed        # returned near the 2 instant successes, NOT the 15s blockers
+    assert env.get("council_state") == "early_exit", env.get("council_state")
+    assert env["status"] == "success", env["status"]
+    assert env["synthesis"]["decision_status"] == "early_exit", env["synthesis"]["decision_status"]
+    assert env["synthesis"].get("recommendation"), "chair did not run on the quorum"
+    assert killed and all(ev.is_set() for ev in killed.values()), "a straggler was not killed"
+    assert env.get("early_exit", {}).get("min_successful") == 2, env.get("early_exit")
+    assert sum(1 for m in env["members"] if m.get("status") == "success") >= 2, env["members"]
+
+
+def test_v4b_min_successful_validation():
+    # 2 <= M <= member-count, and M >= --quorum. Invalid values fail fast (no dispatch).
+    import _council
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    root = tempfile.mkdtemp(prefix="summon-v4bval-")
+    _mk_agents(root, ["m1", "m2", "m3", "chair"])
+
+    def run(min_s, quorum=None):
+        ns = argparse.Namespace(question="q", question_file=None, members="m1,m2,m3",
+                                chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
+                                timeout=30000, out=None, run_dir=root,
+                                min_successful=min_s, quorum=quorum)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = _council.run_council(ns)
+        return rc, _json.loads(buf.getvalue())
+
+    try:
+        rc, env = run(4)                 # > member count
+        assert rc == 1 and "min-successful-members" in env.get("error", ""), env
+        rc, env = run(1)                 # < 2
+        assert rc == 1 and "min-successful-members" in env.get("error", ""), env
+        rc, env = run(2, quorum=3)       # M < quorum
+        assert rc == 1 and ">= --quorum" in env.get("error", ""), env
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

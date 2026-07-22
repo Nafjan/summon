@@ -93,7 +93,13 @@ def stage_path(run_dir: str, generation: int, stage: str) -> str:
 # --- Small shared IO -----------------------------------------------------------
 
 def atomic_write_json(path: str, obj: dict) -> None:
-    """mkstemp + replace in the target's directory. Raises OSError on failure."""
+    """mkstemp + replace in the target's directory. Raises OSError on failure.
+
+    The final ``os.replace`` is retried on a transient ``PermissionError`` (Windows
+    WinError 5: an antivirus scanner or the search indexer momentarily holds the
+    destination file open during the atomic swap). The content is already flushed to the
+    temp file -- only the rename raced -- so a short bounded backoff clears it. POSIX
+    ``rename`` never raises this, so the loop is a single-iteration no-op there."""
     import tempfile
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, exist_ok=True)
@@ -101,7 +107,14 @@ def atomic_write_json(path: str, obj: dict) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(obj, fh, ensure_ascii=False)
-        os.replace(tmp, path)
+        for _attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if _attempt == 4:
+                    raise
+                time.sleep(0.05 * (_attempt + 1))
     except OSError:
         try:
             os.unlink(tmp)

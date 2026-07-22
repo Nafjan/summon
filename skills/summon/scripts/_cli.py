@@ -57,14 +57,14 @@ MODE_FLAGS = {
     "council": {"council", "question", "question_file", "members", "chairman",
                 "rounds", "cwd", "agents_dir", "timeout", "out", "run_dir", "results_dir",
                 "job_file", "quorum", "chairman_fallback", "member_timeout",
-                "chair_timeout", "overall_timeout"},
+                "chair_timeout", "overall_timeout", "min_successful"},
     # A resume may change how the SAME run's stages are gated/timed (quorum,
     # fallback, per-stage timeouts) without changing its identity; question,
     # members, chairman, and rounds still come from the receipt.
     "council-resume": {"council", "resume_run", "cwd", "agents_dir", "timeout",
                        "out", "run_dir", "results_dir", "job_file",
                        "quorum", "chairman_fallback", "member_timeout", "chair_timeout",
-                       "overall_timeout"},
+                       "overall_timeout", "min_successful"},
     # Status takes ONLY its id, where to look, and the output format -- it never
     # dispatches, so it has no working directory (use --run-dir to point it).
     "council-status": {"council_status", "run_dir", "json", "job_file"},
@@ -363,6 +363,13 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "fallback chairman are excluded). Per-stage timeouts still apply within "
                              "it. The parent's own final envelope serialization (no child running) "
                              "is not counted")
+    parser.add_argument("--min-successful-members", dest="min_successful", type=int,
+                        help="With --council: EARLY-EXIT threshold. Once this many members SUCCEED "
+                             "in the final round, summon stops waiting for the stragglers "
+                             "(process-tree-killing the in-flight ones and excluding the queued "
+                             "ones) and chairs the surviving quorum immediately -- a pre-deadline "
+                             "exit for 'we have enough, go now'. Must be >= --quorum (if set) and "
+                             "<= the member count; chairs with council_state=early_exit and exits 0")
     parser.add_argument("--job-dir", dest="job_dir",
                         help="Root for --background job records/results "
                              "(default {tempdir}/subagents_jobs; env SUMMON_JOBS_DIR)")
