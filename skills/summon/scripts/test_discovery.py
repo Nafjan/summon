@@ -5169,6 +5169,8 @@ def test_v6_skill_md_name_parsing():
     try:
         _w('---\nname: "summon"\ndescription: x\n---\nbody\n')
         assert _installs._skill_md_name(d) == "summon"           # quotes stripped
+        _w('---\nname: "summon\ndescription: x\n---\n')
+        assert _installs._skill_md_name(d) is None               # UNTERMINATED quote -> no name
         _w('\ufeff---\nname: summon\n---\n')
         assert _installs._skill_md_name(d) == "summon"           # UTF-8 BOM tolerated
         _w('---\nname: summon # actually a comment\n---\n')
@@ -5252,6 +5254,44 @@ def test_v6_drift_blocks_converged_on_duplicate():
         assert dr["duplicates"][0]["dirs"][0].endswith("summon.pre-refresh-1"), dr["duplicates"]
         assert dr["converged"] is False, dr                      # dupe alone blocks converged
     finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_duplicate_detected_when_canonical_absent():
+    # A host with a summon.pre-refresh-* copy but NO canonical `summon` still loads a summon
+    # skill; it must be detected and block converged (was missed when the probe skipped an
+    # absent canonical).
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-dupnocanon-")
+    try:
+        run = _mk_summon_install(home, ".claude", {"run_subagent.py": '__version__ = "1.0.0"\n'})
+        _w_skill_md(os.path.join(home, ".codex", "skills", "summon.pre-refresh-1"), "summon")  # no canonical
+        recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
+        dr = _installs.drift_report(recs)
+        assert "codex" in [d["label"] for d in dr["duplicates"]], dr["duplicates"]
+        assert dr["converged"] is False, dr
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_duplicate_scan_truncation_blocks_converged():
+    # Hitting the scan cap must NOT silently report clean: a sentinel is emitted so a duplicate
+    # past the cap cannot let converged be True.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-trunc-")
+    orig = _installs._MAX_SKILLS_SCAN
+    try:
+        _installs._MAX_SKILLS_SCAN = 3                         # tiny cap for the test
+        base = os.path.join(home, ".cursor", "skills")
+        os.makedirs(os.path.join(base, "summon"))
+        for i in range(6):
+            os.makedirs(os.path.join(base, "zzz-filler-%d" % i))
+        dupes = _installs.duplicate_summon_skills(base)
+        assert any("truncated" in p for p in dupes), dupes     # sentinel present -> blocks converged
+    finally:
+        _installs._MAX_SKILLS_SCAN = orig
         import shutil as _sh
         _sh.rmtree(home, ignore_errors=True)
 

@@ -291,19 +291,33 @@ def install_skill(host: str, dry: bool) -> tuple:
         staging = None
         if os.path.isdir(backup) and _owned(backup):
             shutil.rmtree(backup, ignore_errors=True)
-        # Sweep OUR old-scheme pre-refresh backups ONLY NOW -- after the new skill is safely
-        # in `dest`. A pre-V6 installer left summon.pre-refresh-<ts> dirs here, each loaded by
-        # the host as a DUPLICATE 'summon' (field incident). Post-swap means an owned backup is
-        # NEVER the only copy we deleted ahead of a build that then fails (data-loss). Each
-        # candidate is re-validated as OURS and not a symlink at the delete site (closes the
-        # check-then-delete window), and only a CONFIRMED removal is counted.
+        # Sweep OUR old-scheme pre-refresh backups ONLY NOW -- after the new skill is safely in
+        # `dest`. A pre-V6 installer left summon.pre-refresh-<ts> dirs here, each loaded by the
+        # host as a DUPLICATE 'summon' (field incident). Post-swap means an owned backup is NEVER
+        # the only copy we deleted ahead of a build that then fails (data loss). Deletion is
+        # ATOMIC via quarantine: rename the candidate to a private staging name FIRST, then
+        # validate + rmtree THAT -- a swap of the original path after the ownership check cannot
+        # redirect the rmtree at a non-owned replacement (the quarantine name is unguessable), and
+        # a non-owned dir that got renamed in is restored, never deleted.
         swept_backups = 0
-        for _b in _owned_prerefresh_backups(parent):
-            p = os.path.join(parent, _b)
-            if os.path.isdir(p) and not os.path.islink(p) and _owned(p):
-                shutil.rmtree(p, ignore_errors=True)
-                if not os.path.exists(p):
-                    swept_backups += 1
+        for _i, _b in enumerate(_owned_prerefresh_backups(parent)):
+            src = os.path.join(parent, _b)
+            if os.path.islink(src) or not os.path.isdir(src):
+                continue
+            quar = os.path.join(parent, f"summon.staging-sweep-{token}-{_i}")
+            try:
+                os.rename(src, quar)          # atomically claim whatever is at src RIGHT NOW
+            except OSError:
+                continue                      # vanished/busy -> nothing to sweep
+            if os.path.islink(quar) or not os.path.isdir(quar) or not _owned(quar):
+                try:
+                    os.rename(quar, src)      # not ours (swapped in before the rename) -> restore
+                except OSError:
+                    pass
+                continue
+            shutil.rmtree(quar, ignore_errors=True)
+            if not os.path.exists(quar):
+                swept_backups += 1
         msg = f"[ok]  skill installed -> {dest}"
         if swept_backups:
             msg += f"; swept {swept_backups} stale pre-refresh backup(s)"
