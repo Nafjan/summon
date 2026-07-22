@@ -133,14 +133,22 @@ def _skill_md_name(skill_dir: str):
         if ln[:1] in (" ", "\t"):        # indented -> a NESTED key, not the top-level name
             continue
         s = ln.strip()
-        if name is None and s.lower().startswith("name:"):
-            val = s.split(":", 1)[1].strip()
-            if val[:1] in ('"', "'"):    # quoted: take the quoted span; an UNTERMINATED quote is
-                end = val.find(val[0], 1)  # malformed frontmatter -> reject the whole lookup, never
-                if end < 0:                # accept a later name after a broken one
+        if name is None and s.startswith("name:"):   # CASE-SENSITIVE key (YAML keys are); `Name:` is not it
+            after = s[5:]
+            if after[:1] not in (" ", "\t", ""):      # require `name: value` / `name:` -- `name:summon`
+                continue                              # is a plain scalar, not a mapping key
+            val = after.strip()
+            if not val:                               # `name:` with no value -> no name here
+                continue
+            if val[:1] in ('"', "'"):                 # quoted: take the quoted span
+                end = val.find(val[0], 1)
+                if end < 0:                           # UNTERMINATED quote -> malformed, reject lookup
+                    return None
+                rest = val[end + 1:].strip()          # trailing junk after the close quote (a lone
+                if rest and not rest.startswith("#"):  # `#comment` is allowed) -> malformed, reject
                     return None
                 val = val[1:end]
-            else:                        # bare: a ' #' begins an inline comment
+            else:                                     # bare: a ' #' begins an inline comment
                 val = val.split(" #", 1)[0].strip()
             name = val
     return name if closed else None      # an UNCLOSED block is not valid frontmatter
@@ -166,9 +174,12 @@ def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> tupl
     is skipped by CANONICAL PATH (a case-variant ``SUMMON`` on Windows, or a symlink to it, is
     the canonical copy, never itself flagged). OUR OWN transient ``summon.staging-*`` artifacts
     are skipped ONLY when they carry a summon manifest -- a FOREIGN dir wearing that name is still
-    flagged. ``truncated`` is True iff the scan hit ``_MAX_SKILLS_SCAN`` (the tail is unscanned, so
-    convergence is unverified -- callers must treat it as blocking, not clean). Fail-soft; ``dirs``
-    are absolute paths, sorted."""
+    flagged. ``truncated`` is True iff the scan was INCOMPLETE -- it hit ``_MAX_SKILLS_SCAN`` OR a
+    read error on an EXISTING dir left siblings unscanned (convergence is then unverified; callers
+    treat it as blocking, not clean). An ABSENT skills dir is NOT truncated (the host is simply not
+    installed). Fail-soft; ``dirs`` are absolute paths, sorted."""
+    if not os.path.isdir(skills_dir):
+        return [], False                             # host not installed -> nothing, NOT incomplete
     canonical = _canonical(os.path.join(skills_dir, skill_name))
     out, truncated = [], False
     try:
@@ -190,6 +201,7 @@ def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> tupl
                 if _skill_md_name(d) == skill_name:
                     out.append(_canonical(d))
     except OSError:
+        truncated = True                             # the dir EXISTS but a read failed -> incomplete
         return sorted(out), truncated
     return sorted(out), truncated
 
@@ -254,6 +266,9 @@ def enumerate_installs(running_scripts_dir: str | None = None,
             # must not be dropped on collapse (else converged is falsely True).
             first["duplicates"] = sorted(set(first.get("duplicates", []))
                                          | set(r.get("duplicates", [])))
+            # an incomplete scan on EITHER collapsed record leaves convergence unverified
+            first["duplicates_truncated"] = bool(first.get("duplicates_truncated")
+                                                 or r.get("duplicates_truncated"))
         else:
             by_key[key] = r
             records.append(r)

@@ -5181,6 +5181,15 @@ def test_v6_skill_md_name_parsing():
         assert _installs._skill_md_name(d) is None               # unclosed block -> not valid
         _w("no frontmatter here\nname: body\n")
         assert _installs._skill_md_name(d) is None               # no leading --- block
+        # false-POSITIVE guards (each would wrongly flag a dir as a duplicate to remove):
+        _w('---\nName: summon\n---\n')
+        assert _installs._skill_md_name(d) is None               # case-sensitive key: Name: != name:
+        _w('---\nname:summon\n---\n')
+        assert _installs._skill_md_name(d) is None               # no space -> a scalar, not a mapping
+        _w('---\nname: "summon"junk\n---\n')
+        assert _installs._skill_md_name(d) is None               # trailing junk after the close quote
+        _w('---\nname: summon\n---\n')
+        assert _installs._skill_md_name(d) == "summon"           # still accepts the real thing
         with open(md, "wb") as fh:                               # oversize -> (None, note); no crash
             fh.write(b"---\nname: summon\n---\n" + b"x" * (_installs._SKILL_MD_MAX + 16))
         assert _installs._skill_md_name(d) is None
@@ -5299,6 +5308,55 @@ def test_v6_duplicate_scan_truncation_blocks_converged():
         assert truncated is True and dirs == [], (dirs, truncated)   # flagged, no fake path in dirs
         dr = _installs.drift_report(_installs.enumerate_installs(running_scripts_dir=run, home=home))
         assert dr["scan_truncated"] and dr["converged"] is False, dr  # blocks converged, tracked apart
+    finally:
+        _installs._MAX_SKILLS_SCAN = orig
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_scan_read_error_marks_incomplete_not_clean():
+    # A skills dir that EXISTS but cannot be listed (a read error) is INCOMPLETE (truncated=True),
+    # never silently clean. An ABSENT dir is NOT truncated (a host is just not installed).
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-scanerr-")
+    try:
+        base = os.path.join(home, ".cursor", "skills")
+        os.makedirs(os.path.join(base, "summon"))
+        dirs, trunc = _installs.duplicate_summon_skills(os.path.join(home, "absent", "skills"))
+        assert dirs == [] and trunc is False, (dirs, trunc)          # absent -> not truncated
+        orig = _installs.os.scandir
+        _installs.os.scandir = lambda p: (_ for _ in ()).throw(PermissionError("denied"))
+        try:
+            dirs, trunc = _installs.duplicate_summon_skills(base)     # exists, but listing fails
+        finally:
+            _installs.os.scandir = orig
+        assert trunc is True, (dirs, trunc)                          # incomplete -> blocks converged
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v6_alias_collapse_preserves_truncation():
+    # When two hosts collapse onto one physical summon (symlink), an INCOMPLETE scan on the
+    # aliased host must survive the merge, else converged is falsely True. Skips w/o symlinks.
+    import _installs
+    home = tempfile.mkdtemp(prefix="summon-symtrunc-")
+    orig = _installs._MAX_SKILLS_SCAN
+    try:
+        run = _mk_summon_install(home, ".claude", {"run_subagent.py": '__version__ = "1.0.0"\n'})
+        codex_summon = os.path.join(home, ".codex", "skills", "summon")
+        os.makedirs(os.path.dirname(codex_summon), exist_ok=True)
+        try:
+            os.symlink(os.path.join(home, ".claude", "skills", "summon"),
+                       codex_summon, target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            return
+        _installs._MAX_SKILLS_SCAN = 2                                # .codex/skills overflows this
+        for i in range(5):
+            os.makedirs(os.path.join(home, ".codex", "skills", "filler-%d" % i))
+        dr = _installs.drift_report(_installs.enumerate_installs(running_scripts_dir=run, home=home))
+        assert dr["scan_truncated"], dr                              # merged from the codex alias
+        assert dr["converged"] is False, dr
     finally:
         _installs._MAX_SKILLS_SCAN = orig
         import shutil as _sh
