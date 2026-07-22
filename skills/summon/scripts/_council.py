@@ -544,8 +544,7 @@ def run_council(args) -> int:
     # to run and divert synthesis to a PARTIAL. It gets its own flag and its own repeated sweep.
     # on = gate flag (active this round); armed = tally only the FINAL round; fired = it
     # triggered at some point (persists, for the envelope); ok = successes THIS round.
-    early = {"on": False, "ok": 0, "armed": False, "thread": None, "fired": False,
-             "killed": set()}   # tags the early-exit sweep actually TARGETED (see the relabel)
+    early = {"on": False, "ok": 0, "armed": False, "thread": None, "fired": False}
     _early_done = threading.Event()
 
     def _early_sweeper() -> None:
@@ -554,13 +553,6 @@ def run_council(args) -> int:
         # registration is caught on a later sweep; a single kill would leak it (it would run
         # to its full member timeout, defeating the point of exiting early).
         while not _early_done.is_set():
-            with lock:
-                # Record the in-flight stragglers THIS sweep is abandoning. The relabel keys
-                # off this set, NOT the async early["on"] flag: a member that reaped + deregistered
-                # BEFORE the quorum landed is gone from `inflight` here, so it never gets marked
-                # -- closing the delayed-bookkeeping race where a genuine pre-quorum failure could
-                # be sampled as excluded after the flag flipped (codex CRITICAL #2).
-                early["killed"].update(inflight.keys())
             _kill_inflight()
             _early_done.wait(0.15)
 
@@ -589,7 +581,6 @@ def run_council(args) -> int:
             early["ok"] = 0
             early["on"] = False
             early["thread"] = None
-            early["killed"] = set()   # fresh sweep-target set per round
         _early_done.clear()
 
     def _early_disarm() -> None:
@@ -763,18 +754,15 @@ def run_council(args) -> int:
                 return _member_view(agent, {"status": "excluded",
                                             "error": "early-exit: quorum reached while queued"})
             env = run_stage(agent, prompt, stage, input_sha, member_timeout_ms)
-            _mtag = f"g{owner.generation}-{stage}"
-            with lock:
-                _swept = _mtag in early["killed"]
-            if _swept and (env or {}).get("status") != "success":
-                # ONLY a straggler the early-exit sweep actually TARGETED (it was still registered
-                # in `inflight` when the quorum landed) is relabeled `excluded` -- an INTENTIONAL
-                # stop. A member that genuinely FAILED on its own before the quorum was never swept
-                # (it had reaped + deregistered), so it stays a real failure. Keying off the
-                # sweep-target set instead of the async early["on"] flag closes the delayed-
-                # bookkeeping race (codex CRITICAL #2). Telemetry (usage/model) is preserved.
-                env = {**(env or {}), "status": "excluded",
-                       "error": "early-exit: abandoned after quorum reached"}
+            # A DISPATCHED member keeps its own honest outcome. We deliberately do NOT relabel an
+            # in-flight member the early-exit sweep killed as `excluded`: a still-registered proc is
+            # inherently ambiguous (a live straggler vs. a member that already TIMED OUT and left a
+            # lingering stdout-holding grandchild -- both stay registered by the V4a kill design,
+            # which refuses poll()/liveness on purpose, _kill_inflight()). Distinguishing them would
+            # need causal termination state that proved race-prone (a delayed post-dispatch check
+            # samples stale flags; recording != killing snapshots leak). So a killed straggler
+            # honestly reports its killed error in members_failed, and only NEVER-DISPATCHED members
+            # (gated below, atomically, before any dispatch) are `excluded`. (codex 3x: relabel race)
         with lock:
             done["n"] += 1
             print(f"[council {done['n']}/{len(members)}] {agent} ({b}) "
@@ -1287,11 +1275,15 @@ def run_council(args) -> int:
         envelope["early_exit"] = {
             "min_successful": min_successful,
             "succeeded": members_succeeded,
-            # only the INTENTIONALLY-stopped members (status excluded); a genuine pre-quorum
-            # failure stays in failed_members, never conflated with an early-exit exclusion.
+            # NEVER-DISPATCHED members only: the quorum landed before they left the gate, so they
+            # are unambiguously intentional stops. Members already IN FLIGHT when the quorum landed
+            # were process-tree-killed and report their killed error in members_failed -- a
+            # registered proc cannot be causally told apart from a genuine timeout (V4a kill design),
+            # so they are not relabeled here.
             "excluded": [m["agent"] for m in results if m.get("status") == "excluded"],
-            "note": "quorum reached; remaining members were process-tree-killed or excluded "
-                    "and the surviving quorum was chaired"}
+            "note": "quorum reached; members not yet dispatched were excluded, in-flight members "
+                    "were process-tree-killed (they appear in members_failed), and the surviving "
+                    "quorum was chaired"}
     if overall["hit"]:
         envelope["council_state"] = "overall_timeout"
         envelope["overall_timeout"] = {

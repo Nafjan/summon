@@ -5794,7 +5794,7 @@ def test_v4b_resume_reruns_early_exit_killed_members():
     # (run_stage persists it), which carry_forward REJECTS (its success-gate), so on a resume
     # WITHOUT early-exit those members RE-RUN -- their stale error is never mistaken for a carried
     # success. (With the same --min-successful-members, the carried successes re-trigger the exit
-    # and the killed ones stay excluded; turning early-exit off on resume runs them.)
+    # and the killed ones are re-killed, reporting failed; turning early-exit off on resume runs them.)
     import _council
     import _executor
     import argparse
@@ -5964,14 +5964,12 @@ def test_v4b_early_exit_sweep_does_not_kill_chairman():
 
 
 def test_v4b_early_exit_pre_quorum_failure_stays_failed():
-    # Codex CRITICAL #2 (this fix round's own regression guard): a member that GENUINELY fails
-    # BEFORE the quorum is reached must stay in members_failed even when its relabel bookkeeping is
-    # DELAYED until after the quorum flag flips. The relabel keys off the sweep-TARGET set (what was
-    # registered in `inflight` when the sweep ran), NOT the async early["on"] flag. `bad` reaped +
-    # deregistered before the sweep -- modeled here as: never registers, returns error only AFTER the
-    # sweep fired -- so it is NOT mislabeled `excluded`. `blk`, a real in-flight straggler the sweep
-    # killed, IS. (Under the pre-fix `early["on"]` relabel, `bad`'s delayed check would see the flag
-    # set and wrongly mark it excluded, hiding a genuine failure -- this test fails on that code.)
+    # Race-free exclusion contract (codex found the causal relabel race-prone across 3 rounds; the
+    # fix is to NOT relabel dispatched members at all): a DISPATCHED non-success member keeps its
+    # honest status in members_failed -- whether it self-failed near the quorum (`bad`, returns error
+    # only after the sweep fired) or was process-tree-killed by the sweep (`blk`). NEITHER is
+    # relabeled `excluded`; only NEVER-DISPATCHED gated members are (none here -- all four dispatch).
+    # A genuine failure is therefore never hidden as an intentional exclusion.
     import _council
     import _executor
     import argparse
@@ -6039,10 +6037,11 @@ def test_v4b_early_exit_pre_quorum_failure_stays_failed():
     failed = {m["agent"] for m in env["summary"]["members_failed"]}
     excluded = {m["agent"] for m in env["summary"]["members_excluded"]}
     ee_excluded = set(env["early_exit"]["excluded"])
+    # Both dispatched non-success members report honestly in members_failed; neither is hidden as an
+    # exclusion, and with no gated member the excluded buckets are empty.
     assert "bad" in failed, ("a genuine pre-quorum failure was hidden", failed, excluded)
-    assert "bad" not in excluded and "bad" not in ee_excluded, ("bad mislabeled excluded", excluded, ee_excluded)
-    assert "blk" in excluded and "blk" in ee_excluded, ("the swept straggler is not excluded", excluded, ee_excluded)
-    assert "blk" not in failed, ("the swept straggler leaked into failed", failed)
+    assert "blk" in failed, ("the killed straggler is not reported failed", failed)
+    assert not excluded and not ee_excluded, ("no member was gated, so nothing is excluded", excluded, ee_excluded)
 
 
 def test_v4b_atomic_write_cleans_temp_on_non_oserror():
