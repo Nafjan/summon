@@ -328,6 +328,17 @@ def run_council(args) -> int:
     if quorum is not None and not (isinstance(quorum, int) and 2 <= quorum <= len(members)):
         return _fail(f"--quorum must be an integer in 2..{len(members)} (the member count)",
                      out_path)
+    # V4b early-exit threshold. Once M members SUCCEED in the final round, stop waiting for
+    # the rest and chair the quorum. Must be 2..member-count AND >= any --quorum (early-exit
+    # below the synthesis quorum would chair below quorum -- contradictory).
+    min_successful = getattr(args, "min_successful", None)
+    if min_successful is not None:
+        if not (isinstance(min_successful, int) and 2 <= min_successful <= len(members)):
+            return _fail(f"--min-successful-members must be an integer in 2..{len(members)} "
+                         "(the member count)", out_path)
+        if quorum is not None and min_successful < quorum:
+            return _fail(f"--min-successful-members ({min_successful}) must be >= --quorum "
+                         f"({quorum})", out_path)
     chairman_fallback = getattr(args, "chairman_fallback", None) or None
 
     from _loader import get_agents_dir, load_agent
@@ -520,6 +531,59 @@ def run_council(args) -> int:
     if overall_deadline is not None:
         threading.Thread(target=_overall_watchdog, daemon=True).start()
 
+    # ---- V4b early-exit machinery ---------------------------------------------
+    # Once `min_successful` members SUCCEED in the FINAL round, stop waiting for the rest:
+    # kill the in-flight stragglers and self-exclude the queued ones, then chair the quorum.
+    # DELIBERATELY separate from the overall-timeout flag: early-exit must NOT set
+    # overall["hit"] -- that would make the still-live watchdog kill the chairman we are about
+    # to run and divert synthesis to a PARTIAL. It gets its own flag and its own repeated sweep.
+    # on = gate flag (active this round); armed = tally only the FINAL round; fired = it
+    # triggered at some point (persists, for the envelope); ok = successes THIS round.
+    early = {"on": False, "ok": 0, "armed": False, "sweeper": False, "fired": False}
+    _early_done = threading.Event()
+
+    def _early_sweeper() -> None:
+        # Mirror the overall-timeout watchdog's LOOP, not a one-shot kill: a straggler that
+        # registers in the window between its early-exit gate-check and its on_spawn
+        # registration is caught on a later sweep; a single kill would leak it (it would run
+        # to its full member timeout, defeating the point of exiting early).
+        while not _early_done.is_set():
+            _kill_inflight()
+            _early_done.wait(0.15)
+
+    def _tally_success(env) -> None:
+        # Called UNDER `lock`: count a member SUCCESS toward the early-exit threshold and, on
+        # the Mth, flip the flag + start the repeated sweep. Only while ARMED (the final member
+        # round). Starting the daemon under the lock is safe: the sweeper's first _kill_inflight
+        # just waits the microsecond until this lock releases.
+        if min_successful is None or not early["armed"] or early["on"]:
+            return
+        if (env or {}).get("status") == "success":
+            early["ok"] += 1
+            if early["ok"] >= min_successful:
+                early["on"] = True
+                early["fired"] = True
+                if not early["sweeper"]:
+                    early["sweeper"] = True
+                    threading.Thread(target=_early_sweeper, daemon=True).start()
+
+    def _early_arm(active: bool) -> None:
+        # Arm early-exit for the round about to run (final round only, per the challenge:
+        # earlier rounds barrier fully so round-2 cross-examination sees a real set).
+        with lock:
+            early["armed"] = bool(active) and (min_successful is not None)
+            early["ok"] = 0
+            early["on"] = False
+        _early_done.clear()
+
+    def _early_disarm() -> None:
+        # Round finished (its pool.map barrier returned): STOP the sweep BEFORE synthesis so
+        # it can never target the chairman, and drop the gate. `fired` is left intact.
+        _early_done.set()
+        with lock:
+            early["armed"] = False
+            early["on"] = False
+
     def backend_of(agent: str) -> str:
         from _manifest import _job_backend
         return _job_backend({"agent": agent}, agents_dir)
@@ -647,6 +711,9 @@ def run_council(args) -> int:
         if _breached():
             return _member_view(agent, {"status": "excluded",
                                         "error": "overall timeout reached before dispatch"})
+        if early["on"]:   # V4b: the quorum was reached before this member started -> skip it
+            return _member_view(agent, {"status": "excluded",
+                                        "error": "early-exit: quorum reached before dispatch"})
         # Resume economics: a prior-generation stage whose upstream inputs are
         # unchanged (input_sha match) is carried forward, never re-paid.
         pg = _prior_generation(stage)
@@ -656,6 +723,7 @@ def run_council(args) -> int:
                 done["n"] += 1
                 print(f"[council {done['n']}/{len(members)}] {agent} carried forward "
                       f"from generation {pg}", file=sys.stderr, flush=True)
+                _tally_success(env)   # a carried-forward stage is a success -> counts toward M
             return _member_view(agent, env)
         fresh_stages.add(stage)
         b = member_backend[agent]
@@ -666,11 +734,15 @@ def run_council(args) -> int:
             if _breached():
                 return _member_view(agent, {"status": "excluded",
                                             "error": "overall timeout reached while queued"})
+            if early["on"]:   # V4b: a queued wave freed after the quorum landed -> do not dispatch
+                return _member_view(agent, {"status": "excluded",
+                                            "error": "early-exit: quorum reached while queued"})
             env = run_stage(agent, prompt, stage, input_sha, member_timeout_ms)
         with lock:
             done["n"] += 1
             print(f"[council {done['n']}/{len(members)}] {agent} ({b}) "
                   f"status={env.get('status')}", file=sys.stderr, flush=True)
+            _tally_success(env)   # V4b: the Mth success here flips the flag + starts the sweep
         return _member_view(agent, env)
 
     def _supersede_stale() -> None:
@@ -755,9 +827,11 @@ def run_council(args) -> int:
             return _rd.content_sha256({"prompt": p1, "member": m,
                                        "agent_sha": _agent_shas.get(m), **_exec_ctx})
 
+        _early_arm(rounds < 2)   # round 1 is the FINAL member round only when --rounds 1
         with ThreadPoolExecutor(max_workers=len(members)) as pool:
             results = list(pool.map(lambda m: run_member(m, p1, f"r1-{m}", _r1_sha(m)),
                                     members))
+        _early_disarm()
 
         # ---- round 2 (optional): cross-examination + peer RANKING -----------
         consensus_ranking = None
@@ -834,8 +908,10 @@ def run_council(args) -> int:
 
             def refine(agent):
                 return run_member(agent, p2, f"r2-{agent}", _r2_sha(agent))
+            _early_arm(True)   # round 2 is the final member round -> early-exit active
             with ThreadPoolExecutor(max_workers=len(members)) as pool:
                 results = list(pool.map(refine, members))
+            _early_disarm()
             # Rankings are an owner-computed STAGE: carried forward when the r2
             # outputs are unchanged, recomputed (and journaled) otherwise. The
             # hash covers raws AND statuses: status gates vote eligibility, so
@@ -1071,11 +1147,20 @@ def run_council(args) -> int:
     # (primary or fallback) AND every member answered; otherwise partial. Quorum
     # NEVER promotes this to success -- it only gates whether synthesis ran.
     status = "success" if (synth_ok and not failed) else "partial"
+    # V4b: on an early exit the killed/excluded stragglers are INTENTIONAL (we had enough),
+    # not failures. When early-exit fired and the chair succeeded on the quorum, the council
+    # is a SUCCESS (marked early_exit below) -- NOT demoted to partial by those exclusions.
+    # (A real overall-timeout, which never sets early["fired"], still demotes to partial.)
+    early_fired = early.get("fired", False)
+    if early_fired and synth_ok and members_succeeded >= (min_successful or 0):
+        status = "success"
 
     if quorum_skipped:
         decision_status = "quorum_not_met"
     elif not synth_ok:
         decision_status = "synthesis_failed"
+    elif early_fired:
+        decision_status = "early_exit"
     elif failed:
         decision_status = "partial_participation"
     else:
@@ -1154,6 +1239,17 @@ def run_council(args) -> int:
         quorum_met=(None if quorum is None else members_succeeded >= quorum))
     # If the overall budget was hit, the run was CUT SHORT (members killed/excluded,
     # the surviving quorum chaired): mark it and never report a clean success.
+    # V4b: a clean early exit (quorum reached + chaired, budget NOT breached) is a SUCCESS
+    # marked early_exit -- distinct from an overall_timeout partial. If a real overall-timeout
+    # ALSO fired (overall["hit"]), it wins in the block below and demotes to partial.
+    if early_fired and not overall["hit"]:
+        envelope["council_state"] = "early_exit"
+        envelope["early_exit"] = {
+            "min_successful": min_successful,
+            "succeeded": members_succeeded,
+            "excluded": [m["agent"] for m in results if (m.get("status") or "") != "success"],
+            "note": "quorum reached; remaining members were process-tree-killed or excluded "
+                    "and the surviving quorum was chaired"}
     if overall["hit"]:
         envelope["council_state"] = "overall_timeout"
         envelope["overall_timeout"] = {
