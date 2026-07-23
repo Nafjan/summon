@@ -50,6 +50,16 @@ _CHILD_MARGIN_MS = 60_000           # parent watchdog = child timeout + this mar
 # value) is still trusted by carry_forward's success-gate. True authenticity would need signing,
 # which is out of scope for a trusted-operator run dir.
 _MEMBER_STATUSES = frozenset({"success", "error", "partial", "blocked", "excluded"})
+
+
+def _as_warning_list(w) -> list:
+    """Any envelope's ``warnings`` as a LIST. A malformed envelope may carry a scalar, dict, or None
+    where a list is expected; iterating those either raises (`for w in 1`) or silently walks
+    characters/keys. Used for BOTH member and chairman envelopes -- the chairman ones never pass
+    through ``_member_view``, so this is their only normalization point."""
+    if isinstance(w, list):
+        return w
+    return [] if w is None else [str(w)]
 _TEARDOWN_BUDGET_S = 15             # wall-clock cap on the FINAL kill sweep (one best-
                                     # effort killpg per unconfirmed tree, then prune), so
                                     # a slow taskkill can't delay the envelope past the host
@@ -102,13 +112,14 @@ def _fail(msg: str, out_path: str | None = None) -> int:
 
 def _position(envelope: dict, cap: int = _POSITION_CAP) -> str:
     """A member's stated position: the report SUMMARY if present, else the result."""
-    rep = envelope.get("report") or {}
+    rep = envelope.get("report")
+    rep = rep if isinstance(rep, dict) else {}   # a malformed/tampered env may carry a non-mapping report
     if rep.get("summary"):
-        body = rep["summary"]
+        body = str(rep["summary"])
         if rep.get("findings"):
-            body += "\n" + rep["findings"]
+            body += "\n" + str(rep["findings"])
         return body[:cap]
-    return (envelope.get("result") or envelope.get("error") or "(no position)")[:cap]
+    return str(envelope.get("result") or envelope.get("error") or "(no position)")[:cap]
 
 
 def _round1_prompt(question: str) -> str:
@@ -244,9 +255,15 @@ def _model_label(env: dict) -> str | None:
     resolved, then targeted; fall back to what was REQUESTED when the backend
     didn't report one (codex often doesn't); show ``requested -> effective``
     when they differ (e.g. the `opus` alias -> a version)."""
-    m = env.get("model") or {}
+    m = env.get("model")
+    m = m if isinstance(m, dict) else {}   # a malformed env may carry a non-mapping `model`
+    # NESTED values must be strings too, or a malformed one escapes this function's `str | None`
+    # contract. Filter each candidate BEFORE the precedence pick, so a malformed truthy `served`
+    # does not MASK a valid `resolved`/`targeted` (which would silently drop a real model label).
     req = m.get("requested")
-    res = m.get("served") or m.get("resolved") or m.get("targeted")
+    req = req if isinstance(req, str) else None
+    res = next((c for c in (m.get("served"), m.get("resolved"), m.get("targeted"))
+                if isinstance(c, str) and c), None)
     if res and req and res != req:
         return f"{req} -> {res}"
     return res or req
@@ -789,21 +806,24 @@ def run_council(args) -> int:
 
     def _member_view(agent: str, env: dict) -> dict:
         # Trust boundary: `env` is a child dispatch envelope OR a carried-forward stage FILE read off
-        # disk on resume. Normalize an unrecognized status to `error` (keeping a warning trail) so a
-        # tampered/garbled artifact cannot be trusted as success/excluded downstream.
+        # disk on resume. SANITIZE its shape ONCE here so no downstream consumer (status classifier,
+        # model label, position, billing/warnings aggregation) can be crashed or fooled by a rogue
+        # or tampered field. This is defense-in-depth (the run dir is trusted operator input) AND
+        # plain robustness against a buggy producer: one malformed member must never abort the whole
+        # council. A bad shape degrades to a safe default; an unknown status becomes `error`.
         _st = env.get("status")
-        if _st not in _MEMBER_STATUSES:
-            _w = env.get("warnings")
-            _w = list(_w) if isinstance(_w, list) else ([] if _w is None else [_w])
-            _w.append(f"unrecognized member status {_st!r} normalized to error")
-            env = {**env, "status": "error", "warnings": _w}
+        _w = list(_as_warning_list(env.get("warnings")))   # same coercion the chairman path uses
+        if not isinstance(_st, str) or _st not in _MEMBER_STATUSES:   # type-check first: a non-string
+            _w = _w + [f"unrecognized member status {_st!r} normalized to error"]  # status is unhashable
+            _st = "error"
+        _billing = env.get("billing")
         return {"agent": agent, "backend": member_backend[agent],
-                "model": _model_label(env),   # served/resolved, else requested (never blank)
-                "status": env.get("status"), "position": _position(env, cap),
+                "model": _model_label(env),   # served/resolved, else requested (guards a non-dict model)
+                "status": _st, "position": _position(env, cap),   # (guards a non-dict report/result)
                 "elapsed_ms": env.get("elapsed_ms"),
-                "billing": env.get("billing"),      # so credit/api spend isn't hidden
-                "warnings": env.get("warnings"),    # e.g. a Fable -> Opus fallback
-                "_raw": env.get("result") or "",   # kept only to parse RANKING
+                "billing": _billing if isinstance(_billing, dict) else None,  # credit/api spend
+                "warnings": _w,                     # e.g. a Fable -> Opus fallback
+                "_raw": str(env.get("result") or ""),   # kept only to parse RANKING (str: never a list)
                 "_env": env}   # full child envelope: checkpoints persist it
 
     def run_member(agent: str, prompt: str, stage: str, input_sha: str) -> dict:
@@ -1227,17 +1247,23 @@ def run_council(args) -> int:
                                     "cannot read files under --cwd (it only sees the prompt) — "
                                     "avoid agy members in a repo-inspection council")
     for m in results:
-        council_warnings += [f"{m['agent']}: {w}" for w in (m.get("warnings") or [])]
+        council_warnings += [f"{m['agent']}: {w}" for w in _as_warning_list(m.get("warnings"))]
     # Aggregate BOTH chairman envelopes (primary + fallback) so a fallback's
-    # warnings/billing are never hidden. On a quorum-skip both are None.
+    # warnings/billing are never hidden. On a quorum-skip both are None. Chairman envelopes do NOT
+    # pass through _member_view, so their shapes are normalized HERE (a scalar `warnings` would
+    # otherwise raise `TypeError: not iterable` and abort the council after synthesis).
     for _cenv, _who in ((primary_env, chairman), (fallback_env, chairman_fallback)):
         if _cenv:
-            council_warnings += [f"{_who}: {w}" for w in (_cenv.get("warnings") or [])]
-    billing_sources = sorted(
-        {(m.get("billing") or {}).get("source") for m in results if m.get("billing")}
-        | {(e.get("billing") or {}).get("source")
-           for e in (primary_env, fallback_env) if e and e.get("billing")}
-        - {None})
+            council_warnings += [f"{_who}: {w}" for w in _as_warning_list(_cenv.get("warnings"))]
+    # Billing sources across members AND both chairman envelopes. SHAPE-SAFE: one malformed envelope
+    # must never abort the council here. A non-dict `billing` would raise on .get; an unhashable
+    # `source` (list/dict) raises building the set; a mixed int/str set raises in sorted(); and the
+    # previous `A | B - {None}` bound `-` tighter than `|`, so None was stripped from only ONE side
+    # (a None source on the other then crashed sorted()). Collect first, keep STRINGS only.
+    _bill_srcs = [m.get("billing") for m in results]
+    _bill_srcs += [e.get("billing") for e in (primary_env, fallback_env) if e]
+    billing_sources = sorted({b.get("source") for b in _bill_srcs if isinstance(b, dict)
+                              and isinstance(b.get("source"), str)})
 
     # `failed` = genuine failures PLUS in-flight members the early-exit sweep killed (they report
     # their killed status honestly -- a registered proc cannot be causally told apart from a real
@@ -1273,9 +1299,11 @@ def run_council(args) -> int:
     def _outcome(env: dict | None, agent: str) -> dict | None:
         if not env:
             return None
+        _b = env.get("billing")
         return {"agent": agent, "model": _model_label(env), "status": env.get("status"),
-                "error": env.get("error"), "billing": env.get("billing"),
-                "warnings": env.get("warnings")}
+                "error": env.get("error"),
+                "billing": _b if isinstance(_b, dict) else None,   # emit well-shaped fields, so a
+                "warnings": _as_warning_list(env.get("warnings"))}  # consumer of OUR envelope is safe
 
     fallback_used = bool(fallback_env is not None and chair_env is fallback_env)
     if quorum_skipped:
@@ -1302,8 +1330,8 @@ def run_council(args) -> int:
         "status": chair_env.get("status"),
         "recommendation": chair_env.get("result") or chair_env.get("error"),
         "report": chair_env.get("report"),
-        "billing": chair_env.get("billing"),
-        "warnings": chair_env.get("warnings"),
+        "billing": chair_env.get("billing") if isinstance(chair_env.get("billing"), dict) else None,
+        "warnings": _as_warning_list(chair_env.get("warnings")),   # always list-shaped for consumers
         "decision_status": decision_status,
         "members_succeeded": members_succeeded,
         "members_total": len(members),
