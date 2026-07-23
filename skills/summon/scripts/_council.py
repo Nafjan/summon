@@ -792,7 +792,10 @@ def run_council(args) -> int:
         # disk on resume. Normalize an unrecognized status to `error` (keeping a warning trail) so a
         # tampered/garbled artifact cannot be trusted as success/excluded downstream.
         _st = env.get("status")
-        if _st not in _MEMBER_STATUSES:
+        # `_st` may be a non-string JSON value (a rogue producer / tampered stage file could set a
+        # list or dict); type-check FIRST so an unhashable value normalizes instead of raising
+        # `TypeError: unhashable type` on the frozenset membership test (which would abort the council).
+        if not isinstance(_st, str) or _st not in _MEMBER_STATUSES:
             _w = env.get("warnings")
             _w = list(_w) if isinstance(_w, list) else ([] if _w is None else [_w])
             _w.append(f"unrecognized member status {_st!r} normalized to error")
