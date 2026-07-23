@@ -50,6 +50,16 @@ _CHILD_MARGIN_MS = 60_000           # parent watchdog = child timeout + this mar
 # value) is still trusted by carry_forward's success-gate. True authenticity would need signing,
 # which is out of scope for a trusted-operator run dir.
 _MEMBER_STATUSES = frozenset({"success", "error", "partial", "blocked", "excluded"})
+
+
+def _as_warning_list(w) -> list:
+    """Any envelope's ``warnings`` as a LIST. A malformed envelope may carry a scalar, dict, or None
+    where a list is expected; iterating those either raises (`for w in 1`) or silently walks
+    characters/keys. Used for BOTH member and chairman envelopes -- the chairman ones never pass
+    through ``_member_view``, so this is their only normalization point."""
+    if isinstance(w, list):
+        return w
+    return [] if w is None else [str(w)]
 _TEARDOWN_BUDGET_S = 15             # wall-clock cap on the FINAL kill sweep (one best-
                                     # effort killpg per unconfirmed tree, then prune), so
                                     # a slow taskkill can't delay the envelope past the host
@@ -246,9 +256,13 @@ def _model_label(env: dict) -> str | None:
     didn't report one (codex often doesn't); show ``requested -> effective``
     when they differ (e.g. the `opus` alias -> a version)."""
     m = env.get("model")
-    m = m if isinstance(m, dict) else {}   # a malformed/tampered env may carry a non-mapping `model`
+    m = m if isinstance(m, dict) else {}   # a malformed env may carry a non-mapping `model`
     req = m.get("requested")
     res = m.get("served") or m.get("resolved") or m.get("targeted")
+    # NESTED values must be strings too, or a malformed one escapes this function's `str | None`
+    # contract (a list `served` would be returned verbatim and then formatted/compared downstream).
+    req = req if isinstance(req, str) else None
+    res = res if isinstance(res, str) else None
     if res and req and res != req:
         return f"{req} -> {res}"
     return res or req
@@ -797,8 +811,7 @@ def run_council(args) -> int:
         # plain robustness against a buggy producer: one malformed member must never abort the whole
         # council. A bad shape degrades to a safe default; an unknown status becomes `error`.
         _st = env.get("status")
-        _w = env.get("warnings")
-        _w = list(_w) if isinstance(_w, list) else ([] if _w is None else [str(_w)])
+        _w = list(_as_warning_list(env.get("warnings")))   # same coercion the chairman path uses
         if not isinstance(_st, str) or _st not in _MEMBER_STATUSES:   # type-check first: a non-string
             _w = _w + [f"unrecognized member status {_st!r} normalized to error"]  # status is unhashable
             _st = "error"
@@ -1233,12 +1246,14 @@ def run_council(args) -> int:
                                     "cannot read files under --cwd (it only sees the prompt) — "
                                     "avoid agy members in a repo-inspection council")
     for m in results:
-        council_warnings += [f"{m['agent']}: {w}" for w in (m.get("warnings") or [])]
+        council_warnings += [f"{m['agent']}: {w}" for w in _as_warning_list(m.get("warnings"))]
     # Aggregate BOTH chairman envelopes (primary + fallback) so a fallback's
-    # warnings/billing are never hidden. On a quorum-skip both are None.
+    # warnings/billing are never hidden. On a quorum-skip both are None. Chairman envelopes do NOT
+    # pass through _member_view, so their shapes are normalized HERE (a scalar `warnings` would
+    # otherwise raise `TypeError: not iterable` and abort the council after synthesis).
     for _cenv, _who in ((primary_env, chairman), (fallback_env, chairman_fallback)):
         if _cenv:
-            council_warnings += [f"{_who}: {w}" for w in (_cenv.get("warnings") or [])]
+            council_warnings += [f"{_who}: {w}" for w in _as_warning_list(_cenv.get("warnings"))]
     # Billing sources across members AND both chairman envelopes. SHAPE-SAFE: one malformed envelope
     # must never abort the council here. A non-dict `billing` would raise on .get; an unhashable
     # `source` (list/dict) raises building the set; a mixed int/str set raises in sorted(); and the

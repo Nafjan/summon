@@ -6565,6 +6565,46 @@ def test_v4_council_survives_malformed_billing_source():
         assert env["billing_sources"] == ["subscription"], (_bad, env["billing_sources"])
 
 
+def test_v4_council_survives_malformed_chairman_envelope():
+    # The CHAIRMAN envelopes (primary/fallback) never pass through _member_view, so their shapes are
+    # normalized at the aggregation instead. A scalar `warnings` there raises
+    # `TypeError: 'int' object is not iterable` AFTER synthesis (losing a completed council); a
+    # malformed billing/model must likewise be filtered rather than crash or escape.
+    import _council
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    root = tempfile.mkdtemp(prefix="summon-chair-")
+    _mk_agents(root, ["m1", "m2", "chair"])
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        if agent == "chair":                       # malformed CHAIRMAN envelope
+            return {"status": "success", "result": "chair", "report": {"summary": "c"},
+                    "warnings": 1, "billing": {"source": []}, "model": {"served": ["bad"]}}
+        return {"status": "success", "result": agent, "report": {"summary": agent},
+                "billing": {"source": "subscription"}}
+
+    ns = argparse.Namespace(question="q", question_file=None, members="m1,m2", chairman="chair",
+                            rounds=1, cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
+                            run_dir=root, min_successful=None)
+    orig = _council._dispatch
+    _council._dispatch = fake
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)          # must NOT raise (scalar warnings / unhashable source)
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._dispatch = orig
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    assert env["status"] == "success", env["status"]                  # council completed
+    assert env["billing_sources"] == ["subscription"], env["billing_sources"]  # chair's [] filtered
+    assert isinstance(env.get("warnings") or [], list), env.get("warnings")
+    assert any("chair: 1" in w for w in (env.get("warnings") or [])), env.get("warnings")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
