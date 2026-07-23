@@ -54,10 +54,12 @@ review (codex); the newest set also went through abstract- and named-persona rev
   with spaces on Windows would delete the wrong directory).
 
 ### Security
-- **Member-status allowlist.** A council normalizes any UNRECOGNIZED status in an ingested member
-  env (a child dispatch envelope OR a carried-forward stage FILE read off disk on resume) to
-  `error`, with a warning trail, so a tampered or garbled run artifact can never mint a false
-  `success`/`excluded`.
+- **Member-status allowlist (defense-in-depth).** A council normalizes any status outside
+  `{success, error, partial, blocked, excluded}` in an ingested member env to `error`, with a
+  warning trail, so a garbled or rogue-producer status can never be shaped into a false
+  `success`/`excluded`. This is NOT tamper resistance: the run dir is trusted operator input, and a
+  forged `status: "success"` (a known value) is still accepted by carry_forward's success-gate;
+  true authenticity would need signing and is out of scope for a trusted-operator run dir.
 
 ## [0.9.0] - unreleased (pre-1.0)
 
