@@ -42,6 +42,14 @@ _TOTAL_POSITIONS_BUDGET = 20000     # cap on ALL positions in one prompt (argv-s
                                     # Windows CreateProcess ~32 KB per token)
 _PER_BACKEND_CAP = 3
 _CHILD_MARGIN_MS = 60_000           # parent watchdog = child timeout + this margin
+# The only statuses a council MEMBER view may carry: the dispatcher's terminal member statuses
+# (a timeout surfaces as `partial`/`error`, never a literal "timeout") plus the council-internal
+# `excluded` (a gated/early-exit member). Anything else in an ingested env is normalized to a
+# genuine failure. This is DEFENSE-IN-DEPTH against a garbled/rogue-producer status -- NOT tamper
+# resistance: the run dir is trusted operator input, and a forged `status: "success"` (a KNOWN
+# value) is still trusted by carry_forward's success-gate. True authenticity would need signing,
+# which is out of scope for a trusted-operator run dir.
+_MEMBER_STATUSES = frozenset({"success", "error", "partial", "blocked", "excluded"})
 _TEARDOWN_BUDGET_S = 15             # wall-clock cap on the FINAL kill sweep (one best-
                                     # effort killpg per unconfirmed tree, then prune), so
                                     # a slow taskkill can't delay the envelope past the host
@@ -780,6 +788,15 @@ def run_council(args) -> int:
         return best
 
     def _member_view(agent: str, env: dict) -> dict:
+        # Trust boundary: `env` is a child dispatch envelope OR a carried-forward stage FILE read off
+        # disk on resume. Normalize an unrecognized status to `error` (keeping a warning trail) so a
+        # tampered/garbled artifact cannot be trusted as success/excluded downstream.
+        _st = env.get("status")
+        if _st not in _MEMBER_STATUSES:
+            _w = env.get("warnings")
+            _w = list(_w) if isinstance(_w, list) else ([] if _w is None else [_w])
+            _w.append(f"unrecognized member status {_st!r} normalized to error")
+            env = {**env, "status": "error", "warnings": _w}
         return {"agent": agent, "backend": member_backend[agent],
                 "model": _model_label(env),   # served/resolved, else requested (never blank)
                 "status": env.get("status"), "position": _position(env, cap),
