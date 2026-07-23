@@ -6581,7 +6581,9 @@ def test_v4_council_survives_malformed_chairman_envelope():
     def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
         if agent == "chair":                       # malformed CHAIRMAN envelope
             return {"status": "success", "result": "chair", "report": {"summary": "c"},
-                    "warnings": 1, "billing": {"source": []}, "model": {"served": ["bad"]}}
+                    "warnings": 1, "billing": {"source": []},
+                    # a malformed truthy `served` must NOT mask the valid `resolved` fallback
+                    "model": {"served": ["bad"], "resolved": "good-model"}}
         return {"status": "success", "result": agent, "report": {"summary": agent},
                 "billing": {"source": "subscription"}}
 
@@ -6603,6 +6605,15 @@ def test_v4_council_survives_malformed_chairman_envelope():
     assert env["billing_sources"] == ["subscription"], env["billing_sources"]  # chair's [] filtered
     assert isinstance(env.get("warnings") or [], list), env.get("warnings")
     assert any("chair: 1" in w for w in (env.get("warnings") or [])), env.get("warnings")
+    # the EMITTED synthesis shapes must be well-formed too (a consumer of our envelope iterates them)
+    syn = env["synthesis"]
+    assert isinstance(syn.get("warnings"), list), syn.get("warnings")
+    # billing keeps its dict-or-None shape (we do not rewrite a child's payload); the malformed
+    # nested source is filtered where it would actually break -- the billing_sources aggregate above
+    assert isinstance(syn.get("billing"), (dict, type(None))), syn.get("billing")
+    assert isinstance((syn.get("primary") or {}).get("warnings"), list), syn.get("primary")
+    # a malformed truthy `served` must not mask the valid `resolved`
+    assert syn.get("model") == "good-model", syn.get("model")
 
 
 if __name__ == "__main__":
