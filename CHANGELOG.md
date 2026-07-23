@@ -6,6 +6,26 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.10.1] - 2026-07-23
+
+### Fixed
+- **A malformed member or chairman envelope can no longer abort a council.** The 0.10.0 member-status
+  allowlist introduced (and adjacent code already had) several paths where one unexpected JSON type
+  from a child raised an uncaught exception mid-run, losing an in-progress or even an
+  already-synthesized council. Found across five cross-vendor review rounds and each fixed with a
+  regression test verified to reproduce the pre-fix failure:
+  - a non-string `status` (list/dict) raised `TypeError: unhashable type` on the allowlist test;
+  - a non-mapping `model`/`report` raised `AttributeError` in `_model_label()`/`_position()`;
+  - a nested non-string `billing.source` raised building the billing set or in `sorted()`, and the
+    aggregation's `A | B - {None}` bound `-` tighter than `|` (stripping `None` from only one side);
+  - a scalar `warnings` on a CHAIRMAN envelope raised `TypeError: not iterable` AFTER synthesis
+    (chairman envelopes bypass the member normalization, so they are normalized at the aggregation);
+  - `_model_label()` could return a non-string, violating its `str | None` contract, and a malformed
+    truthy `served` masked a valid `resolved` fallback.
+  Member envelopes are sanitized once in `_member_view` (status allowlisted, model/report/billing
+  shape-checked, warnings coerced to a list, position/`_raw` stringified); chairman envelopes and the
+  emitted `synthesis` fields are normalized where they are consumed.
+
 ## [0.10.0] - 2026-07-23
 
 Council fault-tolerance flags, install-hygiene duplicate detection, an internal extraction of the

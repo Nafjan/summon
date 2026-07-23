@@ -257,12 +257,13 @@ def _model_label(env: dict) -> str | None:
     when they differ (e.g. the `opus` alias -> a version)."""
     m = env.get("model")
     m = m if isinstance(m, dict) else {}   # a malformed env may carry a non-mapping `model`
-    req = m.get("requested")
-    res = m.get("served") or m.get("resolved") or m.get("targeted")
     # NESTED values must be strings too, or a malformed one escapes this function's `str | None`
-    # contract (a list `served` would be returned verbatim and then formatted/compared downstream).
+    # contract. Filter each candidate BEFORE the precedence pick, so a malformed truthy `served`
+    # does not MASK a valid `resolved`/`targeted` (which would silently drop a real model label).
+    req = m.get("requested")
     req = req if isinstance(req, str) else None
-    res = res if isinstance(res, str) else None
+    res = next((c for c in (m.get("served"), m.get("resolved"), m.get("targeted"))
+                if isinstance(c, str) and c), None)
     if res and req and res != req:
         return f"{req} -> {res}"
     return res or req
@@ -1298,9 +1299,11 @@ def run_council(args) -> int:
     def _outcome(env: dict | None, agent: str) -> dict | None:
         if not env:
             return None
+        _b = env.get("billing")
         return {"agent": agent, "model": _model_label(env), "status": env.get("status"),
-                "error": env.get("error"), "billing": env.get("billing"),
-                "warnings": env.get("warnings")}
+                "error": env.get("error"),
+                "billing": _b if isinstance(_b, dict) else None,   # emit well-shaped fields, so a
+                "warnings": _as_warning_list(env.get("warnings"))}  # consumer of OUR envelope is safe
 
     fallback_used = bool(fallback_env is not None and chair_env is fallback_env)
     if quorum_skipped:
@@ -1327,8 +1330,8 @@ def run_council(args) -> int:
         "status": chair_env.get("status"),
         "recommendation": chair_env.get("result") or chair_env.get("error"),
         "report": chair_env.get("report"),
-        "billing": chair_env.get("billing"),
-        "warnings": chair_env.get("warnings"),
+        "billing": chair_env.get("billing") if isinstance(chair_env.get("billing"), dict) else None,
+        "warnings": _as_warning_list(chair_env.get("warnings")),   # always list-shaped for consumers
         "decision_status": decision_status,
         "members_succeeded": members_succeeded,
         "members_total": len(members),
