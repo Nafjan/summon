@@ -6,6 +6,59 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.10.0] - 2026-07-23
+
+Council fault-tolerance flags, install-hygiene duplicate detection, an internal extraction of the
+kill machinery, and a trust-boundary hardening. Each landed behind a cross-vendor adversarial
+review (codex); the newest set also went through abstract- and named-persona review passes.
+
+### Added
+
+**Council fault-tolerance (`--overall-timeout`, `--min-successful-members`)**
+- `--overall-timeout <ms|Ns|Nm>` caps the WHOLE council's wall clock. On a breach a daemon
+  watchdog process-tree-kills every in-flight member (so returning never blocks on their own child
+  watchdogs, the host exit-124 this prevents), members that would start after the deadline are
+  excluded without dispatching, and a PARTIAL envelope (`council_state: overall_timeout`) is
+  emitted. The deadline is the authoritative monotonic clock, not merely the async flag, so a
+  starved watchdog can never wave a paid child through.
+- `--min-successful-members N` (early-exit): once N members SUCCEED in the final round, stop
+  waiting: process-tree-kill the in-flight stragglers, self-exclude the queued ones, and chair the
+  surviving quorum immediately (a pre-deadline happy path that complements `--overall-timeout`).
+  Validated `2 <= N <= members` and `N >= --quorum`; last-round-only; checkpointed and resumable.
+  Adds a `council_state: early_exit` envelope block.
+
+**Install hygiene: duplicate 'summon' skill detection**
+- `--doctor` and `install.py` now DETECT when a host would load more than one 'summon' skill (a
+  stale `summon.pre-refresh-*` backup a pre-v0.9 refresh left beside the live skill, a hand-copied
+  dupe), which the hash-based drift check alone could not see. Each duplicate is reported with its
+  exact path plus a ready-to-run, QUOTED, platform-appropriate removal command
+  (`Remove-Item`/`rm -rf`). DETECTION-ONLY: summon never auto-deletes a directory (a portable,
+  TOCTOU-free recursive delete of a dir another process could swap is not achievable in stdlib, and
+  an install script must not risk a user dir). An incomplete scan (size cap or read error) blocks a
+  "converged" verdict rather than silently passing.
+
+**Docs**
+- `references/models.md`: the `cursor-agent` backend documented as a cross-vendor MODEL GATEWAY.
+  With a Cursor subscription, `--cli cursor-agent --model <id>` reaches GPT-5.x, Claude, Gemini,
+  Grok, GLM, and Kimi (summon forwards `--model` verbatim), a fallback that needs no per-vendor
+  key. Covers billing (draws from the sub's included usage), the `NO ZDR` model flag, and the
+  login-required failure mode.
+- `references/fan-out.md`: large-file council guidance and an `--overall-timeout` budget example.
+
+### Changed
+- **Internal:** the overall-timeout / kill / early-exit machinery (~170 lines) was extracted out of
+  the 900-line `run_council` into a cohesive `_KillRegistry` class (Thompson "do one thing well").
+  Behavior-preserving: the method bodies are verbatim from the former closures, verified
+  byte-for-byte and codex-CLEAN.
+- The doctor and installer duplicate guidance now print a QUOTED removal command (an unquoted path
+  with spaces on Windows would delete the wrong directory).
+
+### Security
+- **Member-status allowlist.** A council normalizes any UNRECOGNIZED status in an ingested member
+  env (a child dispatch envelope OR a carried-forward stage FILE read off disk on resume) to
+  `error`, with a warning trail, so a tampered or garbled run artifact can never mint a false
+  `success`/`excluded`.
+
 ## [0.9.0] - unreleased (pre-1.0)
 
 First tracked version: the cross-vendor sub-agent dispatcher over Claude, Codex, Cursor,
