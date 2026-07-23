@@ -6397,6 +6397,43 @@ def test_v4b_atomic_write_cleans_temp_on_non_oserror():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_v4_council_normalizes_unknown_member_status():
+    # Trust-boundary hardening: a member env carrying an UNRECOGNIZED status (a tampered/garbled
+    # stage file read on resume, or a rogue producer) must be normalized to `error` -- never trusted
+    # as a false success/excluded -- and counted as a failure, with a warning trail.
+    import _council
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    root = tempfile.mkdtemp(prefix="summon-status-")
+    _mk_agents(root, ["m1", "m2", "chair"])
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        if agent == "m2":
+            return {"status": "sneaky_success", "result": "m2", "report": {"summary": "m2"}}  # BOGUS
+        return {"status": "success", "result": agent, "report": {"summary": agent}}
+
+    ns = argparse.Namespace(question="q", question_file=None, members="m1,m2", chairman="chair",
+                            rounds=1, cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
+                            run_dir=root, min_successful=None)
+    orig = _council._dispatch
+    _council._dispatch = fake
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._dispatch = orig
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    m2 = [m for m in env["members"] if m["agent"] == "m2"][0]
+    assert m2["status"] == "error", m2["status"]                 # bogus status normalized, not trusted
+    assert any("normalized to error" in w for w in (m2.get("warnings") or [])), m2.get("warnings")
+    assert "m2" in {f["agent"] for f in env["summary"]["members_failed"]}, env["summary"]
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
