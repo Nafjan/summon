@@ -6406,32 +6406,38 @@ def test_v4_council_normalizes_unknown_member_status():
     import contextlib
     import io
     import json as _json
-    root = tempfile.mkdtemp(prefix="summon-status-")
-    _mk_agents(root, ["m1", "m2", "chair"])
+    # Every bogus shape must normalize to a failure, NOT crash. A non-string JSON status (a list or
+    # dict from a rogue producer / tampered artifact) is UNHASHABLE -- it must be type-checked before
+    # the frozenset membership test, or `_st not in _MEMBER_STATUSES` raises TypeError and aborts the
+    # whole council.
+    for _bogus in ("sneaky_success", ["bogus"], {"kind": "bad"}, 123, None):
+        root = tempfile.mkdtemp(prefix="summon-status-")
+        _mk_agents(root, ["m1", "m2", "chair"])
 
-    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
-        if agent == "m2":
-            return {"status": "sneaky_success", "result": "m2", "report": {"summary": "m2"}}  # BOGUS
-        return {"status": "success", "result": agent, "report": {"summary": agent}}
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None,
+                 on_reap=None, _b=_bogus):
+            if agent == "m2":
+                return {"status": _b, "result": "m2", "report": {"summary": "m2"}}  # BOGUS shape
+            return {"status": "success", "result": agent, "report": {"summary": agent}}
 
-    ns = argparse.Namespace(question="q", question_file=None, members="m1,m2", chairman="chair",
-                            rounds=1, cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
-                            run_dir=root, min_successful=None)
-    orig = _council._dispatch
-    _council._dispatch = fake
-    try:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
-            _council.run_council(ns)
-        env = _json.loads(buf.getvalue())
-    finally:
-        _council._dispatch = orig
-        import shutil as _sh
-        _sh.rmtree(root, ignore_errors=True)
-    m2 = [m for m in env["members"] if m["agent"] == "m2"][0]
-    assert m2["status"] == "error", m2["status"]                 # bogus status normalized, not trusted
-    assert any("normalized to error" in w for w in (m2.get("warnings") or [])), m2.get("warnings")
-    assert "m2" in {f["agent"] for f in env["summary"]["members_failed"]}, env["summary"]
+        ns = argparse.Namespace(question="q", question_file=None, members="m1,m2", chairman="chair",
+                                rounds=1, cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
+                                run_dir=root, min_successful=None)
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                _council.run_council(ns)          # must not raise (TypeError on unhashable status)
+            env = _json.loads(buf.getvalue())
+        finally:
+            _council._dispatch = orig
+            import shutil as _sh
+            _sh.rmtree(root, ignore_errors=True)
+        m2 = [m for m in env["members"] if m["agent"] == "m2"][0]
+        assert m2["status"] == "error", (_bogus, m2["status"])       # normalized, never trusted
+        assert any("normalized to error" in w for w in (m2.get("warnings") or [])), (_bogus, m2)
+        assert "m2" in {f["agent"] for f in env["summary"]["members_failed"]}, (_bogus, env["summary"])
 
 
 def test_v4_council_rejects_tampered_stage_file_status_on_resume():
