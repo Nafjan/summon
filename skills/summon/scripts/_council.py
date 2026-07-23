@@ -1239,11 +1239,15 @@ def run_council(args) -> int:
     for _cenv, _who in ((primary_env, chairman), (fallback_env, chairman_fallback)):
         if _cenv:
             council_warnings += [f"{_who}: {w}" for w in (_cenv.get("warnings") or [])]
-    billing_sources = sorted(
-        {(m.get("billing") or {}).get("source") for m in results if m.get("billing")}
-        | {(e.get("billing") or {}).get("source")
-           for e in (primary_env, fallback_env) if e and e.get("billing")}
-        - {None})
+    # Billing sources across members AND both chairman envelopes. SHAPE-SAFE: one malformed envelope
+    # must never abort the council here. A non-dict `billing` would raise on .get; an unhashable
+    # `source` (list/dict) raises building the set; a mixed int/str set raises in sorted(); and the
+    # previous `A | B - {None}` bound `-` tighter than `|`, so None was stripped from only ONE side
+    # (a None source on the other then crashed sorted()). Collect first, keep STRINGS only.
+    _bill_srcs = [m.get("billing") for m in results]
+    _bill_srcs += [e.get("billing") for e in (primary_env, fallback_env) if e]
+    billing_sources = sorted({b.get("source") for b in _bill_srcs if isinstance(b, dict)
+                              and isinstance(b.get("source"), str)})
 
     # `failed` = genuine failures PLUS in-flight members the early-exit sweep killed (they report
     # their killed status honestly -- a registered proc cannot be causally told apart from a real

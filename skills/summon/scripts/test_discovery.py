@@ -6527,6 +6527,44 @@ def test_v4_council_survives_malformed_member_envelope_fields():
     assert isinstance(m2.get("warnings"), list), m2.get("warnings")   # non-list warnings coerced to a list
 
 
+def test_v4_council_survives_malformed_billing_source():
+    # The billing AGGREGATION builds a set of `billing.source` and sorts it, so a NESTED malformed
+    # source (unhashable list/dict, an int that breaks sorted(), or None) from ONE member or the
+    # chairman would abort the whole council after synthesis. Every shape must be filtered out while
+    # a legitimate string source still aggregates.
+    import _council
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    for _bad in ({"source": []}, {"source": {}}, {"source": 5}, {"source": None}, {}):
+        root = tempfile.mkdtemp(prefix="summon-billing-")
+        _mk_agents(root, ["m1", "m2", "chair"])
+
+        def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None,
+                 on_reap=None, _b=_bad):
+            base = {"status": "success", "result": agent, "report": {"summary": agent}}
+            if agent == "m2":
+                return {**base, "billing": _b}                     # MALFORMED nested source
+            return {**base, "billing": {"source": "subscription"}}  # legitimate
+
+        ns = argparse.Namespace(question="q", question_file=None, members="m1,m2", chairman="chair",
+                                rounds=1, cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
+                                run_dir=root, min_successful=None)
+        orig = _council._dispatch
+        _council._dispatch = fake
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                _council.run_council(ns)      # must NOT raise (unhashable / mixed-type sort / None)
+            env = _json.loads(buf.getvalue())
+        finally:
+            _council._dispatch = orig
+            import shutil as _sh
+            _sh.rmtree(root, ignore_errors=True)
+        assert env["billing_sources"] == ["subscription"], (_bad, env["billing_sources"])
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
