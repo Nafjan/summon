@@ -102,13 +102,14 @@ def _fail(msg: str, out_path: str | None = None) -> int:
 
 def _position(envelope: dict, cap: int = _POSITION_CAP) -> str:
     """A member's stated position: the report SUMMARY if present, else the result."""
-    rep = envelope.get("report") or {}
+    rep = envelope.get("report")
+    rep = rep if isinstance(rep, dict) else {}   # a malformed/tampered env may carry a non-mapping report
     if rep.get("summary"):
-        body = rep["summary"]
+        body = str(rep["summary"])
         if rep.get("findings"):
-            body += "\n" + rep["findings"]
+            body += "\n" + str(rep["findings"])
         return body[:cap]
-    return (envelope.get("result") or envelope.get("error") or "(no position)")[:cap]
+    return str(envelope.get("result") or envelope.get("error") or "(no position)")[:cap]
 
 
 def _round1_prompt(question: str) -> str:
@@ -244,7 +245,8 @@ def _model_label(env: dict) -> str | None:
     resolved, then targeted; fall back to what was REQUESTED when the backend
     didn't report one (codex often doesn't); show ``requested -> effective``
     when they differ (e.g. the `opus` alias -> a version)."""
-    m = env.get("model") or {}
+    m = env.get("model")
+    m = m if isinstance(m, dict) else {}   # a malformed/tampered env may carry a non-mapping `model`
     req = m.get("requested")
     res = m.get("served") or m.get("resolved") or m.get("targeted")
     if res and req and res != req:
@@ -789,24 +791,25 @@ def run_council(args) -> int:
 
     def _member_view(agent: str, env: dict) -> dict:
         # Trust boundary: `env` is a child dispatch envelope OR a carried-forward stage FILE read off
-        # disk on resume. Normalize an unrecognized status to `error` (keeping a warning trail) so a
-        # tampered/garbled artifact cannot be trusted as success/excluded downstream.
+        # disk on resume. SANITIZE its shape ONCE here so no downstream consumer (status classifier,
+        # model label, position, billing/warnings aggregation) can be crashed or fooled by a rogue
+        # or tampered field. This is defense-in-depth (the run dir is trusted operator input) AND
+        # plain robustness against a buggy producer: one malformed member must never abort the whole
+        # council. A bad shape degrades to a safe default; an unknown status becomes `error`.
         _st = env.get("status")
-        # `_st` may be a non-string JSON value (a rogue producer / tampered stage file could set a
-        # list or dict); type-check FIRST so an unhashable value normalizes instead of raising
-        # `TypeError: unhashable type` on the frozenset membership test (which would abort the council).
-        if not isinstance(_st, str) or _st not in _MEMBER_STATUSES:
-            _w = env.get("warnings")
-            _w = list(_w) if isinstance(_w, list) else ([] if _w is None else [_w])
-            _w.append(f"unrecognized member status {_st!r} normalized to error")
-            env = {**env, "status": "error", "warnings": _w}
+        _w = env.get("warnings")
+        _w = list(_w) if isinstance(_w, list) else ([] if _w is None else [str(_w)])
+        if not isinstance(_st, str) or _st not in _MEMBER_STATUSES:   # type-check first: a non-string
+            _w = _w + [f"unrecognized member status {_st!r} normalized to error"]  # status is unhashable
+            _st = "error"
+        _billing = env.get("billing")
         return {"agent": agent, "backend": member_backend[agent],
-                "model": _model_label(env),   # served/resolved, else requested (never blank)
-                "status": env.get("status"), "position": _position(env, cap),
+                "model": _model_label(env),   # served/resolved, else requested (guards a non-dict model)
+                "status": _st, "position": _position(env, cap),   # (guards a non-dict report/result)
                 "elapsed_ms": env.get("elapsed_ms"),
-                "billing": env.get("billing"),      # so credit/api spend isn't hidden
-                "warnings": env.get("warnings"),    # e.g. a Fable -> Opus fallback
-                "_raw": env.get("result") or "",   # kept only to parse RANKING
+                "billing": _billing if isinstance(_billing, dict) else None,  # credit/api spend
+                "warnings": _w,                     # e.g. a Fable -> Opus fallback
+                "_raw": str(env.get("result") or ""),   # kept only to parse RANKING (str: never a list)
                 "_env": env}   # full child envelope: checkpoints persist it
 
     def run_member(agent: str, prompt: str, stage: str, input_sha: str) -> dict:

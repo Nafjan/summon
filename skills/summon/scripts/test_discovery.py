@@ -6487,6 +6487,46 @@ def test_v4_council_rejects_tampered_stage_file_status_on_resume():
         _sh.rmtree(root, ignore_errors=True)
 
 
+def test_v4_council_survives_malformed_member_envelope_fields():
+    # Adjacent trust-boundary hardening: a member env with a NON-MAPPING `model`/`report` (a rogue
+    # producer / tampered stage file) must not abort the whole council with an AttributeError inside
+    # _model_label()/_position() (which dereference those fields as dicts). The member still gets a
+    # view; the position is coerced to a safe string.
+    import _council
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    root = tempfile.mkdtemp(prefix="summon-malformed-")
+    _mk_agents(root, ["m1", "m2", "chair"])
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        if agent == "m2":   # every dict/list-shaped field malformed at once
+            return {"status": "success", "model": ["bad"], "report": ["bad"], "result": ["bad"],
+                    "billing": ["bad"], "warnings": "notalist"}
+        return {"status": "success", "result": agent, "report": {"summary": agent}}
+
+    ns = argparse.Namespace(question="q", question_file=None, members="m1,m2", chairman="chair",
+                            rounds=1, cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
+                            run_dir=root, min_successful=None)
+    orig = _council._dispatch
+    _council._dispatch = fake
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)                 # must NOT raise (crash on non-dict model/report/billing)
+        env = _json.loads(buf.getvalue())
+    finally:
+        _council._dispatch = orig
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+    m2 = [m for m in env["members"] if m["agent"] == "m2"][0]
+    assert m2["agent"] == "m2", env["members"]                     # member view built, no crash
+    assert isinstance(m2.get("position", ""), str), m2.get("position")   # position coerced to str
+    assert m2.get("billing") is None, m2.get("billing")           # non-dict billing dropped (aggregation-safe)
+    assert isinstance(m2.get("warnings"), list), m2.get("warnings")   # non-list warnings coerced to a list
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
