@@ -71,7 +71,7 @@ from _executor import execute_agent, finalize_exit_fields, is_terminal_success  
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.10.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.10.1"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
