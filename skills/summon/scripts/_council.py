@@ -42,11 +42,14 @@ _TOTAL_POSITIONS_BUDGET = 20000     # cap on ALL positions in one prompt (argv-s
                                     # Windows CreateProcess ~32 KB per token)
 _PER_BACKEND_CAP = 3
 _CHILD_MARGIN_MS = 60_000           # parent watchdog = child timeout + this margin
-# The only statuses a council MEMBER view may carry: the dispatcher's terminal statuses plus the
-# council-internal `excluded` (a gated/early-exit member). Anything else in an ingested env (a
-# tampered or garbled stage FILE read off disk on resume, or a future producer) is normalized to a
-# genuine failure so a bogus string can never mint a false success/excluded.
-_MEMBER_STATUSES = frozenset({"success", "error", "partial", "blocked", "timeout", "excluded"})
+# The only statuses a council MEMBER view may carry: the dispatcher's terminal member statuses
+# (a timeout surfaces as `partial`/`error`, never a literal "timeout") plus the council-internal
+# `excluded` (a gated/early-exit member). Anything else in an ingested env is normalized to a
+# genuine failure. This is DEFENSE-IN-DEPTH against a garbled/rogue-producer status -- NOT tamper
+# resistance: the run dir is trusted operator input, and a forged `status: "success"` (a KNOWN
+# value) is still trusted by carry_forward's success-gate. True authenticity would need signing,
+# which is out of scope for a trusted-operator run dir.
+_MEMBER_STATUSES = frozenset({"success", "error", "partial", "blocked", "excluded"})
 _TEARDOWN_BUDGET_S = 15             # wall-clock cap on the FINAL kill sweep (one best-
                                     # effort killpg per unconfirmed tree, then prune), so
                                     # a slow taskkill can't delay the envelope past the host

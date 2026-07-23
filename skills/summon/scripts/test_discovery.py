@@ -6434,6 +6434,53 @@ def test_v4_council_normalizes_unknown_member_status():
     assert "m2" in {f["agent"] for f in env["summary"]["members_failed"]}, env["summary"]
 
 
+def test_v4_council_rejects_tampered_stage_file_status_on_resume():
+    # Resume trust boundary (complements the fresh-dispatch allowlist test): a prior-generation
+    # stage FILE tampered to carry a BOGUS status must NOT be carried forward -- carry_forward gates
+    # on an EXACT "success", so the member RE-RUNS on resume and the forged status never reaches the
+    # results or the quorum.
+    import _council
+    import argparse
+    import contextlib
+    import io
+    import json as _json
+    root = tempfile.mkdtemp(prefix="summon-tamper-")
+    _mk_agents(root, ["m1", "m2", "chair"])
+    phase = {"run": 1}
+
+    def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        return {"status": "success", "result": f"{agent}-r{phase['run']}",
+                "report": {"summary": agent}}
+
+    def run(ns):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            _council.run_council(ns)
+        return _json.loads(buf.getvalue())
+
+    orig = _council._dispatch
+    _council._dispatch = fake
+    try:
+        env1 = run(argparse.Namespace(question="q", question_file=None, members="m1,m2",
+                   chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root, timeout=30000,
+                   out=None, run_dir=root, min_successful=None))
+        m1f = os.path.join(env1["run_dir"], "g1-r1-m1.json")
+        doc = _json.load(open(m1f, encoding="utf-8"))
+        doc["status"] = "sneaky_win"                            # forge a bogus status on disk
+        _json.dump(doc, open(m1f, "w", encoding="utf-8"))
+        phase["run"] = 2
+        env2 = run(argparse.Namespace(question=None, question_file=None, members=None, chairman=None,
+                   rounds=None, cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
+                   run_dir=root, resume_run=env1["run_id"]))
+        m1 = [m for m in env2["members"] if m["agent"] == "m1"][0]
+        assert m1["status"] == "success", m1["status"]          # fresh re-run, NOT the forged status
+        assert not any("sneaky_win" in _json.dumps(m) for m in env2["members"]), "forged status leaked"
+    finally:
+        _council._dispatch = orig
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
