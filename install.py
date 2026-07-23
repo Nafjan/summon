@@ -471,11 +471,12 @@ def _drift_check() -> None:
         if dups:
             paths = [p for d in dups for p in d["dirs"]]
             where = ", ".join(d["label"] for d in dups)
+            _cmd = ('Remove-Item -Recurse -Force' if os.name == "nt" else 'rm -rf')
             print(f"[~?] install-drift: {len(paths)} duplicate 'summon' skill dir(s) loaded "
                   f"({where}) - each shows as a 2nd summon in that host. summon does NOT "
-                  "auto-delete them; remove each by hand:")
+                  "auto-delete them; remove each by hand (QUOTE the path -- it may contain spaces):")
             for p in paths:
-                print(f"       {p}")
+                print(f'       {_cmd} "{p}"')
         if dr.get("scan_truncated"):
             print("[~?] install-drift: could not fully scan for duplicates (size limit or read "
                   f"error) in: {', '.join(dr['scan_truncated'])}; convergence unverified there")

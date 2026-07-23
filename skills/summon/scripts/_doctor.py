@@ -398,12 +398,20 @@ def render(report: dict) -> str:
             lines.append(f"  drift    : {'; '.join(bits)} - run  python install.py  to converge")
         elif dr.get("converged") and len(dr.get("present", [])) > 1:
             lines.append("  drift    : all installed copies match the running install")
-        for d in (dr.get("duplicates") or []):
+        _dups = dr.get("duplicates") or []
+        for d in _dups:
             for path in d["dirs"]:
                 lines.append(f"  [!!] {d['label']:<10} DUPLICATE 'summon' skill also loaded: {path}")
-        if dr.get("duplicates"):
+        if _dups:
+            # Complete the job (do not just say "by hand"): give a ready-to-run, QUOTED command for
+            # THIS host's shell. Summon paths contain spaces on Windows, so an unquoted rm would
+            # delete the wrong dir -- the quotes are the safety point.
+            _first = _dups[0]["dirs"][0]
+            _cmd = (f'Remove-Item -Recurse -Force "{_first}"' if os.name == "nt"
+                    else f'rm -rf "{_first}"')
             lines.append("  dupes    : the host loads each of the above as a 2nd 'summon'. summon "
-                         "does NOT auto-delete them - remove each dir above by hand")
+                         "does NOT auto-delete them; remove each by hand with the")
+            lines.append(f'             path QUOTED (it may contain spaces), e.g.  {_cmd}')
         if dr.get("scan_truncated"):
             lines.append("  dupes    : could not fully scan for duplicates (size limit or read "
                          f"error) in: {', '.join(dr['scan_truncated'])} - convergence unverified there")

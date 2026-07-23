@@ -342,7 +342,12 @@ class _KillRegistry:
         merely the watchdog's async flag. A delayed/starved watchdog thread must never let a
         dispatch guard wave a paid child through after the deadline, so every gate consults the
         clock directly. Any observer publishes overall["hit"] here (idempotent with the watchdog) so
-        the downstream partial-emission path treats the breach as seen."""
+        the downstream partial-emission path treats the breach as seen.
+
+        DISPATCH GATES USE THIS (and it MUTATES: sets overall["hit"] as a side effect). For a pure
+        read of whether a breach ALREADY fired -- no clock re-check, no mutation -- use the `.hit`
+        property instead. Do not confuse the two; and never write `if reg.breached:` (missing parens
+        is always truthy and silently disables the gate)."""
         if self.overall["hit"]:
             return True
         if self.overall_deadline is not None and time.monotonic() >= self.overall_deadline:
@@ -357,8 +362,10 @@ class _KillRegistry:
 
     @property
     def hit(self) -> bool:
-        """The RAW breach flag (does NOT re-check the clock) -- for the final envelope's
-        partial-vs-early_exit decision, which must read what actually fired, not re-evaluate."""
+        """The RAW breach flag (does NOT re-check the clock, does NOT mutate) -- for the final
+        envelope's partial-vs-early_exit decision, which must read what ACTUALLY fired, not
+        re-evaluate. This is the read-only counterpart to breached() (which gates dispatch and
+        mutates); use breached() in gates, `.hit` only to read history."""
         return self.overall["hit"]
 
     def register_and_gate(self, tag, proc) -> None:
@@ -442,7 +449,12 @@ class _KillRegistry:
             self._early_done.wait(0.15)
 
     def tally_success(self, env) -> None:
-        # Called UNDER self.lock (the caller holds it): count a member SUCCESS toward the early-exit
+        # PRECONDITION: the caller MUST already hold self.lock -- this method does NOT acquire it
+        # (it mutates self.early and starts the sweeper thread). It is only ever called from the
+        # `with reg.lock: done["n"] += 1; ...; reg.tally_success(env)` block, keeping the progress
+        # counter and the tally in ONE acquire. A caller that invokes it WITHOUT the lock is a data
+        # race no test would catch -- do not add such a caller.
+        # Under self.lock (the caller holds it): count a member SUCCESS toward the early-exit
         # threshold and, on the Mth, flip the flag + start the repeated sweep. Only while ARMED (the
         # final member round). Starting the daemon under the lock is safe: the sweeper's first
         # kill_inflight just waits the microsecond until this lock releases.
@@ -557,6 +569,9 @@ def run_council(args) -> int:
     # below the synthesis quorum would chair below quorum -- contradictory).
     min_successful = getattr(args, "min_successful", None)
     if min_successful is not None:
+        # Floor of 2 (not 1): early-exit-at-1 is a degenerate "first answer wins" that defeats the
+        # POINT of a council (a cross-checked quorum) -- use a single dispatch for that. Ceiling is
+        # the member count (you cannot require more successes than members).
         if not (isinstance(min_successful, int) and 2 <= min_successful <= len(members)):
             return _fail(f"--min-successful-members must be an integer in 2..{len(members)} "
                          "(the member count)", out_path)
