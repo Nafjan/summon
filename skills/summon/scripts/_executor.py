@@ -446,9 +446,10 @@ def _defn_snapshot(agents_dir_arg, cwd, agent_name):
     """Load the definition ONCE (for the whole identity), or None if there is no agent.
 
     state: "ok" (loaded), "missing" (no such file), "malformed" (present but the loader
-    refuses it). `sha` is content_sha of the definition (a real read, so it fails closed);
-    the dispatch compares its own ABA-safe last_parsed_sha against it. `fm` is the
-    frontmatter, for the endpoint field.
+    refuses it). `sha` is the hash of the SAME bytes `load_agent_snapshot` parsed the tuple
+    and frontmatter from -- one read, so it fails closed (an unreadable definition yields no
+    sha) and the dispatch's own ABA-safe last_parsed_sha matches it while the file is stable.
+    `fm` is the frontmatter, for the endpoint field -- also from that one buffer.
     """
     if not agent_name:
         return None

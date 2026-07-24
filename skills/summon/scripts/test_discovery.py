@@ -10520,7 +10520,9 @@ def test_v7_identity_loads_the_definition_once_no_hybrid():
     agent_def_sha256 are mutually consistent with one definition. Codex's mutation (return an
     agy tuple but rewrite the file to codex before hashing) is still one read, yet it breaks
     that consistency and fails the sha assertion."""
+    import builtins as _bi
     import hashlib as _hl
+    import pathlib as _pl
 
     import _loader
     from _executor import build_request_identity
@@ -10533,19 +10535,68 @@ def test_v7_identity_loads_the_definition_once_no_hybrid():
         reads["n"] += 1
         return real_snap(ad, an)
 
+    # Count ACTUAL filesystem reads of the definition, across every vector any code could
+    # use: Path.read_bytes (the snapshot's own, and the ONLY legitimate read), plus os.open
+    # and builtins.open (a stray content_sha()/open() second read). Counting helper calls or
+    # comparing hashes of a STABLE file cannot prove same-buffer provenance -- a second read
+    # of an unchanged file returns identical bytes and passes both. Only "the definition file
+    # was opened exactly once" rejects the hybrid window, since a hybrid REQUIRES a 2nd read.
+    real_rb = _pl.Path.read_bytes
+    real_open = _bi.open
+    real_osopen = os.open
+    fs = {"n": 0, "target": None}
+
+    def _is_target(p):
+        try:
+            p = os.fspath(p)
+            if isinstance(p, bytes):
+                p = p.decode()
+            return fs["target"] is not None and os.path.realpath(p) == fs["target"]
+        except Exception:  # noqa: BLE001 — a non-path arg is simply not our file
+            return False
+
+    def _rb(self, *a, **k):
+        if _is_target(self):
+            fs["n"] += 1
+        return real_rb(self, *a, **k)
+
+    def _open(file, *a, **k):
+        if _is_target(file):
+            fs["n"] += 1
+        return real_open(file, *a, **k)
+
+    def _osopen(path, *a, **k):
+        if _is_target(path):
+            fs["n"] += 1
+        return real_osopen(path, *a, **k)
+
     def build_once(name, raw, want_cli, extra=None):
-        with open(os.path.join(d, name + ".md"), "wb") as fh:
+        agent_file = os.path.join(d, name + ".md")
+        with open(agent_file, "wb") as fh:
             fh.write(raw)
         reads["n"] = 0
+        fs["n"] = 0
+        fs["target"] = os.path.realpath(agent_file)
         _loader._load_agent_snapshot_from = counting
+        _pl.Path.read_bytes = _rb
+        _bi.open = _open
+        os.open = _osopen
         try:
             idn = build_request_identity(agent=name, prompt="p", cwd=d, agents_dir=d)
         finally:
             _loader._load_agent_snapshot_from = real_snap
-        # ONE read of the definition...
-        assert reads["n"] == 1, (
-            "%s read the definition %d times -- scattered reads allow a hybrid"
-            % (name, reads["n"]))
+            _pl.Path.read_bytes = real_rb
+            _bi.open = real_open
+            os.open = real_osopen
+            fs["target"] = None
+        # exactly ONE physical read of the definition file. A hybrid needs a 2nd read; a
+        # stray content_sha(tup[3]) or open(tup[3]) anywhere in the identity trips this even
+        # when the file is stable (the case a hash-comparison test cannot catch).
+        assert fs["n"] == 1, (
+            "%s opened the definition file %d times -- a second read is the hybrid window"
+            % (name, fs["n"]))
+        # ONE snapshot load too (the single read went through the snapshot, not around it).
+        assert reads["n"] == 1, (name, "snapshot loads", reads["n"])
         assert idn["resolved_cli"] == want_cli, (name, idn["resolved_cli"])
         # ...and the backend and the hash are BOTH this definition's, from one buffer. A
         # hybrid (backend from B, hash from A) makes exactly one of these disagree.
