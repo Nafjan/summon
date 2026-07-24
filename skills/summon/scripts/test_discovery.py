@@ -10508,6 +10508,38 @@ def test_v7_retry_invocations_inherit_all_attestation_fields():
         _rs.execute_agent = real_execute
 
 
+# One process-wide audit hook counts reads of the agent definition. CPython raises the
+# "open" audit event (PEP 578) for EVERY file open -- io.open, os.open, io.FileIO,
+# builtins.open, and even a `from io import open` alias cached before any monkeypatch --
+# so this is the only monkeypatch-proof way to prove the definition is read exactly once.
+# Binding-specific patches always leak (an aliased or low-level opener slips past them).
+_DEFN_OPEN_AUDIT = {"n": 0, "target": None}
+_DEFN_OPEN_AUDIT_ADDED = []
+
+
+def _defn_open_audit_hook(event, args):
+    if event == "open" and _DEFN_OPEN_AUDIT["target"] is not None:
+        p = args[0]
+        try:
+            if isinstance(p, int):      # an fd (os.open's own event carries a path, not this)
+                return
+            p = os.fspath(p)
+            if isinstance(p, bytes):
+                p = p.decode()
+            if os.path.realpath(p) == _DEFN_OPEN_AUDIT["target"]:
+                _DEFN_OPEN_AUDIT["n"] += 1
+        except Exception:  # noqa: BLE001 — an audit hook must never raise
+            pass
+
+
+def _ensure_defn_open_audit():
+    # Audit hooks cannot be removed once added (by design), so register exactly one, gated on
+    # target being set -- a cheap no-op for every other open in the process.
+    if not _DEFN_OPEN_AUDIT_ADDED:
+        sys.addaudithook(_defn_open_audit_hook)
+        _DEFN_OPEN_AUDIT_ADDED.append(True)
+
+
 def test_v7_identity_loads_the_definition_once_no_hybrid():
     """build_request_identity derived the backend, endpoint, model defaults, effort and the
     agy-account decision from SEPARATE reads of the definition. An A -> B -> A swap between
@@ -10520,9 +10552,7 @@ def test_v7_identity_loads_the_definition_once_no_hybrid():
     agent_def_sha256 are mutually consistent with one definition. Codex's mutation (return an
     agy tuple but rewrite the file to codex before hashing) is still one read, yet it breaks
     that consistency and fails the sha assertion."""
-    import builtins as _bi
     import hashlib as _hl
-    import io as _io
 
     import _loader
     from _executor import build_request_identity
@@ -10535,69 +10565,35 @@ def test_v7_identity_loads_the_definition_once_no_hybrid():
         reads["n"] += 1
         return real_snap(ad, an)
 
-    # Count ACTUAL filesystem reads of the definition, across every vector any code could use
-    # to open it: io.open (what pathlib's read_bytes/open route through -- the snapshot's own,
-    # and the ONLY legitimate read), builtins.open (a bare open() call -- a DISTINCT namespace
-    # binding from io.open, so both must be patched), and os.open (content_sha's low-level
-    # read). pathlib calls the io-module `open`, not the builtins one, so patching only
-    # builtins.open misses read_bytes AND a Path.open second read. Counting helper calls or
-    # comparing hashes of a STABLE file cannot prove same-buffer provenance -- a second read of
-    # an unchanged file returns identical bytes and passes both. Only "the definition file was
-    # opened exactly once" rejects the hybrid window, since a hybrid REQUIRES a 2nd read.
-    real_ioopen = _io.open
-    real_open = _bi.open
-    real_osopen = os.open
-    fs = {"n": 0, "target": None}
-
-    def _is_target(p):
-        try:
-            p = os.fspath(p)
-            if isinstance(p, bytes):
-                p = p.decode()
-            return fs["target"] is not None and os.path.realpath(p) == fs["target"]
-        except Exception:  # noqa: BLE001 — a non-path arg is simply not our file
-            return False
-
-    def _ioopen(file, *a, **k):
-        if _is_target(file):
-            fs["n"] += 1
-        return real_ioopen(file, *a, **k)
-
-    def _open(file, *a, **k):
-        if _is_target(file):
-            fs["n"] += 1
-        return real_open(file, *a, **k)
-
-    def _osopen(path, *a, **k):
-        if _is_target(path):
-            fs["n"] += 1
-        return real_osopen(path, *a, **k)
+    # Prove the definition file is physically read EXACTLY ONCE via the "open" audit event
+    # (see the module-level hook). Counting helper calls or comparing hashes of a STABLE file
+    # cannot prove same-buffer provenance -- a second read of an unchanged file returns
+    # identical bytes and passes both. A hybrid REQUIRES a 2nd read, so "opened once" is the
+    # invariant; the audit event catches every opener (io.open, os.open, io.FileIO, a cached
+    # alias) that binding-specific monkeypatches leak.
+    _ensure_defn_open_audit()
 
     def build_once(name, raw, want_cli, extra=None):
         agent_file = os.path.join(d, name + ".md")
         with open(agent_file, "wb") as fh:
             fh.write(raw)
         reads["n"] = 0
-        fs["n"] = 0
-        fs["target"] = os.path.realpath(agent_file)
+        _DEFN_OPEN_AUDIT["n"] = 0
+        _DEFN_OPEN_AUDIT["target"] = os.path.realpath(agent_file)
         _loader._load_agent_snapshot_from = counting
-        _io.open = _ioopen
-        _bi.open = _open
-        os.open = _osopen
         try:
             idn = build_request_identity(agent=name, prompt="p", cwd=d, agents_dir=d)
         finally:
             _loader._load_agent_snapshot_from = real_snap
-            _io.open = real_ioopen
-            _bi.open = real_open
-            os.open = real_osopen
-            fs["target"] = None
+            _DEFN_OPEN_AUDIT["target"] = None
         # exactly ONE physical read of the definition file. A hybrid needs a 2nd read; a
-        # stray content_sha(tup[3]) or open(tup[3]) anywhere in the identity trips this even
-        # when the file is stable (the case a hash-comparison test cannot catch).
-        assert fs["n"] == 1, (
+        # stray content_sha(tup[3]), open(tup[3]), Path.open, io.FileIO, or a cached-alias
+        # read anywhere in the identity trips this even when the file is stable (the case a
+        # hash-comparison test cannot catch).
+        opened = _DEFN_OPEN_AUDIT["n"]
+        assert opened == 1, (
             "%s opened the definition file %d times -- a second read is the hybrid window"
-            % (name, fs["n"]))
+            % (name, opened))
         # ONE snapshot load too (the single read went through the snapshot, not around it).
         assert reads["n"] == 1, (name, "snapshot loads", reads["n"])
         assert idn["resolved_cli"] == want_cli, (name, idn["resolved_cli"])
