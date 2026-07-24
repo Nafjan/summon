@@ -10522,7 +10522,7 @@ def test_v7_identity_loads_the_definition_once_no_hybrid():
     that consistency and fails the sha assertion."""
     import builtins as _bi
     import hashlib as _hl
-    import pathlib as _pl
+    import io as _io
 
     import _loader
     from _executor import build_request_identity
@@ -10535,13 +10535,16 @@ def test_v7_identity_loads_the_definition_once_no_hybrid():
         reads["n"] += 1
         return real_snap(ad, an)
 
-    # Count ACTUAL filesystem reads of the definition, across every vector any code could
-    # use: Path.read_bytes (the snapshot's own, and the ONLY legitimate read), plus os.open
-    # and builtins.open (a stray content_sha()/open() second read). Counting helper calls or
-    # comparing hashes of a STABLE file cannot prove same-buffer provenance -- a second read
-    # of an unchanged file returns identical bytes and passes both. Only "the definition file
-    # was opened exactly once" rejects the hybrid window, since a hybrid REQUIRES a 2nd read.
-    real_rb = _pl.Path.read_bytes
+    # Count ACTUAL filesystem reads of the definition, across every vector any code could use
+    # to open it: io.open (what pathlib's read_bytes/open route through -- the snapshot's own,
+    # and the ONLY legitimate read), builtins.open (a bare open() call -- a DISTINCT namespace
+    # binding from io.open, so both must be patched), and os.open (content_sha's low-level
+    # read). pathlib calls the io-module `open`, not the builtins one, so patching only
+    # builtins.open misses read_bytes AND a Path.open second read. Counting helper calls or
+    # comparing hashes of a STABLE file cannot prove same-buffer provenance -- a second read of
+    # an unchanged file returns identical bytes and passes both. Only "the definition file was
+    # opened exactly once" rejects the hybrid window, since a hybrid REQUIRES a 2nd read.
+    real_ioopen = _io.open
     real_open = _bi.open
     real_osopen = os.open
     fs = {"n": 0, "target": None}
@@ -10555,10 +10558,10 @@ def test_v7_identity_loads_the_definition_once_no_hybrid():
         except Exception:  # noqa: BLE001 — a non-path arg is simply not our file
             return False
 
-    def _rb(self, *a, **k):
-        if _is_target(self):
+    def _ioopen(file, *a, **k):
+        if _is_target(file):
             fs["n"] += 1
-        return real_rb(self, *a, **k)
+        return real_ioopen(file, *a, **k)
 
     def _open(file, *a, **k):
         if _is_target(file):
@@ -10578,14 +10581,14 @@ def test_v7_identity_loads_the_definition_once_no_hybrid():
         fs["n"] = 0
         fs["target"] = os.path.realpath(agent_file)
         _loader._load_agent_snapshot_from = counting
-        _pl.Path.read_bytes = _rb
+        _io.open = _ioopen
         _bi.open = _open
         os.open = _osopen
         try:
             idn = build_request_identity(agent=name, prompt="p", cwd=d, agents_dir=d)
         finally:
             _loader._load_agent_snapshot_from = real_snap
-            _pl.Path.read_bytes = real_rb
+            _io.open = real_ioopen
             _bi.open = real_open
             os.open = real_osopen
             fs["target"] = None
