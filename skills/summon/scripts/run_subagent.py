@@ -22,6 +22,7 @@ Implementation is split into sibling modules:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -64,18 +65,103 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import _background  # noqa: E402
 import _cli  # noqa: E402
+import _executor  # noqa: E402
 import _receipt  # noqa: E402
 from _builder import AgentInvocation  # noqa: E402
 from _executor import ENVELOPE_VERSION as _ENVELOPE_VERSION  # noqa: E402
-from _executor import execute_agent, finalize_exit_fields, is_terminal_success  # noqa: E402
+from _executor import (agent_def_sha, content_sha,  # noqa: E402
+                       envelope_answers_request, execute_agent, finalize_exit_fields,
+                       is_terminal_success, request_fingerprint)
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.10.1"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.10.2"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
 _JOB_FILE: str | None = None
+
+
+def _endpoint_for_dispatch(identity: dict, agent_file: str, agents_dir: str) -> tuple:
+    """The endpoint this dispatch will call: the SNAPSHOT the request identity already
+    resolved, if it has one.
+
+    Resolving a second time here let a providers.json edit in between send the work to one
+    endpoint while the envelope recorded another -- and restoring the first then let the
+    second's answer resume as its own. A named function rather than an inline branch so a
+    test can exercise the choice: with the registry changed underneath, the snapshot must
+    still win. Falls back to resolving only when the identity could not (an unresolvable
+    endpoint is exactly the case where the error is the point).
+    """
+    snap = (identity or {}).get("_endpoint")
+    if snap:
+        return tuple(snap)
+    return _compat_endpoint(agent_file, agents_dir)
+
+
+def _compat_endpoint(agent_file: str, agents_dir: str) -> tuple:
+    """Re-read an openai-compat agent's frontmatter to resolve its API endpoint.
+
+    A named function, not an inline block, so a test can exercise THIS decoding rather than
+    re-implement it: read as plain utf-8 (as this once was) a BOM hides the frontmatter and
+    the dispatch dies with a misleading "needs a provider or base_url". utf-8-sig matches
+    what load_agent already does for the same file.
+    """
+    from _apibackend import resolve_endpoint
+    from _loader import parse_frontmatter
+    with open(agent_file, encoding="utf-8-sig") as fh:
+        fm, _ = parse_frontmatter(fh.read())
+    return resolve_endpoint(fm, agents_dir)
+
+
+def _write_error_out(out_path: str, env: dict) -> None:
+    """Record a failure at the authoritative --out path WITHOUT ever destroying a stored
+    success.
+
+    The invariant, stated once rather than patched into a sequence: a terminal SUCCESS
+    already at that path is never replaced by an error. It is archived first, and if
+    archiving FAILS the error is not written at all -- a lost answer is worse than a failure
+    that is only on stdout. Anything else there (an error, a partial, junk) is simply
+    replaced, and an empty path is simply written.
+
+    That invariant holds for a SINGLE writer, which is the documented model for a result
+    path (see references/fan-out.md: one --results-dir belongs to one run). The read, the
+    archive and the write are not one atomic step, so a second process writing a success
+    into the same path between this read and this write can still lose it. Locking is not
+    added because the shared-result-path case is already outside what summon supports; the
+    limit is stated here rather than implied away.
+
+    This exists because the naive version -- write the error, full stop -- destroyed
+    completed work whenever the failure came before the resume block could preserve it, and
+    the next version archived first but ignored the archive's own failure and overwrote
+    anyway. Both were caught in review; hence the invariant up front.
+    """
+    from _executor import is_terminal_success
+    from _manifest import _clear_out_file
+    prior = None
+    try:
+        with open(out_path, encoding="utf-8") as fh:
+            prior = json.load(fh)
+    except (OSError, ValueError):
+        prior = None
+    if is_terminal_success(prior):
+        if _clear_out_file(out_path, archive=True):
+            return                      # could not preserve it -> do not overwrite it
+    _write_out(out_path, env)
+
+
+def _request_identity(args) -> dict:
+    """Adapter: the dispatcher's RAW inputs, handed to the one shared identity builder.
+
+    Deliberately does no derivation of its own -- every hash and every environment-backed
+    field is computed inside build_request_identity, so this view and the manifest parent's
+    (_manifest._job_identity) cannot drift apart by having different derived fields.
+    """
+    return _executor.build_request_identity(
+        agent=args.agent, prompt=args.prompt, cwd=args.cwd, agents_dir=args.agents_dir,
+        cli=args.cli, model=args.model, effort=args.effort, json_schema=args.json_schema,
+        resume=args.resume, resume_profile=getattr(args, "resume_profile", None),
+        worktree=args.worktree, allow_credit=getattr(args, "allow_credit", False))
 
 
 def _stamp_job(env: dict) -> dict:
@@ -196,14 +282,22 @@ def _apply_gemini_thinking(model: str, effort: str) -> str:
     return f"{base} ({suffix})"
 
 
-def _inject_memory(system_context: str, cwd: str) -> str:
-    """Append {cwd}/.agents/memory.md to the agent's system context (capped)."""
+def _inject_memory(system_context: str, cwd: str, raw: bytes | None = None) -> str:
+    """Append {cwd}/.agents/memory.md to the agent's system context (capped).
+
+    `raw` lets the caller pass the BYTES it already hashed, so the text injected here is the
+    text that was attested. Reading the file again would leave the window where memory A is
+    fingerprinted and memory B is what the agent actually runs under.
+    """
     mem_path = os.path.join(cwd, ".agents", "memory.md")
-    try:
-        with open(mem_path, encoding="utf-8", errors="replace") as fh:
-            mem = fh.read()
-    except OSError:
-        return system_context
+    if raw is not None:
+        mem = raw.decode("utf-8", errors="replace")
+    else:
+        try:
+            with open(mem_path, encoding="utf-8", errors="replace") as fh:
+                mem = fh.read()
+        except OSError:
+            return system_context
     if not mem.strip():
         return system_context
     if len(mem) > _MEMORY_CAP:
@@ -410,6 +504,19 @@ def main() -> None:
     def _die(msg: str, exit_code: int = 1) -> None:
         env = {"result": "", "exit_code": exit_code, "status": "error", "error": msg}
         env.update(receipt)
+        # --out is the AUTHORITATIVE result path, so a pre-dispatch failure has to land
+        # there too. Emitting only to stdout left that path EMPTY after a refused stale
+        # success was archived -- the old answer correctly gone, but the new failure
+        # recorded nowhere a consumer of the file would look.
+        # Not under --background (which never owns --out; writing there while REJECTING the
+        # combination would be self-contradictory, and it littered a file into the caller's
+        # cwd) and not under --dry-run (which promises to touch nothing).
+        if (getattr(args, "out", None) and not getattr(args, "dry_run", False)
+                and not getattr(args, "background", False)):
+            try:
+                _write_error_out(args.out, env)
+            except Exception:  # noqa: BLE001 — reporting the original error matters more
+                pass
         _emit(env)
         sys.exit(exit_code)
 
@@ -452,25 +559,6 @@ def main() -> None:
         from _council import run_council
         sys.exit(run_council(args))
 
-    # --out resume behavior: a pre-existing SUCCESS envelope means this job is
-    # already done — emit it (marked skipped) and exit without dispatching. A
-    # prior error/blocked/partial envelope is NOT terminal: re-running retries
-    # it (matches the manifest's resume semantics — failures get another shot).
-    # A SUSPECT success (status=success but report_ok=false -> suspect=true) is
-    # NOT terminal either: skipping it would strand a semantically-useful but
-    # unparseable envelope, forcing a manual delete/rename to re-run. Re-dispatch
-    # it instead (consistent with summon's existing "suspect => re-dispatch" stance).
-    if args.out and os.path.isfile(args.out) and not args.dry_run:
-        try:
-            with open(args.out, encoding="utf-8") as fh:
-                prior = json.load(fh)
-        except (OSError, ValueError):
-            prior = None
-        if is_terminal_success(prior):
-            prior["skipped"] = True
-            _emit(prior)
-            sys.exit(0)
-
     # --prompt-file: resolve to a prompt BEFORE the background handler (its
     # validation needs args.prompt). utf-8-sig strips a BOM; strict decoding so
     # mojibake fails loudly instead of reaching a paid model. NOTE: this is
@@ -494,6 +582,62 @@ def main() -> None:
     # so even a missing-agent error downstream carries it.
     receipt.update(_receipt.receipt_prompt(args.prompt))
 
+    # --out resume behavior: a pre-existing SUCCESS envelope means this job is
+    # already done — emit it (marked skipped) and exit without dispatching. A
+    # prior error/blocked/partial envelope is NOT terminal: re-running retries
+    # it (matches the manifest's resume semantics — failures get another shot).
+    # A SUSPECT success (status=success but report_ok=false -> suspect=true) is
+    # NOT terminal either: skipping it would strand a semantically-useful but
+    # unparseable envelope, forcing a manual delete/rename to re-run. Re-dispatch
+    # it instead (consistent with summon's existing "suspect => re-dispatch" stance).
+    #
+    # The skip ALSO has to verify the prior envelope answers THIS request. Keyed by path
+    # alone it returned a stale answer as a fresh one: edit a manifest job's prompt but keep
+    # its id and the job is `skipped` with the OLD result, and on Windows two case-different
+    # job ids share one result file. So compare the receipt prompt hash and the agent -- a
+    # mismatch re-dispatches. This runs AFTER --prompt-file resolution because the hash is
+    # only final once the prompt is. An envelope written before 0.10.2 carries no
+    # prompt_sha256; it is still honored (resume keeps its value) but says so in `warnings`,
+    # because "unknown" must not be reported as "verified".
+    # The request fingerprint joins the receipt too, so EVERY envelope this dispatch writes
+    # carries what it answered -- that is what a later resume compares against.
+    _identity = _request_identity(args)
+    request_sha = request_fingerprint(**_identity)
+    receipt["request_sha256"] = request_sha
+    if args.out and os.path.isfile(args.out) and not args.dry_run:
+        try:
+            with open(args.out, encoding="utf-8") as fh:
+                prior = json.load(fh)
+        except (OSError, ValueError):
+            prior = None
+        if is_terminal_success(prior):
+            _reusable, _note = envelope_answers_request(
+                prior, request_sha, receipt.get("prompt_sha256"), args.agent, _identity)
+            # A BARE --worktree auto-names a FRESH tree on every invocation, so no stored
+            # result was produced in the tree this run will use. A fingerprint cannot express
+            # that (it has to be deterministic to be comparable), so it is decided here.
+            if args.worktree == "":
+                _reusable = False
+            if not _reusable:
+                print(f"[out] {args.out} holds a success for a DIFFERENT request; "
+                      "re-dispatching instead of skipping", file=sys.stderr, flush=True)
+                # ARCHIVE it now, exactly as the manifest does. Leaving it in place meant a
+                # pre-dispatch failure (a missing agent, a bad schema) exited with an error
+                # while the stale success was still sitting at the authoritative path, ready
+                # to be read as this run's result by anything that looks there.
+                from _manifest import _clear_out_file
+                _clear_err = _clear_out_file(args.out, archive=True)
+                if _clear_err:
+                    _die(_clear_err)
+            else:
+                if _note:
+                    _pw = prior.get("warnings")
+                    _pw = _pw if isinstance(_pw, list) else ([] if _pw is None else [str(_pw)])
+                    prior["warnings"] = _pw + [_note]
+                prior["skipped"] = True
+                _emit(prior)
+                sys.exit(0)
+
     # --allow-credit: per-dispatch credit authorization. Env form of the same
     # switch, set process-local so the credit guard and any --background child
     # (env-inherited AND argv-propagated) see it. Fan-out modes never reach
@@ -505,12 +649,26 @@ def main() -> None:
     schema = None
     if args.json_schema:
         try:
-            with open(args.json_schema, encoding="utf-8") as fh:
-                schema = json.load(fh)
+            # Read the BYTES once, hash THEM, then parse from the same buffer -- the
+            # identity fingerprinted this file earlier, and re-reading it here would leave
+            # the window (including A -> B -> A) in which one schema is fingerprinted and a
+            # different one actually validates the result.
+            _schema_raw = Path(args.json_schema).read_bytes()
+            schema = json.loads(_schema_raw.decode("utf-8"))
             if not isinstance(schema, dict):
                 raise ValueError("schema root must be a JSON object")
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, UnicodeDecodeError) as e:
             _die(f"--json-schema: cannot load {args.json_schema}: {e}")
+        # Compared unconditionally, so a schema that was ABSENT at fingerprint time but
+        # exists by now is caught too -- it would otherwise validate the result while
+        # contributing nothing to the identity that names it.
+        _sch_expected = _identity.get("json_schema_sha256")
+        _sch_actual = hashlib.sha256(_schema_raw).hexdigest()
+        if True:
+            if _sch_actual != _sch_expected:
+                _die(f"--json-schema {args.json_schema} changed between fingerprinting and "
+                     f"dispatch ({_sch_expected} -> {_sch_actual}); re-run rather than "
+                     "validate against a contract the envelope does not name")
 
     # --background: hand off to a detached copy of ourselves and return at once.
     if args.background and not args.list:
@@ -551,6 +709,29 @@ def main() -> None:
     except (FileNotFoundError, ValueError) as e:
         _die(str(e))
 
+    # The identity hashed this definition BEFORE dispatch; this is the copy that will
+    # actually be executed. If it changed in between, the run would use one definition's
+    # model, permission and system context while being stamped with another's request hash
+    # -- and restoring the first would then let the second's answer resume as its own. Same
+    # attestation shape as the agy account profile and the openai-compat endpoint snapshot.
+    # UNCONDITIONAL (not only when a hash was recorded): a definition that did NOT resolve
+    # when the identity was built but DOES by dispatch would otherwise run under an identity
+    # naming none of it. agent_file is set (load_agent succeeded), so the actual hash is
+    # real; the expected side is None exactly when the identity found no definition, and
+    # None != a real hash is the mismatch we want. Only a pre-0.10.2 caller (no agent field
+    # in its identity at all) is exempt.
+    from _loader import last_parsed_sha
+    _def_expected = _identity.get("agent_def_sha256")
+    if _identity.get("agent") is not None:
+        # The bytes load_agent PARSED, not a fresh read of the path: re-reading made this
+        # ABA-vulnerable, since a file changed to B and restored to A around the parse
+        # matched on the re-read while B was what got loaded.
+        _def_actual = last_parsed_sha(agent_file) or _executor.content_sha(agent_file)
+        if _def_actual != _def_expected:
+            _die(f"agent definition {args.agent!r} changed between fingerprinting and "
+                 f"dispatch ({_def_expected} -> {_def_actual}); re-run rather than record "
+                 "a result under a definition that was not used")
+
     receipt.update(_receipt.receipt_agent(args, agent_file))
 
     # Shared project memory: inject {cwd}/.agents/memory.md (standing conventions,
@@ -558,7 +739,25 @@ def main() -> None:
     # every prompt. Read from the ORIGINAL cwd (before any worktree rewrite).
     # Skipped on resume — the session already carries it.
     if not args.resume:
-        system_context = _inject_memory(system_context, args.cwd)
+        # Same attestation as the definition and the schema: the identity hashed
+        # .agents/memory.md earlier, and it is read again here to build the system context,
+        # so a change in between would inject instructions the envelope does not name.
+        # Read ONCE, here: hash these bytes and inject THESE bytes. Attesting one read and
+        # injecting another left the very window this check exists to close. The comparison
+        # covers ABSENT too -- a memory file that did not exist at fingerprint time but does
+        # by now would otherwise be used while contributing nothing to the identity.
+        _mem_path = os.path.join(args.cwd, ".agents", "memory.md")
+        try:
+            _mem_raw = Path(_mem_path).read_bytes()
+        except OSError:
+            _mem_raw = None
+        _mem_actual = hashlib.sha256(_mem_raw).hexdigest() if _mem_raw is not None else None
+        _mem_expected = _identity.get("memory_sha256")
+        if _mem_actual != _mem_expected:
+            _die("project memory (.agents/memory.md) changed between fingerprinting and "
+                 f"dispatch ({_mem_expected} -> {_mem_actual}); re-run rather than record a "
+                 "result under instructions the envelope does not name")
+        system_context = _inject_memory(system_context, args.cwd, _mem_raw)
 
     try:
         cli = args.cli or resolve_cli(run_agent_cli)
@@ -574,6 +773,15 @@ def main() -> None:
         setup_error = _preflight_backend(cli)
         if setup_error is not None:
             setup_error.update(receipt)   # provenance even on the no-backend path
+            # --out is AUTHORITATIVE, and this path bypassed _die() (which writes there), so
+            # a preflight failure after a refused stale success was archived left that path
+            # absent entirely -- the old answer correctly gone, the new failure nowhere a
+            # reader of the file would find it.
+            if args.out and not args.background:
+                try:
+                    _write_out(args.out, setup_error)
+                except Exception:  # noqa: BLE001 — reporting the error matters more
+                    pass
             _emit(setup_error)
             sys.exit(setup_error.get("exit_code", 1))
 
@@ -622,12 +830,8 @@ def main() -> None:
     # from the agent's frontmatter now, while we still have the agents dir.
     base_url = api_key_env = None
     if cli == "openai-compat":
-        from _apibackend import resolve_endpoint
-        from _loader import parse_frontmatter
         try:
-            with open(agent_file, encoding="utf-8") as fh:
-                fm, _ = parse_frontmatter(fh.read())
-            base_url, api_key_env = resolve_endpoint(fm, agents_dir)
+            base_url, api_key_env = _endpoint_for_dispatch(_identity, agent_file, agents_dir)
         except (OSError, ValueError) as e:
             _die(f"openai-compat agent {args.agent!r}: {e}")
 
@@ -644,6 +848,10 @@ def main() -> None:
         resume_profile=args.resume_profile,
         extra_args=tuple(extra_args),
         base_url=base_url,
+        # the account digest the identity recorded, so the dispatch can verify the profile
+        # it builds carries the SAME bytes
+        agy_account_sha256=_identity.get("agy_account_sha256"),
+        agy_account_checked=bool(_identity.get("_agy_account_checked")),
         api_key_env=api_key_env,
     )
 
@@ -777,8 +985,9 @@ def _dispatch_with_retries(invocation, args) -> dict:
 def _apply_schema(result: dict, schema: dict, invocation, args) -> dict:
     """Validate the agent's final JSON; on mismatch, ONE corrective follow-up
     through --resume (claude/codex/cursor via session_id; agy via profile)."""
+    from dataclasses import replace as _replace
+
     from _schema import attach_parsed, correction_prompt
-    from _builder import AgentInvocation as _AI
     attach_parsed(result, schema)
     if result["parse_ok"]:
         return result
@@ -786,18 +995,15 @@ def _apply_schema(result: dict, schema: dict, invocation, args) -> dict:
     sid, profile = resume.get("session_id"), resume.get("profile")
     if not sid and not profile:
         return result  # no resume lane (e.g. gemini) — return the verdict as-is
-    retry_inv = _AI(
-        cli=invocation.cli,
+    # CLONE the original invocation and override only the retry-specific fields, so every
+    # other field -- including the agy attestation fields, and anything added later -- rides
+    # along. Reconstructing by hand silently dropped whatever the constructor call omitted.
+    retry_inv = _replace(
+        invocation,
         prompt=correction_prompt(schema, result.get("parse_errors") or []),
-        cwd=invocation.cwd,
         system_context="",  # resume: session already holds the definition
-        agent_file=invocation.agent_file,
-        permission=invocation.permission,
-        model=invocation.model,
-        effort=invocation.effort,
         resume_id=sid or "latest",
-        resume_profile=profile,
-        extra_args=invocation.extra_args,
+        resume_profile=profile or invocation.resume_profile,
     )
     try:
         retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir,
@@ -876,19 +1082,18 @@ def _apply_contract_repair(result: dict, invocation, args) -> dict:
     sid, profile = resume.get("session_id"), resume.get("profile")
     if not sid and not profile:
         return result  # no resume lane (e.g. gemini) — leave the suspect verdict as-is
-    from _builder import AgentInvocation as _AI
-    retry_inv = _AI(
-        cli=invocation.cli,
+    from dataclasses import replace as _replace
+    # CLONE, then override the retry-specific fields. permission and extra_args are
+    # DELIBERATELY overridden (see below); every OTHER field -- agy attestation included --
+    # is inherited, so a new field can never be silently dropped from this path again.
+    retry_inv = _replace(
+        invocation,
         prompt=_CONTRACT_REPAIR_PROMPT,
-        cwd=invocation.cwd,
         system_context="",  # resume: session already holds the definition
-        agent_file=invocation.agent_file,
         permission="read-only",   # formatting re-emit: no write/yolo/tool authority, no side effects
-        model=invocation.model,
-        effort=invocation.effort,
         resume_id=sid or "latest",
-        resume_profile=profile,
-        extra_args=[],   # DROP extra_args: a resume keeps the session's model, and a
+        resume_profile=profile or invocation.resume_profile,
+        extra_args=(),   # DROP extra_args: a resume keeps the session's model, and a
                          # stray permission-override flag (--dangerously-bypass...,
                          # --permission-mode bypassPermissions) would defeat read-only.
     )

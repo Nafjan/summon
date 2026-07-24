@@ -75,7 +75,10 @@ def load_providers(agents_dir: str | None) -> dict:
 def resolve_endpoint(frontmatter: dict, agents_dir: str | None) -> tuple:
     """Return ``(base_url, api_key_env)`` from inline fields or a named provider.
     Raises ValueError on an unresolvable/unknown provider."""
-    base_url = (frontmatter.get("base_url") or "").strip()
+    _raw_base = frontmatter.get("base_url")
+    if _raw_base is not None and not isinstance(_raw_base, str):
+        raise ValueError(f"base_url must be a string, got {type(_raw_base).__name__}")
+    base_url = (_raw_base or "").strip()
     api_key_env = frontmatter.get("api_key_env")
     provider = (frontmatter.get("provider") or "").strip()
     if not base_url and provider:
@@ -83,12 +86,60 @@ def resolve_endpoint(frontmatter: dict, agents_dir: str | None) -> tuple:
         if provider not in providers:
             raise ValueError(f"unknown provider {provider!r} "
                              f"(known: {', '.join(sorted(providers))}, or set base_url)")
-        base_url = providers[provider].get("base_url", "")
+        entry = providers[provider]
+        if not isinstance(entry, dict):
+            raise ValueError(f"provider {provider!r} must be an object with a base_url, "
+                             f"got {type(entry).__name__}")
+        base_url = entry.get("base_url", "")
         if api_key_env is None:
-            api_key_env = providers[provider].get("api_key_env")
+            api_key_env = entry.get("api_key_env")
+    # Type-check what a registry (or frontmatter) supplied: `{"base_url": 42}` reached
+    # .rstrip() and raised AttributeError, which only the last-resort crash envelope caught.
+    for _name, _val in (("base_url", base_url), ("api_key_env", api_key_env)):
+        if _val is not None and not isinstance(_val, str):
+            raise ValueError(f"{_name} must be a string, got {type(_val).__name__}")
     if not base_url:
         raise ValueError("openai-compat agent needs a `provider:` or a `base_url:`")
     return base_url.rstrip("/"), (api_key_env or "")
+
+
+class _NoCrossHostAuthRedirect(urllib.request.HTTPRedirectHandler):
+    """Never carry the API credential to a host the operator did not configure.
+
+    urllib's default handler replays ALL original headers on a redirect, so an endpoint
+    answering `302 Location: https://attacker.example/...` received the `Authorization:
+    Bearer <key>` header verbatim -- a configured (or compromised, or merely mistaken)
+    base_url could exfiltrate the key with one response. Redirects to the SAME origin are
+    still followed, since those are ordinary API routing; anything cross-origin is refused
+    outright rather than followed without the header, because a silent downgrade to an
+    unauthenticated request would produce a confusing 401 instead of naming the real
+    problem.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        from urllib.parse import urlsplit
+
+        def origin(u):
+            # Normalize the DEFAULT port: https://x/v1 and https://x:443/v2 are the SAME
+            # origin, and refusing that as "cross-host" contradicted the documented
+            # same-origin guarantee.
+            parts = urlsplit(u)
+            default = {"http": 80, "https": 443}.get(parts.scheme)
+            return parts.scheme, parts.hostname, (parts.port or default)
+
+        old, new = urlsplit(req.full_url), urlsplit(newurl)
+        if origin(req.full_url) != origin(newurl):
+            raise urllib.error.HTTPError(
+                req.full_url, code,
+                f"refusing to follow a cross-host redirect to {new.scheme}://"
+                f"{new.hostname} (the API credential would travel with it)",
+                headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _opener():
+    """An opener that will not hand the credential to another host on a redirect."""
+    return urllib.request.build_opener(_NoCrossHostAuthRedirect)
 
 
 def call(inv, timeout_ms: int) -> dict:
@@ -121,7 +172,7 @@ def call(inv, timeout_ms: int) -> dict:
     # Every error string below is _redact()ed with the key before returning, so a
     # reflected Authorization header can never reach the envelope or --debug-dir.
     try:
-        with urllib.request.urlopen(req, timeout=max(1, timeout_ms / 1000)) as r:
+        with _opener().open(req, timeout=max(1, timeout_ms / 1000)) as r:
             payload = json.loads(r.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
         detail = ""

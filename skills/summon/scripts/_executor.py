@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import glob
+import hashlib
+import json
 import os
 import queue
 import re
@@ -18,7 +20,12 @@ from _builder import (AgentInvocation, BACKENDS, agy_permission_warning,
                       selects_credit_only)
 from _stream import StreamProcessor, _terminal_is_error
 
-_SUCCESS_EXIT_CODES = (0, 143, -15)  # 0 ok, 143/-15 = SIGTERM (we asked it to stop)
+# SIGTERM, as Popen reports it (-15) and as a shell wrapper reports it (128+15).
+_SIGTERM_EXIT_CODES = (143, -15)
+# Codes that do NOT contradict a success. SIGTERM belongs here only because summon itself
+# calls process.terminate() once a terminal event has been parsed -- see build_final_response,
+# where SIGTERM counts as success ONLY on the branch that HAS that terminal event.
+_SUCCESS_EXIT_CODES = (0,) + _SIGTERM_EXIT_CODES
 
 # The report contract's bookend fields — present in every agent definition.
 _REPORT_BOOKENDS = ("STATUS", "SUMMARY", "FOLLOW-UP", "HANDOFF")
@@ -339,6 +346,818 @@ def _finalize_diagnostics(resp: dict, raw, debug_dir, debug_argv,
     return resp
 
 
+_CONTENT_SHA_CHUNK = 1024 * 1024
+_CONTENT_SHA_TIMEOUT_S = 5.0
+
+
+def content_state(path) -> tuple:
+    """(sha256, state) for a path, where state is "absent" (nothing there -- legitimately
+    not part of the request), "ok", or "unreadable" (it IS there but could not be hashed:
+    a permissions error, a non-regular file, a read that failed or would not settle).
+
+    The distinction is load-bearing. Reporting a failed hash as plain None let
+    request_fingerprint DROP the field, so two DIFFERENT unhashable inputs produced the SAME
+    fingerprint and one could be served as the answer to the other. An input that exists but
+    cannot be identified must fail closed for reuse, not silently vanish from the identity.
+    """
+    if not path:
+        return None, "absent"
+    sha, why = _content_sha_ex(path)
+    if sha:
+        return sha, "ok"
+    return None, ("absent" if why == "absent" else "unreadable")
+
+
+def _content_sha_ex(path) -> tuple:
+    """(sha256, reason). reason is None on success, else "absent" or "unreadable".
+
+    Read SYNCHRONOUSLY and deliberately. An earlier version did this on a joinable daemon
+    worker to bound a stalled network read -- but dispatch itself reads these very files
+    (the agent definition in load_agent, the --json-schema with json.load, .agents/memory.md)
+    with no timeout at all, so the worker protected only the resume CHECK against a hang the
+    actual run is fully exposed to. That asymmetry bought nothing and cost a great deal: a
+    worker pool, a starvation circuit breaker, and a nondeterministic fingerprint under
+    concurrent load. What IS worth keeping is cheap and exact: O_NONBLOCK so a FIFO cannot
+    block at open(), an S_ISREG gate on the HANDLE, chunked reads so memory is bounded by
+    the chunk rather than the file, and a re-fstat so a file rewritten under us reports no
+    identity instead of a hybrid digest.
+    """
+    import stat as _stat
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None, "absent"
+    except OSError:
+        return None, "unreadable"
+    try:
+        before = os.fstat(fd)
+        if not _stat.S_ISREG(before.st_mode):
+            return None, "unreadable"
+        deadline = time.monotonic() + _CONTENT_SHA_TIMEOUT_S
+        h, read_total = hashlib.sha256(), 0
+        while True:
+            chunk = os.read(fd, _CONTENT_SHA_CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+            read_total += len(chunk)
+            # The deadline guards NON-TERMINATION (a file being appended to faster than we
+            # read it), not slowness. Tripping on elapsed time alone called a perfectly
+            # healthy 1 MiB file on a slow share "unreadable" and refused every resume
+            # against it, so it only fires once we have read PAST the size the handle
+            # reported -- which only a growing file can do.
+            if time.monotonic() > deadline and read_total > before.st_size:
+                return None, "unreadable"
+        after = os.fstat(fd)
+        if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+            # Rewritten under us: the digest could be a HYBRID of the old and new content,
+            # matching neither. This catches ACCIDENTAL mutation (an editor saving mid-run),
+            # not a deliberate adversary -- a same-length rewrite with the mtime restored
+            # would slip through. That matches summon's trust model, where files under
+            # --cwd are TRUSTED operator input, so this is robustness, not a tamper boundary.
+            return None, "unreadable"
+        return h.hexdigest(), None
+    except OSError:
+        return None, "unreadable"
+    finally:
+        os.close(fd)
+
+
+def content_sha(path) -> str | None:
+    """sha256 of a file's bytes, or None when there is nothing hashable there. See
+    content_state when the caller needs to tell "absent" from "present but unidentifiable"."""
+    return _content_sha_ex(path)[0] if path else None
+
+
+class _DefnSnapshot:
+    """One load of an agent definition, so every identity field derived from it sees the
+    SAME bytes. Scattered load_agent() calls across the identity builder let an A -> B -> A
+    swap mid-construction produce a HYBRID identity -- the hash from A, the resolved backend
+    from B -- which (among other things) turned agy attestation off for a real agy request.
+    """
+    __slots__ = ("tup", "fm", "sha", "state")
+
+    def __init__(self, tup, fm, sha, state):
+        self.tup, self.fm, self.sha, self.state = tup, fm, sha, state
+
+
+def _defn_snapshot(agents_dir_arg, cwd, agent_name):
+    """Load the definition ONCE (for the whole identity), or None if there is no agent.
+
+    state: "ok" (loaded), "missing" (no such file), "malformed" (present but the loader
+    refuses it). `sha` is content_sha of the definition (a real read, so it fails closed);
+    the dispatch compares its own ABA-safe last_parsed_sha against it. `fm` is the
+    frontmatter, for the endpoint field.
+    """
+    if not agent_name:
+        return None
+    from _loader import (bundled_roster_dir, get_agents_dir, load_agent_snapshot,
+                         validate_agent_name)
+    try:
+        validate_agent_name(agent_name)
+    except Exception:  # noqa: BLE001 — an unusable NAME is not an absent definition
+        return _DefnSnapshot(None, {}, None, "malformed")
+    try:
+        agents_dir = get_agents_dir(agents_dir_arg, cwd)
+    except Exception:  # noqa: BLE001
+        return _DefnSnapshot(None, {}, None, "missing")
+    try:
+        # ONE read: the tuple, the frontmatter and the hash all come from the SAME byte
+        # buffer, so no definition-derived field can see a different byte version -- the
+        # invariant that closes the A->B->A hybrid, not merely "one load_agent call".
+        tup, fm, sha = load_agent_snapshot(agents_dir, agent_name)
+        return _DefnSnapshot(tup, fm or {}, sha, "ok" if sha else "unreadable")
+    except Exception:  # noqa: BLE001 — the dispatch surfaces the real error
+        pass
+    # a file under that name EXISTS but did not load -> malformed, not absent
+    for d in (agents_dir, bundled_roster_dir()):
+        for ext in (".md", ".txt"):
+            try:
+                if d and os.path.exists(os.path.join(d, f"{agent_name}{ext}")):
+                    return _DefnSnapshot(None, {}, None, "malformed")
+            except OSError:
+                pass
+    return _DefnSnapshot(None, {}, None, "missing")
+
+
+def agent_def_state(agents_dir_arg, cwd, agent_name) -> tuple:
+    """(sha256, state) for the agent definition a request will load.
+
+    state is "ok" (hashed), "missing" (no such definition anywhere) or "malformed" (a file
+    IS there but the loader refuses it -- undecodable bytes, a duplicate key, a near-miss
+    key). NEITHER missing nor malformed is reusable: the definition is part of the request,
+    so without it there is nothing to match against, and the dispatch is the only thing that
+    can report the breakage. The two states are still distinguished because they are
+    different facts and the caller says which one it hit.
+    """
+    if not agent_name:
+        return None, "missing"
+    from _loader import (bundled_roster_dir, get_agents_dir, load_agent,
+                         validate_agent_name)
+    try:
+        validate_agent_name(agent_name)
+    except Exception:  # noqa: BLE001 — an unusable NAME is not an absent definition
+        # "missing" would let a legacy envelope be reused and never surface the loader's
+        # own "Invalid agent name" -- a path-traversing name must reach the dispatch.
+        return None, "malformed"
+    try:
+        agents_dir = get_agents_dir(agents_dir_arg, cwd)
+    except Exception:  # noqa: BLE001 — resolution itself is best-effort here
+        return None, "missing"
+    try:
+        _sha, _st = content_state(load_agent(agents_dir, agent_name)[3])
+        # "ok" ONLY with a real digest. Returning (None, "ok") let the definition's hash drop
+        # out of the fingerprint entirely -- so a definition edited from read-only to yolo
+        # hashed the SAME as before and the stale answer stayed reusable. The security
+        # relevant field must never fail open.
+        return (_sha, "ok") if _sha else (None, "unreadable")
+    except Exception:  # noqa: BLE001 — the dispatch itself surfaces the real error
+        pass
+    # A file under that name EXISTS but did not load -> malformed, not merely absent. Decided
+    # by looking, not by sniffing the exception's message.
+    for d in (agents_dir, bundled_roster_dir()):
+        for ext in (".md", ".txt"):
+            try:
+                if d and os.path.exists(os.path.join(d, f"{agent_name}{ext}")):
+                    return None, "malformed"
+            except OSError:
+                pass
+    return None, "missing"
+
+
+def agent_def_sha(agents_dir_arg, cwd, agent_name) -> str | None:
+    """sha256 of the agent DEFINITION a request will actually load, or None if it cannot be
+    resolved. Editing an agent's `model:`, `permission:` or body makes a stored result stale,
+    and nothing else in the fingerprint notices: the path is unchanged and the roster
+    directory may be unchanged too (a `SUB_AGENTS_DIR` pointed at a different tenant resolves
+    the same relative name). Hashing the CONTENT rather than the directory is also the more
+    correct identity -- two roster dirs holding the identical definition really are the same
+    request. Resolution is the loader's own, called identically by the dispatcher and the
+    manifest parent, and any failure (missing agent, malformed frontmatter) degrades to None
+    rather than raising: this runs on the resume path, whose job is to answer a question, not
+    to validate.
+    """
+    return agent_def_state(agents_dir_arg, cwd, agent_name)[0]
+
+
+# Environment that CONFIGURES a backend, by prefix. The child inherits the environment, so
+# these reach the vendor CLI directly and can redirect it to a different endpoint, account or
+# model without any summon flag changing -- exactly the cross-tenant reuse the openai-compat
+# credential fix closed, but for the CLI backends. Enumerating individual variables was a
+# losing game (ANTHROPIC_BASE_URL/API_KEY/MODEL this round, other vendors the next), so the
+# rule is per-backend PREFIXES and every matching variable counts.
+_BACKEND_ENV_PREFIXES = {
+    "claude": ("ANTHROPIC_",),
+    "codex": ("OPENAI_", "CODEX_"),
+    "cursor-agent": ("CURSOR_",),
+    "gemini": ("GEMINI_", "GOOGLE_"),
+    # AGY_* too: the PTY wrapper, the headless-profile root and the interpreter all change
+    # how (and as whom) agy runs.
+    "agy": ("GEMINI_", "GOOGLE_", "AGY_"),
+    # openai-compat is deliberately ABSENT: it spawns no child and reads only the endpoint
+    # and credential its provider resolves to, both already in the identity. Hashing every
+    # OPENAI_* variable there meant an unrelated key change forced a fresh paid request.
+}
+
+
+# Variables the dispatch itself SETS, so whatever was inherited never reaches the child.
+# Hashing them made unrelated ambient values force fresh, paid dispatches.
+# Variables the dispatch supplies a DEFAULT for. Normalized into the hashed view so an
+# unset variable and one explicitly set to that default -- identical to the child -- do not
+# fingerprint differently. Kept next to the builder value it mirrors.
+_BACKEND_ENV_DEFAULTS = {"agy": (("AGY_PTY_QUIET", "20"),)}
+
+_BACKEND_ENV_OVERWRITTEN = {
+    # AGY_PTY_QUIET is NOT here: the builder forwards whatever is set, so it does reach
+    # the child and two values are two different requests.
+    "agy": ("AGY_PTY_DEADLINE",),
+    "gemini": ("GEMINI_SYSTEM_MD",),
+}
+
+
+def _agy_account_sha(resume_profile=None) -> str | None:
+    """Digest of the account/auth files summon COPIES into agy's isolated profile.
+
+    agy authenticates from files, not the environment, so swapping ~/.gemini's OAuth
+    credentials to a different Google account changed who answers while every environment
+    variable stayed put -- and the cached answer from the first account came back. The file
+    list is `_builder._AGY_AUTH_FILES`, the very list the profile builder copies, so this
+    tracks whatever the dispatch actually carries rather than a guess about it.
+    """
+    try:
+        from _builder import _AGY_AUTH_FILES, agy_profile_account_sha
+    except Exception:  # noqa: BLE001
+        return None
+    if resume_profile:
+        # A RESUME runs under the profile it is resuming, whose account was fixed when that
+        # profile was created. Hashing the CURRENT ~/.gemini instead described an account
+        # the run would not use: swap ~/.gemini and the fingerprint moved while the dispatch
+        # still ran as the profile's account, and mutating the PROFILE moved the account
+        # while the fingerprint stood still.
+        return agy_profile_account_sha(resume_profile)
+    real = os.path.join(os.path.expanduser("~"), ".gemini")
+    h, seen_any = hashlib.sha256(b"summon-agy-account-v1"), False
+    for fn in sorted(_AGY_AUTH_FILES):
+        sha = content_sha(os.path.join(real, fn))
+        if sha:
+            seen_any = True
+        h.update(b"\0" + fn.encode("utf-8") + b"\0" + (sha or "").encode("utf-8"))
+    return h.hexdigest()[:32] if seen_any else None
+
+
+def backend_env_sha(resolved_cli, allow_credit=False) -> str | None:
+    """A one-way digest of the environment that configures `resolved_cli`.
+
+    VALUES are hashed, never stored: several of these ARE credentials, and the same reasoning
+    as the openai-compat credential applies -- a digest is not the secret, it does not leave
+    the machine, and the alternative is one account's answer served to another. Returns None
+    when the backend is unknown or nothing is set, so an unconfigured environment adds
+    nothing to the identity.
+
+    This is deliberately COARSE: an unrelated `ANTHROPIC_*` variable changing will invalidate
+    a stored answer. That direction is the safe one -- a needless re-dispatch costs a run, a
+    missed one returns the wrong answer.
+    """
+    prefixes = _BACKEND_ENV_PREFIXES.get(resolved_cli or "")
+    if not prefixes:
+        return None
+    effective = {k: v for k, v in os.environ.items() if k.startswith(prefixes)}
+    # Variables the DISPATCH overwrites unconditionally are not inputs to the request: agy
+    # always sets AGY_PTY_DEADLINE from --timeout (or its own default), so inheriting 1 vs
+    # 999 produced different identities for children that receive the identical value.
+    for _overwritten in _BACKEND_ENV_OVERWRITTEN.get(resolved_cli or "", ()):
+        effective.pop(_overwritten, None)
+    # Variables the dispatch DEFAULTS: unset and "set to the default" are the same child
+    # environment, so they must hash the same. Without this, leaving AGY_PTY_QUIET unset
+    # fingerprinted differently from setting it to the very value the builder supplies.
+    for _name, _default in _BACKEND_ENV_DEFAULTS.get(resolved_cli or "", ()):
+        if effective.get(_name) is None:
+            effective[_name] = _default
+    # Apply summon's OWN delta, so this describes what the child receives rather than what
+    # happens to be named like the vendor's variables. None means "removed from the child".
+    try:
+        from _builder import env_override_for
+        # allow_credit threaded through: the FLAG authorizes the run but only sets its env
+        # var later, so without it this applied the unauthorized stripping and hashed an
+        # environment the authorized child does not receive.
+        for k, v in (env_override_for(resolved_cli, allow_credit) or {}).items():
+            if v is None:
+                effective.pop(k, None)
+            else:
+                effective[k] = v
+    except Exception:  # noqa: BLE001 — identity must never fail on an import edge
+        pass
+    items = sorted(effective.items())
+    if not items:
+        return None
+    h = hashlib.sha256(b"summon-backend-env-v1")
+    for k, v in items:
+        h.update(b"\0" + k.encode("utf-8") + b"\0" + (v or "").encode("utf-8"))
+    return h.hexdigest()[:32]
+
+
+def _credit_env_allows(allow_credit=False) -> bool:
+    """The credit-authorization predicate, delegated to the ONE that dispatch uses so the
+    fingerprint and the dispatch can never disagree about what a value means.
+
+    `allow_credit` (the --allow-credit FLAG) has to be threaded in: the flag sets
+    SUMMON_ALLOW_CREDIT only LATER in the dispatch, after the identity is built, so a
+    derivation reading the environment alone concluded "unauthorized" and recorded the Opus
+    fallback for a request that actually ran Fable.
+    """
+    if allow_credit:
+        return True
+    try:
+        from _builder import credit_spend_allowed
+        return bool(credit_spend_allowed())
+    except Exception:  # noqa: BLE001 — identity must never fail on an import edge
+        return os.environ.get("SUMMON_ALLOW_CREDIT") == "1" or \
+            os.environ.get("SUMMON_ALLOW_FABLE") == "1"
+
+
+def _args_pin_model(args) -> bool:
+    """Does an agent's `args:` already select codex's model?
+
+    `args: -m gpt-x` (or --model, or -c model=...) pins the model just as surely as a
+    `model:` key does, so the config file's default is not what runs -- and folding that
+    default in anyway invalidated stored answers whenever config.toml changed, for a model
+    the agent never uses.
+    """
+    args = [str(a) for a in (args or [])]
+    for i, a in enumerate(args):
+        # `-m X` / `--model X`
+        if a in ("-m", "--model") and i + 1 < len(args):
+            return True
+        # `-m=X` / `--model=X`
+        if a.startswith("--model=") or a.startswith("-m="):
+            return True
+        # a config override: `-c model=X`, `--config model=X`, and their attached forms.
+        # A BARE `model=...` is NOT a pin on its own -- it is only one when it follows a
+        # config option. Treating any standalone `model=` token as a pin meant something
+        # like `--add-dir model=not-a-pin` suppressed the config default and let the old
+        # model's answer be reused.
+        if a in ("-c", "--config") and i + 1 < len(args):
+            if args[i + 1].lstrip().startswith("model="):
+                return True
+        for opt in ("-c=", "--config="):
+            if a.startswith(opt) and a[len(opt):].lstrip().startswith("model="):
+                return True
+    return False
+
+
+# Backends where SUMMON_DEFAULT_EFFORT can still decide the effort. agy is excluded on
+# purpose: it applies a thinking-mode suffix only when effort was given EXPLICITLY (CLI or
+# frontmatter), never from the default, so fingerprinting the default there was pure churn.
+_EFFORT_BACKENDS = ("claude", "codex")
+
+
+def _effort_default_applies(effort, resolved_cli, agents_dir, cwd, agent, defn=None) -> bool:
+    """Can SUMMON_DEFAULT_EFFORT still decide this request's effort?"""
+    if effort or resolved_cli not in _EFFORT_BACKENDS:
+        return False
+    try:
+        if defn is not None:
+            tup = defn.tup
+        else:
+            from _loader import get_agents_dir, load_agent
+            tup = load_agent(get_agents_dir(agents_dir, cwd), agent) if agent else None
+        if tup and tup[7]:
+            return False                       # the definition pins `effort:`
+    except Exception:  # noqa: BLE001 — an unresolvable agent is reported by the dispatch
+        pass
+    return True
+
+
+def _summon_default_model(resolved_cli, model, agents_dir=None, cwd=None,
+                          agent=None, allow_credit=False, defn=None) -> str | None:
+    """The model SUMMON itself substitutes when the request pins none.
+
+    Only cursor today (CURSOR_DEFAULT_MODEL). Read from _builder so the identity tracks the
+    value the dispatch actually uses rather than a copy that can drift from it. BOTH pins
+    have to be checked -- `--model` and the agent definition's own `model:` -- because the
+    `model` argument here is only the CLI override, so a definition-pinned agent would
+    otherwise be invalidated every time the default moved, for a model it never runs.
+    """
+    if resolved_cli == "claude":
+        # The credit guard substitutes summon's OWN fallback for an unauthorized credit-only
+        # model, so changing that constant changes the model dispatched while the request
+        # looks identical -- the same shape as cursor's default, and owned by summon either
+        # way, so it belongs inside the boundary rather than in the excluded list.
+        try:
+            from _builder import (_CREDIT_ONLY_MODELS, _OPUS_FALLBACK, _scrub_credit_args,
+                                  credit_spend_allowed)
+            _authorized = _credit_env_allows(allow_credit)
+            effective, extra_args = model, ()
+            if not effective and agent:
+                # The definition's `model:` (and its `args:`) are substituted just the same,
+                # so tracking only --model left a `model: claude-fable-5` agent -- or an
+                # `args: --model claude-fable-5` one -- unfingerprinted while its dispatched
+                # model followed the fallback constant.
+                if defn is not None:
+                    tup = defn.tup
+                else:
+                    from _loader import get_agents_dir, load_agent
+                    tup = load_agent(get_agents_dir(agents_dir, cwd), agent)
+                effective, extra_args = tup[5], tup[6]
+            if effective in _CREDIT_ONLY_MODELS and not _authorized:
+                return _OPUS_FALLBACK
+            # a credit-only model selected ONLY through args: is scrubbed to the fallback
+            if not effective and not _authorized and _scrub_credit_args(extra_args)[1]:
+                return _OPUS_FALLBACK
+        except Exception:  # noqa: BLE001 — identity must never fail on an import edge
+            return None
+        return None
+    if model or resolved_cli != "cursor-agent":
+        return None
+    try:
+        if defn is not None:
+            tup = defn.tup
+        else:
+            from _loader import get_agents_dir, load_agent
+            tup = load_agent(get_agents_dir(agents_dir, cwd), agent) if agent else None
+        if tup and tup[5]:
+            return None                        # the definition pins it
+    except Exception:  # noqa: BLE001 — an unresolvable agent is reported by the dispatch
+        pass
+    try:
+        from _builder import CURSOR_DEFAULT_MODEL
+        return CURSOR_DEFAULT_MODEL
+    except Exception:  # noqa: BLE001 — identity must never fail on an import edge
+        return None
+
+
+def _codex_default(resolved_cli, model, agents_dir, cwd, agent, defn=None) -> str | None:
+    """The model an UNPINNED codex agent will actually run, from ~/.codex/config.toml.
+
+    Consulted ONLY when the backend resolves to codex and NOTHING else pins a model --
+    neither `--model` nor the agent definition's own `model:`. Both have to be checked: the
+    `model` argument here is just the CLI override, so an agent that pins its model in the
+    definition would otherwise appear unpinned and be invalidated every time the config file
+    changed, for a model it never uses. Any failure degrades to None: the config is advisory
+    here and the dispatch reports a real problem with it.
+    """
+    if resolved_cli != "codex" or model:
+        return None
+    try:
+        if defn is not None:
+            tup = defn.tup
+        else:
+            from _loader import get_agents_dir, load_agent
+            tup = load_agent(get_agents_dir(agents_dir, cwd), agent) if agent else None
+        if tup:
+            if tup[5]:
+                return None                    # the definition's `model:` pins it
+            if _args_pin_model(tup[6]):
+                return None                    # ...or its `args:` do
+    except Exception:  # noqa: BLE001 — an unresolvable agent is reported by the dispatch
+        pass
+    try:
+        from _resolver import _codex_default_model
+        return _codex_default_model()
+    except Exception:  # noqa: BLE001 — identity must never fail on a config read
+        return None
+
+
+def _resolved_cli(cli, agents_dir, cwd, agent, defn=None) -> str | None:
+    """The backend a request will actually dispatch to: explicit --cli, else the agent's
+    `run-agent:`, else CALLER DETECTION (env). Degrades to None (falling back to the raw
+    `cli` field already in the identity) if anything cannot be resolved.
+
+    `defn` is the shared snapshot; omitted (direct callers/tests) -> load here."""
+    if cli:
+        return str(cli)
+    try:
+        from _resolver import resolve_cli
+        if defn is None:
+            from _loader import get_agents_dir, load_agent
+            tup = load_agent(get_agents_dir(agents_dir, cwd), agent) if agent else None
+        else:
+            tup = defn.tup
+        return resolve_cli(tup[0] if tup else None)
+    except Exception:  # noqa: BLE001 — the dispatch itself surfaces the real error
+        return None
+
+
+def _endpoint_state(agents_dir, cwd, agent, defn=None) -> tuple:
+    """Identity of the endpoint an openai-compat agent ACTUALLY resolves to.
+
+    Hashing the whole providers.json meant an agent with an inline `base_url:` (which never
+    consults the registry) was invalidated by any edit to it, and a `tenant-a` agent was
+    invalidated by a change to `tenant-b`. A false refusal is not free -- it costs a paid
+    re-dispatch -- so what is fingerprinted is the RESOLVED endpoint, which is exactly what
+    would change the answer. Unresolvable degrades to None: the dispatch reports that.
+    """
+    try:
+        from _apibackend import resolve_endpoint
+        from _loader import get_agents_dir
+        roster = get_agents_dir(agents_dir, cwd)
+        if defn is not None:
+            fm = defn.fm
+        else:
+            from _loader import load_agent, parse_frontmatter
+            with open(load_agent(roster, agent)[3], encoding="utf-8-sig") as fh:
+                fm, _ = parse_frontmatter(fh.read())
+        base_url, api_key_env = resolve_endpoint(fm, roster)
+    except Exception:  # noqa: BLE001 — the dispatch itself surfaces the real error
+        # UNRESOLVED, not merely unhashed: an agent naming a provider that no longer exists
+        # has no endpoint identity at all. Swallowing that into a bare None dropped the
+        # field from the fingerprint and let a legacy envelope be reused -- returning an
+        # answer from the OLD endpoint instead of letting the dispatch report the unknown
+        # provider. Every other unidentifiable input fails closed; so does this one.
+        return None, "unresolved", None
+    # The credential itself, one-way. Recording only the VARIABLE NAME meant two runs that
+    # differed solely by which token was in TENANT_TOKEN fingerprinted identically, so one
+    # tenant's answer could be served to the other without their endpoint ever being called.
+    # Documenting that and advising separate results dirs does not enforce anything.
+    #
+    # What is stored is a SHA-256 over a domain separator, the variable name and the value --
+    # not the value. It never leaves the machine (it lives in the local result file beside
+    # the answer that credential produced), it cannot be reversed, and confirming a guess
+    # requires already holding a candidate token, which for a high-entropy API key is not a
+    # practical attack. summon's rule that secrets stay in the environment and out of
+    # artifacts is about the SECRET; a one-way digest is not the secret, and the alternative
+    # was a wrong answer.
+    _cred = os.environ.get(api_key_env) if api_key_env else None
+    cred_id = hashlib.sha256(
+        b"summon-credential-v1\0" + (api_key_env or "").encode("utf-8") + b"\0"
+        + _cred.encode("utf-8")).hexdigest()[:32] if _cred else ""
+    # The RESOLVED PAIR is returned alongside the digest so the dispatch can use the very
+    # snapshot that was fingerprinted. Resolving twice meant a providers.json edit between
+    # the two reads sent the request to B while stamping it as A -- and restoring A then let
+    # B's answer resume as A's. The identity and the call now describe the same endpoint.
+    return (hashlib.sha256(f"{base_url}|{api_key_env}|{cred_id}".encode("utf-8")).hexdigest(),
+            "ok", (base_url, api_key_env))
+
+
+# Keys an identity dict carries for the SKIP's benefit that are NOT part of the request
+# (they describe local state, not what was asked), so the fingerprint drops them.
+_IDENTITY_LOCAL = ("_agent_def_state", "_unreadable", "_endpoint", "_agy_account_checked")
+
+
+def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, model=None,
+                           effort=None, json_schema=None, resume=None, resume_profile=None,
+                           worktree=None, allow_credit=False) -> dict:
+    """THE request identity, built in ONE place from RAW inputs.
+
+    The dispatcher and the manifest parent each used to build their own dict, so a field
+    added to one and not the other went unnoticed until resume silently misbehaved -- either
+    re-paying for every job forever (parent hash never matches the child's) or reusing a
+    stale answer. Both now pass only what they RAW have; every derived field (file content
+    hashes, the environment-backed controls) is computed here, once, so the two views cannot
+    diverge by construction.
+
+    `worktree`: pass the argparse value. A BARE --worktree (empty string) auto-names a FRESH
+    tree per run, so it gets the distinguishing marker "<auto>" -- without it a bare-worktree
+    result and a plain-cwd result hashed the same and the plain run reused the worktree's
+    answer. The marker cannot express "never reusable" on its own (a hash must be
+    deterministic to be comparable), so the skip ALSO refuses the bare form; the two together
+    close it from both directions.
+
+    NOT included: the roster DIRECTORY. `agent_def_sha256` is the authoritative agent
+    identity, and two rosters holding a byte-identical definition really are the same
+    request; keeping the lexical path as well contradicted that and re-paid for a moved
+    roster. Also not included: repository state under `cwd` -- folding git HEAD in would
+    invalidate every stored result on any unrelated commit, costing more than the staleness
+    it prevents (`git_head_before` is in the envelope for a caller who wants it).
+    """
+    cwd = os.path.abspath(cwd) if cwd else None
+    # ONE load of the definition for the WHOLE identity: every field derived from it reads
+    # this snapshot, so an A -> B -> A swap mid-construction cannot produce a hybrid identity
+    # (A's hash paired with B's resolved backend, which had turned agy attestation off).
+    _defn = _defn_snapshot(agents_dir, cwd, agent)
+    _adef = (_defn.sha, _defn.state) if _defn is not None else (None, "missing")
+    _rcli = _resolved_cli(cli, agents_dir, cwd, agent, _defn)
+    _endpoint = (_endpoint_state(agents_dir, cwd, agent, _defn)
+                 if _rcli == "openai-compat" else (None, "ok", None))
+    _schema = content_state(json_schema or None)
+    _memory = content_state(os.path.join(cwd, ".agents", "memory.md") if cwd else None)
+    # Anything that EXISTS but could not be hashed leaves a hole in the identity, and a hole
+    # is not a difference: two different unhashable schemas would hash alike. Record it so
+    # the skip can fail closed rather than reuse on an identity it could not fully compute.
+    _unreadable = sorted(n for n, st in (("json_schema", _schema[1]),
+                                         ("memory", _memory[1]),
+                                         ("agent_def", _adef[1]),
+                                         ("endpoint", _endpoint[1]))
+                          if st not in ("ok", "absent", "missing"))
+    return {
+        # not hashed (local facts, not part of the request); carried so the skip can refuse
+        # a MALFORMED definition or an identity it could not fully compute, and so dispatch
+        # can reuse the endpoint snapshot that was fingerprinted.
+        # request_fingerprint drops them: see _IDENTITY_LOCAL.
+        "_agent_def_state": _adef[1],
+        "_endpoint": _endpoint[2],
+        "_unreadable": ",".join(_unreadable) or None,
+        "agent": agent, "prompt": prompt, "cwd": cwd,
+        "cli": cli or None, "model": model or None, "effort": effort or None,
+        # The EFFECTIVE model when summon supplies the default itself. Cursor's default is a
+        # constant in _builder, so a request with no `model:` dispatched whatever that
+        # constant currently is while the identity recorded only `model=None` -- changing it
+        # would have let the previous model's answer resume.
+        "effective_default_model": _summon_default_model(_rcli, model, agents_dir,
+                                                         cwd, agent, allow_credit, _defn),
+        # An UNPINNED codex agent's model comes from ~/.codex/config.toml, so editing that
+        # file changes which model answers while `model` here stays None -- the old answer
+        # was served as current. Only consulted when nothing else pins the model.
+        "codex_default_model": _codex_default(_rcli, model, agents_dir, cwd, agent, _defn),
+        # The backend that will ACTUALLY run, not merely what the caller typed. With no
+        # --cli and no `run-agent:`, resolve_cli falls through to CALLER DETECTION, so the
+        # same command under CLAUDE_CODE=1 and under CODEX_CLI=1 is two different requests
+        # that hashed identically -- the second could reuse the first backend's answer.
+        "resolved_cli": _rcli,
+        "backend_env_sha256": backend_env_sha(_rcli, allow_credit),
+        # ONLY when this is an actual resume: --resume-profile without --resume still takes
+        # the FRESH-profile branch at dispatch, so selecting the resumed profile's account
+        # there made a perfectly good fresh profile look like an account swap and refused it.
+        "agy_account_sha256": (_agy_account_sha(resume_profile if resume else None)
+                               if _rcli == "agy" else None),
+        # True whenever this identity inspected the agy account -- so `agy_account_sha256:
+        # None` means "no account files at fingerprint time" (a state to attest) rather than
+        # "a legacy caller who recorded nothing" (skipped). Local, not hashed.
+        "_agy_account_checked": _rcli == "agy",
+        # The schema is identified by its CONTENTS, not its path: editing schema.json in
+        # place is a different contract for the same filename, and the same contract at two
+        # paths is the same request. The path itself was carried as well until a mutation
+        # sweep showed nothing depended on it -- every case it could distinguish is either
+        # caught by the content hash or fails at load before producing a result.
+        "json_schema_sha256": _schema[0],
+        "resume": resume or None,
+        # Only during an ACTUAL resume: without --resume the dispatch ignores the profile
+        # entirely and builds a fresh one, so fingerprinting the path made two fresh runs
+        # that differ only by an unused profile argument re-pay for the same work.
+        "resume_profile": (resume_profile or None) if resume else None,
+        "worktree": ("<auto>" if worktree == "" else (worktree or None)),
+        # Credit authorization changes the effective MODEL (it lifts the guard's
+        # substitution) and arrives as either the flag or the env var the flag sets.
+        # SUMMON_DEFAULT_EFFORT likewise changes effort without ever being a flag. A
+        # manifest/background child INHERITS this env, so both sides see it alike.
+        # EXACTLY the predicate dispatch uses. Collapsing any non-empty value to "1"
+        # made SUMMON_ALLOW_CREDIT=0 and =1 hash the same while selecting different
+        # effective models for a credit-only request.
+        # Credit authorization only ever changes the model on the CLAUDE backend (it lifts
+        # that guard's substitution), so folding it into any other backend's identity just
+        # re-paid for work the switch could not have altered.
+        "allow_credit": ("1" if _credit_env_allows(allow_credit) else None)
+                        if _rcli == "claude" else None,
+        # The DEFAULT only applies when nothing explicit was asked for; with --effort set
+        # it cannot change the request, and fingerprinting it anyway forced a fresh dispatch
+        # every time an unrelated default moved.
+        # The DEFAULT only applies when nothing explicit was asked for AND the backend
+        # actually takes an effort setting. With --effort given, with the definition pinning
+        # `effort:`, or on a backend that ignores effort entirely, it cannot change the
+        # request -- and fingerprinting it anyway forced a fresh dispatch every time an
+        # unrelated default moved.
+        "default_effort": (os.environ.get("SUMMON_DEFAULT_EFFORT") or None)
+                          if _effort_default_applies(effort, _rcli, agents_dir, cwd, agent,
+                                                     _defn)
+                          else None,
+        # the definition that will actually be loaded, by CONTENT: a roster edit makes a
+        # stored answer stale and neither the agent name nor the roster path shows it
+        "agent_def_sha256": _adef[0],
+        # .agents/memory.md is injected into the system context, so editing it changes the
+        # instructions the answer was produced under
+        "memory_sha256": _memory[0],
+        # An openai-compat agent names a `provider:` whose base_url lives in a
+        # providers.json OUTSIDE the agent file, so retargeting a provider changes where
+        # the work goes while agent + prompt + definition all stay identical.
+        # ONLY for the backend that actually resolves providers. Folding it in
+        # unconditionally meant editing an unused providers.json refused a perfectly good
+        # codex result -- and a refusal is not free: the manifest clears the stale envelope
+        # before re-dispatching, so a false refusal DESTROYED a completed answer.
+        "providers_sha256": _endpoint[0],
+    }
+
+
+def request_fingerprint(**fields) -> str:
+    """A stable hash of everything about a request that can change the ANSWER.
+
+    `--out` and manifest resume decide "already done" from a result FILE, and a file has no
+    memory of what it answered. Keyed on the path alone they returned a stale answer as a
+    fresh one: keep a manifest job's `id` but edit its prompt (or point it at a different
+    model) and the job came back `skipped` with the previous answer. Both skip paths now
+    stamp and compare this fingerprint.
+
+    Included: agent, prompt (hashed), cwd, cli, model, effort, and the schema by CONTENT --
+    the inputs that select or steer the work. The roster DIRECTORY (`agents_dir`) is NOT
+    included: the agent definition's CONTENT is the authoritative identity (`agent_def_sha`),
+    and two rosters holding a byte-identical definition are the same request, so hashing the
+    path would re-pay for a moved roster. EXCLUDED on purpose too: timeout, retries and
+    debug_dir (they change how long or how loudly, never the answer), so raising a timeout
+    does not force a re-pay. Absent fields are dropped rather than sent as null, so adding a
+    field later does not invalidate every stored envelope that lacks it.
+
+    The agent DEFINITION is included, by CONTENT (`agent_def_sha`), so editing an agent's
+    `model:` or body invalidates a stored answer. An earlier version excluded it on the
+    stated grounds that neither skip path had resolved the agent yet -- which was simply
+    wrong: the manifest parent already resolves it in `_job_backend` to pick a semaphore.
+
+    WHAT THIS DOES AND DOES NOT COVER -- read this before extending it.
+
+    COVERED, exactly these channels and no others:
+      * the request as summon received it: agent name, prompt, cwd, cli, model, effort,
+        --resume, --worktree, --allow-credit, and --resume-profile ONLY during an actual
+        resume (without --resume the dispatch ignores it, so neither does the identity);
+      * file CONTENT -- not path -- for the things summon reads itself: the agent
+        definition, the --json-schema, `.agents/memory.md`. The same schema at two paths is
+        the same contract, and the roster DIRECTORY is likewise absent because the
+        definition's content is the authoritative thing;
+      * what summon RESOLVES: the effective backend (`resolve_cli`, including caller
+        detection), the openai-compat endpoint and its credential, cursor's default model,
+        and codex's configured default model when nothing else pins one;
+      * environment variables matching the resolved backend's PREFIXES (ANTHROPIC_*,
+        OPENAI_*/CODEX_*, CURSOR_*, GEMINI_*/GOOGLE_*/AGY_*), after summon's own delta
+        (`_builder.env_override_for`), minus the ones the dispatch OVERWRITES for every run
+        and with the ones it DEFAULTS normalized -- so this is what the child receives, from
+        those prefixes;
+      * for agy, the account files summon copies into the isolated profile.
+
+    NOT COVERED -- and this list is the point, not an apology:
+      * the vendor CLI's own installed state: its config files (beyond codex's `model`),
+        its stored credentials, its signed-in account, its VERSION;
+      * environment outside the prefixes above (an inherited HTTP_PROXY, for instance);
+      * SUMMON'S OWN VERSION and its built-in defaults that are not otherwise listed (the
+        default effort, say). Upgrading summon can therefore change what a re-run would
+        produce without invalidating a stored answer -- a deliberate exclusion, since
+        pinning the dispatcher's identity would invalidate every stored result on every
+        upgrade. The envelope records `summon.version` and `summon.scripts_sha256`, so a
+        caller who wants that strictness can compare them and delete the result file;
+      * the repository state under `cwd` (see below).
+
+    A sub-agent's answer ultimately depends on the whole installation behind the CLI, and
+    summon cannot enumerate that: four successive review rounds each found another channel
+    (a credential value, then vendor environment variables, then summon's own environment
+    transformations, then agy's on-disk account), and a fifth would find another. So the
+    contract is deliberately BOUNDED: a matching fingerprint means "the same request, as
+    summon defines a request", NOT "the same answer is guaranteed". A caller who needs more
+    than that should not resume -- delete the result file, or give each configuration its
+    own --out/--results-dir.
+
+    Also outside on purpose: the repository state under `cwd`. Folding git HEAD in would
+    invalidate every stored result on any unrelated commit, which costs more than the
+    staleness it prevents -- resume exists precisely so an expensive fan-out survives an
+    interruption. It IS recorded in the envelope (`git_head_before`), so a caller who wants
+    that strictness can compare it and delete the result file.
+    """
+    for _local in _IDENTITY_LOCAL:
+        fields.pop(_local, None)
+    prompt = fields.pop("prompt", None)
+    if prompt is not None:
+        fields["prompt_sha256"] = hashlib.sha256(str(prompt).encode("utf-8")).hexdigest()
+    canonical = {k: str(v) for k, v in sorted(fields.items()) if v is not None and v != ""}
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def envelope_answers_request(prior, fingerprint: str, prompt_sha256=None,
+                             agent=None, identity=None) -> tuple[bool, str | None]:
+    """Can `prior` be reused as the answer to the request `fingerprint` describes?
+
+    Returns (reusable, note). `note` is a warning to attach when the answer is "yes, but we
+    could not verify it" -- "unknown" must never be reported as "verified". A MISMATCH is
+    never reused.
+
+    Two layers, because envelopes written before request fingerprinting have no key:
+    1. `request_sha256` present -> the authoritative comparison.
+    2. Absent -> fall back to the fields such an envelope DOES carry. They cannot prove a
+       match, but a differing prompt hash or agent PROVES a difference, and proof of
+       difference is enough to re-dispatch rather than serve a stale answer.
+    """
+    if not isinstance(prior, dict):
+        return False, None
+    if identity and identity.get("_unreadable"):
+        # An input that exists but could not be hashed (a stalled share, a permissions
+        # error) leaves the identity incomplete, and an incomplete identity cannot say two
+        # requests are the same. Re-dispatching costs a run; reusing costs correctness.
+        return False, None
+    if identity and identity.get("agent") \
+            and identity.get("_agent_def_state") in ("malformed", "missing"):
+        # The definition is part of the request, so a MISSING or MALFORMED one means this
+        # request cannot be matched against anything -- and the dispatch is the only thing
+        # that can report it. Applied to pre-fingerprint envelopes too: having one answer
+        # for old envelopes and another for new ones was a contradiction, and the lenient
+        # half preserved results nobody could attribute. A manifest's completed answer is
+        # not lost by the re-dispatch -- it is archived (see _manifest._clear_out_file).
+        return False, None
+    stored = prior.get("request_sha256")
+    if isinstance(stored, str) and stored:
+        # An agent definition that has been DELETED drops its hash out of the recomputed
+        # fingerprint, so this comparison fails and the job re-dispatches. That is the
+        # intended behaviour, not a gap: the definition is part of the request, and a
+        # manifest still naming an agent that no longer exists should hear about it. The
+        # completed answer is not lost -- the manifest moves a superseded success aside
+        # rather than deleting it. An earlier attempt to make that case reusable via a
+        # second, definition-independent fingerprint was withdrawn: it could not tell a
+        # pinned agent from an unpinned one once the file was gone, so it either reused a
+        # different vendor's answer or refused a perfectly good one.
+        return stored == fingerprint, None
+    for mine, theirs in ((prompt_sha256, prior.get("prompt_sha256")),
+                         (agent, prior.get("agent"))):
+        if mine and theirs and mine != theirs:
+            return False, None
+    return True, ("prior envelope predates request fingerprinting (no request_sha256); "
+                  "skipped without verifying it answers this request")
+
+
 def is_terminal_success(env) -> bool:
     """A dispatch envelope is TERMINAL-done only when it succeeded AND is not
     suspect (status=success but report_ok=false -> suspect: a semantically-useful
@@ -449,10 +1268,19 @@ def build_final_response(
         # otherwise a model/API error would leak through as a false success.
         status = "error"
         norm_reason = "backend terminal event self-reported an error"
-    elif exit_code in _SUCCESS_EXIT_CODES and "".join(stdout_lines).strip():
+    elif exit_code == 0 and "".join(stdout_lines).strip():
         # Plain-text backend that exited cleanly WITH output (no parsed terminal event).
         status = "success"
         norm_reason = "clean exit with output, no terminal event to parse"
+    elif exit_code in _SIGTERM_EXIT_CODES and "".join(stdout_lines).strip():
+        # SIGTERM but NO terminal event, so this is not our own post-result terminate() (that
+        # path lands on the first branch, which has a result). Something OUTSIDE killed the run
+        # -- a host-tool timeout, a CI cancel, docker stop -- and the output is whatever the
+        # sub-agent had emitted by then. Calling that success is a FALSE SUCCESS: it would also
+        # make --out / manifest resume SKIP the re-run and persist the truncated answer.
+        status = "partial"
+        norm_reason = (f"terminated by an external signal (backend exit {exit_code}) before any "
+                       "terminal event; output is incomplete")
     else:
         status = "error"
         norm_reason = f"no usable terminal result and backend exit {exit_code} is not success"

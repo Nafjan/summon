@@ -163,6 +163,12 @@ def set_agent(agents_dir: str, name: str, sets: dict) -> dict:
     # editing) is decoded/re-encoded; the body bytes are copied through verbatim.
     with open(path, "rb") as fh:
         raw = fh.read()
+    # A BOM'd agent file LOADS and dispatches fine (the loader reads utf-8-sig), so having
+    # `agent set` reject the very same file as "not ---delimited" was an inconsistency the
+    # user could not act on. Drop the BOM here: it is not re-emitted, which also removes the
+    # byte that caused the original silent-permission-fallback bug.
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
     # Tight delimiter match (one newline, not \s*\n) so a body leading-blank-line
     # isn't swallowed. body starts exactly after the closing '---\n'.
     m = re.match(rb"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", raw, re.DOTALL)
@@ -182,7 +188,11 @@ def set_agent(agents_dir: str, name: str, sets: dict) -> dict:
             out_lines.append(f"{key}: {value}")
 
     new_fm = "\n".join(out_lines).encode("utf-8")
-    _atomic_write_bytes(path, b"---\n" + new_fm + b"\n---\n" + body)
-    with open(path, encoding="utf-8") as fh:
-        final_fm, _ = parse_frontmatter(fh.read())
+    new_bytes = b"---\n" + new_fm + b"\n---\n" + body
+    # Parse BEFORE replacing. Validating the file only after the atomic write meant a
+    # rejected result had ALREADY been committed: an agent carrying frontmatter the parser
+    # now refuses was rewritten on disk and THEN the command reported ValueError, leaving
+    # the user with a mutated file and a failed command.
+    final_fm, _ = parse_frontmatter(new_bytes.decode("utf-8"))
+    _atomic_write_bytes(path, new_bytes)
     return {"path": path, "frontmatter": final_fm}

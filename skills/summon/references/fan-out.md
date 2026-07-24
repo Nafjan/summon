@@ -41,6 +41,15 @@ Rules that still apply (manifest or manual):
    `prompt_file` (or a short "Read X and follow it" prompt). Hard numbers: agy
    rejects prompts over ~28,000 chars (Windows argv limit); other CLIs degrade
    before they fail. Files under cwd also avoid `blocked` reads.
+> **One `--results-dir` belongs to one manifest run.** A job's result path is
+> `<results-dir>/<id>.json`, so two manifests running CONCURRENTLY against the same
+> results dir with the same job `id` are writing to the same file: each may read the
+> other's envelope as its own, and a superseded answer archived by one can be archived
+> again by the other. Archive names are claimed atomically so nothing is silently
+> overwritten, but the shared result path itself is not locked across processes -- this
+> is the same single-user, single-machine model the job registry documents below. Give
+> concurrent runs their own `--results-dir` (or distinct job ids).
+
 2. **Throttle per backend, not globally.** Safe starting points: 3-4 concurrent
    claude/codex/cursor; 2 concurrent agy (each run gets its own isolated
    profile, so concurrency is safe — the cap is for machine load, not

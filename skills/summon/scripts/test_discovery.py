@@ -613,18 +613,27 @@ def test_envelope_model_and_permission_echo():
 def test_out_skip_short_circuits(tmp_base=None):
     import json as _json
     import subprocess as sp
+    NL = chr(10)
     out = os.path.join(tempfile.gettempdir(), f"summon-out-{os.getpid()}.json")
+    # A RESOLVABLE agent: a definition that is missing or malformed now refuses reuse (the
+    # dispatch is the only thing that can report it), so the roster has to be real. This one
+    # resolves and then fails fast at endpoint resolution, so nothing is ever paid for.
+    roster = tempfile.mkdtemp(prefix="summon-outskip-")
+    with open(os.path.join(roster, "cheap.md"), "w", encoding="utf-8") as fh:
+        fh.write("---" + NL + "run-agent: openai-compat" + NL + "base_url: http://127.0.0.1:9/v1" + NL + "---" + NL + "# Resolvable" + NL)
     with open(out, "w", encoding="utf-8") as fh:
         _json.dump({"status": "success", "result": "prior run"}, fh)
     try:
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
-        r = sp.run([sys.executable, script, "--agent", "whatever", "--prompt", "p",
-                    "--cwd", os.getcwd(), "--out", out],
+        r = sp.run([sys.executable, script, "--agent", "cheap", "--prompt", "p",
+                    "--cwd", os.getcwd(), "--out", out, "--agents-dir", roster],
                    capture_output=True, text=True, encoding="utf-8")
         env = _json.loads(r.stdout)
         assert env["skipped"] is True and env["status"] == "success" and r.returncode == 0
     finally:
         os.remove(out)
+        import shutil as _sh
+        _sh.rmtree(roster, ignore_errors=True)
 
 
 def test_v1_out_skip_respects_suspect():
@@ -6615,6 +6624,3956 @@ def test_v4_council_survives_malformed_chairman_envelope():
     # a malformed truthy `served` must not mask the valid `resolved`
     assert syn.get("model") == "good-model", syn.get("model")
 
+
+
+# --- V7: self-audit findings (summon auditing summon via its own manifest fan-out) ---------
+
+def test_v7_loader_tolerates_bom_agent_file():
+    """An editor-added BOM must not hide the frontmatter. Pre-fix the leading BOM made the
+    opening `---` unrecognizable, so run-agent came back None and permission SILENTLY ESCALATED
+    from the declared read-only to the safe-edit default -- privilege from an invisible byte."""
+    from _loader import load_agent
+    d = tempfile.mkdtemp(prefix="summon-bom-")
+    try:
+        with open(os.path.join(d, "bommed.md"), "wb") as fh:
+            fh.write(b"\xef\xbb\xbf"
+                     + "---\nrun-agent: claude\npermission: read-only\n---\n# Bommed\n".encode("utf-8"))
+        run_agent, _, _, _, perm, _, _, _ = load_agent(d, "bommed")
+        assert run_agent == "claude", run_agent
+        assert perm == "read-only", perm
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_loader_undecodable_agent_file_is_a_clean_error():
+    # Pre-fix this escaped as an uncaught UnicodeDecodeError traceback (no JSON envelope).
+    from _loader import load_agent
+    d = tempfile.mkdtemp(prefix="summon-utf8-")
+    try:
+        with open(os.path.join(d, "binary.md"), "wb") as fh:
+            fh.write(b"---\nrun-agent: claude\n---\n# Body \xff\xfe not utf-8\n")
+        try:
+            load_agent(d, "binary")
+            raise AssertionError("expected a clean ValueError")
+        except UnicodeDecodeError:
+            raise AssertionError("raw UnicodeDecodeError escaped the loader")
+        except ValueError as e:
+            assert "not valid UTF-8" in str(e), str(e)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_loader_rejects_duplicate_frontmatter_key():
+    """A repeated key silently LAST-WINS, so `permission: read-only` followed by
+    `permission: yolo` ran as yolo. Ambiguous frontmatter is rejected, not guessed."""
+    from _loader import load_agent
+    d = tempfile.mkdtemp(prefix="summon-dupkey-")
+    try:
+        with open(os.path.join(d, "dup.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: read-only\npermission: yolo\n---\n# Dup\n")
+        try:
+            load_agent(d, "dup")
+            raise AssertionError("duplicate key not rejected")
+        except ValueError as e:
+            assert "duplicate frontmatter key" in str(e) and "permission" in str(e), str(e)
+        # a single occurrence is of course still fine
+        with open(os.path.join(d, "ok.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: read-only\n---\n# Ok\n")
+        assert load_agent(d, "ok")[4] == "read-only"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_args_backslashes_survive_on_windows():
+    r"""`args: --config C:\temp\foo` split to `C:tempfoo` under POSIX shlex rules, silently
+    pointing the backend at the wrong path. Backslashes are made literal WITHOUT losing the
+    inner-quote stripping codex args depend on (`-c key="high"` -> `key=high`)."""
+    import shlex
+
+    from _loader import _literal_backslashes as esc
+    from _loader import parse_extra_args
+    # the actual bug: a bare Windows path
+    assert shlex.split(esc(r"--config C:\temp\foo")) == ["--config", r"C:\temp\foo"]
+    # quoted forms, both flavors
+    assert shlex.split(esc(r'--p "C:\a b\c"')) == ["--p", r"C:\a b\c"]
+    assert shlex.split(esc(r"--p 'C:\a b\c'")) == ["--p", r"C:\a b\c"]
+    # a UNC path keeps BOTH leading separators (they are not an escape pair)
+    assert shlex.split(esc(r"--p \\server\share\x")) == ["--p", r"\\server\share\x"]
+    # backslash PARITY before a quote (the CommandLineToArgvW rule Windows users write to):
+    # an EVEN run is all literal separators and the quote still delimits, so the conventional
+    # quoted path ending in a separator survives instead of becoming an unterminated quote.
+    _B = "\\"
+    assert shlex.split(esc(r'--dir "C:\temp\\"')) == ["--dir", "C:" + _B + "temp" + _B]
+    assert shlex.split(esc(r"--p C:\temp" + _B)) == ["--p", "C:" + _B + "temp" + _B]
+    # an ODD run still escapes the quote -- which for an otherwise-unclosed quote is an error,
+    # exactly as a Windows command line would treat it
+    try:
+        shlex.split(esc(r'--dir "C:\temp\"'))
+        raise AssertionError("odd backslash run should leave the quote unterminated")
+    except ValueError:
+        pass
+    # nested opposite quotes and an empty quoted token are untouched
+    assert shlex.split(esc('--p "it' + chr(39) + 's here"')) == ["--p", "it" + chr(39) + "s here"]
+    assert shlex.split(esc("--p " + chr(39) * 2)) == ["--p", ""]
+    assert shlex.split(esc("")) == []
+    # inner quotes still strip, and a genuine quote escape still escapes
+    assert shlex.split(esc('-c model_reasoning_effort="high" --flag')) == \
+        ["-c", "model_reasoning_effort=high", "--flag"]
+    assert shlex.split(esc(r'--m \"q\"')) == ["--m", '"q"']
+    # on Windows the escaping is wired into parse_extra_args; POSIX splitting is untouched
+    if os.name == "nt":
+        assert parse_extra_args(r"--config C:\temp\foo") == ["--config", r"C:\temp\foo"]
+    assert parse_extra_args('-c model_reasoning_effort="high"') == \
+        ["-c", "model_reasoning_effort=high"]
+
+
+def test_v7_absurd_timeout_is_rejected_not_overflowed():
+    # '1e308' is finite and positive, so it passed both guards and became a 309-digit ms value
+    # that blew up downstream as an OverflowError inside threading.Event().wait().
+    import argparse as _ap
+
+    from _cli import _MAX_TIMEOUT_MS, parse_timeout
+    for bad in ("1e308", "1e30m", str(_MAX_TIMEOUT_MS + 1)):
+        try:
+            parse_timeout(bad)
+            raise AssertionError(f"absurd timeout accepted: {bad}")
+        except _ap.ArgumentTypeError as e:
+            assert "maximum" in str(e), str(e)
+    # the boundary and every ordinary value still work
+    assert parse_timeout(str(_MAX_TIMEOUT_MS)) == _MAX_TIMEOUT_MS
+    assert parse_timeout("600s") == 600_000
+    assert parse_timeout("10m") == 600_000
+    # and the accepted maximum is a value the executor's own wait can actually take
+    import threading
+    threading.Event().wait(0)
+    assert _MAX_TIMEOUT_MS / 1000 < 2 ** 31
+
+
+def test_v7_abbreviated_flags_do_not_bypass_the_mode_matrix():
+    """argparse prefix matching accepted `--mod opus` for --model, but unsupported_mode_flags()
+    scans the RAW argv by literal name -- so an abbreviation slipped past the fan-out
+    "rejected, never silently dropped" matrix and was then dropped anyway."""
+    import contextlib
+    import io as _io
+
+    from _cli import build_parser, unsupported_mode_flags
+    parser = build_parser("test", 1)
+    argv = ["--council", "--question", "q", "--cwd", ".", "--mod", "opus"]
+    try:
+        with contextlib.redirect_stderr(_io.StringIO()):
+            parser.parse_args(argv)
+        raise AssertionError("abbreviated --mod was still accepted")
+    except SystemExit:
+        pass    # argparse rejects the unknown flag outright now
+    # the spelled-out control is still caught by the matrix (unchanged behavior)
+    argv = ["--council", "--question", "q", "--cwd", ".", "--model", "opus"]
+    ns = parser.parse_args(argv)
+    msg = unsupported_mode_flags(argv, ns)
+    assert msg and "--model" in msg, msg
+
+
+def test_v7_external_sigterm_is_partial_not_success():
+    """An EXTERNAL SIGTERM (host-tool timeout, CI cancel, docker stop) killed a plain-text
+    dispatch mid-answer and it was reported `success` -- a false success, and one that
+    is_terminal_success() would then let --out / manifest resume SKIP, persisting the truncated
+    answer. summon's own post-result terminate() is a different branch (it HAS a terminal
+    event), so that path must stay success."""
+    from _executor import build_final_response, is_terminal_success
+    for code in (-15, 143):
+        env = build_final_response("gemini", code, None, ["half an answer\n"], "")
+        assert env["status"] == "partial", (code, env["status"])
+        assert not is_terminal_success(env), code
+        assert "external signal" in env["normalization_reason"], env["normalization_reason"]
+        assert env["result"] == "half an answer\n", env["result"]   # partial output is kept
+    # our own terminate() after a parsed terminal event is still a success
+    env = build_final_response("claude", -15, {"result": "done"}, ["x"], "")
+    assert env["status"] == "success" and is_terminal_success(env), env
+    # a clean plain-text exit is untouched, and a signal with NO output stays an error
+    assert build_final_response("gemini", 0, None, ["out"], "")["status"] == "success"
+    assert build_final_response("gemini", -15, None, ["  "], "")["status"] == "error"
+
+
+def test_v7_out_skip_requires_matching_request():
+    """--out (and so manifest resume) skipped on PATH alone: edit a job's prompt but keep its
+    id and you got the OLD answer back marked `skipped` -- a stale result presented as this
+    run's. Every dispatch now stamps a request fingerprint and the skip compares it."""
+    import json as _json
+    import subprocess as sp
+
+    from _executor import request_fingerprint
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    out = os.path.join(tempfile.gettempdir(), f"summon-ident-{os.getpid()}.json")
+    cwd = os.getcwd()
+
+    # Build the identity with the REAL builder, via the REAL parser, so the fixtures cannot
+    # drift from what a dispatch actually stamps (hand-listing the fields silently missed
+    # every field added later).
+    import run_subagent as _rs
+    from _cli import build_parser
+    _parser = build_parser("t", 1)
+    NL = chr(10)
+
+    roster = tempfile.mkdtemp(prefix="summon-identr-")
+    for _name in ("whatever", "someone-else"):
+        with open(os.path.join(roster, _name + ".md"), "w", encoding="utf-8") as fh:
+            fh.write("---" + NL + "run-agent: openai-compat" + NL + "base_url: http://127.0.0.1:9/v1" + NL + "---" + NL + "# Resolvable" + NL)
+
+    def _ident(prompt, agent="whatever", extra=()):
+        return _rs._request_identity(_parser.parse_args(
+            ["--agent", agent, "--prompt", prompt, "--cwd", cwd, "--out", out,
+             "--agents-dir", roster, *extra]))
+
+    def _fp(prompt, agent="whatever", extra=()):
+        return request_fingerprint(**_ident(prompt, agent, extra))
+
+    def _run(prompt, agent="whatever", extra=()):
+        r = sp.run([sys.executable, script, "--agent", agent, "--prompt", prompt,
+                    "--cwd", cwd, "--out", out, "--agents-dir", roster, *extra],
+                   capture_output=True, text=True, encoding="utf-8")
+        return _json.loads(r.stdout), r.stderr
+
+    def _seed(**over):
+        import hashlib as _hl2
+        _id = _ident("old prompt")
+        prior = {"status": "success", "result": "answer to the OLD request",
+                 "agent": "whatever", "request_sha256": request_fingerprint(**_id),
+                 "prompt_sha256": _hl2.sha256(b"old prompt").hexdigest()}
+        prior.update(over)
+        with open(out, "w", encoding="utf-8") as fh:
+            _json.dump(prior, fh)
+
+    try:
+        # identical request -> still skips (resume keeps working)
+        _seed()
+        env, _ = _run("old prompt")
+        assert env.get("skipped") is True and env["result"] == "answer to the OLD request", env
+
+        # a DIFFERENT prompt, agent, or model must each re-dispatch, not serve the old answer
+        for label, kwargs in (("prompt", {"prompt": "a completely different prompt"}),
+                              ("agent", {"agent": "someone-else"}),
+                              ("model", {"extra": ["--model", "some-other-model"]})):
+            _seed()
+            env, err = _run(kwargs.get("prompt", "old prompt"),
+                            agent=kwargs.get("agent", "whatever"),
+                            extra=kwargs.get("extra", ()))
+            assert env.get("skipped") is not True, (label, env)
+            assert "DIFFERENT request" in err, (label, err)
+
+        # a pre-fingerprint envelope (NEITHER fingerprint field) is still honored, but SAYS
+        # the match was not verified
+        _seed(request_sha256=None, prompt_sha256=None)
+        env, _ = _run("anything at all")
+        assert env.get("skipped") is True, env
+        assert any("predates request fingerprinting" in w
+                   for w in (env.get("warnings") or [])), env
+
+        # ...unless that old envelope PROVES a difference with the fields it does carry
+        import hashlib as _hl
+        _seed(request_sha256=None,
+              prompt_sha256=_hl.sha256(b"the prompt it actually answered").hexdigest())
+        env, err = _run("a different prompt entirely")
+        assert env.get("skipped") is not True, env
+
+        # a real dispatch stamps the fingerprint, so the NEXT run can verify it
+        env, _ = _run("old prompt")
+        assert env.get("request_sha256") == _fp("old prompt"), env
+
+        # A definition DELETED after a successful run drops its hash out of the recomputed
+        # fingerprint, so the job re-dispatches. That is intended: the definition is part of
+        # the request, and a manifest still naming an agent that no longer exists should
+        # hear about it rather than be handed an answer nobody can attribute.
+        roster = tempfile.mkdtemp(prefix="summon-gone-")
+        try:
+            defn = os.path.join(roster, "gone.md")
+            with open(defn, "w", encoding="utf-8") as fh:
+                fh.write("---" + NL + "run-agent: claude" + NL + "---" + NL + "# Gone" + NL)
+            ident = _rs._request_identity(_parser.parse_args(
+                ["--agent", "gone", "--prompt", "p", "--cwd", cwd, "--out", out,
+                 "--agents-dir", roster]))
+            assert ident["agent_def_sha256"], "precondition: the definition hashes"
+            with open(out, "w", encoding="utf-8") as fh:
+                _json.dump({"status": "success", "result": "produced while it existed",
+                            "agent": "gone",
+                            "request_sha256": request_fingerprint(**ident),
+                            "prompt_sha256": _hl.sha256(b"p").hexdigest()}, fh)
+            # with the definition still there it resumes normally
+            env, _ = _run("p", agent="gone", extra=["--agents-dir", roster])
+            assert env.get("skipped") is True, env
+            os.remove(defn)                     # now the roster entry is tidied away
+            env, _ = _run("p", agent="gone", extra=["--agents-dir", roster])
+            assert env.get("skipped") is not True, ("a deleted definition must invalidate "
+                                                    "the stored answer", env)
+        finally:
+            import shutil as _sh2
+            _sh2.rmtree(roster, ignore_errors=True)
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        import shutil as _sh3
+        _sh3.rmtree(roster, ignore_errors=True)
+
+
+def test_v7_manifest_parent_resume_checks_the_request_too():
+    """The manifest PARENT short-circuits before spawning, so the child's identity check
+    never runs for a manifest job -- editing a job's prompt while keeping its id returned the
+    previous answer with `skipped: true` (found by the cross-vendor review of the child-side
+    fix). The parent makes the same check itself now."""
+    from _executor import envelope_answers_request, request_fingerprint
+    from _manifest import _job_identity
+
+    class _A:
+        cwd = os.getcwd()
+        agents_dir = None
+
+    job = {"id": "same-id", "agent": "reviewer", "prompt": "OLD prompt"}
+    stored = request_fingerprint(**_job_identity(job, _A))
+    prior = {"status": "success", "result": "the old answer", "request_sha256": stored}
+
+    # same job -> reusable
+    assert envelope_answers_request(prior, request_fingerprint(**_job_identity(job, _A)))[0]
+    # every identity-bearing edit invalidates it
+    for over in ({"prompt": "NEW prompt"}, {"agent": "other"}, {"model": "m2"},
+                 {"cli": "codex"}, {"effort": "low"}):
+        changed = dict(job, **over)
+        fp = request_fingerprint(**_job_identity(changed, _A))
+        assert not envelope_answers_request(prior, fp)[0], over
+    # a timeout change does NOT (it cannot change the answer, so do not re-pay for it)
+    fp = request_fingerprint(**_job_identity(dict(job, timeout="900s", retries=3), _A))
+    assert envelope_answers_request(prior, fp)[0]
+
+
+def test_v7_manifest_rejects_case_colliding_job_ids():
+    # `Foo` and `foo` are distinct ids but ONE `<id>.json` result file on Windows/macOS, so the
+    # two jobs overwrite each other (and the second resumes off the first's envelope).
+    from _manifest import _normalize_jobs
+    jobs = [{"id": "Foo", "agent": "a", "prompt": "p"},
+            {"id": "foo", "agent": "a", "prompt": "p"}]
+    parsed, err = _normalize_jobs(jobs, os.getcwd())
+    assert parsed is None and err and "duplicate job id" in err, (parsed, err)
+    # distinct ids still validate
+    jobs = [{"id": "Foo", "agent": "a", "prompt": "p"},
+            {"id": "bar", "agent": "a", "prompt": "p"}]
+    parsed, err = _normalize_jobs(jobs, os.getcwd())
+    assert err is None and parsed and [j["id"] for j in parsed] == ["Foo", "bar"], (parsed, err)
+
+
+def test_v7_one_bad_agent_file_does_not_break_the_roster():
+    """--list is the DISCOVERY path: one malformed agent file must not hide every other agent.
+    Making duplicate frontmatter keys a hard ValueError let a single bad file crash the whole
+    listing (found by the cross-vendor review of that very fix)."""
+    from _loader import list_agents
+    d = tempfile.mkdtemp(prefix="summon-roster-")
+    try:
+        with open(os.path.join(d, "good.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\n---\nA fine agent.\n")
+        with open(os.path.join(d, "dup.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: read-only\npermission: yolo\n---\nx\n")
+        names = [a["name"] for a in list_agents(d)]
+        assert "good" in names and "dup" in names, names
+        # the broken one is listed, just without a description
+        assert next(a for a in list_agents(d) if a["name"] == "dup")["description"] == ""
+        assert next(a for a in list_agents(d) if a["name"] == "good")["description"]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_manifest_timeout_is_clamped_not_overflowed():
+    """A manifest job timeout is parsed independently of --timeout, so `1e308` bypassed the
+    dispatcher's ceiling and sized the PARENT watchdog to ~1.5e305 seconds -- which raises
+    OverflowError the moment it becomes a deadline, killing the parent while the child runs on
+    unmanaged."""
+    import time
+
+    from _cli import _MAX_TIMEOUT_MS
+    from _manifest import _parent_timeout, _timeout_seconds
+    cap = _MAX_TIMEOUT_MS / 1000
+    for absurd in ("1e308", "1e308ms", "1e300m", str(_MAX_TIMEOUT_MS * 10)):
+        got = _timeout_seconds(absurd)
+        assert got <= cap, (absurd, got)
+        # the clamped value is one a real deadline can actually hold
+        assert time.monotonic() + _parent_timeout({"timeout": absurd}) < float("inf")
+        time.time() + _parent_timeout({"timeout": absurd})   # would OverflowError pre-fix
+    # ordinary values are untouched, and nonsense still falls back to the default
+    assert _timeout_seconds("600s") == 600.0
+    assert _timeout_seconds("60000") == 60.0
+    assert _timeout_seconds("not-a-number") == 600.0
+    assert _timeout_seconds(None) == 600.0
+    assert _timeout_seconds("nan") == 600.0
+    assert _timeout_seconds("inf") == 600.0
+
+
+def test_v7_openai_compat_reparse_tolerates_a_bom():
+    """The openai-compat path RE-READS the agent file to resolve its endpoint. Reading it as
+    plain utf-8 while load_agent used utf-8-sig meant a BOM hid `base_url:` here only, and
+    the dispatch died with a misleading "needs a provider or base_url". This calls the
+    production helper, so reverting its decoding fails this test (the earlier version opened
+    the file itself and would not have noticed)."""
+    from run_subagent import _compat_endpoint
+    d = tempfile.mkdtemp(prefix="summon-compat-")
+    try:
+        path = os.path.join(d, "local.md")
+        with open(path, "wb") as fh:
+            fh.write(b"\xef\xbb\xbf" + ("---\nrun-agent: openai-compat\n"
+                                        "base_url: http://127.0.0.1:11434/v1\n---\n# Local\n"
+                                        ).encode("utf-8"))
+        base_url, _key = _compat_endpoint(path, d)
+        assert base_url and "11434" in base_url, base_url
+        # the same file without a BOM resolves identically
+        raw = open(path, "rb").read()[3:]
+        with open(path, "wb") as fh:
+            fh.write(raw)
+        assert _compat_endpoint(path, d)[0] == base_url
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_typo_in_a_frontmatter_key_is_not_silently_ignored():
+    """`permisson: read-only` was silently ignored, leaving permission at the STRONGER
+    safe-edit default -- the same silent-escalation shape as the BOM and duplicate-key bugs.
+    A near-miss of a key summon reads is now an error; an unrelated key is still allowed so
+    agent files can carry their own metadata."""
+    from _loader import KNOWN_FRONTMATTER_KEYS, load_agent, parse_frontmatter
+    for typo, meant in (("permisson", "permission"), ("run_agent", "run-agent"),
+                        ("modle", "model"), ("efort", "effort")):
+        try:
+            parse_frontmatter(f"---\n{typo}: v\n---\nbody\n")
+            raise AssertionError(f"typo not caught: {typo}")
+        except ValueError as e:
+            assert typo in str(e) and meant in str(e), str(e)
+    # unrelated metadata keys are untouched, and every key we DO read still parses
+    for ok in ("tags", "name", "description", "author", "x-custom"):
+        fm, _ = parse_frontmatter(f"---\n{ok}: v\n---\nbody\n")
+        assert fm[ok] == "v", fm
+    for known in KNOWN_FRONTMATTER_KEYS:
+        assert parse_frontmatter(f"---\n{known}: v\n---\nb\n")[0][known] == "v"
+    # end to end: the typo is an error, not a quietly stronger permission
+    d = tempfile.mkdtemp(prefix="summon-typo-")
+    try:
+        with open(os.path.join(d, "t.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermisson: read-only\n---\n# T\n")
+        try:
+            load_agent(d, "t")
+            raise AssertionError("a typo in the permission key was silently accepted")
+        except ValueError as e:
+            assert "permisson" in str(e), str(e)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_uppercase_frontmatter_key_is_still_caught():
+    """difflib is case SENSITIVE, so `PERMISSION: read-only` scored no match at all, was
+    silently ignored, and the dispatch ran at the stronger safe-edit default -- the exact
+    escalation the near-miss check exists to stop."""
+    from _loader import load_agent, parse_frontmatter
+    for key in ("PERMISSION", "Permission", "RUN-AGENT", "Model", "ARGS"):
+        try:
+            parse_frontmatter(f"---\n{key}: v\n---\nbody\n")
+            raise AssertionError(f"case variant not caught: {key}")
+        except ValueError as e:
+            assert key in str(e) and "did you mean" in str(e), str(e)
+    d = tempfile.mkdtemp(prefix="summon-upper-")
+    try:
+        with open(os.path.join(d, "u.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\nPERMISSION: read-only\n---\n# U\n")
+        try:
+            load_agent(d, "u")
+            raise AssertionError("uppercase permission key silently accepted")
+        except ValueError as e:
+            assert "PERMISSION" in str(e), str(e)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_backslash_parity_only_for_the_active_quote():
+    """Parity applies only to a quote that DELIMITS in the current context. Inside double
+    quotes an apostrophe is ordinary text, and treating it as a quote halved a legitimate run
+    of separators."""
+    import shlex
+
+    from _loader import _literal_backslashes as esc
+    B = chr(92)
+    # an apostrophe inside double quotes keeps BOTH separators
+    assert shlex.split(esc('--path "C:' + B + 'dir' + B * 2 + chr(39) + 'draft"')) == \
+        ["--path", "C:" + B + "dir" + B * 2 + chr(39) + "draft"]
+    # a run of three before a real delimiter: one literal separator + an escaped quote
+    assert shlex.split(esc('--p "a' + B * 3 + '"b"')) == ["--p", "a" + B + chr(34) + "b"]
+    # outside quotes an apostrophe IS a delimiter, so parity still applies there
+    assert shlex.split(esc("--p " + B * 2 + chr(39) + "x" + chr(39))) == ["--p", B + "x"]
+    # and the ordinary cases are unchanged
+    assert shlex.split(esc(r"--config C:@Ttemp@Tfoo".replace("@T", B))) == \
+        ["--config", "C:" + B + "temp" + B + "foo"]
+
+
+def test_v7_set_agent_validates_before_it_replaces_the_file():
+    """set_agent parsed the result only AFTER the atomic write, so a rejected update had
+    already been committed: the user got a mutated file AND a failed command."""
+    import _roster
+    d = tempfile.mkdtemp(prefix="summon-setval-")
+    try:
+        path = os.path.join(d, "a.md")
+        # `providers` is a near-miss of `provider`, so the parser refuses this file
+        original = "---\nrun-agent: claude\nproviders: internal-catalog\n---\n# Body\n"
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(original)
+        before = open(path, "rb").read()
+        try:
+            _roster.set_agent(d, "a", {"model": "claude-sonnet-5"})
+            raise AssertionError("expected the malformed result to be rejected")
+        except ValueError as e:
+            assert "providers" in str(e), str(e)
+        assert open(path, "rb").read() == before, "the rejected update was still written"
+        # a VALID update still lands
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write("---\nrun-agent: claude\n---\n# Body\n")
+        _roster.set_agent(d, "a", {"model": "claude-sonnet-5"})
+        assert b"model: claude-sonnet-5" in open(path, "rb").read()
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_parent_and_child_fingerprints_agree():
+    """The manifest PARENT and the dispatched CHILD each compute the request fingerprint from
+    their own view of a job. If those two views ever drift the resume path breaks silently in
+    one of two ways: never skipping (re-paying for every job forever) or skipping on a
+    fingerprint the child would not have produced. So take the ACTUAL child command the
+    parent builds, parse it with the REAL parser, and require the two fingerprints to match."""
+    import run_subagent as _rs
+    from _cli import build_parser
+    from _executor import request_fingerprint
+    from _manifest import _child_cmd, _job_identity, _normalize_jobs
+
+    class _A:
+        cwd = os.getcwd()
+        agents_dir = None
+        retries = 0
+
+    manifest_dir = os.getcwd()
+    parser = build_parser("test", 1)
+
+    jobs_raw = [
+        {"id": "plain", "agent": "reviewer", "prompt": "review it"},
+        {"id": "full", "agent": "coder", "prompt": "build it", "cli": "codex",
+         "model": "gpt-5.6-sol", "effort": "high", "timeout": "900s", "retries": 2},
+        {"id": "cwd", "agent": "pair", "prompt": "p", "cwd": os.getcwd()},
+        # a job whose cwd DIFFERS from the manifest default: without one, a parent that
+        # ignored the job's own cwd still matched the child on every fixture
+        {"id": "othercwd", "agent": "pair", "prompt": "p", "cwd": tempfile.gettempdir()},
+        # an openai-compat job: its identity RESOLVES an endpoint on the resume path, which
+        # is real work the other fixtures never trigger
+        {"id": "compat", "agent": "oc", "prompt": "p", "cli": "openai-compat"},
+        {"id": "defaulted", "agent": "planner", "prompt": "plan it"},
+    ]
+    # a manifest `defaults` block must reach BOTH sides identically
+    doc = {"defaults": {"cli": "claude", "model": "opus"}, "jobs": jobs_raw}
+    jobs, err = _normalize_jobs(doc, manifest_dir)
+    assert err is None, err
+
+    # Run the whole matrix with the environment-backed controls UNSET and SET. Leaving them
+    # unset is how this test stayed green while the child carried allow_credit/default_effort
+    # and the parent did not -- every manifest restart re-paid for finished jobs.
+    envs = [{}, {"SUMMON_DEFAULT_EFFORT": "low"}, {"SUMMON_ALLOW_CREDIT": "1"},
+            {"SUMMON_ALLOW_FABLE": "1", "SUMMON_DEFAULT_EFFORT": "max"}]
+    keys = ("SUMMON_DEFAULT_EFFORT", "SUMMON_ALLOW_CREDIT", "SUMMON_ALLOW_FABLE")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        for overrides in envs:
+            for k in keys:
+                os.environ.pop(k, None)
+            os.environ.update(overrides)
+            for job in jobs:
+                parent_fp = request_fingerprint(**_job_identity(job, _A))
+                cmd = _child_cmd(job, _A, "ignored-out.json")
+                child_args = parser.parse_args(cmd[2:])          # drop [python, script]
+                child_fp = request_fingerprint(**_rs._request_identity(child_args))
+                assert parent_fp == child_fp, (overrides, job["id"],
+                                               _job_identity(job, _A),
+                                               _rs._request_identity(child_args))
+    finally:
+        for k in keys:
+            os.environ.pop(k, None)
+            if saved.get(k) is not None:
+                os.environ[k] = saved[k]
+
+    # and the fingerprint actually DISCRIMINATES: changing any included field changes it,
+    # changing an excluded one does not
+    base = dict(jobs_raw[1])
+    base_fp = request_fingerprint(**_job_identity(base, _A))
+    for field, value in (("prompt", "different"), ("agent", "other"), ("cli", "cursor-agent"),
+                         ("model", "other-model"), ("effort", "low")):
+        assert request_fingerprint(**_job_identity(dict(base, **{field: value}), _A)) != base_fp, field
+    for field, value in (("timeout", "1200s"), ("retries", 9), ("debug_dir", "/tmp/d")):
+        assert request_fingerprint(**_job_identity(dict(base, **{field: value}), _A)) == base_fp, field
+
+
+def test_v7_manifest_parent_uses_the_legacy_fallback_too():
+    """The parent called envelope_answers_request WITHOUT the prompt hash and agent, so on a
+    pre-fingerprint envelope it DISAGREED with the child: the child re-dispatched on a proven
+    prompt mismatch while the parent -- which short-circuits before the child ever runs --
+    served the stale answer."""
+    import hashlib as _hl
+    import json as _json
+    import subprocess as sp
+    work = tempfile.mkdtemp(prefix="summon-legacy-")
+    results = os.path.join(work, "results")
+    os.makedirs(results)
+    try:
+        # a LEGACY envelope: no request_sha256, but it records which prompt it answered
+        with open(os.path.join(results, "same-id.json"), "w", encoding="utf-8") as fh:
+            _json.dump({"status": "success", "result": "OLD answer",
+                        "prompt_sha256": _hl.sha256(b"OLD prompt").hexdigest()}, fh)
+        mf = os.path.join(work, "m.json")
+        with open(mf, "w", encoding="utf-8") as fh:
+            _json.dump({"jobs": [{"id": "same-id", "agent": "no-such-agent-xyz",
+                                  "prompt": "NEW prompt", "cwd": work}]}, fh)
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+        r = sp.run([sys.executable, script, "--manifest", mf, "--cwd", work,
+                    "--results-dir", results], capture_output=True, text=True, encoding="utf-8")
+        job = _json.loads(r.stdout)["jobs"][0]
+        assert job.get("skipped") is not True, ("the parent reused a provably stale "
+                                                "legacy envelope", job)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(work, ignore_errors=True)
+
+
+def test_v7_dispatch_only_flags_are_part_of_the_request():
+    """--resume continues a DIFFERENT conversation, --worktree runs against a different tree,
+    and --allow-credit changes the effective model by lifting the credit guard. All three
+    returned the cached answer with `skipped: true` because the fingerprint ignored them."""
+    import run_subagent as _rs
+    from _executor import request_fingerprint
+    from _cli import build_parser
+    # Credit authorization only affects the CLAUDE backend, so the identity only carries it
+    # there -- the agent has to actually resolve to claude for this to be exercised.
+    _rd = tempfile.mkdtemp(prefix="summon-credr-")
+    with open(os.path.join(_rd, "a.md"), "w", encoding="utf-8") as fh:
+        fh.write("---" + chr(10) + "run-agent: claude" + chr(10) + "---" + chr(10) + "# A" + chr(10))
+    parser = build_parser("test", 1)
+    base_argv = ["--agent", "a", "--prompt", "p", "--cwd", os.getcwd(), "--agents-dir", _rd]
+
+    def fp(extra=()):
+        return request_fingerprint(**_rs._request_identity(parser.parse_args([*base_argv, *extra])))
+
+    base = fp()
+    for extra in (["--resume", "session-B"], ["--worktree", "fresh-tree"],
+                  ["--allow-credit"], ["--model", "m2"], ["--cli", "codex"],
+                  ["--effort", "low"]):
+        assert fp(extra) != base, extra
+    # WITHOUT --resume the dispatch ignores --resume-profile and builds a fresh
+    # profile, so two runs differing only by an unused profile argument are the SAME
+    # request and must not re-pay for it
+    assert fp(["--resume-profile", "A"]) == fp(["--resume-profile", "B"]) == base
+    # two DIFFERENT agy resume profiles are two different conversations
+    assert fp(["--resume", "x", "--resume-profile", "A"]) != \
+        fp(["--resume", "x", "--resume-profile", "B"])
+    # a BARE --worktree is handled at the SKIP, not in the hash (it must stay deterministic);
+    # test_v7_bare_worktree_never_resumes covers that behavior end to end
+    # two DIFFERENT resumes are different requests; the same one is the same request
+    assert fp(["--resume", "A"]) != fp(["--resume", "B"])
+    assert fp(["--resume", "A"]) == fp(["--resume", "A"])
+    # a flag that cannot change the answer must NOT invalidate a stored result
+    for extra in (["--timeout", "900s"], ["--retries", "3"]):
+        assert fp(extra) == base, extra
+    import shutil as _sh
+    _sh.rmtree(_rd, ignore_errors=True)
+
+
+def test_v7_json_schema_contents_are_part_of_the_request():
+    # The schema is a CONTRACT: editing schema.json in place is a different request even
+    # though the path is unchanged, and the fingerprint saw only the path.
+    import run_subagent as _rs
+    from _cli import build_parser
+    from _executor import content_sha, request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-schema-")
+    try:
+        path = os.path.join(d, "schema.json")
+        parser = build_parser("test", 1)
+        argv = ["--agent", "a", "--prompt", "p", "--cwd", os.getcwd(), "--json-schema", path]
+
+        def fp():
+            return request_fingerprint(**_rs._request_identity(parser.parse_args(argv)))
+
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"type": "object"}')
+        first = fp()
+        assert fp() == first, "the same file must hash the same"
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"type": "array"}')
+        assert fp() != first, "an edited schema is a different request"
+        # an unreadable/absent schema degrades to None rather than raising
+        assert content_sha(os.path.join(d, "gone.json")) is None
+        assert content_sha(None) is None
+
+        # Asking for a schema is still a different request from asking for none -- carried
+        # by the CONTENT hash, which is the only schema field in the identity. (The path was
+        # carried too until a mutation sweep showed nothing depended on it: the same
+        # contract at two paths is the same request.)
+        no_schema = request_fingerprint(**_rs._request_identity(
+            parser.parse_args(["--agent", "a", "--prompt", "p", "--cwd", os.getcwd()])))
+        assert fp() != no_schema, "requesting a schema must differ from requesting none"
+        from _executor import build_request_identity as _bri
+        assert "json_schema" not in _bri(agent="a", prompt="p", cwd=os.getcwd()),             "the redundant schema PATH field is back; identify the schema by content"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_apostrophe_in_a_windows_path_gets_an_actionable_error():
+    """`args: --path C:\\Users\\O'Brien\\config` is an ordinary Windows path, but POSIX
+    splitting reads the apostrophe as an opening quote. Single-quote GROUPING is kept, so the
+    resolution is that the error tells the user what to do instead of just failing."""
+    from _loader import parse_extra_args
+    B = chr(92)
+    path = "C:" + B + "Users" + B + "O" + chr(39) + "Brien" + B + "config"
+    try:
+        parse_extra_args("--path " + path)
+        raise AssertionError("expected the unbalanced-quote error")
+    except ValueError as e:
+        msg = str(e)
+        assert "apostrophe" in msg and "double-quoted" in msg, msg
+        assert path in msg, msg          # the message shows the working form
+    # and the double-quoted form the message recommends actually works
+    assert parse_extra_args('--path "' + path + '"') == ["--path", path]
+    # an unbalanced quote with NO apostrophe keeps the plain message (no misleading hint)
+    try:
+        parse_extra_args(chr(34) + "unbalanced")
+        raise AssertionError("expected an error")
+    except ValueError as e:
+        assert "apostrophe" not in str(e), str(e)
+
+
+def test_v7_content_sha_never_hangs_or_balloons():
+    """content_sha runs on the RESUME path, before any dispatch, while the caller is only
+    asking "have I answered this already?". A FIFO named schema.json would block forever at
+    open() and slurping the whole file would balloon memory -- so it opens O_NONBLOCK,
+    refuses anything that is not a regular file, and hashes in CHUNKS. Size is deliberately
+    NOT capped: a cap silently drops content identity for exactly the large schemas most
+    worth telling apart."""
+    from _executor import _CONTENT_SHA_CHUNK, content_sha
+    d = tempfile.mkdtemp(prefix="summon-csha-")
+    try:
+        f = os.path.join(d, "s.json")
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        first = content_sha(f)
+        assert first and content_sha(f) == first, "a regular file must hash stably"
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write('{"changed": true}')
+        assert content_sha(f) != first, "edited content must change the hash"
+
+        # A file larger than the 4 MiB SIZE CAP this replaced (and larger than one read
+        # chunk) must still get a real content identity: under the cap both of these hashed
+        # to None, so two different valid schemas at one path were indistinguishable.
+        assert _CONTENT_SHA_CHUNK <= 4 * 1024 * 1024
+        large = 4 * 1024 * 1024 + 37
+        big = os.path.join(d, "big.bin")
+        with open(big, "wb") as fh:
+            fh.write(b"x" * large)
+        big_a = content_sha(big)
+        assert big_a and content_sha(big) == big_a, "a large file must hash, and hash stably"
+        with open(big, "wb") as fh:
+            fh.write(b"y" * large)
+        assert content_sha(big) != big_a, "two large files must not share an identity"
+
+        # EVERY chunk must reach the digest. Two files identical for the first chunks and
+        # differing only in the LAST byte: a `break` after the first h.update() would hash
+        # them the same, which the differ-from-byte-zero fixtures above would not catch.
+        tail_a, tail_b = os.path.join(d, "ta.bin"), os.path.join(d, "tb.bin")
+        common = b"z" * large
+        with open(tail_a, "wb") as fh:
+            fh.write(common + b"A")
+        with open(tail_b, "wb") as fh:
+            fh.write(common + b"B")
+        assert content_sha(tail_a) != content_sha(tail_b), \
+            "a difference in the FINAL byte must change the digest"
+
+        # everything unhashable degrades to None rather than raising or hanging
+        assert content_sha(d) is None                           # a directory
+        assert content_sha(os.path.join(d, "absent")) is None    # missing
+        assert content_sha(None) is None and content_sha("") is None
+        if hasattr(os, "mkfifo"):
+            fifo = os.path.join(d, "schema.json")
+            os.mkfifo(fifo)
+            assert content_sha(fifo) is None, "a FIFO must degrade, not hang"
+        else:
+            print("  [v7-skip] os.mkfifo unavailable (non-POSIX); FIFO case not applicable")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_bare_worktree_never_resumes():
+    """A BARE --worktree auto-names a FRESH tree every invocation, so no stored result was
+    produced in the tree this run will use. The fingerprint cannot express that (it must be
+    deterministic to be comparable), so the skip decides it -- and the earlier test only
+    compared bare-worktree against NO worktree, which passed for the wrong reason."""
+    import json as _json
+    import subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    out = os.path.join(tempfile.gettempdir(), f"summon-wt-{os.getpid()}.json")
+    NL = chr(10)
+    roster = tempfile.mkdtemp(prefix="summon-wtr-")
+    with open(os.path.join(roster, "cheap.md"), "w", encoding="utf-8") as fh:
+        fh.write("---" + NL + "run-agent: openai-compat" + NL + "base_url: http://127.0.0.1:9/v1" + NL + "---" + NL + "# Resolvable" + NL)
+    try:
+        def _run(extra):
+            r = sp.run([sys.executable, script, "--agent", "cheap", "--prompt", "p",
+                        "--cwd", os.getcwd(), "--out", out, "--agents-dir", roster, *extra],
+                       capture_output=True, text=True, encoding="utf-8")
+            return _json.loads(r.stdout)
+
+        # seed a success envelope whose fingerprint matches a BARE --worktree run
+        import run_subagent as _rs
+        from _cli import build_parser
+        from _executor import request_fingerprint
+        ns = build_parser("t", 1).parse_args(
+            ["--agent", "cheap", "--prompt", "p", "--cwd", os.getcwd(),
+             "--out", out, "--agents-dir", roster, "--worktree"])
+        with open(out, "w", encoding="utf-8") as fh:
+            _json.dump({"status": "success", "result": "from a PREVIOUS auto worktree",
+                        "request_sha256": request_fingerprint(**_rs._request_identity(ns))}, fh)
+        env = _run(["--worktree"])
+        assert env.get("skipped") is not True, ("a fresh auto-worktree run reused a result "
+                                                "from a different tree", env)
+        # a NAMED worktree is a stable location, so it resumes normally
+        ns2 = build_parser("t", 1).parse_args(
+            ["--agent", "cheap", "--prompt", "p", "--cwd", os.getcwd(),
+             "--out", out, "--agents-dir", roster, "--worktree", "fixed-tree"])
+        with open(out, "w", encoding="utf-8") as fh:
+            _json.dump({"status": "success", "result": "from fixed-tree",
+                        "request_sha256": request_fingerprint(**_rs._request_identity(ns2))}, fh)
+        env = _run(["--worktree", "fixed-tree"])
+        assert env.get("skipped") is True, ("a NAMED worktree is a stable location and must "
+                                            "still resume", env)
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+
+def test_v7_agent_definition_edit_invalidates_a_stored_result():
+    """Editing an agent's `model:` or body makes a stored answer stale, and nothing else in
+    the fingerprint sees it: the agent NAME, the path and even --agents-dir are unchanged.
+    (A `SUB_AGENTS_DIR` pointed at a different tenant resolves the same relative name too.)
+    The definition is hashed by CONTENT, which is also the more correct identity -- two
+    roster dirs holding an identical definition really are the same request."""
+    from _executor import agent_def_sha
+    d = tempfile.mkdtemp(prefix="summon-adef-")
+    other = tempfile.mkdtemp(prefix="summon-adef2-")
+    try:
+        path = os.path.join(d, "rev.md")
+        defn = "---\nrun-agent: claude\nmodel: opus\n---\n# Reviewer\n"
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(defn)
+        first = agent_def_sha(d, os.getcwd(), "rev")
+        assert first and agent_def_sha(d, os.getcwd(), "rev") == first
+
+        # an IDENTICAL definition in a different roster dir is the SAME request
+        with open(os.path.join(other, "rev.md"), "w", encoding="utf-8") as fh:
+            fh.write(defn)
+        assert agent_def_sha(other, os.getcwd(), "rev") == first
+
+        # editing the model is a DIFFERENT request
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\nmodel: claude-sonnet-5\n---\n# Reviewer\n")
+        assert agent_def_sha(d, os.getcwd(), "rev") != first
+        # so is editing only the BODY (the instructions are the work)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(defn.replace("# Reviewer", "# Reviewer, but be adversarial"))
+        assert agent_def_sha(d, os.getcwd(), "rev") != first
+
+        # unresolvable or malformed degrades to None instead of raising: this runs on the
+        # resume path, whose job is to answer a question, not to validate
+        assert agent_def_sha(d, os.getcwd(), "no-such-agent-zzz") is None
+        assert agent_def_sha(d, os.getcwd(), None) is None
+        with open(os.path.join(d, "bad.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: a\npermission: b\n---\nx\n")
+        assert agent_def_sha(d, os.getcwd(), "bad") is None
+
+        # and it is actually WIRED into the request identity, not merely available
+        import run_subagent as _rs
+        from _cli import build_parser
+        ident = _rs._request_identity(build_parser("t", 1).parse_args(
+            ["--agent", "rev", "--prompt", "p", "--cwd", os.getcwd(), "--agents-dir", d]))
+        assert ident["agent_def_sha256"] == agent_def_sha(d, os.getcwd(), "rev"), ident
+        assert ident["agent_def_sha256"] is not None, ident
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+        _sh.rmtree(other, ignore_errors=True)
+
+
+def test_v7_env_backed_controls_are_part_of_the_request():
+    """SUMMON_ALLOW_CREDIT / SUMMON_ALLOW_FABLE change the effective MODEL (they lift the
+    credit guard's substitution) and SUMMON_DEFAULT_EFFORT changes the effort. None of them
+    is a flag, so the fingerprint did not see them and a cached answer came back for a
+    materially different request."""
+    import run_subagent as _rs
+    from _cli import build_parser
+    from _executor import request_fingerprint
+    # Credit authorization only affects the CLAUDE backend, so the identity only carries it
+    # there -- the agent has to actually resolve to claude for this to be exercised.
+    _rd = tempfile.mkdtemp(prefix="summon-credr-")
+    with open(os.path.join(_rd, "a.md"), "w", encoding="utf-8") as fh:
+        fh.write("---" + chr(10) + "run-agent: claude" + chr(10) + "---" + chr(10) + "# A" + chr(10))
+    parser = build_parser("test", 1)
+    argv = ["--agent", "a", "--prompt", "p", "--cwd", os.getcwd(), "--agents-dir", _rd]
+
+    def fp():
+        return request_fingerprint(**_rs._request_identity(parser.parse_args(argv)))
+
+    saved = {k: os.environ.get(k) for k in
+             ("SUMMON_ALLOW_CREDIT", "SUMMON_ALLOW_FABLE", "SUMMON_DEFAULT_EFFORT")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+        base = fp()
+        for k in ("SUMMON_ALLOW_CREDIT", "SUMMON_ALLOW_FABLE"):
+            os.environ[k] = "1"
+            assert fp() != base, k
+            del os.environ[k]
+        os.environ["SUMMON_DEFAULT_EFFORT"] = "low"
+        low = fp()
+        assert low != base
+        os.environ["SUMMON_DEFAULT_EFFORT"] = "max"
+        assert fp() != low, "a different default effort is a different request"
+        del os.environ["SUMMON_DEFAULT_EFFORT"]
+        assert fp() == base, "clearing the env must restore the original identity"
+        # an EXPLICIT --effort makes the default irrelevant, so it must not invalidate
+        os.environ["SUMMON_DEFAULT_EFFORT"] = "low"
+        exp_low = request_fingerprint(**_rs._request_identity(
+            parser.parse_args([*argv, "--effort", "high"])))
+        os.environ["SUMMON_DEFAULT_EFFORT"] = "max"
+        exp_max = request_fingerprint(**_rs._request_identity(
+            parser.parse_args([*argv, "--effort", "high"])))
+        assert exp_low == exp_max, "a default cannot change a request that pins --effort"
+        del os.environ["SUMMON_DEFAULT_EFFORT"]
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        import shutil as _sh
+        _sh.rmtree(_rd, ignore_errors=True)
+
+
+def test_v7_set_agent_accepts_a_bom_like_the_loader_does():
+    # A BOM'd agent file LOADS and dispatches fine, but `agent set` rejected the very same
+    # file as "not ---delimited" -- an inconsistency the user could not act on.
+    import _roster
+    from _loader import load_agent
+    d = tempfile.mkdtemp(prefix="summon-setbom-")
+    try:
+        path = os.path.join(d, "a.md")
+        with open(path, "wb") as fh:
+            fh.write(b"\xef\xbb\xbf" + ("---\nrun-agent: claude\npermission: read-only\n"
+                                         "---\n# Body\n").encode("utf-8"))
+        assert load_agent(d, "a")[4] == "read-only", "precondition: the loader accepts it"
+        res = _roster.set_agent(d, "a", {"model": "claude-sonnet-5"})
+        assert res["frontmatter"]["model"] == "claude-sonnet-5", res
+        raw = open(path, "rb").read()
+        assert not raw.startswith(b"\xef\xbb\xbf"), "the BOM should not be re-emitted"
+        run_agent, _, _, _, perm, model, _, _ = load_agent(d, "a")
+        assert (run_agent, perm, model) == ("claude", "read-only", "claude-sonnet-5")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_bare_worktree_result_is_not_reused_by_a_plain_run():
+    """The bare-worktree refusal was one-directional: a bare run STORED an envelope whose
+    fingerprint omitted the worktree, so a later PLAIN-cwd run matched it and reused an
+    answer produced in a throwaway tree. The identity now carries an "<auto>" marker (so the
+    two hash differently) AND the skip still refuses the bare form (so two bare runs do not
+    reuse each other) -- closed from both directions."""
+    import run_subagent as _rs
+    from _cli import build_parser
+    from _executor import request_fingerprint
+    parser = build_parser("t", 1)
+    base = ["--agent", "a", "--prompt", "p", "--cwd", os.getcwd()]
+
+    def fp(extra):
+        return request_fingerprint(**_rs._request_identity(parser.parse_args([*base, *extra])))
+
+    plain, bare, named = fp([]), fp(["--worktree"]), fp(["--worktree", "fixed"])
+    assert bare != plain, "a bare-worktree result must not be reusable by a plain run"
+    assert named != plain and named != bare
+    assert fp(["--worktree", "fixed"]) == named, "a NAMED worktree is a stable location"
+
+
+def test_v7_project_memory_is_part_of_the_request():
+    """.agents/memory.md is injected into the agent's system context, so editing it changes
+    the instructions an answer was produced under -- while agent, prompt and every flag stay
+    identical. The fingerprint could not see it, so the old answer came back."""
+    import run_subagent as _rs
+    from _cli import build_parser
+    from _executor import request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-mem-")
+    try:
+        parser = build_parser("t", 1)
+        argv = ["--agent", "a", "--prompt", "p", "--cwd", d]
+
+        def fp():
+            return request_fingerprint(**_rs._request_identity(parser.parse_args(argv)))
+
+        none_yet = fp()
+        os.makedirs(os.path.join(d, ".agents"))
+        mem = os.path.join(d, ".agents", "memory.md")
+        with open(mem, "w", encoding="utf-8") as fh:
+            fh.write("tenant=alpha")
+        alpha = fp()
+        assert alpha != none_yet, "adding project memory changes the request"
+        with open(mem, "w", encoding="utf-8") as fh:
+            fh.write("tenant=beta")
+        assert fp() != alpha, "editing project memory changes the request"
+        os.remove(mem)
+        assert fp() == none_yet, "removing it restores the original identity"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_malformed_definition_is_never_skipped_over():
+    """A definition that is MISSING or MALFORMED must not be skipped over: it is part of the
+    request, so without it there is nothing to match against, and the dispatch is the only
+    thing that can report the breakage. This holds for pre-fingerprint envelopes too --
+    having one answer for old envelopes and another for new ones was a contradiction whose
+    lenient half handed back results nobody could attribute."""
+    from _executor import agent_def_state, envelope_answers_request
+    d = tempfile.mkdtemp(prefix="summon-mal-")
+    try:
+        ok_path = os.path.join(d, "good.md")
+        with open(ok_path, "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\n---\n# Good\n")
+        sha, state = agent_def_state(d, os.getcwd(), "good")
+        assert state == "ok" and sha, (state, sha)
+        assert agent_def_state(d, os.getcwd(), "absent-zzz") == (None, "missing")
+        bad = os.path.join(d, "bad.md")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: a\npermission: b\n---\nx\n")
+        assert agent_def_state(d, os.getcwd(), "bad") == (None, "malformed")
+
+        # NEITHER a missing nor a malformed definition is reusable, and that holds for a
+        # LEGACY envelope (no fingerprint) too. Having one answer for old envelopes and
+        # another for new ones was a contradiction, and the lenient half handed back results
+        # nobody could attribute to a definition.
+        legacy = {"status": "success", "result": "old"}
+        for state in ("missing", "malformed"):
+            assert not envelope_answers_request(legacy, "fp", identity={
+                "agent": "a", "_agent_def_state": state})[0], state
+        # a definition that IS there and loads stays reusable
+        assert envelope_answers_request(legacy, "fp", identity={
+            "agent": "good", "_agent_def_state": "ok"})[0]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_identity_state_field_is_not_part_of_the_hash():
+    # _agent_def_state describes LOCAL state, not what was asked, so it must not change the
+    # fingerprint -- otherwise a roster that is briefly unreadable would invalidate results.
+    from _executor import request_fingerprint
+    base = {"agent": "a", "prompt": "p", "cwd": "/x"}
+    assert request_fingerprint(**base, _agent_def_state="ok") == \
+        request_fingerprint(**base, _agent_def_state="malformed") == \
+        request_fingerprint(**base)
+
+
+def test_v7_content_sha_refuses_an_unstable_file():
+    """A file rewritten under us can yield a HYBRID digest matching neither version, so the
+    hash is only reported when the handle's size and mtime are unchanged across the read."""
+    import time as _t
+    from _executor import content_sha
+    d = tempfile.mkdtemp(prefix="summon-unstable-")
+    try:
+        f = os.path.join(d, "s.json")
+        with open(f, "wb") as fh:
+            fh.write(b"a" * 1024)
+        stable = content_sha(f)
+        assert stable
+        # rewrite with DIFFERENT content and a bumped mtime: the digest must change, never
+        # silently persist the old identity
+        _t.sleep(0.01)
+        with open(f, "wb") as fh:
+            fh.write(b"b" * 2048)
+        assert content_sha(f) not in (None, stable) or content_sha(f) is None
+        # a file whose size changes between the two fstats reports NO identity
+        import _executor as _ex
+        real_read = os.read
+        state = {"n": 0}
+
+        def grow(fd, n):
+            state["n"] += 1
+            if state["n"] == 1:
+                with open(f, "ab") as fh:
+                    fh.write(b"c" * 4096)
+            return real_read(fd, n)
+
+        os.read = grow
+        try:
+            assert _ex.content_sha(f) is None, "a file that changed mid-read has no identity"
+        finally:
+            os.read = real_read
+
+        # a SAME-SIZE rewrite (mtime moves, size does not) must also be refused -- a
+        # size-only stability check would let this through with a hybrid digest
+        state["n"] = 0
+        size = os.path.getsize(f)
+
+        def rewrite_same_size(fd, n):
+            state["n"] += 1
+            if state["n"] == 1:
+                _t.sleep(0.01)
+                with open(f, "r+b") as fh:
+                    fh.write(b"Z" * size)
+            return real_read(fd, n)
+
+        os.read = rewrite_same_size
+        try:
+            assert _ex.content_sha(f) is None, "a same-size rewrite must be refused too"
+        finally:
+            os.read = real_read
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_credit_authorization_uses_the_dispatch_predicate():
+    """The identity collapsed ANY non-empty env value to authorized, while dispatch
+    authorizes only the literal "1" -- so SUMMON_ALLOW_CREDIT=0 and =1 hashed the same while
+    selecting different effective models for a credit-only request."""
+    import run_subagent as _rs
+    from _builder import credit_spend_allowed
+    from _cli import build_parser
+    from _executor import request_fingerprint
+    # Credit authorization only affects the CLAUDE backend, so the identity only carries it
+    # there -- the agent has to actually resolve to claude for this to be exercised.
+    _rd = tempfile.mkdtemp(prefix="summon-credr-")
+    with open(os.path.join(_rd, "a.md"), "w", encoding="utf-8") as fh:
+        fh.write("---" + chr(10) + "run-agent: claude" + chr(10) + "---" + chr(10) + "# A" + chr(10))
+    parser = build_parser("test", 1)
+    argv = ["--agent", "a", "--prompt", "p", "--cwd", os.getcwd(), "--agents-dir", _rd]
+
+    def fp():
+        return request_fingerprint(**_rs._request_identity(parser.parse_args(argv)))
+
+    keys = ("SUMMON_ALLOW_CREDIT", "SUMMON_ALLOW_FABLE")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        base = fp()
+        for k in keys:
+            os.environ[k] = "0"
+            assert not credit_spend_allowed(), k
+            assert fp() == base, f"{k}=0 is NOT authorization and must not change identity"
+            os.environ[k] = "1"
+            assert credit_spend_allowed(), k
+            assert fp() != base, f"{k}=1 authorizes credit and IS a different request"
+            del os.environ[k]
+        # the flag still counts on its own
+        assert request_fingerprint(**_rs._request_identity(
+            parser.parse_args([*argv, "--allow-credit"]))) != base
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+        import shutil as _sh
+        _sh.rmtree(_rd, ignore_errors=True)
+
+
+def test_v7_resolved_backend_is_part_of_the_request():
+    """With no --cli and no `run-agent:`, resolve_cli falls through to CALLER DETECTION, so
+    the same command under CLAUDE_CODE=1 and under CODEX_CLI=1 dispatches to two different
+    vendors -- and hashed identically, so the second could reuse the first's answer."""
+    import run_subagent as _rs
+    from _cli import build_parser
+    from _executor import request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-rcli-")
+    keys = ("CLAUDE_CODE", "CURSOR_AGENT", "CODEX_CLI", "GEMINI_CLI")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        # an agent with NO run-agent: pin, so the caller decides
+        with open(os.path.join(d, "free.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nmodel: some-model\n---\n# Free\n")
+        parser = build_parser("test", 1)
+        argv = ["--agent", "free", "--prompt", "p", "--cwd", os.getcwd(), "--agents-dir", d]
+
+        def fp():
+            return request_fingerprint(**_rs._request_identity(parser.parse_args(argv)))
+
+        # Clear EVERY vendor-prefixed variable, not just the caller-detection ones. With any
+        # left set, `backend_env_sha256` differs between backends on its own and this test
+        # passes without `resolved_cli` being in the identity at all -- which is exactly how
+        # a mutation sweep found its wiring unguarded.
+        from _executor import _BACKEND_ENV_PREFIXES
+        all_prefixes = tuple(sorted({p for ps in _BACKEND_ENV_PREFIXES.values() for p in ps}))
+        vendor_saved = {k: v for k, v in os.environ.items() if k.startswith(all_prefixes)}
+        for k in list(vendor_saved):
+            os.environ.pop(k, None)
+        for k in keys:
+            os.environ.pop(k, None)
+        try:
+            from _executor import backend_env_sha, build_request_identity
+            assert backend_env_sha("claude") is None and backend_env_sha("codex") is None, \
+                "precondition: no vendor environment is set, so only resolved_cli can differ"
+            default = fp()
+            os.environ["CLAUDE_CODE"] = "1"
+            as_claude = fp()
+            assert build_request_identity(agent="free", prompt="p", cwd=os.getcwd(),
+                                          agents_dir=d)["resolved_cli"] == "claude"
+            del os.environ["CLAUDE_CODE"]
+            os.environ["CODEX_CLI"] = "1"
+            as_codex = fp()
+            del os.environ["CODEX_CLI"]
+            assert as_claude != as_codex, "two backends must not share one request identity"
+            assert as_claude != default or as_codex != default
+        finally:
+            os.environ.update(vendor_saved)
+
+        # an agent that PINS run-agent: is unaffected by caller detection
+        with open(os.path.join(d, "pinned.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\n---\n# Pinned\n")
+        argv[1] = "pinned"
+        os.environ["CODEX_CLI"] = "1"
+        pinned_a = fp()
+        del os.environ["CODEX_CLI"]
+        assert fp() == pinned_a, "a pinned run-agent ignores caller detection"
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_provider_registry_is_part_of_the_request():
+    """An openai-compat agent names a `provider:` whose base_url lives in providers.json
+    OUTSIDE the agent file, so retargeting a provider sends the work somewhere else while
+    agent, prompt and the definition's own bytes all stay identical."""
+    import json as _json
+
+    import run_subagent as _rs
+    from _cli import build_parser
+    from _executor import request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-prov-")
+    try:
+        with open(os.path.join(d, "t.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: openai-compat\nprovider: tenant\n---\n# T\n")
+        reg = os.path.join(d, "providers.json")
+        parser = build_parser("test", 1)
+        argv = ["--agent", "t", "--prompt", "p", "--cwd", os.getcwd(), "--agents-dir", d]
+
+        def fp():
+            return request_fingerprint(**_rs._request_identity(parser.parse_args(argv)))
+
+        with open(reg, "w", encoding="utf-8") as fh:
+            _json.dump({"tenant": {"base_url": "https://a.example/v1"}}, fh)
+        a = fp()
+        with open(reg, "w", encoding="utf-8") as fh:
+            _json.dump({"tenant": {"base_url": "https://b.example/v1"}}, fh)
+        assert fp() != a, "retargeting a provider is a different request"
+        os.remove(reg)
+        assert fp() != a
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_invalid_agent_name_is_malformed_not_missing():
+    """An escaping name was classified "missing", which lets a legacy envelope be reused and
+    never surfaces the loader's own "Invalid agent name" -- the name has to reach dispatch."""
+    from _executor import agent_def_state, envelope_answers_request
+    d = tempfile.mkdtemp(prefix="summon-name-")
+    try:
+        for bad in ("../escape", "..", "a/b", chr(92) + "x"):
+            sha, state = agent_def_state(d, os.getcwd(), bad)
+            assert (sha, state) == (None, "malformed"), (bad, sha, state)
+            legacy = {"status": "success", "result": "old"}
+            assert not envelope_answers_request(legacy, "fp", identity={
+                "agent": bad, "_agent_def_state": state})[0], bad
+        # an ordinary absent name is still just missing
+        assert agent_def_state(d, os.getcwd(), "absent-zzz") == (None, "missing")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_manifest_backend_matches_the_dispatched_one():
+    """The scheduler picked the semaphore with `run_agent or "codex"`, but an UNPINNED agent
+    resolves its backend by CALLER DETECTION. Under CLAUDE_CODE=1 every such job dispatched
+    to claude while being counted as codex -- claude's concurrency cap was bypassed entirely
+    and the per-backend telemetry named the wrong vendor."""
+    from _manifest import _job_backend
+    from _resolver import resolve_cli
+    d = tempfile.mkdtemp(prefix="summon-jb-")
+    keys = ("CLAUDE_CODE", "CURSOR_AGENT", "CODEX_CLI", "GEMINI_CLI")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        with open(os.path.join(d, "free.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nmodel: m\n---\n# Unpinned\n")
+        with open(os.path.join(d, "pinned.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\n---\n# Pinned\n")
+        for k in keys:
+            os.environ.pop(k, None)
+        os.environ["CLAUDE_CODE"] = "1"
+        # the scheduler must agree with what dispatch will actually resolve
+        assert _job_backend({"agent": "free"}, d) == resolve_cli(None) == "claude"
+        del os.environ["CLAUDE_CODE"]
+        os.environ["CODEX_CLI"] = "1"
+        assert _job_backend({"agent": "free"}, d) == resolve_cli(None) == "codex"
+        del os.environ["CODEX_CLI"]
+        # an explicit cli and a pinned run-agent are unaffected
+        assert _job_backend({"agent": "free", "cli": "cursor-agent"}, d) == "cursor-agent"
+        os.environ["CODEX_CLI"] = "1"
+        assert _job_backend({"agent": "pinned"}, d) == "claude"
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_unhashable_input_fails_closed_for_reuse():
+    """A hash FAILURE was reported as plain None, so request_fingerprint dropped the field
+    and two DIFFERENT unhashable schemas produced the same fingerprint -- one could be served
+    as the answer to the other. An input that exists but cannot be identified must fail
+    closed."""
+    from _executor import content_state, envelope_answers_request
+    d = tempfile.mkdtemp(prefix="summon-unhash-")
+    try:
+        f = os.path.join(d, "s.json")
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        assert content_state(f)[1] == "ok" and content_state(f)[0]
+        assert content_state(os.path.join(d, "absent")) == (None, "absent")
+        assert content_state(None) == (None, "absent")
+        # a directory EXISTS but cannot be hashed -> unreadable, not absent
+        assert content_state(d) == (None, "unreadable")
+        # and an identity carrying an unreadable input is never reusable
+        prior = {"status": "success", "request_sha256": "abc"}
+        assert envelope_answers_request(prior, "abc", identity={"agent": "a"})[0]
+        assert not envelope_answers_request(
+            prior, "abc", identity={"agent": "a", "_unreadable": "json_schema"})[0]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_manifest_rejects_non_string_fields():
+    """A list-valued `cwd` reached os.path.abspath() during identity construction, OUTSIDE
+    the per-job error handling, and took down the whole manifest with a TypeError instead of
+    producing one job's error envelope."""
+    from _manifest import _normalize_jobs
+    for field, value in (("cwd", ["not", "a", "path"]), ("cli", {"a": 1}),
+                         ("model", ["x"]), ("effort", ["high"]), ("debug_dir", ["d"])):
+        jobs, err = _normalize_jobs([{"agent": "a", "prompt": "p", field: value}], os.getcwd())
+        assert jobs is None and err and field in err and "must be a string" in err, (field, err)
+    # json_schema had its OWN type check already, with its own wording -- still rejected
+    jobs, err = _normalize_jobs(
+        [{"agent": "a", "prompt": "p", "json_schema": {"inline": True}}], os.getcwd())
+    assert jobs is None and err and "json_schema" in err, err
+    # ordinary string (and numeric) values still validate
+    jobs, err = _normalize_jobs(
+        [{"agent": "a", "prompt": "p", "cwd": os.getcwd(), "model": "m", "effort": "high"}],
+        os.getcwd())
+    assert err is None and jobs, err
+
+
+def test_v7_identity_is_deterministic_under_concurrency():
+    """The manifest builds identities from many worker threads at once, and each identity
+    hashes three files. When the hash-worker pool refused to WAIT for a slot, that
+    concurrency saturated it and healthy files degraded to None -- so the SAME request
+    fingerprinted several different ways, which makes resume unreliable in both directions
+    (a stamped fingerprint may be a degraded one, and a later identical run may not match
+    it). A fingerprint that varies by scheduling is not a fingerprint."""
+    import threading as _th
+
+    from _executor import build_request_identity, request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-det-")
+    try:
+        os.makedirs(os.path.join(d, ".agents"))
+        with open(os.path.join(d, ".agents", "memory.md"), "w", encoding="utf-8") as fh:
+            fh.write("project memory")
+        roster = os.path.join(d, "roster")
+        os.makedirs(roster)
+        with open(os.path.join(roster, "rev.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\nmodel: opus\n---\n# Rev\n")
+        schema = os.path.join(d, "schema.json")
+        with open(schema, "w", encoding="utf-8") as fh:
+            fh.write('{"type": "object"}')
+        kw = dict(agent="rev", prompt="p", cwd=d, agents_dir=roster, json_schema=schema)
+
+        seen, errors = [], []
+
+        def worker():
+            try:
+                for _ in range(20):
+                    seen.append(request_fingerprint(**build_request_identity(**kw)))
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e))
+
+        threads = [_th.Thread(target=worker) for _ in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        assert not errors, errors
+        assert len(seen) == 240, len(seen)
+        assert len(set(seen)) == 1, f"one request hashed {len(set(seen))} different ways"
+        # and single-threaded agrees with the concurrent result
+        assert request_fingerprint(**build_request_identity(**kw)) == seen[0]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_unhashable_agent_definition_fails_closed():
+    """agent_def_state reported (None, "ok") when hashing failed, so the definition's hash
+    dropped out of the fingerprint ENTIRELY -- and a definition edited from read-only to yolo
+    then hashed the same as before, leaving the stale answer reusable. The security-relevant
+    field must never fail open.
+
+    The identity now loads the definition through one snapshot (tuple + frontmatter + hash
+    from a single byte buffer), so the failure to simulate is that buffer read failing. A
+    definition that exists but cannot be read must land in `_unreadable` and be non-reusable
+    -- never hash as an absent or "ok" definition."""
+    import _executor as _ex
+    import _loader
+    from _executor import agent_def_state, build_request_identity, request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-failopen-")
+    real_read = os.read
+    real_snap = _loader._load_agent_snapshot_from
+    try:
+        with open(os.path.join(d, "a.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: read-only\n---\n# A\n")
+        # the legacy accessor still fails closed on a hashing failure (os.read path)
+        assert agent_def_state(d, os.getcwd(), "a")[1] == "ok"
+
+        def failing_read(fd, n):
+            raise OSError("simulated read failure")
+
+        os.read = failing_read
+        try:
+            assert agent_def_state(d, os.getcwd(), "a") == (None, "unreadable"), \
+                agent_def_state(d, os.getcwd(), "a")
+        finally:
+            os.read = real_read
+
+        # the IDENTITY reads through the snapshot: make THAT read fail. A definition that
+        # exists but will not load is "malformed" -> agent_def in _unreadable, non-reusable.
+        def failing_snap(ad, an):
+            raise OSError("simulated definition read failure")
+
+        _loader._load_agent_snapshot_from = failing_snap
+        try:
+            ident = build_request_identity(agent="a", prompt="p", cwd=d, agents_dir=d)
+        finally:
+            _loader._load_agent_snapshot_from = real_snap
+        assert ident["_agent_def_state"] != "ok", ident
+        assert ident["_unreadable"] and "agent_def" in ident["_unreadable"], ident
+        # an identity carrying an unreadable definition is never reusable, whatever the hash
+        prior = {"status": "success", "request_sha256": request_fingerprint(**ident)}
+        assert not _ex.envelope_answers_request(
+            prior, request_fingerprint(**ident), identity=ident)[0]
+    finally:
+        os.read = real_read
+        _loader._load_agent_snapshot_from = real_snap
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_superseded_result_is_moved_aside_not_destroyed():
+    """A refusal to reuse is not free: the manifest cleared the stale envelope BEFORE
+    re-dispatching, so any wrong refusal turned a completed answer into an error envelope
+    with nothing to fall back to. A prior SUCCESS is moved aside instead."""
+    import json as _json
+    import subprocess as sp
+    work = tempfile.mkdtemp(prefix="summon-supersede-")
+    results = os.path.join(work, "results")
+    os.makedirs(results)
+    try:
+        out_file = os.path.join(results, "j1.json")
+        with open(out_file, "w", encoding="utf-8") as fh:
+            # a SUCCESS whose fingerprint cannot match the job below -> refused, re-dispatched
+            _json.dump({"status": "success", "result": "PRECIOUS COMPLETED ANSWER",
+                        "request_sha256": "0" * 64}, fh)
+        mf = os.path.join(work, "m.json")
+        with open(mf, "w", encoding="utf-8") as fh:
+            _json.dump({"jobs": [{"id": "j1", "agent": "no-such-agent-xyz",
+                                  "prompt": "p", "cwd": work}]}, fh)
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+        r = sp.run([sys.executable, script, "--manifest", mf, "--cwd", work,
+                    "--results-dir", results], capture_output=True, text=True,
+                   encoding="utf-8")
+        job_status = _json.loads(r.stdout)["jobs"][0]["status"]
+        kept = out_file + ".superseded"
+        assert os.path.isfile(kept), "the refused-but-completed answer was destroyed"
+        with open(kept, encoding="utf-8") as fh:
+            assert _json.load(fh)["result"] == "PRECIOUS COMPLETED ANSWER"
+        # ...and it MOVED: a copy would leave the stale success at the authoritative path,
+        # where the parent re-reads it and reports it as this run's result
+        prior_at_path = _existing = None
+        if os.path.exists(out_file):
+            with open(out_file, encoding="utf-8") as fh:
+                prior_at_path = _json.load(fh)
+        assert prior_at_path is None or prior_at_path.get("result") != "PRECIOUS COMPLETED ANSWER", \
+            "the stale success is still at the authoritative path"
+        # the failed re-dispatch must STAY failed
+        assert job_status != "success", job_status
+    finally:
+        import shutil as _sh
+        _sh.rmtree(work, ignore_errors=True)
+
+
+def test_v7_provider_registry_only_counts_for_openai_compat():
+    """Folding providers.json in unconditionally meant editing an UNUSED registry refused a
+    perfectly good codex result -- and a refusal costs a re-dispatch. It only enters the
+    identity for the backend that actually resolves providers."""
+    import json as _json
+
+    from _executor import build_request_identity
+    d = tempfile.mkdtemp(prefix="summon-provscope-")
+    try:
+        with open(os.path.join(d, "cx.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: codex\n---\n# Codex\n")
+        with open(os.path.join(d, "oc.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: openai-compat\nprovider: tenant\n---\n# Compat\n")
+        reg = os.path.join(d, "providers.json")
+        with open(reg, "w", encoding="utf-8") as fh:
+            _json.dump({"tenant": {"base_url": "https://a.example/v1"}}, fh)
+
+        def ident(agent):
+            return build_request_identity(agent=agent, prompt="p", cwd=d, agents_dir=d)
+
+        cx_before, oc_before = ident("cx"), ident("oc")
+        assert cx_before["providers_sha256"] is None, "a codex agent never resolves providers"
+        assert oc_before["providers_sha256"], "an openai-compat agent does"
+        with open(reg, "w", encoding="utf-8") as fh:
+            _json.dump({"tenant": {"base_url": "https://b.example/v1"}}, fh)
+        assert ident("cx")["providers_sha256"] == cx_before["providers_sha256"]
+        assert ident("oc")["providers_sha256"] != oc_before["providers_sha256"]
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_scheduler_resolves_the_jobs_own_roster():
+    """A job with its own `cwd` resolves its agent from THAT tree's .agents, so resolving
+    every job against the manifest's base roster made the scheduler pick a different backend
+    than the child would -- bypassing that backend's concurrency cap."""
+    from _manifest import _job_agents_dir, _job_backend
+
+    class _A:
+        agents_dir = None
+    base = tempfile.mkdtemp(prefix="summon-base-")
+    other = tempfile.mkdtemp(prefix="summon-other-")
+    # get_agents_dir honours SUB_AGENTS_DIR ahead of {cwd}/.agents, and this box has one set
+    saved_env = os.environ.pop("SUB_AGENTS_DIR", None)
+    try:
+        os.makedirs(os.path.join(base, ".agents"))
+        with open(os.path.join(base, ".agents", "rev.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: codex\n---\n# Base rev\n")
+        os.makedirs(os.path.join(other, ".agents"))
+        with open(os.path.join(other, ".agents", "rev.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\n---\n# Other rev\n")
+        job = {"agent": "rev", "cwd": other}
+        # THE production path: the roster the scheduler resolves for this job must be the
+        # one the child will use, i.e. the job's own cwd -- not the manifest's base_cwd.
+        assert _job_backend(job, _job_agents_dir(job, _A, base)) == "claude"
+        # a job WITHOUT its own cwd still falls back to the manifest's base roster
+        assert _job_backend({"agent": "rev"}, _job_agents_dir({"agent": "rev"}, _A, base)) \
+            == "codex"
+    finally:
+        if saved_env is not None:
+            os.environ["SUB_AGENTS_DIR"] = saved_env
+        import shutil as _sh
+        _sh.rmtree(base, ignore_errors=True)
+        _sh.rmtree(other, ignore_errors=True)
+
+
+def test_v7_manifest_string_fields_are_strings():
+    """The type check accepted int/float while its own error message said "must be a
+    string", and skipped `prompt_file` entirely -- which is USED before validation, so a
+    list-valued one aborted the whole manifest with a TypeError."""
+    from _manifest import _normalize_jobs
+    for field, value in (("cwd", 42), ("cwd", ["not", "a", "path"]), ("cli", {"a": 1}),
+                         ("model", 7), ("effort", ["high"]), ("agent", 1), ("id", ["x"]),
+                         ("debug_dir", 3)):
+        jobs, err = _normalize_jobs([{"agent": "a", "prompt": "p", field: value}], os.getcwd())
+        assert jobs is None and err and field in err and "must be a string" in err, \
+            (field, value, err)
+    # prompt_file replaces prompt, so it is exercised on its own (passing both is a
+    # different, earlier error)
+    jobs, err = _normalize_jobs([{"agent": "a", "prompt_file": ["x"]}], os.getcwd())
+    assert jobs is None and err and "prompt_file" in err and "must be a string" in err, err
+    jobs, err = _normalize_jobs(
+        [{"agent": "a", "prompt": "p", "cwd": os.getcwd(), "model": "m"}], os.getcwd())
+    assert err is None and jobs, err
+
+
+def test_v7_failed_clear_never_dispatches_over_a_stale_success():
+    """Swallowing a failed clear was a FALSE SUCCESS: the stale envelope stayed at the
+    authoritative path, the child failed, and the parent re-read the OLD answer and reported
+    it as this run's result with exit 0. If the path cannot be cleared, the job errors and
+    nothing is dispatched over it."""
+    import json as _json
+
+    from _manifest import _clear_out_file
+    d = tempfile.mkdtemp(prefix="summon-clear-")
+    real_replace, real_remove = os.replace, os.remove
+    try:
+        out = os.path.join(d, "j1.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            _json.dump({"status": "success", "result": "A"}, fh)
+
+        # archiving NEVER overwrites an older archive -- each one is a real answer
+        assert _clear_out_file(out, archive=True) is None
+        assert os.path.isfile(out + ".superseded") and not os.path.exists(out)
+        with open(out, "w", encoding="utf-8") as fh:
+            _json.dump({"status": "success", "result": "B"}, fh)
+        assert _clear_out_file(out, archive=True) is None
+        assert os.path.isfile(out + ".superseded.1"), "the older archive was overwritten"
+        with open(out + ".superseded", encoding="utf-8") as fh:
+            assert _json.load(fh)["result"] == "A"
+
+        # a non-success is removed rather than archived
+        with open(out, "w", encoding="utf-8") as fh:
+            _json.dump({"status": "error"}, fh)
+        assert _clear_out_file(out, archive=False) is None and not os.path.exists(out)
+
+        # nothing there at all is fine
+        assert _clear_out_file(out, archive=True) is None
+
+        # and a clear that FAILS is REPORTED, never swallowed
+        with open(out, "w", encoding="utf-8") as fh:
+            _json.dump({"status": "success", "result": "C"}, fh)
+
+        def boom(*a, **k):
+            raise OSError("simulated")
+
+        os.replace, os.remove = boom, boom
+        try:
+            err = _clear_out_file(out, archive=True)
+            assert err and "cannot clear" in err, err
+            err = _clear_out_file(out, archive=False)
+            assert err and "cannot clear" in err, err
+        finally:
+            os.replace, os.remove = real_replace, real_remove
+        assert os.path.isfile(out), "the file should still be there after a failed clear"
+    finally:
+        os.replace, os.remove = real_replace, real_remove
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_falsey_defaults_block_is_rejected():
+    # `doc.get("defaults") or {}` ERASED the type of a falsey non-object, so [], 0 and ""
+    # sailed past the check meant to catch them.
+    from _manifest import _normalize_jobs
+    job = {"agent": "a", "prompt": "p"}
+    for bad in ([], 0, "", [1, 2], "text", 5):
+        jobs, err = _normalize_jobs({"defaults": bad, "jobs": [job]}, os.getcwd())
+        assert jobs is None and err and "defaults" in err, (bad, err)
+    # absent or null defaults are fine, and a real one still applies
+    for good in ({}, None):
+        jobs, err = _normalize_jobs({"defaults": good, "jobs": [job]}, os.getcwd())
+        assert err is None and jobs, (good, err)
+    jobs, err = _normalize_jobs({"defaults": {"model": "m"}, "jobs": [job]}, os.getcwd())
+    assert err is None and jobs[0]["model"] == "m", (jobs, err)
+
+
+def test_v7_only_the_resolved_endpoint_is_fingerprinted():
+    """Hashing the whole providers.json invalidated an agent with an INLINE base_url (which
+    never consults the registry) and invalidated a `tenant-a` agent when only `tenant-b`
+    changed. A false refusal costs a paid re-dispatch, so what is fingerprinted is the
+    endpoint actually resolved."""
+    import json as _json
+
+    from _executor import build_request_identity
+    d = tempfile.mkdtemp(prefix="summon-endpoint-")
+    try:
+        with open(os.path.join(d, "inline.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: openai-compat\n"
+                     "base_url: http://127.0.0.1:11434/v1\n---\n# Inline\n")
+        with open(os.path.join(d, "ta.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: openai-compat\nprovider: tenant-a\n---\n# A\n")
+        reg = os.path.join(d, "providers.json")
+
+        def write_reg(a, b):
+            with open(reg, "w", encoding="utf-8") as fh:
+                _json.dump({"tenant-a": {"base_url": a}, "tenant-b": {"base_url": b}}, fh)
+
+        def sha(agent):
+            return build_request_identity(agent=agent, prompt="p", cwd=d,
+                                          agents_dir=d)["providers_sha256"]
+
+        write_reg("https://a1.example/v1", "https://b1.example/v1")
+        inline_before, ta_before = sha("inline"), sha("ta")
+        assert inline_before and ta_before
+
+        # editing ONLY tenant-b must not disturb either of them
+        write_reg("https://a1.example/v1", "https://b2.example/v1")
+        assert sha("inline") == inline_before, "an inline base_url ignores the registry"
+        assert sha("ta") == ta_before, "tenant-a is unaffected by a tenant-b edit"
+
+        # editing tenant-a DOES change the tenant-a agent, and still not the inline one
+        write_reg("https://a2.example/v1", "https://b2.example/v1")
+        assert sha("ta") != ta_before
+        assert sha("inline") == inline_before
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_a_slow_but_complete_read_is_not_unreadable():
+    """The deadline guards NON-TERMINATION, not slowness. Tripping on elapsed time alone
+    called a perfectly healthy file on a slow share "unreadable", and an unreadable input is
+    never reused -- so every resume against it paid for another dispatch."""
+    import time as _t
+
+    import _executor as _ex
+    d = tempfile.mkdtemp(prefix="summon-slow-")
+    real_read = os.read
+    saved = _ex._CONTENT_SHA_TIMEOUT_S
+    try:
+        f = os.path.join(d, "memory.md")
+        with open(f, "wb") as fh:
+            fh.write(b"m" * (_ex._CONTENT_SHA_CHUNK + 512))   # two reads
+        expected = _ex.content_sha(f)
+        assert expected
+
+        _ex._CONTENT_SHA_TIMEOUT_S = 0.01        # every read is "late"
+
+        def slow(fd, n):
+            _t.sleep(0.05)
+            return real_read(fd, n)
+
+        os.read = slow
+        try:
+            sha, state = _ex.content_state(f)
+            assert state == "ok" and sha == expected, (state, sha)
+        finally:
+            os.read = real_read
+    finally:
+        os.read = real_read
+        _ex._CONTENT_SHA_TIMEOUT_S = saved
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_archive_names_are_claimed_atomically():
+    """The archive name was chosen with a check-then-act loop, so two writers sharing a
+    --results-dir could pick the SAME free name and the second `os.replace` overwrote the
+    first's archived answer. The name is now CLAIMED with O_CREAT|O_EXCL, which exactly one
+    writer can ever win -- so no archived answer is destroyed even when the check and the
+    move are interleaved."""
+    import json as _json
+    import threading as _th
+
+    from _manifest import _clear_out_file
+    d = tempfile.mkdtemp(prefix="summon-atomic-")
+    try:
+        out = os.path.join(d, "review.json")
+        # Force the interleaving the check-then-act version lost to: every writer sees the
+        # same set of existing names before any of them takes one.
+        gate = _th.Barrier(6)
+        real_open = os.open
+        seen = []
+
+        def gated_open(path, flags, *a, **k):
+            if str(path).endswith(".superseded") and (flags & os.O_EXCL):
+                try:
+                    gate.wait(timeout=5)     # everyone arrives before anyone claims
+                except Exception:            # noqa: BLE001 — barrier broken is fine
+                    pass
+            return real_open(path, flags, *a, **k)
+
+        errors = []
+
+        def writer(n):
+            try:
+                with open(out, "w", encoding="utf-8") as fh:
+                    _json.dump({"status": "success", "result": f"answer-{n}"}, fh)
+                seen.append(_clear_out_file(out, archive=True))
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e))
+
+        os.open = gated_open
+        try:
+            threads = [_th.Thread(target=writer, args=(i,)) for i in range(6)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+        finally:
+            os.open = real_open
+        assert not errors, errors
+        # Losing the race is SUCCESS: the goal is an empty authoritative path, and a
+        # concurrent archiver having cleared it first satisfies that.
+        assert all(e is None for e in seen), seen
+        assert not os.path.exists(out), "the authoritative path was left occupied"
+
+        # Every archive holds a REAL envelope, there is one per writer that had content, and
+        # they are DISTINCT. Asserting only "at least one non-empty archive" was too weak:
+        # an implementation that overwrote every archive with a single final envelope
+        # satisfied it while destroying the others.
+        archives = [f for f in os.listdir(d) if ".superseded" in f]
+        assert archives, "nothing was archived at all"
+        kept = []
+        for a in archives:
+            with open(os.path.join(d, a), encoding="utf-8") as fh:
+                body = fh.read()
+            assert body.strip(), f"{a} is empty: a claimed name lost its content"
+            kept.append(_json.loads(body)["result"])
+        assert all(k.startswith("answer-") for k in kept), kept
+        assert len(set(kept)) == len(kept), f"archives share content, so one was clobbered: {kept}"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_unresolved_endpoint_fails_closed():
+    """An openai-compat agent naming a provider that no longer exists has NO endpoint
+    identity. Swallowing that into a bare None dropped the field from the fingerprint and let
+    a legacy envelope be reused -- returning an answer from the OLD endpoint instead of
+    letting the dispatch report the unknown provider."""
+    import json as _json
+
+    from _executor import build_request_identity, envelope_answers_request
+    d = tempfile.mkdtemp(prefix="summon-endpt-")
+    try:
+        with open(os.path.join(d, "gone.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: openai-compat\nprovider: removed-tenant\n---\n# Gone\n")
+        with open(os.path.join(d, "ok.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: openai-compat\n"
+                     "base_url: http://127.0.0.1:9/v1\n---\n# Ok\n")
+        # no registry at all -> `removed-tenant` cannot resolve
+        bad = build_request_identity(agent="gone", prompt="p", cwd=d, agents_dir=d)
+        assert bad["providers_sha256"] is None, bad
+        assert bad["_unreadable"] and "endpoint" in bad["_unreadable"], bad
+        legacy = {"status": "success", "result": "answer from the old endpoint"}
+        assert not envelope_answers_request(legacy, "fp", identity=bad)[0], \
+            "a legacy envelope was reused for an agent whose endpoint no longer resolves"
+
+        # a resolvable one is unaffected
+        good = build_request_identity(agent="ok", prompt="p", cwd=d, agents_dir=d)
+        assert good["providers_sha256"] and not good["_unreadable"], good
+        assert envelope_answers_request(legacy, "fp", identity=good)[0]
+
+        # and once the provider is defined again, it resolves and is reusable
+        with open(os.path.join(d, "providers.json"), "w", encoding="utf-8") as fh:
+            _json.dump({"removed-tenant": {"base_url": "https://t.example/v1"}}, fh)
+        fixed = build_request_identity(agent="gone", prompt="p", cwd=d, agents_dir=d)
+        assert fixed["providers_sha256"] and not fixed["_unreadable"], fixed
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_codex_config_default_model_is_part_of_the_request():
+    """An UNPINNED codex agent's model comes from ~/.codex/config.toml, so editing that file
+    changes WHICH MODEL answers while the identity's `model` stays None -- the old model's
+    answer was served as current. It is only consulted when nothing else pins the model."""
+    import _executor as _ex
+    from _executor import build_request_identity, request_fingerprint
+    real = _ex._codex_default_model_hook if hasattr(_ex, "_codex_default_model_hook") else None
+    d = tempfile.mkdtemp(prefix="summon-cfg-")
+    try:
+        with open(os.path.join(d, "cx.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: codex\n---\n# Codex\n")          # NO model: pin
+        with open(os.path.join(d, "cxpin.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: codex\nmodel: pinned-model\n---\n# Pinned\n")
+        with open(os.path.join(d, "cl.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\n---\n# Claude\n")
+
+        import _resolver
+        saved = _resolver._codex_default_model
+        try:
+            _resolver._codex_default_model = lambda: "gpt-old"
+            unpinned_old = build_request_identity(agent="cx", prompt="p", cwd=d, agents_dir=d)
+            pinned_old = build_request_identity(agent="cxpin", prompt="p", cwd=d, agents_dir=d)
+            claude_old = build_request_identity(agent="cl", prompt="p", cwd=d, agents_dir=d)
+            _resolver._codex_default_model = lambda: "gpt-new"
+            unpinned_new = build_request_identity(agent="cx", prompt="p", cwd=d, agents_dir=d)
+            pinned_new = build_request_identity(agent="cxpin", prompt="p", cwd=d, agents_dir=d)
+            claude_new = build_request_identity(agent="cl", prompt="p", cwd=d, agents_dir=d)
+        finally:
+            _resolver._codex_default_model = saved
+
+        assert unpinned_old["codex_default_model"] == "gpt-old", unpinned_old
+        assert request_fingerprint(**unpinned_old) != request_fingerprint(**unpinned_new), \
+            "changing the codex default model must invalidate an unpinned agent's answer"
+        # a PINNED model is decided by the definition, so the config cannot change it
+        assert pinned_old["codex_default_model"] is None
+        assert request_fingerprint(**pinned_old) == request_fingerprint(**pinned_new)
+        # and a non-codex backend never consults it at all
+        assert claude_old["codex_default_model"] is None
+        assert request_fingerprint(**claude_old) == request_fingerprint(**claude_new)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_reserved_archive_name_never_survives_empty():
+    """The archive name is reserved before the content is moved into it. If the close, the
+    move, or the cleanup fails, the reservation must not survive as an EMPTY archive that
+    looks like a stored answer."""
+    import json as _json
+
+    from _manifest import _clear_out_file
+    d = tempfile.mkdtemp(prefix="summon-reserve-")
+    real_close, real_replace, real_remove = os.close, os.replace, os.remove
+    try:
+        out = os.path.join(d, "j.json")
+
+        def archives():
+            return [f for f in os.listdir(d) if ".superseded" in f]
+
+        # 1. a close() failure is REPORTED. (The reservation may briefly survive it on
+        # Windows, where a file with an open handle cannot be removed -- and a close that
+        # raised is exactly the case where the handle may still be open. Reporting is what
+        # matters: the caller turns it into a job error and dispatches nothing.)
+        with open(out, "w", encoding="utf-8") as fh:
+            _json.dump({"status": "success", "result": "A"}, fh)
+        os.close = lambda fd: (_ for _ in ()).throw(OSError("close failed"))
+        try:
+            err = _clear_out_file(out, archive=True)
+        finally:
+            os.close = real_close
+        assert err and "cannot clear" in err, err
+        # The reservation is cleaned up, or -- when the OS will not let us, which is exactly
+        # the case a raising close() creates on Windows -- that is REPORTED. Either way the
+        # reservation is ACCOUNTED FOR. Asserting only `err` was not enough: the earlier
+        # clear failure supplies that on its own, so dropping the cleanup reporting entirely
+        # left the test green with an empty archive sitting there.
+        leftover = archives()
+        if leftover:
+            assert "reserved archive" in err, (
+                f"an empty reservation {leftover} survived and nothing reported it: {err}")
+        else:
+            assert "reserved archive" not in err, err
+        for f in archives():                    # clear the artifact before the next case
+            try:
+                os.remove(os.path.join(d, f))
+            except OSError:
+                pass
+
+        # 2. a replace() failure must also clean up. Compared as a DELTA: case 1 leaks an
+        # fd by design (its close raised), and Windows will not delete a file whose handle
+        # is still open, so an artifact from that case can linger here.
+        before = set(archives())
+        os.replace = lambda a, b: (_ for _ in ()).throw(OSError("replace failed"))
+        try:
+            err = _clear_out_file(out, archive=True)
+        finally:
+            os.replace = real_replace
+        assert err, "a failed move must be reported"
+        new_archives = set(archives()) - before
+        assert not new_archives, f"a reservation survived a move failure: {new_archives}"
+
+        # 3. a cleanup failure is REPORTED rather than silently leaving the empty file
+        os.replace = lambda a, b: (_ for _ in ()).throw(OSError("replace failed"))
+        os.remove = lambda p: (_ for _ in ()).throw(OSError("remove failed"))
+        try:
+            err = _clear_out_file(out, archive=True)
+        finally:
+            os.replace, os.remove = real_replace, real_remove
+        assert err, "a failed cleanup must surface somewhere"
+
+        # and the happy path still archives real content
+        before = set(archives())
+        assert _clear_out_file(out, archive=True) is None
+        kept = sorted(set(archives()) - before)
+        assert len(kept) == 1, kept
+        with open(os.path.join(d, kept[0]), encoding="utf-8") as fh:
+            assert _json.load(fh)["result"] == "A"
+    finally:
+        os.close, os.replace, os.remove = real_close, real_replace, real_remove
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_malformed_provider_entry_is_a_clean_error():
+    # `{"tenant": {"base_url": 42}}` reached .rstrip() and raised AttributeError, which only
+    # the last-resort crash envelope caught.
+    import json as _json
+
+    from _apibackend import resolve_endpoint
+    d = tempfile.mkdtemp(prefix="summon-badprov-")
+    try:
+        for entry, needle in (({"base_url": 42}, "base_url must be a string"),
+                              ({"base_url": "https://x/v1", "api_key_env": []},
+                               "api_key_env must be a string"),
+                              # a non-object entry is dropped by load_providers, so the
+                              # clean error is "unknown provider" -- still a ValueError,
+                              # never an AttributeError from .rstrip()
+                              ("not-an-object", "provider")):
+            with open(os.path.join(d, "providers.json"), "w", encoding="utf-8") as fh:
+                _json.dump({"tenant": entry}, fh)
+            try:
+                resolve_endpoint({"provider": "tenant"}, d)
+                raise AssertionError(f"accepted a malformed entry: {entry}")
+            except ValueError as e:
+                assert needle in str(e), (entry, str(e))
+            except AttributeError as e:
+                raise AssertionError(f"AttributeError escaped for {entry}: {e}")
+        # an inline non-string base_url is caught too
+        try:
+            resolve_endpoint({"base_url": 42}, d)
+            raise AssertionError("accepted a numeric inline base_url")
+        except ValueError as e:
+            assert "base_url must be a string" in str(e), str(e)
+        # a well-formed entry still resolves
+        with open(os.path.join(d, "providers.json"), "w", encoding="utf-8") as fh:
+            _json.dump({"tenant": {"base_url": "https://t.example/v1/",
+                                   "api_key_env": "T_KEY"}}, fh)
+        assert resolve_endpoint({"provider": "tenant"}, d) == \
+            ("https://t.example/v1", "T_KEY")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_credential_is_part_of_the_request():
+    """Recording only the NAME of the API-key variable meant two runs differing solely by
+    which token was in TENANT_TOKEN fingerprinted identically -- so one tenant's answer could
+    be served to the other without their endpoint ever being called. What is stored is a
+    one-way digest over a domain separator, the variable name and the value: not the value,
+    not reversible, and never leaving the machine."""
+    import json as _json
+
+    from _executor import build_request_identity
+    d = tempfile.mkdtemp(prefix="summon-cred-")
+    saved = os.environ.get("TENANT_TOKEN")
+    try:
+        with open(os.path.join(d, "t.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: openai-compat\nprovider: tenant\n---\n# T\n")
+        with open(os.path.join(d, "providers.json"), "w", encoding="utf-8") as fh:
+            _json.dump({"tenant": {"base_url": "https://t.example/v1",
+                                   "api_key_env": "TENANT_TOKEN"}}, fh)
+
+        def sha():
+            return build_request_identity(agent="t", prompt="p", cwd=d,
+                                          agents_dir=d)["providers_sha256"]
+
+        os.environ["TENANT_TOKEN"] = "token-A"
+        a = sha()
+        os.environ["TENANT_TOKEN"] = "token-B"
+        b = sha()
+        assert a and b and a != b, "two different credentials must not share an identity"
+        os.environ["TENANT_TOKEN"] = "token-A"
+        assert sha() == a, "the same credential must hash the same"
+        # the digest must not BE the token, nor contain it
+        assert "token-A" not in a and len(a) == 64, a
+        os.environ.pop("TENANT_TOKEN")
+        assert sha() not in (a, b), "an unset credential is its own state"
+    finally:
+        os.environ.pop("TENANT_TOKEN", None)
+        if saved is not None:
+            os.environ["TENANT_TOKEN"] = saved
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_codex_model_pinned_through_args_is_a_pin():
+    """`args: -m gpt-x` pins codex's model just as surely as `model:` does, so the config
+    file's default is not what runs -- and folding it in anyway invalidated stored answers
+    whenever config.toml changed, for a model the agent never uses."""
+    from _executor import _args_pin_model, build_request_identity, request_fingerprint
+    for pinned in (["-m", "gpt-x"], ["--model", "gpt-x"], ["--model=gpt-x"], ["-m=gpt-x"],
+                   ["-c", "model=gpt-x"], ["--config", "model=gpt-x"],
+                   ["-c=model=gpt-x"], ["--config=model=gpt-x"]):
+        assert _args_pin_model(pinned), pinned
+    # A BARE `model=...` is not a pin on its own -- only after a config option. Treating any
+    # standalone `model=` token as one meant `--add-dir model=not-a-pin` suppressed the
+    # config default and let the previous model's answer be reused.
+    for unpinned in ([], ["--foo"], ["-c", "other=1"], ["-m"], ["--modelish", "x"],
+                     ["model=not-a-pin"], ["--add-dir", "model=not-a-pin"],
+                     ["-c", "othermodel=x"], ["--config=other=1"]):
+        assert not _args_pin_model(unpinned), unpinned
+
+    import _resolver
+    d = tempfile.mkdtemp(prefix="summon-argpin-")
+    saved = _resolver._codex_default_model
+    try:
+        with open(os.path.join(d, "byargs.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: codex\nargs: -m pinned-by-args\n---\n# Args\n")
+        with open(os.path.join(d, "free.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: codex\n---\n# Free\n")
+
+        def fp(agent):
+            return request_fingerprint(**build_request_identity(
+                agent=agent, prompt="p", cwd=d, agents_dir=d))
+
+        _resolver._codex_default_model = lambda: "gpt-old"
+        args_old, free_old = fp("byargs"), fp("free")
+        _resolver._codex_default_model = lambda: "gpt-new"
+        assert fp("byargs") == args_old, "an args-pinned model ignores the config default"
+        assert fp("free") != free_old, "an unpinned agent still tracks it"
+    finally:
+        _resolver._codex_default_model = saved
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_dispatch_uses_the_endpoint_that_was_fingerprinted():
+    """The identity and the dispatch resolved the endpoint separately, so a providers.json
+    edit between the two reads sent the request to B while stamping it as A. The identity
+    now carries the snapshot it resolved and the dispatch uses that exact pair."""
+    import json as _json
+
+    from _executor import build_request_identity
+    d = tempfile.mkdtemp(prefix="summon-snap-")
+    try:
+        with open(os.path.join(d, "t.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: openai-compat\nprovider: tenant\n---\n# T\n")
+        reg = os.path.join(d, "providers.json")
+        with open(reg, "w", encoding="utf-8") as fh:
+            _json.dump({"tenant": {"base_url": "https://a.example/v1"}}, fh)
+        ident = build_request_identity(agent="t", prompt="p", cwd=d, agents_dir=d)
+        assert ident["_endpoint"] == ("https://a.example/v1", ""), ident["_endpoint"]
+
+        # the snapshot is what dispatch will use, even after the registry moves underneath
+        with open(reg, "w", encoding="utf-8") as fh:
+            _json.dump({"tenant": {"base_url": "https://b.example/v1"}}, fh)
+        assert ident["_endpoint"][0] == "https://a.example/v1", \
+            "the snapshot must not change under the caller"
+        # ...and a fresh identity sees the new one, so the NEXT run is a different request
+        again = build_request_identity(agent="t", prompt="p", cwd=d, agents_dir=d)
+        assert again["_endpoint"][0] == "https://b.example/v1"
+        assert again["providers_sha256"] != ident["providers_sha256"]
+
+        # the snapshot is a LOCAL field: it must not itself change the fingerprint
+        from _executor import request_fingerprint
+        stripped = dict(again)
+        stripped.pop("_endpoint")
+        assert request_fingerprint(**again) == request_fingerprint(**stripped)
+
+        # ...and the DISPATCH really consumes it. Asserting only that the identity tuple is
+        # stable left the exact regression green (reverting to resolving a second time),
+        # because that never touches the identity. So exercise the production chooser with
+        # the registry MOVED underneath: the snapshot must still win.
+        from run_subagent import _endpoint_for_dispatch
+        agent_file = os.path.join(d, "t.md")
+        assert _endpoint_for_dispatch(ident, agent_file, d) == ident["_endpoint"], \
+            "the dispatch re-resolved instead of using the snapshot it fingerprinted"
+        assert _endpoint_for_dispatch(ident, agent_file, d)[0] == "https://a.example/v1"
+        # a fresh identity carries the NEW endpoint, and the chooser follows it
+        assert _endpoint_for_dispatch(again, agent_file, d)[0] == "https://b.example/v1"
+        # with no snapshot it falls back to resolving, which is what makes an unresolvable
+        # endpoint report its own error rather than silently reusing something
+        assert _endpoint_for_dispatch({}, agent_file, d)[0] == "https://b.example/v1"
+
+        # And prove the DISPATCH goes through it. Testing the chooser alone left the exact
+        # regression green (reverting run_subagent to call _compat_endpoint directly),
+        # because that never touches the chooser. Spy on the production symbol and drive
+        # main() far enough to resolve an endpoint.
+        import run_subagent as _rs2
+        calls = []
+        real_chooser = _rs2._endpoint_for_dispatch
+        real_argv = sys.argv
+
+        def spy(identity, agent_file_, agents_dir_):
+            calls.append(True)
+            return real_chooser(identity, agent_file_, agents_dir_)
+
+        with open(os.path.join(d, "t.md"), "w", encoding="utf-8") as fh:
+            fh.write("---" + chr(10) + "run-agent: openai-compat" + chr(10)
+                     + "provider: tenant" + chr(10) + "model: m" + chr(10)
+                     + "---" + chr(10) + "# T" + chr(10))
+        _rs2._endpoint_for_dispatch = spy
+        sys.argv = ["run_subagent.py", "--agent", "t", "--prompt", "p", "--cwd", d,
+                    "--agents-dir", d, "--dry-run"]
+        try:
+            try:
+                _rs2.main()
+            except SystemExit:
+                pass
+        finally:
+            _rs2._endpoint_for_dispatch = real_chooser
+            sys.argv = real_argv
+        assert calls, "main() resolved the endpoint without going through the chooser"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_credential_never_reaches_an_artifact():
+    """The request identity now derives a field FROM a credential, so the standing rule that
+    secrets stay in the environment has to be verified, not assumed: a real dispatch must
+    leave the token out of stdout, stderr, the --out envelope AND the --debug-dir dump,
+    while the fingerprint still tells two tokens apart.
+
+    Honest note: this is a CANARY, not a guard with a known failing mutation. The credential
+    is hashed into the endpoint digest and that digest is hashed again into the fingerprint,
+    so today the token cannot reach an artifact by construction -- no single-line change was
+    found that makes this test fail. It is kept because the boundary it watches is one a
+    future change could quietly cross (stamping the identity for debuggability, logging a
+    resolved endpoint), and it would fire then."""
+    import json as _json
+    import subprocess as sp
+    work = tempfile.mkdtemp(prefix="summon-leak-")
+    try:
+        roster = os.path.join(work, "roster")
+        os.makedirs(roster)
+        with open(os.path.join(roster, "t.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: openai-compat\nprovider: tenant\nmodel: m\n---\n# T\n")
+        with open(os.path.join(roster, "providers.json"), "w", encoding="utf-8") as fh:
+            _json.dump({"tenant": {"base_url": "http://127.0.0.1:9/v1",
+                                   "api_key_env": "LEAKCHECK_TOKEN"}}, fh)
+        token = "sk-SECRET-do-not-leak-4f9a2b7c1e"
+        out = os.path.join(work, "envelope.json")
+        debug = os.path.join(work, "debug")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+
+        def _run(tok):
+            return sp.run([sys.executable, script, "--agent", "t", "--prompt", "hello",
+                           "--cwd", work, "--agents-dir", roster, "--out", out,
+                           "--debug-dir", debug, "--timeout", "20s"],
+                          capture_output=True, text=True, encoding="utf-8",
+                          env=dict(os.environ, LEAKCHECK_TOKEN=tok))
+
+        r = _run(token)
+        surfaces = {"stdout": r.stdout or "", "stderr": r.stderr or ""}
+        if os.path.isfile(out):
+            with open(out, encoding="utf-8", errors="replace") as fh:
+                surfaces["out"] = fh.read()
+        for root, _dirs, files in os.walk(debug):
+            for f in files:
+                with open(os.path.join(root, f), encoding="utf-8", errors="replace") as fh:
+                    surfaces["debug/" + f] = fh.read()
+        # Literal AND reversibly-encoded: searching only for the raw string meant a
+        # base64'd (or hex'd) copy of the key in an error or debug artifact would sail
+        # through while still being a fully recoverable credential.
+        import base64 as _b64
+        needles = {
+            "literal": token,
+            "base64": _b64.b64encode(token.encode()).decode().rstrip("="),
+            "base64url": _b64.urlsafe_b64encode(token.encode()).decode().rstrip("="),
+            "hex": token.encode().hex(),
+        }
+        leaked = [(k, how) for k, v in surfaces.items()
+                  for how, needle in needles.items() if needle and needle in v]
+        assert not leaked, f"the credential reached {leaked}"
+        assert len(surfaces) >= 3, surfaces.keys()      # we really did inspect the artifacts
+
+        first = _json.loads(surfaces.get("out") or surfaces["stdout"])["request_sha256"]
+        os.remove(out)
+        r2 = _run("sk-OTHER-token-9z")
+        second = _json.loads(r2.stdout)["request_sha256"]
+        assert first and second and first != second, "two credentials shared a fingerprint"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(work, ignore_errors=True)
+
+
+def test_v7_backend_configuring_environment_is_part_of_the_request():
+    """A vendor CLI reads its OWN configuration from the environment, which the child
+    inherits -- so `ANTHROPIC_BASE_URL` (or an API key, or a model override) can point the
+    same summon request at a different endpoint or account with no summon flag changing, and
+    the previous tenant's answer was returned without the new one ever being called.
+
+    Enumerating individual variables was a losing game (one vendor per review round), so the
+    rule is per-backend PREFIXES: every matching variable counts, values hashed one-way. It
+    is deliberately coarse -- an unrelated ANTHROPIC_* change invalidates a stored answer,
+    which is the safe direction."""
+    import _executor as _ex
+    from _executor import backend_env_sha, build_request_identity, request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-benv-")
+    touched = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
+               "CURSOR_API_KEY", "GEMINI_API_KEY"]
+    saved = {k: os.environ.get(k) for k in touched}
+    try:
+        with open(os.path.join(d, "cl.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\n---\n# Claude\n")
+        with open(os.path.join(d, "cu.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: cursor-agent\n---\n# Cursor\n")
+
+        def fp(agent="cl"):
+            return request_fingerprint(**build_request_identity(
+                agent=agent, prompt="p", cwd=d, agents_dir=d))
+
+        for k in touched:
+            os.environ.pop(k, None)
+        base = fp()
+        assert backend_env_sha("claude") is None, "an unset environment adds nothing"
+
+        # each of the three documented gateway controls is a different request
+        for var, val in (("ANTHROPIC_BASE_URL", "https://tenant-a.example"),
+                         ("ANTHROPIC_API_KEY", "key-a"),
+                         ("ANTHROPIC_MODEL", "claude-x")):
+            os.environ[var] = val
+            changed = fp()
+            assert changed != base, var
+            # ...and a DIFFERENT value is a different request again
+            os.environ[var] = val + "-other"
+            assert fp() not in (base, changed), var
+            del os.environ[var]
+        assert fp() == base, "clearing the environment restores the identity"
+
+        # the digest is scoped to the backend: a cursor variable cannot disturb claude
+        os.environ["CURSOR_API_KEY"] = "cursor-token"
+        assert fp("cl") == base, "another backend's environment must not invalidate claude"
+        cursor_before = fp("cu")
+        os.environ["CURSOR_API_KEY"] = "cursor-token-2"
+        assert fp("cu") != cursor_before, "cursor's own environment must count for cursor"
+
+        # values are hashed, never stored
+        os.environ["ANTHROPIC_API_KEY"] = "sk-do-not-store-me"
+        sha = backend_env_sha("claude")
+        assert sha and "sk-do-not-store-me" not in sha and len(sha) == 32, sha
+        # an unknown backend has no rule and contributes nothing
+        assert backend_env_sha("no-such-backend") is None
+        assert backend_env_sha(None) is None
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_effort_default_only_counts_where_dispatch_uses_it():
+    """SUMMON_DEFAULT_EFFORT was fingerprinted whenever --effort was absent, but dispatch
+    also ignores it when the definition pins `effort:` and on backends that take no effort
+    setting at all -- so an unrelated default moving forced fresh, paid dispatches."""
+    from _executor import build_request_identity, request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-eff-")
+    saved = os.environ.get("SUMMON_DEFAULT_EFFORT")
+    try:
+        with open(os.path.join(d, "free.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\n---\n# Free\n")
+        with open(os.path.join(d, "pinned.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\neffort: high\n---\n# Pinned\n")
+        with open(os.path.join(d, "compat.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: openai-compat\n"
+                     "base_url: http://127.0.0.1:9/v1\n---\n# Compat\n")
+
+        def fp(agent, **kw):
+            return request_fingerprint(**build_request_identity(
+                agent=agent, prompt="p", cwd=d, agents_dir=d, **kw))
+
+        os.environ["SUMMON_DEFAULT_EFFORT"] = "low"
+        free_low, pin_low, compat_low = fp("free"), fp("pinned"), fp("compat")
+        explicit_low = fp("free", effort="high")
+        os.environ["SUMMON_DEFAULT_EFFORT"] = "max"
+        assert fp("free") != free_low, "an unpinned agent still tracks the default"
+        assert fp("pinned") == pin_low, "a definition-pinned effort ignores the default"
+        assert fp("compat") == compat_low, "a backend without effort ignores the default"
+        assert fp("free", effort="high") == explicit_low, "--effort overrides the default"
+    finally:
+        os.environ.pop("SUMMON_DEFAULT_EFFORT", None)
+        if saved is not None:
+            os.environ["SUMMON_DEFAULT_EFFORT"] = saved
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_identity_tracks_the_effective_child_environment():
+    """Hashing vendor-PREFIXED variables is not the same as hashing what the child receives:
+    summon forwards `CLI_API_KEY` as `CURSOR_API_KEY` and strips `OPENAI_API_KEY` unless
+    `SUBAGENTS_ALLOW_OPENAI_KEY=1`. So changing the Cursor key, or toggling whether Codex
+    sees a key at all, changed the child's effective auth while the fingerprint stayed
+    equal -- and changing a STRIPPED key invalidated results whose execution was identical.
+    Both the arg builders and the identity now derive that delta from one function."""
+    from _builder import env_override_for
+    from _executor import backend_env_sha
+    touched = ["CLI_API_KEY", "CURSOR_API_KEY", "OPENAI_API_KEY",
+               "SUBAGENTS_ALLOW_OPENAI_KEY", "CODEX_HOME"]
+    saved = {k: os.environ.get(k) for k in touched}
+    try:
+        for k in touched:
+            os.environ.pop(k, None)
+
+        # --- cursor: the FORWARDED key is what the child sees -------------------------
+        base = backend_env_sha("cursor-agent")
+        os.environ["CLI_API_KEY"] = "cursor-A"
+        a = backend_env_sha("cursor-agent")
+        assert a != base, "forwarding a key must change the effective environment"
+        assert env_override_for("cursor-agent") == {"CURSOR_API_KEY": "cursor-A"}
+        os.environ["CLI_API_KEY"] = "cursor-B"
+        assert backend_env_sha("cursor-agent") != a, \
+            "a DIFFERENT forwarded key is a different request"
+        del os.environ["CLI_API_KEY"]
+        assert backend_env_sha("cursor-agent") == base
+
+        # --- codex: the key is STRIPPED unless explicitly allowed ----------------------
+        os.environ["OPENAI_API_KEY"] = "sk-codex-A"
+        stripped = backend_env_sha("codex")
+        assert env_override_for("codex") == {"OPENAI_API_KEY": None}
+        # changing a key the child never receives must NOT invalidate anything
+        os.environ["OPENAI_API_KEY"] = "sk-codex-B"
+        assert backend_env_sha("codex") == stripped, \
+            "a stripped key changed the identity, forcing a needless paid re-dispatch"
+        # ...but ALLOWING it through is a different request, because now the child gets it
+        os.environ["SUBAGENTS_ALLOW_OPENAI_KEY"] = "1"
+        allowed = backend_env_sha("codex")
+        assert allowed != stripped, "letting a key reach the child must change the identity"
+        assert env_override_for("codex") is None
+        # and with it allowed, the key's VALUE matters again
+        os.environ["OPENAI_API_KEY"] = "sk-codex-C"
+        assert backend_env_sha("codex") != allowed
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_v7_agy_ignores_the_effort_default():
+    # agy applies a thinking-mode suffix only when effort was given EXPLICITLY, never from
+    # SUMMON_DEFAULT_EFFORT, so fingerprinting the default for agy was pure churn.
+    from _executor import build_request_identity, request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-agy-")
+    saved = os.environ.get("SUMMON_DEFAULT_EFFORT")
+    try:
+        with open(os.path.join(d, "ag.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: agy\n---\n# Agy\n")
+        with open(os.path.join(d, "cl.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\n---\n# Claude\n")
+
+        def fp(agent):
+            return request_fingerprint(**build_request_identity(
+                agent=agent, prompt="p", cwd=d, agents_dir=d))
+
+        os.environ["SUMMON_DEFAULT_EFFORT"] = "low"
+        agy_low, claude_low = fp("ag"), fp("cl")
+        os.environ["SUMMON_DEFAULT_EFFORT"] = "max"
+        assert fp("ag") == agy_low, "agy must not track a default it never applies"
+        assert fp("cl") != claude_low, "claude does apply it, so it still counts there"
+    finally:
+        os.environ.pop("SUMMON_DEFAULT_EFFORT", None)
+        if saved is not None:
+            os.environ["SUMMON_DEFAULT_EFFORT"] = saved
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_refused_out_success_is_archived_before_a_failing_run():
+    """A refused direct `--out` success stayed at the authoritative path, so a PRE-DISPATCH
+    failure (missing agent, bad schema) exited with an error while the stale success was
+    still sitting there for anything that looks at the file. The manifest already archived
+    in this situation; the direct path now does the same."""
+    import json as _json
+    import subprocess as sp
+    work = tempfile.mkdtemp(prefix="summon-outarch-")
+    try:
+        out = os.path.join(work, "result.json")
+        roster = os.path.join(work, "roster")
+        os.makedirs(roster)
+        with open(out, "w", encoding="utf-8") as fh:
+            _json.dump({"status": "success", "result": "STALE",
+                        "request_sha256": "0" * 64}, fh)
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+        r = sp.run([sys.executable, script, "--agent", "missing-agent", "--prompt", "new",
+                    "--cwd", work, "--agents-dir", roster, "--out", out],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode != 0, r.stdout
+        # the stale success must NOT still be the authoritative result...
+        if os.path.isfile(out):
+            with open(out, encoding="utf-8") as fh:
+                still = _json.load(fh)
+            assert still.get("result") != "STALE", (
+                "a refused stale success was left at the authoritative path", still)
+        # ...and it must have been preserved, not destroyed
+        assert os.path.isfile(out + ".superseded"), os.listdir(work)
+        with open(out + ".superseded", encoding="utf-8") as fh:
+            assert _json.load(fh)["result"] == "STALE"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(work, ignore_errors=True)
+
+
+def test_v7_agy_account_and_wrapper_are_part_of_the_request():
+    """agy authenticates from FILES, not the environment, and summon copies them into an
+    isolated profile -- so swapping ~/.gemini's OAuth credentials to a different Google
+    account changed who answers while every environment variable stayed put, and the first
+    account's cached answer came back. The digest is built from `_builder._AGY_AUTH_FILES`,
+    the very list the profile builder copies, so it tracks what the dispatch actually
+    carries. AGY_* controls (the PTY wrapper, the profile root) count too."""
+    import _executor as _ex
+    from _builder import _AGY_AUTH_FILES
+    from _executor import build_request_identity, request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-agy-acct-")
+    home = tempfile.mkdtemp(prefix="summon-fakehome-")
+    real_expand = os.path.expanduser
+    saved_wrapper = os.environ.get("AGY_PTY_WRAPPER")
+    try:
+        with open(os.path.join(d, "ag.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: agy\n---\n# Agy\n")
+        gemini = os.path.join(home, ".gemini")
+        os.makedirs(gemini)
+
+        def fake_expand(path):
+            return home if path == "~" else real_expand(path)
+
+        def write_account(tag):
+            for fn in _AGY_AUTH_FILES:
+                with open(os.path.join(gemini, fn), "w", encoding="utf-8") as fh:
+                    fh.write(tag + ":" + fn)
+
+        def fp():
+            return request_fingerprint(**build_request_identity(
+                agent="ag", prompt="p", cwd=d, agents_dir=d))
+
+        os.environ.pop("AGY_PTY_WRAPPER", None)
+        os.path.expanduser = fake_expand
+        try:
+            no_account = fp()
+            write_account("account-A")
+            a = fp()
+            assert a != no_account, "the copied account files must count"
+            assert fp() == a, "the same account must hash the same"
+            write_account("account-B")
+            assert fp() != a, "a DIFFERENT account must not reuse the first's answer"
+
+            # the wrapper decides HOW (and as whom) agy runs
+            write_account("account-A")
+            os.environ["AGY_PTY_WRAPPER"] = "wrapper-A.py"
+            wa = fp()
+            os.environ["AGY_PTY_WRAPPER"] = "wrapper-B.py"
+            assert fp() != wa, "a different PTY wrapper is a different request"
+        finally:
+            os.path.expanduser = real_expand
+    finally:
+        os.path.expanduser = real_expand
+        os.environ.pop("AGY_PTY_WRAPPER", None)
+        if saved_wrapper is not None:
+            os.environ["AGY_PTY_WRAPPER"] = saved_wrapper
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v7_claude_credit_strip_is_in_the_shared_delta():
+    """The credit guard strips any ANTHROPIC_*MODEL* var naming a credit-only model, so the
+    child never receives it -- but the identity hashed it anyway, so setting and unsetting a
+    variable dispatch treats identically forced a paid rerun."""
+    from _builder import _CREDIT_ONLY_MODELS, env_override_for
+    from _executor import backend_env_sha
+    saved = {k: os.environ.get(k) for k in ("ANTHROPIC_MODEL", "SUMMON_ALLOW_CREDIT")}
+    credit_model = sorted(_CREDIT_ONLY_MODELS)[0]
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+        base = backend_env_sha("claude")
+        # a credit-only model in ANTHROPIC_MODEL is STRIPPED, so the child sees the same
+        # environment as if it were unset -- and the identity must agree
+        os.environ["ANTHROPIC_MODEL"] = credit_model
+        assert env_override_for("claude") == {"ANTHROPIC_MODEL": None}
+        assert backend_env_sha("claude") == base, \
+            "a variable the child never receives changed the identity"
+        # an ordinary value is NOT stripped, so it does count
+        os.environ["ANTHROPIC_MODEL"] = "claude-ordinary-model"
+        assert env_override_for("claude") is None
+        assert backend_env_sha("claude") != base
+
+        # ...and the BUILDER must actually apply that delta. Asserting only on
+        # env_override_for and the identity left the merge deletable: the child would still
+        # receive the credit-only remap while every assertion above stayed green.
+        import _builder
+        from _builder import AgentInvocation
+        os.environ["ANTHROPIC_MODEL"] = credit_model
+        _cmd, _args, env_override = _builder.build_invocation_args(
+            AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(), model="opus"),
+            timeout_ms=60000)
+        assert env_override and env_override.get("ANTHROPIC_MODEL", "unset") is None, (
+            "the builder did not strip a credit-only ANTHROPIC_MODEL from the child env",
+            env_override)
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_v7_openai_compat_does_not_hash_unrelated_openai_vars():
+    # openai-compat spawns no child and reads only the endpoint + credential its provider
+    # resolves to, both already in the identity. Hashing every OPENAI_* variable there meant
+    # an unrelated key change forced a fresh paid request.
+    from _executor import backend_env_sha
+    saved = os.environ.get("OPENAI_API_KEY")
+    try:
+        os.environ["OPENAI_API_KEY"] = "sk-unrelated-A"
+        first = backend_env_sha("openai-compat")
+        os.environ["OPENAI_API_KEY"] = "sk-unrelated-B"
+        assert backend_env_sha("openai-compat") == first is None, \
+            "openai-compat must not take a generic environment digest"
+    finally:
+        os.environ.pop("OPENAI_API_KEY", None)
+        if saved is not None:
+            os.environ["OPENAI_API_KEY"] = saved
+
+
+def test_v7_pre_dispatch_failure_lands_at_the_out_path():
+    """--out is the AUTHORITATIVE result path. After a refused stale success is archived, a
+    pre-dispatch failure was emitted only to stdout, leaving that path EMPTY -- the old
+    answer correctly gone, but the new failure recorded nowhere a consumer of the file would
+    look."""
+    import json as _json
+    import subprocess as sp
+    work = tempfile.mkdtemp(prefix="summon-outfail-")
+    try:
+        out = os.path.join(work, "result.json")
+        roster = os.path.join(work, "roster")
+        os.makedirs(roster)
+        with open(out, "w", encoding="utf-8") as fh:
+            _json.dump({"status": "success", "result": "STALE",
+                        "request_sha256": "0" * 64}, fh)
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+        r = sp.run([sys.executable, script, "--agent", "missing-agent", "--prompt", "new",
+                    "--cwd", work, "--agents-dir", roster, "--out", out],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode != 0
+        assert os.path.isfile(out), "the authoritative path was left EMPTY after a failure"
+        with open(out, encoding="utf-8") as fh:
+            landed = _json.load(fh)
+        assert landed.get("status") == "error", landed
+        assert landed.get("result") != "STALE", landed
+        # ...and the archived answer is still there
+        with open(out + ".superseded", encoding="utf-8") as fh:
+            assert _json.load(fh)["result"] == "STALE"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(work, ignore_errors=True)
+
+
+def test_v7_cursor_default_model_is_part_of_the_request():
+    """Cursor's default model is a constant SUMMON supplies, so a request with no `model:`
+    dispatched whatever that constant currently is while the identity recorded only
+    `model=None` -- changing it would have let the previous model's answer resume."""
+    import _builder
+    from _executor import build_request_identity, request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-curdef-")
+    saved = _builder.CURSOR_DEFAULT_MODEL
+    try:
+        with open(os.path.join(d, "cu.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: cursor-agent\n---\n# Cursor\n")
+        with open(os.path.join(d, "pin.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: cursor-agent\nmodel: pinned-x\n---\n# Pinned\n")
+        with open(os.path.join(d, "cl.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\n---\n# Claude\n")
+
+        def fp(agent, **kw):
+            return request_fingerprint(**build_request_identity(
+                agent=agent, prompt="p", cwd=d, agents_dir=d, **kw))
+
+        # The pinned control uses ONLY the definition's `model:` -- passing model= here as
+        # well tested the wrong thing entirely (the broken implementation, which ignored
+        # frontmatter pins, passed that version).
+        before_cu, before_pin, before_cl = fp("cu"), fp("pin"), fp("cl")
+        before_explicit = fp("cu", model="explicit-x")
+        _builder.CURSOR_DEFAULT_MODEL = "composer-next"
+        assert fp("cu") != before_cu, "the default cursor model must count"
+        assert fp("pin") == before_pin, "a FRONTMATTER-pinned model ignores the default"
+        assert fp("cu", model="explicit-x") == before_explicit, "--model ignores it too"
+        assert fp("cl") == before_cl, "another backend is unaffected"
+    finally:
+        _builder.CURSOR_DEFAULT_MODEL = saved
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_agy_dispatch_verifies_the_copied_account_bytes():
+    """The identity digests an account before dispatch; the profile the child actually runs
+    under is built (or resumed) LATER. If they disagree the run would answer as one account
+    while being stamped as another, so `_build_agy_args` REFUSES.
+
+    This calls the production builder, not just the digest helpers: the earlier version
+    exercised only `agy_profile_account_sha`, so deleting the entire comparison-and-refusal
+    block left it green. It covers BOTH the fresh-copy and the resume branch, and the
+    "cannot attest" case."""
+    import _builder
+    from _builder import _AGY_AUTH_FILES, AgentInvocation, agy_profile_account_sha
+    d = tempfile.mkdtemp(prefix="summon-agyatt-")
+    try:
+        def make_profile(tag):
+            prof = tempfile.mkdtemp(prefix="summon-prof-", dir=d)
+            gem = os.path.join(prof, ".gemini")
+            os.makedirs(gem)
+            for fn in _AGY_AUTH_FILES:
+                with open(os.path.join(gem, fn), "w", encoding="utf-8") as fh:
+                    fh.write(tag + ":" + fn)
+            return prof
+
+        prof_a, prof_b = make_profile("account-A"), make_profile("account-B")
+        sha_a, sha_b = agy_profile_account_sha(prof_a), agy_profile_account_sha(prof_b)
+        assert sha_a and sha_b and sha_a != sha_b
+
+        def build(resume_profile, expected, resume=True):
+            # resume=False exercises the FRESH-copy branch. Every invocation setting
+            # resume_id meant the fresh attestation call could be deleted with the test
+            # still green -- it never ran that line at all.
+            inv = AgentInvocation(cli="agy", prompt="p", cwd=d,
+                                  resume_id="latest" if resume else None,
+                                  resume_profile=resume_profile if resume else None,
+                                  agy_account_sha256=expected)
+            return _builder.build_invocation_args(inv, timeout_ms=60000)
+
+        # RESUME with the account it was fingerprinted under: allowed
+        build(prof_a, sha_a)
+        # RESUME with a DIFFERENT account than was fingerprinted: refused
+        try:
+            build(prof_a, sha_b)
+            raise AssertionError("dispatched a profile whose account was not the one "
+                                 "fingerprinted")
+        except ValueError as e:
+            assert "account files changed" in str(e), str(e)
+        # a profile with NOTHING to attest is also a refusal -- "could not check" must not
+        # read as "checked and fine". (A profile with no .gemini at all is already refused
+        # by the resume guard, with a better message; what matters is that it is refused.)
+        empty = tempfile.mkdtemp(prefix="summon-empty-", dir=d)
+        os.makedirs(os.path.join(empty, ".gemini"), exist_ok=True)
+        try:
+            build(empty, sha_a)
+            raise AssertionError("dispatched a profile that could not be attested")
+        except ValueError as e:
+            assert ("account files changed" in str(e)
+                    or "profile dir missing" in str(e)), str(e)
+        # with no expectation recorded (a pre-0.10.2 caller) nothing is enforced
+        build(prof_a, None)
+
+        # --- the FRESH branch: a real profile is built from ~/.gemini and attested --------
+        home = tempfile.mkdtemp(prefix="summon-freshhome-", dir=d)
+        real_expand = os.path.expanduser
+        gem = os.path.join(home, ".gemini")
+        os.makedirs(gem)
+        for fn in _AGY_AUTH_FILES:
+            with open(os.path.join(gem, fn), "w", encoding="utf-8") as fh:
+                fh.write("fresh-account:" + fn)
+        os.path.expanduser = lambda p: home if p == "~" else real_expand(p)
+        try:
+            import _executor as _ex
+            fresh_sha = _ex._agy_account_sha()
+            assert fresh_sha, "precondition: the source account hashes"
+            build(None, fresh_sha, resume=False)          # matches -> dispatch proceeds
+            try:
+                build(None, sha_b, resume=False)          # a DIFFERENT account -> refused
+                raise AssertionError("the fresh-copy branch was not attested at all")
+            except ValueError as e:
+                assert "account files changed" in str(e), str(e)
+        finally:
+            os.path.expanduser = real_expand
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_agy_resume_fingerprints_the_resumed_profile():
+    """A RESUME runs under the profile it resumes, whose account was fixed when that profile
+    was created -- so hashing the CURRENT ~/.gemini described an account the run would not
+    use. Swapping ~/.gemini moved the fingerprint while the dispatch stayed the same, and
+    mutating the PROFILE moved the dispatch while the fingerprint stood still."""
+    import _executor as _ex
+    from _builder import _AGY_AUTH_FILES
+    from _executor import build_request_identity, request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-agyres-")
+    home = tempfile.mkdtemp(prefix="summon-agyhome-")
+    real_expand = os.path.expanduser
+    try:
+        with open(os.path.join(d, "ag.md"), "w", encoding="utf-8") as fh:
+            fh.write("---" + chr(10) + "run-agent: agy" + chr(10) + "---" + chr(10)
+                     + "# Agy" + chr(10))
+
+        def write_files(root, tag):
+            gem = os.path.join(root, ".gemini")
+            os.makedirs(gem, exist_ok=True)
+            for fn in _AGY_AUTH_FILES:
+                with open(os.path.join(gem, fn), "w", encoding="utf-8") as fh:
+                    fh.write(tag + ":" + fn)
+
+        prof = os.path.join(d, "profile")
+        write_files(prof, "profile-account-A")
+        write_files(home, "source-account-B")
+
+        def fp(resume_profile=None):
+            return request_fingerprint(**build_request_identity(
+                agent="ag", prompt="p", cwd=d, agents_dir=d, resume="latest",
+                resume_profile=resume_profile))
+
+        os.path.expanduser = lambda p: home if p == "~" else real_expand(p)
+        try:
+            resumed = fp(prof)
+            # changing the SOURCE account must not move a resume's identity...
+            write_files(home, "source-account-C")
+            assert fp(prof) == resumed, \
+                "a resume tracked the source account instead of the profile it resumes"
+            # ...but changing the PROFILE's own account must
+            write_files(prof, "profile-account-D")
+            assert fp(prof) != resumed, "a resume must track the profile's account"
+            # a FRESH run (no resume profile) still tracks the source
+            fresh = fp()
+            write_files(home, "source-account-E")
+            assert fp() != fresh, "a fresh run must still track the source account"
+        finally:
+            os.path.expanduser = real_expand
+    finally:
+        os.path.expanduser = real_expand
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v7_dispatch_overwritten_env_is_not_part_of_the_request():
+    """A variable the DISPATCH sets unconditionally is not an input to the request. agy
+    always writes AGY_PTY_DEADLINE from --timeout (or its own default), so inheriting 1 vs
+    999 produced different identities for children that receive the identical value -- the
+    "environment the child receives" claim was false for exactly that variable."""
+    from _executor import _BACKEND_ENV_OVERWRITTEN, backend_env_sha
+    saved = {k: os.environ.get(k) for k in ("AGY_PTY_DEADLINE", "AGY_PTY_WRAPPER")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+        os.environ["AGY_PTY_WRAPPER"] = "w.py"      # something real to hash
+        base = backend_env_sha("agy")
+        assert base
+        os.environ["AGY_PTY_DEADLINE"] = "1"
+        one = backend_env_sha("agy")
+        os.environ["AGY_PTY_DEADLINE"] = "999"
+        assert backend_env_sha("agy") == one == base, (
+            "an inherited AGY_PTY_DEADLINE changed the identity although the dispatch "
+            "overwrites it for every run")
+        # the exclusion is scoped: another AGY_* variable still counts
+        os.environ["AGY_PTY_WRAPPER"] = "other.py"
+        assert backend_env_sha("agy") != base
+        # EVERY entry in the table, not just the one this test was written for. Listing a
+        # variable that is actually FORWARDED is the opposite error and just as wrong --
+        # AGY_PTY_QUIET was listed here and had to come back out, because the builder passes
+        # its ambient value through to the child.
+        for backend, names in _BACKEND_ENV_OVERWRITTEN.items():
+            for name in names:
+                os.environ[name] = "alpha"
+                first = backend_env_sha(backend)
+                os.environ[name] = "beta"
+                assert backend_env_sha(backend) == first, (
+                    name + " is listed as dispatch-overwritten but changing it changed "
+                    + backend + "'s identity")
+                os.environ.pop(name, None)
+        # ...and a variable the builder FORWARDS must still count
+        os.environ["AGY_PTY_QUIET"] = "1"
+        quiet_one = backend_env_sha("agy")
+        os.environ["AGY_PTY_QUIET"] = "99"
+        assert backend_env_sha("agy") != quiet_one, (
+            "AGY_PTY_QUIET reaches the child, so two values are two different requests")
+
+        # ...and the BUILDER must really forward it. Checking only the fingerprint helpers
+        # left `"AGY_PTY_QUIET": "20"` (a hardcoded value, ignoring the environment)
+        # deletable with every assertion still green.
+        if os.name == "nt":          # the agy wrapper is Windows-only without AGY_PTY_WRAPPER
+            import _builder
+            from _builder import AgentInvocation
+            os.environ["AGY_PTY_QUIET"] = "77"
+            try:
+                _c, _a, env_override = _builder.build_invocation_args(
+                    AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd()),
+                    timeout_ms=60000)
+                assert (env_override or {}).get("AGY_PTY_QUIET") == "77", (
+                    "the builder stopped forwarding the ambient AGY_PTY_QUIET",
+                    (env_override or {}).get("AGY_PTY_QUIET"))
+            except Exception as e:  # noqa: BLE001 — a missing agy profile is not the point
+                if "AGY_PTY_WRAPPER" not in str(e) and "profile" not in str(e).lower():
+                    raise
+        os.environ.pop("AGY_PTY_QUIET", None)
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_v7_die_never_destroys_a_stored_success():
+    """Making `_die` write the error to --out (so a failure is not recorded nowhere) created
+    a worse bug: an EARLY validation error wrote straight over a stored SUCCESS, with no
+    archive, before the resume block had a chance to preserve it. The error must land there,
+    but never at the cost of the answer that was already sitting in it."""
+    import json as _json
+    import subprocess as sp
+    work = tempfile.mkdtemp(prefix="summon-dieout-")
+    try:
+        out = os.path.join(work, "result.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            _json.dump({"status": "success", "result": "PRECIOUS"}, fh)
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+        # --resume with --worktree is rejected by an EARLY validation _die()
+        r = sp.run([sys.executable, script, "--agent", "a", "--prompt", "p", "--cwd", work,
+                    "--out", out, "--resume", "session-x", "--worktree", "tree-x"],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode != 0, r.stdout
+        # the failure is recorded at the authoritative path...
+        with open(out, encoding="utf-8") as fh:
+            landed = _json.load(fh)
+        assert landed.get("status") == "error", landed
+        # ...and the answer that was there is PRESERVED, not destroyed
+        assert os.path.isfile(out + ".superseded"), sorted(os.listdir(work))
+        with open(out + ".superseded", encoding="utf-8") as fh:
+            assert _json.load(fh)["result"] == "PRECIOUS"
+
+        # And when archiving FAILS, the error must not be written AT ALL -- a lost answer is
+        # worse than a failure that is only on stdout. Covering just the happy archive left
+        # the destructive overwrite green (archive-name exhaustion, a clear() error).
+        from run_subagent import _write_error_out
+        out2 = os.path.join(work, "second.json")
+        with open(out2, "w", encoding="utf-8") as fh:
+            _json.dump({"status": "success", "result": "ALSO PRECIOUS"}, fh)
+        import _manifest as _mf
+        real_clear = _mf._clear_out_file
+        _mf._clear_out_file = lambda _p, archive: "simulated archive failure"
+        try:
+            _write_error_out(out2, {"status": "error", "error": "boom"})
+        finally:
+            _mf._clear_out_file = real_clear
+        with open(out2, encoding="utf-8") as fh:
+            assert _json.load(fh)["result"] == "ALSO PRECIOUS", (
+                "the stored success was overwritten although archiving it failed")
+
+        # a NON-success at the path is replaced normally, and an empty path is written
+        out3 = os.path.join(work, "third.json")
+        with open(out3, "w", encoding="utf-8") as fh:
+            _json.dump({"status": "error", "error": "old"}, fh)
+        _write_error_out(out3, {"status": "error", "error": "new"})
+        with open(out3, encoding="utf-8") as fh:
+            assert _json.load(fh)["error"] == "new"
+        out4 = os.path.join(work, "fourth.json")
+        _write_error_out(out4, {"status": "error", "error": "fresh"})
+        with open(out4, encoding="utf-8") as fh:
+            assert _json.load(fh)["error"] == "fresh"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(work, ignore_errors=True)
+
+
+def test_v7_resume_profile_without_resume_uses_the_fresh_account():
+    """`--resume-profile` without `--resume` still takes the FRESH-profile branch at
+    dispatch, so selecting the resumed profile's account for the identity made a perfectly
+    good fresh profile look like an account swap and refused it."""
+    from _builder import _AGY_AUTH_FILES
+    from _executor import build_request_identity
+    d = tempfile.mkdtemp(prefix="summon-rpnr-")
+    home = tempfile.mkdtemp(prefix="summon-rpnrhome-")
+    real_expand = os.path.expanduser
+    try:
+        with open(os.path.join(d, "ag.md"), "w", encoding="utf-8") as fh:
+            fh.write("---" + chr(10) + "run-agent: agy" + chr(10) + "---" + chr(10)
+                     + "# Agy" + chr(10))
+
+        def write_files(root, tag):
+            gem = os.path.join(root, ".gemini")
+            os.makedirs(gem, exist_ok=True)
+            for fn in _AGY_AUTH_FILES:
+                with open(os.path.join(gem, fn), "w", encoding="utf-8") as fh:
+                    fh.write(tag + ":" + fn)
+
+        prof = os.path.join(d, "profile")
+        write_files(prof, "profile-account")
+        write_files(home, "source-account")
+        os.path.expanduser = lambda p: home if p == "~" else real_expand(p)
+        try:
+            import _executor as _ex
+            source_sha = _ex._agy_account_sha()
+            # NO --resume: the account is the SOURCE one, because that is what a fresh
+            # profile will be built from
+            without = build_request_identity(agent="ag", prompt="p", cwd=d, agents_dir=d,
+                                             resume_profile=prof)
+            assert without["agy_account_sha256"] == source_sha, without["agy_account_sha256"]
+            # WITH --resume: the account is the resumed profile's
+            withr = build_request_identity(agent="ag", prompt="p", cwd=d, agents_dir=d,
+                                           resume="latest", resume_profile=prof)
+            assert withr["agy_account_sha256"] != source_sha
+        finally:
+            os.path.expanduser = real_expand
+    finally:
+        os.path.expanduser = real_expand
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v7_credit_fallback_model_is_part_of_the_request():
+    """The credit guard substitutes summon's OWN fallback for an unauthorized credit-only
+    model, so changing that constant changes the model actually dispatched while the request
+    looks identical -- the same shape as cursor's default, and summon-owned either way."""
+    import _builder
+    from _builder import _CREDIT_ONLY_MODELS
+    from _executor import build_request_identity, request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-fallback-")
+    saved_fb = _builder._OPUS_FALLBACK
+    saved_env = {k: os.environ.get(k) for k in ("SUMMON_ALLOW_CREDIT", "SUMMON_ALLOW_FABLE")}
+    credit_model = sorted(_CREDIT_ONLY_MODELS)[0]
+    try:
+        for k in saved_env:
+            os.environ.pop(k, None)
+        with open(os.path.join(d, "cl.md"), "w", encoding="utf-8") as fh:
+            fh.write("---" + chr(10) + "run-agent: claude" + chr(10) + "---" + chr(10)
+                     + "# Claude" + chr(10))
+
+        def fp(model):
+            return request_fingerprint(**build_request_identity(
+                agent="cl", prompt="p", cwd=d, agents_dir=d, model=model))
+
+        # A definition that PINS the credit-only model is substituted just the same, so
+        # testing only the CLI `model=` input left the frontmatter path unguarded.
+        with open(os.path.join(d, "fable.md"), "w", encoding="utf-8") as fh:
+            fh.write("---" + chr(10) + "run-agent: claude" + chr(10) + "model: "
+                     + credit_model + chr(10) + "---" + chr(10) + "# Fable" + chr(10))
+
+        def fp_agent(agent):
+            return request_fingerprint(**build_request_identity(
+                agent=agent, prompt="p", cwd=d, agents_dir=d))
+
+        before_sub, before_plain = fp(credit_model), fp("claude-ordinary")
+        before_fm = fp_agent("fable")
+        _builder._OPUS_FALLBACK = "claude-opus-next"
+        assert fp_agent("fable") != before_fm, (
+            "a FRONTMATTER-pinned credit-only model is substituted too, so it must count")
+        assert fp(credit_model) != before_sub,             "changing the substituted fallback must invalidate the substituted request"
+        assert fp("claude-ordinary") == before_plain,             "a request that is never substituted must be unaffected"
+    finally:
+        _builder._OPUS_FALLBACK = saved_fb
+        for k, v in saved_env.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_agent_definition_change_between_fingerprint_and_dispatch_is_refused():
+    """The identity hashes the agent definition, and the dispatch loads it again later. If it
+    changes in between, the run uses one definition's model, permission and system context
+    while being stamped with another's request hash -- and restoring the first would then let
+    the second's answer resume as its own.
+
+    Driven through main(), with the identity forced to carry a STALE hash: that is the only
+    way to make the window real in a test, and asserting anything less would not exercise the
+    refusal at all."""
+    import io as _io
+    import json as _json
+    import contextlib as _ctx
+
+    import run_subagent as _rs
+    from _executor import content_sha
+    d = tempfile.mkdtemp(prefix="summon-deftoctou-")
+    real_identity = _rs._request_identity
+    real_argv = sys.argv
+    try:
+        defn = os.path.join(d, "a.md")
+        with open(defn, "w", encoding="utf-8") as fh:
+            fh.write("---" + chr(10) + "run-agent: openai-compat" + chr(10)
+                     + "base_url: http://127.0.0.1:9/v1" + chr(10) + "model: m" + chr(10)
+                     + "---" + chr(10) + "# A" + chr(10))
+        argv = ["run_subagent.py", "--agent", "a", "--prompt", "p", "--cwd", d,
+                "--agents-dir", d, "--dry-run"]
+
+        def run_main():
+            out = _io.StringIO()
+            sys.argv = list(argv)
+            try:
+                with _ctx.redirect_stdout(out):
+                    _rs.main()
+            except SystemExit:
+                pass
+            return out.getvalue()
+
+        # 1. UNCHANGED definition: attestation passes and the run proceeds
+        text = run_main()
+        assert "changed between fingerprinting and dispatch" not in text, text
+
+        # 2. the identity carries a hash that no longer matches the file on disk -- exactly
+        #    what a mid-flight edit produces -- and the run must REFUSE
+        def stale(args):
+            ident = dict(real_identity(args))
+            ident["agent_def_sha256"] = "0" * 64
+            return ident
+
+        _rs._request_identity = stale
+        try:
+            text = run_main()
+        finally:
+            _rs._request_identity = real_identity
+        env = _json.loads(text)
+        assert env.get("status") == "error", env
+        assert "changed between fingerprinting and dispatch" in (env.get("error") or ""), env
+        assert content_sha(defn) in (env.get("error") or ""), env
+
+        # 2b. the ABA case, driven through main(): the file is changed to B, PARSED, then
+        #     restored to A before the check. A re-read of the path matches A and waves it
+        #     through while B is what actually loaded. Asserting on the hash helpers alone
+        #     would NOT catch this -- reverting the dispatch to re-read the path leaves such
+        #     assertions green -- so the swap is staged around the production load itself.
+        import _loader as _ld
+        real_load = _ld.load_agent
+        b_text = ("---" + chr(10) + "run-agent: openai-compat" + chr(10)
+                  + "base_url: http://127.0.0.1:9/v1" + chr(10) + "model: B" + chr(10)
+                  + "---" + chr(10) + "# B" + chr(10))
+        a_text = ("---" + chr(10) + "run-agent: openai-compat" + chr(10)
+                  + "base_url: http://127.0.0.1:9/v1" + chr(10) + "model: m" + chr(10)
+                  + "---" + chr(10) + "# A" + chr(10))
+
+        def swapping_load(agents_dir, agent_name):
+            with open(defn, "w", encoding="utf-8") as fh:
+                fh.write(b_text)                     # B is what gets parsed...
+            try:
+                return real_load(agents_dir, agent_name)
+            finally:
+                with open(defn, "w", encoding="utf-8") as fh:
+                    fh.write(a_text)                 # ...and A is back before the check
+
+        _rs.load_agent = swapping_load
+        try:
+            text = run_main()
+        finally:
+            _rs.load_agent = real_load
+            with open(defn, "w", encoding="utf-8") as fh:
+                fh.write(a_text)
+        env = _json.loads(text)
+        assert env.get("status") == "error", (
+            "an A->B->A swap around the load dispatched B under A's fingerprint", env)
+        assert "changed between fingerprinting and dispatch" in (env.get("error") or ""), env
+
+        # 3. a genuinely pre-0.10.2 identity (no `agent` field at all) is exempt: there is
+        #    nothing to compare against. But an identity that DID name an agent yet recorded
+        #    no definition hash is the absent-then-present case, and IS refused (covered by
+        #    test_v7_agent_definition_absent_then_present_is_refused).
+        def legacy(args):
+            ident = dict(real_identity(args))
+            ident.pop("agent", None)
+            ident.pop("agent_def_sha256", None)
+            return ident
+
+        _rs._request_identity = legacy
+        try:
+            text = run_main()
+        finally:
+            _rs._request_identity = real_identity
+        assert "changed between fingerprinting and dispatch" not in text, text
+    finally:
+        _rs._request_identity = real_identity
+        sys.argv = real_argv
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_api_key_never_follows_a_cross_host_redirect():
+    """urllib replays ALL original headers on a redirect, so an endpoint answering
+    `302 Location: https://elsewhere/...` received `Authorization: Bearer <key>` verbatim --
+    a configured, compromised, or merely mistaken base_url could exfiltrate the API key with
+    a single response. Same-origin redirects are ordinary API routing and still followed;
+    cross-origin ones are refused outright, because silently dropping the header would turn
+    this into a confusing 401 instead of naming the real problem.
+
+    Two local servers: the configured one redirects to the 'attacker', which records any
+    Authorization header it receives."""
+    import threading as _th
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from _apibackend import call
+    from _builder import AgentInvocation
+
+    seen = []
+    servers = []
+
+    def serve(handler):
+        srv = HTTPServer(("127.0.0.1", 0), handler)
+        _th.Thread(target=srv.serve_forever, daemon=True).start()
+        servers.append(srv)
+        return srv
+
+    class Attacker(BaseHTTPRequestHandler):
+        # BOTH verbs: urllib rewrites a 302'd POST into a GET, so a handler that only
+        # implements do_POST answers 501 and never records the header it was just handed --
+        # which made the leak assertion below pass on the VULNERABLE code too.
+        def _drain(self):
+            # Respond only AFTER reading the body: replying to a POST without draining it
+            # makes Windows abort the connection, which surfaced as a bogus test failure.
+            try:
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            except Exception:  # noqa: BLE001
+                pass
+
+        def _capture(self):
+            self._drain()
+            seen.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"choices":[{"message":{"content":"pwned"}}]}')
+
+        def do_GET(self):
+            self._capture()
+
+        def do_POST(self):
+            self._capture()
+
+        def log_message(self, *a):
+            pass
+
+    attacker = serve(Attacker)
+    target = "http://127.0.0.1:%d/steal" % attacker.server_port
+
+    class Redirector(BaseHTTPRequestHandler):
+        def do_POST(self):
+            try:
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            except Exception:  # noqa: BLE001
+                pass
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    class SameHost(BaseHTTPRequestHandler):
+        # A SAME-ORIGIN redirect is ordinary routing and must still work. 302 on a POST is
+        # what urllib actually follows (it rewrites to GET); it is also precisely the shape
+        # that leaked the credential cross-host, which is why this is the case to keep
+        # working rather than a 307 stock urllib refuses for POST anyway.
+        def _ok(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"choices":[{"message":{"content":"ok"}}]}')
+
+        def do_GET(self):
+            self._ok()
+
+        def do_POST(self):
+            try:
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            except Exception:  # noqa: BLE001
+                pass
+            if self.path.endswith("/moved"):
+                self._ok()
+                return
+            self.send_response(302)
+            self.send_header("Location", "/moved")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    victim = serve(Redirector)
+    same = serve(SameHost)
+    saved = os.environ.get("LEAKTEST_KEY")
+    try:
+        os.environ["LEAKTEST_KEY"] = "top-secret-token"
+        inv = AgentInvocation(cli="openai-compat", prompt="hi", cwd=os.getcwd(), model="m",
+                              base_url="http://127.0.0.1:%d/v1" % victim.server_port,
+                              api_key_env="LEAKTEST_KEY")
+        res = call(inv, 8000)
+        assert not [h for h in seen if h and "top-secret-token" in h], (
+            "the API key was sent to another host on a redirect")
+        err = res.get("error") or ""
+        assert "cross-host redirect" in err, err
+        assert "top-secret-token" not in err, "the token appeared in the error text"
+
+        # a SAME-origin redirect is still followed
+        inv2 = AgentInvocation(cli="openai-compat", prompt="hi", cwd=os.getcwd(), model="m",
+                               base_url="http://127.0.0.1:%d/v1" % same.server_port,
+                               api_key_env="LEAKTEST_KEY")
+        res2 = call(inv2, 8000)
+        assert res2.get("status") == "success", res2
+    finally:
+        os.environ.pop("LEAKTEST_KEY", None)
+        if saved is not None:
+            os.environ["LEAKTEST_KEY"] = saved
+        for srv in servers:
+            srv.shutdown()
+
+
+def test_v7_schema_and_memory_changes_between_fingerprint_and_dispatch():
+    """The identity hashes the --json-schema and .agents/memory.md, and BOTH are read again
+    later -- the schema to validate the result, memory to build the system context. A change
+    in between means the run validates against a contract, or runs under instructions, that
+    the envelope does not name. Both are attested, the same as the agent definition.
+
+    Driven through main() with the identity forced to carry the earlier hash, because that
+    is the only way to open the window in a test."""
+    import contextlib as _ctx
+    import io as _io
+    import json as _json
+
+    import run_subagent as _rs
+    d = tempfile.mkdtemp(prefix="summon-attest-")
+    real_identity = _rs._request_identity
+    real_argv = sys.argv
+    try:
+        with open(os.path.join(d, "a.md"), "w", encoding="utf-8") as fh:
+            fh.write("---" + chr(10) + "run-agent: openai-compat" + chr(10)
+                     + "base_url: http://127.0.0.1:9/v1" + chr(10) + "model: m" + chr(10)
+                     + "---" + chr(10) + "# A" + chr(10))
+        schema = os.path.join(d, "schema.json")
+        with open(schema, "w", encoding="utf-8") as fh:
+            _json.dump({"type": "object"}, fh)
+        os.makedirs(os.path.join(d, ".agents"), exist_ok=True)
+        memory = os.path.join(d, ".agents", "memory.md")
+        with open(memory, "w", encoding="utf-8") as fh:
+            fh.write("tenant=alpha")
+
+        base_argv = ["run_subagent.py", "--agent", "a", "--prompt", "p", "--cwd", d,
+                     "--agents-dir", d, "--dry-run"]
+
+        def run_main(extra=()):
+            out = _io.StringIO()
+            sys.argv = list(base_argv) + list(extra)
+            try:
+                with _ctx.redirect_stdout(out):
+                    _rs.main()
+            except SystemExit:
+                pass
+            return out.getvalue()
+
+        # baseline: nothing changed, nothing complains
+        text = run_main(["--json-schema", schema])
+        assert "changed between fingerprinting and dispatch" not in text, text
+
+        def with_stale(field, value):
+            def stale(args):
+                ident = dict(real_identity(args))
+                ident[field] = value
+                return ident
+            return stale
+
+        # SCHEMA: the identity names a contract the file no longer matches
+        _rs._request_identity = with_stale("json_schema_sha256", "0" * 64)
+        try:
+            text = run_main(["--json-schema", schema])
+        finally:
+            _rs._request_identity = real_identity
+        env = _json.loads(text)
+        assert env.get("status") == "error", env
+        assert "json-schema" in (env.get("error") or "") and \
+            "changed between fingerprinting and dispatch" in (env.get("error") or ""), env
+
+        # MEMORY: the identity names instructions the file no longer matches
+        _rs._request_identity = with_stale("memory_sha256", "0" * 64)
+        try:
+            text = run_main()
+        finally:
+            _rs._request_identity = real_identity
+        env = _json.loads(text)
+        assert env.get("status") == "error", env
+        assert "memory" in (env.get("error") or ""), env
+
+        # ABSENT -> PRESENT is a change too. An identity that recorded no memory (the file
+        # did not exist when it was built) must NOT then run under a memory file that
+        # appeared in the meantime -- it would shape the answer while contributing nothing
+        # to the identity that names it.
+        _rs._request_identity = with_stale("memory_sha256", None)
+        try:
+            text = run_main()
+        finally:
+            _rs._request_identity = real_identity
+        env = _json.loads(text)
+        assert env.get("status") == "error" and "memory" in (env.get("error") or ""), env
+
+        # ...and with genuinely NO memory file, an identity recording none proceeds
+        os.remove(memory)
+        text = run_main()
+        assert "changed between fingerprinting and dispatch" not in text, text
+    finally:
+        _rs._request_identity = real_identity
+        sys.argv = real_argv
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_injected_memory_is_the_attested_memory():
+    """Attesting memory proves a hash matches; it does NOT prove the bytes that were hashed
+    are the bytes the agent runs under. An `_inject_memory` that ignored the file entirely
+    and injected something else passed every memory test -- so assert on the SYSTEM CONTEXT
+    that comes out, not just on the attestation."""
+    import run_subagent as _rs
+    d = tempfile.mkdtemp(prefix="summon-meminj-")
+    try:
+        os.makedirs(os.path.join(d, ".agents"))
+        mem = os.path.join(d, ".agents", "memory.md")
+        with open(mem, "w", encoding="utf-8") as fh:
+            fh.write("TENANT-ALPHA-MARKER")
+
+        # the file's bytes reach the system context
+        ctx = _rs._inject_memory("BASE", d)
+        assert "BASE" in ctx and "TENANT-ALPHA-MARKER" in ctx, ctx
+
+        # and when the caller supplies the attested bytes, THOSE are what is injected --
+        # not a re-read, which is the whole point of passing them
+        with open(mem, "w", encoding="utf-8") as fh:
+            fh.write("SOMETHING-ELSE-ON-DISK")
+        ctx2 = _rs._inject_memory("BASE", d, b"TENANT-ALPHA-MARKER")
+        assert "TENANT-ALPHA-MARKER" in ctx2, ctx2
+        assert "SOMETHING-ELSE-ON-DISK" not in ctx2, (
+            "the injected memory came from a fresh read, not the attested bytes", ctx2)
+
+        # no memory file at all -> the context is untouched
+        os.remove(mem)
+        assert _rs._inject_memory("BASE", d) == "BASE"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_authorization_survives_a_same_origin_redirect():
+    """The redirect guard must keep the credential on a SAME-origin hop, not merely allow
+    the navigation. A handler that followed the redirect but stripped Authorization passed
+    the earlier test, because the same-origin server did not require auth -- so require it."""
+    import threading as _th
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from _apibackend import call
+    from _builder import AgentInvocation
+
+    seen = []
+    srv_box = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _drain(self):
+            try:
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            except Exception:  # noqa: BLE001
+                pass
+
+        def do_POST(self):
+            self._drain()
+            self.send_response(302)
+            self.send_header("Location", "/moved")
+            self.end_headers()
+
+        def do_GET(self):
+            seen.append(self.headers.get("Authorization"))
+            if self.headers.get("Authorization") != "Bearer same-origin-token":
+                self.send_response(401)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"choices":[{"message":{"content":"ok"}}]}')
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    _th.Thread(target=srv.serve_forever, daemon=True).start()
+    srv_box.append(srv)
+    saved = os.environ.get("SAMEORIGIN_KEY")
+    try:
+        os.environ["SAMEORIGIN_KEY"] = "same-origin-token"
+        inv = AgentInvocation(cli="openai-compat", prompt="hi", cwd=os.getcwd(), model="m",
+                              base_url="http://127.0.0.1:%d/v1" % srv.server_port,
+                              api_key_env="SAMEORIGIN_KEY")
+        res = call(inv, 8000)
+        assert res.get("status") == "success", (
+            "the credential did not survive a same-origin redirect", res, seen)
+        assert "Bearer same-origin-token" in seen, seen
+    finally:
+        os.environ.pop("SAMEORIGIN_KEY", None)
+        if saved is not None:
+            os.environ["SAMEORIGIN_KEY"] = saved
+        for srv in srv_box:
+            srv.shutdown()
+
+
+def test_v7_success_response_content_is_redacted():
+    """The canary only ever reached a refused connection, so redaction of a SUCCESSFUL
+    response body was never exercised: deleting the redact call on that path left every
+    assertion green. An endpoint that REFLECTS the key in a 200 body must not put it in the
+    envelope."""
+    import threading as _th
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from _apibackend import call
+    from _builder import AgentInvocation
+
+    class Reflector(BaseHTTPRequestHandler):
+        def do_POST(self):
+            try:
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            except Exception:  # noqa: BLE001
+                pass
+            auth = self.headers.get("Authorization") or ""
+            body = ('{"choices":[{"message":{"content":"echo ' + auth + '"}}]}').encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Reflector)
+    _th.Thread(target=srv.serve_forever, daemon=True).start()
+    saved = os.environ.get("REFLECT_KEY")
+    try:
+        os.environ["REFLECT_KEY"] = "sk-reflect-me-9f2a"
+        inv = AgentInvocation(cli="openai-compat", prompt="hi", cwd=os.getcwd(), model="m",
+                              base_url="http://127.0.0.1:%d/v1" % srv.server_port,
+                              api_key_env="REFLECT_KEY")
+        res = call(inv, 8000)
+        blob = _json_dumps_safe(res)
+        assert "sk-reflect-me-9f2a" not in blob, (
+            "an endpoint reflected the API key into a SUCCESS body and it reached the "
+            "envelope unredacted")
+    finally:
+        os.environ.pop("REFLECT_KEY", None)
+        if saved is not None:
+            os.environ["REFLECT_KEY"] = saved
+        srv.shutdown()
+
+
+def _json_dumps_safe(obj):
+    import json as _j
+    try:
+        return _j.dumps(obj, default=str)
+    except Exception:  # noqa: BLE001
+        return str(obj)
+
+
+def test_v7_args_only_credit_model_falls_back_to_opus():
+    """A credit-only model selected ONLY through `args:` was scrubbed but not REPLACED, so
+    the request reached the backend with no model at all and the vendor's own default
+    answered. That prevents the unauthorized credit spend but is not the documented
+    behaviour, and silently answers on a model nobody chose."""
+    from _builder import (_CREDIT_ONLY_MODELS, _OPUS_FALLBACK, AgentInvocation,
+                          apply_credit_guard)
+    fable = sorted(_CREDIT_ONLY_MODELS)[0]
+    saved = {k: os.environ.get(k) for k in ("SUMMON_ALLOW_CREDIT", "SUMMON_ALLOW_FABLE")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+
+        # selected via args ONLY -> scrubbed AND replaced with the pinned fallback
+        inv = AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(), model=None,
+                              extra_args=("--model", fable))
+        guarded, _env, warns = apply_credit_guard(inv)
+        assert guarded.model == _OPUS_FALLBACK, (guarded.model, warns)
+        assert fable not in list(guarded.extra_args), guarded.extra_args
+        assert any("pinned" in w for w in warns), warns
+
+        # the flag=value form too
+        inv = AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(), model=None,
+                              extra_args=("--model=" + fable,))
+        assert apply_credit_guard(inv)[0].model == _OPUS_FALLBACK
+
+        # an ordinary args model is untouched, and no fallback is invented
+        inv = AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(), model=None,
+                              extra_args=("--model", "claude-ordinary"))
+        guarded, _e, _w = apply_credit_guard(inv)
+        assert guarded.model is None and "claude-ordinary" in list(guarded.extra_args)
+
+        # and when credit IS authorized, nothing is scrubbed or substituted
+        os.environ["SUMMON_ALLOW_CREDIT"] = "1"
+        inv = AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(), model=None,
+                              extra_args=("--model", fable))
+        guarded, _e, _w = apply_credit_guard(inv)
+        assert guarded.model is None and fable in list(guarded.extra_args), guarded
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_v7_env_authorized_credit_reaches_the_env_identity():
+    """`env_override_for` recognized only the --allow-credit ARGUMENT, while dispatch also
+    honors SUMMON_ALLOW_CREDIT/SUMMON_ALLOW_FABLE. With SUMMON_ALLOW_FABLE=1 and a credit-only
+    ANTHROPIC_MODEL, the child receives it but the identity stripped it -- so setting vs
+    unsetting that variable hashed the same while selecting Fable vs the default."""
+    from _builder import _CREDIT_ONLY_MODELS, env_override_for
+    from _executor import backend_env_sha
+    credit_model = sorted(_CREDIT_ONLY_MODELS)[0]
+    saved = {k: os.environ.get(k) for k in
+             ("ANTHROPIC_MODEL", "SUMMON_ALLOW_CREDIT", "SUMMON_ALLOW_FABLE")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+
+        # UNAUTHORIZED: the credit-only model is stripped, so unset and set hash the same
+        os.environ["ANTHROPIC_MODEL"] = credit_model
+        assert env_override_for("claude") == {"ANTHROPIC_MODEL": None}
+        stripped = backend_env_sha("claude")
+        os.environ.pop("ANTHROPIC_MODEL")
+        assert backend_env_sha("claude") == stripped
+
+        # AUTHORIZED via the ENV var: nothing is stripped, so the value now counts
+        os.environ["SUMMON_ALLOW_FABLE"] = "1"
+        assert env_override_for("claude") is None
+        os.environ["ANTHROPIC_MODEL"] = credit_model
+        with_model = backend_env_sha("claude")
+        os.environ.pop("ANTHROPIC_MODEL")
+        assert backend_env_sha("claude") != with_model, (
+            "an authorized credit-only ANTHROPIC_MODEL reaches the child, so setting it "
+            "must change the identity")
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_v7_args_only_credit_fallback_is_in_the_identity():
+    """A credit-only model selected ONLY through `args:` is scrubbed to the Opus fallback at
+    dispatch, so the EFFECTIVE model is that fallback. Tracking only --model/frontmatter left
+    it out, so changing the fallback constant changed the dispatched model with the
+    fingerprint unmoved (the fix pinned the fallback but the IDENTITY still ignored it)."""
+    import _builder
+    from _builder import _CREDIT_ONLY_MODELS
+    from _executor import build_request_identity, request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-argsfb-")
+    saved_fb = _builder._OPUS_FALLBACK
+    env_saved = {k: os.environ.get(k) for k in ("SUMMON_ALLOW_CREDIT", "SUMMON_ALLOW_FABLE")}
+    fable = sorted(_CREDIT_ONLY_MODELS)[0]
+    try:
+        for k in env_saved:
+            os.environ.pop(k, None)
+        with open(os.path.join(d, "byargs.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\nargs: --model " + fable + "\n---\n# Args\n")
+        with open(os.path.join(d, "ordinary.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\nargs: --model claude-ordinary\n---\n# Ord\n")
+
+        def fp(agent):
+            return request_fingerprint(**build_request_identity(
+                agent=agent, prompt="p", cwd=d, agents_dir=d))
+
+        before_args, before_ord = fp("byargs"), fp("ordinary")
+        _builder._OPUS_FALLBACK = "claude-opus-next"
+        assert fp("byargs") != before_args, (
+            "the args-only credit fallback is not in the identity, so changing it left the "
+            "fingerprint unmoved while the dispatched model changed")
+        assert fp("ordinary") == before_ord, "an ordinary args model must be unaffected"
+    finally:
+        _builder._OPUS_FALLBACK = saved_fb
+        for k, v in env_saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_agent_definition_absent_then_present_is_refused():
+    """The definition re-check ran only when a hash had been recorded. A definition that did
+    not resolve when the identity was built, but does by dispatch, would otherwise run under
+    an identity naming none of it. The comparison is now unconditional."""
+    import contextlib as _ctx
+    import io as _io
+    import json as _json
+
+    import run_subagent as _rs
+    d = tempfile.mkdtemp(prefix="summon-defabs-")
+    real_identity = _rs._request_identity
+    real_argv = sys.argv
+    try:
+        with open(os.path.join(d, "a.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:9/v1\n"
+                     "model: m\n---\n# A\n")
+        argv = ["run_subagent.py", "--agent", "a", "--prompt", "p", "--cwd", d,
+                "--agents-dir", d, "--dry-run"]
+
+        def run_main():
+            out = _io.StringIO()
+            sys.argv = list(argv)
+            try:
+                with _ctx.redirect_stdout(out):
+                    _rs.main()
+            except SystemExit:
+                pass
+            return out.getvalue()
+
+        # identity records NO definition (as if it did not resolve then), file exists NOW
+        def as_if_absent(args):
+            ident = dict(real_identity(args))
+            ident["agent_def_sha256"] = None
+            ident["_agent_def_state"] = "missing"
+            return ident
+
+        _rs._request_identity = as_if_absent
+        try:
+            text = run_main()
+        finally:
+            _rs._request_identity = real_identity
+        env = _json.loads(text)
+        assert env.get("status") == "error", (
+            "a definition that appeared after fingerprinting ran anyway", env)
+        assert "changed between fingerprinting and dispatch" in (env.get("error") or ""), env
+    finally:
+        _rs._request_identity = real_identity
+        sys.argv = real_argv
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_agy_account_absent_then_present_is_refused():
+    """`agy_account_sha256 = None` meant both "legacy caller" and "no account files when
+    fingerprinted". A login between fingerprint and dispatch turned the second into a
+    populated profile that ran with no account digest in the identity. A positive
+    `agy_account_checked` marker distinguishes them, so absent -> present is refused."""
+    from _builder import _AGY_AUTH_FILES, AgentInvocation, agy_profile_account_sha
+    import _builder
+    d = tempfile.mkdtemp(prefix="summon-agyabs-")
+    try:
+        prof = tempfile.mkdtemp(prefix="summon-prof-", dir=d)
+        gem = os.path.join(prof, ".gemini")
+        os.makedirs(gem)
+        for fn in _AGY_AUTH_FILES:
+            with open(os.path.join(gem, fn), "w", encoding="utf-8") as fh:
+                fh.write("logged-in-account:" + fn)
+        assert agy_profile_account_sha(prof) is not None
+
+        # Build the invocation from the REAL identity path -- not by hand -- so the marker
+        # has to be EMITTED by build_request_identity and WIRED into AgentInvocation. The
+        # earlier version passed agy_account_checked= directly and would have stayed green
+        # even though production never set the marker at all (which is exactly what shipped
+        # broken and codex caught).
+        import run_subagent as _rs
+        from _executor import build_request_identity
+        from _loader import get_agents_dir
+
+        agent_dir = tempfile.mkdtemp(prefix="summon-agyagent-", dir=d)
+        with open(os.path.join(agent_dir, "ag.md"), "w", encoding="utf-8") as fh:
+            fh.write("---" + chr(10) + "run-agent: agy" + chr(10) + "---" + chr(10)
+                     + "# Agy" + chr(10))
+
+        # a FRESH ~/.gemini with NO account files -> the identity records agy_account_sha256
+        # None but marks that it checked
+        empty_home = tempfile.mkdtemp(prefix="summon-emptyhome-", dir=d)
+        os.makedirs(os.path.join(empty_home, ".gemini"))
+        real_expand = os.path.expanduser
+        os.path.expanduser = lambda p: empty_home if p == "~" else real_expand(p)
+        try:
+            # FRESH path (no resume): the account digest comes from ~/.gemini, which is
+            # empty here, so the identity records None WITH the checked marker. (On a resume
+            # the digest would come from the profile, which already has files -- that is the
+            # "different account" case, not absent-then-present.)
+            ident = build_request_identity(agent="ag", prompt="p", cwd=agent_dir,
+                                           agents_dir=agent_dir)
+        finally:
+            os.path.expanduser = real_expand
+        assert ident["agy_account_sha256"] is None, ident["agy_account_sha256"]
+        assert ident.get("_agy_account_checked") is True, (
+            "the identity did not emit the account-checked marker at all", ident)
+        # the marker is LOCAL: it must not change the fingerprint
+        from _executor import request_fingerprint
+        stripped = {k: v for k, v in ident.items() if k != "_agy_account_checked"}
+        assert request_fingerprint(**ident) == request_fingerprint(**stripped)
+
+        # And the ATTESTATION refuses on those exact identity values. `prof` now carries an
+        # account (the login completed), so the attestation the dispatch runs -- with the
+        # identity's expected=None and the marker's checked=True -- must refuse. This is the
+        # production refusal function fed the production marker values; the fresh dispatch
+        # path itself is Windows-wrapper-gated, so it is exercised here rather than plumbed.
+        from _builder import _attest_agy_profile
+        try:
+            _attest_agy_profile(prof, ident.get("agy_account_sha256"),
+                                bool(ident.get("_agy_account_checked")))
+            raise AssertionError("an account that appeared after fingerprinting was not "
+                                 "refused")
+        except ValueError as e:
+            assert "account files changed" in str(e), str(e)
+
+        # a genuinely pre-0.10.2 caller (checked=False, expected=None) is still waved through
+        _attest_agy_profile(prof, None, False)   # no exception
+
+        # PRODUCTION WIRING: drive main() for a real agy dispatch and CAPTURE the initial
+        # invocation, so run_subagent's `agy_account_checked=bool(_identity.get(...))`
+        # assignment actually runs. Asserting the identity and attestation separately (above)
+        # does not prove they are connected; this does. Hardcoding that assignment to False
+        # fails here.
+        import contextlib as _ctx
+        import io as _io
+        captured = {}
+
+        def cap_execute(inv, **kw):
+            captured["inv"] = inv
+            raise SystemExit(0)          # stop before the agy profile/wrapper machinery
+
+        real_execute = _rs.execute_agent
+        real_argv = sys.argv
+        os.path.expanduser = lambda p: empty_home if p == "~" else real_expand(p)
+        _rs.execute_agent = cap_execute
+        try:
+            sys.argv = ["run_subagent.py", "--agent", "ag", "--prompt", "p",
+                        "--cwd", agent_dir, "--agents-dir", agent_dir]
+            with _ctx.redirect_stdout(_io.StringIO()):
+                try:
+                    _rs.main()
+                except SystemExit:
+                    pass
+        finally:
+            _rs.execute_agent = real_execute
+            sys.argv = real_argv
+            os.path.expanduser = real_expand
+        assert captured.get("inv") is not None, "main() never built an agy invocation"
+        assert captured["inv"].agy_account_checked is True, (
+            "the initial agy invocation did not carry the account-checked marker -- the "
+            "identity->invocation wiring is broken", captured["inv"])
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v7_every_consumed_identity_key_is_emitted():
+    """A guard against the failure that shipped TWICE: an edit adds a `_identity.get("X")`
+    read in the dispatch but the matching emit in build_request_identity is silently dropped
+    (a half-applied change), so X is always None/False in production while a hand-built test
+    masks it. Every key the dispatch reads from the identity MUST be one the builder emits."""
+    import re
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    exe = open(os.path.join(here, "_executor.py"), encoding="utf-8").read()
+    body = exe[exe.index("def build_request_identity"):exe.index("def request_fingerprint")]
+    emitted = set(re.findall(r'"(_?[a-z][a-z0-9_]*)":', body))
+
+    consumers = ""
+    for f in ("run_subagent.py", "_manifest.py"):
+        consumers += open(os.path.join(here, f), encoding="utf-8").read()
+    read = set(re.findall(r'_identity\.get\("(_?[a-z][a-z0-9_]*)"\)', consumers))
+    read |= set(re.findall(r'_ident(?:ity)?\["(_?[a-z][a-z0-9_]*)"\]', consumers))
+
+    missing = sorted(read - emitted)
+    assert not missing, (
+        "the dispatch reads identity keys the builder never emits (a half-applied edit): "
+        + ", ".join(missing))
+    assert read, "found no identity consumers -- the regex probably broke, not a real pass"
+
+
+def test_v7_retry_invocations_inherit_all_attestation_fields():
+    """The two automatic retries (schema correction, contract repair) built fresh
+    invocations by hand, so any field not in the constructor call -- the agy attestation
+    fields among them -- was silently dropped, and an account swap before a retry was waved
+    through. They now CLONE the original invocation, so this captures the actual retry
+    object each path builds and asserts the attestation fields survive."""
+    import run_subagent as _rs
+    from _builder import AgentInvocation
+
+    orig = AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(), agent_file="x.md",
+                           agy_account_sha256="ACCOUNT-A-SHA", agy_account_checked=True,
+                           resume_profile="/prof")
+
+    captured = {}
+
+    def fake_execute(inv, **kw):
+        captured["inv"] = inv
+        return {"status": "success", "result": "{}", "parse_ok": True, "report_ok": True,
+                "resume": {"session_id": "s"}}
+
+    real_execute = _rs.execute_agent
+    _rs.execute_agent = fake_execute
+
+    class _Args:
+        timeout = 60000
+        debug_dir = None
+        max_tool_output_bytes = None
+
+    try:
+        # schema-correction path: force a parse failure so the retry fires
+        result = {"parse_ok": False, "parse_errors": ["bad"],
+                  "resume": {"session_id": "s", "profile": "/prof"}}
+        _rs._apply_schema(result, {"type": "object"}, orig, _Args())
+        sc = captured.get("inv")
+        assert sc is not None, "schema-correction retry was not constructed"
+        assert sc.agy_account_sha256 == "ACCOUNT-A-SHA" and sc.agy_account_checked is True, (
+            "the schema-correction retry dropped the agy attestation fields", sc)
+
+        # contract-repair path: a suspect success (report_ok False) fires it
+        captured.clear()
+        result = {"status": "success", "report_ok": False,
+                  "resume": {"session_id": "s", "profile": "/prof"}}
+        _rs._apply_contract_repair(result, orig, _Args())
+        cr = captured.get("inv")
+        assert cr is not None, "contract-repair retry was not constructed"
+        assert cr.agy_account_sha256 == "ACCOUNT-A-SHA" and cr.agy_account_checked is True, (
+            "the contract-repair retry dropped the agy attestation fields", cr)
+        # its deliberate hardening survived the clone
+        assert cr.permission == "read-only", cr.permission
+        assert not cr.extra_args, cr.extra_args
+    finally:
+        _rs.execute_agent = real_execute
+
+
+def test_v7_identity_loads_the_definition_once_no_hybrid():
+    """build_request_identity derived the backend, endpoint, model defaults, effort and the
+    agy-account decision from SEPARATE reads of the definition. An A -> B -> A swap between
+    them produced a HYBRID identity -- A's hash with B's resolved backend -- which turned agy
+    attestation off for a real agy request. It now reads the file ONCE via
+    load_agent_snapshot, which returns the tuple, frontmatter and sha from one buffer.
+
+    The invariant is not "one call"; it is "every definition-derived field comes from the
+    SAME bytes". So this asserts BOTH: exactly one file read, AND that resolved_cli and
+    agent_def_sha256 are mutually consistent with one definition. Codex's mutation (return an
+    agy tuple but rewrite the file to codex before hashing) is still one read, yet it breaks
+    that consistency and fails the sha assertion."""
+    import hashlib as _hl
+
+    import _loader
+    from _executor import build_request_identity
+
+    d = tempfile.mkdtemp(prefix="summon-onceload-")
+    real_snap = _loader._load_agent_snapshot_from
+    reads = {"n": 0}
+
+    def counting(ad, an):
+        reads["n"] += 1
+        return real_snap(ad, an)
+
+    def build_once(name, raw, want_cli, extra=None):
+        with open(os.path.join(d, name + ".md"), "wb") as fh:
+            fh.write(raw)
+        reads["n"] = 0
+        _loader._load_agent_snapshot_from = counting
+        try:
+            idn = build_request_identity(agent=name, prompt="p", cwd=d, agents_dir=d)
+        finally:
+            _loader._load_agent_snapshot_from = real_snap
+        # ONE read of the definition...
+        assert reads["n"] == 1, (
+            "%s read the definition %d times -- scattered reads allow a hybrid"
+            % (name, reads["n"]))
+        assert idn["resolved_cli"] == want_cli, (name, idn["resolved_cli"])
+        # ...and the backend and the hash are BOTH this definition's, from one buffer. A
+        # hybrid (backend from B, hash from A) makes exactly one of these disagree.
+        assert idn["agent_def_sha256"] == _hl.sha256(raw).hexdigest(), (
+            name + ": the hash does not match the backend the identity resolved -- they "
+            "came from different byte versions (a hybrid)")
+        if extra:
+            extra(idn)
+        return idn
+
+    try:
+        nl = chr(10)
+        build_once("ag", ("---" + nl + "run-agent: agy" + nl + "---" + nl + "# A" + nl
+                          ).encode(), "agy",
+                   lambda idn: (_ for _ in ()).throw(AssertionError(idn))
+                   if idn["_agy_account_checked"] is not True else None)
+        # every definition-dependent backend, each still exactly ONE read
+        build_once("cx", ("---" + nl + "run-agent: codex" + nl + "---" + nl + "# C" + nl
+                          ).encode(), "codex")
+        build_once("cu", ("---" + nl + "run-agent: cursor-agent" + nl + "---" + nl + "# U"
+                          + nl).encode(), "cursor-agent")
+        build_once("oc", ("---" + nl + "run-agent: openai-compat" + nl
+                          + "base_url: http://127.0.0.1:9/v1" + nl + "---" + nl + "# O" + nl
+                          ).encode(), "openai-compat")
+    finally:
+        _loader._load_agent_snapshot_from = real_snap
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
