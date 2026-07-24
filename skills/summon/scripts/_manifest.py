@@ -28,8 +28,10 @@ this an untrusted third-party manifest.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import math
 import re
 import subprocess
 import sys
@@ -40,6 +42,11 @@ from concurrent.futures import ThreadPoolExecutor
 _JOB_KEYS = ("id", "agent", "prompt", "prompt_file", "cwd", "cli", "model",
              "effort", "timeout", "retries", "json_schema", "debug_dir")
 _DEFAULT_CAP = 3
+# The SAME duration ceiling --timeout enforces, so a manifest cannot size the parent
+# watchdog past what the child would ever accept.
+from _cli import _MAX_TIMEOUT_MS  # noqa: E402
+from _executor import build_request_identity  # noqa: E402
+
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -67,6 +74,84 @@ def _parse_concurrency(spec: str | None) -> dict:
     return caps
 
 
+def _clear_out_file(out_file: str, archive: bool) -> str | None:
+    """Make the authoritative result path EMPTY before a dispatch writes to it.
+
+    Returns None on success, or an error string. A prior success is archived (never
+    overwritten -- an older archive is a real answer too) instead of deleted, so declining to
+    reuse one cannot destroy it. Failure is REPORTED, not swallowed: leaving a stale envelope
+    at the authoritative path meant a failed child was followed by the parent re-reading the
+    old answer and reporting it, with exit 0, as this run's result.
+    """
+    if not os.path.exists(out_file):
+        return None
+    claimed = clear_err = cleanup_err = None
+    try:
+        if archive:
+            # CLAIM the name atomically (O_CREAT|O_EXCL) instead of testing-then-taking it.
+            # The check-then-act loop let two writers sharing a --results-dir choose the
+            # same free name, and the second os.replace then overwrote the first's archived
+            # answer. O_EXCL means exactly one writer can ever own a given name.
+            base = out_file + ".superseded"
+            dest, n = base, 0
+            while True:
+                try:
+                    # Record the claim BEFORE closing: a close() that fails on a network
+                    # filesystem would otherwise leave the reserved name behind forever,
+                    # because `claimed` was still None and the cleanup never ran.
+                    fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    claimed = dest
+                    os.close(fd)
+                    break
+                except FileExistsError:
+                    n += 1
+                    dest = f"{base}.{n}"
+                    if n > 10_000:             # pathological; do not spin forever
+                        return (f"cannot archive the previous result at {out_file}: "
+                                "too many superseded copies")
+            os.replace(out_file, dest)
+            claimed = None                     # the claim now holds the real content
+        else:
+            os.remove(out_file)
+    except FileNotFoundError:
+        # Someone else cleared this path first (two runs sharing a --results-dir). The GOAL
+        # -- an empty authoritative path -- is met, so this is success, not failure. Only
+        # report if the file is somehow still there.
+        pass
+    except OSError as e:
+        # Recorded, NOT returned here: returning from the `try` would discard whatever the
+        # `finally` below finds, and the reservation left behind is exactly the thing that
+        # goes wrong when the clear fails.
+        clear_err = f"cannot clear the previous result at {out_file}: {e}"
+    finally:
+        if claimed:                            # a name we reserved but never filled
+            try:
+                os.remove(claimed)
+            except OSError as e:
+                # Reported, not swallowed: an empty archive left behind is a real (if
+                # small) mess, and every other failure on this path is reported. On Windows
+                # a close() that raised can leave the handle open, and a file with an open
+                # handle cannot be removed -- so this is a genuinely reachable state.
+                cleanup_err = f"cannot remove the reserved archive {claimed}: {e}"
+    if clear_err or cleanup_err:
+        return "; ".join(x for x in (clear_err, cleanup_err) if x)
+    if os.path.exists(out_file):
+        return f"the previous result at {out_file} is still present after clearing it"
+    return None
+
+
+def _job_agents_dir(job: dict, args, base_cwd: str) -> str:
+    """The roster a job's agent will actually be loaded from.
+
+    A job with its own `cwd` resolves its agent from THAT tree's `.agents`, exactly as the
+    child will. Resolving every job against the MANIFEST's base roster instead made the
+    scheduler pick a different backend than the child dispatched to -- bypassing that
+    backend's concurrency cap and labelling its telemetry with the wrong vendor.
+    """
+    from _loader import get_agents_dir
+    return get_agents_dir(args.agents_dir, job.get("cwd") or base_cwd)
+
+
 def _job_backend(job: dict, agents_dir: str) -> str:
     """The backend a job will dispatch to (for the right semaphore): explicit
     cli > agent frontmatter run-agent > dispatcher default (codex)."""
@@ -74,8 +159,13 @@ def _job_backend(job: dict, agents_dir: str) -> str:
         return job["cli"]
     try:
         from _loader import load_agent
+        from _resolver import resolve_cli
         run_agent = load_agent(agents_dir, job["agent"])[0]
-        return run_agent or "codex"
+        # resolve_cli, NOT `or "codex"`: with an UNPINNED agent the backend comes from
+        # CALLER DETECTION, so under CLAUDE_CODE=1 every such job dispatched to claude while
+        # the scheduler counted it as codex -- claude's concurrency cap was bypassed
+        # entirely and the per-backend telemetry named the wrong vendor.
+        return resolve_cli(run_agent)
     except Exception:  # noqa: BLE001 — the child will surface the real error
         return "codex"
 
@@ -85,7 +175,14 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
     if isinstance(doc, list):
         defaults, jobs_raw = {}, doc
     elif isinstance(doc, dict):
-        defaults, jobs_raw = doc.get("defaults") or {}, doc.get("jobs")
+        # `doc.get("defaults") or {}` ERASED the type of a falsey non-object, so `[]`, `0`
+        # and `""` sailed through the check below. Only a genuinely absent (or null)
+        # defaults block becomes {}.
+        defaults, jobs_raw = doc.get("defaults"), doc.get("jobs")
+        defaults = {} if defaults is None else defaults
+        if not isinstance(defaults, dict):
+            # `{**defaults, **raw}` on a list raises TypeError before any job is seen
+            return None, f"manifest 'defaults' must be an object, got {type(defaults).__name__}"
     else:
         return None, "manifest must be a JSON object with 'jobs' or a JSON array"
     if not isinstance(jobs_raw, list) or not jobs_raw:
@@ -99,6 +196,19 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
         unknown = set(job) - set(_JOB_KEYS)
         if unknown:
             return None, f"job #{i}: unknown keys {sorted(unknown)}"
+        # Type-check every field used as a string BEFORE anything uses one. `prompt_file`
+        # was read (os.path.isabs/join) and `cwd` reached os.path.abspath during identity
+        # construction -- both OUTSIDE the per-job error handling -- so a list-valued one
+        # took down the WHOLE manifest with a TypeError instead of producing one job's
+        # error. str ONLY: a numeric `cwd` is not a path, and accepting int/float
+        # contradicted the very message this raises.
+        # json_schema is deliberately absent: it has its own check further down whose
+        # message explains WHY it must be a path, and that wording is worth keeping.
+        for _k in ("agent", "prompt", "prompt_file", "cwd", "cli", "model", "effort", "id",
+                   "debug_dir"):
+            if job.get(_k) is not None and not isinstance(job[_k], str):
+                return None, (f"job #{i}: {_k} must be a string, got "
+                              f"{type(job[_k]).__name__}")
         if not job.get("agent"):
             return None, f"job #{i}: 'agent' is required"
         if job.get("prompt") is not None and job.get("prompt_file") is not None:
@@ -135,9 +245,14 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
         job_id = str(job.get("id") or f"{job['agent']}-{i:03d}")
         if not _ID_RE.match(job_id) or ".." in job_id:
             return None, f"job #{i}: invalid id {job_id!r} (letters/digits/._-)"
-        if job_id in seen:
-            return None, f"duplicate job id {job_id!r}"
-        seen.add(job_id)
+        # Case-INSENSITIVE, because the id becomes `<results-dir>/<id>.json`: on Windows and
+        # macOS `Foo` and `foo` are one file, so two such jobs would overwrite each other's
+        # result (and the second would resume off the first's envelope). Rejecting on every
+        # platform keeps a manifest that works here working there.
+        if job_id.lower() in seen:
+            return None, (f"duplicate job id {job_id!r} (ids are compared case-insensitively "
+                          "because each becomes a <id>.json result file)")
+        seen.add(job_id.lower())
         job["id"] = job_id
         jobs.append(job)
     return jobs, None
@@ -164,9 +279,14 @@ def _timeout_seconds(spec, default: float = 600.0) -> float:
             ms = float(s)  # bare number == milliseconds, matching the child
     except ValueError:
         return default
-    if ms <= 0:
+    if not math.isfinite(ms) or ms <= 0:
         return default
-    return max(1.0, ms / 1000)
+    # Same ceiling the child's --timeout enforces. A finite-but-absurd manifest timeout
+    # ('1e308') sized the PARENT watchdog to ~1.5e305 seconds and raised OverflowError
+    # ("timestamp out of range for platform time_t") when it was turned into a deadline --
+    # killing the parent while its child ran on unmanaged. Odd input falls back to the
+    # default here rather than raising, so clamp rather than reject.
+    return max(1.0, min(ms, _MAX_TIMEOUT_MS) / 1000)
 
 
 def _parent_timeout(job: dict, floor: float = 90.0) -> float:
@@ -268,6 +388,22 @@ def _read_envelope(out_file: str, proc) -> dict:
             "error": f"child produced no valid envelope (exit {proc.returncode}): {combined}"}
 
 
+def _job_identity(job: dict, args) -> dict:
+    """Adapter: a manifest job's RAW inputs, handed to the one shared identity builder.
+
+    Built from the SAME expressions _child_cmd forwards to the child, and it does no
+    derivation of its own -- the shared builder owns every hash and every environment-backed
+    field, so the parent's view and the child's cannot diverge by construction. (They did:
+    the child gained the env-backed credit/effort controls while this side did not, so with
+    SUMMON_DEFAULT_EFFORT set every manifest restart re-dispatched every finished job.)
+    """
+    return build_request_identity(
+        agent=job["agent"], prompt=job["prompt"],
+        cwd=os.path.abspath(job.get("cwd") or args.cwd or os.getcwd()),
+        agents_dir=args.agents_dir, cli=job.get("cli"), model=job.get("model"),
+        effort=job.get("effort"), json_schema=job.get("json_schema"))
+
+
 def _child_cmd(job: dict, args, out_file: str) -> list:
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
     cmd = [sys.executable, script,
@@ -315,7 +451,8 @@ def run_manifest(args) -> int:
     # Pre-build one semaphore per backend BEFORE the pool starts — lazy creation
     # from multiple worker threads is a check-then-act race that can exceed a
     # backend's cap. Resolve each job's backend once here (also reused below).
-    job_backends = {j["id"]: _job_backend(j, agents_dir) for j in jobs}
+    job_backends = {j["id"]: _job_backend(j, _job_agents_dir(j, args, base_cwd))
+                    for j in jobs}
     sems: dict = {b: threading.BoundedSemaphore(caps.get(b, caps["default"]))
                   for b in set(job_backends.values())}
 
@@ -337,24 +474,49 @@ def run_manifest(args) -> int:
         # is re-run, so re-launching a swarm RETRIES its failures AND its
         # unparseable results instead of skipping them permanently. Shared with
         # the direct --out skip via is_terminal_success so both agree.
-        from _executor import is_terminal_success
+        # The parent skips WITHOUT spawning, so the child's own identity check never runs
+        # for a manifest job -- the parent has to make the same check itself, or editing a
+        # job's prompt while keeping its id silently returns the previous answer.
+        from _executor import (envelope_answers_request, is_terminal_success,
+                               request_fingerprint)
         prior = _existing_envelope(out_file)
-        if is_terminal_success(prior):
+        _ident = _job_identity(job, args)
+        _fp = request_fingerprint(**_ident)
+        # Pass the legacy-fallback fields too. Without them the parent and the child
+        # DISAGREE on pre-0.10.2 envelopes: the child re-dispatches on a proven prompt/agent
+        # mismatch while the parent, which never reaches the child, reused the stale answer.
+        _reusable, _note = envelope_answers_request(
+            prior, _fp, hashlib.sha256(str(_ident["prompt"]).encode("utf-8")).hexdigest(),
+            _ident["agent"], _ident)
+        if is_terminal_success(prior) and _reusable:
+            if _note:
+                _pw = prior.get("warnings")
+                _pw = _pw if isinstance(_pw, list) else ([] if _pw is None else [str(_pw)])
+                prior["warnings"] = _pw + [_note]
             envelope, skipped = prior, True
         else:
             skipped = False
+            envelope = None
             with sems[backend]:
                 try:
                     # Clear any stale envelope from a prior failed run FIRST, so
                     # that after a watchdog kill the absence of a fresh file means
                     # "this run failed" — not a masking re-read of the old result.
-                    try:
-                        os.remove(out_file)
-                    except OSError:
+                    # A prior SUCCESS we merely declined to reuse is ARCHIVED rather than
+                    # deleted, so a false refusal cannot destroy a completed answer.
+                    clear_err = _clear_out_file(out_file, is_terminal_success(prior))
+                    if clear_err:
+                        # Swallowing this was a FALSE SUCCESS: the stale envelope stayed at
+                        # the authoritative path, the child failed, and the parent re-read
+                        # the old answer and reported it as this run's result with exit 0.
+                        # If the path cannot be cleared we must not dispatch over it.
+                        envelope, proc, spawn_err = {"status": "error", "error": clear_err}, None, None
+                    else:
+                        proc, spawn_err = _dispatch_child(_child_cmd(job, args, out_file),
+                                                          _parent_timeout(job))
+                    if envelope is not None:
                         pass
-                    proc, spawn_err = _dispatch_child(_child_cmd(job, args, out_file),
-                                                      _parent_timeout(job))
-                    if spawn_err:
+                    elif spawn_err:
                         envelope = {"status": "error", "error": spawn_err}
                     elif proc.timed_out and _existing_envelope(out_file) is None:
                         # Watchdog fired and the child wrote nothing (tree killed).
@@ -386,6 +548,10 @@ def run_manifest(args) -> int:
                   f"elapsed={int(time.monotonic() - t0)}s", file=sys.stderr, flush=True)
         return {"id": job["id"], "backend": backend, "status": status,
                 "skipped": skipped,
+                # WHY it failed, in the summary itself. Without it a job that could not clear
+                # its own result path reported `status: error` while `result_file` still
+                # pointed at the STALE SUCCESS envelope, with nothing anywhere saying so.
+                **({"error": envelope["error"]} if envelope.get("error") else {}),
                 "result_file": out_file,
                 "report_status": (envelope.get("report") or {}).get("status"),
                 "suspect": envelope.get("suspect", False)}
