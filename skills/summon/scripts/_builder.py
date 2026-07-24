@@ -41,6 +41,13 @@ class AgentInvocation:
     extra_args: tuple = ()             # arbitrary backend flags (agent `args:` frontmatter)
     base_url: str | None = None        # openai-compat only: resolved API base url
     api_key_env: str | None = None     # openai-compat only: env var holding the API key
+    # agy only: the account digest the REQUEST IDENTITY recorded, checked against the bytes
+    # actually copied into the isolated profile so a swap in between cannot produce a result
+    # stamped under the wrong account.
+    agy_account_sha256: str | None = None
+    # True when the request identity inspected the agy account (so a None digest above means
+    # "absent when fingerprinted", a state to attest, not "legacy caller, nothing to check").
+    agy_account_checked: bool = False
 
 
 # Short report-contract nudge appended to RESUME prompts. On resume the session
@@ -331,6 +338,14 @@ def apply_credit_guard(inv) -> tuple:
     if scrubbed:
         warnings.append("summon stripped a credit-only model flag from this agent's `args:` "
                         "(it would have run Fable on account credit without opt-in)")
+        if not model:
+            # ...and PUT THE FALLBACK BACK. Scrubbing alone left the request with no model
+            # at all, so the vendor's own default ran -- which prevents the unauthorized
+            # credit spend but is not the documented behaviour ("substitute a credit-only
+            # model with Opus"), and silently answers on a model nobody chose.
+            model = _OPUS_FALLBACK
+            warnings.append(f"summon pinned {_OPUS_FALLBACK} in its place, so this run does "
+                            "not fall through to the backend's own default model")
     env = _credit_env_override()
     if env:
         warnings.append(f"summon stripped env var(s) {sorted(env)} that remap a model alias "
@@ -341,6 +356,40 @@ def apply_credit_guard(inv) -> tuple:
     if model != inv.model or args is not inv.extra_args:
         inv = replace(inv, model=model, extra_args=args)
     return inv, env, warnings
+
+
+def env_override_for(cli: str, allow_credit: bool = False) -> dict | None:
+    """The environment delta summon applies to a child for `cli`, insofar as it depends only
+    on the ENVIRONMENT (not on the resolved invocation).
+
+    ONE definition, used both by the arg builders below and by the request identity. The
+    identity previously hashed variables by vendor PREFIX, which is not the same thing as
+    what the child receives: summon forwards `CLI_API_KEY` as `CURSOR_API_KEY` and strips
+    `OPENAI_API_KEY` unless `SUBAGENTS_ALLOW_OPENAI_KEY=1`. So changing the Cursor key, or
+    toggling whether Codex sees an API key at all, changed the child's effective auth while
+    the fingerprint stayed equal -- and changing a STRIPPED `OPENAI_API_KEY` invalidated
+    results whose execution was identical. Deriving both from this keeps them in step.
+    """
+    if cli == "claude" and (allow_credit or credit_spend_allowed()):
+        # AUTHORIZED (by the flag OR by SUMMON_ALLOW_CREDIT/SUMMON_ALLOW_FABLE): the guard
+        # strips nothing, so neither does the hashed view. Using only the flag left the env
+        # var authorization path hashing the stripped environment while the authorized child
+        # received the credit-only remap.
+        return None
+    if cli == "claude":
+        # The credit guard STRIPS any ANTHROPIC_*MODEL* var naming a credit-only model, so
+        # the child never sees it -- and the identity must not hash a value the child does
+        # not get, or an unset-vs-set pair that dispatch treats identically forces a rerun.
+        # (Only the env-derived half lives here; the model substitution depends on the
+        # resolved invocation and is covered by the identity's own `model` field.)
+        return _credit_env_override() or None
+    if cli == "codex":
+        return _codex_env_override()
+    if cli == "cursor-agent":
+        # Forwarded via env (not argv) to keep the secret out of `ps` output.
+        api_key = os.environ.get("CLI_API_KEY")
+        return {"CURSOR_API_KEY": api_key} if api_key else None
+    return None
 
 
 def _codex_env_override() -> dict | None:
@@ -362,7 +411,7 @@ def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     if inv.effort:
         _e = "high" if inv.effort in ("xhigh", "max") else inv.effort
         effort_flag = ["-c", f"model_reasoning_effort={_e}"]
-    env = _codex_env_override()
+    env = env_override_for("codex")
     head = perm + model_flag + effort_flag + list(inv.extra_args)
     if inv.resume_id:
         # `codex exec resume <id>`: the thread holds the agent definition, so send
@@ -377,10 +426,7 @@ def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
 
 def _build_cursor_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     perm = permission_flags(inv.cli, inv.permission)
-    # Forward CLI_API_KEY (skill contract) as CURSOR_API_KEY (cursor's native
-    # env). Passing via env keeps the secret out of `ps` output.
-    api_key = os.environ.get("CLI_API_KEY")
-    env_override = {"CURSOR_API_KEY": api_key} if api_key else None
+    env_override = env_override_for("cursor-agent")
     model = inv.model or CURSOR_DEFAULT_MODEL
     if inv.resume_id:
         return "cursor-agent", perm + list(inv.extra_args) + [
@@ -566,6 +612,52 @@ def _agy_lock_down(prof: str) -> None:
         raise ValueError(f"agy profile: failed to secure token ACLs on {prof}: " + " | ".join(fails))
 
 
+def _attest_agy_profile(profile: str, expected: str | None,
+                        checked: bool = False) -> None:
+    """Refuse to dispatch unless the profile carries the account that was fingerprinted.
+
+    The identity digests an account before dispatch; this checks what the child will
+    ACTUALLY run under -- the freshly copied profile, or the resumed one. If they differ the
+    account changed in between and the run would answer as one account while being stamped
+    as another.
+
+    `checked` distinguishes "the identity inspected the account" from a pre-0.10.2 caller
+    that recorded nothing. When it did inspect, `expected is None` is a positive claim ("no
+    account files then"), so an account that has since APPEARED (None -> a real digest) is a
+    mismatch and is refused. Only an un-inspecting legacy caller is waved through.
+    """
+    if not checked and not expected:
+        return
+    actual = agy_profile_account_sha(profile)
+    if actual != expected:
+        raise ValueError(
+            "agy account files changed between fingerprinting and dispatch "
+            f"({expected} -> {actual}); re-run rather than record a result under the "
+            "wrong account")
+
+
+def agy_profile_account_sha(profile: str) -> str | None:
+    """Digest of the account files as COPIED into `profile`.
+
+    The identity digests the SOURCE files before dispatch; this digests what actually landed
+    in the profile the child will run under. Comparing them closes the window in which the
+    source could be swapped between the two -- otherwise one account's bytes could be
+    dispatched and stamped with another's fingerprint. Same shape as the endpoint snapshot:
+    describe what was used, not what was seen earlier.
+    """
+    import hashlib as _h
+    h, seen_any = _h.sha256(b"summon-agy-account-v1"), False
+    for fn in sorted(_AGY_AUTH_FILES):
+        try:
+            with open(os.path.join(profile, ".gemini", fn), "rb") as fh:
+                sha = _h.sha256(fh.read()).hexdigest()
+            seen_any = True
+        except OSError:
+            sha = ""
+        h.update(b"\0" + fn.encode("utf-8") + b"\0" + sha.encode("utf-8"))
+    return h.hexdigest()[:32] if seen_any else None
+
+
 def _ensure_agy_profile(cwd: str, deadline_sec: float = 300.0) -> str:
     """Create a FRESH, token-locked, isolated agy home dir for ONE invocation.
 
@@ -685,6 +777,8 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
         # and continue the most-recent conversation. No fresh profile, no scrub —
         # this is the opt-in exception to per-call isolation.
         profile = _resume_agy_profile(inv.resume_profile)
+        _attest_agy_profile(profile, getattr(inv, "agy_account_sha256", None),
+                            getattr(inv, "agy_account_checked", False))
         prompt = _resume_prompt(inv)
         cont = ["--continue"]
     else:
@@ -696,6 +790,8 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
             "(use \"none\" where it does not apply). Do not skip it, even for tiny tasks."
         )
         profile = _ensure_agy_profile(inv.cwd, deadline_sec)
+        _attest_agy_profile(profile, getattr(inv, "agy_account_sha256", None),
+                            getattr(inv, "agy_account_checked", False))
         cont = []
 
     if len(prompt) > _AGY_MAX_PROMPT:

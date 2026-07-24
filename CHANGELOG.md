@@ -6,6 +6,318 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.10.2] - 2026-07-23
+
+### Security
+- **The API key no longer follows a cross-host redirect.** `urllib` replays every original header
+  on a redirect, so an `openai-compat` endpoint answering `302 Location: https://elsewhere/...`
+  received `Authorization: Bearer <key>` verbatim -- a configured, compromised, or merely mistaken
+  `base_url` could exfiltrate the credential with a single response. Same-origin redirects are
+  ordinary API routing and are still followed; a cross-origin one is refused outright, naming the
+  reason, rather than silently retried without the header (which would surface as a confusing 401).
+  Found by cross-vendor adversarial review of this branch and reproduced with two local servers.
+
+### Fixed
+- **Env-authorized credit reaches the environment identity.** `env_override_for` recognized only
+  the `--allow-credit` flag, not `SUMMON_ALLOW_CREDIT`/`SUMMON_ALLOW_FABLE`, so an env-authorized run
+  hashed the stripped environment while the child received the credit-only remap.
+- **The args-only credit fallback is in the request identity.** The guard pins the Opus fallback for
+  an `args:`-only credit-only model, but the identity tracked only `--model`/frontmatter, so changing
+  the fallback constant changed the dispatched model with the fingerprint unmoved.
+- **Automatic retries carry the request's attestation.** The schema-correction and contract-repair
+  retries built a fresh invocation by hand, so an account (or any other field) not in the
+  constructor call was dropped -- an agy account swap between the first response and the retry ran
+  under the original identity. Both retries now CLONE the original invocation and override only the
+  retry-specific fields, so no field can be silently lost from these paths again.
+- **The request identity loads the agent definition ONCE, from a single byte buffer.** The backend,
+  endpoint, model defaults, effort, and agy-account decision were each derived from a SEPARATE
+  `load_agent` read, so a definition swapped A -> B -> A mid-construction produced a hybrid identity
+  -- A's content hash paired with B's resolved backend -- which among other things turned agy account
+  attestation off for a real agy request. `load_agent_snapshot` now returns the parsed tuple, the
+  frontmatter (for the endpoint) and the content hash from ONE `read_bytes`, and
+  `build_request_identity` threads that single snapshot through every definition-derived field. The
+  invariant is not merely "one call" but "every definition-derived value and digest originates from
+  the exact same immutable bytes", so no field can come from a different read.
+- **An agent definition, schema, memory, or agy account that APPEARS after fingerprinting is
+  refused.** Attestation ran only when a hash had been recorded, so an input absent when the identity
+  was built but present by dispatch shaped the run while contributing nothing to the identity naming
+  it. The comparisons are now unconditional, and an explicit `_agy_account_checked` marker
+  distinguishes "no account files then" from a pre-0.10.2 caller that recorded nothing.
+- **A credit-only model selected only through `args:` now falls back to Opus.** The flag was
+  scrubbed but not replaced, so the request reached the backend with no model at all and the
+  vendor's own default answered. That still prevented the unauthorized credit spend, but it is not
+  the documented behavior and silently answered on a model nobody chose.
+- **Project memory is hashed and injected from the same read.** It was attested from one read and
+  injected from another, so an agent could run under instructions the envelope did not name.
+- **An input that appears AFTER fingerprinting is caught.** Attestation only ran when a hash had
+  been recorded, so a `--json-schema` or `.agents/memory.md` that did not exist when the identity
+  was built, but did by the time it was used, shaped the run while contributing nothing to the
+  identity naming it.
+- **`--allow-credit` reaches the environment identity.** The flag authorizes the run but only sets
+  its env var later, so the identity hashed the unauthorized (stripped) environment while the
+  authorized child received the credit-only remap.
+- **Same-origin redirects normalize the default port.** `https://host/v1` to `https://host:443/v2`
+  is the same origin and was being refused as cross-host, contradicting the stated guarantee.
+- **An agent definition file's frontmatter can no longer be misread into a stronger permission.**
+  Found by dogfooding summon's own manifest fan-out as a cross-vendor audit swarm over its
+  under-reviewed modules; each fix ships a regression test verified to reproduce the pre-fix failure.
+  - A **UTF-8 BOM** (added by any Windows editor that saves "UTF-8 with signature") hid the opening
+    `---` fence, so the whole frontmatter was skipped: `run-agent` came back `None` and `permission`
+    silently fell back to the `safe-edit` default even when the file declared `read-only`. Agent
+    files are now read as `utf-8-sig`.
+  - A **duplicate frontmatter key** silently last-wins, so `permission: read-only` followed later in
+    the same block by `permission: yolo` ran as `yolo`. Ambiguous frontmatter is now rejected.
+  - An agent file with **undecodable bytes** raised an uncaught `UnicodeDecodeError` traceback
+    instead of the JSON error envelope the stdout contract promises.
+- **Windows paths in an agent's `args:` are no longer mangled.** POSIX `shlex` rules ate the
+  separators, so `args: --config C:\temp\foo` reached the backend as `C:tempfoo` -- a silently wrong
+  path, not an error. Backslashes are made literal on Windows without losing the inner-quote
+  stripping codex args depend on (`-c model_reasoning_effort="high"` still yields `...=high`), and
+  UNC paths keep both leading separators. POSIX splitting is unchanged.
+- **`--timeout 1e308` is rejected instead of overflowing.** The value is finite and positive, so it
+  passed validation and became a 309-digit millisecond count that blew up far downstream as an
+  `OverflowError` inside the executor's wait. Durations above 7 days are now an argparse error.
+- **An externally killed dispatch is `partial`, not `success`.** A plain-text backend (no parsed
+  terminal event) that was SIGTERMed from OUTSIDE summon -- a host-tool timeout, a CI cancel, a
+  `docker stop` -- exited `-15`/`143` and, because those codes are in the success set, was reported
+  `success` with whatever half-answer it had emitted. `is_terminal_success()` would then let `--out`
+  and manifest resume SKIP the re-run, persisting the truncated answer. SIGTERM still counts as
+  success on the branch that summon itself terminates (after a terminal event has been parsed);
+  without that evidence it is now `partial`, with the output preserved.
+- **A manifest job's roster is the one its own `cwd` selects.** A job with its own `cwd` loads its
+  agent from that tree's `.agents`, but the scheduler resolved every job against the manifest's
+  base roster -- so it could pick a different backend than the child dispatched to, bypassing that
+  backend's concurrency cap.
+- **An unpinned codex agent's configured default model is part of the request.** A codex agent with
+  no `model:` takes its model from `~/.codex/config.toml`, so editing that file changes which model
+  answers while the request looked unchanged, and the previous model's answer was served as
+  current. Consulted only when nothing else pins a model -- not `--model`, not the definition's own
+  `model:`, and not a selector in its `args:` (`-m`, `--model`, `-c model=`) -- so an agent that
+  pins its model is never invalidated by a config edit for a model it does not run.
+- **An environment control that cannot affect a request no longer invalidates it.** Credit
+  authorization only changes the model on the `claude` backend, and `SUMMON_DEFAULT_EFFORT` only
+  applies when no `--effort` was given; folding either in regardless made unrelated environment
+  changes force fresh, paid dispatches.
+- **A malformed provider entry is a clean error.** `{"tenant": {"base_url": 42}}` reached
+  `.rstrip()` and raised `AttributeError`, which only the last-resort crash envelope caught.
+
+  The CREDENTIAL counts, not just the name of the variable holding it. Recording only
+  `api_key_env` meant two runs differing solely by which token was in `TENANT_TOKEN` fingerprinted
+  identically, so one tenant's answer could be served to the other without their endpoint ever
+  being called. What is stored is a one-way SHA-256 over a domain separator, the variable name and
+  the value -- not the value. It cannot be reversed, and confirming a guess would require already
+  holding a candidate token. It is written only where the result envelope goes, so treat a
+  `--out`/`--results-dir` on synchronised or shared storage as carrying it too. summon's rule that secrets stay in the
+  environment and out of artifacts is about the SECRET; a digest is not the secret, and the
+  alternative was a wrong answer.
+
+  Backend-native configuration read from the ENVIRONMENT counts too. A vendor CLI reads its own
+  settings from the environment the child inherits, so `ANTHROPIC_BASE_URL` (or an API key, or a
+  model override) could point the same summon request at a different endpoint or account with no
+  summon flag changing, and the previous tenant's answer came back without the new one being
+  called. Enumerating variables one vendor at a time was a losing game, so the rule is per-backend
+  PREFIXES (`ANTHROPIC_*`, `OPENAI_*`/`CODEX_*`, `CURSOR_*`, `GEMINI_*`/`GOOGLE_*`) with every
+  matching variable counted and values hashed one-way -- and then summon's OWN delta applied, so
+  what is hashed is the environment the CHILD receives rather than whatever is merely named like a
+  vendor's variables. That distinction is load-bearing: summon forwards `CLI_API_KEY` as
+  `CURSOR_API_KEY` and strips `OPENAI_API_KEY` unless `SUBAGENTS_ALLOW_OPENAI_KEY=1`, so a changed
+  Cursor key or a toggled Codex key changed the child's auth while the fingerprint stayed equal,
+  and changing a stripped key invalidated results whose execution was identical. The builders and
+  the identity derive that delta from one function. It is deliberately coarse: an unrelated
+  variable under one of those prefixes will invalidate a stored answer, which is the safe
+  direction, since a needless re-dispatch costs a run and a missed one returns the wrong answer.
+
+  The endpoint the dispatch calls is the one that was fingerprinted. Resolving it separately for
+  the identity and for the call meant a `providers.json` edit in between sent the work to one
+  endpoint while stamping it as another -- and restoring the first then let the second's answer
+  resume as its own. The identity carries the snapshot it resolved and the dispatch uses that pair.
+- **Only the provider endpoint actually resolved is fingerprinted.** Hashing `providers.json`
+  wholesale refused a perfectly good codex answer whenever an unrelated registry was touched,
+  invalidated an agent with an inline `base_url:` (which never consults the registry at all), and
+  invalidated a `tenant-a` agent when only `tenant-b` changed. The identity carries the resolved
+  endpoint, which is what would actually change the answer, and only for `openai-compat`. An
+  endpoint that cannot be RESOLVED at all (an agent naming a provider that no longer exists) is
+  never reused: swallowing that into a missing field let a pre-fingerprint envelope hand back an
+  answer from the old endpoint instead of letting the dispatch report the unknown provider.
+- **A manifest job's backend is resolved the way dispatch resolves it.** The scheduler picked its
+  concurrency slot with `run-agent or codex`, but an UNPINNED agent takes its backend from caller
+  detection -- so under `CLAUDE_CODE=1` every such job dispatched to claude while being counted as
+  codex. Claude's `--concurrency` cap was bypassed entirely and the per-backend telemetry named the
+  wrong vendor.
+- **The schema and project memory that run are the ones that were fingerprinted.** Both are hashed
+  for the request identity and then read again -- the `--json-schema` to validate the result,
+  `.agents/memory.md` to build the system context -- so a change in between meant validating against
+  a contract, or running under instructions, that the envelope did not name. Both are now attested
+  against the recorded hash, and the schema is parsed from the same bytes it is hashed from.
+- **The agent definition that runs is the one that was fingerprinted.** The identity hashes the
+  definition and the dispatch loads it again afterwards, so replacing the file in between ran one
+  definition's model, permission and system context while stamping the envelope with another's
+  request hash -- and restoring the first would then let the second's answer resume as its own.
+  The dispatch compares the bytes the loader actually PARSED (not a fresh read of the path, which
+  left an A-to-B-to-A window open) against the hash it recorded, and refuses rather than produce a
+  mislabelled result. Same shape as the openai-compat endpoint snapshot and the agy
+  account attestation.
+- **A refused resume no longer destroys the answer it refused, or dispatches over it.** The
+  manifest cleared a job's stored envelope BEFORE re-dispatching, so any wrong refusal turned a
+  completed answer into an error envelope with nothing to fall back to -- and a clear that FAILED
+  was swallowed, leaving the stale envelope at the authoritative path where the parent re-read it
+  and reported the OLD answer as this run's result, with exit 0. A prior success is now ARCHIVED
+  A pre-dispatch failure is written to `--out` as well, since that path is authoritative and a
+  failure recorded nowhere is worse than none -- but it ARCHIVES whatever was there first. Writing
+  the error straight over the path destroyed a stored success whenever the failure came before the
+  resume block could preserve it (an early `--resume` + `--worktree` rejection, say).
+
+  (`<id>.json.superseded`, the name CLAIMED with `O_CREAT|O_EXCL` so two runs sharing a
+  `--results-dir` can never pick the same one and overwrite each other's archived answer) instead
+  of deleted, and a clear that fails is a job error that dispatches nothing. Losing that race is
+  success, not failure: the goal is an empty authoritative path, and a concurrent archiver having
+  cleared it first satisfies it.
+
+  An agent definition that is MISSING or MALFORMED means the request cannot be matched against
+  anything, and the dispatch is the only thing that can report it -- so neither is reused, and that
+  holds for pre-fingerprint envelopes too. Having one answer for old envelopes and another for new
+  ones was a contradiction whose lenient half handed back results nobody could attribute.
+- **An input that exists but cannot be hashed fails closed.** A hash failure was reported as plain
+  `None`, which dropped the field from the fingerprint entirely -- so two DIFFERENT unhashable
+  schemas produced the SAME fingerprint and one could be served as the answer to the other.
+  "Absent" and "present but unidentifiable" are now distinguished, and the latter is never reused.
+- **A manifest job's fields are type-checked before anything uses them.** A list-valued `cwd`
+  reached `os.path.abspath` during identity construction and a list-valued `prompt_file` reached
+  `os.path.isabs` -- both outside the per-job error handling, taking down the whole manifest with a
+  `TypeError` instead of producing one job's error. Strings only: a numeric `cwd` is not a path, and
+  accepting one contradicted the very message the check raises. A non-mapping `defaults` block is
+  rejected too, rather than raising when it is merged into the first job.
+- **An invalid agent name reaches the dispatch instead of being resumed over.** A path-traversing
+  name like `../escape` was classified as merely "missing", so a pre-fingerprint envelope could be
+  reused and the loader's own "Invalid agent name" was never surfaced.
+- **`set-agent` accepts a BOM'd agent file.** The loader reads agent files as `utf-8-sig`, so a
+  BOM'd file dispatched fine, but `agent set` rejected the very same file as "not ---delimited" --
+  an inconsistency the user had no way to act on. The BOM is dropped on the way through rather than
+  re-emitted, which also removes the byte behind the original silent-permission-fallback bug.
+- **`set-agent` validates before it writes.** The result was parsed only AFTER the atomic
+  replace, so an update that the parser then rejected had already been committed: the user was
+  left with a mutated agent file and a failed command.
+- **A typo in a frontmatter key is an error, not a silent default.** `permisson: read-only` was
+  ignored, leaving `permission` at the stronger `safe-edit` default -- the same silent-escalation
+  shape as the BOM bug. A key that is a near-miss of one summon reads is now rejected with a "did
+  you mean" pointer; unrelated keys are still accepted and ignored, so an agent file can carry its
+  own metadata. The comparison is case-normalized, since `PERMISSION: read-only` otherwise scored
+  no match at all and escalated exactly like the lowercase typo. It stays a heuristic: an unusual
+  but intended key can be caught (rename it) and a wild typo can still slip through.
+- **One malformed agent file no longer crashes `--list`.** Making duplicate keys a hard error meant a
+  single bad file took down the whole roster listing, hiding every other agent. Discovery is
+  fail-soft again: the broken file is listed with an empty description.
+- **A manifest job's `timeout` obeys the same ceiling as `--timeout`.** It is parsed independently,
+  so `1e308` bypassed the dispatcher's cap and sized the PARENT watchdog to ~1.5e305 seconds, which
+  raised `OverflowError` the moment it became a deadline -- killing the parent while its child ran
+  on unmanaged. Non-finite and over-cap values are clamped.
+- **The `openai-compat` endpoint lookup is BOM-tolerant too.** It re-reads the agent file to resolve
+  `base_url`, and did so as plain UTF-8 while the loader had moved to `utf-8-sig`, so a BOM made the
+  dispatch fail with a misleading "needs a provider or base_url".
+- **`--out` / manifest resume no longer returns a stale answer as a fresh one.** The skip was keyed
+  on the result file's PATH alone, so editing a manifest job's prompt while keeping its `id` came
+  back `skipped` with the previous prompt's answer -- and pointing the same job at a different
+  model did too. Every dispatch now stamps a `request_sha256` over the inputs that can change the
+  answer (agent, prompt, cwd, cli, model, effort, and the json-schema by content), and BOTH resume paths
+  compare it: the dispatcher's `--out` skip and the manifest PARENT, which short-circuits before
+  spawning and so never reached the child's check. Timeout, retries and debug-dir are deliberately
+  excluded, so raising a timeout does not force a re-pay. An envelope written before 0.10.2 has no
+  fingerprint: it is still honored (unless the fields it does carry PROVE a difference), but the
+  emitted envelope says the match was not verified (unless the fields it does carry PROVE a
+  difference, which both paths honor identically). `--resume`, `--worktree` and `--allow-credit`
+  count too: they continue a different conversation, run against a different tree, and change the
+  effective model. A `--json-schema` is fingerprinted by its CONTENTS, since editing schema.json in
+  place is a different contract for the same filename.
+
+  The agent DEFINITION counts too, by content: editing an agent's `model:` or its instructions
+  makes a stored answer stale, and neither the agent name nor the roster path shows it (a
+  `SUB_AGENTS_DIR` pointed at a different roster resolves the same relative name). Hashing content
+  rather than the directory is also the more correct identity, since two rosters holding a
+  byte-identical definition really are the same request -- so the lexical roster path is NOT in the
+  fingerprint, which would have contradicted that and re-paid for a moved roster. `.agents/memory.md`
+  is in as well, since it is injected into the agent's system context: editing it changes the
+  instructions an answer was produced under while every flag stays identical. So are
+  `--resume-profile` and the env-backed controls `SUMMON_ALLOW_CREDIT` / `SUMMON_ALLOW_FABLE` /
+  `SUMMON_DEFAULT_EFFORT`, which change the effective model and effort without ever being flags.
+
+  A bare `--worktree` auto-names a fresh tree per run. A deterministic hash cannot express "never
+  the same twice", so it is closed from both directions: the identity carries an `<auto>` marker
+  (a bare-worktree result is not reusable by a plain-cwd run) and the skip additionally refuses the
+  bare form (two bare runs do not reuse each other). A NAMED worktree is a stable location and
+  resumes normally.
+
+  Both resume paths are now built by ONE function. Each used to assemble its own identity dict, so
+  a field added to one and not the other went unnoticed until resume silently misbehaved -- which
+  happened twice: the child gained the env-backed controls while the manifest parent did not (with
+  `SUMMON_DEFAULT_EFFORT` set, every manifest restart re-dispatched every finished job), and the
+  parent was passed a narrower legacy fallback than the child. The two sides now hand raw inputs to
+  a shared builder that owns every derived field, and a regression test parses the real child argv
+  and requires the two fingerprints to match across a matrix of job shapes and environments.
+
+  The identity describes the EFFECTIVE dispatch, not the raw flags. With no `--cli` and no
+  `run-agent:` pin, the backend comes from caller detection, so the same command under
+  `CLAUDE_CODE=1` and under `CODEX_CLI=1` goes to two different vendors -- those hashed alike, and
+  the second run could reuse the first backend's answer. Credit authorization uses the exact same
+  predicate dispatch uses -- which accepts only the literal `"1"`. The identity had counted ANY
+  non-empty value as authorization, so `SUMMON_ALLOW_CREDIT=0` and `=1` hashed identically while
+  selecting different effective models. An `openai-compat`
+  agent's `provider:` resolves through a `providers.json` outside the agent file, so that registry
+  is folded in too -- retargeting a provider sends the work elsewhere while agent, prompt and the
+  definition's own bytes stay identical.
+
+  A file hashed for the fingerprint is opened `O_NONBLOCK` (so a FIFO cannot block at `open`),
+  gated on being a regular file, read in chunks so memory is bounded by the chunk rather than the
+  file, and re-`fstat`ed afterwards -- a file rewritten mid-read can produce a hybrid digest
+  matching neither version, so an unstable file reports no content identity rather than a wrong
+  one. The read deadline guards NON-TERMINATION (a file being appended to faster than it can be
+  read), not slowness: a healthy file on a slow share still hashes, where tripping on elapsed time
+  alone had called it unreadable and made every resume against it pay for a fresh dispatch. An input that exists but cannot be hashed is never reused, since a missing hash is a hole in
+  the identity and a hole is not a difference. The stability check catches accidental mutation, not
+  a deliberate adversary, which matches summon's trust model where files under `--cwd` are trusted
+  operator input.
+
+  WHAT THE FINGERPRINT COVERS, exactly: the request as summon received it (agent, prompt, cwd, cli,
+  model, effort, `--resume`, worktree, credit authorization, and `--resume-profile` only during an
+  actual resume); file CONTENT -- not path -- for what summon
+  reads itself (the agent definition, the `--json-schema`, `.agents/memory.md`; the same schema at
+  two paths is the same contract, and the roster directory is likewise not part of the identity); what summon resolves (the
+  effective backend including caller detection, the openai-compat endpoint and its credential,
+  cursor's default model, codex's configured default when nothing else pins one, and the credit
+  guard's own substituted fallback model); environment
+  variables matching the resolved backend's PREFIXES (`ANTHROPIC_*`, `OPENAI_*`/`CODEX_*`,
+  `CURSOR_*`, `GEMINI_*`/`GOOGLE_*`/`AGY_*`) after summon's own delta, minus any the dispatch
+  overwrites for every run (`AGY_PTY_DEADLINE`, `GEMINI_SYSTEM_MD`) and normalizing the ones it
+  DEFAULTS (`AGY_PTY_QUIET`, so unset and set-to-the-default hash alike); and for agy the account
+  files of the profile the
+  run will actually use -- the freshly copied one, or the one a `--resume-profile` resumes. It does NOT cover the vendor CLI's own installed state --
+  its config beyond codex's `model`, its stored credentials, its signed-in account, its VERSION --
+  nor environment outside those prefixes (an inherited `HTTP_PROXY`, say), nor summon's OWN version
+  and unlisted built-in defaults -- upgrading summon can change what a re-run would produce without
+  invalidating a stored answer, which is deliberate, since pinning the dispatcher would invalidate
+  every stored result on every upgrade (`summon.version` and `summon.scripts_sha256` are in the
+  envelope for a caller who wants to enforce it). A sub-agent's answer depends on the whole installation
+  behind the CLI, and summon cannot enumerate that. So a matching fingerprint means "the same
+  request, as summon defines a request" -- not "the same answer is guaranteed". If you need more
+  than that, do not resume: delete the result file, or give each configuration its own
+  `--out`/`--results-dir`.
+
+  ONE thing stays outside on purpose: the repository state under `cwd`. Folding git HEAD in would
+  invalidate every stored result on any unrelated commit, costing more than the staleness it
+  prevents. It is recorded in the envelope as `git_head_before` for a caller that wants to enforce
+  it.
+- **An apostrophe in a Windows path gives an actionable error.** `args: --path C:\Users\O'Brien\config`
+  failed with a bare "No closing quotation", because POSIX splitting reads the apostrophe as an
+  opening quote. Single-quote grouping is kept (long-standing behavior some rosters rely on), so the
+  error now names the cause and shows the double-quoted form that works.
+- **Case-colliding manifest job ids are rejected.** `Foo` and `foo` are distinct ids but one
+  `<id>.json` result file on Windows and macOS, so the two jobs overwrote each other's result and
+  the second resumed off the first's envelope. Ids are now compared case-insensitively on every
+  platform, so a manifest that works on Linux works everywhere.
+- **Abbreviated flags no longer bypass the fan-out flag matrix.** argparse prefix matching accepted
+  `--mod opus` for `--model`, but the matrix scans the raw argv by literal flag name -- so an
+  abbreviation slipped past the "rejected, never silently dropped" guarantee and was then dropped
+  anyway. The parser now runs with `allow_abbrev=False`; spell flags out.
+
 ## [0.10.1] - 2026-07-23
 
 ### Fixed

@@ -14,6 +14,9 @@ import argparse
 import math
 
 
+_MAX_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000   # 7 days; see parse_timeout
+
+
 def parse_timeout(value: str) -> int:
     """--timeout accepts bare milliseconds (backward compatible) or a human
     suffix: '90s', '10m', '600000ms'. Returns whole milliseconds (>= 1;
@@ -36,6 +39,13 @@ def parse_timeout(value: str) -> int:
     if not math.isfinite(ms) or ms <= 0:
         raise argparse.ArgumentTypeError(
             f"invalid --timeout {value!r}: must be a positive finite duration")
+    # A finite but absurd value ('1e308') survived the checks above and then blew up far
+    # downstream as an OverflowError inside threading.Event().wait() -- a traceback instead of a
+    # dispatch. Nothing legitimate waits on a sub-agent for over a week, so cap it here where the
+    # error is an argparse message the caller can act on.
+    if ms > _MAX_TIMEOUT_MS:
+        raise argparse.ArgumentTypeError(
+            f"invalid --timeout {value!r}: exceeds the {_MAX_TIMEOUT_MS} ms (7 day) maximum")
     return max(1, int(round(ms)))
 
 
@@ -240,7 +250,13 @@ def rewrite_subcommand(argv: list) -> tuple:
 def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     """The full flat-flag argparse spec. ``version``/``envelope_version`` are
     injected (the entry point owns them) so this module never imports it back."""
-    parser = argparse.ArgumentParser(description="Execute external CLI AIs as sub-agents")
+    # allow_abbrev=False: argparse's prefix matching accepted `--mod opus` for --model, but
+    # unsupported_mode_flags() scans the RAW argv by literal flag name, so an abbreviated
+    # flag slipped past the "rejected, never silently dropped" fan-out matrix and was then
+    # dropped anyway -- exactly the failure that matrix exists to prevent. Abbreviations are
+    # also ambiguous as flags are added. Spell flags out.
+    parser = argparse.ArgumentParser(description="Execute external CLI AIs as sub-agents",
+                                     allow_abbrev=False)
     parser.add_argument("--version", action="version",
                         version=f"summon {version} (envelope schema v{envelope_version})")
     parser.add_argument("--list", action="store_true", help="List available agents")
