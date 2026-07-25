@@ -12053,6 +12053,88 @@ def test_v8_every_test_is_actually_collected_by_the_runner():
         "the source defines %d tests but %d are importable; a duplicate name silently "
         "shadowed one." % (in_source, collected))
 
+
+def test_v8_over_long_argv_is_diagnosed_as_argv_not_a_missing_cli():
+    """Windows caps a command line at 32767 chars and reports the overflow as
+    ERROR_FILE_NOT_FOUND -- so Python raised FileNotFoundError and summon reported
+    "CLI not found: ...node.EXE" for a prompt that was merely too big.
+
+    That misdiagnosis is expensive: it sends you to reinstall a working backend. It is
+    almost certainly behind the standing reports that "the codex CLI is not installed."
+    Measured 2026-07-25: a 20k prompt dispatched fine; 31k and 34k both failed this way.
+
+    The message must name the ARGV as the cause and must not claim the binary is missing."""
+    from _builder import argv_length_error, _ARGV_TOTAL_LIMIT_NT, _ARGV_SINGLE_LIMIT_POSIX
+    import _builder
+
+    real_name = _builder.os.name
+    try:
+        _builder.os.name = "nt"
+        assert argv_length_error("codex", "codex.exe", ["-x", "hello"]) is None
+        big = "x" * (_ARGV_TOTAL_LIMIT_NT + 10)
+        msg = argv_length_error("codex", "codex.exe", ["-x", big])
+        assert msg, "an over-long Windows command line must be refused before spawning"
+        assert "command line" in msg and str(_ARGV_TOTAL_LIMIT_NT) in msg, msg
+        # It may EXPLAIN the historical misdiagnosis (that context is the useful part);
+        # what it must not do is LEAD with it. The cause comes first.
+        assert "command line" in msg[:80], (
+            "the message must open with the real cause, not bury it: %s" % msg[:120])
+        assert "--prompt-file" in msg or "prompt-file" in msg, (
+            "callers reach for --prompt-file assuming it avoids argv; the message must say "
+            "it does not: %s" % msg)
+        # the budget is the WHOLE line: many medium args overflow it just as one huge one
+        many = ["y" * 1000] * 40
+        assert argv_length_error("codex", "codex.exe", many), (
+            "the limit is the total command line, not the longest single argument")
+
+        _builder.os.name = "posix"
+        # POSIX has a large total but caps ONE argument; 40k total is fine there
+        assert argv_length_error("codex", "codex", many) is None
+        huge = "z" * (_ARGV_SINGLE_LIMIT_POSIX + 10)
+        pm = argv_length_error("codex", "codex", ["-x", huge])
+        assert pm and str(_ARGV_SINGLE_LIMIT_POSIX) in pm, pm
+        assert "argument" in pm[:80], pm
+    finally:
+        _builder.os.name = real_name
+
+
+def test_v8_over_long_argv_never_reaches_popen():
+    """The check has to run BEFORE the spawn, not as a nicer message afterwards: the whole
+    defect was that the spawn's own error could not be trusted to name its cause. Asserts
+    at the layer the bug lived at -- Popen must not be called at all, and the envelope must
+    NOT carry 127 (which means "CLI not found" and would keep the misdiagnosis alive)."""
+    import _builder
+    import _executor
+
+    real_popen = _executor.subprocess.Popen
+    real_name = _builder.os.name
+    real_resolve = _executor._resolve_launch
+    called = {"n": 0}
+
+    def spy(*a, **k):
+        called["n"] += 1
+        raise AssertionError("Popen was called with an argv known to be over the limit")
+
+    try:
+        _builder.os.name = "nt"
+        _executor.subprocess.Popen = spy
+        _executor._resolve_launch = lambda c, a: (c, a)
+        inv = _builder.AgentInvocation(
+            cli="codex", prompt="p" * 40000, cwd=os.getcwd(),
+            system_context="ctx", permission="read-only")
+        resp = _executor.execute_agent(inv, timeout_ms=30000)
+    finally:
+        _executor.subprocess.Popen = real_popen
+        _executor._resolve_launch = real_resolve
+        _builder.os.name = real_name
+
+    assert called["n"] == 0, "the over-long argv reached Popen; the check ran too late"
+    assert resp.get("status") == "error", resp.get("status")
+    assert resp.get("exit_code") == 1, (
+        "exit 127 means 'CLI not found' and would preserve the misdiagnosis; an argv that "
+        "is too long is not a missing binary (got %r)" % resp.get("exit_code"))
+    assert "command line" in (resp.get("error") or ""), resp.get("error")
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

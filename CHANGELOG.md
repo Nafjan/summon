@@ -22,6 +22,21 @@ never on added fields.
   enforce a tier, withhold the capability rather than document a caveat.**
   Both the envelope and `--dry-run` warn that a read-only agy dispatch cannot see the repo.
 
+### Fixed (argv)
+- **An over-long prompt was reported as `CLI not found`.** Every CLI backend receives the
+  prompt through argv. Windows caps the whole command line at 32767 chars and reports the
+  overflow as ERROR_FILE_NOT_FOUND, so Python raised `FileNotFoundError` and summon blamed
+  the binary: `CLI not found: ...node.EXE` -- for a backend that was working perfectly.
+  This is very likely behind the standing reports that "the codex CLI is not installed".
+  Found by dogfooding: a 42k-char review prompt failed this way in 116ms, and the same
+  backend answered a short prompt immediately afterwards. Measured boundary: 20k fine, 31k
+  and 34k refused.
+  summon now measures the ASSEMBLED command line (after the Windows .cmd-to-node rewrite,
+  and including the system context, which is why a 31k prompt measures 34127) and refuses
+  before spawning with exit **1** and a message naming argv as the cause. The surviving
+  `FileNotFoundError` handler no longer asserts a missing binary when the argv is large.
+  `--prompt-file` does NOT avoid this and now says so in SKILL.md.
+
 ### Fixed
 - **The archive-name EACCES retry counted CUMULATIVE denials, not consecutive ones.** In a
   busy results dir (many names already taken, so the loop keeps walking) transient
