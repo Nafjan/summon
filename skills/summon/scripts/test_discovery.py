@@ -719,6 +719,7 @@ def test_v1_model_mismatch_detection():
     assert _executor._model_mismatch("gpt-4", "gpt-4o") is True          # different non-alias models
     assert _executor._model_mismatch("gpt-5.6-sol", "gpt-5.6-sol") is False
     assert _executor._model_mismatch("opus", "claude-opus-4-8") is False  # alias floats to latest
+    assert _executor._model_mismatch("opus", "claude-opus-5") is False    # ...whatever it lands on
     assert _executor._model_mismatch("sonnet", "claude-sonnet-5") is False
     # token-exact, not substring: a real reroute that merely CONTAINS the alias
     # as a substring must still warn (review finding #4)
@@ -2003,10 +2004,10 @@ def test_fable_credit_only_guard():
               "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL"):
         os.environ.pop(k, None)
     eff, note = _builder.resolve_billing_model("claude-fable-5", "claude")
-    assert eff == "claude-opus-4-8" and note, (eff, note)
+    assert eff == _builder._OPUS_FALLBACK and note, (eff, note)
     # argv carries the fallback alias, not fable
     _, args, _ = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="claude-fable-5"))
-    assert _models(args) == ["claude-opus-4-8"], _models(args)
+    assert _models(args) == [_builder._OPUS_FALLBACK], _models(args)
 
     # CC3: credit-only model flags in `args:` are scrubbed (both forms)
     _, a1, _ = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="opus",
@@ -2014,7 +2015,7 @@ def test_fable_credit_only_guard():
     assert "claude-fable-5" not in a1
     _, a2, _ = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="claude-fable-5",
                                     extra_args=["--model", "claude-fable-5"]))
-    assert _models(a2) == ["claude-opus-4-8"], _models(a2)
+    assert _models(a2) == [_builder._OPUS_FALLBACK], _models(a2)
 
     # CC2: an ANTHROPIC_* alias remap to a credit-only model is stripped from the child env
     os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL"] = "claude-fable-5"
@@ -2546,7 +2547,8 @@ def test_allow_credit_flag_dry_run_and_fanout_rejection():
             "--model", "claude-fable-5", "--dry-run"]
     r = sp.run(base, capture_output=True, text=True, encoding="utf-8", env=env)
     view = _json.loads(r.stdout)
-    assert view["model_effective"] == "claude-opus-4-8", view  # guard fell back
+    import _builder as _b
+    assert view["model_effective"] == _b._OPUS_FALLBACK, view  # guard fell back
     r2 = sp.run(base + ["--allow-credit"], capture_output=True, text=True,
                 encoding="utf-8", env=env)
     view2 = _json.loads(r2.stdout)
@@ -5555,6 +5557,21 @@ def test_v6_installs_hosts_match_installer():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert set(mod.HOSTS) == set(_installs.HOST_DIRS), (set(mod.HOSTS), set(_installs.HOST_DIRS))
+    # Matching KEYS is not enough: the installer writes to HOSTS[k]/skills/summon while the
+    # detector probes HOME/HOST_DIRS[k]/skills/summon/scripts. If those two paths disagree the
+    # installer keeps succeeding while the detector finds nothing -- the host goes
+    # present:False, drops out of `present`/`hashed`/`drifted`, and `converged` STAYS TRUE.
+    # A host silently uncovered is exactly what drift detection exists to prevent, so assert
+    # the PATHS agree, not just the labels. Nested hosts (Antigravity lives under ~/.gemini)
+    # make a hand-written value that no longer matches its label a realistic typo.
+    home = os.path.expanduser("~")
+    for key, root in mod.HOSTS.items():
+        detector_root = os.path.join(home, _installs.HOST_DIRS[key])
+        assert (os.path.normcase(os.path.abspath(root))
+                == os.path.normcase(os.path.abspath(detector_root))), (
+            "host %r: the installer writes under %r but the drift detector probes %r -- the "
+            "host would report present:False forever while still being installed" % (
+                key, root, detector_root))
 
 
 def test_v6_read_version_parser_robustness():

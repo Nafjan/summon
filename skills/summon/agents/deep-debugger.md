@@ -1,6 +1,6 @@
 ---
 run-agent: claude
-model: claude-opus-4-8
+model: claude-opus-5
 permission: safe-edit
 ---
 

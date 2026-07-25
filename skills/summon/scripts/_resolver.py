@@ -208,7 +208,8 @@ def discover_models(cli: str | None = None) -> dict:
             "source": "static",
             "aliases": list(_CLAUDE_ALIASES),
             "note": "Aliases auto-resolve to the latest model (float for free). "
-                    "Full IDs (e.g. claude-opus-4-8, claude-fable-5) also accepted via --model.",
+                    "Full IDs (e.g. claude-opus-5, claude-fable-5) also accepted via --model. "
+                    "NOTE: the aliases can LAG the newest release -- pin a full id to be sure.",
         }
 
     # codex: no `models` subcommand. Unpinned agents inherit ~/.codex/config.toml's
