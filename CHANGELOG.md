@@ -6,70 +6,62 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
-## [0.14.2] - 2026-07-25
+## [0.15.0] - 2026-07-26
+
+### Breaking
+- **`agy` at `read-only` is now REFUSED.** It previously dispatched. agy does not enforce
+  that tier, and a permission tier the backend will not honour is worse than no tier because
+  callers act on it -- so summon fails closed, as `--gate-with` already does.
+  Set `SUMMON_ALLOW_UNENFORCED_READONLY=1` to dispatch anyway; the tier then carries a
+  warning saying it is ADVISORY and enforced by nothing. `--dry-run` reports `would_refuse`,
+  so preflight tells you before you spend anything. The refusal happens BEFORE
+  `build_invocation_args`, which for agy creates a profile and copies OAuth material -- a
+  dispatch being refused must not copy credentials for itself.
 
 ### Security
-- **agy no longer receives the caller's workspace at `read-only`.** 0.14.0 began passing
-  `--add-dir <cwd>` so agy could do repo-grounded work; that made agy's `read-only` tier
-  REACHABLE, and agy cannot enforce it. Four canaries measured it: an agent clamped to
-  `read-only` created a file and appended to another under `--cwd` with `--sandbox` in
-  force, and again with `--mode plan` added. Neither flag withholds agy's file tools.
-  summon now withholds `--add-dir` at `read-only` -- agy can still write, but only inside
-  its own disposable per-invocation profile. A fourth canary confirmed the caller's
-  workspace was untouched.
-  The general rule, now written into the orchestration guide: **a capability flag is a
-  privilege grant, and it inherits the weakest tier that can reach it. When you cannot
-  enforce a tier, withhold the capability rather than document a caveat.**
-  Both the envelope and `--dry-run` warn that a read-only agy dispatch cannot see the repo.
-
-### Fixed (argv)
-- **An over-long prompt was reported as `CLI not found`.** Every CLI backend receives the
-  prompt through argv. Windows caps the whole command line at 32767 chars and reports the
-  overflow as ERROR_FILE_NOT_FOUND, so Python raised `FileNotFoundError` and summon blamed
-  the binary: `CLI not found: ...node.EXE` -- for a backend that was working perfectly.
-  This is very likely behind the standing reports that "the codex CLI is not installed".
-  Found by dogfooding: a 42k-char review prompt failed this way in 116ms, and the same
-  backend answered a short prompt immediately afterwards. Measured boundary: 20k fine, 31k
-  and 34k refused.
-  summon now measures the ASSEMBLED command line (after the Windows .cmd-to-node rewrite,
-  and including the system context, which is why a 31k prompt measures 34127) and refuses
-  before spawning with exit **1** and a message naming argv as the cause. The surviving
-  `FileNotFoundError` handler no longer asserts a missing binary when the argv is large.
-  `--prompt-file` does NOT avoid this and now says so in SKILL.md.
+- **The 0.14.2 containment fix did not contain anything, and this release replaces it.**
+  0.14.0 began passing `--add-dir <cwd>` so agy could do repo-grounded work; 0.14.2 withheld
+  that flag at `read-only` and shipped it as a security boundary, with a warning telling
+  callers agy "cannot read your repository".
+  Canary 5 (2026-07-26) disproved it: a **declared** read-only agy agent, given absolute
+  paths, read a secret file back verbatim and created a new one -- both confirmed on disk,
+  with `--sandbox` and `--mode plan` in force and the workspace withheld. Withholding
+  `--add-dir` only breaks RELATIVE paths. The earlier canary "passed" because it asked for a
+  relative path, which is how a non-fix survived review, a release and its own changelog
+  entry. **`--add-dir` is now passed at every tier that can dispatch**; the containment is
+  the refusal above, not a flag the vendor never promised to honour.
+- **An agent definition could reopen the boundary through its own `args:`.** Frontmatter
+  `args: ["--add-dir", "/repo"]` is appended AFTER the permission flags, so it silently
+  rewrote the tier summon had just computed; `--max-permission` and `--gate-with` drop
+  `extra_args` wholesale for exactly this reason, but a DIRECTLY declared tier did not.
+  Workspace- and tier-moving flags are now stripped from `extra_args`; everything else still
+  passes through. Found by cross-vendor review and confirmed by building the argv.
 
 ### Fixed
-- **The archive-name EACCES retry counted CUMULATIVE denials, not consecutive ones.** In a
-  busy results dir (many names already taken, so the loop keeps walking) transient
-  contention could exceed 64 denials in total while never denying twice in a row -- and the
-  clear aborted, which is the exact failure the retry was added to prevent. Only a genuinely
-  unwritable directory denies every name in a row; a plain EEXIST now breaks the streak.
-- **A failed `os.close()` was treated as a name collision.** `os.close` sat inside the try
-  that catches "this name is taken", so a close raising EACCES sent the loop to the next
-  index with `claimed` already pointing at a name it genuinely owned. The next successful
-  claim overwrote `claimed`, and the cleanup removed only the last reservation -- the first
-  leaked as a permanent empty archive with its fd still open. Only the `os.open` can
-  collide, and the try now says so.
-- **`--dry-run` was silent about the two things it is cheapest to fix.** It emitted the agy
-  permission warning but neither the timeout nor the read-only-workspace one, so preflight
-  told you least about a short clock and an unreadable workspace. Both paths now assemble
-  from one `advisory_warnings()`.
-
-### Changed
-- **The advised agy timeout floor is 420s, not 300s.** 300s was an interpolation: 180s was
-  measured to time out and 420s to complete, and taking the midpoint dressed a guess up as
-  evidence. 420s is the smallest budget an agy dispatch has actually been OBSERVED to
-  complete under, which also makes the at-threshold silence principled rather than an
-  off-by-one.
+- **The argv preflight undercounted by up to 2x.** It summed raw characters; Windows counts
+  the SERIALISED command line in UTF-16 code units. `'\\"' * 10000` measured 20010 and
+  serialised to 40011, passing preflight and then failing `CreateProcess` -- the exact
+  misdiagnosis the check exists to prevent. It now measures `list2cmdline` output in UTF-16
+  units including the NUL. POSIX compared characters against a BYTE limit (70k accented
+  characters is 140k bytes) and ignored `ARG_MAX` entirely; it now measures bytes and checks
+  the total including the environment, reading the real limit from `sysconf`.
+- **The archive-name denial heuristic was defeated twice.** A cumulative tally aborted on
+  transient contention; a consecutive streak was then defeated by an unwritable directory
+  whose occupied names return EEXIST and whose free names return EACCES -- the streak never
+  reaches two, so the loop made all 10001 probes and reported "too many superseded copies",
+  the wrong cause entirely. Both heuristics were approximating "is this directory writable",
+  which is now simply asked: one direct probe with a name nothing else can hold. 130 probes
+  instead of 10001, and the right diagnosis.
+- **`--dry-run` did not know about the refusal**, so preflight showed a dispatch that would
+  never run. Same drift class as the warnings: two paths describing one dispatch, maintained
+  separately.
 
 ### Testing
-- **The suite was silently skipping tests.** The runner collects `globals()` inside its
-  `__main__` block, so four newly appended tests were defined too late to exist -- and the
-  suite printed a green "346/346 passed" that had never executed them. A suite that
-  under-reports its own size reports confidence it did not earn. A structural guard now
-  asserts no `def test_` appears below the runner block, and that the count defined in
-  source equals the count importable (which also catches a duplicate name shadowing a test).
-- 351/351 discovery, 22/22 install. Every fix above was mutation-tested: reverted to its
-  exact broken form to prove the new test kills it.
+- 357/357 discovery, 22/22 install. Every fix mutation-tested.
+- The suite had been **silently skipping tests**: the runner snapshots `globals()` inside its
+  `__main__` block, so four appended tests were defined too late to exist, and it printed a
+  green "346/346 passed" that had never executed them. A guard now asserts no `def test_`
+  appears below the runner and that the source count equals the importable count.
 
 ## [0.14.1] - 2026-07-25
 

@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.14.2"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.15.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -970,6 +970,13 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     }
     for _w in _guard_warnings:  # credit-only guard actions surfaced in the preview
         view.setdefault("warnings", []).append(_w)
+    # A dispatch that will be REFUSED must say so in preflight. Surfaced as `would_refuse`
+    # plus `error` rather than a warning, because it is not advice: the run does not happen.
+    from _builder import readonly_unenforceable_error as _refuse
+    _ro = _refuse(invocation.cli, invocation.permission)
+    if _ro:
+        view["would_refuse"] = True
+        view["error"] = _ro
     # Same helper as the real envelope, so preflight shows exactly what the run would
     # warn about -- a short agy clock and a withheld read-only workspace are both things
     # you want to learn BEFORE paying, which is the whole point of --dry-run.

@@ -93,7 +93,7 @@ def _clear_out_file(out_file: str, archive: bool) -> str | None:
             # same free name, and the second os.replace then overwrote the first's archived
             # answer. O_EXCL means exactly one writer can ever own a given name.
             base = out_file + ".superseded"
-            dest, n, _denied = base, 0, 0
+            dest, n, _denied, _last_denial = base, 0, 0, None
             while True:
                 try:
                     # ONLY the open can collide. os.close() was once inside this try too,
@@ -111,22 +111,47 @@ def _clear_out_file(out_file: str, archive: bool) -> str | None:
                     # then dropped and a stale success left in place. Skipping to the next
                     # index is safe: we are only choosing an UNUSED archive name.
                     if isinstance(_claim_err, PermissionError):
-                        # CONSECUTIVE, not cumulative. A total tally aborted after 64
-                        # transient denials spread across a long run even when the next
-                        # name was free -- contention is not the same failure as an
-                        # unwritable directory, and only the latter denies every name in
-                        # a row.
                         _denied += 1
-                        # A genuinely unwritable directory denies every name, so distinguish
-                        # that from contention instead of grinding to the 10k bound.
+                        _last_denial = _claim_err
+                        # MEASURE, do not guess. Two heuristics were tried and both were
+                        # defeated: a cumulative tally aborted on transient contention
+                        # spread across a long run, and a consecutive streak was defeated
+                        # by an unwritable directory whose occupied names return EEXIST and
+                        # whose free names return EACCES -- the streak never reached two,
+                        # so the loop ground through all 10k probes and then reported "too
+                        # many superseded copies", which is the wrong diagnosis entirely
+                        # (found by cross-vendor review, reproduced on a real WSL directory).
+                        #
+                        # The question the heuristics were approximating is simply "is this
+                        # directory writable at all", so ask it directly, once, with a name
+                        # nothing else can be holding.
                         if _denied > 64:
-                            return (f"cannot archive the previous result at {out_file}: "
-                                    f"permission denied claiming an archive name ({_claim_err})")
-                    else:
-                        _denied = 0            # a plain EEXIST breaks the denial streak
+                            probe = f"{base}.wtest.{os.getpid()}.{_denied}"
+                            try:
+                                _pfd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                            except PermissionError:
+                                return (f"cannot archive the previous result at {out_file}: "
+                                        f"permission denied claiming an archive name "
+                                        f"({_claim_err})")
+                            except OSError:
+                                pass          # inconclusive; keep walking names
+                            else:
+                                os.close(_pfd)
+                                try:
+                                    os.remove(probe)
+                                except OSError:
+                                    pass
+                                _denied = 0   # writable: the denials really were contention
                     n += 1
                     dest = f"{base}.{n}"
                     if n > 10_000:             # pathological; do not spin forever
+                        if _last_denial is not None:
+                            # Denials were seen along the way, so "too many copies" would
+                            # name the wrong cause and send the reader to delete files that
+                            # are not the problem.
+                            return (f"cannot archive the previous result at {out_file}: "
+                                    f"permission denied claiming an archive name "
+                                    f"({_last_denial})")
                         return (f"cannot archive the previous result at {out_file}: "
                                 "too many superseded copies")
                     continue

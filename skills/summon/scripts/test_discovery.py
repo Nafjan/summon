@@ -11721,131 +11721,200 @@ def test_v8_archive_claim_reports_a_genuinely_unwritable_dir():
         % err)
 
 
-def test_v8_agy_workspace_is_withheld_at_read_only():
-    """SECURITY: agy must NOT receive --cwd at read-only, because agy has no enforceable
-    read-only tier.
+def test_v8_agy_read_only_fails_closed():
+    """agy has NO enforceable read-only tier, so summon refuses the dispatch.
 
-    Measured 2026-07-25 with three canaries: an agy agent clamped to `read-only` created a
-    file and appended to another under --cwd, with `--sandbox` in force, and again with
-    `--mode plan` added. Neither flag withholds agy's file tools. So passing --add-dir at
-    read-only would have summon promise a tier it cannot deliver, and --add-dir is exactly
-    what makes the promise reachable. Withheld, agy still writes -- but only inside its own
-    disposable per-invocation profile. A fourth canary confirmed the caller's workspace was
-    untouched.
+    History matters here. summon first mapped read-only to `--mode plan --sandbox`; canaries
+    showed both allow writes. It then WITHHELD `--add-dir` and shipped that as containment
+    with a warning saying agy "cannot read your repository". Canary 5 (2026-07-26) gave a
+    DECLARED read-only agy agent two absolute paths: it read a secret file back verbatim and
+    created a new one, both confirmed on disk. Withholding the workspace only broke relative
+    paths; it was never a boundary.
 
-    At safe-edit/yolo the flag IS passed: both map to --dangerously-skip-permissions on agy,
-    so the workspace grants nothing the agent did not already have.
+    A tier the backend will not honour is worse than no tier, because callers act on it. So
+    this fails closed, like --gate-with does."""
+    from _builder import readonly_unenforceable_error as refuse
 
-    This asserts on the ARGS BUILT, not on source text, and does not invoke the real
-    profile builder -- the previous version of this test called it, copying live OAuth
-    material for a pure argv assertion, and swallowed every ValueError so that deleting
-    --add-dir still passed."""
+    msg = refuse("agy", "read-only")
+    assert msg, "agy at read-only must be REFUSED, not dispatched with a caveat"
+    assert "ABSOLUTE" in msg or "absolute" in msg, (
+        "the refusal must cite WHY the tier is unenforceable, since the obvious reading is "
+        "that summon is being over-cautious: %s" % msg)
+    assert "safe-edit" in msg and "SUMMON_ALLOW_UNENFORCED_READONLY" in msg, (
+        "a refusal that names no way forward just blocks work: %s" % msg)
+
+    # every other combination still dispatches
+    assert refuse("agy", "safe-edit") is None
+    assert refuse("agy", "yolo") is None
+    for backend in ("claude", "codex", "cursor-agent", "gemini"):
+        assert refuse(backend, "read-only") is None, (
+            "%s enforces read-only; refusing it would be a regression" % backend)
+
+
+def test_v8_agy_read_only_opt_in_dispatches_but_says_it_is_advisory():
+    """Refusing outright would strand someone who knowingly wants agy's reasoning on a
+    throwaway checkout. The opt-in makes the tier advisory rather than enforced -- and must
+    say exactly that, because the failure mode is a caller who thinks read-only held."""
     import _builder
+    from _builder import (readonly_unenforceable_error as refuse,
+                          agy_readonly_workspace_warning as warn)
 
-    real_ensure = _builder._ensure_agy_profile
-    real_attest = _builder._attest_agy_profile
-    real_wrapper = getattr(_builder, "_agy_wrapper_path", None)
-    d = tempfile.mkdtemp(prefix="summon-agyro-")
+    had = _builder.os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
     try:
-        # stub the side-effecting profile build: this test is about ARGV only
-        _builder._ensure_agy_profile = lambda cwd, deadline_sec=300.0: d
-        _builder._attest_agy_profile = lambda *a, **k: None
-
-        def args_for(permission):
-            inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=d,
-                                           system_context="ctx", permission=permission)
-            try:
-                _cmd, args, _env = _builder.build_invocation_args(inv, timeout_ms=60000)
-            except ValueError as e:
-                # a MISSING WRAPPER is an environment fact (Windows-only ConPTY); any other
-                # ValueError is a real failure and must not be swallowed into a pass
-                if "wrapper" in str(e).lower() or "windows-only" in str(e).lower():
-                    return None
-                raise
-            return args
-
-        ro = args_for("read-only")
-        if ro is None:
-            return          # no agy wrapper on this OS; nothing to assert about argv
-        assert "--add-dir" not in ro, (
-            "agy received the caller's workspace at READ-ONLY. agy cannot enforce that "
-            "tier -- a canary wrote files under --cwd with --sandbox and --mode plan both "
-            "set -- so handing it the workspace makes an unenforceable promise reachable. "
-            "args=%r" % (ro,))
-
-        for perm in ("safe-edit", "yolo"):
-            a = args_for(perm)
-            assert a is not None and "--add-dir" in a, (
-                "%s did not receive --add-dir; it already has write authority, so "
-                "withholding the workspace only breaks repo work for no safety gain "
-                "(args=%r)" % (perm, a))
-            assert a[a.index("--add-dir") + 1] == d, (perm, a)
-            assert a.index("--add-dir") < a.index("--print"), (
-                "--add-dir must precede --print, which consumes the next token as the "
-                "prompt (%s)" % perm)
+        assert warn("agy", "read-only") is None, (
+            "without the opt-in the dispatch is refused, so an advisory warning would be "
+            "describing a run that never happens")
+        _builder.os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        assert refuse("agy", "read-only") is None, "the opt-in must actually let it through"
+        w = warn("agy", "read-only")
+        assert w and "ADVISORY" in w, w
+        assert "enforced by nothing" in w, (
+            "the warning must not soften: the tier is enforced by NOTHING (%s)" % w)
+        # and it must not fire for backends that really do enforce the tier
+        assert warn("claude", "read-only") is None
     finally:
-        _builder._ensure_agy_profile = real_ensure
-        _builder._attest_agy_profile = real_attest
-        if real_wrapper is not None:
-            _builder._agy_wrapper_path = real_wrapper
-        import shutil as _sh
-        _sh.rmtree(d, ignore_errors=True)
+        if had is None:
+            _builder.os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            _builder.os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
 
 
-def test_v8_agy_read_only_warns_that_it_cannot_see_the_repo():
-    """Withholding the workspace silently would be worse than the limitation: the agent
-    answers from the prompt alone and sounds confident about files it never opened. The
-    warning has to say so, and say why."""
-    from _builder import agy_readonly_workspace_warning as warn
+def test_v8_refusal_happens_before_the_profile_is_built():
+    """agy's profile build COPIES OAUTH MATERIAL into a per-invocation directory. A dispatch
+    summon is going to refuse must not do that work, and certainly must not copy credentials
+    for it. The check originally sat after build_invocation_args and cost ~1.1s plus a
+    credential copy per refusal; it now costs nothing."""
+    import _builder
+    import _executor
 
-    w = warn("agy", "read-only")
-    assert w and "does NOT receive" in w, w
-    assert "safe-edit" in w, "the warning must name the way to actually do repo work"
-    assert warn("agy", "safe-edit") is None
-    assert warn("agy", "yolo") is None
-    assert warn("claude", "read-only") is None
+    built = {"n": 0}
+    real_build = _executor.build_invocation_args
+
+    def spy(*a, **k):
+        built["n"] += 1
+        return real_build(*a, **k)
+
+    try:
+        _executor.build_invocation_args = spy
+        inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                       system_context="ctx", permission="read-only")
+        resp = _executor.execute_agent(inv, timeout_ms=30000)
+    finally:
+        _executor.build_invocation_args = real_build
+
+    assert built["n"] == 0, (
+        "the refused dispatch still built an agy profile (and copied OAuth material into "
+        "it). Fail closed BEFORE side effects, not after.")
+    assert resp.get("status") == "error" and resp.get("exit_code") == 1, resp
 
 
-def test_v8_archive_claim_counts_consecutive_denials_not_total():
-    """The EACCES retry gave up after 64 CUMULATIVE denials. Contention spread across a
-    long run could exceed that while the next name was perfectly free, so a transient race
-    aborted the clear -- the very failure the retry was added to prevent. Only an
-    unwritable directory denies every name IN A ROW."""
+def test_v8_agent_args_cannot_reopen_the_agy_boundary():
+    """An agent definition's own `args:` are appended AFTER the permission flags, so
+    frontmatter `args: ["--add-dir", "/repo"]` silently rewrote the tier summon computed.
+    --max-permission and --gate-with drop extra_args wholesale for exactly this reason; a
+    DIRECTLY declared tier did not, which left the permission mapping advisory against the
+    roster. Found by cross-vendor review (2026-07-26) and confirmed: the built argv did
+    contain --add-dir at read-only.
+
+    Ordinary passthrough args must survive -- this keeps the tier honest, it does not police
+    the roster."""
+    from _builder import _strip_agy_boundary_flags as strip
+
+    assert strip(["--add-dir", "/repo", "--keep", "v"]) == ["--keep", "v"], (
+        "--add-dir and its VALUE must both go, or the bare path becomes a stray argument")
+    assert strip(["--add-dir=/repo", "--keep"]) == ["--keep"], "the = form too"
+    assert strip(["--mode", "yolo"]) == [], "a second --mode overrides the computed tier"
+    assert strip(["--sandbox"]) == [], "sandbox state is summon's to decide"
+    assert strip(["--dangerously-skip-permissions"]) == [], (
+        "an agent must not be able to grant itself the bypass through args:")
+    # everything else passes through untouched, including values that LOOK like flags
+    assert strip(["--foo", "bar", "-q"]) == ["--foo", "bar", "-q"]
+    assert strip([]) == []
+
+
+def test_v8_archive_denial_is_measured_not_guessed():
+    """Two heuristics were tried for "is this directory unwritable, or just busy?", and both
+    were defeated.
+
+    A CUMULATIVE tally aborted on transient contention spread across a long run. A
+    CONSECUTIVE streak was then defeated by the case cross-vendor review reproduced on a
+    real filesystem: an unwritable directory whose occupied names return EEXIST and whose
+    free names return EACCES. The streak never reaches two, so the loop ground through all
+    10001 probes and reported "too many superseded copies" -- sending the reader off to
+    delete files that were never the problem.
+
+    The question both heuristics approximated is just "is this directory writable", so it is
+    now asked directly, once, with a name nothing else can be holding."""
     import _manifest
 
-    d = tempfile.mkdtemp(prefix="summon-consec-")
+    d = tempfile.mkdtemp(prefix="summon-denial-")
     real_open = os.open
     seen = {"n": 0}
     try:
         out = os.path.join(d, "r.json")
         with open(out, "w", encoding="utf-8") as fh:
-            fh.write('{"status": "success"}')
+            fh.write(chr(123) + '"status": "success"' + chr(125))
 
-        def flaky(path, flags, *a, **k):
-            # A BUSY results dir: most names are already taken (EEXIST, so the loop keeps
-            # walking), with transient EACCES interspersed. Denials accumulate past 64 in
-            # TOTAL but never 64 in a row -- the case a cumulative counter aborts and a
-            # consecutive one correctly rides out. The loop exits at the first success, so
-            # interleaving alone cannot accumulate; the EEXIST names are what let it.
-            if str(path).find(".superseded") != -1:
+        def alternating(path, flags, *a, **k):
+            # occupied names EEXIST, free names EACCES: a denial streak never forms
+            if ".superseded" in str(path) and ".wtest" not in str(path):
                 seen["n"] += 1
-                if seen["n"] <= 200:
-                    if seen["n"] % 2 == 1:
-                        raise PermissionError(13, "Permission denied", str(path))
+                if seen["n"] % 2:
                     raise FileExistsError(17, "File exists", str(path))
+                raise PermissionError(13, "Permission denied", str(path))
+            if ".wtest" in str(path):
+                raise PermissionError(13, "Permission denied", str(path))
             return real_open(path, flags, *a, **k)
 
-        os.open = flaky
+        os.open = alternating
         err = _manifest._clear_out_file(out, archive=True)
     finally:
         os.open = real_open
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
 
-    assert seen["n"] > 64, ("the probe did not exceed the old cumulative bound", seen)
+    assert "permission denied" in (err or ""), (
+        "an unwritable directory must be diagnosed as a PERMISSION problem; 'too many "
+        "superseded copies' names the wrong cause entirely: %r" % err)
+    assert seen["n"] < 500, (
+        "the loop walked %d names before giving up. The writability probe exists so a denied "
+        "directory is detected in tens of probes, not ten thousand." % seen["n"])
+
+
+def test_v8_transient_contention_still_rides_out():
+    """The counterpart. A directory that IS writable must not be misread as denied just
+    because contention produced denials -- that was the original bug, where a transient race
+    aborted the clear and the dispatch's real error envelope was dropped in favour of a
+    stale success."""
+    import _manifest
+
+    d = tempfile.mkdtemp(prefix="summon-contend-")
+    real_open = os.open
+    seen = {"n": 0}
+    try:
+        out = os.path.join(d, "r.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(chr(123) + '"status": "success"' + chr(125))
+
+        def busy(path, flags, *a, **k):
+            # 200 denials, far past the old bound, on a directory that IS writable: the
+            # probe succeeds and the walk continues
+            if ".superseded" in str(path) and ".wtest" not in str(path):
+                seen["n"] += 1
+                if seen["n"] <= 200:
+                    raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, flags, *a, **k)
+
+        os.open = busy
+        err = _manifest._clear_out_file(out, archive=True)
+    finally:
+        os.open = real_open
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
     assert err is None, (
-        "interleaved transient denials aborted the clear: %r -- the counter must track "
-        "CONSECUTIVE denials, since only an unwritable dir denies every name in a row" % err)
+        "transient contention on a WRITABLE directory aborted the clear: %r. The writability "
+        "probe is what distinguishes this from a denied directory." % err)
 
 
 def test_v8_gate_records_its_own_definition_hash():
@@ -11987,23 +12056,61 @@ def test_v8_dry_run_and_the_real_envelope_warn_identically():
     import _builder
     import run_subagent as rs
 
+    # The OPT-IN path. Without SUMMON_ALLOW_UNENFORCED_READONLY a read-only agy dispatch is
+    # refused outright, so there is no run for advisory warnings to describe. With it, two
+    # warnings from two DIFFERENT helpers apply, which is what makes this a parity test
+    # rather than a tautology.
+    had = _builder.os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    _builder.os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+    try:
+        inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                       system_context="ctx", permission="read-only")
+        expected = _builder.advisory_warnings("agy", "read-only", 60_000)
+        assert len(expected) >= 2, (
+            "agy at read-only on a 60s clock, opted in, should warn about BOTH the advisory "
+            "tier and the short budget: %r" % (expected,))
+
+        args = types.SimpleNamespace(agent="x", timeout=60_000, worktree=None, out=None,
+                                     dry_run=True)
+        view = rs._dry_run_view(inv, args, agents_dir=os.getcwd())
+        got = view.get("warnings", [])
+        for w in expected:
+            assert w in got, (
+                "--dry-run did not surface a warning the real dispatch would: %r. Preflight "
+                "is where this is still free to act on." % w[:90])
+
+        # and no duplicates: the two paths must not both append the same text
+        assert len(got) == len(set(got)), (
+            "a warning appeared twice in the preview: %r" % (got,))
+    finally:
+        if had is None:
+            _builder.os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            _builder.os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+
+def test_v8_dry_run_reports_a_dispatch_that_would_be_refused():
+    """--dry-run answers "what would happen if I ran this". For a read-only agy agent the
+    answer is "nothing, it fails closed" -- the single most useful thing preflight can say,
+    and it said nothing at all until the refusal was wired in here too. Same drift class as
+    the warnings: two paths describing one dispatch, maintained separately."""
+    import _builder
+    import run_subagent as rs
+
     inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
                                    system_context="ctx", permission="read-only")
-    expected = _builder.advisory_warnings("agy", "read-only", 60_000)
-    assert len(expected) >= 2, ("agy at read-only on a 60s clock should warn about BOTH the "
-                                "withheld workspace and the short budget: %r" % (expected,))
-
-    args = types.SimpleNamespace(agent="x", timeout=60_000, worktree=None, out=None,
+    args = types.SimpleNamespace(agent="x", timeout=600_000, worktree=None, out=None,
                                  dry_run=True)
     view = rs._dry_run_view(inv, args, agents_dir=os.getcwd())
-    got = view.get("warnings", [])
-    for w in expected:
-        assert w in got, (
-            "--dry-run did not surface a warning the real dispatch would: %r. Preflight is "
-            "where this is still free to act on." % w[:90])
+    assert view.get("would_refuse") is True, (
+        "preflight showed a dispatch that will actually be refused: %r" % (view.get("error"),))
+    assert "cannot enforce" in (view.get("error") or ""), view.get("error")
 
-    # and no duplicates: the two paths must not both append the same text
-    assert len(got) == len(set(got)), ("a warning appeared twice in the preview: %r" % (got,))
+    # a backend that DOES enforce the tier must preflight clean
+    inv2 = _builder.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                    system_context="ctx", permission="read-only")
+    view2 = rs._dry_run_view(inv2, args, agents_dir=os.getcwd())
+    assert not view2.get("would_refuse"), view2
 
 
 def test_v8_advisory_warnings_is_the_only_assembly_point():

@@ -106,15 +106,14 @@ run_subagent.py --council --question-file q.md \
   `coder`/cursor, `pair`/sonnet-5) — all can read files under `--cwd`. Override with
   `--members`; author custom-persona members with `--new-agent`. A council of clones
   is pointless — keep it diverse.
-  > **Note:** `agy` members (e.g. `researcher`) run in an isolated profile, and summon
-  > only puts your `--cwd` into that profile's workspace at `safe-edit`/`yolo` — NOT at
-  > `read-only`, because agy has no enforceable read-only tier (measured: it wrote files
-  > with both `--sandbox` and `--mode plan` in force, so the workspace is withheld rather
-  > than promise a tier it cannot deliver). A read-only agy member therefore answers from
-  > the prompt alone: fine for a pure-reasoning question, wrong for repo inspection. Give
-  > an agy council member `safe-edit` deliberately (on agy that is a FULL bypass), inline
-  > the material into `--question`, or use a repo-capable backend. The envelope carries a
-  > warning either way.
+  > **Note:** an `agy` member (e.g. `researcher`) declared `read-only` is **refused** —
+  > agy cannot enforce that tier, so summon fails closed rather than imply a boundary that
+  > does not exist (measured: a declared read-only agy agent read a secret file and created
+  > another by absolute path, with `--sandbox` and `--mode plan` both in force). Give an agy
+  > council member `safe-edit` as a deliberate choice — on agy that is a FULL bypass, so
+  > point the council at a repo you can afford to have written to — or use a backend that
+  > enforces the tier. `SUMMON_ALLOW_UNENFORCED_READONLY=1` dispatches anyway and marks the
+  > tier advisory.
 - **`--rounds 2`** adds a cross-examination + peer-ranking round (à la Karpathy's
   llm-council): each member sees ALL positions anonymized (can't tell which is
   theirs → no favoritism), refines their stance, and **ranks** them best-to-worst.
