@@ -114,13 +114,14 @@ _PERMISSION_MAPPING = {
         "yolo": ["-f", "--trust"],
     },
     "agy": {
-        # NEITHER of these prevents agy from writing files. Measured 2026-07-25 with
-        # canaries that attempted a create and an append under --cwd: `--sandbox` restricts
-        # TERMINAL operations only, and `--mode plan` did not withhold the file tools
-        # either -- both wrote successfully, confirmed on disk. They are kept as defence in
-        # depth and because a future agy may honour them, but summon does NOT rely on them.
-        # What actually contains a read-only agy dispatch is withholding --add-dir, so the
-        # agent never receives the caller's workspace at all (see _build_agy_args).
+        # agy HAS NO ENFORCEABLE READ-ONLY TIER. Measured over five canaries on
+        # 2026-07-25/26: `--sandbox` restricts TERMINAL operations only; `--mode plan` does
+        # not withhold the file tools; and withholding `--add-dir` only breaks RELATIVE
+        # paths -- canary 5 had a declared-read-only agent read a secret and create a file
+        # by ABSOLUTE path, both confirmed on disk. These flags are sent as defence in
+        # depth and because a future agy may honour them, but summon relies on NONE of
+        # them and no longer claims the tier: an agy read-only dispatch FAILS CLOSED
+        # (see readonly_unenforceable_error).
         "read-only": ["--mode", "plan", "--sandbox"],
         "safe-edit": ["--dangerously-skip-permissions"],
         "yolo": ["--dangerously-skip-permissions"],
@@ -184,21 +185,89 @@ def agy_permission_warning(cli: str, permission: str) -> str | None:
 _AGY_MIN_ADVISED_TIMEOUT_MS = 420_000
 
 
-def agy_readonly_workspace_warning(cli: str, permission: str) -> str | None:
-    """Explain why a read-only agy agent cannot see --cwd.
+_AGY_BOUNDARY_FLAGS = ("--add-dir", "--mode", "--sandbox",
+                       "--dangerously-skip-permissions", "--yolo")
 
-    Silence here would be worse than the limitation: the agent answers from the prompt
-    alone and sounds confident about files it never opened.
+
+def _strip_agy_boundary_flags(extra_args) -> list:
+    """Remove agy flags that would move the permission boundary summon just set.
+
+    An agent definition's own `args:` are appended AFTER the permission flags, so
+    `args: ["--add-dir", "/repo"]` in frontmatter silently rewrote the tier summon had just
+    computed. --max-permission and --gate-with already drop extra_args wholesale for this
+    reason; a DIRECTLY declared tier did not, which left the mapping advisory against the
+    roster (found by cross-vendor review, 2026-07-26).
+
+    Not a general sanitiser: it drops exactly the flags that grant workspace or change the
+    tier, plus their values. Everything else an agent author writes still passes through --
+    the point is to keep the tier honest, not to police the roster.
+    """
+    out, skip = [], False
+    for a in extra_args:
+        if skip:
+            skip = False
+            continue
+        base = a.split("=", 1)[0]
+        if base in _AGY_BOUNDARY_FLAGS:
+            # --add-dir/--mode take a separate value; the boolean flags do not.
+            skip = ("=" not in a) and base in ("--add-dir", "--mode")
+            continue
+        out.append(a)
+    return out
+
+
+_UNENFORCED_RO_OPT_IN = "SUMMON_ALLOW_UNENFORCED_READONLY"
+
+
+def readonly_unenforceable_error(cli: str, permission: str) -> str | None:
+    """Refuse a dispatch whose declared permission tier the backend cannot enforce.
+
+    summon FAILS CLOSED here for the same reason --gate-with does: a permission tier is a
+    promise to the caller, and a promise the backend will not keep is worse than no
+    promise, because it is acted on. agy is the only such backend today.
+
+    Measured across five canaries (2026-07-25/26). `--sandbox` restricts TERMINAL
+    operations only. `--mode plan` does not withhold the file tools. Withholding
+    `--add-dir` -- which summon shipped briefly as a containment fix -- only breaks
+    RELATIVE paths: canary 5 gave a DECLARED read-only agy agent two absolute paths, and it
+    read a secret file back verbatim and created a new one, both confirmed on disk.
+
+    The opt-in exists because refusing outright would strand anyone who knowingly wants
+    agy's reasoning on a throwaway checkout. It makes the tier ADVISORY, not enforced, and
+    says so.
     """
     if cli != "agy" or permission != "read-only":
         return None
-    return ("agy at read-only does NOT receive --cwd, so it cannot read your repository. "
-            "agy has no enforceable read-only tier -- measured 2026-07-25, an agent clamped "
-            "to read-only wrote files under --cwd with both --sandbox and --mode plan in "
-            "force -- so summon withholds the workspace rather than promise a tier it "
-            "cannot deliver. For repo-grounded agy work use safe-edit (which on agy is a "
-            "FULL bypass; point it only at repos you can afford to have written to), or "
-            "inline the content, or use a repo-capable backend.")
+    if os.environ.get(_UNENFORCED_RO_OPT_IN) == "1":
+        return None
+    return ("agy cannot enforce the read-only tier, so summon refuses this dispatch rather "
+            "than imply a boundary that does not exist. Measured: a declared read-only agy "
+            "agent read a secret file and created another by ABSOLUTE path, with --sandbox "
+            "and --mode plan both in force and the workspace withheld. agy at any tier can "
+            "read and write anything your user account can.\n"
+            "Choose deliberately:\n"
+            "  - use a backend that enforces read-only (claude, codex, cursor-agent); or\n"
+            "  - declare safe-edit if write access is acceptable (on agy that IS a full "
+            "bypass -- point it only at a repo you can afford to have written to); or\n"
+            "  - set " + _UNENFORCED_RO_OPT_IN + "=1 to dispatch anyway, accepting that "
+            "read-only is ADVISORY for agy and enforced by nothing.")
+
+
+def agy_readonly_workspace_warning(cli: str, permission: str) -> str | None:
+    """Warn on the OPT-IN path that read-only is advisory only.
+
+    Reached only when the caller set the opt-in, so the dispatch proceeds -- but it must
+    not proceed quietly. An earlier version of this warning claimed agy "cannot read your
+    repository", which canary 5 disproved: it read a secret by absolute path.
+    """
+    if cli != "agy" or permission != "read-only":
+        return None
+    if os.environ.get(_UNENFORCED_RO_OPT_IN) != "1":
+        return None
+    return ("read-only is ADVISORY for agy and enforced by nothing: it can read and write "
+            "any path your user account can, whatever this tier says. You set "
+            + _UNENFORCED_RO_OPT_IN + "=1, so summon dispatched anyway. Treat the result as "
+            "having had full filesystem access.")
 
 
 def agy_timeout_warning(cli: str, timeout_ms: int | None) -> str | None:
@@ -213,9 +282,11 @@ def agy_timeout_warning(cli: str, timeout_ms: int | None) -> str | None:
             f"partial.")
 
 
-# Windows caps an entire command line at 32767 chars (CreateProcess, including the
-# terminating null). POSIX instead caps each SINGLE argument at MAX_ARG_STRLEN = 131072
-# on Linux, with a much larger total. Measured 2026-07-25 on Windows: a 20k-char prompt
+# Windows caps an entire command line at 32767 UTF-16 code units (CreateProcess,
+# including the terminating null), measured on the SERIALISED line -- subprocess quotes and
+# escapes arguments, so the raw character sum is not the number that matters. POSIX instead
+# caps each SINGLE argument at MAX_ARG_STRLEN = 131072 BYTES on Linux, and caps arguments
+# plus environment together at ARG_MAX. Measured 2026-07-25 on Windows: a 20k-char prompt
 # dispatched fine, 31k and 34k both failed -- and CreateProcess reports the overflow as
 # ERROR_FILE_NOT_FOUND, which Python raises as FileNotFoundError, which summon reported as
 # "CLI not found: ...node.EXE". That sends you to debug an install that was never broken.
@@ -233,8 +304,16 @@ def argv_length_error(cli: str, command: str, args: list) -> str | None:
     the command line.
     """
     if os.name == "nt":
-        # +1 per argument for the separating space, matching how CreateProcess counts.
-        total = len(command) + sum(len(a) + 1 for a in args)
+        # Measure what CreateProcess ACTUALLY receives, not a character sum of the parts.
+        # subprocess serialises argv with list2cmdline, which adds quotes around anything
+        # containing a space and DOUBLES embedded backslashes before a quote -- so a raw sum
+        # undercounts badly. Cross-vendor review measured `\\"` * 10000 at 20010 by the old
+        # count and 40011 UTF-16 units once serialised; both passed preflight and then failed
+        # CreateProcess as WinError 206, which is the exact misdiagnosis this check exists to
+        # prevent. Windows counts UTF-16 code units, so a non-BMP character costs TWO, and
+        # the terminating NUL counts inside the limit.
+        line = subprocess.list2cmdline([command, *args])
+        total = len(line.encode("utf-16-le")) // 2 + 1        # +1 for the terminating NUL
         if total > _ARGV_TOTAL_LIMIT_NT:
             return (f"the assembled command line is {total} characters, over the Windows "
                     f"limit of {_ARGV_TOTAL_LIMIT_NT}. The prompt reaches {cli} through "
@@ -245,11 +324,31 @@ def argv_length_error(cli: str, command: str, args: list) -> str | None:
                     f"the prompt, or write the material to a file under --cwd and ask the "
                     f"agent to READ it (a repo-capable backend will).")
         return None
-    longest = max((len(a) for a in args), default=0)
+    # BYTES, not characters: execve counts encoded bytes, so 70k accented characters is
+    # 140k bytes and sailed past a character comparison (measured under WSL, E2BIG).
+    blobs = [a.encode("utf-8", "surrogateescape") for a in args]
+    longest = max((len(b) for b in blobs), default=0)
     if longest > _ARGV_SINGLE_LIMIT_POSIX:
-        return (f"a single argument is {longest} characters, over the {_ARGV_SINGLE_LIMIT_POSIX} "
+        return (f"a single argument is {longest} bytes, over the {_ARGV_SINGLE_LIMIT_POSIX} "
                 f"per-argument limit. The prompt reaches {cli} through argv. Shorten it, or "
                 f"write the material to a file under --cwd and ask the agent to READ it.")
+    # And the TOTAL, which counts the environment too: many medium arguments overflow
+    # ARG_MAX without any single one being close to the per-argument cap (measured: 25 x
+    # 100000 bytes passed preflight, then E2BIG). Read the real limit rather than assume;
+    # fall back to the POSIX minimum guarantee if sysconf is unavailable.
+    try:
+        arg_max = os.sysconf("SC_ARG_MAX")
+    except (ValueError, OSError, AttributeError):
+        arg_max = 2 ** 21
+    env_bytes = sum(len(k) + len(v) + 2 for k, v in os.environ.items())
+    total = len(command.encode("utf-8", "surrogateescape")) + sum(len(b) + 1 for b in blobs)
+    # A margin: the kernel also stores pointers and the auxiliary vector in this budget, and
+    # the exact overhead is not knowable from here.
+    if total + env_bytes > arg_max - 4096:
+        return (f"the arguments and environment total {total + env_bytes} bytes, over this "
+                f"system's ARG_MAX of {arg_max}. The prompt reaches {cli} through argv. "
+                f"Shorten it, or write the material to a file under --cwd and ask the agent "
+                f"to READ it.")
     return None
 
 
@@ -935,19 +1034,22 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
     # usable for repo-grounded work: without it, relative paths resolve against a scratch
     # dir inside the isolated profile.
     #
-    # It is withheld at READ-ONLY, and that is a security boundary rather than a nicety.
-    # agy has no enforceable read-only tier: canaries on 2026-07-25 showed an agent clamped
-    # to read-only creating a file and appending to another under --cwd, with both
-    # `--sandbox` and `--mode plan` in force. So handing it the workspace at read-only would
-    # mean summon promising a tier it cannot deliver -- and --add-dir is precisely what
-    # makes that promise reachable. Withheld, agy can still write, but only inside its own
-    # disposable per-invocation profile, where it does no harm.
-    #
-    # At safe-edit and yolo the agent already HAS write authority (both map to
-    # --dangerously-skip-permissions on agy), so passing the workspace grants nothing new.
-    add_dir = (["--add-dir", inv.cwd]
-               if inv.cwd and inv.permission != "read-only" else [])
-    args = [wrapper, *perm, *add_dir, *inv.extra_args, *cont, *model_flag, "--print", prompt]
+    # It is passed at EVERY tier that can dispatch. Withholding it at read-only was tried
+    # and reverted: it bought no containment at all, because agy reaches any absolute path
+    # regardless (canary 5, 2026-07-26 -- a DECLARED read-only agent read a secret file and
+    # created another, both by absolute path, both confirmed on disk). All it did was break
+    # relative-path work while leaving a false impression of a boundary. Read-only agy now
+    # fails closed instead, so the only dispatches reaching here already have write
+    # authority, or an explicit and informed opt-in.
+    add_dir = ["--add-dir", inv.cwd] if inv.cwd else []
+    # An agent definition's own `args:` are appended AFTER the permission flags, so a
+    # frontmatter `args: ["--add-dir", "/repo"]` or a second --mode silently rewrites the
+    # tier summon just computed. --max-permission and --gate-with already drop extra_args
+    # wholesale for exactly this reason; a DIRECTLY declared tier did not, which left the
+    # permission mapping advisory against the roster. Drop only the flags that move the
+    # boundary, so ordinary passthrough args keep working.
+    extra = _strip_agy_boundary_flags(inv.extra_args)
+    args = [wrapper, *perm, *add_dir, *extra, *cont, *model_flag, "--print", prompt]
     env = {
         "USERPROFILE": profile,
         "HOME": profile,

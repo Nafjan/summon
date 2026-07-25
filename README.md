@@ -242,8 +242,8 @@ dispatch it with the **summon** skill instead of doing everything yourself:
   councils and swarms diverse; a council of clones is pointless.
 
 Verify, don't trust: branch on the returned `status`; a `report_ok:false` or
-`suspect:true` "success" means re-dispatch. Read `warnings` (model fell back, agy at
-read-only cannot see `--cwd`, credit spend). `model.served` proves what actually ran.
+`suspect:true` "success" means re-dispatch. Read `warnings` (model fell back, agy read-only is
+advisory only, credit spend). `model.served` proves what actually ran.
 Preview a paid fan-out with `--dry-run`, pass `--json-schema` when you need structured
 output, chain via `report.handoff` into the next call, and pass `--out` on any
 council you cannot afford to lose (the envelope is checkpointed each phase).

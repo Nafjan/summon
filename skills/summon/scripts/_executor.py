@@ -16,6 +16,7 @@ import time
 
 from _builder import (AgentInvocation, BACKENDS, advisory_warnings,
                       argv_length_error, agy_permission_warning,
+                      readonly_unenforceable_error,
                       agy_readonly_workspace_warning, agy_timeout_warning,
                       apply_credit_guard, backend_kind, build_invocation_args,
                       credit_spend_allowed, infer_billing, permission_flags,
@@ -1805,6 +1806,13 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         resp = _enrich(BACKENDS[inv.cli]["call"](inv, timeout_ms), None)
         resp["resume"] = {"cli": inv.cli, "session_id": None}  # stateless: no resume
         return _stamp(resp)
+
+    # BEFORE build_invocation_args, which has side effects: for agy it creates a
+    # per-invocation profile and copies OAuth material into it. A dispatch we are going to
+    # refuse must not do that work, let alone copy credentials for it.
+    _ro_err = readonly_unenforceable_error(inv.cli, inv.permission)
+    if _ro_err:
+        return _stamp(_enrich(_error_response(inv.cli, 1, _ro_err), None))
 
     # timeout_ms is threaded to the builder so agy's wrapper deadline AND its
     # profile-TTL cleanup (which runs during build) both reflect the real request.

@@ -290,15 +290,17 @@ Honest edges — plan around these, don't be surprised by them:
   an ABSOLUTE path read fine — so agy always had file tools and simply was not standing in
   `--cwd`. After the fix the relative lookup returns the token, with agy reporting the
   workspace as your `--cwd`.
-  **At `read-only` the workspace is deliberately WITHHELD**, so an agy read-only dispatch
-  cannot see your repo at all. agy has no enforceable read-only tier: canaries (2026-07-25)
-  showed an agent clamped to read-only creating a file and appending to another under
-  `--cwd` with BOTH `--sandbox` and `--mode plan` in force. Rather than promise a tier the
-  backend does not honour, summon withholds `--add-dir` there -- agy can still write, but
-  only inside its own disposable per-invocation profile. For repo-grounded agy work use
-  `safe-edit` as a deliberate choice (on agy that is a full bypass; point it only at repos
-  you can afford to have written to), inline the content into the prompt, or pick a
-  repo-capable backend. The envelope and `--dry-run` both warn.
+  **agy at `read-only` is REFUSED.** agy cannot enforce that tier, and summon fails closed
+  rather than imply a boundary that does not exist. Measured over five canaries
+  (2026-07-25/26): `--sandbox` restricts terminal operations only; `--mode plan` does not
+  withhold the file tools; and withholding the workspace only breaks RELATIVE paths — a
+  **declared** read-only agy agent read a secret file and created another by ABSOLUTE path,
+  both confirmed on disk. agy at any tier can read and write anything your user account can.
+  Use `safe-edit` as a deliberate choice (on agy that is a full bypass; point it only at
+  repos you can afford to have written to), pick a backend that enforces the tier
+  (claude/codex/cursor-agent), or set `SUMMON_ALLOW_UNENFORCED_READONLY=1` to dispatch
+  anyway — which marks the tier advisory and says so in `warnings`. `--dry-run` reports
+  `would_refuse` so you learn this before spending anything.
   (agy still never reports token usage or a resolved model, and its `safe-edit` tier is a
   full bypass — see the permission note.)
 - **`status` reflects the backend's own signal.** The envelope downgrades a self-reported
