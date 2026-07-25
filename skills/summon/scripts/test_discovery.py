@@ -3904,8 +3904,15 @@ def test_v4_overall_timeout_skips_fallback_after_breach():
 def test_v4_overall_timeout_setup_overrun():
     # Re-review finding #4: setup (owner acquisition, receipt write) runs BEFORE the
     # watchdog exists, so a budget already spent by setup must not dispatch any paid
-    # member. A 1 ms budget is always exhausted by setup -> zero-member partial, no
-    # member ever dispatched.
+    # member -> zero-member partial, no member ever dispatched.
+    #
+    # The clock is FAKED rather than relying on a 1 ms budget being "always exhausted by
+    # setup". It is not: time.monotonic() has ~15.6 ms granularity on Windows, so fast
+    # setup can legitimately read as 0 ms elapsed, the deadline genuinely has not passed,
+    # and dispatching is CORRECT. That assumption failed on windows-latest 3.10 while
+    # passing on the other three CI jobs -- a test asserting a race, not a behaviour.
+    # Advancing the fake clock past the budget makes the precondition true by
+    # construction on every platform.
     import _council
     import argparse
     import contextlib
@@ -3928,6 +3935,18 @@ def test_v4_overall_timeout_setup_overrun():
                             timeout=30000, out=None, run_dir=root, overall_timeout=1)
     orig_d = _council._dispatch
     _council._dispatch = fake
+    # Fake clock: the first reading establishes the start, every later one is 5s beyond
+    # it, so ANY positive budget is exhausted by the time setup finishes -- regardless of
+    # platform clock granularity or how fast the machine is.
+    real_monotonic = _council.time.monotonic
+    _clock = {"n": 0}
+
+    def fake_monotonic():
+        base = real_monotonic()
+        _clock["n"] += 1
+        return base if _clock["n"] == 1 else base + 5.0
+
+    _council.time.monotonic = fake_monotonic
     try:
         t0 = _t.monotonic()
         buf = io.StringIO()
@@ -3936,6 +3955,7 @@ def test_v4_overall_timeout_setup_overrun():
         elapsed = _t.monotonic() - t0
         env = _json.loads(buf.getvalue())
     finally:
+        _council.time.monotonic = real_monotonic
         _council._dispatch = orig_d
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
