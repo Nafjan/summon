@@ -11506,6 +11506,34 @@ def test_v8_controls_are_part_of_the_request_identity():
     other = request_fingerprint(**build_request_identity(**base, gate_with="sol-review"))
     assert other != gated, "swapping the gate agent left the fingerprint unchanged"
 
+
+def test_v8_orchestration_guide_version_stamp_is_current():
+    """references/orchestration.md claims a version it was verified against. That claim
+    silently went FIVE releases stale before anyone noticed, which is worse than no claim:
+    a doc that says "verified against X" reads as checked.
+
+    The guide is the one place that tells an orchestrator what summon can be trusted to do,
+    so a stale stamp there is the same failure class as a stale model pin -- true when
+    written, quietly false later, with nothing tying it to the thing it describes."""
+    import re
+
+    scripts = os.path.dirname(os.path.abspath(__file__))
+    guide = os.path.join(os.path.dirname(scripts), "references", "orchestration.md")
+    if not os.path.isfile(guide):     # installed copies may omit references; skip
+        return
+    src = open(os.path.join(scripts, "run_subagent.py"), encoding="utf-8").read()
+    m = re.search(r'__version__ = "([0-9.]+)"', src)
+    assert m, "could not read __version__"
+    version = m.group(1)
+
+    text = open(guide, encoding="utf-8").read()
+    stamped = re.search(r"verified against summon \*\*([0-9.]+)\*\*", text)
+    assert stamped, "the guide no longer carries a 'verified against summon X' stamp"
+    assert stamped.group(1) == version, (
+        "orchestration.md claims it was verified against %s but summon is %s -- re-verify "
+        "the guide against the current behaviour and update the stamp, or the claim is "
+        "false" % (stamped.group(1), version))
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
