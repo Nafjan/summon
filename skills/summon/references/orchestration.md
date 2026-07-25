@@ -9,7 +9,7 @@ Project-agnostic and host-agnostic. Adopt the parts you need; every section is
 written so a single orchestrator (human or agent) can act on it without a
 house style guide.
 
-Semantics below were verified against summon **0.13.8**. Model ids and alias
+Semantics below were verified against summon **0.13.9**. Model ids and alias
 behaviour are volatile: re-check with `doctor`, `list`, `models`, and
 `--dry-run` before a run you care about.
 
@@ -190,20 +190,26 @@ and report what you found.
 ### Backends that do not stand in `--cwd`
 
 A backend can have full file tools and still be useless for repo work, because it
-is not WHERE you think it is. Summon's `agy` backend relocates into a scratch dir
-inside its own profile, so a relative reference resolves there and fails, while
-the same file at an ABSOLUTE path reads fine (measured 2026-07-25 with a canary;
-re-check before relying on it).
+is not WHERE you think it is. That is a distinct failure from having no file
+access, and it is worth checking for explicitly.
 
-The failure mode this creates is worse than a refusal: an agent that cannot find
-your files may answer from the prompt alone and sound confident about code it
-never opened. So do not infer capability from a plausible-sounding answer.
+Summon hit exactly this with `agy`: it isolates that backend's `HOME` for auth
+hygiene, and agy then resolved relative paths against a scratch dir inside the
+isolated profile. A canary showed a relative lookup failing while the SAME file
+at an absolute path read fine -- proof the tools worked and only the location was
+wrong. Summon now passes `--add-dir <cwd>` and relative paths work (0.13.9).
 
-Before assigning repo-grounded work to an unfamiliar backend, spend one dispatch
-on a canary: put a unique token in a file and ask the agent to read it back, both
-relative and absolute. That is the cheapest way to learn which of the two failure
-shapes you are dealing with -- no file access at all, or file access from the
-wrong place.
+The failure mode this creates is nastier than a refusal: an agent that cannot
+find your files may answer from the prompt alone and sound confident about code
+it never opened. Do not infer capability from a plausible-sounding answer.
+
+**Canary any unfamiliar backend before trusting it with repo-grounded work.** One
+dispatch: put a unique token in a file, ask the agent to read it back BOTH by
+relative name and by absolute path. The two results tell you which world you are
+in -- no file access at all, file access from the wrong place (fixable by telling
+the backend where the repo is), or working normally. This costs one call and
+replaces a guess with a fact; summon's own documentation asserted the wrong
+answer here for months because nobody spent that call.
 
 ---
 
