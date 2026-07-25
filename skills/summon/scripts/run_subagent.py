@@ -75,7 +75,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.10.4"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.11.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -859,6 +859,21 @@ def main() -> None:
         _emit(_dry_run_view(invocation, args, agents_dir))
         sys.exit(0)
 
+    # --gate-with: another agent must APPROVE this dispatch before it runs. Placed
+    # BEFORE git_head_before and the dispatch itself so a refused request never
+    # touches the tree. Fails closed inside _gate.decide.
+    if getattr(args, "gate_with", None):
+        _gate_decision = _run_gate(args, agents_dir, invocation)
+        if not _gate_decision.get("approved"):
+            from _gate import blocked_envelope
+            _env = blocked_envelope(_gate_decision, agent=args.agent, cli=cli)
+            _env["request_sha256"] = receipt.get("request_sha256")
+            finalize_exit_fields(_env)
+            if args.out:
+                _write_out(args.out, _env)
+            _emit(_env)
+            sys.exit(0)
+
     # Effective-tree provenance: recompute HEAD after any worktree rewrite,
     # BEFORE the agent can commit anything.
     receipt["git_head_before"] = _receipt.git_head(args.cwd)
@@ -871,6 +886,8 @@ def main() -> None:
         result = _dispatch_with_retries(invocation, args)
     except ValueError as e:
         _die(str(e))
+    if getattr(args, "gate_with", None):
+        result["gate"] = _gate_decision
 
     # --json-schema: structured-output contract with ONE corrective retry.
     if schema is not None and result.get("status") == "success":
@@ -965,6 +982,57 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
         except ValueError as e:
             view["error"] = str(e)
     return view
+
+
+def _run_gate(args, agents_dir, gated_inv) -> dict:
+    """Dispatch the --gate-with agent to adjudicate this request. Returns a gate
+    decision dict (see _gate.decide); FAILS CLOSED on every failure path.
+
+    The gate is forced to ``read-only`` REGARDLESS of what its own definition
+    declares. A gate that could write would be a privilege-escalation path: the
+    caller could name a yolo profile as its own approver and gain write access
+    through the approval step itself.
+    """
+    from _builder import AgentInvocation
+    from _gate import decide, gate_prompt
+    from _loader import load_agent
+
+    try:
+        tup = load_agent(agents_dir, args.gate_with)
+    except Exception as e:  # noqa: BLE001 — an unusable gate must REFUSE, not pass
+        return decide(None, args.gate_with) | {
+            "reason": f"gate agent {args.gate_with!r} could not be loaded: {e}"}
+
+    gate_cli, gate_ctx, _desc, gate_file, _perm, gate_model, gate_args, gate_effort = tup
+    try:
+        from _resolver import resolve_cli
+        gate_cli = resolve_cli(gate_cli)
+    except Exception:  # noqa: BLE001
+        pass
+    if gate_cli == args.cli and gate_cli is not None:
+        print(f"note: --gate-with {args.gate_with!r} resolves to the same backend "
+              f"({gate_cli}) as the gated dispatch; a same-vendor gate shares the "
+              f"caller's blind spots", file=sys.stderr)
+
+    prompt = gate_prompt(agent=args.agent, prompt=args.prompt, cwd=args.cwd,
+                         permission=gated_inv.permission, cli=gated_inv.cli,
+                         model=gated_inv.model)
+    gate_inv = AgentInvocation(
+        cli=gate_cli, prompt=prompt, cwd=args.cwd, system_context=gate_ctx,
+        agent_file=gate_file,
+        permission="read-only",   # FORCED: never inherit the gate definition's tier
+        model=gate_model, effort=gate_effort, extra_args=tuple(gate_args or ()),
+    )
+    timeout = args.gate_timeout or args.timeout
+    if isinstance(timeout, str):
+        from _cli import parse_timeout
+        timeout = parse_timeout(timeout)
+    try:
+        resp = execute_agent(gate_inv, timeout_ms=timeout, debug_dir=args.debug_dir)
+    except Exception as e:  # noqa: BLE001 — a crashed gate REFUSES
+        return decide(None, args.gate_with) | {
+            "reason": f"gate dispatch failed: {type(e).__name__}: {e}"}
+    return decide(resp, args.gate_with)
 
 
 def _dispatch_with_retries(invocation, args) -> dict:

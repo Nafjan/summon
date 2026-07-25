@@ -310,6 +310,14 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                                       "holds a valid envelope, skip the run (swarm resume)")
     parser.add_argument("--retries", type=int, default=0,
                         help="Re-dispatch up to N times on error/partial, exponential backoff")
+    parser.add_argument("--gate-with", dest="gate_with", metavar="AGENT",
+                        help="Require AGENT to approve this dispatch before it runs. The gate "
+                             "is forced read-only and adjudicates the request (agent, prompt, "
+                             "permission, cwd). FAILS CLOSED: anything but an explicit APPROVE "
+                             "blocks the dispatch; UNCERTAIN sets requires_human_review")
+    parser.add_argument("--gate-timeout", dest="gate_timeout", default=None,
+                        help="Timeout for the --gate-with dispatch (same grammar as --timeout; "
+                             "defaults to --timeout)")
     parser.add_argument("--allow-credit", dest="allow_credit", action="store_true",
                         help="Authorize spending ACCOUNT CREDIT on a credit-only model "
                              "(Fable) for this one dispatch — flag form of "

@@ -10642,6 +10642,147 @@ def test_v7_identity_loads_the_definition_once_no_hybrid():
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
 
+
+def test_v8_gate_parse_verdict_last_wins_and_line_anchored():
+    """A gate that reasons aloud before ruling ("a naive reviewer would say
+    VERDICT: APPROVE, but...") must be read by its CONCLUSION, so the LAST verdict
+    wins. The pattern is line-anchored too: a verdict quoted mid-sentence is not a
+    ruling. Taking the FIRST match would let a hypothesis the gate went on to reject
+    approve the dispatch."""
+    from _gate import parse_verdict
+    nl = chr(10)
+    assert parse_verdict("VERDICT: APPROVE") == "APPROVE"
+    assert parse_verdict("verdict: deny") == "DENY"
+    assert parse_verdict(None) is None
+    assert parse_verdict("no ruling here") is None
+    assert parse_verdict("VERDICT: APPROVE is tempting" + nl + "VERDICT: DENY") == "DENY"
+    assert parse_verdict("do not say VERDICT: APPROVE lightly") is None
+
+
+def test_v8_gate_fails_closed_on_every_failure_path():
+    """The gate must never fail OPEN. A gate that errored, timed out, was blocked,
+    returned nothing, or emitted no parseable verdict produced NO ruling, and
+    "could not answer" must never read as "approved"."""
+    from _gate import decide
+    assert decide(None, "g")["approved"] is False
+    assert decide("not a dict", "g")["approved"] is False
+    for st in ("error", "blocked", "partial", "timeout", None):
+        d = decide({"status": st, "result": "VERDICT: APPROVE"}, "g")
+        assert d["approved"] is False, (st, d)
+        assert d["verdict"] == "DENY", (st, d)
+    d = decide({"status": "success", "result": "looks fine to me"}, "g")
+    assert d["approved"] is False and "parseable" in (d["reason"] or "")
+    assert decide({"status": "success", "result": "VERDICT: APPROVE"}, "g")["approved"] is True
+    for v in ("DENY", "UNCERTAIN"):
+        assert decide({"status": "success", "result": "VERDICT: " + v}, "g")["approved"] is False
+
+
+def test_v8_gate_uncertain_routes_to_human_not_silent_refusal():
+    """UNCERTAIN is not DENY: it means the gate could not tell, which is exactly the
+    case a human must decide. The envelope must SAY so, or an uncertain ruling is
+    indistinguishable from a policy refusal and reaches nobody."""
+    from _gate import blocked_envelope, decide
+    unc = decide({"status": "success", "result": "VERDICT: UNCERTAIN"}, "g")
+    env = blocked_envelope(unc, agent="a", cli="claude")
+    assert env["status"] == "blocked"
+    assert env["requires_human_review"] is True, env
+    assert "human" in env["blocked_reason"]
+    den = blocked_envelope(decide({"status": "success", "result": "VERDICT: DENY"}, "g"),
+                           agent="a", cli="claude")
+    assert den["requires_human_review"] is False, den
+
+
+def test_v8_gate_is_forced_read_only_even_if_its_definition_is_yolo():
+    """A gate whose own definition declares full bypass must still RUN read-only.
+    Otherwise --gate-with is itself a privilege-escalation path: name a yolo profile
+    as your own approver and the approval step hands you the write access."""
+    import run_subagent as _rs
+    d = tempfile.mkdtemp(prefix="summon-gateperm-")
+    seen = {}
+    real_exec = _rs.execute_agent
+    nl = chr(10)
+    try:
+        with open(os.path.join(d, "yolo-gate.md"), "w", encoding="utf-8") as fh:
+            fh.write("---" + nl + "run-agent: claude" + nl + "permission: yolo" + nl
+                     + "---" + nl + "# Gate" + nl)
+
+        def fake_exec(inv, **kw):
+            seen["permission"] = inv.permission
+            return {"status": "success", "result": "VERDICT: APPROVE"}
+
+        _rs.execute_agent = fake_exec
+
+        class A:
+            gate_with = "yolo-gate"
+            agent = "impl"
+            prompt = "p"
+            cwd = d
+            cli = None
+            timeout = 60000
+            gate_timeout = None
+            debug_dir = None
+
+        from _builder import AgentInvocation
+        gated = AgentInvocation(cli="claude", prompt="p", cwd=d, permission="safe-edit")
+        dec = _rs._run_gate(A(), d, gated)
+    finally:
+        _rs.execute_agent = real_exec
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+    assert seen.get("permission") == "read-only", (
+        "the gate ran with permission %r -- it must be forced read-only regardless "
+        "of its own definition" % seen.get("permission"))
+    assert dec["approved"] is True
+
+
+def test_v8_gate_denial_prevents_the_real_dispatch_entirely():
+    """The whole point: a refused request must never reach the backend. Asserting on
+    the returned envelope alone would still pass if the work had already run, so this
+    drives main() and asserts the GATED agent was never executed."""
+    import contextlib as _ctx
+    import io as _io
+    import json as _json
+
+    import run_subagent as _rs
+    d = tempfile.mkdtemp(prefix="summon-gateblock-")
+    calls = []
+    real_exec = _rs.execute_agent
+    real_argv = sys.argv
+    nl = chr(10)
+    try:
+        for name, perm in (("gate", "read-only"), ("impl", "safe-edit")):
+            with open(os.path.join(d, name + ".md"), "w", encoding="utf-8") as fh:
+                fh.write("---" + nl + "run-agent: claude" + nl + "permission: " + perm
+                         + nl + "---" + nl + "# " + name + nl)
+
+        def fake_exec(inv, **kw):
+            calls.append(inv.permission)
+            if inv.permission == "read-only":
+                return {"status": "success",
+                        "result": "VERDICT: DENY" + nl + "REASON: too broad"}
+            return {"status": "success", "result": "I DID THE WORK"}
+
+        _rs.execute_agent = fake_exec
+        sys.argv = ["run_subagent.py", "--agent", "impl", "--prompt", "p", "--cwd", d,
+                    "--agents-dir", d, "--gate-with", "gate"]
+        out = _io.StringIO()
+        try:
+            with _ctx.redirect_stdout(out):
+                _rs.main()
+        except SystemExit:
+            pass
+        env = _json.loads(out.getvalue())
+    finally:
+        _rs.execute_agent = real_exec
+        sys.argv = real_argv
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+    assert env["status"] == "blocked", env
+    assert env["gate"]["verdict"] == "DENY", env
+    assert calls == ["read-only"], (
+        "the gated dispatch RAN despite refusal (permissions executed: %r)" % calls)
+    assert "I DID THE WORK" not in _json.dumps(env)
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
