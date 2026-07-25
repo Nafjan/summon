@@ -6,6 +6,20 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.13.8] - 2026-07-25
+
+### Fixed
+- **The fake clock in the overall-timeout test was itself order-dependent.** The first
+  attempt special-cased "the first clock read is the run start". That is an assumption,
+  not a guarantee: other code reads the clock during setup BEFORE `_run_start` is
+  captured, so on windows-latest 3.10 the run start absorbed the offset and the deadline
+  moved FURTHER OUT rather than into the past -- the opposite of the intent. The clock now
+  advances on EVERY read, so whichever call captures the run start, the next read is
+  already past any positive budget.
+- `_council.time` IS the global `time` module, so faking it also faked the test's own
+  stopwatch and the wall-clock assertion read 70 simulated seconds. The test now measures
+  with a captured real `monotonic`.
+
 ## [0.13.7] - 2026-07-25
 
 ### Fixed

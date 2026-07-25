@@ -3935,24 +3935,29 @@ def test_v4_overall_timeout_setup_overrun():
                             timeout=30000, out=None, run_dir=root, overall_timeout=1)
     orig_d = _council._dispatch
     _council._dispatch = fake
-    # Fake clock: the first reading establishes the start, every later one is 5s beyond
-    # it, so ANY positive budget is exhausted by the time setup finishes -- regardless of
-    # platform clock granularity or how fast the machine is.
+    # Fake clock that ADVANCES 10s on every read. Order-independent by construction:
+    # whichever call captures the run start, the very next read is already 10s later, so
+    # any positive budget is spent. An earlier attempt special-cased "the first call is
+    # the run start" -- that held locally and failed on windows-latest 3.10, because other
+    # code reads the clock during setup BEFORE _run_start is captured, which pushed the
+    # deadline out of reach instead of into the past.
     real_monotonic = _council.time.monotonic
-    _clock = {"n": 0}
+    _clock = {"t": real_monotonic()}
 
     def fake_monotonic():
-        base = real_monotonic()
-        _clock["n"] += 1
-        return base if _clock["n"] == 1 else base + 5.0
+        _clock["t"] += 10.0
+        return _clock["t"]
 
     _council.time.monotonic = fake_monotonic
     try:
-        t0 = _t.monotonic()
+        # real_monotonic, not _t.monotonic: `_council.time` IS the global time module, so
+        # faking it above also fakes the test's own stopwatch. The wall-clock assertion
+        # below has to measure actual seconds, not simulated ones.
+        t0 = real_monotonic()
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
             rc = _council.run_council(ns)
-        elapsed = _t.monotonic() - t0
+        elapsed = real_monotonic() - t0
         env = _json.loads(buf.getvalue())
     finally:
         _council.time.monotonic = real_monotonic
