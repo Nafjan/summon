@@ -332,7 +332,20 @@ _ARGV_TOTAL_LIMIT_NT = 32767
 _ARGV_SINGLE_LIMIT_POSIX = 131072
 
 
-def argv_length_error(cli: str, command: str, args: list) -> str | None:
+def _utf8(s: str) -> bytes:
+    """Encode for measurement, never raising.
+
+    Arguments can carry lone surrogates -- from a prompt decoded with surrogateescape, or a
+    filesystem path on either platform. `surrogateescape` handles the low half but raises on
+    a lone HIGH surrogate, so measurement fell over on input it was supposed to describe.
+    """
+    try:
+        return s.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return s.encode("utf-8", "surrogatepass")
+
+
+def argv_length_error(cli: str, command: str, args: list, env=None) -> str | None:
     """Reject an over-long command line BEFORE spawning, with the real reason.
 
     The prompt is passed via argv by every CLI backend, so a large prompt (a diff, a
@@ -350,7 +363,11 @@ def argv_length_error(cli: str, command: str, args: list) -> str | None:
         # prevent. Windows counts UTF-16 code units, so a non-BMP character costs TWO, and
         # the terminating NUL counts inside the limit.
         line = subprocess.list2cmdline([command, *args])
-        total = len(line.encode("utf-16-le")) // 2 + 1        # +1 for the terminating NUL
+        # surrogatepass: a prompt decoded from an odd byte stream can carry a LONE
+        # SURROGATE, and a plain .encode() raises UnicodeEncodeError -- turning a preflight
+        # meant to produce a clear message into an uncaught crash on the dispatch path.
+        # Measuring is best-effort; refusing to measure must never be fatal.
+        total = len(line.encode("utf-16-le", "surrogatepass")) // 2 + 1   # +1 for the NUL
         if total > _ARGV_TOTAL_LIMIT_NT:
             return (f"the assembled command line is {total} characters, over the Windows "
                     f"limit of {_ARGV_TOTAL_LIMIT_NT}. The prompt reaches {cli} through "
@@ -363,9 +380,11 @@ def argv_length_error(cli: str, command: str, args: list) -> str | None:
         return None
     # BYTES, not characters: execve counts encoded bytes, so 70k accented characters is
     # 140k bytes and sailed past a character comparison (measured under WSL, E2BIG).
-    blobs = [a.encode("utf-8", "surrogateescape") for a in args]
+    blobs = [_utf8(a) for a in args]
     longest = max((len(b) for b in blobs), default=0)
-    if longest > _ARGV_SINGLE_LIMIT_POSIX:
+    # >=, not >: MAX_ARG_STRLEN COUNTS THE TERMINATING NUL, so 131072 bytes of payload is
+    # already one over. Measured under WSL: 131071 spawned, 131072 failed with E2BIG.
+    if longest >= _ARGV_SINGLE_LIMIT_POSIX:
         return (f"a single argument is {longest} bytes, over the {_ARGV_SINGLE_LIMIT_POSIX} "
                 f"per-argument limit. The prompt reaches {cli} through argv. Shorten it, or "
                 f"write the material to a file under --cwd and ask the agent to READ it.")
@@ -377,7 +396,13 @@ def argv_length_error(cli: str, command: str, args: list) -> str | None:
         arg_max = os.sysconf("SC_ARG_MAX")
     except (ValueError, OSError, AttributeError):
         arg_max = 2 ** 21
-    env_bytes = sum(len(k) + len(v) + 2 for k, v in os.environ.items())
+    # BYTES of the environment that will ACTUALLY be passed, not characters of this
+    # process's. Both were wrong: character counting under-measured multibyte values (22
+    # values of 50k non-ASCII chars passed preflight, then /bin/true failed with E2BIG),
+    # and reading os.environ measured a different environment from the one _merge_env hands
+    # to Popen.
+    _env = os.environ if env is None else env
+    env_bytes = sum(len(_utf8(k)) + len(_utf8(v)) + 2 for k, v in _env.items())
     total = len(command.encode("utf-8", "surrogateescape")) + sum(len(b) + 1 for b in blobs)
     # A margin: the kernel also stores pointers and the auxiliary vector in this budget, and
     # the exact overhead is not knowable from here.
@@ -728,6 +753,16 @@ _AGY_AUTH_FILES = (
     "state.json", "trustedFolders.json", "extension_integrity.json",
 )
 _AGY_MAX_PROMPT = 28000  # one argv token; stay under Windows CreateProcess ~32 KB
+
+
+def _reject_oversized_agy_prompt(prompt: str) -> None:
+    """Raise if the assembled agy prompt cannot be passed as one argv token."""
+    if len(prompt) > _AGY_MAX_PROMPT:
+        raise ValueError(
+            f"agy prompt is {len(prompt)} chars (> {_AGY_MAX_PROMPT}); it is passed as one "
+            "Windows argv token and would risk CreateProcess truncation. Shorten the "
+            "agent definition or task prompt, or write the material to a file under --cwd "
+            "and ask the agent to READ it.")
 _AGY_RUN_TTL_SEC = 900   # don't clean run dirs younger than this (may be in use)
 
 
@@ -1053,16 +1088,19 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
             "block from your agent definition above, with every field present "
             "(use \"none\" where it does not apply). Do not skip it, even for tiny tasks."
         )
+        # CHECK BEFORE BUILDING. The guard below used to run after _ensure_agy_profile, so a
+        # prompt that was never going to dispatch still created a profile directory and
+        # copied OAuth material into it before raising -- orphaning credentials for a run
+        # that never happened. Same rule as the unenforceable-tier refusal: fail before side
+        # effects, not after them.
+        _reject_oversized_agy_prompt(prompt)
         profile = _ensure_agy_profile(inv.cwd, deadline_sec)
         _attest_agy_profile(profile, getattr(inv, "agy_account_sha256", None),
                             getattr(inv, "agy_account_checked", False))
         cont = []
 
-    if len(prompt) > _AGY_MAX_PROMPT:
-        raise ValueError(
-            f"agy prompt is {len(prompt)} chars (> {_AGY_MAX_PROMPT}); it is passed as one "
-            "Windows argv token and would risk CreateProcess truncation. Shorten the "
-            "agent definition or task prompt.")
+    # the resume branch above builds no profile, so checking it here costs nothing
+    _reject_oversized_agy_prompt(prompt)
 
     # Launch the wrapper, NOT agy directly. Arg order matters: agy's --print
     # consumes the NEXT token as the prompt, so flags (perm, --continue, --model)

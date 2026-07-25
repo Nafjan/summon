@@ -13,6 +13,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 _VERSION_TIMEOUT = 10
@@ -155,25 +156,39 @@ def _default_probe_runner(name: str, path: str) -> dict | None:
         return None
     try:
         # The probe is a liveness check, not a privileged dispatch, so it asks for the
-        # least authority: read-only. For agy that tier is refused (agy cannot enforce it),
-        # which would report a perfectly healthy agy as unverifiable. Probe it at the
-        # lowest tier it can actually honour instead, and let the caller see that the
-        # probe says nothing about read-only for this backend.
-        _perm = "safe-edit" if name == "agy" else "read-only"
-        inv = AgentInvocation(cli=name, prompt="ping", cwd=os.getcwd(),
+        # least authority: read-only. agy refuses that tier (it cannot enforce it), which
+        # would report a healthy agy as unverifiable -- so agy is probed one tier up.
+        #
+        # But safe-edit on agy means --dangerously-skip-permissions --add-dir <cwd>, i.e. a
+        # HEALTH CHECK with full authority over the caller's working tree. That is not a
+        # trade worth making for a liveness ping, so the agy probe runs in an empty throwaway
+        # directory: it still proves the backend starts, answers and authenticates, and the
+        # only thing it can write to is a temp dir we are about to delete.
+        _probe_dir = None
+        if name == "agy":
+            _perm, _probe_dir = "safe-edit", tempfile.mkdtemp(prefix="summon-probe-")
+            _cwd = _probe_dir
+        else:
+            _perm, _cwd = "read-only", os.getcwd()
+        inv = AgentInvocation(cli=name, prompt="ping", cwd=_cwd,
                               system_context="", permission=_perm)
         resp = execute_agent(inv, timeout_ms=_PROBE_TIMEOUT * 1000)
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "text": f"{type(e).__name__}: {e}"}
+    finally_dir = locals().get("_probe_dir")
+    if finally_dir:
+        shutil.rmtree(finally_dir, ignore_errors=True)
     text = " ".join(str(resp.get(k) or "") for k in ("error", "output_tail", "result"))
     out = {"status": resp.get("status"), "text": text}
     if name == "agy":
         # Do not let a green probe imply a tier that was never exercised: agy has no
         # enforceable read-only, and the probe deliberately ran one tier up.
         out["probed_permission"] = "safe-edit"
-        out["note"] = ("probed at safe-edit: agy cannot enforce read-only, so a read-only "
-                       "dispatch is refused (SUMMON_ALLOW_UNENFORCED_READONLY=1 overrides "
-                       "for a tier you declare yourself)")
+        out["note"] = ("probed at safe-edit IN AN EMPTY TEMPORARY DIRECTORY: agy cannot "
+                       "enforce read-only, so a read-only dispatch is refused "
+                       "(SUMMON_ALLOW_UNENFORCED_READONLY=1 overrides for a tier you declare "
+                       "yourself), and safe-edit on agy is a full bypass -- which a health "
+                       "check must not aim at your repo. Says nothing about read-only.")
     return out
 
 

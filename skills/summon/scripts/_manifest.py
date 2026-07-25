@@ -34,6 +34,7 @@ import os
 import math
 import re
 import subprocess
+import uuid
 import sys
 import threading
 import time
@@ -126,7 +127,16 @@ def _clear_out_file(out_file: str, archive: bool) -> str | None:
                         # directory writable at all", so ask it directly, once, with a name
                         # nothing else can be holding.
                         if _denied > 64:
-                            probe = f"{base}.wtest.{os.getpid()}.{_denied}"
+                            # A FRESH name every time. Keying it on _denied reused the name
+                            # once the counter reset, so a probe whose cleanup failed (the
+                            # remove is best-effort) would make every later probe fail
+                            # O_EXCL with EEXIST -- read as "inconclusive" forever, silently
+                            # disabling the measurement this exists to perform.
+                            # uuid4, not a counter: a per-call sequence collides between
+                            # CONCURRENT calls in the same process, and the manifest runs
+                            # jobs in threads. The probe must be unique across processes AND
+                            # threads or it measures someone else's file.
+                            probe = f"{base}.wtest.{os.getpid()}.{uuid.uuid4().hex}"
                             try:
                                 _pfd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                             except PermissionError:
@@ -136,11 +146,17 @@ def _clear_out_file(out_file: str, archive: bool) -> str | None:
                             except OSError:
                                 pass          # inconclusive; keep walking names
                             else:
-                                os.close(_pfd)
+                                # try/finally, matching the archive claim ten lines above:
+                                # a close() that raises must not skip the remove and strand
+                                # both the descriptor and the file. The two paths had the
+                                # same shape and only one had the care.
                                 try:
-                                    os.remove(probe)
-                                except OSError:
-                                    pass
+                                    os.close(_pfd)
+                                finally:
+                                    try:
+                                        os.remove(probe)
+                                    except OSError:
+                                        pass
                                 _denied = 0   # writable: the denials really were contention
                     n += 1
                     dest = f"{base}.{n}"
