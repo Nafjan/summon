@@ -9310,7 +9310,12 @@ def test_v7_cursor_default_model_is_part_of_the_request():
 
 
 def test_v7_agy_dispatch_verifies_the_copied_account_bytes():
-    """The identity digests an account before dispatch; the profile the child actually runs
+    """SKIPPED off Windows: the agy path builds a ConPTY wrapper invocation, and the
+    bundled wrapper is Windows-only by design (agy has no working pipe mode). Off
+    Windows the dispatch correctly raises before the attestation this test asserts
+    on, so running it there tests the platform, not the attestation.
+
+    The identity digests an account before dispatch; the profile the child actually runs
     under is built (or resumed) LATER. If they disagree the run would answer as one account
     while being stamped as another, so `_build_agy_args` REFUSES.
 
@@ -9318,6 +9323,8 @@ def test_v7_agy_dispatch_verifies_the_copied_account_bytes():
     exercised only `agy_profile_account_sha`, so deleting the entire comparison-and-refusal
     block left it green. It covers BOTH the fresh-copy and the resume branch, and the
     "cannot attest" case."""
+    if os.name != "nt":
+        return                  # ConPTY wrapper is Windows-only (see docstring above)
     import _builder
     from _builder import _AGY_AUTH_FILES, AgentInvocation, agy_profile_account_sha
     d = tempfile.mkdtemp(prefix="summon-agyatt-")
@@ -10337,6 +10344,37 @@ def test_v7_agent_definition_absent_then_present_is_refused():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def _pretend_backends_installed():
+    """Context manager: make every backend look present on PATH.
+
+    run_subagent gates on `shutil.which(cli)` and returns a 127 "not installed"
+    envelope BEFORE dispatch. A test that stubs execute_agent to observe dispatch
+    behaviour therefore never reaches its stub on a machine without that CLI --
+    which is every CI runner. Tests that exercise DISPATCH LOGIC must not also
+    require the vendor CLI to be installed; the ones that genuinely need a real
+    backend belong in a live smoke test, not the unit suite."""
+    import contextlib
+    import shutil as _sh
+
+    @contextlib.contextmanager
+    def _ctxm():
+        real = _sh.which
+
+        def fake(cmd, *a, **k):
+            found = real(cmd, *a, **k)
+            if found:
+                return found
+            # a plausible absolute path; nothing executes it (execute_agent is stubbed)
+            return os.path.join(tempfile.gettempdir(), str(cmd))
+
+        _sh.which = fake
+        try:
+            yield
+        finally:
+            _sh.which = real
+    return _ctxm()
+
+
 def test_v7_agy_account_absent_then_present_is_refused():
     """`agy_account_sha256 = None` meant both "legacy caller" and "no account files when
     fingerprinted". A login between fingerprint and dispatch turned the second into a
@@ -10428,11 +10466,12 @@ def test_v7_agy_account_absent_then_present_is_refused():
         try:
             sys.argv = ["run_subagent.py", "--agent", "ag", "--prompt", "p",
                         "--cwd", agent_dir, "--agents-dir", agent_dir]
-            with _ctx.redirect_stdout(_io.StringIO()):
-                try:
-                    _rs.main()
-                except SystemExit:
-                    pass
+            with _pretend_backends_installed():
+                with _ctx.redirect_stdout(_io.StringIO()):
+                    try:
+                        _rs.main()
+                    except SystemExit:
+                        pass
         finally:
             _rs.execute_agent = real_execute
             sys.argv = real_argv
@@ -10773,11 +10812,12 @@ def test_v8_gate_denial_prevents_the_real_dispatch_entirely():
         sys.argv = ["run_subagent.py", "--agent", "impl", "--prompt", "p", "--cwd", d,
                     "--agents-dir", d, "--gate-with", "gate"]
         out = _io.StringIO()
-        try:
-            with _ctx.redirect_stdout(out):
-                _rs.main()
-        except SystemExit:
-            pass
+        with _pretend_backends_installed():
+            try:
+                with _ctx.redirect_stdout(out):
+                    _rs.main()
+            except SystemExit:
+                pass
         env = _json.loads(out.getvalue())
     finally:
         _rs.execute_agent = real_exec
@@ -10876,6 +10916,17 @@ def test_v8_popen_flags_suppress_the_windows_console():
     import _spawn
 
     real_name = os.name
+    # The Windows creation-flag constants do not EXIST on a POSIX build, so faking
+    # os.name alone makes popen_flags raise AttributeError on CI. Inject them for
+    # the duration, which tests the LOGIC on every platform rather than only where
+    # the constants happen to be defined.
+    _injected = []
+    for _attr, _val in (("CREATE_NO_WINDOW", 0x08000000),
+                        ("DETACHED_PROCESS", 0x00000008),
+                        ("CREATE_NEW_PROCESS_GROUP", 0x00000200)):
+        if not hasattr(_sp, _attr):
+            setattr(_sp, _attr, _val)
+            _injected.append(_attr)
     try:
         os.name = "nt"
         # importlib.reload is not needed: popen_flags reads os.name at CALL time
@@ -10898,6 +10949,8 @@ def test_v8_popen_flags_suppress_the_windows_console():
                 "creationflags is Windows-only; passing it on POSIX raises")
     finally:
         os.name = real_name
+        for _attr in _injected:
+            delattr(_sp, _attr)
 
 
 def test_v8_popen_flags_never_evaluates_windows_constants_on_posix():
@@ -11193,11 +11246,12 @@ def test_v8_retry_refusal_evidence_is_not_overwritten_by_the_initial_approval():
         sys.argv = ["run_subagent.py", "--agent", "impl", "--prompt", "p", "--cwd", d,
                     "--agents-dir", d, "--gate-with", "gate", "--retries", "3"]
         out = _io.StringIO()
-        try:
-            with _ctx.redirect_stdout(out):
-                _rs.main()
-        except SystemExit:
-            pass
+        with _pretend_backends_installed():
+            try:
+                with _ctx.redirect_stdout(out):
+                    _rs.main()
+            except SystemExit:
+                pass
         env = _json.loads(out.getvalue())
     finally:
         _rs.execute_agent = real_exec

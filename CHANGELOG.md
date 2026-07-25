@@ -6,6 +6,28 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.13.5] - 2026-07-25
+
+### Fixed
+- **CI had been red on every push since the 0.10.2 merge.** Five tests passed on a
+  developer machine and failed on GitHub runners, because they tested the MACHINE rather
+  than the code. No product defect was involved; all five were test bugs.
+  - Three drove `main()` with a stubbed `execute_agent` to observe dispatch behaviour, but
+    `run_subagent.py` gates on `shutil.which(cli)` and returns a 127 "not installed"
+    envelope BEFORE dispatch. On a runner with no vendor CLI the stub was never reached.
+    A shared `_pretend_backends_installed()` helper now makes the PATH lookup succeed, so
+    the tests exercise dispatch logic without also requiring the vendor CLI.
+  - `test_v8_popen_flags_suppress_the_windows_console` faked `os.name = "nt"` on Linux,
+    where `subprocess.CREATE_NO_WINDOW` does not exist. The constants are now injected for
+    the duration, so the platform LOGIC is tested everywhere rather than only where the
+    constants happen to be defined.
+  - `test_v7_agy_dispatch_verifies_the_copied_account_bytes` exercises the ConPTY wrapper
+    path, which is Windows-only by design (agy has no working pipe mode). It now skips off
+    Windows, where the dispatch correctly raises before the attestation under test.
+- Verified by simulating the CI environment locally -- vendor CLIs stripped from `PATH`,
+  the five tests re-run -- rather than by re-running them where they already passed.
+  Passing on a dev box is what hid this for a day.
+
 ## [0.13.4] - 2026-07-25
 
 ### Documentation
