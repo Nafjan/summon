@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.13.1"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.13.2"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -162,7 +162,9 @@ def _request_identity(args) -> dict:
         agent=args.agent, prompt=args.prompt, cwd=args.cwd, agents_dir=args.agents_dir,
         cli=args.cli, model=args.model, effort=args.effort, json_schema=args.json_schema,
         resume=args.resume, resume_profile=getattr(args, "resume_profile", None),
-        worktree=args.worktree, allow_credit=getattr(args, "allow_credit", False))
+        worktree=args.worktree, allow_credit=getattr(args, "allow_credit", False),
+        gate_with=getattr(args, "gate_with", None),
+        max_permission=getattr(args, "max_permission", None))
 
 
 def _stamp_job(env: dict) -> dict:

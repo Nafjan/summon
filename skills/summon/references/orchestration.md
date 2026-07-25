@@ -104,12 +104,32 @@ If independence is the point, vary the **backend**, not just the `--model`
 string. Reserve single-gateway fan-out for throughput, where a shared failure
 domain is acceptable.
 
+These are three separate axes, and conflating them is how a council looks
+independent while sharing a single point of failure:
+
+| Axis | What varying it buys | What it does NOT buy |
+|---|---|---|
+| **Model provider** (Anthropic / OpenAI / Google / xAI) | Different training, different blind spots | Nothing about availability: one gateway can front all of them |
+| **Backend** (`claude` / `codex` / `cursor-agent` / `agy`) | Separate transport, auth, billing and remap surface | Not automatically a different model provider: a gateway reaches many |
+| **Account** | Independent quota and rate limits | Nothing about model or transport |
+
+A review is cross-vendor when the **model provider** differs from the author's.
+A council is fault-tolerant when the **backend** differs. Ask for both.
+
 ### Aliases lag. Pin full ids.
 
 Floating aliases (`opus`, `sonnet`, `haiku`) resolve to whatever the vendor CLI
-currently points them at, which is routinely **behind** the newest release. As
-of 2026-07-25, `--model opus` served `claude-opus-4-7` while `claude-opus-5`
-was current, two releases back.
+currently points them at, which is routinely **behind** the newest release. A
+measurement taken 2026-07-25 saw `--model opus` serve `claude-opus-4-7` while
+`claude-opus-5` was current -- but treat that as an ILLUSTRATION, not a fact you
+can rely on today.
+
+**Neither `models` nor `--dry-run` can verify this for you.** `models` lists the
+aliases; `--dry-run` shows what summon will TARGET. Neither observes what the
+vendor's alias actually expands to, or what served the request. The only way to
+know is a live canary dispatch whose terminal telemetry names the model -- which
+means a backend that reports one (claude or codex; see section 3). Anywhere else,
+record the expansion as unverified rather than assuming it.
 
 Pin full version ids in agent definitions and re-check them on a schedule. An
 alias in a governance-critical reviewer definition is a silent downgrade.
@@ -137,7 +157,9 @@ Defaults that hold up:
 
 `--max-permission {read-only,safe-edit}` caps a dispatch at that tier. It is a
 CLAMP, not an override: an agent declaring `read-only` stays read-only under a
-`safe-edit` ceiling, and an unknown ceiling keeps the declared tier. Summon has
+`safe-edit` ceiling. (The helper also keeps the declared tier when handed an
+unrecognised ceiling, but the CLI rejects those at parse time, so that is an
+internal safety property rather than something you can invoke.) Summon has
 no general `--permission` flag on purpose -- one would let any caller hand any
 agent full bypass, a larger hole than any it would close.
 
@@ -230,9 +252,13 @@ Most orchestration waste is re-running work that already succeeded.
 - **`--retries N`** retries `error`/`partial` with backoff. `blocked` is never
   retried, because its cause is structural.
 - **`--json-schema FILE`** validates the agent's final JSON against a contract
-  and attaches `parsed` / `parse_ok` / `parse_errors`, with one corrective
-  retry. Use it to make verdicts machine-checkable instead of prose an agent
-  can drift from.
+  and attaches `parsed` / `parse_ok` / `parse_errors`. Use it to make verdicts
+  machine-checkable instead of prose an agent can drift from.
+  Validation always runs; the ONE corrective retry does not. The correction is a
+  `--resume` follow-up, so it only happens on a backend with a resume lane
+  (claude, codex, cursor by session id; agy by profile). Gemini rejects resume
+  and openai-compat is stateless, so there the verdict you get is the first one:
+  `parse_ok: false` is final rather than a first attempt.
 - **`--dry-run`** resolves the full dispatch, including model and permission
   flags, without spending anything. Cheapest way to catch a wrong model or an
   over-privileged profile.

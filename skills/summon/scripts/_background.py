@@ -51,6 +51,11 @@ def child_argv(args: argparse.Namespace, result_file: str) -> list:
     # flag omitted here is silently dropped -- and dropping --gate-with meant a
     # gated background dispatch ran with no approval at all. The gate runs in the
     # CHILD, which is where the dispatch it authorizes actually happens.
+    # Same class of bug as the gate below, and reintroduced with a NEW flag three
+    # releases after the gate one was fixed: a control that is not forwarded here is
+    # silently absent in the child, so --background --max-permission ran UNCLAMPED.
+    if getattr(args, "max_permission", None):
+        out += ["--max-permission", args.max_permission]
     if getattr(args, "gate_with", None):
         out += ["--gate-with", args.gate_with]
     if getattr(args, "gate_timeout", None):

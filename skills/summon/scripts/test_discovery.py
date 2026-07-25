@@ -11437,6 +11437,75 @@ def test_v8_every_public_flag_is_documented_in_skill_md():
         "these public flags are missing from SKILL.md: %s -- document them, or mark them "
         "help=argparse.SUPPRESS if they are internal" % ", ".join(undocumented))
 
+
+def test_v8_every_control_flag_reaches_the_background_child():
+    """STRUCTURAL: a control that changes what a dispatch is ALLOWED to do must survive
+    detachment. child_argv rebuilds the child's argv field by field, so anything absent is
+    silently dropped -- not defaulted, not warned about.
+
+    This has bitten twice. --gate-with was omitted, so a gated --background dispatch ran
+    with no approval at all (0.11.3). Three releases later --max-permission was added and
+    omitted the same way, so --background --max-permission read-only ran UNCLAMPED.
+
+    It asserts on the argv child_argv actually BUILDS, not on the source text: the first
+    version of this test grepped the module and passed against the broken code, because
+    the comment explaining the bug mentioned the very flag whose forwarding was missing."""
+    from _background import child_argv
+
+    class A:
+        agent = "impl"; prompt = "p"; cwd = "/tmp/x"; prompt_file = None
+        agents_dir = None; timeout = 60000; cli = None; model = None; effort = None
+        resume = None; resume_profile = None; out = None; json_schema = None
+        debug_dir = None; retries = 0; worktree = None; allow_credit = True
+        no_contract_repair = False; gate_with = "opus-review"; gate_timeout = "300s"
+        max_permission = "read-only"
+
+    argv = child_argv(A(), "/tmp/r.json")
+    for flag, val in (("--gate-with", "opus-review"), ("--gate-timeout", "300s"),
+                      ("--max-permission", "read-only")):
+        assert flag in argv, (
+            "%s is not in the detached child's argv: a --background dispatch would "
+            "silently run WITHOUT it. argv=%r" % (flag, argv))
+        assert argv[argv.index(flag) + 1] == val, (flag, argv)
+    assert "--allow-credit" in argv, argv
+
+    class B(A):
+        gate_with = None; gate_timeout = None; max_permission = None; allow_credit = False
+
+    plain = child_argv(B(), "/tmp/r.json")
+    for flag in ("--gate-with", "--gate-timeout", "--max-permission", "--allow-credit"):
+        assert flag not in plain, ("%s appeared for a run that never asked for it" % flag)
+
+
+def test_v8_controls_are_part_of_the_request_identity():
+    """A stored `--out` success from an UNGATED, UNCLAMPED run must not satisfy a later
+    GATED, CLAMPED request for the same task.
+
+    The skip compares request fingerprints. With the controls outside the identity, the
+    two requests hashed identically, so the cache handed back a result produced under
+    authority the new request deliberately withheld -- a control bypass through the
+    resume path rather than the dispatch path."""
+    from _executor import build_request_identity, request_fingerprint
+
+    base = dict(agent=None, prompt="do the thing", cwd=".")
+    plain = request_fingerprint(**build_request_identity(**base))
+    gated = request_fingerprint(**build_request_identity(**base, gate_with="opus-review"))
+    clamped = request_fingerprint(**build_request_identity(**base,
+                                                           max_permission="read-only"))
+    both = request_fingerprint(**build_request_identity(
+        **base, gate_with="opus-review", max_permission="read-only"))
+
+    assert plain != gated, (
+        "a gated request fingerprints identically to an ungated one, so a cached ungated "
+        "success would be served as the answer to a gated request")
+    assert plain != clamped, (
+        "a clamped request fingerprints identically to an unclamped one")
+    assert len({plain, gated, clamped, both}) == 4, (
+        "the four control combinations must be four distinct requests")
+    # a DIFFERENT gate is a different request too
+    other = request_fingerprint(**build_request_identity(**base, gate_with="sol-review"))
+    assert other != gated, "swapping the gate agent left the fingerprint unchanged"
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
