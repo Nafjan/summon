@@ -898,7 +898,8 @@ _IDENTITY_LOCAL = ("_agent_def_state", "_unreadable", "_endpoint", "_agy_account
 
 def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, model=None,
                            effort=None, json_schema=None, resume=None, resume_profile=None,
-                           worktree=None, allow_credit=False) -> dict:
+                           worktree=None, allow_credit=False, gate_with=None,
+                           max_permission=None) -> dict:
     """THE request identity, built in ONE place from RAW inputs.
 
     The dispatcher and the manifest parent each used to build their own dict, so a field
@@ -988,6 +989,12 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # that differ only by an unused profile argument re-pay for the same work.
         "resume_profile": (resume_profile or None) if resume else None,
         "worktree": ("<auto>" if worktree == "" else (worktree or None)),
+        # The CONTROLS are part of the request. Without them a stored --out success
+        # from an UNGATED, UNCLAMPED run satisfied a later gated+clamped request for
+        # the "same" task: the skip handed back a result produced under authority the
+        # new request deliberately withheld. A gated request is not the same request.
+        "gate_with": gate_with or None,
+        "max_permission": max_permission or None,
         # Credit authorization changes the effective MODEL (it lifts the guard's
         # substitution) and arrives as either the flag or the env var the flag sets.
         # SUMMON_DEFAULT_EFFORT likewise changes effort without ever being a flag. A

@@ -6,6 +6,34 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.13.2] - 2026-07-25
+
+### Security
+- **`--background --max-permission` ran UNCLAMPED.** `child_argv` rebuilds the detached
+  child's argv field by field, and the new clamp was not among the forwarded flags, so it
+  was silently absent in the child. This is the IDENTICAL bug fixed for `--gate-with` in
+  0.11.3, reintroduced with a new flag three releases later -- in the same release whose
+  documentation says to enumerate execution paths rather than fix the one in front of you.
+- **The `--out` cache ignored the controls.** Neither `gate_with` nor `max_permission` was
+  part of the request identity, so a stored success from an UNGATED, UNCLAMPED run
+  fingerprinted identically to a later GATED, CLAMPED request and was handed back as its
+  answer -- a control bypass through the resume path rather than the dispatch path. Both
+  are now in the identity, so those are four distinct requests.
+- A structural test asserts every authority-affecting flag survives detachment, checked
+  against the argv `child_argv` actually BUILDS. Its first version grepped the module
+  source and passed against the broken code, because the comment explaining the bug
+  mentioned the very flag whose forwarding was missing.
+
+### Documentation
+- `references/orchestration.md` corrected on four points raised in review: the dated alias
+  measurement is marked an illustration and the doc now states that neither `models` nor
+  `--dry-run` can verify an alias expansion (only a live canary on a backend that reports
+  a terminal model can); schema VALIDATION always runs but the corrective retry needs a
+  resume lane, which Gemini and openai-compat lack; model-provider, backend and account
+  independence are separated into three axes with a table, since conflating them is how a
+  council looks independent while sharing one failure domain; and the "unknown ceiling"
+  behaviour is labelled an internal property, since argparse rejects those at parse time.
+
 ## [0.13.1] - 2026-07-25
 
 ### Documentation
