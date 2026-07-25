@@ -9,7 +9,7 @@ Project-agnostic and host-agnostic. Adopt the parts you need; every section is
 written so a single orchestrator (human or agent) can act on it without a
 house style guide.
 
-Semantics below were verified against summon **0.10.4**. Model ids and alias
+Semantics below were verified against summon **0.13.0**. Model ids and alias
 behaviour are volatile: re-check with `doctor`, `list`, `models`, and
 `--dry-run` before a run you care about.
 
@@ -62,6 +62,7 @@ Record these from every dispatch that matters:
 | `report_ok`, `suspect` | Whether the contract block parsed. `status:success` with `report_ok:false` sets `suspect` -- re-dispatch rather than trust. |
 | `model.requested` / `.targeted` / `.served` | See below. These are three different claims. |
 | `billing.source` | `subscription` / `api` / `credit`. Advisory; the vendor's billing is truth. |
+| `gate` | Present when `--gate-with` ran: the verdict, the gate's own definition hash and model. A gated dispatch that reports NO gate field is indistinguishable from an ungated one, so treat its absence as unapproved. |
 
 ### The `model.served` trap
 
@@ -132,6 +133,23 @@ Defaults that hold up:
 - Full bypass is not a routine tier. If a run needs it, isolate it, keep
   credentials and sensitive data out of it, and record why.
 
+### `--max-permission`: clamp down, never up
+
+`--max-permission {read-only,safe-edit}` caps a dispatch at that tier. It is a
+CLAMP, not an override: an agent declaring `read-only` stays read-only under a
+`safe-edit` ceiling, and an unknown ceiling keeps the declared tier. Summon has
+no general `--permission` flag on purpose -- one would let any caller hand any
+agent full bypass, a larger hole than any it would close.
+
+It also **drops the agent's `args:` passthrough**, because `extra_args` are
+appended AFTER the permission flags and a definition carrying
+`--dangerously-skip-permissions` would otherwise defeat the clamp entirely.
+
+Use it when the ORCHESTRATOR knows an agent needs less authority than its
+definition grants: a reviewer reused as a deliberator, a general-purpose agent
+pointed at a read-only task. It is the honest way to reuse a capable definition
+without editing it.
+
 ### Worktrees: know what summon does and does not isolate
 
 `--worktree` isolates a **single dispatch**. Council and manifest modes do
@@ -166,7 +184,11 @@ A council you can defend:
 
 - **independent members** (vary the backend, section 4) and a synthesizer that
   did not vote (`--chairman`, plus `--chairman-fallback` for an independent
-  non-member fallback);
+  non-member fallback). Chairmen are dispatched **read-only automatically**: a
+  chairman reads member positions and writes prose, so it never needs repository
+  access, and a council question that induced it to write would be a change
+  nobody authorised. Members are NOT clamped, since forming a position can
+  legitimately require running things;
 - **read-only** member profiles;
 - **`--quorum N`** so a thin council does not synthesize from one survivor;
 - **bounded** `--member-timeout` / `--chair-timeout`;
@@ -176,6 +198,13 @@ A council you can defend:
 
 If quorum, independence, permissions, or receipts cannot be shown, call the
 result an informal consultation rather than a governance artifact.
+
+**Check what your chair costs.** The default chairman is `architect` (Opus 5).
+It used to be `fable`, which meant every council omitting `--chairman` routed
+SYNTHESIS -- the single most expensive stage -- to a credit-billed model at
+roughly twice the price, without it being the stronger model for that work. If
+your project pins its own chairman, check which model it actually resolves to;
+`--dry-run` will tell you in one call.
 
 **Budget the wall clock.** Members run at most 3 concurrent per backend, so
 roughly `rounds x waves x (timeout + 60s) + (timeout + 60s)`, where
@@ -220,7 +249,8 @@ CLI is running there is no cross-vendor hook into its individual actions, so the
 gate adjudicates the *request* before anything runs.
 
 ```bash
-run_subagent.py --agent implementer --prompt "..." --cwd <abs>                 --gate-with opus-review
+run_subagent.py --agent implementer --prompt "..." --cwd <abs> \
+                --gate-with opus-review
 ```
 
 The gate agent is dispatched **forced read-only**, regardless of what its own
@@ -237,6 +267,32 @@ cannot tell, and a person decides.
 
 The gate's ruling, its model evidence, and its definition hash land in the
 envelope's `gate` field, so a skipped or forged approval is detectable afterwards.
+
+**Every dispatch path is gated, which took four attempts to get right.** This is
+worth stating plainly because it is the failure mode most likely to recur in any
+system you build on top. A gate authorises ONE execution, and summon turned out
+to have several ways to execute:
+
+- the initial dispatch;
+- each `--retries` attempt (a retry is another execution, not a continuation);
+- the `--json-schema` corrective follow-up, which re-dispatches with the ORIGINAL
+  permission and so was a second write-capable run that no gate had approved;
+- `--background`, whose detached child argv is rebuilt field by field, so the gate
+  flag was simply absent and the whole dispatch ran ungated.
+
+Each was found separately, and after each one the invariant looked satisfied. The
+lesson generalises: when you close a privilege hole, **enumerate the execution
+paths rather than fixing the one in front of you**. A refused correction records
+`gate_correction_refused` instead of overwriting `gate`, because the original
+approval authorised work that genuinely completed -- rewriting it would misreport
+finished work as denied.
+
+The gate's own `args:` are dropped for the same reason: an agent's `extra_args`
+are appended AFTER the permission flags, so a gate definition carrying
+`--dangerously-skip-permissions` would have defeated its own forced read-only.
+Verdict parsing is line-anchored, embedded prompts are defanged, and two DISTINCT
+verdicts refuse as ambiguous -- otherwise a crafted prompt could inject the
+approval it wanted.
 
 **What this does and does not give you.** No sub-agent can escalate itself: the
 permission comes from the definition plus dispatch flags, which only the
