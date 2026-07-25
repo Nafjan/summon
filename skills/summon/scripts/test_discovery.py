@@ -12693,11 +12693,22 @@ def test_v8_posix_argv_limits_count_bytes_and_the_nul():
         assert argv_length_error("codex", "codex", ["z" * CAP]), (
             "%d bytes plus the terminating NUL exceeds MAX_ARG_STRLEN; execve gives E2BIG "
             "while preflight said it was fine" % CAP)
-        # environment measured in BYTES, from the env actually passed
-        big = {("K%d" % i): ("\u00e9" * 50000) for i in range(22)}
+        # Environment measured in BYTES, from the env actually passed. Size it off the REAL
+        # limit: hard-coding 22x50k tripped Windows' 2MB fallback and sailed under a Linux
+        # runner's larger ARG_MAX. This is the SECOND time that assumption bit on this
+        # branch -- I fixed it for the argument case and then wrote it again for the
+        # environment case. Deriving is the fix both times.
+        try:
+            _arg_max = os.sysconf("SC_ARG_MAX")
+        except (ValueError, OSError, AttributeError):
+            _arg_max = 2 ** 21
+        _chars = 50_000                      # non-ASCII: 50k chars is 100k BYTES
+        _vars = _arg_max // (_chars * 2) + 8
+        big = {("K%d" % i): ("\u00e9" * _chars) for i in range(_vars)}
         assert argv_length_error("codex", "codex", ["x"], big), (
-            "a large multibyte environment counts toward ARG_MAX; counting characters "
-            "under-measures it by half")
+            "%d environment values of %d non-ASCII characters is %d BYTES, past this "
+            "system's ARG_MAX of %d -- counting characters under-measures it by half"
+            % (_vars, _chars, _vars * _chars * 2, _arg_max))
         assert argv_length_error("codex", "codex", ["x"], {"A": "1"}) is None
     finally:
         _builder.os.name = real
