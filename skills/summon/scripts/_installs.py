@@ -261,7 +261,8 @@ def _probe(label: str, scripts_dir: str, managed: bool) -> dict:
 
 
 def enumerate_installs(running_scripts_dir: str | None = None,
-                       home: str | None = None) -> list:
+                       home: str | None = None,
+                       project_dir: str | None = None) -> list:
     """Every summon install we can locate: the five host copies (``managed``), the
     ``~/.agents`` third-party-clone location from the incident, and the RUNNING copy.
 
@@ -277,6 +278,17 @@ def enumerate_installs(running_scripts_dir: str | None = None,
     raw.append(_probe("agents",
                       os.path.join(home, ".agents", "skills", "summon", "scripts"),
                       managed=False))
+    # A PROJECT-LOCAL copy (`<project>/.agents/skills/summon`) is a real, used layout --
+    # a project can carry its own roster and a vendored dispatcher. install.py never
+    # touches it (it targets host roots), so nothing refreshes it and it rots silently:
+    # exactly how a copy reached v0.9.0 code behind a hand-edited version string, and how
+    # a stale copy kept the Windows console-window bug after the hosts were fixed. It is
+    # unmanaged (no ownership manifest), so it is REPORTED, never written.
+    if project_dir:
+        raw.append(_probe("project",
+                          os.path.join(project_dir, ".agents", "skills", "summon",
+                                       "scripts"),
+                          managed=False))
     records: list = []
     by_key: dict = {}
     for r in raw:

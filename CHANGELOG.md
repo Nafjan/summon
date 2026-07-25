@@ -6,6 +6,21 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.11.2] - 2026-07-25
+
+### Added
+- **`doctor` now enumerates PROJECT-LOCAL copies (`<project>/.agents/skills/summon`).**
+  A project can carry its own agent roster plus a vendored dispatcher, and that layout is
+  in real use. `install.py` never touches it (it targets host roots), so nothing refreshed
+  it and it rotted invisibly: one such copy was found running v0.9.0 code behind a
+  hand-edited version string, and another kept the Windows console-window bug after every
+  host copy had been fixed. Drift detection could not see either, because it only probed
+  the host roots, `~/.agents`, and the running copy.
+  `enumerate_installs` takes a `project_dir` and `doctor` passes its `--cwd`, so the copy
+  is REPORTED with its version and hash. It stays **unmanaged** (no ownership manifest):
+  summon reports it and never writes it, so a project that deliberately pins a vendored
+  copy is surfaced rather than silently overwritten.
+
 ## [0.11.1] - 2026-07-25
 
 ### Fixed
