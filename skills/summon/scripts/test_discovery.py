@@ -12103,8 +12103,11 @@ def test_v8_dry_run_reports_a_dispatch_that_would_be_refused():
                                  dry_run=True)
     view = rs._dry_run_view(inv, args, agents_dir=os.getcwd())
     assert view.get("would_refuse") is True, (
-        "preflight showed a dispatch that will actually be refused: %r" % (view.get("error"),))
-    assert "cannot enforce" in (view.get("error") or ""), view.get("error")
+        "preflight showed a dispatch that will actually be refused: %r" % (view,))
+    # `refusal`, not `error`: on a host with no agy wrapper the backend branch sets `error`
+    # to say the preview is partial, and it used to overwrite the refusal (caught by CI on
+    # Linux, where the wrapper is absent). Two different facts, two keys.
+    assert "cannot enforce" in (view.get("refusal") or ""), view.get("refusal")
 
     # a backend that DOES enforce the tier must preflight clean
     inv2 = _builder.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
