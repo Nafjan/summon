@@ -964,6 +964,14 @@ def run_council(args) -> int:
         # Stage-input hashes cover the EXACT prompt plus execution identity
         # (member, its definition hash, cwd, roster dir): a changed repo, a
         # retuned agent, or a different question all invalidate carry-forward.
+        # The unenforced-read-only opt-in decides whether an agy stage can run AT ALL,
+        # so a stage carried forward from a run that HAD it would serve an advisory-only
+        # answer to a resume that would now fail closed. Council builds its own stage
+        # identity rather than using build_request_identity -- the third place in this
+        # codebase to build one -- so the control has to be folded in here too.
+        _exec_ctx = {**_exec_ctx,
+                     "unenforced_readonly": ("1" if os.environ.get(
+                         "SUMMON_ALLOW_UNENFORCED_READONLY") == "1" else None)}
         p1 = _round1_prompt(question)
 
         def _r1_sha(m: str) -> str:

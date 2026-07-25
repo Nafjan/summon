@@ -823,6 +823,39 @@ def _codex_default(resolved_cli, model, agents_dir, cwd, agent, defn=None) -> st
         return None
 
 
+def _resolved_permission(defn, max_permission) -> str | None:
+    """The tier a request will actually run at: the definition's `permission:` after the
+    --max-permission clamp. Degrades to None when it cannot be resolved, which simply means
+    a caller-side narrowing declines to narrow -- never a wrong answer.
+
+    Used to fingerprint SUMMON_ALLOW_UNENFORCED_READONLY only where it matters. The opt-in
+    decides whether a read-only agy request runs at all; on agy safe-edit/yolo it cannot
+    change anything, and fingerprinting it there re-paid for identical work every time the
+    variable moved.
+    """
+    if defn is None:
+        return None
+    try:
+        # `.fm`, the snapshot's actual field. An earlier version read `.frontmatter`, which
+        # does not exist -- getattr's default then returned {} and every agent resolved to
+        # the DEFAULT tier, a plausible wrong answer rather than a visible failure. Read the
+        # real attribute and let a genuinely absent one degrade to None (no narrowing)
+        # instead of to a confident mistake.
+        fm = getattr(defn, "fm", None)
+        if fm is None:
+            return None
+        declared = (fm or {}).get("permission")
+        if not declared:
+            from _builder import DEFAULT_PERMISSION
+            declared = DEFAULT_PERMISSION
+        if max_permission:
+            from _builder import clamp_permission
+            return clamp_permission(str(declared), str(max_permission))
+        return str(declared)
+    except Exception:  # noqa: BLE001 - identity must never fail on a narrowing hint
+        return None
+
+
 def _resolved_cli(cli, agents_dir, cwd, agent, defn=None) -> str | None:
     """The backend a request will actually dispatch to: explicit --cli, else the agent's
     `run-agent:`, else CALLER DETECTION (env). Degrades to None (falling back to the raw
@@ -933,6 +966,7 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
     _defn = _defn_snapshot(agents_dir, cwd, agent)
     _adef = (_defn.sha, _defn.state) if _defn is not None else (None, "missing")
     _rcli = _resolved_cli(cli, agents_dir, cwd, agent, _defn)
+    _rperm = _resolved_permission(_defn, max_permission)
     _endpoint = (_endpoint_state(agents_dir, cwd, agent, _defn)
                  if _rcli == "openai-compat" else (None, "ok", None))
     _schema = content_state(json_schema or None)
@@ -1016,8 +1050,13 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # place that can catch it. agy-only, for the same reason allow_credit is claude-only:
         # on any other backend it cannot change the outcome, and fingerprinting it there
         # would re-pay for work the switch could not have altered.
+        # Narrowed by EFFECTIVE PERMISSION, not just backend. The opt-in only decides
+        # whether a READ-ONLY agy request runs; on agy safe-edit/yolo it cannot change the
+        # outcome, and fingerprinting it there re-paid for identical work (and risked
+        # repeating side effects) every time the variable moved.
         "unenforced_readonly": ("1" if os.environ.get(
-            "SUMMON_ALLOW_UNENFORCED_READONLY") == "1" else None) if _rcli == "agy" else None,
+            "SUMMON_ALLOW_UNENFORCED_READONLY") == "1" else None)
+            if (_rcli == "agy" and _rperm == "read-only") else None,
         # The DEFAULT only applies when nothing explicit was asked for; with --effort set
         # it cannot change the request, and fingerprinting it anyway forced a fresh dispatch
         # every time an unrelated default moved.

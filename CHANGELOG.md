@@ -8,6 +8,41 @@ never on added fields.
 
 ## [0.15.0] - 2026-07-26
 
+### Security (round 5)
+- **The contract repair was never re-gated.** A gate authorises ONE execution -- retries
+  re-gate, schema correction re-gates -- and the corrective resume did not. Round 3 made
+  that costly: to stop the repair pretending read-only on a backend that cannot enforce it,
+  the repair now runs at the task's own tier, which on agy is
+  `--dangerously-skip-permissions`. So a GATED agy task with a malformed report bought a
+  second full-authority run nobody approved. The repair prompt is instruction, not
+  containment. It is now re-gated; a denial keeps the original result and records
+  `gate_repair_refused`.
+- **Council carried stage results across an opt-in change.** Council builds its own stage
+  identity -- the third place in this codebase to build one, which is precisely the drift
+  `build_request_identity` was created to end -- and it omitted
+  `SUMMON_ALLOW_UNENFORCED_READONLY`. A resume reused every agy stage produced WITH the
+  opt-in after it was removed: zero dispatches, for a request that would now fail closed.
+  The control is folded into the shared per-run stage context.
+- **`doctor --probe` generated its disclosure and then dropped it.** `_default_probe_runner`
+  reports which tier it exercised; `_probe_one` discarded it, so output said "eligibility
+  verified" with no hint that read-only was never tested for agy. A disclosure that never
+  reaches the reader is not a disclosure.
+
+### Fixed (round 5)
+- **The opt-in churned fingerprints where it cannot matter.** It was narrowed by backend
+  only, so an agy `safe-edit`/`yolo` request changed identity when the variable moved --
+  re-paying for identical work and risking repeated side effects. It is now narrowed by
+  EFFECTIVE permission (definition tier after the `--max-permission` clamp).
+- **A `--` in an agent's `args:` could hang every dispatch.** agy's parser stops at the
+  terminator, so summon's own `--print` was then read as literal text and agy 1.1.7 fell
+  into interactive behaviour until the timeout. Not a permission bypass; an agent definition
+  should still not be able to hang the dispatcher.
+
+### Testing (round 5)
+- 372/372 discovery, 22/22 install. Four of five round-5 mutants died on the first pass; the
+  fifth exposed a test asserting one layer too high (it checked the probe runner's return
+  value, not the entry doctor publishes), so deleting the plumbing left it green. Replaced.
+
 ### Security (round 4)
 - **`doctor --probe` handed agy full authority over your working tree.** Round 3 raised the
   agy probe to `safe-edit` so a healthy agy could be verified at all -- but `safe-edit` on
