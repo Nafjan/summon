@@ -11406,6 +11406,37 @@ def test_v8_max_permission_drops_extra_args():
         "permission flags and would defeat it" % (view["extra_args"],))
     assert "--dangerously-skip-permissions" not in " ".join(view.get("args") or []), view
 
+
+def test_v8_every_public_flag_is_documented_in_skill_md():
+    """STRUCTURAL: every non-suppressed flag in the argparse spec must appear in SKILL.md.
+
+    Five public flags had drifted out of the docs unnoticed -- --max-permission,
+    --probe, --max-tool-output-bytes, --min-successful-members, --overall-timeout --
+    because adding a flag and documenting it are separate acts and nothing tied them
+    together. A flag users cannot discover may as well not exist. argparse.SUPPRESS is
+    the explicit way to mark a flag internal, and those are exempt."""
+    import re
+
+    scripts = os.path.dirname(os.path.abspath(__file__))
+    cli_src = open(os.path.join(scripts, "_cli.py"), encoding="utf-8").read()
+    skill = os.path.join(os.path.dirname(scripts), "SKILL.md")
+    if not os.path.isfile(skill):     # installed copies may omit docs; skip gracefully
+        return
+    doc = open(skill, encoding="utf-8").read()
+
+    flags = sorted(set(re.findall(r'add_argument\("(--[a-z0-9-]+)"', cli_src)))
+    assert len(flags) > 20, "flag scan found only %d -- did the parser move?" % len(flags)
+    undocumented = []
+    for f in flags:
+        i = cli_src.find('"%s"' % f)
+        if "help=argparse.SUPPRESS" in cli_src[i:i + 200]:
+            continue              # explicitly internal
+        if f not in doc:
+            undocumented.append(f)
+    assert not undocumented, (
+        "these public flags are missing from SKILL.md: %s -- document them, or mark them "
+        "help=argparse.SUPPRESS if they are internal" % ", ".join(undocumented))
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

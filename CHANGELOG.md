@@ -6,6 +6,21 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.13.1] - 2026-07-25
+
+### Documentation
+- **Five public flags were missing from SKILL.md** and are now documented:
+  `--max-permission`, `--probe`, `--max-tool-output-bytes`, `--min-successful-members`,
+  and `--overall-timeout`. A flag users cannot discover may as well not exist.
+- **A structural test now asserts every public flag is documented.** It parses the
+  argparse spec and requires each non-suppressed flag to appear in SKILL.md, so adding a
+  flag without documenting it fails the suite rather than drifting unnoticed. Flags that
+  are genuinely internal declare `help=argparse.SUPPRESS` and are exempt (only
+  `--job-file` is). The root cause was not forgetfulness: adding a flag and documenting
+  it were separate acts with nothing tying them together, the same shape as a model pin
+  rotting behind tests that asserted a literal.
+- `references/orchestration.md` refreshed to 0.13.0 (see 0.13.0 entry).
+
 ## [0.13.0] - 2026-07-25
 
 ### Security
