@@ -6,6 +6,29 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.10.4] - 2026-07-25
+
+### Fixed
+- **The Opus pin was two releases stale: dispatches ran Opus 4.8, not Opus 5.** The four Opus
+  agents (`planner`, `architect`, `deep-debugger`, `security-auditor`) pinned
+  `claude-opus-4-8` in their frontmatter, and `_OPUS_FALLBACK` -- the model the credit guard
+  substitutes for Fable -- pinned the same. All now pin `claude-opus-5`, verified served on
+  subscription billing by a live dispatch before the pin was changed.
+- **The `opus` alias is still NOT a substitute for the pin.** Re-verified 2026-07-25:
+  `--model opus` served `claude-opus-4-7`, two releases behind. Pinning a full id remains the
+  only way to get the newest Opus; `models` output now says so explicitly.
+- **The pin can no longer rot silently.** Four tests asserted the credit-guard fallback
+  against the literal `"claude-opus-4-8"`, so bumping the constant would have left them
+  asserting a dead model (and, before that, kept the stale pin looking correct). They now
+  assert against `_builder._OPUS_FALLBACK` itself.
+
+### Removed
+- **The dead `~/.agents/skills/summon` copy.** Nothing loads skills from `~/.agents/skills/`
+  (it holds the agent ROSTER, one level up), so that copy was never read -- it only rotted,
+  once reaching v0.9.0 code behind a hand-edited `0.10.1` version string. `doctor` still
+  probes the location as an unmanaged tripwire, so a third-party clone reappearing there is
+  reported; it simply now reports absent.
+
 ## [0.10.3] - 2026-07-25
 
 ### Added

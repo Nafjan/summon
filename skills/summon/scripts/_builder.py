@@ -242,11 +242,12 @@ def infer_billing(cli: str) -> dict:
 # agent) is unaffected: that is metered by design.
 _CREDIT_ONLY_MODELS = {"claude-fable-5"}
 # The latest subscription-covered Opus, PINNED (not the `opus` alias). The alias
-# currently LAGS — it resolves to claude-opus-4-7 while 4-8 is the latest — so a
-# pin gives the actual latest (verified available on the CLI). Bump this line when
-# a newer Opus ships. The credit-env strip still covers an `opus`-alias remap for
-# any agent that uses the alias directly.
-_OPUS_FALLBACK = "claude-opus-4-8"
+# LAGS BADLY — re-verified 2026-07-25: `--model opus` still served claude-opus-4-7,
+# two releases behind claude-opus-5 — so a pin is what actually gets the latest
+# (claude-opus-5 verified served on subscription billing via a live dispatch).
+# Bump this line when a newer Opus ships. The credit-env strip still covers an
+# `opus`-alias remap for any agent that uses the alias directly.
+_OPUS_FALLBACK = "claude-opus-5"
 # Flags that select a model — the guard scrubs credit-only values from any of
 # these in an agent's `args:` passthrough (incl. --fallback-model, which Claude
 # uses on primary-model overload).

@@ -1202,7 +1202,7 @@ def _model_mismatch(requested, ran) -> bool:
     except Exception:  # noqa: BLE001 — telemetry best-effort, never fatal
         _CLAUDE_ALIASES = ("opus", "sonnet", "haiku")
     # A floating alias expands to an id that carries the alias as a WHOLE TOKEN
-    # ('opus' -> 'claude-opus-4-8'); a substring test would wrongly hide a real
+    # ('opus' -> 'claude-opus-5'); a substring test would wrongly hide a real
     # reroute ('opus' -> 'notopus'), so split on id separators and match exactly.
     if r in _CLAUDE_ALIASES and r in re.split(r"[-_/.:]+", s):
         return False
@@ -1735,7 +1735,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # ran (served, else the legacy resolved), surface it prominently -- a pinned
         # agent model silently downgraded/rerouted is a spend + fidelity surprise.
         # Suppress only KNOWN alias expansions (opus/sonnet/haiku float to the
-        # latest release, so requested 'opus' vs served 'claude-opus-4-8' is not a
+        # latest release, so requested 'opus' vs served 'claude-opus-5' is not a
         # mismatch); everything else warns.
         _ran = _served or _legacy
         if _model_mismatch(_requested_model, _ran):

@@ -54,9 +54,11 @@ HOSTS = {
     "copilot": os.path.join(HOME, ".copilot"),
     # Antigravity keeps its file-based skills per PROFILE, under ~/.gemini rather than a
     # root of its own -- so it needs explicit entries; ~/.gemini alone only reaches the
-    # Gemini CLI's own skills dir, which Antigravity does not read. The profiles are
-    # separate physical copies that Antigravity syncs in parallel, so each is installed
-    # into independently; absent ones are simply not detected.
+    # Gemini CLI's own skills dir, which Antigravity does not read. A profile may be a real
+    # dir or a link onto a shared one (observed: `antigravity` and `antigravity-cli` both
+    # junction to ~/.gemini/config), so installing every profile can write the SAME physical
+    # dir more than once -- harmless, the copy is idempotent, and the drift detector merges
+    # them into one record by canonical path. Absent profiles are simply not detected.
     "antigravity": os.path.join(HOME, ".gemini", "antigravity"),
     "antigravity-cli": os.path.join(HOME, ".gemini", "antigravity-cli"),
     "antigravity-ide": os.path.join(HOME, ".gemini", "antigravity-ide"),
