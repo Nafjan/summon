@@ -6,6 +6,19 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.13.6] - 2026-07-25
+
+### Fixed
+- **A council timing test asserted a race, not a behaviour.**
+  `test_v4_overall_timeout_setup_overrun` assumed "a 1 ms budget is ALWAYS exhausted by
+  setup". It is not: `time.monotonic()` has roughly 15.6 ms granularity on Windows, so
+  fast setup can legitimately read as 0 ms elapsed -- the deadline genuinely has not
+  passed, and dispatching members is CORRECT. The test won that race on three of four CI
+  jobs and lost it on windows-latest 3.10.
+  The clock is now faked (first reading establishes the start, later ones are 5 s beyond),
+  so any positive budget is exhausted by construction on every platform and at any machine
+  speed. The product behaviour under test is unchanged.
+
 ## [0.13.5] - 2026-07-25
 
 ### Fixed
