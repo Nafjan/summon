@@ -6,6 +6,18 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.10.3] - 2026-07-25
+
+### Added
+- **Antigravity is a first-class install host.** Antigravity keeps its file-based skills
+  per PROFILE under `~/.gemini/antigravity*`, not in a root of its own, so `~/.gemini` alone
+  only ever reached the Gemini CLI's skills dir -- Antigravity never saw summon, and any copy
+  put there by hand was unmanaged (no ownership manifest, invisible to drift detection).
+  `install.py` now targets each Antigravity profile (`antigravity`, `antigravity-cli`,
+  `antigravity-ide`) like any other host, and `_installs.HOST_DIRS` tracks them so
+  `doctor` reports their version and drift. Profiles that do not exist are simply not
+  detected; profiles that share one physical dir collapse into a single record.
+
 ## [0.10.2] - 2026-07-23
 
 ### Security
