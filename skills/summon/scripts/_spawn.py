@@ -41,3 +41,14 @@ def popen_flags(*, detached: bool = False) -> dict:
         return {"creationflags": (subprocess.DETACHED_PROCESS
                                   | subprocess.CREATE_NEW_PROCESS_GROUP)}
     return {"creationflags": subprocess.CREATE_NO_WINDOW}
+
+
+def run_flags() -> dict:
+    """Flags for a short-lived UTILITY subprocess.run: git, taskkill, icacls, a version
+    probe. These are console applications too, so on Windows they flash (or, when summon
+    itself has no console, ALLOCATE) a window without CREATE_NO_WINDOW.
+
+    POSIX gets nothing: unlike a spawned backend these are awaited inline and never need
+    their own session, so start_new_session would be noise rather than protection.
+    """
+    return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}

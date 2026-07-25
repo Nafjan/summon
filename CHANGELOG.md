@@ -6,6 +6,20 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.11.4] - 2026-07-25
+
+### Fixed
+- **Windows console flashes from utility subprocesses (review CONCERN).** The 0.11.1 fix
+  covered `subprocess.Popen`, but summon also shells out to console applications via
+  `subprocess.run`: `git`, `taskkill`, `icacls`, and a `pyte`/`winpty` probe. Each one can
+  flash a window, or ALLOCATE one when summon itself has no console. `_spawn.run_flags()`
+  is the single definition for those, and all 10 call sites use it.
+- **The structural test now covers `subprocess.run` as well as `Popen`.** It earned its
+  keep immediately: it found two `icacls` calls in `_builder.py` that the by-hand pass had
+  missed, and the suite then caught an import placed in the wrong function scope, so
+  `run_flags` was undefined exactly where those calls live. Scope is now verified at every
+  site.
+
 ## [0.11.3] - 2026-07-25
 
 ### Security

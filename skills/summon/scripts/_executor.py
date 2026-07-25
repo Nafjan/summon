@@ -1405,8 +1405,9 @@ def _kill_tree(process: subprocess.Popen) -> None:
             # exited, a still-running backend grandchild is orphaned. The correct fix
             # is a Windows Job Object (kill the tree independent of leader lifetime);
             # POSIX's killpg below already reaches the group through a dead leader.
+            from _spawn import run_flags
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                           capture_output=True, timeout=10)
+                           capture_output=True, timeout=10, **run_flags())
         else:
             # start_new_session=True makes the child its own group leader, so the
             # PGID equals the child PID. Signal the group by PID directly instead

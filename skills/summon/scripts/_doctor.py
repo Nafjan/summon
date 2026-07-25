@@ -94,9 +94,10 @@ def _probe_version(path: str) -> str | None:
     if os.name == "nt" and path.lower().endswith((".cmd", ".bat")):
         cmd = ["cmd", "/c", path, "--version"]
     try:
+        from _spawn import run_flags
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=_VERSION_TIMEOUT,
-                           stdin=subprocess.DEVNULL)
+                           stdin=subprocess.DEVNULL, **run_flags())
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     if r.returncode != 0:

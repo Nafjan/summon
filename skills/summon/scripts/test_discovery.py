@@ -10835,6 +10835,36 @@ def test_v8_every_popen_uses_the_shared_platform_flags():
         "spawn must share ONE platform-flag definition, or Windows console flags "
         "drift per site again" % ", ".join(offenders))
 
+    # subprocess.run spawns console apps too (git, taskkill, icacls, version probes).
+    # They flash -- or, when summon has no console of its own, ALLOCATE -- a window
+    # without the flag. Only calls that launch an EXTERNAL program are checked; the
+    # allowlist covers helpers that never reach a console binary.
+    _RUN_ALLOW = {"_spawn.py"}
+    run_offenders = []
+    for fn in sorted(os.listdir(scripts)):
+        if not fn.endswith(".py") or fn.startswith("test_") or fn in _RUN_ALLOW:
+            continue
+        try:
+            tree = ast.parse(open(os.path.join(scripts, fn), encoding="utf-8").read())
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "run"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "subprocess"):
+                continue
+            ok = any(kw.arg is None and isinstance(kw.value, ast.Call)
+                     and isinstance(kw.value.func, ast.Name)
+                     and kw.value.func.id in ("run_flags", "popen_flags")
+                     for kw in node.keywords)
+            if not ok:
+                run_offenders.append("%s:%d" % (fn, node.lineno))
+    assert not run_offenders, (
+        "these subprocess.run call sites launch a console app without **run_flags(): "
+        "%s -- on Windows each one can flash or allocate a console window"
+        % ", ".join(run_offenders))
+
 
 def test_v8_popen_flags_suppress_the_windows_console():
     """The actual contract, per platform. On Windows a console app spawned without
