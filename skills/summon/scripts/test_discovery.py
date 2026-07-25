@@ -11711,6 +11711,42 @@ def test_v8_archive_claim_reports_a_genuinely_unwritable_dir():
         "an unwritable archive directory must be reported as a permission problem, got %r"
         % err)
 
+
+def test_v8_agy_invocation_adds_the_cwd_to_its_workspace():
+    """agy must be told where the caller's repo is, via `--add-dir <cwd>`.
+
+    Summon redirects HOME/USERPROFILE to an isolated per-invocation profile (auth
+    hygiene), and agy consequently resolves relative paths against a scratch dir INSIDE
+    that profile. Two canaries on 2026-07-25 measured it: "read probe.txt in the current
+    working directory" returned BLOCKED with agy quoting the scratch path, while the same
+    file at an absolute path read fine -- so agy had file tools all along and simply was
+    not standing in --cwd. With `--add-dir` the RELATIVE lookup succeeds.
+
+    The flag must come BEFORE `--print`, which consumes the next token as the prompt."""
+    from _builder import AgentInvocation, build_invocation_args
+
+    if os.name != "nt":
+        return          # the bundled ConPTY wrapper is Windows-only; see the agy notes
+
+    d = tempfile.mkdtemp(prefix="summon-agyadd-")
+    try:
+        inv = AgentInvocation(cli="agy", prompt="p", cwd=d, system_context="ctx",
+                              permission="read-only")
+        try:
+            _cmd, args, _env = build_invocation_args(inv, timeout_ms=60000)
+        except ValueError:
+            return      # no agy account on this machine: nothing to assert about argv
+        assert "--add-dir" in args, (
+            "the agy invocation does not pass --add-dir, so the agent resolves relative "
+            "paths against a profile scratch dir instead of --cwd. args=%r" % (args,))
+        assert args[args.index("--add-dir") + 1] == d, args
+        assert args.index("--add-dir") < args.index("--print"), (
+            "--add-dir must precede --print: agy treats the token after --print as the "
+            "prompt, so a flag placed later is swallowed into it")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

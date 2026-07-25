@@ -827,7 +827,13 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
     # Launch the wrapper, NOT agy directly. Arg order matters: agy's --print
     # consumes the NEXT token as the prompt, so flags (perm, --continue, --model)
     # precede it.
-    args = [wrapper, *perm, *inv.extra_args, *cont, *model_flag, "--print", prompt]
+    # --add-dir puts the caller's --cwd INTO agy's workspace. Without it agy resolves
+    # relative paths against a scratch dir inside the isolated profile (HOME/USERPROFILE
+    # are redirected there for auth isolation), so "read config.py" failed while the same
+    # file at an absolute path read fine -- measured with a canary, 2026-07-25. Passing the
+    # workspace explicitly is what makes agy usable for repo-grounded work.
+    add_dir = ["--add-dir", inv.cwd] if inv.cwd else []
+    args = [wrapper, *perm, *add_dir, *inv.extra_args, *cont, *model_flag, "--print", prompt]
     env = {
         "USERPROFILE": profile,
         "HOME": profile,

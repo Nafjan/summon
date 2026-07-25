@@ -6,6 +6,30 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.13.9] - 2026-07-25
+
+### Fixed
+- **agy can now read `--cwd`. The backend was written off in the docs for months over a
+  one-flag gap.** Summon redirects `HOME`/`USERPROFILE` to an isolated per-invocation
+  profile for auth hygiene, and agy consequently resolved RELATIVE paths against a scratch
+  dir inside that profile instead of the caller's repo. Summon now passes
+  **`--add-dir <cwd>`**, which puts the caller's directory into agy's workspace.
+  Measured end to end with a canary file:
+  - BEFORE: "read `probe.txt` in the current working directory" returned BLOCKED, with agy
+    quoting `.../runs/<run>/.gemini/antigravity-cli/scratch` as its cwd.
+  - The SAME file at an ABSOLUTE path read fine -- so agy always had working file tools and
+    simply was not standing in `--cwd`.
+  - AFTER: the relative lookup returns the token, and agy reports the workspace as the
+    caller's `--cwd`.
+  The flag is placed BEFORE `--print`, which consumes the next token as the prompt.
+- `SKILL.md` and `references/orchestration.md` updated: agy is repo-capable, and agy
+  members may serve on repo councils (with the honest caveat that agy still reports no
+  usage and no served model, which weakens its evidence trail).
+- The orchestration guide now prescribes canarying an unfamiliar backend -- one dispatch,
+  a unique token, read back BOTH relative and absolute -- because those two results
+  distinguish "no file access" from "file access from the wrong place", and summon's own
+  documentation asserted the wrong answer here for want of that single call.
+
 ## [0.13.8] - 2026-07-25
 
 ### Fixed
