@@ -28,7 +28,12 @@ from _receipt import scripts_sha256, _read_regular_bounded
 # HOSTS keys -- test_installs_hosts_match_installer guards against drift between the
 # installer and this detector.
 HOST_DIRS = {"claude": ".claude", "codex": ".codex", "cursor": ".cursor",
-             "gemini": ".gemini", "copilot": ".copilot"}
+             "gemini": ".gemini", "copilot": ".copilot",
+             # Antigravity's skills live per-profile UNDER ~/.gemini, so these are nested
+             # relative paths rather than a top-level dot-dir (joined the same way).
+             "antigravity": os.path.join(".gemini", "antigravity"),
+             "antigravity-cli": os.path.join(".gemini", "antigravity-cli"),
+             "antigravity-ide": os.path.join(".gemini", "antigravity-ide")}
 _MANIFEST = ".summon-install.json"
 # Per-file ceiling for hashing/parsing an install we do NOT own (drift enumeration of
 # other copies). Real production modules are well under 200 KB; this only bounds a

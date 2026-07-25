@@ -9,7 +9,8 @@
 
 What it does:
   1. Copies SKILL.md + scripts/ + references/ + agents/ into <host>/skills/summon/ for each
-     detected host (~/.claude, ~/.codex, ~/.cursor, ~/.gemini, ~/.copilot), writing
+     detected host (~/.claude, ~/.codex, ~/.cursor, ~/.gemini, ~/.copilot, and each
+     Antigravity profile under ~/.gemini/antigravity*), writing
      an ownership manifest (.summon-install.json) into each copy.
   2. Copies the starter agent roster into ~/.agents/ with EXCLUSIVE creation —
      an agent file you already have is never touched, even under races.
@@ -51,6 +52,14 @@ HOSTS = {
     "cursor": os.path.join(HOME, ".cursor"),
     "gemini": os.path.join(HOME, ".gemini"),
     "copilot": os.path.join(HOME, ".copilot"),
+    # Antigravity keeps its file-based skills per PROFILE, under ~/.gemini rather than a
+    # root of its own -- so it needs explicit entries; ~/.gemini alone only reaches the
+    # Gemini CLI's own skills dir, which Antigravity does not read. The profiles are
+    # separate physical copies that Antigravity syncs in parallel, so each is installed
+    # into independently; absent ones are simply not detected.
+    "antigravity": os.path.join(HOME, ".gemini", "antigravity"),
+    "antigravity-cli": os.path.join(HOME, ".gemini", "antigravity-cli"),
+    "antigravity-ide": os.path.join(HOME, ".gemini", "antigravity-ide"),
 }
 
 # The skill lives in skills/summon/ in the repo, so `npx skills add Nafjan/summon`
@@ -507,8 +516,8 @@ def main() -> int:
         hosts = detect_hosts()
         if not hosts:
             print("No AI-CLI host dirs found (~/.claude, ~/.codex, ~/.cursor, ~/.gemini, "
-                  "~/.copilot).\nInstall and run at least one CLI first, or pass --hosts "
-                  "explicitly.")
+                  "~/.copilot, ~/.gemini/antigravity*).\nInstall and run at least one CLI "
+                  "first, or pass --hosts explicitly.")
             return 2
 
     print(f"hosts: {', '.join(hosts)}\n")
