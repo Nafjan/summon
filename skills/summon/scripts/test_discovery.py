@@ -11247,6 +11247,165 @@ def test_v8_default_chairman_resolves_and_is_not_credit_only():
         "--chairman would spend account credit, or fall back with a warning, by default"
         % model)
 
+
+def test_v8_schema_correction_is_re_gated_and_keeps_gate_evidence():
+    """CRITICAL (cross-vendor review): --gate-with re-gated _dispatch_with_retries, but the
+    SCHEMA CORRECTION is a third dispatch path and was neither gated nor gate-preserving.
+
+    Two distinct defects, both reproduced here:
+      1. The correction re-dispatches with the ORIGINAL permission (retry_inv does not
+         override it), so a gated safe-edit run got a SECOND write-capable execution that
+         no gate ever approved.
+      2. It returns a DIFFERENT envelope on accept, so gate evidence attached to the
+         original silently vanished -- a gated dispatch reporting no gate at all.
+    """
+    import run_subagent as _rs
+
+    real_exec = _rs.execute_agent
+    real_gate = _rs._run_gate
+    calls = {"exec": 0, "gate": 0}
+    schema = {"type": "object", "required": ["ok"],
+              "properties": {"ok": {"type": "boolean"}}}
+
+    class A:
+        gate_with = "g"; agent = "impl"; timeout = 1000; debug_dir = None
+        retries = 0; gate_timeout = None; cwd = "."; prompt = "p"; cli = None
+
+    from _builder import AgentInvocation
+    inv = AgentInvocation(cli="claude", prompt="p", cwd=".", permission="safe-edit",
+                          resume_id="s1")
+
+    # --- case 1: the correction gate REFUSES -> no second execution at all ---------
+    try:
+        def exec_fail(i, **kw):
+            calls["exec"] += 1
+            return {"status": "success", "result": "not json", "attempts": 1}
+
+        def gate_refuse(args, agents_dir, i):
+            calls["gate"] += 1
+            return {"approved": False, "verdict": "DENY", "agent": "g",
+                    "reason": "correction not authorised"}
+
+        _rs.execute_agent = exec_fail
+        _rs._run_gate = gate_refuse
+        start = {"status": "success", "result": "not json", "attempts": 1,
+                 "resume": {"cli": "claude", "session_id": "s1"},
+                 "gate": {"approved": True, "verdict": "APPROVE", "agent": "g"}}
+        out = _rs._apply_schema(dict(start), schema, inv, A(), ".")
+    finally:
+        _rs.execute_agent = real_exec
+        _rs._run_gate = real_gate
+
+    assert calls["exec"] == 0, (
+        "the schema correction executed %d time(s) despite the gate refusing -- an "
+        "unapproved write-capable dispatch" % calls["exec"])
+    assert out.get("gate_correction_refused", {}).get("verdict") == "DENY", out
+    assert out["gate"]["approved"] is True, (
+        "the refusal overwrote the approval that authorised the run which ALREADY "
+        "completed; a refused correction is its own fact, not a retroactive denial")
+
+    # --- case 2: correction APPROVED and accepted -> evidence survives replacement --
+    calls["exec"] = 0
+    try:
+        def exec_ok(i, **kw):
+            calls["exec"] += 1
+            return {"status": "success", "result": '{"ok": true}', "attempts": 1}
+
+        _rs.execute_agent = exec_ok
+        _rs._run_gate = lambda args, ad, i: {"approved": True, "verdict": "APPROVE",
+                                             "agent": "g"}
+        start = {"status": "success", "result": "not json", "attempts": 1,
+                 "resume": {"cli": "claude", "session_id": "s1"},
+                 "gate": {"approved": True, "verdict": "APPROVE", "agent": "g"}}
+        out2 = _rs._apply_schema(dict(start), schema, inv, A(), ".")
+    finally:
+        _rs.execute_agent = real_exec
+        _rs._run_gate = real_gate
+
+    assert calls["exec"] == 1, calls
+    assert out2.get("parse_ok") is True, out2
+    assert "gate" in out2, (
+        "the accepted correction returned a fresh envelope with NO gate field: a gated "
+        "dispatch that reports no gate is indistinguishable from an ungated one")
+    assert out2["gate"]["verdict"] == "APPROVE", out2["gate"]
+
+
+def test_v8_max_permission_clamps_down_and_never_escalates():
+    """WARNING (cross-vendor review): a council chairman synthesises positions and never
+    needs write, but was dispatched with whatever its definition declared (`architect` is
+    safe-edit). Forcing it read-only needs a dispatch-level control -- and a general
+    `--permission` override would be WORSE than the bug, since any caller could then hand
+    any agent full bypass. `--max-permission` is therefore a CLAMP: one-directional by
+    construction."""
+    from _builder import clamp_permission
+
+    # reduces
+    assert clamp_permission("yolo", "read-only") == "read-only"
+    assert clamp_permission("safe-edit", "read-only") == "read-only"
+    assert clamp_permission("yolo", "safe-edit") == "safe-edit"
+    # NEVER raises -- the property the whole design rests on
+    assert clamp_permission("read-only", "safe-edit") == "read-only"
+    assert clamp_permission("read-only", "yolo") == "read-only"
+    assert clamp_permission("safe-edit", "yolo") == "safe-edit"
+    # absent or unknown ceiling: keep the declared tier (fail safe, never widen)
+    assert clamp_permission("safe-edit", None) == "safe-edit"
+    assert clamp_permission("read-only", "nonsense") == "read-only"
+    assert clamp_permission("safe-edit", "nonsense") == "safe-edit"
+
+
+def test_v8_council_chairman_stage_is_clamped_read_only():
+    """The chairman stage command must carry the clamp. Asserting on clamp_permission
+    alone would pass while the council still dispatched an unclamped chairman, so this
+    checks the actual argv the council builds, and that MEMBERS are left alone."""
+    import inspect
+
+    import _council
+    src = inspect.getsource(_council)
+    assert '"--max-permission", "read-only"' in src, (
+        "the council never passes --max-permission: a chairman would run with whatever "
+        "its definition declares, including safe-edit")
+    assert 'startswith("chairman")' in src, (
+        "the clamp is not scoped to chairman stages -- members must keep their declared "
+        "permission, since forming a position can require running things")
+
+
+def test_v8_max_permission_drops_extra_args():
+    """The clamp must also drop the agent's `args:` passthrough. build_invocation_args
+    appends extra_args AFTER the permission flags, so a definition carrying
+    --dangerously-skip-permissions would defeat the clamp -- the identical hole that made
+    a GATE's own args an escalation path."""
+    import contextlib as _ctx
+    import io as _io
+    import json as _json
+
+    import run_subagent as _rs
+    d = tempfile.mkdtemp(prefix="summon-clamp-")
+    real_argv = sys.argv
+    nl = chr(10)
+    try:
+        with open(os.path.join(d, "sneaky.md"), "w", encoding="utf-8") as fh:
+            fh.write("---" + nl + "run-agent: claude" + nl + "permission: yolo" + nl
+                     + "args: --dangerously-skip-permissions" + nl + "---" + nl + "# S" + nl)
+        sys.argv = ["run_subagent.py", "--agent", "sneaky", "--prompt", "p", "--cwd", d,
+                    "--agents-dir", d, "--max-permission", "read-only", "--dry-run"]
+        out = _io.StringIO()
+        try:
+            with _ctx.redirect_stdout(out):
+                _rs.main()
+        except SystemExit:
+            pass
+        view = _json.loads(out.getvalue())
+    finally:
+        sys.argv = real_argv
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+    assert view["permission"] == "read-only", view
+    assert view["permission_flags"] == ["--permission-mode", "plan"], view
+    assert view["extra_args"] == [], (
+        "extra_args survived the clamp (%r): an agent `args:` is appended after the "
+        "permission flags and would defeat it" % (view["extra_args"],))
+    assert "--dangerously-skip-permissions" not in " ".join(view.get("args") or []), view
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

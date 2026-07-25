@@ -68,6 +68,7 @@ import _cli  # noqa: E402
 import _executor  # noqa: E402
 import _receipt  # noqa: E402
 from _builder import AgentInvocation  # noqa: E402
+from _builder import clamp_permission as _clamp  # noqa: E402
 from _executor import ENVELOPE_VERSION as _ENVELOPE_VERSION  # noqa: E402
 from _executor import (agent_def_sha, content_sha,  # noqa: E402
                        envelope_answers_request, execute_agent, finalize_exit_fields,
@@ -75,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.12.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.13.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -842,12 +843,18 @@ def main() -> None:
         cwd=args.cwd,
         system_context=system_context,
         agent_file=agent_file,
-        permission=permission,
+        # --max-permission CLAMPS downward only (see _builder.clamp_permission): an agent
+        # declaring read-only stays read-only. extra_args are dropped alongside it because
+        # an agent's `args:` is appended AFTER the permission flags and could otherwise
+        # carry --dangerously-skip-permissions and defeat the clamp -- the same hole that
+        # made a gate's own args a privilege-escalation path.
+        permission=_clamp(permission, getattr(args, "max_permission", None)),
         model=final_model,               # incl. agy Gemini thinking-mode suffix
         effort=effort,                    # --effort > frontmatter > env > default(high)
         resume_id=args.resume,
         resume_profile=args.resume_profile,
-        extra_args=tuple(extra_args),
+        extra_args=(() if getattr(args, "max_permission", None)
+                    else tuple(extra_args)),
         base_url=base_url,
         # the account digest the identity recorded, so the dispatch can verify the profile
         # it builds carries the SAME bytes
@@ -900,14 +907,14 @@ def main() -> None:
 
     # --json-schema: structured-output contract with ONE corrective retry.
     if schema is not None and result.get("status") == "success":
-        result = _apply_schema(result, schema, invocation, args)
+        result = _apply_schema(result, schema, invocation, args, agents_dir)
 
     # Report-contract auto-repair: a suspect success (status=success but the report
     # block is malformed -> report_ok false) gets ONE constrained corrective resume,
     # unless disabled. Cheaper and more targeted than the caller re-dispatching the
     # whole task. Runs after --json-schema so a still-suspect envelope gets one shot.
     if not getattr(args, "no_contract_repair", False):
-        result = _apply_contract_repair(result, invocation, args)
+        result = _apply_contract_repair(result, invocation, args, agents_dir)
 
     # Receipt LAST, from main()-scope values: a schema-correction retry replaces
     # the envelope, and this keeps prompt_sha256 bound to the ROOT prompt (the
@@ -1087,7 +1094,7 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
     return result
 
 
-def _apply_schema(result: dict, schema: dict, invocation, args) -> dict:
+def _apply_schema(result: dict, schema: dict, invocation, args, agents_dir=None) -> dict:
     """Validate the agent's final JSON; on mismatch, ONE corrective follow-up
     through --resume (claude/codex/cursor via session_id; agy via profile)."""
     from dataclasses import replace as _replace
@@ -1110,6 +1117,18 @@ def _apply_schema(result: dict, schema: dict, invocation, args) -> dict:
         resume_id=sid or "latest",
         resume_profile=profile or invocation.resume_profile,
     )
+    # The schema correction re-dispatches with the ORIGINAL permission (retry_inv does
+    # not override it), so under --gate-with it is a SECOND write-capable execution. A
+    # gate authorises one. Re-gate it, exactly as _dispatch_with_retries does; a refusal
+    # keeps the original result -- which was itself approved and completed -- rather than
+    # performing an unapproved edit.
+    _refused = _regate_or_none(args, agents_dir, retry_inv)
+    if _refused is not None:
+        # NOT result["gate"]: that field holds the approval which authorised the run that
+        # already happened, and overwriting it would misreport completed work as denied.
+        # The refusal of the CORRECTION is its own fact.
+        result["gate_correction_refused"] = _refused
+        return result
     try:
         retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir,
                               max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
@@ -1128,6 +1147,10 @@ def _apply_schema(result: dict, schema: dict, invocation, args) -> dict:
         # paid for too -- otherwise a schema repair silently under-reports spend).
         retry["attempts"] = result.get("attempts", 1) + retry.get("attempts", 1)
         _aggregate_spend(retry, result)
+        # The retry is a DIFFERENT envelope, so gate evidence attached to the original
+        # would simply vanish here -- a gated dispatch reporting no gate at all.
+        if "gate" in result and "gate" not in retry:
+            retry["gate"] = result["gate"]
         return retry
     # Rejected: keep the original, but the failed corrective call was still spent.
     result["attempts"] = result.get("attempts", 1) + retry.get("attempts", 1)
@@ -1168,7 +1191,7 @@ def _aggregate_spend(result: dict, retry: dict) -> None:
         result["usage"] = merged
 
 
-def _apply_contract_repair(result: dict, invocation, args) -> dict:
+def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> dict:
     """A dispatch that SUCCEEDED but whose report contract is malformed (report_ok
     false -> suspect) gets ONE constrained corrective resume that re-emits the exact
     contract, teaching STATUS = execution state (not a decision verdict).

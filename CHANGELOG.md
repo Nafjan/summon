@@ -6,6 +6,39 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.13.0] - 2026-07-25
+
+### Security
+- **The schema correction was a THIRD, ungated dispatch path.** `--gate-with` re-gated
+  `_dispatch_with_retries`, but `_apply_schema`'s corrective follow-up re-dispatches with
+  the ORIGINAL permission, so a gated `safe-edit` run got a second write-capable execution
+  no gate ever approved. It also returned a fresh envelope on accept, so the gate evidence
+  attached to the original silently vanished -- a gated dispatch reporting no gate at all,
+  indistinguishable from an ungated one. The correction is now re-gated, and gate evidence
+  is carried onto the replacement envelope.
+  A refused correction records `gate_correction_refused` rather than overwriting `gate`:
+  the original approval authorised work that genuinely completed, and stamping it as
+  denied would misreport finished work.
+  `_apply_contract_repair` needed neither change and got neither: it already forces
+  `permission="read-only"` with `extra_args=()`, so it is a formatting re-emit with no
+  write authority, and it mutates the envelope in place rather than replacing it.
+
+### Added
+- **`--max-permission {read-only,safe-edit}`: a downward-only permission CLAMP.** Councils
+  needed to force a chairman read-only, and the obvious fix -- a general `--permission`
+  override -- would have been worse than the bug, since any caller could then hand any
+  agent full bypass. The clamp is one-directional by construction: an agent declaring
+  `read-only` stays read-only even under `--max-permission safe-edit`. An unknown ceiling
+  keeps the declared tier rather than widening it.
+  It also DROPS the agent's `args:` passthrough, because `extra_args` are appended after
+  the permission flags and would otherwise defeat the clamp -- the same hole that made a
+  gate's own args an escalation path in 0.11.3.
+- **Council chairmen are dispatched read-only.** A chairman synthesises member positions
+  into a verdict; it reads what members produced and writes prose, so a council question
+  that induced it to touch the repository would be a write nobody authorised. MEMBERS are
+  deliberately NOT clamped: forming a position can legitimately require running things,
+  and that is governed by the member definitions a council is configured with.
+
 ## [0.12.0] - 2026-07-25
 
 ### Changed

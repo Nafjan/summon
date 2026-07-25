@@ -236,6 +236,14 @@ def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
     out_file = os.path.join(out_dir, f"{tag}.json")
     cmd = [sys.executable, script, "--agent", agent, "--prompt", prompt,
            "--cwd", cwd, "--out", out_file, "--timeout", str(timeout_ms)]
+    # A CHAIRMAN synthesises member positions into a verdict. It reads what the members
+    # produced and writes prose; it has no reason to touch the repository, and a hostile
+    # council question that induced it to do so would be a write nobody authorised. Clamp
+    # it, rather than trusting every chairman definition to declare read-only. Members are
+    # NOT clamped: forming a position can legitimately require running things, and that is
+    # governed by the member definitions a council is configured with.
+    if str(tag).startswith("chairman"):
+        cmd += ["--max-permission", "read-only"]
     if agents_dir:
         cmd += ["--agents-dir", agents_dir]
     watchdog = max(1.0, (timeout_ms + _CHILD_MARGIN_MS) / 1000)
