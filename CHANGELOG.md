@@ -6,6 +6,35 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.11.0] - 2026-07-25
+
+### Added
+- **`--gate-with AGENT`: a dispatch must be approved by another agent before it runs.**
+  Answers "make weaker models ask a stronger one for permission, and escalate to a human
+  only when the strong model is unsure" without requiring a change to how summon grants
+  privilege. The privilege boundary is the DISPATCH boundary: once a child CLI is running
+  there is no cross-vendor hook into its individual tool calls, so the gate adjudicates the
+  REQUEST (agent, prompt, permission, cwd) before anything executes. That is also the
+  stronger control, since the gate judges a whole request in context rather than one
+  decontextualised tool call, and its ruling lands in the envelope as hashed evidence.
+  - The gate is dispatched **forced read-only**, regardless of what its own definition
+    declares. Otherwise `--gate-with` would itself be a privilege-escalation path: name a
+    full-bypass profile as your own approver and the approval step hands you write access.
+  - It **fails closed**. Only an explicit `VERDICT: APPROVE` from a gate run that completed
+    lets the dispatch proceed; a denial, error, timeout, blocked gate, or unparseable
+    verdict all refuse, because "could not answer" must never read as "approved".
+  - `VERDICT: UNCERTAIN` refuses AND sets `requires_human_review: true` -- the escalation
+    path, distinct from a policy denial so an uncertain ruling actually reaches a person.
+  - The verdict parser takes the LAST `VERDICT:` line and is line-anchored, so a gate that
+    reasons aloud before ruling is read by its conclusion and a verdict quoted mid-sentence
+    is not mistaken for one.
+  - Single dispatch only; rejected for `--manifest`/`--council` by the existing fan-out
+    flag whitelist. `--gate-timeout` bounds the gate independently.
+  - Summon has no persistent policy engine and so cannot *force* a gate. Keep non-elite
+    definitions read-only and reserve write-capable definitions for gated dispatches; the
+    receipts then make a skipped gate detectable.
+- **`references/orchestration.md`** gains a section on gating a privileged dispatch.
+
 ## [0.10.4] - 2026-07-25
 
 ### Fixed

@@ -211,6 +211,45 @@ Most orchestration waste is re-running work that already succeeded.
 
 ---
 
+## 7a. Gating a privileged dispatch (`--gate-with`)
+
+A common ask is "make weaker models request permission from a stronger one, and
+escalate to a human only when the strong model is unsure". Summon supports this,
+but at the **dispatch** boundary rather than the tool-call boundary: once a child
+CLI is running there is no cross-vendor hook into its individual actions, so the
+gate adjudicates the *request* before anything runs.
+
+```bash
+run_subagent.py --agent implementer --prompt "..." --cwd <abs>                 --gate-with opus-review
+```
+
+The gate agent is dispatched **forced read-only**, regardless of what its own
+definition declares. That is deliberate: if a gate could inherit write access,
+naming a full-bypass profile as your own approver would turn the approval step
+itself into privilege escalation.
+
+It **fails closed**. Only an explicit `VERDICT: APPROVE` from a gate run that
+completed lets the dispatch proceed. A denial, an error, a timeout, a blocked
+gate, or an unparseable verdict all refuse, because "could not answer" must never
+read as "approved". `VERDICT: UNCERTAIN` refuses *and* sets
+`requires_human_review: true`, which is the escalation path: the gate declares it
+cannot tell, and a person decides.
+
+The gate's ruling, its model evidence, and its definition hash land in the
+envelope's `gate` field, so a skipped or forged approval is detectable afterwards.
+
+**What this does and does not give you.** No sub-agent can escalate itself: the
+permission comes from the definition plus dispatch flags, which only the
+orchestrator sets. But summon has no persistent policy engine, so it cannot
+*force* you to use a gate. Keep every non-elite definition read-only and reserve
+write-capable definitions for gated dispatches; then the only way to skip the
+control is an orchestrator that deliberately bypasses it, and the receipts make
+that visible.
+
+Cost stays bounded if you gate by risk tier rather than universally.
+
+---
+
 ## 8. Host adapters
 
 The framework above is host-agnostic. Only the *in-IDE* delegation mechanism
