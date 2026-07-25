@@ -75,7 +75,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.11.4"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.11.5"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -890,7 +890,12 @@ def main() -> None:
         result = _dispatch_with_retries(invocation, args, agents_dir)
     except ValueError as e:
         _die(str(e))
-    if getattr(args, "gate_with", None):
+    if getattr(args, "gate_with", None) and "gate" not in result:
+        # Only stamp the INITIAL approval when the dispatch did not already carry a
+        # gate decision. _dispatch_with_retries attaches its own when a RETRY gate
+        # refuses, and overwriting that with the initial approval produced an
+        # envelope that read `blocked` while recording gate.approved=true -- false
+        # evidence, which is precisely what the gate exists to make impossible.
         result["gate"] = _gate_decision
 
     # --json-schema: structured-output contract with ONE corrective retry.

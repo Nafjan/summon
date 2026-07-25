@@ -11147,6 +11147,75 @@ def test_v8_each_retry_is_re_gated():
         "the loop kept executing after the gate withdrew approval (%d execs)"
         % calls["exec"])
 
+
+def test_v8_retry_refusal_evidence_is_not_overwritten_by_the_initial_approval():
+    """CONCERN (cross-vendor review): main() stamped the INITIAL gate decision onto the
+    result AFTER _dispatch_with_retries returned. When a RETRY gate refused, that
+    overwrote the denial with the earlier approval, producing an envelope that read
+    `blocked` while recording gate.approved=true -- the fabricated-artifact failure the
+    gate exists to prevent.
+
+    This drives main() END TO END. An earlier version of this test called
+    _dispatch_with_retries directly and PASSED against the unfixed code, because the
+    overwrite lives in main(): it asserted the property at a layer that never had the
+    bug. Mutation testing caught that; hence the full-dispatch drive here."""
+    import contextlib as _ctx
+    import io as _io
+    import json as _json
+
+    import run_subagent as _rs
+
+    d = tempfile.mkdtemp(prefix="summon-gateevid-")
+    real_exec = _rs.execute_agent
+    real_gate = _rs._run_gate
+    real_sleep = _rs.time.sleep
+    real_argv = sys.argv
+    seq = {"gate": 0}
+    nl = chr(10)
+    try:
+        for name, perm in (("gate", "read-only"), ("impl", "safe-edit")):
+            with open(os.path.join(d, name + ".md"), "w", encoding="utf-8") as fh:
+                fh.write("---" + nl + "run-agent: claude" + nl + "permission: " + perm
+                         + nl + "---" + nl + "# " + name + nl)
+
+        # every attempt fails, so the retry path is exercised
+        _rs.execute_agent = lambda inv, **kw: {"status": "error", "result": "boom"}
+
+        def gate(args, agents_dir, inv):
+            seq["gate"] += 1
+            if seq["gate"] == 1:
+                return {"approved": True, "verdict": "APPROVE", "agent": "gate"}
+            return {"approved": False, "verdict": "DENY", "agent": "gate",
+                    "reason": "approval withdrawn on retry"}
+
+        _rs._run_gate = gate
+        _rs.time.sleep = lambda *_a, **_k: None
+        sys.argv = ["run_subagent.py", "--agent", "impl", "--prompt", "p", "--cwd", d,
+                    "--agents-dir", d, "--gate-with", "gate", "--retries", "3"]
+        out = _io.StringIO()
+        try:
+            with _ctx.redirect_stdout(out):
+                _rs.main()
+        except SystemExit:
+            pass
+        env = _json.loads(out.getvalue())
+    finally:
+        _rs.execute_agent = real_exec
+        _rs._run_gate = real_gate
+        _rs.time.sleep = real_sleep
+        sys.argv = real_argv
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    assert seq["gate"] >= 2, ("the retry was never re-gated (gate ran %d time(s))"
+                              % seq["gate"])
+    assert env.get("status") == "blocked", env
+    assert "gate" in env, "the emitted envelope carried no gate evidence"
+    assert env["gate"].get("approved") is False, (
+        "the emitted envelope records gate.approved=%r on a BLOCKED result -- the "
+        "initial approval overwrote the retry refusal" % env["gate"].get("approved"))
+    assert env["gate"].get("verdict") == "DENY", env["gate"]
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
