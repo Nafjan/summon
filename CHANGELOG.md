@@ -6,6 +6,56 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.14.2] - 2026-07-25
+
+### Security
+- **agy no longer receives the caller's workspace at `read-only`.** 0.14.0 began passing
+  `--add-dir <cwd>` so agy could do repo-grounded work; that made agy's `read-only` tier
+  REACHABLE, and agy cannot enforce it. Four canaries measured it: an agent clamped to
+  `read-only` created a file and appended to another under `--cwd` with `--sandbox` in
+  force, and again with `--mode plan` added. Neither flag withholds agy's file tools.
+  summon now withholds `--add-dir` at `read-only` -- agy can still write, but only inside
+  its own disposable per-invocation profile. A fourth canary confirmed the caller's
+  workspace was untouched.
+  The general rule, now written into the orchestration guide: **a capability flag is a
+  privilege grant, and it inherits the weakest tier that can reach it. When you cannot
+  enforce a tier, withhold the capability rather than document a caveat.**
+  Both the envelope and `--dry-run` warn that a read-only agy dispatch cannot see the repo.
+
+### Fixed
+- **The archive-name EACCES retry counted CUMULATIVE denials, not consecutive ones.** In a
+  busy results dir (many names already taken, so the loop keeps walking) transient
+  contention could exceed 64 denials in total while never denying twice in a row -- and the
+  clear aborted, which is the exact failure the retry was added to prevent. Only a genuinely
+  unwritable directory denies every name in a row; a plain EEXIST now breaks the streak.
+- **A failed `os.close()` was treated as a name collision.** `os.close` sat inside the try
+  that catches "this name is taken", so a close raising EACCES sent the loop to the next
+  index with `claimed` already pointing at a name it genuinely owned. The next successful
+  claim overwrote `claimed`, and the cleanup removed only the last reservation -- the first
+  leaked as a permanent empty archive with its fd still open. Only the `os.open` can
+  collide, and the try now says so.
+- **`--dry-run` was silent about the two things it is cheapest to fix.** It emitted the agy
+  permission warning but neither the timeout nor the read-only-workspace one, so preflight
+  told you least about a short clock and an unreadable workspace. Both paths now assemble
+  from one `advisory_warnings()`.
+
+### Changed
+- **The advised agy timeout floor is 420s, not 300s.** 300s was an interpolation: 180s was
+  measured to time out and 420s to complete, and taking the midpoint dressed a guess up as
+  evidence. 420s is the smallest budget an agy dispatch has actually been OBSERVED to
+  complete under, which also makes the at-threshold silence principled rather than an
+  off-by-one.
+
+### Testing
+- **The suite was silently skipping tests.** The runner collects `globals()` inside its
+  `__main__` block, so four newly appended tests were defined too late to exist -- and the
+  suite printed a green "346/346 passed" that had never executed them. A suite that
+  under-reports its own size reports confidence it did not earn. A structural guard now
+  asserts no `def test_` appears below the runner block, and that the count defined in
+  source equals the count importable (which also catches a duplicate name shadowing a test).
+- 351/351 discovery, 22/22 install. Every fix above was mutation-tested: reverted to its
+  exact broken form to prove the new test kills it.
+
 ## [0.14.1] - 2026-07-25
 
 ### Fixed

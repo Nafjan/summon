@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.14.1"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.14.2"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -937,7 +937,7 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     path is shown instead."""
     from _builder import (BACKENDS, backend_kind, build_invocation_args,
                           permission_flags as _pf, _PERMISSION_MAPPING, _agy_wrapper,
-                          agy_permission_warning, apply_credit_guard, infer_billing,
+                          advisory_warnings, apply_credit_guard, infer_billing,
                           credit_spend_allowed, selects_credit_only)
     _guarded, _, _guard_warnings = apply_credit_guard(invocation)
     _eff_model = _guarded.model
@@ -970,9 +970,11 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     }
     for _w in _guard_warnings:  # credit-only guard actions surfaced in the preview
         view.setdefault("warnings", []).append(_w)
-    _pw = agy_permission_warning(invocation.cli, invocation.permission)
-    if _pw:  # same helper as the real envelope -> identical warning, exactly once
-        view.setdefault("warnings", []).append(_pw)
+    # Same helper as the real envelope, so preflight shows exactly what the run would
+    # warn about -- a short agy clock and a withheld read-only workspace are both things
+    # you want to learn BEFORE paying, which is the whole point of --dry-run.
+    for _w in advisory_warnings(invocation.cli, invocation.permission, args.timeout):
+        view.setdefault("warnings", []).append(_w)
     if backend_kind(invocation.cli) == "api":
         view["command"] = f"POST ({invocation.cli})"
         view["base_url"] = invocation.base_url

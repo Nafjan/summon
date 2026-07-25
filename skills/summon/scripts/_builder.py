@@ -114,7 +114,14 @@ _PERMISSION_MAPPING = {
         "yolo": ["-f", "--trust"],
     },
     "agy": {
-        "read-only": ["--sandbox"],
+        # NEITHER of these prevents agy from writing files. Measured 2026-07-25 with
+        # canaries that attempted a create and an append under --cwd: `--sandbox` restricts
+        # TERMINAL operations only, and `--mode plan` did not withhold the file tools
+        # either -- both wrote successfully, confirmed on disk. They are kept as defence in
+        # depth and because a future agy may honour them, but summon does NOT rely on them.
+        # What actually contains a read-only agy dispatch is withholding --add-dir, so the
+        # agent never receives the caller's workspace at all (see _build_agy_args).
+        "read-only": ["--mode", "plan", "--sandbox"],
         "safe-edit": ["--dangerously-skip-permissions"],
         "yolo": ["--dangerously-skip-permissions"],
     },
@@ -168,7 +175,30 @@ def agy_permission_warning(cli: str, permission: str) -> str | None:
 # completed; a nested dispatch given 180s timed out mid-work and reported exit 124. That
 # failure reads as "agy is broken" rather than "the budget was short", which is why it is
 # worth a warning rather than silence.
-_AGY_MIN_ADVISED_TIMEOUT_MS = 300_000
+#
+# The number is 420s because that is the SMALLEST budget an agy dispatch has actually been
+# observed to complete under. It was 300s, which no measurement supported -- 180s failed and
+# 420s worked, and picking the midpoint dressed an interpolation up as evidence. Erring high
+# only costs an advisory line; erring low is the silence that lets a short clock masquerade
+# as a broken backend. Raise the threshold only by lowering a MEASURED completion.
+_AGY_MIN_ADVISED_TIMEOUT_MS = 420_000
+
+
+def agy_readonly_workspace_warning(cli: str, permission: str) -> str | None:
+    """Explain why a read-only agy agent cannot see --cwd.
+
+    Silence here would be worse than the limitation: the agent answers from the prompt
+    alone and sounds confident about files it never opened.
+    """
+    if cli != "agy" or permission != "read-only":
+        return None
+    return ("agy at read-only does NOT receive --cwd, so it cannot read your repository. "
+            "agy has no enforceable read-only tier -- measured 2026-07-25, an agent clamped "
+            "to read-only wrote files under --cwd with both --sandbox and --mode plan in "
+            "force -- so summon withholds the workspace rather than promise a tier it "
+            "cannot deliver. For repo-grounded agy work use safe-edit (which on agy is a "
+            "FULL bypass; point it only at repos you can afford to have written to), or "
+            "inline the content, or use a repo-capable backend.")
 
 
 def agy_timeout_warning(cli: str, timeout_ms: int | None) -> str | None:
@@ -176,10 +206,25 @@ def agy_timeout_warning(cli: str, timeout_ms: int | None) -> str | None:
     if cli != "agy" or not timeout_ms or timeout_ms >= _AGY_MIN_ADVISED_TIMEOUT_MS:
         return None
     return (f"agy was given {int(timeout_ms / 1000)}s. It is a MULTI-STEP agent and "
-            f"routinely needs longer; a measured canary needed over 180s for a single "
-            f"file read. Budgets under {int(_AGY_MIN_ADVISED_TIMEOUT_MS / 1000)}s often "
-            f"time out mid-work (exit 124), which looks like a broken backend rather than "
-            f"a short clock. Raise --timeout, or expect a partial.")
+            f"routinely needs longer: a measured dispatch at 180s timed out mid-work, and "
+            f"{int(_AGY_MIN_ADVISED_TIMEOUT_MS / 1000)}s is the smallest budget one has been "
+            f"observed to COMPLETE under. A short clock reports exit 124, which reads as a "
+            f"broken backend rather than a budget you set. Raise --timeout, or expect a "
+            f"partial.")
+
+
+def advisory_warnings(cli: str, permission: str, timeout_ms: int | None) -> list:
+    """Every advisory warning a dispatch should carry, in ONE place.
+
+    The real envelope and --dry-run each assembled this list themselves and had already
+    drifted: --dry-run emitted the permission warning but neither the timeout nor the
+    read-only-workspace one. That is backwards -- preflight is exactly where a short clock
+    or an unreadable workspace is still free to fix. A guard test asserts the two paths
+    stay identical.
+    """
+    return [w for w in (agy_permission_warning(cli, permission),
+                        agy_readonly_workspace_warning(cli, permission),
+                        agy_timeout_warning(cli, timeout_ms)) if w]
 
 
 def _concatenated_prompt(inv: AgentInvocation) -> str:
@@ -846,12 +891,22 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
     # Launch the wrapper, NOT agy directly. Arg order matters: agy's --print
     # consumes the NEXT token as the prompt, so flags (perm, --continue, --model)
     # precede it.
-    # --add-dir puts the caller's --cwd INTO agy's workspace. Without it agy resolves
-    # relative paths against a scratch dir inside the isolated profile (HOME/USERPROFILE
-    # are redirected there for auth isolation), so "read config.py" failed while the same
-    # file at an absolute path read fine -- measured with a canary, 2026-07-25. Passing the
-    # workspace explicitly is what makes agy usable for repo-grounded work.
-    add_dir = ["--add-dir", inv.cwd] if inv.cwd else []
+    # --add-dir puts the caller's --cwd INTO agy's workspace, which is what makes agy
+    # usable for repo-grounded work: without it, relative paths resolve against a scratch
+    # dir inside the isolated profile.
+    #
+    # It is withheld at READ-ONLY, and that is a security boundary rather than a nicety.
+    # agy has no enforceable read-only tier: canaries on 2026-07-25 showed an agent clamped
+    # to read-only creating a file and appending to another under --cwd, with both
+    # `--sandbox` and `--mode plan` in force. So handing it the workspace at read-only would
+    # mean summon promising a tier it cannot deliver -- and --add-dir is precisely what
+    # makes that promise reachable. Withheld, agy can still write, but only inside its own
+    # disposable per-invocation profile, where it does no harm.
+    #
+    # At safe-edit and yolo the agent already HAS write authority (both map to
+    # --dangerously-skip-permissions on agy), so passing the workspace grants nothing new.
+    add_dir = (["--add-dir", inv.cwd]
+               if inv.cwd and inv.permission != "read-only" else [])
     args = [wrapper, *perm, *add_dir, *inv.extra_args, *cont, *model_flag, "--print", prompt]
     env = {
         "USERPROFILE": profile,

@@ -14,8 +14,9 @@ import subprocess
 import threading
 import time
 
-from _builder import (AgentInvocation, BACKENDS, agy_permission_warning,
-                      agy_timeout_warning,
+from _builder import (AgentInvocation, BACKENDS, advisory_warnings,
+                      agy_permission_warning,
+                      agy_readonly_workspace_warning, agy_timeout_warning,
                       apply_credit_guard, backend_kind, build_invocation_args,
                       credit_spend_allowed, infer_billing, permission_flags,
                       selects_credit_only)
@@ -1754,14 +1755,12 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 f"been rerouted or fallen back)")
         resp["permission"] = inv.permission
         resp["effort"] = inv.effort   # reasoning effort actually applied (None = backend default)
-        # agy DOES read --cwd (summon passes --add-dir since 0.13.9). What still bites is
-        # the clock: agy is a multi-step agent, so a short budget kills it mid-work.
-        _tw = agy_timeout_warning(inv.cli, timeout_ms)
-        if _tw:
-            resp.setdefault("warnings", []).append(_tw)
-        _pw = agy_permission_warning(inv.cli, inv.permission)
-        if _pw:
-            resp.setdefault("warnings", []).append(_pw)
+        # agy reads --cwd at safe-edit/yolo (summon passes --add-dir since 0.13.9) but NOT
+        # at read-only, where the workspace is withheld because agy cannot enforce that tier.
+        # The other thing that bites is the clock: agy is multi-step, so a short budget kills
+        # it mid-work. Both live in advisory_warnings, shared with --dry-run.
+        for _w in advisory_warnings(inv.cli, inv.permission, timeout_ms):
+            resp.setdefault("warnings", []).append(_w)
         try:
             resp["permission_flags"] = permission_flags(inv.cli, inv.permission)
         except ValueError:

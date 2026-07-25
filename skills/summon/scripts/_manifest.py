@@ -96,13 +96,12 @@ def _clear_out_file(out_file: str, archive: bool) -> str | None:
             dest, n, _denied = base, 0, 0
             while True:
                 try:
-                    # Record the claim BEFORE closing: a close() that fails on a network
-                    # filesystem would otherwise leave the reserved name behind forever,
-                    # because `claimed` was still None and the cleanup never ran.
+                    # ONLY the open can collide. os.close() was once inside this try too,
+                    # so a close() that failed was read as "that name is taken": the loop
+                    # moved on having already set `claimed`, the next successful claim
+                    # overwrote it, and the earlier reservation leaked as a permanent empty
+                    # archive with its fd still open. A close failure is not a collision.
                     fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                    claimed = dest
-                    os.close(fd)
-                    break
                 except (FileExistsError, PermissionError) as _claim_err:
                     # PermissionError, not just FileExistsError: on WINDOWS a name whose
                     # file is pending deletion by a concurrent writer fails O_EXCL with
@@ -112,17 +111,31 @@ def _clear_out_file(out_file: str, archive: bool) -> str | None:
                     # then dropped and a stale success left in place. Skipping to the next
                     # index is safe: we are only choosing an UNUSED archive name.
                     if isinstance(_claim_err, PermissionError):
+                        # CONSECUTIVE, not cumulative. A total tally aborted after 64
+                        # transient denials spread across a long run even when the next
+                        # name was free -- contention is not the same failure as an
+                        # unwritable directory, and only the latter denies every name in
+                        # a row.
                         _denied += 1
                         # A genuinely unwritable directory denies every name, so distinguish
                         # that from contention instead of grinding to the 10k bound.
                         if _denied > 64:
                             return (f"cannot archive the previous result at {out_file}: "
                                     f"permission denied claiming an archive name ({_claim_err})")
+                    else:
+                        _denied = 0            # a plain EEXIST breaks the denial streak
                     n += 1
                     dest = f"{base}.{n}"
                     if n > 10_000:             # pathological; do not spin forever
                         return (f"cannot archive the previous result at {out_file}: "
                                 "too many superseded copies")
+                    continue
+                # The name is OURS. Record the claim BEFORE closing, so a close() that
+                # fails on a network filesystem still leaves the reservation visible to
+                # the finally-cleanup instead of stranding it forever.
+                claimed = dest
+                os.close(fd)                       # OSError here -> outer handler + cleanup
+                break
             os.replace(out_file, dest)
             claimed = None                     # the claim now holds the real content
         else:

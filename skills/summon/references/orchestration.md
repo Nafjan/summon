@@ -9,7 +9,7 @@ Project-agnostic and host-agnostic. Adopt the parts you need; every section is
 written so a single orchestrator (human or agent) can act on it without a
 house style guide.
 
-Semantics below were verified against summon **0.14.1**. Model ids and alias
+Semantics below were verified against summon **0.14.2**. Model ids and alias
 behaviour are volatile: re-check with `doctor`, `list`, `models`, and
 `--dry-run` before a run you care about.
 
@@ -198,6 +198,16 @@ hygiene, and agy then resolved relative paths against a scratch dir inside the
 isolated profile. A canary showed a relative lookup failing while the SAME file
 at an absolute path read fine -- proof the tools worked and only the location was
 wrong. Summon now passes `--add-dir <cwd>` and relative paths work (0.13.9).
+
+That fix then produced the second lesson, which is the more general one: **a capability
+flag is a privilege grant, and it inherits the weakest tier that can reach it.** Handing
+agy the workspace made it repo-capable at every permission level -- including `read-only`,
+which agy cannot actually enforce. Canaries confirmed an agent clamped to read-only
+creating and appending files under `--cwd` with both `--sandbox` and `--mode plan` set.
+Summon now withholds the workspace at read-only: the honest position is that agy is a
+write-capable backend, and the containment is the disposable per-invocation profile, not
+a flag the vendor never promised to honour. **When you cannot enforce a tier, do not offer
+it -- withhold the capability instead of documenting a caveat.**
 
 The failure mode this creates is nastier than a refusal: an agent that cannot
 find your files may answer from the prompt alone and sound confident about code
