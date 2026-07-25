@@ -5,3 +5,8 @@ __pycache__/
 
 # review scratch (prompts, diffs, sub-agent results)
 .agents/
+
+# agy (Antigravity) writes its language-server log to a file literally named `--print`
+# in the working directory of a dispatch. It is agy's litter, not summon's output, but it
+# lands in whatever repo you point a dispatch at -- so keep it out of commits.
+--print

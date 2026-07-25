@@ -11721,6 +11721,28 @@ def test_v8_archive_claim_reports_a_genuinely_unwritable_dir():
         % err)
 
 
+def _no_agy_optin():
+    """Context manager: assert refusal behaviour with the opt-in DEFINITELY unset.
+
+    Three tests assumed the ambient environment did not carry
+    SUMMON_ALLOW_UNENFORCED_READONLY. With it set they fail, and the order test proceeds
+    into a real agy build and dispatch -- an assertion about refusing to spend money that
+    spends money. Found by the cross-vendor test audit, 2026-07-26.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        had = os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        try:
+            yield
+        finally:
+            if had is not None:
+                os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+    return _ctx()
+
+
 def test_v8_agy_read_only_fails_closed():
     """agy has NO enforceable read-only tier, so summon refuses the dispatch.
 
@@ -11735,20 +11757,21 @@ def test_v8_agy_read_only_fails_closed():
     this fails closed, like --gate-with does."""
     from _builder import readonly_unenforceable_error as refuse
 
-    msg = refuse("agy", "read-only")
-    assert msg, "agy at read-only must be REFUSED, not dispatched with a caveat"
-    assert "ABSOLUTE" in msg or "absolute" in msg, (
-        "the refusal must cite WHY the tier is unenforceable, since the obvious reading is "
-        "that summon is being over-cautious: %s" % msg)
-    assert "safe-edit" in msg and "SUMMON_ALLOW_UNENFORCED_READONLY" in msg, (
-        "a refusal that names no way forward just blocks work: %s" % msg)
+    with _no_agy_optin():
+        msg = refuse("agy", "read-only")
+        assert msg, "agy at read-only must be REFUSED, not dispatched with a caveat"
+        assert "ABSOLUTE" in msg or "absolute" in msg, (
+            "the refusal must cite WHY the tier is unenforceable, since the obvious reading "
+            "is that summon is being over-cautious: %s" % msg)
+        assert "safe-edit" in msg and "SUMMON_ALLOW_UNENFORCED_READONLY" in msg, (
+            "a refusal that names no way forward just blocks work: %s" % msg)
 
-    # every other combination still dispatches
-    assert refuse("agy", "safe-edit") is None
-    assert refuse("agy", "yolo") is None
-    for backend in ("claude", "codex", "cursor-agent", "gemini"):
-        assert refuse(backend, "read-only") is None, (
-            "%s enforces read-only; refusing it would be a regression" % backend)
+        # every other combination still dispatches
+        assert refuse("agy", "safe-edit") is None
+        assert refuse("agy", "yolo") is None
+        for backend in ("claude", "codex", "cursor-agent", "gemini"):
+            assert refuse(backend, "read-only") is None, (
+                "%s enforces read-only; refusing it would be a regression" % backend)
 
 
 def test_v8_agy_read_only_opt_in_dispatches_but_says_it_is_advisory():
@@ -11789,18 +11812,22 @@ def test_v8_refusal_happens_before_the_profile_is_built():
 
     built = {"n": 0}
     real_build = _executor.build_invocation_args
+    # hermetic: with the opt-in set this test would DISPATCH agy for real
+    _ctx = _no_agy_optin()
 
     def spy(*a, **k):
         built["n"] += 1
         return real_build(*a, **k)
 
     try:
+        _ctx.__enter__()
         _executor.build_invocation_args = spy
         inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
                                        system_context="ctx", permission="read-only")
         resp = _executor.execute_agent(inv, timeout_ms=30000)
     finally:
         _executor.build_invocation_args = real_build
+        _ctx.__exit__(None, None, None)
 
     assert built["n"] == 0, (
         "the refused dispatch still built an agy profile (and copied OAuth material into "
@@ -11818,7 +11845,45 @@ def test_v8_agent_args_cannot_reopen_the_agy_boundary():
 
     Ordinary passthrough args must survive -- this keeps the tier honest, it does not police
     the roster."""
+    import _builder
     from _builder import _strip_agy_boundary_flags as strip
+
+    # FIRST the integration, because the unit assertions below pass even if nobody CALLS
+    # the strip function: deleting its use in _build_agy_args restored --add-dir in the
+    # real argv while this test stayed green (cross-vendor audit, 2026-07-26).
+    real_ensure = _builder._ensure_agy_profile
+    real_attest = _builder._attest_agy_profile
+    real_wrapper = _builder._agy_wrapper
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        _builder._ensure_agy_profile = lambda cwd, deadline_sec=300.0: tempfile.gettempdir()
+        _builder._attest_agy_profile = lambda *a, **k: None
+        _builder._agy_wrapper = lambda: "wrapper.py"
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"   # so read-only builds at all
+        inv = _builder.AgentInvocation(
+            cli="agy", prompt="p", cwd=os.getcwd(), system_context="c",
+            permission="read-only",
+            extra_args=("--add-dir", "/elsewhere", "--mode", "yolo",
+                        "--dangerously-skip-permissions", "--keep", "me"))
+        _cmd, argv, _env = _builder.build_invocation_args(inv, timeout_ms=60000)
+        assert argv.count("--add-dir") <= 1, (
+            "the agent's own --add-dir survived into the real argv: %r" % (argv,))
+        assert "/elsewhere" not in argv, (
+            "an agent definition pointed agy at a directory summon never authorised: %r"
+            % (argv,))
+        assert "yolo" not in argv and "--dangerously-skip-permissions" not in argv, (
+            "an agent granted itself a tier through args:: %r" % (argv,))
+        assert "--keep" in argv and "me" in argv, (
+            "ordinary passthrough args must survive; this keeps the tier honest, it does "
+            "not police the roster: %r" % (argv,))
+    finally:
+        _builder._ensure_agy_profile = real_ensure
+        _builder._attest_agy_profile = real_attest
+        _builder._agy_wrapper = real_wrapper
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
 
     assert strip(["--add-dir", "/repo", "--keep", "v"]) == ["--keep", "v"], (
         "--add-dir and its VALUE must both go, or the bare path becomes a stray argument")
@@ -11850,6 +11915,7 @@ def test_v8_archive_denial_is_measured_not_guessed():
     d = tempfile.mkdtemp(prefix="summon-denial-")
     real_open = os.open
     seen = {"n": 0}
+    probes = {"n": 0}
     try:
         out = os.path.join(d, "r.json")
         with open(out, "w", encoding="utf-8") as fh:
@@ -11863,6 +11929,7 @@ def test_v8_archive_denial_is_measured_not_guessed():
                     raise FileExistsError(17, "File exists", str(path))
                 raise PermissionError(13, "Permission denied", str(path))
             if ".wtest" in str(path):
+                probes["n"] += 1        # the direct writability question, asked once
                 raise PermissionError(13, "Permission denied", str(path))
             return real_open(path, flags, *a, **k)
 
@@ -11879,6 +11946,16 @@ def test_v8_archive_denial_is_measured_not_guessed():
     assert seen["n"] < 500, (
         "the loop walked %d names before giving up. The writability probe exists so a denied "
         "directory is detected in tens of probes, not ten thousand." % seen["n"])
+    # THE DISTINGUISHING ASSERTION. Both assertions above are satisfied by the OLD
+    # cumulative counter too -- alternating denials reach 65 cumulative after 130 attempts,
+    # so it returned the same message and this test passed against the exact code it claims
+    # to replace (cross-vendor audit, 2026-07-26). The difference is not the outcome here;
+    # it is that the new code ASKS the filesystem instead of inferring from a tally. A
+    # counter-based implementation never opens a probe name.
+    assert probes["n"] > 0, (
+        "no writability probe was attempted, so the verdict came from a counting heuristic. "
+        "Both heuristics tried before were defeated by inputs that count the same as a "
+        "healthy directory; only measuring distinguishes them.")
 
 
 def test_v8_transient_contention_still_rides_out():
@@ -12045,6 +12122,59 @@ def test_v8_agy_timeout_threshold_is_a_measured_completion():
     assert agy_timeout_warning("agy", None) is None
 
 
+def test_v8_advisory_warnings_reach_the_real_envelope():
+    """The parity test below compares --dry-run against advisory_warnings(). Neither is the
+    ENVELOPE, so replacing _executor's assembly with a no-op left it green: the warnings
+    would have vanished from every real dispatch while three tests reported success
+    (cross-vendor audit, 2026-07-26).
+
+    This drives execute_agent for real, stubbing only the spawn and the process driver, and
+    asserts the warnings arrive on the response the caller actually receives."""
+    import _builder
+    import _executor
+
+    real = {k: getattr(_executor, k, None) for k in ("subprocess", "_drive_process")}
+    r_ensure = _builder._ensure_agy_profile
+    r_attest = _builder._attest_agy_profile
+    r_wrapper = _builder._agy_wrapper
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        _builder._ensure_agy_profile = lambda cwd, deadline_sec=300.0: tempfile.gettempdir()
+        _builder._attest_agy_profile = lambda *a, **k: None
+        _builder._agy_wrapper = lambda: "wrapper.py"
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+
+        class _P:                      # stands in for the spawned child
+            pid = 1234
+
+        _executor.subprocess = types.SimpleNamespace(
+            Popen=lambda *a, **k: _P(), DEVNULL=-3, PIPE=-1, STDOUT=-2)
+        _executor._drive_process = lambda *a, **k: {"status": "success", "result": "ok",
+                                                    "exit_code": 0}
+        inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                       system_context="c", permission="read-only")
+        resp = _executor.execute_agent(inv, timeout_ms=60_000)
+    finally:
+        for k, v in real.items():
+            if v is not None:
+                setattr(_executor, k, v)
+        _builder._ensure_agy_profile = r_ensure
+        _builder._attest_agy_profile = r_attest
+        _builder._agy_wrapper = r_wrapper
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+    got = resp.get("warnings") or []
+    assert any("ADVISORY" in w for w in got), (
+        "the real envelope carried no advisory-tier warning, so a caller who opted in would "
+        "believe read-only held: %r" % (got,))
+    assert any("MULTI-STEP" in w for w in got), (
+        "the short-clock warning did not reach the envelope either: %r" % (got,))
+    assert len(got) == len(set(got)), ("a warning was appended twice: %r" % (got,))
+
+
 def test_v8_dry_run_and_the_real_envelope_warn_identically():
     """--dry-run exists to catch a wrong permission, a dead backend or a short clock BEFORE
     paying. It emitted the agy permission warning but neither the timeout nor the
@@ -12101,7 +12231,8 @@ def test_v8_dry_run_reports_a_dispatch_that_would_be_refused():
                                    system_context="ctx", permission="read-only")
     args = types.SimpleNamespace(agent="x", timeout=600_000, worktree=None, out=None,
                                  dry_run=True)
-    view = rs._dry_run_view(inv, args, agents_dir=os.getcwd())
+    with _no_agy_optin():
+        view = rs._dry_run_view(inv, args, agents_dir=os.getcwd())
     assert view.get("would_refuse") is True, (
         "preflight showed a dispatch that will actually be refused: %r" % (view,))
     # `refusal`, not `error`: on a host with no agy wrapper the backend branch sets `error`
@@ -12192,6 +12323,23 @@ def test_v8_over_long_argv_is_diagnosed_as_argv_not_a_missing_cli():
         assert "--prompt-file" in msg or "prompt-file" in msg, (
             "callers reach for --prompt-file assuming it avoids argv; the message must say "
             "it does not: %s" % msg)
+        # The mutants that a raw character count does NOT catch. Both were measured:
+        # subprocess serialises argv with list2cmdline, which DOUBLES backslashes before a
+        # quote, and Windows counts UTF-16 code units, so a non-BMP char costs two.
+        escaped = "\\\"" * 10000            # raw 20010, serialised ~40011 units
+        assert argv_length_error("codex", "codex.exe", [escaped]), (
+            "a raw character sum passes this and CreateProcess then fails it as a MISSING "
+            "FILE -- the exact misdiagnosis this check exists to prevent")
+        astral = chr(0x1F600) * 17000        # raw 17010, but 34010 UTF-16 units
+        assert argv_length_error("codex", "codex.exe", [astral]), (
+            "non-BMP characters cost TWO UTF-16 units each; counting characters undercounts "
+            "by half")
+        # ...and one that is genuinely FINE must still pass, or the fix trades a false
+        # negative for a false positive
+        assert argv_length_error("codex", "codex.exe", [chr(0x1F600) * 10000]) is None, (
+            "10k astral chars is 20k units, comfortably under the limit; refusing it would "
+            "break legitimate dispatches")
+
         # the budget is the WHOLE line: many medium args overflow it just as one huge one
         many = ["y" * 1000] * 40
         assert argv_length_error("codex", "codex.exe", many), (
@@ -12200,6 +12348,14 @@ def test_v8_over_long_argv_is_diagnosed_as_argv_not_a_missing_cli():
         _builder.os.name = "posix"
         # POSIX has a large total but caps ONE argument; 40k total is fine there
         assert argv_length_error("codex", "codex", many) is None
+        # BYTES, not characters: 70k accented chars is 140k bytes and sailed past a
+        # character comparison (measured under WSL: E2BIG)
+        assert argv_length_error("codex", "codex", ["\u00e9" * 70000]), (
+            "execve counts encoded BYTES; comparing characters undercounts multibyte text")
+        # and the TOTAL, which no single-argument check can catch
+        assert argv_length_error("codex", "codex", ["z" * 100000] * 25), (
+            "many medium arguments overflow ARG_MAX without any single one being close to "
+            "the per-argument cap")
         huge = "z" * (_ARGV_SINGLE_LIMIT_POSIX + 10)
         pm = argv_length_error("codex", "codex", ["-x", huge])
         assert pm and str(_ARGV_SINGLE_LIMIT_POSIX) in pm, pm
