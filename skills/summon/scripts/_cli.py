@@ -355,7 +355,9 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="With --council: read the question from a file")
     parser.add_argument("--members", help="With --council: comma-separated member agents "
                                           "(default: a vendor-diverse set)")
-    parser.add_argument("--chairman", help="With --council: the synthesizer agent (default: fable)")
+    parser.add_argument("--chairman", help="With --council: the synthesizer agent "
+                        "(default: architect, which is Opus 5; pass fable explicitly for the "
+                        "escalation tier)")
     parser.add_argument("--rounds", type=int, default=1,
                         help="With --council: 1 (independent) or 2 (adds cross-examination)")
     parser.add_argument("--run-dir", dest="run_dir",

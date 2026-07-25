@@ -35,7 +35,11 @@ from concurrent.futures import ThreadPoolExecutor
 # agy backend runs in an isolated profile and CANNOT read --cwd — it errors out
 # of any repo-inspection council (use it only for pure-reasoning councils).
 DEFAULT_MEMBERS = ["planner", "reviewer", "coder", "pair"]
-DEFAULT_CHAIRMAN = "fable"          # the escalation/synthesis tier
+DEFAULT_CHAIRMAN = "architect"      # Opus 5 synthesis at half Fable's cost
+# Was "fable". Fable is roughly 2x Opus 5 and does not beat it on most synthesis, and
+# it is CREDIT-billed on the claude CLI -- so the old default either silently fell back
+# to Opus with a warning (unauthorized) or quietly spent credit (authorized). Neither is
+# a good default. Pass --chairman fable explicitly when the escalation tier is wanted.
 _MAX_MEMBERS = 10                   # bound fan-out: 1 thread/member + argv-safe position budget
 _POSITION_CAP = 4000                # max chars of any single position
 _TOTAL_POSITIONS_BUDGET = 20000     # cap on ALL positions in one prompt (argv-safe;

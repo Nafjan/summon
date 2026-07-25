@@ -6,6 +6,21 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.12.0] - 2026-07-25
+
+### Changed
+- **The default council chairman is no longer Fable.** `DEFAULT_CHAIRMAN` was `fable`, so
+  every council that omitted `--chairman` routed SYNTHESIS -- the most expensive single
+  stage -- to a model costing roughly 2x Opus 5 without beating it on that work. Worse,
+  Fable is credit-billed on the claude CLI, so the old default either fell back to Opus
+  with a warning (unauthorized) or quietly spent account credit (authorized). Neither is a
+  defensible default. It is now `architect`, a bundled agent pinned to `claude-opus-5`.
+  Pass `--chairman fable` explicitly when the escalation tier is genuinely wanted.
+- A test now asserts the default chairman **resolves in the bundled roster** and is **not
+  credit-only**. Both halves catch real bugs: the obvious rename to `opus` would have
+  shipped a default that resolves for nobody (no such bundled agent), and the previous
+  value was the credit-only model. Both mutants are killed.
+
 ## [0.11.5] - 2026-07-25
 
 ### Fixed

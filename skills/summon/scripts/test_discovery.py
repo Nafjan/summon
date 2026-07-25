@@ -11216,6 +11216,37 @@ def test_v8_retry_refusal_evidence_is_not_overwritten_by_the_initial_approval():
         "initial approval overwrote the retry refusal" % env["gate"].get("approved"))
     assert env["gate"].get("verdict") == "DENY", env["gate"]
 
+
+def test_v8_default_chairman_resolves_and_is_not_credit_only():
+    """The council's DEFAULT chairman must (a) actually exist in the BUNDLED roster and
+    (b) not be a credit-only model.
+
+    Both halves are real bugs caught in the making. Changing the default to a plausible
+    name ("opus") would have shipped a default that resolves for nobody, since no such
+    bundled agent exists. And the previous default WAS credit-only (`fable`), so every
+    council that omitted --chairman either silently fell back to Opus with a warning or
+    quietly spent account credit -- at roughly twice Opus 5's price, for a model that
+    does not beat it on synthesis."""
+    from _builder import _CREDIT_ONLY_MODELS
+    from _council import DEFAULT_CHAIRMAN
+    from _loader import bundled_roster_dir, load_agent
+
+    bundled = bundled_roster_dir()
+    assert bundled, "no bundled roster to resolve the default chairman against"
+    try:
+        tup = load_agent(bundled, DEFAULT_CHAIRMAN)
+    except Exception as e:  # noqa: BLE001
+        raise AssertionError(
+            "DEFAULT_CHAIRMAN %r does not resolve in the bundled roster (%s) -- a council "
+            "that omits --chairman would fail for anyone without a project agent of that "
+            "name" % (DEFAULT_CHAIRMAN, e)) from None
+
+    model = tup[5]
+    assert model not in _CREDIT_ONLY_MODELS, (
+        "the default chairman resolves to credit-only model %r: a council that omits "
+        "--chairman would spend account credit, or fall back with a warning, by default"
+        % model)
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
