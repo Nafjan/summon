@@ -75,7 +75,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.11.3"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.11.4"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -309,8 +309,9 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
     """Create an isolated git worktree so a (possibly parallel) editing agent
     can't collide with the main tree or other agents. Returns {path, branch}.
     Raises ValueError (surfaced as a clean JSON error) on any failure."""
+    from _spawn import run_flags
     r = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, **run_flags())
     if r.returncode != 0:
         raise ValueError(f"--worktree requires a git repo; {cwd} is not inside one")
     repo = r.stdout.strip()
@@ -328,11 +329,11 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
     # Don't clobber an existing branch: `-b` (not `-B`) fails if agents/<name>
     # already exists, so prior committed agent work is never force-reset away.
     if subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet",
-                       f"refs/heads/{branch}"], capture_output=True, text=True).returncode == 0:
+                       f"refs/heads/{branch}"], capture_output=True, text=True, **run_flags()).returncode == 0:
         raise ValueError(f"branch {branch} already exists; pick a different --worktree name "
                          "(its commits would otherwise be at risk)")
     r2 = subprocess.run(["git", "-C", repo, "worktree", "add", "-b", branch, wt, "HEAD"],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, **run_flags())
     if r2.returncode != 0:
         raise ValueError(f"git worktree add failed: {(r2.stderr or r2.stdout).strip()}")
     # If --cwd was a SUBDIRECTORY of the repo, run inside the matching subdir of

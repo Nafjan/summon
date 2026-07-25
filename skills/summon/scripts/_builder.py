@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass, replace
 
 from _loader import DEFAULT_PERMISSION
+from _spawn import run_flags
 
 # cursor-agent exposes no machine-readable model list and no floating alias like
 # claude's `opus`/`sonnet`, so its default is pinned here. This is the SINGLE
@@ -474,7 +475,7 @@ def _has_pty_modules(python: str) -> bool:
     Quick probe subprocess; fail-soft False on any error."""
     try:
         r = subprocess.run([python, "-c", "import pyte, winpty"],
-                           capture_output=True, timeout=8, stdin=subprocess.DEVNULL)
+                           capture_output=True, timeout=8, stdin=subprocess.DEVNULL, **run_flags())
         return r.returncode == 0
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
@@ -595,7 +596,7 @@ def _agy_lock_down(prof: str) -> None:
     # inherit-only and leaves the file with an empty DACL, so files need PLAIN ":F".
     r = subprocess.run(
         ["icacls", prof, "/inheritance:r", "/grant:r", f"{user}:F", "/T", "/C"],
-        capture_output=True, text=True)
+        capture_output=True, text=True, **run_flags())
     if r.returncode != 0:
         fails.append((r.stderr or r.stdout).strip())
     # Pass 2: make EVERY directory's ACE inheritable (not just the root) so files
@@ -606,7 +607,8 @@ def _agy_lock_down(prof: str) -> None:
         dirs.extend(os.path.join(root, d) for d in dnames)
     for d in dirs:
         r = subprocess.run(
-            ["icacls", d, "/grant:r", f"{user}:(OI)(CI)F"], capture_output=True, text=True)
+            ["icacls", d, "/grant:r", f"{user}:(OI)(CI)F"], capture_output=True,
+            text=True, **run_flags())
         if r.returncode != 0:
             fails.append((r.stderr or r.stdout).strip())
     if fails:

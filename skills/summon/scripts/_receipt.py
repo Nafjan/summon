@@ -144,9 +144,10 @@ def git_head(cwd: str) -> str | None:
     commit during the run). Best-effort: None outside a repo or without git.
     Uses the shared ``subprocess`` module object so a test patching it is seen."""
     try:
+        from _spawn import run_flags
         r = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
                            capture_output=True, text=True, timeout=2,
-                           stdin=subprocess.DEVNULL)
+                           stdin=subprocess.DEVNULL, **run_flags())
         head = (r.stdout or "").strip()
         return head if r.returncode == 0 and head else None
     except (OSError, subprocess.SubprocessError):

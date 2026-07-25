@@ -159,9 +159,10 @@ def _agy_live_models() -> tuple[str, list, str | None]:
     if not exe:
         return "unavailable", [], "agy not on PATH"
     try:
+        from _spawn import run_flags
         r = subprocess.run([exe, "models"], capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
-                           timeout=_AGY_MODELS_TIMEOUT, stdin=subprocess.DEVNULL)
+                           timeout=_AGY_MODELS_TIMEOUT, stdin=subprocess.DEVNULL, **run_flags())
     except (OSError, ValueError, subprocess.SubprocessError) as e:
         # errors="replace" prevents UnicodeDecodeError, but keep ValueError +
         # the broad SubprocessError base so NOTHING escapes the fail-soft contract.
