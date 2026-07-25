@@ -12352,10 +12352,20 @@ def test_v8_over_long_argv_is_diagnosed_as_argv_not_a_missing_cli():
         # character comparison (measured under WSL: E2BIG)
         assert argv_length_error("codex", "codex", ["\u00e9" * 70000]), (
             "execve counts encoded BYTES; comparing characters undercounts multibyte text")
-        # and the TOTAL, which no single-argument check can catch
-        assert argv_length_error("codex", "codex", ["z" * 100000] * 25), (
-            "many medium arguments overflow ARG_MAX without any single one being close to "
-            "the per-argument cap")
+        # and the TOTAL, which no single-argument check can catch. Derive the input from
+        # the platform's ACTUAL limit: hard-coding 25x100k tripped Windows' 2MB fallback
+        # but sailed under the CI runner's larger real ARG_MAX, so the test passed locally
+        # and failed on Linux. Ask the system, then exceed what it says.
+        try:
+            _arg_max = os.sysconf("SC_ARG_MAX")
+        except (ValueError, OSError, AttributeError):
+            _arg_max = 2 ** 21
+        _chunk = 100_000
+        _n = _arg_max // _chunk + 8          # comfortably past the limit and its margin
+        assert argv_length_error("codex", "codex", ["z" * _chunk] * _n), (
+            "%d arguments of %d bytes exceed this system's ARG_MAX of %d, but preflight "
+            "allowed it; many medium arguments overflow the total without any single one "
+            "being close to the per-argument cap" % (_n, _chunk, _arg_max))
         huge = "z" * (_ARGV_SINGLE_LIMIT_POSIX + 10)
         pm = argv_length_error("codex", "codex", ["-x", huge])
         assert pm and str(_ARGV_SINGLE_LIMIT_POSIX) in pm, pm
