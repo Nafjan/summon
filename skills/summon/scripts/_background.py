@@ -47,6 +47,14 @@ def child_argv(args: argparse.Namespace, result_file: str) -> list:
             out += [flag, val]
     if args.retries:
         out += ["--retries", str(args.retries)]
+    # The gate MUST survive detachment. This argv is rebuilt field by field, so a
+    # flag omitted here is silently dropped -- and dropping --gate-with meant a
+    # gated background dispatch ran with no approval at all. The gate runs in the
+    # CHILD, which is where the dispatch it authorizes actually happens.
+    if getattr(args, "gate_with", None):
+        out += ["--gate-with", args.gate_with]
+    if getattr(args, "gate_timeout", None):
+        out += ["--gate-timeout", str(args.gate_timeout)]
     if args.worktree is not None:
         out += [f"--worktree={args.worktree}"]  # =form is unambiguous for the bare case
     return out + ["--job-file", result_file]
