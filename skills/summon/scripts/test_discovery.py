@@ -11755,6 +11755,64 @@ def test_v8_agy_invocation_adds_the_cwd_to_its_workspace():
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
 
+
+def test_v8_gate_records_its_own_definition_hash():
+    """The `gate` block advertises the gate's own definition hash as evidence, but
+    `agent_def` is attached by main() via _receipt and _run_gate calls execute_agent
+    DIRECTLY -- so the field was structurally always None while the docs claimed it.
+
+    A LIVE gate run exposed it: the verdict was correct and the provenance was empty. Unit
+    tests had not, because they stub execute_agent and never exercised the real response
+    shape. Without a definition hash there is no way to tell WHICH gate definition
+    adjudicated a dispatch, which is the whole point of recording it."""
+    import run_subagent as _rs
+
+    d = tempfile.mkdtemp(prefix="summon-gatesha-")
+    real_exec = _rs.execute_agent
+    nl = chr(10)
+    try:
+        gate_md = os.path.join(d, "g.md")
+        with open(gate_md, "w", encoding="utf-8") as fh:
+            fh.write("---" + nl + "run-agent: claude" + nl + "permission: read-only" + nl
+                     + "---" + nl + "# Gate" + nl)
+
+        # a response shaped like execute_agent's: NO agent_def key, as in production
+        _rs.execute_agent = lambda inv, **kw: {
+            "status": "success", "result": "VERDICT: APPROVE" + nl + "REASON: fine"}
+
+        class A:
+            gate_with = "g"; agent = "impl"; prompt = "p"; cwd = d
+            cli = None; timeout = 60000; gate_timeout = None; debug_dir = None
+
+        from _builder import AgentInvocation
+        gated = AgentInvocation(cli="claude", prompt="p", cwd=d, permission="safe-edit")
+        dec = _rs._run_gate(A(), d, gated)
+    finally:
+        _rs.execute_agent = real_exec
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    assert dec["approved"] is True, dec
+    assert dec.get("agent_def_sha256"), (
+        "the gate decision carries no definition hash, so there is no record of WHICH gate "
+        "definition adjudicated the dispatch: %r" % dec)
+    assert len(dec["agent_def_sha256"]) == 64, dec["agent_def_sha256"]
+
+
+def test_v8_gate_verdict_always_carries_a_reason():
+    """A refusal with `reason: None` is unactionable. The prompt asks for a REASON line but
+    a model may rule without one -- observed live: a correct DENY arrived reasonless. Every
+    verdict now carries at least the meaning of the verdict itself."""
+    from _gate import decide
+    nl = chr(10)
+    for verdict in ("APPROVE", "DENY", "UNCERTAIN"):
+        dec = decide({"status": "success", "result": "VERDICT: " + verdict}, "g")
+        assert dec["reason"], ("verdict %s produced a null reason: %r" % (verdict, dec))
+    # an explicit REASON still wins over the fallback
+    dec = decide({"status": "success",
+                  "result": "VERDICT: DENY" + nl + "REASON: touches prod"}, "g")
+    assert "touches prod" in dec["reason"], dec
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

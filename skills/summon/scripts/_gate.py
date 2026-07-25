@@ -145,8 +145,15 @@ def decide(gate_response: dict | None, gate_agent: str) -> dict:
     dec["verdict"] = verdict
     dec["reason"] = _reason(gate_response.get("result")) or dec["reason"]
     dec["approved"] = verdict == APPROVE
-    if verdict == UNCERTAIN and not dec["reason"]:
-        dec["reason"] = "gate was uncertain; routed to human review"
+    if not dec["reason"]:
+        # The prompt asks for a REASON line, but a model may rule without one. A refusal
+        # with a null reason is unactionable -- observed live: a correct DENY arrived with
+        # reason=None, leaving the caller nothing to act on. Supply the verdict's meaning.
+        dec["reason"] = {
+            UNCERTAIN: "gate was uncertain; routed to human review",
+            DENY: "gate denied the dispatch but gave no reason line",
+            APPROVE: "gate approved the dispatch",
+        }.get(verdict)
     return dec
 
 
