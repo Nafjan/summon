@@ -11635,6 +11635,77 @@ def test_v8_no_doc_claims_a_stale_default_chairman():
                     "%s advertises `%s` as a default where the real DEFAULT_CHAIRMAN is "
                     "`%s`" % (rel, claimed, DEFAULT_CHAIRMAN))
 
+
+def test_v8_archive_claim_survives_windows_permission_denied():
+    """A name whose file is pending deletion by a concurrent writer fails O_EXCL with
+    EACCES on Windows, not EEXIST. The claim loop caught only FileExistsError, so that
+    transient race aborted the whole clear -- and since _write_error_out refuses to
+    overwrite when archiving fails, the dispatch's REAL error envelope was dropped and a
+    stale success left in place.
+
+    Deterministic rather than racy: os.open is stubbed to deny the first few names, which
+    is what contention looks like from inside the loop. The original test only caught this
+    when the OS happened to lose the race, which is why it passed locally and failed on
+    windows-latest 3.10."""
+    import _manifest
+
+    d = tempfile.mkdtemp(prefix="summon-eacces-")
+    real_open = os.open
+    denied = {"n": 0}
+    try:
+        out = os.path.join(d, "review.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write('{"status": "success", "result": "prior"}')
+
+        def flaky_open(path, flags, *a, **k):
+            # deny the first 3 archive-name claims, as a racing writer would
+            if str(path).find(".superseded") != -1 and denied["n"] < 3:
+                denied["n"] += 1
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, flags, *a, **k)
+
+        os.open = flaky_open
+        err = _manifest._clear_out_file(out, archive=True)
+    finally:
+        os.open = real_open
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    assert denied["n"] == 3, denied
+    assert err is None, (
+        "a transient EACCES while claiming an archive name aborted the clear: %r -- the "
+        "loop must skip to the next name, as it does for EEXIST" % err)
+
+
+def test_v8_archive_claim_reports_a_genuinely_unwritable_dir():
+    """The EACCES retry must not become an infinite grind when the directory is REALLY
+    unwritable: every name denies, so the loop has to give up and SAY so rather than
+    spinning to the 10,000 bound."""
+    import _manifest
+
+    d = tempfile.mkdtemp(prefix="summon-eacces2-")
+    real_open = os.open
+    try:
+        out = os.path.join(d, "review.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write('{"status": "success"}')
+
+        def always_denied(path, flags, *a, **k):
+            if str(path).find(".superseded") != -1:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, flags, *a, **k)
+
+        os.open = always_denied
+        err = _manifest._clear_out_file(out, archive=True)
+    finally:
+        os.open = real_open
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    assert err and "permission denied" in err.lower(), (
+        "an unwritable archive directory must be reported as a permission problem, got %r"
+        % err)
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

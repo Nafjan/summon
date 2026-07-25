@@ -6,6 +6,26 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.13.7] - 2026-07-25
+
+### Fixed
+- **Windows: a concurrent writer could make a dispatch DROP its error envelope.** The
+  archive-name claim loop in `_clear_out_file` caught only `FileExistsError`, but on
+  Windows a name whose file is pending deletion by another writer fails `O_EXCL` with
+  `PermissionError` (EACCES), not EEXIST. That escaped to the outer handler and aborted
+  the whole clear -- and because `_write_error_out` deliberately refuses to overwrite when
+  archiving fails (so a stored success is never destroyed), the consequence was that the
+  dispatch's REAL error envelope was never written and a stale success stayed at the
+  authoritative path.
+  EACCES is now treated like EEXIST: skip to the next index, which is safe because the
+  loop is only choosing an UNUSED archive name. A bounded counter distinguishes transient
+  contention from a genuinely unwritable directory, which is reported rather than ground
+  against the 10,000-name limit.
+- Two deterministic tests replace the racy one: `os.open` is stubbed to deny the first few
+  claims (what contention looks like from inside the loop) and, separately, to deny every
+  claim. The original test only caught this when the OS happened to lose the race, which
+  is why it passed locally and failed on windows-latest 3.10.
+
 ## [0.13.6] - 2026-07-25
 
 ### Fixed

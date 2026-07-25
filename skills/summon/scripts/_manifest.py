@@ -93,7 +93,7 @@ def _clear_out_file(out_file: str, archive: bool) -> str | None:
             # same free name, and the second os.replace then overwrote the first's archived
             # answer. O_EXCL means exactly one writer can ever own a given name.
             base = out_file + ".superseded"
-            dest, n = base, 0
+            dest, n, _denied = base, 0, 0
             while True:
                 try:
                     # Record the claim BEFORE closing: a close() that fails on a network
@@ -103,7 +103,21 @@ def _clear_out_file(out_file: str, archive: bool) -> str | None:
                     claimed = dest
                     os.close(fd)
                     break
-                except FileExistsError:
+                except (FileExistsError, PermissionError) as _claim_err:
+                    # PermissionError, not just FileExistsError: on WINDOWS a name whose
+                    # file is pending deletion by a concurrent writer fails O_EXCL with
+                    # EACCES rather than EEXIST. Treating that as fatal made a transient
+                    # race abort the whole clear -- and because _write_error_out refuses to
+                    # overwrite when archiving fails, the dispatch's real error envelope was
+                    # then dropped and a stale success left in place. Skipping to the next
+                    # index is safe: we are only choosing an UNUSED archive name.
+                    if isinstance(_claim_err, PermissionError):
+                        _denied += 1
+                        # A genuinely unwritable directory denies every name, so distinguish
+                        # that from contention instead of grinding to the 10k bound.
+                        if _denied > 64:
+                            return (f"cannot archive the previous result at {out_file}: "
+                                    f"permission denied claiming an archive name ({_claim_err})")
                     n += 1
                     dest = f"{base}.{n}"
                     if n > 10_000:             # pathological; do not spin forever
