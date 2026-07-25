@@ -8,6 +8,46 @@ never on added fields.
 
 ## [0.15.0] - 2026-07-26
 
+### Security (round 4)
+- **`doctor --probe` handed agy full authority over your working tree.** Round 3 raised the
+  agy probe to `safe-edit` so a healthy agy could be verified at all -- but `safe-edit` on
+  agy is `--dangerously-skip-permissions --add-dir <cwd>`, so a LIVENESS PING ran with write
+  access to whatever directory you were in. The agy probe now runs in an empty throwaway
+  directory, which still proves the backend starts, answers and authenticates. Other
+  backends keep probing at read-only, which they enforce.
+
+### Fixed (round 4)
+- **The argv preflight crashed on undecodable text.** It is mandatory on every dispatch, and
+  a lone surrogate (from a prompt decoded off an odd byte stream) raised `UnicodeEncodeError`
+  -- an uncaught crash from the check written to produce a clear message.
+- **POSIX limits were off by a NUL and counted characters as bytes.** `MAX_ARG_STRLEN`
+  includes the terminating NUL, so 131072 bytes of payload is already one over (measured:
+  131071 spawned, 131072 gave E2BIG while preflight said fine). The environment was counted
+  in characters, and read from `os.environ` rather than the environment actually handed to
+  `Popen`.
+- **`build_invocation_args` raised straight through `execute_agent`.** summon's contract is
+  one JSON envelope on stdout, always; a build-time guard (oversized agy prompt, missing
+  ConPTY wrapper) gave callers a traceback where an envelope belongs.
+- **A doomed agy prompt still built a profile and copied OAuth material into it**, then
+  raised -- orphaning credentials for a run that never happened. The length guard now runs
+  before the profile build. A rejection that happens after the build (an over-long argv)
+  hands the profile back on the envelope so it can be resumed or cleaned up.
+- **The writability probe could disable itself.** Its name was keyed on a counter that
+  resets, so a failed cleanup left the name occupied and every later probe read as
+  "inconclusive" -- silently reverting to no measurement at all. It is now uuid4-unique
+  (a per-call counter still collided between concurrent calls in one process) with
+  try/finally close and remove, matching the archive claim ten lines above it.
+
+### Docs (round 4)
+- SKILL.md's "exact per-CLI flags" table still showed agy `read-only` as `--sandbox`, and
+  the caveat below it described an ordinary mapping. Both now say it is refused, and why.
+
+### Testing (round 4)
+- The round-3 doctor test was vacuous: it called `_doctor._probe_backend`, which does not
+  exist, so `hasattr` returned None and it asserted nothing. Replaced with two tests that
+  drive the real `_default_probe_runner`.
+- 368/368 discovery, 22/22 install.
+
 ### Security (round 3)
 - **The opt-in could waive a tier summon IMPOSED.** `SUMMON_ALLOW_UNENFORCED_READONLY` is
   ambient process authority, inherited by every backend, background, manifest and council

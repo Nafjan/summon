@@ -422,7 +422,7 @@ levels are NOT identical across CLIs; when behavior surprises you, check this ta
 
 | Level | claude | codex | cursor-agent | gemini | agy |
 |-------|--------|-------|--------------|--------|-----|
-| `read-only` | `--permission-mode plan` | `-s read-only` | `--mode plan` | `--approval-mode plan` | `--sandbox` |
+| `read-only` | `--permission-mode plan` | `-s read-only` | `--mode plan` | `--approval-mode plan` | **refused** (see below) |
 | `safe-edit` | `--permission-mode acceptEdits` | `-s workspace-write -c approval_policy=never` | `--trust` | `--approval-mode auto_edit` | `--dangerously-skip-permissions` |
 | `yolo` | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `-f --trust` | `-y` | `--dangerously-skip-permissions` |
 
@@ -430,12 +430,20 @@ Caveats worth knowing:
 - `read-only` sandboxes differ: claude's plan mode can block even *reads* the
   prompt depends on (a blocked run now returns `status: blocked` — see the
   status table). If a read-only agent must read files, keep them under `--cwd`.
-- **agy has no workspace-write tier**: `read-only` maps to `--sandbox`, but BOTH
-  `safe-edit` and `yolo` map to `--dangerously-skip-permissions` — so a `safe-edit`
-  agy agent runs with a FULL permission bypass, identical to `yolo`. Constrain agy
-  agents by instruction, and treat any repo you point them at as trusted. Every agy
-  `safe-edit` dispatch (and its `--dry-run`) carries a `warnings` entry saying exactly
-  this, so the level name can never read as a real sandbox.
+- **agy has no workspace-write tier AND no enforceable read-only tier.** `safe-edit`
+  and `yolo` BOTH map to `--dangerously-skip-permissions` — a `safe-edit` agy agent runs
+  with a FULL permission bypass, identical to `yolo`. And `read-only` is **refused**:
+  measured over five canaries, `--sandbox` restricts terminal operations only, `--mode plan`
+  does not withhold the file tools, and withholding the workspace only breaks *relative*
+  paths — a declared read-only agy agent read a secret file and created another by absolute
+  path. summon fails closed rather than name a tier nothing enforces; the flags are still
+  sent as defence in depth but nothing relies on them.
+  `SUMMON_ALLOW_UNENFORCED_READONLY=1` dispatches anyway and marks the tier advisory in
+  `warnings` — but it only waives a tier **you** declared, never one summon imposed (a
+  `--gate-with` adjudicator, a `--max-permission` clamp that bit, a contract-repair resume).
+  Constrain agy agents by instruction, and treat any repo you point them at as trusted.
+  Every agy `safe-edit` dispatch (and its `--dry-run`) carries a `warnings` entry saying
+  exactly this, so the level name can never read as a real sandbox.
 - For investigation agents that only need to *read*, `yolo` +
   "do not modify files" in the agent body is often more reliable than
   `read-only` — several CLIs' plan modes end turns asking for approval.

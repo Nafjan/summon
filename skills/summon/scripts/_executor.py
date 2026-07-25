@@ -1825,16 +1825,33 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
 
     # timeout_ms is threaded to the builder so agy's wrapper deadline AND its
     # profile-TTL cleanup (which runs during build) both reflect the real request.
-    command, args, env_override = build_invocation_args(inv, timeout_ms)
+    try:
+        command, args, env_override = build_invocation_args(inv, timeout_ms)
+    except ValueError as _build_err:
+        # The dispatcher's contract is ONE JSON envelope on stdout, always. Build-time
+        # guards (an oversized agy prompt, a missing ConPTY wrapper) raised straight through
+        # execute_agent instead, so a caller parsing stdout got a traceback where an
+        # envelope belongs -- and every orchestration path that branches on `status` saw an
+        # exception rather than a status to branch on.
+        return _stamp(_enrich(_error_response(inv.cli, 1, str(_build_err)), None))
     command, args = _resolve_launch(command, args)
     # AFTER _resolve_launch: on Windows a .cmd shim is rewritten to `node <path>/cli.js`,
     # which changes the length that actually gets measured by CreateProcess.
-    _argv_err = argv_length_error(inv.cli, command, args)
+    proc_env = _merge_env(env_override)
+    # AFTER _merge_env: the POSIX total counts the environment, and the environment that
+    # matters is the one Popen receives -- overrides included, stripped keys excluded.
+    _argv_err = argv_length_error(inv.cli, command, args, proc_env)
     if _argv_err:
         # exit 1, not 127: 127 means "CLI not found", and reporting this as a missing
         # binary is precisely the misdiagnosis being fixed.
-        return _stamp(_enrich(_error_response(inv.cli, 1, _argv_err), None))
-    proc_env = _merge_env(env_override)
+        _resp = _error_response(inv.cli, 1, _argv_err)
+        # agy builds its per-invocation profile during build_invocation_args, so a rejection
+        # HERE leaves a populated profile on disk with no handle to it: the caller could
+        # neither resume nor clean it up, and it lingered until a TTL sweep. Hand it back.
+        if inv.cli == "agy" and env_override:
+            _resp["resume"] = {"cli": inv.cli, "session_id": None,
+                               "profile": env_override.get("USERPROFILE")}
+        return _stamp(_enrich(_resp, None))
     debug_argv = [command, *args]
 
     # POSIX: put the child in its own session so _kill_tree can signal the whole

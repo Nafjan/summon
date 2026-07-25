@@ -12522,34 +12522,258 @@ def test_v8_strip_matches_the_parsers_spelling_not_ours():
     assert strip(["-q", "-v", "--keep"]) == ["-q", "-v", "--keep"]
 
 
-def test_v8_doctor_probes_agy_at_a_tier_it_can_honour():
-    """The probe asked for read-only, which agy now refuses -- so a perfectly healthy agy
-    reported as unverifiable, with every eligibility field blank. The probe is a liveness
-    check, not a privileged dispatch, so it runs one tier up for agy and SAYS it did:
-    a green probe must not imply a tier that was never exercised."""
+def test_v8_doctor_probe_does_not_aim_agy_at_your_repo():
+    """A health check must not hand a backend write authority over the caller's tree.
+
+    Two bugs, one after the other. The probe asked every backend for read-only, which agy
+    now refuses -- so a healthy agy reported as unverifiable. Probing agy one tier up fixed
+    that and introduced something worse: `safe-edit` on agy is
+    `--dangerously-skip-permissions --add-dir <cwd>`, so a LIVENESS PING ran with full
+    authority over whatever directory you happened to be in. Cross-vendor review built the
+    real argv and confirmed both flags.
+
+    The probe now runs agy in an empty throwaway directory. It still proves the backend
+    starts, answers and authenticates; the only thing it can write to is a temp dir being
+    deleted immediately after.
+
+    This calls the REAL runner. The previous version of this test invoked
+    `_doctor._probe_backend`, which does not exist -- `hasattr` returned None and the test
+    returned successfully having asserted nothing at all."""
     import _doctor
+    import _executor
 
     seen = {}
 
     def fake_execute(inv, timeout_ms=0, **k):
         seen["permission"] = inv.permission
+        seen["cwd"] = inv.cwd
+        seen["cli"] = inv.cli
         return {"status": "success", "result": "pong"}
 
-    import _executor
     real = _executor.execute_agent
     try:
         _executor.execute_agent = fake_execute
-        out = _doctor._probe_backend("agy") if hasattr(_doctor, "_probe_backend") else None
-    except Exception:
-        out = None
+        out = _doctor._default_probe_runner("agy", "agy")
     finally:
         _executor.execute_agent = real
-    if out is None:
-        return                      # probe helper is named differently; nothing to assert
+
+    assert seen.get("cli") == "agy", ("the real runner was never reached", seen)
     assert seen.get("permission") == "safe-edit", (
-        "the probe asked for a tier agy refuses, so it can never verify agy: %r" % (seen,))
-    assert "safe-edit" in (out.get("note") or ""), (
-        "a green probe must not imply read-only was exercised: %r" % (out,))
+        "agy refuses read-only, so probing at that tier can never verify it: %r" % (seen,))
+    cwd = seen.get("cwd") or ""
+    assert cwd and os.path.abspath(cwd) != os.path.abspath(os.getcwd()), (
+        "the probe pointed agy at the CALLER'S working directory with a full permission "
+        "bypass. A liveness ping must not carry write authority over your repo: %r" % (seen,))
+    assert not os.path.exists(cwd), (
+        "the throwaway probe directory %r outlived the probe" % cwd)
+    assert out and out.get("probed_permission") == "safe-edit", out
+    assert "read-only" in (out.get("note") or ""), (
+        "a green probe must say it exercised NO read-only tier for agy: %r" % (out,))
+
+
+def test_v8_doctor_probe_still_uses_read_only_where_it_is_enforced():
+    """The counterpart: every other backend enforces read-only, so the probe must keep
+    asking for the least authority there. Raising everyone to safe-edit to accommodate agy
+    would trade one backend's limitation for a privilege increase across all of them."""
+    import _doctor
+    import _executor
+
+    seen = {}
+
+    def fake_execute(inv, timeout_ms=0, **k):
+        seen[inv.cli] = (inv.permission, inv.cwd)
+        return {"status": "success", "result": "pong"}
+
+    real = _executor.execute_agent
+    try:
+        _executor.execute_agent = fake_execute
+        for name in ("claude", "codex", "cursor-agent"):
+            _doctor._default_probe_runner(name, name)
+    finally:
+        _executor.execute_agent = real
+
+    for name in ("claude", "codex", "cursor-agent"):
+        perm, cwd = seen.get(name, (None, None))
+        assert perm == "read-only", (
+            "%s enforces read-only; the probe must ask for the least authority" % name)
+        assert os.path.abspath(cwd) == os.path.abspath(os.getcwd()), (
+            "%s probes in the real cwd, which is safe at read-only and exercises the "
+            "realistic path" % name)
+
+
+def test_v8_writability_probe_uses_a_fresh_name_each_time():
+    """The probe name was keyed on the denial counter, which RESETS after a successful
+    probe -- so the same name came round again. The remove is best-effort, so one failed
+    cleanup left that name occupied, and every later probe then failed O_EXCL with EEXIST
+    and was read as "inconclusive": the measurement silently disabled itself, exactly where
+    it was introduced to replace a guessing heuristic.
+
+    A probe that can stop working without saying so is worse than the heuristic it
+    replaced."""
+    import _manifest
+
+    d = tempfile.mkdtemp(prefix="summon-probename-")
+    real_open, real_remove = os.open, os.remove
+    seen = {"n": 0, "probes": []}
+    try:
+        out = os.path.join(d, "r.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(chr(123) + '"status": "success"' + chr(125))
+
+        def stub_open(path, flags, *a, **k):
+            if ".wtest" in str(path):
+                seen["probes"].append(str(path))
+                return real_open(path, flags, *a, **k)   # writable
+            if ".superseded" in str(path):
+                seen["n"] += 1
+                if seen["n"] <= 400:                      # long contention: several probes
+                    raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, flags, *a, **k)
+
+        def stub_remove(path):
+            if ".wtest" in str(path):
+                raise OSError(5, "cleanup failed")        # the best-effort remove fails
+            return real_remove(path)
+
+        os.open, os.remove = stub_open, stub_remove
+        err = _manifest._clear_out_file(out, archive=True)
+    finally:
+        os.open, os.remove = real_open, real_remove
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    assert len(seen["probes"]) > 1, (
+        "the scenario did not exercise repeated probing (%d)" % len(seen["probes"]))
+    assert len(set(seen["probes"])) == len(seen["probes"]), (
+        "a probe name repeated: %r. With a failed cleanup the repeat is already occupied, "
+        "so the probe answers 'inconclusive' forever." % (seen["probes"],))
+    assert err is None, (
+        "contention on a writable directory must still ride out even when probe cleanup "
+        "fails: %r" % err)
+
+
+def test_v8_argv_preflight_never_crashes_on_undecodable_text():
+    """The preflight is MANDATORY on every dispatch, so it must never be the thing that
+    fails. A prompt decoded from an odd byte stream can carry a lone surrogate, and a plain
+    .encode() raises UnicodeEncodeError -- turning a check written to produce a clear
+    message into an uncaught crash. `surrogateescape` handles the low half and raises on a
+    lone HIGH surrogate, so both halves need covering.
+
+    Measuring is best-effort; refusing to measure must never be fatal."""
+    import _builder
+    from _builder import argv_length_error
+
+    real = _builder.os.name
+    try:
+        for name in ("nt", "posix"):
+            _builder.os.name = name
+            for bad in ("\ud800", "\udcff", "ok" + "\ud800" + "tail"):
+                argv_length_error("codex", "codex", [bad])          # must not raise
+                argv_length_error("codex", "codex", ["x"], {"K": bad})
+    finally:
+        _builder.os.name = real
+
+
+def test_v8_posix_argv_limits_count_bytes_and_the_nul():
+    """Two off-by-reality bugs in the POSIX branch, both measured under WSL.
+
+    MAX_ARG_STRLEN COUNTS THE TERMINATING NUL, so 131072 bytes of payload is already one
+    over: 131071 spawned, 131072 failed with E2BIG while preflight said fine. And the
+    environment was counted in CHARACTERS -- 22 values of 50k non-ASCII passed preflight and
+    then E2BIG'd -- and read from os.environ rather than the environment actually handed to
+    Popen."""
+    import _builder
+    from _builder import argv_length_error, _ARGV_SINGLE_LIMIT_POSIX as CAP
+
+    real = _builder.os.name
+    try:
+        _builder.os.name = "posix"
+        assert argv_length_error("codex", "codex", ["z" * (CAP - 1)]) is None, (
+            "%d bytes fits once the NUL is counted and must not be refused" % (CAP - 1))
+        assert argv_length_error("codex", "codex", ["z" * CAP]), (
+            "%d bytes plus the terminating NUL exceeds MAX_ARG_STRLEN; execve gives E2BIG "
+            "while preflight said it was fine" % CAP)
+        # environment measured in BYTES, from the env actually passed
+        big = {("K%d" % i): ("\u00e9" * 50000) for i in range(22)}
+        assert argv_length_error("codex", "codex", ["x"], big), (
+            "a large multibyte environment counts toward ARG_MAX; counting characters "
+            "under-measures it by half")
+        assert argv_length_error("codex", "codex", ["x"], {"A": "1"}) is None
+    finally:
+        _builder.os.name = real
+
+
+def test_v8_build_failures_return_an_envelope_not_an_exception():
+    """summon's contract is ONE JSON envelope on stdout, always. Build-time guards -- an
+    oversized agy prompt, a missing ConPTY wrapper -- raised ValueError straight through
+    execute_agent instead, so a caller parsing stdout got a traceback where an envelope
+    belongs, and every orchestration path that branches on `status` had an exception to
+    handle rather than a status to branch on.
+
+    Found while testing something else: the scenario I wrote to exercise a different
+    rejection path hit this guard first and blew up."""
+    import _builder
+    import _executor
+
+    r_wrapper = _builder._agy_wrapper
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        _builder._agy_wrapper = lambda: "wrapper.py"
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        inv = _builder.AgentInvocation(cli="agy", prompt="p" * 40000, cwd=os.getcwd(),
+                                       system_context="c", permission="read-only")
+        resp = _executor.execute_agent(inv, timeout_ms=30_000)   # must not raise
+    finally:
+        _builder._agy_wrapper = r_wrapper
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+    assert isinstance(resp, dict) and resp.get("status") == "error", resp
+    assert resp.get("exit_code") == 1, resp
+    assert "28000" in (resp.get("error") or ""), (
+        "the envelope must carry the guard's actual reason: %r" % resp.get("error"))
+
+
+def test_v8_a_doomed_agy_prompt_builds_no_profile():
+    """The length guard ran AFTER _ensure_agy_profile, so a prompt that could never dispatch
+    still created a profile directory and copied OAuth material into it, then raised --
+    orphaning credentials for a run that never happened. Same rule as the unenforceable-tier
+    refusal: fail before side effects, not after them."""
+    import _builder
+    import _executor
+
+    built = {"n": 0}
+    r_ensure = _builder._ensure_agy_profile
+    r_attest = _builder._attest_agy_profile
+    r_wrapper = _builder._agy_wrapper
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        def spy(cwd, deadline_sec=300.0):
+            built["n"] += 1
+            return tempfile.gettempdir()
+
+        _builder._ensure_agy_profile = spy
+        _builder._attest_agy_profile = lambda *a, **k: None
+        _builder._agy_wrapper = lambda: "wrapper.py"
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        inv = _builder.AgentInvocation(cli="agy", prompt="p" * 40000, cwd=os.getcwd(),
+                                       system_context="c", permission="read-only")
+        _executor.execute_agent(inv, timeout_ms=30_000)
+    finally:
+        _builder._ensure_agy_profile = r_ensure
+        _builder._attest_agy_profile = r_attest
+        _builder._agy_wrapper = r_wrapper
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+    assert built["n"] == 0, (
+        "a prompt that cannot dispatch still built an agy profile and copied credentials "
+        "into it before failing")
+
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
@@ -12562,5 +12786,6 @@ if __name__ == "__main__":
         except Exception as e:  # noqa: BLE001 — test harness reports, doesn't raise
             failed += 1
             print(f"[FAIL] {t.__name__}: {type(e).__name__}: {e}")
-    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    print("")
+    print(f"{len(tests) - failed}/{len(tests)} passed")
     sys.exit(1 if failed else 0)
