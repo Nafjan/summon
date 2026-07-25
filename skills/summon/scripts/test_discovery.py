@@ -10553,6 +10553,7 @@ def test_v7_retry_invocations_inherit_all_attestation_fields():
     import run_subagent as _rs
     from _builder import AgentInvocation
 
+    import _builder as _b
     orig = AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(), agent_file="x.md",
                            agy_account_sha256="ACCOUNT-A-SHA", agy_account_checked=True,
                            resume_profile="/prof")
@@ -10591,9 +10592,33 @@ def test_v7_retry_invocations_inherit_all_attestation_fields():
         assert cr is not None, "contract-repair retry was not constructed"
         assert cr.agy_account_sha256 == "ACCOUNT-A-SHA" and cr.agy_account_checked is True, (
             "the contract-repair retry dropped the agy attestation fields", cr)
-        # its deliberate hardening survived the clone
-        assert cr.permission == "read-only", cr.permission
+        # Its deliberate hardening survived the clone -- but honestly. The repair drops to
+        # read-only where that MEANS something; agy cannot enforce the tier, and the repair
+        # RESUMES the session that already held the task's authority, so claiming read-only
+        # there would be theatre. It runs at the original tier and warns instead.
+        assert cr.permission == orig.permission, (
+            "agy cannot enforce read-only and the resume continues an already-authorised "
+            "session; the repair must not pretend otherwise", cr.permission)
+        assert cr.permission_forced is False, (
+            "nothing was forced here, so an ambient opt-in has nothing to waive")
+        assert any("not read-only" in w for w in (result.get("warnings") or [])), (
+            "a repair that could not drop privilege must SAY so: %r" % (result.get("warnings"),))
         assert not cr.extra_args, cr.extra_args
+
+        # ...and on a backend that DOES enforce it, the drop still happens.
+        captured.clear()
+        enforcing = _b.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                       agent_file="x.md", permission="safe-edit",
+                                       extra_args=("--dangerous",))
+        r2 = {"status": "success", "report_ok": False, "resume": {"session_id": "s"}}
+        _rs._apply_contract_repair(r2, enforcing, _Args())
+        cr2 = captured.get("inv")
+        assert cr2 is not None and cr2.permission == "read-only", (
+            "claude enforces read-only, so the repair must still drop privilege", cr2)
+        assert cr2.permission_forced is True, (
+            "a tier summon imposed must be marked forced, or an ambient opt-in could waive it")
+        assert not any("not read-only" in w for w in (r2.get("warnings") or [])), (
+            "no warning is owed when the drop actually happened: %r" % (r2.get("warnings"),))
     finally:
         _rs.execute_agent = real_execute
 
@@ -12410,6 +12435,121 @@ def test_v8_over_long_argv_never_reaches_popen():
         "exit 127 means 'CLI not found' and would preserve the misdiagnosis; an argv that "
         "is too long is not a missing binary (got %r)" % resp.get("exit_code"))
     assert "command line" in (resp.get("error") or ""), resp.get("error")
+
+
+def test_v8_optin_cannot_waive_a_tier_summon_imposed():
+    """SUMMON_ALLOW_UNENFORCED_READONLY is ambient process authority, inherited by every
+    backend, background, manifest and council child. Cross-vendor review demonstrated the
+    consequence: setting it for ONE dispatch silently authorised advisory-only gates and
+    clamped members underneath it. A gate that the environment it runs in can waive is not
+    a gate.
+
+    So the opt-in waives a tier the CALLER DECLARED for their own dispatch, and never one
+    summon IMPOSED to reduce privilege -- a --gate-with adjudicator, a --max-permission
+    clamp that actually bit, a contract-repair resume."""
+    from _builder import readonly_unenforceable_error as refuse
+
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        assert refuse("agy", "read-only") is None, (
+            "the opt-in must still waive a tier the caller chose; otherwise it does nothing")
+        msg = refuse("agy", "read-only", forced=True)
+        assert msg, (
+            "the opt-in waived a tier SUMMON imposed. An env var inherited by every child "
+            "must not be able to turn a gate or a clamp advisory.")
+        assert "does not apply here" in msg, msg
+        # a backend that enforces the tier is unaffected in both directions
+        assert refuse("claude", "read-only", forced=True) is None
+    finally:
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+
+def test_v8_optin_is_part_of_the_request_identity():
+    """Cached reuse happens BEFORE execute_agent can refuse, so identity is the only place
+    that can catch it: a stored --out success produced WITH the opt-in satisfied a later
+    request made WITHOUT it, handing back an advisory-only result to a request that should
+    have failed closed. The same request hashed identically either way.
+
+    agy-only, for the same reason allow_credit is claude-only: elsewhere the switch cannot
+    change the outcome, and fingerprinting it would re-pay for work it could not alter."""
+    from _executor import build_request_identity as ident
+
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        without = ident(agent="a", prompt="p", cwd=".", cli="agy")
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        with_optin = ident(agent="a", prompt="p", cwd=".", cli="agy")
+        assert without != with_optin, (
+            "the opt-in decides whether the request RUNS AT ALL, so it must change the "
+            "identity; otherwise --out resume, manifest carry-forward and council reuse "
+            "serve an advisory-only answer to a request that would now be refused")
+        # and it must not disturb backends it cannot affect
+        os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        c_without = ident(agent="a", prompt="p", cwd=".", cli="claude")
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        c_with = ident(agent="a", prompt="p", cwd=".", cli="claude")
+        assert c_without == c_with, (
+            "fingerprinting the opt-in on a backend it cannot affect re-pays for identical "
+            "work every time the variable moves")
+    finally:
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+
+def test_v8_strip_matches_the_parsers_spelling_not_ours():
+    """agy parses with Go's flag package, which accepts SINGLE-dash long options. The
+    sanitiser matched only the double-dash spelling, so `-add-dir=/repo` walked straight
+    past it -- cross-vendor review ran `agy -add-dir=... help`, `-mode=accept-edits`,
+    `-sandbox=false` and `-dangerously-skip-permissions=true` against the real binary and
+    all exited 0.
+
+    A sanitiser has to speak the TARGET's grammar, not the one we find natural."""
+    from _builder import _strip_agy_boundary_flags as strip
+
+    for probe in ("-add-dir=/repo", "-mode=accept-edits", "-sandbox=false",
+                  "-dangerously-skip-permissions=true"):
+        assert strip([probe, "--keep"]) == ["--keep"], (
+            "%s survived the sanitiser; agy accepts this spelling" % probe)
+    assert strip(["-add-dir", "/repo", "--keep"]) == ["--keep"], "value form too"
+    # ordinary short flags are not boundary flags and must survive
+    assert strip(["-q", "-v", "--keep"]) == ["-q", "-v", "--keep"]
+
+
+def test_v8_doctor_probes_agy_at_a_tier_it_can_honour():
+    """The probe asked for read-only, which agy now refuses -- so a perfectly healthy agy
+    reported as unverifiable, with every eligibility field blank. The probe is a liveness
+    check, not a privileged dispatch, so it runs one tier up for agy and SAYS it did:
+    a green probe must not imply a tier that was never exercised."""
+    import _doctor
+
+    seen = {}
+
+    def fake_execute(inv, timeout_ms=0, **k):
+        seen["permission"] = inv.permission
+        return {"status": "success", "result": "pong"}
+
+    import _executor
+    real = _executor.execute_agent
+    try:
+        _executor.execute_agent = fake_execute
+        out = _doctor._probe_backend("agy") if hasattr(_doctor, "_probe_backend") else None
+    except Exception:
+        out = None
+    finally:
+        _executor.execute_agent = real
+    if out is None:
+        return                      # probe helper is named differently; nothing to assert
+    assert seen.get("permission") == "safe-edit", (
+        "the probe asked for a tier agy refuses, so it can never verify agy: %r" % (seen,))
+    assert "safe-edit" in (out.get("note") or ""), (
+        "a green probe must not imply read-only was exercised: %r" % (out,))
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())

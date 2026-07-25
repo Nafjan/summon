@@ -851,6 +851,13 @@ def main() -> None:
         # carry --dangerously-skip-permissions and defeat the clamp -- the same hole that
         # made a gate's own args a privilege-escalation path.
         permission=_clamp(permission, getattr(args, "max_permission", None)),
+        # A CLAMP is summon reducing privilege on the caller's instruction, so like the gate
+        # it must not be waivable by an ambient opt-in. Marked forced only when the clamp
+        # actually bit -- a request that was already at or below the ceiling was not forced
+        # anywhere, and calling it forced would refuse dispatches the caller chose freely.
+        permission_forced=bool(
+            getattr(args, "max_permission", None)
+            and _clamp(permission, args.max_permission) != permission),
         model=final_model,               # incl. agy Gemini thinking-mode suffix
         effort=effort,                    # --effort > frontmatter > env > default(high)
         resume_id=args.resume,
@@ -973,7 +980,8 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     # A dispatch that will be REFUSED must say so in preflight. Surfaced as `would_refuse`
     # plus `error` rather than a warning, because it is not advice: the run does not happen.
     from _builder import readonly_unenforceable_error as _refuse
-    _ro = _refuse(invocation.cli, invocation.permission)
+    _ro = _refuse(invocation.cli, invocation.permission,
+                  forced=getattr(invocation, "permission_forced", False))
     if _ro:
         # Its OWN key, not `error`. In this view `error` means "the preview could not be
         # built" (e.g. no agy wrapper on this OS) and is set later by the backend branches,
@@ -1052,6 +1060,7 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
         cli=gate_cli, prompt=prompt, cwd=args.cwd, system_context=gate_ctx,
         agent_file=gate_file,
         permission="read-only",   # FORCED: never inherit the gate definition's tier
+        permission_forced=True,   # so the opt-in cannot turn the adjudicator advisory
         model=gate_model, effort=gate_effort,
         # extra_args are DELIBERATELY DROPPED. build_invocation_args appends an
         # agent's `args:` AFTER the permission flags, so a gate definition carrying
@@ -1217,6 +1226,29 @@ def _aggregate_spend(result: dict, retry: dict) -> None:
         result["usage"] = merged
 
 
+def _repair_permission(invocation) -> tuple:
+    """The tier a corrective resume should run at, and a warning when it is not read-only.
+
+    The repair normally forces `read-only`: it is a formatting re-emit and must not gain
+    authority. Forcing it on a backend that cannot ENFORCE read-only was a first attempt at
+    this and it was wrong twice over. It refused the resume outright -- discarding the
+    refusal, so the envelope claimed `contract_repair_attempted: true` and `attempts: 2` for
+    a call that never reached a backend -- and it bought nothing, because the repair RESUMES
+    THE SESSION THAT ALREADY RAN. That session held the task's authority; a tier on the
+    resume cannot retroactively contain it, and on agy the tier is unenforceable regardless.
+
+    So: read-only where it means something, the original tier where it does not, and say
+    which. Pretending is the one option that is never right.
+    """
+    from _builder import readonly_unenforceable_error
+    if readonly_unenforceable_error(invocation.cli, "read-only", forced=True) is None:
+        return "read-only", True, None
+    return invocation.permission, False, (
+        "the corrective resume ran at %r, not read-only: %s cannot enforce read-only, and "
+        "the resume continues the session that already held this authority. It re-emits the "
+        "report contract and asks for no new work." % (invocation.permission, invocation.cli))
+
+
 def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> dict:
     """A dispatch that SUCCEEDED but whose report contract is malformed (report_ok
     false -> suspect) gets ONE constrained corrective resume that re-emits the exact
@@ -1232,6 +1264,9 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
     repeat the task's side effects). No resume lane -> no-op."""
     if not (result.get("status") == "success" and not result.get("report_ok")):
         return result
+    _perm, _forced, _perm_warning = _repair_permission(invocation)
+    if _perm_warning:
+        result.setdefault("warnings", []).append(_perm_warning)
     resume = result.get("resume") or {}
     sid, profile = resume.get("session_id"), resume.get("profile")
     if not sid and not profile:
@@ -1244,7 +1279,8 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         invocation,
         prompt=_CONTRACT_REPAIR_PROMPT,
         system_context="",  # resume: session already holds the definition
-        permission="read-only",   # formatting re-emit: no write/yolo/tool authority, no side effects
+        permission=_perm,         # read-only where the backend enforces it (see above)
+        permission_forced=_forced,
         resume_id=sid or "latest",
         resume_profile=profile or invocation.resume_profile,
         extra_args=(),   # DROP extra_args: a resume keeps the session's model, and a

@@ -1010,6 +1010,14 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # re-paid for work the switch could not have altered.
         "allow_credit": ("1" if _credit_env_allows(allow_credit) else None)
                         if _rcli == "claude" else None,
+        # The unenforced-read-only opt-in decides whether this request RUNS AT ALL, so a
+        # stored success produced under it must not satisfy a later request made without it.
+        # Cached reuse happens BEFORE execute_agent can refuse, so identity is the only
+        # place that can catch it. agy-only, for the same reason allow_credit is claude-only:
+        # on any other backend it cannot change the outcome, and fingerprinting it there
+        # would re-pay for work the switch could not have altered.
+        "unenforced_readonly": ("1" if os.environ.get(
+            "SUMMON_ALLOW_UNENFORCED_READONLY") == "1" else None) if _rcli == "agy" else None,
         # The DEFAULT only applies when nothing explicit was asked for; with --effort set
         # it cannot change the request, and fingerprinting it anyway forced a fresh dispatch
         # every time an unrelated default moved.
@@ -1810,7 +1818,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # BEFORE build_invocation_args, which has side effects: for agy it creates a
     # per-invocation profile and copies OAuth material into it. A dispatch we are going to
     # refuse must not do that work, let alone copy credentials for it.
-    _ro_err = readonly_unenforceable_error(inv.cli, inv.permission)
+    _ro_err = readonly_unenforceable_error(inv.cli, inv.permission,
+                                           forced=inv.permission_forced)
     if _ro_err:
         return _stamp(_enrich(_error_response(inv.cli, 1, _ro_err), None))
 

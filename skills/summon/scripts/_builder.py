@@ -49,6 +49,12 @@ class AgentInvocation:
     # True when the request identity inspected the agy account (so a None digest above means
     # "absent when fingerprinted", a state to attest, not "legacy caller, nothing to check").
     agy_account_checked: bool = False
+    # True when SUMMON imposed `permission` rather than the caller declaring it: a
+    # --gate-with adjudicator, a --max-permission clamp, a contract-repair resume. Such a
+    # tier is a privilege REDUCTION and cannot be waived by the unenforced-read-only opt-in,
+    # which exists to waive a tier you chose for yourself. Carried on the invocation because
+    # the executor is where the refusal happens and the distinction is invisible by then.
+    permission_forced: bool = False
 
 
 # Short report-contract nudge appended to RESUME prompts. On resume the session
@@ -208,8 +214,22 @@ def _strip_agy_boundary_flags(extra_args) -> list:
             skip = False
             continue
         base = a.split("=", 1)[0]
+        # agy parses with Go's flag package, which accepts SINGLE-dash long options: cross
+        # vendor review ran `agy -add-dir=... help`, `-mode=accept-edits`, `-sandbox=false`
+        # and `-dangerously-skip-permissions=true` and all exited 0, while this function
+        # returned them unchanged. Matching only the double-dash spelling was a sanitiser
+        # that the target's own parser walked straight past.
+        if base.startswith("-") and not base.startswith("--"):
+            base = "-" + base
         if base in _AGY_BOUNDARY_FLAGS:
             # --add-dir/--mode take a separate value; the boolean flags do not.
+            #
+            # KNOWN LIMITATION, deliberately resolved toward safety: a token is judged by
+            # its spelling, not its position, so `--log-file --add-dir out.txt` (where
+            # --add-dir is the log FILENAME) loses both tokens. Dropping a legitimate value
+            # is recoverable and loud; leaving an agent able to hand itself the workspace is
+            # neither. Positional parsing would need agy's own grammar, which changes under
+            # us -- that is what made spelling-matching unreliable in the first place.
             skip = ("=" not in a) and base in ("--add-dir", "--mode")
             continue
         out.append(a)
@@ -219,7 +239,8 @@ def _strip_agy_boundary_flags(extra_args) -> list:
 _UNENFORCED_RO_OPT_IN = "SUMMON_ALLOW_UNENFORCED_READONLY"
 
 
-def readonly_unenforceable_error(cli: str, permission: str) -> str | None:
+def readonly_unenforceable_error(cli: str, permission: str, *,
+                                 forced: bool = False) -> str | None:
     """Refuse a dispatch whose declared permission tier the backend cannot enforce.
 
     summon FAILS CLOSED here for the same reason --gate-with does: a permission tier is a
@@ -238,6 +259,22 @@ def readonly_unenforceable_error(cli: str, permission: str) -> str | None:
     """
     if cli != "agy" or permission != "read-only":
         return None
+    if forced:
+        # A tier SUMMON imposed -- a --gate-with adjudicator, a --max-permission clamp, a
+        # contract-repair resume -- is a privilege REDUCTION, and an ambient environment
+        # variable must not lift it. The opt-in waives a tier the CALLER declared for their
+        # own dispatch; it is not a global "read-only is optional" switch.
+        #
+        # This is the concrete hazard cross-vendor review demonstrated: the variable is
+        # inherited by every backend, background, manifest and council child, so setting it
+        # for one dispatch silently authorized advisory-only gates and clamped members
+        # underneath it. A gate that can be waived by the environment it runs in is not a
+        # gate.
+        return ("agy cannot enforce read-only, and this dispatch was FORCED to read-only by "
+                "summon (a gate, a --max-permission clamp, or a contract-repair resume). "
+                + _UNENFORCED_RO_OPT_IN + " does not apply here: it waives a tier you chose, "
+                "not one summon imposed to reduce privilege. Use a backend that enforces "
+                "read-only for this role.")
     if os.environ.get(_UNENFORCED_RO_OPT_IN) == "1":
         return None
     return ("agy cannot enforce the read-only tier, so summon refuses this dispatch rather "

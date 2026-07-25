@@ -154,13 +154,27 @@ def _default_probe_runner(name: str, path: str) -> dict | None:
     except Exception:  # noqa: BLE001 - probing is best-effort
         return None
     try:
+        # The probe is a liveness check, not a privileged dispatch, so it asks for the
+        # least authority: read-only. For agy that tier is refused (agy cannot enforce it),
+        # which would report a perfectly healthy agy as unverifiable. Probe it at the
+        # lowest tier it can actually honour instead, and let the caller see that the
+        # probe says nothing about read-only for this backend.
+        _perm = "safe-edit" if name == "agy" else "read-only"
         inv = AgentInvocation(cli=name, prompt="ping", cwd=os.getcwd(),
-                              system_context="", permission="read-only")
+                              system_context="", permission=_perm)
         resp = execute_agent(inv, timeout_ms=_PROBE_TIMEOUT * 1000)
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "text": f"{type(e).__name__}: {e}"}
     text = " ".join(str(resp.get(k) or "") for k in ("error", "output_tail", "result"))
-    return {"status": resp.get("status"), "text": text}
+    out = {"status": resp.get("status"), "text": text}
+    if name == "agy":
+        # Do not let a green probe imply a tier that was never exercised: agy has no
+        # enforceable read-only, and the probe deliberately ran one tier up.
+        out["probed_permission"] = "safe-edit"
+        out["note"] = ("probed at safe-edit: agy cannot enforce read-only, so a read-only "
+                       "dispatch is refused (SUMMON_ALLOW_UNENFORCED_READONLY=1 overrides "
+                       "for a tier you declare yourself)")
+    return out
 
 
 def _probe_one(name: str, b: dict, runner) -> None:
