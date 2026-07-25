@@ -975,8 +975,12 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     from _builder import readonly_unenforceable_error as _refuse
     _ro = _refuse(invocation.cli, invocation.permission)
     if _ro:
+        # Its OWN key, not `error`. In this view `error` means "the preview could not be
+        # built" (e.g. no agy wrapper on this OS) and is set later by the backend branches,
+        # which clobbered the refusal on Linux. They are different facts and both are worth
+        # reporting: the dispatch would be refused, AND the preview is partial.
         view["would_refuse"] = True
-        view["error"] = _ro
+        view["refusal"] = _ro
     # Same helper as the real envelope, so preflight shows exactly what the run would
     # warn about -- a short agy clock and a withheld read-only workspace are both things
     # you want to learn BEFORE paying, which is the whole point of --dry-run.
