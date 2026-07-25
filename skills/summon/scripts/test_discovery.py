@@ -10783,6 +10783,113 @@ def test_v8_gate_denial_prevents_the_real_dispatch_entirely():
         "the gated dispatch RAN despite refusal (permissions executed: %r)" % calls)
     assert "I DID THE WORK" not in _json.dumps(env)
 
+
+def test_v8_every_popen_uses_the_shared_platform_flags():
+    """STRUCTURAL: every subprocess.Popen in the skill must take its platform flags
+    from _spawn.popen_flags, and it is parsed out of the SOURCE so a spawn site added
+    later is covered without anyone remembering to extend this test.
+
+    The Windows console-window bug was not one missing flag, it was flags COPIED per
+    call site and then drifting. Patching _executor alone left the window, because a
+    manifest/council run spawns python.exe first and node.exe inherits the console it
+    allocated. Asserting behaviour at one site cannot catch that; asserting that no
+    site rolls its own can."""
+    import ast
+
+    scripts = os.path.dirname(os.path.abspath(__file__))
+    offenders, checked = [], 0
+    for fn in sorted(os.listdir(scripts)):
+        if not fn.endswith(".py") or fn.startswith("test_"):
+            continue
+        src = open(os.path.join(scripts, fn), encoding="utf-8").read()
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            if not (isinstance(f, ast.Attribute) and f.attr == "Popen"):
+                continue
+            checked += 1
+            # a **popen_flags(...) kwarg must be present
+            ok = any(
+                kw.arg is None and isinstance(kw.value, ast.Call)
+                and isinstance(kw.value.func, ast.Name)
+                and kw.value.func.id == "popen_flags"
+                for kw in node.keywords)
+            if not ok:
+                offenders.append("%s:%d" % (fn, node.lineno))
+    assert checked >= 3, ("expected at least 3 Popen sites (executor, manifest, "
+                          "background); found %d -- did the scan break?" % checked)
+    assert not offenders, (
+        "these subprocess.Popen call sites do not use **popen_flags(): %s -- every "
+        "spawn must share ONE platform-flag definition, or Windows console flags "
+        "drift per site again" % ", ".join(offenders))
+
+
+def test_v8_popen_flags_suppress_the_windows_console():
+    """The actual contract, per platform. On Windows a console app spawned without
+    CREATE_NO_WINDOW allocates a console, which is the empty node.exe window users
+    saw. On POSIX there is no console to suppress and start_new_session is what
+    _kill_tree needs, so the two platforms assert different things."""
+    import subprocess as _sp
+
+    import _spawn
+
+    real_name = os.name
+    try:
+        os.name = "nt"
+        # importlib.reload is not needed: popen_flags reads os.name at CALL time
+        worker = _spawn.popen_flags()
+        detached = _spawn.popen_flags(detached=True)
+        assert "creationflags" in worker, worker
+        assert worker["creationflags"] & _sp.CREATE_NO_WINDOW, (
+            "a waited-on worker must carry CREATE_NO_WINDOW or Windows allocates a "
+            "console window for every console-app backend")
+        assert "start_new_session" not in worker, worker
+        # the detached launcher needs its own GROUP; DETACHED_PROCESS already means
+        # "no console", and Windows documents CREATE_NO_WINDOW as ignored with it
+        assert detached["creationflags"] & _sp.DETACHED_PROCESS, detached
+        assert detached["creationflags"] & _sp.CREATE_NEW_PROCESS_GROUP, detached
+
+        os.name = "posix"
+        for kw in (_spawn.popen_flags(), _spawn.popen_flags(detached=True)):
+            assert kw == {"start_new_session": True}, kw
+            assert "creationflags" not in kw, (
+                "creationflags is Windows-only; passing it on POSIX raises")
+    finally:
+        os.name = real_name
+
+
+def test_v8_popen_flags_never_evaluates_windows_constants_on_posix():
+    """subprocess.CREATE_NO_WINDOW does not EXIST on POSIX builds, so the helper must
+    not touch it there. A refactor to a dict literal (both branches evaluated) would
+    raise AttributeError on Linux/macOS for every dispatch -- caught here rather than
+    by a POSIX user."""
+    import _spawn
+
+    real_name = os.name
+    sentinel = {}
+    try:
+        os.name = "posix"
+        import subprocess as _sp
+        saved = {}
+        for attr in ("CREATE_NO_WINDOW", "DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
+            if hasattr(_sp, attr):
+                saved[attr] = getattr(_sp, attr)
+                delattr(_sp, attr)      # simulate a real POSIX build
+        try:
+            sentinel = _spawn.popen_flags()
+            assert sentinel == {"start_new_session": True}, sentinel
+            assert _spawn.popen_flags(detached=True) == {"start_new_session": True}
+        finally:
+            for attr, val in saved.items():
+                setattr(_sp, attr, val)
+    finally:
+        os.name = real_name
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

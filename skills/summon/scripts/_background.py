@@ -90,12 +90,8 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict) ->
     if prompt_sha:
         child_env["SUMMON_JOB_PROMPT_SHA"] = prompt_sha   # lets the crash path verify
     kwargs["env"] = child_env
-    if os.name == "nt":
-        kwargs["creationflags"] = (
-            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
-    else:
-        kwargs["start_new_session"] = True
-    proc = subprocess.Popen(cmd, **kwargs)
+    from _spawn import popen_flags
+    proc = subprocess.Popen(cmd, **kwargs, **popen_flags(detached=True))
     # Handle built from ONLY pre-Popen values (no path recompute, no fs call), so
     # it cannot throw here and strand the live child.
     handle = {"status": "background", "job_id": job_id, "pid": proc.pid,
