@@ -6,6 +6,37 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.11.1] - 2026-07-25
+
+### Fixed
+- **Windows: empty `node.exe` console windows no longer pop up (bug report).** On Windows a
+  console application spawned without `CREATE_NO_WINDOW` ALLOCATES A CONSOLE, so every
+  Codex-backed dispatch left a persistent terminal tab titled after the Node executable.
+  - **Fixing the executor alone was not enough, which is the heart of the bug.** The spawn
+    paths NEST: a manifest or council run spawns `python.exe` (the child dispatcher), which
+    spawns `node.exe` (the vendor CLI). If the OUTER python spawn lacks the flag it
+    allocates the console and the inner Node process inherits it, so the window appeared
+    even with `_executor.py` patched. Every link in the chain must carry the flag.
+  - Platform spawn flags are now defined ONCE, in `_spawn.popen_flags()`, and used by every
+    site: the executor's backend dispatch, `_manifest._dispatch_child` (which the council
+    reuses), and the `--background` launcher. The root cause was flags COPIED per call site
+    and then drifting, so the fix is centralization, not another copy.
+  - `popen_flags(detached=True)` keeps `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` for the
+    background launcher. `CREATE_NO_WINDOW` is deliberately NOT stacked on there: Windows
+    documents it as ignored when combined with `DETACHED_PROCESS`.
+  - POSIX is unchanged (`start_new_session=True`), and the helper never evaluates a
+    Windows-only constant on POSIX, where `subprocess.CREATE_NO_WINDOW` does not exist.
+  - A STRUCTURAL test parses the source and asserts every `subprocess.Popen` call takes
+    `**popen_flags()`, so a spawn site added later is covered without anyone remembering to
+    extend the test. Six mutants injected (including the exact reported bug: manifest
+    rolling its own flags while the executor stays patched); all six killed.
+
+**Operational note.** An already-running manifest or council keeps the code it imported at
+start. Existing runs must finish, or be restarted, before the fix takes effect for them.
+Installed host copies are separate from this source tree: run `install.py` to refresh them,
+and `doctor` reports any copy still carrying the old flags as drift (the receipt hashes the
+whole scripts dir, so a subprocess-flag-only difference is enough to flag it).
+
 ## [0.11.0] - 2026-07-25
 
 ### Added

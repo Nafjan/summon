@@ -326,11 +326,11 @@ def _dispatch_child(cmd: list, timeout_sec: float, on_spawn=None, on_reap=None):
     UNREGISTER the child adjacent to its reap, shrinking the window in which an
     external snapshot-kill could still target the (now reaping) pid."""
     from _executor import _kill_tree, _safe_communicate
-    popen_extra = {"start_new_session": True} if os.name != "nt" else {}
+    from _spawn import popen_flags
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 stdin=subprocess.DEVNULL, text=True,
-                                encoding="utf-8", errors="replace", **popen_extra)
+                                encoding="utf-8", errors="replace", **popen_flags())
     except OSError as e:
         return None, f"{type(e).__name__}: {e}"
     if on_spawn is not None:

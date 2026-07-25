@@ -1811,7 +1811,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # POSIX: put the child in its own session so _kill_tree can signal the whole
     # group (a shim's grandchild otherwise survives process.kill() and keeps
     # stdout open, defeating the timeout). Windows walks the tree via taskkill /T.
-    popen_extra = {"start_new_session": True} if os.name != "nt" else {}
+    from _spawn import popen_flags
     try:
         # stdin=DEVNULL: sub-agent CLIs (notably codex) probe stdin for "additional
         # input" and block reading from a TTY inherited from the parent. We never
@@ -1827,7 +1827,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             errors="replace",
             bufsize=1,
             env=proc_env,
-            **popen_extra,
+            **popen_flags(),
         )
     except FileNotFoundError:
         return _stamp(_enrich(_error_response(inv.cli, 127, f"CLI not found: {command}"), None))
