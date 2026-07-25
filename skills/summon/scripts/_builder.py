@@ -213,6 +213,12 @@ def _strip_agy_boundary_flags(extra_args) -> list:
         if skip:
             skip = False
             continue
+        if a == "--":
+            # agy's parser stops at `--`, so summon's own `--print` (appended after
+            # extra_args) is then treated as literal text: agy 1.1.7 fell into interactive
+            # behaviour and hung until the timeout. Not a permission bypass, but an agent
+            # definition should not be able to hang every dispatch that uses it.
+            continue
         base = a.split("=", 1)[0]
         # agy parses with Go's flag package, which accepts SINGLE-dash long options: cross
         # vendor review ran `agy -add-dir=... help`, `-mode=accept-edits`, `-sandbox=false`

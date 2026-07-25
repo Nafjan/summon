@@ -202,6 +202,15 @@ def _probe_one(name: str, b: dict, runner) -> None:
     if result is None:
         b["probe_note"] = "no eligibility probe defined for this backend"
         return
+    # Carry the probe's own metadata into the published entry. _default_probe_runner
+    # reports which tier it exercised (agy cannot be probed at read-only, so it runs one
+    # tier up in a throwaway directory) and _probe_one discarded it -- so the output said
+    # "eligibility verified" with no hint that read-only was never tested for that backend.
+    # A disclosure that never reaches the reader is not a disclosure.
+    if result.get("probed_permission"):
+        b["probed_permission"] = result["probed_permission"]
+    if result.get("note"):
+        b["probe_note"] = result["note"]
     status, text = result.get("status"), result.get("text") or ""
     # SUCCESS is authoritative and checked FIRST: a genuine success proves auth +
     # account eligibility + a model responded, so a model that merely ECHOED a

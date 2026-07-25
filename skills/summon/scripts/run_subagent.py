@@ -1287,6 +1287,21 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
                          # stray permission-override flag (--dangerously-bypass...,
                          # --permission-mode bypassPermissions) would defeat read-only.
     )
+    # A gate authorises ONE execution. Retries re-gate; schema correction re-gates; this
+    # path did not -- and round 3 made that expensive by giving the repair the task's own
+    # tier on backends that cannot enforce read-only. On agy that is
+    # --dangerously-skip-permissions, so a gated agy task with a malformed report bought a
+    # second FULL-AUTHORITY run nobody approved. The repair prompt is instruction, not
+    # containment.
+    _repair_refused = _regate_or_none(args, agents_dir, retry_inv)
+    if _repair_refused is not None:
+        # Its own field, not result["gate"]: that holds the approval for the run that
+        # already completed, and overwriting it would misreport approved work as denied.
+        result["gate_repair_refused"] = _repair_refused
+        result.setdefault("warnings", []).append(
+            "the report contract is malformed and the corrective resume was DENIED by the "
+            "gate, so it was not run; the original result stands as returned")
+        return result
     try:
         retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir,
                               max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))

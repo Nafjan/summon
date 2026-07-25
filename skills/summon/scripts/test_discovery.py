@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+from pathlib import Path
 import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -12478,17 +12479,26 @@ def test_v8_optin_is_part_of_the_request_identity():
     change the outcome, and fingerprinting it would re-pay for work it could not alter."""
     from _executor import build_request_identity as ident
 
+    # A REAL read-only agy definition: the narrowing keys on the EFFECTIVE permission, so
+    # an agent with no definition (default safe-edit) is correctly excluded and would make
+    # this test assert the opposite of the intent.
+    d = tempfile.mkdtemp(prefix="summon-ident-")
+    (Path(d) / "ro.md").write_text(
+        chr(10).join(["---", "name: ro", "description: d",
+                      "run-agent: agy", "permission: read-only",
+                      "---", "", "body", ""]),
+        encoding="utf-8")
     had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
     try:
         os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
-        without = ident(agent="a", prompt="p", cwd=".", cli="agy")
+        without = ident(agent="ro", prompt="p", cwd=".", cli="agy", agents_dir=d)
         os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
-        with_optin = ident(agent="a", prompt="p", cwd=".", cli="agy")
+        with_optin = ident(agent="ro", prompt="p", cwd=".", cli="agy", agents_dir=d)
         assert without != with_optin, (
             "the opt-in decides whether the request RUNS AT ALL, so it must change the "
             "identity; otherwise --out resume, manifest carry-forward and council reuse "
             "serve an advisory-only answer to a request that would now be refused")
-        # and it must not disturb backends it cannot affect
+        # and it must not disturb requests it cannot affect: another backend...
         os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
         c_without = ident(agent="a", prompt="p", cwd=".", cli="claude")
         os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
@@ -12496,11 +12506,28 @@ def test_v8_optin_is_part_of_the_request_identity():
         assert c_without == c_with, (
             "fingerprinting the opt-in on a backend it cannot affect re-pays for identical "
             "work every time the variable moves")
+        # ...nor an agy request at a tier the opt-in has no bearing on. safe-edit runs
+        # either way, so churning its fingerprint re-pays for identical work and risks
+        # REPEATING side effects.
+        (Path(d) / "se.md").write_text(
+            chr(10).join(["---", "name: se", "description: d",
+                          "run-agent: agy", "permission: safe-edit",
+                          "---", "", "b", ""]),
+            encoding="utf-8")
+        os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        se_without = ident(agent="se", prompt="p", cwd=".", cli="agy", agents_dir=d)
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        se_with = ident(agent="se", prompt="p", cwd=".", cli="agy", agents_dir=d)
+        assert se_without == se_with, (
+            "an agy safe-edit request runs with or without the opt-in, so its identity must "
+            "not move when the variable does")
     finally:
         if had is None:
             os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
         else:
             os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
 
 
 def test_v8_strip_matches_the_parsers_spelling_not_ours():
@@ -12785,6 +12812,119 @@ def test_v8_a_doomed_agy_prompt_builds_no_profile():
         "a prompt that cannot dispatch still built an agy profile and copied credentials "
         "into it before failing")
 
+
+def test_v8_contract_repair_is_re_gated():
+    """A gate authorises ONE execution. Retries re-gate; schema correction re-gates; the
+    contract repair did not -- and round 3 made that expensive by giving the repair the
+    task's own tier on backends that cannot enforce read-only. On agy that tier is
+    --dangerously-skip-permissions, so a GATED agy task with a malformed report bought a
+    second full-authority run nobody approved. The repair prompt is instruction, not
+    containment."""
+    import run_subagent as rs
+
+    calls = {"gate": 0, "exec": 0}
+
+    def fake_gate(args, agents_dir, invocation):
+        calls["gate"] += 1
+        return {"approved": False, "verdict": "DENY", "reason": "not twice"}
+
+    def fake_exec(inv, **k):
+        calls["exec"] += 1
+        return {"status": "success", "result": "x", "report_ok": True}
+
+    real_gate, real_exec = rs._run_gate, rs.execute_agent
+    try:
+        rs._run_gate, rs.execute_agent = fake_gate, fake_exec
+        args = types.SimpleNamespace(gate_with="reviewer", timeout=1000, debug_dir=None,
+                                     no_contract_repair=False)
+        inv = _b_invocation()
+        result = {"status": "success", "report_ok": False,
+                  "resume": {"session_id": "s", "profile": "/p"}}
+        out = rs._apply_contract_repair(result, inv, args, agents_dir=None)
+    finally:
+        rs._run_gate, rs.execute_agent = real_gate, real_exec
+
+    assert calls["gate"] == 1, (
+        "the corrective resume was not re-gated; a gate authorises one execution and this "
+        "is a second one (gate calls: %d)" % calls["gate"])
+    assert calls["exec"] == 0, (
+        "the gate DENIED the repair and it ran anyway -- %d execution(s)" % calls["exec"])
+    assert out.get("gate_repair_refused"), out
+    assert out.get("gate") is None or out.get("gate") == result.get("gate"), (
+        "the refusal of the CORRECTION must not overwrite the approval that authorised the "
+        "run which already completed")
+
+
+def _b_invocation():
+    """An agy invocation whose repair keeps write authority (agy cannot enforce read-only)."""
+    import _builder
+    return _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                    system_context="c", permission="safe-edit")
+
+
+def test_v8_council_stage_identity_includes_the_optin():
+    """Council builds its OWN stage identity -- the third place in this codebase to build
+    one, after the dispatcher and the manifest, which is exactly the drift
+    build_request_identity was created to end. It omitted the opt-in, so a resume carried
+    forward agy stage results produced WITH it after it was removed: every success reused,
+    zero dispatches, for a request that would now fail closed."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_council.py"),
+               encoding="utf-8").read()
+    assert "SUMMON_ALLOW_UNENFORCED_READONLY" in src, (
+        "council stage hashes omit the opt-in, so carry-forward can serve an advisory-only "
+        "answer to a resume that would be refused")
+    # it must be folded into the shared per-run context, not one call site of three
+    i = src.index("SUMMON_ALLOW_UNENFORCED_READONLY")
+    assert "_exec_ctx" in src[max(0, i - 400):i], (
+        "fold the control into the shared stage context; adding it to one of the three "
+        "hash sites is how the next omission happens")
+
+
+def test_v8_agy_double_dash_cannot_hang_the_dispatch():
+    """agy's parser stops at `--`, so summon's own `--print` (appended after extra_args) is
+    then read as literal text: agy 1.1.7 fell into interactive behaviour and hung until the
+    timeout. Not a permission bypass, but an agent definition should not be able to hang
+    every dispatch that uses it."""
+    from _builder import _strip_agy_boundary_flags as strip
+
+    assert strip(["--"]) == [], "a bare -- terminator must not reach agy"
+    assert strip(["--foo", "--", "--bar"]) == ["--foo", "--bar"], (
+        "only the terminator is dropped; the surrounding args are the author's business")
+    assert strip(["--foo=--"]) == ["--foo=--"], (
+        "a VALUE that happens to be -- is not a terminator")
+
+
+def test_v8_probe_disclosure_reaches_the_published_entry():
+    """The runner reports which tier it exercised; `_probe_one` fills the entry doctor
+    actually publishes. Those are different layers, and the disclosure was generated and
+    then DROPPED between them -- output said "eligibility verified" with no hint that
+    read-only was never tested for agy.
+
+    An earlier version of this test asserted on the runner's return value, so deleting the
+    plumbing left it green. A disclosure that never reaches the reader is not a disclosure,
+    and a test that never reaches the reader's layer is not a test of it."""
+    import _doctor
+    import _executor
+
+    real = _executor.execute_agent
+    try:
+        _executor.execute_agent = lambda inv, timeout_ms=0, **k: {
+            "status": "success", "result": "pong"}
+        entry = {}
+        _doctor._probe_one("agy", entry, _doctor._default_probe_runner)
+        other = {}
+        _doctor._probe_one("claude", other, _doctor._default_probe_runner)
+    finally:
+        _executor.execute_agent = real
+
+    assert entry.get("probed_permission") == "safe-edit", (
+        "the PUBLISHED entry does not say which tier was exercised, so a green agy probe "
+        "reads as ordinary eligibility: %r" % (entry,))
+    assert "read-only" in (entry.get("probe_note") or ""), (
+        "the entry must say the probe proves nothing about read-only for agy: %r" % (entry,))
+    assert entry.get("auth_ok") is True, ("a successful probe still certifies auth", entry)
+    assert other.get("probed_permission") is None, (
+        "backends probed at the least authority need no disclosure: %r" % (other,))
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
