@@ -310,6 +310,16 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                                       "holds a valid envelope, skip the run (swarm resume)")
     parser.add_argument("--retries", type=int, default=0,
                         help="Re-dispatch up to N times on error/partial, exponential backoff")
+    parser.add_argument("--max-permission", dest="max_permission",
+                        choices=["read-only", "safe-edit"],
+                        help="CLAMP the dispatch to at most this permission tier. It can "
+                             "only REDUCE authority, never raise it: an agent declaring "
+                             "read-only stays read-only even under --max-permission "
+                             "safe-edit. Also drops the agent's `args:` passthrough, which "
+                             "could otherwise carry a permission-override flag that "
+                             "defeats the clamp. Deliberately NOT a general --permission "
+                             "override: one of those would let any caller escalate any "
+                             "agent, which is worse than the problem it solves")
     parser.add_argument("--gate-with", dest="gate_with", metavar="AGENT",
                         help="Require AGENT to approve this dispatch before it runs. The gate "
                              "is forced read-only and adjudicates the request (agent, prompt, "

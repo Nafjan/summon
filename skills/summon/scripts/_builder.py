@@ -121,6 +121,27 @@ _PERMISSION_MAPPING = {
 }
 
 
+# Authority ORDER, lowest first. Used only to clamp downward; nothing raises a tier.
+_PERMISSION_ORDER = ("read-only", "safe-edit", "yolo")
+
+
+def clamp_permission(declared: str, ceiling: str | None) -> str:
+    """The lesser of the agent's declared permission and a caller-supplied ceiling.
+
+    One-directional BY CONSTRUCTION: the result is never higher than `declared`, so a
+    caller cannot use this to escalate an agent. That is the whole reason summon has no
+    general ``--permission`` override -- an override would let any caller hand any agent
+    full bypass, which is a larger hole than the one it would close.
+    """
+    if not ceiling:
+        return declared
+    try:
+        return (declared if _PERMISSION_ORDER.index(declared)
+                <= _PERMISSION_ORDER.index(ceiling) else ceiling)
+    except ValueError:          # unknown tier: fail SAFE, keep the declared value
+        return declared
+
+
 def permission_flags(cli: str, permission: str) -> list:
     """Map permission level to CLI-specific flags. Fails fast on unknown values."""
     try:
