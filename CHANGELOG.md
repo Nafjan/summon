@@ -8,6 +8,43 @@ never on added fields.
 
 ## [0.15.0] - 2026-07-26
 
+### Security (round 3)
+- **The opt-in could waive a tier summon IMPOSED.** `SUMMON_ALLOW_UNENFORCED_READONLY` is
+  ambient process authority, inherited by every backend, background, manifest and council
+  child -- so setting it for one dispatch silently authorised advisory-only `--gate-with`
+  adjudicators and `--max-permission` clamps underneath it. A gate the environment it runs
+  in can waive is not a gate. The opt-in now waives only a tier the CALLER DECLARED;
+  invocations carry `permission_forced` for tiers summon imposed, and those always refuse.
+  A clamp is marked forced only when it actually reduced the tier.
+- **The opt-in was absent from the request identity**, and cached reuse happens BEFORE
+  `execute_agent` can refuse -- so a stored `--out` success produced WITH the opt-in
+  satisfied a later request made without it. It is now part of the identity, agy-only, for
+  the same reason `allow_credit` is claude-only.
+- **The `extra_args` sanitiser spoke the wrong grammar.** agy parses with Go's flag package,
+  which accepts single-dash long options; the strip matched only `--` spellings, so
+  `-add-dir=/repo` walked past it (verified against the real binary). A sanitiser has to
+  speak the TARGET's grammar. The value-position ambiguity is resolved toward safety and
+  documented.
+
+### Fixed (round 3)
+- **Contract auto-repair broke for agy, then pretended not to.** The repair forces
+  read-only; agy refuses that tier, and the refusal was discarded -- leaving
+  `contract_repair_attempted: true` and `attempts: 2` for a call that never reached a
+  backend. Forcing it bought nothing anyway: the repair RESUMES the session that already
+  held the task's authority. It now runs read-only where that means something, at the
+  original tier where it does not, and says which.
+- **`doctor --probe` could no longer verify agy at all**, because it always probed at
+  read-only. It probes agy at `safe-edit` and reports which tier it exercised, so a green
+  probe cannot imply a tier that was never tested.
+
+### Testing (round 3)
+- A cross-vendor audit of this branch's OWN TESTS found four mutants that survived them,
+  all now killed: the archive test passed against the exact implementation it replaced; the
+  warning-parity test never built an envelope; the boundary test never built an argv; both
+  argv tests used pure ASCII. Three refusal tests were also non-hermetic on the opt-in --
+  one would have made a real paid agy dispatch while asserting that it refuses to.
+- 362/362 discovery, 22/22 install.
+
 ### Breaking
 - **`agy` at `read-only` is now REFUSED.** It previously dispatched. agy does not enforce
   that tier, and a permission tier the backend will not honour is worse than no tier because
