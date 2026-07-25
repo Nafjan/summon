@@ -6,6 +6,36 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.14.1] - 2026-07-25
+
+### Fixed
+- **The gate recorded no definition hash.** `gate.agent_def_sha256` was structurally always
+  null: `agent_def` is attached by `main()` via `_receipt`, and `_run_gate` calls
+  `execute_agent` DIRECTLY. The field that SKILL.md and the orchestration guide both
+  describe as gate evidence -- which definition adjudicated this dispatch -- could never be
+  populated. `_run_gate` now attaches it.
+  Found by the first LIVE `--gate-with` run. Unit tests could not have caught it: they stub
+  `execute_agent`, and the bug was in the shape of the real response.
+- **A verdict with no REASON line produced `reason: None`.** Observed live on a correct
+  DENY, leaving the caller nothing to act on. Every verdict now carries at least its own
+  meaning; an explicit REASON still wins.
+
+### Added
+- **`docs/VERSIONING_AND_1.0_CRITERIA.md`** -- summon's public contract (CLI, envelope,
+  agent definitions, report contract, exit codes), what 1.0.0 would commit to, and seven
+  checkable criteria.
+  Scored honestly at 0.14.0: **5 met, 1 partial, 1 not met, so 1.0.0 is not warranted.**
+  The blocker is C4, "defect discovery has flattened": 17 releases and 12+ independent
+  review rounds today produced exactly one clean result, and the most recent live test
+  found the null-evidence bug above. C1-C3, C6 and C7 describe the codebase; C4 describes
+  our KNOWLEDGE of it, and only time and independent eyes can satisfy it.
+
+### Verified live
+- `--gate-with` end to end for the first time: a DENY of a disproportionate request
+  (`quick-reviewer` declares `safe-edit`; the task was to summarise a file) and an APPROVE
+  with substantive reasoning that then executed the work -- adjudicated cross-vendor, a Sol
+  gate over a Claude agent.
+
 ## [0.14.0] - 2026-07-25
 
 ### Fixed

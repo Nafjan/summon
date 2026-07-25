@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.14.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.14.1"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -1057,6 +1057,17 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
     except Exception as e:  # noqa: BLE001 — a crashed gate REFUSES
         return decide(None, args.gate_with) | {
             "reason": f"gate dispatch failed: {type(e).__name__}: {e}"}
+    # Attach the gate's OWN definition hash. `agent_def` is normally added by main() via
+    # _receipt, and _run_gate calls execute_agent directly -- so without this the field the
+    # docs advertise as gate evidence ("which definition adjudicated this") was structurally
+    # always None. A live gate run is what exposed it: the verdict was right and the
+    # provenance was empty.
+    try:
+        from _loader import last_parsed_sha
+        resp.setdefault("agent_def", {"file": gate_file,
+                                      "sha256": last_parsed_sha(gate_file)})
+    except Exception:  # noqa: BLE001 — evidence is best-effort; never fail the gate on it
+        pass
     return decide(resp, args.gate_with)
 
 

@@ -15,6 +15,7 @@ dispatch, structured report parsing, and cost/usage telemetry — see Parameters
 - **[run_subagent.py](scripts/run_subagent.py)** - Main execution script
 - **[codex.md](references/codex.md)** - Codex-specific setup (permissions, timeout)
 - **[orchestration.md](references/orchestration.md)** - rules of engagement for multi-agent work: what the envelope proves, cross-vendor routing, permission traps, council quality bar, resume-instead-of-re-pay (project- and IDE-agnostic)
+- **[VERSIONING_AND_1.0_CRITERIA.md](../../docs/VERSIONING_AND_1.0_CRITERIA.md)** - the public contract, what 1.0.0 would freeze, and the criteria that decide it (summon is deliberately still 0.x)
 - **[references/](references/)** - deep-dive docs: models, backends, customizing agents, fan-out & council (read on demand)
 
 **Script Path**: Use absolute path `{SKILL_DIR}/scripts/run_subagent.py` where `{SKILL_DIR}` is the directory containing this SKILL.md file.
