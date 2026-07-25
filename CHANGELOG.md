@@ -6,6 +6,25 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.11.5] - 2026-07-25
+
+### Fixed
+- **A blocked dispatch could record `gate.approved: true`.** `main()` stamped the INITIAL
+  gate decision onto the result after `_dispatch_with_retries` returned, so when a RETRY
+  gate REFUSED, the earlier approval overwrote the denial. The envelope then read
+  `status: blocked` while carrying approval evidence -- a self-contradicting receipt, and
+  exactly the fabricated artifact the gate exists to prevent. The initial decision is now
+  attached only when the dispatch did not already carry one.
+  Found by cross-vendor review on a SUBSTITUTED route: the usual codex reviewer was
+  returning 503s, so the pass ran on Sol 5.6 via the cursor gateway. Its `model.served`
+  was null, so that attribution is inferred rather than confirmed.
+
+### Notes
+- The first regression test written for this bug was WORTHLESS and mutation testing caught
+  it: it called `_dispatch_with_retries` directly and passed against the unfixed code,
+  because the overwrite lives in `main()`. It asserted the property at a layer that never
+  had the bug. The test now drives `main()` end to end and kills the mutant.
+
 ## [0.11.4] - 2026-07-25
 
 ### Fixed
