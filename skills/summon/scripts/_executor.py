@@ -15,6 +15,7 @@ import threading
 import time
 
 from _builder import (AgentInvocation, BACKENDS, agy_permission_warning,
+                      agy_timeout_warning,
                       apply_credit_guard, backend_kind, build_invocation_args,
                       credit_spend_allowed, infer_billing, permission_flags,
                       selects_credit_only)
@@ -1753,14 +1754,11 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 f"been rerouted or fallen back)")
         resp["permission"] = inv.permission
         resp["effort"] = inv.effort   # reasoning effort actually applied (None = backend default)
-        # agy can't read --cwd files; a "read <file>" prompt makes it review the
-        # pointer sentence and return a confident-but-empty verdict. Warn so a
-        # schema-valid result isn't trusted blindly.
-        if inv.cli == "agy" and _agy_prompt_references_file(inv.prompt):
-            resp.setdefault("warnings", []).append(
-                "agy runs in an isolated profile and CANNOT read files under --cwd — this "
-                "prompt appears to reference a file to read; agy sees only the prompt text, "
-                "so inline the file's content instead of pointing at a path")
+        # agy DOES read --cwd (summon passes --add-dir since 0.13.9). What still bites is
+        # the clock: agy is a multi-step agent, so a short budget kills it mid-work.
+        _tw = agy_timeout_warning(inv.cli, timeout_ms)
+        if _tw:
+            resp.setdefault("warnings", []).append(_tw)
         _pw = agy_permission_warning(inv.cli, inv.permission)
         if _pw:
             resp.setdefault("warnings", []).append(_pw)

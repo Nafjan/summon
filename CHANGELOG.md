@@ -6,6 +6,31 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.14.0] - 2026-07-25
+
+### Fixed
+- **A stale runtime warning contradicted the 0.13.9 fix.** Every agy dispatch whose prompt
+  mentioned a file still emitted "agy runs in an isolated profile and CANNOT read files
+  under `--cwd` ... inline the file's content instead". That became false the moment
+  `--add-dir` landed, and it would have steered callers away from the capability that had
+  just been restored. Removed.
+- **The false claim was PINNED BY A TEST.** `test_manifest_path_resolution_and_agy_codex_telemetry`
+  asserted `any("CANNOT read files" in w ...)` -- it REQUIRED summon to emit the wrong
+  warning, so fixing the behaviour turned the suite red and would have looked like a
+  regression. The assertion now checks the opposite (the retired warning must not return)
+  plus the warning that actually matters. Same shape as a model pin rotting behind a test
+  asserting a literal: a test encoding a FACT rather than a property fights its own
+  correction.
+
+### Added
+- **`agy` warns when its timeout is too short.** agy is a multi-step agent and routinely
+  needs minutes; a nested dispatch given `--timeout 180s` timed out mid-work with exit 124,
+  which reads as "the backend is broken" rather than "the clock was short". Dispatches under
+  300s now carry a warning naming the measurement. Diagnosed from a real incident: a review
+  agent chose 180s for its own agy canary, and the resulting 124 was mistaken for a summon
+  timeout-plumbing bug -- the outer 900s budget was never breached, the two numbers simply
+  belonged to two different dispatches.
+
 ## [0.13.9] - 2026-07-25
 
 ### Fixed
