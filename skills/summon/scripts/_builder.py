@@ -213,6 +213,46 @@ def agy_timeout_warning(cli: str, timeout_ms: int | None) -> str | None:
             f"partial.")
 
 
+# Windows caps an entire command line at 32767 chars (CreateProcess, including the
+# terminating null). POSIX instead caps each SINGLE argument at MAX_ARG_STRLEN = 131072
+# on Linux, with a much larger total. Measured 2026-07-25 on Windows: a 20k-char prompt
+# dispatched fine, 31k and 34k both failed -- and CreateProcess reports the overflow as
+# ERROR_FILE_NOT_FOUND, which Python raises as FileNotFoundError, which summon reported as
+# "CLI not found: ...node.EXE". That sends you to debug an install that was never broken.
+# A margin is left for the exe path and the flags, which are part of the same budget.
+_ARGV_TOTAL_LIMIT_NT = 32767
+_ARGV_SINGLE_LIMIT_POSIX = 131072
+
+
+def argv_length_error(cli: str, command: str, args: list) -> str | None:
+    """Reject an over-long command line BEFORE spawning, with the real reason.
+
+    The prompt is passed via argv by every CLI backend, so a large prompt (a diff, a
+    packet, a pasted file) can exceed the OS limit. --prompt-file does NOT avoid this: it
+    is a quoting and encoding convenience, and the content still reaches the backend on
+    the command line.
+    """
+    if os.name == "nt":
+        # +1 per argument for the separating space, matching how CreateProcess counts.
+        total = len(command) + sum(len(a) + 1 for a in args)
+        if total > _ARGV_TOTAL_LIMIT_NT:
+            return (f"the assembled command line is {total} characters, over the Windows "
+                    f"limit of {_ARGV_TOTAL_LIMIT_NT}. The prompt reaches {cli} through "
+                    f"argv, so a large prompt overflows it -- and Windows reports that "
+                    f"overflow as a MISSING FILE, which is why this used to surface as "
+                    f"'CLI not found'. --prompt-file does not help: it is a quoting "
+                    f"convenience and the content still goes on the command line. Shorten "
+                    f"the prompt, or write the material to a file under --cwd and ask the "
+                    f"agent to READ it (a repo-capable backend will).")
+        return None
+    longest = max((len(a) for a in args), default=0)
+    if longest > _ARGV_SINGLE_LIMIT_POSIX:
+        return (f"a single argument is {longest} characters, over the {_ARGV_SINGLE_LIMIT_POSIX} "
+                f"per-argument limit. The prompt reaches {cli} through argv. Shorten it, or "
+                f"write the material to a file under --cwd and ask the agent to READ it.")
+    return None
+
+
 def advisory_warnings(cli: str, permission: str, timeout_ms: int | None) -> list:
     """Every advisory warning a dispatch should carry, in ONE place.
 

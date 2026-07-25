@@ -15,7 +15,7 @@ import threading
 import time
 
 from _builder import (AgentInvocation, BACKENDS, advisory_warnings,
-                      agy_permission_warning,
+                      argv_length_error, agy_permission_warning,
                       agy_readonly_workspace_warning, agy_timeout_warning,
                       apply_credit_guard, backend_kind, build_invocation_args,
                       credit_spend_allowed, infer_billing, permission_flags,
@@ -1810,6 +1810,13 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # profile-TTL cleanup (which runs during build) both reflect the real request.
     command, args, env_override = build_invocation_args(inv, timeout_ms)
     command, args = _resolve_launch(command, args)
+    # AFTER _resolve_launch: on Windows a .cmd shim is rewritten to `node <path>/cli.js`,
+    # which changes the length that actually gets measured by CreateProcess.
+    _argv_err = argv_length_error(inv.cli, command, args)
+    if _argv_err:
+        # exit 1, not 127: 127 means "CLI not found", and reporting this as a missing
+        # binary is precisely the misdiagnosis being fixed.
+        return _stamp(_enrich(_error_response(inv.cli, 1, _argv_err), None))
     proc_env = _merge_env(env_override)
     debug_argv = [command, *args]
 
@@ -1835,7 +1842,16 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             **popen_flags(),
         )
     except FileNotFoundError:
-        return _stamp(_enrich(_error_response(inv.cli, 127, f"CLI not found: {command}"), None))
+        # Windows raises this for an over-long command line too (ERROR_FILE_NOT_FOUND).
+        # argv_length_error above catches the known limit; if we still land here with a
+        # large argv, say so rather than asserting an install problem we did not verify.
+        _n = len(command) + sum(len(a) + 1 for a in args)
+        _hint = ("" if _n < 16000 else
+                 f" (the command line is {_n} chars; on Windows an over-long command line "
+                 f"is reported as a missing file, so this may be argv overflow rather than "
+                 f"a missing binary)")
+        return _stamp(_enrich(
+            _error_response(inv.cli, 127, f"CLI not found: {command}{_hint}"), None))
     except OSError as e:
         return _stamp(_enrich(_error_response(inv.cli, 1, f"{type(e).__name__}: {e}"), None))
 
