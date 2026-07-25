@@ -114,7 +114,7 @@ run_subagent.py --council --question-file q.md \
   theirs → no favoritism), refines their stance, and **ranks** them best-to-worst.
   Votes aggregate (Borda) into `consensus_ranking` in the envelope, which the
   chairman weighs as one signal. `--rounds 1` (default) = independent positions only.
-- **The chairman** (`--chairman`, default `fable`) reads all final positions and
+- **The chairman** (`--chairman`, default `architect`, which is Opus 5) reads all final positions and
   returns the decision, a confidence, the points of agreement, the dissents (named),
   and a next action — making the call even when the council is split.
 - **Pass `--out` on any council you cannot afford to lose.** The council envelope is

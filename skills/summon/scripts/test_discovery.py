@@ -11534,6 +11534,33 @@ def test_v8_orchestration_guide_version_stamp_is_current():
         "the guide against the current behaviour and update the stamp, or the claim is "
         "false" % (stamped.group(1), version))
 
+
+def test_v8_no_doc_claims_a_stale_default_chairman():
+    """The default chairman changed from `fable` to `architect` in 0.12.0, but two docs
+    still advertised `fable` afterwards -- SKILL.md's parameter table and fan-out.md's
+    council walkthrough. A reader following either would budget for the wrong model and
+    misattribute the synthesis.
+
+    Asserts the docs name the ACTUAL constant rather than any hardcoded value, so the next
+    change to it cannot leave the docs behind."""
+    import re
+
+    from _council import DEFAULT_CHAIRMAN
+    scripts = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(scripts)
+    for rel in ("SKILL.md", os.path.join("references", "fan-out.md")):
+        path = os.path.join(root, rel)
+        if not os.path.isfile(path):
+            continue
+        text = open(path, encoding="utf-8").read()
+        for m in re.finditer(r"default[:\s]+.{0,3}`([a-z-]+)`", text):
+            claimed = m.group(1)
+            # only judge claims that name a chairman-ish agent
+            if claimed in ("fable", "architect", "opus", "sol"):
+                assert claimed == DEFAULT_CHAIRMAN, (
+                    "%s advertises `%s` as a default where the real DEFAULT_CHAIRMAN is "
+                    "`%s`" % (rel, claimed, DEFAULT_CHAIRMAN))
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

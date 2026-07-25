@@ -6,6 +6,36 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.13.4] - 2026-07-25
+
+### Documentation
+- **The documented agy limitation was WRONG, and cost a whole backend.** SKILL.md claimed
+  the agy backend "cannot read files under `--cwd` -- it only sees the prompt", and routed
+  all repo-grounded work away from it on that basis. Measured with a canary file on
+  2026-07-25: agy relocates its own working directory into a scratch dir inside its
+  isolated profile
+  (`~/.agents/state/agy-headless-profile/runs/<run>/.gemini/antigravity-cli/scratch`), so
+  a RELATIVE lookup fails there -- but the same file at an ABSOLUTE path was read
+  correctly via agy's `view_file` tool. It has shell and file tools throughout; it simply
+  does not stand in `--cwd`.
+  Corrected in SKILL.md (the limitation and the council-members routing note) and in
+  `references/orchestration.md`, and marked as one measurement of a volatile backend that
+  readers should re-check with their own canary.
+- **`references/orchestration.md`'s "prompt-contained backends" section rewritten** around
+  the real failure mode, which is nastier than a refusal: an agent that cannot find your
+  files may answer from the prompt alone and sound confident about code it never opened.
+  The section now prescribes a one-dispatch canary (unique token in a file, read it back
+  relative AND absolute) rather than inferring capability from a plausible answer.
+- **Two docs still advertised `fable` as the default chairman**, stale since 0.12.0 --
+  SKILL.md's parameter table and fan-out.md's council walkthrough. A reader following
+  either would budget for the wrong model and misattribute the synthesis. Fixed, plus a
+  test asserting no doc names a default chairman other than the real `DEFAULT_CHAIRMAN`.
+
+### Notes
+- The version-stamp guard added in 0.13.3 caught its first real drift immediately: this
+  release's own bump left the guide stamped at the previous version, and the suite failed
+  until it was re-verified and updated.
+
 ## [0.13.3] - 2026-07-25
 
 ### Documentation

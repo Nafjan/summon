@@ -9,7 +9,7 @@ Project-agnostic and host-agnostic. Adopt the parts you need; every section is
 written so a single orchestrator (human or agent) can act on it without a
 house style guide.
 
-Semantics below were verified against summon **0.13.2**. Model ids and alias
+Semantics below were verified against summon **0.13.4**. Model ids and alias
 behaviour are volatile: re-check with `doctor`, `list`, `models`, and
 `--dry-run` before a run you care about.
 
@@ -187,12 +187,23 @@ For repository deliberation (read-only council over a codebase):
 Never reset, stash, or discard someone else's dirty worktree. Isolate new work
 and report what you found.
 
-### Prompt-contained backends
+### Backends that do not stand in `--cwd`
 
-Some backends cannot read the repository under `--cwd` and only see the prompt
-text. Sending them a "review this repo" task yields confident output about code
-they never read. Check backend capability before assigning repo-grounded work,
-and prefer repo-capable backends for anything that must cite real files.
+A backend can have full file tools and still be useless for repo work, because it
+is not WHERE you think it is. Summon's `agy` backend relocates into a scratch dir
+inside its own profile, so a relative reference resolves there and fails, while
+the same file at an ABSOLUTE path reads fine (measured 2026-07-25 with a canary;
+re-check before relying on it).
+
+The failure mode this creates is worse than a refusal: an agent that cannot find
+your files may answer from the prompt alone and sound confident about code it
+never opened. So do not infer capability from a plausible-sounding answer.
+
+Before assigning repo-grounded work to an unfamiliar backend, spend one dispatch
+on a canary: put a unique token in a file and ask the agent to read it back, both
+relative and absolute. That is the cheapest way to learn which of the two failure
+shapes you are dealing with -- no file access at all, or file access from the
+wrong place.
 
 ---
 

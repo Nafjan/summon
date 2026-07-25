@@ -183,7 +183,7 @@ Parse JSON output and check `status` field:
 | `--results-dir` | No | With `--manifest`: where job envelopes land (default `{cwd}/.agents/results`) |
 | `--council` | - | Consensus deliberation: dispatch `--question` to diverse members, chairman synthesizes. See "Council mode" |
 | `--question` / `--question-file` | With `--council` | The decision to deliberate |
-| `--members` / `--chairman` / `--rounds` | No | With `--council`: member agents (default is a vendor-diverse, **repo-capable** set — claude+codex+cursor; `agy` members can't read `--cwd`, so avoid them for repo councils), synthesizer (default `fable`), 1 or 2 rounds |
+| `--members` / `--chairman` / `--rounds` | No | With `--council`: member agents (default is a vendor-diverse, **repo-capable** set — claude+codex+cursor; `agy` members do not stand in `--cwd` and need ABSOLUTE paths in the question, so prefer the repo-capable set unless you are willing to write full paths into it), synthesizer (default `architect`, which is Opus 5; pass `fable` explicitly for the pricier escalation tier), 1 or 2 rounds |
 | `--run-dir` | No | With `--council`: root for the durable run directory (default `{cwd}/.agents/runs`; env `SUMMON_RUNS_DIR`) |
 | `--resume-run RUN_ID` | - | Resume a council run: re-run only missing/failed/changed stages (question and members come from the run's `receipt.json`). Subcommand form: `council resume <run-id>` |
 | `--council-status RUN_ID` | - | Print a council run's durable state, read-only (add `--json`). Subcommand form: `council status <run-id>` |
@@ -279,12 +279,20 @@ never silently hides an unchecked constraint. Keep schemas within the subset.
 
 Honest edges — plan around these, don't be surprised by them:
 
-- **agy has no `--cwd` file access.** The agy (Antigravity) backend runs in a fresh,
-  isolated per-invocation profile, so the agent **cannot read files under `--cwd`** — it
-  only sees the prompt. Use agy for generate/research/reason tasks; for anything that must
-  read the caller's repo (a code review, a refactor), use claude/codex/cursor, or inline
-  the relevant content into the prompt. (agy also never reports token usage or a resolved
-  model.)
+- **agy needs ABSOLUTE paths: it does not stand in `--cwd`.** The agy (Antigravity)
+  backend relocates its own working directory into a scratch dir inside its isolated
+  per-invocation profile
+  (`~/.agents/state/agy-headless-profile/runs/<run>/.gemini/antigravity-cli/scratch`), so
+  anything RELATIVE — "read `config.py`", "the current directory" — resolves there and
+  fails. It is **not** cut off from the filesystem: it has shell and file tools and will
+  happily read your repo when given a full path.
+  Measured 2026-07-25 with a canary file: a relative lookup returned `BLOCKED` ("the file
+  does not exist in the current working directory", quoting the scratch path), while the
+  same file at an absolute path was read correctly via agy's `view_file` tool. Treat this
+  as one measurement of a volatile backend, and re-check with your own canary before
+  relying on it.
+  So: pass agy absolute paths, or inline the content. (agy still never reports token usage
+  or a resolved model.)
 - **`status` reflects the backend's own signal.** The envelope downgrades a self-reported
   `STATUS: BLOCKED/PARTIAL/ERROR`, an approval-marker tail, and a backend error result to a
   non-success status — but a compliant-looking report block is taken at face value. Under a
