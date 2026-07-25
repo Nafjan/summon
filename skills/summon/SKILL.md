@@ -290,6 +290,15 @@ Honest edges — plan around these, don't be surprised by them:
   an ABSOLUTE path read fine — so agy always had file tools and simply was not standing in
   `--cwd`. After the fix the relative lookup returns the token, with agy reporting the
   workspace as your `--cwd`.
+  **At `read-only` the workspace is deliberately WITHHELD**, so an agy read-only dispatch
+  cannot see your repo at all. agy has no enforceable read-only tier: canaries (2026-07-25)
+  showed an agent clamped to read-only creating a file and appending to another under
+  `--cwd` with BOTH `--sandbox` and `--mode plan` in force. Rather than promise a tier the
+  backend does not honour, summon withholds `--add-dir` there -- agy can still write, but
+  only inside its own disposable per-invocation profile. For repo-grounded agy work use
+  `safe-edit` as a deliberate choice (on agy that is a full bypass; point it only at repos
+  you can afford to have written to), inline the content into the prompt, or pick a
+  repo-capable backend. The envelope and `--dry-run` both warn.
   (agy still never reports token usage or a resolved model, and its `safe-edit` tier is a
   full bypass — see the permission note.)
 - **`status` reflects the backend's own signal.** The envelope downgrades a self-reported

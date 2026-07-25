@@ -106,9 +106,15 @@ run_subagent.py --council --question-file q.md \
   `coder`/cursor, `pair`/sonnet-5) — all can read files under `--cwd`. Override with
   `--members`; author custom-persona members with `--new-agent`. A council of clones
   is pointless — keep it diverse.
-  > **Note:** `agy` members (e.g. `researcher`) run in an isolated profile and can't
-  > read `--cwd`, so they error out of a repo-inspection council (fine only for a
-  > pure-reasoning question). The council envelope surfaces a warning when one is used.
+  > **Note:** `agy` members (e.g. `researcher`) run in an isolated profile, and summon
+  > only puts your `--cwd` into that profile's workspace at `safe-edit`/`yolo` — NOT at
+  > `read-only`, because agy has no enforceable read-only tier (measured: it wrote files
+  > with both `--sandbox` and `--mode plan` in force, so the workspace is withheld rather
+  > than promise a tier it cannot deliver). A read-only agy member therefore answers from
+  > the prompt alone: fine for a pure-reasoning question, wrong for repo inspection. Give
+  > an agy council member `safe-edit` deliberately (on agy that is a FULL bypass), inline
+  > the material into `--question`, or use a repo-capable backend. The envelope carries a
+  > warning either way.
 - **`--rounds 2`** adds a cross-examination + peer-ranking round (à la Karpathy's
   llm-council): each member sees ALL positions anonymized (can't tell which is
   theirs → no favoritism), refines their stance, and **ranks** them best-to-worst.

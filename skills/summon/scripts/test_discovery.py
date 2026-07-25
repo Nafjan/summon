@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -11720,40 +11721,131 @@ def test_v8_archive_claim_reports_a_genuinely_unwritable_dir():
         % err)
 
 
-def test_v8_agy_invocation_adds_the_cwd_to_its_workspace():
-    """agy must be told where the caller's repo is, via `--add-dir <cwd>`.
+def test_v8_agy_workspace_is_withheld_at_read_only():
+    """SECURITY: agy must NOT receive --cwd at read-only, because agy has no enforceable
+    read-only tier.
 
-    Summon redirects HOME/USERPROFILE to an isolated per-invocation profile (auth
-    hygiene), and agy consequently resolves relative paths against a scratch dir INSIDE
-    that profile. Two canaries on 2026-07-25 measured it: "read probe.txt in the current
-    working directory" returned BLOCKED with agy quoting the scratch path, while the same
-    file at an absolute path read fine -- so agy had file tools all along and simply was
-    not standing in --cwd. With `--add-dir` the RELATIVE lookup succeeds.
+    Measured 2026-07-25 with three canaries: an agy agent clamped to `read-only` created a
+    file and appended to another under --cwd, with `--sandbox` in force, and again with
+    `--mode plan` added. Neither flag withholds agy's file tools. So passing --add-dir at
+    read-only would have summon promise a tier it cannot deliver, and --add-dir is exactly
+    what makes the promise reachable. Withheld, agy still writes -- but only inside its own
+    disposable per-invocation profile. A fourth canary confirmed the caller's workspace was
+    untouched.
 
-    The flag must come BEFORE `--print`, which consumes the next token as the prompt."""
-    from _builder import AgentInvocation, build_invocation_args
+    At safe-edit/yolo the flag IS passed: both map to --dangerously-skip-permissions on agy,
+    so the workspace grants nothing the agent did not already have.
 
-    if os.name != "nt":
-        return          # the bundled ConPTY wrapper is Windows-only; see the agy notes
+    This asserts on the ARGS BUILT, not on source text, and does not invoke the real
+    profile builder -- the previous version of this test called it, copying live OAuth
+    material for a pure argv assertion, and swallowed every ValueError so that deleting
+    --add-dir still passed."""
+    import _builder
 
-    d = tempfile.mkdtemp(prefix="summon-agyadd-")
+    real_ensure = _builder._ensure_agy_profile
+    real_attest = _builder._attest_agy_profile
+    real_wrapper = getattr(_builder, "_agy_wrapper_path", None)
+    d = tempfile.mkdtemp(prefix="summon-agyro-")
     try:
-        inv = AgentInvocation(cli="agy", prompt="p", cwd=d, system_context="ctx",
-                              permission="read-only")
-        try:
-            _cmd, args, _env = build_invocation_args(inv, timeout_ms=60000)
-        except ValueError:
-            return      # no agy account on this machine: nothing to assert about argv
-        assert "--add-dir" in args, (
-            "the agy invocation does not pass --add-dir, so the agent resolves relative "
-            "paths against a profile scratch dir instead of --cwd. args=%r" % (args,))
-        assert args[args.index("--add-dir") + 1] == d, args
-        assert args.index("--add-dir") < args.index("--print"), (
-            "--add-dir must precede --print: agy treats the token after --print as the "
-            "prompt, so a flag placed later is swallowed into it")
+        # stub the side-effecting profile build: this test is about ARGV only
+        _builder._ensure_agy_profile = lambda cwd, deadline_sec=300.0: d
+        _builder._attest_agy_profile = lambda *a, **k: None
+
+        def args_for(permission):
+            inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=d,
+                                           system_context="ctx", permission=permission)
+            try:
+                _cmd, args, _env = _builder.build_invocation_args(inv, timeout_ms=60000)
+            except ValueError as e:
+                # a MISSING WRAPPER is an environment fact (Windows-only ConPTY); any other
+                # ValueError is a real failure and must not be swallowed into a pass
+                if "wrapper" in str(e).lower() or "windows-only" in str(e).lower():
+                    return None
+                raise
+            return args
+
+        ro = args_for("read-only")
+        if ro is None:
+            return          # no agy wrapper on this OS; nothing to assert about argv
+        assert "--add-dir" not in ro, (
+            "agy received the caller's workspace at READ-ONLY. agy cannot enforce that "
+            "tier -- a canary wrote files under --cwd with --sandbox and --mode plan both "
+            "set -- so handing it the workspace makes an unenforceable promise reachable. "
+            "args=%r" % (ro,))
+
+        for perm in ("safe-edit", "yolo"):
+            a = args_for(perm)
+            assert a is not None and "--add-dir" in a, (
+                "%s did not receive --add-dir; it already has write authority, so "
+                "withholding the workspace only breaks repo work for no safety gain "
+                "(args=%r)" % (perm, a))
+            assert a[a.index("--add-dir") + 1] == d, (perm, a)
+            assert a.index("--add-dir") < a.index("--print"), (
+                "--add-dir must precede --print, which consumes the next token as the "
+                "prompt (%s)" % perm)
     finally:
+        _builder._ensure_agy_profile = real_ensure
+        _builder._attest_agy_profile = real_attest
+        if real_wrapper is not None:
+            _builder._agy_wrapper_path = real_wrapper
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v8_agy_read_only_warns_that_it_cannot_see_the_repo():
+    """Withholding the workspace silently would be worse than the limitation: the agent
+    answers from the prompt alone and sounds confident about files it never opened. The
+    warning has to say so, and say why."""
+    from _builder import agy_readonly_workspace_warning as warn
+
+    w = warn("agy", "read-only")
+    assert w and "does NOT receive" in w, w
+    assert "safe-edit" in w, "the warning must name the way to actually do repo work"
+    assert warn("agy", "safe-edit") is None
+    assert warn("agy", "yolo") is None
+    assert warn("claude", "read-only") is None
+
+
+def test_v8_archive_claim_counts_consecutive_denials_not_total():
+    """The EACCES retry gave up after 64 CUMULATIVE denials. Contention spread across a
+    long run could exceed that while the next name was perfectly free, so a transient race
+    aborted the clear -- the very failure the retry was added to prevent. Only an
+    unwritable directory denies every name IN A ROW."""
+    import _manifest
+
+    d = tempfile.mkdtemp(prefix="summon-consec-")
+    real_open = os.open
+    seen = {"n": 0}
+    try:
+        out = os.path.join(d, "r.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write('{"status": "success"}')
+
+        def flaky(path, flags, *a, **k):
+            # A BUSY results dir: most names are already taken (EEXIST, so the loop keeps
+            # walking), with transient EACCES interspersed. Denials accumulate past 64 in
+            # TOTAL but never 64 in a row -- the case a cumulative counter aborts and a
+            # consecutive one correctly rides out. The loop exits at the first success, so
+            # interleaving alone cannot accumulate; the EEXIST names are what let it.
+            if str(path).find(".superseded") != -1:
+                seen["n"] += 1
+                if seen["n"] <= 200:
+                    if seen["n"] % 2 == 1:
+                        raise PermissionError(13, "Permission denied", str(path))
+                    raise FileExistsError(17, "File exists", str(path))
+            return real_open(path, flags, *a, **k)
+
+        os.open = flaky
+        err = _manifest._clear_out_file(out, archive=True)
+    finally:
+        os.open = real_open
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    assert seen["n"] > 64, ("the probe did not exceed the old cumulative bound", seen)
+    assert err is None, (
+        "interleaved transient denials aborted the clear: %r -- the counter must track "
+        "CONSECUTIVE denials, since only an unwritable dir denies every name in a row" % err)
 
 
 def test_v8_gate_records_its_own_definition_hash():
@@ -11812,6 +11904,154 @@ def test_v8_gate_verdict_always_carries_a_reason():
     dec = decide({"status": "success",
                   "result": "VERDICT: DENY" + nl + "REASON: touches prod"}, "g")
     assert "touches prod" in dec["reason"], dec
+def test_v8_a_failed_close_is_not_treated_as_a_name_collision():
+    """os.close() lived inside the try that catches "this name is taken".
+
+    So a close() that failed was read as a collision: the loop moved to the next index
+    having ALREADY set `claimed` to a name it genuinely owned, the next successful claim
+    overwrote `claimed`, and the finally-cleanup removed only the last reservation. The
+    first one leaked as a permanent empty archive -- with its fd still open. A close
+    failure is not a collision, and only the open can collide."""
+    import _manifest
+
+    d = tempfile.mkdtemp(prefix="summon-close-")
+    real_close = os.close
+    state = {"failed": False}
+    try:
+        out = os.path.join(d, "r.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write('{"status": "success"}')
+
+        def one_bad_close(fd):
+            # PermissionError SPECIFICALLY. A plain OSError never reached the collision
+            # handler (it catches only FileExistsError/PermissionError) and so never
+            # exercised the bug -- an earlier version of this test raised EIO and passed
+            # against the broken code. EACCES from close is what the old comment claimed
+            # to handle and is exactly what it mishandled.
+            if not state["failed"]:
+                state["failed"] = True
+                real_close(fd)                     # do not leak the descriptor in the test
+                raise PermissionError(13, "Permission denied")
+            return real_close(fd)
+
+        os.close = one_bad_close
+        err = _manifest._clear_out_file(out, archive=True)
+    finally:
+        os.close = real_close
+
+    try:
+        leaked = [f for f in os.listdir(d) if ".superseded" in f
+                  and os.path.getsize(os.path.join(d, f)) == 0]
+        assert not leaked, (
+            "a failed close() left an EMPTY archive behind: %r. The close was caught as a "
+            "collision, so the loop claimed a second name and the cleanup only knew about "
+            "that one." % (leaked,))
+        assert err, "a failed close() must be REPORTED, not silently swallowed"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v8_agy_timeout_threshold_is_a_measured_completion():
+    """The advised floor was 300s, which no measurement supported: 180s timed out and 420s
+    completed, and taking the midpoint dressed an interpolation up as evidence. It is now
+    the smallest budget an agy dispatch has been OBSERVED to complete under.
+
+    Also pins the boundary. `>=` means exactly-at-threshold is silent, which is only right
+    if the threshold is itself a measured success -- otherwise the one budget we know least
+    about gets the least warning."""
+    from _builder import agy_timeout_warning, _AGY_MIN_ADVISED_TIMEOUT_MS as FLOOR
+
+    assert FLOOR == 420_000, (
+        "the floor must be a MEASURED completion, not an interpolation between a failure "
+        "and a success (got %r)" % FLOOR)
+    assert agy_timeout_warning("agy", FLOOR) is None, "at a measured-good budget: silence"
+    assert agy_timeout_warning("agy", FLOOR - 1) is not None, "one ms below must warn"
+    w = agy_timeout_warning("agy", 60_000)
+    assert str(FLOOR // 1000) in w, (
+        "the warning must quote the SAME number as the constant, or the two drift and the "
+        "text starts advising a budget the code does not enforce: %s" % w)
+    assert "180" in w, "the warning should cite the measured FAILURE that motivates it"
+    assert agy_timeout_warning("claude", 1000) is None
+    assert agy_timeout_warning("agy", None) is None
+
+
+def test_v8_dry_run_and_the_real_envelope_warn_identically():
+    """--dry-run exists to catch a wrong permission, a dead backend or a short clock BEFORE
+    paying. It emitted the agy permission warning but neither the timeout nor the
+    read-only-workspace one -- so preflight was silent about exactly the two things it is
+    cheapest to fix there. Both paths now assemble from advisory_warnings.
+
+    The list-membership check is the guard: a fourth warning added to one path only would
+    fail here."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                   system_context="ctx", permission="read-only")
+    expected = _builder.advisory_warnings("agy", "read-only", 60_000)
+    assert len(expected) >= 2, ("agy at read-only on a 60s clock should warn about BOTH the "
+                                "withheld workspace and the short budget: %r" % (expected,))
+
+    args = types.SimpleNamespace(agent="x", timeout=60_000, worktree=None, out=None,
+                                 dry_run=True)
+    view = rs._dry_run_view(inv, args, agents_dir=os.getcwd())
+    got = view.get("warnings", [])
+    for w in expected:
+        assert w in got, (
+            "--dry-run did not surface a warning the real dispatch would: %r. Preflight is "
+            "where this is still free to act on." % w[:90])
+
+    # and no duplicates: the two paths must not both append the same text
+    assert len(got) == len(set(got)), ("a warning appeared twice in the preview: %r" % (got,))
+
+
+def test_v8_advisory_warnings_is_the_only_assembly_point():
+    """STRUCTURAL GUARD. The two emit paths each assembled the warning list by hand and
+    drifted -- one gained a warning the other never got. Binding them means nobody appends
+    an agy_*_warning to an envelope directly; they go through advisory_warnings, which both
+    paths call. A new warning then reaches preflight and the envelope by construction."""
+    root = os.path.dirname(os.path.abspath(__file__))
+    helpers = ("agy_permission_warning(", "agy_timeout_warning(",
+               "agy_readonly_workspace_warning(")
+    for mod in ("_executor.py", "run_subagent.py", "_council.py"):
+        path = os.path.join(root, mod)
+        if not os.path.isfile(path):
+            continue
+        src = open(path, encoding="utf-8").read()
+        for h in helpers:
+            assert h not in src, (
+                "%s calls %s directly. Assemble advisory warnings in ONE place "
+                "(_builder.advisory_warnings) so --dry-run and the real envelope cannot "
+                "drift apart again." % (mod, h.rstrip("(")))
+
+
+def test_v8_every_test_is_actually_collected_by_the_runner():
+    """STRUCTURAL GUARD. The runner collects `globals()` at __main__ time, so a test
+    appended BELOW that block is defined too late to exist and is silently skipped.
+
+    Four tests landed there and the suite still printed "346/346 passed" -- a green run
+    that had never executed them. A suite that under-reports its own size is worse than a
+    red one: it reports confidence it did not earn. Compare the count the runner would
+    collect against the count of `def test_` in the source; they must be equal."""
+    src = open(os.path.abspath(__file__), encoding="utf-8").read()
+    # chr(10), not an escape: the marker must be LINE-ANCHORED so it matches the real
+    # runner block and not this function's own mention of it a few lines above.
+    marker = chr(10) + 'if __name__ == "__main__":'
+    assert marker in src, "the runner block moved; this guard needs updating"
+    above, _, below = src.partition(marker)
+    orphaned = [ln.split("(")[0][4:] for ln in below.splitlines()
+                if ln.startswith("def test_")]
+    assert not orphaned, (
+        "%d test(s) are defined AFTER the __main__ block and will never run: %s. Move them "
+        "above it -- the runner snapshots globals() and cannot see them." % (
+            len(orphaned), ", ".join(orphaned)))
+    in_source = sum(1 for ln in above.splitlines() if ln.startswith("def test_"))
+    collected = sum(1 for k, v in globals().items()
+                    if k.startswith("test_") and callable(v))
+    assert in_source == collected, (
+        "the source defines %d tests but %d are importable; a duplicate name silently "
+        "shadowed one." % (in_source, collected))
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
