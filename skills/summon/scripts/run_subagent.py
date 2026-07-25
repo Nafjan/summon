@@ -75,7 +75,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.11.2"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.11.3"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -863,6 +863,9 @@ def main() -> None:
     # BEFORE git_head_before and the dispatch itself so a refused request never
     # touches the tree. Fails closed inside _gate.decide.
     if getattr(args, "gate_with", None):
+        # A gate authorises ONE execution. --retries would otherwise run the task
+        # again (up to N times) on a single approval, which for a side-effecting
+        # task is materially more than what was approved. Each attempt re-gates.
         _gate_decision = _run_gate(args, agents_dir, invocation)
         if not _gate_decision.get("approved"):
             from _gate import blocked_envelope
@@ -883,7 +886,7 @@ def main() -> None:
     # errors rather than tracebacks. All other CLI-side failures are already
     # shaped into the response by execute_agent.
     try:
-        result = _dispatch_with_retries(invocation, args)
+        result = _dispatch_with_retries(invocation, args, agents_dir)
     except ValueError as e:
         _die(str(e))
     if getattr(args, "gate_with", None):
@@ -1021,7 +1024,14 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
         cli=gate_cli, prompt=prompt, cwd=args.cwd, system_context=gate_ctx,
         agent_file=gate_file,
         permission="read-only",   # FORCED: never inherit the gate definition's tier
-        model=gate_model, effort=gate_effort, extra_args=tuple(gate_args or ()),
+        model=gate_model, effort=gate_effort,
+        # extra_args are DELIBERATELY DROPPED. build_invocation_args appends an
+        # agent's `args:` AFTER the permission flags, so a gate definition carrying
+        # --dangerously-skip-permissions (claude), --sandbox danger-full-access
+        # (codex) or -f (cursor) would defeat the forced read-only tier above and
+        # turn the approval step into the escalation path it exists to prevent.
+        # A gate adjudicates a request; it is not a configurable dispatch.
+        extra_args=(),
     )
     timeout = args.gate_timeout or args.timeout
     if isinstance(timeout, str):
@@ -1035,9 +1045,23 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
     return decide(resp, args.gate_with)
 
 
-def _dispatch_with_retries(invocation, args) -> dict:
+def _regate_or_none(args, agents_dir, invocation):
+    """Re-run the gate for a RETRY attempt. Returns the decision if refused (so the
+    caller stops), or None when approved. A gate authorises one execution."""
+    if not getattr(args, "gate_with", None):
+        return None
+    dec = _run_gate(args, agents_dir, invocation)
+    return None if dec.get("approved") else dec
+
+
+def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
     """execute_agent with --retries: exponential backoff on error/partial only
-    (blocked won't improve by retrying — its cause is structural)."""
+    (blocked won't improve by retrying — its cause is structural).
+
+    Under --gate-with, EACH retry is re-gated. A gate authorises one execution; N
+    attempts of a side-effecting task on a single approval is materially more than
+    what was approved. A refusal mid-retry stops the loop and returns the blocked
+    envelope rather than the last failure."""
     attempt = 0
     while True:
         result = execute_agent(invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
@@ -1045,6 +1069,13 @@ def _dispatch_with_retries(invocation, args) -> dict:
         attempt += 1
         if result.get("status") not in ("error", "partial") or attempt > max(0, args.retries):
             break
+        refused = _regate_or_none(args, agents_dir, invocation)
+        if refused is not None:
+            from _gate import blocked_envelope
+            result = blocked_envelope(refused, agent=getattr(args, "agent", None),
+                                      cli=invocation.cli)
+            result["attempts"] = attempt
+            return result
         time.sleep(min(30, 2 ** attempt))
     result["attempts"] = attempt
     return result

@@ -6,6 +6,35 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.11.3] - 2026-07-25
+
+### Security
+- **Four ways `--gate-with` could be bypassed, all found by cross-vendor adversarial
+  review of 0.11.0 and all fixed.** Each defeated the gate's stated guarantee, so the
+  feature as first shipped could not be relied on.
+  - **`--background` ran completely ungated.** The detached child's argv is rebuilt field
+    by field, and `--gate-with` was not among the flags carried over, so a gated background
+    dispatch executed with no approval at all. Both gate flags now propagate; the gate runs
+    in the child, where the dispatch it authorises happens.
+  - **A gate definition's `args:` could restore write capability.** `build_invocation_args`
+    appends an agent's `args:` AFTER the permission flags, so a gate carrying
+    `--dangerously-skip-permissions` (claude), `--sandbox danger-full-access` (codex) or
+    `-f` (cursor) defeated the forced read-only tier -- making the approval step itself the
+    escalation path it exists to prevent. The gate's `extra_args` are now DROPPED: a gate
+    adjudicates a request, it is not a configurable dispatch.
+  - **A crafted prompt could forge the verdict.** The gated agent's prompt is embedded in
+    the gate prompt as data, and the parser took the LAST verdict line, so an injected
+    trailing `VERDICT: APPROVE` outvoted the gate's real ruling. `defang()` now neutralises
+    verdict-shaped lines in embedded text, and two DISTINCT verdicts refuse as ambiguous
+    rather than resolving to either. (The "last wins" rule was itself a defence -- against a
+    gate reasoning aloud before ruling -- so hardening one axis had opened another.)
+  - **`--retries` ran on a single approval.** A gate authorises ONE execution; N attempts of
+    a side-effecting task is materially more than what was approved. Each attempt re-gates,
+    and a refusal mid-retry stops the loop with a blocked envelope.
+  - Five mutants, one per fix, each reverting the fix to its exact broken form: all killed.
+    The superseded "last verdict wins" test was replaced rather than left passing, since it
+    asserted behaviour now known to be exploitable.
+
 ## [0.11.2] - 2026-07-25
 
 ### Added
