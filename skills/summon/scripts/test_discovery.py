@@ -2119,7 +2119,15 @@ def test_manifest_path_resolution_and_agy_codex_telemetry():
     finally:
         _executor.build_invocation_args = orig
     # #3: agy "read <file>" prompt surfaces a can't-read-files warning
-    assert any("CANNOT read files" in w for w in ra.get("warnings", [])), ra.get("warnings")
+    # The old assertion here required the warning "agy ... CANNOT read files under --cwd".
+    # That claim was FALSE and is gone: summon passes --add-dir <cwd> since 0.13.9, and a
+    # canary confirmed agy reads relative paths. A test that asserts a wrong claim keeps it
+    # alive, so this now checks the opposite -- and that the warning which DOES matter for
+    # agy (a budget too short for a multi-step agent) is the one emitted.
+    _w = ra.get("warnings", [])
+    assert not any("CANNOT read files" in x for x in _w), (
+        "the retired agy no-file-access warning is back; agy reads --cwd since 0.13.9", _w)
+    assert any("MULTI-STEP agent" in x for x in _w), _w
     # #4: codex model.resolved falls back to the config default (when one is configured)
     from _resolver import _codex_default_model
     dflt = _codex_default_model()

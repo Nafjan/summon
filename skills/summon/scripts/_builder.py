@@ -163,6 +163,25 @@ def agy_permission_warning(cli: str, permission: str) -> str | None:
     return None
 
 
+# agy is a multi-step agent (it plans, calls tools, then answers), so it routinely needs
+# minutes where a single-shot backend needs seconds. Measured 2026-07-25: canaries at 420s
+# completed; a nested dispatch given 180s timed out mid-work and reported exit 124. That
+# failure reads as "agy is broken" rather than "the budget was short", which is why it is
+# worth a warning rather than silence.
+_AGY_MIN_ADVISED_TIMEOUT_MS = 300_000
+
+
+def agy_timeout_warning(cli: str, timeout_ms: int | None) -> str | None:
+    """Warn when an agy dispatch is given a budget it will probably overrun."""
+    if cli != "agy" or not timeout_ms or timeout_ms >= _AGY_MIN_ADVISED_TIMEOUT_MS:
+        return None
+    return (f"agy was given {int(timeout_ms / 1000)}s. It is a MULTI-STEP agent and "
+            f"routinely needs longer; a measured canary needed over 180s for a single "
+            f"file read. Budgets under {int(_AGY_MIN_ADVISED_TIMEOUT_MS / 1000)}s often "
+            f"time out mid-work (exit 124), which looks like a broken backend rather than "
+            f"a short clock. Raise --timeout, or expect a partial.")
+
+
 def _concatenated_prompt(inv: AgentInvocation) -> str:
     """The prompt for CLIs with no native system-prompt slot: the agent's system
     context concatenated ahead of the user task."""
