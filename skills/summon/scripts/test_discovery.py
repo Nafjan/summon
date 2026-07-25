@@ -10890,6 +10890,92 @@ def test_v8_popen_flags_never_evaluates_windows_constants_on_posix():
     finally:
         os.name = real_name
 
+
+def test_v8_project_local_copy_is_enumerated_and_reported():
+    """A PROJECT-LOCAL copy (`<project>/.agents/skills/summon`) is a real layout: a project
+    carries its own roster plus a vendored dispatcher. install.py never touches it (it
+    targets host roots), so nothing refreshes it and it rots invisibly -- that is how a copy
+    reached v0.9.0 code behind a hand-edited version string, and how a stale copy kept the
+    Windows console-window bug after every host was fixed.
+
+    It must be ENUMERATED (so drift is visible) and UNMANAGED (summon never writes it)."""
+    import _installs
+
+    proj = tempfile.mkdtemp(prefix="summon-projlocal-")
+    home = tempfile.mkdtemp(prefix="summon-projhome-")
+    nl = chr(10)
+    try:
+        scripts = os.path.join(proj, ".agents", "skills", "summon", "scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "run_subagent.py"), "w", encoding="utf-8") as fh:
+            fh.write('__version__ = "0.0.1"' + nl)
+
+        # without project_dir it is invisible -- the gap this closes
+        recs = _installs.enumerate_installs(home=home)
+        assert not [r for r in recs if r.get("label") == "project"], (
+            "a project record appeared without project_dir being passed")
+
+        recs = _installs.enumerate_installs(home=home, project_dir=proj)
+        proj_recs = [r for r in recs if r.get("label") == "project"]
+        assert len(proj_recs) == 1, [r.get("label") for r in recs]
+        rec = proj_recs[0]
+        assert rec["present"] is True, rec
+        assert rec["managed"] is False, (
+            "the project-local copy has no ownership manifest; summon must REPORT it, "
+            "never claim to manage (and so overwrite) it")
+        assert rec["version"] == "0.0.1", rec
+        assert rec["sha256"], rec
+
+        # absent project dir must not invent a record
+        recs2 = _installs.enumerate_installs(home=home, project_dir=home)
+        assert not [r for r in recs2 if r.get("label") == "project" and r.get("present")], \
+            "reported a present project copy where none exists"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(proj, ignore_errors=True)
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v8_stale_project_local_copy_shows_as_drift():
+    """The point of enumerating it: a project-local copy running OLD code while the hosts
+    are current must be reported as drift, not silently tolerated. This is the concrete
+    scenario from the Windows console-window bug -- hosts patched, project copy still
+    spawning consoles."""
+    import _installs
+
+    proj = tempfile.mkdtemp(prefix="summon-projdrift-")
+    home = tempfile.mkdtemp(prefix="summon-projdrifth-")
+    nl = chr(10)
+    try:
+        # one managed host copy (the reference) and a DIFFERENT project-local copy
+        host = os.path.join(home, ".claude", "skills", "summon", "scripts")
+        os.makedirs(host)
+        with open(os.path.join(host, "run_subagent.py"), "w", encoding="utf-8") as fh:
+            fh.write('__version__ = "9.9.9"' + nl + "# current" + nl)
+        with open(os.path.join(home, ".claude", "skills", "summon",
+                               ".summon-install.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"installed_by": "summon", "installed_at": 1}')
+
+        proj_scripts = os.path.join(proj, ".agents", "skills", "summon", "scripts")
+        os.makedirs(proj_scripts)
+        with open(os.path.join(proj_scripts, "run_subagent.py"), "w", encoding="utf-8") as fh:
+            fh.write('__version__ = "0.0.1"' + nl + "# STALE" + nl)
+
+        recs = _installs.enumerate_installs(home=home, project_dir=proj)
+        rep = _installs.drift_report(recs)
+        labels = [r.get("label") for r in recs if r.get("present")]
+        assert "project" in labels, labels
+        proj_rec = [r for r in recs if r.get("label") == "project"][0]
+        host_rec = [r for r in recs if r.get("label") == "claude"][0]
+        assert proj_rec["sha256"] != host_rec["sha256"], (
+            "a stale project copy hashed identically to the current host copy")
+        assert rep.get("converged") is not True, (
+            "a project-local copy running different code must NOT report converged")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(proj, ignore_errors=True)
+        _sh.rmtree(home, ignore_errors=True)
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

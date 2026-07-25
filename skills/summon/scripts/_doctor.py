@@ -298,7 +298,8 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None,
     try:
         from _installs import enumerate_installs, drift_report
         _recs = enumerate_installs(
-            running_scripts_dir=os.path.dirname(os.path.abspath(__file__)))
+            running_scripts_dir=os.path.dirname(os.path.abspath(__file__)),
+            project_dir=cwd)
         report["installs"] = {"records": _recs, "drift": drift_report(_recs)}
     except Exception:  # noqa: BLE001 - advisory section; must never break doctor
         report["installs"] = None
