@@ -6,6 +6,25 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.13.3] - 2026-07-25
+
+### Documentation
+- **`references/orchestration.md` audited against actual capability**, not just re-stamped.
+  Three controls were missing entirely:
+  - `--overall-timeout`, the one that matters most for councils: per-stage timeouts do NOT
+    bound the total, so N members at T each can still run N x T. Without it the host tool
+    kills the dispatcher with nothing to show; with it you get a PARTIAL envelope.
+  - `--min-successful-members`, and its distinction from `--quorum` -- quorum decides
+    whether synthesis runs at all, this decides when to STOP WAITING for stragglers.
+  - `doctor --cwd <repo>` reporting PROJECT-LOCAL copies, which `install.py` never
+    refreshes and which therefore rot silently.
+- **A test now asserts the guide's version stamp matches `__version__`.** The stamp had
+  gone five releases stale once, and one release stale again immediately after being
+  fixed. A doc claiming "verified against X" reads as checked, so a false stamp is worse
+  than none. This is the fourth guard of the same shape: a CLAIM and the THING IT
+  DESCRIBES were maintained separately, so the fix is to make the claim checkable against
+  its subject rather than resolving to remember.
+
 ## [0.13.2] - 2026-07-25
 
 ### Security

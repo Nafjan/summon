@@ -9,7 +9,7 @@ Project-agnostic and host-agnostic. Adopt the parts you need; every section is
 written so a single orchestrator (human or agent) can act on it without a
 house style guide.
 
-Semantics below were verified against summon **0.13.0**. Model ids and alias
+Semantics below were verified against summon **0.13.2**. Model ids and alias
 behaviour are volatile: re-check with `doctor`, `list`, `models`, and
 `--dry-run` before a run you care about.
 
@@ -213,7 +213,16 @@ A council you can defend:
   legitimately require running things;
 - **read-only** member profiles;
 - **`--quorum N`** so a thin council does not synthesize from one survivor;
-- **bounded** `--member-timeout` / `--chair-timeout`;
+- **bounded** `--member-timeout` / `--chair-timeout`, and
+  **`--overall-timeout`** as a HARD wall-clock budget for the whole deliberation.
+  Per-stage timeouts do not bound the total: N members at T each can still run
+  N x T. On breach summon process-tree-kills the in-flight members and emits a
+  PARTIAL council envelope, which is the difference between a bounded result and
+  your host tool killing the dispatcher with nothing to show;
+- **`--min-successful-members N`** to stop waiting for stragglers once N members
+  have succeeded in the final round. Distinct from `--quorum`, which decides
+  whether synthesis runs at all: this one decides when to STOP WAITING. Set both
+  and a slow member cannot hold the deliberation hostage;
 - **durable output**: `--out` plus the run directory, so a kill does not lose
   paid work;
 - recorded **dissent** and unresolved risks, not just the synthesis.
@@ -262,6 +271,14 @@ Most orchestration waste is re-running work that already succeeded.
 - **`--dry-run`** resolves the full dispatch, including model and permission
   flags, without spending anything. Cheapest way to catch a wrong model or an
   over-privileged profile.
+- **`doctor --cwd <repo>`** enumerates every summon copy it can find and flags
+  drift: the per-host installs, and any PROJECT-LOCAL copy at
+  `<repo>/.agents/skills/summon`. That last one matters because `install.py`
+  only refreshes host installs, so a vendored project copy is never updated by a
+  normal install and rots silently -- which is how a copy ran months-old code
+  behind a hand-edited version string, and how another kept a fixed bug after
+  every host was patched. It is reported, never written: summon surfaces a
+  deliberately vendored copy rather than overwriting it.
 - **`--resume`** continues a session instead of re-sending the whole definition.
 
 ---
