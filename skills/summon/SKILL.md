@@ -312,8 +312,13 @@ Honest edges — plan around these, don't be surprised by them:
 - **`--manifest` resume retries failures.** A prior job envelope is only "done" when its
   `status` is `success`; re-running a manifest re-dispatches `error`/`blocked`/`partial`
   jobs. Delete a result file to force a clean re-run. Two manifest *processes* pointed at
-  the same results dir can each start a job before the other's file lands (wasteful
-  duplicate, not corruption — final writes are atomic); don't run two on one results dir.
+  the same results dir will **corrupt each other's attribution**, not merely duplicate work:
+  measured with two real parents sharing one job id and different prompts, parent A read and
+  reported parent B's answer and both exited success. Individual writes are atomic, but
+  nothing owns the shared path, so the last writer wins. summon now REFUSES an envelope
+  whose `request_sha256` does not match the job being run (`result_path_conflict: true`
+  rather than a wrong answer), but that is a safety net, not a lock: **give each concurrent
+  run its own `--results-dir`.**
 - **`openai-compat` makes a real network call** to the `base_url` you configure and sends
   your API key in the `Authorization` header. Never point an `openai-compat` agent (or a
   manifest that inlines `base_url`) at an untrusted host — that beams your key to it. Its

@@ -8,6 +8,40 @@ never on added fields.
 
 ## [0.15.0] - 2026-07-26
 
+### Fixed (round 8)
+- **Two manifest runs sharing a results dir corrupted each other's ATTRIBUTION**, not merely
+  duplicated work. Measured with two real processes on one job id and different prompts:
+  parent A read and reported parent B's answer, and both exited success. The envelope was
+  byte-valid; its attribution was not. summon stamps `request_sha256` on every envelope so a
+  stored answer can be checked against the request it is served for -- the manifest read
+  path simply never asked. It now refuses a foreign envelope with `result_path_conflict`
+  instead of serving a wrong answer. This is a safety net, not a lock: give each concurrent
+  run its own `--results-dir`.
+- **The forensics fallback write bypassed the atomic writer.** When a child wrote no
+  envelope, the parent persisted one with a direct `open(..., "w")`; a concurrent reader
+  observed the file as the single byte `{`, and a crash in that window strands it
+  permanently unparseable -- exactly what "a present file is a COMPLETE file" promises
+  cannot happen. It now uses temp + `os.replace` like every other envelope write.
+
+### Docs (round 8)
+- **"wasteful duplicate, not corruption" was false** and is corrected with the measurement
+  that disproved it.
+- fan-out.md's "per-backend concurrency semaphores" now says per PROCESS: two manifest runs
+  do not share caps.
+
+### Deliberately NOT changed (round 8)
+- A writability probe whose cleanup fails leaves a zero-byte `.superseded.wtest.<pid>.<uuid>`
+  behind, and review suggested reporting it. It is not reported, and the reasoning is now in
+  the code: archive names are constructed exactly and never globbed, so summon cannot
+  mistake it for an archive -- while reporting it would make `_clear_out_file` return failure
+  for a clear that SUCCEEDED, and `_write_error_out` refuses to overwrite when archiving
+  fails, which drops the dispatch's real error envelope and leaves a stale success. That bug
+  was fixed earlier on this branch; trading it back for tidier litter is a bad deal. Caught
+  because the change broke an existing test.
+
+### Testing (round 8)
+- 381/381 discovery, 22/22 install.
+
 ### Fixed (round 7)
 - **A repaired envelope could contradict itself.** Found by dogfooding, not review: this
   repo's own round-6 review dispatch came back `status: success` with `exit_code: 1` and an

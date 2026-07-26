@@ -20,8 +20,8 @@ run_subagent.py --manifest jobs.json --concurrency agy=2,codex=3 --results-dir o
 }
 ```
 
-What you get: per-backend concurrency semaphores, one atomic envelope per job in
-`--results-dir/<id>.json`, **skip-if-done resume** (re-running a swarm skips only
+What you get: per-backend concurrency semaphores (per PROCESS -- two manifest runs do
+not share caps), one atomic envelope per job in `--results-dir/<id>.json`, **skip-if-done resume** (re-running a swarm skips only
 jobs whose prior envelope was `success`, and **re-dispatches** any that ended
 `error`/`blocked`/`partial` — so a re-run retries the failures; delete a result
 file to force a clean re-run), per-job retries, progress lines on stderr,
