@@ -10,3 +10,8 @@ __pycache__/
 # in the working directory of a dispatch. It is agy's litter, not summon's output, but it
 # lands in whatever repo you point a dispatch at -- so keep it out of commits.
 --print
+
+# graphify knowledge graph: regenerated from the source, large, and machine-specific.
+# It was ignored only via .git/info/exclude, which is local to one clone -- a fresh
+# checkout would not have ignored it.
+graphify-out/
