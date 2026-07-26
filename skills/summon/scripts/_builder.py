@@ -191,55 +191,85 @@ def agy_permission_warning(cli: str, permission: str) -> str | None:
 _AGY_MIN_ADVISED_TIMEOUT_MS = 420_000
 
 
-_AGY_BOUNDARY_FLAGS = ("--add-dir", "--mode", "--sandbox",
-                       "--dangerously-skip-permissions", "--yolo")
+# Flags that MOVE THE PERMISSION BOUNDARY, per backend. Derived from each backend's own
+# permission mapping plus its documented bypass switches, because an agent definition's
+# `args:` are appended AFTER the flags summon computes -- so a later flag wins.
+#
+# This started as an agy-only list, which was fixing the instance instead of the class:
+# cross-vendor review reproduced the same escalation on every other backend, e.g. a
+# read-only Claude definition producing `--permission-mode plan --dangerously-skip-permissions`
+# while the envelope still reported `permission: read-only`. `--max-permission` and
+# `--gate-with` already drop extra_args wholesale for exactly this reason; a DIRECTLY
+# declared tier did not, which left the permission mapping advisory against the roster.
+_BOUNDARY_FLAGS = {
+    "claude": ("--permission-mode", "--dangerously-skip-permissions"),
+    "codex": ("-s", "--sandbox", "--dangerously-bypass-approvals-and-sandbox",
+              "--full-auto", "--yolo"),
+    "cursor-agent": ("--mode", "--trust", "-f", "--force"),
+    "gemini": ("--approval-mode", "-y", "--yolo"),
+    "agy": ("--add-dir", "--mode", "--sandbox", "--dangerously-skip-permissions", "--yolo"),
+}
+# Flags that consume the NEXT token as their value; dropping the flag must drop the value
+# too, or the bare value becomes a stray positional argument.
+_BOUNDARY_TAKES_VALUE = {"--permission-mode", "-s", "--sandbox", "--mode", "--approval-mode",
+                         "--add-dir"}
+# codex configures approval policy through `-c key=value`, so the KEY decides, not the flag.
+_CODEX_CONFIG_KEYS = ("approval_policy", "sandbox_mode", "sandbox_permissions")
 
 
-def _strip_agy_boundary_flags(extra_args) -> list:
-    """Remove agy flags that would move the permission boundary summon just set.
+def strip_boundary_flags(cli: str, extra_args) -> list:
+    """Remove agent-supplied flags that would move the permission boundary summon set.
 
-    An agent definition's own `args:` are appended AFTER the permission flags, so
-    `args: ["--add-dir", "/repo"]` in frontmatter silently rewrote the tier summon had just
-    computed. --max-permission and --gate-with already drop extra_args wholesale for this
-    reason; a DIRECTLY declared tier did not, which left the mapping advisory against the
-    roster (found by cross-vendor review, 2026-07-26).
+    Not a general sanitiser: it drops exactly the flags that change the tier (plus their
+    values) and leaves every other passthrough argument alone. The point is to keep the
+    declared tier honest, not to police what an agent author may configure.
 
-    Not a general sanitiser: it drops exactly the flags that grant workspace or change the
-    tier, plus their values. Everything else an agent author writes still passes through --
-    the point is to keep the tier honest, not to police the roster.
+    KNOWN LIMITATION, resolved toward safety: a token is judged by its spelling, not its
+    position, so `--log-file --mode` (where `--mode` is the log FILENAME) loses both tokens.
+    Dropping a legitimate value is recoverable and loud; leaving an agent able to grant
+    itself a full bypass is neither.
     """
+    flags = _BOUNDARY_FLAGS.get(cli)
+    if not flags:
+        return list(extra_args)
     out, skip = [], False
-    for a in extra_args:
+    it = list(extra_args)
+    for i, a in enumerate(it):
         if skip:
             skip = False
             continue
-        if a == "--":
-            # agy's parser stops at `--`, so summon's own `--print` (appended after
-            # extra_args) is then treated as literal text: agy 1.1.7 fell into interactive
-            # behaviour and hung until the timeout. Not a permission bypass, but an agent
-            # definition should not be able to hang every dispatch that uses it.
-            continue
         base = a.split("=", 1)[0]
-        # agy parses with Go's flag package, which accepts SINGLE-dash long options: cross
-        # vendor review ran `agy -add-dir=... help`, `-mode=accept-edits`, `-sandbox=false`
-        # and `-dangerously-skip-permissions=true` and all exited 0, while this function
-        # returned them unchanged. Matching only the double-dash spelling was a sanitiser
-        # that the target's own parser walked straight past.
-        if base.startswith("-") and not base.startswith("--"):
+        # Go-style single-dash long options: agy's parser accepts `-add-dir=...`, and
+        # matching only the double-dash spelling was a sanitiser the target walked past.
+        if base.startswith("-") and not base.startswith("--") and len(base) > 2:
             base = "-" + base
-        if base in _AGY_BOUNDARY_FLAGS:
-            # --add-dir/--mode take a separate value; the boolean flags do not.
-            #
-            # KNOWN LIMITATION, deliberately resolved toward safety: a token is judged by
-            # its spelling, not its position, so `--log-file --add-dir out.txt` (where
-            # --add-dir is the log FILENAME) loses both tokens. Dropping a legitimate value
-            # is recoverable and loud; leaving an agent able to hand itself the workspace is
-            # neither. Positional parsing would need agy's own grammar, which changes under
-            # us -- that is what made spelling-matching unreliable in the first place.
-            skip = ("=" not in a) and base in ("--add-dir", "--mode")
+        if a == "--":
+            # A terminator stops the backend's parser before summon's own trailing flags,
+            # which on agy 1.1.7 dropped it into interactive behaviour until the timeout.
             continue
+        if base in flags:
+            skip = ("=" not in a) and base in _BOUNDARY_TAKES_VALUE
+            continue
+        if cli == "codex" and base == "-c":
+            # `-c` is codex's GENERAL config flag -- summon itself uses
+            # `-c model_reasoning_effort=high` for --effort -- so it cannot be stripped
+            # wholesale. Only a boundary KEY matters. Dropping every `-c` broke an existing
+            # test that asserts ordinary config reaches argv, which is the test doing its
+            # job: a sanitiser that eats legitimate configuration is a bug, not caution.
+            nxt = it[i + 1] if i + 1 < len(it) else ""
+            if any(str(nxt).startswith(k + "=") for k in _CODEX_CONFIG_KEYS):
+                skip = True
+                continue
+        if cli == "codex" and "=" in a and any(
+                a.startswith(k + "=") for k in _CODEX_CONFIG_KEYS):
+            continue                        # a bare `approval_policy=never` value token
         out.append(a)
     return out
+
+
+def _strip_agy_boundary_flags(extra_args) -> list:
+    """Back-compat shim: the agy-specific entry point now delegates to the shared one."""
+    return strip_boundary_flags("agy", extra_args)
 
 
 _UNENFORCED_RO_OPT_IN = "SUMMON_ALLOW_UNENFORCED_READONLY"
@@ -463,7 +493,8 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         # or it hangs on an approval prompt). Just point at the session + new task.
         command, base_args = build_command(inv.cli, _resume_prompt(inv))
         return (command,
-                perm + model_flag + effort_flag + list(inv.extra_args)
+                perm + model_flag + effort_flag
+                + strip_boundary_flags(inv.cli, inv.extra_args)
                 + ["--resume", inv.resume_id] + base_args,
                 None)
 
@@ -475,7 +506,8 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     )
     command, base_args = build_command(inv.cli, inv.prompt)
     return (command,
-            perm + model_flag + effort_flag + list(inv.extra_args)
+            perm + model_flag + effort_flag
+            + strip_boundary_flags(inv.cli, inv.extra_args)
             + ["--append-system-prompt", system_prompt] + base_args,
             None)
 
@@ -491,8 +523,12 @@ def _build_gemini_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     model_flag = ["--model", inv.model] if inv.model else []
     if inv.agent_file:
         command, base_args = build_command(inv.cli, inv.prompt)
-        return command, perm + model_flag + list(inv.extra_args) + base_args, {"GEMINI_SYSTEM_MD": inv.agent_file}
-    return _concatenated_args(inv, perm + model_flag + list(inv.extra_args), env=None)
+        return (command,
+                perm + model_flag + strip_boundary_flags(inv.cli, inv.extra_args)
+                + base_args,
+                {"GEMINI_SYSTEM_MD": inv.agent_file})
+    return _concatenated_args(
+        inv, perm + model_flag + strip_boundary_flags(inv.cli, inv.extra_args), env=None)
 
 
 # Which env var flips each CLI from subscription (login) to metered API billing.
@@ -706,7 +742,8 @@ def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         _e = "high" if inv.effort in ("xhigh", "max") else inv.effort
         effort_flag = ["-c", f"model_reasoning_effort={_e}"]
     env = env_override_for("codex")
-    head = perm + model_flag + effort_flag + list(inv.extra_args)
+    head = (perm + model_flag + effort_flag
+            + strip_boundary_flags(inv.cli, inv.extra_args))
     if inv.resume_id:
         # `codex exec resume <id>`: the thread holds the agent definition, so send
         # only the task + reminder (no [System Context] prefix). Permission/model
@@ -723,10 +760,10 @@ def _build_cursor_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     env_override = env_override_for("cursor-agent")
     model = inv.model or CURSOR_DEFAULT_MODEL
     if inv.resume_id:
-        return "cursor-agent", perm + list(inv.extra_args) + [
+        return "cursor-agent", perm + strip_boundary_flags(inv.cli, inv.extra_args) + [
             "--model", model, "--resume", inv.resume_id, "--output-format", "json",
             "-p", _resume_prompt(inv)], env_override
-    return "cursor-agent", perm + list(inv.extra_args) + [
+    return "cursor-agent", perm + strip_boundary_flags(inv.cli, inv.extra_args) + [
         "--model", model, "--output-format", "json", "-p", _concatenated_prompt(inv)], env_override
 
 

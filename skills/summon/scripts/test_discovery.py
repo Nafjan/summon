@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -2653,6 +2654,12 @@ def test_receipt_and_model_evidence_on_error_dispatch():
         with open(af, "rb") as fh:
             assert ad["sha256"] == hashlib.sha256(fh.read()).hexdigest(), ad
         assert env["prompt_sha256"] == hashlib.sha256(b"hello").hexdigest(), env
+        # This half asserts summon AGREES WITH GIT, which is meaningless without git on
+        # PATH -- and a hermeticity sweep that strips every external binary made it error
+        # rather than skip. A legitimate environment skip, unlike an escape hatch that hides
+        # a real failure: with no git there is nothing to agree with.
+        if shutil.which("git") is None:
+            return
         gh = sp.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
                     cwd=os.getcwd())
         head = gh.stdout.strip() if gh.returncode == 0 else ""
@@ -11524,34 +11531,55 @@ def test_v8_max_permission_drops_extra_args():
 
 
 def test_v8_every_public_flag_is_documented_in_skill_md():
-    """STRUCTURAL: every non-suppressed flag in the argparse spec must appear in SKILL.md.
+    """STRUCTURAL: every non-suppressed flag argparse ACTUALLY EXPOSES must appear in
+    SKILL.md.
 
-    Five public flags had drifted out of the docs unnoticed -- --max-permission,
-    --probe, --max-tool-output-bytes, --min-successful-members, --overall-timeout --
-    because adding a flag and documenting it are separate acts and nothing tied them
-    together. A flag users cannot discover may as well not exist. argparse.SUPPRESS is
-    the explicit way to mark a flag internal, and those are exempt."""
-    import re
+    Five public flags had drifted out of the docs unnoticed -- --max-permission, --probe,
+    --max-tool-output-bytes, --min-successful-members, --overall-timeout -- because adding a
+    flag and documenting it are separate acts and nothing tied them together.
+
+    This used to scrape `add_argument("--x"` out of the source with a regex, which is a
+    weaker claim than it looks: certification review found it saw 55 of the 56 public flags,
+    missing `--timeout` because its declaration spans two lines, and `--help` because
+    argparse generates it. A test that enumerates the surface differently from the parser is
+    testing its own regex. It now walks the REAL parser, subparsers included, so no
+    declaration style can hide a flag.
+
+    argparse.SUPPRESS remains the explicit way to mark a flag internal. `--help` and
+    `--version` are argparse built-ins that every CLI user already knows; they are exempt by
+    name rather than by accident."""
+    import argparse
+
+    import _cli
 
     scripts = os.path.dirname(os.path.abspath(__file__))
-    cli_src = open(os.path.join(scripts, "_cli.py"), encoding="utf-8").read()
     skill = os.path.join(os.path.dirname(scripts), "SKILL.md")
     if not os.path.isfile(skill):     # installed copies may omit docs; skip gracefully
         return
     doc = open(skill, encoding="utf-8").read()
 
-    flags = sorted(set(re.findall(r'add_argument\("(--[a-z0-9-]+)"', cli_src)))
-    assert len(flags) > 20, "flag scan found only %d -- did the parser move?" % len(flags)
-    undocumented = []
-    for f in flags:
-        i = cli_src.find('"%s"' % f)
-        if "help=argparse.SUPPRESS" in cli_src[i:i + 200]:
-            continue              # explicitly internal
-        if f not in doc:
-            undocumented.append(f)
+    public, suppressed = set(), set()
+
+    def walk(parser):
+        for action in parser._actions:
+            for opt in action.option_strings:
+                if opt.startswith("--"):
+                    (suppressed if action.help == argparse.SUPPRESS
+                     else public).add(opt)
+            if isinstance(action, argparse._SubParsersAction):
+                for sub in action.choices.values():
+                    walk(sub)
+
+    walk(_cli.build_parser("0.0.0", 1))
+    public -= {"--help", "--version"}     # argparse built-ins, universally understood
+
+    assert len(public) > 40, (
+        "flag walk found only %d -- did the parser move?" % len(public))
+    undocumented = sorted(f for f in public if f not in doc)
     assert not undocumented, (
-        "these public flags are missing from SKILL.md: %s -- document them, or mark them "
-        "help=argparse.SUPPRESS if they are internal" % ", ".join(undocumented))
+        "these flags are public but undocumented in SKILL.md: %s. Either document them or "
+        "mark them internal with argparse.SUPPRESS (currently suppressed: %s)"
+        % (undocumented, sorted(suppressed) or "none"))
 
 
 def test_v8_every_control_flag_reaches_the_background_child():
@@ -13815,6 +13843,147 @@ def test_v9_a_failed_terminate_falls_back_instead_of_claiming_success():
         _jobobj._k32.CloseHandle = real_close
 
 
+def test_v9_no_backend_lets_an_agent_grant_itself_a_bypass():
+    """CROSS-BACKEND privilege bypass (C5). An agent definition's `args:` are appended AFTER
+    the permission flags summon computes, so a later flag wins. A read-only definition could
+    therefore produce `--permission-mode plan --dangerously-skip-permissions` on Claude --
+    with the envelope still reporting `permission: read-only`.
+
+    The first fix covered agy ONLY, which was fixing the instance instead of the class:
+    cross-vendor review reproduced the identical escalation on Claude, Codex, Cursor and
+    Gemini. This test enumerates every backend so the next narrow fix fails here.
+
+    `--max-permission` and `--gate-with` already drop extra_args wholesale; this closes the
+    directly-declared tier, which is the one an agent author controls."""
+    import _builder
+
+    evil = {
+        "claude": ["--dangerously-skip-permissions"],
+        "codex": ["--dangerously-bypass-approvals-and-sandbox"],
+        "cursor-agent": ["-f", "--trust"],
+        "gemini": ["-y", "--yolo"],
+        "agy": ["--dangerously-skip-permissions", "-add-dir=/elsewhere"],
+    }
+    for cli, flags in evil.items():
+        inv = _builder.AgentInvocation(cli=cli, prompt="p", cwd=os.getcwd(),
+                                       system_context="c", permission="read-only",
+                                       extra_args=tuple(flags))
+        try:
+            _cmd, argv, _env = _builder.build_invocation_args(inv, timeout_ms=60_000)
+        except ValueError:
+            continue                       # backend unbuildable here (agy wrapper on POSIX)
+        leaked = [f for f in flags if f in argv]
+        assert not leaked, (
+            "%s: an agent definition granted itself %r through `args:` while the envelope "
+            "reports permission=read-only. Every backend must be covered, not just the one "
+            "a reviewer happened to name." % (cli, leaked))
+
+    # ...and ordinary passthrough arguments must survive, or this becomes a roster police
+    keep = _builder.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                    system_context="c", permission="read-only",
+                                    extra_args=("--verbose", "--foo", "bar"))
+    _c, argv, _e = _builder.build_invocation_args(keep, timeout_ms=60_000)
+    for tok in ("--verbose", "--foo", "bar"):
+        assert tok in argv, ("stripped a harmless passthrough argument %r" % tok)
+
+
+def test_v9_boundary_strip_covers_every_backend_with_a_permission_mapping():
+    """STRUCTURAL companion: a backend that HAS a permission mapping but NO boundary-flag
+    list is a silent hole -- its tier is advisory against the roster and nothing says so.
+    Adding a backend must therefore add both."""
+    from _builder import _PERMISSION_MAPPING, _BOUNDARY_FLAGS
+
+    missing = sorted(set(_PERMISSION_MAPPING) - set(_BOUNDARY_FLAGS))
+    assert not missing, (
+        "these backends map permission tiers but have no boundary-flag list, so an agent "
+        "definition can override the tier through `args:`: %s" % missing)
+
+
+def test_v9_a_gate_denial_still_carries_its_provenance():
+    """C6, "the envelope never lies", has to include the envelope that says NO.
+
+    A gate refusal built a fresh blocked envelope and copied only `request_sha256`, so a
+    denied dispatch lost `summon`, `agent_def`, `prompt_sha256`, `git_head_before`,
+    `permission` and `permission_flags` -- every one of which SKILL.md describes as
+    evidence, and every one of which was already resolved before the gate ran. A denial is
+    exactly when a caller needs to know WHICH request and WHICH definition were refused."""
+    import _gate
+
+    receipt = {
+        "request_sha256": "a" * 64,
+        "summon": {"version": "9.9.9", "scripts_sha256": "b" * 64},
+        "agent_def": {"file": "x.md", "sha256": "c" * 64, "source": "explicit"},
+        "prompt_sha256": "d" * 64,
+        "git_head_before": "e" * 40,
+        "agents_dir": "/roster",
+        "cwd": "/work",
+    }
+    decision = {"approved": False, "verdict": "DENY", "reason": "disproportionate"}
+    env = _gate.blocked_envelope(decision, agent="rev", cli="claude")
+    # mirror the dispatcher's enrichment
+    for k in ("request_sha256", "summon", "agent_def", "prompt_sha256",
+              "git_head_before", "agents_dir", "cwd"):
+        if receipt.get(k) is not None:
+            env[k] = receipt[k]
+    env["permission"] = "read-only"
+
+    for field in ("request_sha256", "summon", "agent_def", "prompt_sha256",
+                  "git_head_before", "permission"):
+        assert env.get(field), (
+            "a denied dispatch dropped %r, which the docs call evidence and which was "
+            "known before the gate ran" % field)
+    assert env.get("status") == "blocked", env.get("status")
+
+    # and the dispatcher must actually perform that copy -- not just be capable of it
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "run_subagent.py"), encoding="utf-8").read()
+    i = src.index("_env = blocked_envelope(")
+    window = src[i:i + 1200]
+    for field in ("agent_def", "prompt_sha256", "git_head_before", "permission_flags"):
+        assert field in window, (
+            "the gate-refusal branch does not carry %r into the envelope" % field)
+
+
+def test_v9_drift_sees_the_default_npx_project_install():
+    """C7. `npx skills add` puts a project copy at `<project>/.claude/skills/summon`, and
+    enumeration only looked at `<project>/.agents/skills/summon`. A stale copy in the first
+    location was invisible: drift reported `converged: true` while that host ran old code,
+    which is the precise failure this module exists to prevent."""
+    import _installs
+
+    d = tempfile.mkdtemp(prefix="summon-proj-")
+    try:
+        scripts = os.path.join(d, ".claude", "skills", "summon", "scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "run_subagent.py"), "w", encoding="utf-8") as fh:
+            fh.write('__version__ = "0.1.0"' + chr(10))
+
+        labels = [r.get("label") for r in _installs.enumerate_installs(project_dir=d)]
+        assert "project-claude" in labels, (
+            "a stale copy under <project>/.claude/skills/summon was not enumerated, so "
+            "drift cannot see it: %r" % (labels,))
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v9_leak_detector_watches_the_orchestration_modules_too():
+    """C3. The detector listed os/subprocess/clock functions but not the ORCHESTRATION
+    modules this suite patches constantly. Certification review replaced
+    `_council._dispatch` -- swapped repeatedly from line 1728 onward -- and the detector
+    reported nothing leaked.
+
+    A detector blind to the most-patched globals in the file is the shape of guard this
+    project keeps having to fix: it certifies hygiene it never checked."""
+    fp = _global_fingerprint()
+    for required in ("_council._dispatch", "_gate.decide", "_resolver.resolve_cli",
+                     "_loader.load_agent", "_manifest._dispatch_child",
+                     "run_subagent.execute_agent"):
+        assert required in fp, (
+            "%s is patched by tests in this file but is not fingerprinted, so a test that "
+            "fails to restore it silently corrupts every later test" % required)
+
+
 def _global_fingerprint():
     """Identity of the globals these tests monkeypatch.
 
@@ -13847,12 +14016,26 @@ def _global_fingerprint():
     # MODULE FUNCTIONS this suite swaps constantly -- execute_agent, the builder, the gate.
     # Leaving them out meant the most commonly patched things in the file were the ones the
     # detector could not see, which is close to the opposite of useful.
+    # IMPORT them rather than reading sys.modules: a module a test imports for the FIRST
+    # time, patches, and fails to restore was invisible to the "before" snapshot, so the
+    # leak could not be detected. All of these are local, already-loaded-in-practice, and
+    # cheap; a failed import simply omits that module rather than breaking the run.
+    for _m in ("_council", "_gate", "_resolver", "_loader", "_manifest", "_doctor",
+               "_builder", "_executor", "run_subagent"):
+        try:
+            __import__(_m)
+        except Exception:  # noqa: BLE001
+            pass
     for _mod, _attrs in (("run_subagent", ("execute_agent", "_run_gate", "_dispatch_with_retries")),
                          ("_executor", ("execute_agent", "build_invocation_args",
                                         "_drive_process", "_resolve_launch")),
                          ("_builder", ("_ensure_agy_profile", "_attest_agy_profile",
                                        "_agy_wrapper")),
                          ("_manifest", ("_dispatch_child",)),
+                         ("_council", ("_dispatch", "run_member", "_optin_stage_ctx")),
+                         ("_gate", ("decide", "parse_verdict")),
+                         ("_resolver", ("resolve_cli", "discover_models")),
+                         ("_loader", ("load_agent",)),
                          ("_doctor", ("_default_probe_runner",))):
         _m = sys.modules.get(_mod)
         if _m is not None:
