@@ -12926,17 +12926,56 @@ def test_v8_probe_disclosure_reaches_the_published_entry():
     assert other.get("probed_permission") is None, (
         "backends probed at the least authority need no disclosure: %r" % (other,))
 
+def _global_fingerprint():
+    """Identity of the globals these tests monkeypatch.
+
+    The suite runs in ONE process in sorted order, so a test that patches os.open or
+    subprocess and fails to restore it -- easy to do when an assertion fires mid-test and
+    the restore is not in a finally -- silently corrupts every test that runs after it. The
+    corruption presents as an unrelated failure much later, or worse, as a pass. Comparing
+    identities before and after each test names the culprit instead."""
+    import subprocess as _sp
+    return {
+        "os.name": os.name, "os.open": os.open, "os.close": os.close,
+        "os.remove": os.remove, "os.replace": os.replace,
+        "subprocess.Popen": _sp.Popen, "subprocess.run": _sp.run,
+        "env.optin": os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY"),
+        "env.credit": os.environ.get("SUMMON_ALLOW_CREDIT"),
+    }
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
     failed = 0
     for t in tests:
+        _before = _global_fingerprint()
         try:
             t()
             print(f"[PASS] {t.__name__}")
         except Exception as e:  # noqa: BLE001 — test harness reports, doesn't raise
             failed += 1
             print(f"[FAIL] {t.__name__}: {type(e).__name__}: {e}")
+        _after = _global_fingerprint()
+        _leaked = sorted(k for k in _before
+                         if _before[k] is not _after[k] and _before[k] != _after[k])
+        if _leaked:
+            failed += 1
+            print(f"[FAIL] {t.__name__}: LEAKED PATCHED GLOBALS {_leaked} -- restore them "
+                  f"in a finally, or every test after this one runs against them")
+            for _k in _leaked:                      # repair so one leak is not N failures
+                if _k.startswith("env."):
+                    _n = {"env.optin": "SUMMON_ALLOW_UNENFORCED_READONLY",
+                          "env.credit": "SUMMON_ALLOW_CREDIT"}[_k]
+                    if _before[_k] is None:
+                        os.environ.pop(_n, None)
+                    else:
+                        os.environ[_n] = _before[_k]
+                elif _k.startswith("os."):
+                    setattr(os, _k.split(".", 1)[1], _before[_k])
+                elif _k.startswith("subprocess."):
+                    import subprocess as _sp2
+                    setattr(_sp2, _k.split(".", 1)[1], _before[_k])
     print("")
     print(f"{len(tests) - failed}/{len(tests)} passed")
     sys.exit(1 if failed else 0)
