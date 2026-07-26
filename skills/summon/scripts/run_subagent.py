@@ -1341,13 +1341,35 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         if not (result.get("result") or "").strip():
             result["result"] = retry.get("result") or ""
             result["result_from_repair"] = True
-        # The accepted outcome came from the RETRY, so the exit code must describe that run.
-        # Leaving the failed first attempt's code behind produced status "success" next to
-        # exit_code 1 -- contradictory to whichever field the caller happens to trust. The
-        # original is preserved rather than discarded: it is real evidence about attempt 1.
-        if retry.get("exit_code") is not None and result.get("exit_code") != retry["exit_code"]:
-            result["original_exit_code"] = result.get("exit_code")
-            result["exit_code"] = retry["exit_code"]
+        # The accepted outcome came from the RETRY, so the WHOLE exit tuple must describe
+        # that run. Round 7 rewrote status and exit_code and stopped there, leaving
+        # backend_exit_code, dispatcher_status and normalization_reason describing attempt 1
+        # -- so the envelope still contradicted itself, just in fields I had not looked at,
+        # and the changelog's "the contradiction is gone" was false. finalize_exit_fields()
+        # cannot repair them afterwards because it uses setdefault: already-set values win.
+        #
+        # Preserve the complete original tuple (it is real evidence about attempt 1), then
+        # adopt the retry's, recomputing the reason from the new pair rather than copying a
+        # sentence written about the old one.
+        _EXIT_TUPLE = ("exit_code", "backend_exit_code", "dispatcher_status",
+                       "normalization_reason")
+        if retry.get("exit_code") is not None:
+            _orig = {k: result.get(k) for k in _EXIT_TUPLE if k in result}
+            if _orig.get("exit_code") != retry.get("exit_code") or _orig.get(
+                    "dispatcher_status") != retry.get("status"):
+                result["original_exit"] = _orig
+                result["original_exit_code"] = _orig.get("exit_code")   # kept: named field
+                for _k in _EXIT_TUPLE:
+                    result.pop(_k, None)
+                result["exit_code"] = retry["exit_code"]
+                if retry.get("backend_exit_code") is not None:
+                    result["backend_exit_code"] = retry["backend_exit_code"]
+                if retry.get("dispatcher_status"):
+                    result["dispatcher_status"] = retry["dispatcher_status"]
+                if retry.get("normalization_reason"):
+                    result["normalization_reason"] = retry["normalization_reason"]
+                from _executor import finalize_exit_fields as _fin
+                _fin(result)          # recompute anything the retry did not carry
         if retry.get("resume"):
             result["resume"] = retry["resume"]     # latest session id for follow-ups
         if retry.get("warnings"):
