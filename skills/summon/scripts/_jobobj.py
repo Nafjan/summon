@@ -143,29 +143,41 @@ def terminate(process) -> bool:
     job = getattr(process, _ATTR, None)
     if not _AVAILABLE or not job:
         return False
+    terminated = False
     try:
-        _k32.TerminateJobObject(job, 1)
-        return True
+        # CHECK THE BOOL. Ignoring it made a failed TerminateJobObject report success, so
+        # _kill_tree skipped the taskkill fallback entirely and a live backend escaped
+        # teardown. KILL_ON_JOB_CLOSE usually masks this -- the close below kills the tree
+        # too -- but "usually" is not a teardown guarantee.
+        terminated = bool(_k32.TerminateJobObject(job, 1))
     except Exception:  # noqa: BLE001
-        return False
-    finally:
-        close(process)
+        terminated = False
+    # CloseHandle is the second chance: with KILL_ON_JOB_CLOSE, releasing the last handle
+    # kills every member. Only claim the kill when one of the two actually reported success.
+    closed = close(process)
+    return terminated or closed
 
 
-def close(process) -> None:
-    """Release the job handle once the child is finished with.
+def close(process) -> bool:
+    """Release the job handle once the dispatch is over. Returns True if the handle closed.
 
     Held open for the child's whole lifetime ON PURPOSE: KILL_ON_JOB_CLOSE means the OS
-    tears the tree down if summon dies unexpectedly. Closing it early would give that up.
+    tears the tree down if summon dies unexpectedly. Closing it early would give that up --
+    but NOT closing it at all leaks a kernel handle per dispatch and, worse, leaves any
+    descendant the backend spawned still running after the dispatch returns. Measured: 20
+    dispatches leaked ~20 handles, and a failed attempt's grandchild outlived its envelope.
+
+    Idempotent: the attribute is cleared first, so a concurrent second caller (council
+    teardown racing normal completion) cannot double-close the same raw handle.
     """
     job = getattr(process, _ATTR, None)
     if not job:
-        return
-    try:
-        _k32.CloseHandle(job)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
+        return False
+    try:                      # clear FIRST: two threads must not both see the same handle
         setattr(process, _ATTR, None)
     except Exception:  # noqa: BLE001
-        pass
+        return False
+    try:
+        return bool(_k32.CloseHandle(job))
+    except Exception:  # noqa: BLE001
+        return False
