@@ -1053,11 +1053,16 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
               f"({gate_cli}) as the gated dispatch; a same-vendor gate shares the "
               f"caller's blind spots", file=sys.stderr)
 
-    prompt = gate_prompt(agent=args.agent, prompt=args.prompt, cwd=args.cwd,
+    # EVERY field comes from the invocation actually being gated, not from args. Taking
+    # prompt/cwd from args meant a re-gate (retry, schema correction, contract repair)
+    # adjudicated the ORIGINAL task while a DIFFERENT request was dispatched -- the gate
+    # approved something nobody was about to run. args is the first dispatch's shape; the
+    # invocation is what is about to happen.
+    prompt = gate_prompt(agent=args.agent, prompt=gated_inv.prompt, cwd=gated_inv.cwd,
                          permission=gated_inv.permission, cli=gated_inv.cli,
                          model=gated_inv.model)
     gate_inv = AgentInvocation(
-        cli=gate_cli, prompt=prompt, cwd=args.cwd, system_context=gate_ctx,
+        cli=gate_cli, prompt=prompt, cwd=gated_inv.cwd, system_context=gate_ctx,
         agent_file=gate_file,
         permission="read-only",   # FORCED: never inherit the gate definition's tier
         permission_forced=True,   # so the opt-in cannot turn the adjudicator advisory
@@ -1265,8 +1270,10 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
     if not (result.get("status") == "success" and not result.get("report_ok")):
         return result
     _perm, _forced, _perm_warning = _repair_permission(invocation)
-    if _perm_warning:
-        result.setdefault("warnings", []).append(_perm_warning)
+    # NOT appended yet: it says the resume RAN at this tier, and the gate below may deny it.
+    # Emitting it here produced flatly contradictory telemetry -- "the corrective resume ran
+    # at safe-edit" sitting next to "DENIED by the gate, so it was not run". A warning about
+    # an execution belongs after the execution.
     resume = result.get("resume") or {}
     sid, profile = resume.get("session_id"), resume.get("profile")
     if not sid and not profile:
@@ -1302,6 +1309,8 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
             "the report contract is malformed and the corrective resume was DENIED by the "
             "gate, so it was not run; the original result stands as returned")
         return result
+    if _perm_warning:                     # approved: the resume is about to actually run
+        result.setdefault("warnings", []).append(_perm_warning)
     try:
         retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir,
                               max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
