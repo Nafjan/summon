@@ -1944,7 +1944,17 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     except Exception:  # noqa: BLE001 - teardown plumbing must never break a dispatch
         pass
 
-    response = _drive_process(process, inv.cli, timeout_ms)
+    try:
+        response = _drive_process(process, inv.cli, timeout_ms)
+    finally:
+        # The dispatch is OVER here whichever way it ended. Closing the job releases the
+        # kernel handle AND, via KILL_ON_JOB_CLOSE, reaps any descendant the backend left
+        # running -- the case that let a retry overlap with the previous attempt's tree.
+        try:
+            from _jobobj import close as _job_close
+            _job_close(process)
+        except Exception:  # noqa: BLE001 - cleanup must never mask the real result
+            pass
     # Resume handle: what the orchestrator passes to a follow-up `--resume`.
     # session_id comes from the stream (claude/codex/cursor); agy has no stream
     # id, so it resumes by reusing the same profile dir instead.

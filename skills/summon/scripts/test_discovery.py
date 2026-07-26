@@ -13679,6 +13679,142 @@ def test_v9_public_docs_do_not_oversell_what_the_code_does():
         "the README no longer tells a reader how to actually verify sign-in")
 
 
+def test_v9_a_completed_dispatch_releases_its_job_and_reaps_stragglers():
+    """A normal return never released the job. Two consequences, both measured by review:
+    twenty dispatches leaked a kernel handle each, and -- the functional one -- a leader
+    that exited while a descendant kept running left that descendant ALIVE after
+    execute_agent returned, so a retry could start on top of the previous attempt's tree.
+
+    Closing is not mere hygiene here: KILL_ON_JOB_CLOSE means releasing the handle also
+    reaps whatever the finished dispatch left behind."""
+    if os.name != "nt":
+        return
+    import subprocess as _sp
+    import _jobobj
+    from _spawn import popen_flags, run_flags
+
+    if not _jobobj.available():
+        return
+
+    # Drive execute_agent, NOT _jobobj.close directly. The first version of this test
+    # called close() itself, so deleting the executor's cleanup left it green: it proved
+    # the helper works, never that anything calls it.
+    import _builder
+    import _executor
+
+    released = {"n": 0}
+    real_close = _jobobj.close
+    real_drive = _executor._drive_process
+    real_build = _executor.build_invocation_args
+    try:
+        def spy_close(proc):
+            released["n"] += 1
+            return real_close(proc)
+
+        _jobobj.close = spy_close
+        _executor.build_invocation_args = lambda inv, t=None: (
+            sys.executable, ["-c", "pass"], None)
+        _executor._drive_process = lambda *a, **k: {"status": "success", "result": "ok",
+                                                    "exit_code": 0}
+        inv = _builder.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                       system_context="c", permission="read-only")
+        _executor.execute_agent(inv, timeout_ms=30_000)
+    finally:
+        _jobobj.close = real_close
+        _executor._drive_process = real_drive
+        _executor.build_invocation_args = real_build
+
+    assert released["n"] >= 1, (
+        "execute_agent returned without releasing the job. The handle leaks per dispatch "
+        "and -- via KILL_ON_JOB_CLOSE -- any descendant the backend left running survives "
+        "into the next retry.")
+
+
+def test_v9_close_is_idempotent_and_reports_whether_it_released():
+    """Council teardown can race normal completion on the same Popen. The attribute is
+    cleared BEFORE the handle is closed, so a second caller sees nothing to close rather
+    than double-closing a raw kernel handle -- which is undefined behaviour, and on Windows
+    can close an unrelated handle that has since reused the value."""
+    import _jobobj
+
+    class _P:
+        pass
+
+    p = _P()
+    assert _jobobj.close(p) is False, "nothing attached -> nothing released"
+    setattr(p, "_summon_job_handle", None)
+    assert _jobobj.close(p) is False
+
+    if os.name != "nt" or not _jobobj.available():
+        return
+    # THE ORDERING, with a handle actually attached. The first version used an object with
+    # no handle, so it never exercised the clear-then-close sequence at all and a mutant
+    # that closed first survived it.
+    calls = {"n": 0}
+    real_close = _jobobj._k32.CloseHandle
+    try:
+        def counting_close(h):
+            calls["n"] += 1
+            return 1
+
+        _jobobj._k32.CloseHandle = counting_close
+        q = _P()
+        setattr(q, "_summon_job_handle", 4242)
+        assert _jobobj.close(q) is True, "the first close should release and report it"
+        assert _jobobj.close(q) is False, (
+            "a second caller saw the same handle: the attribute must be cleared BEFORE "
+            "closing, or council teardown racing normal completion double-closes a raw "
+            "kernel handle")
+        assert calls["n"] == 1, ("CloseHandle ran %d times for one job" % calls["n"])
+    finally:
+        _jobobj._k32.CloseHandle = real_close
+
+
+def test_v9_a_failed_terminate_falls_back_instead_of_claiming_success():
+    """TerminateJobObject returns a Win32 BOOL and the result was ignored, so a FAILED
+    terminate reported success -- and `_kill_tree` therefore skipped its taskkill fallback
+    entirely, letting a live backend escape teardown. KILL_ON_JOB_CLOSE usually masks this
+    because the close kills the tree too, but "usually" is not a teardown guarantee.
+
+    terminate() now claims success only when the terminate OR the close actually reported
+    it."""
+    if os.name != "nt":
+        return
+    import _jobobj
+
+    if not _jobobj.available():
+        return
+
+    class _P:
+        pass
+
+    p = _P()
+    setattr(p, "_summon_job_handle", 12345)      # a handle value that is not ours
+    real_term = _jobobj._k32.TerminateJobObject
+    real_close = _jobobj._k32.CloseHandle
+    try:
+        _jobobj._k32.TerminateJobObject = lambda *a: 0     # BOTH report failure
+        _jobobj._k32.CloseHandle = lambda *a: 0
+        assert _jobobj.terminate(p) is False, (
+            "terminate() claimed the tree was killed when both Win32 calls reported "
+            "failure; _kill_tree would then skip its taskkill fallback")
+    finally:
+        _jobobj._k32.TerminateJobObject = real_term
+        _jobobj._k32.CloseHandle = real_close
+
+    # and when the close succeeds, the kill IS established even if terminate failed
+    p2 = _P()
+    setattr(p2, "_summon_job_handle", 12345)
+    try:
+        _jobobj._k32.TerminateJobObject = lambda *a: 0
+        _jobobj._k32.CloseHandle = lambda *a: 1
+        assert _jobobj.terminate(p2) is True, (
+            "KILL_ON_JOB_CLOSE means a successful close DOES kill the tree")
+    finally:
+        _jobobj._k32.TerminateJobObject = real_term
+        _jobobj._k32.CloseHandle = real_close
+
+
 def _global_fingerprint():
     """Identity of the globals these tests monkeypatch.
 

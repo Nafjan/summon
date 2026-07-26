@@ -6,6 +6,23 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.15.2] - 2026-07-26
+
+### Fixed
+
+- **A completed dispatch now releases its Job Object** (Windows). The handle was only closed
+  on a timeout kill, so every normal return leaked one -- and, more seriously, a leader that
+  exited while a descendant kept running left that descendant ALIVE after `execute_agent`
+  returned, so a `--retries` attempt could start on top of the previous attempt's tree.
+  Because the job carries `KILL_ON_JOB_CLOSE`, releasing the handle also reaps whatever the
+  finished dispatch left behind.
+- **A failed `TerminateJobObject` no longer reports success.** The Win32 `BOOL` was ignored,
+  so a failed terminate looked like a kill and `_kill_tree` skipped its `taskkill` fallback
+  entirely. Termination is now claimed only when the terminate or the handle close actually
+  reports it.
+- **`close()` is idempotent.** It clears the stored handle before closing, so council
+  teardown racing normal completion cannot double-close the same raw kernel handle.
+
 ## [0.15.1] - 2026-07-26
 
 ### Fixed
