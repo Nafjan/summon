@@ -8,6 +8,39 @@ never on added fields.
 
 ## [0.15.0] - 2026-07-26
 
+### Fixed (round 7)
+- **A repaired envelope could contradict itself.** Found by dogfooding, not review: this
+  repo's own round-6 review dispatch came back `status: success` with `exit_code: 1` and an
+  EMPTY `result`, its findings only in `repaired_report_text`. A caller following the
+  documented contract -- branch on `status`, read `result` -- would have got an empty string
+  and no error, and the completed review nearly went in the bin as a failure. Two defects
+  met there: "keep the original text verbatim" preserves nothing when the original is empty
+  (the repaired text is now used, flagged `result_from_repair`), and the accepted outcome
+  comes from the RETRY, so attempt 1's exit code no longer sits next to attempt 2's status
+  (the original is kept as `original_exit_code`).
+- **A successful writability probe cleared the counter but not the recorded denial**, so at
+  the 10001-name bound a long-dead transient error was reported as a permanent permission
+  failure -- the wrong diagnosis in the function that exists to diagnose it. This also made
+  the round-5 changelog entry's "right diagnosis" claim false in exactly the case it
+  described; that entry is corrected rather than left standing.
+- **The corrective resume duplicated warnings.** It repeats the original dispatch's
+  conditions -- same backend, tier and clock -- so it emits the same advisories, and
+  concatenating produced each one twice.
+- **`_no_agy_optin()` restored a value but not ABSENCE**, so a test body that SET the
+  variable left it set, contaminating every later test in a single-process suite.
+
+### Docs (round 7)
+- SKILL.md's fan-out flag matrix listed only the council flags through `--out`, while the
+  CLI also accepts `--run-dir`, `--results-dir`, `--quorum`, `--chairman-fallback`, the
+  per-stage timeouts, `--overall-timeout` and `--min-successful-members` -- several of them
+  documented correctly a few lines above the matrix that denied them.
+
+### Testing (round 7)
+- 380/380 discovery, 22/22 install. Five mutants, all killed, with restores verified
+  byte-identical: an earlier mutation run used `/tmp`, which is a DIFFERENT directory for
+  Git Bash and for Python on Windows, so a restore silently failed and left a mutant in the
+  working tree masquerading as a real test failure.
+
 ### Security (round 5)
 - **The contract repair was never re-gated.** A gate authorises ONE execution -- retries
   re-gate, schema correction re-gates -- and the corrective resume did not. Round 3 made
@@ -164,6 +197,9 @@ never on added fields.
   the wrong cause entirely. Both heuristics were approximating "is this directory writable",
   which is now simply asked: one direct probe with a name nothing else can hold. 130 probes
   instead of 10001, and the right diagnosis.
+  (Round 6 found this incomplete: a successful probe reset the counter but not the recorded
+  denial, so at the 10k bound a long-dead transient error was still reported as a permanent
+  permission failure. Both are cleared now.)
 - **`--dry-run` did not know about the refusal**, so preflight showed a dispatch that would
   never run. Same drift class as the warnings: two paths describing one dispatch, maintained
   separately.

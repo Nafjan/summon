@@ -213,7 +213,9 @@ with `--prompt-file`; `--question` with `--question-file`; manifest job `prompt`
 **Fan-out flag matrix (rejected, never silently dropped):** `--manifest` consumes only
 `--concurrency`, `--results-dir`, `--cwd`, `--agents-dir`, `--retries`; `--council`
 consumes only `--question`/`--question-file`, `--members`, `--chairman`, `--rounds`,
-`--cwd`, `--agents-dir`, `--timeout`, `--out`. Any other dispatch flag passed to these
+`--cwd`, `--agents-dir`, `--timeout`, `--out`, `--run-dir`, `--results-dir`, `--quorum`,
+`--chairman-fallback`, `--member-timeout`, `--chair-timeout`, `--overall-timeout` and
+`--min-successful-members`. Any other dispatch flag passed to these
 modes is rejected up front with a pointer to where the capability lives (per-job manifest
 keys, or the member agent's own definition).
 

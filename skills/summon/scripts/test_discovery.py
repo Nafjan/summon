@@ -11763,7 +11763,13 @@ def _no_agy_optin():
         try:
             yield
         finally:
-            if had is not None:
+            # RESTORE ABSENCE TOO. The old form only restored a value it had removed, so a
+            # body that SET the variable left it set -- contaminating every later test in a
+            # suite that runs in one process. "Restore what was there" has to include
+            # "restore that nothing was there".
+            if had is None:
+                os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+            else:
                 os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
 
     return _ctx()
@@ -13038,6 +13044,200 @@ def test_v8_probe_disclosure_reaches_the_published_entry():
     assert entry.get("auth_ok") is True, ("a successful probe still certifies auth", entry)
     assert other.get("probed_permission") is None, (
         "backends probed at the least authority need no disclosure: %r" % (other,))
+
+
+def test_v8_a_successful_probe_clears_the_denial_it_disproved():
+    """A successful writability probe proves the denials were transient, and reset the
+    counter -- but not `_last_denial`. So on reaching the 10k name bound, a long-dead
+    transient error was reported as a permanent permission failure: the WRONG diagnosis, in
+    the very function that exists to diagnose this correctly, and it made the changelog's
+    "right diagnosis" claim false in exactly the case it describes.
+
+    Repro (from cross-vendor review): 65 transient denials, one successful probe, then every
+    candidate name occupied."""
+    import _manifest
+
+    d = tempfile.mkdtemp(prefix="summon-stale-")
+    real_open = os.open
+    st = {"n": 0}
+    try:
+        out = os.path.join(d, "r.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(chr(123) + '"status": "success"' + chr(125))
+
+        def stub(path, flags, *a, **k):
+            p_ = str(path)
+            if ".wtest" in p_:
+                return real_open(path, flags, *a, **k)      # writable
+            if ".superseded" in p_:
+                st["n"] += 1
+                if st["n"] <= 65:
+                    raise PermissionError(13, "transient", p_)
+                raise FileExistsError(17, "occupied", p_)   # crowded, not denied
+            return real_open(path, flags, *a, **k)
+
+        os.open = stub
+        err = _manifest._clear_out_file(out, archive=True)
+    finally:
+        os.open = real_open
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    assert "too many superseded copies" in (err or ""), (
+        "a CROWDED directory was reported as a permission failure, using a denial the "
+        "probe had already disproved: %r" % err)
+    assert "permission denied" not in (err or ""), err
+
+
+def test_v8_optin_helper_restores_absence_not_just_a_value():
+    """`_no_agy_optin()` popped the variable and restored it only if it had HAD a value. A
+    body that SET the variable therefore left it set, contaminating every later test in a
+    suite that runs in one process in sorted order.
+
+    "Restore what was there" has to include "restore that nothing was there". The runner's
+    leak detector would now catch the symptom; this fixes the cause."""
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        with _no_agy_optin():
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"   # body sets it
+        assert "SUMMON_ALLOW_UNENFORCED_READONLY" not in os.environ, (
+            "the helper left the variable SET after a body that set it; every later test "
+            "then runs with the opt-in active")
+
+        # and the ordinary case still round-trips
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        with _no_agy_optin():
+            assert "SUMMON_ALLOW_UNENFORCED_READONLY" not in os.environ, (
+                "the helper must actually remove it inside the block, or every refusal "
+                "assertion under it is testing the opt-in path instead")
+        assert os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY") == "1"
+    finally:
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+
+def test_v8_a_repaired_envelope_is_not_self_contradictory():
+    """FOUND BY DOGFOODING, not by review. This repo's own round-6 review dispatch came back
+    `status: success` with `exit_code: 1` and an EMPTY `result`, its actual findings visible
+    only in `repaired_report_text`. A caller branching on status and reading `result` -- the
+    documented way to use summon -- would have got an empty string and no error, and I
+    nearly discarded a completed review as a failed one.
+
+    Two separate defects met there. "Keep the original text verbatim" preserves nothing when
+    the original text is empty. And the accepted outcome comes from the RETRY, so leaving
+    the failed first attempt's exit code behind contradicts whichever field the caller
+    happens to trust."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="safe-edit")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    real = rs.execute_agent
+    try:
+        rs.execute_agent = lambda i, **k: {
+            "status": "success", "result": "THE REAL FINDINGS", "report_ok": True,
+            "exit_code": 0}
+        original = {"status": "success", "report_ok": False, "result": "", "exit_code": 1,
+                    "resume": {"session_id": "s"}}
+        out = rs._apply_contract_repair(original, inv, args)
+    finally:
+        rs.execute_agent = real
+
+    assert out.get("status") == "success", out.get("status")
+    assert (out.get("result") or "").strip(), (
+        "a repaired success carried an EMPTY result; the content existed only in "
+        "repaired_report_text, where a caller following the documented contract never "
+        "looks: %r" % out)
+    assert out.get("exit_code") == 0, (
+        "status success alongside exit_code %r -- the two fields describe different runs, "
+        "and a caller trusting either one is misled" % out.get("exit_code"))
+    assert out.get("original_exit_code") == 1, (
+        "attempt 1's exit code is real evidence and must be preserved, not discarded")
+    assert out.get("repaired_report_text"), out
+
+
+def test_v8_a_repair_that_keeps_real_text_does_not_overwrite_it():
+    """The counterpart. When the original run DID produce text, the repair must not replace
+    it with the terse corrective re-emit -- that was the whole reason the overlay keeps the
+    original verbatim, and a fallback for the empty case must not quietly become a
+    replacement for the normal one."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="read-only")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    real = rs.execute_agent
+    try:
+        rs.execute_agent = lambda i, **k: {
+            "status": "success", "result": "terse re-emit", "report_ok": True,
+            "exit_code": 0}
+        original = {"status": "success", "report_ok": False,
+                    "result": "the agent's FULL analysis", "exit_code": 0,
+                    "resume": {"session_id": "s"}}
+        out = rs._apply_contract_repair(original, inv, args)
+    finally:
+        rs.execute_agent = real
+
+    assert out.get("result") == "the agent's FULL analysis", (
+        "the repair overwrote the original analysis with the corrective re-emit: %r"
+        % out.get("result"))
+    assert not out.get("result_from_repair")
+    assert out.get("repaired_report_text") == "terse re-emit"
+
+
+def test_v8_repair_does_not_duplicate_warnings():
+    """The corrective resume repeats the original dispatch's conditions -- same backend,
+    same tier, same clock -- so it emits the same advisory warnings. Concatenating produced
+    every one of them twice, so a caller counting warnings, or a human reading them, saw a
+    doubled list describing a single condition."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="safe-edit")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    real = rs.execute_agent
+    try:
+        rs.execute_agent = lambda i, **k: {
+            "status": "success", "result": "ok", "report_ok": True, "exit_code": 0,
+            "warnings": ["shared condition", "retry-only note"]}
+        original = {"status": "success", "report_ok": False, "result": "x", "exit_code": 0,
+                    "warnings": ["shared condition"], "resume": {"session_id": "s"}}
+        out = rs._apply_contract_repair(original, inv, args)
+    finally:
+        rs.execute_agent = real
+
+    w = out.get("warnings") or []
+    assert len(w) == len(set(w)), ("warnings duplicated across the repair: %r" % (w,))
+    assert "retry-only note" in w, ("a warning only the retry raised must survive: %r" % (w,))
+    assert "shared condition" in w
+
+
+def test_v8_repair_without_a_resume_lane_claims_nothing():
+    """A backend with no resume lane cannot be repaired at all. The tier warning used to be
+    appended before that was known, so an envelope could say "the corrective resume ran at
+    safe-edit" when no resume had run and none could."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="safe-edit")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    out = rs._apply_contract_repair(
+        {"status": "success", "report_ok": False, "result": "x", "resume": {}}, inv, args)
+    assert not any("corrective resume ran" in w for w in (out.get("warnings") or [])), (
+        "claimed a resume ran when there was no resume lane: %r" % (out.get("warnings"),))
+    assert out.get("contract_repaired") is not True
+
 
 def _global_fingerprint():
     """Identity of the globals these tests monkeypatch.

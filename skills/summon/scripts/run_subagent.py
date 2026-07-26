@@ -1333,10 +1333,35 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         result.pop("suspect", None)
         result["contract_repaired"] = True
         result["repaired_report_text"] = retry.get("result")   # the corrected block, for reference
+        # If the ORIGINAL text was empty, "keep the original verbatim" preserves nothing:
+        # the envelope then reports success with an empty `result`, and the only content
+        # lives in a field most callers never read. Observed for real on this repo's own
+        # review dispatch -- the findings existed, and a caller branching on status and
+        # reading `result` would have seen an empty string and no error.
+        if not (result.get("result") or "").strip():
+            result["result"] = retry.get("result") or ""
+            result["result_from_repair"] = True
+        # The accepted outcome came from the RETRY, so the exit code must describe that run.
+        # Leaving the failed first attempt's code behind produced status "success" next to
+        # exit_code 1 -- contradictory to whichever field the caller happens to trust. The
+        # original is preserved rather than discarded: it is real evidence about attempt 1.
+        if retry.get("exit_code") is not None and result.get("exit_code") != retry["exit_code"]:
+            result["original_exit_code"] = result.get("exit_code")
+            result["exit_code"] = retry["exit_code"]
         if retry.get("resume"):
             result["resume"] = retry["resume"]     # latest session id for follow-ups
         if retry.get("warnings"):
-            result["warnings"] = (result.get("warnings") or []) + retry["warnings"]
+            # DEDUPE, order-preserving. The corrective resume repeats the original
+            # dispatch's conditions -- same backend, same tier, same clock -- so it emits
+            # the same advisory warnings, and concatenating produced every one of them
+            # twice. A caller counting warnings, or a human reading them, sees a doubled
+            # list describing one condition.
+            _merged = (result.get("warnings") or []) + retry["warnings"]
+            _seen, result["warnings"] = set(), []
+            for _w in _merged:
+                if _w not in _seen:
+                    _seen.add(_w)
+                    result["warnings"].append(_w)
     else:
         result["contract_repair_attempted"] = True   # a call was spent; it did not improve
     return result
