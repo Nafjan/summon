@@ -6,6 +6,27 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.15.1] - 2026-07-26
+
+### Fixed
+
+- **Windows: a timeout can no longer strand a running backend** ([#10](https://github.com/Nafjan/summon/issues/10)).
+  `taskkill /F /T` walks parent-to-child PID links, so once the dispatching leader had
+  exited it reported *"process not found"* and any still-running backend grandchild -- the
+  one holding stdout open and defeating the wall-clock timeout -- survived. A council
+  `--overall-timeout` could therefore report a finished deliberation while a paid CLI kept
+  running. POSIX never had this: a process group outlives its leader, so `killpg` reaches
+  through.
+  Windows children are now assigned to a kernel **Job Object**, which kills every member
+  regardless of who exited first. Reproduced live before the fix (`taskkill` said *process
+  not found*, the orphan survived) and verified after.
+  A second guarantee comes free: the job is created `KILL_ON_JOB_CLOSE`, so if summon itself
+  is killed -- crash, Ctrl-C, closed terminal -- the OS takes the backend tree with it rather
+  than leaving a paid CLI running unattended. `--background` children are deliberately
+  excluded; they are meant to outlive the launcher.
+  Stdlib-only (`ctypes`), fails soft: where Job Objects are unavailable the previous
+  `taskkill` path is unchanged, and it still covers the common leader-alive case.
+
 ## [0.15.0] - 2026-07-26
 
 **The permissions release.** A permission tier is a promise, and this version stops summon

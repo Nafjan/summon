@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 import types
 
@@ -13522,6 +13523,100 @@ def test_v8_docs_do_not_promise_cross_process_result_ownership():
         assert "wasteful duplicate, not corruption" not in low, (
             "%s still claims a shared results dir is only wasteful; two real processes "
             "showed one parent serving the other's answer" % label)
+
+
+def test_v9_job_object_kills_a_tree_through_a_dead_leader():
+    """ISSUE #10. `taskkill /F /T /PID <leader>` walks parent->child PID links, so once the
+    leader has exited it reports "process not found" and a still-running backend grandchild
+    -- the one holding stdout open and defeating the wall-clock timeout -- is orphaned.
+    POSIX never had this: a process group outlives its leader, so killpg reaches through.
+
+    A Job Object is the Windows equivalent guarantee. This drives the exact reported
+    scenario: spawn a leader that starts a long-lived grandchild and exits immediately, then
+    kill through the job and assert the grandchild is gone.
+
+    Windows-only by nature; skipped elsewhere."""
+    if os.name != "nt":
+        return
+    import subprocess as _sp
+    import _jobobj
+    from _spawn import popen_flags, run_flags
+
+    if not _jobobj.available():
+        return                       # ctypes/Job Objects unavailable on this build
+
+    leader_src = (
+        "import subprocess, sys\n"
+        "gc = subprocess.Popen([sys.executable, '-c',\n"
+        "    'import time,sys\\nopen(sys.argv[1],\"w\").write(\"alive\")\\n"
+        "time.sleep(120)', sys.argv[1]])\n"
+        "print(gc.pid, flush=True)\n")
+
+    d = tempfile.mkdtemp(prefix="summon-job-")
+    mark = os.path.join(d, "alive.txt")
+    gc_pid = None
+    try:
+        leader = _sp.Popen([sys.executable, "-c", leader_src, mark],
+                           stdout=_sp.PIPE, text=True, **popen_flags())
+        attached = _jobobj.attach(leader)
+        # Read the grandchild's pid BEFORE asserting on anything: an assertion that fires
+        # first leaves `gc_pid` unset, and the cleanup below then cannot reach a process
+        # that sleeps for two minutes. Found by watching a mutation run strand one.
+        gc_pid = int((leader.stdout.readline() or "0").strip())
+        assert attached, "the child could not be assigned to a job"
+        assert gc_pid, "the scenario did not produce a grandchild"
+        leader.wait(timeout=30)                       # THE LEADER IS NOW GONE
+        for _ in range(40):
+            if os.path.exists(mark):
+                break
+            time.sleep(0.05)
+
+        assert _jobobj.terminate(leader), "the job did not handle the kill"
+        time.sleep(0.6)
+        out = _sp.run(["tasklist", "/FI", "PID eq %d" % gc_pid],
+                      capture_output=True, text=True, **run_flags())
+        assert str(gc_pid) not in (out.stdout or ""), (
+            "the grandchild outlived a kill issued through a DEAD leader -- this is exactly "
+            "issue #10, and taskkill cannot reach it")
+        gc_pid = None
+    finally:
+        if gc_pid:                                    # never leave a stray process behind
+            _sp.run(["taskkill", "/F", "/PID", str(gc_pid)],
+                    capture_output=True, **run_flags())
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v9_background_children_are_never_put_in_a_job():
+    """A `--background` child is SUPPOSED to outlive summon. The job carries
+    KILL_ON_JOB_CLOSE -- which is the point for a foreground dispatch, since summon dying
+    should not leave a paid backend running -- so assigning a detached child would execute
+    it the moment the launcher exits. That would turn --background into --foreground with
+    extra steps."""
+    import _jobobj
+
+    class _FakeProc:
+        _handle = 0                 # never assigned regardless, but be explicit
+        pid = 1
+
+    assert _jobobj.attach(_FakeProc(), detached=True) is False, (
+        "a detached child was put in a kill-on-close job; it would die with the launcher")
+
+
+def test_v9_job_helpers_are_inert_off_windows_and_never_raise():
+    """Teardown plumbing must never be the thing that breaks a dispatch. Every helper fails
+    soft: no job, no crash, and the caller keeps the taskkill/killpg path it already had."""
+    import _jobobj
+
+    class _FakeProc:
+        pid = 1
+
+    p = _FakeProc()
+    assert _jobobj.terminate(p) is False, "no job attached -> caller must fall back"
+    _jobobj.close(p)                                  # must not raise
+    if os.name != "nt":
+        assert _jobobj.available() is False
+        assert _jobobj.attach(p) is False
 
 
 def _global_fingerprint():
