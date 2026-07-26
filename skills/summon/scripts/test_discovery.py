@@ -13619,6 +13619,66 @@ def test_v9_job_helpers_are_inert_off_windows_and_never_raise():
         assert _jobobj.attach(p) is False
 
 
+def test_v9_public_docs_do_not_oversell_what_the_code_does():
+    """STRUCTURAL GUARD over README.md and TERMS.md.
+
+    A documentation review found nine claims the code does not support, three of them
+    guarantees a reader would act on: worktree isolation described as automatic when it is
+    opt-in, TERMS asserting summon "does not call any provider API itself" while
+    `openai-compat` makes a direct HTTPS request, and a council-scoped "never corrupted
+    output" line stated as a repository-wide property that the manifest race disproves.
+
+    Each entry below pairs a phrase that must NOT appear with the reason. This is the same
+    binding used for the agy claims: a sentence and the behaviour it describes drift unless
+    something checks them against each other."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))))
+    banned = [
+        ("README.md", "runs in its own git worktree",
+         "worktree isolation is opt-in via --worktree; without it concurrent editing "
+         "agents share --cwd"),
+        ("TERMS.md", "does not call any provider API itself",
+         "the openai-compat backend calls the configured base_url directly "
+         "(_apibackend.py builds a urllib Request)"),
+        ("README.md", "wasted spend, never" + chr(10) + "corrupted output",
+         "that bound is council-scoped; two manifest runs sharing a --results-dir were "
+         "measured serving each other's answers"),
+        ("README.md", "makes any agent return validated JSON",
+         "--json-schema validates and retries once, and only where the backend supports "
+         "resume"),
+        # NOTE the precision: "a CLI installed and logged in" is a legitimate REQUIREMENT.
+        # What must not appear is doctor being described as reporting login state, which it
+        # does only under --probe. The first draft of this guard banned the bare phrase and
+        # flagged the requirements list -- a guard that cries wolf gets disabled.
+        ("README.md", "tells you what you have and what's missing",
+         "the default doctor reads versions only; sign-in is verified by doctor --probe"),
+        ("README.md", "Every result includes `report.handoff`",
+         "error, timeout and malformed replies can carry report: null"),
+    ]
+    def _flat(t):
+        # Docs are HARD-WRAPPED, so a phrase that spans a line break is not findable as a
+        # literal. Collapsing whitespace makes the guard survive reflowing, which an editor
+        # or a future rewrap will do without touching meaning.
+        return " ".join(t.split())
+
+    for fname, phrase, why in banned:
+        path = os.path.join(root, fname)
+        if not os.path.isfile(path):
+            continue
+        text = _flat(open(path, encoding="utf-8", errors="replace").read())
+        assert _flat(phrase) not in text, (
+            "%s claims %r, but %s" % (fname, phrase, why))
+
+    # and the corrections must actually be PRESENT, not merely the old text deleted --
+    # otherwise this guard is satisfied by saying nothing at all
+    readme = _flat(open(os.path.join(root, "README.md"),
+                        encoding="utf-8", errors="replace").read())
+    assert _flat("give each concurrent run its own `--results-dir`") in readme, (
+        "the manifest concurrency caveat was removed rather than corrected")
+    assert "doctor --probe" in readme, (
+        "the README no longer tells a reader how to actually verify sign-in")
+
+
 def _global_fingerprint():
     """Identity of the globals these tests monkeypatch.
 

@@ -46,8 +46,9 @@ OpenAI, Anthropic, Google, and local models (Ollama, LM Studio) work as agents t
 Most multi-agent tools assume one specific CLI is the orchestrator. Summon inverts that:
 **any CLI can be the boss.** Your Codex session can summon Claude for a review. Your Claude
 session can summon Codex for an adversarial pass. Your terminal can summon a whole council
-to decide something. Each runs in its own git worktree, in parallel, and every result comes
-back as one JSON envelope you can branch on.
+to decide something. They run in parallel -- add `--worktree` and each editing agent gets
+its own isolated branch -- and every result comes back as one JSON envelope you can branch
+on.
 
 And because each backend runs on its own login, the subscriptions you already pay for
 finally pull together: Claude Max, ChatGPT, Cursor, Gemini, and Antigravity on the same
@@ -86,7 +87,8 @@ drive it, and it hands back structured results instead of a stream.
   each other anonymously, and a chairman synthesizes a call with confidence and dissents.
 - **Swarm over documents:** a manifest of 40 jobs with per-backend concurrency, resumable
   if it crashes. Good for reviewing, summarizing, or labeling at scale.
-- **Structured extraction:** `--json-schema` makes any agent return validated JSON.
+- **Structured extraction:** `--json-schema` validates an agent's final JSON and, on a
+  backend that supports resume, spends one corrective retry when it does not match.
 - **Use local + frontier models together:** an Ollama model and Claude in the same council.
 
 ---
@@ -132,8 +134,10 @@ thin `/sub-agents` alias.
 Set up "summon" for me (github.com/Nafjan/summon), a cross-vendor AI sub-agent dispatcher.
 
 1. Clone https://github.com/Nafjan/summon and cd into it.
-2. Run `python summon.py doctor` and tell me which backends are installed and logged in
-   (claude, codex, cursor-agent, gemini, agy) and which are missing.
+2. Run `python summon.py doctor` and tell me which backends are installed (claude, codex,
+   cursor-agent, gemini, agy) and which are missing. That check reads versions only -- if I
+   approve a small live call per backend, run `doctor --probe` to verify sign-in and
+   account eligibility too.
 3. Run `python install.py` to install the summon skill into every AI CLI on this machine
    (it auto-detects ~/.claude, ~/.codex, ~/.cursor, ~/.gemini, ~/.copilot and never
    overwrites my own agents). Add `--with-alias` only if I ask for the legacy /sub-agents name.
@@ -181,7 +185,7 @@ Git-style subcommands. The old flat `--flag` form still works too:
 |---|---|
 | `summon dispatch --agent N --prompt … --cwd D` | run one agent (the default action) |
 | `summon list` | list available agents |
-| `summon models [--cli B]` | what each backend can run right now |
+| `summon models [--cli B]` | invocable models per backend, with a `source` per entry (live query, local config, or static list) |
 | `summon doctor [--json]` | backend / setup health check (run this first) |
 | `summon manifest FILE` | run a batch swarm (per-backend concurrency, resumable) |
 | `summon council --question "…"` | **decide by consensus** of diverse models |
@@ -198,10 +202,14 @@ Git-style subcommands. The old flat `--flag` form still works too:
 1. **Pick the right agent, not just the right model.** Agents bundle a model, a persona,
    and a report contract. `reviewer` (Codex) reviews; `planner` (Opus) plans; `pair`
    (Sonnet) does everyday work. `summon list` shows them; `summon agent new` makes your own.
-2. **Chain with `handoff`.** Every result includes `report.handoff`. Paste it into the
-   next dispatch instead of re-explaining; that's how multi-step work stays cheap.
-3. **Trust the envelope, not the prose.** Branch on `status`; a run that ends asking for
-   approval or self-reports `BLOCKED` comes back `blocked`, never a false `success`. Check
+2. **Chain with `handoff`.** Every result that satisfies the report contract carries
+   `report.handoff` (an error, timeout or malformed reply may not, which is what
+   `report_ok` tells you). Paste it into the next dispatch instead of re-explaining;
+   that's how multi-step work stays cheap.
+3. **Trust the envelope, not the prose.** Branch on `status`: a self-reported `BLOCKED`,
+   and a recognised approval request in the run's final output, are downgraded to
+   `blocked`. Approval detection matches known markers rather than reading intent, so also
+   treat `suspect: true` as unverified rather than assuming every stalled run is caught. Check
    `model.served` to confirm which model actually did the work (`served: null` means
    summon saw no service evidence: no terminal model report and no output tokens, even
    when `targeted` names a model).
@@ -238,8 +246,10 @@ dispatch it with the **summon** skill instead of doing everything yourself:
   chairman synthesize. Disagreement that survives round 2 is worth taking seriously.
 - **Independent work → `--manifest`.** Fan several jobs out with per-backend
   concurrency; each writes its own result envelope you can inspect.
-- **Escalate the hardest problems** to the top tier (`fable`, or an opus agent). Keep
-  councils and swarms diverse; a council of clones is pointless.
+- **Escalate the hardest problems** to the top tier (an opus agent, or `fable`). Note that
+  `fable` runs on Opus unless you authorize credit spend: Fable bills account credit rather
+  than the subscription, so the guard substitutes the latest subscription Opus and says so
+  in `warnings`. Keep councils and swarms diverse; a council of clones is pointless.
 
 Verify, don't trust: branch on the returned `status`; a `report_ok:false` or
 `suspect:true` "success" means re-dispatch. Read `warnings` (model fell back, an agy
@@ -404,7 +414,8 @@ a headless session.
   dispatcher itself. The optional **agy** backend's PTY wrapper wants `pip install pywinpty pyte`.
 - **At least one backend:** a vendor CLI installed and logged in (`claude`, `codex`,
   `cursor-agent`, `gemini`, or `agy`), and/or an API key for an `openai-compat` provider (or
-  a local Ollama/LM Studio server). `summon doctor` tells you what you have and what's missing.
+  a local Ollama/LM Studio server). `summon doctor` tells you which are installed;
+  `doctor --probe` spends a small live call per backend to confirm sign-in and eligibility.
 - **`git`** if you use `--worktree`.
 - **A host that can run a shell command:** a coding CLI, an AI IDE, a desktop agent app, or
   a plain terminal. Anything that can invoke `python` and read the skill can drive it.
@@ -536,10 +547,15 @@ turned an OS command-line overflow from a bogus `CLI not found` into an accurate
   v2** to retire the legacy `model.resolved` in favor of `targeted`/`served`.
 
 **Known limitation:** the durable-run owner lock has a sub-millisecond stale-break/release
-window that pure-stdlib cross-platform file operations cannot fully close. Generation
-namespacing bounds the worst case to a single duplicate stage dispatch (wasted spend, never
-corrupted output), and it requires a process suspended past its lease resuming inside that
-exact window; single-machine use does not hit it. Closing it fully would need OS advisory
+window that pure-stdlib cross-platform file operations cannot fully close. For COUNCIL runs,
+generation namespacing bounds the worst case to a single duplicate stage dispatch (wasted
+spend, not corrupted output), and it requires a process suspended past its lease resuming
+inside that exact window; single-machine use does not hit it.
+This does **not** extend to manifests. Two manifest runs sharing one `--results-dir` are not
+serialized by anything: measured with two real processes, one parent read and reported the
+other's answer. summon now refuses an envelope whose `request_sha256` does not match the job
+being run (`result_path_conflict`), but that is a safety net, not a lock -- **give each
+concurrent run its own `--results-dir`.** Closing it fully would need OS advisory
 locks (with their own NFS / suspended-process gaps).
 
 ## Credits
