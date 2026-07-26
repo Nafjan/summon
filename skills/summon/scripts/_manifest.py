@@ -156,6 +156,19 @@ def _clear_out_file(out_file: str, archive: bool) -> str | None:
                                     try:
                                         os.remove(probe)
                                     except OSError:
+                                        # DELIBERATELY not reported as an error. A stranded
+                                        # zero-byte `.superseded.wtest.<pid>.<uuid>` is
+                                        # cosmetic: archive names are constructed exactly and
+                                        # never globbed, so summon cannot mistake it for an
+                                        # archive. Reporting it would make _clear_out_file
+                                        # return failure for a clear that SUCCEEDED, and
+                                        # _write_error_out refuses to overwrite when
+                                        # archiving fails -- which drops the dispatch's real
+                                        # error envelope and leaves a stale success. That is
+                                        # a bug this file already fixed once; trading it back
+                                        # for tidier litter is a bad deal. An operator
+                                        # globbing `*.superseded*` may see one; the `.wtest.`
+                                        # infix marks it.
                                         pass
                                 # BOTH, not just the counter. A successful probe proves
                                 # the denials were transient, so keeping the last one alive
@@ -446,12 +459,29 @@ def _existing_envelope(out_file: str) -> dict | None:
     return None
 
 
-def _read_envelope(out_file: str, proc) -> dict:
+def _read_envelope(out_file: str, proc, expect_sha: str | None = None) -> dict:
     """The child's --out file is the authoritative envelope. Fall back to the
     child's exit info only if the file is missing/corrupt (child crashed before
-    writing) — NEVER slice stdout, which host banners can pollute."""
+    writing) — NEVER slice stdout, which host banners can pollute.
+
+    `expect_sha` is this job's `request_sha256`. A results directory is documented as
+    belonging to ONE manifest run, but nothing enforced it: two parents sharing a directory
+    and a job id with DIFFERENT prompts both read whichever envelope landed last, so one
+    parent reported the other's answer and both exited success (measured with two real
+    processes, 2026-07-26). The envelope already carries the identity of the request it
+    answers; this is the read path finally checking it.
+    """
     env = _existing_envelope(out_file)
     if env is not None:
+        got = env.get("request_sha256")
+        if expect_sha and got and got != expect_sha:
+            return {"status": "error",
+                    "error": ("the envelope at this result path answers a DIFFERENT request "
+                              f"(expected {expect_sha[:12]}, found {got[:12]}). A results "
+                              "directory belongs to one manifest run; two runs sharing this "
+                              "path will overwrite each other's answers. Give each run its "
+                              "own --results-dir."),
+                    "result_path_conflict": True}
         return env
     # Combine BOTH streams: the real traceback often goes to stdout while stderr
     # only carries a shell/hook banner. `stderr or stdout` would surface just the
@@ -598,8 +628,10 @@ def run_manifest(args) -> int:
                                              f"({int(_parent_timeout(job))}s); process tree killed"}
                     else:
                         # The child's --out file is AUTHORITATIVE — never parse the
-                        # child's stdout, which a shell/hook banner can pollute.
-                        envelope = _read_envelope(out_file, proc)
+                        # child's stdout, which a shell/hook banner can pollute. `_fp` is
+                        # this job's request identity: a shared results dir means the
+                        # envelope sitting here might answer a DIFFERENT run's question.
+                        envelope = _read_envelope(out_file, proc, _fp)
                 except Exception as e:  # noqa: BLE001 — one job must never crash the pool
                     envelope = {"status": "error", "error": f"{type(e).__name__}: {e}"}
         # Always leave forensics: if the job ran (not skipped) but the child wrote
@@ -607,9 +639,25 @@ def run_manifest(args) -> int:
         # persist the error envelope ourselves — so `result_file` in the summary
         # actually exists and a failed job is never zero-forensics.
         if not skipped and not os.path.exists(out_file):
+            # temp + os.replace, like every other envelope write. A direct open("w") was
+            # observed by a concurrent reader as the single byte "{", and a crash inside
+            # that window strands a permanently unparseable file -- which is exactly what
+            # "a present file is a COMPLETE file" promises cannot happen. The promise is
+            # only as good as its least careful writer.
             try:
-                with open(out_file, "w", encoding="utf-8") as fh:
-                    json.dump(envelope, fh, ensure_ascii=False)
+                _d = os.path.dirname(os.path.abspath(out_file)) or "."
+                os.makedirs(_d, exist_ok=True)
+                _fd, _tmp = tempfile.mkstemp(dir=_d, prefix=".summon-out-", suffix=".tmp")
+                try:
+                    with os.fdopen(_fd, "w", encoding="utf-8") as fh:
+                        json.dump(envelope, fh, ensure_ascii=False)
+                    os.replace(_tmp, out_file)
+                except BaseException:
+                    try:
+                        os.unlink(_tmp)
+                    except OSError:
+                        pass
+                    raise
             except OSError:
                 pass
         status = envelope.get("status", "error")

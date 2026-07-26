@@ -7,6 +7,7 @@ config.toml table-boundary parsing and the eager-agy-probe filter bug.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -13237,6 +13238,55 @@ def test_v8_repair_without_a_resume_lane_claims_nothing():
     assert not any("corrective resume ran" in w for w in (out.get("warnings") or [])), (
         "claimed a resume ran when there was no resume lane: %r" % (out.get("warnings"),))
     assert out.get("contract_repaired") is not True
+
+
+def test_v8_a_foreign_envelope_is_refused_not_served():
+    """Two manifest parents sharing a --results-dir and job id, with DIFFERENT prompts, both
+    read whichever envelope landed last: parent A reported parent B's answer and both exited
+    success. Measured with two real processes (cross-vendor review, 2026-07-26), which also
+    made SKILL.md's "wasteful duplicate, not corruption" false -- the JSON was byte-valid,
+    its attribution was not.
+
+    summon already stamps `request_sha256` on every envelope so a stored answer can be
+    checked against the request it is served for. The manifest read path simply never asked."""
+    import _manifest
+
+    class _P:
+        stdout = ""
+        stderr = ""
+        returncode = 0
+
+    d = tempfile.mkdtemp(prefix="summon-foreign-")
+    try:
+        f = os.path.join(d, "job.json")
+        with open(f, "w", encoding="utf-8") as fh:
+            json.dump({"status": "success", "result": "answer-from-B",
+                       "request_sha256": "B" * 64}, fh)
+
+        same = _manifest._read_envelope(f, _P(), "B" * 64)
+        assert same.get("result") == "answer-from-B", (
+            "an envelope answering THIS request must still be served", same)
+
+        foreign = _manifest._read_envelope(f, _P(), "A" * 64)
+        assert foreign.get("status") == "error", (
+            "an envelope answering a DIFFERENT request was served as this job's answer: %r"
+            % (foreign,))
+        assert foreign.get("result_path_conflict") is True, foreign
+        assert "results-dir" in (foreign.get("error") or ""), (
+            "the error must name the fix, since the cause is invisible: %r"
+            % foreign.get("error"))
+
+        # back-compat: an envelope with no stamp, or a caller with no expectation, still reads
+        legacy = _manifest._read_envelope(f, _P(), None)
+        assert legacy.get("result") == "answer-from-B"
+        with open(f, "w", encoding="utf-8") as fh:
+            json.dump({"status": "success", "result": "unstamped"}, fh)
+        assert _manifest._read_envelope(f, _P(), "A" * 64).get("result") == "unstamped", (
+            "a pre-stamp envelope carries no identity to contradict; refusing it would "
+            "break resume for everything written before this field existed")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
 
 
 def _global_fingerprint():
