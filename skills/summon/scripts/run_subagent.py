@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.15.2"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.15.3"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -887,7 +887,21 @@ def main() -> None:
         if not _gate_decision.get("approved"):
             from _gate import blocked_envelope
             _env = blocked_envelope(_gate_decision, agent=args.agent, cli=cli)
-            _env["request_sha256"] = receipt.get("request_sha256")
+            # Carry the provenance the receipt already resolved. A refusal is exactly when
+            # a caller needs to know WHICH request and WHICH definition were denied, and
+            # every one of these was known before the gate ran.
+            for _k in ("request_sha256", "summon", "agent_def", "prompt_sha256",
+                       "git_head_before", "agents_dir", "cwd"):
+                if receipt.get(_k) is not None:
+                    _env[_k] = receipt[_k]
+            _env["permission"] = invocation.permission
+            try:
+                from _builder import permission_flags as _pf, _PERMISSION_MAPPING
+                _env["permission_flags"] = (_pf(invocation.cli, invocation.permission)
+                                            if invocation.cli in _PERMISSION_MAPPING
+                                            else None)
+            except Exception:  # noqa: BLE001 - evidence is best-effort, never fatal
+                _env["permission_flags"] = None
             finalize_exit_fields(_env)
             if args.out:
                 _write_out(args.out, _env)

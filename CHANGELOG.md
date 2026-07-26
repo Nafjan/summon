@@ -6,6 +6,48 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.15.3] - 2026-07-26
+
+**Certification round 1.** A formal attempt at the 1.0 bar found five real defects,
+including a privilege bypass on every backend. All are fixed and guarded.
+
+### Security
+
+- **An agent definition could grant itself a permission bypass on ANY backend.** Frontmatter
+  `args:` are appended AFTER the permission flags summon computes, so a later flag wins: a
+  `read-only` definition could produce `--permission-mode plan --dangerously-skip-permissions`
+  on Claude, with the envelope still reporting `permission: read-only`. Reproduced on Claude,
+  Codex, Cursor and Gemini.
+  An earlier fix covered `agy` only -- the instance rather than the class. Boundary flags are
+  now stripped for every backend across all seven argv splice sites, with a structural test
+  asserting that any backend with a permission mapping must also declare its boundary flags.
+  Ordinary passthrough arguments still reach the CLI: `codex -c` is narrowed to the config
+  KEYS that move the boundary, so `-c model_reasoning_effort=high` is untouched.
+
+### Fixed
+
+- **A gate denial dropped its own evidence.** The refusal built a fresh envelope carrying
+  only `request_sha256`, losing `agent_def`, `summon`, `prompt_sha256`, `git_head_before`,
+  `permission` and `permission_flags` -- all resolved before the gate ran. A denial is
+  exactly when a caller needs to know what was refused.
+- **Drift could not see the default `npx skills add` project copy.** Enumeration checked
+  `<project>/.agents/skills/summon` only, so a stale copy under `.claude/skills/summon` left
+  drift reporting `converged: true` while that host ran old code.
+- **The public-flag test read the source instead of the parser**, so it saw 55 of 56 public
+  flags -- missing `--timeout`, whose declaration spans two lines. A test that enumerates the
+  surface differently from argparse is testing its own regex. It now walks the real parser,
+  subparsers included.
+- **The leak detector was blind to the orchestration modules** the suite patches most
+  (`_council._dispatch`, the gate, the resolver, the loader) and could only see modules
+  already imported, so a test that imported one for the first time and leaked it went
+  unnoticed. It imports and fingerprints them explicitly now.
+- A provenance test required `git` on PATH and errored under a hermeticity sweep; it skips
+  cleanly when git is absent, since agreement with git is meaningless without git.
+
+### Testing
+
+400 dispatcher tests, 22 install tests. The C5 bypass is mutation-verified per backend.
+
 ## [0.15.2] - 2026-07-26
 
 ### Fixed

@@ -9,7 +9,7 @@ Project-agnostic and host-agnostic. Adopt the parts you need; every section is
 written so a single orchestrator (human or agent) can act on it without a
 house style guide.
 
-Semantics below were verified against summon **0.15.2**. Model ids and alias
+Semantics below were verified against summon **0.15.3**. Model ids and alias
 behaviour are volatile: re-check with `doctor`, `list`, `models`, and
 `--dry-run` before a run you care about.
 

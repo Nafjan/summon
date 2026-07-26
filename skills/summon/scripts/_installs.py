@@ -285,10 +285,14 @@ def enumerate_installs(running_scripts_dir: str | None = None,
     # a stale copy kept the Windows console-window bug after the hosts were fixed. It is
     # unmanaged (no ownership manifest), so it is REPORTED, never written.
     if project_dir:
-        raw.append(_probe("project",
-                          os.path.join(project_dir, ".agents", "skills", "summon",
-                                       "scripts"),
-                          managed=False))
+        # BOTH conventional project locations. `.agents/skills/summon` is summon's own
+        # layout; `.claude/skills/summon` is where `npx skills add` puts it by default, and
+        # that one was invisible to enumeration -- a stale copy there left drift reporting
+        # `converged: true` while the host ran old code, which is the exact failure this
+        # module exists to prevent.
+        for _label, _rel in (("project", (".agents", "skills", "summon", "scripts")),
+                             ("project-claude", (".claude", "skills", "summon", "scripts"))):
+            raw.append(_probe(_label, os.path.join(project_dir, *_rel), managed=False))
     records: list = []
     by_key: dict = {}
     for r in raw:
