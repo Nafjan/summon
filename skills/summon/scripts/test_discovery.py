@@ -7,9 +7,12 @@ config.toml table-boundary parsing and the eager-agy-probe filter bug.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
+from pathlib import Path
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -10552,6 +10555,7 @@ def test_v7_retry_invocations_inherit_all_attestation_fields():
     import run_subagent as _rs
     from _builder import AgentInvocation
 
+    import _builder as _b
     orig = AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(), agent_file="x.md",
                            agy_account_sha256="ACCOUNT-A-SHA", agy_account_checked=True,
                            resume_profile="/prof")
@@ -10590,9 +10594,33 @@ def test_v7_retry_invocations_inherit_all_attestation_fields():
         assert cr is not None, "contract-repair retry was not constructed"
         assert cr.agy_account_sha256 == "ACCOUNT-A-SHA" and cr.agy_account_checked is True, (
             "the contract-repair retry dropped the agy attestation fields", cr)
-        # its deliberate hardening survived the clone
-        assert cr.permission == "read-only", cr.permission
+        # Its deliberate hardening survived the clone -- but honestly. The repair drops to
+        # read-only where that MEANS something; agy cannot enforce the tier, and the repair
+        # RESUMES the session that already held the task's authority, so claiming read-only
+        # there would be theatre. It runs at the original tier and warns instead.
+        assert cr.permission == orig.permission, (
+            "agy cannot enforce read-only and the resume continues an already-authorised "
+            "session; the repair must not pretend otherwise", cr.permission)
+        assert cr.permission_forced is False, (
+            "nothing was forced here, so an ambient opt-in has nothing to waive")
+        assert any("not read-only" in w for w in (result.get("warnings") or [])), (
+            "a repair that could not drop privilege must SAY so: %r" % (result.get("warnings"),))
         assert not cr.extra_args, cr.extra_args
+
+        # ...and on a backend that DOES enforce it, the drop still happens.
+        captured.clear()
+        enforcing = _b.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                       agent_file="x.md", permission="safe-edit",
+                                       extra_args=("--dangerous",))
+        r2 = {"status": "success", "report_ok": False, "resume": {"session_id": "s"}}
+        _rs._apply_contract_repair(r2, enforcing, _Args())
+        cr2 = captured.get("inv")
+        assert cr2 is not None and cr2.permission == "read-only", (
+            "claude enforces read-only, so the repair must still drop privilege", cr2)
+        assert cr2.permission_forced is True, (
+            "a tier summon imposed must be marked forced, or an ambient opt-in could waive it")
+        assert not any("not read-only" in w for w in (r2.get("warnings") or [])), (
+            "no warning is owed when the drop actually happened: %r" % (r2.get("warnings"),))
     finally:
         _rs.execute_agent = real_execute
 
@@ -11720,40 +11748,283 @@ def test_v8_archive_claim_reports_a_genuinely_unwritable_dir():
         % err)
 
 
-def test_v8_agy_invocation_adds_the_cwd_to_its_workspace():
-    """agy must be told where the caller's repo is, via `--add-dir <cwd>`.
+def _no_agy_optin():
+    """Context manager: assert refusal behaviour with the opt-in DEFINITELY unset.
 
-    Summon redirects HOME/USERPROFILE to an isolated per-invocation profile (auth
-    hygiene), and agy consequently resolves relative paths against a scratch dir INSIDE
-    that profile. Two canaries on 2026-07-25 measured it: "read probe.txt in the current
-    working directory" returned BLOCKED with agy quoting the scratch path, while the same
-    file at an absolute path read fine -- so agy had file tools all along and simply was
-    not standing in --cwd. With `--add-dir` the RELATIVE lookup succeeds.
+    Three tests assumed the ambient environment did not carry
+    SUMMON_ALLOW_UNENFORCED_READONLY. With it set they fail, and the order test proceeds
+    into a real agy build and dispatch -- an assertion about refusing to spend money that
+    spends money. Found by the cross-vendor test audit, 2026-07-26.
+    """
+    import contextlib
 
-    The flag must come BEFORE `--print`, which consumes the next token as the prompt."""
-    from _builder import AgentInvocation, build_invocation_args
-
-    if os.name != "nt":
-        return          # the bundled ConPTY wrapper is Windows-only; see the agy notes
-
-    d = tempfile.mkdtemp(prefix="summon-agyadd-")
-    try:
-        inv = AgentInvocation(cli="agy", prompt="p", cwd=d, system_context="ctx",
-                              permission="read-only")
+    @contextlib.contextmanager
+    def _ctx():
+        had = os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
         try:
-            _cmd, args, _env = build_invocation_args(inv, timeout_ms=60000)
-        except ValueError:
-            return      # no agy account on this machine: nothing to assert about argv
-        assert "--add-dir" in args, (
-            "the agy invocation does not pass --add-dir, so the agent resolves relative "
-            "paths against a profile scratch dir instead of --cwd. args=%r" % (args,))
-        assert args[args.index("--add-dir") + 1] == d, args
-        assert args.index("--add-dir") < args.index("--print"), (
-            "--add-dir must precede --print: agy treats the token after --print as the "
-            "prompt, so a flag placed later is swallowed into it")
+            yield
+        finally:
+            # RESTORE ABSENCE TOO. The old form only restored a value it had removed, so a
+            # body that SET the variable left it set -- contaminating every later test in a
+            # suite that runs in one process. "Restore what was there" has to include
+            # "restore that nothing was there".
+            if had is None:
+                os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+            else:
+                os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+    return _ctx()
+
+
+def test_v8_agy_read_only_fails_closed():
+    """agy has NO enforceable read-only tier, so summon refuses the dispatch.
+
+    History matters here. summon first mapped read-only to `--mode plan --sandbox`; canaries
+    showed both allow writes. It then WITHHELD `--add-dir` and shipped that as containment
+    with a warning saying agy "cannot read your repository". Canary 5 (2026-07-26) gave a
+    DECLARED read-only agy agent two absolute paths: it read a secret file back verbatim and
+    created a new one, both confirmed on disk. Withholding the workspace only broke relative
+    paths; it was never a boundary.
+
+    A tier the backend will not honour is worse than no tier, because callers act on it. So
+    this fails closed, like --gate-with does."""
+    from _builder import readonly_unenforceable_error as refuse
+
+    with _no_agy_optin():
+        msg = refuse("agy", "read-only")
+        assert msg, "agy at read-only must be REFUSED, not dispatched with a caveat"
+        assert "ABSOLUTE" in msg or "absolute" in msg, (
+            "the refusal must cite WHY the tier is unenforceable, since the obvious reading "
+            "is that summon is being over-cautious: %s" % msg)
+        assert "safe-edit" in msg and "SUMMON_ALLOW_UNENFORCED_READONLY" in msg, (
+            "a refusal that names no way forward just blocks work: %s" % msg)
+
+        # every other combination still dispatches
+        assert refuse("agy", "safe-edit") is None
+        assert refuse("agy", "yolo") is None
+        for backend in ("claude", "codex", "cursor-agent", "gemini"):
+            assert refuse(backend, "read-only") is None, (
+                "%s enforces read-only; refusing it would be a regression" % backend)
+
+
+def test_v8_agy_read_only_opt_in_dispatches_but_says_it_is_advisory():
+    """Refusing outright would strand someone who knowingly wants agy's reasoning on a
+    throwaway checkout. The opt-in makes the tier advisory rather than enforced -- and must
+    say exactly that, because the failure mode is a caller who thinks read-only held."""
+    import _builder
+    from _builder import (readonly_unenforceable_error as refuse,
+                          agy_readonly_workspace_warning as warn)
+
+    had = _builder.os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        assert warn("agy", "read-only") is None, (
+            "without the opt-in the dispatch is refused, so an advisory warning would be "
+            "describing a run that never happens")
+        _builder.os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        assert refuse("agy", "read-only") is None, "the opt-in must actually let it through"
+        w = warn("agy", "read-only")
+        assert w and "ADVISORY" in w, w
+        assert "enforced by nothing" in w, (
+            "the warning must not soften: the tier is enforced by NOTHING (%s)" % w)
+        # and it must not fire for backends that really do enforce the tier
+        assert warn("claude", "read-only") is None
     finally:
+        if had is None:
+            _builder.os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            _builder.os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+
+def test_v8_refusal_happens_before_the_profile_is_built():
+    """agy's profile build COPIES OAUTH MATERIAL into a per-invocation directory. A dispatch
+    summon is going to refuse must not do that work, and certainly must not copy credentials
+    for it. The check originally sat after build_invocation_args and cost ~1.1s plus a
+    credential copy per refusal; it now costs nothing."""
+    import _builder
+    import _executor
+
+    built = {"n": 0}
+    real_build = _executor.build_invocation_args
+    # hermetic: with the opt-in set this test would DISPATCH agy for real
+    _ctx = _no_agy_optin()
+
+    def spy(*a, **k):
+        built["n"] += 1
+        return real_build(*a, **k)
+
+    try:
+        _ctx.__enter__()
+        _executor.build_invocation_args = spy
+        inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                       system_context="ctx", permission="read-only")
+        resp = _executor.execute_agent(inv, timeout_ms=30000)
+    finally:
+        _executor.build_invocation_args = real_build
+        _ctx.__exit__(None, None, None)
+
+    assert built["n"] == 0, (
+        "the refused dispatch still built an agy profile (and copied OAuth material into "
+        "it). Fail closed BEFORE side effects, not after.")
+    assert resp.get("status") == "error" and resp.get("exit_code") == 1, resp
+
+
+def test_v8_agent_args_cannot_reopen_the_agy_boundary():
+    """An agent definition's own `args:` are appended AFTER the permission flags, so
+    frontmatter `args: ["--add-dir", "/repo"]` silently rewrote the tier summon computed.
+    --max-permission and --gate-with drop extra_args wholesale for exactly this reason; a
+    DIRECTLY declared tier did not, which left the permission mapping advisory against the
+    roster. Found by cross-vendor review (2026-07-26) and confirmed: the built argv did
+    contain --add-dir at read-only.
+
+    Ordinary passthrough args must survive -- this keeps the tier honest, it does not police
+    the roster."""
+    import _builder
+    from _builder import _strip_agy_boundary_flags as strip
+
+    # FIRST the integration, because the unit assertions below pass even if nobody CALLS
+    # the strip function: deleting its use in _build_agy_args restored --add-dir in the
+    # real argv while this test stayed green (cross-vendor audit, 2026-07-26).
+    real_ensure = _builder._ensure_agy_profile
+    real_attest = _builder._attest_agy_profile
+    real_wrapper = _builder._agy_wrapper
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        _builder._ensure_agy_profile = lambda cwd, deadline_sec=300.0: tempfile.gettempdir()
+        _builder._attest_agy_profile = lambda *a, **k: None
+        _builder._agy_wrapper = lambda: "wrapper.py"
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"   # so read-only builds at all
+        inv = _builder.AgentInvocation(
+            cli="agy", prompt="p", cwd=os.getcwd(), system_context="c",
+            permission="read-only",
+            extra_args=("--add-dir", "/elsewhere", "--mode", "yolo",
+                        "--dangerously-skip-permissions", "--keep", "me"))
+        _cmd, argv, _env = _builder.build_invocation_args(inv, timeout_ms=60000)
+        assert argv.count("--add-dir") <= 1, (
+            "the agent's own --add-dir survived into the real argv: %r" % (argv,))
+        assert "/elsewhere" not in argv, (
+            "an agent definition pointed agy at a directory summon never authorised: %r"
+            % (argv,))
+        assert "yolo" not in argv and "--dangerously-skip-permissions" not in argv, (
+            "an agent granted itself a tier through args:: %r" % (argv,))
+        assert "--keep" in argv and "me" in argv, (
+            "ordinary passthrough args must survive; this keeps the tier honest, it does "
+            "not police the roster: %r" % (argv,))
+    finally:
+        _builder._ensure_agy_profile = real_ensure
+        _builder._attest_agy_profile = real_attest
+        _builder._agy_wrapper = real_wrapper
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+    assert strip(["--add-dir", "/repo", "--keep", "v"]) == ["--keep", "v"], (
+        "--add-dir and its VALUE must both go, or the bare path becomes a stray argument")
+    assert strip(["--add-dir=/repo", "--keep"]) == ["--keep"], "the = form too"
+    assert strip(["--mode", "yolo"]) == [], "a second --mode overrides the computed tier"
+    assert strip(["--sandbox"]) == [], "sandbox state is summon's to decide"
+    assert strip(["--dangerously-skip-permissions"]) == [], (
+        "an agent must not be able to grant itself the bypass through args:")
+    # everything else passes through untouched, including values that LOOK like flags
+    assert strip(["--foo", "bar", "-q"]) == ["--foo", "bar", "-q"]
+    assert strip([]) == []
+
+
+def test_v8_archive_denial_is_measured_not_guessed():
+    """Two heuristics were tried for "is this directory unwritable, or just busy?", and both
+    were defeated.
+
+    A CUMULATIVE tally aborted on transient contention spread across a long run. A
+    CONSECUTIVE streak was then defeated by the case cross-vendor review reproduced on a
+    real filesystem: an unwritable directory whose occupied names return EEXIST and whose
+    free names return EACCES. The streak never reaches two, so the loop ground through all
+    10001 probes and reported "too many superseded copies" -- sending the reader off to
+    delete files that were never the problem.
+
+    The question both heuristics approximated is just "is this directory writable", so it is
+    now asked directly, once, with a name nothing else can be holding."""
+    import _manifest
+
+    d = tempfile.mkdtemp(prefix="summon-denial-")
+    real_open = os.open
+    seen = {"n": 0}
+    probes = {"n": 0}
+    try:
+        out = os.path.join(d, "r.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(chr(123) + '"status": "success"' + chr(125))
+
+        def alternating(path, flags, *a, **k):
+            # occupied names EEXIST, free names EACCES: a denial streak never forms
+            if ".superseded" in str(path) and ".wtest" not in str(path):
+                seen["n"] += 1
+                if seen["n"] % 2:
+                    raise FileExistsError(17, "File exists", str(path))
+                raise PermissionError(13, "Permission denied", str(path))
+            if ".wtest" in str(path):
+                probes["n"] += 1        # the direct writability question, asked once
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, flags, *a, **k)
+
+        os.open = alternating
+        err = _manifest._clear_out_file(out, archive=True)
+    finally:
+        os.open = real_open
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
+
+    assert "permission denied" in (err or ""), (
+        "an unwritable directory must be diagnosed as a PERMISSION problem; 'too many "
+        "superseded copies' names the wrong cause entirely: %r" % err)
+    assert seen["n"] < 500, (
+        "the loop walked %d names before giving up. The writability probe exists so a denied "
+        "directory is detected in tens of probes, not ten thousand." % seen["n"])
+    # THE DISTINGUISHING ASSERTION. Both assertions above are satisfied by the OLD
+    # cumulative counter too -- alternating denials reach 65 cumulative after 130 attempts,
+    # so it returned the same message and this test passed against the exact code it claims
+    # to replace (cross-vendor audit, 2026-07-26). The difference is not the outcome here;
+    # it is that the new code ASKS the filesystem instead of inferring from a tally. A
+    # counter-based implementation never opens a probe name.
+    assert probes["n"] > 0, (
+        "no writability probe was attempted, so the verdict came from a counting heuristic. "
+        "Both heuristics tried before were defeated by inputs that count the same as a "
+        "healthy directory; only measuring distinguishes them.")
+
+
+def test_v8_transient_contention_still_rides_out():
+    """The counterpart. A directory that IS writable must not be misread as denied just
+    because contention produced denials -- that was the original bug, where a transient race
+    aborted the clear and the dispatch's real error envelope was dropped in favour of a
+    stale success."""
+    import _manifest
+
+    d = tempfile.mkdtemp(prefix="summon-contend-")
+    real_open = os.open
+    seen = {"n": 0}
+    try:
+        out = os.path.join(d, "r.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(chr(123) + '"status": "success"' + chr(125))
+
+        def busy(path, flags, *a, **k):
+            # 200 denials, far past the old bound, on a directory that IS writable: the
+            # probe succeeds and the walk continues
+            if ".superseded" in str(path) and ".wtest" not in str(path):
+                seen["n"] += 1
+                if seen["n"] <= 200:
+                    raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, flags, *a, **k)
+
+        os.open = busy
+        err = _manifest._clear_out_file(out, archive=True)
+    finally:
+        os.open = real_open
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    assert err is None, (
+        "transient contention on a WRITABLE directory aborted the clear: %r. The writability "
+        "probe is what distinguishes this from a denied directory." % err)
 
 
 def test_v8_gate_records_its_own_definition_hash():
@@ -11812,17 +12083,1477 @@ def test_v8_gate_verdict_always_carries_a_reason():
     dec = decide({"status": "success",
                   "result": "VERDICT: DENY" + nl + "REASON: touches prod"}, "g")
     assert "touches prod" in dec["reason"], dec
+def test_v8_a_failed_close_is_not_treated_as_a_name_collision():
+    """os.close() lived inside the try that catches "this name is taken".
+
+    So a close() that failed was read as a collision: the loop moved to the next index
+    having ALREADY set `claimed` to a name it genuinely owned, the next successful claim
+    overwrote `claimed`, and the finally-cleanup removed only the last reservation. The
+    first one leaked as a permanent empty archive -- with its fd still open. A close
+    failure is not a collision, and only the open can collide."""
+    import _manifest
+
+    d = tempfile.mkdtemp(prefix="summon-close-")
+    real_close = os.close
+    state = {"failed": False}
+    try:
+        out = os.path.join(d, "r.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write('{"status": "success"}')
+
+        def one_bad_close(fd):
+            # PermissionError SPECIFICALLY. A plain OSError never reached the collision
+            # handler (it catches only FileExistsError/PermissionError) and so never
+            # exercised the bug -- an earlier version of this test raised EIO and passed
+            # against the broken code. EACCES from close is what the old comment claimed
+            # to handle and is exactly what it mishandled.
+            if not state["failed"]:
+                state["failed"] = True
+                real_close(fd)                     # do not leak the descriptor in the test
+                raise PermissionError(13, "Permission denied")
+            return real_close(fd)
+
+        os.close = one_bad_close
+        err = _manifest._clear_out_file(out, archive=True)
+    finally:
+        os.close = real_close
+
+    try:
+        leaked = [f for f in os.listdir(d) if ".superseded" in f
+                  and os.path.getsize(os.path.join(d, f)) == 0]
+        assert not leaked, (
+            "a failed close() left an EMPTY archive behind: %r. The close was caught as a "
+            "collision, so the loop claimed a second name and the cleanup only knew about "
+            "that one." % (leaked,))
+        assert err, "a failed close() must be REPORTED, not silently swallowed"
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v8_agy_timeout_threshold_is_a_measured_completion():
+    """The advised floor was 300s, which no measurement supported: 180s timed out and 420s
+    completed, and taking the midpoint dressed an interpolation up as evidence. It is now
+    the smallest budget an agy dispatch has been OBSERVED to complete under.
+
+    Also pins the boundary. `>=` means exactly-at-threshold is silent, which is only right
+    if the threshold is itself a measured success -- otherwise the one budget we know least
+    about gets the least warning."""
+    from _builder import agy_timeout_warning, _AGY_MIN_ADVISED_TIMEOUT_MS as FLOOR
+
+    assert FLOOR == 420_000, (
+        "the floor must be a MEASURED completion, not an interpolation between a failure "
+        "and a success (got %r)" % FLOOR)
+    assert agy_timeout_warning("agy", FLOOR) is None, "at a measured-good budget: silence"
+    assert agy_timeout_warning("agy", FLOOR - 1) is not None, "one ms below must warn"
+    w = agy_timeout_warning("agy", 60_000)
+    assert str(FLOOR // 1000) in w, (
+        "the warning must quote the SAME number as the constant, or the two drift and the "
+        "text starts advising a budget the code does not enforce: %s" % w)
+    assert "180" in w, "the warning should cite the measured FAILURE that motivates it"
+    assert agy_timeout_warning("claude", 1000) is None
+    assert agy_timeout_warning("agy", None) is None
+
+
+def test_v8_advisory_warnings_reach_the_real_envelope():
+    """The parity test below compares --dry-run against advisory_warnings(). Neither is the
+    ENVELOPE, so replacing _executor's assembly with a no-op left it green: the warnings
+    would have vanished from every real dispatch while three tests reported success
+    (cross-vendor audit, 2026-07-26).
+
+    This drives execute_agent for real, stubbing only the spawn and the process driver, and
+    asserts the warnings arrive on the response the caller actually receives."""
+    import _builder
+    import _executor
+
+    real = {k: getattr(_executor, k, None) for k in ("subprocess", "_drive_process")}
+    r_ensure = _builder._ensure_agy_profile
+    r_attest = _builder._attest_agy_profile
+    r_wrapper = _builder._agy_wrapper
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        _builder._ensure_agy_profile = lambda cwd, deadline_sec=300.0: tempfile.gettempdir()
+        _builder._attest_agy_profile = lambda *a, **k: None
+        _builder._agy_wrapper = lambda: "wrapper.py"
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+
+        class _P:                      # stands in for the spawned child
+            pid = 1234
+
+        _executor.subprocess = types.SimpleNamespace(
+            Popen=lambda *a, **k: _P(), DEVNULL=-3, PIPE=-1, STDOUT=-2)
+        _executor._drive_process = lambda *a, **k: {"status": "success", "result": "ok",
+                                                    "exit_code": 0}
+        inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                       system_context="c", permission="read-only")
+        resp = _executor.execute_agent(inv, timeout_ms=60_000)
+    finally:
+        for k, v in real.items():
+            if v is not None:
+                setattr(_executor, k, v)
+        _builder._ensure_agy_profile = r_ensure
+        _builder._attest_agy_profile = r_attest
+        _builder._agy_wrapper = r_wrapper
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+    got = resp.get("warnings") or []
+    assert any("ADVISORY" in w for w in got), (
+        "the real envelope carried no advisory-tier warning, so a caller who opted in would "
+        "believe read-only held: %r" % (got,))
+    assert any("MULTI-STEP" in w for w in got), (
+        "the short-clock warning did not reach the envelope either: %r" % (got,))
+    assert len(got) == len(set(got)), ("a warning was appended twice: %r" % (got,))
+
+
+def test_v8_dry_run_and_the_real_envelope_warn_identically():
+    """--dry-run exists to catch a wrong permission, a dead backend or a short clock BEFORE
+    paying. It emitted the agy permission warning but neither the timeout nor the
+    read-only-workspace one -- so preflight was silent about exactly the two things it is
+    cheapest to fix there. Both paths now assemble from advisory_warnings.
+
+    The list-membership check is the guard: a fourth warning added to one path only would
+    fail here."""
+    import _builder
+    import run_subagent as rs
+
+    # The OPT-IN path. Without SUMMON_ALLOW_UNENFORCED_READONLY a read-only agy dispatch is
+    # refused outright, so there is no run for advisory warnings to describe. With it, two
+    # warnings from two DIFFERENT helpers apply, which is what makes this a parity test
+    # rather than a tautology.
+    had = _builder.os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    _builder.os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+    try:
+        inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                       system_context="ctx", permission="read-only")
+        expected = _builder.advisory_warnings("agy", "read-only", 60_000)
+        assert len(expected) >= 2, (
+            "agy at read-only on a 60s clock, opted in, should warn about BOTH the advisory "
+            "tier and the short budget: %r" % (expected,))
+
+        args = types.SimpleNamespace(agent="x", timeout=60_000, worktree=None, out=None,
+                                     dry_run=True)
+        view = rs._dry_run_view(inv, args, agents_dir=os.getcwd())
+        got = view.get("warnings", [])
+        for w in expected:
+            assert w in got, (
+                "--dry-run did not surface a warning the real dispatch would: %r. Preflight "
+                "is where this is still free to act on." % w[:90])
+
+        # and no duplicates: the two paths must not both append the same text
+        assert len(got) == len(set(got)), (
+            "a warning appeared twice in the preview: %r" % (got,))
+    finally:
+        if had is None:
+            _builder.os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            _builder.os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+
+def test_v8_dry_run_reports_a_dispatch_that_would_be_refused():
+    """--dry-run answers "what would happen if I ran this". For a read-only agy agent the
+    answer is "nothing, it fails closed" -- the single most useful thing preflight can say,
+    and it said nothing at all until the refusal was wired in here too. Same drift class as
+    the warnings: two paths describing one dispatch, maintained separately."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                   system_context="ctx", permission="read-only")
+    args = types.SimpleNamespace(agent="x", timeout=600_000, worktree=None, out=None,
+                                 dry_run=True)
+    with _no_agy_optin():
+        view = rs._dry_run_view(inv, args, agents_dir=os.getcwd())
+    assert view.get("would_refuse") is True, (
+        "preflight showed a dispatch that will actually be refused: %r" % (view,))
+    # `refusal`, not `error`: on a host with no agy wrapper the backend branch sets `error`
+    # to say the preview is partial, and it used to overwrite the refusal (caught by CI on
+    # Linux, where the wrapper is absent). Two different facts, two keys.
+    assert "cannot enforce" in (view.get("refusal") or ""), view.get("refusal")
+
+    # a backend that DOES enforce the tier must preflight clean
+    inv2 = _builder.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                    system_context="ctx", permission="read-only")
+    view2 = rs._dry_run_view(inv2, args, agents_dir=os.getcwd())
+    assert not view2.get("would_refuse"), view2
+
+
+def test_v8_advisory_warnings_is_the_only_assembly_point():
+    """STRUCTURAL GUARD. The two emit paths each assembled the warning list by hand and
+    drifted -- one gained a warning the other never got. Binding them means nobody appends
+    an agy_*_warning to an envelope directly; they go through advisory_warnings, which both
+    paths call. A new warning then reaches preflight and the envelope by construction."""
+    root = os.path.dirname(os.path.abspath(__file__))
+    helpers = ("agy_permission_warning(", "agy_timeout_warning(",
+               "agy_readonly_workspace_warning(")
+    for mod in ("_executor.py", "run_subagent.py", "_council.py"):
+        path = os.path.join(root, mod)
+        if not os.path.isfile(path):
+            continue
+        src = open(path, encoding="utf-8").read()
+        for h in helpers:
+            assert h not in src, (
+                "%s calls %s directly. Assemble advisory warnings in ONE place "
+                "(_builder.advisory_warnings) so --dry-run and the real envelope cannot "
+                "drift apart again." % (mod, h.rstrip("(")))
+
+
+def test_v8_every_test_is_actually_collected_by_the_runner():
+    """STRUCTURAL GUARD. The runner collects `globals()` at __main__ time, so a test
+    appended BELOW that block is defined too late to exist and is silently skipped.
+
+    Four tests landed there and the suite still printed "346/346 passed" -- a green run
+    that had never executed them. A suite that under-reports its own size is worse than a
+    red one: it reports confidence it did not earn. Compare the count the runner would
+    collect against the count of `def test_` in the source; they must be equal."""
+    src = open(os.path.abspath(__file__), encoding="utf-8").read()
+    # chr(10), not an escape: the marker must be LINE-ANCHORED so it matches the real
+    # runner block and not this function's own mention of it a few lines above.
+    marker = chr(10) + 'if __name__ == "__main__":'
+    assert marker in src, "the runner block moved; this guard needs updating"
+    above, _, below = src.partition(marker)
+    orphaned = [ln.split("(")[0][4:] for ln in below.splitlines()
+                if ln.startswith("def test_")]
+    assert not orphaned, (
+        "%d test(s) are defined AFTER the __main__ block and will never run: %s. Move them "
+        "above it -- the runner snapshots globals() and cannot see them." % (
+            len(orphaned), ", ".join(orphaned)))
+    in_source = sum(1 for ln in above.splitlines() if ln.startswith("def test_"))
+    collected = sum(1 for k, v in globals().items()
+                    if k.startswith("test_") and callable(v))
+    assert in_source == collected, (
+        "the source defines %d tests but %d are importable; a duplicate name silently "
+        "shadowed one." % (in_source, collected))
+
+
+def test_v8_over_long_argv_is_diagnosed_as_argv_not_a_missing_cli():
+    """Windows caps a command line at 32767 chars and reports the overflow as
+    ERROR_FILE_NOT_FOUND -- so Python raised FileNotFoundError and summon reported
+    "CLI not found: ...node.EXE" for a prompt that was merely too big.
+
+    That misdiagnosis is expensive: it sends you to reinstall a working backend. It is
+    almost certainly behind the standing reports that "the codex CLI is not installed."
+    Measured 2026-07-25: a 20k prompt dispatched fine; 31k and 34k both failed this way.
+
+    The message must name the ARGV as the cause and must not claim the binary is missing."""
+    from _builder import argv_length_error, _ARGV_TOTAL_LIMIT_NT, _ARGV_SINGLE_LIMIT_POSIX
+    import _builder
+
+    real_name = _builder.os.name
+    try:
+        _builder.os.name = "nt"
+        assert argv_length_error("codex", "codex.exe", ["-x", "hello"]) is None
+        big = "x" * (_ARGV_TOTAL_LIMIT_NT + 10)
+        msg = argv_length_error("codex", "codex.exe", ["-x", big])
+        assert msg, "an over-long Windows command line must be refused before spawning"
+        assert "command line" in msg and str(_ARGV_TOTAL_LIMIT_NT) in msg, msg
+        # It may EXPLAIN the historical misdiagnosis (that context is the useful part);
+        # what it must not do is LEAD with it. The cause comes first.
+        assert "command line" in msg[:80], (
+            "the message must open with the real cause, not bury it: %s" % msg[:120])
+        assert "--prompt-file" in msg or "prompt-file" in msg, (
+            "callers reach for --prompt-file assuming it avoids argv; the message must say "
+            "it does not: %s" % msg)
+        # The mutants that a raw character count does NOT catch. Both were measured:
+        # subprocess serialises argv with list2cmdline, which DOUBLES backslashes before a
+        # quote, and Windows counts UTF-16 code units, so a non-BMP char costs two.
+        escaped = "\\\"" * 10000            # raw 20010, serialised ~40011 units
+        assert argv_length_error("codex", "codex.exe", [escaped]), (
+            "a raw character sum passes this and CreateProcess then fails it as a MISSING "
+            "FILE -- the exact misdiagnosis this check exists to prevent")
+        astral = chr(0x1F600) * 17000        # raw 17010, but 34010 UTF-16 units
+        assert argv_length_error("codex", "codex.exe", [astral]), (
+            "non-BMP characters cost TWO UTF-16 units each; counting characters undercounts "
+            "by half")
+        # ...and one that is genuinely FINE must still pass, or the fix trades a false
+        # negative for a false positive
+        assert argv_length_error("codex", "codex.exe", [chr(0x1F600) * 10000]) is None, (
+            "10k astral chars is 20k units, comfortably under the limit; refusing it would "
+            "break legitimate dispatches")
+
+        # the budget is the WHOLE line: many medium args overflow it just as one huge one
+        many = ["y" * 1000] * 40
+        assert argv_length_error("codex", "codex.exe", many), (
+            "the limit is the total command line, not the longest single argument")
+
+        _builder.os.name = "posix"
+        # POSIX has a large total but caps ONE argument; 40k total is fine there
+        assert argv_length_error("codex", "codex", many) is None
+        # BYTES, not characters: 70k accented chars is 140k bytes and sailed past a
+        # character comparison (measured under WSL: E2BIG)
+        assert argv_length_error("codex", "codex", ["\u00e9" * 70000]), (
+            "execve counts encoded BYTES; comparing characters undercounts multibyte text")
+        # and the TOTAL, which no single-argument check can catch. Derive the input from
+        # the platform's ACTUAL limit: hard-coding 25x100k tripped Windows' 2MB fallback
+        # but sailed under the CI runner's larger real ARG_MAX, so the test passed locally
+        # and failed on Linux. Ask the system, then exceed what it says.
+        try:
+            _arg_max = os.sysconf("SC_ARG_MAX")
+        except (ValueError, OSError, AttributeError):
+            _arg_max = 2 ** 21
+        _chunk = 100_000
+        _n = _arg_max // _chunk + 8          # comfortably past the limit and its margin
+        assert argv_length_error("codex", "codex", ["z" * _chunk] * _n), (
+            "%d arguments of %d bytes exceed this system's ARG_MAX of %d, but preflight "
+            "allowed it; many medium arguments overflow the total without any single one "
+            "being close to the per-argument cap" % (_n, _chunk, _arg_max))
+        huge = "z" * (_ARGV_SINGLE_LIMIT_POSIX + 10)
+        pm = argv_length_error("codex", "codex", ["-x", huge])
+        assert pm and str(_ARGV_SINGLE_LIMIT_POSIX) in pm, pm
+        assert "argument" in pm[:80], pm
+    finally:
+        _builder.os.name = real_name
+
+
+def test_v8_over_long_argv_never_reaches_popen():
+    """The check has to run BEFORE the spawn, not as a nicer message afterwards: the whole
+    defect was that the spawn's own error could not be trusted to name its cause. Asserts
+    at the layer the bug lived at -- Popen must not be called at all, and the envelope must
+    NOT carry 127 (which means "CLI not found" and would keep the misdiagnosis alive)."""
+    import _builder
+    import _executor
+
+    real_popen = _executor.subprocess.Popen
+    real_name = _builder.os.name
+    real_resolve = _executor._resolve_launch
+    called = {"n": 0}
+
+    def spy(*a, **k):
+        called["n"] += 1
+        raise AssertionError("Popen was called with an argv known to be over the limit")
+
+    try:
+        _builder.os.name = "nt"
+        _executor.subprocess.Popen = spy
+        _executor._resolve_launch = lambda c, a: (c, a)
+        inv = _builder.AgentInvocation(
+            cli="codex", prompt="p" * 40000, cwd=os.getcwd(),
+            system_context="ctx", permission="read-only")
+        resp = _executor.execute_agent(inv, timeout_ms=30000)
+    finally:
+        _executor.subprocess.Popen = real_popen
+        _executor._resolve_launch = real_resolve
+        _builder.os.name = real_name
+
+    assert called["n"] == 0, "the over-long argv reached Popen; the check ran too late"
+    assert resp.get("status") == "error", resp.get("status")
+    assert resp.get("exit_code") == 1, (
+        "exit 127 means 'CLI not found' and would preserve the misdiagnosis; an argv that "
+        "is too long is not a missing binary (got %r)" % resp.get("exit_code"))
+    assert "command line" in (resp.get("error") or ""), resp.get("error")
+
+
+def test_v8_optin_cannot_waive_a_tier_summon_imposed():
+    """SUMMON_ALLOW_UNENFORCED_READONLY is ambient process authority, inherited by every
+    backend, background, manifest and council child. Cross-vendor review demonstrated the
+    consequence: setting it for ONE dispatch silently authorised advisory-only gates and
+    clamped members underneath it. A gate that the environment it runs in can waive is not
+    a gate.
+
+    So the opt-in waives a tier the CALLER DECLARED for their own dispatch, and never one
+    summon IMPOSED to reduce privilege -- a --gate-with adjudicator, a --max-permission
+    clamp that actually bit, a contract-repair resume."""
+    from _builder import readonly_unenforceable_error as refuse
+
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        assert refuse("agy", "read-only") is None, (
+            "the opt-in must still waive a tier the caller chose; otherwise it does nothing")
+        msg = refuse("agy", "read-only", forced=True)
+        assert msg, (
+            "the opt-in waived a tier SUMMON imposed. An env var inherited by every child "
+            "must not be able to turn a gate or a clamp advisory.")
+        assert "does not apply here" in msg, msg
+        # a backend that enforces the tier is unaffected in both directions
+        assert refuse("claude", "read-only", forced=True) is None
+    finally:
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+
+def test_v8_optin_is_part_of_the_request_identity():
+    """Cached reuse happens BEFORE execute_agent can refuse, so identity is the only place
+    that can catch it: a stored --out success produced WITH the opt-in satisfied a later
+    request made WITHOUT it, handing back an advisory-only result to a request that should
+    have failed closed. The same request hashed identically either way.
+
+    agy-only, for the same reason allow_credit is claude-only: elsewhere the switch cannot
+    change the outcome, and fingerprinting it would re-pay for work it could not alter."""
+    from _executor import build_request_identity as ident
+
+    # A REAL read-only agy definition: the narrowing keys on the EFFECTIVE permission, so
+    # an agent with no definition (default safe-edit) is correctly excluded and would make
+    # this test assert the opposite of the intent.
+    d = tempfile.mkdtemp(prefix="summon-ident-")
+    (Path(d) / "ro.md").write_text(
+        chr(10).join(["---", "name: ro", "description: d",
+                      "run-agent: agy", "permission: read-only",
+                      "---", "", "body", ""]),
+        encoding="utf-8")
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        without = ident(agent="ro", prompt="p", cwd=".", cli="agy", agents_dir=d)
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        with_optin = ident(agent="ro", prompt="p", cwd=".", cli="agy", agents_dir=d)
+        assert without != with_optin, (
+            "the opt-in decides whether the request RUNS AT ALL, so it must change the "
+            "identity; otherwise --out resume, manifest carry-forward and council reuse "
+            "serve an advisory-only answer to a request that would now be refused")
+        # and it must not disturb requests it cannot affect: another backend...
+        os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        c_without = ident(agent="a", prompt="p", cwd=".", cli="claude")
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        c_with = ident(agent="a", prompt="p", cwd=".", cli="claude")
+        assert c_without == c_with, (
+            "fingerprinting the opt-in on a backend it cannot affect re-pays for identical "
+            "work every time the variable moves")
+        # ...nor an agy request at a tier the opt-in has no bearing on. safe-edit runs
+        # either way, so churning its fingerprint re-pays for identical work and risks
+        # REPEATING side effects.
+        (Path(d) / "se.md").write_text(
+            chr(10).join(["---", "name: se", "description: d",
+                          "run-agent: agy", "permission: safe-edit",
+                          "---", "", "b", ""]),
+            encoding="utf-8")
+        os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        se_without = ident(agent="se", prompt="p", cwd=".", cli="agy", agents_dir=d)
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        se_with = ident(agent="se", prompt="p", cwd=".", cli="agy", agents_dir=d)
+        assert se_without == se_with, (
+            "an agy safe-edit request runs with or without the opt-in, so its identity must "
+            "not move when the variable does")
+    finally:
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v8_strip_matches_the_parsers_spelling_not_ours():
+    """agy parses with Go's flag package, which accepts SINGLE-dash long options. The
+    sanitiser matched only the double-dash spelling, so `-add-dir=/repo` walked straight
+    past it -- cross-vendor review ran `agy -add-dir=... help`, `-mode=accept-edits`,
+    `-sandbox=false` and `-dangerously-skip-permissions=true` against the real binary and
+    all exited 0.
+
+    A sanitiser has to speak the TARGET's grammar, not the one we find natural."""
+    from _builder import _strip_agy_boundary_flags as strip
+
+    for probe in ("-add-dir=/repo", "-mode=accept-edits", "-sandbox=false",
+                  "-dangerously-skip-permissions=true"):
+        assert strip([probe, "--keep"]) == ["--keep"], (
+            "%s survived the sanitiser; agy accepts this spelling" % probe)
+    assert strip(["-add-dir", "/repo", "--keep"]) == ["--keep"], "value form too"
+    # ordinary short flags are not boundary flags and must survive
+    assert strip(["-q", "-v", "--keep"]) == ["-q", "-v", "--keep"]
+
+
+def test_v8_doctor_probe_does_not_aim_agy_at_your_repo():
+    """A health check must not hand a backend write authority over the caller's tree.
+
+    Two bugs, one after the other. The probe asked every backend for read-only, which agy
+    now refuses -- so a healthy agy reported as unverifiable. Probing agy one tier up fixed
+    that and introduced something worse: `safe-edit` on agy is
+    `--dangerously-skip-permissions --add-dir <cwd>`, so a LIVENESS PING ran with full
+    authority over whatever directory you happened to be in. Cross-vendor review built the
+    real argv and confirmed both flags.
+
+    The probe now runs agy in an empty throwaway directory. It still proves the backend
+    starts, answers and authenticates; the only thing it can write to is a temp dir being
+    deleted immediately after.
+
+    This calls the REAL runner. The previous version of this test invoked
+    `_doctor._probe_backend`, which does not exist -- `hasattr` returned None and the test
+    returned successfully having asserted nothing at all."""
+    import _doctor
+    import _executor
+
+    seen = {}
+
+    def fake_execute(inv, timeout_ms=0, **k):
+        seen["permission"] = inv.permission
+        seen["cwd"] = inv.cwd
+        seen["cli"] = inv.cli
+        return {"status": "success", "result": "pong"}
+
+    real = _executor.execute_agent
+    try:
+        _executor.execute_agent = fake_execute
+        out = _doctor._default_probe_runner("agy", "agy")
+    finally:
+        _executor.execute_agent = real
+
+    assert seen.get("cli") == "agy", ("the real runner was never reached", seen)
+    assert seen.get("permission") == "safe-edit", (
+        "agy refuses read-only, so probing at that tier can never verify it: %r" % (seen,))
+    cwd = seen.get("cwd") or ""
+    assert cwd and os.path.abspath(cwd) != os.path.abspath(os.getcwd()), (
+        "the probe pointed agy at the CALLER'S working directory with a full permission "
+        "bypass. A liveness ping must not carry write authority over your repo: %r" % (seen,))
+    assert not os.path.exists(cwd), (
+        "the throwaway probe directory %r outlived the probe" % cwd)
+    assert out and out.get("probed_permission") == "safe-edit", out
+    assert "read-only" in (out.get("note") or ""), (
+        "a green probe must say it exercised NO read-only tier for agy: %r" % (out,))
+
+
+def test_v8_doctor_probe_still_uses_read_only_where_it_is_enforced():
+    """The counterpart: every other backend enforces read-only, so the probe must keep
+    asking for the least authority there. Raising everyone to safe-edit to accommodate agy
+    would trade one backend's limitation for a privilege increase across all of them."""
+    import _doctor
+    import _executor
+
+    seen = {}
+
+    def fake_execute(inv, timeout_ms=0, **k):
+        seen[inv.cli] = (inv.permission, inv.cwd)
+        return {"status": "success", "result": "pong"}
+
+    real = _executor.execute_agent
+    try:
+        _executor.execute_agent = fake_execute
+        for name in ("claude", "codex", "cursor-agent"):
+            _doctor._default_probe_runner(name, name)
+    finally:
+        _executor.execute_agent = real
+
+    for name in ("claude", "codex", "cursor-agent"):
+        perm, cwd = seen.get(name, (None, None))
+        assert perm == "read-only", (
+            "%s enforces read-only; the probe must ask for the least authority" % name)
+        assert os.path.abspath(cwd) == os.path.abspath(os.getcwd()), (
+            "%s probes in the real cwd, which is safe at read-only and exercises the "
+            "realistic path" % name)
+
+
+def test_v8_writability_probe_uses_a_fresh_name_each_time():
+    """The probe name was keyed on the denial counter, which RESETS after a successful
+    probe -- so the same name came round again. The remove is best-effort, so one failed
+    cleanup left that name occupied, and every later probe then failed O_EXCL with EEXIST
+    and was read as "inconclusive": the measurement silently disabled itself, exactly where
+    it was introduced to replace a guessing heuristic.
+
+    A probe that can stop working without saying so is worse than the heuristic it
+    replaced."""
+    import _manifest
+
+    d = tempfile.mkdtemp(prefix="summon-probename-")
+    real_open, real_remove = os.open, os.remove
+    seen = {"n": 0, "probes": []}
+    try:
+        out = os.path.join(d, "r.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(chr(123) + '"status": "success"' + chr(125))
+
+        def stub_open(path, flags, *a, **k):
+            if ".wtest" in str(path):
+                seen["probes"].append(str(path))
+                return real_open(path, flags, *a, **k)   # writable
+            if ".superseded" in str(path):
+                seen["n"] += 1
+                if seen["n"] <= 400:                      # long contention: several probes
+                    raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, flags, *a, **k)
+
+        def stub_remove(path):
+            if ".wtest" in str(path):
+                raise OSError(5, "cleanup failed")        # the best-effort remove fails
+            return real_remove(path)
+
+        os.open, os.remove = stub_open, stub_remove
+        err = _manifest._clear_out_file(out, archive=True)
+    finally:
+        os.open, os.remove = real_open, real_remove
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    assert len(seen["probes"]) > 1, (
+        "the scenario did not exercise repeated probing (%d)" % len(seen["probes"]))
+    assert len(set(seen["probes"])) == len(seen["probes"]), (
+        "a probe name repeated: %r. With a failed cleanup the repeat is already occupied, "
+        "so the probe answers 'inconclusive' forever." % (seen["probes"],))
+    assert err is None, (
+        "contention on a writable directory must still ride out even when probe cleanup "
+        "fails: %r" % err)
+
+
+def test_v8_argv_preflight_never_crashes_on_undecodable_text():
+    """The preflight is MANDATORY on every dispatch, so it must never be the thing that
+    fails. A prompt decoded from an odd byte stream can carry a lone surrogate, and a plain
+    .encode() raises UnicodeEncodeError -- turning a check written to produce a clear
+    message into an uncaught crash. `surrogateescape` handles the low half and raises on a
+    lone HIGH surrogate, so both halves need covering.
+
+    Measuring is best-effort; refusing to measure must never be fatal."""
+    import _builder
+    from _builder import argv_length_error
+
+    real = _builder.os.name
+    try:
+        for name in ("nt", "posix"):
+            _builder.os.name = name
+            for bad in ("\ud800", "\udcff", "ok" + "\ud800" + "tail"):
+                argv_length_error("codex", "codex", [bad])          # must not raise
+                argv_length_error("codex", "codex", ["x"], {"K": bad})
+    finally:
+        _builder.os.name = real
+
+
+def test_v8_posix_argv_limits_count_bytes_and_the_nul():
+    """Two off-by-reality bugs in the POSIX branch, both measured under WSL.
+
+    MAX_ARG_STRLEN COUNTS THE TERMINATING NUL, so 131072 bytes of payload is already one
+    over: 131071 spawned, 131072 failed with E2BIG while preflight said fine. And the
+    environment was counted in CHARACTERS -- 22 values of 50k non-ASCII passed preflight and
+    then E2BIG'd -- and read from os.environ rather than the environment actually handed to
+    Popen."""
+    import _builder
+    from _builder import argv_length_error, _ARGV_SINGLE_LIMIT_POSIX as CAP
+
+    real = _builder.os.name
+    try:
+        _builder.os.name = "posix"
+        assert argv_length_error("codex", "codex", ["z" * (CAP - 1)]) is None, (
+            "%d bytes fits once the NUL is counted and must not be refused" % (CAP - 1))
+        assert argv_length_error("codex", "codex", ["z" * CAP]), (
+            "%d bytes plus the terminating NUL exceeds MAX_ARG_STRLEN; execve gives E2BIG "
+            "while preflight said it was fine" % CAP)
+        # Environment measured in BYTES, from the env actually passed. Size it off the REAL
+        # limit: hard-coding 22x50k tripped Windows' 2MB fallback and sailed under a Linux
+        # runner's larger ARG_MAX. This is the SECOND time that assumption bit on this
+        # branch -- I fixed it for the argument case and then wrote it again for the
+        # environment case. Deriving is the fix both times.
+        try:
+            _arg_max = os.sysconf("SC_ARG_MAX")
+        except (ValueError, OSError, AttributeError):
+            _arg_max = 2 ** 21
+        _chars = 50_000                      # non-ASCII: 50k chars is 100k BYTES
+        _vars = _arg_max // (_chars * 2) + 8
+        big = {("K%d" % i): ("\u00e9" * _chars) for i in range(_vars)}
+        assert argv_length_error("codex", "codex", ["x"], big), (
+            "%d environment values of %d non-ASCII characters is %d BYTES, past this "
+            "system's ARG_MAX of %d -- counting characters under-measures it by half"
+            % (_vars, _chars, _vars * _chars * 2, _arg_max))
+        assert argv_length_error("codex", "codex", ["x"], {"A": "1"}) is None
+    finally:
+        _builder.os.name = real
+
+
+def test_v8_build_failures_return_an_envelope_not_an_exception():
+    """summon's contract is ONE JSON envelope on stdout, always. Build-time guards -- an
+    oversized agy prompt, a missing ConPTY wrapper -- raised ValueError straight through
+    execute_agent instead, so a caller parsing stdout got a traceback where an envelope
+    belongs, and every orchestration path that branches on `status` had an exception to
+    handle rather than a status to branch on.
+
+    Found while testing something else: the scenario I wrote to exercise a different
+    rejection path hit this guard first and blew up."""
+    import _builder
+    import _executor
+
+    r_wrapper = _builder._agy_wrapper
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        _builder._agy_wrapper = lambda: "wrapper.py"
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        inv = _builder.AgentInvocation(cli="agy", prompt="p" * 40000, cwd=os.getcwd(),
+                                       system_context="c", permission="read-only")
+        resp = _executor.execute_agent(inv, timeout_ms=30_000)   # must not raise
+    finally:
+        _builder._agy_wrapper = r_wrapper
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+    assert isinstance(resp, dict) and resp.get("status") == "error", resp
+    assert resp.get("exit_code") == 1, resp
+    assert "28000" in (resp.get("error") or ""), (
+        "the envelope must carry the guard's actual reason: %r" % resp.get("error"))
+
+
+def test_v8_a_doomed_agy_prompt_builds_no_profile():
+    """The length guard ran AFTER _ensure_agy_profile, so a prompt that could never dispatch
+    still created a profile directory and copied OAuth material into it, then raised --
+    orphaning credentials for a run that never happened. Same rule as the unenforceable-tier
+    refusal: fail before side effects, not after them."""
+    import _builder
+    import _executor
+
+    built = {"n": 0}
+    r_ensure = _builder._ensure_agy_profile
+    r_attest = _builder._attest_agy_profile
+    r_wrapper = _builder._agy_wrapper
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        def spy(cwd, deadline_sec=300.0):
+            built["n"] += 1
+            return tempfile.gettempdir()
+
+        _builder._ensure_agy_profile = spy
+        _builder._attest_agy_profile = lambda *a, **k: None
+        _builder._agy_wrapper = lambda: "wrapper.py"
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        inv = _builder.AgentInvocation(cli="agy", prompt="p" * 40000, cwd=os.getcwd(),
+                                       system_context="c", permission="read-only")
+        _executor.execute_agent(inv, timeout_ms=30_000)
+    finally:
+        _builder._ensure_agy_profile = r_ensure
+        _builder._attest_agy_profile = r_attest
+        _builder._agy_wrapper = r_wrapper
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+    assert built["n"] == 0, (
+        "a prompt that cannot dispatch still built an agy profile and copied credentials "
+        "into it before failing")
+
+
+def test_v8_the_gate_adjudicates_the_request_that_will_actually_run():
+    """`_run_gate` built its prompt from `args`, not from the invocation handed to it. So
+    every RE-gate -- retries, schema correction, and the contract repair -- asked the
+    adjudicator about the ORIGINAL task while a DIFFERENT request was dispatched. The gate
+    approved something nobody was about to execute.
+
+    This asserts on the prompt the gate actually BUILDS. The round-5 version mocked
+    `_run_gate` wholesale and only counted calls, so it passed while this reproduced."""
+    import _builder
+    import run_subagent as rs
+
+    d = tempfile.mkdtemp(prefix="summon-gateq-")
+    seen = {}
+    real = rs.execute_agent
+    try:
+        (Path(d) / "rev.md").write_text(chr(10).join(
+            ["---", "name: rev", "description: d", "run-agent: claude",
+             "permission: read-only", "---", "", "adjudicate", ""]), encoding="utf-8")
+
+        def fake_exec(inv, **k):
+            seen["prompt"] = inv.prompt
+            seen["cwd"] = inv.cwd
+            return {"status": "success",
+                    "result": "VERDICT: APPROVE" + chr(10) + "REASON: ok"}
+
+        rs.execute_agent = fake_exec
+        args = types.SimpleNamespace(gate_with="rev", agent="a", prompt="ORIGINAL_TASK",
+                                     cwd=os.getcwd(), cli=None, timeout=1000,
+                                     gate_timeout=None, debug_dir=None)
+        gated = _builder.AgentInvocation(cli="claude", prompt="REPAIR_TASK",
+                                         cwd=os.getcwd(), system_context="c",
+                                         permission="read-only")
+        rs._run_gate(args, d, gated)
+    finally:
+        rs.execute_agent = real
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    prompt = seen.get("prompt") or ""
+    assert "REPAIR_TASK" in prompt, (
+        "the gate was not shown the request about to be dispatched: %r" % prompt[:200])
+    assert "ORIGINAL_TASK" not in prompt, (
+        "the gate adjudicated the ORIGINAL task while a different request was about to "
+        "run. An approval for a request nobody executes is worse than no gate: %r"
+        % prompt[:200])
+
+
+def test_v8_contract_repair_is_re_gated():
+    """A gate authorises ONE execution. Retries re-gate; schema correction re-gates; the
+    contract repair did not -- and on a backend that cannot enforce read-only the repair
+    keeps the task's tier, so a gated agy task with a malformed report bought a second
+    full-authority run nobody approved."""
+    import run_subagent as rs
+
+    calls = {"gate": 0, "exec": 0}
+
+    def fake_gate(args, agents_dir, invocation):
+        calls["gate"] += 1
+        return {"approved": False, "verdict": "DENY", "reason": "not twice"}
+
+    def fake_exec(inv, **k):
+        calls["exec"] += 1
+        return {"status": "success", "result": "x", "report_ok": True}
+
+    real_gate, real_exec = rs._run_gate, rs.execute_agent
+    try:
+        rs._run_gate, rs.execute_agent = fake_gate, fake_exec
+        args = types.SimpleNamespace(gate_with="reviewer", timeout=1000, debug_dir=None,
+                                     no_contract_repair=False)
+        inv = _b_invocation()
+        result = {"status": "success", "report_ok": False,
+                  "resume": {"session_id": "s", "profile": "/p"}}
+        out = rs._apply_contract_repair(result, inv, args, agents_dir=None)
+    finally:
+        rs._run_gate, rs.execute_agent = real_gate, real_exec
+
+    assert calls["gate"] == 1, ("the corrective resume was not re-gated", calls)
+    assert calls["exec"] == 0, ("the gate DENIED the repair and it ran anyway", calls)
+    assert out.get("gate_repair_refused"), out
+    # telemetry must not contradict itself: the "ran at <tier>" warning is written only
+    # after the gate approves, so a denial cannot report both
+    warnings = out.get("warnings") or []
+    assert not any("corrective resume ran" in w for w in warnings), (
+        "a DENIED repair still reported that it ran: %r" % (warnings,))
+    assert any("DENIED" in w for w in warnings), (
+        "a denial must be visible to a caller reading warnings: %r" % (warnings,))
+
+
+def _b_invocation():
+    """An agy invocation whose repair keeps write authority (agy cannot enforce read-only)."""
+    import _builder
+    return _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                    system_context="c", permission="safe-edit")
+
+
+def test_v8_council_optin_identity_is_scoped_not_blanket():
+    """Behavioural, not a source grep. The round-5 version searched _council.py for the
+    variable name, so it passed while the key was being added UNCONDITIONALLY -- including
+    as null, which changed every stage hash: every council run written before the fix lost
+    carry-forward, and toggling the variable re-ran claude/codex/cursor stages it cannot
+    affect.
+
+    Absent control -> identity unchanged from legacy. Present control -> identity moves."""
+    import _council
+    import _rundir as rd
+
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    base = {"prompt": "p", "member": "m", "agent_sha": "x", "cwd": "/c"}
+    try:
+        # THE REAL FUNCTION, not a hand-built dict. The previous version hashed dicts it
+        # constructed itself and so never executed _council at all -- it passed against the
+        # unconditional version this exists to prevent.
+        os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        absent_ctx = _council._optin_stage_ctx()
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        optin_ctx = _council._optin_stage_ctx()
+    finally:
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+    assert absent_ctx == {}, (
+        "an unset control must contribute NO key; adding it as null changes every stage "
+        "hash and re-pays for every council run written before the fix: %r" % (absent_ctx,))
+    assert optin_ctx == {"unenforced_readonly": "1"}, optin_ctx
+    legacy = rd.content_sha256(base)
+    absent = rd.content_sha256({**base, **absent_ctx})
+    optin = rd.content_sha256({**base, **optin_ctx})
+    assert legacy == absent, (
+        "adding the key as null changed the hash, so every pre-existing council run "
+        "re-pays in full for work already done")
+    assert optin != legacy, (
+        "with the opt-in set the stage identity must move, or a resume serves an "
+        "advisory-only answer to a request that would now fail closed")
+
+    # The helper must be MERGED INTO the shared stage context. A correct helper that
+    # nothing calls is the same bug in a nicer shape, and council hashes stages in four
+    # places (round 1, round 2, chairman, fallback chairman) -- folding it in once is what
+    # keeps a fifth from being missed.
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_council.py"),
+               encoding="utf-8").read()
+    assert "**_optin_stage_ctx()" in src, (
+        "the control is computed but never merged into the stage context, so no stage "
+        "identity actually carries it")
+    assert "_exec_ctx = {**_exec_ctx, **_optin_stage_ctx()}" in src, (
+        "merge it into the SHARED context rather than at individual hash sites")
+
+
+def test_v8_doctor_disclosure_reaches_the_human_output():
+    """`render()`, not the JSON. Round 5 propagated `probed_permission`/`probe_note` into
+    the entry and the round-5 test checked the entry -- so the human renderer, which is what
+    a person running `doctor` actually sees, still printed only "eligibility verified" while
+    the test passed. Two outputs describing one probe, and only the one nobody reads was
+    honest."""
+    import _doctor
+
+    # Build the report from doctor's OWN collector, then inject the probe fields. A
+    # hand-written fixture drifts from render()'s real shape -- mine was missing four keys
+    # and only said so once the escape hatch came off -- and a fixture that drifts stops
+    # testing the thing it names.
+    report = _doctor.doctor(probe=False)
+    entry = report["backends"].get("agy")
+    if entry is None:
+        return                      # agy not present in this environment's backend table
+    entry.update({"found": True, "version": "1.1.7", "path": "/x/agy",
+                  "probe_ran": True, "auth_ok": True, "account_eligible": True,
+                  "model_access_verified": True, "probed_permission": "safe-edit",
+                  "probe_note": "probed at safe-edit IN AN EMPTY TEMPORARY DIRECTORY: agy "
+                                "cannot enforce read-only, so a read-only dispatch is "
+                                "refused"})
+    human = _doctor.render(report)
+    assert "safe-edit" in human, (
+        "the human output never names the tier the probe exercised, so 'eligibility "
+        "verified' reads as ordinary verification:" + chr(10) + human[:600])
+    assert "read-only" in human, (
+        "the human output must say read-only was NOT exercised for this backend:"
+        + chr(10) + human[:600])
+
+
+def test_v8_agy_double_dash_cannot_hang_the_dispatch():
+    """agy's parser stops at `--`, so summon's own `--print` (appended after extra_args) is
+    then read as literal text: agy 1.1.7 fell into interactive behaviour and hung until the
+    timeout. Not a permission bypass, but an agent definition should not be able to hang
+    every dispatch that uses it."""
+    from _builder import _strip_agy_boundary_flags as strip
+
+    assert strip(["--"]) == [], "a bare -- terminator must not reach agy"
+    assert strip(["--foo", "--", "--bar"]) == ["--foo", "--bar"], (
+        "only the terminator is dropped; the surrounding args are the author's business")
+    assert strip(["--foo=--"]) == ["--foo=--"], (
+        "a VALUE that happens to be -- is not a terminator")
+
+
+def test_v8_probe_disclosure_reaches_the_published_entry():
+    """The runner reports which tier it exercised; `_probe_one` fills the entry doctor
+    actually publishes. Those are different layers, and the disclosure was generated and
+    then DROPPED between them -- output said "eligibility verified" with no hint that
+    read-only was never tested for agy.
+
+    An earlier version of this test asserted on the runner's return value, so deleting the
+    plumbing left it green. A disclosure that never reaches the reader is not a disclosure,
+    and a test that never reaches the reader's layer is not a test of it."""
+    import _doctor
+    import _executor
+
+    real = _executor.execute_agent
+    try:
+        _executor.execute_agent = lambda inv, timeout_ms=0, **k: {
+            "status": "success", "result": "pong"}
+        entry = {}
+        _doctor._probe_one("agy", entry, _doctor._default_probe_runner)
+        other = {}
+        _doctor._probe_one("claude", other, _doctor._default_probe_runner)
+    finally:
+        _executor.execute_agent = real
+
+    assert entry.get("probed_permission") == "safe-edit", (
+        "the PUBLISHED entry does not say which tier was exercised, so a green agy probe "
+        "reads as ordinary eligibility: %r" % (entry,))
+    assert "read-only" in (entry.get("probe_note") or ""), (
+        "the entry must say the probe proves nothing about read-only for agy: %r" % (entry,))
+    assert entry.get("auth_ok") is True, ("a successful probe still certifies auth", entry)
+    assert other.get("probed_permission") is None, (
+        "backends probed at the least authority need no disclosure: %r" % (other,))
+
+
+def test_v8_a_successful_probe_clears_the_denial_it_disproved():
+    """A successful writability probe proves the denials were transient, and reset the
+    counter -- but not `_last_denial`. So on reaching the 10k name bound, a long-dead
+    transient error was reported as a permanent permission failure: the WRONG diagnosis, in
+    the very function that exists to diagnose this correctly, and it made the changelog's
+    "right diagnosis" claim false in exactly the case it describes.
+
+    Repro (from cross-vendor review): 65 transient denials, one successful probe, then every
+    candidate name occupied."""
+    import _manifest
+
+    d = tempfile.mkdtemp(prefix="summon-stale-")
+    real_open = os.open
+    st = {"n": 0}
+    try:
+        out = os.path.join(d, "r.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(chr(123) + '"status": "success"' + chr(125))
+
+        def stub(path, flags, *a, **k):
+            p_ = str(path)
+            if ".wtest" in p_:
+                return real_open(path, flags, *a, **k)      # writable
+            if ".superseded" in p_:
+                st["n"] += 1
+                if st["n"] <= 65:
+                    raise PermissionError(13, "transient", p_)
+                raise FileExistsError(17, "occupied", p_)   # crowded, not denied
+            return real_open(path, flags, *a, **k)
+
+        os.open = stub
+        err = _manifest._clear_out_file(out, archive=True)
+    finally:
+        os.open = real_open
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    assert "too many superseded copies" in (err or ""), (
+        "a CROWDED directory was reported as a permission failure, using a denial the "
+        "probe had already disproved: %r" % err)
+    assert "permission denied" not in (err or ""), err
+
+
+def test_v8_optin_helper_restores_absence_not_just_a_value():
+    """`_no_agy_optin()` popped the variable and restored it only if it had HAD a value. A
+    body that SET the variable therefore left it set, contaminating every later test in a
+    suite that runs in one process in sorted order.
+
+    "Restore what was there" has to include "restore that nothing was there". The runner's
+    leak detector would now catch the symptom; this fixes the cause."""
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    try:
+        os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        with _no_agy_optin():
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"   # body sets it
+        assert "SUMMON_ALLOW_UNENFORCED_READONLY" not in os.environ, (
+            "the helper left the variable SET after a body that set it; every later test "
+            "then runs with the opt-in active")
+
+        # and the ordinary case still round-trips
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        with _no_agy_optin():
+            assert "SUMMON_ALLOW_UNENFORCED_READONLY" not in os.environ, (
+                "the helper must actually remove it inside the block, or every refusal "
+                "assertion under it is testing the opt-in path instead")
+        assert os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY") == "1"
+    finally:
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+
+def test_v8_a_repaired_envelope_is_not_self_contradictory():
+    """FOUND BY DOGFOODING, not by review. This repo's own round-6 review dispatch came back
+    `status: success` with `exit_code: 1` and an EMPTY `result`, its actual findings visible
+    only in `repaired_report_text`. A caller branching on status and reading `result` -- the
+    documented way to use summon -- would have got an empty string and no error, and I
+    nearly discarded a completed review as a failed one.
+
+    Two separate defects met there. "Keep the original text verbatim" preserves nothing when
+    the original text is empty. And the accepted outcome comes from the RETRY, so leaving
+    the failed first attempt's exit code behind contradicts whichever field the caller
+    happens to trust."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="safe-edit")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    real = rs.execute_agent
+    try:
+        rs.execute_agent = lambda i, **k: {
+            "status": "success", "result": "THE REAL FINDINGS", "report_ok": True,
+            "exit_code": 0}
+        original = {"status": "success", "report_ok": False, "result": "", "exit_code": 1,
+                    "resume": {"session_id": "s"}}
+        out = rs._apply_contract_repair(original, inv, args)
+    finally:
+        rs.execute_agent = real
+
+    assert out.get("status") == "success", out.get("status")
+    assert (out.get("result") or "").strip(), (
+        "a repaired success carried an EMPTY result; the content existed only in "
+        "repaired_report_text, where a caller following the documented contract never "
+        "looks: %r" % out)
+    assert out.get("exit_code") == 0, (
+        "status success alongside exit_code %r -- the two fields describe different runs, "
+        "and a caller trusting either one is misled" % out.get("exit_code"))
+    assert out.get("original_exit_code") == 1, (
+        "attempt 1's exit code is real evidence and must be preserved, not discarded")
+    assert out.get("repaired_report_text"), out
+
+
+def test_v8_a_repair_that_keeps_real_text_does_not_overwrite_it():
+    """The counterpart. When the original run DID produce text, the repair must not replace
+    it with the terse corrective re-emit -- that was the whole reason the overlay keeps the
+    original verbatim, and a fallback for the empty case must not quietly become a
+    replacement for the normal one."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="read-only")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    real = rs.execute_agent
+    try:
+        rs.execute_agent = lambda i, **k: {
+            "status": "success", "result": "terse re-emit", "report_ok": True,
+            "exit_code": 0}
+        original = {"status": "success", "report_ok": False,
+                    "result": "the agent's FULL analysis", "exit_code": 0,
+                    "resume": {"session_id": "s"}}
+        out = rs._apply_contract_repair(original, inv, args)
+    finally:
+        rs.execute_agent = real
+
+    assert out.get("result") == "the agent's FULL analysis", (
+        "the repair overwrote the original analysis with the corrective re-emit: %r"
+        % out.get("result"))
+    assert not out.get("result_from_repair")
+    assert out.get("repaired_report_text") == "terse re-emit"
+
+
+def test_v8_repair_does_not_duplicate_warnings():
+    """The corrective resume repeats the original dispatch's conditions -- same backend,
+    same tier, same clock -- so it emits the same advisory warnings. Concatenating produced
+    every one of them twice, so a caller counting warnings, or a human reading them, saw a
+    doubled list describing a single condition."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="safe-edit")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    real = rs.execute_agent
+    try:
+        rs.execute_agent = lambda i, **k: {
+            "status": "success", "result": "ok", "report_ok": True, "exit_code": 0,
+            "warnings": ["shared condition", "retry-only note"]}
+        original = {"status": "success", "report_ok": False, "result": "x", "exit_code": 0,
+                    "warnings": ["shared condition"], "resume": {"session_id": "s"}}
+        out = rs._apply_contract_repair(original, inv, args)
+    finally:
+        rs.execute_agent = real
+
+    w = out.get("warnings") or []
+    assert len(w) == len(set(w)), ("warnings duplicated across the repair: %r" % (w,))
+    assert "retry-only note" in w, ("a warning only the retry raised must survive: %r" % (w,))
+    assert "shared condition" in w
+
+
+def test_v8_repair_without_a_resume_lane_claims_nothing():
+    """A backend with no resume lane cannot be repaired at all. The tier warning used to be
+    appended before that was known, so an envelope could say "the corrective resume ran at
+    safe-edit" when no resume had run and none could."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="safe-edit")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    out = rs._apply_contract_repair(
+        {"status": "success", "report_ok": False, "result": "x", "resume": {}}, inv, args)
+    assert not any("corrective resume ran" in w for w in (out.get("warnings") or [])), (
+        "claimed a resume ran when there was no resume lane: %r" % (out.get("warnings"),))
+    assert out.get("contract_repaired") is not True
+
+
+def test_v8_a_foreign_envelope_is_refused_not_served():
+    """Two manifest parents sharing a --results-dir and job id, with DIFFERENT prompts, both
+    read whichever envelope landed last: parent A reported parent B's answer and both exited
+    success. Measured with two real processes (cross-vendor review, 2026-07-26), which also
+    made SKILL.md's "wasteful duplicate, not corruption" false -- the JSON was byte-valid,
+    its attribution was not.
+
+    summon already stamps `request_sha256` on every envelope so a stored answer can be
+    checked against the request it is served for. The manifest read path simply never asked."""
+    import _manifest
+
+    class _P:
+        stdout = ""
+        stderr = ""
+        returncode = 0
+
+    d = tempfile.mkdtemp(prefix="summon-foreign-")
+    try:
+        f = os.path.join(d, "job.json")
+        with open(f, "w", encoding="utf-8") as fh:
+            json.dump({"status": "success", "result": "answer-from-B",
+                       "request_sha256": "B" * 64}, fh)
+
+        same = _manifest._read_envelope(f, _P(), "B" * 64)
+        assert same.get("result") == "answer-from-B", (
+            "an envelope answering THIS request must still be served", same)
+
+        foreign = _manifest._read_envelope(f, _P(), "A" * 64)
+        assert foreign.get("status") == "error", (
+            "an envelope answering a DIFFERENT request was served as this job's answer: %r"
+            % (foreign,))
+        assert foreign.get("result_path_conflict") is True, foreign
+        assert "results-dir" in (foreign.get("error") or ""), (
+            "the error must name the fix, since the cause is invisible: %r"
+            % foreign.get("error"))
+
+        # back-compat: an envelope with no stamp, or a caller with no expectation, still reads
+        legacy = _manifest._read_envelope(f, _P(), None)
+        assert legacy.get("result") == "answer-from-B"
+        with open(f, "w", encoding="utf-8") as fh:
+            json.dump({"status": "success", "result": "unstamped"}, fh)
+        assert _manifest._read_envelope(f, _P(), "A" * 64).get("result") == "unstamped", (
+            "a pre-stamp envelope carries no identity to contradict; refusing it would "
+            "break resume for everything written before this field existed")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v8_repair_adopts_the_whole_exit_tuple():
+    """Round 7 rewrote `status` and `exit_code` on an accepted repair and stopped there,
+    leaving `backend_exit_code`, `dispatcher_status` and `normalization_reason` describing
+    attempt 1. So the envelope still contradicted itself -- in the fields I had not looked
+    at -- and the changelog's "the contradiction is gone" was false.
+
+    `finalize_exit_fields()` cannot repair this afterwards: it uses setdefault, so the stale
+    values win. The round-7 test asserted only `exit_code`, which is why it passed.
+
+    Asserts the ENTIRE tuple, on a BLOCKED repair (not just DONE), because the failure mode
+    is a field nobody thought to check."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="read-only")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    real = rs.execute_agent
+    try:
+        rs.execute_agent = lambda i, **k: {
+            "status": "blocked", "result": "R", "report_ok": True, "exit_code": 0,
+            "backend_exit_code": 0, "dispatcher_status": "blocked"}
+        original = {"status": "success", "report_ok": False, "result": "orig",
+                    "exit_code": 1, "backend_exit_code": 1, "dispatcher_status": "success",
+                    "normalization_reason": "normalized to success (raw backend exit 1)",
+                    "resume": {"session_id": "s"}}
+        out = rs._apply_contract_repair(original, inv, args)
+    finally:
+        rs.execute_agent = real
+
+    assert out.get("status") == "blocked", out.get("status")
+    assert out.get("exit_code") == 0, out.get("exit_code")
+    assert out.get("backend_exit_code") == 0, (
+        "backend_exit_code still describes attempt 1: %r" % out.get("backend_exit_code"))
+    assert out.get("dispatcher_status") == "blocked", (
+        "dispatcher_status still describes attempt 1: %r" % out.get("dispatcher_status"))
+    reason = out.get("normalization_reason") or ""
+    assert "raw backend exit 1" not in reason, (
+        "the normalization reason is a sentence written about the FIRST attempt: %r" % reason)
+    assert "blocked" in reason, reason
+
+    # attempt 1's telemetry is evidence, not noise -- it is preserved, not discarded
+    orig_tuple = out.get("original_exit") or {}
+    assert orig_tuple.get("exit_code") == 1 and orig_tuple.get("dispatcher_status") == "success", (
+        "the original exit tuple must be preserved: %r" % (orig_tuple,))
+    assert out.get("original_exit_code") == 1
+
+
+def test_v8_leak_detector_covers_module_functions_and_environ_identity():
+    """The first detector listed five os functions and two env VALUES. Cross-vendor review
+    replaced `os.unlink`, `sys.argv` and `os.environ` ITSELF and it reported nothing leaked
+    -- an incomplete detector is worse than none, because it certifies hygiene it never
+    checked.
+
+    Verified by injection separately (four deliberate leaks, all named). This asserts the
+    fingerprint's SHAPE, so a future edit cannot quietly shrink it back."""
+    fp = _global_fingerprint()
+    for required in ("os.unlink", "os.read", "os.listdir", "os.stat", "os.rename",
+                     "sys.argv", "os.environ.id", "os.environ.obj", "env.snapshot",
+                     "time.time", "time.monotonic", "subprocess.Popen",
+                     # the MOST commonly patched things in this file were the ones the
+                     # detector could not see -- close to the opposite of useful
+                     "run_subagent.execute_agent", "_executor.build_invocation_args",
+                     "_builder._ensure_agy_profile"):
+        assert required in fp, (
+            "%s is patched somewhere in this suite but is not fingerprinted, so a test that "
+            "leaks it corrupts every later test silently" % required)
+    # env is captured WHOLE, not as named variables: naming them meant an unlisted one
+    # leaked undetected
+    assert isinstance(fp["env.snapshot"], tuple) and fp["os.environ.id"] == id(os.environ)
+
+
+def test_v8_accepted_repair_adopts_telemetry_unconditionally():
+    """Adoption was gated on "did exit_code or status change?", so two runs that happened to
+    share an exit code kept the FIRST attempt's `normalization_reason` and recorded no
+    history -- the changelog's "the whole tuple now comes from the retry" was false for the
+    case where both runs succeed cleanly for different reasons.
+
+    If the retry's ANSWER is the one being published, its telemetry is too."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="read-only")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    real = rs.execute_agent
+    try:
+        rs.execute_agent = lambda i, **k: {
+            "status": "success", "result": "R", "report_ok": True, "exit_code": 0,
+            "backend_exit_code": 0, "dispatcher_status": "success",
+            "normalization_reason": "parsed a clean terminal event"}
+        original = {"status": "success", "report_ok": False, "result": "orig",
+                    "exit_code": 0, "backend_exit_code": 0, "dispatcher_status": "success",
+                    "normalization_reason": "clean exit with output",
+                    "resume": {"session_id": "s"}}
+        out = rs._apply_contract_repair(original, inv, args)
+    finally:
+        rs.execute_agent = real
+
+    assert out.get("normalization_reason") == "parsed a clean terminal event", (
+        "the published envelope kept attempt 1's explanation while serving attempt 2's "
+        "answer: %r" % out.get("normalization_reason"))
+    hist = out.get("exit_history") or []
+    assert len(hist) == 1 and hist[0]["normalization_reason"] == "clean exit with output", (
+        "the superseded attempt must be recorded even when the exit codes match: %r" % hist)
+
+
+def test_v8_exit_history_survives_more_than_one_retry():
+    """`original_exit` was singular and therefore wrong as soon as two retries could run: an
+    accepted SCHEMA correction replaces the root envelope before contract repair ever sees
+    it, so the "original" preserved was the schema retry -- while the changelog claimed
+    attempt 1. An append-only list cannot drift that way."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="read-only")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    # simulate two successive supersessions through the shared helper
+    env = {"exit_code": 9, "backend_exit_code": 9, "dispatcher_status": "error",
+           "normalization_reason": "status error (backend exit 9)"}
+    rs._push_exit_history(env, {"exit_code": 7, "backend_exit_code": 7,
+                                "dispatcher_status": "error",
+                                "normalization_reason": "status error (backend exit 7)"})
+    rs._push_exit_history(env, {"exit_code": 0, "backend_exit_code": 0,
+                                "dispatcher_status": "success",
+                                "normalization_reason": "exit and status agree"})
+    hist = env.get("exit_history") or []
+    assert [h["exit_code"] for h in hist] == [9, 7], (
+        "every superseded attempt must be kept IN ORDER, not just the most recent: %r"
+        % (hist,))
+    assert env["exit_code"] == 0 and env["dispatcher_status"] == "success"
+    assert env["original_exit"]["exit_code"] == 7, (
+        "the singular alias documents the MOST RECENT superseded attempt, not attempt 1")
+
+
+def test_v8_environ_replacement_is_repaired_not_just_reported():
+    """A wholesale `os.environ` swap was detected and deliberately left in place, so every
+    later test ran against a plain dict with no `os.putenv` synchronisation. Naming the
+    culprit without containing it is half a guard.
+
+    Subtle detail this exercises: the replacement dict compares EQUAL to the real mapping by
+    value, so only the IDENTITY check fires -- the repair had been hung off the object
+    comparison, which could never trigger."""
+    real_env = os.environ
+    before = _global_fingerprint()
+    try:
+        os.environ = dict(os.environ)          # noqa: B003 - the leak under test
+        after = _global_fingerprint()
+        leaked = sorted(k for k in before
+                        if before[k] is not after[k] and before[k] != after[k])
+        assert "os.environ.id" in leaked, (
+            "a wholesale replacement must be detected by identity; value comparison cannot "
+            "see it: %r" % (leaked,))
+        os.environ = before["os.environ.obj"]   # the repair the runner performs
+    finally:
+        os.environ = real_env
+    assert os.environ is real_env
+    assert type(os.environ).__name__ == "_Environ", (
+        "the process must be left with the REAL mapping, or os.putenv sync stays broken "
+        "for every later test")
+
+
+def _global_fingerprint():
+    """Identity of the globals these tests monkeypatch.
+
+    The suite runs in ONE process in sorted order, so a test that patches os.open or
+    subprocess and fails to restore it -- easy to do when an assertion fires mid-test and
+    the restore is not in a finally -- silently corrupts every test that runs after it. The
+    corruption presents as an unrelated failure much later, or worse, as a pass. Comparing
+    identities before and after each test names the culprit instead."""
+    import subprocess as _sp
+    import time as _t
+    snap = {
+        # The first version listed five os functions and two env VALUES. Cross-vendor
+        # review replaced os.unlink, sys.argv and os.environ itself, and the detector
+        # reported nothing leaked. An incomplete detector is worse than none: it certifies
+        # hygiene it never checked.
+        "sys.argv": tuple(sys.argv),
+        # IDENTITY, not just contents: a test that REPLACES os.environ wholesale leaves
+        # every .get() answering from the new object, so comparing values sees nothing.
+        # the OBJECT, not just its id: naming the culprit without restoring it left the
+        # process running on a plain dict, so os.putenv sync was broken for every later test
+        "os.environ.obj": os.environ,
+        "os.environ.id": id(os.environ),
+        "env.snapshot": tuple(sorted(os.environ.items())),
+        "time.time": _t.time, "time.monotonic": _t.monotonic, "time.sleep": _t.sleep,
+        "subprocess.Popen": _sp.Popen, "subprocess.run": _sp.run,
+    }
+    for _n in ("name", "open", "close", "remove", "replace", "unlink", "read", "listdir",
+               "stat", "makedirs", "rename", "fdopen", "getpid"):
+        snap["os." + _n] = getattr(os, _n, None)
+    # MODULE FUNCTIONS this suite swaps constantly -- execute_agent, the builder, the gate.
+    # Leaving them out meant the most commonly patched things in the file were the ones the
+    # detector could not see, which is close to the opposite of useful.
+    for _mod, _attrs in (("run_subagent", ("execute_agent", "_run_gate", "_dispatch_with_retries")),
+                         ("_executor", ("execute_agent", "build_invocation_args",
+                                        "_drive_process", "_resolve_launch")),
+                         ("_builder", ("_ensure_agy_profile", "_attest_agy_profile",
+                                       "_agy_wrapper")),
+                         ("_manifest", ("_dispatch_child",)),
+                         ("_doctor", ("_default_probe_runner",))):
+        _m = sys.modules.get(_mod)
+        if _m is not None:
+            for _a in _attrs:
+                snap["%s.%s" % (_mod, _a)] = getattr(_m, _a, None)
+    return snap
+
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
     failed = 0
     for t in tests:
+        _before = _global_fingerprint()
+        _raised = False
         try:
             t()
             print(f"[PASS] {t.__name__}")
         except Exception as e:  # noqa: BLE001 — test harness reports, doesn't raise
+            _raised = True
             failed += 1
             print(f"[FAIL] {t.__name__}: {type(e).__name__}: {e}")
-    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+        _after = _global_fingerprint()
+        _leaked = sorted(k for k in _before
+                         if _before[k] is not _after[k] and _before[k] != _after[k])
+        if _leaked:
+            # Count the TEST, not its symptoms. A test that both raises AND leaks was
+            # counted twice, so one broken test inflated `failed` and the printed totals
+            # stopped matching the number of tests that ran.
+            if not _raised:
+                failed += 1
+            print(f"[FAIL] {t.__name__}: LEAKED PATCHED GLOBALS {_leaked} -- restore them "
+                  f"in a finally, or every test after this one runs against them")
+            for _k in _leaked:                      # repair so one leak is not N failures
+                if _k == "env.snapshot":
+                    # Restore the whole mapping: naming individual variables meant a test
+                    # that set an UNLISTED one leaked it undetected and unrepaired.
+                    _want = dict(_before[_k])
+                    for _dead in [x for x in os.environ if x not in _want]:
+                        os.environ.pop(_dead, None)
+                    for _kk, _vv in _want.items():
+                        if os.environ.get(_kk) != _vv:
+                            os.environ[_kk] = _vv
+                elif _k == "os.environ.id":
+                    # Repair keys off the ID, because that is the check that FIRES: a
+                    # replacement dict compares EQUAL to the real mapping by value, so the
+                    # object comparison never reports a difference. Restoring here was dead
+                    # code hanging off a branch that could not run.
+                    os.environ = _before["os.environ.obj"]     # noqa: B003
+                elif _k == "os.environ.obj":
+                    pass                          # handled by the id branch
+                elif _k == "sys.argv":
+                    sys.argv[:] = list(_before[_k])
+                elif _k.startswith("os."):
+                    setattr(os, _k.split(".", 1)[1], _before[_k])
+                elif _k.startswith("time."):
+                    import time as _t2
+                    setattr(_t2, _k.split(".", 1)[1], _before[_k])
+                elif _k.startswith("subprocess."):
+                    import subprocess as _sp2
+                    setattr(_sp2, _k.split(".", 1)[1], _before[_k])
+    print("")
+    print(f"{len(tests) - failed}/{len(tests)} passed")
     sys.exit(1 if failed else 0)

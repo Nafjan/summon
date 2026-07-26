@@ -20,8 +20,8 @@ run_subagent.py --manifest jobs.json --concurrency agy=2,codex=3 --results-dir o
 }
 ```
 
-What you get: per-backend concurrency semaphores, one atomic envelope per job in
-`--results-dir/<id>.json`, **skip-if-done resume** (re-running a swarm skips only
+What you get: per-backend concurrency semaphores (per PROCESS -- two manifest runs do
+not share caps), one atomic envelope per job in `--results-dir/<id>.json`, **skip-if-done resume** (re-running a swarm skips only
 jobs whose prior envelope was `success`, and **re-dispatches** any that ended
 `error`/`blocked`/`partial` — so a re-run retries the failures; delete a result
 file to force a clean re-run), per-job retries, progress lines on stderr,
@@ -106,9 +106,14 @@ run_subagent.py --council --question-file q.md \
   `coder`/cursor, `pair`/sonnet-5) — all can read files under `--cwd`. Override with
   `--members`; author custom-persona members with `--new-agent`. A council of clones
   is pointless — keep it diverse.
-  > **Note:** `agy` members (e.g. `researcher`) run in an isolated profile and can't
-  > read `--cwd`, so they error out of a repo-inspection council (fine only for a
-  > pure-reasoning question). The council envelope surfaces a warning when one is used.
+  > **Note:** an `agy` member (e.g. `researcher`) declared `read-only` is **refused** —
+  > agy cannot enforce that tier, so summon fails closed rather than imply a boundary that
+  > does not exist (measured: a declared read-only agy agent read a secret file and created
+  > another by absolute path, with `--sandbox` and `--mode plan` both in force). Give an agy
+  > council member `safe-edit` as a deliberate choice — on agy that is a FULL bypass, so
+  > point the council at a repo you can afford to have written to — or use a backend that
+  > enforces the tier. `SUMMON_ALLOW_UNENFORCED_READONLY=1` dispatches anyway and marks the
+  > tier advisory.
 - **`--rounds 2`** adds a cross-examination + peer-ranking round (à la Karpathy's
   llm-council): each member sees ALL positions anonymized (can't tell which is
   theirs → no favoritism), refines their stance, and **ranks** them best-to-worst.

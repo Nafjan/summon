@@ -9,7 +9,7 @@ Project-agnostic and host-agnostic. Adopt the parts you need; every section is
 written so a single orchestrator (human or agent) can act on it without a
 house style guide.
 
-Semantics below were verified against summon **0.14.1**. Model ids and alias
+Semantics below were verified against summon **0.15.0**. Model ids and alias
 behaviour are volatile: re-check with `doctor`, `list`, `models`, and
 `--dry-run` before a run you care about.
 
@@ -199,6 +199,23 @@ isolated profile. A canary showed a relative lookup failing while the SAME file
 at an absolute path read fine -- proof the tools worked and only the location was
 wrong. Summon now passes `--add-dir <cwd>` and relative paths work (0.13.9).
 
+That fix then produced the more important lesson, and it took two wrong answers to get
+to it. Handing agy the workspace made it repo-capable at every permission level, including
+`read-only`, which agy does not enforce. The first correction withheld the workspace at
+read-only and called that containment. A later canary demolished it: a **declared**
+read-only agy agent, given absolute paths, read a secret file back verbatim and created
+another, both confirmed on disk. Withholding `--add-dir` only breaks RELATIVE paths. It was
+never a boundary -- it was a boundary-shaped comment.
+
+So summon now **fails closed**: a read-only agy dispatch is refused, with an explicit
+opt-in for anyone who knowingly wants it on a throwaway checkout.
+
+**A permission tier you cannot enforce is worse than no tier, because callers act on it.**
+Offer the tier only where the backend honours it; elsewhere refuse, and say why. And when
+you write a mitigation, test the thing an attacker would actually do -- the first canary
+asked for a relative path and "passed", which is how a non-fix survived review, a release,
+and its own changelog entry.
+
 The failure mode this creates is nastier than a refusal: an agent that cannot
 find your files may answer from the prompt alone and sound confident about code
 it never opened. Do not infer capability from a plausible-sounding answer.
@@ -328,7 +345,7 @@ cannot tell, and a person decides.
 The gate's ruling, its model evidence, and its definition hash land in the
 envelope's `gate` field, so a skipped or forged approval is detectable afterwards.
 
-**Every dispatch path is gated, which took four attempts to get right.** This is
+**Every dispatch path is gated, which took six attempts to get right.** This is
 worth stating plainly because it is the failure mode most likely to recur in any
 system you build on top. A gate authorises ONE execution, and summon turned out
 to have several ways to execute:
@@ -338,11 +355,20 @@ to have several ways to execute:
 - the `--json-schema` corrective follow-up, which re-dispatches with the ORIGINAL
   permission and so was a second write-capable run that no gate had approved;
 - `--background`, whose detached child argv is rebuilt field by field, so the gate
-  flag was simply absent and the whole dispatch ran ungated.
+  flag was simply absent and the whole dispatch ran ungated;
+- the **contract auto-repair** resume, which is also a second execution -- and on a
+  backend that cannot enforce read-only it keeps the task's own authority, so a
+  gated `agy` task with a malformed report bought a full-bypass run nobody approved;
+- and then, having gated all five, the gate itself was **adjudicating the wrong
+  request**: it built its prompt from the caller's original arguments rather than
+  from the invocation about to be dispatched, so every re-gate above asked about the
+  FIRST task while a different one ran. An approval for a request nobody executes is
+  worse than no gate, because it looks like coverage.
 
 Each was found separately, and after each one the invariant looked satisfied. The
-lesson generalises: when you close a privilege hole, **enumerate the execution
-paths rather than fixing the one in front of you**. A refused correction records
+lesson generalises twice over: when you close a privilege hole, **enumerate the
+execution paths rather than fixing the one in front of you** -- and then check that
+the check itself is looking at the thing it is about to authorise. A refused correction records
 `gate_correction_refused` instead of overwriting `gate`, because the original
 approval authorised work that genuinely completed -- rewriting it would misreport
 finished work as denied.

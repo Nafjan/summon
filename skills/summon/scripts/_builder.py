@@ -49,6 +49,12 @@ class AgentInvocation:
     # True when the request identity inspected the agy account (so a None digest above means
     # "absent when fingerprinted", a state to attest, not "legacy caller, nothing to check").
     agy_account_checked: bool = False
+    # True when SUMMON imposed `permission` rather than the caller declaring it: a
+    # --gate-with adjudicator, a --max-permission clamp, a contract-repair resume. Such a
+    # tier is a privilege REDUCTION and cannot be waived by the unenforced-read-only opt-in,
+    # which exists to waive a tier you chose for yourself. Carried on the invocation because
+    # the executor is where the refusal happens and the distinction is invisible by then.
+    permission_forced: bool = False
 
 
 # Short report-contract nudge appended to RESUME prompts. On resume the session
@@ -114,7 +120,15 @@ _PERMISSION_MAPPING = {
         "yolo": ["-f", "--trust"],
     },
     "agy": {
-        "read-only": ["--sandbox"],
+        # agy HAS NO ENFORCEABLE READ-ONLY TIER. Measured over five canaries on
+        # 2026-07-25/26: `--sandbox` restricts TERMINAL operations only; `--mode plan` does
+        # not withhold the file tools; and withholding `--add-dir` only breaks RELATIVE
+        # paths -- canary 5 had a declared-read-only agent read a secret and create a file
+        # by ABSOLUTE path, both confirmed on disk. These flags are sent as defence in
+        # depth and because a future agy may honour them, but summon relies on NONE of
+        # them and no longer claims the tier: an agy read-only dispatch FAILS CLOSED
+        # (see readonly_unenforceable_error).
+        "read-only": ["--mode", "plan", "--sandbox"],
         "safe-edit": ["--dangerously-skip-permissions"],
         "yolo": ["--dangerously-skip-permissions"],
     },
@@ -168,7 +182,135 @@ def agy_permission_warning(cli: str, permission: str) -> str | None:
 # completed; a nested dispatch given 180s timed out mid-work and reported exit 124. That
 # failure reads as "agy is broken" rather than "the budget was short", which is why it is
 # worth a warning rather than silence.
-_AGY_MIN_ADVISED_TIMEOUT_MS = 300_000
+#
+# The number is 420s because that is the SMALLEST budget an agy dispatch has actually been
+# observed to complete under. It was 300s, which no measurement supported -- 180s failed and
+# 420s worked, and picking the midpoint dressed an interpolation up as evidence. Erring high
+# only costs an advisory line; erring low is the silence that lets a short clock masquerade
+# as a broken backend. Raise the threshold only by lowering a MEASURED completion.
+_AGY_MIN_ADVISED_TIMEOUT_MS = 420_000
+
+
+_AGY_BOUNDARY_FLAGS = ("--add-dir", "--mode", "--sandbox",
+                       "--dangerously-skip-permissions", "--yolo")
+
+
+def _strip_agy_boundary_flags(extra_args) -> list:
+    """Remove agy flags that would move the permission boundary summon just set.
+
+    An agent definition's own `args:` are appended AFTER the permission flags, so
+    `args: ["--add-dir", "/repo"]` in frontmatter silently rewrote the tier summon had just
+    computed. --max-permission and --gate-with already drop extra_args wholesale for this
+    reason; a DIRECTLY declared tier did not, which left the mapping advisory against the
+    roster (found by cross-vendor review, 2026-07-26).
+
+    Not a general sanitiser: it drops exactly the flags that grant workspace or change the
+    tier, plus their values. Everything else an agent author writes still passes through --
+    the point is to keep the tier honest, not to police the roster.
+    """
+    out, skip = [], False
+    for a in extra_args:
+        if skip:
+            skip = False
+            continue
+        if a == "--":
+            # agy's parser stops at `--`, so summon's own `--print` (appended after
+            # extra_args) is then treated as literal text: agy 1.1.7 fell into interactive
+            # behaviour and hung until the timeout. Not a permission bypass, but an agent
+            # definition should not be able to hang every dispatch that uses it.
+            continue
+        base = a.split("=", 1)[0]
+        # agy parses with Go's flag package, which accepts SINGLE-dash long options: cross
+        # vendor review ran `agy -add-dir=... help`, `-mode=accept-edits`, `-sandbox=false`
+        # and `-dangerously-skip-permissions=true` and all exited 0, while this function
+        # returned them unchanged. Matching only the double-dash spelling was a sanitiser
+        # that the target's own parser walked straight past.
+        if base.startswith("-") and not base.startswith("--"):
+            base = "-" + base
+        if base in _AGY_BOUNDARY_FLAGS:
+            # --add-dir/--mode take a separate value; the boolean flags do not.
+            #
+            # KNOWN LIMITATION, deliberately resolved toward safety: a token is judged by
+            # its spelling, not its position, so `--log-file --add-dir out.txt` (where
+            # --add-dir is the log FILENAME) loses both tokens. Dropping a legitimate value
+            # is recoverable and loud; leaving an agent able to hand itself the workspace is
+            # neither. Positional parsing would need agy's own grammar, which changes under
+            # us -- that is what made spelling-matching unreliable in the first place.
+            skip = ("=" not in a) and base in ("--add-dir", "--mode")
+            continue
+        out.append(a)
+    return out
+
+
+_UNENFORCED_RO_OPT_IN = "SUMMON_ALLOW_UNENFORCED_READONLY"
+
+
+def readonly_unenforceable_error(cli: str, permission: str, *,
+                                 forced: bool = False) -> str | None:
+    """Refuse a dispatch whose declared permission tier the backend cannot enforce.
+
+    summon FAILS CLOSED here for the same reason --gate-with does: a permission tier is a
+    promise to the caller, and a promise the backend will not keep is worse than no
+    promise, because it is acted on. agy is the only such backend today.
+
+    Measured across five canaries (2026-07-25/26). `--sandbox` restricts TERMINAL
+    operations only. `--mode plan` does not withhold the file tools. Withholding
+    `--add-dir` -- which summon shipped briefly as a containment fix -- only breaks
+    RELATIVE paths: canary 5 gave a DECLARED read-only agy agent two absolute paths, and it
+    read a secret file back verbatim and created a new one, both confirmed on disk.
+
+    The opt-in exists because refusing outright would strand anyone who knowingly wants
+    agy's reasoning on a throwaway checkout. It makes the tier ADVISORY, not enforced, and
+    says so.
+    """
+    if cli != "agy" or permission != "read-only":
+        return None
+    if forced:
+        # A tier SUMMON imposed -- a --gate-with adjudicator, a --max-permission clamp, a
+        # contract-repair resume -- is a privilege REDUCTION, and an ambient environment
+        # variable must not lift it. The opt-in waives a tier the CALLER declared for their
+        # own dispatch; it is not a global "read-only is optional" switch.
+        #
+        # This is the concrete hazard cross-vendor review demonstrated: the variable is
+        # inherited by every backend, background, manifest and council child, so setting it
+        # for one dispatch silently authorized advisory-only gates and clamped members
+        # underneath it. A gate that can be waived by the environment it runs in is not a
+        # gate.
+        return ("agy cannot enforce read-only, and this dispatch was FORCED to read-only by "
+                "summon (a gate, a --max-permission clamp, or a contract-repair resume). "
+                + _UNENFORCED_RO_OPT_IN + " does not apply here: it waives a tier you chose, "
+                "not one summon imposed to reduce privilege. Use a backend that enforces "
+                "read-only for this role.")
+    if os.environ.get(_UNENFORCED_RO_OPT_IN) == "1":
+        return None
+    return ("agy cannot enforce the read-only tier, so summon refuses this dispatch rather "
+            "than imply a boundary that does not exist. Measured: a declared read-only agy "
+            "agent read a secret file and created another by ABSOLUTE path, with --sandbox "
+            "and --mode plan both in force and the workspace withheld. agy at any tier can "
+            "read and write anything your user account can.\n"
+            "Choose deliberately:\n"
+            "  - use a backend that enforces read-only (claude, codex, cursor-agent); or\n"
+            "  - declare safe-edit if write access is acceptable (on agy that IS a full "
+            "bypass -- point it only at a repo you can afford to have written to); or\n"
+            "  - set " + _UNENFORCED_RO_OPT_IN + "=1 to dispatch anyway, accepting that "
+            "read-only is ADVISORY for agy and enforced by nothing.")
+
+
+def agy_readonly_workspace_warning(cli: str, permission: str) -> str | None:
+    """Warn on the OPT-IN path that read-only is advisory only.
+
+    Reached only when the caller set the opt-in, so the dispatch proceeds -- but it must
+    not proceed quietly. An earlier version of this warning claimed agy "cannot read your
+    repository", which canary 5 disproved: it read a secret by absolute path.
+    """
+    if cli != "agy" or permission != "read-only":
+        return None
+    if os.environ.get(_UNENFORCED_RO_OPT_IN) != "1":
+        return None
+    return ("read-only is ADVISORY for agy and enforced by nothing: it can read and write "
+            "any path your user account can, whatever this tier says. You set "
+            + _UNENFORCED_RO_OPT_IN + "=1, so summon dispatched anyway. Treat the result as "
+            "having had full filesystem access.")
 
 
 def agy_timeout_warning(cli: str, timeout_ms: int | None) -> str | None:
@@ -176,10 +318,120 @@ def agy_timeout_warning(cli: str, timeout_ms: int | None) -> str | None:
     if cli != "agy" or not timeout_ms or timeout_ms >= _AGY_MIN_ADVISED_TIMEOUT_MS:
         return None
     return (f"agy was given {int(timeout_ms / 1000)}s. It is a MULTI-STEP agent and "
-            f"routinely needs longer; a measured canary needed over 180s for a single "
-            f"file read. Budgets under {int(_AGY_MIN_ADVISED_TIMEOUT_MS / 1000)}s often "
-            f"time out mid-work (exit 124), which looks like a broken backend rather than "
-            f"a short clock. Raise --timeout, or expect a partial.")
+            f"routinely needs longer: a measured dispatch at 180s timed out mid-work, and "
+            f"{int(_AGY_MIN_ADVISED_TIMEOUT_MS / 1000)}s is the smallest budget one has been "
+            f"observed to COMPLETE under. A short clock reports exit 124, which reads as a "
+            f"broken backend rather than a budget you set. Raise --timeout, or expect a "
+            f"partial.")
+
+
+# Windows caps an entire command line at 32767 UTF-16 code units (CreateProcess,
+# including the terminating null), measured on the SERIALISED line -- subprocess quotes and
+# escapes arguments, so the raw character sum is not the number that matters. POSIX instead
+# caps each SINGLE argument at MAX_ARG_STRLEN = 131072 BYTES on Linux, and caps arguments
+# plus environment together at ARG_MAX. Measured 2026-07-25 on Windows: a 20k-char prompt
+# dispatched fine, 31k and 34k both failed -- and CreateProcess reports the overflow as
+# ERROR_FILE_NOT_FOUND, which Python raises as FileNotFoundError, which summon reported as
+# "CLI not found: ...node.EXE". That sends you to debug an install that was never broken.
+# A margin is left for the exe path and the flags, which are part of the same budget.
+_ARGV_TOTAL_LIMIT_NT = 32767
+_ARGV_SINGLE_LIMIT_POSIX = 131072
+
+
+def _utf8(s: str) -> bytes:
+    """Encode for measurement, never raising.
+
+    Arguments can carry lone surrogates -- from a prompt decoded with surrogateescape, or a
+    filesystem path on either platform. `surrogateescape` handles the low half but raises on
+    a lone HIGH surrogate, so measurement fell over on input it was supposed to describe.
+    """
+    try:
+        return s.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return s.encode("utf-8", "surrogatepass")
+
+
+def argv_length_error(cli: str, command: str, args: list, env=None) -> str | None:
+    """Reject an over-long command line BEFORE spawning, with the real reason.
+
+    The prompt is passed via argv by every CLI backend, so a large prompt (a diff, a
+    packet, a pasted file) can exceed the OS limit. --prompt-file does NOT avoid this: it
+    is a quoting and encoding convenience, and the content still reaches the backend on
+    the command line.
+    """
+    if os.name == "nt":
+        # Measure what CreateProcess ACTUALLY receives, not a character sum of the parts.
+        # subprocess serialises argv with list2cmdline, which adds quotes around anything
+        # containing a space and DOUBLES embedded backslashes before a quote -- so a raw sum
+        # undercounts badly. Cross-vendor review measured `\\"` * 10000 at 20010 by the old
+        # count and 40011 UTF-16 units once serialised; both passed preflight and then failed
+        # CreateProcess as WinError 206, which is the exact misdiagnosis this check exists to
+        # prevent. Windows counts UTF-16 code units, so a non-BMP character costs TWO, and
+        # the terminating NUL counts inside the limit.
+        line = subprocess.list2cmdline([command, *args])
+        # surrogatepass: a prompt decoded from an odd byte stream can carry a LONE
+        # SURROGATE, and a plain .encode() raises UnicodeEncodeError -- turning a preflight
+        # meant to produce a clear message into an uncaught crash on the dispatch path.
+        # Measuring is best-effort; refusing to measure must never be fatal.
+        total = len(line.encode("utf-16-le", "surrogatepass")) // 2 + 1   # +1 for the NUL
+        if total > _ARGV_TOTAL_LIMIT_NT:
+            return (f"the assembled command line is {total} characters, over the Windows "
+                    f"limit of {_ARGV_TOTAL_LIMIT_NT}. The prompt reaches {cli} through "
+                    f"argv, so a large prompt overflows it -- and Windows reports that "
+                    f"overflow as a MISSING FILE, which is why this used to surface as "
+                    f"'CLI not found'. --prompt-file does not help: it is a quoting "
+                    f"convenience and the content still goes on the command line. Shorten "
+                    f"the prompt, or write the material to a file under --cwd and ask the "
+                    f"agent to READ it (a repo-capable backend will).")
+        return None
+    # BYTES, not characters: execve counts encoded bytes, so 70k accented characters is
+    # 140k bytes and sailed past a character comparison (measured under WSL, E2BIG).
+    blobs = [_utf8(a) for a in args]
+    longest = max((len(b) for b in blobs), default=0)
+    # >=, not >: MAX_ARG_STRLEN COUNTS THE TERMINATING NUL, so 131072 bytes of payload is
+    # already one over. Measured under WSL: 131071 spawned, 131072 failed with E2BIG.
+    if longest >= _ARGV_SINGLE_LIMIT_POSIX:
+        return (f"a single argument is {longest} bytes, over the {_ARGV_SINGLE_LIMIT_POSIX} "
+                f"per-argument limit. The prompt reaches {cli} through argv. Shorten it, or "
+                f"write the material to a file under --cwd and ask the agent to READ it.")
+    # And the TOTAL, which counts the environment too: many medium arguments overflow
+    # ARG_MAX without any single one being close to the per-argument cap (measured: 25 x
+    # 100000 bytes passed preflight, then E2BIG). Read the real limit rather than assume;
+    # fall back to the POSIX minimum guarantee if sysconf is unavailable.
+    try:
+        arg_max = os.sysconf("SC_ARG_MAX")
+    except (ValueError, OSError, AttributeError):
+        arg_max = 2 ** 21
+    # BYTES of the environment that will ACTUALLY be passed, not characters of this
+    # process's. Both were wrong: character counting under-measured multibyte values (22
+    # values of 50k non-ASCII chars passed preflight, then /bin/true failed with E2BIG),
+    # and reading os.environ measured a different environment from the one _merge_env hands
+    # to Popen.
+    _env = os.environ if env is None else env
+    env_bytes = sum(len(_utf8(k)) + len(_utf8(v)) + 2 for k, v in _env.items())
+    total = len(command.encode("utf-8", "surrogateescape")) + sum(len(b) + 1 for b in blobs)
+    # A margin: the kernel also stores pointers and the auxiliary vector in this budget, and
+    # the exact overhead is not knowable from here.
+    if total + env_bytes > arg_max - 4096:
+        return (f"the arguments and environment total {total + env_bytes} bytes, over this "
+                f"system's ARG_MAX of {arg_max}. The prompt reaches {cli} through argv. "
+                f"Shorten it, or write the material to a file under --cwd and ask the agent "
+                f"to READ it.")
+    return None
+
+
+def advisory_warnings(cli: str, permission: str, timeout_ms: int | None) -> list:
+    """Every advisory warning a dispatch should carry, in ONE place.
+
+    The real envelope and --dry-run each assembled this list themselves and had already
+    drifted: --dry-run emitted the permission warning but neither the timeout nor the
+    read-only-workspace one. That is backwards -- preflight is exactly where a short clock
+    or an unreadable workspace is still free to fix. A guard test asserts the two paths
+    stay identical.
+    """
+    return [w for w in (agy_permission_warning(cli, permission),
+                        agy_readonly_workspace_warning(cli, permission),
+                        agy_timeout_warning(cli, timeout_ms)) if w]
 
 
 def _concatenated_prompt(inv: AgentInvocation) -> str:
@@ -507,6 +759,16 @@ _AGY_AUTH_FILES = (
     "state.json", "trustedFolders.json", "extension_integrity.json",
 )
 _AGY_MAX_PROMPT = 28000  # one argv token; stay under Windows CreateProcess ~32 KB
+
+
+def _reject_oversized_agy_prompt(prompt: str) -> None:
+    """Raise if the assembled agy prompt cannot be passed as one argv token."""
+    if len(prompt) > _AGY_MAX_PROMPT:
+        raise ValueError(
+            f"agy prompt is {len(prompt)} chars (> {_AGY_MAX_PROMPT}); it is passed as one "
+            "Windows argv token and would risk CreateProcess truncation. Shorten the "
+            "agent definition or task prompt, or write the material to a file under --cwd "
+            "and ask the agent to READ it.")
 _AGY_RUN_TTL_SEC = 900   # don't clean run dirs younger than this (may be in use)
 
 
@@ -832,27 +1094,43 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
             "block from your agent definition above, with every field present "
             "(use \"none\" where it does not apply). Do not skip it, even for tiny tasks."
         )
+        # CHECK BEFORE BUILDING. The guard below used to run after _ensure_agy_profile, so a
+        # prompt that was never going to dispatch still created a profile directory and
+        # copied OAuth material into it before raising -- orphaning credentials for a run
+        # that never happened. Same rule as the unenforceable-tier refusal: fail before side
+        # effects, not after them.
+        _reject_oversized_agy_prompt(prompt)
         profile = _ensure_agy_profile(inv.cwd, deadline_sec)
         _attest_agy_profile(profile, getattr(inv, "agy_account_sha256", None),
                             getattr(inv, "agy_account_checked", False))
         cont = []
 
-    if len(prompt) > _AGY_MAX_PROMPT:
-        raise ValueError(
-            f"agy prompt is {len(prompt)} chars (> {_AGY_MAX_PROMPT}); it is passed as one "
-            "Windows argv token and would risk CreateProcess truncation. Shorten the "
-            "agent definition or task prompt.")
+    # the resume branch above builds no profile, so checking it here costs nothing
+    _reject_oversized_agy_prompt(prompt)
 
     # Launch the wrapper, NOT agy directly. Arg order matters: agy's --print
     # consumes the NEXT token as the prompt, so flags (perm, --continue, --model)
     # precede it.
-    # --add-dir puts the caller's --cwd INTO agy's workspace. Without it agy resolves
-    # relative paths against a scratch dir inside the isolated profile (HOME/USERPROFILE
-    # are redirected there for auth isolation), so "read config.py" failed while the same
-    # file at an absolute path read fine -- measured with a canary, 2026-07-25. Passing the
-    # workspace explicitly is what makes agy usable for repo-grounded work.
+    # --add-dir puts the caller's --cwd INTO agy's workspace, which is what makes agy
+    # usable for repo-grounded work: without it, relative paths resolve against a scratch
+    # dir inside the isolated profile.
+    #
+    # It is passed at EVERY tier that can dispatch. Withholding it at read-only was tried
+    # and reverted: it bought no containment at all, because agy reaches any absolute path
+    # regardless (canary 5, 2026-07-26 -- a DECLARED read-only agent read a secret file and
+    # created another, both by absolute path, both confirmed on disk). All it did was break
+    # relative-path work while leaving a false impression of a boundary. Read-only agy now
+    # fails closed instead, so the only dispatches reaching here already have write
+    # authority, or an explicit and informed opt-in.
     add_dir = ["--add-dir", inv.cwd] if inv.cwd else []
-    args = [wrapper, *perm, *add_dir, *inv.extra_args, *cont, *model_flag, "--print", prompt]
+    # An agent definition's own `args:` are appended AFTER the permission flags, so a
+    # frontmatter `args: ["--add-dir", "/repo"]` or a second --mode silently rewrites the
+    # tier summon just computed. --max-permission and --gate-with already drop extra_args
+    # wholesale for exactly this reason; a DIRECTLY declared tier did not, which left the
+    # permission mapping advisory against the roster. Drop only the flags that move the
+    # boundary, so ordinary passthrough args keep working.
+    extra = _strip_agy_boundary_flags(inv.extra_args)
+    args = [wrapper, *perm, *add_dir, *extra, *cont, *model_flag, "--print", prompt]
     env = {
         "USERPROFILE": profile,
         "HOME": profile,

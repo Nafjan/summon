@@ -34,6 +34,7 @@ import os
 import math
 import re
 import subprocess
+import uuid
 import sys
 import threading
 import time
@@ -93,16 +94,15 @@ def _clear_out_file(out_file: str, archive: bool) -> str | None:
             # same free name, and the second os.replace then overwrote the first's archived
             # answer. O_EXCL means exactly one writer can ever own a given name.
             base = out_file + ".superseded"
-            dest, n, _denied = base, 0, 0
+            dest, n, _denied, _last_denial = base, 0, 0, None
             while True:
                 try:
-                    # Record the claim BEFORE closing: a close() that fails on a network
-                    # filesystem would otherwise leave the reserved name behind forever,
-                    # because `claimed` was still None and the cleanup never ran.
+                    # ONLY the open can collide. os.close() was once inside this try too,
+                    # so a close() that failed was read as "that name is taken": the loop
+                    # moved on having already set `claimed`, the next successful claim
+                    # overwrote it, and the earlier reservation leaked as a permanent empty
+                    # archive with its fd still open. A close failure is not a collision.
                     fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                    claimed = dest
-                    os.close(fd)
-                    break
                 except (FileExistsError, PermissionError) as _claim_err:
                     # PermissionError, not just FileExistsError: on WINDOWS a name whose
                     # file is pending deletion by a concurrent writer fails O_EXCL with
@@ -113,16 +113,88 @@ def _clear_out_file(out_file: str, archive: bool) -> str | None:
                     # index is safe: we are only choosing an UNUSED archive name.
                     if isinstance(_claim_err, PermissionError):
                         _denied += 1
-                        # A genuinely unwritable directory denies every name, so distinguish
-                        # that from contention instead of grinding to the 10k bound.
+                        _last_denial = _claim_err
+                        # MEASURE, do not guess. Two heuristics were tried and both were
+                        # defeated: a cumulative tally aborted on transient contention
+                        # spread across a long run, and a consecutive streak was defeated
+                        # by an unwritable directory whose occupied names return EEXIST and
+                        # whose free names return EACCES -- the streak never reached two,
+                        # so the loop ground through all 10k probes and then reported "too
+                        # many superseded copies", which is the wrong diagnosis entirely
+                        # (found by cross-vendor review, reproduced on a real WSL directory).
+                        #
+                        # The question the heuristics were approximating is simply "is this
+                        # directory writable at all", so ask it directly, once, with a name
+                        # nothing else can be holding.
                         if _denied > 64:
-                            return (f"cannot archive the previous result at {out_file}: "
-                                    f"permission denied claiming an archive name ({_claim_err})")
+                            # A FRESH name every time. Keying it on _denied reused the name
+                            # once the counter reset, so a probe whose cleanup failed (the
+                            # remove is best-effort) would make every later probe fail
+                            # O_EXCL with EEXIST -- read as "inconclusive" forever, silently
+                            # disabling the measurement this exists to perform.
+                            # uuid4, not a counter: a per-call sequence collides between
+                            # CONCURRENT calls in the same process, and the manifest runs
+                            # jobs in threads. The probe must be unique across processes AND
+                            # threads or it measures someone else's file.
+                            probe = f"{base}.wtest.{os.getpid()}.{uuid.uuid4().hex}"
+                            try:
+                                _pfd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                            except PermissionError:
+                                return (f"cannot archive the previous result at {out_file}: "
+                                        f"permission denied claiming an archive name "
+                                        f"({_claim_err})")
+                            except OSError:
+                                pass          # inconclusive; keep walking names
+                            else:
+                                # try/finally, matching the archive claim ten lines above:
+                                # a close() that raises must not skip the remove and strand
+                                # both the descriptor and the file. The two paths had the
+                                # same shape and only one had the care.
+                                try:
+                                    os.close(_pfd)
+                                finally:
+                                    try:
+                                        os.remove(probe)
+                                    except OSError:
+                                        # DELIBERATELY not reported as an error. A stranded
+                                        # zero-byte `.superseded.wtest.<pid>.<uuid>` is
+                                        # cosmetic: archive names are constructed exactly and
+                                        # never globbed, so summon cannot mistake it for an
+                                        # archive. Reporting it would make _clear_out_file
+                                        # return failure for a clear that SUCCEEDED, and
+                                        # _write_error_out refuses to overwrite when
+                                        # archiving fails -- which drops the dispatch's real
+                                        # error envelope and leaves a stale success. That is
+                                        # a bug this file already fixed once; trading it back
+                                        # for tidier litter is a bad deal. An operator
+                                        # globbing `*.superseded*` may see one; the `.wtest.`
+                                        # infix marks it.
+                                        pass
+                                # BOTH, not just the counter. A successful probe proves
+                                # the denials were transient, so keeping the last one alive
+                                # let a long-dead error be reported at the 10k bound as a
+                                # permanent permission failure -- the wrong diagnosis, in
+                                # the very function that exists to diagnose this correctly.
+                                _denied, _last_denial = 0, None
                     n += 1
                     dest = f"{base}.{n}"
                     if n > 10_000:             # pathological; do not spin forever
+                        if _last_denial is not None:
+                            # Denials were seen along the way, so "too many copies" would
+                            # name the wrong cause and send the reader to delete files that
+                            # are not the problem.
+                            return (f"cannot archive the previous result at {out_file}: "
+                                    f"permission denied claiming an archive name "
+                                    f"({_last_denial})")
                         return (f"cannot archive the previous result at {out_file}: "
                                 "too many superseded copies")
+                    continue
+                # The name is OURS. Record the claim BEFORE closing, so a close() that
+                # fails on a network filesystem still leaves the reservation visible to
+                # the finally-cleanup instead of stranding it forever.
+                claimed = dest
+                os.close(fd)                       # OSError here -> outer handler + cleanup
+                break
             os.replace(out_file, dest)
             claimed = None                     # the claim now holds the real content
         else:
@@ -387,12 +459,29 @@ def _existing_envelope(out_file: str) -> dict | None:
     return None
 
 
-def _read_envelope(out_file: str, proc) -> dict:
+def _read_envelope(out_file: str, proc, expect_sha: str | None = None) -> dict:
     """The child's --out file is the authoritative envelope. Fall back to the
     child's exit info only if the file is missing/corrupt (child crashed before
-    writing) — NEVER slice stdout, which host banners can pollute."""
+    writing) — NEVER slice stdout, which host banners can pollute.
+
+    `expect_sha` is this job's `request_sha256`. A results directory is documented as
+    belonging to ONE manifest run, but nothing enforced it: two parents sharing a directory
+    and a job id with DIFFERENT prompts both read whichever envelope landed last, so one
+    parent reported the other's answer and both exited success (measured with two real
+    processes, 2026-07-26). The envelope already carries the identity of the request it
+    answers; this is the read path finally checking it.
+    """
     env = _existing_envelope(out_file)
     if env is not None:
+        got = env.get("request_sha256")
+        if expect_sha and got and got != expect_sha:
+            return {"status": "error",
+                    "error": ("the envelope at this result path answers a DIFFERENT request "
+                              f"(expected {expect_sha[:12]}, found {got[:12]}). A results "
+                              "directory belongs to one manifest run; two runs sharing this "
+                              "path will overwrite each other's answers. Give each run its "
+                              "own --results-dir."),
+                    "result_path_conflict": True}
         return env
     # Combine BOTH streams: the real traceback often goes to stdout while stderr
     # only carries a shell/hook banner. `stderr or stdout` would surface just the
@@ -539,8 +628,10 @@ def run_manifest(args) -> int:
                                              f"({int(_parent_timeout(job))}s); process tree killed"}
                     else:
                         # The child's --out file is AUTHORITATIVE — never parse the
-                        # child's stdout, which a shell/hook banner can pollute.
-                        envelope = _read_envelope(out_file, proc)
+                        # child's stdout, which a shell/hook banner can pollute. `_fp` is
+                        # this job's request identity: a shared results dir means the
+                        # envelope sitting here might answer a DIFFERENT run's question.
+                        envelope = _read_envelope(out_file, proc, _fp)
                 except Exception as e:  # noqa: BLE001 — one job must never crash the pool
                     envelope = {"status": "error", "error": f"{type(e).__name__}: {e}"}
         # Always leave forensics: if the job ran (not skipped) but the child wrote
@@ -548,9 +639,25 @@ def run_manifest(args) -> int:
         # persist the error envelope ourselves — so `result_file` in the summary
         # actually exists and a failed job is never zero-forensics.
         if not skipped and not os.path.exists(out_file):
+            # temp + os.replace, like every other envelope write. A direct open("w") was
+            # observed by a concurrent reader as the single byte "{", and a crash inside
+            # that window strands a permanently unparseable file -- which is exactly what
+            # "a present file is a COMPLETE file" promises cannot happen. The promise is
+            # only as good as its least careful writer.
             try:
-                with open(out_file, "w", encoding="utf-8") as fh:
-                    json.dump(envelope, fh, ensure_ascii=False)
+                _d = os.path.dirname(os.path.abspath(out_file)) or "."
+                os.makedirs(_d, exist_ok=True)
+                _fd, _tmp = tempfile.mkstemp(dir=_d, prefix=".summon-out-", suffix=".tmp")
+                try:
+                    with os.fdopen(_fd, "w", encoding="utf-8") as fh:
+                        json.dump(envelope, fh, ensure_ascii=False)
+                    os.replace(_tmp, out_file)
+                except BaseException:
+                    try:
+                        os.unlink(_tmp)
+                    except OSError:
+                        pass
+                    raise
             except OSError:
                 pass
         status = envelope.get("status", "error")

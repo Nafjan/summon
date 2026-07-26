@@ -13,6 +13,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 _VERSION_TIMEOUT = 10
@@ -154,13 +155,41 @@ def _default_probe_runner(name: str, path: str) -> dict | None:
     except Exception:  # noqa: BLE001 - probing is best-effort
         return None
     try:
-        inv = AgentInvocation(cli=name, prompt="ping", cwd=os.getcwd(),
-                              system_context="", permission="read-only")
+        # The probe is a liveness check, not a privileged dispatch, so it asks for the
+        # least authority: read-only. agy refuses that tier (it cannot enforce it), which
+        # would report a healthy agy as unverifiable -- so agy is probed one tier up.
+        #
+        # But safe-edit on agy means --dangerously-skip-permissions --add-dir <cwd>, i.e. a
+        # HEALTH CHECK with full authority over the caller's working tree. That is not a
+        # trade worth making for a liveness ping, so the agy probe runs in an empty throwaway
+        # directory: it still proves the backend starts, answers and authenticates, and the
+        # only thing it can write to is a temp dir we are about to delete.
+        _probe_dir = None
+        if name == "agy":
+            _perm, _probe_dir = "safe-edit", tempfile.mkdtemp(prefix="summon-probe-")
+            _cwd = _probe_dir
+        else:
+            _perm, _cwd = "read-only", os.getcwd()
+        inv = AgentInvocation(cli=name, prompt="ping", cwd=_cwd,
+                              system_context="", permission=_perm)
         resp = execute_agent(inv, timeout_ms=_PROBE_TIMEOUT * 1000)
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "text": f"{type(e).__name__}: {e}"}
+    finally_dir = locals().get("_probe_dir")
+    if finally_dir:
+        shutil.rmtree(finally_dir, ignore_errors=True)
     text = " ".join(str(resp.get(k) or "") for k in ("error", "output_tail", "result"))
-    return {"status": resp.get("status"), "text": text}
+    out = {"status": resp.get("status"), "text": text}
+    if name == "agy":
+        # Do not let a green probe imply a tier that was never exercised: agy has no
+        # enforceable read-only, and the probe deliberately ran one tier up.
+        out["probed_permission"] = "safe-edit"
+        out["note"] = ("probed at safe-edit IN AN EMPTY TEMPORARY DIRECTORY: agy cannot "
+                       "enforce read-only, so a read-only dispatch is refused "
+                       "(SUMMON_ALLOW_UNENFORCED_READONLY=1 overrides for a tier you declare "
+                       "yourself), and safe-edit on agy is a full bypass -- which a health "
+                       "check must not aim at your repo. Says nothing about read-only.")
+    return out
 
 
 def _probe_one(name: str, b: dict, runner) -> None:
@@ -173,6 +202,15 @@ def _probe_one(name: str, b: dict, runner) -> None:
     if result is None:
         b["probe_note"] = "no eligibility probe defined for this backend"
         return
+    # Carry the probe's own metadata into the published entry. _default_probe_runner
+    # reports which tier it exercised (agy cannot be probed at read-only, so it runs one
+    # tier up in a throwaway directory) and _probe_one discarded it -- so the output said
+    # "eligibility verified" with no hint that read-only was never tested for that backend.
+    # A disclosure that never reaches the reader is not a disclosure.
+    if result.get("probed_permission"):
+        b["probed_permission"] = result["probed_permission"]
+    if result.get("note"):
+        b["probe_note"] = result["note"]
     status, text = result.get("status"), result.get("text") or ""
     # SUCCESS is authoritative and checked FIRST: a genuine success proves auth +
     # account eligibility + a model responded, so a model that merely ECHOED a
@@ -193,8 +231,14 @@ def _probe_one(name: str, b: dict, runner) -> None:
         b["model_access_verified"] = False
         b["guidance"] = verdict["guidance"]
     else:
-        # timeout / error / blocked with no known signature: stays UNVERIFIED.
-        b["probe_note"] = f"probe did not confirm eligibility (status={status}): {text[:160]}"
+        # timeout / error / blocked with no known signature: stays UNVERIFIED. APPEND rather
+        # than overwrite: the runner's own note (which tier it exercised, and why) is still
+        # true, and on a FAILED probe it is exactly what a reader needs to interpret the
+        # failure.
+        _prior = b.get("probe_note")
+        b["probe_note"] = (
+            f"probe did not confirm eligibility (status={status}): {text[:160]}"
+            + (f" [{_prior}]" if _prior else ""))
 
 
 def _probe_eligibility(backends: dict, runner=None) -> None:
@@ -351,12 +395,20 @@ def render(report: dict) -> str:
             # probe-verified -> [OK] eligible; unprobed -> [~?] unverified.
             if mark == "[OK]":
                 if b.get("account_eligible") is True:
-                    detail = f"{ver} - eligibility verified  ({b['path']})"
+                    _at = (f" at {b['probed_permission']}" if b.get("probed_permission")
+                           else "")
+                    detail = f"{ver} - eligibility verified{_at}  ({b['path']})"
                 else:
                     mark = "[~?]"
                     detail = f"{ver} - installed; eligibility unverified  ({b['path']})"
         lines.append(f"  {mark} {name:<13} {detail}")
         lines.append(f"       auth: {b['auth_hint']}")
+        # The disclosure reached --json and stopped there, so the person actually READING
+        # doctor saw "eligibility verified" with no hint that read-only was never exercised
+        # for this backend. Two outputs describing one probe, and only the one nobody reads
+        # was honest.
+        if b.get("probe_note"):
+            lines.append(f"       note: {b['probe_note']}")
     ad = report["agents_dir"]
     lines += [
         "",

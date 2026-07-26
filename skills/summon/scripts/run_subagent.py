@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.14.1"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.15.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -851,6 +851,13 @@ def main() -> None:
         # carry --dangerously-skip-permissions and defeat the clamp -- the same hole that
         # made a gate's own args a privilege-escalation path.
         permission=_clamp(permission, getattr(args, "max_permission", None)),
+        # A CLAMP is summon reducing privilege on the caller's instruction, so like the gate
+        # it must not be waivable by an ambient opt-in. Marked forced only when the clamp
+        # actually bit -- a request that was already at or below the ceiling was not forced
+        # anywhere, and calling it forced would refuse dispatches the caller chose freely.
+        permission_forced=bool(
+            getattr(args, "max_permission", None)
+            and _clamp(permission, args.max_permission) != permission),
         model=final_model,               # incl. agy Gemini thinking-mode suffix
         effort=effort,                    # --effort > frontmatter > env > default(high)
         resume_id=args.resume,
@@ -937,7 +944,7 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     path is shown instead."""
     from _builder import (BACKENDS, backend_kind, build_invocation_args,
                           permission_flags as _pf, _PERMISSION_MAPPING, _agy_wrapper,
-                          agy_permission_warning, apply_credit_guard, infer_billing,
+                          advisory_warnings, apply_credit_guard, infer_billing,
                           credit_spend_allowed, selects_credit_only)
     _guarded, _, _guard_warnings = apply_credit_guard(invocation)
     _eff_model = _guarded.model
@@ -970,9 +977,23 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     }
     for _w in _guard_warnings:  # credit-only guard actions surfaced in the preview
         view.setdefault("warnings", []).append(_w)
-    _pw = agy_permission_warning(invocation.cli, invocation.permission)
-    if _pw:  # same helper as the real envelope -> identical warning, exactly once
-        view.setdefault("warnings", []).append(_pw)
+    # A dispatch that will be REFUSED must say so in preflight. Surfaced as `would_refuse`
+    # plus `error` rather than a warning, because it is not advice: the run does not happen.
+    from _builder import readonly_unenforceable_error as _refuse
+    _ro = _refuse(invocation.cli, invocation.permission,
+                  forced=getattr(invocation, "permission_forced", False))
+    if _ro:
+        # Its OWN key, not `error`. In this view `error` means "the preview could not be
+        # built" (e.g. no agy wrapper on this OS) and is set later by the backend branches,
+        # which clobbered the refusal on Linux. They are different facts and both are worth
+        # reporting: the dispatch would be refused, AND the preview is partial.
+        view["would_refuse"] = True
+        view["refusal"] = _ro
+    # Same helper as the real envelope, so preflight shows exactly what the run would
+    # warn about -- a short agy clock and a withheld read-only workspace are both things
+    # you want to learn BEFORE paying, which is the whole point of --dry-run.
+    for _w in advisory_warnings(invocation.cli, invocation.permission, args.timeout):
+        view.setdefault("warnings", []).append(_w)
     if backend_kind(invocation.cli) == "api":
         view["command"] = f"POST ({invocation.cli})"
         view["base_url"] = invocation.base_url
@@ -1032,13 +1053,19 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
               f"({gate_cli}) as the gated dispatch; a same-vendor gate shares the "
               f"caller's blind spots", file=sys.stderr)
 
-    prompt = gate_prompt(agent=args.agent, prompt=args.prompt, cwd=args.cwd,
+    # EVERY field comes from the invocation actually being gated, not from args. Taking
+    # prompt/cwd from args meant a re-gate (retry, schema correction, contract repair)
+    # adjudicated the ORIGINAL task while a DIFFERENT request was dispatched -- the gate
+    # approved something nobody was about to run. args is the first dispatch's shape; the
+    # invocation is what is about to happen.
+    prompt = gate_prompt(agent=args.agent, prompt=gated_inv.prompt, cwd=gated_inv.cwd,
                          permission=gated_inv.permission, cli=gated_inv.cli,
                          model=gated_inv.model)
     gate_inv = AgentInvocation(
-        cli=gate_cli, prompt=prompt, cwd=args.cwd, system_context=gate_ctx,
+        cli=gate_cli, prompt=prompt, cwd=gated_inv.cwd, system_context=gate_ctx,
         agent_file=gate_file,
         permission="read-only",   # FORCED: never inherit the gate definition's tier
+        permission_forced=True,   # so the opt-in cannot turn the adjudicator advisory
         model=gate_model, effort=gate_effort,
         # extra_args are DELIBERATELY DROPPED. build_invocation_args appends an
         # agent's `args:` AFTER the permission flags, so a gate definition carrying
@@ -1204,6 +1231,63 @@ def _aggregate_spend(result: dict, retry: dict) -> None:
         result["usage"] = merged
 
 
+_EXIT_TUPLE = ("exit_code", "backend_exit_code", "dispatcher_status",
+               "normalization_reason")
+
+
+def _push_exit_history(result: dict, retry: dict) -> None:
+    """Publish the retry's exit telemetry, keeping every superseded attempt in order.
+
+    `original_exit` was singular and therefore wrong as soon as more than one retry could
+    run: an accepted SCHEMA correction replaces the root envelope before contract repair
+    ever looks at it, so the "original" it preserved was the schema retry, not attempt 1 --
+    while the changelog claimed attempt 1. An append-only list cannot drift that way, and
+    `attempts` already tells the caller how many runs there were.
+
+    `original_exit`/`original_exit_code` are kept as aliases for the MOST RECENT superseded
+    attempt, because they are already documented; `exit_history` is the truthful record.
+    """
+    from _executor import finalize_exit_fields as _fin
+
+    superseded = {k: result.get(k) for k in _EXIT_TUPLE if k in result}
+    if superseded:
+        result.setdefault("exit_history", []).append(superseded)
+        result["original_exit"] = superseded            # most recent, not "attempt 1"
+        result["original_exit_code"] = superseded.get("exit_code")
+    for k in _EXIT_TUPLE:
+        result.pop(k, None)
+    result["exit_code"] = retry.get("exit_code")
+    for k in ("backend_exit_code", "dispatcher_status", "normalization_reason"):
+        if retry.get(k) is not None:
+            result[k] = retry[k]
+    # ADOPT the retry's own reason where it has one; recompute only as a fallback, since a
+    # sentence the retry wrote about itself beats one we infer.
+    _fin(result)
+
+
+def _repair_permission(invocation) -> tuple:
+    """The tier a corrective resume should run at, and a warning when it is not read-only.
+
+    The repair normally forces `read-only`: it is a formatting re-emit and must not gain
+    authority. Forcing it on a backend that cannot ENFORCE read-only was a first attempt at
+    this and it was wrong twice over. It refused the resume outright -- discarding the
+    refusal, so the envelope claimed `contract_repair_attempted: true` and `attempts: 2` for
+    a call that never reached a backend -- and it bought nothing, because the repair RESUMES
+    THE SESSION THAT ALREADY RAN. That session held the task's authority; a tier on the
+    resume cannot retroactively contain it, and on agy the tier is unenforceable regardless.
+
+    So: read-only where it means something, the original tier where it does not, and say
+    which. Pretending is the one option that is never right.
+    """
+    from _builder import readonly_unenforceable_error
+    if readonly_unenforceable_error(invocation.cli, "read-only", forced=True) is None:
+        return "read-only", True, None
+    return invocation.permission, False, (
+        "the corrective resume ran at %r, not read-only: %s cannot enforce read-only, and "
+        "the resume continues the session that already held this authority. It re-emits the "
+        "report contract and asks for no new work." % (invocation.permission, invocation.cli))
+
+
 def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> dict:
     """A dispatch that SUCCEEDED but whose report contract is malformed (report_ok
     false -> suspect) gets ONE constrained corrective resume that re-emits the exact
@@ -1219,6 +1303,11 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
     repeat the task's side effects). No resume lane -> no-op."""
     if not (result.get("status") == "success" and not result.get("report_ok")):
         return result
+    _perm, _forced, _perm_warning = _repair_permission(invocation)
+    # NOT appended yet: it says the resume RAN at this tier, and the gate below may deny it.
+    # Emitting it here produced flatly contradictory telemetry -- "the corrective resume ran
+    # at safe-edit" sitting next to "DENIED by the gate, so it was not run". A warning about
+    # an execution belongs after the execution.
     resume = result.get("resume") or {}
     sid, profile = resume.get("session_id"), resume.get("profile")
     if not sid and not profile:
@@ -1231,13 +1320,31 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         invocation,
         prompt=_CONTRACT_REPAIR_PROMPT,
         system_context="",  # resume: session already holds the definition
-        permission="read-only",   # formatting re-emit: no write/yolo/tool authority, no side effects
+        permission=_perm,         # read-only where the backend enforces it (see above)
+        permission_forced=_forced,
         resume_id=sid or "latest",
         resume_profile=profile or invocation.resume_profile,
         extra_args=(),   # DROP extra_args: a resume keeps the session's model, and a
                          # stray permission-override flag (--dangerously-bypass...,
                          # --permission-mode bypassPermissions) would defeat read-only.
     )
+    # A gate authorises ONE execution. Retries re-gate; schema correction re-gates; this
+    # path did not -- and round 3 made that expensive by giving the repair the task's own
+    # tier on backends that cannot enforce read-only. On agy that is
+    # --dangerously-skip-permissions, so a gated agy task with a malformed report bought a
+    # second FULL-AUTHORITY run nobody approved. The repair prompt is instruction, not
+    # containment.
+    _repair_refused = _regate_or_none(args, agents_dir, retry_inv)
+    if _repair_refused is not None:
+        # Its own field, not result["gate"]: that holds the approval for the run that
+        # already completed, and overwriting it would misreport approved work as denied.
+        result["gate_repair_refused"] = _repair_refused
+        result.setdefault("warnings", []).append(
+            "the report contract is malformed and the corrective resume was DENIED by the "
+            "gate, so it was not run; the original result stands as returned")
+        return result
+    if _perm_warning:                     # approved: the resume is about to actually run
+        result.setdefault("warnings", []).append(_perm_warning)
     try:
         retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir,
                               max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
@@ -1260,10 +1367,45 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         result.pop("suspect", None)
         result["contract_repaired"] = True
         result["repaired_report_text"] = retry.get("result")   # the corrected block, for reference
+        # If the ORIGINAL text was empty, "keep the original verbatim" preserves nothing:
+        # the envelope then reports success with an empty `result`, and the only content
+        # lives in a field most callers never read. Observed for real on this repo's own
+        # review dispatch -- the findings existed, and a caller branching on status and
+        # reading `result` would have seen an empty string and no error.
+        if not (result.get("result") or "").strip():
+            result["result"] = retry.get("result") or ""
+            result["result_from_repair"] = True
+        # The accepted outcome came from the RETRY, so the WHOLE exit tuple must describe
+        # that run. Round 7 rewrote status and exit_code and stopped there, leaving
+        # backend_exit_code, dispatcher_status and normalization_reason describing attempt 1
+        # -- so the envelope still contradicted itself, just in fields I had not looked at,
+        # and the changelog's "the contradiction is gone" was false. finalize_exit_fields()
+        # cannot repair them afterwards because it uses setdefault: already-set values win.
+        #
+        # Preserve the complete original tuple (it is real evidence about attempt 1), then
+        # adopt the retry's, recomputing the reason from the new pair rather than copying a
+        # sentence written about the old one.
+        if retry.get("exit_code") is not None:
+            # UNCONDITIONAL once the retry is accepted. Gating on "did exit_code or status
+            # change?" left attempt 1's normalization_reason in place whenever the two runs
+            # happened to share an exit code -- two clean successes with DIFFERENT reasons
+            # kept the wrong sentence and recorded no history at all. If the retry's answer
+            # is the one being published, its telemetry is too.
+            _push_exit_history(result, retry)
         if retry.get("resume"):
             result["resume"] = retry["resume"]     # latest session id for follow-ups
         if retry.get("warnings"):
-            result["warnings"] = (result.get("warnings") or []) + retry["warnings"]
+            # DEDUPE, order-preserving. The corrective resume repeats the original
+            # dispatch's conditions -- same backend, same tier, same clock -- so it emits
+            # the same advisory warnings, and concatenating produced every one of them
+            # twice. A caller counting warnings, or a human reading them, sees a doubled
+            # list describing one condition.
+            _merged = (result.get("warnings") or []) + retry["warnings"]
+            _seen, result["warnings"] = set(), []
+            for _w in _merged:
+                if _w not in _seen:
+                    _seen.add(_w)
+                    result["warnings"].append(_w)
     else:
         result["contract_repair_attempted"] = True   # a call was spent; it did not improve
     return result

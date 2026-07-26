@@ -152,7 +152,7 @@ Parse JSON output and check `status` field:
 | `--set KEY=VALUE` | No | With the two above: `run-agent`, `model`, `permission`, `args` (repeatable) |
 | `--agent` | Yes* | Agent definition name from --list |
 | `--prompt` | Yes* | Task description to delegate (or `--prompt-file`) |
-| `--prompt-file FILE` | Yes* | Read the prompt from a UTF-8 file (BOM tolerated; strict decoding). Mutually exclusive with `--prompt`. Quoting/encoding ergonomics for long prompts; backends still receive the prompt via argv, so backend argv limits (agy ~28k chars) still apply. A `--background` child re-reads the file |
+| `--prompt-file FILE` | Yes* | Read the prompt from a UTF-8 file (BOM tolerated; strict decoding). Mutually exclusive with `--prompt`. Quoting/encoding ergonomics for long prompts; it does **not** avoid the OS argv limit - backends still receive the prompt on the command line. Windows caps the WHOLE assembled line at 32767 chars (measured: 20k prompt fine, 31k refused; the system context counts toward it), POSIX caps a single argument at 131072, and agy's own limit is ~28k. Over the limit summon refuses before spawning with an argv error - it used to surface as a bogus `CLI not found`, since Windows reports the overflow as a missing file. For material that large, write it to a file under `--cwd` and ask the agent to READ it. A `--background` child re-reads the file |
 | `--cwd` | Yes* | Working directory (absolute path) |
 | `--timeout` | No | Bare ms or with suffix: `600s`, `10m` (default: 600000 = 10m). Set your host tool's own timeout ABOVE this value — the script needs a few seconds of overhead beyond the CLI deadline |
 | `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
@@ -213,7 +213,9 @@ with `--prompt-file`; `--question` with `--question-file`; manifest job `prompt`
 **Fan-out flag matrix (rejected, never silently dropped):** `--manifest` consumes only
 `--concurrency`, `--results-dir`, `--cwd`, `--agents-dir`, `--retries`; `--council`
 consumes only `--question`/`--question-file`, `--members`, `--chairman`, `--rounds`,
-`--cwd`, `--agents-dir`, `--timeout`, `--out`. Any other dispatch flag passed to these
+`--cwd`, `--agents-dir`, `--timeout`, `--out`, `--run-dir`, `--results-dir`, `--quorum`,
+`--chairman-fallback`, `--member-timeout`, `--chair-timeout`, `--overall-timeout` and
+`--min-successful-members`. Any other dispatch flag passed to these
 modes is rejected up front with a pointer to where the capability lives (per-job manifest
 keys, or the member agent's own definition).
 
@@ -290,6 +292,17 @@ Honest edges — plan around these, don't be surprised by them:
   an ABSOLUTE path read fine — so agy always had file tools and simply was not standing in
   `--cwd`. After the fix the relative lookup returns the token, with agy reporting the
   workspace as your `--cwd`.
+  **agy at `read-only` is REFUSED.** agy cannot enforce that tier, and summon fails closed
+  rather than imply a boundary that does not exist. Measured over five canaries
+  (2026-07-25/26): `--sandbox` restricts terminal operations only; `--mode plan` does not
+  withhold the file tools; and withholding the workspace only breaks RELATIVE paths — a
+  **declared** read-only agy agent read a secret file and created another by ABSOLUTE path,
+  both confirmed on disk. agy at any tier can read and write anything your user account can.
+  Use `safe-edit` as a deliberate choice (on agy that is a full bypass; point it only at
+  repos you can afford to have written to), pick a backend that enforces the tier
+  (claude/codex/cursor-agent), or set `SUMMON_ALLOW_UNENFORCED_READONLY=1` to dispatch
+  anyway — which marks the tier advisory and says so in `warnings`. `--dry-run` reports
+  `would_refuse` so you learn this before spending anything.
   (agy still never reports token usage or a resolved model, and its `safe-edit` tier is a
   full bypass — see the permission note.)
 - **`status` reflects the backend's own signal.** The envelope downgrades a self-reported
@@ -299,8 +312,13 @@ Honest edges — plan around these, don't be surprised by them:
 - **`--manifest` resume retries failures.** A prior job envelope is only "done" when its
   `status` is `success`; re-running a manifest re-dispatches `error`/`blocked`/`partial`
   jobs. Delete a result file to force a clean re-run. Two manifest *processes* pointed at
-  the same results dir can each start a job before the other's file lands (wasteful
-  duplicate, not corruption — final writes are atomic); don't run two on one results dir.
+  the same results dir will **corrupt each other's attribution**, not merely duplicate work:
+  measured with two real parents sharing one job id and different prompts, parent A read and
+  reported parent B's answer and both exited success. Individual writes are atomic, but
+  nothing owns the shared path, so the last writer wins. summon now REFUSES an envelope
+  whose `request_sha256` does not match the job being run (`result_path_conflict: true`
+  rather than a wrong answer), but that is a safety net, not a lock: **give each concurrent
+  run its own `--results-dir`.**
 - **`openai-compat` makes a real network call** to the `base_url` you configure and sends
   your API key in the `Authorization` header. Never point an `openai-compat` agent (or a
   manifest that inlines `base_url`) at an untrusted host — that beams your key to it. Its
@@ -411,7 +429,7 @@ levels are NOT identical across CLIs; when behavior surprises you, check this ta
 
 | Level | claude | codex | cursor-agent | gemini | agy |
 |-------|--------|-------|--------------|--------|-----|
-| `read-only` | `--permission-mode plan` | `-s read-only` | `--mode plan` | `--approval-mode plan` | `--sandbox` |
+| `read-only` | `--permission-mode plan` | `-s read-only` | `--mode plan` | `--approval-mode plan` | **refused** (see below) |
 | `safe-edit` | `--permission-mode acceptEdits` | `-s workspace-write -c approval_policy=never` | `--trust` | `--approval-mode auto_edit` | `--dangerously-skip-permissions` |
 | `yolo` | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `-f --trust` | `-y` | `--dangerously-skip-permissions` |
 
@@ -419,12 +437,20 @@ Caveats worth knowing:
 - `read-only` sandboxes differ: claude's plan mode can block even *reads* the
   prompt depends on (a blocked run now returns `status: blocked` — see the
   status table). If a read-only agent must read files, keep them under `--cwd`.
-- **agy has no workspace-write tier**: `read-only` maps to `--sandbox`, but BOTH
-  `safe-edit` and `yolo` map to `--dangerously-skip-permissions` — so a `safe-edit`
-  agy agent runs with a FULL permission bypass, identical to `yolo`. Constrain agy
-  agents by instruction, and treat any repo you point them at as trusted. Every agy
-  `safe-edit` dispatch (and its `--dry-run`) carries a `warnings` entry saying exactly
-  this, so the level name can never read as a real sandbox.
+- **agy has no workspace-write tier AND no enforceable read-only tier.** `safe-edit`
+  and `yolo` BOTH map to `--dangerously-skip-permissions` — a `safe-edit` agy agent runs
+  with a FULL permission bypass, identical to `yolo`. And `read-only` is **refused**:
+  measured over five canaries, `--sandbox` restricts terminal operations only, `--mode plan`
+  does not withhold the file tools, and withholding the workspace only breaks *relative*
+  paths — a declared read-only agy agent read a secret file and created another by absolute
+  path. summon fails closed rather than name a tier nothing enforces; the flags are still
+  sent as defence in depth but nothing relies on them.
+  `SUMMON_ALLOW_UNENFORCED_READONLY=1` dispatches anyway and marks the tier advisory in
+  `warnings` — but it only waives a tier **you** declared, never one summon imposed (a
+  `--gate-with` adjudicator, a `--max-permission` clamp that bit, a contract-repair resume).
+  Constrain agy agents by instruction, and treat any repo you point them at as trusted.
+  Every agy `safe-edit` dispatch (and its `--dry-run`) carries a `warnings` entry saying
+  exactly this, so the level name can never read as a real sandbox.
 - For investigation agents that only need to *read*, `yolo` +
   "do not modify files" in the agent body is often more reliable than
   `read-only` — several CLIs' plan modes end turns asking for approval.
