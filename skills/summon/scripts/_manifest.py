@@ -157,7 +157,12 @@ def _clear_out_file(out_file: str, archive: bool) -> str | None:
                                         os.remove(probe)
                                     except OSError:
                                         pass
-                                _denied = 0   # writable: the denials really were contention
+                                # BOTH, not just the counter. A successful probe proves
+                                # the denials were transient, so keeping the last one alive
+                                # let a long-dead error be reported at the 10k bound as a
+                                # permanent permission failure -- the wrong diagnosis, in
+                                # the very function that exists to diagnose this correctly.
+                                _denied, _last_denial = 0, None
                     n += 1
                     dest = f"{base}.{n}"
                     if n > 10_000:             # pathological; do not spin forever
