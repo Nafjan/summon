@@ -8,6 +8,26 @@ never on added fields.
 
 ## [0.15.0] - 2026-07-26
 
+### Fixed (round 9)
+- **The repaired-envelope contradiction was only half fixed** (see the corrected round-7
+  entry below). `status` and `exit_code` were adopted from the retry while
+  `backend_exit_code`, `dispatcher_status` and `normalization_reason` still described the
+  first attempt -- and `finalize_exit_fields()` uses `setdefault`, so nothing downstream
+  could repair them. The whole tuple now comes from the retry, the reason is RECOMPUTED
+  rather than copied from a sentence about the old pair, and attempt 1's tuple is preserved
+  under `original_exit`.
+- **The test-suite leak detector missed most of what the suite patches.** It listed five
+  `os` functions and two environment VALUES; the suite also patches `os.unlink`, `os.read`,
+  `sys.argv`, clocks and module attributes, and a test can replace `os.environ` wholesale --
+  which made every value comparison blind. Now fingerprints the environment as a snapshot
+  plus its IDENTITY, `sys.argv`, thirteen `os` functions, the clocks and subprocess.
+  Verified by injecting the exact leaks review proved invisible; all four are named.
+- **A test that both raised and leaked counted as two failures**, so one broken test
+  inflated the totals.
+
+### Testing (round 9)
+- 383/383 discovery, 22/22 install.
+
 ### Fixed (round 8)
 - **Two manifest runs sharing a results dir corrupted each other's ATTRIBUTION**, not merely
   duplicated work. Measured with two real processes on one job id and different prompts:
@@ -52,14 +72,22 @@ never on added fields.
   (the repaired text is now used, flagged `result_from_repair`), and the accepted outcome
   comes from the RETRY, so attempt 1's exit code no longer sits next to attempt 2's status
   (the original is kept as `original_exit_code`).
+  **Round 8 found this half-done and the claim above overstated**: `status` and `exit_code`
+  were rewritten while `backend_exit_code`, `dispatcher_status` and `normalization_reason`
+  still described attempt 1, so the envelope went on contradicting itself in the fields I
+  had not looked at. `finalize_exit_fields()` could not repair them afterwards because it
+  uses `setdefault`. The WHOLE tuple is now adopted from the retry, with attempt 1's
+  preserved under `original_exit`.
 - **A successful writability probe cleared the counter but not the recorded denial**, so at
   the 10001-name bound a long-dead transient error was reported as a permanent permission
   failure -- the wrong diagnosis in the function that exists to diagnose it. This also made
   the round-5 changelog entry's "right diagnosis" claim false in exactly the case it
   described; that entry is corrected rather than left standing.
 - **The corrective resume duplicated warnings.** It repeats the original dispatch's
-  conditions -- same backend, tier and clock -- so it emits the same advisories, and
-  concatenating produced each one twice.
+  conditions -- same backend and clock -- so it emits the same advisories, and concatenating
+  produced each one twice. (The TIER is not always the same: on a backend that enforces
+  read-only the repair drops to it, and only on agy does it keep the task's tier. The
+  original wording here said "same tier" and was wrong.)
 - **`_no_agy_optin()` restored a value but not ABSENCE**, so a test body that SET the
   variable left it set, contaminating every later test in a single-process suite.
 

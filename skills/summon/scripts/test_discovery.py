@@ -13289,6 +13289,75 @@ def test_v8_a_foreign_envelope_is_refused_not_served():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_v8_repair_adopts_the_whole_exit_tuple():
+    """Round 7 rewrote `status` and `exit_code` on an accepted repair and stopped there,
+    leaving `backend_exit_code`, `dispatcher_status` and `normalization_reason` describing
+    attempt 1. So the envelope still contradicted itself -- in the fields I had not looked
+    at -- and the changelog's "the contradiction is gone" was false.
+
+    `finalize_exit_fields()` cannot repair this afterwards: it uses setdefault, so the stale
+    values win. The round-7 test asserted only `exit_code`, which is why it passed.
+
+    Asserts the ENTIRE tuple, on a BLOCKED repair (not just DONE), because the failure mode
+    is a field nobody thought to check."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="read-only")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    real = rs.execute_agent
+    try:
+        rs.execute_agent = lambda i, **k: {
+            "status": "blocked", "result": "R", "report_ok": True, "exit_code": 0,
+            "backend_exit_code": 0, "dispatcher_status": "blocked"}
+        original = {"status": "success", "report_ok": False, "result": "orig",
+                    "exit_code": 1, "backend_exit_code": 1, "dispatcher_status": "success",
+                    "normalization_reason": "normalized to success (raw backend exit 1)",
+                    "resume": {"session_id": "s"}}
+        out = rs._apply_contract_repair(original, inv, args)
+    finally:
+        rs.execute_agent = real
+
+    assert out.get("status") == "blocked", out.get("status")
+    assert out.get("exit_code") == 0, out.get("exit_code")
+    assert out.get("backend_exit_code") == 0, (
+        "backend_exit_code still describes attempt 1: %r" % out.get("backend_exit_code"))
+    assert out.get("dispatcher_status") == "blocked", (
+        "dispatcher_status still describes attempt 1: %r" % out.get("dispatcher_status"))
+    reason = out.get("normalization_reason") or ""
+    assert "raw backend exit 1" not in reason, (
+        "the normalization reason is a sentence written about the FIRST attempt: %r" % reason)
+    assert "blocked" in reason, reason
+
+    # attempt 1's telemetry is evidence, not noise -- it is preserved, not discarded
+    orig_tuple = out.get("original_exit") or {}
+    assert orig_tuple.get("exit_code") == 1 and orig_tuple.get("dispatcher_status") == "success", (
+        "the original exit tuple must be preserved: %r" % (orig_tuple,))
+    assert out.get("original_exit_code") == 1
+
+
+def test_v8_leak_detector_covers_what_the_suite_actually_patches():
+    """The first detector listed five os functions and two env VALUES. Cross-vendor review
+    replaced `os.unlink`, `sys.argv` and `os.environ` ITSELF and it reported nothing leaked
+    -- an incomplete detector is worse than none, because it certifies hygiene it never
+    checked.
+
+    Verified by injection separately (four deliberate leaks, all named). This asserts the
+    fingerprint's SHAPE, so a future edit cannot quietly shrink it back."""
+    fp = _global_fingerprint()
+    for required in ("os.unlink", "os.read", "os.listdir", "os.stat", "os.rename",
+                     "sys.argv", "os.environ.id", "env.snapshot",
+                     "time.time", "time.monotonic", "subprocess.Popen"):
+        assert required in fp, (
+            "%s is patched somewhere in this suite but is not fingerprinted, so a test that "
+            "leaks it corrupts every later test silently" % required)
+    # env is captured WHOLE, not as named variables: naming them meant an unlisted one
+    # leaked undetected
+    assert isinstance(fp["env.snapshot"], tuple) and fp["os.environ.id"] == id(os.environ)
+
+
 def _global_fingerprint():
     """Identity of the globals these tests monkeypatch.
 
@@ -13298,13 +13367,24 @@ def _global_fingerprint():
     corruption presents as an unrelated failure much later, or worse, as a pass. Comparing
     identities before and after each test names the culprit instead."""
     import subprocess as _sp
-    return {
-        "os.name": os.name, "os.open": os.open, "os.close": os.close,
-        "os.remove": os.remove, "os.replace": os.replace,
+    import time as _t
+    snap = {
+        # The first version listed five os functions and two env VALUES. Cross-vendor
+        # review replaced os.unlink, sys.argv and os.environ itself, and the detector
+        # reported nothing leaked. An incomplete detector is worse than none: it certifies
+        # hygiene it never checked.
+        "sys.argv": tuple(sys.argv),
+        # IDENTITY, not just contents: a test that REPLACES os.environ wholesale leaves
+        # every .get() answering from the new object, so comparing values sees nothing.
+        "os.environ.id": id(os.environ),
+        "env.snapshot": tuple(sorted(os.environ.items())),
+        "time.time": _t.time, "time.monotonic": _t.monotonic, "time.sleep": _t.sleep,
         "subprocess.Popen": _sp.Popen, "subprocess.run": _sp.run,
-        "env.optin": os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY"),
-        "env.credit": os.environ.get("SUMMON_ALLOW_CREDIT"),
     }
+    for _n in ("name", "open", "close", "remove", "replace", "unlink", "read", "listdir",
+               "stat", "makedirs", "rename", "fdopen", "getpid"):
+        snap["os." + _n] = getattr(os, _n, None)
+    return snap
 
 
 if __name__ == "__main__":
@@ -13313,29 +13393,44 @@ if __name__ == "__main__":
     failed = 0
     for t in tests:
         _before = _global_fingerprint()
+        _raised = False
         try:
             t()
             print(f"[PASS] {t.__name__}")
         except Exception as e:  # noqa: BLE001 — test harness reports, doesn't raise
+            _raised = True
             failed += 1
             print(f"[FAIL] {t.__name__}: {type(e).__name__}: {e}")
         _after = _global_fingerprint()
         _leaked = sorted(k for k in _before
                          if _before[k] is not _after[k] and _before[k] != _after[k])
         if _leaked:
-            failed += 1
+            # Count the TEST, not its symptoms. A test that both raises AND leaks was
+            # counted twice, so one broken test inflated `failed` and the printed totals
+            # stopped matching the number of tests that ran.
+            if not _raised:
+                failed += 1
             print(f"[FAIL] {t.__name__}: LEAKED PATCHED GLOBALS {_leaked} -- restore them "
                   f"in a finally, or every test after this one runs against them")
             for _k in _leaked:                      # repair so one leak is not N failures
-                if _k.startswith("env."):
-                    _n = {"env.optin": "SUMMON_ALLOW_UNENFORCED_READONLY",
-                          "env.credit": "SUMMON_ALLOW_CREDIT"}[_k]
-                    if _before[_k] is None:
-                        os.environ.pop(_n, None)
-                    else:
-                        os.environ[_n] = _before[_k]
+                if _k == "env.snapshot":
+                    # Restore the whole mapping: naming individual variables meant a test
+                    # that set an UNLISTED one leaked it undetected and unrepaired.
+                    _want = dict(_before[_k])
+                    for _dead in [x for x in os.environ if x not in _want]:
+                        os.environ.pop(_dead, None)
+                    for _kk, _vv in _want.items():
+                        if os.environ.get(_kk) != _vv:
+                            os.environ[_kk] = _vv
+                elif _k in ("os.environ.id", "env.snapshot"):
+                    pass              # reported; a wholesale swap cannot be safely undone
+                elif _k == "sys.argv":
+                    sys.argv[:] = list(_before[_k])
                 elif _k.startswith("os."):
                     setattr(os, _k.split(".", 1)[1], _before[_k])
+                elif _k.startswith("time."):
+                    import time as _t2
+                    setattr(_t2, _k.split(".", 1)[1], _before[_k])
                 elif _k.startswith("subprocess."):
                     import subprocess as _sp2
                     setattr(_sp2, _k.split(".", 1)[1], _before[_k])
