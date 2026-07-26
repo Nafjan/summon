@@ -12813,13 +12813,58 @@ def test_v8_a_doomed_agy_prompt_builds_no_profile():
         "into it before failing")
 
 
+def test_v8_the_gate_adjudicates_the_request_that_will_actually_run():
+    """`_run_gate` built its prompt from `args`, not from the invocation handed to it. So
+    every RE-gate -- retries, schema correction, and the contract repair -- asked the
+    adjudicator about the ORIGINAL task while a DIFFERENT request was dispatched. The gate
+    approved something nobody was about to execute.
+
+    This asserts on the prompt the gate actually BUILDS. The round-5 version mocked
+    `_run_gate` wholesale and only counted calls, so it passed while this reproduced."""
+    import _builder
+    import run_subagent as rs
+
+    d = tempfile.mkdtemp(prefix="summon-gateq-")
+    seen = {}
+    real = rs.execute_agent
+    try:
+        (Path(d) / "rev.md").write_text(chr(10).join(
+            ["---", "name: rev", "description: d", "run-agent: claude",
+             "permission: read-only", "---", "", "adjudicate", ""]), encoding="utf-8")
+
+        def fake_exec(inv, **k):
+            seen["prompt"] = inv.prompt
+            seen["cwd"] = inv.cwd
+            return {"status": "success",
+                    "result": "VERDICT: APPROVE" + chr(10) + "REASON: ok"}
+
+        rs.execute_agent = fake_exec
+        args = types.SimpleNamespace(gate_with="rev", agent="a", prompt="ORIGINAL_TASK",
+                                     cwd=os.getcwd(), cli=None, timeout=1000,
+                                     gate_timeout=None, debug_dir=None)
+        gated = _builder.AgentInvocation(cli="claude", prompt="REPAIR_TASK",
+                                         cwd=os.getcwd(), system_context="c",
+                                         permission="read-only")
+        rs._run_gate(args, d, gated)
+    finally:
+        rs.execute_agent = real
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    prompt = seen.get("prompt") or ""
+    assert "REPAIR_TASK" in prompt, (
+        "the gate was not shown the request about to be dispatched: %r" % prompt[:200])
+    assert "ORIGINAL_TASK" not in prompt, (
+        "the gate adjudicated the ORIGINAL task while a different request was about to "
+        "run. An approval for a request nobody executes is worse than no gate: %r"
+        % prompt[:200])
+
+
 def test_v8_contract_repair_is_re_gated():
     """A gate authorises ONE execution. Retries re-gate; schema correction re-gates; the
-    contract repair did not -- and round 3 made that expensive by giving the repair the
-    task's own tier on backends that cannot enforce read-only. On agy that tier is
-    --dangerously-skip-permissions, so a GATED agy task with a malformed report bought a
-    second full-authority run nobody approved. The repair prompt is instruction, not
-    containment."""
+    contract repair did not -- and on a backend that cannot enforce read-only the repair
+    keeps the task's tier, so a gated agy task with a malformed report bought a second
+    full-authority run nobody approved."""
     import run_subagent as rs
 
     calls = {"gate": 0, "exec": 0}
@@ -12844,15 +12889,16 @@ def test_v8_contract_repair_is_re_gated():
     finally:
         rs._run_gate, rs.execute_agent = real_gate, real_exec
 
-    assert calls["gate"] == 1, (
-        "the corrective resume was not re-gated; a gate authorises one execution and this "
-        "is a second one (gate calls: %d)" % calls["gate"])
-    assert calls["exec"] == 0, (
-        "the gate DENIED the repair and it ran anyway -- %d execution(s)" % calls["exec"])
+    assert calls["gate"] == 1, ("the corrective resume was not re-gated", calls)
+    assert calls["exec"] == 0, ("the gate DENIED the repair and it ran anyway", calls)
     assert out.get("gate_repair_refused"), out
-    assert out.get("gate") is None or out.get("gate") == result.get("gate"), (
-        "the refusal of the CORRECTION must not overwrite the approval that authorised the "
-        "run which already completed")
+    # telemetry must not contradict itself: the "ran at <tier>" warning is written only
+    # after the gate approves, so a denial cannot report both
+    warnings = out.get("warnings") or []
+    assert not any("corrective resume ran" in w for w in warnings), (
+        "a DENIED repair still reported that it ran: %r" % (warnings,))
+    assert any("DENIED" in w for w in warnings), (
+        "a denial must be visible to a caller reading warnings: %r" % (warnings,))
 
 
 def _b_invocation():
@@ -12862,22 +12908,89 @@ def _b_invocation():
                                     system_context="c", permission="safe-edit")
 
 
-def test_v8_council_stage_identity_includes_the_optin():
-    """Council builds its OWN stage identity -- the third place in this codebase to build
-    one, after the dispatcher and the manifest, which is exactly the drift
-    build_request_identity was created to end. It omitted the opt-in, so a resume carried
-    forward agy stage results produced WITH it after it was removed: every success reused,
-    zero dispatches, for a request that would now fail closed."""
+def test_v8_council_optin_identity_is_scoped_not_blanket():
+    """Behavioural, not a source grep. The round-5 version searched _council.py for the
+    variable name, so it passed while the key was being added UNCONDITIONALLY -- including
+    as null, which changed every stage hash: every council run written before the fix lost
+    carry-forward, and toggling the variable re-ran claude/codex/cursor stages it cannot
+    affect.
+
+    Absent control -> identity unchanged from legacy. Present control -> identity moves."""
+    import _council
+    import _rundir as rd
+
+    had = os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY")
+    base = {"prompt": "p", "member": "m", "agent_sha": "x", "cwd": "/c"}
+    try:
+        # THE REAL FUNCTION, not a hand-built dict. The previous version hashed dicts it
+        # constructed itself and so never executed _council at all -- it passed against the
+        # unconditional version this exists to prevent.
+        os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        absent_ctx = _council._optin_stage_ctx()
+        os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
+        optin_ctx = _council._optin_stage_ctx()
+    finally:
+        if had is None:
+            os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+
+    assert absent_ctx == {}, (
+        "an unset control must contribute NO key; adding it as null changes every stage "
+        "hash and re-pays for every council run written before the fix: %r" % (absent_ctx,))
+    assert optin_ctx == {"unenforced_readonly": "1"}, optin_ctx
+    legacy = rd.content_sha256(base)
+    absent = rd.content_sha256({**base, **absent_ctx})
+    optin = rd.content_sha256({**base, **optin_ctx})
+    assert legacy == absent, (
+        "adding the key as null changed the hash, so every pre-existing council run "
+        "re-pays in full for work already done")
+    assert optin != legacy, (
+        "with the opt-in set the stage identity must move, or a resume serves an "
+        "advisory-only answer to a request that would now fail closed")
+
+    # The helper must be MERGED INTO the shared stage context. A correct helper that
+    # nothing calls is the same bug in a nicer shape, and council hashes stages in four
+    # places (round 1, round 2, chairman, fallback chairman) -- folding it in once is what
+    # keeps a fifth from being missed.
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_council.py"),
                encoding="utf-8").read()
-    assert "SUMMON_ALLOW_UNENFORCED_READONLY" in src, (
-        "council stage hashes omit the opt-in, so carry-forward can serve an advisory-only "
-        "answer to a resume that would be refused")
-    # it must be folded into the shared per-run context, not one call site of three
-    i = src.index("SUMMON_ALLOW_UNENFORCED_READONLY")
-    assert "_exec_ctx" in src[max(0, i - 400):i], (
-        "fold the control into the shared stage context; adding it to one of the three "
-        "hash sites is how the next omission happens")
+    assert "**_optin_stage_ctx()" in src, (
+        "the control is computed but never merged into the stage context, so no stage "
+        "identity actually carries it")
+    assert "_exec_ctx = {**_exec_ctx, **_optin_stage_ctx()}" in src, (
+        "merge it into the SHARED context rather than at individual hash sites")
+
+
+def test_v8_doctor_disclosure_reaches_the_human_output():
+    """`render()`, not the JSON. Round 5 propagated `probed_permission`/`probe_note` into
+    the entry and the round-5 test checked the entry -- so the human renderer, which is what
+    a person running `doctor` actually sees, still printed only "eligibility verified" while
+    the test passed. Two outputs describing one probe, and only the one nobody reads was
+    honest."""
+    import _doctor
+
+    # Build the report from doctor's OWN collector, then inject the probe fields. A
+    # hand-written fixture drifts from render()'s real shape -- mine was missing four keys
+    # and only said so once the escape hatch came off -- and a fixture that drifts stops
+    # testing the thing it names.
+    report = _doctor.doctor(probe=False)
+    entry = report["backends"].get("agy")
+    if entry is None:
+        return                      # agy not present in this environment's backend table
+    entry.update({"found": True, "version": "1.1.7", "path": "/x/agy",
+                  "probe_ran": True, "auth_ok": True, "account_eligible": True,
+                  "model_access_verified": True, "probed_permission": "safe-edit",
+                  "probe_note": "probed at safe-edit IN AN EMPTY TEMPORARY DIRECTORY: agy "
+                                "cannot enforce read-only, so a read-only dispatch is "
+                                "refused"})
+    human = _doctor.render(report)
+    assert "safe-edit" in human, (
+        "the human output never names the tier the probe exercised, so 'eligibility "
+        "verified' reads as ordinary verification:" + chr(10) + human[:600])
+    assert "read-only" in human, (
+        "the human output must say read-only was NOT exercised for this backend:"
+        + chr(10) + human[:600])
 
 
 def test_v8_agy_double_dash_cannot_hang_the_dispatch():

@@ -345,7 +345,7 @@ cannot tell, and a person decides.
 The gate's ruling, its model evidence, and its definition hash land in the
 envelope's `gate` field, so a skipped or forged approval is detectable afterwards.
 
-**Every dispatch path is gated, which took four attempts to get right.** This is
+**Every dispatch path is gated, which took six attempts to get right.** This is
 worth stating plainly because it is the failure mode most likely to recur in any
 system you build on top. A gate authorises ONE execution, and summon turned out
 to have several ways to execute:
@@ -355,11 +355,20 @@ to have several ways to execute:
 - the `--json-schema` corrective follow-up, which re-dispatches with the ORIGINAL
   permission and so was a second write-capable run that no gate had approved;
 - `--background`, whose detached child argv is rebuilt field by field, so the gate
-  flag was simply absent and the whole dispatch ran ungated.
+  flag was simply absent and the whole dispatch ran ungated;
+- the **contract auto-repair** resume, which is also a second execution -- and on a
+  backend that cannot enforce read-only it keeps the task's own authority, so a
+  gated `agy` task with a malformed report bought a full-bypass run nobody approved;
+- and then, having gated all five, the gate itself was **adjudicating the wrong
+  request**: it built its prompt from the caller's original arguments rather than
+  from the invocation about to be dispatched, so every re-gate above asked about the
+  FIRST task while a different one ran. An approval for a request nobody executes is
+  worse than no gate, because it looks like coverage.
 
 Each was found separately, and after each one the invariant looked satisfied. The
-lesson generalises: when you close a privilege hole, **enumerate the execution
-paths rather than fixing the one in front of you**. A refused correction records
+lesson generalises twice over: when you close a privilege hole, **enumerate the
+execution paths rather than fixing the one in front of you** -- and then check that
+the check itself is looking at the thing it is about to authorise. A refused correction records
 `gate_correction_refused` instead of overwriting `gate`, because the original
 approval authorised work that genuinely completed -- rewriting it would misreport
 finished work as denied.

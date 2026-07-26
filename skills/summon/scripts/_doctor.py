@@ -231,8 +231,14 @@ def _probe_one(name: str, b: dict, runner) -> None:
         b["model_access_verified"] = False
         b["guidance"] = verdict["guidance"]
     else:
-        # timeout / error / blocked with no known signature: stays UNVERIFIED.
-        b["probe_note"] = f"probe did not confirm eligibility (status={status}): {text[:160]}"
+        # timeout / error / blocked with no known signature: stays UNVERIFIED. APPEND rather
+        # than overwrite: the runner's own note (which tier it exercised, and why) is still
+        # true, and on a FAILED probe it is exactly what a reader needs to interpret the
+        # failure.
+        _prior = b.get("probe_note")
+        b["probe_note"] = (
+            f"probe did not confirm eligibility (status={status}): {text[:160]}"
+            + (f" [{_prior}]" if _prior else ""))
 
 
 def _probe_eligibility(backends: dict, runner=None) -> None:
@@ -389,12 +395,20 @@ def render(report: dict) -> str:
             # probe-verified -> [OK] eligible; unprobed -> [~?] unverified.
             if mark == "[OK]":
                 if b.get("account_eligible") is True:
-                    detail = f"{ver} - eligibility verified  ({b['path']})"
+                    _at = (f" at {b['probed_permission']}" if b.get("probed_permission")
+                           else "")
+                    detail = f"{ver} - eligibility verified{_at}  ({b['path']})"
                 else:
                     mark = "[~?]"
                     detail = f"{ver} - installed; eligibility unverified  ({b['path']})"
         lines.append(f"  {mark} {name:<13} {detail}")
         lines.append(f"       auth: {b['auth_hint']}")
+        # The disclosure reached --json and stopped there, so the person actually READING
+        # doctor saw "eligibility verified" with no hint that read-only was never exercised
+        # for this backend. Two outputs describing one probe, and only the one nobody reads
+        # was honest.
+        if b.get("probe_note"):
+            lines.append(f"       note: {b['probe_note']}")
     ad = report["agents_dir"]
     lines += [
         "",
