@@ -13455,6 +13455,75 @@ def test_v8_environ_replacement_is_repaired_not_just_reported():
         "for every later test")
 
 
+def test_v8_docs_agree_with_the_code_on_agy_read_only():
+    """STRUCTURAL GUARD over the DOCS, not the code.
+
+    Every load-bearing fact about agy's permission tiers is asserted in four files --
+    README.md, SKILL.md, references/orchestration.md, references/fan-out.md -- and a fact
+    maintained in four places drifts. It already has, twice on this branch: the docs claimed
+    agy read-only "cannot read your repository" (disproved by a canary that read a secret by
+    absolute path) and that a shared results dir was a "wasteful duplicate, not corruption"
+    (disproved by two processes where one served the other's answer).
+
+    So: if the CODE refuses agy at read-only, every doc that discusses it must say so, and
+    none may still describe the superseded containment story. This binds the claim to its
+    subject the same way the flag-documentation and version-stamp guards do."""
+    import _builder
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # skills/summon
+    repo = os.path.dirname(os.path.dirname(root))
+
+    # the behaviour the docs must match, read from the code itself
+    had = os.environ.pop("SUMMON_ALLOW_UNENFORCED_READONLY", None)
+    try:
+        refuses = bool(_builder.readonly_unenforceable_error("agy", "read-only"))
+    finally:
+        if had is not None:
+            os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = had
+    assert refuses, "precondition: the code refuses agy at read-only"
+
+    docs = {
+        "README.md": os.path.join(repo, "README.md"),
+        "SKILL.md": os.path.join(root, "SKILL.md"),
+        "references/orchestration.md": os.path.join(root, "references", "orchestration.md"),
+        "references/fan-out.md": os.path.join(root, "references", "fan-out.md"),
+    }
+    # the claim the canary disproved; it must not survive anywhere
+    dead = "cannot read your repository"
+    for label, path in docs.items():
+        if not os.path.isfile(path):
+            continue
+        text = open(path, encoding="utf-8", errors="replace").read()
+        low = text.lower()
+        if "agy" not in low or "read-only" not in low:
+            continue
+        assert dead not in low, (
+            "%s still carries the claim a canary disproved (%r). agy reaches any ABSOLUTE "
+            "path regardless of the workspace flag." % (label, dead))
+        assert ("refus" in low or "fails closed" in low or "fail closed" in low), (
+            "%s discusses agy and read-only but never says the dispatch is REFUSED, so a "
+            "reader is left with the superseded story" % label)
+
+
+def test_v8_docs_do_not_promise_cross_process_result_ownership():
+    """The second doc claim a repro disproved: two manifest runs sharing a --results-dir
+    were described as a "wasteful duplicate, not corruption". Measured, parent A read and
+    reported parent B's answer. Any doc that discusses sharing a results directory has to
+    say attribution breaks, not that it is merely wasteful."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo = os.path.dirname(os.path.dirname(root))
+    for label, path in (("README.md", os.path.join(repo, "README.md")),
+                        ("SKILL.md", os.path.join(root, "SKILL.md")),
+                        ("references/fan-out.md",
+                         os.path.join(root, "references", "fan-out.md"))):
+        if not os.path.isfile(path):
+            continue
+        low = open(path, encoding="utf-8", errors="replace").read().lower()
+        assert "wasteful duplicate, not corruption" not in low, (
+            "%s still claims a shared results dir is only wasteful; two real processes "
+            "showed one parent serving the other's answer" % label)
+
+
 def _global_fingerprint():
     """Identity of the globals these tests monkeypatch.
 
