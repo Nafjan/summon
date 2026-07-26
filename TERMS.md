@@ -1,10 +1,14 @@
 # Terms of Service — read before you rely on summon
 
-summon does not call any provider API itself. It drives each vendor's **own official
-CLI** (`claude`, `codex`, `cursor-agent`, `gemini`, `agy`) using **your** logged-in
-account. Those CLIs are built by the vendors for scripted/automated use, so basic
-personal and development automation is within their intended use — but a few things
-are genuinely your responsibility. This is guidance, not legal advice; the providers'
+The five CLI backends do not call any provider API directly: summon drives each vendor's
+**own official CLI** (`claude`, `codex`, `cursor-agent`, `gemini`, `agy`) using **your**
+logged-in account. The sixth, `openai-compat`, is the deliberate exception -- it makes a
+direct HTTPS request to the `base_url` you configure, billed to your API key (see
+[API-key backends](#api-key-backends-opt-in-and-cleaner-for-products) below).
+
+Those CLIs are built by the vendors for scripted/automated use, so basic personal and
+development automation is within their intended use — but a few things are genuinely your
+responsibility. This is guidance, not legal advice; the providers'
 terms are the source of truth and they change.
 
 ## Generally fine (the intended use)

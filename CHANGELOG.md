@@ -27,6 +27,28 @@ never on added fields.
   Stdlib-only (`ctypes`), fails soft: where Job Objects are unavailable the previous
   `taskkill` path is unchanged, and it still covers the common leader-alive case.
 
+### Documentation (0.15.2)
+
+- **Nine README/TERMS claims corrected against the code.** A documentation review verified
+  every sentence rather than reading it as context, and found the docs promising more than
+  summon delivers. The three that a reader would have acted on:
+  - Worktree isolation was described as automatic. It is opt-in via `--worktree`; without
+    it, concurrent editing agents share `--cwd`.
+  - TERMS opened with "summon does not call any provider API itself" while `openai-compat`
+    makes a direct HTTPS request to your configured `base_url` -- and contradicted itself
+    forty lines later.
+  - A council-scoped bound ("wasted spend, never corrupted output") was stated as a
+    repository-wide property. It does not cover manifests, where two runs sharing a
+    `--results-dir` were measured serving each other's answers.
+  Also corrected: `--json-schema` "makes any agent return validated JSON" (it validates and
+  retries once, only where the backend supports resume); the default `doctor` reporting
+  which backends are "logged in" (it reads versions; `--probe` verifies sign-in); `models`
+  showing "what each backend can run right now" (only agy queries live); "every result
+  includes `report.handoff`" (errors and malformed replies may not); the approval-request
+  downgrade being exhaustive (it matches known markers in the final output); and escalating
+  to `fable` (it runs on Opus unless you authorize credit spend).
+- A guard now binds these claims to the code, so a reverted sentence fails the suite.
+
 ## [0.15.0] - 2026-07-26
 
 **The permissions release.** A permission tier is a promise, and this version stops summon
