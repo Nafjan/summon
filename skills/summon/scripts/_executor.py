@@ -1462,6 +1462,12 @@ def _kill_tree(process: subprocess.Popen) -> None:
             # exited, a still-running backend grandchild is orphaned. The correct fix
             # is a Windows Job Object (kill the tree independent of leader lifetime);
             # POSIX's killpg below already reaches the group through a dead leader.
+            # A Job Object kills every member regardless of who has already exited, so
+            # it is tried FIRST; taskkill remains the fallback for a child that could not
+            # be assigned (nested-job restrictions, older Windows).
+            from _jobobj import terminate as _job_terminate
+            if _job_terminate(process):
+                return
             from _spawn import run_flags
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
                            capture_output=True, timeout=10, **run_flags())
@@ -1927,6 +1933,16 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             _error_response(inv.cli, 127, f"CLI not found: {command}{_hint}"), None))
     except OSError as e:
         return _stamp(_enrich(_error_response(inv.cli, 1, f"{type(e).__name__}: {e}"), None))
+
+    # Windows only: put the child in a kill-on-close Job Object so its whole tree can be
+    # terminated even after this leader exits (issue #10) -- taskkill walks parent->child
+    # PID links and loses the tree the moment the leader is gone -- and so an unexpected
+    # death of summon itself does not leave a paid backend running unattended.
+    try:
+        from _jobobj import attach as _job_attach
+        _job_attach(process)
+    except Exception:  # noqa: BLE001 - teardown plumbing must never break a dispatch
+        pass
 
     response = _drive_process(process, inv.cli, timeout_ms)
     # Resume handle: what the orchestrator passes to a follow-up `--resume`.
