@@ -242,8 +242,8 @@ dispatch it with the **summon** skill instead of doing everything yourself:
   councils and swarms diverse; a council of clones is pointless.
 
 Verify, don't trust: branch on the returned `status`; a `report_ok:false` or
-`suspect:true` "success" means re-dispatch. Read `warnings` (model fell back, agy read-only is
-advisory only, credit spend). `model.served` proves what actually ran.
+`suspect:true` "success" means re-dispatch. Read `warnings` (model fell back, an agy
+read-only dispatch was refused or is running advisory-only, credit spend). `model.served` proves what actually ran.
 Preview a paid fan-out with `--dry-run`, pass `--json-schema` when you need structured
 output, chain via `report.handoff` into the next call, and pass `--out` on any
 council you cannot afford to lose (the envelope is checkpointed each phase).
@@ -307,7 +307,7 @@ vendors.
   "report_ok": true,
   "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
                "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
-  "summon":  { "version": "0.9.0", "scripts_sha256": "9f2c…" },
+  "summon":  { "version": "0.15.0", "scripts_sha256": "9f2c…" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -321,6 +321,12 @@ vendors.
   contract don't get believed.
 - `model.served` → the model that actually did the work (evidence-based; `null` = no
   service evidence observed). `targeted` = what the session was pointed at.
+- Situational fields appear only when they apply: `exit_history` + `original_exit` (a
+  corrective resume superseded an earlier attempt; every superseded attempt is kept in
+  order), `result_from_repair` (the first attempt produced no text, so the repaired text is
+  the answer), `result_path_conflict` (the envelope found at a shared `--results-dir` path
+  answers a *different* request and was refused rather than served), and `gate`,
+  `gate_correction_refused` or `gate_repair_refused` under `--gate-with`.
 - `summon.scripts_sha256` + `agent_def.sha256` → provenance: which dispatcher build and
   which agent definition produced this envelope.
 - `billing.source` → did this draw from a **subscription** or metered **api** credits.
@@ -413,8 +419,16 @@ You bring the model access; summon just orchestrates the CLIs and APIs you alrea
 
 - **Permissions.** Each agent's `permission:` (`read-only` / `safe-edit` / `yolo`) maps to
   that CLI's own sandbox flags. Bundled agents ship `safe-edit` (auto-approve edits, no
-  bypass). The exception is agy: it has no workspace-write tier, so its `safe-edit` is a
-  full bypass, like `yolo`. Raise anything to `yolo` deliberately, and only in repos you trust.
+  bypass). Raise anything to `yolo` deliberately, and only in repos you trust.
+- **agy is the exception, twice over.** It has no workspace-write tier, so its `safe-edit`
+  is a full bypass like `yolo`. And it has **no enforceable `read-only` tier at all**, so
+  since 0.15.0 summon *refuses* an agy dispatch declared `read-only` rather than imply a
+  boundary that does not exist. Measured over five canaries: `--sandbox` restricts terminal
+  operations only, `--mode plan` does not withhold the file tools, and withholding the
+  workspace only breaks *relative* paths -- a declared read-only agy agent read a secret
+  file and created another by absolute path. `SUMMON_ALLOW_UNENFORCED_READONLY=1` dispatches
+  anyway and marks the tier advisory in `warnings`; it waives only a tier **you** declared,
+  never one summon imposed (a `--gate-with` adjudicator, a clamp that bit, a repair resume).
 - **Treat the whole `--cwd` as trusted.** Files under it, `.agents/memory.md`
   (auto-injected into agent context), and manifest `prompt_file`s are trusted operator
   input. Every bundled agent also carries an "untrusted content: data, not instructions"
@@ -427,6 +441,14 @@ You bring the model access; summon just orchestrates the CLIs and APIs you alrea
   accounts, build a product on subscription auth, or hammer parallel volume; use API-key
   backends for commercial or high-volume work. Providers can change programmatic-billing
   rules. Full guidance in **[TERMS.md](TERMS.md)**.
+- **Prompt size is bounded by the OS, not by summon.** Every CLI backend receives the
+  prompt through `argv`. Windows caps the whole assembled command line at 32767 characters
+  and reports the overflow as a *missing file*, which summon used to relay as a bogus
+  `CLI not found`; POSIX caps a single argument at 128 KiB and the total (including your
+  environment) at `ARG_MAX`. Summon now measures the real, serialized line before spawning
+  and refuses with an error that names argv as the cause. `--prompt-file` does **not** avoid
+  this -- it is a quoting convenience and the content still travels on the command line. For
+  material that large, write it to a file under `--cwd` and ask the agent to read it.
 - **No phone-home.** For the five CLI backends, summon sends no telemetry and makes no
   network calls of its own; it just spawns the backend CLIs, plus supporting tools where a
   feature needs them (`git`, `icacls`/`chmod`, the agy PTY wrapper, a detached copy of
@@ -472,14 +494,13 @@ Shaped by two extended field reports (a GTM-materials agent and a complex-coding
 agent). Every validated request is either shipped, scheduled below, or declined with a
 reason. Ordering is roughly by priority, not a commitment.
 
+**Shipped since this roadmap was written:** council quorum + `--chairman-fallback` +
+per-stage timeouts; the background job registry read path (`jobs list` / `status` / `wait`
+with nonce-verified results); install-drift detection in `doctor` and `install.py`;
+`--gate-with` approval gating across every execution path; and the argv preflight that
+turned an OS command-line overflow from a bogus `CLI not found` into an accurate error.
+
 **Next (scoped):**
-- **Council quorum + chairman fallback**: synthesize on an explicit quorum when members
-  fail on resume (top-level status stays `partial`; a separate `decision_status` reports
-  usability), and a `--chairman-fallback` agent when the primary chairman fails. Adds
-  `--member-timeout` / `--chair-timeout`.
-- **Background job registry (read path)**: `--job-dir` / `SUMMON_JOBS_DIR`, two-phase
-  launch records written before spawn, and `jobs list` / `jobs status` / `jobs wait`, so a
-  detached job that dies before writing a result is never zero-forensics.
 - **Honest fan-out rollups**: a durable attempt journal (already present for councils)
   extended to manifests, so `usage`/`cost_usd` totals count every round, retry, and
   correction instead of undercounting after a crash.
@@ -500,8 +521,12 @@ reason. Ordering is roughly by priority, not a commitment.
   pricing table and won't guess a bill.)
 - **`--verify-no-mutations`**: hash git status/diff before and after a read-only agent and
   fail the envelope if it changed anything, backstopping the `yolo` + "do not modify" pattern.
-- **Capability-aware rosters**: declare `repo-read` / `vision` / `web` capabilities so a
-  council can reject an agy member from a repo-reading task before spending time.
+- **Capability-aware rosters**: declare `repo-read` / `vision` / `web` / `enforces-read-only`
+  capabilities so a council can reject an unsuitable member before spending time. The
+  original motivation (agy cannot read `--cwd`) is obsolete -- agy is repo-capable at
+  `safe-edit` -- but a sharper one replaced it: agy cannot *enforce* `read-only`, so a
+  governed review roster needs to express "this role requires a tier the backend will
+  actually honour" rather than trusting the label.
 - **Session forking**: `--fork-session` / `--resume-if-compatible` so resuming a failed
   Fable session can fall back to Opus instead of re-pinning the unavailable model.
 - **Multi-root input bundles** and a **`--spec` request file** for work spanning several
