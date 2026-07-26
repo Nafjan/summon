@@ -14,8 +14,10 @@ import subprocess
 import threading
 import time
 
-from _builder import (AgentInvocation, BACKENDS, agy_permission_warning,
-                      agy_timeout_warning,
+from _builder import (AgentInvocation, BACKENDS, advisory_warnings,
+                      argv_length_error, agy_permission_warning,
+                      readonly_unenforceable_error,
+                      agy_readonly_workspace_warning, agy_timeout_warning,
                       apply_credit_guard, backend_kind, build_invocation_args,
                       credit_spend_allowed, infer_billing, permission_flags,
                       selects_credit_only)
@@ -821,6 +823,39 @@ def _codex_default(resolved_cli, model, agents_dir, cwd, agent, defn=None) -> st
         return None
 
 
+def _resolved_permission(defn, max_permission) -> str | None:
+    """The tier a request will actually run at: the definition's `permission:` after the
+    --max-permission clamp. Degrades to None when it cannot be resolved, which simply means
+    a caller-side narrowing declines to narrow -- never a wrong answer.
+
+    Used to fingerprint SUMMON_ALLOW_UNENFORCED_READONLY only where it matters. The opt-in
+    decides whether a read-only agy request runs at all; on agy safe-edit/yolo it cannot
+    change anything, and fingerprinting it there re-paid for identical work every time the
+    variable moved.
+    """
+    if defn is None:
+        return None
+    try:
+        # `.fm`, the snapshot's actual field. An earlier version read `.frontmatter`, which
+        # does not exist -- getattr's default then returned {} and every agent resolved to
+        # the DEFAULT tier, a plausible wrong answer rather than a visible failure. Read the
+        # real attribute and let a genuinely absent one degrade to None (no narrowing)
+        # instead of to a confident mistake.
+        fm = getattr(defn, "fm", None)
+        if fm is None:
+            return None
+        declared = (fm or {}).get("permission")
+        if not declared:
+            from _builder import DEFAULT_PERMISSION
+            declared = DEFAULT_PERMISSION
+        if max_permission:
+            from _builder import clamp_permission
+            return clamp_permission(str(declared), str(max_permission))
+        return str(declared)
+    except Exception:  # noqa: BLE001 - identity must never fail on a narrowing hint
+        return None
+
+
 def _resolved_cli(cli, agents_dir, cwd, agent, defn=None) -> str | None:
     """The backend a request will actually dispatch to: explicit --cli, else the agent's
     `run-agent:`, else CALLER DETECTION (env). Degrades to None (falling back to the raw
@@ -931,6 +966,7 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
     _defn = _defn_snapshot(agents_dir, cwd, agent)
     _adef = (_defn.sha, _defn.state) if _defn is not None else (None, "missing")
     _rcli = _resolved_cli(cli, agents_dir, cwd, agent, _defn)
+    _rperm = _resolved_permission(_defn, max_permission)
     _endpoint = (_endpoint_state(agents_dir, cwd, agent, _defn)
                  if _rcli == "openai-compat" else (None, "ok", None))
     _schema = content_state(json_schema or None)
@@ -1008,6 +1044,19 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # re-paid for work the switch could not have altered.
         "allow_credit": ("1" if _credit_env_allows(allow_credit) else None)
                         if _rcli == "claude" else None,
+        # The unenforced-read-only opt-in decides whether this request RUNS AT ALL, so a
+        # stored success produced under it must not satisfy a later request made without it.
+        # Cached reuse happens BEFORE execute_agent can refuse, so identity is the only
+        # place that can catch it. agy-only, for the same reason allow_credit is claude-only:
+        # on any other backend it cannot change the outcome, and fingerprinting it there
+        # would re-pay for work the switch could not have altered.
+        # Narrowed by EFFECTIVE PERMISSION, not just backend. The opt-in only decides
+        # whether a READ-ONLY agy request runs; on agy safe-edit/yolo it cannot change the
+        # outcome, and fingerprinting it there re-paid for identical work (and risked
+        # repeating side effects) every time the variable moved.
+        "unenforced_readonly": ("1" if os.environ.get(
+            "SUMMON_ALLOW_UNENFORCED_READONLY") == "1" else None)
+            if (_rcli == "agy" and _rperm == "read-only") else None,
         # The DEFAULT only applies when nothing explicit was asked for; with --effort set
         # it cannot change the request, and fingerprinting it anyway forced a fresh dispatch
         # every time an unrelated default moved.
@@ -1754,14 +1803,12 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 f"been rerouted or fallen back)")
         resp["permission"] = inv.permission
         resp["effort"] = inv.effort   # reasoning effort actually applied (None = backend default)
-        # agy DOES read --cwd (summon passes --add-dir since 0.13.9). What still bites is
-        # the clock: agy is a multi-step agent, so a short budget kills it mid-work.
-        _tw = agy_timeout_warning(inv.cli, timeout_ms)
-        if _tw:
-            resp.setdefault("warnings", []).append(_tw)
-        _pw = agy_permission_warning(inv.cli, inv.permission)
-        if _pw:
-            resp.setdefault("warnings", []).append(_pw)
+        # agy reads --cwd at safe-edit/yolo (summon passes --add-dir since 0.13.9) but NOT
+        # at read-only, where the workspace is withheld because agy cannot enforce that tier.
+        # The other thing that bites is the clock: agy is multi-step, so a short budget kills
+        # it mid-work. Both live in advisory_warnings, shared with --dry-run.
+        for _w in advisory_warnings(inv.cli, inv.permission, timeout_ms):
+            resp.setdefault("warnings", []).append(_w)
         try:
             resp["permission_flags"] = permission_flags(inv.cli, inv.permission)
         except ValueError:
@@ -1807,11 +1854,43 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         resp["resume"] = {"cli": inv.cli, "session_id": None}  # stateless: no resume
         return _stamp(resp)
 
+    # BEFORE build_invocation_args, which has side effects: for agy it creates a
+    # per-invocation profile and copies OAuth material into it. A dispatch we are going to
+    # refuse must not do that work, let alone copy credentials for it.
+    _ro_err = readonly_unenforceable_error(inv.cli, inv.permission,
+                                           forced=inv.permission_forced)
+    if _ro_err:
+        return _stamp(_enrich(_error_response(inv.cli, 1, _ro_err), None))
+
     # timeout_ms is threaded to the builder so agy's wrapper deadline AND its
     # profile-TTL cleanup (which runs during build) both reflect the real request.
-    command, args, env_override = build_invocation_args(inv, timeout_ms)
+    try:
+        command, args, env_override = build_invocation_args(inv, timeout_ms)
+    except ValueError as _build_err:
+        # The dispatcher's contract is ONE JSON envelope on stdout, always. Build-time
+        # guards (an oversized agy prompt, a missing ConPTY wrapper) raised straight through
+        # execute_agent instead, so a caller parsing stdout got a traceback where an
+        # envelope belongs -- and every orchestration path that branches on `status` saw an
+        # exception rather than a status to branch on.
+        return _stamp(_enrich(_error_response(inv.cli, 1, str(_build_err)), None))
     command, args = _resolve_launch(command, args)
+    # AFTER _resolve_launch: on Windows a .cmd shim is rewritten to `node <path>/cli.js`,
+    # which changes the length that actually gets measured by CreateProcess.
     proc_env = _merge_env(env_override)
+    # AFTER _merge_env: the POSIX total counts the environment, and the environment that
+    # matters is the one Popen receives -- overrides included, stripped keys excluded.
+    _argv_err = argv_length_error(inv.cli, command, args, proc_env)
+    if _argv_err:
+        # exit 1, not 127: 127 means "CLI not found", and reporting this as a missing
+        # binary is precisely the misdiagnosis being fixed.
+        _resp = _error_response(inv.cli, 1, _argv_err)
+        # agy builds its per-invocation profile during build_invocation_args, so a rejection
+        # HERE leaves a populated profile on disk with no handle to it: the caller could
+        # neither resume nor clean it up, and it lingered until a TTL sweep. Hand it back.
+        if inv.cli == "agy" and env_override:
+            _resp["resume"] = {"cli": inv.cli, "session_id": None,
+                               "profile": env_override.get("USERPROFILE")}
+        return _stamp(_enrich(_resp, None))
     debug_argv = [command, *args]
 
     # POSIX: put the child in its own session so _kill_tree can signal the whole
@@ -1836,7 +1915,16 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             **popen_flags(),
         )
     except FileNotFoundError:
-        return _stamp(_enrich(_error_response(inv.cli, 127, f"CLI not found: {command}"), None))
+        # Windows raises this for an over-long command line too (ERROR_FILE_NOT_FOUND).
+        # argv_length_error above catches the known limit; if we still land here with a
+        # large argv, say so rather than asserting an install problem we did not verify.
+        _n = len(command) + sum(len(a) + 1 for a in args)
+        _hint = ("" if _n < 16000 else
+                 f" (the command line is {_n} chars; on Windows an over-long command line "
+                 f"is reported as a missing file, so this may be argv overflow rather than "
+                 f"a missing binary)")
+        return _stamp(_enrich(
+            _error_response(inv.cli, 127, f"CLI not found: {command}{_hint}"), None))
     except OSError as e:
         return _stamp(_enrich(_error_response(inv.cli, 1, f"{type(e).__name__}: {e}"), None))
 

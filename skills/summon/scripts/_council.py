@@ -532,6 +532,24 @@ class _KillRegistry:
             th.join()   # wait out any in-flight sweep iteration (bounded by one kill_inflight)
 
 
+def _optin_stage_ctx() -> dict:
+    """The unenforced-read-only control, as a stage-identity fragment.
+
+    A separate function so it can be TESTED. The logic previously sat inline inside
+    run_council, where the only way to check it was to grep the source -- and a grep-based
+    test duly passed while the key was being added unconditionally, including as null. That
+    changed every stage hash: every council run written before the fix lost carry-forward
+    and re-paid in full, and toggling the variable re-ran claude/codex/cursor stages it
+    cannot affect.
+
+    ABSENT means absent: an unset control contributes NO key, so identities computed before
+    this existed still match.
+    """
+    if os.environ.get("SUMMON_ALLOW_UNENFORCED_READONLY") == "1":
+        return {"unenforced_readonly": "1"}
+    return {}
+
+
 def run_council(args) -> int:
     """Entry point for ``--council``. Returns the process exit code."""
     _run_start = time.monotonic()   # overall-timeout budget covers the WHOLE run
@@ -964,6 +982,12 @@ def run_council(args) -> int:
         # Stage-input hashes cover the EXACT prompt plus execution identity
         # (member, its definition hash, cwd, roster dir): a changed repo, a
         # retuned agent, or a different question all invalidate carry-forward.
+        # The unenforced-read-only opt-in decides whether an agy stage can run AT ALL,
+        # so a stage carried forward from a run that HAD it would serve an advisory-only
+        # answer to a resume that would now fail closed. Council builds its own stage
+        # identity rather than using build_request_identity -- the third place in this
+        # codebase to build one -- so the control has to be folded in here too.
+        _exec_ctx = {**_exec_ctx, **_optin_stage_ctx()}
         p1 = _round1_prompt(question)
 
         def _r1_sha(m: str) -> str:

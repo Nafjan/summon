@@ -6,6 +6,303 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.15.0] - 2026-07-26
+
+### Fixed (round 10)
+- **Exit-telemetry adoption was conditional and the history was singular.** Gating adoption
+  on "did the exit code or status change?" left attempt 1's `normalization_reason` in place
+  whenever two runs shared an exit code, and recorded no history at all. And a single
+  `original_exit` cannot describe a chain: an accepted schema correction replaces the root
+  envelope before contract repair runs, so what it preserved was the schema retry rather
+  than the first attempt. Adoption is now unconditional on acceptance, and `exit_history` is
+  append-only.
+- **The leak detector could not see module functions**, which are the most commonly patched
+  things in the suite -- `run_subagent.execute_agent`, `_executor.build_invocation_args`,
+  `_builder._ensure_agy_profile` and friends. Now fingerprinted.
+- **A wholesale `os.environ` replacement was reported but not repaired**, leaving every
+  later test on a plain dict with no `os.putenv` synchronisation. It is now restored -- and
+  the repair had to move onto the IDENTITY branch, because a replacement dict compares EQUAL
+  to the real mapping by value, so the object comparison the repair hung off could never
+  fire. Verified by running a test that swaps the mapping and a later test that asserts it
+  is a real `_Environ`.
+
+### Testing (round 10)
+- 386/386 discovery, 22/22 install.
+
+### Fixed (round 9)
+- **The repaired-envelope contradiction was only half fixed** (see the corrected round-7
+  entry below). `status` and `exit_code` were adopted from the retry while
+  `backend_exit_code`, `dispatcher_status` and `normalization_reason` still described the
+  first attempt -- and `finalize_exit_fields()` uses `setdefault`, so nothing downstream
+  could repair them. The whole tuple now comes from the retry, the reason is RECOMPUTED
+  rather than copied from a sentence about the old pair, and attempt 1's tuple is preserved
+  under `original_exit`.
+- **The test-suite leak detector missed most of what the suite patches.** It listed five
+  `os` functions and two environment VALUES; the suite also patches `os.unlink`, `os.read`,
+  `sys.argv`, clocks and module attributes, and a test can replace `os.environ` wholesale --
+  which made every value comparison blind. Now fingerprints the environment as a snapshot
+  plus its IDENTITY, `sys.argv`, thirteen `os` functions, the clocks and subprocess.
+  Verified by injecting the exact leaks review proved invisible; all four are named.
+- **A test that both raised and leaked counted as two failures**, so one broken test
+  inflated the totals.
+
+### Testing (round 9)
+- 383/383 discovery, 22/22 install.
+
+### Fixed (round 8)
+- **Two manifest runs sharing a results dir corrupted each other's ATTRIBUTION**, not merely
+  duplicated work. Measured with two real processes on one job id and different prompts:
+  parent A read and reported parent B's answer, and both exited success. The envelope was
+  byte-valid; its attribution was not. summon stamps `request_sha256` on every envelope so a
+  stored answer can be checked against the request it is served for -- the manifest read
+  path simply never asked. It now refuses a foreign envelope with `result_path_conflict`
+  instead of serving a wrong answer. This is a safety net, not a lock: give each concurrent
+  run its own `--results-dir`.
+- **The forensics fallback write bypassed the atomic writer.** When a child wrote no
+  envelope, the parent persisted one with a direct `open(..., "w")`; a concurrent reader
+  observed the file as the single byte `{`, and a crash in that window strands it
+  permanently unparseable -- exactly what "a present file is a COMPLETE file" promises
+  cannot happen. It now uses temp + `os.replace` like every other envelope write.
+
+### Docs (round 8)
+- **"wasteful duplicate, not corruption" was false** and is corrected with the measurement
+  that disproved it.
+- fan-out.md's "per-backend concurrency semaphores" now says per PROCESS: two manifest runs
+  do not share caps.
+
+### Deliberately NOT changed (round 8)
+- A writability probe whose cleanup fails leaves a zero-byte `.superseded.wtest.<pid>.<uuid>`
+  behind, and review suggested reporting it. It is not reported, and the reasoning is now in
+  the code: archive names are constructed exactly and never globbed, so summon cannot
+  mistake it for an archive -- while reporting it would make `_clear_out_file` return failure
+  for a clear that SUCCEEDED, and `_write_error_out` refuses to overwrite when archiving
+  fails, which drops the dispatch's real error envelope and leaves a stale success. That bug
+  was fixed earlier on this branch; trading it back for tidier litter is a bad deal. Caught
+  because the change broke an existing test.
+
+### Testing (round 8)
+- 381/381 discovery, 22/22 install.
+
+### Fixed (round 7)
+- **A repaired envelope could contradict itself.** Found by dogfooding, not review: this
+  repo's own round-6 review dispatch came back `status: success` with `exit_code: 1` and an
+  EMPTY `result`, its findings only in `repaired_report_text`. A caller following the
+  documented contract -- branch on `status`, read `result` -- would have got an empty string
+  and no error, and the completed review nearly went in the bin as a failure. Two defects
+  met there: "keep the original text verbatim" preserves nothing when the original is empty
+  (the repaired text is now used, flagged `result_from_repair`), and the accepted outcome
+  comes from the RETRY, so attempt 1's exit code no longer sits next to attempt 2's status
+  (the original is kept as `original_exit_code`).
+  **Round 8 found this half-done and the claim above overstated**: `status` and `exit_code`
+  were rewritten while `backend_exit_code`, `dispatcher_status` and `normalization_reason`
+  still described attempt 1, so the envelope went on contradicting itself in the fields I
+  had not looked at. `finalize_exit_fields()` could not repair them afterwards because it
+  uses `setdefault`. The whole tuple is adopted from the retry, with the superseded
+  attempt preserved.
+  **Round 10 found even that overstated, twice.** Adoption was GATED on the exit code or
+  status changing, so two runs that happened to share an exit code kept the first attempt's
+  `normalization_reason`; it is now unconditional once the retry is accepted. And
+  `original_exit` was singular, so with a schema correction ahead of a contract repair it
+  held the SCHEMA retry, not attempt 1 -- the entry said attempt 1 and was wrong. There is
+  now an append-only `exit_history`; `original_exit` remains as an alias for the most recent
+  superseded attempt. The reason is ADOPTED from the retry where it has one, recomputed only
+  as a fallback -- the earlier wording said "recomputed", which described the fallback as if
+  it were the normal path.
+- **A successful writability probe cleared the counter but not the recorded denial**, so at
+  the 10001-name bound a long-dead transient error was reported as a permanent permission
+  failure -- the wrong diagnosis in the function that exists to diagnose it. This also made
+  the round-5 changelog entry's "right diagnosis" claim false in exactly the case it
+  described; that entry is corrected rather than left standing.
+- **The corrective resume duplicated warnings.** It repeats the original dispatch's
+  conditions -- same backend and clock -- so it emits the same advisories, and concatenating
+  produced each one twice. (The TIER is not always the same: on a backend that enforces
+  read-only the repair drops to it, and only on agy does it keep the task's tier. The
+  original wording here said "same tier" and was wrong.)
+- **`_no_agy_optin()` restored a value but not ABSENCE**, so a test body that SET the
+  variable left it set, contaminating every later test in a single-process suite.
+
+### Docs (round 7)
+- SKILL.md's fan-out flag matrix listed only the council flags through `--out`, while the
+  CLI also accepts `--run-dir`, `--results-dir`, `--quorum`, `--chairman-fallback`, the
+  per-stage timeouts, `--overall-timeout` and `--min-successful-members` -- several of them
+  documented correctly a few lines above the matrix that denied them.
+
+### Testing (round 7)
+- 380/380 discovery, 22/22 install. Five mutants, all killed, with restores verified
+  byte-identical: an earlier mutation run used `/tmp`, which is a DIFFERENT directory for
+  Git Bash and for Python on Windows, so a restore silently failed and left a mutant in the
+  working tree masquerading as a real test failure.
+
+### Security (round 5)
+- **The contract repair was never re-gated.** A gate authorises ONE execution -- retries
+  re-gate, schema correction re-gates -- and the corrective resume did not. Round 3 made
+  that costly: to stop the repair pretending read-only on a backend that cannot enforce it,
+  the repair now runs at the task's own tier, which on agy is
+  `--dangerously-skip-permissions`. So a GATED agy task with a malformed report bought a
+  second full-authority run nobody approved. The repair prompt is instruction, not
+  containment. It is now re-gated; a denial keeps the original result and records
+  `gate_repair_refused`.
+- **Council carried stage results across an opt-in change.** Council builds its own stage
+  identity -- the third place in this codebase to build one, which is precisely the drift
+  `build_request_identity` was created to end -- and it omitted
+  `SUMMON_ALLOW_UNENFORCED_READONLY`. A resume reused every agy stage produced WITH the
+  opt-in after it was removed: zero dispatches, for a request that would now fail closed.
+  The control is folded into the shared per-run stage context.
+- **`doctor --probe` generated its disclosure and then dropped it.** `_default_probe_runner`
+  reports which tier it exercised; `_probe_one` discarded it, so output said "eligibility
+  verified" with no hint that read-only was never tested for agy. A disclosure that never
+  reaches the reader is not a disclosure.
+
+### Fixed (round 5)
+- **The opt-in churned fingerprints where it cannot matter.** It was narrowed by backend
+  only, so an agy `safe-edit`/`yolo` request changed identity when the variable moved --
+  re-paying for identical work and risking repeated side effects. It is now narrowed by
+  EFFECTIVE permission (definition tier after the `--max-permission` clamp).
+- **A `--` in an agent's `args:` could hang every dispatch.** agy's parser stops at the
+  terminator, so summon's own `--print` was then read as literal text and agy 1.1.7 fell
+  into interactive behaviour until the timeout. Not a permission bypass; an agent definition
+  should still not be able to hang the dispatcher.
+
+### Testing (round 5)
+- 372/372 discovery, 22/22 install. Four of five round-5 mutants died on the first pass; the
+  fifth exposed a test asserting one layer too high (it checked the probe runner's return
+  value, not the entry doctor publishes), so deleting the plumbing left it green. Replaced.
+
+### Security (round 4)
+- **`doctor --probe` handed agy full authority over your working tree.** Round 3 raised the
+  agy probe to `safe-edit` so a healthy agy could be verified at all -- but `safe-edit` on
+  agy is `--dangerously-skip-permissions --add-dir <cwd>`, so a LIVENESS PING ran with write
+  access to whatever directory you were in. The agy probe now runs in an empty throwaway
+  directory, which still proves the backend starts, answers and authenticates. Other
+  backends keep probing at read-only, which they enforce.
+
+### Fixed (round 4)
+- **The argv preflight crashed on undecodable text.** It is mandatory on every dispatch, and
+  a lone surrogate (from a prompt decoded off an odd byte stream) raised `UnicodeEncodeError`
+  -- an uncaught crash from the check written to produce a clear message.
+- **POSIX limits were off by a NUL and counted characters as bytes.** `MAX_ARG_STRLEN`
+  includes the terminating NUL, so 131072 bytes of payload is already one over (measured:
+  131071 spawned, 131072 gave E2BIG while preflight said fine). The environment was counted
+  in characters, and read from `os.environ` rather than the environment actually handed to
+  `Popen`.
+- **`build_invocation_args` raised straight through `execute_agent`.** summon's contract is
+  one JSON envelope on stdout, always; a build-time guard (oversized agy prompt, missing
+  ConPTY wrapper) gave callers a traceback where an envelope belongs.
+- **A doomed agy prompt still built a profile and copied OAuth material into it**, then
+  raised -- orphaning credentials for a run that never happened. The length guard now runs
+  before the profile build. A rejection that happens after the build (an over-long argv)
+  hands the profile back on the envelope so it can be resumed or cleaned up.
+- **The writability probe could disable itself.** Its name was keyed on a counter that
+  resets, so a failed cleanup left the name occupied and every later probe read as
+  "inconclusive" -- silently reverting to no measurement at all. It is now uuid4-unique
+  (a per-call counter still collided between concurrent calls in one process) with
+  try/finally close and remove, matching the archive claim ten lines above it.
+
+### Docs (round 4)
+- SKILL.md's "exact per-CLI flags" table still showed agy `read-only` as `--sandbox`, and
+  the caveat below it described an ordinary mapping. Both now say it is refused, and why.
+
+### Testing (round 4)
+- The round-3 doctor test was vacuous: it called `_doctor._probe_backend`, which does not
+  exist, so `hasattr` returned None and it asserted nothing. Replaced with two tests that
+  drive the real `_default_probe_runner`.
+- 368/368 discovery, 22/22 install.
+
+### Security (round 3)
+- **The opt-in could waive a tier summon IMPOSED.** `SUMMON_ALLOW_UNENFORCED_READONLY` is
+  ambient process authority, inherited by every backend, background, manifest and council
+  child -- so setting it for one dispatch silently authorised advisory-only `--gate-with`
+  adjudicators and `--max-permission` clamps underneath it. A gate the environment it runs
+  in can waive is not a gate. The opt-in now waives only a tier the CALLER DECLARED;
+  invocations carry `permission_forced` for tiers summon imposed, and those always refuse.
+  A clamp is marked forced only when it actually reduced the tier.
+- **The opt-in was absent from the request identity**, and cached reuse happens BEFORE
+  `execute_agent` can refuse -- so a stored `--out` success produced WITH the opt-in
+  satisfied a later request made without it. It is now part of the identity, agy-only, for
+  the same reason `allow_credit` is claude-only.
+- **The `extra_args` sanitiser spoke the wrong grammar.** agy parses with Go's flag package,
+  which accepts single-dash long options; the strip matched only `--` spellings, so
+  `-add-dir=/repo` walked past it (verified against the real binary). A sanitiser has to
+  speak the TARGET's grammar. The value-position ambiguity is resolved toward safety and
+  documented.
+
+### Fixed (round 3)
+- **Contract auto-repair broke for agy, then pretended not to.** The repair forces
+  read-only; agy refuses that tier, and the refusal was discarded -- leaving
+  `contract_repair_attempted: true` and `attempts: 2` for a call that never reached a
+  backend. Forcing it bought nothing anyway: the repair RESUMES the session that already
+  held the task's authority. It now runs read-only where that means something, at the
+  original tier where it does not, and says which.
+- **`doctor --probe` could no longer verify agy at all**, because it always probed at
+  read-only. It probes agy at `safe-edit` and reports which tier it exercised, so a green
+  probe cannot imply a tier that was never tested.
+
+### Testing (round 3)
+- A cross-vendor audit of this branch's OWN TESTS found four mutants that survived them,
+  all now killed: the archive test passed against the exact implementation it replaced; the
+  warning-parity test never built an envelope; the boundary test never built an argv; both
+  argv tests used pure ASCII. Three refusal tests were also non-hermetic on the opt-in --
+  one would have made a real paid agy dispatch while asserting that it refuses to.
+- 362/362 discovery, 22/22 install.
+
+### Breaking
+- **`agy` at `read-only` is now REFUSED.** It previously dispatched. agy does not enforce
+  that tier, and a permission tier the backend will not honour is worse than no tier because
+  callers act on it -- so summon fails closed, as `--gate-with` already does.
+  Set `SUMMON_ALLOW_UNENFORCED_READONLY=1` to dispatch anyway; the tier then carries a
+  warning saying it is ADVISORY and enforced by nothing. `--dry-run` reports `would_refuse`,
+  so preflight tells you before you spend anything. The refusal happens BEFORE
+  `build_invocation_args`, which for agy creates a profile and copies OAuth material -- a
+  dispatch being refused must not copy credentials for itself.
+
+### Security
+- **The 0.14.2 containment fix did not contain anything, and this release replaces it.**
+  0.14.0 began passing `--add-dir <cwd>` so agy could do repo-grounded work; 0.14.2 withheld
+  that flag at `read-only` and shipped it as a security boundary, with a warning telling
+  callers agy "cannot read your repository".
+  Canary 5 (2026-07-26) disproved it: a **declared** read-only agy agent, given absolute
+  paths, read a secret file back verbatim and created a new one -- both confirmed on disk,
+  with `--sandbox` and `--mode plan` in force and the workspace withheld. Withholding
+  `--add-dir` only breaks RELATIVE paths. The earlier canary "passed" because it asked for a
+  relative path, which is how a non-fix survived review, a release and its own changelog
+  entry. **`--add-dir` is now passed at every tier that can dispatch**; the containment is
+  the refusal above, not a flag the vendor never promised to honour.
+- **An agent definition could reopen the boundary through its own `args:`.** Frontmatter
+  `args: ["--add-dir", "/repo"]` is appended AFTER the permission flags, so it silently
+  rewrote the tier summon had just computed; `--max-permission` and `--gate-with` drop
+  `extra_args` wholesale for exactly this reason, but a DIRECTLY declared tier did not.
+  Workspace- and tier-moving flags are now stripped from `extra_args`; everything else still
+  passes through. Found by cross-vendor review and confirmed by building the argv.
+
+### Fixed
+- **The argv preflight undercounted by up to 2x.** It summed raw characters; Windows counts
+  the SERIALISED command line in UTF-16 code units. `'\\"' * 10000` measured 20010 and
+  serialised to 40011, passing preflight and then failing `CreateProcess` -- the exact
+  misdiagnosis the check exists to prevent. It now measures `list2cmdline` output in UTF-16
+  units including the NUL. POSIX compared characters against a BYTE limit (70k accented
+  characters is 140k bytes) and ignored `ARG_MAX` entirely; it now measures bytes and checks
+  the total including the environment, reading the real limit from `sysconf`.
+- **The archive-name denial heuristic was defeated twice.** A cumulative tally aborted on
+  transient contention; a consecutive streak was then defeated by an unwritable directory
+  whose occupied names return EEXIST and whose free names return EACCES -- the streak never
+  reaches two, so the loop made all 10001 probes and reported "too many superseded copies",
+  the wrong cause entirely. Both heuristics were approximating "is this directory writable",
+  which is now simply asked: one direct probe with a name nothing else can hold. 130 probes
+  instead of 10001, and the right diagnosis.
+  (Round 6 found this incomplete: a successful probe reset the counter but not the recorded
+  denial, so at the 10k bound a long-dead transient error was still reported as a permanent
+  permission failure. Both are cleared now.)
+- **`--dry-run` did not know about the refusal**, so preflight showed a dispatch that would
+  never run. Same drift class as the warnings: two paths describing one dispatch, maintained
+  separately.
+
+### Testing
+- 357/357 discovery, 22/22 install. Every fix mutation-tested.
+- The suite had been **silently skipping tests**: the runner snapshots `globals()` inside its
+  `__main__` block, so four appended tests were defined too late to exist, and it printed a
+  green "346/346 passed" that had never executed them. A guard now asserts no `def test_`
+  appears below the runner and that the source count equals the importable count.
+
 ## [0.14.1] - 2026-07-25
 
 ### Fixed
