@@ -1,27 +1,26 @@
 # Known issues
 
+No open issues. Resolved entries are kept below with the measurement that closed them, so
+the record shows what was actually verified rather than only what was claimed.
+
 ## Windows: process-tree kill cannot reach descendants of an exited leader
 
-Tracked in [#10](https://github.com/Nafjan/summon/issues/10).
+**RESOLVED in 0.15.1** ([#10](https://github.com/Nafjan/summon/issues/10)).
 
-`--overall-timeout` and council teardown kill in-flight children with `_kill_tree`
-(`skills/summon/scripts/_executor.py`). On POSIX, `killpg(pgid, SIGKILL)` reaches the whole
-process group even after the leader exits. On **Windows**, `taskkill /F /T /PID <leader>` walks
-parent -> child PID links, so once the `run_subagent.py` leader has exited, a still-running
-backend grandchild (one holding stdout) is orphaned and survives the kill.
+Windows children are assigned to a kernel **Job Object** at spawn, so
+`TerminateJobObject` kills every member regardless of which processes have already exited --
+the same guarantee POSIX gets from a process group. Reproduced live before the fix
+(`taskkill` reported *"process not found"* and the orphan survived) and verified after;
+the scenario is a regression test, skipped off Windows.
 
-- **Scope:** narrow. It requires the `run_subagent.py` leader to exit early while a detached
-  backend outlives it and holds stdout. The common path (leader alive, so `taskkill /T` walks
-  the live tree) works.
-- **POSIX:** not affected (`killpg` targets the group via the PGID regardless of leader
-  lifetime).
-- **Consequence:** in that tail case a paid/fs-capable backend can keep running after the
-  council envelope reports the deliberation ended.
-- **Fix (planned):** Windows Job Objects (`CreateJobObjectW` + `AssignProcessToJobObject` +
-  `TerminateJobObject`), a kernel handle that owns the whole tree independent of the leader's
-  lifetime. Stdlib-only via `ctypes`; changes the spawn path for all dispatches, so it is its
-  own focused pass. See #10.
+The job is created `KILL_ON_JOB_CLOSE`, so summon dying unexpectedly also tears down the
+backend tree. `--background` children are excluded by design -- they are meant to outlive
+the launcher.
 
-`--overall-timeout` shipped POSIX-correct on this understanding (the queued-wave, monotonic
-deadline gate, deregister-on-clean-EOF, and bounded teardown machinery are sound on both
-platforms; only the Windows *reachability* of an exited leader's descendants is open).
+**Residual, by design:** stock `subprocess.Popen` discards the child's thread handle, so the
+textbook `CREATE_SUSPENDED` -> assign -> `ResumeThread` sequence is unreachable from the
+stdlib. Assignment happens immediately after spawn, leaving a microsecond window against a
+child that spends milliseconds starting a runtime before it can spawn anything. Where Job
+Objects are unavailable (nested-job restrictions, older Windows) the previous `taskkill`
+path is unchanged and still covers the common leader-alive case.
+
