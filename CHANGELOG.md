@@ -8,6 +8,27 @@ never on added fields.
 
 ## [0.15.0] - 2026-07-26
 
+### Fixed (round 10)
+- **Exit-telemetry adoption was conditional and the history was singular.** Gating adoption
+  on "did the exit code or status change?" left attempt 1's `normalization_reason` in place
+  whenever two runs shared an exit code, and recorded no history at all. And a single
+  `original_exit` cannot describe a chain: an accepted schema correction replaces the root
+  envelope before contract repair runs, so what it preserved was the schema retry rather
+  than the first attempt. Adoption is now unconditional on acceptance, and `exit_history` is
+  append-only.
+- **The leak detector could not see module functions**, which are the most commonly patched
+  things in the suite -- `run_subagent.execute_agent`, `_executor.build_invocation_args`,
+  `_builder._ensure_agy_profile` and friends. Now fingerprinted.
+- **A wholesale `os.environ` replacement was reported but not repaired**, leaving every
+  later test on a plain dict with no `os.putenv` synchronisation. It is now restored -- and
+  the repair had to move onto the IDENTITY branch, because a replacement dict compares EQUAL
+  to the real mapping by value, so the object comparison the repair hung off could never
+  fire. Verified by running a test that swaps the mapping and a later test that asserts it
+  is a real `_Environ`.
+
+### Testing (round 10)
+- 386/386 discovery, 22/22 install.
+
 ### Fixed (round 9)
 - **The repaired-envelope contradiction was only half fixed** (see the corrected round-7
   entry below). `status` and `exit_code` were adopted from the retry while
@@ -76,8 +97,17 @@ never on added fields.
   were rewritten while `backend_exit_code`, `dispatcher_status` and `normalization_reason`
   still described attempt 1, so the envelope went on contradicting itself in the fields I
   had not looked at. `finalize_exit_fields()` could not repair them afterwards because it
-  uses `setdefault`. The WHOLE tuple is now adopted from the retry, with attempt 1's
-  preserved under `original_exit`.
+  uses `setdefault`. The whole tuple is adopted from the retry, with the superseded
+  attempt preserved.
+  **Round 10 found even that overstated, twice.** Adoption was GATED on the exit code or
+  status changing, so two runs that happened to share an exit code kept the first attempt's
+  `normalization_reason`; it is now unconditional once the retry is accepted. And
+  `original_exit` was singular, so with a schema correction ahead of a contract repair it
+  held the SCHEMA retry, not attempt 1 -- the entry said attempt 1 and was wrong. There is
+  now an append-only `exit_history`; `original_exit` remains as an alias for the most recent
+  superseded attempt. The reason is ADOPTED from the retry where it has one, recomputed only
+  as a fallback -- the earlier wording said "recomputed", which described the fallback as if
+  it were the normal path.
 - **A successful writability probe cleared the counter but not the recorded denial**, so at
   the 10001-name bound a long-dead transient error was reported as a permanent permission
   failure -- the wrong diagnosis in the function that exists to diagnose it. This also made

@@ -1231,6 +1231,40 @@ def _aggregate_spend(result: dict, retry: dict) -> None:
         result["usage"] = merged
 
 
+_EXIT_TUPLE = ("exit_code", "backend_exit_code", "dispatcher_status",
+               "normalization_reason")
+
+
+def _push_exit_history(result: dict, retry: dict) -> None:
+    """Publish the retry's exit telemetry, keeping every superseded attempt in order.
+
+    `original_exit` was singular and therefore wrong as soon as more than one retry could
+    run: an accepted SCHEMA correction replaces the root envelope before contract repair
+    ever looks at it, so the "original" it preserved was the schema retry, not attempt 1 --
+    while the changelog claimed attempt 1. An append-only list cannot drift that way, and
+    `attempts` already tells the caller how many runs there were.
+
+    `original_exit`/`original_exit_code` are kept as aliases for the MOST RECENT superseded
+    attempt, because they are already documented; `exit_history` is the truthful record.
+    """
+    from _executor import finalize_exit_fields as _fin
+
+    superseded = {k: result.get(k) for k in _EXIT_TUPLE if k in result}
+    if superseded:
+        result.setdefault("exit_history", []).append(superseded)
+        result["original_exit"] = superseded            # most recent, not "attempt 1"
+        result["original_exit_code"] = superseded.get("exit_code")
+    for k in _EXIT_TUPLE:
+        result.pop(k, None)
+    result["exit_code"] = retry.get("exit_code")
+    for k in ("backend_exit_code", "dispatcher_status", "normalization_reason"):
+        if retry.get(k) is not None:
+            result[k] = retry[k]
+    # ADOPT the retry's own reason where it has one; recompute only as a fallback, since a
+    # sentence the retry wrote about itself beats one we infer.
+    _fin(result)
+
+
 def _repair_permission(invocation) -> tuple:
     """The tier a corrective resume should run at, and a warning when it is not read-only.
 
@@ -1351,25 +1385,13 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         # Preserve the complete original tuple (it is real evidence about attempt 1), then
         # adopt the retry's, recomputing the reason from the new pair rather than copying a
         # sentence written about the old one.
-        _EXIT_TUPLE = ("exit_code", "backend_exit_code", "dispatcher_status",
-                       "normalization_reason")
         if retry.get("exit_code") is not None:
-            _orig = {k: result.get(k) for k in _EXIT_TUPLE if k in result}
-            if _orig.get("exit_code") != retry.get("exit_code") or _orig.get(
-                    "dispatcher_status") != retry.get("status"):
-                result["original_exit"] = _orig
-                result["original_exit_code"] = _orig.get("exit_code")   # kept: named field
-                for _k in _EXIT_TUPLE:
-                    result.pop(_k, None)
-                result["exit_code"] = retry["exit_code"]
-                if retry.get("backend_exit_code") is not None:
-                    result["backend_exit_code"] = retry["backend_exit_code"]
-                if retry.get("dispatcher_status"):
-                    result["dispatcher_status"] = retry["dispatcher_status"]
-                if retry.get("normalization_reason"):
-                    result["normalization_reason"] = retry["normalization_reason"]
-                from _executor import finalize_exit_fields as _fin
-                _fin(result)          # recompute anything the retry did not carry
+            # UNCONDITIONAL once the retry is accepted. Gating on "did exit_code or status
+            # change?" left attempt 1's normalization_reason in place whenever the two runs
+            # happened to share an exit code -- two clean successes with DIFFERENT reasons
+            # kept the wrong sentence and recorded no history at all. If the retry's answer
+            # is the one being published, its telemetry is too.
+            _push_exit_history(result, retry)
         if retry.get("resume"):
             result["resume"] = retry["resume"]     # latest session id for follow-ups
         if retry.get("warnings"):

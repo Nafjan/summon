@@ -13338,7 +13338,7 @@ def test_v8_repair_adopts_the_whole_exit_tuple():
     assert out.get("original_exit_code") == 1
 
 
-def test_v8_leak_detector_covers_what_the_suite_actually_patches():
+def test_v8_leak_detector_covers_module_functions_and_environ_identity():
     """The first detector listed five os functions and two env VALUES. Cross-vendor review
     replaced `os.unlink`, `sys.argv` and `os.environ` ITSELF and it reported nothing leaked
     -- an incomplete detector is worse than none, because it certifies hygiene it never
@@ -13348,14 +13348,111 @@ def test_v8_leak_detector_covers_what_the_suite_actually_patches():
     fingerprint's SHAPE, so a future edit cannot quietly shrink it back."""
     fp = _global_fingerprint()
     for required in ("os.unlink", "os.read", "os.listdir", "os.stat", "os.rename",
-                     "sys.argv", "os.environ.id", "env.snapshot",
-                     "time.time", "time.monotonic", "subprocess.Popen"):
+                     "sys.argv", "os.environ.id", "os.environ.obj", "env.snapshot",
+                     "time.time", "time.monotonic", "subprocess.Popen",
+                     # the MOST commonly patched things in this file were the ones the
+                     # detector could not see -- close to the opposite of useful
+                     "run_subagent.execute_agent", "_executor.build_invocation_args",
+                     "_builder._ensure_agy_profile"):
         assert required in fp, (
             "%s is patched somewhere in this suite but is not fingerprinted, so a test that "
             "leaks it corrupts every later test silently" % required)
     # env is captured WHOLE, not as named variables: naming them meant an unlisted one
     # leaked undetected
     assert isinstance(fp["env.snapshot"], tuple) and fp["os.environ.id"] == id(os.environ)
+
+
+def test_v8_accepted_repair_adopts_telemetry_unconditionally():
+    """Adoption was gated on "did exit_code or status change?", so two runs that happened to
+    share an exit code kept the FIRST attempt's `normalization_reason` and recorded no
+    history -- the changelog's "the whole tuple now comes from the retry" was false for the
+    case where both runs succeed cleanly for different reasons.
+
+    If the retry's ANSWER is the one being published, its telemetry is too."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="read-only")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    real = rs.execute_agent
+    try:
+        rs.execute_agent = lambda i, **k: {
+            "status": "success", "result": "R", "report_ok": True, "exit_code": 0,
+            "backend_exit_code": 0, "dispatcher_status": "success",
+            "normalization_reason": "parsed a clean terminal event"}
+        original = {"status": "success", "report_ok": False, "result": "orig",
+                    "exit_code": 0, "backend_exit_code": 0, "dispatcher_status": "success",
+                    "normalization_reason": "clean exit with output",
+                    "resume": {"session_id": "s"}}
+        out = rs._apply_contract_repair(original, inv, args)
+    finally:
+        rs.execute_agent = real
+
+    assert out.get("normalization_reason") == "parsed a clean terminal event", (
+        "the published envelope kept attempt 1's explanation while serving attempt 2's "
+        "answer: %r" % out.get("normalization_reason"))
+    hist = out.get("exit_history") or []
+    assert len(hist) == 1 and hist[0]["normalization_reason"] == "clean exit with output", (
+        "the superseded attempt must be recorded even when the exit codes match: %r" % hist)
+
+
+def test_v8_exit_history_survives_more_than_one_retry():
+    """`original_exit` was singular and therefore wrong as soon as two retries could run: an
+    accepted SCHEMA correction replaces the root envelope before contract repair ever sees
+    it, so the "original" preserved was the schema retry -- while the changelog claimed
+    attempt 1. An append-only list cannot drift that way."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="claude", prompt="p", cwd=os.getcwd(),
+                                   system_context="c", permission="read-only")
+    args = types.SimpleNamespace(gate_with=None, timeout=1000, debug_dir=None,
+                                 no_contract_repair=False)
+    # simulate two successive supersessions through the shared helper
+    env = {"exit_code": 9, "backend_exit_code": 9, "dispatcher_status": "error",
+           "normalization_reason": "status error (backend exit 9)"}
+    rs._push_exit_history(env, {"exit_code": 7, "backend_exit_code": 7,
+                                "dispatcher_status": "error",
+                                "normalization_reason": "status error (backend exit 7)"})
+    rs._push_exit_history(env, {"exit_code": 0, "backend_exit_code": 0,
+                                "dispatcher_status": "success",
+                                "normalization_reason": "exit and status agree"})
+    hist = env.get("exit_history") or []
+    assert [h["exit_code"] for h in hist] == [9, 7], (
+        "every superseded attempt must be kept IN ORDER, not just the most recent: %r"
+        % (hist,))
+    assert env["exit_code"] == 0 and env["dispatcher_status"] == "success"
+    assert env["original_exit"]["exit_code"] == 7, (
+        "the singular alias documents the MOST RECENT superseded attempt, not attempt 1")
+
+
+def test_v8_environ_replacement_is_repaired_not_just_reported():
+    """A wholesale `os.environ` swap was detected and deliberately left in place, so every
+    later test ran against a plain dict with no `os.putenv` synchronisation. Naming the
+    culprit without containing it is half a guard.
+
+    Subtle detail this exercises: the replacement dict compares EQUAL to the real mapping by
+    value, so only the IDENTITY check fires -- the repair had been hung off the object
+    comparison, which could never trigger."""
+    real_env = os.environ
+    before = _global_fingerprint()
+    try:
+        os.environ = dict(os.environ)          # noqa: B003 - the leak under test
+        after = _global_fingerprint()
+        leaked = sorted(k for k in before
+                        if before[k] is not after[k] and before[k] != after[k])
+        assert "os.environ.id" in leaked, (
+            "a wholesale replacement must be detected by identity; value comparison cannot "
+            "see it: %r" % (leaked,))
+        os.environ = before["os.environ.obj"]   # the repair the runner performs
+    finally:
+        os.environ = real_env
+    assert os.environ is real_env
+    assert type(os.environ).__name__ == "_Environ", (
+        "the process must be left with the REAL mapping, or os.putenv sync stays broken "
+        "for every later test")
 
 
 def _global_fingerprint():
@@ -13376,6 +13473,9 @@ def _global_fingerprint():
         "sys.argv": tuple(sys.argv),
         # IDENTITY, not just contents: a test that REPLACES os.environ wholesale leaves
         # every .get() answering from the new object, so comparing values sees nothing.
+        # the OBJECT, not just its id: naming the culprit without restoring it left the
+        # process running on a plain dict, so os.putenv sync was broken for every later test
+        "os.environ.obj": os.environ,
         "os.environ.id": id(os.environ),
         "env.snapshot": tuple(sorted(os.environ.items())),
         "time.time": _t.time, "time.monotonic": _t.monotonic, "time.sleep": _t.sleep,
@@ -13384,6 +13484,20 @@ def _global_fingerprint():
     for _n in ("name", "open", "close", "remove", "replace", "unlink", "read", "listdir",
                "stat", "makedirs", "rename", "fdopen", "getpid"):
         snap["os." + _n] = getattr(os, _n, None)
+    # MODULE FUNCTIONS this suite swaps constantly -- execute_agent, the builder, the gate.
+    # Leaving them out meant the most commonly patched things in the file were the ones the
+    # detector could not see, which is close to the opposite of useful.
+    for _mod, _attrs in (("run_subagent", ("execute_agent", "_run_gate", "_dispatch_with_retries")),
+                         ("_executor", ("execute_agent", "build_invocation_args",
+                                        "_drive_process", "_resolve_launch")),
+                         ("_builder", ("_ensure_agy_profile", "_attest_agy_profile",
+                                       "_agy_wrapper")),
+                         ("_manifest", ("_dispatch_child",)),
+                         ("_doctor", ("_default_probe_runner",))):
+        _m = sys.modules.get(_mod)
+        if _m is not None:
+            for _a in _attrs:
+                snap["%s.%s" % (_mod, _a)] = getattr(_m, _a, None)
     return snap
 
 
@@ -13422,8 +13536,14 @@ if __name__ == "__main__":
                     for _kk, _vv in _want.items():
                         if os.environ.get(_kk) != _vv:
                             os.environ[_kk] = _vv
-                elif _k in ("os.environ.id", "env.snapshot"):
-                    pass              # reported; a wholesale swap cannot be safely undone
+                elif _k == "os.environ.id":
+                    # Repair keys off the ID, because that is the check that FIRES: a
+                    # replacement dict compares EQUAL to the real mapping by value, so the
+                    # object comparison never reports a difference. Restoring here was dead
+                    # code hanging off a branch that could not run.
+                    os.environ = _before["os.environ.obj"]     # noqa: B003
+                elif _k == "os.environ.obj":
+                    pass                          # handled by the id branch
                 elif _k == "sys.argv":
                     sys.argv[:] = list(_before[_k])
                 elif _k.startswith("os."):
