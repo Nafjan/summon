@@ -13984,6 +13984,114 @@ def test_v9_leak_detector_watches_the_orchestration_modules_too():
             "fails to restore it silently corrupts every later test" % required)
 
 
+def test_v9_agy_empty_scrape_retries_once_and_says_so():
+    """FIELD REPORT (2026-07-27). agy succeeded at 55s and failed at 47s on comparable
+    prompts, returning `result: "\\n"`. That is not a refusal: agy has no pipe mode, so its
+    output is read through a ConPTY + pyte terminal scrape, and a dropped frame yields an
+    empty envelope after a full run's wall clock. The operator assumed the PROMPT was at
+    fault and rewrote it.
+
+    Every other backend fails LOUDLY -- a pipe closes, an exit code arrives. A screen-scraped
+    one fails EMPTY, so requiring `--retries` for the single backend where output loss is
+    structural puts the burden in the wrong place. One automatic retry, only for that exact
+    shape, and the envelope says it spent the extra dispatch."""
+    import _builder
+    import run_subagent as rs
+
+    empty = {"cli": "agy", "status": "error", "result": chr(10), "exit_code": 1}
+    good = {"cli": "agy", "status": "success", "result": "recovered", "exit_code": 0,
+            "report_ok": True}
+
+    def drive(sequence, retries=0):
+        calls = {"n": 0}
+
+        def fake(inv, **k):
+            calls["n"] += 1
+            return dict(sequence[min(calls["n"] - 1, len(sequence) - 1)])
+
+        real = rs.execute_agent
+        try:
+            rs.execute_agent = fake
+            args = types.SimpleNamespace(retries=retries, timeout=1000, debug_dir=None,
+                                         gate_with=None, max_tool_output_bytes=None)
+            inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                                           system_context="c", permission="safe-edit")
+            return rs._dispatch_with_retries(inv, args), calls["n"]
+        finally:
+            rs.execute_agent = real
+
+    out, n = drive([empty, good])
+    assert n == 2, ("an empty agy scrape must be retried once even at --retries 0 (got %d "
+                    "dispatches)" % n)
+    assert out.get("status") == "success", out.get("status")
+    assert any("retried once" in w for w in (out.get("warnings") or [])), (
+        "the RETURNED envelope must disclose the extra dispatch; appending the warning to "
+        "the first attempt loses it the moment the retry replaces that dict: %r"
+        % (out.get("warnings"),))
+
+    # it must not loop, and must not fire where the failure is real
+    _out2, n2 = drive([empty, empty])
+    assert n2 == 2, ("the automatic retry must happen ONCE, not repeatedly (got %d)" % n2)
+    _out3, n3 = drive([{"cli": "agy", "status": "error", "result": "a real refusal",
+                        "exit_code": 1}])
+    assert n3 == 1, "agy failing WITH output is a real failure; retrying spends money twice"
+    _out4, n4 = drive([{"cli": "claude", "status": "error", "result": "", "exit_code": 1}])
+    assert n4 == 1, "pipe-based backends fail loudly; the rule is agy-only by design"
+
+
+def test_v9_a_failed_run_leads_with_the_backend_error_not_hook_noise():
+    """FIELD REPORT (2026-07-27). A third-party plugin hook injected an unquoted Windows
+    path into a PowerShell command line, and its parse error was the FIRST thing in a failed
+    gemini envelope. The operator diagnosed the hook, reported it as the cause, and only
+    then found the real `IneligibleTierError` underneath.
+
+    summon cannot fix someone else's hook. It can refuse to let that hook be the headline,
+    and it can say the noise is not from the backend so the operator knows where to look."""
+    from _executor import host_noise_present, salient_error
+
+    captured = chr(10).join([
+        "Warning: At line:1 char:40",
+        "+ ... bun.exe \"C:\\Users\\me\\.claude\\plugins\\marketplaces\\x ...",
+        "Unexpected token in expression or statement.",
+        "    + CategoryInfo          : ParserError: (:) []",
+        "Loaded cached credentials.",
+        "Error authenticating: IneligibleTierError: This client is no longer supported "
+        "for Gemini Code Assist for individuals.",
+    ])
+    head = salient_error(captured)
+    assert head and "IneligibleTierError" in head, (
+        "the backend's own failure must become the headline, not the hook's parse error: "
+        "%r" % head)
+    assert "Unexpected token" not in head and "At line:" not in head, head
+    assert host_noise_present(captured), (
+        "host noise must be flagged so the operator knows it is neither summon nor the "
+        "backend")
+
+    # NEVER guess: noise with no real error underneath yields nothing rather than a
+    # confident wrong headline, and the full text always survives in output_tail.
+    noise_only = chr(10).join(["Warning: At line:1 char:40",
+                               "Unexpected token 'x' in expression or statement."])
+    assert salient_error(noise_only) is None, (
+        "with no recognisable backend error, a generic message beats an invented one")
+    assert salient_error("all fine") is None
+    assert host_noise_present("all fine") is False
+
+
+def test_v9_empty_agy_output_is_named_as_a_scrape_loss():
+    """The envelope already knew the difference between "the agent produced nothing" and
+    "the scrape lost the frame" -- it just described both the same way. Naming it is what
+    tells an operator to retry rather than rewrite the prompt."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_executor.py"),
+               encoding="utf-8").read()
+    assert "empty terminal scrape" in src, (
+        "the empty-agy path must name the scrape as the likely cause")
+    i = src.index("empty terminal scrape")
+    window = src[max(0, i - 600):i]
+    assert 'cli == "agy"' in window, (
+        "the scrape-loss wording must be gated on agy; other backends failing empty is a "
+        "different fact")
+
+
 def _global_fingerprint():
     """Identity of the globals these tests monkeypatch.
 

@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.15.3"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.16.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -1121,6 +1121,20 @@ def _regate_or_none(args, agents_dir, invocation):
     return None if dec.get("approved") else dec
 
 
+def _is_agy_scrape_loss(result: dict) -> bool:
+    """True when agy returned nothing at all after a run that actually executed.
+
+    agy has no pipe mode, so summon reads its output through a ConPTY + pyte terminal
+    scrape; a dropped frame yields an empty envelope after full wall-clock. That is a
+    LOST RESULT, not a refusal, and it is the one failure a blind retry genuinely fixes.
+    Deliberately narrow: agy only, empty only, error only -- a retry that fires on a real
+    refusal just spends money twice.
+    """
+    return (result.get("cli") == "agy"
+            and result.get("status") == "error"
+            and not (result.get("result") or "").strip())
+
+
 def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
     """execute_agent with --retries: exponential backoff on error/partial only
     (blocked won't improve by retrying — its cause is structural).
@@ -1130,11 +1144,32 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
     what was approved. A refusal mid-retry stops the loop and returns the blocked
     envelope rather than the last failure."""
     attempt = 0
+    _auto_scrape_retry = False
     while True:
         result = execute_agent(invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
                                max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
         attempt += 1
-        if result.get("status") not in ("error", "partial") or attempt > max(0, args.retries):
+        # A scrape-loss on agy gets ONE free retry even at --retries 0. Every other
+        # backend fails LOUDLY (a pipe closes, an exit code arrives); a screen-scraped one
+        # fails EMPTY, so the operator has to know to opt into retries for the single
+        # backend where output loss is structural rather than exceptional. Field report
+        # (2026-07-27): agy succeeded at 55s and failed empty at 47s on comparable prompts.
+        # `attempts` and the warning below keep it honest -- this spends a real dispatch.
+        _budget = max(0, args.retries)
+        if _budget == 0 and attempt == 1 and _is_agy_scrape_loss(result):
+            _budget = 1
+            _auto_scrape_retry = True
+        if result.get("status") not in ("error", "partial") or attempt > _budget:
+            if _auto_scrape_retry:
+                # On the RETURNED envelope, not the discarded first attempt. Appending it
+                # inside the loop lost the warning the moment the retry replaced that dict,
+                # so a recovered run reported success with no trace of the extra dispatch
+                # it had spent.
+                result.setdefault("warnings", []).append(
+                    "agy returned an empty terminal scrape, so summon retried once "
+                    "automatically: on this backend an empty result is usually a lost frame "
+                    "rather than an agent that declined. This spent an extra dispatch (see "
+                    "`attempts`). Use --retries to control it.")
             break
         refused = _regate_or_none(args, agents_dir, invocation)
         if refused is not None:
