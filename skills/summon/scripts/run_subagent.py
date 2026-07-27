@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.16.2"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.16.3"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -348,7 +348,10 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
     rel = os.path.relpath(os.path.abspath(cwd), repo)
     sub = os.path.join(wt, rel)
     effective = sub if rel not in (".", "") and not rel.startswith("..") and os.path.isdir(sub) else wt
-    return {"path": wt, "cwd": effective, "branch": branch}
+    # `repo` so a later teardown can run `git -C <repo> worktree remove`: git rejects
+    # a bare path outside the repository context, which is how the first attempt at
+    # denial cleanup silently failed.
+    return {"path": wt, "cwd": effective, "branch": branch, "repo": repo}
 
 
 # --- Background dispatch + jobs queries (moved to _background.py) ---------------
@@ -886,22 +889,21 @@ def main() -> None:
         _gate_decision = _run_gate(args, agents_dir, invocation)
         if not _gate_decision.get("approved"):
             from _gate import blocked_envelope
-            _env = blocked_envelope(_gate_decision, agent=args.agent, cli=cli)
-            # Carry the provenance the receipt already resolved. A refusal is exactly when
-            # a caller needs to know WHICH request and WHICH definition were denied, and
-            # every one of these was known before the gate ran.
-            for _k in ("request_sha256", "summon", "agent_def", "prompt_sha256",
-                       "git_head_before", "agents_dir", "cwd"):
-                if receipt.get(_k) is not None:
-                    _env[_k] = receipt[_k]
-            _env["permission"] = invocation.permission
-            try:
-                from _builder import permission_flags as _pf, _PERMISSION_MAPPING
-                _env["permission_flags"] = (_pf(invocation.cli, invocation.permission)
-                                            if invocation.cli in _PERMISSION_MAPPING
-                                            else None)
-            except Exception:  # noqa: BLE001 - evidence is best-effort, never fatal
-                _env["permission_flags"] = None
+            _env = _enrich_denial(
+                blocked_envelope(_gate_decision, agent=args.agent, cli=cli),
+                receipt, invocation)
+            # A DENIED dispatch must not leave a branch and checkout behind. --worktree runs
+            # ~90 lines BEFORE the gate, so a DENY still created `.claude/worktrees/<name>`
+            # and `refs/heads/agents/<name>`. The gate exists to authorise side effects, and
+            # one had already happened; removing it is the honest completion of the refusal.
+            if worktree_info:
+                _removed = _remove_worktree(worktree_info)
+                _env["worktree_removed"] = _removed
+                if not _removed:
+                    _env.setdefault("warnings", []).append(
+                        "the gate denied this dispatch, but its --worktree checkout could "
+                        "not be removed; remove it by hand: "
+                        + str(worktree_info.get("cwd")))
             finalize_exit_fields(_env)
             if args.out:
                 _write_out(args.out, _env)
@@ -1112,6 +1114,68 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
     return decide(resp, args.gate_with)
 
 
+def _enrich_denial(env: dict, receipt, invocation) -> dict:
+    """Put a gate denial's own provenance on the envelope. Used by EVERY denial site.
+
+    A refusal is exactly when a caller needs to know WHICH request and WHICH definition were
+    refused, and all of it is resolved before the gate runs. Only fields the receipt ACTUALLY
+    holds are copied -- an earlier version copied `cwd` and `agents_dir` from a receipt that
+    never stored them, so the denial advertised keys that were silently absent.
+
+    `permission_flags` is deliberately NOT set: those flags describe an execution that did
+    not happen, and reporting the target backend's sandbox flags for a refused dispatch
+    states something untrue. The TIER is a property of the request, so it is reported.
+    """
+    try:
+        for key in ("request_sha256", "summon", "agent_def", "prompt_sha256",
+                    "git_head_before"):
+            if receipt and receipt.get(key) is not None:
+                env[key] = receipt[key]
+        if invocation is not None:
+            env["permission"] = invocation.permission
+            env["cwd"] = invocation.cwd
+    except Exception:  # noqa: BLE001 - evidence is best-effort, never fatal
+        pass
+    return env
+
+
+def _remove_worktree(info) -> bool:
+    """Tear down a worktree summon created. True when the checkout is gone.
+
+    Used when a gate DENIES a dispatch: `--worktree` runs before the gate, so a refusal
+    would otherwise leave a real branch and checkout behind -- a side effect from a request
+    that was never authorised.
+    """
+    if not info:
+        return False
+    path = info.get("cwd") or info.get("path")
+    branch = info.get("branch")
+    if not path:
+        return False
+    from _spawn import run_flags
+    repo = info.get("repo")
+    # `git -C <repo>`: git refuses `worktree remove` on a bare path outside the repository
+    # context ("fatal: ... is not a working tree"), so the first version of this removed
+    # nothing. It did report that honestly -- the return value is a real existence check,
+    # which is how the test caught it -- but an accurate report of a broken teardown still
+    # leaves the checkout on disk. Normalise separators too: the stored path mixes forward
+    # and back slashes on Windows.
+    target = os.path.normpath(str(path))
+    base = ["git"] + (["-C", str(repo)] if repo else [])
+    try:
+        subprocess.run(base + ["worktree", "remove", "--force", target],
+                       capture_output=True, timeout=30, **run_flags())
+    except Exception:  # noqa: BLE001
+        pass
+    if branch:
+        try:
+            subprocess.run(base + ["branch", "-D", str(branch)],
+                           capture_output=True, timeout=30, **run_flags())
+        except Exception:  # noqa: BLE001
+            pass
+    return not os.path.exists(target)
+
+
 def _regate_or_none(args, agents_dir, invocation):
     """Re-run the gate for a RETRY attempt. Returns the decision if refused (so the
     caller stops), or None when approved. A gate authorises one execution."""
@@ -1191,8 +1255,10 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
         refused = _regate_or_none(args, agents_dir, invocation)
         if refused is not None:
             from _gate import blocked_envelope
-            result = blocked_envelope(refused, agent=getattr(args, "agent", None),
-                                      cli=invocation.cli)
+            result = _enrich_denial(
+                blocked_envelope(refused, agent=getattr(args, "agent", None),
+                                 cli=invocation.cli),
+                getattr(args, "_receipt", None), invocation)
             result["attempts"] = attempt
             return result
         time.sleep(min(30, 2 ** attempt))
