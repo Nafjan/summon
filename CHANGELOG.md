@@ -6,6 +6,46 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.16.0] - 2026-07-27
+
+**From a field report.** An operator ran a day of multi-agent work across all five backends
+and wrote up three failures with repros. Two turned out to be diagnosable by `doctor --probe`
+already; the third was a real bug. All the reachable suggestions are implemented.
+
+### Added
+
+- **agy gets one automatic retry when its terminal scrape comes back empty.** agy has no pipe
+  mode, so summon reads its output through a ConPTY + pyte scrape; a dropped frame yields an
+  empty envelope after a full run's wall clock. Reported: success at 55s, empty failure at 47s
+  on comparable prompts -- and the operator reasonably assumed the PROMPT was at fault.
+  Every other backend fails LOUDLY (a pipe closes, an exit code arrives); a screen-scraped one
+  fails EMPTY, so requiring `--retries` for the single backend where output loss is structural
+  put the burden in the wrong place. The retry fires only for that exact shape (agy + error +
+  empty result), happens once, counts in `attempts`, and the returned envelope says it spent
+  the extra dispatch.
+- **`normalization_reason` names a scrape loss** instead of describing it as a generic missing
+  result, and says to retry before rewriting the prompt. The envelope already knew the
+  difference; it just was not saying it.
+- **A failed run leads with the backend's own error.** stdout and stderr are merged at spawn,
+  so the real reason (e.g. `Error authenticating: IneligibleTierError: ...`) sat in the body
+  while `error` read only `CLI exited with code 1`. When a recognisable backend failure is
+  present it becomes the headline and is also exposed as `backend_error`; when nothing is
+  recognisable the message stays generic rather than guessing.
+- **Host and hook noise is called out as neither summon's nor the backend's.** A third-party
+  plugin hook injecting an unquoted Windows path into a PowerShell command line put its parse
+  error at the TOP of a failed envelope; the operator diagnosed the hook, reported it as the
+  cause, and found the real error underneath only afterwards. That noise can no longer be the
+  headline, and a warning points at it explicitly. `output_tail` keeps the raw text verbatim.
+
+### Known gap (scoped, not built)
+
+- A `--cli gemini` dispatch to an ineligible account still runs and fails after ~12s rather
+  than failing fast. `doctor --probe` diagnoses it precisely today, but there is **no probe
+  cache**, so the dispatch path has nothing to consult. Doing this properly means storing
+  per-backend eligibility with a staleness policy -- eligibility changes underneath you, which
+  is exactly what happened in the report. Deferred rather than half-built; the conservative
+  half (surfacing the real reason instead of a generic exit code) ships above.
+
 ## [0.15.3] - 2026-07-26
 
 **Certification round 1.** A formal attempt at the 1.0 bar found five real defects,

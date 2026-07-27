@@ -1225,6 +1225,63 @@ def is_terminal_success(env) -> bool:
                 and not env.get("suspect"))
 
 
+# Hook / launcher noise that a HOST environment injects ahead of the backend's own output.
+# Field report (2026-07-27): a third-party plugin hook put an unquoted Windows path into a
+# PowerShell command line, and its parse error was the FIRST thing in a failed gemini
+# envelope -- so the operator diagnosed the hook, reported it as the cause, and only then
+# found the real `IneligibleTierError` underneath. summon cannot fix someone else's hook,
+# but it should not let that hook's noise be the headline on a failure.
+_NOISE_MARKERS = (
+    "at line:", "unexpected token", "+ categoryinfo", "+ fullyqualifiederrorid",
+    "\\plugins\\marketplaces\\", "parsererror", "is not recognized as the name of a",
+)
+# Signatures of a REAL backend failure, most specific first. These are the sentences an
+# operator actually needs; they are routinely buried under the noise above.
+_SIGNAL_MARKERS = (
+    "error authenticating", "ineligibletiererror", "not supported for",
+    "authentication failed", "unauthorized", "forbidden", "quota", "rate limit",
+    "insufficient", "invalid api key", "no such model", "model not found",
+    "econnrefused", "timed out", "permission denied",
+)
+
+
+def salient_error(text: str) -> str | None:
+    """The line an operator most needs from a failed run's captured output.
+
+    Prefers a recognised backend failure over host/hook noise. Returns None rather than
+    guessing when nothing scores -- a wrong headline is worse than a generic one, and the
+    full text is always preserved in `output_tail` regardless.
+    """
+    if not text:
+        return None
+    best = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if len(line) < 12 or len(line) > 400:
+            continue
+        low = line.lower()
+        if any(m in low for m in _NOISE_MARKERS):
+            continue                      # host noise: never the headline
+        for rank, marker in enumerate(_SIGNAL_MARKERS):
+            if marker in low:
+                if best is None or rank < best[0]:
+                    best = (rank, line)
+                break
+    return best[1] if best else None
+
+
+def host_noise_present(text: str) -> bool:
+    """True when the captured output contains host/hook noise the operator did not cause.
+
+    Worth surfacing separately: it is not summon's bug and not the backend's, but it is
+    actively misleading on a failure, and the operator can go fix their hook.
+    """
+    if not text:
+        return False
+    low = text.lower()
+    return any(m in low for m in _NOISE_MARKERS)
+
+
 def finalize_exit_fields(resp: dict) -> dict:
     """Backfill the exit-code-clarity fields on any dispatch-shaped envelope
     (has both status and exit_code). Idempotent: a builder that already set the
@@ -1342,6 +1399,19 @@ def build_final_response(
     else:
         status = "error"
         norm_reason = f"no usable terminal result and backend exit {exit_code} is not success"
+        # A SCRAPE-BASED backend that returns nothing is a different failure from an agent
+        # that produced nothing. agy has no pipe mode, so summon reads its output through a
+        # ConPTY + pyte terminal scrape; when that loses the frame the envelope is empty
+        # after a full run's wall-clock. Field report (2026-07-27): 47s of work, result
+        # "\n", and the operator reasonably assumed the PROMPT was at fault and rewrote it.
+        # The distinction is already knowable here, so say it.
+        if cli == "agy" and not (result.get("result") if result else
+                                 "".join(stdout_lines)).strip():
+            norm_reason = (f"empty terminal scrape after a completed run (backend exit "
+                           f"{exit_code}). agy has no pipe mode, so its output is read from "
+                           f"a terminal scrape that can drop the frame -- this is usually a "
+                           f"lost result, NOT the agent declining to answer. Retry before "
+                           f"rewriting the prompt.")
 
     response = {
         "result": result.get("result", "") if result else "".join(stdout_lines),
@@ -1367,7 +1437,22 @@ def build_final_response(
             msg = f"CLI exited with code {exit_code}"
             if stderr and stderr.strip():
                 msg += f": {stderr.strip()}"
+            # Lead with the backend's OWN failure when it can be identified. stdout and
+            # stderr are merged at spawn, so the real reason is usually in the captured
+            # body while `error` said only "CLI exited with code 1" -- and any host hook
+            # noise sits ahead of it. The full text is still in `output_tail`.
+            _captured = "".join(stdout_lines)
+            _salient = salient_error(_captured)
+            if _salient and _salient not in msg:
+                msg = f"{msg}: {_salient}" if not stderr or not stderr.strip() else msg
+                response["backend_error"] = _salient
             response["error"] = msg
+            if host_noise_present(_captured):
+                response.setdefault("warnings", []).append(
+                    "the captured output contains host/hook noise (a shell or plugin hook "
+                    "in your environment wrote to this dispatch's console). It is not from "
+                    "the backend and not from summon; on a failure it can read as the "
+                    "cause. See `output_tail` for the raw text.")
     if status != "success":
         # Diagnosability: the tail of the RAW captured output (stdout+stderr are
         # merged at spawn), so a failure is inspectable without a re-run.
