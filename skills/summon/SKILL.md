@@ -156,7 +156,7 @@ Parse JSON output and check `status` field:
 | `--cwd` | Yes* | Working directory (absolute path) |
 | `--timeout` | No | Bare ms or with suffix: `600s`, `10m` (default: 600000 = 10m). Set your host tool's own timeout ABOVE this value — the script needs a few seconds of overhead beyond the CLI deadline |
 | `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
-| `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `gemini`, `agy` |
+| `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `agy`, `gemini` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
 | `--model` | No | Override the agent's frontmatter model for this call |
 | `--effort` | No | Reasoning effort `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none` = the backend's own default). **claude** → `--effort`; **codex** → `-c model_reasoning_effort` (xhigh/max clamp to high); **agy** → a Gemini model's thinking suffix (`Gemini 3.1 Pro (High)`), applied only when set explicitly (not all models have all levels). Precedence: `--effort` > agent `effort:` frontmatter > `SUMMON_DEFAULT_EFFORT` env > built-in default **`high`**. Surfaced in the envelope's `effort` field (claude/codex) or `model.requested` (agy) |
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy |

@@ -1282,6 +1282,56 @@ def host_noise_present(text: str) -> bool:
     return any(m in low for m in _NOISE_MARKERS)
 
 
+# agy's bundled Go language server writes a glog-style log into the dispatch's working
+# directory, under the literal filename `--print` (it picks summon's `--print` flag up as a
+# log target). Measured 2026-07-26: a 163 KB `--print` file in the repo root after agy runs.
+# summon spawns agy, so this is summon's litter to clean: pointing agy at a repo should not
+# leave a junk file in it. Removal is conservative -- only a file that did NOT exist before
+# the dispatch and that looks like a glog log is touched, so a real file with that
+# (admittedly unlikely) name is never destroyed.
+_GLOG_SIGNATURE = ("server.go", "Starting language server", "Language server version")
+
+
+def _agy_litter_path(cwd: str | None) -> str | None:
+    """The stray log path an agy dispatch may create in `cwd`."""
+    if not cwd:
+        return None
+    try:
+        return os.path.join(cwd, "--print")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _looks_like_agy_log(path: str) -> bool:
+    """True only for a file that is clearly agy's language-server log."""
+    try:
+        if os.path.getsize(path) > 50_000_000:      # never slurp something enormous
+            return False
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return False
+    return any(marker in head for marker in _GLOG_SIGNATURE)
+
+
+def _sweep_agy_litter(cwd: str | None, existed_before: bool) -> bool:
+    """Remove agy's stray `--print` log if this dispatch created it. Returns True if removed.
+
+    Fails soft everywhere: leaving litter is a nuisance, but deleting the wrong file in
+    someone's repository is not recoverable, so every check must pass.
+    """
+    path = _agy_litter_path(cwd)
+    if not path or existed_before or not os.path.isfile(path):
+        return False
+    if not _looks_like_agy_log(path):
+        return False
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
 def finalize_exit_fields(resp: dict) -> dict:
     """Backfill the exit-code-clarity fields on any dispatch-shaped envelope
     (has both status and exit_code). Idempotent: a builder that already set the
@@ -1967,6 +2017,11 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     command, args = _resolve_launch(command, args)
     # AFTER _resolve_launch: on Windows a .cmd shim is rewritten to `node <path>/cli.js`,
     # which changes the length that actually gets measured by CreateProcess.
+    # agy litters the dispatch cwd with a language-server log; note whether one is already
+    # there so the sweep below can only remove a file THIS run created.
+    _litter_before = bool(inv.cli == "agy"
+                          and (_agy_litter_path(inv.cwd) or "")
+                          and os.path.isfile(_agy_litter_path(inv.cwd)))
     proc_env = _merge_env(env_override)
     # AFTER _merge_env: the POSIX total counts the environment, and the environment that
     # matters is the one Popen receives -- overrides included, stripped keys excluded.
@@ -2040,6 +2095,11 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             _job_close(process)
         except Exception:  # noqa: BLE001 - cleanup must never mask the real result
             pass
+        if inv.cli == "agy":
+            try:
+                _sweep_agy_litter(inv.cwd, _litter_before)
+            except Exception:  # noqa: BLE001
+                pass
     # Resume handle: what the orchestrator passes to a follow-up `--resume`.
     # session_id comes from the stream (claude/codex/cursor); agy has no stream
     # id, so it resumes by reusing the same profile dir instead.
