@@ -478,7 +478,23 @@ def frozen_backend_warning(cli: str) -> str | None:
     return _FROZEN_BACKENDS.get(cli)
 
 
-def advisory_warnings(cli: str, permission: str, timeout_ms: int | None) -> list:
+def cursor_premium_agreement_warning(cli: str, model: str | None) -> str | None:
+    """Cursor serves Fable only after a one-time data-handling agreement.
+
+    The agreement is accepted in Cursor's own UI, per user -- summon can neither accept it
+    on your behalf nor see whether you already have. Saying so at dispatch beats letting
+    the run fail with a vendor error the caller then has to go and decode (reported
+    2026-07-27 by an operator who had already accepted it, and wanted others warned).
+    """
+    if cli != "cursor-agent" or (model or "") not in _PREMIUM_MODELS:
+        return None
+    return (f"cursor serves {model} only after a ONE-TIME data-handling agreement accepted "
+            f"in the Cursor UI. summon cannot accept it for you or check whether you have; "
+            f"if this dispatch fails on a vendor policy error, that is the likely cause.")
+
+
+def advisory_warnings(cli: str, permission: str, timeout_ms: int | None,
+                      model: str | None = None) -> list:
     """Every advisory warning a dispatch should carry, in ONE place.
 
     The real envelope and --dry-run each assembled this list themselves and had already
@@ -488,6 +504,8 @@ def advisory_warnings(cli: str, permission: str, timeout_ms: int | None) -> list
     stay identical.
     """
     return [w for w in (frozen_backend_warning(cli),
+                        premium_model_warning(model, cli),
+                        cursor_premium_agreement_warning(cli, model),
                         agy_permission_warning(cli, permission),
                         agy_readonly_workspace_warning(cli, permission),
                         agy_timeout_warning(cli, timeout_ms)) if w]
@@ -598,7 +616,15 @@ def infer_billing(cli: str) -> dict:
 # (Opus) and require an explicit opt-in to spend credit — so a `fable` dispatch
 # never silently draws down credit. The API-key path (an openai-compat anthropic
 # agent) is unaffected: that is metered by design.
-_CREDIT_ONLY_MODELS = {"claude-fable-5"}
+_CREDIT_ONLY_MODELS: set[str] = set()
+# Served on the subscription, but at a PREMIUM rate with stricter limits, so a caller
+# who reaches for one should know what it costs before the dispatch rather than after.
+# Fable is roughly 2x Opus per token (first-party API list: $10/$50 per MTok vs $5/$25)
+# and its rate limits are tighter -- a long fan-out can exhaust them mid-run.
+_PREMIUM_MODELS = {
+    "claude-fable-5": ("about twice Opus per token, with stricter rate limits than Opus -- "
+                       "a long fan-out can exhaust them mid-run"),
+}
 # The latest subscription-covered Opus, PINNED (not the `opus` alias). The alias
 # LAGS BADLY — re-verified 2026-07-25: `--model opus` still served claude-opus-4-7,
 # two releases behind claude-opus-5 — so a pin is what actually gets the latest
@@ -613,9 +639,36 @@ _MODEL_FLAG_NAMES = ("--model", "-m", "--fallback-model")
 
 
 def credit_spend_allowed() -> bool:
-    """The operator opted in to spending account credit on a credit-only model."""
+    """The operator opted in to spending account credit on a credit-only model.
+
+    `_CREDIT_ONLY_MODELS` is EMPTY as of 0.17.0 -- Anthropic reversed the Fable exclusion
+    and it is served on the subscription again. The opt-in is still read and still honoured
+    so that scripts and agent definitions carrying `SUMMON_ALLOW_FABLE=1` keep working
+    unchanged; it simply has nothing to authorize right now. Keep the machinery: a future
+    model may be credit-only, and re-deriving this guard from scratch would be worse than
+    leaving a tested one idle.
+    """
     return (os.environ.get("SUMMON_ALLOW_FABLE") == "1"
             or os.environ.get("SUMMON_ALLOW_CREDIT") == "1")
+
+
+def premium_model_warning(model: str | None, cli: str) -> str | None:
+    """Spend notice for a model that IS covered but costs materially more.
+
+    Anthropic reversed the Fable exclusion (2026-07-27): it is served on the Max
+    subscription again, at roughly twice Opus's rate with stricter limits. summon used to
+    SUBSTITUTE Opus here on the premise that Fable billed account credit. That premise is
+    now false, and substituting a model the caller asked for -- and is entitled to run --
+    is worse than running it. The rate is still worth saying out loud once, before the
+    dispatch, rather than leaving the operator to discover it on the bill.
+    """
+    if cli not in ("claude", "cursor-agent"):
+        return None
+    note = _PREMIUM_MODELS.get(model or "")
+    if not note:
+        return None
+    return (f"{model} is covered by the subscription but costs {note}. summon does not "
+            f"substitute it -- you asked for it, you get it.")
 
 
 def resolve_billing_model(model: str | None, cli: str) -> tuple[str | None, str | None]:
@@ -624,9 +677,9 @@ def resolve_billing_model(model: str | None, cli: str) -> tuple[str | None, str 
     Opus unless credit spend is authorized (None note when unchanged/authorized)."""
     if cli == "claude" and model in _CREDIT_ONLY_MODELS and not credit_spend_allowed():
         return _OPUS_FALLBACK, (
-            f"{model} is no longer covered by the Claude Max subscription (it bills "
-            f"account credit); summon fell back to Opus. To run it on credit set "
-            f"SUMMON_ALLOW_FABLE=1, or use an ANTHROPIC_API_KEY (openai-compat) agent.")
+            f"{model} is not covered by the Claude subscription (it bills account credit); "
+            f"summon fell back to Opus. To run it on credit set SUMMON_ALLOW_CREDIT=1, or "
+            f"use an ANTHROPIC_API_KEY (openai-compat) agent.")
     return model, None
 
 

@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.16.4"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.17.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -1020,7 +1020,8 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     # Same helper as the real envelope, so preflight shows exactly what the run would
     # warn about -- a short agy clock and a withheld read-only workspace are both things
     # you want to learn BEFORE paying, which is the whole point of --dry-run.
-    for _w in advisory_warnings(invocation.cli, invocation.permission, args.timeout):
+    for _w in advisory_warnings(invocation.cli, invocation.permission, args.timeout,
+                                invocation.model):
         view.setdefault("warnings", []).append(_w)
     if backend_kind(invocation.cli) == "api":
         view["command"] = f"POST ({invocation.cli})"

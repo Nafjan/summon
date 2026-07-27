@@ -6,6 +6,35 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.17.0] - 2026-07-27
+
+### Changed
+
+- **Fable is no longer substituted away.** Anthropic reversed the exclusion:
+  `claude-fable-5` is served on the Max subscription again, at roughly twice Opus per token
+  with stricter rate limits. summon previously ran an `opus` alias in its place on the
+  premise that Fable billed account credit -- a premise that is now false, and substituting
+  a model the caller explicitly asked for (and is entitled to run) is a bigger intervention
+  than the warning it shipped with. Fable now RUNS, and the dispatch states its cost once,
+  before a token is spent. Refusing to run it is not summon's call.
+- **Cursor's one-time data-handling agreement is surfaced.** cursor serves Fable only after
+  an agreement accepted in Cursor's own UI. summon can neither accept it for you nor detect
+  whether you have, so a `cursor-agent` Fable dispatch says so up front rather than letting
+  the run fail on a vendor policy error the caller then has to decode.
+- **The credit-guard machinery is kept, and still tested.** `_CREDIT_ONLY_MODELS` is empty
+  and `SUMMON_ALLOW_FABLE=1` / `--allow-credit` still parse, so existing scripts and agent
+  definitions carrying them keep working unchanged. A future model may be credit-only, and
+  re-deriving a tested guard from scratch is worse than leaving one idle.
+
+### Testing
+
+409/409 discovery, 22/22 install; six mutants killed. Five guard tests had hardcoded Fable
+as their fixture and died with `IndexError` on the emptied roster -- a lucky failure: with
+`.get()` instead of indexing they would have gone green while testing nothing at all. They
+are re-anchored to a synthetic credit-only model via a decorator whose finally-block
+restores the roster even when a test fails, so the MECHANISM stays covered regardless of
+who is on the roster.
+
 ## [0.16.4] - 2026-07-27
 
 ### Fixed

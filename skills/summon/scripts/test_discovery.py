@@ -1999,82 +1999,73 @@ def test_manifest_timeout_grammar_matches_child():
     assert _manifest._parent_timeout({"timeout": "30s"}) >= 90.0
 
 
-def test_fable_credit_only_guard():
-    # Fable (claude-fable-5) is credit-only: on the claude CLI it falls back to
-    # the `opus` alias unless SUMMON_ALLOW_FABLE=1; the API path is never rewritten.
-    import _builder, _executor
-    from _builder import AgentInvocation, build_invocation_args as _bia, apply_credit_guard
+def test_fable_runs_unsubstituted_and_says_what_it_costs():
+    """Anthropic REVERSED the Fable exclusion (2026-07-27): `claude-fable-5` is served on
+    the Max subscription again, at roughly twice Opus per token with stricter limits, and
+    cursor serves it after a one-time data-handling agreement.
+
+    summon used to SUBSTITUTE Opus here, on the premise that Fable billed account credit.
+    That premise is now false, and substituting a model the caller explicitly asked for --
+    and is entitled to run -- is a bigger intervention than the warning it came with. The
+    rate is still worth stating once, before the dispatch; refusing to run it is not
+    summon's call."""
+    import _builder
+    from _builder import AgentInvocation, advisory_warnings, build_invocation_args as _bia
 
     def _models(args):
-        return [args[i + 1] for i, x in enumerate(args) if x in ("--model", "-m", "--fallback-model")]
+        return [args[i + 1] for i, x in enumerate(args)
+                if x in ("--model", "-m", "--fallback-model")]
 
-    for k in ("SUMMON_ALLOW_FABLE", "SUMMON_ALLOW_CREDIT", "ANTHROPIC_API_KEY",
-              "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL"):
+    for k in ("SUMMON_ALLOW_FABLE", "SUMMON_ALLOW_CREDIT", "ANTHROPIC_API_KEY"):
         os.environ.pop(k, None)
-    eff, note = _builder.resolve_billing_model("claude-fable-5", "claude")
-    assert eff == _builder._OPUS_FALLBACK and note, (eff, note)
-    # argv carries the fallback alias, not fable
-    _, args, _ = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="claude-fable-5"))
-    assert _models(args) == [_builder._OPUS_FALLBACK], _models(args)
 
-    # CC3: credit-only model flags in `args:` are scrubbed (both forms)
+    # NO substitution, on either backend that serves it
+    for cli in ("claude", "cursor-agent"):
+        eff, note = _builder.resolve_billing_model("claude-fable-5", cli)
+        assert eff == "claude-fable-5", (cli, eff)
+        assert note is None, (cli, note)
+    _, args, _ = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".",
+                                      model="claude-fable-5"))
+    assert _models(args) == ["claude-fable-5"], (
+        "the caller asked for Fable and is entitled to it: %r" % (_models(args),))
+
+    # ...and it is no longer scrubbed out of an agent's own args:
     _, a1, _ = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="opus",
                                     extra_args=["--fallback-model", "claude-fable-5"]))
-    assert "claude-fable-5" not in a1
-    _, a2, _ = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="claude-fable-5",
-                                    extra_args=["--model", "claude-fable-5"]))
-    assert _models(a2) == [_builder._OPUS_FALLBACK], _models(a2)
+    assert "claude-fable-5" in a1, a1
 
-    # CC2: an ANTHROPIC_* alias remap to a credit-only model is stripped from the child env
-    os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL"] = "claude-fable-5"
+    # the COST is stated once, before the dispatch
+    w = advisory_warnings("claude", "safe-edit", 600_000, "claude-fable-5")
+    assert any("twice Opus" in x for x in w), w
+    assert any("rate limits" in x for x in w), (
+        "stricter limits matter as much as the per-token rate on a long fan-out: %r" % (w,))
+
+    # cursor additionally needs a ONE-TIME data-handling agreement, accepted in its own UI.
+    # summon can neither accept it nor detect it, so it must not fail silently on a vendor
+    # policy error the caller then has to decode (reported by an operator, 2026-07-27).
+    wc = advisory_warnings("cursor-agent", "safe-edit", 600_000, "claude-fable-5")
+    assert any("data-handling agreement" in x for x in wc), wc
+    assert any("cannot accept it for you" in x for x in wc), wc
+    # ...and claude does NOT carry cursor's agreement notice
+    assert not any("data-handling agreement" in x for x in w), w
+
+    # a non-premium model carries neither notice
+    assert advisory_warnings("claude", "safe-edit", 600_000, "claude-opus-5") == []
+    assert advisory_warnings("cursor-agent", "safe-edit", 600_000, None) == []
+
+    # The guard MACHINERY is kept for the next credit-only model, and still works. The
+    # opt-in env vars are still honoured so existing scripts carrying them do not break.
+    with_probe = _with_credit_probe(lambda: _builder.resolve_billing_model(
+        _CREDIT_PROBE, "claude"))
+    eff, note = with_probe()
+    assert eff == _builder._OPUS_FALLBACK and note, (eff, note)
+    os.environ["SUMMON_ALLOW_CREDIT"] = "1"
     try:
-        _, _, env = _bia(AgentInvocation(cli="claude", prompt="x", cwd=".", model="opus"))
-        assert env and env.get("ANTHROPIC_DEFAULT_OPUS_MODEL") is None, env
+        eff2, note2 = _with_credit_probe(lambda: _builder.resolve_billing_model(
+            _CREDIT_PROBE, "claude"))()
+        assert eff2 == _CREDIT_PROBE and note2 is None, (eff2, note2)
     finally:
-        del os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL"]
-
-    # CC1: a claude resume can't be re-pinned -> warns
-    _, _, w = apply_credit_guard(AgentInvocation(cli="claude", prompt="x", cwd=".",
-                                                 model="claude-fable-5", resume_id="s1"))
-    assert any("resuming" in x for x in w), w
-
-    # authorized -> real Fable, no substitution; API path never rewritten
-    os.environ["SUMMON_ALLOW_FABLE"] = "1"
-    try:
-        assert _builder.resolve_billing_model("claude-fable-5", "claude") == ("claude-fable-5", None)
-    finally:
-        del os.environ["SUMMON_ALLOW_FABLE"]
-    assert _builder.resolve_billing_model("claude-fable-5", "openai-compat") == ("claude-fable-5", None)
-
-    # envelope transparency: fallback preserves requested + warns; opus billing stays subscription
-    orig = _executor.build_invocation_args
-    _executor.build_invocation_args = lambda inv, timeout_ms=None: ("definitely-not-a-real-cli-xyz", [], None)
-    def _run(inv):
-        return _executor.execute_agent(inv, timeout_ms=800)
-    try:
-        r = _run(AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), model="claude-fable-5"))
-        # DC4: unauthorized resume of a Fable request -> billing 'unknown' (guard
-        # can't re-pin on --resume) with the resume warning
-        r_res = _run(AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(),
-                                     model="claude-fable-5", resume_id="s1"))
-        os.environ["SUMMON_ALLOW_FABLE"] = "1"
-        # CC4: authorized WITH an API key bills api, not credit
-        os.environ["ANTHROPIC_API_KEY"] = "sk-x"
-        r2 = _run(AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), model="claude-fable-5"))
-        del os.environ["ANTHROPIC_API_KEY"]
-        # DC1: authorized Fable selected only via args: still bills credit
-        r_args = _run(AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(), model=None,
-                                      extra_args=["--model", "claude-fable-5"]))
-    finally:
-        _executor.build_invocation_args = orig
-        os.environ.pop("SUMMON_ALLOW_FABLE", None); os.environ.pop("ANTHROPIC_API_KEY", None)
-    assert r["model"]["requested"] == "claude-fable-5", r["model"]
-    assert any("account credit" in x for x in r.get("warnings", [])), r.get("warnings")
-    assert r["billing"]["source"] == "subscription", r["billing"]
-    assert r2["billing"]["source"] == "api", r2["billing"]
-    assert r_res["billing"]["source"] == "unknown", r_res["billing"]
-    assert r_args["billing"]["source"] == "credit", r_args["billing"]
-
+        del os.environ["SUMMON_ALLOW_CREDIT"]
 
 def test_effort_frontmatter_backends_and_envelope():
     import _builder, _executor
@@ -2563,13 +2554,18 @@ def test_allow_credit_flag_dry_run_and_fanout_rejection():
             "--model", "claude-fable-5", "--dry-run"]
     r = sp.run(base, capture_output=True, text=True, encoding="utf-8", env=env)
     view = _json.loads(r.stdout)
-    import _builder as _b
-    assert view["model_effective"] == _b._OPUS_FALLBACK, view  # guard fell back
+    # Fable is back on the subscription (2026-07-27), so it runs UNSUBSTITUTED with no
+    # authorization needed -- and the dry-run states the cost before a token is spent,
+    # which is the whole point of preflight.
+    assert view["model_effective"] == "claude-fable-5", view
+    assert any("twice Opus" in w for w in view.get("warnings") or []), view
     r2 = sp.run(base + ["--allow-credit"], capture_output=True, text=True,
                 encoding="utf-8", env=env)
     view2 = _json.loads(r2.stdout)
-    assert view2["model_effective"] == "claude-fable-5", view2   # authorized
-    assert view2["billing_predicted"]["source"] == "credit", view2
+    assert view2["model_effective"] == "claude-fable-5", view2
+    # --allow-credit still PARSES so existing scripts carrying it keep working; it simply
+    # has nothing to authorize while the credit-only roster is empty.
+    assert r2.returncode == 0, r2.stderr[:400]
     # fan-out modes must REJECT the flag (env inheritance would silently
     # authorize every child)
     r3 = sp.run([sys.executable, script, "--council", "--question", "q",
@@ -9239,6 +9235,34 @@ def test_v7_agy_account_and_wrapper_are_part_of_the_request():
         _sh.rmtree(home, ignore_errors=True)
 
 
+_CREDIT_PROBE = "claude-credit-only-probe-5"
+
+
+def _with_credit_probe(fn):
+    """Register a SYNTHETIC credit-only model for the duration of one test.
+
+    The real roster went empty when Anthropic reversed the Fable exclusion, and these
+    tests protect the guard MECHANISM rather than any particular model -- hardcoding Fable
+    is what made them break. The finally-block restores the roster even when the test
+    fails, so one red test cannot leak the mutation into everything after it.
+    """
+
+    def wrapper(*a, **k):
+        import _builder
+        before = set(_builder._CREDIT_ONLY_MODELS)
+        _builder._CREDIT_ONLY_MODELS.add(_CREDIT_PROBE)
+        try:
+            return fn(*a, **k)
+        finally:
+            _builder._CREDIT_ONLY_MODELS.clear()
+            _builder._CREDIT_ONLY_MODELS.update(before)
+
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
+@_with_credit_probe
 def test_v7_claude_credit_strip_is_in_the_shared_delta():
     """The credit guard strips any ANTHROPIC_*MODEL* var naming a credit-only model, so the
     child never receives it -- but the identity hashed it anyway, so setting and unsetting a
@@ -9246,7 +9270,7 @@ def test_v7_claude_credit_strip_is_in_the_shared_delta():
     from _builder import _CREDIT_ONLY_MODELS, env_override_for
     from _executor import backend_env_sha
     saved = {k: os.environ.get(k) for k in ("ANTHROPIC_MODEL", "SUMMON_ALLOW_CREDIT")}
-    credit_model = sorted(_CREDIT_ONLY_MODELS)[0]
+    credit_model = _CREDIT_PROBE  # synthetic; the real roster is empty
     try:
         for k in saved:
             os.environ.pop(k, None)
@@ -9689,6 +9713,7 @@ def test_v7_resume_profile_without_resume_uses_the_fresh_account():
         _sh.rmtree(home, ignore_errors=True)
 
 
+@_with_credit_probe
 def test_v7_credit_fallback_model_is_part_of_the_request():
     """The credit guard substitutes summon's OWN fallback for an unauthorized credit-only
     model, so changing that constant changes the model actually dispatched while the request
@@ -9699,7 +9724,7 @@ def test_v7_credit_fallback_model_is_part_of_the_request():
     d = tempfile.mkdtemp(prefix="summon-fallback-")
     saved_fb = _builder._OPUS_FALLBACK
     saved_env = {k: os.environ.get(k) for k in ("SUMMON_ALLOW_CREDIT", "SUMMON_ALLOW_FABLE")}
-    credit_model = sorted(_CREDIT_ONLY_MODELS)[0]
+    credit_model = _CREDIT_PROBE  # synthetic; the real roster is empty
     try:
         for k in saved_env:
             os.environ.pop(k, None)
@@ -10229,6 +10254,7 @@ def _json_dumps_safe(obj):
         return str(obj)
 
 
+@_with_credit_probe
 def test_v7_args_only_credit_model_falls_back_to_opus():
     """A credit-only model selected ONLY through `args:` was scrubbed but not REPLACED, so
     the request reached the backend with no model at all and the vendor's own default
@@ -10236,7 +10262,7 @@ def test_v7_args_only_credit_model_falls_back_to_opus():
     behaviour, and silently answers on a model nobody chose."""
     from _builder import (_CREDIT_ONLY_MODELS, _OPUS_FALLBACK, AgentInvocation,
                           apply_credit_guard)
-    fable = sorted(_CREDIT_ONLY_MODELS)[0]
+    fable = _CREDIT_PROBE  # synthetic; the real roster is empty
     saved = {k: os.environ.get(k) for k in ("SUMMON_ALLOW_CREDIT", "SUMMON_ALLOW_FABLE")}
     try:
         for k in saved:
@@ -10274,6 +10300,7 @@ def test_v7_args_only_credit_model_falls_back_to_opus():
                 os.environ[k] = v
 
 
+@_with_credit_probe
 def test_v7_env_authorized_credit_reaches_the_env_identity():
     """`env_override_for` recognized only the --allow-credit ARGUMENT, while dispatch also
     honors SUMMON_ALLOW_CREDIT/SUMMON_ALLOW_FABLE. With SUMMON_ALLOW_FABLE=1 and a credit-only
@@ -10281,7 +10308,7 @@ def test_v7_env_authorized_credit_reaches_the_env_identity():
     unsetting that variable hashed the same while selecting Fable vs the default."""
     from _builder import _CREDIT_ONLY_MODELS, env_override_for
     from _executor import backend_env_sha
-    credit_model = sorted(_CREDIT_ONLY_MODELS)[0]
+    credit_model = _CREDIT_PROBE  # synthetic; the real roster is empty
     saved = {k: os.environ.get(k) for k in
              ("ANTHROPIC_MODEL", "SUMMON_ALLOW_CREDIT", "SUMMON_ALLOW_FABLE")}
     try:
@@ -10311,6 +10338,7 @@ def test_v7_env_authorized_credit_reaches_the_env_identity():
                 os.environ[k] = v
 
 
+@_with_credit_probe
 def test_v7_args_only_credit_fallback_is_in_the_identity():
     """A credit-only model selected ONLY through `args:` is scrubbed to the Opus fallback at
     dispatch, so the EFFECTIVE model is that fallback. Tracking only --model/frontmatter left
@@ -10322,7 +10350,7 @@ def test_v7_args_only_credit_fallback_is_in_the_identity():
     d = tempfile.mkdtemp(prefix="summon-argsfb-")
     saved_fb = _builder._OPUS_FALLBACK
     env_saved = {k: os.environ.get(k) for k in ("SUMMON_ALLOW_CREDIT", "SUMMON_ALLOW_FABLE")}
-    fable = sorted(_CREDIT_ONLY_MODELS)[0]
+    fable = _CREDIT_PROBE  # synthetic; the real roster is empty
     try:
         for k in env_saved:
             os.environ.pop(k, None)
