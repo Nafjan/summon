@@ -13934,14 +13934,21 @@ def test_v9_a_gate_denial_still_carries_its_provenance():
             "known before the gate ran" % field)
     assert env.get("status") == "blocked", env.get("status")
 
-    # and the dispatcher must actually perform that copy -- not just be capable of it
+    # And the dispatcher must actually perform that copy -- not just be capable of it.
+    # The enrichment moved into a SHARED helper after review found the retry denial site
+    # was never enriched, so this now checks the helper exists and that every denial site
+    # routes through it, rather than grepping one inlined block.
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "run_subagent.py"), encoding="utf-8").read()
-    i = src.index("_env = blocked_envelope(")
-    window = src[i:i + 1200]
-    for field in ("agent_def", "prompt_sha256", "git_head_before", "permission_flags"):
-        assert field in window, (
-            "the gate-refusal branch does not carry %r into the envelope" % field)
+    assert "def _enrich_denial(" in src, "the shared denial enrichment is gone"
+    i = src.index("def _enrich_denial(")
+    body = src[i:i + 1400]
+    for field in ("agent_def", "prompt_sha256", "git_head_before", "permission"):
+        assert field in body, (
+            "the shared denial enrichment does not carry %r" % field)
+    assert src.count("_enrich_denial(") >= 3, (
+        "a denial site is bypassing the shared enrichment (definition + two call sites "
+        "expected); found %d" % src.count("_enrich_denial("))
 
 
 def test_v9_drift_sees_the_default_npx_project_install():
@@ -14229,6 +14236,146 @@ def test_v9_summon_cleans_up_agys_stray_language_server_log():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_v9_a_denied_dispatch_leaves_no_worktree_behind():
+    """`--worktree` creates a branch AND a checkout ~90 lines BEFORE the gate runs, so a
+    DENY still left `.claude/worktrees/<name>` and `refs/heads/agents/<name>` on disk. The
+    gate exists to authorise side effects; one had already happened before it was asked.
+
+    Removing it is the honest completion of a refusal -- and when removal fails, the envelope
+    says so rather than pretending, because a stranded checkout the caller does not know
+    about is worse than one they do."""
+    import subprocess as _sp
+    import run_subagent as rs
+    from _spawn import run_flags
+
+    d = tempfile.mkdtemp(prefix="summon-wt-")
+    try:
+        _sp.run(["git", "init", "-q", d], capture_output=True, timeout=30, **run_flags())
+        _sp.run(["git", "-C", d, "config", "user.email", "t@t"], capture_output=True,
+                timeout=30, **run_flags())
+        _sp.run(["git", "-C", d, "config", "user.name", "t"], capture_output=True,
+                timeout=30, **run_flags())
+        with open(os.path.join(d, "f.txt"), "w", encoding="utf-8") as fh:
+            fh.write("x")
+        _sp.run(["git", "-C", d, "add", "-A"], capture_output=True, timeout=30, **run_flags())
+        _sp.run(["git", "-C", d, "commit", "-qm", "init"], capture_output=True, timeout=30,
+                **run_flags())
+
+        info = rs._setup_worktree(d, "denied-probe", "rev")
+        path = info.get("cwd") or info.get("path")
+        assert path and os.path.isdir(path), "the worktree was not created; scenario invalid"
+
+        removed = rs._remove_worktree(info)
+        assert removed is True, "a denied dispatch must be able to tear its worktree down"
+        assert not os.path.exists(path), (
+            "the checkout survived a denial: %s" % path)
+        branches = _sp.run(["git", "-C", d, "branch", "--list"], capture_output=True,
+                           text=True, timeout=30, **run_flags()).stdout
+        assert "denied-probe" not in branches, (
+            "the branch survived a denial: %r" % branches)
+
+        # AND the denial path must actually CALL it. Testing the helper alone left a mutant
+        # alive that simply stopped invoking it from the gate-refusal branch -- the teardown
+        # worked perfectly and nothing reached it.
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "run_subagent.py"), encoding="utf-8").read()
+        i = src.index("_env = _enrich_denial(")
+        window = src[i:i + 1200]
+        assert "_remove_worktree(worktree_info)" in window, (
+            "the gate-denial branch does not tear down the worktree it created before the "
+            "gate ran, so a refused dispatch still leaves a branch and checkout behind")
+        # The GUARD, not just the call: a mutant that changed `if worktree_info:` to
+        # `if False:` left the call text sitting there unreachable, and a grep for the call
+        # alone happily matched it. Bind the condition that actually reaches it.
+        assert "if worktree_info:" in window, (
+            "the teardown is unreachable -- the branch guarding it is not `if "
+            "worktree_info:`, so a denial can still strand the checkout")
+        assert "worktree_removed" in window, (
+            "the envelope must report whether the teardown succeeded; a stranded checkout "
+            "the caller does not know about is worse than one they do")
+    except FileNotFoundError:
+        return                       # no git on PATH; nothing to assert
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v9_every_denial_site_enriches_the_same_way():
+    """The first enrichment fix covered only the INITIAL denial. A denial during `--retries`
+    used a second `blocked_envelope` call that never got it -- and the regression test
+    searched only the first textual occurrence of that call, so it passed while the retry
+    path stayed bare. Two call sites with one obligation drift; they share a function now.
+
+    Also fixes what the enrichment CLAIMED: `cwd` and `agents_dir` were copied from a receipt
+    that never stored them, and `permission_flags` reported the target backend's sandbox
+    flags for a dispatch that never ran."""
+    import _builder
+    import run_subagent as rs
+
+    inv = _builder.AgentInvocation(cli="claude", prompt="p", cwd="/work",
+                                   system_context="c", permission="read-only")
+    receipt = {"request_sha256": "a" * 64, "summon": {"version": "9.9.9"},
+               "agent_def": {"sha256": "b" * 64}, "prompt_sha256": "c" * 64,
+               "git_head_before": "d" * 40}
+    env = rs._enrich_denial({"status": "blocked"}, receipt, inv)
+
+    for field in ("request_sha256", "summon", "agent_def", "prompt_sha256",
+                  "git_head_before", "permission", "cwd"):
+        assert env.get(field), ("a denial dropped %r, which was resolved before the gate ran"
+                                % field)
+    assert "permission_flags" not in env, (
+        "permission_flags describes an execution that never happened; reporting the target "
+        "backend's sandbox flags for a REFUSED dispatch states something untrue")
+    assert "agents_dir" not in env, (
+        "the receipt never stored agents_dir, so advertising the key made the denial look "
+        "like it carried evidence it did not have")
+
+    # a missing receipt must degrade, never explode: a denial is already a bad moment
+    bare = rs._enrich_denial({"status": "blocked"}, None, inv)
+    assert bare.get("permission") == "read-only" and bare.get("status") == "blocked"
+
+    # BOTH call sites must route through the helper
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "run_subagent.py"), encoding="utf-8").read()
+    assert src.count("_enrich_denial(") >= 3, (
+        "every blocked_envelope() site must go through the shared enrichment (definition + "
+        "two call sites expected); found %d references" % src.count("_enrich_denial("))
+
+
+def test_v9_leak_detector_repairs_module_attributes_it_detects():
+    """Two gaps, both from certification review. `_resolver._agy_live_models` is patched by
+    this suite and was not fingerprinted at all. And a DETECTED leak on a module attribute
+    (`_gate.decide`) was named and then left installed -- the recovery loop had branches for
+    os/env/sys/time/subprocess and nothing generic -- so every later test still ran against
+    the patched function. Detecting without repairing is half a guard."""
+    import _gate
+    import _resolver
+
+    fp = _global_fingerprint()
+    for required in ("_resolver._agy_live_models", "_gate.decide", "_council._dispatch"):
+        assert required in fp, ("%s is patched by this suite but not fingerprinted" % required)
+
+    before = _global_fingerprint()
+    real = _gate.decide
+    try:
+        _gate.decide = lambda *a, **k: None
+        after = _global_fingerprint()
+        leaked = [k for k in before if before[k] is not after[k] and before[k] != after[k]]
+        assert "_gate.decide" in leaked, leaked
+        # the runner's generic branch: restore any module attribute it named
+        for k in leaked:
+            if "." in k and not k.startswith(("os.", "env.", "sys.", "time.", "subprocess.")):
+                _mod_name, _attr = k.rsplit(".", 1)
+                _mod = sys.modules.get(_mod_name)
+                if _mod is not None and before[k] is not None:
+                    setattr(_mod, _attr, before[k])
+        assert _gate.decide is real, (
+            "a detected module-attribute leak was not repaired, so every later test would "
+            "run against the patched function")
+    finally:
+        _gate.decide = real
+
+
 def _global_fingerprint():
     """Identity of the globals these tests monkeypatch.
 
@@ -14279,7 +14426,8 @@ def _global_fingerprint():
                          ("_manifest", ("_dispatch_child",)),
                          ("_council", ("_dispatch", "run_member", "_optin_stage_ctx")),
                          ("_gate", ("decide", "parse_verdict")),
-                         ("_resolver", ("resolve_cli", "discover_models")),
+                         ("_resolver", ("resolve_cli", "discover_models",
+                                        "_agy_live_models", "_codex_default_model_scan")),
                          ("_loader", ("load_agent",)),
                          ("_doctor", ("_default_probe_runner",))):
         _m = sys.modules.get(_mod)
@@ -14342,6 +14490,18 @@ if __name__ == "__main__":
                 elif _k.startswith("subprocess."):
                     import subprocess as _sp2
                     setattr(_sp2, _k.split(".", 1)[1], _before[_k])
+                elif "." in _k:
+                    # GENERIC module-attribute restoration. Without this, a detected leak on
+                    # e.g. `_gate.decide` was NAMED and then left installed -- the detector
+                    # reported the problem and every later test still ran against the patched
+                    # function. Detecting without repairing is half a guard.
+                    _mod_name, _attr = _k.rsplit(".", 1)
+                    _mod = sys.modules.get(_mod_name)
+                    if _mod is not None and _before[_k] is not None:
+                        try:
+                            setattr(_mod, _attr, _before[_k])
+                        except Exception:  # noqa: BLE001
+                            pass
     print("")
     print(f"{len(tests) - failed}/{len(tests)} passed")
     sys.exit(1 if failed else 0)

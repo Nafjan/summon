@@ -6,6 +6,39 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.16.3] - 2026-07-27
+
+The outstanding findings from certification round 2.
+
+### Security
+
+- **A denied dispatch no longer leaves a worktree behind.** `--worktree` creates a branch and
+  a checkout roughly ninety lines BEFORE the gate runs, so a DENY still left
+  `.claude/worktrees/<name>` and `refs/heads/agents/<name>` on disk. The gate exists to
+  authorise side effects and one had already happened before it was asked. Denials now tear
+  it down and report `worktree_removed`; when removal fails the envelope says so and names
+  the path, because a stranded checkout the caller does not know about is worse than one
+  they do.
+
+### Fixed
+
+- **Only one of two denial sites carried provenance.** A refusal during `--retries` used a
+  second `blocked_envelope` call that never got the enrichment -- and the regression test
+  searched only the FIRST textual occurrence of that call, so it passed while the retry path
+  stayed bare. Both sites share one `_enrich_denial` now.
+- **Part of that provenance was untrue.** `cwd` and `agents_dir` were copied from a receipt
+  that never stored them, and `permission_flags` reported the target backend's sandbox flags
+  for a dispatch that never ran. Flags describe an execution; a refused dispatch has none.
+  The tier is reported because it is a property of the request.
+- **The leak detector named module-attribute leaks without repairing them.** Its recovery
+  loop had branches for os / env / sys / time / subprocess and nothing generic, so a detected
+  `_gate.decide` leak was reported and left installed for every later test.
+  `_resolver._agy_live_models`, patched by this suite, was not fingerprinted at all.
+
+### Testing
+
+408/408 discovery, 22/22 install. Eleven mutants killed across this batch and 0.16.2.
+
 ## [0.16.2] - 2026-07-27
 
 Cross-vendor adversarial review of 0.16.0, an hour after it shipped. Three real defects in
