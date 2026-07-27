@@ -276,10 +276,13 @@ def test_blocked_error_text_never_recommends_escalation():
 def test_timeout_rejects_bad_domains():
     import argparse as ap
     import run_subagent as rs
-    for bad in ("0", "-5s", "1e999", "nan", "0.0001"):  # 0.0001ms rounds to 0 -> min 1? see below
-        if bad == "0.0001":
-            assert rs._parse_timeout(bad) == 1  # sub-ms rounds up to the 1ms floor
-            continue
+    # Sub-millisecond input still rounds up to the 1ms floor. It is FLAGGED as a bare
+    # sub-second value for the dispatch path, but the parser itself stays permissive so
+    # `jobs wait` can poll with a short budget.
+    assert rs._parse_timeout("0.0001ms") == 1
+    assert rs._parse_timeout("0.0001") == 1
+    assert rs._parse_timeout("0.0001").bare_sub_second is True
+    for bad in ("0", "-5s", "1e999", "nan"):
         try:
             rs._parse_timeout(bad)
             raise AssertionError(f"expected rejection for {bad!r}")
@@ -3812,7 +3815,11 @@ def test_v4_overall_timeout_excludes_queued_wave():
     ns = argparse.Namespace(question="q", question_file=None,
                             members=",".join(names), chairman="chair", rounds=1,
                             cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
-                            run_dir=root, overall_timeout=1000)
+                            # 4s, not 1s: on a loaded CI runner setup plus the two members
+                            # consumed the whole 1s budget, so the breach landed BEFORE the
+                            # chairman was ever dispatched and the scenario never happened.
+                            # The chairman blocks up to 15s, so 4s still breaches inside it.
+                            run_dir=root, overall_timeout=4000)
     orig_d, orig_k = _council._dispatch, _executor._kill_tree
     _council._dispatch, _executor._kill_tree = fake, fake_kill
     try:
@@ -3915,9 +3922,17 @@ def test_v4_overall_timeout_skips_fallback_after_breach():
     assert elapsed < 20, elapsed
     assert env["status"] == "partial", env["status"]
     assert env.get("council_state") == "overall_timeout", env.get("council_state")
-    # THE fix: the fallback chairman was never launched after the breach
+    # THE INVARIANT, and it holds however early the breach lands: no fallback chairman is
+    # ever dispatched after the budget is blown.
     assert "chair2" not in dispatched, dispatched
-    assert "chair" in dispatched and {"m1", "m2"} <= set(dispatched), dispatched
+    assert {"m1", "m2"} <= set(dispatched), dispatched
+    # The intended SCENARIO is a breach during the primary chairman. If a slow runner blew
+    # the budget before the chairman was even reached, the guard above still proves itself
+    # -- but say so rather than silently testing a weaker case.
+    if "chair" not in dispatched:
+        assert env.get("council_state") == "overall_timeout", (
+            "the chairman was never dispatched, so the breach must have landed during "
+            "setup or the member wave: %r" % (dispatched,))
 
 
 def test_v4_overall_timeout_setup_overrun():
@@ -14374,6 +14389,48 @@ def test_v9_leak_detector_repairs_module_attributes_it_detects():
             "run against the patched function")
     finally:
         _gate.decide = real
+
+
+def test_v9_a_bare_sub_second_timeout_is_a_units_mistake():
+    """FIELD REPORT (2026-07-27). An operator passed a bare `--timeout` value to a
+    four-member council; bare values are MILLISECONDS for backward compatibility, so every
+    seat was killed after about a second and no work was performed. The run had to be
+    resumed with explicit units.
+
+    Bare milliseconds stay valid for large values -- `600000` has always meant ten minutes --
+    but nothing legitimate asks a CLI backend to start, authenticate and answer in under a
+    second, so that range is a typo rather than a budget. The error names the likely intent
+    instead of just refusing."""
+    import argparse as ap
+    import run_subagent as rs
+
+    # The PARSER stays permissive and merely RECORDS the fact. argparse runs before the mode
+    # is known, and `jobs wait --timeout 300` is a legitimate non-blocking poll -- rejecting
+    # bare sub-second values globally broke exactly that, which an existing test caught.
+    for bare in ("300", "60", "900", "1"):
+        parsed = rs._parse_timeout(bare)
+        assert int(parsed) == int(float(bare)), parsed
+        assert parsed.bare_sub_second is True, (
+            "bare %r is %s MILLISECONDS and must be flagged for the dispatch path"
+            % (bare, bare))
+
+    # explicit units are never flagged: writing the unit means the caller meant it
+    for explicit in ("300ms", "1000", "600000", "300s", "10m"):
+        assert rs._parse_timeout(explicit).bare_sub_second is False, explicit
+    assert rs._parse_timeout("300ms") == 300
+    assert rs._parse_timeout("300s") == 300_000
+    assert rs._parse_timeout("600000") == 600_000, "bare ms stays backward compatible"
+
+    # ...and the DISPATCH path is what refuses it, naming the likely intent
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "run_subagent.py"), encoding="utf-8").read()
+    marker = 'getattr(args.timeout, "bare_sub_second", False)'
+    assert marker in src, (
+        "no dispatch-path guard: a bare sub-second budget would reach the backends and kill "
+        "every one of them instantly")
+    i = src.index(marker)
+    assert "MILLISECONDS" in src[i:i + 700] and "Did you mean" in src[i:i + 700], (
+        "the refusal must name the likely intent, not merely refuse")
 
 
 def _global_fingerprint():

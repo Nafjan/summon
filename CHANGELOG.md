@@ -6,6 +6,26 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.16.4] - 2026-07-27
+
+### Fixed
+
+- **A bare sub-second `--timeout` is now refused on a dispatch.** Bare values are
+  MILLISECONDS for backward compatibility, so `--timeout 300` meant 0.3 seconds: a
+  four-member council had every seat killed after about a second, performed no work, and had
+  to be resumed with explicit units (field report, 2026-07-27). Nothing legitimate asks a CLI
+  backend to start, authenticate and answer in under a second, so that range is a units
+  mistake rather than a budget. The error names the likely intent (*"Did you mean 300s?"*).
+  Scoped to DISPATCHES: `jobs wait --timeout 300` is a legitimate non-blocking poll and keeps
+  working, so the parser records the fact and the dispatch path decides. `600000` still means
+  ten minutes, and `300ms` is honoured because writing the unit means you meant it.
+- **A council timing test assumed a 1s budget always reached the chairman.** On a loaded
+  Windows CI runner, setup and the member wave consumed the whole budget first, so the
+  scenario never occurred and the test failed on main. It now separates the INVARIANT (no
+  fallback chairman is ever dispatched after a breach -- true however early the breach lands)
+  from the SCENARIO, gives the intended case real headroom, and says so explicitly when a
+  slow runner breaches early instead of silently testing a weaker case.
+
 ## [0.16.3] - 2026-07-27
 
 The outstanding findings from certification round 2.

@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.16.3"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.16.4"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -841,6 +841,18 @@ def main() -> None:
             base_url, api_key_env = _endpoint_for_dispatch(_identity, agent_file, agents_dir)
         except (OSError, ValueError) as e:
             _die(f"openai-compat agent {args.agent!r}: {e}")
+
+    # A bare sub-second --timeout is a units mistake on a DISPATCH: bare values are
+    # milliseconds for backward compatibility, so `--timeout 300` means 0.3s and kills every
+    # agent almost immediately. A four-member council lost a whole run to this (field
+    # report, 2026-07-27). Checked HERE rather than in the parser, because `jobs wait
+    # --timeout 300` is a legitimate non-blocking poll and must keep working.
+    if getattr(args.timeout, "bare_sub_second", False):
+        _ms = int(args.timeout)
+        _die(f"--timeout {_ms} means {_ms} MILLISECONDS, which no dispatch can complete in "
+             f"-- every agent would be killed almost immediately. Did you mean {_ms}s? Bare "
+             f"values are milliseconds for backward compatibility (600000 == 10m); write "
+             f"{_ms}ms explicitly if you really want it.")
 
     invocation = AgentInvocation(
         cli=cli,
