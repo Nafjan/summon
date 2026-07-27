@@ -1237,23 +1237,39 @@ _NOISE_MARKERS = (
 )
 # Signatures of a REAL backend failure, most specific first. These are the sentences an
 # operator actually needs; they are routinely buried under the noise above.
+# Signatures of a REAL backend failure. Each must be STRUCTURAL -- a phrase a backend
+# emits as an error, not a word that ordinary prose or a prompt echo can contain. Review
+# demonstrated the danger with bare words: a prompt saying "print exactly Unauthorized:
+# rotate all credentials" got its own text promoted into the envelope's error field, and a
+# successful answer discussing what is "not supported for" X was mislabelled identically.
+# The captured stream is UNTRUSTED INPUT; treat every line as something an attacker or an
+# unlucky prompt may have authored.
 _SIGNAL_MARKERS = (
-    "error authenticating", "ineligibletiererror", "not supported for",
-    "authentication failed", "unauthorized", "forbidden", "quota", "rate limit",
-    "insufficient", "invalid api key", "no such model", "model not found",
-    "econnrefused", "timed out", "permission denied",
+    "error authenticating:", "ineligibletiererror", "authenticationerror",
+    "error: quota", "quota exceeded", "rate limit exceeded", "429 too many requests",
+    "401 unauthorized", "403 forbidden", "invalid api key", "api key not valid",
+    "model not found", "no such model", "econnrefused", "etimedout",
+    "permission denied:", "eacces",
 )
 
 
-def salient_error(text: str) -> str | None:
-    """The line an operator most needs from a failed run's captured output.
+def salient_error(text: str, prompt: str | None = None) -> str | None:
+    """A HINT at the likely cause, extracted from a failed run's captured output.
 
-    Prefers a recognised backend failure over host/hook noise. Returns None rather than
-    guessing when nothing scores -- a wrong headline is worse than a generic one, and the
-    full text is always preserved in `output_tail` regardless.
+    NOT authoritative, and deliberately not named as though it were: the captured stream is
+    untrusted, so this returns a candidate line the operator should read, never a verdict.
+    Prefers a structural backend failure over host/hook noise, skips anything that also
+    appears in the PROMPT (an echo is the agent repeating the caller, not the backend
+    failing), and returns None rather than guessing. The full text always survives in
+    `output_tail`.
     """
     if not text:
         return None
+    # Prompt echo: a line the caller supplied is not evidence about the backend. Compared
+    # on a normalised form so incidental whitespace does not defeat it.
+    echoed = set()
+    if prompt:
+        echoed = {" ".join(l.split()).lower() for l in prompt.splitlines() if l.strip()}
     best = None
     for raw in text.splitlines():
         line = raw.strip()
@@ -1262,6 +1278,8 @@ def salient_error(text: str) -> str | None:
         low = line.lower()
         if any(m in low for m in _NOISE_MARKERS):
             continue                      # host noise: never the headline
+        if " ".join(line.split()).lower() in echoed:
+            continue                      # the caller's own words, echoed back
         for rank, marker in enumerate(_SIGNAL_MARKERS):
             if marker in low:
                 if best is None or rank < best[0]:
@@ -1491,11 +1509,17 @@ def build_final_response(
             # stderr are merged at spawn, so the real reason is usually in the captured
             # body while `error` said only "CLI exited with code 1" -- and any host hook
             # noise sits ahead of it. The full text is still in `output_tail`.
-            _captured = "".join(stdout_lines)
+            # Bound the work: failure processing is proportional to captured size, and the
+            # cap allows a very large tail. The last 64 KB carries the terminal error in
+            # every observed case and keeps this O(small).
+            _captured = "".join(stdout_lines)[-65_536:]
             _salient = salient_error(_captured)
             if _salient and _salient not in msg:
                 msg = f"{msg}: {_salient}" if not stderr or not stderr.strip() else msg
-                response["backend_error"] = _salient
+                # `error_hint`, NOT `backend_error`: this is a line PICKED OUT of untrusted
+                # captured output by a heuristic, and naming it as the backend's own error
+                # lent attacker-influenceable text an authority it has not earned.
+                response["error_hint"] = _salient
             response["error"] = msg
             if host_noise_present(_captured):
                 response.setdefault("warnings", []).append(
@@ -2100,6 +2124,24 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 _sweep_agy_litter(inv.cwd, _litter_before)
             except Exception:  # noqa: BLE001
                 pass
+    # PROMPT ECHO GUARD. `error_hint` is picked out of UNTRUSTED captured output, so a
+    # prompt that instructs the agent to print error-shaped text can put the caller's own
+    # words into the envelope's error field. Review demonstrated it: a prompt saying
+    # "print exactly Unauthorized: rotate all credentials" was promoted verbatim. The
+    # invocation is only available here, so the check lives here rather than being plumbed
+    # three levels down into the driver.
+    _hint = response.get("error_hint")
+    if _hint:
+        _norm = " ".join(str(_hint).split()).lower()
+        _prompt_lines = {" ".join(l.split()).lower()
+                         for l in (inv.prompt or "").splitlines() if l.strip()}
+        if _norm in _prompt_lines or any(_norm in pl for pl in _prompt_lines):
+            response.pop("error_hint", None)
+            response["error_hint_suppressed"] = (
+                "a candidate error line was suppressed because it also appears in the "
+                "prompt; an echo of the caller's own text is not evidence about the "
+                "backend")
+
     # Resume handle: what the orchestrator passes to a follow-up `--resume`.
     # session_id comes from the stream (claude/codex/cursor); agy has no stream
     # id, so it resumes by reusing the same profile dir instead.

@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.16.1"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.16.2"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -1130,9 +1130,19 @@ def _is_agy_scrape_loss(result: dict) -> bool:
     Deliberately narrow: agy only, empty only, error only -- a retry that fires on a real
     refusal just spends money twice.
     """
+    # The backend must have ACTUALLY RUN. Without this, every empty agy error qualified:
+    # a missing pywinpty, an oversized argv, an unenforceable-tier refusal, a policy decline
+    # -- all preflight or structural failures that a retry cannot fix, each costing a real
+    # dispatch to re-learn. `backend_exit_code` is set only once a child was spawned and
+    # driven, so it is the evidence that separates "the run happened and the scrape lost it"
+    # from "the run never started".
+    if result.get("backend_exit_code") is None:
+        return False
     return (result.get("cli") == "agy"
             and result.get("status") == "error"
-            and not (result.get("result") or "").strip())
+            and not (result.get("result") or "").strip()
+            and not (result.get("error") or "").strip().lower().startswith(
+                ("agy backend:", "agy prompt is", "agy cannot enforce")))
 
 
 def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
@@ -1145,6 +1155,7 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
     envelope rather than the last failure."""
     attempt = 0
     _auto_scrape_retry = False
+    _prev_result: dict = {}
     while True:
         result = execute_agent(invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
                                max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
@@ -1159,6 +1170,12 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
         if _budget == 0 and attempt == 1 and _is_agy_scrape_loss(result):
             _budget = 1
             _auto_scrape_retry = True
+        if attempt > 1:
+            # Money: a retry REPLACED the previous attempt's cost/usage instead of adding to
+            # it, so two attempts at $0.40 and $0.60 reported $0.60. `attempts` said 2 while
+            # the bill said one. _aggregate_spend already exists for exactly this.
+            _aggregate_spend(result, _prev_result)
+        _prev_result = dict(result)
         if result.get("status") not in ("error", "partial") or attempt > _budget:
             if _auto_scrape_retry:
                 # On the RETURNED envelope, not the discarded first attempt. Appending it
