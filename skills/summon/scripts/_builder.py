@@ -450,6 +450,34 @@ def argv_length_error(cli: str, command: str, args: list, env=None) -> str | Non
     return None
 
 
+_FROZEN_BACKENDS = {
+    "gemini": (
+        "the `gemini` CLI backend is FROZEN: Google has stopped updating and supporting it, "
+        "and Gemini Code Assist for individuals now rejects it outright "
+        "(`IneligibleTierError: This client is no longer supported`). summon still dispatches "
+        "to it so existing setups do not break mid-flight, but it is not being developed and "
+        "will not be fixed if the vendor changes it again.\n"
+        "For Gemini models use one of:\n"
+        "  - `agy` (Antigravity), the supported Gemini path and summon's default for Gemini "
+        "work; or\n"
+        "  - `openai-compat` with a GEMINI_API_KEY, which bills the metered API and has no "
+        "subscription-tier eligibility to lose.\n"
+        "Run `doctor --probe` to see whether this account is still eligible at all."),
+}
+
+
+def frozen_backend_warning(cli: str) -> str | None:
+    """A backend summon still supports but no longer recommends, and why.
+
+    Frozen, not removed: breaking a working setup because the vendor stopped caring is the
+    caller's decision to make, not summon's. But the status has to be visible ON THE
+    DISPATCH -- a field report (2026-07-27) had an operator burn two dispatches on a backend
+    whose vendor had already cut them off, because nothing said so until they ran a probe
+    they had no reason to think they needed.
+    """
+    return _FROZEN_BACKENDS.get(cli)
+
+
 def advisory_warnings(cli: str, permission: str, timeout_ms: int | None) -> list:
     """Every advisory warning a dispatch should carry, in ONE place.
 
@@ -459,7 +487,8 @@ def advisory_warnings(cli: str, permission: str, timeout_ms: int | None) -> list
     or an unreadable workspace is still free to fix. A guard test asserts the two paths
     stay identical.
     """
-    return [w for w in (agy_permission_warning(cli, permission),
+    return [w for w in (frozen_backend_warning(cli),
+                        agy_permission_warning(cli, permission),
                         agy_readonly_workspace_warning(cli, permission),
                         agy_timeout_warning(cli, timeout_ms)) if w]
 

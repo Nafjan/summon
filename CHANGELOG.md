@@ -6,6 +6,27 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.16.1] - 2026-07-27
+
+### Changed
+
+- **The `gemini` CLI backend is FROZEN.** Google has stopped updating and supporting it, and
+  Gemini Code Assist for individuals now rejects it outright. Dispatches still run -- breaking
+  a working setup because a vendor stopped caring is the caller's decision, not summon's --
+  but every `--cli gemini` dispatch and `--dry-run` now carries a freeze notice naming the two
+  paths that do work (`agy`, or `openai-compat` with a `GEMINI_API_KEY`) and pointing at
+  `doctor --probe` for a definitive per-account answer. No bundled agent used gemini and it
+  was never a council default, so this affects only explicit `--cli gemini` callers.
+
+### Fixed
+
+- **summon no longer litters the repositories it points agy at.** agy's bundled Go language
+  server writes a glog file into the dispatch's working directory under the literal name
+  `--print` (it picks summon's own flag up as a log target); a 163 KB one was found in this
+  repo. summon spawns agy, so it sweeps that file afterwards -- but only when the file did
+  not exist before the dispatch AND parses as agy's log, because deleting the wrong file in
+  someone's repository is not recoverable.
+
 ## [0.16.0] - 2026-07-27
 
 **From a field report.** An operator ran a day of multi-agent work across all five backends

@@ -14092,6 +14092,71 @@ def test_v9_empty_agy_output_is_named_as_a_scrape_loss():
         "different fact")
 
 
+def test_v9_gemini_backend_is_frozen_and_says_so_on_dispatch():
+    """Google stopped updating and supporting the `gemini` CLI, and Gemini Code Assist for
+    individuals now rejects it outright. A field report (2026-07-27) had an operator burn two
+    dispatches on it because nothing said so until they ran a probe they had no reason to
+    think they needed.
+
+    FROZEN, not removed: breaking a working setup because a vendor stopped caring is the
+    caller's decision. But the status has to be visible ON THE DISPATCH, and it has to name
+    the paths that do work."""
+    from _builder import advisory_warnings, frozen_backend_warning
+
+    w = frozen_backend_warning("gemini")
+    assert w and "FROZEN" in w, w
+    assert "agy" in w and "openai-compat" in w, (
+        "a freeze notice that names no alternative just blocks work: %s" % w)
+    assert "doctor --probe" in w, "point at the command that gives a definitive answer"
+    assert any("FROZEN" in x for x in advisory_warnings("gemini", "read-only", 600_000)), (
+        "the notice must reach the dispatch envelope through the shared assembler")
+    for other in ("claude", "codex", "cursor-agent", "agy", "openai-compat"):
+        assert frozen_backend_warning(other) is None, other
+
+
+def test_v9_summon_cleans_up_agys_stray_language_server_log():
+    """agy's bundled Go language server writes a glog file into the dispatch's working
+    directory under the literal name `--print` (it picks summon's own flag up as a log
+    target). Measured: a 163 KB `--print` left in the repo root after agy runs.
+
+    summon spawns agy, so this is summon's litter to clean -- pointing agy at a repository
+    should not leave junk in it. The sweep is deliberately paranoid: deleting the wrong file
+    in someone's repo is not recoverable, so a pre-existing file, or one that does not look
+    like agy's log, is never touched."""
+    from _executor import _looks_like_agy_log, _sweep_agy_litter
+
+    d = tempfile.mkdtemp(prefix="summon-litter-")
+    try:
+        p = os.path.join(d, "--print")
+        glog = ("I0726 00:28:40.630033 53596 server.go:1423] Starting language server "
+                "process with pid 53596" + chr(10))
+
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(glog)
+        assert _sweep_agy_litter(d, existed_before=False) is True
+        assert not os.path.exists(p), "litter this run created should be gone"
+
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(glog)
+        assert _sweep_agy_litter(d, existed_before=True) is False, (
+            "a file that was already there is not ours to delete")
+        assert os.path.exists(p)
+        os.remove(p)
+
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("my important notes" + chr(10))
+        assert _sweep_agy_litter(d, existed_before=False) is False, (
+            "a real user file that happens to carry this name must survive")
+        assert os.path.exists(p)
+        os.remove(p)
+
+        assert _sweep_agy_litter(d, existed_before=False) is False
+        assert _looks_like_agy_log(os.path.join(d, "nope")) is False
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
 def _global_fingerprint():
     """Identity of the globals these tests monkeypatch.
 
