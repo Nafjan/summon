@@ -17,6 +17,19 @@ import math
 _MAX_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000   # 7 days; see parse_timeout
 
 
+class Milliseconds(int):
+    """A parsed --timeout, carrying whether it was written as a BARE sub-second number.
+
+    argparse runs before the mode is known, and the same flag serves two very different
+    jobs: a DISPATCH budget, where a bare `300` (meaning 0.3s) can only kill every agent
+    instantly, and a `jobs wait` POLL, where "give up after 300ms" is a perfectly sensible
+    non-blocking check. So the parser records the fact and the dispatch path decides --
+    rejecting it globally broke `jobs wait --timeout 300`, which is legitimate.
+    """
+
+    bare_sub_second = False
+
+
 def parse_timeout(value: str) -> int:
     """--timeout accepts bare milliseconds (backward compatible) or a human
     suffix: '90s', '10m', '600000ms'. Returns whole milliseconds (>= 1;
@@ -39,6 +52,12 @@ def parse_timeout(value: str) -> int:
     if not math.isfinite(ms) or ms <= 0:
         raise argparse.ArgumentTypeError(
             f"invalid --timeout {value!r}: must be a positive finite duration")
+    # A BARE value under one second is a units mistake, not a budget. No backend starts,
+    # authenticates and answers in under a second, so `--timeout 300` meaning 0.3s can only
+    # kill the dispatch instantly -- which is exactly what it did to a four-member council
+    # in the field (2026-07-27): every seat killed after ~1s, no work performed. An explicit
+    # `300ms` is still accepted, because someone writing the unit means it.
+    _bare_sub_second = (not s.endswith(("ms", "s", "m"))) and ms < 1000
     # A finite but absurd value ('1e308') survived the checks above and then blew up far
     # downstream as an OverflowError inside threading.Event().wait() -- a traceback instead of a
     # dispatch. Nothing legitimate waits on a sub-agent for over a week, so cap it here where the
@@ -46,7 +65,9 @@ def parse_timeout(value: str) -> int:
     if ms > _MAX_TIMEOUT_MS:
         raise argparse.ArgumentTypeError(
             f"invalid --timeout {value!r}: exceeds the {_MAX_TIMEOUT_MS} ms (7 day) maximum")
-    return max(1, int(round(ms)))
+    out = Milliseconds(max(1, int(round(ms))))
+    out.bare_sub_second = _bare_sub_second
+    return out
 
 
 # --- Fan-out mode flag matrix --------------------------------------------------
