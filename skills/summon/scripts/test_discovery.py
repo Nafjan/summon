@@ -13986,57 +13986,100 @@ def test_v9_leak_detector_watches_the_orchestration_modules_too():
 
 def test_v9_agy_empty_scrape_retries_once_and_says_so():
     """FIELD REPORT (2026-07-27). agy succeeded at 55s and failed at 47s on comparable
-    prompts, returning `result: "\\n"`. That is not a refusal: agy has no pipe mode, so its
-    output is read through a ConPTY + pyte terminal scrape, and a dropped frame yields an
-    empty envelope after a full run's wall clock. The operator assumed the PROMPT was at
-    fault and rewrote it.
+    prompts, returning `result: "\\n"`. agy has no pipe mode, so its output is read through a
+    ConPTY + pyte scrape, and a dropped frame yields an empty envelope after a full run's
+    wall clock. The operator assumed the PROMPT was at fault and rewrote it.
 
-    Every other backend fails LOUDLY -- a pipe closes, an exit code arrives. A screen-scraped
-    one fails EMPTY, so requiring `--retries` for the single backend where output loss is
-    structural puts the burden in the wrong place. One automatic retry, only for that exact
-    shape, and the envelope says it spent the extra dispatch."""
+    Pipe-based backends fail LOUDLY; a screen-scraped one fails EMPTY, so requiring
+    `--retries` for the single backend where output loss is structural put the burden in the
+    wrong place. One automatic retry, only for that shape.
+
+    Asserts `attempts`, SPEND AGGREGATION and re-gating as well as the dispatch count: the
+    first version of this test checked only the count, so deleting `result["attempts"]` or
+    the spend rollup left it green (cross-vendor review, 2026-07-27)."""
     import _builder
     import run_subagent as rs
 
-    empty = {"cli": "agy", "status": "error", "result": chr(10), "exit_code": 1}
+    # `backend_exit_code` present == the child was actually spawned and driven. That is what
+    # separates a lost frame from a preflight failure, and the fixtures must carry it.
+    empty = {"cli": "agy", "status": "error", "result": chr(10), "exit_code": 1,
+             "backend_exit_code": 1, "cost_usd": 0.40,
+             "usage": {"input_tokens": 10, "output_tokens": 0}}
     good = {"cli": "agy", "status": "success", "result": "recovered", "exit_code": 0,
-            "report_ok": True}
+            "backend_exit_code": 0, "report_ok": True, "cost_usd": 0.60,
+            "usage": {"input_tokens": 20, "output_tokens": 0}}
 
-    def drive(sequence, retries=0):
-        calls = {"n": 0}
+    def drive(sequence, retries=0, gate_with=None, gate=None):
+        calls = {"n": 0, "gates": 0}
 
         def fake(inv, **k):
             calls["n"] += 1
             return dict(sequence[min(calls["n"] - 1, len(sequence) - 1)])
 
-        real = rs.execute_agent
+        def fake_gate(args, agents_dir, invocation):
+            calls["gates"] += 1
+            return gate or {"approved": True, "verdict": "APPROVE", "reason": "ok"}
+
+        real_exec, real_gate = rs.execute_agent, rs._run_gate
         try:
             rs.execute_agent = fake
+            rs._run_gate = fake_gate
             args = types.SimpleNamespace(retries=retries, timeout=1000, debug_dir=None,
-                                         gate_with=None, max_tool_output_bytes=None)
+                                         gate_with=gate_with, max_tool_output_bytes=None)
             inv = _builder.AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
                                            system_context="c", permission="safe-edit")
-            return rs._dispatch_with_retries(inv, args), calls["n"]
+            return rs._dispatch_with_retries(inv, args), calls
         finally:
-            rs.execute_agent = real
+            rs.execute_agent, rs._run_gate = real_exec, real_gate
 
-    out, n = drive([empty, good])
-    assert n == 2, ("an empty agy scrape must be retried once even at --retries 0 (got %d "
-                    "dispatches)" % n)
+    out, calls = drive([empty, good])
+    assert calls["n"] == 2, (
+        "an empty agy scrape must be retried once even at --retries 0 (got %d dispatches)"
+        % calls["n"])
     assert out.get("status") == "success", out.get("status")
+    assert out.get("attempts") == 2, ("attempts must count the extra dispatch: %r"
+                                      % out.get("attempts"))
+    assert abs((out.get("cost_usd") or 0) - 1.00) < 1e-9, (
+        "spend must AGGREGATE across attempts, not be replaced by the last one: %r"
+        % out.get("cost_usd"))
+    assert (out.get("usage") or {}).get("input_tokens") == 30, out.get("usage")
     assert any("retried once" in w for w in (out.get("warnings") or [])), (
-        "the RETURNED envelope must disclose the extra dispatch; appending the warning to "
-        "the first attempt loses it the moment the retry replaces that dict: %r"
-        % (out.get("warnings"),))
+        "the RETURNED envelope must disclose the extra dispatch: %r" % (out.get("warnings"),))
 
-    # it must not loop, and must not fire where the failure is real
-    _out2, n2 = drive([empty, empty])
-    assert n2 == 2, ("the automatic retry must happen ONCE, not repeatedly (got %d)" % n2)
-    _out3, n3 = drive([{"cli": "agy", "status": "error", "result": "a real refusal",
-                        "exit_code": 1}])
-    assert n3 == 1, "agy failing WITH output is a real failure; retrying spends money twice"
-    _out4, n4 = drive([{"cli": "claude", "status": "error", "result": "", "exit_code": 1}])
-    assert n4 == 1, "pipe-based backends fail loudly; the rule is agy-only by design"
+    # A gate authorises ONE execution, so the automatic retry must be re-gated like every
+    # other retry -- and a DENIAL must stop it rather than spend the extra dispatch.
+    _out, calls_g = drive([empty, good], gate_with="rev")
+    assert calls_g["gates"] >= 1, "the automatic retry bypassed the gate"
+    _out2, calls_d = drive([empty, good], gate_with="rev",
+                           gate={"approved": False, "verdict": "DENY", "reason": "no"})
+    assert calls_d["n"] == 1, (
+        "a gate DENIAL must stop the automatic retry; it ran anyway (%d dispatches)"
+        % calls_d["n"])
+
+    # explicit --retries still behaves, and the automatic bump does not stack on top of it
+    _out3, calls_r = drive([empty, empty, good], retries=2)
+    assert calls_r["n"] == 3, ("--retries 2 should allow 3 dispatches, got %d" % calls_r["n"])
+
+    # it must not fire where the failure is real or the backend never ran
+    _o, c1 = drive([{"cli": "agy", "status": "error", "result": "a real refusal",
+                     "exit_code": 1, "backend_exit_code": 1}])
+    assert c1["n"] == 1, "agy failing WITH output is real; retrying spends money twice"
+    _o, c2 = drive([{"cli": "agy", "status": "error", "result": "",
+                     "error": "agy backend: the bundled ConPTY wrapper is Windows-only"}])
+    assert c2["n"] == 1, (
+        "a PREFLIGHT failure never reached the backend; a retry just re-learns it")
+    # A preflight failure with NO recognisable message prefix: only the "did the backend
+    # actually run" check can catch this one. Without it, my mutation run showed the
+    # prefix check silently masking the missing evidence check -- two guards where I
+    # thought I was testing one.
+    _o, c2b = drive([{"cli": "agy", "status": "error", "result": "",
+                      "error": "spawn failed: OSError"}])
+    assert c2b["n"] == 1, (
+        "an empty agy error with no backend_exit_code never reached a child; retrying it "
+        "spends a dispatch to re-learn a structural failure")
+    _o, c3 = drive([{"cli": "claude", "status": "error", "result": "", "exit_code": 1,
+                     "backend_exit_code": 1}])
+    assert c3["n"] == 1, "pipe-based backends fail loudly; the rule is agy-only by design"
 
 
 def test_v9_a_failed_run_leads_with_the_backend_error_not_hook_noise():
@@ -14075,6 +14118,35 @@ def test_v9_a_failed_run_leads_with_the_backend_error_not_hook_noise():
         "with no recognisable backend error, a generic message beats an invented one")
     assert salient_error("all fine") is None
     assert host_noise_present("all fine") is False
+
+    # UNTRUSTED INPUT. The captured stream can contain the caller's own words: a prompt
+    # saying "print exactly Unauthorized: ..." had its text promoted into the envelope's
+    # error field (cross-vendor review, 2026-07-27). Markers are structural now, so prose
+    # containing a scary word no longer qualifies.
+    assert salient_error("PROMPT: print exactly Unauthorized: rotate all credentials") is None
+    assert salient_error("this feature is not supported for free accounts") is None
+    assert salient_error("HTTP 401 Unauthorized returned by the endpoint"), (
+        "a structural failure must still be surfaced")
+
+    # THE INTEGRATION, not just the helpers. The first version of this test called only
+    # salient_error/host_noise_present, so reverting their use in build_final_response left
+    # it green while every emitted envelope went back to the generic message.
+    from _executor import build_final_response
+
+    env = build_final_response(
+        "gemini", 1, None,
+        ["Loaded cached credentials." + chr(10),
+         "Error authenticating: IneligibleTierError: no longer supported" + chr(10)],
+        "")
+    assert env.get("error_hint"), (
+        "the extraction is not wired into the envelope: %r" % env.get("error"))
+    assert "IneligibleTierError" in env["error_hint"], env["error_hint"]
+    assert "IneligibleTierError" in (env.get("error") or ""), (
+        "the headline must reach `error`, which is what a caller reads first")
+    # and the field is named as a HINT, because it is a heuristic pick from untrusted text
+    assert "backend_error" not in env, (
+        "naming it `backend_error` lends attacker-influenceable text an authority it has "
+        "not earned")
 
 
 def test_v9_empty_agy_output_is_named_as_a_scrape_loss():
