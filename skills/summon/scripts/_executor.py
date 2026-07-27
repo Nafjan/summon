@@ -1972,7 +1972,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # at read-only, where the workspace is withheld because agy cannot enforce that tier.
         # The other thing that bites is the clock: agy is multi-step, so a short budget kills
         # it mid-work. Both live in advisory_warnings, shared with --dry-run.
-        for _w in advisory_warnings(inv.cli, inv.permission, timeout_ms):
+        for _w in advisory_warnings(inv.cli, inv.permission, timeout_ms, inv.model):
             resp.setdefault("warnings", []).append(_w)
         try:
             resp["permission_flags"] = permission_flags(inv.cli, inv.permission)
