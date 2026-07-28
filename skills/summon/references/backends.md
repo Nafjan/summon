@@ -14,7 +14,7 @@ Pure stdlib HTTP, no SDK. This bills your **API key/credits**, not a subscriptio
 ---
 run-agent: openai-compat
 provider: openrouter                 # or: openai / anthropic / google / groq / ollama / lmstudio / <your provider>
-model: anthropic/claude-3.5-sonnet   # the API's model id
+model: anthropic/claude-sonnet-5   # the API's model id
 ---
 ```
 or point anywhere directly (no provider needed):

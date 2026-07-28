@@ -1,7 +1,7 @@
 ---
 run-agent: openai-compat
 provider: openrouter
-model: anthropic/claude-3.5-sonnet
+model: anthropic/claude-sonnet-5
 permission: read-only
 ---
 
@@ -29,3 +29,8 @@ SUMMARY: <one sentence>
 FINDINGS: <your work product>, or "none"
 FOLLOW-UP: <recommended next actions>, or "none"
 HANDOFF: <context the orchestrator must pass into the next call>, or "none"
+
+<!-- Model id follows OpenRouter's `vendor/model` convention. Their roster is
+     their own and summon cannot enumerate it, so confirm the current id against
+     OpenRouter's model list before relying on this example. The previous value
+     (anthropic/claude-3.5-sonnet) was RETIRED 2025-10-28 and would 404. -->

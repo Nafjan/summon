@@ -22,10 +22,13 @@ reaches an agent depends only on how that agent names its model:
 > dispatch envelope reports `model.served` (the model that actually did the work, on
 > evidence; `model.targeted` is what the session was pointed at, and `resolved` is the
 > legacy field) — check it. For **guaranteed-latest**, pin the explicit version ID
-> (`claude-sonnet-5`, `claude-opus-4-8`) and re-verify when a new model ships; for
+> (`claude-sonnet-5`, `claude-opus-5`) and re-verify when a new model ships; for
 > **auto-float-when-it-works**, use the alias but confirm `model.served` is what you
-> expect. This roster pins Sonnet explicitly (its alias lagged) and leaves `opus` as an
-> alias (verified serving 4.8).
+> expect. This roster pins EVERY claude agent to a full version id -- both aliases were
+> observed lagging, so nothing here floats. A guard test binds this table to the
+> agents' own frontmatter, because a hand-maintained roster drifts the moment a
+> model ships (it had already drifted to `opus -> 4.8` while the agents were pinned
+> to claude-opus-5).
 
 `--list-models` answers "what can each backend run *right now*" live where the CLI
 exposes it. Each entry is tagged with a `source` so you know how much to trust it:
@@ -53,7 +56,7 @@ serving via `model.resolved` at snapshot time:
 
 | Agents | Backend | Model (verified) | Use for |
 |---|---|---|---|
-| `planner`, `architect`, `deep-debugger`, `security-auditor` | claude | `opus` → claude-opus-4-8 | planning, architecture, gnarly debugging, security audits |
+| `planner`, `architect`, `deep-debugger`, `security-auditor` | claude | `claude-opus-5` (pinned) | planning, architecture, gnarly debugging, security audits |
 | `fable` | claude | `claude-fable-5` | escalation tier: hardest problems, highest-stakes calls |
 | `pair`, `editor`, `quick-reviewer`, `pr-prep` | claude | `claude-sonnet-5` | balanced general work, prose, fast reviews, PR prep |
 | `reviewer`, `adversarial-reviewer`, `implementer`, `debugger`, `test-author` | codex | config default (gpt-5.6-sol at snapshot) | code review, adversarial passes, implementation, tests |
@@ -74,12 +77,14 @@ changes as Cursor adds models). Because summon passes `--model` through verbatim
 them is reachable through summon with no code change:
 
 ```
-run_subagent.py --agent coder --cli cursor-agent --model claude-opus-4-8-thinking-high --prompt "..."
+run_subagent.py --agent coder --cli cursor-agent --model <cursor-model-id> --prompt "..."
 run_subagent.py --agent coder --cli cursor-agent --model gpt-5.6-sol-high --prompt "..."
 ```
 
 Cursor's parameterized model syntax works too (the string is forwarded untouched):
-`--model 'claude-opus-4-8[context=1m,effort=high,fast=false]'`.
+`--model '<cursor-model-id>[context=1m,effort=high,fast=false]'`. The ids above are
+SYNTAX illustrations, not a current roster -- summon cannot enumerate cursor's models
+(`--list-models` reports `source: static` for it), so check Cursor's own model list.
 
 **Why this matters:** for a user who already has a Cursor sub, the `cursor-agent` backend
 is a practical **cross-vendor fallback**: a way to reach GPT, Claude, Gemini, Grok, and

@@ -12,7 +12,7 @@ Agent frontmatter (two equivalent styles):
     ---                                   ---
     run-agent: openai-compat              run-agent: openai-compat
     provider: openrouter                  base_url: http://localhost:11434/v1
-    model: anthropic/claude-3.5-sonnet    api_key_env: ""        # local, no key
+    model: anthropic/claude-sonnet-5    api_key_env: ""        # local, no key
     ---                                   model: llama3.1
                                           ---
 

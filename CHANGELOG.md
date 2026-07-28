@@ -6,6 +6,37 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.17.1] - 2026-07-27
+
+### Fixed
+
+- **An example agent pinned a RETIRED model.** `openrouter-example` shipped
+  `anthropic/claude-3.5-sonnet`, retired 2025-10-28 -- a file whose entire job is to be
+  copied, 404-ing on a new user's first dispatch. The same id was in `references/backends.md`
+  and the `_apibackend` docstring. All three now name a current model.
+- **The roster doc disagreed with the agents it described.** `references/models.md` claimed
+  the four deep-reasoning agents ran the `opus` ALIAS resolving to `claude-opus-4-8`; every
+  one of them pins `claude-opus-5` in its own frontmatter, and nothing floats. The doc also
+  told readers to pin `claude-opus-4-8` for guaranteed-latest.
+- **Cursor model ids are marked as syntax illustrations.** summon cannot enumerate cursor's
+  roster (`--list-models` reports `source: static` for it), so naming specific ids there
+  implied a currency summon has no way to check.
+
+### Testing
+
+A guard now BINDS the roster table to the agents' own frontmatter: any claude model the
+table names must be one a bundled agent actually pins, and no bundled agent may point at a
+retired model. This is the eleventh structural guard against the same defect -- a claim and
+its subject maintained separately always drift. 410/410 discovery, 22/22 install; both
+mutants killed.
+
+### Unchanged, deliberately
+
+`agy` really does serve `claude-opus-4-6-thinking` and `claude-sonnet-4-6` -- that is live
+output from `agy models`, not stale documentation. The dated alias-lag measurements in
+`orchestration.md` and `_builder.py` are labelled as observations from 2026-07-25 and
+explicitly not as current fact; they are the reason the pins exist.
+
 ## [0.17.0] - 2026-07-27
 
 ### Changed
