@@ -14461,6 +14461,75 @@ def test_v9_a_bare_sub_second_timeout_is_a_units_mistake():
         "the refusal must name the likely intent, not merely refuse")
 
 
+def test_v9_the_roster_doc_matches_the_agents_it_describes():
+    """`references/models.md` carries a table of which agent runs which model. It is
+    hand-maintained prose about files that live somewhere else -- the exact shape that has
+    drifted in this repo roughly ten times now -- and it HAD drifted: the table said the
+    four deep-reasoning agents ran the `opus` alias resolving to claude-opus-4-8, while
+    every one of them pins `claude-opus-5` in its own frontmatter. Both halves were wrong,
+    and nothing failed.
+
+    So bind the claim to its subject: every full model id the table names for a claude
+    agent must be a model some bundled agent actually pins. A doc that names a model no
+    agent uses is either stale or aspirational, and neither should ship silently."""
+    import re
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    agents_dir = os.path.join(here, "..", "agents")
+    doc = os.path.join(here, "..", "references", "models.md")
+    if not (os.path.isdir(agents_dir) and os.path.isfile(doc)):
+        return                       # not an installed layout; nothing to bind
+
+    pinned = set()
+    for fn in os.listdir(agents_dir):
+        if not fn.endswith(".md"):
+            continue
+        with open(os.path.join(agents_dir, fn), encoding="utf-8") as fh:
+            head = fh.read(600)
+        m = re.search(r"^model:\s*(\S+)", head, re.M)
+        if m:
+            pinned.add(m.group(1).strip().strip("\"'"))
+
+    assert pinned, "no bundled agent pins a model; the fixture is wrong, not the doc"
+
+    with open(doc, encoding="utf-8") as fh:
+        text = fh.read()
+
+    # Only the ROSTER TABLE is bound -- prose elsewhere legitimately discusses older models
+    # (alias-lag history, agy's own 4.6-era lanes) and must stay free to do so.
+    rows = [l for l in text.splitlines()
+            if l.startswith("| `") and "| claude |" in l]
+    assert rows, "the claude rows of the roster table are gone; re-anchor this test"
+
+    for row in rows:
+        for model in re.findall(r"claude-(?:opus|sonnet|haiku|fable)-[0-9][0-9a-z.-]*", row):
+            assert model in pinned, (
+                "references/models.md claims a claude agent runs %r, but no bundled agent "
+                "pins it. Pinned models are %s. Either the doc is stale or an agent moved "
+                "-- they must not disagree." % (model, sorted(pinned)))
+
+    # And no bundled agent may point at a model documented as RETIRED: an example agent
+    # that 404s on first dispatch is the worst possible first impression from a file whose
+    # whole job is to be copied (openrouter-example shipped `anthropic/claude-3.5-sonnet`,
+    # retired 2025-10-28, until this guard was written).
+    retired = ("claude-3.5-sonnet", "claude-3-5-sonnet", "claude-3-opus",
+               "claude-3-sonnet", "claude-2.1", "claude-2.0", "claude-3-7-sonnet",
+               "claude-3-5-haiku")
+    for fn in os.listdir(agents_dir):
+        if not fn.endswith(".md"):
+            continue
+        with open(os.path.join(agents_dir, fn), encoding="utf-8") as fh:
+            head = fh.read(600)
+        m = re.search(r"^model:\s*(\S+)", head, re.M)
+        if not m:
+            continue
+        val = m.group(1)
+        for dead in retired:
+            assert dead not in val, (
+                "agent %r pins %r, which is a RETIRED model -- a copied example that 404s "
+                "on first use" % (fn, val))
+
+
 def _global_fingerprint():
     """Identity of the globals these tests monkeypatch.
 
