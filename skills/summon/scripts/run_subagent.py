@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.19.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.19.1"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -178,15 +178,25 @@ def _complete_artifact_provenance(env: dict, args, before: dict | None) -> dict:
     stable = bool(after and not error and after.get("sha256") == before.get("sha256"))
     evidence["stable_during_dispatch"] = stable
     evidence["after_sha256"] = after.get("sha256") if after else None
-    evidence["changed"] = changed_paths(before, after) if not stable else []
+    # If the after-read failed, the changed set is UNKNOWN rather than "every
+    # input changed". Keep the result suspect, but do not manufacture a change
+    # claim that the failed read cannot support.
+    evidence["changed"] = changed_paths(before, after) if after and not stable else []
     if error:
         evidence["after_error"] = error
     env["artifacts"] = evidence
     if not stable:
-        changed = ", ".join(evidence["changed"]) or "the named baseline"
-        env.setdefault("warnings", []).append(
-            "artifact provenance changed during dispatch (%s); the review does not "
-            "describe one stable loose-file baseline" % changed)
+        if error:
+            warning = (
+                "artifact provenance could not be verified after dispatch (%s); "
+                "the review does not describe one verified stable loose-file baseline"
+                % error)
+        else:
+            changed = ", ".join(evidence["changed"]) or "the named baseline"
+            warning = (
+                "artifact provenance changed during dispatch (%s); the review does not "
+                "describe one stable loose-file baseline" % changed)
+        env.setdefault("warnings", []).append(warning)
         # Keep the executor outcome honest while preventing --out/manifest from
         # treating the review as terminal evidence for an unstable corpus.
         if env.get("status") == "success":
