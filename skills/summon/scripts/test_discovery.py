@@ -14521,14 +14521,51 @@ def test_v9_a_denied_dispatch_leaves_no_worktree_behind():
         path = info.get("cwd") or info.get("path")
         assert path and os.path.isdir(path), "the worktree was not created; scenario invalid"
 
-        removed = rs._remove_worktree(info)
-        assert removed is True, "a denied dispatch must be able to tear its worktree down"
+        cleanup = rs._remove_worktree(info)
+        assert cleanup["worktree_removed"] is True, cleanup
+        assert cleanup["branch_removed"] is True and cleanup["preserved"] is False, cleanup
         assert not os.path.exists(path), (
             "the checkout survived a denial: %s" % path)
         branches = _sp.run(["git", "-C", d, "branch", "--list"], capture_output=True,
                            text=True, timeout=30, **run_flags()).stdout
         assert "denied-probe" not in branches, (
             "the branch survived a denial: %r" % branches)
+
+        # A file that appears while the gate runs belongs to the caller/agent, not to
+        # summon. Preserve the checkout and branch, and name the reason.
+        dirty = rs._setup_worktree(d, "denied-dirty", "rev")
+        dirty_path = dirty["path"]
+        precious = os.path.join(dirty_path, "precious-untracked.txt")
+        with open(precious, "w", encoding="utf-8") as fh:
+            fh.write("do not delete")
+        dirty_cleanup = rs._remove_worktree(dirty)
+        assert dirty_cleanup["preserved"] is True, dirty_cleanup
+        assert dirty_cleanup["worktree_removed"] is False, dirty_cleanup
+        assert "uncommitted changes or untracked" in dirty_cleanup["reason"]
+        assert os.path.isfile(precious), "gate denial deleted uncommitted work"
+        dirty_branch = _sp.run(["git", "-C", d, "rev-parse", "--verify", "--quiet",
+                                "refs/heads/" + dirty["branch"]], capture_output=True,
+                               timeout=30, **run_flags())
+        assert dirty_branch.returncode == 0, "gate denial deleted the dirty branch"
+
+        # A new commit leaves status clean, so status alone is insufficient. HEAD must
+        # still equal the exact commit captured when summon created the worktree.
+        committed = rs._setup_worktree(d, "denied-commit", "rev")
+        committed_path = committed["path"]
+        with open(os.path.join(committed_path, "committed.txt"), "w", encoding="utf-8") as fh:
+            fh.write("committed work")
+        _sp.run(["git", "-C", committed_path, "add", "-A"], capture_output=True,
+                timeout=30, **run_flags())
+        made_commit = _sp.run(["git", "-C", committed_path, "commit", "-qm", "agent work"],
+                              capture_output=True, timeout=30, **run_flags())
+        assert made_commit.returncode == 0, made_commit.stderr
+        committed_cleanup = rs._remove_worktree(committed)
+        assert committed_cleanup["preserved"] is True, committed_cleanup
+        assert committed_cleanup["worktree_removed"] is False, committed_cleanup
+        assert "HEAD advanced" in committed_cleanup["reason"], committed_cleanup
+        head_now = _sp.run(["git", "-C", committed_path, "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=30, **run_flags())
+        assert head_now.returncode == 0 and head_now.stdout.strip() != committed["base_head"]
 
         # AND the denial path must actually CALL it. Testing the helper alone left a mutant
         # alive that simply stopped invoking it from the gate-refusal branch -- the teardown
@@ -14549,6 +14586,13 @@ def test_v9_a_denied_dispatch_leaves_no_worktree_behind():
         assert "worktree_removed" in window, (
             "the envelope must report whether the teardown succeeded; a stranded checkout "
             "the caller does not know about is worse than one they do")
+        assert "worktree_cleanup" in window and "worktree_preserved" in window, (
+            "a denial must say that it preserved newly appeared work and why")
+        skill = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                  "SKILL.md"), encoding="utf-8").read()
+        assert "no force-removal or force branch deletion" in skill
+        assert "worktree_preserved:true" in skill, (
+            "public docs must tell an orchestrator when denial cleanup preserved work")
     except FileNotFoundError:
         return                       # no git on PATH; nothing to assert
     finally:
@@ -14618,13 +14662,10 @@ def test_v9_leak_detector_repairs_module_attributes_it_detects():
         after = _global_fingerprint()
         leaked = [k for k in before if before[k] is not after[k] and before[k] != after[k]]
         assert "_gate.decide" in leaked, leaked
-        # the runner's generic branch: restore any module attribute it named
-        for k in leaked:
-            if "." in k and not k.startswith(("os.", "env.", "sys.", "time.", "subprocess.")):
-                _mod_name, _attr = k.rsplit(".", 1)
-                _mod = sys.modules.get(_mod_name)
-                if _mod is not None and before[k] is not None:
-                    setattr(_mod, _attr, before[k])
+        # Exercise the runner's REAL repair layer. The previous regression test
+        # reimplemented the generic branch here, so deleting the harness branch
+        # left the test green: the test performed the restoration it claimed to test.
+        _repair_global_leaks(before, leaked)
         assert _gate.decide is real, (
             "a detected module-attribute leak was not repaired, so every later test would "
             "run against the patched function")
@@ -15059,6 +15100,47 @@ def _global_fingerprint():
     return snap
 
 
+def _repair_global_leaks(before: dict, leaked) -> None:
+    """Restore every global named by the runner's before/after detector."""
+    for key in leaked:
+        if key == "env.snapshot":
+            # Restore the whole mapping: naming individual variables meant a test
+            # that set an UNLISTED one leaked it undetected and unrepaired.
+            want = dict(before[key])
+            for dead in [x for x in os.environ if x not in want]:
+                os.environ.pop(dead, None)
+            for env_key, env_value in want.items():
+                if os.environ.get(env_key) != env_value:
+                    os.environ[env_key] = env_value
+        elif key == "os.environ.id":
+            # Repair keys off the ID, because that is the check that FIRES: a
+            # replacement dict compares EQUAL to the real mapping by value, so the
+            # object comparison never reports a difference.
+            os.environ = before["os.environ.obj"]     # noqa: B003
+        elif key == "os.environ.obj":
+            pass                                      # handled by the id branch
+        elif key == "sys.argv":
+            sys.argv[:] = list(before[key])
+        elif key.startswith("os."):
+            setattr(os, key.split(".", 1)[1], before[key])
+        elif key.startswith("time."):
+            import time as repair_time
+            setattr(repair_time, key.split(".", 1)[1], before[key])
+        elif key.startswith("subprocess."):
+            import subprocess as repair_subprocess
+            setattr(repair_subprocess, key.split(".", 1)[1], before[key])
+        elif "." in key:
+            # Generic module-attribute restoration. Without this, a detected leak
+            # on e.g. `_gate.decide` was named and then left installed.
+            mod_name, attr = key.rsplit(".", 1)
+            module = sys.modules.get(mod_name)
+            if module is not None and before[key] is not None:
+                try:
+                    setattr(module, attr, before[key])
+                except Exception:  # noqa: BLE001
+                    pass
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
@@ -15084,46 +15166,7 @@ if __name__ == "__main__":
                 failed += 1
             print(f"[FAIL] {t.__name__}: LEAKED PATCHED GLOBALS {_leaked} -- restore them "
                   f"in a finally, or every test after this one runs against them")
-            for _k in _leaked:                      # repair so one leak is not N failures
-                if _k == "env.snapshot":
-                    # Restore the whole mapping: naming individual variables meant a test
-                    # that set an UNLISTED one leaked it undetected and unrepaired.
-                    _want = dict(_before[_k])
-                    for _dead in [x for x in os.environ if x not in _want]:
-                        os.environ.pop(_dead, None)
-                    for _kk, _vv in _want.items():
-                        if os.environ.get(_kk) != _vv:
-                            os.environ[_kk] = _vv
-                elif _k == "os.environ.id":
-                    # Repair keys off the ID, because that is the check that FIRES: a
-                    # replacement dict compares EQUAL to the real mapping by value, so the
-                    # object comparison never reports a difference. Restoring here was dead
-                    # code hanging off a branch that could not run.
-                    os.environ = _before["os.environ.obj"]     # noqa: B003
-                elif _k == "os.environ.obj":
-                    pass                          # handled by the id branch
-                elif _k == "sys.argv":
-                    sys.argv[:] = list(_before[_k])
-                elif _k.startswith("os."):
-                    setattr(os, _k.split(".", 1)[1], _before[_k])
-                elif _k.startswith("time."):
-                    import time as _t2
-                    setattr(_t2, _k.split(".", 1)[1], _before[_k])
-                elif _k.startswith("subprocess."):
-                    import subprocess as _sp2
-                    setattr(_sp2, _k.split(".", 1)[1], _before[_k])
-                elif "." in _k:
-                    # GENERIC module-attribute restoration. Without this, a detected leak on
-                    # e.g. `_gate.decide` was NAMED and then left installed -- the detector
-                    # reported the problem and every later test still ran against the patched
-                    # function. Detecting without repairing is half a guard.
-                    _mod_name, _attr = _k.rsplit(".", 1)
-                    _mod = sys.modules.get(_mod_name)
-                    if _mod is not None and _before[_k] is not None:
-                        try:
-                            setattr(_mod, _attr, _before[_k])
-                        except Exception:  # noqa: BLE001
-                            pass
+            _repair_global_leaks(_before, _leaked)  # one leak must not become N failures
     print("")
     print(f"{len(tests) - failed}/{len(tests)} passed")
     sys.exit(1 if failed else 0)

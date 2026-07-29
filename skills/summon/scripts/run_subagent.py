@@ -375,10 +375,17 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
     rel = os.path.relpath(os.path.abspath(cwd), repo)
     sub = os.path.join(wt, rel)
     effective = sub if rel not in (".", "") and not rel.startswith("..") and os.path.isdir(sub) else wt
+    _head = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"],
+                           capture_output=True, text=True, **run_flags())
+    # Cleanup fails closed when this evidence is unavailable: without the exact
+    # commit the new branch began at, a later clean status cannot distinguish
+    # "untouched" from "the gate/misbehaving peer made a commit".
+    base_head = _head.stdout.strip() if _head.returncode == 0 else None
     # `repo` so a later teardown can run `git -C <repo> worktree remove`: git rejects
     # a bare path outside the repository context, which is how the first attempt at
     # denial cleanup silently failed.
-    return {"path": wt, "cwd": effective, "branch": branch, "repo": repo}
+    return {"path": wt, "cwd": effective, "branch": branch, "repo": repo,
+            "base_head": base_head}
 
 
 # --- Background dispatch + jobs queries (moved to _background.py) ---------------
@@ -973,13 +980,15 @@ def main() -> None:
             # and `refs/heads/agents/<name>`. The gate exists to authorise side effects, and
             # one had already happened; removing it is the honest completion of the refusal.
             if worktree_info:
-                _removed = _remove_worktree(worktree_info)
-                _env["worktree_removed"] = _removed
-                if not _removed:
+                _cleanup = _remove_worktree(worktree_info)
+                _env["worktree_removed"] = _cleanup["worktree_removed"]
+                _env["worktree_cleanup"] = _cleanup
+                if _cleanup["preserved"]:
+                    _env["worktree_preserved"] = True
                     _env.setdefault("warnings", []).append(
-                        "the gate denied this dispatch, but its --worktree checkout could "
-                        "not be removed; remove it by hand: "
-                        + str(worktree_info.get("cwd")))
+                        "the gate denied this dispatch, but summon preserved its --worktree "
+                        "because removing it could lose work (%s). Inspect %s and branch %s"
+                        % (_cleanup["reason"], _cleanup["path"], _cleanup["branch"]))
             finalize_exit_fields(_env)
             if args.out:
                 _write_out(args.out, _env)
@@ -1252,23 +1261,32 @@ def _enrich_denial(env: dict, receipt, invocation) -> dict:
     return env
 
 
-def _remove_worktree(info) -> bool:
-    """Tear down a worktree summon created. True when the checkout is gone.
+def _remove_worktree(info) -> dict:
+    """Safely clean a worktree summon created, preserving any work that appeared.
 
     Used when a gate DENIES a dispatch: `--worktree` runs before the gate, so a refusal
     would otherwise leave a real branch and checkout behind -- a side effect from a request
-    that was never authorised.
+    that was never authorised. A concurrent writer or misbehaving gate can touch the tree
+    while approval runs. Deletion is allowed only when BOTH the index/worktree are clean
+    and HEAD still equals the commit captured at creation. Every ambiguous case preserves
+    the checkout and branch.
     """
+    result = {
+        "worktree_removed": False, "branch_removed": False, "preserved": True,
+        "reason": "worktree cleanup lacked creation metadata",
+        "path": None, "branch": None,
+    }
     if not info:
-        return False
+        return result
     # The worktree ROOT, not `cwd`. `_setup_worktree` sets `cwd` to the SUBDIRECTORY
     # mirroring the caller's original --cwd, so when --cwd was a repo subdirectory `cwd`
     # points INSIDE the checkout and `git worktree remove` fails on it -- the denial then
     # left both the checkout and the branch behind (certification round 3).
     path = info.get("path") or info.get("cwd")
     branch = info.get("branch")
+    result["branch"] = branch
     if not path:
-        return False
+        return result
     from _spawn import run_flags
     repo = info.get("repo")
     # `git -C <repo>`: git refuses `worktree remove` on a bare path outside the repository
@@ -1278,19 +1296,74 @@ def _remove_worktree(info) -> bool:
     # leaves the checkout on disk. Normalise separators too: the stored path mixes forward
     # and back slashes on Windows.
     target = os.path.normpath(str(path))
+    result["path"] = target
     base = ["git"] + (["-C", str(repo)] if repo else [])
+    if not repo or not branch or not info.get("base_head"):
+        return result
+    # The helper receives only internal metadata, but keep the destructive target
+    # bounded to the directory _setup_worktree owns.
     try:
-        subprocess.run(base + ["worktree", "remove", "--force", target],
-                       capture_output=True, timeout=30, **run_flags())
-    except Exception:  # noqa: BLE001
-        pass
-    if branch:
-        try:
-            subprocess.run(base + ["branch", "-D", str(branch)],
-                           capture_output=True, timeout=30, **run_flags())
-        except Exception:  # noqa: BLE001
-            pass
-    return not os.path.exists(target)
+        owned_root = os.path.abspath(os.path.join(str(repo), ".claude", "worktrees"))
+        if os.path.commonpath((owned_root, os.path.abspath(target))) != owned_root:
+            result["reason"] = "worktree path is outside summon's owned worktree directory"
+            return result
+    except ValueError:
+        result["reason"] = "worktree path is outside summon's owned worktree directory"
+        return result
+
+    try:
+        status = subprocess.run(["git", "-C", target, "status", "--porcelain=v1",
+                                 "--untracked-files=all"], capture_output=True, text=True,
+                                timeout=30, **run_flags())
+        head = subprocess.run(["git", "-C", target, "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=30, **run_flags())
+    except Exception as e:  # noqa: BLE001
+        result["reason"] = "could not verify worktree identity: %s: %s" % (
+            type(e).__name__, e)
+        return result
+    if status.returncode != 0 or head.returncode != 0:
+        result["reason"] = "could not verify worktree status/HEAD"
+        return result
+    if status.stdout.strip():
+        result["reason"] = "uncommitted changes or untracked files appeared"
+        return result
+    if head.stdout.strip() != info["base_head"]:
+        result["reason"] = "branch HEAD advanced after worktree creation"
+        return result
+
+    # No force flags. If work appears after the checks, git's own clean-worktree
+    # guard refuses removal; if a commit races in, branch -d refuses the unmerged
+    # commit. The two independent guards preserve work across either window.
+    try:
+        removed = subprocess.run(base + ["worktree", "remove", target],
+                                 capture_output=True, text=True, timeout=30, **run_flags())
+    except Exception as e:  # noqa: BLE001
+        result["reason"] = "worktree removal failed: %s: %s" % (type(e).__name__, e)
+        return result
+    result["worktree_removed"] = not os.path.exists(target)
+    if removed.returncode != 0 or not result["worktree_removed"]:
+        result["reason"] = ("git refused worktree removal: "
+                            + (removed.stderr or removed.stdout or "unknown error").strip())
+        return result
+
+    try:
+        deleted = subprocess.run(base + ["branch", "-d", str(branch)],
+                                 capture_output=True, text=True, timeout=30, **run_flags())
+        exists = subprocess.run(base + ["rev-parse", "--verify", "--quiet",
+                                        "refs/heads/" + str(branch)],
+                                capture_output=True, timeout=30, **run_flags())
+        result["branch_removed"] = exists.returncode != 0
+        if deleted.returncode != 0 or not result["branch_removed"]:
+            result["reason"] = ("checkout removed but branch preserved: "
+                                + (deleted.stderr or deleted.stdout or "git refused deletion").strip())
+            return result
+    except Exception as e:  # noqa: BLE001
+        result["reason"] = "checkout removed but branch cleanup failed: %s: %s" % (
+            type(e).__name__, e)
+        return result
+    result["preserved"] = False
+    result["reason"] = "pristine checkout and unchanged branch removed"
+    return result
 
 
 def _regate_or_none(args, agents_dir, invocation):
