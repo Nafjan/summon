@@ -88,6 +88,11 @@ _BLOCKED_TAIL = 800
 # contract — the envelope must not contradict it (that would be the silent-
 # success leak again, on the MOST compliant path). Only ever downgrades.
 _REPORT_TO_ENVELOPE = {"BLOCKED": "blocked", "PARTIAL": "partial", "ERROR": "error"}
+_REVIEW_VERDICTS = {
+    "BLOCK": "block", "DENY": "block",
+    "CONCERNS": "conditional", "CONDITIONAL": "conditional", "UNCERTAIN": "conditional",
+    "CLEAN": "pass", "PASS": "pass", "APPROVE": "pass",
+}
 
 # Envelope schema version — bumped only on a breaking change to the response
 # shape, so an orchestrator can branch on it. Adding fields does NOT bump it.
@@ -98,6 +103,15 @@ def _detect_blocked(text: str) -> list:
     """Approval markers present in the TAIL of the result (case-insensitive)."""
     tail = (text or "")[-_BLOCKED_TAIL:].lower()
     return [m for m in _BLOCKED_MARKERS if m in tail]
+
+
+def _review_verdict(report: dict | None) -> str | None:
+    """Normalize a review decision without conflating it with execution state."""
+    raw = report.get("verdict") if isinstance(report, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    first = raw.strip().split()[0].rstrip("|,:;-").upper()
+    return _REVIEW_VERDICTS.get(first)
 
 
 def parse_report(text: str) -> dict | None:
@@ -161,6 +175,10 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     happen. An orchestrator trusting ``status`` must not collect that as a win.
     """
     response["envelope"] = ENVELOPE_VERSION
+    # Preserve the executor's outcome BEFORE report semantics reconcile the public
+    # status. A successful review can legitimately return VERDICT: BLOCK; a failed
+    # execution cannot. Keeping the two signals separate lets callers branch correctly.
+    response.setdefault("execution_status", response.get("status"))
     # setdefault (not =) so a non-stream backend (openai-compat) that already
     # populated these from its HTTP response isn't clobbered with None.
     response.setdefault("session_id", processor.session_id if processor else None)
@@ -178,6 +196,7 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     response["report_ok"] = bool(
         report and all(b.lower().replace("-", "_") in report for b in _REPORT_BOOKENDS)
     )
+    response["verdict"] = _review_verdict(report)
     # 1) Structured self-report wins over exit-0 "success" (never upgrades).
     if response.get("status") == "success" and report and report.get("status"):
         first = report["status"].split()[0].rstrip("|,").upper()
@@ -208,6 +227,12 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
             )
     if response.get("status") == "success" and not response["report_ok"]:
         response["suspect"] = True
+    # Keep compact structured findings ahead of the potentially long narrative in
+    # serialized envelopes. JSON object order is not semantic, but this makes the
+    # common human/tool streaming path useful without scanning the transcript first.
+    if "result" in response:
+        result_text = response.pop("result")
+        response["result"] = result_text
     return response
 
 
@@ -929,13 +954,14 @@ def _endpoint_state(agents_dir, cwd, agent, defn=None) -> tuple:
 
 # Keys an identity dict carries for the SKIP's benefit that are NOT part of the request
 # (they describe local state, not what was asked), so the fingerprint drops them.
-_IDENTITY_LOCAL = ("_agent_def_state", "_unreadable", "_endpoint", "_agy_account_checked")
+_IDENTITY_LOCAL = ("_agent_def_state", "_unreadable", "_endpoint", "_agy_account_checked",
+                   "_artifact_manifest", "_artifact_error")
 
 
 def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, model=None,
                            effort=None, json_schema=None, resume=None, resume_profile=None,
                            worktree=None, allow_credit=False, gate_with=None,
-                           max_permission=None) -> dict:
+                           max_permission=None, artifacts=None) -> dict:
     """THE request identity, built in ONE place from RAW inputs.
 
     The dispatcher and the manifest parent each used to build their own dict, so a field
@@ -971,13 +997,16 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
                  if _rcli == "openai-compat" else (None, "ok", None))
     _schema = content_state(json_schema or None)
     _memory = content_state(os.path.join(cwd, ".agents", "memory.md") if cwd else None)
+    from _artifacts import build_manifest as _build_artifact_manifest
+    _artifact_manifest, _artifact_error = _build_artifact_manifest(artifacts, cwd)
     # Anything that EXISTS but could not be hashed leaves a hole in the identity, and a hole
     # is not a difference: two different unhashable schemas would hash alike. Record it so
     # the skip can fail closed rather than reuse on an identity it could not fully compute.
     _unreadable = sorted(n for n, st in (("json_schema", _schema[1]),
                                          ("memory", _memory[1]),
                                          ("agent_def", _adef[1]),
-                                         ("endpoint", _endpoint[1]))
+                                         ("endpoint", _endpoint[1]),
+                                         ("artifacts", "unreadable" if _artifact_error else "ok"))
                           if st not in ("ok", "absent", "missing"))
     return {
         # not hashed (local facts, not part of the request); carried so the skip can refuse
@@ -987,6 +1016,8 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         "_agent_def_state": _adef[1],
         "_endpoint": _endpoint[2],
         "_unreadable": ",".join(_unreadable) or None,
+        "_artifact_manifest": _artifact_manifest,
+        "_artifact_error": _artifact_error,
         "agent": agent, "prompt": prompt, "cwd": cwd,
         "cli": cli or None, "model": model or None, "effort": effort or None,
         # The EFFECTIVE model when summon supplies the default itself. Cursor's default is a
@@ -1020,6 +1051,10 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # sweep showed nothing depended on it -- every case it could distinguish is either
         # caught by the content hash or fails at load before producing a result.
         "json_schema_sha256": _schema[0],
+        # Loose inputs are identified by a manifest over relative path + content
+        # hash + size. Unlike a schema path, the artifact filename is part of the
+        # review contract because findings and locators name it.
+        "artifact_manifest_sha256": ((_artifact_manifest or {}).get("sha256")),
         "resume": resume or None,
         # Only during an ACTUAL resume: without --resume the dispatch ignores the profile
         # entirely and builds a fresh one, so fingerprinting the path made two fresh runs
@@ -2075,6 +2110,9 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 f"been rerouted or fallen back)")
         resp["permission"] = inv.permission
         resp["effort"] = inv.effort   # reasoning effort actually applied (None = backend default)
+        # True only for a caller-requested continuation. Automatic schema/report
+        # repair retries have their own explicit fields and do not relabel the root run.
+        resp["resumed"] = bool(inv.resume_id)
         # agy reads --cwd at safe-edit/yolo (summon passes --add-dir since 0.13.9) but NOT
         # at read-only, where the workspace is withheld because agy cannot enforce that tier.
         # The other thing that bites is the clock: agy is multi-step, so a short budget kills

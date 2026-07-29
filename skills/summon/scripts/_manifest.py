@@ -12,7 +12,7 @@ Manifest format (JSON):
     }
 A bare JSON array is accepted as the jobs list. Per-job keys override defaults:
 id, agent, prompt | prompt_file, cwd, cli, model, effort, timeout, retries,
-json_schema, debug_dir. Each job's envelope lands in
+json_schema, debug_dir, artifacts. Each job's envelope lands in
 ``<results-dir>/<id>.json`` (atomic; an existing valid envelope skips the job —
 re-running a crashed swarm resumes where it stopped).
 
@@ -41,7 +41,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 _JOB_KEYS = ("id", "agent", "prompt", "prompt_file", "cwd", "cli", "model",
-             "effort", "timeout", "retries", "json_schema", "debug_dir")
+             "effort", "timeout", "retries", "json_schema", "debug_dir", "artifacts")
 _DEFAULT_CAP = 3
 # The SAME duration ceiling --timeout enforces, so a manifest cannot size the parent
 # watchdog past what the child would ever accept.
@@ -320,6 +320,12 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
         if job.get("json_schema") is not None and not isinstance(job["json_schema"], str):
             return None, (f"job #{i}: json_schema must be a file path (string), "
                           f"got {type(job['json_schema']).__name__}")
+        if job.get("artifacts") is not None:
+            artifacts = job["artifacts"]
+            if (not isinstance(artifacts, list)
+                    or not all(isinstance(p, str) and p for p in artifacts)):
+                return None, (f"job #{i}: artifacts must be an array of non-empty "
+                              "file-path strings")
         # prompt_file is resolved above; json_schema / debug_dir are also passed to
         # the child, which resolves relative paths against ITS cwd (the job's cwd,
         # NOT the manifest dir). Anchor them to the manifest dir here so a relative
@@ -504,7 +510,8 @@ def _job_identity(job: dict, args) -> dict:
         agent=job["agent"], prompt=job["prompt"],
         cwd=os.path.abspath(job.get("cwd") or args.cwd or os.getcwd()),
         agents_dir=args.agents_dir, cli=job.get("cli"), model=job.get("model"),
-        effort=job.get("effort"), json_schema=job.get("json_schema"))
+        effort=job.get("effort"), json_schema=job.get("json_schema"),
+        artifacts=job.get("artifacts"))
 
 
 def _child_cmd(job: dict, args, out_file: str) -> list:
@@ -523,6 +530,8 @@ def _child_cmd(job: dict, args, out_file: str) -> list:
     retries = job.get("retries", args.retries)
     if retries:
         cmd += ["--retries", str(retries)]
+    for artifact in job.get("artifacts") or ():
+        cmd += ["--artifact", artifact]
     return cmd
 
 

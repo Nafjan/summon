@@ -374,6 +374,12 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--json-schema", dest="json_schema",
                         help="Validate the agent's final JSON against this schema file; attach "
                              "parsed/parse_ok; one corrective retry via resume on mismatch")
+    parser.add_argument("--artifact", dest="artifacts", action="append", default=[],
+                        metavar="FILE",
+                        help="Record loose-file provenance for an input under --cwd "
+                             "(repeatable): path, bytes, sha256, and page metadata where "
+                             "available; re-check after dispatch and mark changed baselines "
+                             "suspect")
     parser.add_argument("--no-contract-repair", dest="no_contract_repair", action="store_true",
                         help="Disable the automatic ONE-shot corrective resume that fixes a "
                              "malformed report contract on a suspect success (status=success but "

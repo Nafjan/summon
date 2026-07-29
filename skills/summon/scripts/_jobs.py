@@ -13,7 +13,9 @@ was no way to list, inspect, or wait on jobs. This module adds:
 Threat model (single-user, single-machine): records and results live under a
 per-user directory with the OS's default permissions. summon does not defend
 against a hostile OTHER local user on a shared host -- point ``--job-dir`` at a
-directory only you can read there. Liveness verification and reaping are B5.
+directory only you can read there. Liveness is a process-existence probe, not a
+cryptographic process-identity claim: a sufficiently old record whose pid has
+been reused can still look alive.
 """
 
 from __future__ import annotations
@@ -263,7 +265,59 @@ def _valid_nonce(v) -> bool:
     return isinstance(v, str) and bool(v)
 
 
-def _classify(rec, rec_state: str, result, res_state: str) -> tuple[str, bool]:
+def _pid_liveness(pid) -> str:
+    """``alive`` / ``dead`` / ``unknown`` from a no-side-effect process probe.
+
+    POSIX ``kill(pid, 0)`` checks existence without sending a signal. Windows
+    uses OpenProcess + GetExitCodeProcess so `jobs status` does not shell out to
+    tasklist. Access-denied means the process exists but is protected.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return "unknown"
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return "alive"
+        except ProcessLookupError:
+            return "dead"
+        except PermissionError:
+            return "alive"
+        except OSError:
+            return "unknown"
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        open_process.restype = wintypes.HANDLE
+        get_exit = kernel32.GetExitCodeProcess
+        get_exit.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        get_exit.restype = wintypes.BOOL
+        close = kernel32.CloseHandle
+        close.argtypes = (wintypes.HANDLE,)
+        close.restype = wintypes.BOOL
+        handle = open_process(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            err = ctypes.get_last_error()
+            if err == 87:                         # ERROR_INVALID_PARAMETER: no such pid
+                return "dead"
+            if err == 5:                          # ERROR_ACCESS_DENIED: protected but alive
+                return "alive"
+            return "unknown"
+        try:
+            code = wintypes.DWORD()
+            if not get_exit(handle, ctypes.byref(code)):
+                return "unknown"
+            return "alive" if code.value == 259 else "dead"  # STILL_ACTIVE
+        finally:
+            close(handle)
+    except Exception:  # noqa: BLE001 - a status query must stay fail-soft
+        return "unknown"
+
+
+def _classify(rec, rec_state: str, result, res_state: str,
+              pid_liveness: str | None = None) -> tuple[str, bool]:
     """(state, trusted). corrupt is REACHABLE: a malformed record or a malformed
     result file classifies the job corrupt rather than silently reading as
     missing/running. Never trusts a result it cannot authenticate against the
@@ -286,7 +340,11 @@ def _classify(rec, rec_state: str, result, res_state: str) -> tuple[str, bool]:
     # no result yet
     if rec.get("pid") is None:
         return "prepared", False      # spawn unconfirmed (likely died between phases)
-    return "running", False           # pid known; liveness NOT verified (B5)
+    if pid_liveness == "alive":
+        return "running", False
+    if pid_liveness == "dead":
+        return "stale", False          # child is gone and never wrote a result
+    return "unverified", False         # probe unavailable; never assert "running"
 
 
 def job_status(root: str, job_id: str) -> dict | None:
@@ -299,13 +357,17 @@ def job_status(root: str, job_id: str) -> dict | None:
     result, res_state = _read(rpath)
     if rec_state == _MISSING and res_state == _MISSING:
         return None
-    state, trusted = _classify(rec, rec_state, result, res_state)
+    liveness = None
+    if rec is not None and result is None and rec.get("pid") is not None:
+        liveness = _pid_liveness(rec.get("pid"))
+    state, trusted = _classify(rec, rec_state, result, res_state, liveness)
     return {
         "job_id": job_id, "state": state, "trusted": trusted,
         "agent": (rec or {}).get("agent"),
         "pid": (rec or {}).get("pid"),
         "prepared_at": (rec or {}).get("prepared_at"),
         "spawned_at": (rec or {}).get("spawned_at"),
+        "liveness": liveness,
         "result_file": rpath if res_state == _OK else None,
         "result_status": (result or {}).get("status"),
         "record": rec, "result": result,
@@ -334,7 +396,8 @@ def list_jobs(root: str) -> list[dict]:
         st = job_status(root, jid)
         if st:
             rows.append({k: st[k] for k in ("job_id", "state", "trusted", "agent",
-                                            "pid", "prepared_at", "result_status")})
+                                            "pid", "prepared_at", "result_status",
+                                            "liveness")})
     rows.sort(key=lambda r: r.get("prepared_at") or 0, reverse=True)
     return rows
 
@@ -344,7 +407,9 @@ def wait_job(root: str, job_id: str, timeout_ms: int, poll_sec: float = 0.5):
     unverifiable, or corrupt file present at the path is skipped until the
     current child replaces it with a nonce-matching result or the deadline
     passes. Returns ``(result_envelope, "done")`` or ``(None, "timeout")``.
-    Raises ValueError on a bad id."""
+    Returns ``(None, "stale")`` as soon as the recorded process is gone with no
+    result, rather than burning the caller's whole wait budget. Raises ValueError
+    on a bad id."""
     if not valid_job_id(job_id):
         raise ValueError(f"invalid job id: {job_id!r}")
     deadline = time.monotonic() + max(0.0, timeout_ms / 1000)
@@ -358,6 +423,9 @@ def wait_job(root: str, job_id: str, timeout_ms: int, poll_sec: float = 0.5):
                 return result, "done"
             # unverifiable/corrupt/nonce-not-yet-matching: keep waiting for the
             # child's own write (deterministic: never returns an untrusted result)
+        if rec is not None and rec.get("pid") is not None \
+                and _pid_liveness(rec.get("pid")) == "dead":
+            return None, "stale"
         if time.monotonic() >= deadline:
             return None, "timeout"
         time.sleep(min(poll_sec, max(0.0, deadline - time.monotonic())))

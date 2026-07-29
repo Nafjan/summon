@@ -264,6 +264,54 @@ def test_report_done_never_upgrades_executor_error():
     assert out["status"] == "error"
 
 
+def test_execution_status_and_review_verdict_are_separate_signals():
+    """A completed review that rejects its subject is successful EXECUTION, not a
+    failed dispatch. The normalized verdict is additive; the raw reviewer word
+    remains in report.verdict for auditability."""
+    from _executor import _enrich
+
+    for raw, normalized in (("BLOCK", "block"), ("CONCERNS", "conditional"),
+                            ("CLEAN", "pass"), ("DENY", "block"),
+                            ("UNCERTAIN", "conditional"), ("APPROVE", "pass")):
+        resp = {"result": ("STATUS: DONE\nSUMMARY: reviewed\nVERDICT: %s\n"
+                           "FOLLOW-UP: none\nHANDOFF: none" % raw),
+                "exit_code": 1, "status": "success", "cli": "codex"}
+        out = _enrich(resp, None)
+        assert out["execution_status"] == "success", out
+        assert out["status"] == "success", out
+        assert out["verdict"] == normalized, (raw, out)
+        assert out["report"]["verdict"] == raw
+        assert list(out).index("report") < list(out).index("result"), (
+            "structured findings must serialize before the long transcript")
+
+    blocked = _enrich({
+        "result": "STATUS: BLOCKED\nSUMMARY: missing input\nFOLLOW-UP: provide it\nHANDOFF: none",
+        "exit_code": 0, "status": "success", "cli": "codex"}, None)
+    assert blocked["execution_status"] == "success"
+    assert blocked["status"] == "blocked" and blocked["verdict"] is None
+
+
+def test_resumed_flag_describes_a_caller_requested_continuation():
+    """The envelope must make anchoring/audit context visible without making a
+    caller infer it from the presence of a resume handle."""
+    import _builder
+    import _executor
+
+    original = _builder.BACKENDS["openai-compat"]["call"]
+    report = ("STATUS: DONE\nSUMMARY: ok\nFOLLOW-UP: none\nHANDOFF: none")
+    _builder.BACKENDS["openai-compat"]["call"] = lambda inv, timeout: {
+        "result": report, "exit_code": 0, "status": "success", "cli": inv.cli}
+    try:
+        base = dict(cli="openai-compat", prompt="p", cwd=os.getcwd(),
+                    base_url="https://example.invalid/v1")
+        fresh = _executor.execute_agent(_builder.AgentInvocation(**base), timeout_ms=1000)
+        resumed = _executor.execute_agent(
+            _builder.AgentInvocation(**base, resume_id="session-1"), timeout_ms=1000)
+    finally:
+        _builder.BACKENDS["openai-compat"]["call"] = original
+    assert fresh["resumed"] is False and resumed["resumed"] is True
+
+
 def test_blocked_error_text_never_recommends_escalation():
     from _executor import _enrich
     resp = {"result": "The tool call was blocked. Please approve.",
@@ -4707,10 +4755,11 @@ def test_jobs_launch_record_and_state_machine():
         assert os.path.isfile(_jobs.record_path(root, jid))
         st = _jobs.job_status(root, jid)
         assert st["state"] == "prepared" and st["trusted"] is False
-        # after spawn: state 'running' (pid known, liveness NOT asserted)
-        _jobs.update_spawned(root, jid, 4242)
+        # after spawn: state 'running' only when the pid is verified alive
+        _jobs.update_spawned(root, jid, os.getpid())
         st = _jobs.job_status(root, jid)
-        assert st["state"] == "running" and st["pid"] == 4242
+        assert st["state"] == "running" and st["pid"] == os.getpid()
+        assert st["liveness"] == "alive"
         # a TRUSTED terminal result (nonce matches)
         _jobs._atomic_write_json(_jobs.result_path(root, jid),
                                  {"status": "success", "job_nonce": nonce})
@@ -4764,6 +4813,170 @@ def test_jobs_wait_deadline_and_nonce():
     finally:
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
+
+
+def test_jobs_dead_pid_is_stale_and_wait_fails_fast():
+    """A pid in a record is not evidence that work continues. Status probes it;
+    wait stops once the process is gone instead of burning its full timeout."""
+    import _jobs
+    root = tempfile.mkdtemp(prefix="summon-jobsstale-")
+    original = _jobs._pid_liveness
+    try:
+        jid = _jobs.new_job_id()
+        _jobs.write_prepared(root, jid, nonce="d" * 32, agent="a",
+                             prompt_sha256=None, cwd="/w", flags={}, summon={})
+        _jobs.update_spawned(root, jid, 4242)
+
+        _jobs._pid_liveness = lambda pid: "dead"
+        st = _jobs.job_status(root, jid)
+        assert st["state"] == "stale" and st["liveness"] == "dead", st
+        started = time.monotonic()
+        result, outcome = _jobs.wait_job(root, jid, timeout_ms=60_000, poll_sec=0.1)
+        assert result is None and outcome == "stale"
+        assert time.monotonic() - started < 1, "stale wait burned the caller's budget"
+
+        _jobs._pid_liveness = lambda pid: "unknown"
+        unknown = _jobs.job_status(root, jid)
+        assert unknown["state"] == "unverified" and unknown["liveness"] == "unknown"
+    finally:
+        _jobs._pid_liveness = original
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_artifact_manifest_hashes_loose_inputs_and_detects_change():
+    """Loose-file provenance is part of request reuse and is checked again after
+    dispatch. DOCX page metadata is labelled rather than presented as measured PDF
+    truth."""
+    import argparse
+    import zipfile
+    from _artifacts import build_manifest
+    from _executor import build_request_identity, request_fingerprint
+    import run_subagent as rs
+
+    root = tempfile.mkdtemp(prefix="summon-artifacts-")
+    try:
+        txt = os.path.join(root, "packet.txt")
+        docx = os.path.join(root, "report.docx")
+        with open(txt, "w", encoding="utf-8") as fh:
+            fh.write("baseline A")
+        app_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/'
+            '2006/extended-properties"><Pages>17</Pages></Properties>')
+        with zipfile.ZipFile(docx, "w") as zf:
+            zf.writestr("docProps/app.xml", app_xml)
+
+        before, err = build_manifest(["packet.txt", "report.docx"], root)
+        assert err is None and before["sha256"]
+        assert [f["path"] for f in before["files"]] == ["packet.txt", "report.docx"]
+        assert before["files"][0]["bytes"] == len("baseline A")
+        assert before["files"][1]["page_count"] == 17
+        assert before["files"][1]["page_count_source"] == "docx_app_properties"
+
+        base = dict(agent="missing", prompt="review", cwd=root, agents_dir=root,
+                    artifacts=["packet.txt", "report.docx"])
+        fp1 = request_fingerprint(**build_request_identity(**base))
+        with open(txt, "w", encoding="utf-8") as fh:
+            fh.write("baseline B")
+        fp2 = request_fingerprint(**build_request_identity(**base))
+        assert fp1 != fp2, "changed loose inputs reused the previous review"
+
+        args = argparse.Namespace(artifacts=["packet.txt", "report.docx"], cwd=root)
+        env = {"status": "success", "warnings": []}
+        rs._complete_artifact_provenance(env, args, before)
+        assert env["artifacts"]["stable_during_dispatch"] is False
+        assert env["artifacts"]["changed"] == ["packet.txt"]
+        assert env["suspect"] is True and env["warnings"]
+
+        outside = os.path.join(os.path.dirname(root), "outside.txt")
+        with open(outside, "w", encoding="utf-8") as fh:
+            fh.write("not under cwd")
+        try:
+            _m, outside_err = build_manifest([outside], root)
+            assert _m is None and "outside --cwd" in outside_err
+        finally:
+            os.remove(outside)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
+def test_artifacts_reach_background_and_manifest_children():
+    import argparse
+    import _background
+    import _manifest
+
+    ns = argparse.Namespace(
+        agent="a", prompt="p", prompt_file=None, cwd=os.getcwd(),
+        allow_credit=False, no_contract_repair=False, agents_dir=None,
+        timeout=600000, cli=None, model=None, effort=None, resume=None,
+        resume_profile=None, out=None, json_schema=None, debug_dir=None,
+        retries=0, max_permission=None, gate_with=None, gate_timeout=None,
+        worktree=None, artifacts=["one.pdf", "two.docx"])
+    argv = _background.child_argv(ns, "result.json")
+    assert argv.count("--artifact") == 2
+    assert argv[argv.index("--artifact") + 1] == "one.pdf"
+
+    job = {"id": "audit", "agent": "a", "prompt": "p",
+           "artifacts": ["one.pdf", "two.docx"]}
+    child = _manifest._child_cmd(job, argparse.Namespace(
+        cwd=os.getcwd(), agents_dir=None, retries=0), "out.json")
+    assert child.count("--artifact") == 2
+
+
+def test_field_feedback_docs_and_document_audit_templates_are_bound():
+    """The audit guidance is consumed as skill control logic, so bind its claims
+    to runnable templates and current backend behavior."""
+    import _schema
+    from _loader import load_agent
+
+    skill_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    examples = os.path.join(skill_root, "examples")
+    schema_path = os.path.join(examples, "document-audit.schema.json")
+    manifest_path = os.path.join(examples, "document-audit.manifest.json")
+    agents_dir = os.path.join(examples, "document-audit-agents")
+    question_path = os.path.join(examples, "document-audit-question.md")
+    for path in (schema_path, manifest_path, question_path, agents_dir):
+        assert os.path.exists(path), "document-audit template missing: %s" % path
+
+    schema = json.load(open(schema_path, encoding="utf-8"))
+    sample = {
+        "verdict": "block", "summary": "one confirmed conflict",
+        "findings": [{
+            "finding_id": "F-1", "artifact": "deliverable.docx",
+            "locator": "page 7, table 2", "source_evidence": "source says 10",
+            "severity": "high", "confidence": 0.9, "disposition": "confirmed",
+            "recommended_correction": "replace 12 with 10",
+        }],
+    }
+    assert _schema.validate(sample, schema) == []
+    assert _schema.validate({**sample, "findings": []}, schema) == []
+    bad = dict(sample)
+    bad["verdict"] = "looks-good"
+    assert _schema.validate(bad, schema), "schema accepted an unknown audit verdict"
+
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+    assert len(manifest["jobs"]) == 3
+    assert manifest["defaults"]["artifacts"] and manifest["defaults"]["json_schema"]
+    backends = set()
+    for name in ("audit-correspondence", "audit-mechanics", "audit-contradictions"):
+        loaded = load_agent(agents_dir, name)
+        backends.add(loaded[0])
+        assert loaded[4] == "read-only"
+        body = open(loaded[3], encoding="utf-8").read()
+        for field in ("STATUS:", "SUMMARY:", "VERDICT:", "FOLLOW-UP:", "HANDOFF:"):
+            assert field in body, (name, field)
+    assert backends == {"claude", "codex", "cursor-agent"}, backends
+
+    skill = open(os.path.join(skill_root, "SKILL.md"), encoding="utf-8").read()
+    for claim in ("--artifact FILE", "execution_status", "resumed:false",
+                  "doctor --json", "does not inherit the parent's connector/MCP surface"):
+        assert claim in skill, "field-feedback guidance drifted or disappeared: %s" % claim
+    council_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "_council.py"), encoding="utf-8").read()
+    assert "cannot read files under --cwd" not in council_src, (
+        "council still emits the pre---add-dir claim that agy cannot read the workspace")
 
 
 def test_jobs_facade_and_matrix():
@@ -14821,7 +15034,7 @@ def _global_fingerprint():
     # leak could not be detected. All of these are local, already-loaded-in-practice, and
     # cheap; a failed import simply omits that module rather than breaking the run.
     for _m in ("_council", "_gate", "_resolver", "_loader", "_manifest", "_doctor",
-               "_builder", "_executor", "run_subagent"):
+               "_builder", "_executor", "_jobs", "run_subagent"):
         try:
             __import__(_m)
         except Exception:  # noqa: BLE001
@@ -14837,7 +15050,8 @@ def _global_fingerprint():
                          ("_resolver", ("resolve_cli", "discover_models",
                                         "_agy_live_models", "_codex_default_model_scan")),
                          ("_loader", ("load_agent",)),
-                         ("_doctor", ("_default_probe_runner",))):
+                         ("_doctor", ("_default_probe_runner",)),
+                         ("_jobs", ("_pid_liveness",))):
         _m = sys.modules.get(_mod)
         if _m is not None:
             for _a in _attrs:

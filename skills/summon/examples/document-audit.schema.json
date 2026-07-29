@@ -1,0 +1,48 @@
+{
+  "type": "object",
+  "required": ["verdict", "summary", "findings"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["block", "conditional", "pass"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "finding_id",
+          "artifact",
+          "locator",
+          "source_evidence",
+          "severity",
+          "confidence",
+          "disposition",
+          "recommended_correction"
+        ],
+        "properties": {
+          "finding_id": {"type": "string", "minLength": 1},
+          "artifact": {"type": "string", "minLength": 1},
+          "locator": {"type": "string", "minLength": 1},
+          "source_evidence": {"type": "string", "minLength": 1},
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low", "note"]
+          },
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+          "disposition": {
+            "type": "string",
+            "enum": ["confirmed", "qualified", "false-positive"]
+          },
+          "recommended_correction": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

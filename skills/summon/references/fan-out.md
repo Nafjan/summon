@@ -27,7 +27,7 @@ jobs whose prior envelope was `success`, and **re-dispatches** any that ended
 file to force a clean re-run), per-job retries, progress lines on stderr,
 and a single summary JSON on stdout (`total/succeeded/failed/skipped/suspect`).
 Job keys: `id, agent, prompt|prompt_file, cwd, cli, model, effort, timeout,
-retries, json_schema, debug_dir` (defaults apply to all, per-job overrides win).
+retries, json_schema, debug_dir, artifacts` (defaults apply to all, per-job overrides win).
 Relative `prompt_file`, `json_schema`, and `debug_dir` paths resolve against the
 **manifest file's directory** (so the examples above just work). The manifest uses
 the same agent discovery as a direct dispatch — you don't need `--agents-dir` if
@@ -207,6 +207,17 @@ instruction already triggered.
 This decomposition completed successfully in the field where a direct all-in-one council over
 the same corpus did not: it bounds every context, isolates failures to one seat, and keeps the
 synthesis step small.
+
+The installed `examples/` directory turns this pattern into a starting point:
+`document-audit.schema.json` (claim ledger), `document-audit.manifest.json`
+(three non-overlapping seats), and `document-audit-agents/` plus
+`document-audit-question.md` (role-specialized council). The manifest's `artifacts`
+array is the per-job form of repeatable `--artifact`: it records loose-file hashes/sizes
+and detects a corpus that changed during the review.
+
+For FINAL adjudication, start a fresh council rather than resuming the reviewer that
+already proposed or approved corrections. Resume is for continuity and crash recovery;
+fresh context reduces anchoring and makes `resumed:false` an auditable gate condition.
 
 ### Timeout budget: a worked example
 
