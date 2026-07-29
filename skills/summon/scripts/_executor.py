@@ -178,7 +178,7 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     # Preserve the executor's outcome BEFORE report semantics reconcile the public
     # status. A successful review can legitimately return VERDICT: BLOCK; a failed
     # execution cannot. Keeping the two signals separate lets callers branch correctly.
-    response.setdefault("execution_status", response.get("status"))
+    response["execution_status"] = response.get("status")
     # setdefault (not =) so a non-stream backend (openai-compat) that already
     # populated these from its HTTP response isn't clobbered with None.
     response.setdefault("session_id", processor.session_id if processor else None)
