@@ -29,6 +29,17 @@ class Milliseconds(int):
 
     bare_sub_second = False
 
+    def __str__(self) -> str:
+        """Serialize WITH the unit, always.
+
+        `--background` and council forward this into a child's argv. Emitting a bare number
+        threw away `bare_sub_second`, so an explicit `300ms` the parent accepted reached the
+        child as "300" and was refused there as a units mistake -- summon contradicting its
+        own promise across a process boundary (certification round 3). `300ms` round-trips
+        to itself; there is no ambiguity left to lose.
+        """
+        return "%dms" % int(self)
+
 
 def parse_timeout(value: str) -> int:
     """--timeout accepts bare milliseconds (backward compatible) or a human
@@ -346,7 +357,12 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "is forced read-only and adjudicates the request (agent, prompt, "
                              "permission, cwd). FAILS CLOSED: anything but an explicit APPROVE "
                              "blocks the dispatch; UNCERTAIN sets requires_human_review")
+    # `type=parse_timeout` was MISSING: the help promised "same grammar as --timeout" and
+    # the flag parsed nothing, so `--gate-timeout 600s` reached the gate as the raw STRING
+    # "600s" via `timeout = args.gate_timeout or args.timeout` (certification round 3 found
+    # the guard bypass; the missing parser underneath it is the actual defect).
     parser.add_argument("--gate-timeout", dest="gate_timeout", default=None,
+                        type=parse_timeout,
                         help="Timeout for the --gate-with dispatch (same grammar as --timeout; "
                              "defaults to --timeout)")
     parser.add_argument("--allow-credit", dest="allow_credit", action="store_true",

@@ -128,7 +128,10 @@ def new_agent(agents_dir: str, name: str, sets: dict) -> dict:
     _validate_values(sets, allow_empty=False)
     fm = {**_DEFAULTS, **sets}
     os.makedirs(agents_dir, exist_ok=True)
-    path = os.path.join(agents_dir, f"{name}.md")
+    # normpath: `--agents-dir "C:/Users/x/.agents"` + join produced
+    # "C:/Users/x/.agents\name.md" -- mixed separators in a MACHINE-READABLE field
+    # (field report, 2026-07-28). Normalise before it reaches an envelope.
+    path = os.path.normpath(os.path.join(agents_dir, f"{name}.md"))
     title = name.replace("-", " ").replace("_", " ").title()
     text = _TEMPLATE.format(
         frontmatter="\n".join(f"{k}: {v}" for k, v in fm.items()),
@@ -155,7 +158,10 @@ def set_agent(agents_dir: str, name: str, sets: dict) -> dict:
     if not sets:
         raise ValueError("--set-agent needs at least one --set KEY=VALUE")
     _validate_values(sets, allow_empty=True)
-    path = os.path.join(agents_dir, f"{name}.md")
+    # normpath: `--agents-dir "C:/Users/x/.agents"` + join produced
+    # "C:/Users/x/.agents\name.md" -- mixed separators in a MACHINE-READABLE field
+    # (field report, 2026-07-28). Normalise before it reaches an envelope.
+    path = os.path.normpath(os.path.join(agents_dir, f"{name}.md"))
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Agent definition not found: {name}")
     # BINARY read/write: the body must stay byte-identical, so we never let text

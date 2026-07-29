@@ -164,6 +164,63 @@ def permission_flags(cli: str, permission: str) -> list:
         raise ValueError(f"No permission mapping for cli={cli!r}, permission={permission!r}") from e
 
 
+def effective_permission(cli: str, permission: str) -> str:
+    """The tier the backend ACTUALLY enforces, which is not always the declared one.
+
+    A security census built from declared `permission:` strings UNDERSTATES real capability
+    on agy, where `safe-edit` maps to the same full bypass as `yolo` -- and a census that
+    undercounts capability is worse than no census, because it is trusted (field report,
+    2026-07-28). Every consumer that summarises capability across a roster must ask this,
+    not the frontmatter.
+    """
+    if cli == "agy":
+        if permission == "safe-edit":
+            return "yolo"          # identical flags; the label is the only difference
+        if permission == "read-only":
+            return "unenforceable"  # refused at dispatch unless explicitly waived
+    return permission
+
+
+def roster_permission_lint(agents: list) -> list:
+    """Roster-wide tier/backend mismatches, so they surface BEFORE a dispatch.
+
+    summon refuses an unenforceable tier correctly, but only when the agent is dispatched.
+    A roster maintained as a controlled artifact can therefore sit for months holding
+    definitions whose declared intent the backend can never honour -- two of them named
+    `reviewer` in the report that prompted this. Per-dispatch refusal is right and arrives
+    too late for whoever maintains the roster.
+
+    Each entry: {agent, cli, declared, effective, severity, note}.
+    """
+    out = []
+    for a in agents or []:
+        name = a.get("name")
+        cli = a.get("run_agent") or a.get("cli")
+        declared = a.get("permission")
+        if not cli or not declared:
+            continue
+        eff = effective_permission(cli, declared)
+        if eff == declared:
+            continue
+        if eff == "unenforceable":
+            out.append({
+                "agent": name, "cli": cli, "declared": declared, "effective": eff,
+                "severity": "error",
+                "note": (f"{cli} cannot enforce '{declared}'; this definition is refused at "
+                         f"dispatch unless the operator explicitly waives the tier. The "
+                         f"roster currently misrepresents what this agent is allowed to do."),
+            })
+        else:
+            out.append({
+                "agent": name, "cli": cli, "declared": declared, "effective": eff,
+                "severity": "warning",
+                "note": (f"on {cli}, '{declared}' runs with the SAME full bypass as "
+                         f"'{eff}'. A capability census reading the declared string "
+                         f"understates this agent -- report the effective tier."),
+            })
+    return out
+
+
 def agy_permission_warning(cli: str, permission: str) -> str | None:
     """The agy safe-edit surprise, surfaced per dispatch: agy has no
     workspace-write tier, so 'safe-edit' maps to the same full bypass as

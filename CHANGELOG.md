@@ -6,6 +6,71 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.18.0] - 2026-07-28
+
+Certification round 3 (VERDICT: BLOCK) plus a governance field report.
+
+### Security
+
+- **CRITICAL: the agy litter sweep could delete a caller's file.** `_looks_like_agy_log`
+  accepted any ONE loose phrase in the first 4 KB, so a file reading *"Release checklist:
+  verify Starting language server appears in diagnostics."* was accepted and DELETED.
+  Identity is now structural -- the first non-blank line must be a glog preamble or record,
+  AND some line must match glog's machine record format -- plus a re-stat immediately before
+  unlink so what is deleted is what passed the check. Prose can contain any phrase; prose
+  cannot accidentally BE glog.
+
+### Fixed
+
+- **`--gate-timeout` was never parsed.** The help promised "same grammar as `--timeout`" and
+  the flag had no `type=`, so `--gate-timeout 600s` reached the gate as the raw STRING
+  "600s". It now parses, and bare sub-second values are refused like `--timeout`.
+- **An explicit `300ms` was refused by its own child.** `--background` and council stringify
+  the parsed timeout into a child's argv; a bare number dropped the unit, so the child
+  re-read "300" as a units mistake. `Milliseconds.__str__` now always emits the unit.
+- **A units error left a worktree behind.** `--worktree` created a branch and checkout
+  BEFORE the guard ran. Validation now precedes every side effect.
+- **Worktree teardown targeted the wrong path.** It preferred `cwd`, which points INSIDE the
+  checkout when `--cwd` is a repo subdirectory, so removal failed and the denial stranded
+  both checkout and branch. It now targets the worktree root.
+- **Timeouts hid their own cause.** A 480s stall returned `result: ""` while the real reason
+  (`rg` missing from the child's PATH) sat in `output_tail`. Timeouts now set
+  `partial_output_only`, promote the cause into `error`/`error_hint`, and warn where to
+  look. Missing-tool and wrong-shell signatures are recognised; generic phrases only count
+  at end-of-line, where a shell puts them and prose does not.
+- **`--set-agent` emitted mixed path separators** in a machine-readable field.
+
+### Added
+
+- **Roster-level permission lint** (`roster_warnings` in `--list --json` and `doctor
+  --json`). summon refuses an unenforceable tier per DISPATCH, so a roster held as a
+  controlled artifact could carry definitions whose declared intent their backend can never
+  honour -- unnoticed until dispatch. Reports the EFFECTIVE tier: on agy, `safe-edit` runs
+  with the same full bypass as `yolo`, so a census built from declared strings understates
+  capability, and a census that undercounts is worse than none because it is trusted.
+  summon's own bundled roster had four such agents; all four are re-tiered.
+- **An explicit `--agents-dir` that falls through to the bundled roster now warns.** The
+  unqualified fallback stays silent -- that one is intended.
+- **`--dry-run` reports `agent_def`** (file, sha256, agents_dir, source). `agents_dir` is
+  which directory was SEARCHED; those differ in exactly the case worth catching.
+- **A "Roster resolution" section in SKILL.md** stating all four facts together.
+
+### Testing
+
+419/419 discovery, 22/22 install; ten mutants killed. Two defects here were mine, caught by
+running rather than reading: the new timeout code called `.strip()` on `get_result()`, which
+returns a DICT -- it would have crashed every timeout that produced a result, and only a
+negative test case exposed it. And the litter test's prose cases were all caught by the
+first-line gate, so deleting the record-format check left it green; killing that mutant
+needed a file opening with a glog phrase but containing no record.
+
+### Verified live
+
+Three agy dispatches: default model (20.8s), explicit `gemini-3.1-pro-high` (18.6s), and a
+clean-directory sweep test (14.6s, zero files left). Contract parsing, permission flags and
+the litter sweep all behaved. `model.served` is always null on agy -- it emits no service
+telemetry, so summon can report what it TARGETED but never prove what answered.
+
 ## [0.17.1] - 2026-07-27
 
 ### Fixed

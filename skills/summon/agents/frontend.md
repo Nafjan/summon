@@ -1,6 +1,6 @@
 ---
 run-agent: agy
-permission: safe-edit
+permission: yolo
 ---
 
 # Frontend
