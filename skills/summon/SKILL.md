@@ -105,6 +105,35 @@ not need to create anything to start dispatching. A project `.agents/` dir (or
 2. Add an agent definition file, or scaffold one with `--new-agent <name>`
 3. Re-run `--list` to verify
 
+### Roster resolution (read this before building a control on it)
+
+Four facts, together, because a governance control was built on the first one alone and was
+wrong (field report, 2026-07-28):
+
+1. **Search order** — `--agents-dir` > `$SUB_AGENTS_DIR` > `{cwd}/.agents/`. These are
+   **exclusive**: the first one that exists is *the* directory, not a merge of all three.
+2. **The bundled roster is a MERGED fallback.** A name not found in the chosen directory is
+   looked up in the roster bundled inside the skill. This is why a fresh install can
+   dispatch before you have created anything.
+3. **Consequence:** `--agents-dir` picks the directory that is *searched*. It does **not**
+   guarantee the definition came from there — 1 and 2 combine so that an explicit directory
+   can still serve a bundled definition.
+4. **`agent_def.source` is the proof.** Every envelope (including failures, and since 0.18.0
+   `--dry-run` too) carries `agent_def.{file, sha256, agents_dir, source}` with `source` in
+   `project` / `bundled` / `explicit` / `env`. That field, not the flag you passed, is what
+   an audit should read.
+
+Since 0.18.0 an explicit `--agents-dir` that falls through to bundled also emits a
+`warnings` entry, so the surprising case is no longer silent. Nothing is emitted when no
+directory was named — that fallback is the intended behaviour.
+
+**Roster-wide lint:** `--list --json` and `doctor --json` carry `roster_warnings`, flagging
+definitions whose declared `permission:` their backend cannot enforce (per-dispatch refusal
+is correct but arrives too late for a roster maintained as a controlled artifact). Note the
+direction that matters: on `agy`, `safe-edit` runs with the SAME full bypass as `yolo`, so a
+capability census built from declared strings **understates** real capability. Report the
+`effective` field, never the declared one.
+
 ### Step 2: Execute Agent
 
 ```bash

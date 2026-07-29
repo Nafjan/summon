@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.17.1"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.18.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -687,7 +687,16 @@ def main() -> None:
     if args.list:
         agents_dir = get_agents_dir(args.agents_dir, args.cwd)
         agents = list_agents(agents_dir)
-        print(json.dumps({"agents": agents, "agents_dir": agents_dir}, ensure_ascii=False))
+        # Roster-level tier lint. Per-dispatch refusal is correct but arrives too late for
+        # anyone maintaining a roster as a controlled artifact: a definition whose declared
+        # tier its backend cannot enforce sits unnoticed until someone dispatches it (field
+        # report, 2026-07-28 -- two of the offenders there were named reviewers).
+        from _builder import roster_permission_lint
+        _out = {"agents": agents, "agents_dir": agents_dir}
+        _lint = roster_permission_lint(agents)
+        if _lint:
+            _out["roster_warnings"] = _lint
+        print(json.dumps(_out, ensure_ascii=False))
         sys.exit(0)
 
     # Validate required args for execution
@@ -795,6 +804,21 @@ def main() -> None:
     # --worktree: run the agent in an isolated git worktree instead of the cwd.
     # NEVER created under --dry-run (dry-run is mutation-free by contract).
     worktree_info = None
+    # Units validation runs BEFORE any side effect: `--worktree` creates a branch
+    # and a checkout below, and a units error used to leave both behind
+    # (certification round 3). Nothing to clean up if nothing was created.
+    # `--gate-timeout` reaches the backend through _run_gate -> execute_agent, which does
+    # NOT pass back through this function, so it bypassed the guard entirely and a gate
+    # could be handed a 300ms budget (certification round 3). Same rule, both flags.
+    for _flag, _val in (("--timeout", args.timeout),
+                        ("--gate-timeout", getattr(args, "gate_timeout", None))):
+        if getattr(_val, "bare_sub_second", False):
+            _n = int(_val)
+            _die(f"{_flag} {_n} means {_n} MILLISECONDS, which no dispatch can complete in "
+                 f"-- every agent would be killed almost immediately. Did you mean {_n}s? "
+                 f"Bare values are milliseconds for backward compatibility (600000 == 10m); "
+                 f"write {_n}ms explicitly if you really want it.")
+
     if args.worktree is not None and not args.dry_run:
         try:
             worktree_info = _setup_worktree(args.cwd, args.worktree, args.agent)
@@ -888,7 +912,7 @@ def main() -> None:
     )
 
     if args.dry_run:
-        _emit(_dry_run_view(invocation, args, agents_dir))
+        _emit(_dry_run_view(invocation, args, agents_dir, agent_file))
         sys.exit(0)
 
     # --gate-with: another agent must APPROVE this dispatch before it runs. Placed
@@ -957,6 +981,18 @@ def main() -> None:
     # the envelope, and this keeps prompt_sha256 bound to the ROOT prompt (the
     # correction prompt must never restamp it).
     result.update(receipt)
+    # An explicit --agents-dir that fell through to the BUNDLED roster is an intent
+    # violation: the caller named a directory and got something else. `--agents-dir` selects
+    # which directory is SEARCHED; only `agent_def.source` proves provenance -- and a real
+    # governance control was written on the other belief (field report, 2026-07-28). Warn on
+    # the real dispatch, not just --dry-run, because the dispatch is what gets audited.
+    try:
+        from _loader import explicit_dir_fallback_warning
+        _fw = explicit_dir_fallback_warning(args.agents_dir, agent_file)
+        if _fw and _fw not in (result.get("warnings") or []):
+            result.setdefault("warnings", []).append(_fw)
+    except Exception:  # noqa: BLE001 - provenance advisory must never break a dispatch
+        pass
 
     if worktree_info:
         result["worktree"] = worktree_info
@@ -966,7 +1002,8 @@ def main() -> None:
     sys.exit(0 if result["status"] == "success" else 1)
 
 
-def _dry_run_view(invocation, args, agents_dir: str) -> dict:
+def _dry_run_view(invocation, args, agents_dir: str,
+                  agent_file: str | None = None) -> dict:
     """The fully resolved dispatch, without executing. For agy the per-call
     profile is NOT built (that copies OAuth tokens = a mutation); the wrapper
     path is shown instead."""
@@ -1023,6 +1060,24 @@ def _dry_run_view(invocation, args, agents_dir: str) -> dict:
     for _w in advisory_warnings(invocation.cli, invocation.permission, args.timeout,
                                 invocation.model):
         view.setdefault("warnings", []).append(_w)
+    # An explicit --agents-dir that silently fell through to the bundled roster is an
+    # INTENT violation, not a convenience: a governance control was written on the belief
+    # that --agents-dir guaranteed provenance (field report, 2026-07-28).
+    try:
+        from _loader import explicit_dir_fallback_warning
+        _fw = explicit_dir_fallback_warning(args.agents_dir, agent_file)
+        if _fw:
+            view.setdefault("warnings", []).append(_fw)
+    except Exception:  # noqa: BLE001 - a preflight view must always render
+        pass
+    # PROVENANCE PARITY: dry-run reported `agents_dir` (which directory was searched) but
+    # not `agent_def` (where the definition actually came from). Those differ in precisely
+    # the case worth catching, and dry-run's whole purpose is catching things before paying.
+    try:
+        from _receipt import receipt_agent
+        view.update(receipt_agent(args, agent_file))
+    except Exception:  # noqa: BLE001
+        pass
     if backend_kind(invocation.cli) == "api":
         view["command"] = f"POST ({invocation.cli})"
         view["base_url"] = invocation.base_url
@@ -1161,7 +1216,11 @@ def _remove_worktree(info) -> bool:
     """
     if not info:
         return False
-    path = info.get("cwd") or info.get("path")
+    # The worktree ROOT, not `cwd`. `_setup_worktree` sets `cwd` to the SUBDIRECTORY
+    # mirroring the caller's original --cwd, so when --cwd was a repo subdirectory `cwd`
+    # points INSIDE the checkout and `git worktree remove` fails on it -- the denial then
+    # left both the checkout and the branch behind (certification round 3).
+    path = info.get("path") or info.get("cwd")
     branch = info.get("branch")
     if not path:
         return False

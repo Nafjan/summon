@@ -319,9 +319,11 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
 
             try:
                 content = agent_file.read_text(encoding="utf-8-sig")
-                _, body = parse_frontmatter(content)
+                fm, body = parse_frontmatter(content)
                 description = extract_description(body)
-                agents.append({"name": name, "description": description})
+                agents.append({"name": name, "description": description,
+                               "run_agent": (fm or {}).get("run-agent"),
+                               "permission": (fm or {}).get("permission")})
             except (OSError, UnicodeDecodeError, ValueError):
                 # Unreadable / binary / malformed-frontmatter file: still list it so the
                 # caller sees it exists. ValueError matters since duplicate frontmatter keys
@@ -341,6 +343,8 @@ def list_agents(agents_dir: str) -> list[dict]:
     listed with an empty description.
     """
     agents = _list_agents_in(agents_dir)
+    for a in agents:
+        a.setdefault("source", "project")
     seen = {a["name"] for a in agents}
 
     bundled = bundled_roster_dir()
@@ -348,9 +352,41 @@ def list_agents(agents_dir: str) -> list[dict]:
         for a in _list_agents_in(bundled):
             if a["name"] not in seen:
                 seen.add(a["name"])
+                # WHICH roster served each name, so a caller can tell a project definition
+                # from a bundled fallback without dispatching it (field report, 2026-07-28).
+                a["source"] = "bundled"
                 agents.append(a)
 
     return sorted(agents, key=lambda a: a["name"])
+
+
+def explicit_dir_fallback_warning(agents_dir_arg, agent_file) -> str | None:
+    """Warn when the caller NAMED a roster directory and got a bundled definition anyway.
+
+    The bundled fallback is right when no directory was stated. It is an intent violation
+    when one was: a governance control was written mandating `--agents-dir` in the belief
+    that it guaranteed roster provenance, and it does not -- resolution falls through to the
+    bundled roster silently, and only the receipt's `agent_def.source` reveals it (field
+    report, 2026-07-28). Saying so at dispatch is the difference between a control that
+    works and one that only looks like it does.
+    """
+    if not agents_dir_arg or not agent_file:
+        return None
+    bundled = bundled_roster_dir()
+    if not bundled:
+        return None
+    try:
+        served = Path(agent_file).resolve().parent
+        if served != Path(bundled).resolve():
+            return None
+        if served == Path(agents_dir_arg).resolve():
+            return None          # they explicitly pointed AT the bundled roster
+    except OSError:
+        return None
+    return ("--agents-dir named %r, but this definition was served from the BUNDLED roster "
+            "(%s) because the name was not found there. `--agents-dir` selects which "
+            "directory is SEARCHED; it does not guarantee provenance -- check "
+            "`agent_def.source` for that." % (str(agents_dir_arg), bundled))
 
 
 def get_agents_dir(args_agents_dir: str | None, args_cwd: str | None) -> str:

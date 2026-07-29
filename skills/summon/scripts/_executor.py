@@ -1250,6 +1250,25 @@ _SIGNAL_MARKERS = (
     "401 unauthorized", "403 forbidden", "invalid api key", "api key not valid",
     "model not found", "no such model", "econnrefused", "etimedout",
     "permission denied:", "eacces",
+    # MISSING TOOL / WRONG SHELL. These are machine-generated shell diagnostics, not prose,
+    # and they are the single most common cause of a long silent stall: the agent reaches
+    # for a tool the child cannot see and retries or waits until the clock runs out. A field
+    # report burned 480s on `rg` missing from a codex child's PATH and the message was
+    # visible only in output_tail (2026-07-28).
+    "is not recognized as a name of a cmdlet",
+    "is not recognized as an internal or external command",
+    ": command not found",
+    "executable file not found in",
+)
+
+# Generic enough to appear in ORDINARY PROSE ("...no such file or directory handling..."),
+# so these count only when the line ENDS with them -- which is where a shell puts them
+# (`cat: foo.txt: No such file or directory`) and where a sentence does not. Found by
+# testing the negative case after the anywhere-in-line form promoted a release-note
+# sentence; the positive cases had all passed.
+_SIGNAL_SUFFIXES = (
+    "no such file or directory",
+    "command not found",
 )
 
 
@@ -1280,6 +1299,14 @@ def salient_error(text: str, prompt: str | None = None) -> str | None:
             continue                      # host noise: never the headline
         if " ".join(line.split()).lower() in echoed:
             continue                      # the caller's own words, echoed back
+        # Generic suffixes are ranked after every explicit marker: an auth or quota
+        # signature on another line is a better headline than a missing-file tail.
+        _tail = low.rstrip().rstrip(".").rstrip()
+        _base = len(_SIGNAL_MARKERS)
+        for rank, marker in enumerate(_SIGNAL_SUFFIXES):
+            if _tail.endswith(marker):
+                if best is None or (_base + rank) < best[0]:
+                    best = (_base + rank, line.strip())
         for rank, marker in enumerate(_SIGNAL_MARKERS):
             if marker in low:
                 if best is None or rank < best[0]:
@@ -1320,8 +1347,33 @@ def _agy_litter_path(cwd: str | None) -> str | None:
         return None
 
 
+# glog's RECORD format, which the Go language server emits and no human writes by hand:
+#   I0727 12:00:00.123456       1 main.go:10] message
+# Matching this is the identity check. The previous version matched loose PHRASES
+# ("Starting language server") anywhere in the head, which certification round 3 broke in
+# one line: a caller's file reading "Release checklist: verify Starting language server
+# appears in diagnostics." was accepted and DELETED. Prose can contain any phrase; prose
+# cannot accidentally be glog.
+_GLOG_RECORD = re.compile(r"^[IWEF]\d{4} \d{2}:\d{2}:\d{2}\.\d{6}\s+\d+ \S+:\d+\]")
+# glog's own file preamble. A real log starts with one of these or with a record line.
+_GLOG_HEADER = ("Log file created at:", "Running on machine:", "Log line format:")
+
+
 def _looks_like_agy_log(path: str) -> bool:
-    """True only for a file that is clearly agy's language-server log."""
+    """True only for a file that is STRUCTURALLY agy's language-server log.
+
+    Two independent conditions, both required, because the cost of a false positive here
+    is an unrecoverable deletion in someone's repository while the cost of a false negative
+    is a leftover file:
+
+      1. the first non-blank line is a glog preamble line or a glog record -- a caller's
+         document that merely quotes a log line somewhere in the middle is not a log;
+      2. at least one line matches glog's machine record format, which is not something
+         prose produces by accident.
+
+    Certification round 3 deleted a real file that satisfied neither, because the old check
+    accepted any one loose phrase anywhere in the first 4 KB.
+    """
     try:
         if os.path.getsize(path) > 50_000_000:      # never slurp something enormous
             return False
@@ -1329,7 +1381,14 @@ def _looks_like_agy_log(path: str) -> bool:
             head = fh.read(4096)
     except OSError:
         return False
-    return any(marker in head for marker in _GLOG_SIGNATURE)
+
+    lines = [ln for ln in head.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    first = lines[0]
+    if not (any(first.startswith(h) for h in _GLOG_HEADER) or _GLOG_RECORD.match(first)):
+        return False
+    return any(_GLOG_RECORD.match(ln) for ln in lines)
 
 
 def _sweep_agy_litter(cwd: str | None, existed_before: bool) -> bool:
@@ -1341,9 +1400,21 @@ def _sweep_agy_litter(cwd: str | None, existed_before: bool) -> bool:
     path = _agy_litter_path(cwd)
     if not path or existed_before or not os.path.isfile(path):
         return False
+    # TOCTOU: the identity check reads the file, the deletion happens later, and in between
+    # the path can be replaced. Fingerprint what was VERIFIED and refuse to delete anything
+    # that is no longer byte-identical to it. This cannot close the windowentirely on every
+    # filesystem, but it means the thing deleted is the thing that passed the check.
+    try:
+        before = os.stat(path)
+    except OSError:
+        return False
     if not _looks_like_agy_log(path):
         return False
     try:
+        after = os.stat(path)
+        if (after.st_size, after.st_mtime_ns, after.st_ino) != (
+                before.st_size, before.st_mtime_ns, before.st_ino):
+            return False        # it changed under us; it is no longer what we verified
         os.remove(path)
         return True
     except OSError:
@@ -1584,8 +1655,44 @@ def _attach_raw(resp: dict, stdout_lines: list | None) -> dict:
 
 def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
                      stdout_lines: list | None = None) -> dict:
-    resp = _partial_response(cli, processor.get_result(), 124, f"Timeout after {timeout_ms}ms")
-    return _attach_raw(resp, stdout_lines)
+    """Timeout envelope, with the diagnostic promoted out of `output_tail`.
+
+    A timeout whose `result` is empty used to say only "Timeout after Nms" while the real
+    cause -- a missing tool, a wrong shell, a prompt for input nobody could answer -- sat in
+    `output_tail`. Callers branch on status/result/report, so the actionable content was in
+    the one field they had no reason to read (field report, 2026-07-28: 480s burned on
+    `rg` not being on the child's PATH, reported as an opaque timeout).
+
+    Three additions, none of which invent an answer:
+      * `partial_output_only: true` when the run produced captured text but no result, so a
+        caller can branch on "there is something to read" without guessing;
+      * the salient line promoted into `error_hint`, using the same untrusted-text
+        extraction as the failure path (prompt echoes excluded upstream);
+      * a warning naming `output_tail` and, when a session id survived, the fact that the
+        run is RESUMABLE -- summon already preserves `resume.session_id` through a timeout,
+        which reads as total loss when `result` is empty.
+    """
+    result = processor.get_result()
+    resp = _partial_response(cli, result, 124, f"Timeout after {timeout_ms}ms")
+    resp = _attach_raw(resp, stdout_lines)
+
+    captured = "".join(stdout_lines or [])
+    # `processor.get_result()` returns the parsed result JSON (a dict) or None -- NOT a
+    # string. An earlier draft called .strip() on it, which would have raised
+    # AttributeError on every timeout that DID produce a result, i.e. crashed the exact
+    # path it was meant to improve. Truthiness covers dict, str and None alike.
+    _empty = not result if not isinstance(result, str) else not result.strip()
+    if _empty and captured.strip():
+        resp["partial_output_only"] = True
+        hint = salient_error(captured)
+        if hint:
+            resp["error_hint"] = hint
+            resp["error"] = f"Timeout after {timeout_ms}ms -- likely cause: {hint}"
+        resp.setdefault("warnings", []).append(
+            "this run timed out with no parsed result; the captured output is in "
+            "`output_tail` and usually names the real cause (a missing tool, a wrong "
+            "shell, or a prompt waiting for input).")
+    return resp
 
 
 def _drain_to_eof(line_q: queue.Queue, budget_sec: float = 0.5) -> None:

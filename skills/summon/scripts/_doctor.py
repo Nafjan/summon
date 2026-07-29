@@ -46,6 +46,19 @@ _BACKEND_ISSUE_SIGNS = (
 )
 
 
+
+def _roster_lint(agents):
+    """Roster tier lint, import-guarded so doctor always renders.
+
+    doctor is the command people run when something is already wrong; it must never be the
+    thing that fails. A lint that cannot import degrades to an empty list.
+    """
+    try:
+        from _builder import roster_permission_lint
+        return roster_permission_lint(agents)
+    except Exception:  # noqa: BLE001 - diagnostics must not break diagnostics
+        return []
+
 def classify_ineligibility(text, backend=None):
     """Detect a known AUTH or ELIGIBILITY failure in probe/dispatch output. Returns
     ``{kind, backend, reason, guidance}`` (kind is 'auth' or 'eligibility') or None.
@@ -289,7 +302,10 @@ def _check_agents_dir(agents_dir: str | None, cwd: str | None) -> dict:
         found = os.path.isdir(resolved)
         entry = {"path": resolved, "found": found,
                  "agent_count": len(agents),
-                 "agents": sorted(a.get("name", "?") for a in agents)[:50]}
+                 "agents": sorted(a.get("name", "?") for a in agents)[:50],
+                 # Declared-vs-enforceable mismatches across the WHOLE roster, so a
+                 # controlled roster is auditable without dispatching every agent.
+                 "roster_warnings": _roster_lint(agents)}
         # list_agents falls back to the skill's bundled starter roster, so a
         # fresh install lists agents even when the project dir is absent. Say so
         # explicitly rather than emitting a contradictory found:false + count>0.

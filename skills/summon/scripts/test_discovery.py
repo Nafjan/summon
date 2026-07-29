@@ -14530,6 +14530,260 @@ def test_v9_the_roster_doc_matches_the_agents_it_describes():
                 "on first use" % (fn, val))
 
 
+def test_v10_litter_sweep_requires_structural_glog_identity():
+    """CERTIFICATION ROUND 3, CRITICAL. `_looks_like_agy_log` accepted any ONE loose phrase
+    anywhere in the first 4 KB, so a caller's file reading "Release checklist: verify
+    Starting language server appears in diagnostics." was accepted and DELETED. Deleting a
+    file in someone's repository is not recoverable; the cost of a miss is a leftover file.
+
+    Identity is now structural: the first non-blank line must be a glog preamble or record,
+    AND some line must match glog's machine record format. Prose can contain any phrase;
+    prose cannot accidentally BE glog."""
+    import shutil
+    from _executor import _looks_like_agy_log
+
+    GLOG = ("Log file created at: 2026/07/28 04:00:00" + chr(10) +
+            "Running on machine: HOST" + chr(10) +
+            "I0728 04:00:00.123456       1 main.go:10] Starting language server" + chr(10))
+    REAL_TAIL = ("I0726 00:28:40.630033 53596 server.go:1423] Starting language server"
+                 + chr(10))
+
+    d = tempfile.mkdtemp(prefix="summon-litter-")
+    try:
+        def verdict(body):
+            p = os.path.join(d, "--print")
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            return _looks_like_agy_log(p)
+
+        assert verdict(GLOG) is True, "a real glog file must still be swept"
+        assert verdict(REAL_TAIL) is True, (
+            "a record-only log (the shape actually observed on disk) must be swept")
+
+        # the exact reproduction from the review
+        assert verdict("Release checklist: verify Starting language server appears in "
+                       "diagnostics." + chr(10)) is False
+        # a document that QUOTES a log line is still a document
+        assert verdict("# Debugging notes" + chr(10) + "Saw this:" + chr(10) +
+                       "I0728 04:00:00.123456       1 main.go:10] x" + chr(10)) is False
+        # every old marker phrase, as prose
+        assert verdict("Starting language server" + chr(10) + "glog" + chr(10)) is False
+        assert verdict("") is False
+
+        # A document whose FIRST LINE happens to open with a glog preamble phrase but which
+        # contains no machine record. Only the record-format check can reject this -- the
+        # first-line gate passes it. Without this case a mutant that deleted the record
+        # check entirely survived: every other negative here is caught by the first gate, so
+        # one input was exercising two guards and only proving one.
+        assert verdict("Log file created at: the start of every run, per our conventions."
+                       + chr(10) + "We then diff the output by hand." + chr(10)) is False
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_v10_timeout_budget_survives_serialization():
+    """CERTIFICATION ROUND 3 + FIELD REPORT. `--background` and council stringify the parsed
+    timeout into a child's argv. int.__str__ dropped the unit, so an explicit `300ms` the
+    PARENT accepted arrived as "300" and the CHILD refused it as a units mistake -- summon
+    contradicting its own documented promise across a process boundary."""
+    import run_subagent as rs
+
+    for text in ("300ms", "600s", "600000", "10m", "1ms"):
+        parent = rs._parse_timeout(text)
+        child = rs._parse_timeout(str(parent))
+        assert int(child) == int(parent), (text, int(parent), int(child))
+        assert child.bare_sub_second == parent.bare_sub_second, (
+            "%r lost its units provenance across serialization: parent bare=%s child bare=%s"
+            % (text, parent.bare_sub_second, child.bare_sub_second))
+
+    # the specific promise: an explicit sub-second unit survives and is NOT refused
+    forwarded = str(rs._parse_timeout("300ms"))
+    assert rs._parse_timeout(forwarded).bare_sub_second is False, forwarded
+    assert "ms" in forwarded, ("serialization must carry the unit, got %r" % forwarded)
+
+
+def test_v10_gate_timeout_is_parsed_and_guarded():
+    """CERTIFICATION ROUND 3 found a guard bypass; the defect underneath was bigger. The
+    `--gate-timeout` argument had NO `type=`, so the help text's promise of "same grammar as
+    --timeout" was never implemented and `--gate-timeout 600s` reached the gate as the raw
+    STRING "600s" via `timeout = args.gate_timeout or args.timeout`."""
+    from _cli import build_parser, Milliseconds
+
+    p = build_parser("test", 1)
+    base = ["--agent", "x", "--prompt", "y", "--cwd", os.getcwd()]
+
+    a = p.parse_args(base + ["--gate-timeout", "600s"])
+    assert isinstance(a.gate_timeout, Milliseconds), (
+        "--gate-timeout is unparsed: a %s reaches the gate as its budget"
+        % type(a.gate_timeout).__name__)
+    assert int(a.gate_timeout) == 600_000, int(a.gate_timeout)
+    assert p.parse_args(base + ["--gate-timeout", "10m"]).gate_timeout == 600_000
+
+    # and a bare sub-second value is flagged for the dispatch guard, same as --timeout
+    assert p.parse_args(base + ["--gate-timeout", "300"]).gate_timeout.bare_sub_second is True
+    assert p.parse_args(base + ["--gate-timeout", "300ms"]).gate_timeout.bare_sub_second is False
+
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "run_subagent.py"), encoding="utf-8").read()
+    assert '("--gate-timeout", getattr(args, "gate_timeout", None))' in src, (
+        "the dispatch units guard does not cover --gate-timeout; _run_gate calls "
+        "execute_agent directly and never passes back through it")
+
+
+def test_v10_units_guard_precedes_every_side_effect():
+    """CERTIFICATION ROUND 3. `--worktree x --timeout 300` correctly errored and still left
+    `.claude/worktrees/x` and the branch behind: the worktree was created ~55 lines before
+    the units guard ran. Argument validation must precede side effects -- there is nothing
+    to clean up if nothing was created."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "run_subagent.py"), encoding="utf-8").read()
+    guard = src.index('for _flag, _val in (("--timeout"')
+    worktree = src.index("if args.worktree is not None and not args.dry_run:")
+    assert guard < worktree, (
+        "the units guard runs AFTER worktree creation, so a rejected dispatch still leaves "
+        "a branch and a checkout on disk")
+
+
+def test_v10_worktree_teardown_targets_the_root_not_the_cwd():
+    """CERTIFICATION ROUND 3. `_setup_worktree` sets `cwd` to the SUBDIRECTORY mirroring the
+    caller's original --cwd. Teardown preferred `cwd`, so when --cwd was a repo
+    subdirectory it asked git to remove a path INSIDE the checkout, which fails -- and the
+    denial left both the checkout and the branch behind."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "run_subagent.py"), encoding="utf-8").read()
+    i = src.index("def _remove_worktree(")
+    body = src[i:i + 1400]
+    assert 'info.get("path") or info.get("cwd")' in body, (
+        "teardown must prefer the worktree ROOT; preferring `cwd` strands a subdirectory "
+        "dispatch's checkout")
+
+
+def test_v10_roster_lint_reports_effective_not_declared_capability():
+    """FIELD REPORT (2026-07-28). summon refuses an unenforceable tier per DISPATCH, so a
+    roster maintained as a controlled artifact can hold definitions whose declared intent
+    the backend can never honour -- unnoticed until someone dispatches one. Two of the
+    offenders in the report were named reviewers.
+
+    The direction matters: on agy `safe-edit` runs with the SAME full bypass as `yolo`, so a
+    capability census built from declared strings UNDERSTATES real capability, and a census
+    that undercounts is worse than none because it is trusted."""
+    from _builder import effective_permission, roster_permission_lint
+
+    assert effective_permission("agy", "safe-edit") == "yolo", (
+        "agy safe-edit IS full bypass; reporting the declared string understates it")
+    assert effective_permission("agy", "read-only") == "unenforceable"
+    assert effective_permission("claude", "safe-edit") == "safe-edit"
+    assert effective_permission("codex", "read-only") == "read-only"
+
+    lint = roster_permission_lint([
+        {"name": "reviewer", "run_agent": "agy", "permission": "safe-edit"},
+        {"name": "auditor", "run_agent": "agy", "permission": "read-only"},
+        {"name": "planner", "run_agent": "claude", "permission": "read-only"},
+        {"name": "nameless", "run_agent": None, "permission": "read-only"},
+    ])
+    by = {w["agent"]: w for w in lint}
+    assert set(by) == {"reviewer", "auditor"}, sorted(by)
+    assert by["reviewer"]["effective"] == "yolo" and by["reviewer"]["severity"] == "warning"
+    assert by["auditor"]["severity"] == "error", by["auditor"]
+
+    # summon's OWN bundled roster must not commit the understatement it warns about
+    from _loader import bundled_roster_dir, list_agents
+    bundled = bundled_roster_dir()
+    if bundled:
+        own = roster_permission_lint(list_agents(bundled))
+        assert own == [], (
+            "summon's bundled roster misrepresents its own agents' capability: %r" % (own,))
+
+
+def test_v10_explicit_agents_dir_falling_back_to_bundled_is_never_silent():
+    """FIELD REPORT (2026-07-28). A governance control was written mandating `--agents-dir`
+    in the belief that it guaranteed roster provenance. It does not: resolution falls
+    through to the bundled roster silently. `--agents-dir` selects which directory is
+    SEARCHED; only `agent_def.source` proves where the definition came from.
+
+    The unqualified fallback is correct and must stay quiet -- warning there would be noise
+    on the intended path."""
+    import shutil
+    from _loader import bundled_roster_dir, explicit_dir_fallback_warning
+
+    bundled = bundled_roster_dir()
+    if not bundled:
+        return
+    served = os.path.join(bundled, "planner.md")
+    if not os.path.isfile(served):
+        return
+
+    empty = tempfile.mkdtemp(prefix="summon-emptyroster-")
+    try:
+        w = explicit_dir_fallback_warning(empty, served)
+        assert w and "--agents-dir named" in w, w
+        assert "agent_def.source" in w, ("the warning must name the field that DOES prove "
+                                         "provenance: %r" % w)
+        # no explicit dir -> the fallback is the intended behaviour, so stay silent
+        assert explicit_dir_fallback_warning(None, served) is None
+        # explicitly pointing AT the bundled roster is not a surprise either
+        assert explicit_dir_fallback_warning(bundled, served) is None
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
+
+
+def test_v10_timeout_envelope_surfaces_the_cause_not_just_the_clock():
+    """FIELD REPORT (2026-07-28). A dispatch burned 480s and returned result="" with the
+    real cause -- `rg` missing from the child's PATH -- visible only in `output_tail`, a
+    field callers have no reason to read. Callers branch on status/result/report, so an
+    actionable failure read as an opaque timeout."""
+    from _executor import _timeout_payload, salient_error
+
+    class _P:
+        def get_result(self):
+            return ""
+
+    env = _timeout_payload("codex", _P(), 480_000, [
+        "The term 'rg' is not recognized as a name of a cmdlet, function, script file."
+        + chr(10)])
+    assert env.get("partial_output_only") is True, env
+    assert env.get("error_hint"), ("the cause must be promoted out of output_tail: %r"
+                                   % env.get("error"))
+    assert "rg" in env["error_hint"]
+    assert "likely cause" in (env.get("error") or ""), env.get("error")
+    assert any("output_tail" in w for w in (env.get("warnings") or [])), env.get("warnings")
+
+    # a timeout that DID produce a result is not relabelled. NOTE the fixture type:
+    # `processor.get_result()` returns the parsed result JSON (a dict) or None, never a
+    # string -- an earlier draft of both this test and the code under it assumed str, and
+    # the code would have raised AttributeError on every timeout that produced a result.
+    class _Q:
+        def get_result(self):
+            return {"result": "a real answer"}
+
+    done = _timeout_payload("codex", _Q(), 1000, ["noise"])
+    assert done.get("partial_output_only") is None, done
+    assert done.get("result") == "a real answer", done
+
+    # PROSE containing a generic phrase is still never promoted: these markers count only
+    # at end-of-line, where a shell puts them and a sentence does not.
+    assert salient_error("The release notes mention no such file or directory handling.") is None
+    assert salient_error("We should document what command not found means.") is None
+    assert salient_error("cat: foo.txt: No such file or directory") is not None
+    assert salient_error("bash: rg: command not found") is not None
+
+
+def test_v10_roster_paths_are_emitted_normalised():
+    """FIELD REPORT (2026-07-28). `--set-agent` with a forward-slash `--agents-dir` emitted
+    "C:/Users/x/.agents\\name.md" -- mixed separators in a machine-readable field."""
+    import shutil
+    from _roster import new_agent
+
+    d = tempfile.mkdtemp(prefix="summon-sep-").replace(os.sep, "/")
+    try:
+        out = new_agent(d, "sep-probe", {"run-agent": "claude"})
+        p = out["path"]
+        assert not ("/" in p and chr(92) in p), ("mixed separators in an emitted path: %r" % p)
+        assert p == os.path.normpath(p), p
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _global_fingerprint():
     """Identity of the globals these tests monkeypatch.
 
