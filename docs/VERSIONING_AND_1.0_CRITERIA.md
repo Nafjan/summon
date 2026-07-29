@@ -1,6 +1,6 @@
 # Versioning, and what summon 1.0.0 would mean
 
-Status: **criteria defined; 1.0.0 NOT yet claimed.** Current line is 0.18.x.
+Status: **criteria defined; 1.0.0 NOT yet claimed.** Current line is 0.19.x.
 
 > This line drifted (it said 0.14.x through four minor releases). If you are editing
 > it, that is the eleventh instance of the defect this repo keeps hitting: a claim and
