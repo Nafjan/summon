@@ -4863,6 +4863,53 @@ def test_jobs_dead_pid_is_stale_and_wait_fails_fast():
         _sh.rmtree(root, ignore_errors=True)
 
 
+def test_jobs_wait_rechecks_result_before_declaring_stale():
+    """A child can atomically publish its result and exit after wait_job's first
+    read but before its liveness probe. The final result must win that race."""
+    import _jobs
+    root = tempfile.mkdtemp(prefix="summon-jobsfinishrace-")
+    original = _jobs._pid_liveness
+    try:
+        jid = _jobs.new_job_id()
+        nonce = "r" * 32
+        _jobs.write_prepared(root, jid, nonce=nonce, agent="a",
+                             prompt_sha256=None, cwd="/w", flags={}, summon={})
+        _jobs.update_spawned(root, jid, 4242)
+
+        def finish_then_report_dead(_pid):
+            _jobs._atomic_write_json(
+                _jobs.result_path(root, jid),
+                {"status": "success", "job_nonce": nonce},
+            )
+            return "dead"
+
+        _jobs._pid_liveness = finish_then_report_dead
+        result, outcome = _jobs.wait_job(root, jid, timeout_ms=60_000, poll_sec=0.1)
+        assert outcome == "done" and result is not None, (result, outcome)
+        assert result["job_nonce"] == nonce
+
+        foreign = _jobs.new_job_id()
+        _jobs.write_prepared(root, foreign, nonce="f" * 32, agent="a",
+                             prompt_sha256=None, cwd="/w", flags={}, summon={})
+        _jobs.update_spawned(root, foreign, 4243)
+
+        def publish_foreign_then_report_dead(_pid):
+            _jobs._atomic_write_json(
+                _jobs.result_path(root, foreign),
+                {"status": "success", "job_nonce": "WRONG"},
+            )
+            return "dead"
+
+        _jobs._pid_liveness = publish_foreign_then_report_dead
+        result, outcome = _jobs.wait_job(
+            root, foreign, timeout_ms=60_000, poll_sec=0.1)
+        assert result is None and outcome == "stale", (result, outcome)
+    finally:
+        _jobs._pid_liveness = original
+        import shutil as _sh
+        _sh.rmtree(root, ignore_errors=True)
+
+
 def test_artifact_manifest_hashes_loose_inputs_and_detects_change():
     """Loose-file provenance is part of request reuse and is checked again after
     dispatch. DOCX page metadata is labelled rather than presented as measured PDF
@@ -4907,6 +4954,16 @@ def test_artifact_manifest_hashes_loose_inputs_and_detects_change():
         assert env["artifacts"]["stable_during_dispatch"] is False
         assert env["artifacts"]["changed"] == ["packet.txt"]
         assert env["suspect"] is True and env["warnings"]
+
+        os.remove(txt)
+        unreadable = {"status": "success", "warnings": []}
+        rs._complete_artifact_provenance(unreadable, args, before)
+        assert unreadable["artifacts"]["stable_during_dispatch"] is False
+        assert unreadable["artifacts"]["changed"] == [], (
+            "a failed after-read cannot prove that every artifact changed")
+        assert "after_error" in unreadable["artifacts"]
+        assert "could not be verified" in unreadable["warnings"][0]
+        assert unreadable["suspect"] is True
 
         outside = os.path.join(os.path.dirname(root), "outside.txt")
         with open(outside, "w", encoding="utf-8") as fh:

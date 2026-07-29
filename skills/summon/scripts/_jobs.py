@@ -425,6 +425,14 @@ def wait_job(root: str, job_id: str, timeout_ms: int, poll_sec: float = 0.5):
             # child's own write (deterministic: never returns an untrusted result)
         if rec is not None and rec.get("pid") is not None \
                 and _pid_liveness(rec.get("pid")) == "dead":
+            # The child can publish its atomic result and exit between the read
+            # above and this liveness probe. Re-read once after observing death
+            # so that a verified terminal result wins that unavoidable race.
+            result, res_state = _read(rpath)
+            if result is not None:
+                _state, trusted = _classify(rec, rec_state, result, res_state)
+                if trusted:
+                    return result, "done"
             return None, "stale"
         if time.monotonic() >= deadline:
             return None, "timeout"

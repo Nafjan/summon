@@ -6,6 +6,29 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.19.1] - 2026-07-29
+
+Cross-vendor certification round 1 returned **CONCERNS**, so it earned no clean
+credit and reset the counter to 0/3 on this new surface.
+
+### Fixed
+
+- **`jobs wait` no longer loses a result at child exit.** A child could atomically
+  publish its result and exit after the wait loop's read but before its liveness
+  probe. The dead-PID branch now performs one final authenticated read, accepting
+  the job's nonce-matching result while still rejecting foreign or corrupt files.
+- **Artifact read failures no longer masquerade as proven changes.** A failed
+  after-dispatch read still makes a successful review suspect, but `changed` stays
+  empty and `after_error` records why stability is unknown. Warnings distinguish an
+  unverifiable after-state from an observed identity change.
+
+### Testing
+
+The exit race is reproduced by publishing the result inside the liveness probe;
+the pre-fix function returns `stale`. The regression also proves a foreign result
+in the same window remains untrusted. The artifact-read regression also kills the
+old all-paths-changed branch. 427/427 discovery and 22/22 installer tests pass.
+
 ## [0.19.0] - 2026-07-29
 
 Field feedback from two large document-audit runs, followed by the two outstanding
