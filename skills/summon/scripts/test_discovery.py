@@ -290,6 +290,13 @@ def test_execution_status_and_review_verdict_are_separate_signals():
     assert blocked["execution_status"] == "success"
     assert blocked["status"] == "blocked" and blocked["verdict"] is None
 
+    injected = _enrich({
+        "result": "STATUS: DONE\nSUMMARY: ok\nFOLLOW-UP: none\nHANDOFF: none",
+        "exit_code": 0, "status": "success", "execution_status": "injected",
+        "cli": "codex"}, None)
+    assert injected["execution_status"] == "success", (
+        "execution_status must snapshot executor status, not trust a backend field")
+
 
 def test_resumed_flag_describes_a_caller_requested_continuation():
     """The envelope must make anchoring/audit context visible without making a
@@ -4959,8 +4966,8 @@ def test_artifact_manifest_hashes_loose_inputs_and_detects_change():
         unreadable = {"status": "success", "warnings": []}
         rs._complete_artifact_provenance(unreadable, args, before)
         assert unreadable["artifacts"]["stable_during_dispatch"] is False
-        assert unreadable["artifacts"]["changed"] == [], (
-            "a failed after-read cannot prove that every artifact changed")
+        assert unreadable["artifacts"]["changed"] is None, (
+            "a failed after-read is unknown, not a proven empty change set")
         assert "after_error" in unreadable["artifacts"]
         assert "could not be verified" in unreadable["warnings"][0]
         assert unreadable["suspect"] is True
@@ -14674,6 +14681,50 @@ def test_v9_a_denied_dispatch_leaves_no_worktree_behind():
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
+
+
+def test_v9_worktree_cleanup_rejects_symlink_escape_before_git():
+    """Lexical containment is insufficient when a leaf below the owned worktree
+    root is a symlink to an external directory. Reject it before any git command."""
+    import run_subagent as rs
+    import shutil as _sh
+
+    repo = tempfile.mkdtemp(prefix="summon-wt-symlink-repo-")
+    outside = tempfile.mkdtemp(prefix="summon-wt-symlink-outside-")
+    link = os.path.join(repo, ".claude", "worktrees", "escaped")
+    original_run = rs.subprocess.run
+    try:
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        sentinel = os.path.join(outside, "precious.txt")
+        with open(sentinel, "w", encoding="utf-8") as fh:
+            fh.write("must survive")
+        try:
+            os.symlink(outside, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            return  # platform/account cannot create directory symlinks
+
+        def git_must_not_run(*_args, **_kwargs):
+            raise AssertionError("git ran before the symlink escape was rejected")
+
+        rs.subprocess.run = git_must_not_run
+        cleanup = rs._remove_worktree({
+            "repo": repo, "path": link, "cwd": link,
+            "branch": "agents/escaped", "base_head": "a" * 40,
+        })
+        assert cleanup["preserved"] is True
+        assert cleanup["worktree_removed"] is False
+        assert cleanup["reason"] == (
+            "worktree path is outside summon's owned worktree directory"), cleanup
+        assert os.path.isfile(sentinel), "containment check touched the external target"
+    finally:
+        rs.subprocess.run = original_run
+        try:
+            if os.path.lexists(link):
+                os.unlink(link)
+        except OSError:
+            pass
+        _sh.rmtree(repo, ignore_errors=True)
+        _sh.rmtree(outside, ignore_errors=True)
 
 
 def test_v9_every_denial_site_enriches_the_same_way():

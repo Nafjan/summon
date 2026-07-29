@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.19.1"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "0.19.2"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -181,7 +181,11 @@ def _complete_artifact_provenance(env: dict, args, before: dict | None) -> dict:
     # If the after-read failed, the changed set is UNKNOWN rather than "every
     # input changed". Keep the result suspect, but do not manufacture a change
     # claim that the failed read cannot support.
-    evidence["changed"] = changed_paths(before, after) if after and not stable else []
+    evidence["changed"] = (
+        None if after is None
+        else changed_paths(before, after) if not stable
+        else []
+    )
     if error:
         evidence["after_error"] = error
     env["artifacts"] = evidence
@@ -659,7 +663,6 @@ def main() -> None:
     request_sha = request_fingerprint(**_identity)
     receipt["request_sha256"] = request_sha
     _artifact_manifest = _identity.get("_artifact_manifest")
-    args._artifact_manifest = _artifact_manifest
     if _artifact_manifest:
         # Before-only on refusal/preflight paths; a completed dispatch replaces this
         # with a before/after stability record below.
@@ -969,7 +972,8 @@ def main() -> None:
     )
 
     if args.dry_run:
-        _emit(_dry_run_view(invocation, args, agents_dir, agent_file))
+        _emit(_dry_run_view(invocation, args, agents_dir, agent_file,
+                            artifact_manifest=_artifact_manifest))
         sys.exit(0)
 
     # --gate-with: another agent must APPROVE this dispatch before it runs. Placed
@@ -1063,7 +1067,8 @@ def main() -> None:
 
 
 def _dry_run_view(invocation, args, agents_dir: str,
-                  agent_file: str | None = None) -> dict:
+                  agent_file: str | None = None,
+                  artifact_manifest: dict | None = None) -> dict:
     """The fully resolved dispatch, without executing. For agy the per-call
     profile is NOT built (that copies OAuth tokens = a mutation); the wrapper
     path is shown instead."""
@@ -1100,8 +1105,8 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "worktree": ("would create" if args.worktree is not None else None),
         "system_context_chars": len(invocation.system_context),
     }
-    if getattr(args, "_artifact_manifest", None):
-        view["artifacts"] = dict(args._artifact_manifest,
+    if artifact_manifest:
+        view["artifacts"] = dict(artifact_manifest,
                                  stable_during_dispatch=None,
                                  after_sha256=None)
     for _w in _guard_warnings:  # credit-only guard actions surfaced in the preview
@@ -1313,8 +1318,10 @@ def _remove_worktree(info) -> dict:
     # The helper receives only internal metadata, but keep the destructive target
     # bounded to the directory _setup_worktree owns.
     try:
-        owned_root = os.path.abspath(os.path.join(str(repo), ".claude", "worktrees"))
-        if os.path.commonpath((owned_root, os.path.abspath(target))) != owned_root:
+        owned_root = os.path.realpath(os.path.abspath(
+            os.path.join(str(repo), ".claude", "worktrees")))
+        resolved_target = os.path.realpath(os.path.abspath(target))
+        if os.path.commonpath((owned_root, resolved_target)) != owned_root:
             result["reason"] = "worktree path is outside summon's owned worktree directory"
             return result
     except ValueError:

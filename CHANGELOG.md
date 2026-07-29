@@ -6,6 +6,35 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.19.2] - 2026-07-29
+
+The restarted, gated cross-vendor certification round returned **CONCERNS** with
+three warning-level findings. It earned no clean credit; this new surface resets
+the counter to 0/3 again. The real gate soak did succeed: a read-only
+`quick-reviewer` approved the bounded review and the read-only ceiling held for the
+main Claude reviewer.
+
+### Fixed
+
+- **`execution_status` is always the executor snapshot.** Enrichment now overwrites
+  any pre-existing backend field before report reconciliation instead of trusting
+  it through `setdefault`.
+- **Unknown artifact changes are explicitly null.** When the after-dispatch
+  manifest cannot be read, `changed:null` and `after_error` distinguish unknown
+  stability from a proven empty change set. Observed differences remain a list.
+- **Worktree cleanup resolves containment through symlinks.** Both the owned root
+  and target are compared by real path before any Git command, so a symlinked leaf
+  cannot route cleanup outside summon's worktree directory.
+- **Dry-run artifact data uses an explicit parameter.** The private manifest no
+  longer travels as an undocumented attribute injected into the argparse Namespace.
+
+### Testing
+
+All three certification findings have failure-first regressions: each failed
+against 0.19.1 before its production fix. The worktree case also proves Git is not
+invoked before a symlink escape is rejected. 428/428 discovery and 22/22
+installer tests pass.
+
 ## [0.19.1] - 2026-07-29
 
 Cross-vendor certification round 1 returned **CONCERNS**, so it earned no clean
