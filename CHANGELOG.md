@@ -6,6 +6,62 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [0.19.0] - 2026-07-29
+
+Field feedback from two large document-audit runs, followed by the two outstanding
+certification-round-3 fixes. This release has **not** earned 1.0.0: the independent
+clean-round counter is still 0/3 before certification begins.
+
+### Added
+
+- **Execution and adjudication are separate signals.** `execution_status` preserves whether
+  the dispatch ran; top-level `verdict` normalizes review decisions to `block`,
+  `conditional`, or `pass`. A completed `VERDICT: BLOCK` review is no longer
+  indistinguishable from a failed review process. Structured report fields serialize before
+  the long narrative transcript.
+- **Caller-requested continuations report `resumed:true`.** Final adversarial gates can now
+  enforce fresh context rather than infer anchoring risk from a resume handle.
+- **Loose-file provenance via repeatable `--artifact`.** Git HEAD cannot identify untracked
+  PDFs/DOCX/XLSX inputs. summon now records relative filename, bytes, SHA-256, and labeled
+  page metadata where stdlib can read it; the manifest participates in request reuse and is
+  checked again after dispatch. A changed corpus is `suspect`, never silently terminal.
+  Manifest jobs accept the same input as an `artifacts` array.
+- **Document-audit templates.** The installed skill ships a claim-ledger JSON schema,
+  three-seat manifest, role-specialized cross-vendor council roster, and chairman question.
+
+### Fixed
+
+- **`jobs status` no longer calls every recorded pid `running`.** It performs a stdlib
+  process-existence probe and reports liveness-verified `running`, `stale` (pid gone with no
+  result), or `unverified` when the probe is unavailable. `jobs wait` returns early on stale
+  instead of burning its entire timeout. PID reuse remains an explicit limit.
+- **Gate denial cleanup could delete newly appeared work.** The old path ran
+  `git worktree remove --force` and `git branch -D`. Cleanup now captures the creation HEAD,
+  preserves any dirty or advanced tree, and uses non-forced worktree/branch removal as a
+  second guard against races after the checks. `worktree_cleanup` reports checkout and
+  branch outcomes separately; `worktree_preserved:true` names any ambiguous or changed case.
+- **The leak-detector regression test repaired the leak itself.** Its generic module repair
+  loop is now one real harness function, and the regression invokes that exact layer. Deleting
+  the harness branch now fails the test.
+- **agy council warnings matched current behavior.** agy has read `--cwd` through
+  `--add-dir` since 0.13.9; the stale warning said it could not. The warning now names the
+  actual limits: unenforced write authority and null served-model telemetry.
+
+### Documentation
+
+- Child connector/MCP/credential capability is explicitly distinct from the parent's. Large
+  external-source reviews should materialize bounded evidence packets under `--cwd`.
+- `doctor --json` drift is promoted to a pre-orchestration check, including the upgrade
+  warning for pre-0.18.0 copies carrying the agy file-deletion bug.
+- Resume is for continuity and crash recovery; fresh context is the rule for final
+  adjudication.
+
+### Testing
+
+426/426 discovery, 22/22 install. Seven representative mutants were killed across the new
+field-feedback paths; both worktree preservation guards and the real leak-repair branch were
+also mutation-verified.
+
 ## [0.18.0] - 2026-07-28
 
 Certification round 3 (VERDICT: BLOCK) plus a governance field report.

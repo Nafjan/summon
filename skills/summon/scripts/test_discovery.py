@@ -372,6 +372,25 @@ def test_envelope_version_and_cli_version():
     assert r.returncode == 0 and "summon" in r.stdout and "envelope schema" in r.stdout
 
 
+def test_current_version_claims_match_the_dispatcher():
+    """Bind current-line/sample claims to __version__; prose maintained separately
+    from the value drifted through four prior minor releases."""
+    import re
+    import run_subagent as rs
+
+    repo = Path(__file__).resolve().parents[3]
+    criteria = (repo / "docs" / "VERSIONING_AND_1.0_CRITERIA.md").read_text(
+        encoding="utf-8")
+    current = re.search(r"Current line is ([0-9]+\.[0-9]+)\.x", criteria)
+    assert current and current.group(1) == ".".join(rs.__version__.split(".")[:2])
+
+    readme = (repo / "README.md").read_text(encoding="utf-8")
+    sample = re.search(r'"summon":\s*\{\s*"version":\s*"([0-9.]+)"', readme)
+    assert sample and sample.group(1) == rs.__version__, (
+        "README sample envelope claims %s but the dispatcher is %s"
+        % (sample.group(1) if sample else None, rs.__version__))
+
+
 def test_elapsed_ms_present_even_on_spawn_failure():
     import _executor
     from _builder import AgentInvocation
