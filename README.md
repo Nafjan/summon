@@ -10,7 +10,7 @@
   <a href="https://github.com/Nafjan/summon/actions/workflows/ci.yml"><img src="https://github.com/Nafjan/summon/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
-  <img src="https://img.shields.io/badge/deps-stdlib_only-brightgreen.svg" alt="stdlib only">
+  <img src="https://img.shields.io/badge/core-stdlib_only-brightgreen.svg" alt="core: stdlib only">
   <img src="https://img.shields.io/badge/backends-6-brightgreen.svg" alt="6 backends">
   <img src="https://img.shields.io/badge/install-npx_skills_add-8B5CF6.svg" alt="npx skills add">
 </p>
@@ -246,14 +246,16 @@ dispatch it with the **summon** skill instead of doing everything yourself:
   chairman synthesize. Disagreement that survives round 2 is worth taking seriously.
 - **Independent work → `--manifest`.** Fan several jobs out with per-backend
   concurrency; each writes its own result envelope you can inspect.
-- **Escalate the hardest problems** to the top tier (an opus agent, or `fable`). Note that
-  `fable` runs on Opus unless you authorize credit spend: Fable bills account credit rather
-  than the subscription, so the guard substitutes the latest subscription Opus and says so
-  in `warnings`. Keep councils and swarms diverse; a council of clones is pointless.
+- **Escalate the hardest problems** to the top tier (an opus agent, or `fable`). Fable
+  billing depends on the Claude seat and remaining usage: Max/premium seats may use it
+  for up to 50% of their regular weekly limit at no extra cost, while Pro/standard seats
+  use usage credits from the start. summon runs the requested model, warns before
+  dispatch, and reports billing as unknown without a metered API-key route. Keep councils
+  and swarms diverse; a council of clones is pointless.
 
 Verify, don't trust: branch on the returned `status`; a `report_ok:false` or
-`suspect:true` "success" means re-dispatch. Read `warnings` (model fell back, an agy
-read-only dispatch was refused or is running advisory-only, credit spend). `model.served` proves what actually ran.
+`suspect:true` "success" means re-dispatch. Read `warnings` (model fallback, premium
+model cost, or an agy read-only dispatch refused/advisory-only). `model.served` proves what actually ran.
 Preview a paid fan-out with `--dry-run`, pass `--json-schema` when you need structured
 output, chain via `report.handoff` into the next call, and pass `--out` on any
 council you cannot afford to lose (the envelope is checkpointed each phase).
@@ -280,8 +282,8 @@ A few habits that keep multi-agent work fast, cheap, and trustworthy:
   sub-agents and keep only their `report.handoff`. That's how long chains stay affordable.
 - **Prefer structured output for anything you branch on.** `--json-schema` + `parse_ok`
   removes brittle "find the JSON" heuristics from your side entirely.
-- **Isolate parallel edits.** `--worktree` gives each concurrent agent its own branch so a
-  fan-out can't collide; you diff and merge the winner.
+- **Isolate parallel edits.** `--worktree` gives each concurrent agent its own branch,
+  reducing ordinary checkout collisions; you still review, diff, and merge the winner.
 
 ### Pairs well with your other skills
 
@@ -317,7 +319,7 @@ vendors.
   "report_ok": true,
   "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
                "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
-  "summon":  { "version": "0.19.2", "scripts_sha256": "9f2c…" },
+  "summon":  { "version": "1.0.0", "scripts_sha256": "9f2c…" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -411,7 +413,8 @@ a headless session.
 ## System requirements
 
 - **Python 3.10+** (3.11+ recommended). Standard library only, so no `pip install` for the
-  dispatcher itself. The optional **agy** backend's PTY wrapper wants `pip install pywinpty pyte`.
+  dispatcher itself. The optional **agy** backend's PTY wrapper uses `pywinpty` and `pyte`
+  (tested with `pywinpty 3.0.3` and `pyte 0.8.2`).
 - **At least one backend:** a vendor CLI installed and logged in (`claude`, `codex`,
   `cursor-agent`, `gemini`, or `agy`), and/or an API key for an `openai-compat` provider (or
   a local Ollama/LM Studio server). `summon doctor` tells you which are installed;

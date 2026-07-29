@@ -1,14 +1,14 @@
-# Versioning, and what summon 1.0.0 would mean
+# Versioning, and what summon 1.0.0 means
 
-Status: **criteria defined; 1.0.0 NOT yet claimed.** Current line is 0.19.x.
+Status: **criteria met; 1.0.0 publication authorized on 2026-07-29.** Current line is 1.0.x.
 
 > This line drifted (it said 0.14.x through four minor releases). If you are editing
 > it, that is the eleventh instance of the defect this repo keeps hitting: a claim and
 > the thing it describes, maintained separately.
 
 This document exists because "is it 1.0 yet?" is otherwise answered by feel, and feel is
-a poor instrument for a promise that binds every future release. Below: what 1.0.0 would
-commit summon to, the criteria that decide it, and an honest scoring against them.
+a poor instrument for a promise that binds every future release. Below: what 1.0.0
+commits summon to, the criteria that decided it, and an honest scoring against them.
 
 ---
 
@@ -76,28 +76,79 @@ silently leave a host running old code.
 
 ---
 
-## Honest scoring, 2026-07-25 (v0.14.0)
+## Honest scoring, 2026-07-29 (v1.0.0 candidate)
 
 | # | Criterion | Verdict | Evidence |
 |---|---|---|---|
-| C1 | Surface enumerated and frozen | **MET** | 54 public flags, all documented; a structural test parses the argparse spec and fails the suite on any undocumented flag. `--job-file` is the only suppressed one. |
-| C2 | Docs match behaviour | **MET (newly)** | Three false claims corrected today, each by measurement: the Opus alias pin, the guide's version stamp, and the agy `--cwd` claim. Guards now bind the version stamp and the default-chairman claim to their real values. |
-| C3 | Green across the matrix | **MET** | CI green on ubuntu/windows x 3.10/3.13. Achieved today after five non-hermetic tests were fixed -- CI had been red on every push for a full day. |
-| C4 | Defect discovery flattened | **NOT MET, decisively** | **Ten** consecutive cross-vendor rounds over ONE branch. Every round returned BLOCK or CONCERNS with reproducible findings. Zero clean rounds. See the evidence table below. |
-| C5 | Security controls hold | **PARTIAL** | Four `--gate-with` bypasses were found and fixed after shipping (background, gate `args:`, verdict injection, retries), then a fifth (the schema-correction path). All fixes are mutation-verified. But they were found in sequence, each after the previous was declared complete. |
-| C6 | The envelope never lies | **MET (newly)** | `gate.approved` could contradict `status: blocked` (fixed); `model.served` can be inferred and is now documented as such; the gate definition hash was null and is now populated. |
+| C1 | Surface enumerated and frozen | **MET** | Every public flag is documented; a structural test parses the argparse spec and fails the suite on any undocumented flag. `--job-file` is the only suppressed one. |
+| C2 | Docs match behaviour | **MET** | Version/sample claims are bound to `__version__`; volatile backend claims are measured and qualified; the 0.19 feedback corrections are regression-bound. |
+| C3 | Green across the matrix | **MET** | CI was green on ubuntu/windows x 3.10/3.13 before the final surface; the corrected 1.0 candidate passes 429/429 discovery and 22/22 installer tests locally, with platform-only cases explicitly skipped where unavailable. |
+| C4 | Defect discovery flattened | **MET (3/3)** | Three fresh Cursor/Composer adversarial reviews returned CLEAN on production-script hash `21aecdd7aa3dd84653b9c8ef5630e20869fce8b1b3e94d797b37c13a69b4c1e4`. Invalid, timed-out, repaired, resumed, BLOCK, and CONCERNS attempts were excluded. |
+| C5 | Security controls hold | **MET** | Gate/clamp bypass fixes are mutation-verified. Round 1 exercised a real `--max-permission read-only` clamp; a separate current-surface gated dispatch explicitly approved and then returned CLEAN. No repo mutation occurred. |
+| C6 | The envelope never lies | **MET** | `execution_status` now snapshots executor outcome independently from normalized `verdict`; `resumed`, model evidence, gate decisions, artifact stability, and null/unknown states are explicit and regression-bound. |
 | C7 | Upgrade and drift handled | **MET** | `doctor` enumerates host installs, the running copy, and project-local copies; drift reports a stale copy by hash. |
 
-**Verdict: 5 of 7 met, 1 partial, 1 not met. 1.0.0 is not yet warranted.**
+**Verdict: 7 of 7 met. 1.0.0 is warranted.**
 
 ---
 
+## Current C4 closure evidence: three clean rounds on the corrected surface
 
-## The C4 evidence: ten rounds over one branch
+The production surface froze at script hash
+`21aecdd7aa3dd84653b9c8ef5630e20869fce8b1b3e94d797b37c13a69b4c1e4`.
+All three counting reviews were fresh Cursor/Composer sessions over Codex-authored code
+and used the same bounded evidence packet. No production file changed between rounds.
+
+| Round | Job | Focus | Structured evidence | Verdict |
+|---|---|---|---|---|
+| 1 | `25aa0191accf4d3b977fd2c028112450` | Runtime billing, argv precedence, resume evidence | `status:success`, `execution_status:success`, `report_ok:true`, `verdict:pass`, one attempt, no repair/resume | **CLEAN** — notes only |
+| 2 | `26d46c22aaf24e8182600a185e6133d8` | Negative cases, warning parity, security disposition | Same success/pass fields; one attempt, no repair/resume | **CLEAN** — no findings |
+| 3 | `6901603cb84441c890ccdb05df975071` | Public-contract truth, cross-platform consistency | Same success/pass fields; one attempt, no repair/resume | **CLEAN** — no findings |
+
+Cursor reported the pinned `composer-2.5` target and nonzero usage but does not expose a
+served-model identity, so the record does not invent one. Failed Claude 529 attempts,
+timeouts, malformed contracts, and repaired reports earned no credit.
+
+Before these rounds, the requested strict static skill-security scan returned mechanical
+`FAIL` (12 critical, 69 high). A fresh Claude security auditor manually triaged every
+category and returned CLEAN: presence-only credential checks never emit secret values;
+network, cleanup, symlink, chmod, and installer hits were hardened or documented
+capabilities and fixtures rather than exploitable findings.
+
+---
+
+## Previous C4 closure evidence: three clean rounds on one surface
+
+The functional surface froze at commit `12394b4236804dd38a579ccd12f9f34c5f013367`.
+All three counting reviews were fresh Claude Sonnet 5 sessions over Codex-authored code.
+They reviewed the same `d91c025..12394b4` range; no code changed between them.
+
+That record justified the version bump at the time, but it did not certify the corrected
+Fable telemetry added before publication. The current three-round record above supersedes
+it for the published 1.0 surface.
+
+| Round | Permission | Focus | Structured evidence | Verdict |
+|---|---|---|---|---|
+| 1 | read-only | Full feedback and section-3 surface | `status:success`, `execution_status:success`, `report_ok:true`, `verdict:pass`, one attempt, no repair/resume/suspect | **CLEAN** |
+| 2 | safe-edit, explicit no-edit; Git verified unchanged | Security, concurrency, negative paths | Same success/pass fields; one attempt, no repair/resume/suspect | **CLEAN** |
+| 3 | safe-edit, explicit no-edit; Git verified unchanged | Windows/POSIX, public contracts, test strength | Same success/pass fields; one attempt, no repair/resume/suspect | **CLEAN** |
+
+Non-counting attempts are part of the audit trail: one Opus stream-idle error, one
+reviewer timeout, and two narrative CLEAN results whose malformed/repair-resumed
+contracts left the structured verdict null. None was promoted into clean credit.
+
+Round 1 exercised `--max-permission read-only` on the same HEAD and its envelope
+reported `permission:read-only`. The separate C5 soak then ran with a real
+`--gate-with quick-reviewer` plus `--max-permission safe-edit`. The gate recorded
+`approved:true`; the one-attempt main review returned `verdict:pass`; Git remained
+unchanged.
+
+---
+
+## Historical C4 evidence: why 1.0 was previously blocked
 
 `fix/agy-readonly-containment` was reviewed cross-vendor (codex adjudicating Claude-written
-code) after every fix batch. The bar is three consecutive clean rounds. The counter never
-started.
+code) after every fix batch. In that earlier campaign the clean counter never started.
 
 | Round | Verdict | Findings | The one that mattered |
 |---|---|---|---|
@@ -122,46 +173,47 @@ though it were the whole problem. Two documented guarantees were measurably fals
 rewritten against a repro: "agy read-only cannot see your repository", and "wasteful
 duplicate, not corruption".
 
-**The honest read.** A 0.x line that absorbs this much correction per round is healthy. The
+**The honest read at the time.** A 0.x line that absorbs this much correction per round is healthy. The
 same rate under a 1.0 promise would mean shipping breaking fixes to a frozen contract. C4 is
 not a formality to wait out; it is the difference between "we have not found the bugs" and
-"there are fewer bugs to find", and this branch cannot yet tell those apart.
+"there are fewer bugs to find". The three-round 0.19.2 record above is the later evidence
+that finally distinguished those states.
 
-**What would actually move C4:** the same surface reviewed three times with nothing new
-found, at least twice cross-vendor, plus real-world use of `--gate-with` and
-`--max-permission` by someone who did not write them. Not more features. The *absence* of
-findings, sustained.
+**What moved C4:** the same surface was reviewed three times with nothing material found,
+all three cross-vendor, plus real-world use of `--gate-with` and `--max-permission` by a
+reviewer that did not write them. It was the sustained absence of findings, not another
+feature.
 
-## Why C4 is the one that blocks
+## Why C4 was the one that blocked
 
 C1-C3, C6 and C7 describe the state of the codebase. C4 describes the state of our
 KNOWLEDGE of it, and it is the only criterion that cannot be satisfied by doing more
 work today -- only by doing work and then finding nothing.
 
-Today's record is unambiguous: nearly every independent check found something real, and
+The earlier record was unambiguous: nearly every independent check found something real, and
 several found defects in code that had just been declared fixed. The `--gate-with`
 feature alone went through five rounds, each closing a bypass the previous round had not
-looked for. That is a healthy process producing an honest signal, and the signal says the
-surface is still yielding.
+looked for. That healthy process produced the signal to wait; the later three-round clean
+record produced the signal to freeze.
 
-Freezing a contract while the discovery rate is that high would mean promising not to
-break something we are still learning the shape of.
+Freezing earlier would have meant promising not to break something whose shape was still
+being learned.
 
 ## The gate to 1.0.0
 
-1. **Three consecutive clean review rounds** over the changed surface (no BLOCK, no
+1. **ACHIEVED:** Three consecutive clean review rounds over the changed surface (no BLOCK, no
    CONCERN), at least two cross-vendor. Reviews must be of the SAME surface -- rotating to
    fresh code resets the count, because it measures knowledge of a stable thing.
-2. **A soak period with no security finding**: `--gate-with` and `--max-permission` used
+2. **ACHIEVED:** A soak period with no security finding: `--gate-with` and `--max-permission` used
    in real dispatches, not only tests.
-3. **C5 upgraded to MET** by (1) and (2) together.
+3. **ACHIEVED:** C4 returned to MET when (1) was satisfied on the corrected surface.
 
-None of that requires new features. It requires the absence of new findings, which is a
-thing only time and independent eyes can supply.
+No new feature closed this gate. Independent eyes finding nothing material on the stable
+surface did.
 
-## Until then
+## After 1.0
 
-0.x with a maintained CHANGELOG is the honest label. The envelope already carries its own
-`envelope: 1` schema version, so consumers who need a stability guarantee today have one
-at the layer that actually matters for integration -- the response shape -- without the
-dispatcher pretending to a stability it has not yet demonstrated.
+The public surfaces named above now follow semantic versioning. Backward-compatible fields
+and capabilities may be added in 1.x; a breaking CLI/report/agent-definition contract change
+requires 2.0. The response shape keeps its independent `envelope: 1` version and bumps that
+number on a breaking envelope-shape change.

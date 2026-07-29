@@ -19,7 +19,7 @@ from _builder import (AgentInvocation, BACKENDS, advisory_warnings,
                       readonly_unenforceable_error,
                       agy_readonly_workspace_warning, agy_timeout_warning,
                       apply_credit_guard, backend_kind, build_invocation_args,
-                      credit_spend_allowed, infer_billing, permission_flags,
+                      credit_spend_allowed, infer_dispatch_billing, permission_flags,
                       selects_credit_only)
 from _stream import StreamProcessor, _terminal_is_error
 
@@ -2029,7 +2029,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     threshold for the human-facing output_tail (None -> the built-in default).
     """
     started = time.monotonic()
-    # Credit-only model guard (Fable): build_invocation_args enforces it in the
+    # Credit-only model guard: build_invocation_args enforces it in the
     # argv/env (so --dry-run and real dispatch agree); here we keep the ORIGINAL
     # request, the GUARDED effective model (feeds model.targeted), and the guard
     # warnings for the envelope's transparency.
@@ -2117,39 +2117,56 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # at read-only, where the workspace is withheld because agy cannot enforce that tier.
         # The other thing that bites is the clock: agy is multi-step, so a short budget kills
         # it mid-work. Both live in advisory_warnings, shared with --dry-run.
-        for _w in advisory_warnings(inv.cli, inv.permission, timeout_ms, inv.model):
+        for _w in advisory_warnings(inv.cli, inv.permission, timeout_ms, inv.model,
+                                    inv.extra_args):
             resp.setdefault("warnings", []).append(_w)
         try:
             resp["permission_flags"] = permission_flags(inv.cli, inv.permission)
         except ValueError:
             resp["permission_flags"] = None
         # Which billing source this run drew from (subscription vs API credits) —
-        # pairs with usage/cost_usd so an orchestrator can attribute spend.
-        resp.setdefault("billing", infer_billing(inv.cli))
-        # Fable / credit-only transparency: surface every guard warning (model
+        # pairs with usage/cost_usd so an orchestrator can attribute spend. A
+        # Claude resume keeps the session's ORIGINAL model; the new invocation's
+        # agent/model is not evidence. Only a terminal model report can resolve it.
+        if inv.cli == "claude" and inv.resume_id and not _terminal_model:
+            resp["billing"] = {
+                "source": "unknown",
+                "note": "resumed Claude session kept its original model; no terminal "
+                        "model evidence was available, so billing cannot be inferred",
+            }
+        else:
+            _billing_model = (_terminal_model
+                              if inv.cli == "claude" and inv.resume_id
+                              else _requested_model)
+            _billing_args = (() if inv.cli == "claude" and inv.resume_id
+                             else inv.extra_args)
+            resp.setdefault("billing", infer_dispatch_billing(
+                inv.cli, _billing_model, _billing_args))
+        # Credit-only transparency: surface every guard warning (model
         # fallback, scrubbed args, stripped env alias, resume caveat) …
         for w in _guard_warnings:
             resp.setdefault("warnings", []).append(w)
-        # … and correct the billing source for a Fable run. The effective model
+        # … and correct the billing source for a credit-only run. The effective model
         # can come from --model OR an `args:` selector, so key off that (not just
-        # inv.model). An ANTHROPIC_API_KEY meters the API instead of account credit.
+        # inv.model). ANTHROPIC_API_KEY presence predicts the API route; vendor
+        # authentication remains authoritative.
         if inv.cli == "claude":
             _picks_credit = selects_credit_only(_requested_model, inv.extra_args)
             if credit_spend_allowed() and _picks_credit:
                 if os.environ.get("ANTHROPIC_API_KEY"):
                     resp["billing"] = {"source": "api",
-                        "note": "credit-only model (Fable) via ANTHROPIC_API_KEY (metered API, not credit)"}
+                        "note": "credit-only model via ANTHROPIC_API_KEY "
+                                "(metered API, not account credit)"}
                 else:
                     resp["billing"] = {"source": "credit",
-                        "note": "credit-only model (Fable) billed to account credit "
-                                "(no longer on the Claude Max subscription)"}
+                        "note": "credit-only model billed to account credit"}
             elif inv.resume_id and _picks_credit:
-                # Unauthorized resume of a Fable request: --resume keeps the
+                # Unauthorized resume of a credit-only request: --resume keeps the
                 # session's original model (the guard can't re-pin it), so the
                 # billing source is genuinely not determinable here.
                 resp["billing"] = {"source": "unknown",
                     "note": "resumed claude session runs its original model (guard can't re-pin "
-                            "on --resume); if it was Fable this bills account credit"}
+                            "on --resume); billing cannot be proven"}
         raw = resp.pop("_debug_raw", None)
         _finalize_diagnostics(resp, raw, debug_dir, debug_argv, max_tool_output_bytes)
         _attach_eligibility(resp)

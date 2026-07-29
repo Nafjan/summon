@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "0.19.2"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "1.0.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -1074,18 +1074,24 @@ def _dry_run_view(invocation, args, agents_dir: str,
     path is shown instead."""
     from _builder import (BACKENDS, backend_kind, build_invocation_args,
                           permission_flags as _pf, _PERMISSION_MAPPING, _agy_wrapper,
-                          advisory_warnings, apply_credit_guard, infer_billing,
+                          advisory_warnings, apply_credit_guard, infer_dispatch_billing,
                           credit_spend_allowed, selects_credit_only)
     _guarded, _, _guard_warnings = apply_credit_guard(invocation)
     _eff_model = _guarded.model
     # Predict the billing source so preflight can reveal a charge (mirrors _stamp).
-    _bill = infer_billing(invocation.cli)
-    if invocation.cli == "claude" and selects_credit_only(invocation.model, invocation.extra_args):
-        if credit_spend_allowed():
+    _bill = infer_dispatch_billing(invocation.cli, invocation.model,
+                                   invocation.extra_args)
+    if invocation.cli == "claude":
+        if invocation.resume_id:
+            _bill = {
+                "source": "unknown",
+                "note": "resumed Claude session keeps its original model; billing "
+                        "cannot be inferred before terminal model evidence",
+            }
+        elif (selects_credit_only(invocation.model, invocation.extra_args)
+              and credit_spend_allowed()):
             _bill = {"source": "api" if os.environ.get("ANTHROPIC_API_KEY") else "credit",
-                     "note": "credit-only model (Fable) authorized"}
-        elif invocation.resume_id:
-            _bill = {"source": "unknown", "note": "resume keeps the session's original model"}
+                     "note": "credit-only model authorized"}
     view = {
         "dry_run": True,
         "agent": args.agent,
@@ -1093,7 +1099,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "cwd": invocation.cwd,
         "agents_dir": agents_dir,
         "model_requested": invocation.model,
-        "model_effective": _eff_model,  # after the credit-only (Fable) fallback
+        "model_effective": _eff_model,  # after any credit-only-model fallback
         "billing_predicted": _bill,     # subscription / credit / api / unknown
         "permission": invocation.permission,
         # openai-compat (and any future non-sandbox backend) has no permission
@@ -1127,7 +1133,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
     # warn about -- a short agy clock and a withheld read-only workspace are both things
     # you want to learn BEFORE paying, which is the whole point of --dry-run.
     for _w in advisory_warnings(invocation.cli, invocation.permission, args.timeout,
-                                invocation.model):
+                                invocation.model, invocation.extra_args):
         view.setdefault("warnings", []).append(_w)
     # An explicit --agents-dir that silently fell through to the bundled roster is an
     # INTENT violation, not a convenience: a governance control was written on the belief

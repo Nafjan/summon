@@ -319,6 +319,26 @@ def test_resumed_flag_describes_a_caller_requested_continuation():
     assert fresh["resumed"] is False and resumed["resumed"] is True
 
 
+def test_resumed_claude_billing_requires_original_model_evidence():
+    """A new agent definition cannot prove what model an old Claude session keeps."""
+    import _builder
+    import _executor
+
+    original = _executor.build_invocation_args
+    _executor.build_invocation_args = (
+        lambda inv, timeout_ms=None: ("definitely-not-a-real-cli-xyz", [], None))
+    try:
+        out = _executor.execute_agent(
+            _builder.AgentInvocation(
+                cli="claude", prompt="continue", cwd=os.getcwd(),
+                model="claude-opus-5", resume_id="old-fable-session"),
+            timeout_ms=500)
+    finally:
+        _executor.build_invocation_args = original
+    assert out["billing"]["source"] == "unknown", out
+    assert "original model" in out["billing"]["note"], out
+
+
 def test_blocked_error_text_never_recommends_escalation():
     from _executor import _enrich
     resp = {"result": "The tool call was blocked. Please approve.",
@@ -2073,16 +2093,13 @@ def test_manifest_timeout_grammar_matches_child():
     assert _manifest._parent_timeout({"timeout": "30s"}) >= 90.0
 
 
-def test_fable_runs_unsubstituted_and_says_what_it_costs():
-    """Anthropic REVERSED the Fable exclusion (2026-07-27): `claude-fable-5` is served on
-    the Max subscription again, at roughly twice Opus per token with stricter limits, and
-    cursor serves it after a one-time data-handling agreement.
+def test_fable_runs_unsubstituted_and_reports_plan_dependent_billing():
+    """Fable billing depends on the Claude seat and remaining allowance.
 
-    summon used to SUBSTITUTE Opus here, on the premise that Fable billed account credit.
-    That premise is now false, and substituting a model the caller explicitly asked for --
-    and is entitled to run -- is a bigger intervention than the warning it came with. The
-    rate is still worth stating once, before the dispatch; refusing to run it is not
-    summon's call."""
+    Max/premium seats may use Fable for up to 50% of their regular weekly limit;
+    Pro/standard seats use usage credits from the first token. summon cannot inspect
+    either fact, so it must run the requested model, warn before dispatch, and report
+    unknown billing without an API key."""
     import _builder
     from _builder import AgentInvocation, advisory_warnings, build_invocation_args as _bia
 
@@ -2108,11 +2125,55 @@ def test_fable_runs_unsubstituted_and_says_what_it_costs():
                                     extra_args=["--fallback-model", "claude-fable-5"]))
     assert "claude-fable-5" in a1, a1
 
-    # the COST is stated once, before the dispatch
+    # The plan-dependent billing state is stated once, before the dispatch.
     w = advisory_warnings("claude", "safe-edit", 600_000, "claude-fable-5")
-    assert any("twice Opus" in x for x in w), w
-    assert any("rate limits" in x for x in w), (
-        "stricter limits matter as much as the per-token rate on a long fan-out: %r" % (w,))
+    assert any("plan-dependent billing" in x for x in w), w
+    assert any("Max/premium" in x and "Pro/standard" in x for x in w), w
+    assert any("cannot inspect your plan" in x for x in w), w
+
+    billing = _builder.infer_dispatch_billing("claude", "claude-fable-5")
+    assert billing["source"] == "unknown", billing
+    assert "plan-dependent" in billing["note"], billing
+    assert _builder.selects_plan_dependent_billing(
+        "opus", ["--fallback-model=claude-fable-5"])
+    fallback_warnings = advisory_warnings(
+        "claude", "safe-edit", 600_000, "opus",
+        ["--fallback-model=claude-fable-5"])
+    assert any("plan-dependent billing" in x for x in fallback_warnings), fallback_warnings
+    os.environ["ANTHROPIC_API_KEY"] = "sk-test"
+    try:
+        api_billing = _builder.infer_dispatch_billing(
+            "claude", "opus", ["--fallback-model", "claude-fable-5"])
+        assert api_billing["source"] == "api", api_billing
+    finally:
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    # Model warnings and billing follow each backend's actual argv precedence.
+    # Claude appends passthrough args after its model, so a later --model wins.
+    overridden_claude = advisory_warnings(
+        "claude", "safe-edit", 600_000, "claude-fable-5",
+        ["--model", "claude-opus-5"])
+    assert not any("plan-dependent billing" in x for x in overridden_claude), (
+        overridden_claude)
+    assert _builder.infer_dispatch_billing(
+        "claude", "claude-fable-5",
+        ["--model=claude-opus-5"])["source"] == "subscription"
+    selected_claude = advisory_warnings(
+        "claude", "safe-edit", 600_000, "claude-opus-5",
+        ["-m=claude-fable-5"])
+    assert any("plan-dependent billing" in x for x in selected_claude), selected_claude
+
+    # Cursor appends its authoritative --model after passthrough args.
+    overridden_cursor = advisory_warnings(
+        "cursor-agent", "safe-edit", 600_000, "composer-2.5",
+        ["--model", "claude-fable-5"])
+    assert not any("premium model" in x or "data-handling agreement" in x
+                   for x in overridden_cursor), overridden_cursor
+    selected_cursor = advisory_warnings(
+        "cursor-agent", "safe-edit", 600_000, "claude-fable-5",
+        ["--model", "composer-2.5"])
+    assert any("Cursor plan" in x for x in selected_cursor), selected_cursor
+    assert any("data-handling agreement" in x for x in selected_cursor), selected_cursor
 
     # cursor additionally needs a ONE-TIME data-handling agreement, accepted in its own UI.
     # summon can neither accept it nor detect it, so it must not fail silently on a vendor
@@ -2628,11 +2689,13 @@ def test_allow_credit_flag_dry_run_and_fanout_rejection():
             "--model", "claude-fable-5", "--dry-run"]
     r = sp.run(base, capture_output=True, text=True, encoding="utf-8", env=env)
     view = _json.loads(r.stdout)
-    # Fable is back on the subscription (2026-07-27), so it runs UNSUBSTITUTED with no
-    # authorization needed -- and the dry-run states the cost before a token is spent,
-    # which is the whole point of preflight.
+    # Fable runs UNSUBSTITUTED with no blanket credit authorization. The dry-run cannot
+    # inspect the Claude seat or remaining allowance, so it says that billing is
+    # plan-dependent before a token is spent and refuses to guess the source.
     assert view["model_effective"] == "claude-fable-5", view
-    assert any("twice Opus" in w for w in view.get("warnings") or []), view
+    assert view["billing_predicted"]["source"] == "unknown", view
+    assert "plan-dependent" in view["billing_predicted"]["note"], view
+    assert any("plan-dependent billing" in w for w in view.get("warnings") or []), view
     r2 = sp.run(base + ["--allow-credit"], capture_output=True, text=True,
                 encoding="utf-8", env=env)
     view2 = _json.loads(r2.stdout)
@@ -11679,16 +11742,15 @@ def test_v8_retry_refusal_evidence_is_not_overwritten_by_the_initial_approval():
     assert env["gate"].get("verdict") == "DENY", env["gate"]
 
 
-def test_v8_default_chairman_resolves_and_is_not_credit_only():
+def test_v8_default_chairman_resolves_and_is_not_unconditionally_credit_only():
     """The council's DEFAULT chairman must (a) actually exist in the BUNDLED roster and
     (b) not be a credit-only model.
 
-    Both halves are real bugs caught in the making. Changing the default to a plausible
+    Both halves were real bugs caught in the making. Changing the default to a plausible
     name ("opus") would have shipped a default that resolves for nobody, since no such
-    bundled agent exists. And the previous default WAS credit-only (`fable`), so every
-    council that omitted --chairman either silently fell back to Opus with a warning or
-    quietly spent account credit -- at roughly twice Opus 5's price, for a model that
-    does not beat it on synthesis."""
+    bundled agent exists. The previous default (`fable`) was classified as credit-only
+    under the vendor policy at the time; Fable is now plan-dependent, but this guard still
+    prevents a future unconditionally credit-only model from becoming the silent default."""
     from _builder import _CREDIT_ONLY_MODELS
     from _council import DEFAULT_CHAIRMAN
     from _loader import bundled_roster_dir, load_agent
