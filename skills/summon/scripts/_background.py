@@ -62,6 +62,8 @@ def child_argv(args: argparse.Namespace, result_file: str) -> list:
         out += ["--gate-timeout", str(args.gate_timeout)]
     if args.worktree is not None:
         out += [f"--worktree={args.worktree}"]  # =form is unambiguous for the bare case
+    for artifact in getattr(args, "artifacts", ()) or ():
+        out += ["--artifact", artifact]
     return out + ["--job-file", result_file]
 
 
@@ -151,6 +153,10 @@ def run_jobs_query(args, emit_error) -> int:
         emit_error(f"timed out waiting for job {args.jobs_wait!r} (no verified result yet)",
                    exit_code=124)
         return 124
+    if outcome == "stale":
+        emit_error(f"background job {args.jobs_wait!r} is stale: its process is no longer "
+                   "alive and no verified result was written")
+        return 1
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result.get("status") == "success" else 1
 

@@ -164,7 +164,34 @@ def _request_identity(args) -> dict:
         resume=args.resume, resume_profile=getattr(args, "resume_profile", None),
         worktree=args.worktree, allow_credit=getattr(args, "allow_credit", False),
         gate_with=getattr(args, "gate_with", None),
-        max_permission=getattr(args, "max_permission", None))
+        max_permission=getattr(args, "max_permission", None),
+        artifacts=getattr(args, "artifacts", None))
+
+
+def _complete_artifact_provenance(env: dict, args, before: dict | None) -> dict:
+    """Attach the post-dispatch stability check for an opt-in artifact baseline."""
+    if not before:
+        return env
+    from _artifacts import build_manifest, changed_paths
+    after, error = build_manifest(getattr(args, "artifacts", None), args.cwd)
+    evidence = dict(before)
+    stable = bool(after and not error and after.get("sha256") == before.get("sha256"))
+    evidence["stable_during_dispatch"] = stable
+    evidence["after_sha256"] = after.get("sha256") if after else None
+    evidence["changed"] = changed_paths(before, after) if not stable else []
+    if error:
+        evidence["after_error"] = error
+    env["artifacts"] = evidence
+    if not stable:
+        changed = ", ".join(evidence["changed"]) or "the named baseline"
+        env.setdefault("warnings", []).append(
+            "artifact provenance changed during dispatch (%s); the review does not "
+            "describe one stable loose-file baseline" % changed)
+        # Keep the executor outcome honest while preventing --out/manifest from
+        # treating the review as terminal evidence for an unstable corpus.
+        if env.get("status") == "success":
+            env["suspect"] = True
+    return env
 
 
 def _stamp_job(env: dict) -> dict:
@@ -530,6 +557,9 @@ def main() -> None:
     if args.resume and args.worktree is not None:
         _die("--resume and --worktree are incompatible: a session lives in the "
              "original project dir, not a fresh worktree")
+    if args.worktree is not None and getattr(args, "artifacts", None):
+        _die("--artifact and --worktree are incompatible: loose files are measured under "
+             "the original --cwd but an isolated worktree may not contain them")
 
     # --dry-run is a SINGLE-dispatch preview only. Combining it with modes that
     # fan out or detach would otherwise slip past the dry-run exit and run real
@@ -611,6 +641,16 @@ def main() -> None:
     _identity = _request_identity(args)
     request_sha = request_fingerprint(**_identity)
     receipt["request_sha256"] = request_sha
+    _artifact_manifest = _identity.get("_artifact_manifest")
+    args._artifact_manifest = _artifact_manifest
+    if _artifact_manifest:
+        # Before-only on refusal/preflight paths; a completed dispatch replaces this
+        # with a before/after stability record below.
+        receipt["artifacts"] = dict(_artifact_manifest,
+                                    stable_during_dispatch=None,
+                                    after_sha256=None)
+    if _identity.get("_artifact_error"):
+        _die("--artifact: " + str(_identity["_artifact_error"]))
     if args.out and os.path.isfile(args.out) and not args.dry_run:
         try:
             with open(args.out, encoding="utf-8") as fh:
@@ -981,6 +1021,7 @@ def main() -> None:
     # the envelope, and this keeps prompt_sha256 bound to the ROOT prompt (the
     # correction prompt must never restamp it).
     result.update(receipt)
+    _complete_artifact_provenance(result, args, _artifact_manifest)
     # An explicit --agents-dir that fell through to the BUNDLED roster is an intent
     # violation: the caller named a directory and got something else. `--agents-dir` selects
     # which directory is SEARCHED; only `agent_def.source` proves provenance -- and a real
@@ -1040,6 +1081,10 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "worktree": ("would create" if args.worktree is not None else None),
         "system_context_chars": len(invocation.system_context),
     }
+    if getattr(args, "_artifact_manifest", None):
+        view["artifacts"] = dict(args._artifact_manifest,
+                                 stable_during_dispatch=None,
+                                 after_sha256=None)
     for _w in _guard_warnings:  # credit-only guard actions surfaced in the preview
         view.setdefault("warnings", []).append(_w)
     # A dispatch that will be REFUSED must say so in preflight. Surfaced as `would_refuse`
@@ -1196,7 +1241,7 @@ def _enrich_denial(env: dict, receipt, invocation) -> dict:
     """
     try:
         for key in ("request_sha256", "summon", "agent_def", "prompt_sha256",
-                    "git_head_before"):
+                    "git_head_before", "artifacts"):
             if receipt and receipt.get(key) is not None:
                 env[key] = receipt[key]
         if invocation is not None:

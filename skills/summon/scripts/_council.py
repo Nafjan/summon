@@ -1275,13 +1275,13 @@ def run_council(args) -> int:
     # credit/api spend or Fable fallback WITHOUT digging into members (full
     # member envelopes persist in the run dir).
     council_warnings = []
-    # agy members can't read --cwd (isolated profile) — call it out, since it's
-    # the usual reason an agy member errors/excludes in a repo council.
+    # agy can read --cwd because the builder passes --add-dir, but its permission
+    # tier is still a full bypass and its service telemetry is incomplete.
     for mem, bk in member_backend.items():
         if bk == "agy":
-            council_warnings.append(f"{mem}: the agy backend runs in an isolated profile and "
-                                    "cannot read files under --cwd (it only sees the prompt) — "
-                                    "avoid agy members in a repo-inspection council")
+            council_warnings.append(f"{mem}: agy can read --cwd via --add-dir, but its "
+                                    "safe-edit tier is a full bypass and model.served stays "
+                                    "null because agy emits no service telemetry")
     for m in results:
         council_warnings += [f"{m['agent']}: {w}" for w in _as_warning_list(m.get("warnings"))]
     # Aggregate BOTH chairman envelopes (primary + fallback) so a fallback's
