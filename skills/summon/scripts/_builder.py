@@ -551,7 +551,8 @@ def cursor_premium_agreement_warning(cli: str, model: str | None) -> str | None:
 
 
 def advisory_warnings(cli: str, permission: str, timeout_ms: int | None,
-                      model: str | None = None) -> list:
+                      model: str | None = None,
+                      extra_args: list | tuple = ()) -> list:
     """Every advisory warning a dispatch should carry, in ONE place.
 
     The real envelope and --dry-run each assembled this list themselves and had already
@@ -560,9 +561,10 @@ def advisory_warnings(cli: str, permission: str, timeout_ms: int | None,
     or an unreadable workspace is still free to fix. A guard test asserts the two paths
     stay identical.
     """
+    notice_model = _selected_premium_model(cli, model, extra_args)
     return [w for w in (frozen_backend_warning(cli),
-                        premium_model_warning(model, cli),
-                        cursor_premium_agreement_warning(cli, model),
+                        premium_model_warning(notice_model, cli),
+                        cursor_premium_agreement_warning(cli, notice_model),
                         agy_permission_warning(cli, permission),
                         agy_readonly_workspace_warning(cli, permission),
                         agy_timeout_warning(cli, timeout_ms)) if w]
@@ -665,22 +667,25 @@ def infer_billing(cli: str) -> dict:
     return {"source": "unknown", "note": ""}
 
 
-# --- Credit-only model guard (Fable) -----------------------------------------
-# Some models are NOT covered by the vendor's flat subscription and bill account
-# CREDIT (API-style) even through the subscription CLI. Fable (claude-fable-5)
-# left the Claude Max subscription and is now credit-only. Mirroring the
-# OPENAI_API_KEY guard, we DEFAULT to the latest subscription-covered model
-# (Opus) and require an explicit opt-in to spend credit — so a `fable` dispatch
-# never silently draws down credit. The API-key path (an openai-compat anthropic
-# agent) is unaffected: that is metered by design.
+# --- Credit-only and plan-dependent model billing ----------------------------
+# Keep the credit-only guard ready for a future model that is unconditionally
+# billed to account credit through a subscription CLI. No current model meets
+# that definition. Fable is different: Max/premium seats may use it for up to
+# 50% of their regular weekly limit, while Pro/standard seats use usage credits
+# from the first token. summon cannot inspect the seat type or remaining limit, so it runs
+# the requested model and reports the billing source as unknown unless an API-key
+# route indicates metered API billing.
 _CREDIT_ONLY_MODELS: set[str] = set()
-# Served on the subscription, but at a PREMIUM rate with stricter limits, so a caller
-# who reaches for one should know what it costs before the dispatch rather than after.
-# Fable is roughly 2x Opus per token (first-party API list: $10/$50 per MTok vs $5/$25)
-# and its rate limits are tighter -- a long fan-out can exhaust them mid-run.
+_PLAN_DEPENDENT_BILLING_MODELS = {"claude-fable-5"}
+# Premium models deserve a pre-dispatch billing notice even when summon cannot
+# determine which part of the vendor plan will pay for the run.
 _PREMIUM_MODELS = {
-    "claude-fable-5": ("about twice Opus per token, with stricter rate limits than Opus -- "
-                       "a long fan-out can exhaust them mid-run"),
+    "claude-fable-5": (
+        "plan-dependent billing: Max/premium seats may use Fable for up to 50% of "
+        "their regular weekly limit at no extra cost, while Pro/standard seats use "
+        "usage credits from the start; after that limit, eligible plans may continue "
+        "on usage credits"
+    ),
 }
 # The latest subscription-covered Opus, PINNED (not the `opus` alias). The alias
 # LAGS BADLY — re-verified 2026-07-25: `--model opus` still served claude-opus-4-7,
@@ -695,37 +700,73 @@ _OPUS_FALLBACK = "claude-opus-5"
 _MODEL_FLAG_NAMES = ("--model", "-m", "--fallback-model")
 
 
+def _selected_model_candidates(cli: str, model: str | None,
+                               extra_args: list | tuple = ()) -> tuple:
+    """Return models that can actually run after backend-specific argv precedence."""
+    # Cursor appends its authoritative --model after passthrough args, so an
+    # earlier selector cannot override the invocation model.
+    if cli == "cursor-agent":
+        return (model,) if model else ()
+    # Claude appends passthrough args after the invocation model. The last
+    # primary selector wins; its fallback is an independent candidate.
+    if cli != "claude":
+        return (model,) if model else ()
+    primary, fallback = model, None
+    ea = extra_args or []
+    i = 0
+    while i < len(ea):
+        a = ea[i]
+        key, value = None, None
+        if a in _MODEL_FLAG_NAMES and i + 1 < len(ea):
+            key, value = a, ea[i + 1]
+            i += 2
+        else:
+            if "=" in a:
+                maybe_key, maybe_value = a.split("=", 1)
+                if maybe_key in _MODEL_FLAG_NAMES:
+                    key, value = maybe_key, maybe_value
+            i += 1
+        if key in ("--model", "-m"):
+            primary = value
+        elif key == "--fallback-model":
+            fallback = value
+    return tuple(x for x in (primary, fallback) if x)
+
+
+def _selected_premium_model(cli: str, model: str | None,
+                            extra_args: list | tuple = ()) -> str | None:
+    """Return a premium model that can run after backend argv precedence."""
+    for candidate in _selected_model_candidates(cli, model, extra_args):
+        if candidate in _PREMIUM_MODELS:
+            return candidate
+    return None
+
+
 def credit_spend_allowed() -> bool:
     """The operator opted in to spending account credit on a credit-only model.
 
-    `_CREDIT_ONLY_MODELS` is EMPTY as of 0.17.0 -- Anthropic reversed the Fable exclusion
-    and it is served on the subscription again. The opt-in is still read and still honoured
-    so that scripts and agent definitions carrying `SUMMON_ALLOW_FABLE=1` keep working
-    unchanged; it simply has nothing to authorize right now. Keep the machinery: a future
-    model may be credit-only, and re-deriving this guard from scratch would be worse than
-    leaving a tested one idle.
+    `_CREDIT_ONLY_MODELS` is empty today. Fable is handled separately because its
+    billing depends on the Claude plan and remaining allowance. The opt-in is still
+    read and honoured so existing scripts keep working; it simply has nothing to
+    authorize right now. Keep the machinery ready for the next credit-only model.
     """
     return (os.environ.get("SUMMON_ALLOW_FABLE") == "1"
             or os.environ.get("SUMMON_ALLOW_CREDIT") == "1")
 
 
 def premium_model_warning(model: str | None, cli: str) -> str | None:
-    """Spend notice for a model that IS covered but costs materially more.
-
-    Anthropic reversed the Fable exclusion (2026-07-27): it is served on the Max
-    subscription again, at roughly twice Opus's rate with stricter limits. summon used to
-    SUBSTITUTE Opus here on the premise that Fable billed account credit. That premise is
-    now false, and substituting a model the caller asked for -- and is entitled to run --
-    is worse than running it. The rate is still worth saying out loud once, before the
-    dispatch, rather than leaving the operator to discover it on the bill.
-    """
+    """Pre-dispatch notice for a premium model with non-uniform billing."""
     if cli not in ("claude", "cursor-agent"):
         return None
     note = _PREMIUM_MODELS.get(model or "")
     if not note:
         return None
-    return (f"{model} is covered by the subscription but costs {note}. summon does not "
-            f"substitute it -- you asked for it, you get it.")
+    if cli == "cursor-agent":
+        return (f"{model} is a premium model with provider-specific billing and limits. "
+                f"summon cannot inspect your Cursor plan and does not substitute the "
+                f"requested model; check Cursor usage settings.")
+    return (f"{model} has {note}. summon cannot inspect your plan or remaining allowance "
+            f"and does not substitute the requested model; check Claude usage settings.")
 
 
 def resolve_billing_model(model: str | None, cli: str) -> tuple[str | None, str | None]:
@@ -743,7 +784,7 @@ def resolve_billing_model(model: str | None, cli: str) -> tuple[str | None, str 
 def selects_credit_only(model: str | None, extra_args: list) -> bool:
     """Would this dispatch run a credit-only model, considering BOTH the model
     field AND a --model/-m/--fallback-model selector in ``args:``? Used for
-    accurate billing/warning telemetry (Fable can be picked either way)."""
+    accurate billing/warning telemetry."""
     if model in _CREDIT_ONLY_MODELS:
         return True
     ea = extra_args or []
@@ -755,6 +796,34 @@ def selects_credit_only(model: str | None, extra_args: list) -> bool:
             if k in _MODEL_FLAG_NAMES and v in _CREDIT_ONLY_MODELS:
                 return True
     return False
+
+
+def selects_plan_dependent_billing(model: str | None, extra_args: list | tuple,
+                                   cli: str = "claude") -> bool:
+    """Does the dispatch select a model whose billing depends on account state?"""
+    return any(candidate in _PLAN_DEPENDENT_BILLING_MODELS
+               for candidate in _selected_model_candidates(cli, model, extra_args))
+
+
+def infer_dispatch_billing(cli: str, model: str | None = None,
+                           extra_args: list | tuple = ()) -> dict:
+    """Best-effort billing telemetry for the fully selected dispatch."""
+    if cli == "claude" and selects_plan_dependent_billing(model, extra_args, cli):
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            return {"source": "api",
+                    "note": "ANTHROPIC_API_KEY present "
+                            "(predicted metered API billing; vendor authentication "
+                            "remains authoritative)"}
+        return {
+            "source": "unknown",
+            "note": (
+                "Fable 5 billing is plan-dependent: included for up to 50% of regular "
+                "weekly usage on Max/premium seats; usage credits on Pro/standard "
+                "seats or after that limit. summon cannot inspect the plan or "
+                "remaining usage"
+            ),
+        }
+    return infer_billing(cli)
 
 
 def _scrub_credit_args(extra_args: list) -> tuple[list, bool]:
@@ -806,7 +875,7 @@ def apply_credit_guard(inv) -> tuple:
     args, scrubbed = _scrub_credit_args(inv.extra_args)
     if scrubbed:
         warnings.append("summon stripped a credit-only model flag from this agent's `args:` "
-                        "(it would have run Fable on account credit without opt-in)")
+                        "(it could have spent account credit without opt-in)")
         if not model:
             # ...and PUT THE FALLBACK BACK. Scrubbing alone left the request with no model
             # at all, so the vendor's own default ran -- which prevents the unauthorized
@@ -821,7 +890,7 @@ def apply_credit_guard(inv) -> tuple:
                         "to a credit-only model for this run")
     if inv.resume_id and selects_credit_only(inv.model, inv.extra_args):
         warnings.append("resuming a claude session keeps its ORIGINAL model — summon cannot "
-                        "re-pin it to Opus, so this Fable session bills account credit")
+                        "re-pin it to Opus or prove the original session's billing source")
     if model != inv.model or args is not inv.extra_args:
         inv = replace(inv, model=model, extra_args=args)
     return inv, env, warnings
