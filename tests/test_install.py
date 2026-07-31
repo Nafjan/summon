@@ -405,6 +405,20 @@ def test_alias_ownership_is_frontmatter_not_body_substring():
         assert install._is_our_alias(md) is True, "own alias not recognized"
 
 
+def test_kimi_host_installs_a_managed_skill_bundle():
+    home = _fake_home()
+    try:
+        os.makedirs(os.path.join(home, ".kimi-code"), exist_ok=True)
+        r = _run(home, "--hosts", "kimi", "--no-agents")
+        dest = os.path.join(home, ".kimi-code", "skills", "summon")
+        assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+        assert os.path.isfile(os.path.join(dest, "SKILL.md"))
+        with open(os.path.join(dest, ".summon-install.json"), encoding="utf-8") as fh:
+            assert json.load(fh)["installed_by"] == "summon"
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

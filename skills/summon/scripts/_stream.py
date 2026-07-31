@@ -18,7 +18,10 @@ def _terminal_is_error(data) -> bool:
     subtype = data.get("subtype")
     if isinstance(subtype, str) and subtype.startswith("error"):
         return True
-    return data.get("status") in ("error", "failed")
+    status = data.get("status")
+    if isinstance(status, str):
+        status = status.lower()
+    return status in ("error", "failed")
 
 
 class StreamProcessor:
@@ -36,6 +39,8 @@ class StreamProcessor:
         self.codex_messages = []
         self.is_gemini = False
         self.is_codex = False
+        self.is_kimi = False
+        self.kimi_parts = []
         # Telemetry captured from stream events (None when the CLI doesn't emit it):
         self.session_id = None  # claude session_id / codex thread_id / cursor chat id
         self.usage = None       # token usage dict
@@ -76,6 +81,17 @@ class StreamProcessor:
                 self.handshake_model = data["model"]
             return False
 
+        # Agy stream-json emits session events under `event` instead of `type`
+        # for the legacy one-shot stream (init/step_update/result). Capture the
+        # session and model details there so resume can continue later and
+        # model provenance stays accurate.
+        if data.get("event") == "init":
+            if data.get("conversation_id"):
+                self.session_id = data["conversation_id"]
+            if data.get("model"):
+                self.handshake_model = data["model"]
+            return False
+
         if data.get("type") == "init":
             self.is_gemini = True
             if data.get("session_id"):
@@ -102,6 +118,24 @@ class StreamProcessor:
                 self.codex_messages.append(item["text"])
             return False
 
+        # Kimi Code's stream-json protocol is JSONL messages rather than
+        # terminal events.  Assistant messages are accumulated until EOF; a
+        # tool transcript is not a terminal result and must never cause summon
+        # to terminate the process mid-turn.
+        if data.get("role") == "assistant" and "type" not in data and "event" not in data:
+            self.is_kimi = True
+            content = data.get("content", "")
+            if isinstance(content, str):
+                self.kimi_parts.append(content)
+            elif isinstance(content, list):
+                self.kimi_parts.extend(
+                    part.get("text", "") for part in content
+                    if isinstance(part, dict) and isinstance(part.get("text"), str))
+            return False
+        if self.is_kimi and data.get("role") in ("tool", "meta", "user") and \
+                "type" not in data and "event" not in data:
+            return False
+
         # Codex: turn.completed signals end (and carries token usage)
         if self.is_codex and data.get("type") == "turn.completed":
             if isinstance(data.get("usage"), dict):
@@ -114,8 +148,33 @@ class StreamProcessor:
             return True
 
         # Result type signals completion
-        if data.get("type") == "result":
+        if data.get("type") == "result" or data.get("event") == "result":
             self._capture_telemetry(data)
+            # agy's `result` event wraps terminal output under a `result`
+            # object. The payload is intentionally similar to a terminal event:
+            # `status` + `response` + `usage`, but keyed differently from
+            # Claude/Gemini.
+            payload = data.get("result")
+            if isinstance(payload, dict) and "response" in payload:
+                raw_status = payload.get("status")
+                if raw_status is None or (isinstance(raw_status, str) and not raw_status.strip()):
+                    status = "success"
+                elif isinstance(raw_status, str):
+                    status = raw_status.lower()
+                else:
+                    status = str(raw_status).lower()
+                self.is_error = _terminal_is_error(payload)
+                self.result_json = {
+                    "type": "result",
+                    "result": payload.get("response", ""),
+                    "status": "error" if self.is_error else status,
+                }
+                if raw_status is None or (isinstance(raw_status, str) and not raw_status.strip()):
+                    self.result_json["blank_status_fallback"] = True
+                self._capture_telemetry(payload)
+                if payload.get("error"):
+                    self.result_json["error"] = payload.get("error")
+                return True
             # A terminal result can itself report failure: claude sets is_error /
             # subtype "error_*"; gemini/cursor may carry status "error"/"failed".
             # Record it so build_final_response never stamps such a run "success"
@@ -135,9 +194,11 @@ class StreamProcessor:
                 self.result_json = data
             return True
 
-        # Fallback: first valid JSON without a type field (some cursor result
+        # Fallback: first valid JSON without a `type` field (some cursor result
         # shapes). Capture telemetry here too, so a session/chat id isn't lost.
-        if "type" not in data:
+        # AGY also emits non-terminal `event` records (`step_update`), so we
+        # must not treat any event-bearing packet as completion.
+        if "type" not in data and "event" not in data:
             self._capture_telemetry(data)
             self.result_json = data
             return True
@@ -172,3 +233,12 @@ class StreamProcessor:
 
     def get_result(self):
         return self.result_json
+
+    def finalize_stream(self) -> None:
+        """Finish protocols whose success is defined by clean EOF, not an event."""
+        if self.result_json is None and self.is_kimi:
+            self.result_json = {
+                "type": "result",
+                "result": "\n".join(p for p in self.kimi_parts if p),
+                "status": "success",
+            }

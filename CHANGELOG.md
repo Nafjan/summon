@@ -4,53 +4,25 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
-## [1.0.0] - 2026-07-29
+## [Unreleased]
 
-**Summon any AI, from any CLI.** Version 1.0 establishes the stable public contract for
-the capabilities built throughout the 0.x series. The highlights below are a milestone
-recap; the final release also corrects plan-dependent Fable billing telemetry.
+**Kimi Code joins Summon, alongside a more dependable AGY path.**
 
 ### Highlights
 
-- **Cross-vendor orchestration from the tool you already use.** Send work to Claude,
-  Codex, Cursor, Gemini, Antigravity, an OpenAI-compatible API, or a local model without
-  leaving your current CLI or agent app.
-- **Councils for decisions, swarms for scale.** Run vendor-diverse deliberations with
-  anonymized peer ranking, or fan out resumable manifest jobs with per-backend
-  concurrency.
-- **Safer parallel implementation.** Isolate editing agents in Git worktrees, preview
-  resolved runs before spending tokens, clamp permissions on backends that enforce them,
-  and require an independent gate before the child agent runs.
-- **Results built for automation.** Every run returns a stable JSON envelope separating
-  execution state from the agent's verdict, with model provenance, warnings, resume
-  state, and structured report or handoff data when available.
-- **Reliable structured output.** Validate responses against summon's documented JSON
-  Schema subset, surface unsupported keywords in `parse_warnings`, and use a corrective
-  retry on backends that support resume.
-- **Auditable work beyond Git.** Track loose documents by SHA-256, detect changes during
-  a run, and use the bundled document-audit templates for claim-led reviews.
-- **Operational confidence.** Background jobs survive the parent session, `doctor`
-  surfaces backend readiness and installation drift, and every dispatch identifies the
-  exact installed script copy that ran.
-- **A small core.** The dispatcher is standard-library Python and needs no summon server.
-  The optional Antigravity PTY bridge uses `pywinpty` and `pyte`.
+- **Use Summon directly in Kimi Code:** `install.py --hosts kimi` installs the complete skill at `~/.kimi-code/skills/summon`, ready for Kimi’s native `/skill:summon` workflow.
+- **Call Kimi from any supported host:** the new `kimi` backend uses Kimi’s native `stream-json` protocol, supports K3 and K2.7 model pins, and returns the same structured Summon envelope as the other CLI backends.
+- **Safer Kimi one-shots:** each Kimi child receives a fresh, ACL-locked runtime profile with no inherited sessions, logs, user skills, or MCP configuration. Because Kimi’s prompt mode has no enforceable workspace sandbox, Summon refuses misleading `read-only` and `safe-edit` declarations; the explicit `kimi-worker` is for trusted isolated worktrees.
+- **AGY reliability pass:** a built-in cross-platform stream proxy replaces fragile terminal scraping where AGY exposes JSONL, with stronger event parsing and model-alias handling.
 
-### Stable contract
+### Also improved
 
-The documented CLI, agent definitions, report fields, and exit codes are now public API.
-The response envelope remains independently versioned as `envelope: 1`, allowing
-backward-compatible additions throughout the 1.x line.
+- Hardened debug argument redaction and boundary-flag handling.
+- Made worktree cleanup preserve uncommitted work.
+- Clarified wrapper readiness in diagnostics.
 
-### Fixed
-
-- Reported Fable billing as plan-dependent instead of assuming every Claude plan includes it.
-
-### Release confidence
-
-The corrected runtime surface earned three consecutive clean cross-vendor adversarial
-reviews after a clean manual security audit. The final release passes 429 discovery tests
-and 22 installer tests. The exact acceptance criteria and evidence are documented in
-[Versioning and 1.0 criteria](docs/VERSIONING_AND_1.0_CRITERIA.md).
+Release certification remains separate: three clean cross-vendor rounds are still required
+before a 1.0 certification claim.
 
 ## [0.19.2] - 2026-07-29
 

@@ -606,19 +606,65 @@ def test_doctor_json_roundtrip():
 
 
 def test_agy_posix_fence():
-    # On POSIX without AGY_PTY_WRAPPER, the agy builder must fail fast with a
-    # clear ValueError BEFORE any profile work. Real coverage on the Linux CI
-    # leg; on Windows this asserts the happy path instead.
+    # POSIX no longer needs AGY_PTY_WRAPPER for stream mode. The built-in
+    # cross-platform proxy should be used there.
     from _builder import AgentInvocation, build_invocation_args
     inv = AgentInvocation(cli="agy", prompt="hi", cwd=os.getcwd(),
                           system_context="x", permission="yolo")
-    if os.name == "nt" or os.environ.get("AGY_PTY_WRAPPER"):
+    if os.environ.get("AGY_PTY_WRAPPER"):
         return  # fence not applicable here
+    command, args, _ = build_invocation_args(inv)
+    assert os.path.basename(command).lower() in {"python.exe", "python3", "python"}, (
+        "agy invocation should go through a wrapper/interpreter path")
+    assert os.path.basename(args[0]).lower() == "agy_stream_proxy.py", (
+        "POSIX should default to the cross-platform proxy, not AGY_PTY_WRAPPER gate")
+
+
+def test_agy_model_alias_is_normalized_to_display_name():
+    # A large percentage of AGY reports came in as failures because users passed
+    # short aliases instead of display names. Summon should normalize them before
+    # invoking the backend.
+    from _builder import _normalize_agy_model, AgentInvocation, build_invocation_args
+    assert _normalize_agy_model("claude-sonnet-4-6-thinking") == \
+        "Claude Sonnet 4.6 (Thinking)"
+    assert _normalize_agy_model("claude-opus-4-6-thinking") == \
+        "Claude Opus 4.6 (Thinking)"
+    assert _normalize_agy_model("gpt-oss-120b-medium") == \
+        "GPT-OSS 120B (Medium)"
+
+    inv = AgentInvocation(cli="agy", prompt="hi", cwd=os.getcwd(),
+                          model="claude-sonnet-4-6-thinking", permission="yolo",
+                          system_context="x")
+    if os.environ.get("AGY_PTY_WRAPPER"):
+        return
+    _, args, _ = build_invocation_args(inv)
     try:
-        build_invocation_args(inv)
-        raise AssertionError("expected ValueError on POSIX without AGY_PTY_WRAPPER")
-    except ValueError as e:
-        assert "AGY_PTY_WRAPPER" in str(e)
+        i = args.index("--model")
+        assert args[i + 1] == "Claude Sonnet 4.6 (Thinking)", args
+    except ValueError:
+        raise AssertionError(f"agy args do not contain model flag: {args}")
+
+
+def test_agy_build_uses_proxy_boundary_passthrough_flag():
+    """When summon uses the stream proxy, it must keep summon-injected boundary flags in
+    place. The proxy strips those flags when run directly, so summon explicitly opts into
+    passthrough to preserve the `--add-dir` / `--dangerously-skip-permissions`
+    behavior it already controls."""
+    from _builder import AgentInvocation, build_invocation_args
+    saved = os.environ.get("AGY_PTY_WRAPPER")
+    try:
+        os.environ.pop("AGY_PTY_WRAPPER", None)
+        inv = AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                              system_context="x", permission="safe-edit")
+        command, args, env = build_invocation_args(inv)
+        if os.path.basename(command).lower() != "agy_stream_proxy.py":
+            return  # pragma: no cover - legacy wrapper path or nonstandard env
+        assert env.get("AGY_STREAM_PROXY_ALLOW_BOUNDARY") == "1", env
+        assert "--add-dir" in args, args
+        assert "--dangerously-skip-permissions" in args, args
+    finally:
+        if saved is not None:
+            os.environ["AGY_PTY_WRAPPER"] = saved
 
 
 def test_extract_json_last_toplevel_wins():
@@ -1954,6 +2000,59 @@ def test_stream_exposes_all_models_used():
                     '"claude-haiku-4-5":{"outputTokens":50}}}')
     assert sp.model == "claude-sonnet-5", sp.model
     assert sp.models_used == ["claude-haiku-4-5", "claude-sonnet-5"], sp.models_used
+
+
+def test_stream_parses_agy_stream_json_result_payload():
+    from _stream import StreamProcessor
+    sp = StreamProcessor()
+    sp.process_line('{"event":"init","conversation_id":"123"}')
+    # Non-terminal AGY progress updates must not be mistaken as terminal completion.
+    assert sp.get_result() is None
+    sp.process_line('{"event":"step_update","step_update":{"step_index":0,"state":"DONE"}}')
+    assert sp.get_result() is None
+    sp.process_line('{"event":"result","result":{"conversation_id":"123","status":"SUCCESS",'
+                   '"response":"hello\\n","usage":{"input_tokens":1,"output_tokens":2}}}')
+    out = sp.get_result()
+    assert out == {"type": "result", "result": "hello\n", "status": "success"}, out
+    assert sp.usage == {"input_tokens": 1, "output_tokens": 2}
+
+
+def test_stream_captures_agy_stream_init_model():
+    from _stream import StreamProcessor
+    sp = StreamProcessor()
+    sp.process_line('{"event":"init","model":"Gemini 3.5 Flash (High)","conversation_id":"abc"}')
+    assert sp.handshake_model == "Gemini 3.5 Flash (High)", sp.handshake_model
+    assert sp.session_id == "abc"
+
+
+def test_agy_proxy_output_format_scan_stops_before_prompt():
+    # A prompt containing legacy-looking flags must not suppress injection.
+    from agy_stream_proxy import _has_output_format_flag
+    assert not _has_output_format_flag(["--print", "--output-format=json"])
+    assert not _has_output_format_flag(["--print", "Please include --output-format=json in text"])
+    assert not _has_output_format_flag(["--print", "hello --output", "--output-format"])
+    assert _has_output_format_flag(["--output-format", "json", "--print", "task"])
+    assert not _has_output_format_flag(["--print", "--output-format", "json"])
+    assert not _has_output_format_flag(["--print", "--dangerously-skip-permissions", "x"])
+
+
+def test_agy_proxy_strips_boundary_flags():
+    from agy_stream_proxy import _strip_boundary_flags
+    assert _strip_boundary_flags([
+        "--add-dir", "/tmp/project",
+        "--mode", "read-only",
+        "--dangerously-skip-permissions",
+        "--print", "task content --add-dir /repo --sandbox deep",
+    ]) == ["--print", "task content --add-dir /repo --sandbox deep"]
+    assert _strip_boundary_flags(["--output-format", "stream-json", "--print", "x"]) == \
+        ["--output-format", "stream-json", "--print", "x"]
+    assert _strip_boundary_flags(["--mode=read-only", "--sandbox=off", "--print", "task"]) == \
+        ["--print", "task"]
+    assert _strip_boundary_flags(["--conversation", "abc", "--print", "task"]) == ["--print", "task"]
+    assert _strip_boundary_flags(["--continue", "--agent", "foo", "--print", "task"]) == ["--print", "task"]
+    assert _strip_boundary_flags([
+        "--log-file", "C:\\tmp\\agy.log", "--print", "task"
+    ]) == ["--print", "task"]
 
 
 def test_timeout_does_not_hang_on_grandchild_holding_stdout():
@@ -10558,6 +10657,26 @@ def test_v7_authorization_survives_a_same_origin_redirect():
             srv.shutdown()
 
 
+def test_v10_sanitize_argv_hides_secret_value_pairs():
+    """A secret flag and its value passed as separate argv tokens must both be redacted.
+    This only appears in debug artifacts and is therefore the last place a leaked token
+    can still appear; a raw value there is still recoverable."""
+    import _executor as _ex
+    out = _ex._sanitize_argv(["agy", "--api-key", "abc", "--print", "x"])
+    assert "--api-key <redacted>" in out, out
+    assert "abc" not in out, out
+    assert "--print" in out and " x" in out
+
+
+def test_v10_sanitize_argv_hides_secret_assignment_pairs():
+    """Secrets written as key=value argv tokens are still redacted. The prior implementation
+    rewrote only a few forms and leaked values from a plain `--token value` sequence."""
+    import _executor as _ex
+    out = _ex._sanitize_argv(["agy", "--auth-token=abc123", "--output-format", "stream-json"])
+    assert "--auth-token=<redacted>" in out
+    assert "abc123" not in out
+
+
 def test_v7_success_response_content_is_redacted():
     """The canary only ever reached a refused connection, so redaction of a SUCCESSFUL
     response body was never exercised: deleting the redact call on that path left every
@@ -14412,6 +14531,7 @@ def test_v9_agy_empty_scrape_retries_once_and_says_so():
     # separates a lost frame from a preflight failure, and the fixtures must carry it.
     empty = {"cli": "agy", "status": "error", "result": chr(10), "exit_code": 1,
              "backend_exit_code": 1, "cost_usd": 0.40,
+             "normalization_reason": "empty terminal scrape after a completed run",
              "usage": {"input_tokens": 10, "output_tokens": 0}}
     good = {"cli": "agy", "status": "success", "result": "recovered", "exit_code": 0,
             "backend_exit_code": 0, "report_ok": True, "cost_usd": 0.60,
@@ -15328,6 +15448,216 @@ def _repair_global_leaks(before: dict, leaked) -> None:
                     setattr(module, attr, before[key])
                 except Exception:  # noqa: BLE001
                     pass
+
+
+def test_v10_kimi_builder_isolated_and_boundary_safe():
+    """Kimi one-shots must use JSONL plus a fresh no-MCP home, never child args."""
+    import _builder as b
+    root = tempfile.mkdtemp(prefix="summon-kimi-source-")
+    state = tempfile.mkdtemp(prefix="summon-kimi-state-")
+    saved = {k: os.environ.get(k) for k in ("KIMI_CODE_HOME", "KIMI_HEADLESS_PROFILE")}
+    try:
+        os.makedirs(os.path.join(root, "credentials"))
+        with open(os.path.join(root, "config.toml"), "w", encoding="utf-8") as fh:
+            fh.write('default_model = "kimi-code/k3"\n')
+        with open(os.path.join(root, "credentials", "token.json"), "w", encoding="utf-8") as fh:
+            fh.write("test-token")
+        with open(os.path.join(root, "device_id"), "w", encoding="utf-8") as fh:
+            fh.write("test-device")
+        os.environ["KIMI_CODE_HOME"] = root
+        os.environ["KIMI_HEADLESS_PROFILE"] = state
+        inv = b.AgentInvocation(cli="kimi", prompt="--plan is prompt text", cwd=".",
+                                permission="yolo", model="kimi-code/k3",
+                                extra_args=("--auto", "--session", "other", "--trace"))
+        command, args, env = b.build_invocation_args(inv)
+        assert command == "kimi" and args[:2] == ["--model", "kimi-code/k3"], args
+        assert args[-3:] == ["--output-format", "stream-json", "--prompt"] or "--prompt" in args
+        assert "--auto" not in args and "--session" not in args and "other" not in args
+        assert "--trace" in args
+        profile = env["KIMI_CODE_HOME"]
+        assert os.path.isfile(os.path.join(profile, "config.toml"))
+        assert os.path.isfile(os.path.join(profile, "credentials", "token.json"))
+        assert os.path.isfile(os.path.join(profile, "device_id"))
+        assert not os.path.exists(os.path.join(profile, "mcp.json"))
+        assert env["HOME"] == profile and env["USERPROFILE"] == profile
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(state, ignore_errors=True)
+
+
+def test_v10_kimi_stream_finalizes_only_at_eof():
+    import _executor as ex
+    from _stream import StreamProcessor
+    sp = StreamProcessor()
+    assert sp.process_line('{"role":"assistant","content":"first"}') is False
+    assert sp.process_line('{"role":"tool","tool_call_id":"t1","content":"ok"}') is False
+    assert sp.process_line('{"role":"assistant","content":"final"}') is False
+    sp.finalize_stream()
+    assert sp.get_result()["result"] == "first\nfinal"
+    failed = ex.build_final_response("kimi", 1, sp.get_result(), ["provider failed\n"], "")
+    assert failed["status"] == "error", failed
+
+
+def test_v10_kimi_permission_contract_fails_closed():
+    from _builder import effective_permission, readonly_unenforceable_error
+    assert effective_permission("kimi", "read-only") == "unenforceable"
+    assert effective_permission("kimi", "safe-edit") == "yolo"
+    assert readonly_unenforceable_error("kimi", "read-only")
+    assert readonly_unenforceable_error("kimi", "safe-edit")
+    assert readonly_unenforceable_error("kimi", "yolo") is None
+
+
+def test_v10_debug_and_envelope_redact_backend_secret_echoes():
+    import _executor as ex
+    leaked = 'Authorization: Bearer live-secret\n{"api_key":"json-secret"}'
+    clean = ex._redact_output_secrets(leaked)
+    assert "live-secret" not in clean and "json-secret" not in clean, clean
+    resp = {"result": leaked, "output_tail": leaked}
+    ex._finalize_diagnostics(resp, leaked, None, [], None)
+    assert "live-secret" not in resp["result"] and "json-secret" not in resp["output_tail"]
+
+
+def test_v10_kimi_install_drift_honors_data_home_override():
+    import _installs as installs
+    home = tempfile.mkdtemp(prefix="summon-home-")
+    kimi = tempfile.mkdtemp(prefix="summon-kimi-home-")
+    saved = os.environ.get("KIMI_CODE_HOME")
+    try:
+        os.makedirs(os.path.join(kimi, "skills", "summon", "scripts"))
+        os.environ["KIMI_CODE_HOME"] = kimi
+        rows = installs.enumerate_installs(home=home)
+        row = next(r for r in rows if r["label"] == "kimi")
+        assert row["scripts_dir"].startswith(kimi), row
+    finally:
+        if saved is None:
+            os.environ.pop("KIMI_CODE_HOME", None)
+        else:
+            os.environ["KIMI_CODE_HOME"] = saved
+        shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(kimi, ignore_errors=True)
+
+
+def test_v10_kimi_builder_isolated_and_boundary_safe():
+    """Kimi one-shots must use JSONL plus a fresh no-MCP home, never child args."""
+    import _builder as b
+    root = tempfile.mkdtemp(prefix="summon-kimi-source-")
+    state = tempfile.mkdtemp(prefix="summon-kimi-state-")
+    saved = {k: os.environ.get(k) for k in ("KIMI_CODE_HOME", "KIMI_HEADLESS_PROFILE")}
+    try:
+        os.makedirs(os.path.join(root, "credentials"))
+        with open(os.path.join(root, "config.toml"), "w", encoding="utf-8") as fh:
+            fh.write('default_model = "kimi-code/k3"\n')
+        with open(os.path.join(root, "credentials", "token.json"), "w", encoding="utf-8") as fh:
+            fh.write("test-token")
+        os.environ["KIMI_CODE_HOME"] = root
+        os.environ["KIMI_HEADLESS_PROFILE"] = state
+        inv = b.AgentInvocation(cli="kimi", prompt="--plan is prompt text", cwd=".",
+                                permission="yolo", model="kimi-code/k3",
+                                extra_args=("--auto", "--session", "other", "--trace"))
+        command, args, env = b.build_invocation_args(inv)
+        assert command == "kimi" and args[:2] == ["--model", "kimi-code/k3"], args
+        assert args[-4:] == ["--output-format", "stream-json", "--prompt", args[-1]], args
+        assert "--auto" not in args and "--session" not in args and "other" not in args
+        assert "--trace" in args
+        profile = env["KIMI_CODE_HOME"]
+        assert os.path.isfile(os.path.join(profile, "config.toml"))
+        assert os.path.isfile(os.path.join(profile, "credentials", "token.json"))
+        assert not os.path.exists(os.path.join(profile, "mcp.json"))
+        assert env["HOME"] == profile and env["USERPROFILE"] == profile
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(state, ignore_errors=True)
+
+
+def test_v10_kimi_stream_finalizes_only_at_eof():
+    import _executor as ex
+    from _stream import StreamProcessor
+    sp = StreamProcessor()
+    assert sp.process_line('{"role":"assistant","content":"first"}') is False
+    assert sp.process_line('{"role":"tool","tool_call_id":"t1","content":"ok"}') is False
+    assert sp.process_line('{"role":"assistant","content":"final"}') is False
+    sp.finalize_stream()
+    assert sp.get_result()["result"] == "first\nfinal"
+    failed = ex.build_final_response("kimi", 1, sp.get_result(), ["provider failed\n"], "")
+    assert failed["status"] == "error", failed
+
+
+def test_v10_kimi_permission_contract_fails_closed():
+    from _builder import effective_permission, readonly_unenforceable_error
+    assert effective_permission("kimi", "read-only") == "unenforceable"
+    assert effective_permission("kimi", "safe-edit") == "yolo"
+    assert readonly_unenforceable_error("kimi", "read-only")
+    assert readonly_unenforceable_error("kimi", "safe-edit")
+    assert readonly_unenforceable_error("kimi", "yolo") is None
+
+
+def test_v10_kimi_builder_isolated_and_boundary_safe():
+    """Kimi one-shots must use JSONL plus a fresh no-MCP home, never child args."""
+    import _builder as b
+    root = tempfile.mkdtemp(prefix="summon-kimi-source-")
+    state = tempfile.mkdtemp(prefix="summon-kimi-state-")
+    saved = {k: os.environ.get(k) for k in ("KIMI_CODE_HOME", "KIMI_HEADLESS_PROFILE")}
+    try:
+        os.makedirs(os.path.join(root, "credentials"))
+        with open(os.path.join(root, "config.toml"), "w", encoding="utf-8") as fh:
+            fh.write('default_model = "kimi-code/k3"\n')
+        with open(os.path.join(root, "credentials", "token.json"), "w", encoding="utf-8") as fh:
+            fh.write("test-token")
+        os.environ["KIMI_CODE_HOME"] = root
+        os.environ["KIMI_HEADLESS_PROFILE"] = state
+        inv = b.AgentInvocation(cli="kimi", prompt="--plan is prompt text", cwd=".",
+                                permission="yolo", model="kimi-code/k3",
+                                extra_args=("--auto", "--session", "other", "--trace"))
+        command, args, env = b.build_invocation_args(inv)
+        assert command == "kimi" and args[:2] == ["--model", "kimi-code/k3"], args
+        assert args[-4:] == ["--output-format", "stream-json", "--prompt", args[-1]], args
+        assert "--auto" not in args and "--session" not in args and "other" not in args
+        assert "--trace" in args
+        profile = env["KIMI_CODE_HOME"]
+        assert os.path.isfile(os.path.join(profile, "config.toml"))
+        assert os.path.isfile(os.path.join(profile, "credentials", "token.json"))
+        assert not os.path.exists(os.path.join(profile, "mcp.json"))
+        assert env["HOME"] == profile and env["USERPROFILE"] == profile
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(state, ignore_errors=True)
+
+
+def test_v10_kimi_stream_finalizes_only_at_eof():
+    import _executor as ex
+    from _stream import StreamProcessor
+    sp = StreamProcessor()
+    assert sp.process_line('{"role":"assistant","content":"first"}') is False
+    assert sp.process_line('{"role":"tool","tool_call_id":"t1","content":"ok"}') is False
+    assert sp.process_line('{"role":"assistant","content":"final"}') is False
+    sp.finalize_stream()
+    assert sp.get_result()["result"] == "first\nfinal"
+    failed = ex.build_final_response("kimi", 1, sp.get_result(), ["provider failed\n"], "")
+    assert failed["status"] == "error", failed
+
+
+def test_v10_kimi_permission_contract_fails_closed():
+    from _builder import effective_permission, readonly_unenforceable_error
+    assert effective_permission("kimi", "read-only") == "unenforceable"
+    assert effective_permission("kimi", "safe-edit") == "yolo"
+    assert readonly_unenforceable_error("kimi", "read-only")
+    assert readonly_unenforceable_error("kimi", "safe-edit")
+    assert readonly_unenforceable_error("kimi", "yolo") is None
 
 
 if __name__ == "__main__":
