@@ -93,6 +93,10 @@ _BACKENDS = {
         "install": "npm install -g @google/gemini-cli",
         "auth": "gemini  (first interactive run) or GEMINI_API_KEY",
     },
+    "kimi": {
+        "install": "Kimi Code CLI (https://moonshotai.github.io/kimi-code/)",
+        "auth": "kimi login",
+    },
     "agy": {
         "install": "Antigravity CLI (https://antigravity.google)",
         "auth": "agy login  - Windows-only out of the box (ConPTY wrapper); "
@@ -271,20 +275,27 @@ def _probe_eligibility(backends: dict, runner=None) -> None:
 def _check_agy_extras(backends: dict) -> dict:
     """agy needs more than the CLI: a PTY wrapper + an interpreter with
     pywinpty+pyte (bundled wrapper), or a user-supplied wrapper on POSIX."""
-    from _builder import _agy_python, _has_pty_modules, _agy_wrapper
-    entry: dict = {"platform_ok": os.name == "nt" or bool(os.environ.get("AGY_PTY_WRAPPER"))}
+    from _builder import _agy_python, _has_pty_modules, _agy_wrapper, _agy_wrapper_is_stream
+    entry: dict = {"platform_ok": True}
     try:
         wrapper = _agy_wrapper()
         entry["wrapper"] = wrapper
         entry["wrapper_found"] = os.path.isfile(wrapper)
+        entry["platform_ok"] = entry["wrapper_found"]
     except ValueError as e:
         entry["wrapper"] = None
         entry["wrapper_found"] = False
         entry["note"] = str(e)
+        entry["platform_ok"] = False
         return entry
     if os.environ.get("AGY_PTY_WRAPPER"):
         entry["python"] = os.environ.get("AGY_PTY_PYTHON") or sys.executable
         entry["pty_modules"] = None  # custom wrapper: deps unknown by design
+    elif _agy_wrapper_is_stream(wrapper):
+        # Stream wrapper is invoked directly as a script; keep ``python`` as the
+        # interpreter used for non-stream environments and use wrapper availability as evidence.
+        entry["python"] = sys.executable
+        entry["pty_modules"] = True
     else:
         py = _agy_python()
         entry["python"] = py
@@ -402,7 +413,7 @@ def render(report: dict) -> str:
             if name == "agy":
                 ex = report["agy_extras"]
                 if not ex.get("platform_ok"):
-                    mark, detail = "[!!]", "CLI found but backend needs Windows or AGY_PTY_WRAPPER"
+                    mark, detail = "[!!]", "CLI found but the agy wrapper is not available"
                 elif not ex.get("wrapper_found"):
                     mark, detail = "[!!]", f"CLI found but PTY wrapper missing ({ex.get('wrapper')})"
                 elif ex.get("pty_modules") is False:

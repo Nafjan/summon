@@ -28,7 +28,7 @@ from _receipt import scripts_sha256, _read_regular_bounded
 # HOSTS keys -- test_installs_hosts_match_installer guards against drift between the
 # installer and this detector.
 HOST_DIRS = {"claude": ".claude", "codex": ".codex", "cursor": ".cursor",
-             "gemini": ".gemini", "copilot": ".copilot",
+             "gemini": ".gemini", "kimi": ".kimi-code", "copilot": ".copilot",
              # Antigravity's skills live per-profile UNDER ~/.gemini, so these are nested
              # relative paths rather than a top-level dot-dir (joined the same way).
              "antigravity": os.path.join(".gemini", "antigravity"),
@@ -50,6 +50,13 @@ def _canonical(path: str) -> str:
         return os.path.normcase(os.path.realpath(path))
     except OSError:
         return os.path.normcase(os.path.abspath(path))
+
+
+def _host_root(name: str, relative: str, home: str) -> str:
+    """Resolve a host root, honoring Kimi's portable data-home override."""
+    if name == "kimi":
+        return os.environ.get("KIMI_CODE_HOME") or os.path.join(home, relative)
+    return os.path.join(home, relative)
 
 
 def _read_installed_at(install_dir: str):
@@ -273,7 +280,7 @@ def enumerate_installs(running_scripts_dir: str | None = None,
     elsewhere (a repo/worktree checkout) it is appended as its own record. ``home`` is
     injectable for tests."""
     home = home or os.path.expanduser("~")
-    raw = [_probe(name, os.path.join(home, d, "skills", "summon", "scripts"), managed=True)
+    raw = [_probe(name, os.path.join(_host_root(name, d, home), "skills", "summon", "scripts"), managed=True)
            for name, d in HOST_DIRS.items()]
     raw.append(_probe("agents",
                       os.path.join(home, ".agents", "skills", "summon", "scripts"),
