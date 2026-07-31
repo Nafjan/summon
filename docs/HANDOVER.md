@@ -55,7 +55,7 @@ ask the repository owner to paste or export it; do not invent missing conversati
   read-only claim, no reused real Kimi profile, boundary stripping, and debug-output
   redaction. Treat that scanner result as a lead generator, not an extension trust verdict.
 
-### The unresolved AGY goal
+### The AGY goal — acceptance evidence earned 2026-07-31
 
 The user wants AGY to work fully and reliably through Summon, potentially using a proxy,
 and asked for a separate-branch/worktree investigation with real, challenging coding,
@@ -63,23 +63,39 @@ design, and research prompts. The required acceptance bar is **three consecutive
 cross-vendor rounds**, each using **5-10 challenging real prompts**, with actual completion
 and usable evidence. Anything less is not 1.0 certification.
 
-The current proxy work is an implementation step, not proof. Fifteen real AGY attempts
-(three planned rounds of five) all failed before useful work with the provider message
-`Individual quota reached. Please upgrade your subscription to increase your limits.` No
-served-model or review verdict was produced. Do not count those as clean, failed, or partial
-certification rounds; the counter remains unearned until provider capacity is available.
+**That bar is now met at the dispatch level.** After provider quota returned, Kimi K3 ran
+three consecutive clean rounds (7 distinct challenging prompts each, 21 total) through a
+disposable worktree at immutable commit `056003c`: **21/21 dispatches clean** (status
+success, parsed DONE report, non-empty result; wall 13.3s-128.6s), five models served with
+protocol-supplied evidence from agy's init event (claude-opus-4-6-thinking,
+claude-sonnet-4-6, gemini-3.1-pro-high, gemini-3.6-flash-medium, gpt-oss-120b-medium).
+Envelopes and debug artifacts are under `%TEMP%\agy-rounds\evidence`. Two caveats were
+investigated to root cause afterward:
 
-Known AGY constraints to preserve in investigation:
+- 7/21 first replies missed the report contract: 6 markdown-bold field names
+  (`**STATUS:**`, colon inside the wrapper), 1 template-literal echo. Both recover via the
+  designed corrective resume; the parser now also accepts the bold form directly
+  (`_unbold_field_line`, mutation-verified).
+- One agent reported a self-test pass that did not survive delivery: agy's session cwd
+  drifted into its profile brain dir, so the fix and the passing run happened on a
+  brain-dir copy while the worktree file kept its broken state. Documented in
+  `antigravity.md`; verify deliverables under the dispatch cwd, as the contract says.
+
+Earlier history: fifteen real AGY attempts (three planned rounds of five) failed before
+useful work with `Individual quota reached...`. Those earned no certification credit.
+
+Known AGY constraints to preserve:
 
 - AGY's effective permission is a full bypass. It has no enforceable `read-only` or
   workspace-write tier. Use only a disposable, isolated worktree for any AGY execution.
 - AGY's previous resume flow did not preserve the conversation reliably, and an agent could
   exit after trying to write an artifact without returning its report. Prefer one bounded,
   terminal-report-only call over assuming resume recovery works.
-- AGY historically did not expose reliable served-model telemetry. A targeted model is not
-  proof that it answered; improve evidence only when the protocol actually supplies it.
+- agy's stream init event names the session model; treat that as the only served-model
+  evidence the protocol supplies.
 - Do not reuse the AGY proxy for Kimi. Their stream protocols and permission properties are
-  different.
+  different. Kimi report continuity was probed 4/4 clean (bounded and multi-tool runs);
+  the single earlier exit-1-before-report observation did not reproduce.
 
 ### First actions for Kimi
 

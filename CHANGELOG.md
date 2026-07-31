@@ -19,6 +19,8 @@ regression notes, and test evidence, see the
 
 - Hardened debug argument redaction and boundary-flag handling.
 - Clarified wrapper readiness in diagnostics.
+- Accept markdown-bold report fields (`**STATUS:**`) from markdown-rendered backends such as
+  AGY, avoiding an unnecessary corrective resume.
 
 Release certification remains separate: three clean cross-vendor rounds are still required
 before these additions earn a certification claim.

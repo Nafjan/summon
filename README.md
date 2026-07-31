@@ -414,7 +414,8 @@ a headless session.
 ## System requirements
 
 - **Python 3.10+** (3.11+ recommended). Standard library only, so no `pip install` for the
-  dispatcher itself. The optional **agy** backend's PTY wrapper uses `pywinpty` and `pyte`
+  dispatcher itself — the default **agy** path (a stream-json proxy) is stdlib too. Only the
+  legacy opt-in agy PTY wrapper needs `pywinpty` and `pyte`
   (tested with `pywinpty 3.0.3` and `pyte 0.8.2`).
 - **At least one backend:** a vendor CLI installed and logged in (`claude`, `codex`,
   `cursor-agent`, `gemini`, `kimi`, or `agy`), and/or an API key for an `openai-compat` provider (or

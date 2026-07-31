@@ -104,6 +104,14 @@ _REPORT_FIELDS = frozenset({
 # rather than a quoted "STATUS: DONE | PARTIAL | BLOCKED" contract example.
 _STATUS_VALUES = frozenset({"DONE", "PARTIAL", "BLOCKED", "SUCCESS", "ERROR"})
 _REPORT_FIELD_RE = re.compile(r"^([A-Z][A-Z0-9_-]{1,}):[ \t]?(.*)$")
+# Markdown-rendered backends (agy above all) bold the contract field names, with
+# the colon landing INSIDE or OUTSIDE the wrapper: `**STATUS:** v` / `**STATUS**: v`.
+_BOLD_FIELD_PREFIX = re.compile(r"^\*\*([A-Z][A-Z0-9_-]{1,})(?::\*\*|\*\*:)")
+
+
+def _unbold_field_line(line: str) -> str:
+    """Strip a markdown-bold wrapper around a report field key, if present."""
+    return _BOLD_FIELD_PREFIX.sub(lambda m: m.group(1) + ":", line, count=1)
 # A line begins a NEW field when its key is either a known field OR a well-formed
 # all-caps identifier (letters/digits/underscore, 2-30 chars) — so a third-party
 # agent's CUSTOM field (SCORE:, RUBRIC:, ...) is captured, not silently folded
@@ -180,7 +188,10 @@ def parse_report(text: str) -> dict | None:
     begins a new field when its key is a known field OR a well-formed all-caps
     identifier (so third-party agents' custom fields are captured, not folded);
     any other line continues the current value (multi-line safe). Keys are
-    lowercased with ``-`` mapped to ``_`` (e.g. ``follow_up``).
+    lowercased with ``-`` mapped to ``_`` (e.g. ``follow_up``). Markdown-bold
+    field names (``**STATUS:**``) are accepted — backends that render markdown
+    wrap the contract typographically; the status-value and template guards
+    apply unchanged after the wrapper is stripped.
 
     Returns None when no genuine ``STATUS:`` line exists.
     """
@@ -189,8 +200,9 @@ def parse_report(text: str) -> dict | None:
     lines = text.splitlines()
     start = None
     for i in range(len(lines) - 1, -1, -1):
-        if lines[i].startswith("STATUS:"):
-            value = lines[i][len("STATUS:"):].strip()
+        anchor = _unbold_field_line(lines[i])
+        if anchor.startswith("STATUS:"):
+            value = anchor[len("STATUS:"):].strip()
             first = value.split()[0].rstrip("|,").upper() if value else ""
             # Skip ONLY the echoed contract TEMPLATE ("DONE | PARTIAL | BLOCKED"):
             # a value whose pipe-separated tokens are ALL status keywords. A real
@@ -208,7 +220,7 @@ def parse_report(text: str) -> dict | None:
     fields: dict = {}
     current_key = None
     for line in lines[start:]:
-        m = _REPORT_FIELD_RE.match(line)
+        m = _REPORT_FIELD_RE.match(_unbold_field_line(line))
         if m and _is_field_key(m.group(1)):
             current_key = m.group(1).lower().replace("-", "_")
             fields[current_key] = m.group(2).strip()
