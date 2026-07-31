@@ -156,6 +156,18 @@ def _check_backends() -> dict:
         else:
             entry["install"] = _BACKENDS[name]["install"]
         entry["auth_hint"] = _BACKENDS[name]["auth"]
+        # Native ACP transport (gemini/kimi/cursor-agent): whether the INSTALLED
+        # version actually speaks it, so a too-old CLI is discovered here
+        # rather than when the automatic ACP fallback fires mid-incident.
+        if name in ("gemini", "kimi", "cursor-agent") and path:
+            try:
+                from _acpbackend import _probe_acp
+                _acp_err = _probe_acp(name)
+                entry["acp"] = {"supported": _acp_err is None}
+                if _acp_err:
+                    entry["acp"]["note"] = _acp_err
+            except Exception:  # noqa: BLE001 - advisory; never break doctor
+                pass
         out[name] = entry
     return out
 
@@ -430,6 +442,13 @@ def render(report: dict) -> str:
                     detail = f"{ver} - installed; eligibility unverified  ({b['path']})"
         lines.append(f"  {mark} {name:<13} {detail}")
         lines.append(f"       auth: {b['auth_hint']}")
+        # Native ACP support of the INSTALLED CLI (fallback/oversized prompts
+        # depend on it); shown only where the backend can speak ACP at all.
+        if b.get("acp"):
+            if b["acp"].get("supported"):
+                lines.append("       acp: [OK] native ACP transport available")
+            else:
+                lines.append(f"       acp: [--] {b['acp'].get('note', 'not supported')}")
         # The disclosure reached --json and stopped there, so the person actually READING
         # doctor saw "eligibility verified" with no hint that read-only was never exercised
         # for this backend. Two outputs describing one probe, and only the one nobody reads

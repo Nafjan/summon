@@ -37,6 +37,10 @@ class AgentInvocation:
     system_context: str = ""
     agent_file: str | None = None
     permission: str = DEFAULT_PERMISSION
+    # "subprocess" (default: spawn the CLI one-shot) or "acp" (run the turn over
+    # the Agent Client Protocol, where the backend supports it natively). The
+    # executor dispatches on this; see _acpbackend.
+    transport: str = "subprocess"
     model: str | None = None
     effort: str | None = None          # reasoning effort (claude only): low..max
     resume_id: str | None = None       # backend session/thread/chat id to resume
@@ -1601,6 +1605,9 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
 #                  to spawn (claude/codex/cursor/gemini/agy).
 #   "api"        — the executor calls the backend's own request function instead
 #                  of spawning a process (openai-compat: an HTTP call).
+# An optional "acp" key on a subprocess backend registers NATIVE Agent Client
+# Protocol support: {"call": fn} invoked when inv.transport == "acp" (fallback,
+# oversized prompts, or explicit opt-in — see _acpbackend).
 # Adding a backend = add ONE entry here (+ its build/call fn). ``side_effects``
 # flags a build that mutates the filesystem (agy creates a per-call profile), so
 # callers like --dry-run know not to invoke build() as a pure preview.
@@ -1612,12 +1619,23 @@ def _api_call(inv: AgentInvocation, timeout_ms: int) -> dict:
     return _call(inv, timeout_ms)
 
 
+def _acp_call(inv: AgentInvocation, timeout_ms: int) -> dict:
+    from _acpbackend import call as _call    # lazy: keep _builder import-light
+    return _call(inv, timeout_ms)
+
+
 BACKENDS: dict = {
     "claude":       {"kind": "subprocess", "build": _build_claude_args},
     "codex":        {"kind": "subprocess", "build": _build_codex_args},
-    "cursor-agent": {"kind": "subprocess", "build": _build_cursor_args},
-    "gemini":       {"kind": "subprocess", "build": _build_gemini_args},
-    "kimi":         {"kind": "subprocess", "build": _build_kimi_args, "side_effects": True},
+    # The "acp" key marks NATIVE Agent Client Protocol support and provides the
+    # call the executor uses when inv.transport == "acp". The backend keeps its
+    # subprocess kind/build as the primary transport; ACP is the alternate.
+    "cursor-agent": {"kind": "subprocess", "build": _build_cursor_args,
+                     "acp": {"call": _acp_call}},
+    "gemini":       {"kind": "subprocess", "build": _build_gemini_args,
+                     "acp": {"call": _acp_call}},
+    "kimi":         {"kind": "subprocess", "build": _build_kimi_args, "side_effects": True,
+                     "acp": {"call": _acp_call}},
     "agy":          {"kind": "subprocess", "build": _build_agy_args, "side_effects": True},
     "openai-compat": {"kind": "api", "call": _api_call},
 }
@@ -1631,6 +1649,13 @@ def backend_kind(cli: str) -> str | None:
     """'subprocess' | 'api' | None (unknown backend)."""
     b = BACKENDS.get(cli)
     return b["kind"] if b else None
+
+
+def supports_acp(cli: str) -> bool:
+    """True when the backend has a NATIVE ACP entry point (the executor can
+    dispatch inv.transport == "acp" to it)."""
+    b = BACKENDS.get(cli)
+    return bool(b and b.get("acp"))
 
 
 def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None
