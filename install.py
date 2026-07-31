@@ -9,7 +9,7 @@
 
 What it does:
   1. Copies SKILL.md + scripts/ + references/ + agents/ into <host>/skills/summon/ for each
-     detected host (~/.claude, ~/.codex, ~/.cursor, ~/.gemini, ~/.copilot, and each
+     detected host (~/.claude, ~/.codex, ~/.cursor, ~/.gemini, ~/.kimi-code, ~/.copilot, and each
      Antigravity profile under ~/.gemini/antigravity*), writing
      an ownership manifest (.summon-install.json) into each copy.
   2. Copies the starter agent roster into ~/.agents/ with EXCLUSIVE creation —
@@ -51,6 +51,7 @@ HOSTS = {
     "codex": os.path.join(HOME, ".codex"),
     "cursor": os.path.join(HOME, ".cursor"),
     "gemini": os.path.join(HOME, ".gemini"),
+    "kimi": os.environ.get("KIMI_CODE_HOME") or os.path.join(HOME, ".kimi-code"),
     "copilot": os.path.join(HOME, ".copilot"),
     # Antigravity keeps its file-based skills per PROFILE, under ~/.gemini rather than a
     # root of its own -- so it needs explicit entries; ~/.gemini alone only reaches the
@@ -80,7 +81,7 @@ MANIFEST = ".summon-install.json"
 _ALIAS_MARKER = "Legacy alias for the \"summon\" skill"
 ALIAS_SKILL = """---
 name: sub-agents
-description: Legacy alias for the "summon" skill — a cross-vendor sub-agent dispatcher (Claude, Codex, Cursor, Gemini, Antigravity). Prefer /summon; this name is kept for backward compatibility and runs the exact same dispatcher.
+description: Legacy alias for the "summon" skill — a cross-vendor sub-agent dispatcher (Claude, Codex, Cursor, Gemini, Kimi, Antigravity). Prefer /summon; this name is kept for backward compatibility and runs the exact same dispatcher.
 allowed-tools: Bash Read
 ---
 
@@ -517,7 +518,7 @@ def main() -> int:
     else:
         hosts = detect_hosts()
         if not hosts:
-            print("No AI-CLI host dirs found (~/.claude, ~/.codex, ~/.cursor, ~/.gemini, "
+            print("No AI-CLI host dirs found (~/.claude, ~/.codex, ~/.cursor, ~/.gemini, ~/.kimi-code, "
                   "~/.copilot, ~/.gemini/antigravity*).\nInstall and run at least one CLI "
                   "first, or pass --hosts explicitly.")
             return 2

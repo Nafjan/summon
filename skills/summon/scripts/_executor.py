@@ -14,6 +14,66 @@ import subprocess
 import threading
 import time
 
+
+_SENSITIVE_ARG_PREFIXES = (
+    "api_key=", "api=", "token=", "secret=", "password=", "private_key=", "access_token=",
+    "--api-key=", "--oauth-token=", "--authorization=", "--auth-token=", "--access-token=",
+)
+_SENSITIVE_ARG_FLAGS = {
+    "--api-key", "--oauth-token", "--authorization", "--auth-token", "--access-token",
+    "--password", "--private-key", "--secret", "--token",
+}
+
+# CLI transcripts are model/provider-controlled and can echo credentials from a
+# failed request or a tool response.  Keep this deliberately narrow: redact a
+# named secret assignment, not ordinary prose that merely contains the word
+# "token".  It covers JSON (`"api_key":"..."`) and common terminal forms
+# (`Authorization: Bearer ...`) before either an envelope or debug log persists.
+_SENSITIVE_OUTPUT_RE = re.compile(
+    r"(?im)(\b(?:api[_-]?key|access[_-]?token|oauth[_-]?token|auth[_-]?token|"
+    r"private[_-]?key|password|secret|authorization)\b\s*(?:=\s*|:\s*(?:bearer\s+)?"
+    r"|[\"']?\s*:\s*[\"']?))([^\s,}\]\\\"']+)")
+
+
+def _redact_output_secrets(text: str) -> str:
+    """Redact named credentials from backend output before it becomes an artifact."""
+    if not isinstance(text, str):
+        return text
+    return _SENSITIVE_OUTPUT_RE.sub(lambda m: m.group(1) + "<redacted>", text)
+
+
+def _sanitize_argv(argv: list) -> str:
+    """Redact likely secrets in debug argv; keep the rest for reproducibility."""
+    out = []
+    redact_next = False
+    for arg in argv:
+        text = str(arg)
+        lowered = text.lower()
+        if redact_next:
+            out.append("<redacted>")
+            redact_next = False
+            continue
+        if any(prefix in lowered for prefix in _SENSITIVE_ARG_PREFIXES):
+            marker = "=" if "=" in text else " "
+            if marker in text:
+                left, _ = text.split(marker, 1)
+                text = f"{left}{marker}<redacted>"
+            else:
+                text = "<redacted>"
+        elif "=" in text:
+            left, _ = lowered.split("=", 1)
+            left = left.strip()
+            if any(left == flag or left == flag.strip("-") for flag in _SENSITIVE_ARG_FLAGS) or \
+                    left.replace("_", "-") in _SENSITIVE_ARG_FLAGS:
+                marker = "="
+                key = text.split("=", 1)[0]
+                text = f"{key}{marker}<redacted>"
+        elif any(lowered == flag for flag in _SENSITIVE_ARG_FLAGS) or \
+                any(lowered == flag.lstrip("-") for flag in _SENSITIVE_ARG_FLAGS):
+            redact_next = True
+        out.append(text if len(text) <= 2000 else text[:2000] + "...[truncated]")
+    return " ".join(out)
+
 from _builder import (AgentInvocation, BACKENDS, advisory_warnings,
                       argv_length_error, agy_permission_warning,
                       readonly_unenforceable_error,
@@ -237,9 +297,9 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
 
 
 # Payload elision + startup-noise filtering for the human-facing output_tail.
-# The FULL raw transcript is kept for --debug-dir (the debug_file pointer); only
-# the tail is sanitized so a failure stays diagnosable without a re-run and
-# without a base64 image blob or provider startup noise drowning the signal.
+# The debug transcript retains more context than the tail, but both are secret-
+# redacted.  The tail additionally elides large binary/base64 blobs and startup
+# noise so a failure stays diagnosable without a re-run.
 _DEFAULT_MAX_TOOL_OUTPUT_BYTES = 2048
 
 # base64 AND base64url alphabets (+/ and -_) plus '=' padding. A linear scan over
@@ -365,7 +425,11 @@ def _finalize_diagnostics(resp: dict, raw, debug_dir, debug_argv,
     written. The debug file keeps the UNsanitized raw (the full-detail pointer);
     a failed _write_debug returns None so the tail advises --debug-dir instead of
     naming a nonexistent file. Extracted from _stamp so the wiring is testable."""
-    dbg = _write_debug(debug_dir, debug_argv, raw or "", resp) if debug_dir else None
+    raw = _redact_output_secrets(raw or "")
+    for key in ("result", "error", "error_hint", "output_tail"):
+        if isinstance(resp.get(key), str):
+            resp[key] = _redact_output_secrets(resp[key])
+    dbg = _write_debug(debug_dir, debug_argv, raw, resp) if debug_dir else None
     if dbg:
         resp["debug_file"] = dbg
     if resp.get("output_tail") is not None and raw:
@@ -1437,7 +1501,8 @@ def _sweep_agy_litter(cwd: str | None, existed_before: bool) -> bool:
         return False
     # TOCTOU: the identity check reads the file, the deletion happens later, and in between
     # the path can be replaced. Fingerprint what was VERIFIED and refuse to delete anything
-    # that is no longer byte-identical to it. This cannot close the windowentirely on every
+    # that is no longer byte-identical to it. This cannot close the window entirely
+    # on every
     # filesystem, but it means the thing deleted is the thing that passed the check.
     try:
         before = os.stat(path)
@@ -1541,6 +1606,12 @@ def build_final_response(
     """
     exit_code = returncode if returncode is not None else 1
 
+    # Kimi's JSONL protocol has no terminal-success record.  Its assistant
+    # messages become a result only at clean EOF, so a non-zero process status
+    # must win over accumulated text (otherwise a partial reply plus a provider
+    # failure would be mislabelled success).
+    if cli == "kimi" and exit_code != 0:
+        result = None
     result_errored = bool(result) and _terminal_is_error(result)
     if result and not result_errored:
         # Terminal event parsed AND it did not self-report an error -> task
@@ -1574,17 +1645,14 @@ def build_final_response(
         status = "error"
         norm_reason = f"no usable terminal result and backend exit {exit_code} is not success"
         # A SCRAPE-BASED backend that returns nothing is a different failure from an agent
-        # that produced nothing. agy has no pipe mode, so summon reads its output through a
-        # ConPTY + pyte terminal scrape; when that loses the frame the envelope is empty
-        # after a full run's wall-clock. Field report (2026-07-27): 47s of work, result
-        # "\n", and the operator reasonably assumed the PROMPT was at fault and rewrote it.
-        # The distinction is already knowable here, so say it.
+        # that produced nothing. When the agy legacy wrapper is in use, a terminal-scrape
+        # loss can look identical: full wall-clock, non-empty exit code, and no result.
+        # That distinction is already knowable here, so say it.
         if cli == "agy" and not (result.get("result") if result else
                                  "".join(stdout_lines)).strip():
             norm_reason = (f"empty terminal scrape after a completed run (backend exit "
-                           f"{exit_code}). agy has no pipe mode, so its output is read from "
-                           f"a terminal scrape that can drop the frame -- this is usually a "
-                           f"lost result, NOT the agent declining to answer. Retry before "
+                           f"{exit_code}). This usually means the wrapper lost the final "
+                           f"line, NOT that the agent declined to answer. Retry before "
                            f"rewriting the prompt.")
 
     response = {
@@ -1643,6 +1711,18 @@ def build_final_response(
 
 _LINE = "line"
 _EOF = "eof"
+
+
+def _agy_stream_wrapper(cmd: str | None, args: list) -> bool:
+    """Identify the built-in stream-json wrapper among possible legacy wrappers."""
+    candidates = [cmd]
+    if args:
+        candidates.append(args[0])
+        if len(args) > 1:
+            candidates.append(args[1])
+    return any(
+        os.path.basename(str(x)).lower() == "agy_stream_proxy.py" for x in candidates if x
+    )
 
 # Cap on accumulated stdout codepoints per invocation. Protects the broker
 # from OOM if a sub-agent emits high-rate non-terminal output for the full
@@ -1818,20 +1898,24 @@ def _safe_communicate(process: subprocess.Popen, timeout: float = 3.0):
         return (None, None)
 
 
-def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int) -> dict:
+def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
+                   parse_stream: bool | None = None) -> dict:
     """Drive the subprocess and enrich whatever response path it takes.
 
     Single choke point: every return from the read loop (success, timeout,
     output-cap abort, I/O error) passes through ``_enrich`` so callers always
     see the same telemetry/report keys.
     """
+    if parse_stream is None:
+        parse_stream = cli != "agy"
     processor = StreamProcessor()
-    response = _drive_process_loop(process, cli, timeout_ms, processor)
+    response = _drive_process_loop(process, cli, timeout_ms, processor, parse_stream=parse_stream)
     return _enrich(response, processor)
 
 
 def _drive_process_loop(
-    process: subprocess.Popen, cli: str, timeout_ms: int, processor: StreamProcessor
+    process: subprocess.Popen, cli: str, timeout_ms: int, processor: StreamProcessor,
+    parse_stream: bool = True,
 ) -> dict:
     """Read process stdout via StreamProcessor, enforce a wall-clock deadline.
 
@@ -1846,11 +1930,9 @@ def _drive_process_loop(
     only one consumer ever reads ``process.stdout``.
     """
     deadline = time.monotonic() + timeout_ms / 1000
-    # agy's output is the ConPTY+pyte wrapper's plain-text scrape, NOT stream
-    # JSON; never treat one of its lines as a terminal event (a JSON-looking
-    # answer line such as a bare number would otherwise truncate the result).
-    # Plain-text success is decided by build_final_response (exit code + stdout).
-    parse_stream = cli != "agy"
+    # Non-stream CLIs can still return useful plain output on non-zero status; only
+    # the wrapper that emits line-delimited JSON events is safe to parse.
+    parse_stream = bool(parse_stream)
     stdout_lines: list = []
     accumulated_chars = 0
     line_q = _spawn_reader(process)
@@ -1907,6 +1989,7 @@ def _drive_process_loop(
             _, stderr = _safe_communicate(process)
             return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
 
+        processor.finalize_stream()
         return build_final_response(
             cli, process.returncode, processor.get_result(), stdout_lines, stderr
         )
@@ -1996,11 +2079,15 @@ def _write_debug(debug_dir: str, argv: list, raw: str, response: dict) -> str | 
         nl = "\n"
         with open(path, "w", encoding="utf-8", errors="replace") as fh:
             fh.write("# argv (prompt truncated to 2000 chars per token)" + nl)
-            fh.write(" ".join(a if len(a) <= 2000 else a[:2000] + "...[truncated]" for a in argv))
+            fh.write(_sanitize_argv([str(a) for a in argv]))
             fh.write(nl + nl + "# raw captured output (stdout+stderr merged)" + nl)
             fh.write(raw or "(none)")
             fh.write(nl + nl + "# final envelope" + nl)
             fh.write(_json.dumps(response, ensure_ascii=False, indent=1))
+        try:
+            os.chmod(path, 0o600)
+        except Exception:  # noqa: BLE001
+            pass
         return path
     except OSError:
         return None
@@ -2271,7 +2358,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         pass
 
     try:
-        response = _drive_process(process, inv.cli, timeout_ms)
+        parse_stream = inv.cli != "agy" or _agy_stream_wrapper(command, args)
+        response = _drive_process(process, inv.cli, timeout_ms, parse_stream=parse_stream)
     finally:
         # The dispatch is OVER here whichever way it ended. Closing the job releases the
         # kernel handle AND, via KILL_ON_JOB_CLOSE, reaps any descendant the backend left
