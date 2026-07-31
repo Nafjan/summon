@@ -119,21 +119,21 @@ class StreamProcessor:
             return False
 
         # Kimi Code's stream-json protocol is JSONL messages rather than
-        # terminal events.  Assistant messages are accumulated until EOF; a
-        # tool transcript is not a terminal result and must never cause summon
-        # to terminate the process mid-turn.
-        if data.get("role") == "assistant" and "type" not in data and "event" not in data:
+        # terminal events.  ANY role-bearing record (system/user/tool/meta/
+        # assistant) is conversational, never a terminal result -- including a
+        # leading system record before the first assistant message, which must
+        # not be mistaken for a cursor-style typeless result and truncate the
+        # run at line one.  Assistant content accumulates until EOF.
+        if "type" not in data and "event" not in data and isinstance(data.get("role"), str):
             self.is_kimi = True
-            content = data.get("content", "")
-            if isinstance(content, str):
-                self.kimi_parts.append(content)
-            elif isinstance(content, list):
-                self.kimi_parts.extend(
-                    part.get("text", "") for part in content
-                    if isinstance(part, dict) and isinstance(part.get("text"), str))
-            return False
-        if self.is_kimi and data.get("role") in ("tool", "meta", "user") and \
-                "type" not in data and "event" not in data:
+            if data["role"] == "assistant":
+                content = data.get("content", "")
+                if isinstance(content, str):
+                    self.kimi_parts.append(content)
+                elif isinstance(content, list):
+                    self.kimi_parts.extend(
+                        part.get("text", "") for part in content
+                        if isinstance(part, dict) and isinstance(part.get("text"), str))
             return False
 
         # Codex: turn.completed signals end (and carries token usage)

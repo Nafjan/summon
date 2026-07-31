@@ -48,20 +48,27 @@ def _has_output_format_flag(args: list[str]) -> bool:
     return False
 
 
+# Flags that consume the NEXT token as their value.
+_BOUNDARY_VALUE_FLAGS = {
+    "--add-dir", "--mode", "--sandbox", "--conversation",
+    "--agent", "--project", "--log-file", "--output-file", "--continue-id",
+}
+# Boolean flags: stripped alone, no value token follows.
+_BOUNDARY_FLAG_ONLY = {
+    "--dangerously-skip-permissions", "--yolo", "--resume", "--continue",
+    "--new-project",
+}
+
+
 def _strip_boundary_flags(args: list[str]) -> list[str]:
     """Drop flags that can increase workspace scope or bypass read-only controls.
 
     The proxy is a boundary utility; callers must not pass boundary flags through
     this layer. Strip only direct agy flags (and their values) to avoid prompt
-    text being accidentally rewritten.
+    text being accidentally rewritten. Both spellings are covered: `--flag value`
+    and `--flag=value`; a value-taking flag stripped without its value would
+    leave a stray positional token agy could interpret as input.
     """
-    boundary_flags = {
-        "--add-dir", "--mode", "--sandbox",
-        "--conversation", "--continue", "--continue=", "--agent", "--agent=", "--project",
-        "--project=", "--new-project", "--new-project=", "--log-file", "--log-file=",
-        "--dangerously-skip-permissions", "--yolo", "--resume", "--continue-id", "--output-file"
-    }
-    boundary_prefixes = {"--add-dir=", "--mode=", "--sandbox="}
     result: list[str] = []
     i = 0
     while i < len(args):
@@ -71,25 +78,14 @@ def _strip_boundary_flags(args: list[str]) -> list[str]:
             result.append(a)
             result.extend(args[i + 1:])
             break
-        if a in {
-            "--add-dir", "--mode", "--sandbox", "--conversation",
-            "--agent", "--project", "--log-file",
-        }:
-            if i + 1 < len(args):
-                i += 2
-            else:
-                i += 1
+        if a in _BOUNDARY_VALUE_FLAGS:
+            i += 2 if i + 1 < len(args) else 1
             continue
-        if a in {
-            "--dangerously-skip-permissions", "--yolo", "--resume", "--continue-id",
-            "--continue", "--new-project", "--output-file"
-        }:
+        if a in _BOUNDARY_FLAG_ONLY:
             i += 1
             continue
-        if a in boundary_prefixes:
-            i += 1
-            continue
-        if any(a.startswith(pfx) for pfx in boundary_prefixes):
+        name, sep, _ = a.partition("=")
+        if sep and name in _BOUNDARY_VALUE_FLAGS | _BOUNDARY_FLAG_ONLY:
             i += 1
             continue
         result.append(a)
