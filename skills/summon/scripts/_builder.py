@@ -361,7 +361,9 @@ def readonly_unenforceable_error(cli: str, permission: str, *,
 
     summon FAILS CLOSED here for the same reason --gate-with does: a permission tier is a
     promise to the caller, and a promise the backend will not keep is worse than no
-    promise, because it is acted on. agy is the only such backend today.
+    promise, because it is acted on. agy and kimi are such backends today: agy
+    (opt-in waivable) cannot contain even read-only, and kimi (never waivable)
+    cannot enforce anything below yolo in non-interactive mode.
 
     Measured across five canaries (2026-07-25/26). `--sandbox` restricts TERMINAL
     operations only. `--mode plan` does not withhold the file tools. Withholding
@@ -1405,7 +1407,7 @@ def _ensure_agy_profile(cwd: str, deadline_sec: float = 300.0) -> str:
     return prof
 
 
-_KIMI_RUN_TTL_SEC = 900
+_KIMI_RUN_TTL_SEC = 24 * 3600
 
 
 def _kimi_cleanup_old_runs(runs_dir: str) -> None:
@@ -1414,6 +1416,13 @@ def _kimi_cleanup_old_runs(runs_dir: str) -> None:
     Kimi retains credentials and may write sessions below ``KIMI_CODE_HOME``;
     profiles are never reused, and only old directories owned by this profile
     root are considered here.  Failure to remove one is safe and silent.
+
+    The TTL must exceed the longest plausible dispatch (the default timeout is
+    10 minutes but ``--timeout`` accepts hours): a previous 900s TTL let a
+    second dispatch delete a concurrent run's live home mid-flight.  A run
+    lasting longer than 24h can still lose its home to a concurrent sweep --
+    accepted residual, since every run gets a fresh directory and correctness
+    never depends on this cleanup.
     """
     cutoff = time.time() - _KIMI_RUN_TTL_SEC
     try:

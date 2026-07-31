@@ -35,8 +35,21 @@ ask the repository owner to paste or export it; do not invent missing conversati
   checks passed. `python tests/test_install.py` passed **23/23**.
 - Controlled live Kimi K3 checks passed: a terminal-only `PONG` and a write canary in an
   otherwise empty isolated fixture. No private repository source was sent for that test.
-- The full discovery suite was attempted but exceeded the current host's 240-second command
-  limit. Do not describe it as green until it completes in the next environment.
+- The full discovery suite has now completed on the takeover host: **446/446** (it previously
+  exceeded a 240-second host limit). The takeover also fixed the two failures it exposed --
+  a stale doctor backend roster (`+kimi`) and three triplicated `test_v10_kimi_*`
+  definitions that silently shadowed six tests, including the only `device_id` coverage --
+  plus a vacuous agy proxy passthrough test, a Kimi profile TTL race (a 900s reaper could
+  delete a concurrent run's live home; now 24h), a stream-parser gap where a leading
+  `{"role":"system"}` record was misread as a terminal result, half-implemented
+  `--flag=value` boundary stripping in the agy proxy, and prompt-mangling substring
+  redaction in the debug argv sanitizer (now key-match plus a named-assignment second
+  pass). Every fix is mutation-verified.
+- A Kimi orientation attempt through Summon (`kimi-worker`, `kimi-code/k3`) read this
+  handover and worked for ~78s, then the CLI exited code 1 without emitting a final
+  result event, so no report was returned. The exit-code guard correctly reported the
+  run as an error rather than mislabeling partial output as success. Treat Kimi
+  multi-tool/report continuity as an active reliability issue to diagnose.
 - The security audit of the installed, bundled VS Code Kimi extension produced many
   minified-bundle false positives. Its actionable branch findings were adopted: no fake
   read-only claim, no reused real Kimi profile, boundary stripping, and debug-output

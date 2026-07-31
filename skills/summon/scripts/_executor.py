@@ -15,13 +15,9 @@ import threading
 import time
 
 
-_SENSITIVE_ARG_PREFIXES = (
-    "api_key=", "api=", "token=", "secret=", "password=", "private_key=", "access_token=",
-    "--api-key=", "--oauth-token=", "--authorization=", "--auth-token=", "--access-token=",
-)
-_SENSITIVE_ARG_FLAGS = {
-    "--api-key", "--oauth-token", "--authorization", "--auth-token", "--access-token",
-    "--password", "--private-key", "--secret", "--token",
+_SENSITIVE_ARG_KEYS = {
+    "api", "api-key", "token", "secret", "password", "private-key",
+    "access-token", "oauth-token", "auth-token", "authorization",
 }
 
 # CLI transcripts are model/provider-controlled and can echo credentials from a
@@ -42,37 +38,38 @@ def _redact_output_secrets(text: str) -> str:
     return _SENSITIVE_OUTPUT_RE.sub(lambda m: m.group(1) + "<redacted>", text)
 
 
+def _sensitive_arg_key(text: str) -> str:
+    """Normalize a possible `key` (from `key=value` or a bare flag) for matching."""
+    return text.lower().lstrip("-").replace("_", "-")
+
+
 def _sanitize_argv(argv: list) -> str:
-    """Redact likely secrets in debug argv; keep the rest for reproducibility."""
+    """Redact likely secrets in debug argv; keep the rest for reproducibility.
+
+    Two passes.  Per token, a secret is redacted only when the sensitive name is
+    the WHOLE key of `key=value` or the whole flag of `--flag value` -- a prompt
+    token that merely mentions `password=` keeps its text.  Then the joined line
+    gets the same named-assignment redaction as backend output, so a credential
+    embedded in a larger token (e.g. a JSON blob) is still caught.
+    """
     out = []
     redact_next = False
     for arg in argv:
         text = str(arg)
-        lowered = text.lower()
         if redact_next:
             out.append("<redacted>")
             redact_next = False
             continue
-        if any(prefix in lowered for prefix in _SENSITIVE_ARG_PREFIXES):
-            marker = "=" if "=" in text else " "
-            if marker in text:
-                left, _ = text.split(marker, 1)
-                text = f"{left}{marker}<redacted>"
+        key, sep, _ = text.partition("=")
+        if _sensitive_arg_key(key) in _SENSITIVE_ARG_KEYS:
+            if sep:
+                out.append(f"{key}=<redacted>")
             else:
-                text = "<redacted>"
-        elif "=" in text:
-            left, _ = lowered.split("=", 1)
-            left = left.strip()
-            if any(left == flag or left == flag.strip("-") for flag in _SENSITIVE_ARG_FLAGS) or \
-                    left.replace("_", "-") in _SENSITIVE_ARG_FLAGS:
-                marker = "="
-                key = text.split("=", 1)[0]
-                text = f"{key}{marker}<redacted>"
-        elif any(lowered == flag for flag in _SENSITIVE_ARG_FLAGS) or \
-                any(lowered == flag.lstrip("-") for flag in _SENSITIVE_ARG_FLAGS):
-            redact_next = True
+                out.append(text)
+                redact_next = True
+            continue
         out.append(text if len(text) <= 2000 else text[:2000] + "...[truncated]")
-    return " ".join(out)
+    return _redact_output_secrets(" ".join(out))
 
 from _builder import (AgentInvocation, BACKENDS, advisory_warnings,
                       argv_length_error, agy_permission_warning,
@@ -422,9 +419,11 @@ def _finalize_diagnostics(resp: dict, raw, debug_dir, debug_argv,
                           max_tool_output_bytes) -> dict:
     """Write the debug transcript (if requested) then sanitize output_tail, with
     the tail's ``debug_file`` reference reflecting whether the file was ACTUALLY
-    written. The debug file keeps the UNsanitized raw (the full-detail pointer);
-    a failed _write_debug returns None so the tail advises --debug-dir instead of
-    naming a nonexistent file. Extracted from _stamp so the wiring is testable."""
+    written. The debug file keeps the full-length raw transcript (the tail is
+    truncated and blob-elided), but EVERY artifact -- debug file included -- is
+    secret-redacted first; a failed _write_debug returns None so the tail
+    advises --debug-dir instead of naming a nonexistent file. Extracted from
+    _stamp so the wiring is testable."""
     raw = _redact_output_secrets(raw or "")
     for key in ("result", "error", "error_hint", "output_tail"):
         if isinstance(resp.get(key), str):
@@ -1501,9 +1500,8 @@ def _sweep_agy_litter(cwd: str | None, existed_before: bool) -> bool:
         return False
     # TOCTOU: the identity check reads the file, the deletion happens later, and in between
     # the path can be replaced. Fingerprint what was VERIFIED and refuse to delete anything
-    # that is no longer byte-identical to it. This cannot close the window entirely
-    # on every
-    # filesystem, but it means the thing deleted is the thing that passed the check.
+    # that is no longer byte-identical to it. This cannot close the window entirely on
+    # every filesystem, but it means the thing deleted is the thing that passed the check.
     try:
         before = os.stat(path)
     except OSError:
