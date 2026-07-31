@@ -45,7 +45,7 @@ jobs:
         shell: bash
         run: |
           python summon.py --list-models > models.json
-          python -c "import json; m=json.load(open('models.json'))['models']; assert set(m) == {'claude','codex','agy','cursor-agent','gemini'}; print({k: v['source'] for k, v in m.items()})"
+          python -c "import json; m=json.load(open('models.json'))['models']; assert set(m) == {'claude','codex','agy','cursor-agent','gemini','kimi'}; print({k: v['source'] for k, v in m.items()})"
 
       - name: Dry-run resolves without executing (no backend needed)
         shell: bash
