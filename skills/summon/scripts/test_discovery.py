@@ -605,16 +605,54 @@ def test_doctor_json_roundtrip():
     assert isinstance(parsed["ok"], bool)
 
 
+def _fake_agy_home():
+    """Redirect the agy profile builder at a throwaway credential fixture.
+
+    Building an agy invocation copies auth from ~/.gemini and FAILS CLOSED when
+    oauth_creds.json is absent -- correct for dispatch, but it makes any builder
+    test host-dependent (green on a logged-in machine, red on CI). Point HOME/
+    USERPROFILE at a fixture so the build path is exercised identically
+    everywhere. Also isolates the headless profile state dir and forces the
+    default wrapper (no AGY_PTY_WRAPPER override)."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        home = tempfile.mkdtemp(prefix="summon-fake-home-")
+        state = tempfile.mkdtemp(prefix="summon-fake-agy-state-")
+        gem = os.path.join(home, ".gemini")
+        os.makedirs(gem)
+        with open(os.path.join(gem, "oauth_creds.json"), "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        saved = {k: os.environ.get(k)
+                 for k in ("HOME", "USERPROFILE", "AGY_HEADLESS_PROFILE", "AGY_PTY_WRAPPER")}
+        os.environ["HOME"] = home
+        os.environ["USERPROFILE"] = home
+        os.environ["AGY_HEADLESS_PROFILE"] = state
+        os.environ.pop("AGY_PTY_WRAPPER", None)
+        try:
+            yield home
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(state, ignore_errors=True)
+
+    return _ctx()
+
+
 def test_agy_posix_fence():
     # POSIX no longer needs AGY_PTY_WRAPPER for stream mode. The built-in
     # cross-platform proxy should be used there.
     from _builder import AgentInvocation, build_invocation_args
     inv = AgentInvocation(cli="agy", prompt="hi", cwd=os.getcwd(),
                           system_context="x", permission="yolo")
-    if os.environ.get("AGY_PTY_WRAPPER"):
-        return  # fence not applicable here
-    command, args, _ = build_invocation_args(inv)
-    assert os.path.basename(command).lower() in {"python.exe", "python3", "python"}, (
+    with _fake_agy_home():
+        command, args, _ = build_invocation_args(inv)
+    assert os.path.basename(command).lower().startswith("python"), (
         "agy invocation should go through a wrapper/interpreter path")
     assert os.path.basename(args[0]).lower() == "agy_stream_proxy.py", (
         "POSIX should default to the cross-platform proxy, not AGY_PTY_WRAPPER gate")
@@ -635,9 +673,8 @@ def test_agy_model_alias_is_normalized_to_display_name():
     inv = AgentInvocation(cli="agy", prompt="hi", cwd=os.getcwd(),
                           model="claude-sonnet-4-6-thinking", permission="yolo",
                           system_context="x")
-    if os.environ.get("AGY_PTY_WRAPPER"):
-        return
-    _, args, _ = build_invocation_args(inv)
+    with _fake_agy_home():
+        _, args, _ = build_invocation_args(inv)
     try:
         i = args.index("--model")
         assert args[i + 1] == "Claude Sonnet 4.6 (Thinking)", args
@@ -651,9 +688,7 @@ def test_agy_build_uses_proxy_boundary_passthrough_flag():
     passthrough to preserve the `--add-dir` / `--dangerously-skip-permissions`
     behavior it already controls."""
     from _builder import AgentInvocation, build_invocation_args, _agy_wrapper_is_stream
-    saved = os.environ.get("AGY_PTY_WRAPPER")
-    try:
-        os.environ.pop("AGY_PTY_WRAPPER", None)
+    with _fake_agy_home():
         inv = AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
                               system_context="x", permission="safe-edit")
         command, args, env = build_invocation_args(inv)
@@ -666,9 +701,6 @@ def test_agy_build_uses_proxy_boundary_passthrough_flag():
         assert env.get("AGY_STREAM_PROXY_ALLOW_BOUNDARY") == "1", env
         assert "--add-dir" in args, args
         assert "--dangerously-skip-permissions" in args, args
-    finally:
-        if saved is not None:
-            os.environ["AGY_PTY_WRAPPER"] = saved
 
 
 def test_extract_json_last_toplevel_wins():
