@@ -115,6 +115,27 @@ def _compat_endpoint(agent_file: str, agents_dir: str) -> tuple:
     return resolve_endpoint(fm, agents_dir)
 
 
+def _transport_for_dispatch(agent_file: str | None, cli_arg: str | None) -> str:
+    """Resolve the dispatch transport: --transport flag > agent `transport:`
+    frontmatter > "subprocess". Raises ValueError on an unknown value.
+
+    Re-reads the frontmatter like _compat_endpoint (utf-8-sig, so a BOM cannot
+    hide the field) instead of widening load_agent's return tuple, which has
+    many callers."""
+    fm_transport = None
+    if agent_file:
+        from _loader import parse_frontmatter
+        with open(agent_file, encoding="utf-8-sig") as fh:
+            fm, _ = parse_frontmatter(fh.read())
+        raw = fm.get("transport")
+        if raw is not None:
+            fm_transport = str(raw).strip().lower()
+    transport = (cli_arg or fm_transport or "subprocess").lower()
+    if transport not in ("subprocess", "acp"):
+        raise ValueError(f"invalid transport {transport!r}: use 'subprocess' or 'acp'")
+    return transport
+
+
 def _write_error_out(out_path: str, env: dict) -> None:
     """Record a failure at the authoritative --out path WITHOUT ever destroying a stored
     success.
@@ -926,6 +947,23 @@ def main() -> None:
         except (OSError, ValueError) as e:
             _die(f"openai-compat agent {args.agent!r}: {e}")
 
+    # Transport: --transport flag > agent `transport:` frontmatter > subprocess.
+    # ACP requires NATIVE backend support; asking for it anywhere else is a
+    # configuration error, not a dispatch failure.
+    try:
+        transport = _transport_for_dispatch(agent_file, getattr(args, "transport", None))
+    except ValueError as e:
+        _die(str(e))
+    if transport == "acp":
+        from _builder import supports_acp as _supports_acp
+        if not _supports_acp(cli):
+            _die(f"backend {cli!r} has no acp transport "
+                 f"(native ACP: gemini, kimi, cursor-agent)")
+    # The kill switch is process-wide: the executor's oversized-prompt ACP
+    # routing reads the env var and never sees args, so the flag writes it here.
+    if getattr(args, "no_acp_fallback", False):
+        os.environ["SUMMON_ACP_FALLBACK"] = "0"
+
     # A bare sub-second --timeout is a units mistake on a DISPATCH: bare values are
     # milliseconds for backward compatibility, so `--timeout 300` means 0.3s and kills every
     # agent almost immediately. A four-member council lost a whole run to this (field
@@ -964,6 +1002,7 @@ def main() -> None:
         extra_args=(() if getattr(args, "max_permission", None)
                     else tuple(extra_args)),
         base_url=base_url,
+        transport=transport,             # --transport > frontmatter > subprocess
         # the account digest the identity recorded, so the dispatch can verify the profile
         # it builds carries the SAME bytes
         agy_account_sha256=_identity.get("agy_account_sha256"),
@@ -1153,7 +1192,12 @@ def _dry_run_view(invocation, args, agents_dir: str,
         view.update(receipt_agent(args, agent_file))
     except Exception:  # noqa: BLE001
         pass
-    if backend_kind(invocation.cli) == "api":
+    if invocation.transport == "acp":
+        # ACP dispatches build no argv (the executor hands the turn to
+        # _acpbackend.call); render the transport, not a command line.
+        view["command"] = f"{invocation.cli} <acp>"
+        view["transport"] = "acp"
+    elif backend_kind(invocation.cli) == "api":
         view["command"] = f"POST ({invocation.cli})"
         view["base_url"] = invocation.base_url
         view["endpoint"] = (invocation.base_url or "?") + "/chat/completions"
@@ -1424,6 +1468,48 @@ def _is_agy_scrape_loss(result: dict) -> bool:
                 ("agy backend:", "agy prompt is", "agy cannot enforce")))
 
 
+def _acp_fallback_enabled(args) -> bool:
+    """Kill switch: --no-acp-fallback, or SUMMON_ACP_FALLBACK=0 (which the flag
+    also sets so the executor's oversized-prompt routing sees it)."""
+    return (os.environ.get("SUMMON_ACP_FALLBACK") != "0"
+            and not getattr(args, "no_acp_fallback", False))
+
+
+def _acp_fallback_worthy(result: dict) -> bool:
+    """True only for failure classes a TRANSPORT change can fix (premortem T3).
+
+    Deliberately narrow, same philosophy as _is_agy_scrape_loss: a fallback that
+    fires on a structural failure spends a real paid dispatch to fail the same
+    way over a different wire. IN: timeouts, stream-sniffing/output-shape
+    losses, mid-stream pipe failures, backend-internal errors. OUT:
+    CLI-not-found (ACP spawns the same binary), auth/eligibility (a credential
+    problem, not a transport problem), structural refusals that never reached a
+    backend, argv-length (the executor routes those over ACP itself)."""
+    if result.get("status") not in ("error", "partial"):
+        return False
+    reason = (result.get("normalization_reason") or "").lower()
+    if result.get("exit_code") == 124 or "timed out" in reason:
+        return True
+    err = (result.get("error") or "").lower()
+    if "over the windows limit" in err or "a single argument is" in err:
+        return False
+    if result.get("exit_code") == 127 or "cli not found" in err:
+        return False
+    if "cannot enforce" in err:
+        return False
+    # Auth/eligibility signatures, shared with --doctor's classifier so a newly
+    # catalogued signature narrows fallback automatically. The result tail is
+    # included because an auth failure sometimes surfaces only in output text.
+    try:
+        from _doctor import classify_ineligibility
+        text = " ".join([err, reason, (result.get("result") or "")[:500]])
+        if classify_ineligibility(text, backend=result.get("cli")):
+            return False
+    except Exception:  # noqa: BLE001 — a broken classifier must not block recovery
+        pass
+    return True
+
+
 def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
     """execute_agent with --retries: exponential backoff on error/partial only
     (blocked won't improve by retrying — its cause is structural).
@@ -1478,6 +1564,55 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
             return result
         time.sleep(min(30, 2 ** attempt))
     result["attempts"] = attempt
+
+    # ACP fallback: ONE recovery attempt over the Agent Client Protocol when the
+    # subprocess path failed in a way a transport change can fix (premortem T3
+    # predicate keeps it narrow). Re-gated like any retry; spend and attempts
+    # stay honest whichever envelope is returned; the `fallback` field records
+    # the attempt either way (and doubles as Phase-2 scoping telemetry, E1).
+    from _builder import supports_acp as _supports_acp
+    if (result.get("status") in ("error", "partial")
+            and invocation.transport == "subprocess"
+            and _supports_acp(invocation.cli)
+            and _acp_fallback_enabled(args)
+            and _acp_fallback_worthy(result)):
+        refused = _regate_or_none(args, agents_dir, invocation)
+        if refused is not None:
+            from _gate import blocked_envelope
+            denied = _enrich_denial(
+                blocked_envelope(refused, agent=getattr(args, "agent", None),
+                                 cli=invocation.cli),
+                getattr(args, "_receipt", None), invocation)
+            # The primary attempt's spend happened whether or not the gate
+            # allows the recovery; folding it in keeps accounting honest.
+            _aggregate_spend(denied, result)
+            denied["attempts"] = attempt
+            return denied
+        from dataclasses import replace as _replace
+        fb = execute_agent(_replace(invocation, transport="acp"),
+                           timeout_ms=args.timeout, debug_dir=args.debug_dir,
+                           max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
+        if fb.get("status") == "success":
+            # Recovered: return the ACP envelope with the primary failure folded
+            # in (spend + provenance), never silently.
+            _aggregate_spend(fb, result)
+            fb["attempts"] = attempt + 1
+            fb["fallback"] = {
+                "from": "subprocess", "to": "acp",
+                "reason": result.get("error") or result.get("normalization_reason"),
+                "primary_status": result.get("status"),
+            }
+            fb.setdefault("warnings", []).append(
+                "the subprocess transport failed, so summon recovered this run over "
+                "ACP (see `fallback`). This spent an extra dispatch (see `attempts`). "
+                "Use --no-acp-fallback to control it.")
+            return fb
+        # Recovery failed too: keep the ORIGINAL envelope (richer primary-path
+        # diagnostics), but the spent fallback attempt is recorded and billed.
+        _aggregate_spend(result, fb)
+        result["attempts"] = attempt + 1
+        result["fallback"] = {"to": "acp", "status": fb.get("status"),
+                              "error": fb.get("error")}
     return result
 
 

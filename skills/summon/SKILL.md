@@ -229,6 +229,8 @@ completed review returning `VERDICT: BLOCK` is successful execution and a reject
 | `--gate-with AGENT` | No | Require AGENT to APPROVE this dispatch before it runs. The gate is dispatched **forced read-only** (regardless of its own definition, so a gate can never be a privilege-escalation path) and adjudicates the *request*: agent, prompt, permission, cwd. **Fails closed** -- a gate that denies, errors, times out, or emits no parseable `VERDICT:` line blocks the dispatch with `status:blocked`. `VERDICT: UNCERTAIN` additionally sets `requires_human_review:true`, routing the decision to a person. The decision lands in the envelope's `gate` field. Single dispatch only (rejected for `--manifest`/`--council`). |
 | `--gate-timeout` | No | Timeout for the `--gate-with` dispatch (same grammar as `--timeout`; defaults to it) |
 | `--retries N` | No | Re-dispatch up to N times on `error`/`partial` (exponential backoff; `blocked` is never retried — its cause is structural). Envelope gains `attempts` |
+| `--transport {subprocess,acp}` | No | Force the dispatch transport (default `subprocess`). `acp` runs the turn over the Agent Client Protocol — native support only: `gemini` (`--acp`), `kimi` (`acp`), `cursor-agent` (`acp`). Overrides the agent's `transport:` frontmatter. See "ACP transport" |
+| `--no-acp-fallback` | No | Disable the automatic ACP recovery attempt when a subprocess dispatch fails, and the oversized-prompt ACP routing. Env form: `SUMMON_ACP_FALLBACK=0` |
 | `--allow-credit` | No | Authorize spending ACCOUNT CREDIT on an unconditionally credit-only model for this one dispatch (no model meets that definition today; Fable billing is plan-dependent and handled separately, so this currently authorizes nothing and is kept for compatibility); flag form of `SUMMON_ALLOW_CREDIT=1`. Single dispatch only: rejected for `--manifest`/`--council`, where env inheritance would silently authorize every child (set the env var deliberately for fan-out spend) |
 | `--json-schema FILE` | No | Structured output contract: extract the agent's final JSON, validate against the schema, attach `parsed`/`parse_ok`/`parse_errors`; ONE corrective retry via resume on mismatch |
 | `--artifact FILE` | No | Opt a loose input file under `--cwd` into the provenance receipt (repeatable). Records relative filename, bytes, SHA-256, and page count where stdlib exposes labeled metadata (DOCX; null rather than guessing for PDF). The manifest is part of request reuse and is re-hashed after dispatch; a changed baseline sets `artifacts.stable_during_dispatch:false` and `suspect:true`. Incompatible with `--worktree`; manifest jobs use an `artifacts` array |
@@ -373,6 +375,34 @@ Enforced keywords: `type`, `properties`, `required`, `items`, `enum`, `const`,
 enforced** and is reported in the envelope's `parse_warnings` — so `parse_ok: true`
 never silently hides an unchecked constraint. Keep schemas within the subset.
 
+## ACP transport
+
+For the backends with **native** Agent Client Protocol support — `gemini`, `kimi`,
+`cursor-agent` — summon can run the turn over ACP (JSON-RPC over stdio) instead of a
+one-shot argv spawn. Three ways it engages:
+
+1. **Auto-fallback** (default on): when a subprocess dispatch ends `error`/`partial` in a
+   way a transport change can plausibly fix (timeouts, stream-shape losses), summon makes
+   ONE recovery attempt over ACP, re-gated under `--gate-with`. Structural failures
+   (CLI missing, auth, unenforceable tier, argv-length) never trigger it. The envelope
+   records `fallback: {from, to, reason, primary_status}` and the attempt counts in
+   `attempts`/spend. Disable with `--no-acp-fallback` or `SUMMON_ACP_FALLBACK=0`.
+2. **Oversized prompts**: a prompt over the OS argv limit routes to ACP automatically
+   (the prompt travels via stdin, no cap) with a warning, instead of erroring.
+3. **Opt-in**: `transport: acp` frontmatter or `--transport acp` makes ACP the primary
+   path for that agent.
+
+ACP caveats: no system-prompt channel (the agent definition is prepended to the prompt);
+model pinning is best-effort (`session/set_model` where advertised, otherwise a warning);
+permission is enforced by summon auto-answering `session/request_permission` per tier
+(allow-once only, never allow-always; a request whose options contain no safely
+classifiable choice cancels the turn — fail closed, and never an invented or positional
+optionId); the ACP
+session id is telemetry (`acp.session_id`) and NOT a resume handle (`resume.session_id`
+stays `None`, and `--resume` over ACP is refused); usage/cost fields depend on what the backend emits. Every ACP-served
+envelope carries `transport: "acp"`. `--doctor` reports whether each installed CLI
+actually speaks ACP.
+
 ## Known limitations & caveats
 
 Honest edges — plan around these, don't be surprised by them:
@@ -506,6 +536,7 @@ permissions.
 | `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.served` |
 | `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning effort for this agent (claude + codex); overrides the default `high`. `--effort` at dispatch overrides it |
 | `args` | shell-style string (optional) | Arbitrary extra backend flags passed verbatim, e.g. `args: -c model_reasoning_effort="high"` (codex). Model pinning stops being a special case |
+| `transport` | `subprocess` (default), `acp` (optional) | Dispatch transport. `acp` runs the turn over the Agent Client Protocol (native: gemini, kimi, cursor-agent); `--transport` at dispatch overrides it |
 
 **`model:` per-CLI semantics** (the string is passed to the CLI verbatim):
 
