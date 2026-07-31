@@ -15620,6 +15620,22 @@ def test_v10_sanitize_argv_keeps_prompt_text_that_mentions_secrets():
     assert "json-secret" not in out2, out2
 
 
+def test_v10_parse_report_accepts_markdown_bold_fields():
+    """Backends that render markdown (agy especially) bold the contract fields:
+    `**STATUS:** DONE`. The contract is line-anchored, so the bold wrapper used
+    to make a compliant report unparseable and force a corrective resume."""
+    import _executor as ex
+    bold = ("Did the work.\n\n**STATUS:** DONE  \n**SUMMARY:** s  \n"
+            "**FOLLOW-UP:** f  \n**HANDOFF:** h")
+    rep = ex.parse_report(bold)
+    assert rep and rep["status"] == "DONE" and rep["handoff"] == "h", rep
+    # A bold-wrapped TEMPLATE echo is still not a report.
+    assert ex.parse_report("**STATUS:** DONE | PARTIAL | BLOCKED") is None
+    # Plain parsing is unchanged.
+    plain = ex.parse_report("STATUS: DONE\nSUMMARY: s\nFOLLOW-UP: f\nHANDOFF: h")
+    assert plain and plain["status"] == "DONE"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
