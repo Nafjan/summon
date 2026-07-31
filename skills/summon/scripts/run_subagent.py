@@ -5,7 +5,7 @@ Usage:
     scripts/run_subagent.py --agent <name> --prompt "<task>" --cwd <path>
     scripts/run_subagent.py --list
 
-Supported CLIs: claude, cursor-agent, codex, gemini.
+Supported CLIs: claude, cursor-agent, codex, gemini, kimi, agy.
 
 Environment:
     SUB_AGENTS_DIR: Override default agents directory ({cwd}/.agents/).
@@ -1401,9 +1401,9 @@ def _regate_or_none(args, agents_dir, invocation):
 def _is_agy_scrape_loss(result: dict) -> bool:
     """True when agy returned nothing at all after a run that actually executed.
 
-    agy has no pipe mode, so summon reads its output through a ConPTY + pyte terminal
-    scrape; a dropped frame yields an empty envelope after full wall-clock. That is a
-    LOST RESULT, not a refusal, and it is the one failure a blind retry genuinely fixes.
+    Some legacy setups still use a terminal scrape path where a dropped frame yields
+    an empty envelope after a full wall-clock. That is a LOST RESULT, not a refusal,
+    and it is the one failure a blind retry genuinely fixes.
     Deliberately narrow: agy only, empty only, error only -- a retry that fires on a real
     refusal just spends money twice.
     """
@@ -1415,8 +1415,10 @@ def _is_agy_scrape_loss(result: dict) -> bool:
     # from "the run never started".
     if result.get("backend_exit_code") is None:
         return False
+    reason = (result.get("normalization_reason") or "").lower()
     return (result.get("cli") == "agy"
             and result.get("status") == "error"
+            and "empty terminal scrape" in reason
             and not (result.get("result") or "").strip()
             and not (result.get("error") or "").strip().lower().startswith(
                 ("agy backend:", "agy prompt is", "agy cannot enforce")))

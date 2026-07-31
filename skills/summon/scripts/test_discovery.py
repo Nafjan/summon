@@ -601,24 +601,106 @@ def test_doctor_json_roundtrip():
     import _doctor
     rep = _doctor.doctor()
     parsed = _json.loads(_json.dumps(rep, ensure_ascii=False))
-    assert set(parsed["backends"]) == {"claude", "codex", "cursor-agent", "gemini", "agy"}
+    assert set(parsed["backends"]) == {"claude", "codex", "cursor-agent", "gemini", "kimi", "agy"}
     assert isinstance(parsed["ok"], bool)
 
 
+def _fake_agy_home():
+    """Redirect the agy profile builder at a throwaway credential fixture.
+
+    Building an agy invocation copies auth from ~/.gemini and FAILS CLOSED when
+    oauth_creds.json is absent -- correct for dispatch, but it makes any builder
+    test host-dependent (green on a logged-in machine, red on CI). Point HOME/
+    USERPROFILE at a fixture so the build path is exercised identically
+    everywhere. Also isolates the headless profile state dir and forces the
+    default wrapper (no AGY_PTY_WRAPPER override)."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        home = tempfile.mkdtemp(prefix="summon-fake-home-")
+        state = tempfile.mkdtemp(prefix="summon-fake-agy-state-")
+        gem = os.path.join(home, ".gemini")
+        os.makedirs(gem)
+        with open(os.path.join(gem, "oauth_creds.json"), "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        saved = {k: os.environ.get(k)
+                 for k in ("HOME", "USERPROFILE", "AGY_HEADLESS_PROFILE", "AGY_PTY_WRAPPER")}
+        os.environ["HOME"] = home
+        os.environ["USERPROFILE"] = home
+        os.environ["AGY_HEADLESS_PROFILE"] = state
+        os.environ.pop("AGY_PTY_WRAPPER", None)
+        try:
+            yield home
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(state, ignore_errors=True)
+
+    return _ctx()
+
+
 def test_agy_posix_fence():
-    # On POSIX without AGY_PTY_WRAPPER, the agy builder must fail fast with a
-    # clear ValueError BEFORE any profile work. Real coverage on the Linux CI
-    # leg; on Windows this asserts the happy path instead.
+    # POSIX no longer needs AGY_PTY_WRAPPER for stream mode. The built-in
+    # cross-platform proxy should be used there.
     from _builder import AgentInvocation, build_invocation_args
     inv = AgentInvocation(cli="agy", prompt="hi", cwd=os.getcwd(),
                           system_context="x", permission="yolo")
-    if os.name == "nt" or os.environ.get("AGY_PTY_WRAPPER"):
-        return  # fence not applicable here
+    with _fake_agy_home():
+        command, args, _ = build_invocation_args(inv)
+    assert os.path.basename(command).lower().startswith("python"), (
+        "agy invocation should go through a wrapper/interpreter path")
+    assert os.path.basename(args[0]).lower() == "agy_stream_proxy.py", (
+        "POSIX should default to the cross-platform proxy, not AGY_PTY_WRAPPER gate")
+
+
+def test_agy_model_alias_is_normalized_to_display_name():
+    # A large percentage of AGY reports came in as failures because users passed
+    # short aliases instead of display names. Summon should normalize them before
+    # invoking the backend.
+    from _builder import _normalize_agy_model, AgentInvocation, build_invocation_args
+    assert _normalize_agy_model("claude-sonnet-4-6-thinking") == \
+        "Claude Sonnet 4.6 (Thinking)"
+    assert _normalize_agy_model("claude-opus-4-6-thinking") == \
+        "Claude Opus 4.6 (Thinking)"
+    assert _normalize_agy_model("gpt-oss-120b-medium") == \
+        "GPT-OSS 120B (Medium)"
+
+    inv = AgentInvocation(cli="agy", prompt="hi", cwd=os.getcwd(),
+                          model="claude-sonnet-4-6-thinking", permission="yolo",
+                          system_context="x")
+    with _fake_agy_home():
+        _, args, _ = build_invocation_args(inv)
     try:
-        build_invocation_args(inv)
-        raise AssertionError("expected ValueError on POSIX without AGY_PTY_WRAPPER")
-    except ValueError as e:
-        assert "AGY_PTY_WRAPPER" in str(e)
+        i = args.index("--model")
+        assert args[i + 1] == "Claude Sonnet 4.6 (Thinking)", args
+    except ValueError:
+        raise AssertionError(f"agy args do not contain model flag: {args}")
+
+
+def test_agy_build_uses_proxy_boundary_passthrough_flag():
+    """When summon uses the stream proxy, it must keep summon-injected boundary flags in
+    place. The proxy strips those flags when run directly, so summon explicitly opts into
+    passthrough to preserve the `--add-dir` / `--dangerously-skip-permissions`
+    behavior it already controls."""
+    from _builder import AgentInvocation, build_invocation_args, _agy_wrapper_is_stream
+    with _fake_agy_home():
+        inv = AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd(),
+                              system_context="x", permission="safe-edit")
+        command, args, env = build_invocation_args(inv)
+        # build_invocation_args returns the INTERPRETER as command and the proxy
+        # as args[0], so a basename(command) guard never reaches the assertions.
+        # Check the wrapper identity the way the executor does.
+        assert _agy_wrapper_is_stream(), "expected the bundled stream proxy to resolve"
+        invoked = [os.path.basename(str(x)).lower() for x in [command, *args]]
+        assert "agy_stream_proxy.py" in invoked, (command, args)
+        assert env.get("AGY_STREAM_PROXY_ALLOW_BOUNDARY") == "1", env
+        assert "--add-dir" in args, args
+        assert "--dangerously-skip-permissions" in args, args
 
 
 def test_extract_json_last_toplevel_wins():
@@ -1954,6 +2036,71 @@ def test_stream_exposes_all_models_used():
                     '"claude-haiku-4-5":{"outputTokens":50}}}')
     assert sp.model == "claude-sonnet-5", sp.model
     assert sp.models_used == ["claude-haiku-4-5", "claude-sonnet-5"], sp.models_used
+
+
+def test_stream_parses_agy_stream_json_result_payload():
+    from _stream import StreamProcessor
+    sp = StreamProcessor()
+    sp.process_line('{"event":"init","conversation_id":"123"}')
+    # Non-terminal AGY progress updates must not be mistaken as terminal completion.
+    assert sp.get_result() is None
+    sp.process_line('{"event":"step_update","step_update":{"step_index":0,"state":"DONE"}}')
+    assert sp.get_result() is None
+    sp.process_line('{"event":"result","result":{"conversation_id":"123","status":"SUCCESS",'
+                   '"response":"hello\\n","usage":{"input_tokens":1,"output_tokens":2}}}')
+    out = sp.get_result()
+    assert out == {"type": "result", "result": "hello\n", "status": "success"}, out
+    assert sp.usage == {"input_tokens": 1, "output_tokens": 2}
+
+
+def test_stream_captures_agy_stream_init_model():
+    from _stream import StreamProcessor
+    sp = StreamProcessor()
+    sp.process_line('{"event":"init","model":"Gemini 3.5 Flash (High)","conversation_id":"abc"}')
+    assert sp.handshake_model == "Gemini 3.5 Flash (High)", sp.handshake_model
+    assert sp.session_id == "abc"
+
+
+def test_agy_proxy_output_format_scan_stops_before_prompt():
+    # A prompt containing legacy-looking flags must not suppress injection.
+    from agy_stream_proxy import _has_output_format_flag
+    assert not _has_output_format_flag(["--print", "--output-format=json"])
+    assert not _has_output_format_flag(["--print", "Please include --output-format=json in text"])
+    assert not _has_output_format_flag(["--print", "hello --output", "--output-format"])
+    assert _has_output_format_flag(["--output-format", "json", "--print", "task"])
+    assert not _has_output_format_flag(["--print", "--output-format", "json"])
+    assert not _has_output_format_flag(["--print", "--dangerously-skip-permissions", "x"])
+
+
+def test_agy_proxy_strips_boundary_flags():
+    from agy_stream_proxy import _strip_boundary_flags
+    assert _strip_boundary_flags([
+        "--add-dir", "/tmp/project",
+        "--mode", "read-only",
+        "--dangerously-skip-permissions",
+        "--print", "task content --add-dir /repo --sandbox deep",
+    ]) == ["--print", "task content --add-dir /repo --sandbox deep"]
+    assert _strip_boundary_flags(["--output-format", "stream-json", "--print", "x"]) == \
+        ["--output-format", "stream-json", "--print", "x"]
+    assert _strip_boundary_flags(["--mode=read-only", "--sandbox=off", "--print", "task"]) == \
+        ["--print", "task"]
+    assert _strip_boundary_flags(["--conversation", "abc", "--print", "task"]) == ["--print", "task"]
+    assert _strip_boundary_flags(["--continue", "--agent", "foo", "--print", "task"]) == ["--print", "task"]
+    assert _strip_boundary_flags([
+        "--log-file", "C:\\tmp\\agy.log", "--print", "task"
+    ]) == ["--print", "task"]
+    # `--flag=value` spellings of every value-taking boundary flag strip too;
+    # previously only --add-dir=/--mode=/--sandbox= were covered.
+    assert _strip_boundary_flags([
+        "--agent=foo", "--conversation=x", "--log-file=y", "--project=z",
+        "--output-file=o", "--continue-id=c", "--print", "task"
+    ]) == ["--print", "task"]
+    # A value-taking flag stripped without its value must not leave a stray
+    # positional token agy could interpret as input.
+    assert _strip_boundary_flags(["--output-file", "o.md", "--print", "task"]) == ["--print", "task"]
+    assert _strip_boundary_flags(["--continue-id", "abc", "--print", "task"]) == ["--print", "task"]
+    # Boolean boundary flags in =-form are stripped as well.
+    assert _strip_boundary_flags(["--new-project=x", "--print", "task"]) == ["--print", "task"]
 
 
 def test_timeout_does_not_hang_on_grandchild_holding_stdout():
@@ -10558,6 +10705,26 @@ def test_v7_authorization_survives_a_same_origin_redirect():
             srv.shutdown()
 
 
+def test_v10_sanitize_argv_hides_secret_value_pairs():
+    """A secret flag and its value passed as separate argv tokens must both be redacted.
+    This only appears in debug artifacts and is therefore the last place a leaked token
+    can still appear; a raw value there is still recoverable."""
+    import _executor as _ex
+    out = _ex._sanitize_argv(["agy", "--api-key", "abc", "--print", "x"])
+    assert "--api-key <redacted>" in out, out
+    assert "abc" not in out, out
+    assert "--print" in out and " x" in out
+
+
+def test_v10_sanitize_argv_hides_secret_assignment_pairs():
+    """Secrets written as key=value argv tokens are still redacted. The prior implementation
+    rewrote only a few forms and leaked values from a plain `--token value` sequence."""
+    import _executor as _ex
+    out = _ex._sanitize_argv(["agy", "--auth-token=abc123", "--output-format", "stream-json"])
+    assert "--auth-token=<redacted>" in out
+    assert "abc123" not in out
+
+
 def test_v7_success_response_content_is_redacted():
     """The canary only ever reached a refused connection, so redaction of a SUCCESSFUL
     response body was never exercised: deleting the redact call on that path left every
@@ -14412,6 +14579,7 @@ def test_v9_agy_empty_scrape_retries_once_and_says_so():
     # separates a lost frame from a preflight failure, and the fixtures must carry it.
     empty = {"cli": "agy", "status": "error", "result": chr(10), "exit_code": 1,
              "backend_exit_code": 1, "cost_usd": 0.40,
+             "normalization_reason": "empty terminal scrape after a completed run",
              "usage": {"input_tokens": 10, "output_tokens": 0}}
     good = {"cli": "agy", "status": "success", "result": "recovered", "exit_code": 0,
             "backend_exit_code": 0, "report_ok": True, "cost_usd": 0.60,
@@ -15328,6 +15496,176 @@ def _repair_global_leaks(before: dict, leaked) -> None:
                     setattr(module, attr, before[key])
                 except Exception:  # noqa: BLE001
                     pass
+
+
+def test_v10_kimi_builder_isolated_and_boundary_safe():
+    """Kimi one-shots must use JSONL plus a fresh no-MCP home, never child args."""
+    import _builder as b
+    root = tempfile.mkdtemp(prefix="summon-kimi-source-")
+    state = tempfile.mkdtemp(prefix="summon-kimi-state-")
+    saved = {k: os.environ.get(k) for k in ("KIMI_CODE_HOME", "KIMI_HEADLESS_PROFILE")}
+    try:
+        os.makedirs(os.path.join(root, "credentials"))
+        with open(os.path.join(root, "config.toml"), "w", encoding="utf-8") as fh:
+            fh.write('default_model = "kimi-code/k3"\n')
+        with open(os.path.join(root, "credentials", "token.json"), "w", encoding="utf-8") as fh:
+            fh.write("test-token")
+        with open(os.path.join(root, "device_id"), "w", encoding="utf-8") as fh:
+            fh.write("test-device")
+        os.environ["KIMI_CODE_HOME"] = root
+        os.environ["KIMI_HEADLESS_PROFILE"] = state
+        inv = b.AgentInvocation(cli="kimi", prompt="--plan is prompt text", cwd=".",
+                                permission="yolo", model="kimi-code/k3",
+                                extra_args=("--auto", "--session", "other", "--trace"))
+        command, args, env = b.build_invocation_args(inv)
+        assert command == "kimi" and args[:2] == ["--model", "kimi-code/k3"], args
+        assert args[-4:] == ["--output-format", "stream-json", "--prompt", args[-1]], args
+        assert "--auto" not in args and "--session" not in args and "other" not in args
+        assert "--trace" in args
+        profile = env["KIMI_CODE_HOME"]
+        assert os.path.isfile(os.path.join(profile, "config.toml"))
+        assert os.path.isfile(os.path.join(profile, "credentials", "token.json"))
+        assert os.path.isfile(os.path.join(profile, "device_id"))
+        assert not os.path.exists(os.path.join(profile, "mcp.json"))
+        assert env["HOME"] == profile and env["USERPROFILE"] == profile
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(state, ignore_errors=True)
+
+
+def test_v10_kimi_stream_finalizes_only_at_eof():
+    import _executor as ex
+    from _stream import StreamProcessor
+    sp = StreamProcessor()
+    assert sp.process_line('{"role":"assistant","content":"first"}') is False
+    assert sp.process_line('{"role":"tool","tool_call_id":"t1","content":"ok"}') is False
+    assert sp.process_line('{"role":"assistant","content":"final"}') is False
+    sp.finalize_stream()
+    assert sp.get_result()["result"] == "first\nfinal"
+    failed = ex.build_final_response("kimi", 1, sp.get_result(), ["provider failed\n"], "")
+    assert failed["status"] == "error", failed
+
+
+def test_v10_kimi_permission_contract_fails_closed():
+    from _builder import effective_permission, readonly_unenforceable_error
+    assert effective_permission("kimi", "read-only") == "unenforceable"
+    assert effective_permission("kimi", "safe-edit") == "yolo"
+    assert readonly_unenforceable_error("kimi", "read-only")
+    assert readonly_unenforceable_error("kimi", "safe-edit")
+    assert readonly_unenforceable_error("kimi", "yolo") is None
+
+
+def test_v10_debug_and_envelope_redact_backend_secret_echoes():
+    import _executor as ex
+    leaked = 'Authorization: Bearer live-secret\n{"api_key":"json-secret"}'
+    clean = ex._redact_output_secrets(leaked)
+    assert "live-secret" not in clean and "json-secret" not in clean, clean
+    resp = {"result": leaked, "output_tail": leaked}
+    ex._finalize_diagnostics(resp, leaked, None, [], None)
+    assert "live-secret" not in resp["result"] and "json-secret" not in resp["output_tail"]
+
+
+def test_v10_kimi_install_drift_honors_data_home_override():
+    import _installs as installs
+    home = tempfile.mkdtemp(prefix="summon-home-")
+    kimi = tempfile.mkdtemp(prefix="summon-kimi-home-")
+    saved = os.environ.get("KIMI_CODE_HOME")
+    try:
+        os.makedirs(os.path.join(kimi, "skills", "summon", "scripts"))
+        os.environ["KIMI_CODE_HOME"] = kimi
+        rows = installs.enumerate_installs(home=home)
+        row = next(r for r in rows if r["label"] == "kimi")
+        assert row["scripts_dir"].startswith(kimi), row
+    finally:
+        if saved is None:
+            os.environ.pop("KIMI_CODE_HOME", None)
+        else:
+            os.environ["KIMI_CODE_HOME"] = saved
+        shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(kimi, ignore_errors=True)
+
+
+def test_v10_kimi_profile_cleanup_keeps_recent_runs():
+    """The profile sweep must never delete a home a live dispatch could be using.
+
+    Regression: a 900s TTL let a second kimi dispatch rmtree a concurrent run's
+    profile (credentials included) mid-flight whenever the first ran past 15
+    minutes. The TTL must exceed the longest plausible dispatch; only genuinely
+    old directories are reaped."""
+    import _builder as b
+    runs = tempfile.mkdtemp(prefix="summon-kimi-runs-")
+    try:
+        recent = os.path.join(runs, "run-recent")
+        ancient = os.path.join(runs, "run-ancient")
+        os.makedirs(recent)
+        os.makedirs(ancient)
+        now = time.time()
+        one_hour = now - 3600  # older than the buggy 900s TTL, younger than any dispatch
+        os.utime(recent, (one_hour, one_hour))
+        over_a_day = now - (25 * 3600)
+        os.utime(ancient, (over_a_day, over_a_day))
+        b._kimi_cleanup_old_runs(runs)
+        assert os.path.isdir(recent), "a 1h-old profile was reaped under a live run"
+        assert not os.path.exists(ancient), "a 25h-old profile should have been reaped"
+    finally:
+        shutil.rmtree(runs, ignore_errors=True)
+
+
+def test_v10_kimi_leading_records_are_never_terminal():
+    """A kimi stream can open with system/meta records before any assistant text.
+
+    Regression: typeless, eventless JSON used to fall into the cursor-style
+    fallback and become a terminal result, truncating the run at line one."""
+    from _stream import StreamProcessor
+    sp = StreamProcessor()
+    assert sp.process_line('{"role":"system","content":"init"}') is False
+    assert sp.process_line('{"role":"meta","trace":"t"}') is False
+    assert sp.process_line('{"role":"assistant","content":"answer"}') is False
+    sp.finalize_stream()
+    assert sp.get_result()["result"] == "answer"
+
+
+def test_v10_typeless_result_without_role_still_terminates():
+    """The cursor-style fallback the kimi guard must NOT break: a typeless,
+    eventless, ROLE-LESS JSON object is still a terminal result."""
+    from _stream import StreamProcessor
+    sp = StreamProcessor()
+    assert sp.process_line('{"result":"cursor answer","chatId":"c1"}') is True
+    assert sp.get_result()["result"] == "cursor answer"
+    assert sp.session_id == "c1"
+
+
+def test_v10_sanitize_argv_keeps_prompt_text_that_mentions_secrets():
+    """A prompt that merely mentions `password=` keeps its text; the prior
+    substring match truncated the whole prompt token at the mention. An actual
+    named credential inside a token is still caught by the second pass."""
+    import _executor as _ex
+    prompt = "fix the password= handling logic in auth.py"
+    out = _ex._sanitize_argv(["kimi", "--prompt", prompt])
+    assert "password" in out and "logic" in out, out
+    out2 = _ex._sanitize_argv(["kimi", "--prompt", 'echo {"api_key":"json-secret"}'])
+    assert "json-secret" not in out2, out2
+
+
+def test_v10_parse_report_accepts_markdown_bold_fields():
+    """Backends that render markdown (agy especially) bold the contract fields:
+    `**STATUS:** DONE`. The contract is line-anchored, so the bold wrapper used
+    to make a compliant report unparseable and force a corrective resume."""
+    import _executor as ex
+    bold = ("Did the work.\n\n**STATUS:** DONE  \n**SUMMARY:** s  \n"
+            "**FOLLOW-UP:** f  \n**HANDOFF:** h")
+    rep = ex.parse_report(bold)
+    assert rep and rep["status"] == "DONE" and rep["handoff"] == "h", rep
+    # A bold-wrapped TEMPLATE echo is still not a report.
+    assert ex.parse_report("**STATUS:** DONE | PARTIAL | BLOCKED") is None
+    # Plain parsing is unchanged.
+    plain = ex.parse_report("STATUS: DONE\nSUMMARY: s\nFOLLOW-UP: f\nHANDOFF: h")
+    assert plain and plain["status"] == "DONE"
 
 
 if __name__ == "__main__":

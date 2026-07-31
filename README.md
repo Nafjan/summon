@@ -36,9 +36,10 @@ OpenAI, Anthropic, Google, and local models (Ollama, LM Studio) work as agents t
                           ┌──────────────────────┐
    any host CLI ────────► │       summon         │ ───► claude         (Anthropic)
    (claude, codex,        │  stdlib dispatcher   │ ───► codex          (OpenAI)
-   cursor, gemini,        │  one JSON envelope   │ ───► cursor-agent   (Cursor)
+   cursor, gemini, kimi,  │  one JSON envelope   │ ───► cursor-agent   (Cursor)
    or your terminal)      │  no server, no pip   │ ───► gemini         (Google)
-                          └──────────────────────┘ ───► agy            (Antigravity)
+                          └──────────────────────┘ ───► kimi           (Moonshot AI)
+                                                   └──► agy            (Antigravity)
                                                    └──► openai-compat   (OpenRouter / OpenAI /
                                                         Anthropic / Google / Ollama / …)
 ```
@@ -413,10 +414,11 @@ a headless session.
 ## System requirements
 
 - **Python 3.10+** (3.11+ recommended). Standard library only, so no `pip install` for the
-  dispatcher itself. The optional **agy** backend's PTY wrapper uses `pywinpty` and `pyte`
+  dispatcher itself — the default **agy** path (a stream-json proxy) is stdlib too. Only the
+  legacy opt-in agy PTY wrapper needs `pywinpty` and `pyte`
   (tested with `pywinpty 3.0.3` and `pyte 0.8.2`).
 - **At least one backend:** a vendor CLI installed and logged in (`claude`, `codex`,
-  `cursor-agent`, `gemini`, or `agy`), and/or an API key for an `openai-compat` provider (or
+  `cursor-agent`, `gemini`, `kimi`, or `agy`), and/or an API key for an `openai-compat` provider (or
   a local Ollama/LM Studio server). `summon doctor` tells you which are installed;
   `doctor --probe` spends a small live call per backend to confirm sign-in and eligibility.
 - **`git`** if you use `--worktree`.
@@ -434,6 +436,9 @@ You bring the model access; summon just orchestrates the CLIs and APIs you alrea
 - **Permissions.** Each agent's `permission:` (`read-only` / `safe-edit` / `yolo`) maps to
   that CLI's own sandbox flags. Bundled agents ship `safe-edit` (auto-approve edits, no
   bypass). Raise anything to `yolo` deliberately, and only in repos you trust.
+- **Kimi Code is deliberately stricter.** Its non-interactive prompt runner auto-handles tools
+  and cannot combine with its plan mode, so Summon refuses Kimi `read-only` and `safe-edit`.
+  Use the bundled `kimi-worker` only at `yolo` in a trusted isolated worktree.
 - **agy is the exception, twice over.** It has no workspace-write tier, so its `safe-edit`
   is a full bypass like `yolo`. And it has **no enforceable `read-only` tier at all**, so
   since 0.15.0 summon *refuses* an agy dispatch declared `read-only` rather than imply a

@@ -1,5 +1,120 @@
 # Handover: summon 0.18.0 → the road to 1.0.0
 
+## Active takeover: Kimi K3, 2026-07-31
+
+This section is the authoritative handover for the active branch. The remainder of this
+file is valuable historical context from the 0.18.0 takeover, but some of its release and
+test counts are obsolete.
+
+**Branch and review:** `codex/agy-stream-proxy`, commit `84b272e`, draft PR
+https://github.com/Nafjan/summon/pull/12 against `main`.
+
+**Conversation access:** Kimi Code has no direct access to the Codex desktop conversation
+that produced this branch. Treat this section, the draft PR description, `git log`, and the
+working tree as the full transfer. If a transcript detail is required beyond these sources,
+ask the repository owner to paste or export it; do not invent missing conversation context.
+
+### What this branch adds
+
+- Native Kimi Code support in Summon: `kimi --output-format stream-json --prompt`, Kimi
+  model pins, stream finalisation at EOF, Kimi detection, and a managed user skill at
+  `~/.kimi-code/skills/summon`.
+- `kimi-worker`, an explicit `yolo` agent. Kimi prompt mode auto-handles tools and rejects
+  permission flags beside `--prompt`; Summon therefore refuses `read-only` and `safe-edit`
+  instead of claiming containment it cannot enforce.
+- Isolated Kimi profiles. Only the Kimi config, credentials, and device id are copied; MCP
+  configuration, sessions, logs, skills, and history are excluded. Boundary/session/agent
+  flags are stripped from delegated Kimi calls.
+- AGY stream-proxy and stream-parser work, plus secret-redaction for raw backend output in
+  envelopes and debug artifacts.
+- A feature-first public changelog, with short maintenance notes.
+
+### Evidence and present limits
+
+- Targeted Kimi isolation, stream, permission-contract, installer-drift, and secret-redaction
+  checks passed. `python tests/test_install.py` passed **23/23**.
+- Controlled live Kimi K3 checks passed: a terminal-only `PONG` and a write canary in an
+  otherwise empty isolated fixture. No private repository source was sent for that test.
+- The full discovery suite has now completed on the takeover host: **446/446** (it previously
+  exceeded a 240-second host limit). The takeover also fixed the two failures it exposed --
+  a stale doctor backend roster (`+kimi`) and three triplicated `test_v10_kimi_*`
+  definitions that silently shadowed six tests, including the only `device_id` coverage --
+  plus a vacuous agy proxy passthrough test, a Kimi profile TTL race (a 900s reaper could
+  delete a concurrent run's live home; now 24h), a stream-parser gap where a leading
+  `{"role":"system"}` record was misread as a terminal result, half-implemented
+  `--flag=value` boundary stripping in the agy proxy, and prompt-mangling substring
+  redaction in the debug argv sanitizer (now key-match plus a named-assignment second
+  pass). Every fix is mutation-verified.
+- A Kimi orientation attempt through Summon (`kimi-worker`, `kimi-code/k3`) read this
+  handover and worked for ~78s, then the CLI exited code 1 without emitting a final
+  result event, so no report was returned. The exit-code guard correctly reported the
+  run as an error rather than mislabeling partial output as success. Treat Kimi
+  multi-tool/report continuity as an active reliability issue to diagnose.
+- The security audit of the installed, bundled VS Code Kimi extension produced many
+  minified-bundle false positives. Its actionable branch findings were adopted: no fake
+  read-only claim, no reused real Kimi profile, boundary stripping, and debug-output
+  redaction. Treat that scanner result as a lead generator, not an extension trust verdict.
+
+### The AGY goal — acceptance evidence earned 2026-07-31
+
+The user wants AGY to work fully and reliably through Summon, potentially using a proxy,
+and asked for a separate-branch/worktree investigation with real, challenging coding,
+design, and research prompts. The required acceptance bar is **three consecutive clean
+cross-vendor rounds**, each using **5-10 challenging real prompts**, with actual completion
+and usable evidence. Anything less is not 1.0 certification.
+
+**That bar is now met at the dispatch level.** After provider quota returned, Kimi K3 ran
+three consecutive clean rounds (7 distinct challenging prompts each, 21 total) through a
+disposable worktree at immutable commit `056003c`: **21/21 dispatches clean** (status
+success, parsed DONE report, non-empty result; wall 13.3s-128.6s), five models served with
+protocol-supplied evidence from agy's init event (claude-opus-4-6-thinking,
+claude-sonnet-4-6, gemini-3.1-pro-high, gemini-3.6-flash-medium, gpt-oss-120b-medium).
+Envelopes and debug artifacts are under `%TEMP%\agy-rounds\evidence`. Two caveats were
+investigated to root cause afterward:
+
+- 7/21 first replies missed the report contract: 6 markdown-bold field names
+  (`**STATUS:**`, colon inside the wrapper), 1 template-literal echo. Both recover via the
+  designed corrective resume; the parser now also accepts the bold form directly
+  (`_unbold_field_line`, mutation-verified).
+- One agent reported a self-test pass that did not survive delivery: agy's session cwd
+  drifted into its profile brain dir, so the fix and the passing run happened on a
+  brain-dir copy while the worktree file kept its broken state. Documented in
+  `antigravity.md`; verify deliverables under the dispatch cwd, as the contract says.
+
+Earlier history: fifteen real AGY attempts (three planned rounds of five) failed before
+useful work with `Individual quota reached...`. Those earned no certification credit.
+
+Known AGY constraints to preserve:
+
+- AGY's effective permission is a full bypass. It has no enforceable `read-only` or
+  workspace-write tier. Use only a disposable, isolated worktree for any AGY execution.
+- AGY's previous resume flow did not preserve the conversation reliably, and an agent could
+  exit after trying to write an artifact without returning its report. Prefer one bounded,
+  terminal-report-only call over assuming resume recovery works.
+- agy's stream init event names the session model; treat that as the only served-model
+  evidence the protocol supplies.
+- Do not reuse the AGY proxy for Kimi. Their stream protocols and permission properties are
+  different. Kimi report continuity was probed 4/4 clean (bounded and multi-tool runs);
+  the single earlier exit-1-before-report observation did not reproduce.
+
+### First actions for Kimi
+
+1. Read this section, `skills/summon/SKILL.md`, `docs/VERSIONING_AND_1.0_CRITERIA.md`, and
+   the draft PR diff before making a change.
+2. Preserve the two untracked paths, `tmp-agy-smoke/` and `tmp_agy_smoke.py`; they predate
+   this takeover and are evidence, not owned cleanup.
+3. Complete the full discovery suite in an environment without the 240-second harness cap;
+   investigate any failure before changing behavior. Keep `python tests/test_install.py`
+   green.
+4. When AGY capacity returns, use an immutable commit and disposable worktree. Execute fresh
+   cross-vendor rounds with distinct coding, design, and research prompts. Record targeted
+   model, actual protocol evidence, report/verdict, exit status, and billable/served evidence
+   if available. Stop and fix any concern before beginning the next consecutive round.
+5. Keep the PR draft until the evidence supports review. Do not release or claim 1.0 based
+   on this branch alone.
+
+---
+
 You are taking over `summon` from a Claude session that shipped 0.14.x → 0.18.0. You have
 none of its context. This file is the whole transfer. Read it before touching anything.
 

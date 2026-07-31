@@ -8,6 +8,8 @@ permission-level mapping, system-prompt injection mechanism. The dispatcher
 from __future__ import annotations
 
 import json
+import getpass
+import re
 import os
 import shutil
 import subprocess
@@ -95,6 +97,11 @@ def build_command(cli: str, prompt: str) -> tuple[str, list]:
         # Antigravity (Google) CLI. Native Go binary; plain-text output.
         return "agy", ["--print", prompt]
 
+    if cli == "kimi":
+        # Kimi Code has a native JSONL one-shot mode.  Do not add --auto,
+        # --yolo, or --plan here: its current CLI rejects those with --prompt.
+        return "kimi", ["--output-format", "stream-json", "--prompt", prompt]
+
     raise ValueError(f"Unknown CLI: {cli}")
 
 
@@ -131,6 +138,15 @@ _PERMISSION_MAPPING = {
         "read-only": ["--mode", "plan", "--sandbox"],
         "safe-edit": ["--dangerously-skip-permissions"],
         "yolo": ["--dangerously-skip-permissions"],
+    },
+    "kimi": {
+        # Kimi's non-interactive --prompt mode auto-handles regular tool calls
+        # and rejects --plan/--yolo/--auto.  Summon therefore permits only an
+        # explicitly declared yolo invocation (enforced below); these remain
+        # empty so the CLI contract stays valid.
+        "read-only": [],
+        "safe-edit": [],
+        "yolo": [],
     },
 }
 
@@ -178,6 +194,11 @@ def effective_permission(cli: str, permission: str) -> str:
             return "yolo"          # identical flags; the label is the only difference
         if permission == "read-only":
             return "unenforceable"  # refused at dispatch unless explicitly waived
+    if cli == "kimi":
+        if permission == "read-only":
+            return "unenforceable"
+        if permission == "safe-edit":
+            return "yolo"
     return permission
 
 
@@ -265,11 +286,13 @@ _BOUNDARY_FLAGS = {
     "cursor-agent": ("--mode", "--trust", "-f", "--force"),
     "gemini": ("--approval-mode", "-y", "--yolo"),
     "agy": ("--add-dir", "--mode", "--sandbox", "--dangerously-skip-permissions", "--yolo"),
+    "kimi": ("--auto", "--yolo", "--plan", "--session", "-S", "--continue", "-c",
+             "--agent", "--agent-file", "--add-dir", "--skills-dir"),
 }
 # Flags that consume the NEXT token as their value; dropping the flag must drop the value
 # too, or the bare value becomes a stray positional argument.
 _BOUNDARY_TAKES_VALUE = {"--permission-mode", "-s", "--sandbox", "--mode", "--approval-mode",
-                         "--add-dir"}
+                         "--add-dir", "--session", "-S", "--agent", "--agent-file", "--skills-dir"}
 # codex configures approval policy through `-c key=value`, so the KEY decides, not the flag.
 _CODEX_CONFIG_KEYS = ("approval_policy", "sandbox_mode", "sandbox_permissions")
 
@@ -338,7 +361,9 @@ def readonly_unenforceable_error(cli: str, permission: str, *,
 
     summon FAILS CLOSED here for the same reason --gate-with does: a permission tier is a
     promise to the caller, and a promise the backend will not keep is worse than no
-    promise, because it is acted on. agy is the only such backend today.
+    promise, because it is acted on. agy and kimi are such backends today: agy
+    (opt-in waivable) cannot contain even read-only, and kimi (never waivable)
+    cannot enforce anything below yolo in non-interactive mode.
 
     Measured across five canaries (2026-07-25/26). `--sandbox` restricts TERMINAL
     operations only. `--mode plan` does not withhold the file tools. Withholding
@@ -350,6 +375,19 @@ def readonly_unenforceable_error(cli: str, permission: str, *,
     agy's reasoning on a throwaway checkout. It makes the tier ADVISORY, not enforced, and
     says so.
     """
+    if cli == "kimi":
+        if permission == "read-only":
+            return ("kimi's non-interactive --prompt mode cannot be combined with its "
+                    "read-only plan mode, so summon refuses this dispatch rather than "
+                    "claim a boundary Kimi cannot apply. Use an enforcing backend for "
+                    "reviews, or a deliberately declared kimi yolo agent in a trusted "
+                    "worktree for full-authority work.")
+        if permission == "safe-edit":
+            return ("kimi's non-interactive --prompt mode auto-handles tool calls but has "
+                    "no workspace-write sandbox. Declare permission: yolo explicitly for "
+                    "a trusted, isolated worktree; summon refuses the misleading safe-edit "
+                    "label.")
+        return None
     if cli != "agy" or permission != "read-only":
         return None
     if forced:
@@ -635,6 +673,24 @@ def _build_gemini_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
                 {"GEMINI_SYSTEM_MD": inv.agent_file})
     return _concatenated_args(
         inv, perm + model_flag + strip_boundary_flags(inv.cli, inv.extra_args), env=None)
+
+
+def _build_kimi_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
+    """Build Kimi Code's native JSONL one-shot invocation.
+
+    Kimi 0.31's ``--prompt`` runner is deliberately not combined with session,
+    agent, skills, or permission flags: the CLI rejects several combinations and
+    they could silently replace Summon's declared authority boundary.  The child
+    receives a per-call ``KIMI_CODE_HOME`` built below, with only its own auth and
+    configuration material; notably no inherited MCP configuration or sessions.
+    """
+    if inv.resume_id:
+        raise ValueError("resume is not supported for the kimi backend yet: its JSONL output does not provide a stable session id")
+    model_flag = ["--model", inv.model] if inv.model else []
+    profile = _ensure_kimi_profile()
+    command, base_args = build_command(inv.cli, _concatenated_prompt(inv))
+    return (command, model_flag + strip_boundary_flags(inv.cli, inv.extra_args) + base_args,
+            {"KIMI_CODE_HOME": profile, "USERPROFILE": profile, "HOME": profile})
 
 
 # Which env var flips each CLI from subscription (login) to metered API billing.
@@ -1003,7 +1059,42 @@ _AGY_AUTH_FILES = (
     "oauth_creds.json", "google_accounts.json", "installation_id",
     "state.json", "trustedFolders.json", "extension_integrity.json",
 )
+_AGY_MODEL_ALIASES = {
+    # Common user-provided aliases that should map to agy's display model names.
+    "claude-opus-4-6-thinking": "Claude Opus 4.6 (Thinking)",
+    "claude-opus-4.6-thinking": "Claude Opus 4.6 (Thinking)",
+    "claude opus 4 6 thinking": "Claude Opus 4.6 (Thinking)",
+    "claude opus 4.6 thinking": "Claude Opus 4.6 (Thinking)",
+    "claude-opus-4.6-thinking": "Claude Opus 4.6 (Thinking)",
+    "claude-sonnet-4-6-thinking": "Claude Sonnet 4.6 (Thinking)",
+    "claude sonnet 4 6 thinking": "Claude Sonnet 4.6 (Thinking)",
+    "claude sonnet 4.6 thinking": "Claude Sonnet 4.6 (Thinking)",
+    "claude-sonnet-4.6-thinking": "Claude Sonnet 4.6 (Thinking)",
+    "gpt oss 120b medium": "GPT-OSS 120B (Medium)",
+    "gpt-oss 120b medium": "GPT-OSS 120B (Medium)",
+    "gpt_oss_120b_medium": "GPT-OSS 120B (Medium)",
+    "gptoss120bmedium": "GPT-OSS 120B (Medium)",
+    "gemini 3 6 flash high": "Gemini 3.6 Flash (High)",
+    "gemini 3 6 flash medium": "Gemini 3.6 Flash (Medium)",
+    "gemini 3 6 flash low": "Gemini 3.6 Flash (Low)",
+    "gemini 3 5 flash high": "Gemini 3.5 Flash (High)",
+    "gemini 3 5 flash medium": "Gemini 3.5 Flash (Medium)",
+    "gemini 3 5 flash low": "Gemini 3.5 Flash (Low)",
+    "gemini 3 1 pro high": "Gemini 3.1 Pro (High)",
+    "gemini 3 1 pro low": "Gemini 3.1 Pro (Low)",
+}
 _AGY_MAX_PROMPT = 28000  # one argv token; stay under Windows CreateProcess ~32 KB
+
+
+def _normalize_agy_model(model: str | None) -> str | None:
+    """Convert common aliases into canonical agy model display names."""
+    if not model:
+        return None
+    trimmed = model.strip()
+    if not trimmed:
+        return trimmed
+    key = re.sub(r"[^a-z0-9]+", " ", trimmed.lower()).strip()
+    return _AGY_MODEL_ALIASES.get(key, trimmed)
 
 
 def _reject_oversized_agy_prompt(prompt: str) -> None:
@@ -1052,24 +1143,32 @@ def _agy_python() -> str:
     return sys.executable
 
 
-def _agy_wrapper() -> str:
-    """Path to the PTY wrapper script. The bundled wrapper is ConPTY (Windows).
+def _agy_wrapper_is_stream(wrapper: str | None = None) -> bool:
+    """True when the resolved wrapper can emit `agy` stream-json events."""
+    if wrapper is None:
+        wrapper = _agy_wrapper()
+    return os.path.basename(wrapper).lower() == "agy_stream_proxy.py"
 
-    On POSIX there is no bundled wrapper yet: fail fast with a clear message
-    (set $AGY_PTY_WRAPPER to a PTY-capture script to bring your own). Checked
-    here — the first agy-specific step — so the error precedes profile setup.
+
+def _agy_wrapper() -> str:
+    """Path to the agy wrapper script.
+
+    The default is the built-in stream-json proxy (`agy_stream_proxy.py`), which
+    works cross-platform. A custom wrapper remains supported via
+    ``$AGY_PTY_WRAPPER`` for operators that require alternate routing/observability.
+    The error is raised here — before any profile work — so dispatch failures are
+    reported before credentials are copied.
     """
     override = os.environ.get("AGY_PTY_WRAPPER")
     if override:
         return override
-    if os.name != "nt":
-        raise ValueError(
-            "agy backend: the bundled ConPTY wrapper is Windows-only. On this OS set "
-            "AGY_PTY_WRAPPER to a PTY-capture wrapper for `agy --print` (agy has no "
-            "working pipe mode), or use another backend (claude/codex/cursor/gemini).")
-    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agy_pty_pyte.py")
-    if os.path.isfile(here):  # bundled beside the scripts (public installs)
-        return here
+    here = os.path.dirname(os.path.abspath(__file__))
+    here_wrapper = os.path.join(here, "agy_stream_proxy.py")
+    if os.path.isfile(here_wrapper):  # bundled beside the scripts (public installs)
+        return here_wrapper
+    legacy = os.path.join(here, "agy_pty_pyte.py")
+    if os.path.isfile(legacy):
+        return legacy
     return os.path.join(os.path.expanduser("~"), ".agents", "scripts", "agy_pty_pyte.py")
 
 
@@ -1134,9 +1233,34 @@ def _agy_lock_down(prof: str) -> None:
         except OSError as e:
             raise ValueError(f"agy profile: failed to secure token permissions on {prof}: {e}") from e
         return
-    user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+    # USERNAME can describe the interactive desktop account while this process
+    # is running under an IDE sandbox/service identity.  ACLing a child profile
+    # to that ambient name then locks the actual child out of its own tokens.
+    # Ask Windows for the effective principal first; fall back only when that
+    # diagnostic is unavailable (e.g. a constrained test environment).
+    user = ""
+    try:
+        current = subprocess.run(["whoami"], capture_output=True, text=True,
+                                 timeout=5, **run_flags())
+        if current.returncode == 0:
+            user = (current.stdout or "").strip().splitlines()[0].strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    user = user or os.environ.get("USERNAME") or os.environ.get("USER")
+    if not user:
+        try:
+            user = getpass.getuser()
+        except (OSError, KeyError):
+            user = ""
     if not user:
         raise ValueError("agy profile: cannot determine current user for ACL lockdown")
+    user = user.strip()
+    if "\\" in user:
+        # DOMAIN\user is a valid icacls principal; trim whitespace that can
+        # bleed in from wrapper hosts.
+        user = user.replace(" ", "")
+    if not user or any(ch in user for ch in (";", "<", ">", "|", "&", "^", "\x00", "\"")):
+        raise ValueError(f"agy profile: suspicious user principal for ACL lockdown: {user!r}")
     fails = []
     # Pass 1: strip inherited ACEs and give the owner an EFFECTIVE full-control ACE
     # on every dir AND file. NOTE: an (OI)(CI) ACE applied to a *file* is
@@ -1283,6 +1407,83 @@ def _ensure_agy_profile(cwd: str, deadline_sec: float = 300.0) -> str:
     return prof
 
 
+_KIMI_RUN_TTL_SEC = 24 * 3600
+
+
+def _kimi_cleanup_old_runs(runs_dir: str) -> None:
+    """Best-effort expiry for isolated Kimi profiles.
+
+    Kimi retains credentials and may write sessions below ``KIMI_CODE_HOME``;
+    profiles are never reused, and only old directories owned by this profile
+    root are considered here.  Failure to remove one is safe and silent.
+
+    The TTL must exceed the longest plausible dispatch (the default timeout is
+    10 minutes but ``--timeout`` accepts hours): a previous 900s TTL let a
+    second dispatch delete a concurrent run's live home mid-flight.  A run
+    lasting longer than 24h can still lose its home to a concurrent sweep --
+    accepted residual, since every run gets a fresh directory and correctness
+    never depends on this cleanup.
+    """
+    cutoff = time.time() - _KIMI_RUN_TTL_SEC
+    try:
+        names = os.listdir(runs_dir)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(runs_dir, name)
+        try:
+            if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def _ensure_kimi_profile() -> str:
+    """Make a fresh, ACL-locked Kimi home with no inherited MCP/session state.
+
+    The only copied material is the local Kimi configuration and credentials
+    necessary for the installed CLI to authenticate.  ``mcp.json``, sessions,
+    logs, history, and user skills intentionally remain outside the child home.
+    """
+    source = os.environ.get("KIMI_CODE_HOME") or os.path.join(os.path.expanduser("~"), ".kimi-code")
+    config = os.path.join(source, "config.toml")
+    credentials = os.path.join(source, "credentials")
+    device_id = os.path.join(source, "device_id")
+    if not os.path.isfile(config) and not os.path.isdir(credentials):
+        raise ValueError("kimi profile: no Kimi configuration or credentials found; run `kimi login` first")
+    # A desktop agent may run under a sandbox identity that cannot traverse a
+    # profile directory another IDE created beneath ~/.agents.  The per-call
+    # Kimi profile is deliberately disposable, so the current user's temp root
+    # is both safer for cross-host operation and avoids a stale ACL becoming a
+    # global outage.  Every child directory is still owner-ACL-locked below.
+    base = os.environ.get("KIMI_HEADLESS_PROFILE") or os.path.join(
+        tempfile.gettempdir(), "summon-kimi-headless-profile")
+    runs = os.path.join(base, "runs")
+    try:
+        os.makedirs(runs, exist_ok=True)
+        _kimi_cleanup_old_runs(runs)
+        profile = tempfile.mkdtemp(prefix="run-", dir=runs)
+        if os.path.isfile(config):
+            shutil.copy2(config, os.path.join(profile, "config.toml"))
+        if os.path.isdir(credentials):
+            shutil.copytree(credentials, os.path.join(profile, "credentials"))
+        # Kimi's managed OAuth client binds requests to this installation id;
+        # without it a copied credential can authenticate locally yet fail the
+        # provider handshake as a generic connection error.
+        if os.path.isfile(device_id):
+            shutil.copy2(device_id, os.path.join(profile, "device_id"))
+        _agy_lock_down(profile)
+        return profile
+    except ValueError:
+        if 'profile' in locals():
+            shutil.rmtree(profile, ignore_errors=True)
+        raise
+    except OSError as e:
+        if 'profile' in locals():
+            shutil.rmtree(profile, ignore_errors=True)
+        raise ValueError(f"kimi profile: build failed: {type(e).__name__}: {e}") from e
+
+
 def _resume_agy_profile(profile: str | None) -> str:
     """Validate + refresh a profile dir being resumed. Extends its mtime so the
     TTL cleanup won't reap it mid-use. Fails closed if it's gone (its short-lived
@@ -1318,9 +1519,11 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
     wrapper = _agy_wrapper()  # FIRST: fails fast on POSIX before any profile is built
     perm = permission_flags(inv.cli, inv.permission)  # --dangerously-skip-permissions
     # Optional model pin from agent frontmatter (`model:`). agy accepts display
-    # names ("Claude Opus 4.6 (Thinking)") or slugs ("gemini-3.1-pro"); default
-    # if unset is "Gemini 3.5 Flash (Medium)". See `agy models`.
-    model_flag = ["--model", inv.model] if inv.model else []
+    # names ("Claude Opus 4.6 (Thinking)") or short aliases
+    # ("claude-opus-4-6-thinking"). Default if unset is "Gemini 3.5 Flash
+    # (Medium)". See `agy models`.
+    model = _normalize_agy_model(inv.model)
+    model_flag = ["--model", model] if model else []
 
     if inv.resume_id:
         # Resume: reuse the SAME profile (its conversation DB holds the session)
@@ -1384,6 +1587,11 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
         "AGY_PTY_DEADLINE": repr(deadline_sec),
         "AGY_PTY_QUIET": os.environ.get("AGY_PTY_QUIET", "20"),
     }
+    if _agy_wrapper_is_stream(wrapper):
+        # The stream wrapper strips boundary flags to reduce accidental bypass risk when
+        # used directly; summon already performs shared boundary stripping itself, so keep
+        # our own scoped boundary flags intact by signalling explicit passthrough.
+        env["AGY_STREAM_PROXY_ALLOW_BOUNDARY"] = "1"
     return _agy_python(), args, env
 
 
@@ -1409,6 +1617,7 @@ BACKENDS: dict = {
     "codex":        {"kind": "subprocess", "build": _build_codex_args},
     "cursor-agent": {"kind": "subprocess", "build": _build_cursor_args},
     "gemini":       {"kind": "subprocess", "build": _build_gemini_args},
+    "kimi":         {"kind": "subprocess", "build": _build_kimi_args, "side_effects": True},
     "agy":          {"kind": "subprocess", "build": _build_agy_args, "side_effects": True},
     "openai-compat": {"kind": "api", "call": _api_call},
 }

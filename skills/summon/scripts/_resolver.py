@@ -40,6 +40,8 @@ def detect_caller_cli() -> str | None:
         return "codex"
     if os.environ.get("GEMINI_CLI"):
         return "gemini"
+    if os.environ.get("KIMI_CODE"):
+        return "kimi"
 
     try:
         ppid = os.getppid()
@@ -55,6 +57,8 @@ def detect_caller_cli() -> str | None:
                     return "codex"
                 if "gemini" in cmdline:
                     return "gemini"
+                if "kimi" in cmdline:
+                    return "kimi"
     except (FileNotFoundError, PermissionError, OSError):
         # /proc absent on macOS, may be unreadable under sandbox. Caller
         # detection is best-effort — fall through silently.
@@ -249,6 +253,27 @@ def discover_models(cli: str | None = None) -> dict:
             "source": "static",
             "note": "gemini exposes no model list; -m/--model accepts gemini model ids; "
                     "unpinned uses gemini's own default.",
+        }
+
+    # Kimi Code has no model-list command.  The selected default is in its own
+    # TOML profile, but it can be an alias/provider-local identifier, so report
+    # it as configuration rather than a fabricated live catalogue.
+    if want("kimi"):
+        home = os.environ.get("KIMI_CODE_HOME") or os.path.join(os.path.expanduser("~"), ".kimi-code")
+        default = None
+        try:
+            import tomllib
+            with open(os.path.join(home, "config.toml"), "rb") as fh:
+                parsed = tomllib.load(fh)
+            value = parsed.get("default_model")
+            default = value if isinstance(value, str) else None
+        except (ImportError, OSError, ValueError):
+            pass
+        info["kimi"] = {
+            "source": "config" if default else "static",
+            "default": default,
+            "note": "Kimi Code accepts --model aliases but exposes no model-list command; "
+                    "the unpinned default comes from ~/.kimi-code/config.toml.",
         }
 
     return info

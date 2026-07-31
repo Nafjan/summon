@@ -1,12 +1,12 @@
 ---
 name: summon
-description: Summon another AI CLI — Claude, Codex, Cursor, Gemini, or Antigravity — as a sub-agent to run a task, in parallel when useful. Use whenever the user names an agent or sub-agent to run, asks to delegate work to another AI or a specific model, wants a second opinion or a cross-vendor code review, wants to fan several models out over a task, or references an agent definition. One dispatcher over five backends returns a structured JSON result (status, parsed report, token cost, the model actually served) and supports session resume, isolated git worktrees, background and manifest-driven swarms, JSON-schema-validated output, model discovery, and per-agent model/permission config. Formerly named "sub-agents".
+description: Summon another AI CLI — Claude, Codex, Cursor, Gemini, Kimi, or Antigravity — as a sub-agent to run a task, in parallel when useful. Use whenever the user names an agent or sub-agent to run, asks to delegate work to another AI or a specific model, wants a second opinion or a cross-vendor code review, wants to fan several models out over a task, or references an agent definition. One dispatcher over six CLI backends returns a structured JSON result and supports isolated git worktrees, background and manifest-driven swarms, JSON-schema-validated output, model discovery, and per-agent model/permission config. Formerly named "sub-agents".
 allowed-tools: Bash Read
 ---
 
 # Summon — Cross-Vendor Sub-Agents for Any AI CLI
 
-Spawns external CLI AIs (claude, cursor-agent, codex, gemini, agy) as isolated sub-agents with dedicated
+Spawns external CLI AIs (claude, cursor-agent, codex, gemini, kimi, agy) as isolated sub-agents with dedicated
 context. Supports session resume, per-call model/effort overrides, isolated git worktrees, background
 dispatch, structured report parsing, loose-file provenance, and cost/usage telemetry -- see Parameters and
 the response-field table.
@@ -210,7 +210,7 @@ completed review returning `VERDICT: BLOCK` is successful execution and a reject
 | `--cwd` | Yes* | Working directory (absolute path) |
 | `--timeout` | No | Bare ms or with suffix: `600s`, `10m` (default: 600000 = 10m). A BARE sub-second value on a dispatch is refused as a units mistake -- `--timeout 300` means 0.3s and would kill every agent instantly; write `300s` (or `300ms` if you truly mean it). `jobs wait` still accepts short bare polls. Set your host tool's own timeout ABOVE this value — the script needs a few seconds of overhead beyond the CLI deadline |
 | `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
-| `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `agy`, `gemini` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
+| `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `kimi`, `agy`, `gemini` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
 | `--model` | No | Override the agent's frontmatter model for this call |
 | `--effort` | No | Reasoning effort `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none` = the backend's own default). **claude** → `--effort`; **codex** → `-c model_reasoning_effort` (xhigh/max clamp to high); **agy** → a Gemini model's thinking suffix (`Gemini 3.1 Pro (High)`), applied only when set explicitly (not all models have all levels). Precedence: `--effort` > agent `effort:` frontmatter > `SUMMON_DEFAULT_EFFORT` env > built-in default **`high`**. Surfaced in the envelope's `effort` field (claude/codex) or `model.requested` (agy) |
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy. Resume for implementation continuity; use a fresh context for final adversarial adjudication so a reviewer is not grading its own prior work. The envelope records `resumed:true|false` |
@@ -501,7 +501,7 @@ permissions.
 
 | Field | Values | Description |
 |-------|--------|-------------|
-| `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `agy`, `openai-compat` | Which backend executes this agent (`openai-compat` = any OpenAI-compatible API — see "Custom & API backends") |
+| `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `kimi`, `agy`, `openai-compat` | Which backend executes this agent (`openai-compat` = any OpenAI-compatible API — see "Custom & API backends") |
 | `permission` | `read-only`, `safe-edit` (default), `yolo` | Approval/sandbox level the sub-agent runs with |
 | `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.served` |
 | `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning effort for this agent (claude + codex); overrides the default `high`. `--effort` at dispatch overrides it |
@@ -515,6 +515,7 @@ permissions.
 | codex | any codex model id (`-m`) | `gpt-5.6-sol` | `~/.codex/config.toml` `model` |
 | cursor-agent | cursor model ids | `composer-2.5` | `composer-2.5` |
 | gemini | gemini model ids (`-m`) | `gemini-3.1-pro` | CLI's default |
+| kimi | Kimi provider/model id (`--model`) | `kimi-code/k3`, `kimi-code/kimi-for-coding` | Kimi's default |
 | agy | display name or slug (see `agy models`) | `Claude Opus 4.6 (Thinking)`, `gemini-3.1-pro` | Gemini Flash tier |
 
 Run `--list-models` to see what each backend can run right now.
@@ -522,16 +523,20 @@ Run `--list-models` to see what each backend can run right now.
 **`permission` → exact per-CLI flags** (what the script actually passes — the
 levels are NOT identical across CLIs; when behavior surprises you, check this table):
 
-| Level | claude | codex | cursor-agent | gemini | agy |
-|-------|--------|-------|--------------|--------|-----|
-| `read-only` | `--permission-mode plan` | `-s read-only` | `--mode plan` | `--approval-mode plan` | **refused** (see below) |
-| `safe-edit` | `--permission-mode acceptEdits` | `-s workspace-write -c approval_policy=never` | `--trust` | `--approval-mode auto_edit` | `--dangerously-skip-permissions` |
-| `yolo` | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `-f --trust` | `-y` | `--dangerously-skip-permissions` |
+| Level | claude | codex | cursor-agent | gemini | kimi | agy |
+|-------|--------|-------|--------------|--------|------|-----|
+| `read-only` | `--permission-mode plan` | `-s read-only` | `--mode plan` | `--approval-mode plan` | **refused** (see below) | **refused** (see below) |
+| `safe-edit` | `--permission-mode acceptEdits` | `-s workspace-write -c approval_policy=never` | `--trust` | `--approval-mode auto_edit` | **refused** (see below) | `--dangerously-skip-permissions` |
+| `yolo` | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `-f --trust` | `-y` | prompt mode auto-handles tools | `--dangerously-skip-permissions` |
 
 Caveats worth knowing:
 - `read-only` sandboxes differ: claude's plan mode can block even *reads* the
   prompt depends on (a blocked run now returns `status: blocked` — see the
   status table). If a read-only agent must read files, keep them under `--cwd`.
+- **Kimi's non-interactive prompt mode is full-authority.** Its CLI rejects plan/yolo/auto
+  flags beside `--prompt`, and then auto-handles tool calls. Summon therefore refuses Kimi
+  `read-only` and `safe-edit` rather than mislabel the authority; use the explicit
+  `kimi-worker` `yolo` agent only in a trusted isolated worktree.
 - **agy has no workspace-write tier AND no enforceable read-only tier.** `safe-edit`
   and `yolo` BOTH map to `--dangerously-skip-permissions` — a `safe-edit` agy agent runs
   with a FULL permission bypass, identical to `yolo`. And `read-only` is **refused**:
