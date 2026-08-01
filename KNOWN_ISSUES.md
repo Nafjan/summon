@@ -22,6 +22,12 @@
   ACP. The predicate is narrow by failure class (timeouts, output-shape losses, pipe
   failures; never auth/CLI-missing/refusals), and the envelope records the attempt in
   `fallback`/`attempts` — use `--no-acp-fallback` for non-idempotent tasks.
+- **ACP permission enforcement is reactive-only** (review finding, 2026-07-31): no
+  permission flags travel to an ACP agent, so containment would depend on the agent
+  choosing to send `session/request_permission` — unverified on real CLIs (gemini is
+  frozen for individuals, cursor-agent untested, kimi is yolo-only everywhere). summon
+  therefore refuses sub-yolo tiers over ACP; a tier can be re-opened per backend once
+  reactive enforcement or a `session/set_mode` mapping is proven on a working account.
 
 ## Windows: process-tree kill cannot reach descendants of an exited leader
 

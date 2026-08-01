@@ -394,10 +394,13 @@ one-shot argv spawn. Three ways it engages:
 
 ACP caveats: no system-prompt channel (the agent definition is prepended to the prompt);
 model pinning is best-effort (`session/set_model` where advertised, otherwise a warning);
-permission is enforced by summon auto-answering `session/request_permission` per tier
-(allow-once only, never allow-always; a request whose options contain no safely
-classifiable choice cancels the turn — fail closed, and never an invented or positional
-optionId); the ACP
+**ACP is yolo-only** — no permission flags travel to an ACP agent, so a tier's
+enforcement would depend on the agent choosing to send `session/request_permission`
+(reactive only, unverified on real CLIs). summon therefore refuses `read-only` and
+`safe-edit` over ACP rather than mislabel the authority; within a `yolo` run, summon
+auto-answers permission requests (allow-once only, never allow-always; a request whose
+options contain no safely classifiable choice cancels the turn — fail closed, and never
+an invented or positional optionId). The ACP
 session id is telemetry (`acp.session_id`) and NOT a resume handle (`resume.session_id`
 stays `None`, and `--resume` over ACP is refused); usage/cost fields depend on what the backend emits. Every ACP-served
 envelope carries `transport: "acp"`. `--doctor` reports whether each installed CLI

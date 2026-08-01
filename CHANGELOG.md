@@ -26,7 +26,9 @@ regression notes, and test evidence, see the
   `SUMMON_ACP_FALLBACK=0`). Envelopes record `transport`, `fallback` (the recovery
   attempt, doubling as telemetry for scoping ACP phase 2 — claude/codex adapters — on
   measured fallback rates), and `acp.session_id` (telemetry only; the resume lane stays
-  empty). Permission requests are auto-answered per tier (allow-once only, fail closed);
+  empty). ACP is yolo-only: permission flags cannot travel over the protocol, so
+  `read-only`/`safe-edit` are refused rather than run with reactive-only containment
+  (within yolo, permission requests are auto-answered allow-once only, fail closed);
   model pinning is best-effort with a warning. `--doctor` reports per-CLI ACP support.
 - Hardened debug argument redaction and boundary-flag handling.
 - Clarified wrapper readiness in diagnostics.

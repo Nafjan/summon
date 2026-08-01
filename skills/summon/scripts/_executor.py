@@ -2277,8 +2277,6 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         debug_argv = [inv.cli, inv.base_url or "?", inv.model or "?"]
         resp = _enrich(BACKENDS[inv.cli]["call"](inv, timeout_ms), None)
         resp["resume"] = {"cli": inv.cli, "session_id": None}  # stateless: no resume
-        raw = resp.pop("_debug_raw", None)
-        _finalize_diagnostics(resp, raw, debug_dir, debug_argv, max_tool_output_bytes)
         return _stamp(resp)
 
     # BEFORE build_invocation_args, which has side effects: for agy it creates a
@@ -2299,6 +2297,21 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         if not _supports_acp(inv.cli):
             return _stamp(_enrich(_error_response(
                 inv.cli, 2, f"backend {inv.cli!r} has no acp transport"), None))
+        if inv.permission != "yolo":
+            # Reactive-only enforcement: no permission flags travel to an ACP
+            # agent, so containment depends on the agent CHOOSING to send
+            # session/request_permission -- unverified on real CLIs (gemini is
+            # frozen for individuals, cursor untested, kimi is yolo-only
+            # everywhere anyway). Unverifiable containment is not containment:
+            # refuse rather than mislabel the tier.
+            return _stamp(_enrich(_error_response(
+                inv.cli, 2,
+                f"the ACP transport cannot enforce {inv.permission!r}: no "
+                "permission flags travel to the agent and containment depends on "
+                "the agent choosing to ask (reactive only, unverified on real "
+                "CLIs). summon refuses rather than mislabel the tier. Use yolo "
+                "over ACP, or the subprocess transport, which enforces tiers via "
+                "CLI flags."), None))
         debug_argv = [inv.cli, "<acp>"]
         resp = _enrich(BACKENDS[inv.cli]["acp"]["call"](inv, timeout_ms), None)
         # Premortem T1: the ACP session id is NOT a resume handle for the

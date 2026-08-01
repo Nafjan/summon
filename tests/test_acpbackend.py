@@ -201,6 +201,89 @@ def test_turn_state_accumulation_is_bounded():
     assert "truncated" in diag[-1]
 
 
+def test_wrong_protocol_version_is_structural_error():
+    """An agent negotiating a different ACP version must not be driven as v1."""
+    resp = _call("wrong-version")
+    assert resp["status"] == "error"
+    assert "protocol" in (resp.get("error") or "")
+
+
+def test_missing_session_id_is_structural_error():
+    """session/new without a usable sessionId is a protocol violation, not a
+    session named None flowing into every later call."""
+    resp = _call("bad-session")
+    assert resp["status"] == "error"
+    assert "sessionId" in (resp.get("error") or "")
+
+
+def test_acp_child_env_comes_from_builder_minus_superseded_channels():
+    """The ACP child must run under the builder-installed identity (kimi's
+    isolated credential profile, etc.) -- never the ambient account's full
+    profile -- minus the env channel ACP supersedes (GEMINI_SYSTEM_MD, which is
+    prepended to the prompt on this transport instead)."""
+    import _builder
+    orig_build = _builder.build_invocation_args
+    orig_popen = _acpbackend.subprocess.Popen
+    captured = {}
+    _builder.build_invocation_args = lambda inv: (
+        "gemini", ["--acp"], {"KIMI_CODE_HOME": "/iso", "GEMINI_SYSTEM_MD": "/md"})
+
+    def spy(cmd, **kw):
+        captured["env"] = kw.get("env")
+        return orig_popen(cmd, **kw)
+
+    patched = _patch_launch()
+    _acpbackend.subprocess.Popen = spy
+    try:
+        resp = _acpbackend.call(_inv(), 30000)
+    finally:
+        _builder.build_invocation_args = orig_build
+        _acpbackend.subprocess.Popen = orig_popen
+        _restore(patched)
+    assert resp["status"] == "success", resp.get("error")
+    assert captured["env"]["KIMI_CODE_HOME"] == "/iso"
+    assert "GEMINI_SYSTEM_MD" not in captured["env"]
+
+
+def test_acp_refuses_sub_yolo_tiers():
+    """Reactive-only enforcement is not containment: read-only and safe-edit
+    over ACP are refused, not warned (re-review finding, 2026-07-31)."""
+    for tier in ("read-only", "safe-edit"):
+        resp = _executor.execute_agent(_inv(permission=tier), timeout_ms=5000)
+        assert resp["status"] == "error", (tier, resp)
+        assert "cannot enforce" in (resp.get("error") or ""), (tier, resp.get("error"))
+
+
+def test_fallback_skipped_for_sub_yolo_invocations():
+    """A safe-edit subprocess failure must not attempt ACP recovery at all --
+    the fallback would run the same prompt at a tier ACP cannot enforce."""
+    import run_subagent as rs
+    calls = []
+    primary = {"status": "error", "exit_code": 1, "cli": "gemini",
+               "error": "backend exploded mid-stream",
+               "normalization_reason": "backend internal error"}
+    orig_exec = rs.execute_agent
+    rs.execute_agent = lambda *a, **kw: (calls.append(1) or dict(primary))
+
+    class _Args:
+        agent = "x"
+        timeout = 5000
+        debug_dir = None
+        max_tool_output_bytes = None
+        _receipt = None
+        retries = 0
+        no_acp_fallback = False
+        gate_with = None
+
+    try:
+        inv = AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd(),
+                              permission="safe-edit")
+        rs._dispatch_with_retries(inv, _Args())
+    finally:
+        rs.execute_agent = orig_exec
+    assert len(calls) == 1, calls
+
+
 def test_fallback_gate_denial_keeps_primary_spend():
     """A gate that denies the ACP recovery must not erase the primary attempt's
     cost: the dispatch happened either way."""
@@ -226,7 +309,7 @@ def test_fallback_gate_denial_keeps_primary_spend():
 
     try:
         inv = AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd(),
-                              permission="safe-edit")
+                              permission="yolo")
         out = rs._dispatch_with_retries(inv, _Args())
     finally:
         rs.execute_agent = orig_exec
@@ -294,7 +377,8 @@ def test_oversized_prompt_routes_over_acp():
     _executor.argv_length_error = lambda *a, **kw: "simulated argv overflow"
     try:
         resp = _executor.execute_agent(
-            AgentInvocation(cli="gemini", prompt="x" * 40000, cwd=os.getcwd()),
+            AgentInvocation(cli="gemini", prompt="x" * 40000, cwd=os.getcwd(),
+                            permission="yolo"),
             timeout_ms=30000)
     finally:
         _executor.argv_length_error = orig_measure
@@ -403,7 +487,8 @@ def test_fallback_recovers_and_accounts_spend():
     rs.execute_agent = fake_execute
     try:
         out = rs._dispatch_with_retries(
-            AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd()), _args_ns())
+            AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd(),
+                            permission="yolo"), _args_ns())
     finally:
         rs.execute_agent = orig
     assert calls == ["subprocess", "acp"]
@@ -422,7 +507,8 @@ def test_fallback_failed_recovery_keeps_original():
         _result(error="acp also failed") if inv.transport == "acp" else _result())
     try:
         out = rs._dispatch_with_retries(
-            AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd()), _args_ns())
+            AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd(),
+                            permission="yolo"), _args_ns())
     finally:
         rs.execute_agent = orig
     assert out["status"] == "error"
@@ -444,7 +530,8 @@ def test_fallback_skipped_for_structural_failures():
     rs.execute_agent = fake_execute
     try:
         out = rs._dispatch_with_retries(
-            AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd()), _args_ns())
+            AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd(),
+                            permission="yolo"), _args_ns())
     finally:
         rs.execute_agent = orig
     assert calls == ["subprocess"]                      # no wasted recovery dispatch
@@ -460,7 +547,8 @@ def test_no_acp_fallback_kill_switch():
     os.environ["SUMMON_ACP_FALLBACK"] = "0"
     try:
         out = rs._dispatch_with_retries(
-            AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd()), _args_ns())
+            AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd(),
+                            permission="yolo"), _args_ns())
     finally:
         rs.execute_agent = orig
         if old_env is None:

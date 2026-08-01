@@ -10,6 +10,8 @@ Modes:
   permission-no-once  offers ONLY allow_always for a read-kind call
   permission-empty   offers an empty options list for a read-kind call
   no-stopreason      answers session/prompt with a result missing stopReason
+  wrong-version      negotiates protocolVersion 99 at initialize
+  bad-session        answers session/new with no sessionId
   slow             never answers session/prompt (timeout/cancel tests)
   malformed        emits a non-JSON line on stdout mid-stream
   lingering        answers the turn, then sleeps (teardown must not wait)
@@ -67,9 +69,13 @@ def main():
         method, mid, params = msg["method"], msg.get("id"), msg.get("params") or {}
 
         if method == "initialize":
+            ver = 99 if mode == "wrong-version" else 1
             send({"jsonrpc": "2.0", "id": mid, "result": {
-                "protocolVersion": 1, "agentCapabilities": {}}})
+                "protocolVersion": ver, "agentCapabilities": {}}})
         elif method == "session/new":
+            if mode == "bad-session":
+                send({"jsonrpc": "2.0", "id": mid, "result": {}})
+                continue
             send({"jsonrpc": "2.0", "id": mid, "result": {
                 "sessionId": session_id,
                 "models": {"availableModels": [
