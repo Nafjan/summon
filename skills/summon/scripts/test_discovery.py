@@ -227,6 +227,85 @@ def test_environment_handoff_reaches_fresh_and_resumed_child_prompts():
     assert "LEFT_BEHIND: none" in resumed and "caller to decide" in resumed
 
 
+def test_environment_handoff_and_dry_run_previews_redact_secret_values():
+    """Parsed report fields and dry-run argv previews are envelope surfaces too.
+
+    The raw transcript is redacted during diagnostic finalization, but parsing happens
+    earlier. A secret in HANDOFF or LEFT_BEHIND must not survive in the independent
+    structured copies. Likewise a dry-run preview bypasses that finalizer entirely.
+    """
+    import json
+    import run_subagent as rs
+    from _executor import _enrich, _finalize_diagnostics
+
+    report_secret = "report-audit-secret"
+    preview_secret = "preview-audit-secret"
+    raw = ("STATUS: DONE\nSUMMARY: s\nFOLLOW-UP: none\n"
+           f"HANDOFF: api_key={report_secret}\n"
+           f"LEFT_BEHIND: authorization: bearer {report_secret}")
+    response = _enrich({"result": raw, "exit_code": 0, "status": "success",
+                        "cli": "codex"}, None)
+    _finalize_diagnostics(response, raw, None, [], None)
+    assert report_secret not in json.dumps(response), response
+    assert response["environment_handoff"]["left_behind"].endswith("<redacted>")
+
+    preview = rs._dry_run_arg_preview("x" * 420 + f" api_key={preview_secret}")
+    assert preview_secret not in preview and "api_key=<redacted>" in preview, preview
+
+
+def test_environment_handoff_reaches_and_survives_a_gate_dispatch():
+    """A gate is a fresh child, not an exception to the caller-owned handoff.
+
+    `_run_gate` constructs its invocation directly instead of passing through main's
+    fresh-dispatch setup. It must therefore add the universal context itself and retain
+    the gate's structured declaration in the decision that the caller actually receives.
+    """
+    import run_subagent as rs
+    from _builder import AgentInvocation
+
+    d = tempfile.mkdtemp(prefix="summon-gate-handoff-")
+    seen = {}
+    real_exec = rs.execute_agent
+    try:
+        with open(os.path.join(d, "gate.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: read-only\n---\n# Gate\n")
+
+        def fake_exec(inv, **kwargs):
+            seen["system_context"] = inv.system_context
+            return {
+                "status": "success",
+                "result": "VERDICT: APPROVE\nREASON: bounded review",
+                "environment_handoff": {
+                    "declared": True,
+                    "left_behind": "C:/tmp/gate-note.txt (stopped; delete safely)",
+                },
+            }
+
+        rs.execute_agent = fake_exec
+
+        class Args:
+            gate_with = "gate"
+            agent = "implementation"
+            cli = None
+            timeout = 60_000
+            gate_timeout = None
+            debug_dir = None
+
+        gated = AgentInvocation(cli="claude", prompt="review", cwd=d,
+                                 permission="safe-edit")
+        decision = rs._run_gate(Args(), d, gated)
+    finally:
+        rs.execute_agent = real_exec
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    assert "## Environment handoff (required)" in seen.get("system_context", ""), seen
+    assert decision["environment_handoff"] == {
+        "declared": True,
+        "left_behind": "C:/tmp/gate-note.txt (stopped; delete safely)",
+    }, decision
+
+
 def test_blocked_approval_downgrades_success():
     # A run that ENDS asking for interactive approval with no report contract
     # must become status:blocked (a 0 exit is not task completion).

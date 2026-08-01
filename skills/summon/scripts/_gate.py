@@ -114,7 +114,8 @@ def decide(gate_response: dict | None, gate_agent: str) -> dict:
     """
     dec = {"agent": gate_agent, "verdict": DENY, "approved": False,
            "reason": None, "gate_status": None, "model": None,
-           "agent_def_sha256": None, "session_id": None}
+           "agent_def_sha256": None, "session_id": None,
+           "environment_handoff": {"declared": False, "left_behind": None}}
     if not isinstance(gate_response, dict):
         dec["reason"] = "gate produced no response"
         return dec
@@ -128,6 +129,17 @@ def decide(gate_response: dict | None, gate_agent: str) -> dict:
     resume = gate_response.get("resume")
     if isinstance(resume, dict):
         dec["session_id"] = resume.get("session_id")
+    # The gate is a child too. Its report is intentionally collapsed into a small
+    # decision object, so preserve its handoff separately instead of silently
+    # discarding anything it created. execute_agent has already redacted this
+    # structured value before it reaches the gate boundary.
+    handoff = gate_response.get("environment_handoff")
+    if isinstance(handoff, dict):
+        left = handoff.get("left_behind")
+        dec["environment_handoff"] = {
+            "declared": bool(handoff.get("declared")),
+            "left_behind": left if isinstance(left, str) else None,
+        }
 
     # A gate that did not complete cannot approve. Its own status is the first gate:
     # error, blocked, partial and timeout all mean "no ruling was obtained".
