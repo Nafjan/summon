@@ -11827,6 +11827,47 @@ def test_v8_stale_project_local_copy_shows_as_drift():
         _sh.rmtree(home, ignore_errors=True)
 
 
+def test_v10_timeout_diagnostics_do_not_duplicate_the_milliseconds_unit():
+    """A parsed Milliseconds value prints as ``Nms`` for argv round-tripping.
+    Human timeout diagnostics append their own unit, so they must use int(value)
+    or a 360-second timeout becomes the misleading ``360000msms``."""
+    from _cli import parse_timeout
+    from _stream import StreamProcessor
+    import _executor
+
+    resp = _executor._timeout_payload("claude", StreamProcessor(),
+                                      parse_timeout("360s"), [])
+    assert resp["error"] == "Timeout after 360000ms", resp["error"]
+    assert resp["timeout"] == {"budget_ms": 360000,
+                               "stage": "backend-execution",
+                               "partial_output": False}, resp["timeout"]
+
+
+def test_v10_kimi_review_docs_require_an_isolated_worktree():
+    """Kimi prompt mode is yolo-only. A doc that calls a Kimi job a review but
+    omits the worktree recipe invites callers to mistake it for read-only, so
+    bind both public entry points to the exact containment guidance."""
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    for path in (os.path.join(root, "README.md"),
+                 os.path.join(root, "skills", "summon", "SKILL.md")):
+        text = open(path, encoding="utf-8").read()
+        assert "review-only Kimi job,\n  use `--worktree`" in text, path
+        assert "enforceable read-only boundary" in text, path
+
+
+def test_v10_unreleased_changelog_binds_timeout_fix():
+    """The public release note describes this operator-visible repair.
+    Keep its claims tied to the regression guards rather than letting a focused
+    changelog drift into a promise the code no longer keeps."""
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    text = open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8").read()
+    unreleased = text.split("## [1.1.0]", 1)[0]
+    assert "ACP timeout cleanup" in unreleased, "missing ACP timeout release note"
+    assert "timeout_budget_ms = int(timeout_ms)" in open(
+        os.path.join(root, "skills", "summon", "scripts", "_acpbackend.py"),
+        encoding="utf-8").read(), "ACP timeout note drifted from its unit fix"
+
+
 def test_v8_gate_prompt_injection_cannot_forge_a_verdict():
     """BLOCK (codex): the gated agent's prompt is embedded in the gate prompt as
     data. A crafted prompt containing a line-anchored VERDICT: APPROVE could be

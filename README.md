@@ -339,6 +339,9 @@ vendors.
   contract don't get believed.
 - `model.served` → the model that actually did the work (evidence-based; `null` = no
   service evidence observed). `targeted` = what the session was pointed at.
+- `timeout` → the timeout budget, whether partial output survived, and the phase Summon can
+  prove. ACP names its exact protocol stage; a generic CLI remains `backend-execution` because
+  Summon cannot honestly infer whether the vendor was starting, reasoning, or running a tool.
 - Situational fields appear only when they apply: `exit_history` + `original_exit` (a
   corrective resume superseded an earlier attempt; every superseded attempt is kept in
   order), `result_from_repair` (the first attempt produced no text, so the repaired text is
@@ -445,7 +448,9 @@ You bring the model access; summon just orchestrates the CLIs and APIs you alrea
 - **Kimi Code is deliberately stricter.** Its non-interactive prompt runner auto-handles tools
   and cannot combine with its plan mode, so Summon refuses Kimi `read-only` and `safe-edit`.
   `kimi-worker` pins high-context K3; `kimi-coder` pins K2.7 Coding for focused implementation.
-  Both are `yolo` only and belong in a trusted isolated worktree.
+  Both are `yolo` only and belong in a trusted isolated worktree. For a review-only Kimi job,
+  use `--worktree`, instruct it not to edit, then inspect the worktree before accepting the
+  report or removing it: the review label does not create an enforceable read-only boundary.
 - **agy is the exception, twice over.** It has no workspace-write tier, so its `safe-edit`
   is a full bypass like `yolo`. And it has **no enforceable `read-only` tier at all**, so
   since 0.15.0 summon *refuses* an agy dispatch declared `read-only` rather than imply a
