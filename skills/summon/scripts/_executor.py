@@ -270,6 +270,15 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     # the agy profile on the normal path.
     response.setdefault("resume", {"cli": response.get("cli"), "session_id": response.get("session_id")})
     report = parse_report(response.get("result") or "")
+    # Report values are extracted before diagnostics redact ``result``. They are
+    # independently serialized into the envelope, so leaving them raw would let
+    # a model-echoed credential bypass the otherwise-redacted transcript through
+    # HANDOFF, LEFT_BEHIND, or any custom report field.
+    if report:
+        report = {
+            key: _redact_output_secrets(value) if isinstance(value, str) else value
+            for key, value in report.items()
+        }
     response["report"] = report
     # Kept distinct from report_ok for compatibility with older/project-local definitions.
     # New bundled definitions and initial dispatch context require LEFT_BEHIND, while a

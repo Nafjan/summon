@@ -62,7 +62,7 @@ Record these from every dispatch that matters:
 | `report_ok`, `suspect` | Whether the contract block parsed. `status:success` with `report_ok:false` sets `suspect` -- re-dispatch rather than trust. |
 | `model.requested` / `.targeted` / `.served` | See below. These are three different claims. |
 | `billing.source` | `subscription` / `api` / `credit`. Advisory; the vendor's billing is truth. |
-| `gate` | Present when `--gate-with` ran: the verdict, the gate's own definition hash and model. A gated dispatch that reports NO gate field is indistinguishable from an ungated one, so treat its absence as unapproved. |
+| `gate` | Present when `--gate-with` ran: the verdict, the gate's own definition hash and model, plus `environment_handoff` if the gate retained a resource. A gated dispatch that reports NO gate field is indistinguishable from an ungated one, so treat its absence as unapproved. |
 
 ### The `model.served` trap
 
