@@ -48,11 +48,13 @@ prompt with the candidate `--model` and check the envelope's `model.served`; an
 unsupported ID fails fast with the CLI's own error, costing nothing but the attempt.
 Never assume an alias has caught up to a launch — probe or pin.
 
-## Bundled roster snapshot (2026-07 — `--list` is the live truth)
+## Bundled roster snapshot (2026-08 — `--list` is the live truth)
 
 The definitive list is always `--list` (definitions register/edit instantly, so the
-roster may have changed since this table). Models below were verified actually
-serving via `model.resolved` at snapshot time:
+roster may have changed since this table). Models below were verified with the
+strongest backend evidence available at snapshot time: `model.resolved` or
+`model.served` where the backend emits it, and an explicit Kimi stream-model selection
+and response for Kimi:
 
 | Agents | Backend | Model (verified) | Use for |
 |---|---|---|---|
@@ -61,6 +63,8 @@ serving via `model.resolved` at snapshot time:
 | `pair`, `editor`, `quick-reviewer`, `pr-prep` | claude | `claude-sonnet-5` | balanced general work, prose, fast reviews, PR prep |
 | `reviewer`, `adversarial-reviewer`, `implementer`, `debugger`, `test-author` | codex | config default (gpt-5.6-sol at snapshot) | code review, adversarial passes, implementation, tests |
 | `coder`, `bug-fixer` | cursor-agent | composer-2.5 | multi-step coding, bug fixing |
+| `kimi-worker` | kimi | `kimi-code/k3` (pinned, live verified) | high-context architecture, independent review, broad repository research, ambiguous multi-file work |
+| `kimi-coder` | kimi | `kimi-code/kimi-for-coding` (pinned, live verified) | scoped implementation, refactoring, debugging, focused verification |
 | `researcher`, `docs-writer`, `frontend`, `antigravity` | agy | Gemini default (pin via `model:`) | research, docs, frontend |
 
 Cross-vendor routing rule of thumb: never have an agent's work reviewed by its own

@@ -15152,13 +15152,14 @@ def test_v9_the_roster_doc_matches_the_agents_it_describes():
     # Only the ROSTER TABLE is bound -- prose elsewhere legitimately discusses older models
     # (alias-lag history, agy's own 4.6-era lanes) and must stay free to do so.
     rows = [l for l in text.splitlines()
-            if l.startswith("| `") and "| claude |" in l]
-    assert rows, "the claude rows of the roster table are gone; re-anchor this test"
+            if l.startswith("| `") and ("| claude |" in l or "| kimi |" in l)]
+    assert rows, "the claude/kimi rows of the roster table are gone; re-anchor this test"
 
     for row in rows:
-        for model in re.findall(r"claude-(?:opus|sonnet|haiku|fable)-[0-9][0-9a-z.-]*", row):
+        for model in re.findall(r"(?:claude-(?:opus|sonnet|haiku|fable)-[0-9][0-9a-z.-]*|"
+                                r"kimi-code/[A-Za-z0-9._-]+)", row):
             assert model in pinned, (
-                "references/models.md claims a claude agent runs %r, but no bundled agent "
+                "references/models.md claims an agent runs %r, but no bundled agent "
                 "pins it. Pinned models are %s. Either the doc is stale or an agent moved "
                 "-- they must not disagree." % (model, sorted(pinned)))
 

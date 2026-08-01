@@ -13,6 +13,10 @@ regression notes, and test evidence, see the
   This covers temporary paths, processes, servers, VMs, and container resources; summon
   never deletes them automatically.
 
+- **Purposeful Kimi roster roles:** `kimi-worker` now identifies K3 as the high-context
+  architecture/review worker, while `kimi-coder` pins K2.7 Coding for scoped implementation
+  and debugging. Both retain Kimi's explicit full-authority worktree requirement.
+
 ## [1.1.0] - 2026-07-31
 
 **Kimi Code joins Summon, alongside a more dependable AGY path.**
