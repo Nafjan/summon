@@ -443,7 +443,8 @@ You bring the model access; summon just orchestrates the CLIs and APIs you alrea
   bypass). Raise anything to `yolo` deliberately, and only in repos you trust.
 - **Kimi Code is deliberately stricter.** Its non-interactive prompt runner auto-handles tools
   and cannot combine with its plan mode, so Summon refuses Kimi `read-only` and `safe-edit`.
-  Use the bundled `kimi-worker` only at `yolo` in a trusted isolated worktree.
+  `kimi-worker` pins high-context K3; `kimi-coder` pins K2.7 Coding for focused implementation.
+  Both are `yolo` only and belong in a trusted isolated worktree.
 - **agy is the exception, twice over.** It has no workspace-write tier, so its `safe-edit`
   is a full bypass like `yolo`. And it has **no enforceable `read-only` tier at all**, so
   since 0.15.0 summon *refuses* an agy dispatch declared `read-only` rather than imply a

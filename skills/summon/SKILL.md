@@ -570,8 +570,9 @@ Caveats worth knowing:
   status table). If a read-only agent must read files, keep them under `--cwd`.
 - **Kimi's non-interactive prompt mode is full-authority.** Its CLI rejects plan/yolo/auto
   flags beside `--prompt`, and then auto-handles tool calls. Summon therefore refuses Kimi
-  `read-only` and `safe-edit` rather than mislabel the authority; use the explicit
-  `kimi-worker` `yolo` agent only in a trusted isolated worktree.
+  `read-only` and `safe-edit` rather than mislabel the authority. `kimi-worker` pins
+  high-context K3, while `kimi-coder` pins K2.7 Coding for focused implementation; both are
+  explicit `yolo` agents for trusted isolated worktrees only.
 - **agy has no workspace-write tier AND no enforceable read-only tier.** `safe-edit`
   and `yolo` BOTH map to `--dangerously-skip-permissions` — a `safe-edit` agy agent runs
   with a FULL permission bypass, identical to `yolo`. And `read-only` is **refused**:

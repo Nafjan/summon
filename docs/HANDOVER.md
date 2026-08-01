@@ -1,6 +1,54 @@
 # Handover: summon 0.18.0 → the road to 1.0.0
 
-## Active takeover: Kimi K3, 2026-07-31
+## Handover back to Codex, 2026-07-31 (from Kimi K3)
+
+The K3 takeover is complete and **summon 1.1.0 is released** (tag `v1.1.0`, GitHub
+Release, PRs #12 and #13 merged, CI green on all four legs). This section supersedes the
+K3 takeover section below, which is kept as the record of how we got here.
+
+**You can now summon Kimi Code, including K3.** The bundled roster has `kimi-worker`
+(pinned `kimi-code/k3`, explicit yolo), and any agent can be pointed at Kimi with
+`--cli kimi --model kimi-code/k3` or `--model kimi-code/kimi-for-coding`. Kimi's
+non-interactive prompt mode auto-handles tools, so summon refuses `read-only` and
+`safe-edit` for kimi rather than mislabel authority -- treat every kimi dispatch as
+full-authority and keep it in trusted/isolated worktrees. Each kimi child gets a fresh
+ACL-locked profile (config + credentials + device_id only; no MCP config, sessions,
+logs, skills, or history). Both kimi models were live-verified from `main` today.
+
+**AGY works through summon now.** The built-in `agy_stream_proxy.py` (stream-json) is
+the default cross-platform path; the ConPTY+pyte scraper is legacy opt-in. Acceptance
+evidence: three consecutive completed rounds, 21/21 envelopes normalized to success
+after a parsed terminal report across 21 challenging prompts, and five
+protocol-attested models. This is recovery evidence, not a claim of error-free raw
+backend execution: the raw agy process exited 1 in these runs and 7/21 first replies
+missed the report contract (mostly markdown-bold fields, which the parser now accepts).
+Its session cwd can also drift into its profile brain dir; verify deliverables under
+`--cwd` as `antigravity.md` now warns.
+
+**ACP transport (phase 1) exists for gemini/kimi/cursor-agent -- yolo only.** No
+permission flags travel over ACP, and a live probe showed sub-yolo containment is
+unverifiable (gemini frozen for individuals, cursor untested), so summon refuses
+read-only/safe-edit over ACP. Re-open per backend only with proof of enforcement. A
+live kimi ACP dispatch works end-to-end through the isolated profile.
+
+**Reference material for you:**
+- This session's transcript (the whole takeover: review rounds, probes, release):
+  `<local-profile>\.kimi-code\sessions\<redacted-run>\<redacted-session>\agents\main\wire.jsonl`
+  (plus `kimi-code.log` in the same directory).
+- Your own prior session's transcript:
+  `<local-profile>\.codex\sessions\2026\07\29\rollout-2026-07-29T18-26-46-<redacted-session>.jsonl`
+- AGY acceptance envelopes: `%TEMP%\agy-rounds\evidence\` (round1-3 summaries + per-dispatch
+  debug dirs). Review envelopes: `%TEMP%\acp-review\`.
+- Suites at release: 447/447 discovery, 23/23 install, 34/34 ACP.
+
+**Open items (documented, not hidden):** agy brain-dir drift; ACP sub-yolo reopening;
+gemini CLI frozen for individuals; a large backlog of stale git worktrees from earlier
+sessions (`.claude/worktrees/*`, `<local scratch worktree>`) that nobody has reaped;
+the untracked `tmp-agy-smoke/` + `tmp_agy_smoke.py` evidence paths remain preserved.
+
+---
+
+## Active takeover: Kimi K3, 2026-07-31 (COMPLETED -- see the handover-back section above)
 
 This section is the authoritative handover for the active branch. The remainder of this
 file is valuable historical context from the 0.18.0 takeover, but some of its release and
