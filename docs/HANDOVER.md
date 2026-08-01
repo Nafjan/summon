@@ -31,20 +31,16 @@ unverifiable (gemini frozen for individuals, cursor untested), so summon refuses
 read-only/safe-edit over ACP. Re-open per backend only with proof of enforcement. A
 live kimi ACP dispatch works end-to-end through the isolated profile.
 
-**Reference material for you:**
-- This session's transcript (the whole takeover: review rounds, probes, release):
-  `<local-profile>\.kimi-code\sessions\<redacted-run>\<redacted-session>\agents\main\wire.jsonl`
-  (plus `kimi-code.log` in the same directory).
-- Your own prior session's transcript:
-  `<local-profile>\.codex\sessions\2026\07\29\rollout-2026-07-29T18-26-46-<redacted-session>.jsonl`
-- AGY acceptance envelopes: `%TEMP%\agy-rounds\evidence\` (round1-3 summaries + per-dispatch
-  debug dirs). Review envelopes: `%TEMP%\acp-review\`.
+**Reference material for maintainers:**
+
+- Takeover transcripts, review envelopes, and debug artifacts are retained outside this
+  repository. Ask the release owner for the evidence when it is genuinely needed; do not
+  publish local profile paths, session identifiers, or raw transcripts here.
 - Suites at release: 447/447 discovery, 23/23 install, 34/34 ACP.
 
 **Open items (documented, not hidden):** agy brain-dir drift; ACP sub-yolo reopening;
 gemini CLI frozen for individuals; a large backlog of stale git worktrees from earlier
-sessions (`.claude/worktrees/*`, `<local scratch worktree>`) that nobody has reaped;
-the untracked `tmp-agy-smoke/` + `tmp_agy_smoke.py` evidence paths remain preserved.
+sessions that nobody has reaped; the local AGY evidence paths remain preserved.
 
 ---
 
@@ -293,7 +289,7 @@ you think it reaches.**
 
 ## 5. House rules (non-negotiable)
 
-- **Commits:** author `the repository-configured author identity`, **no AI co-author trailer**.
+- **Commits:** use the repository-configured author identity, **no AI co-author trailer**.
   Message body explains *why*, including your own mistakes — the git log here is a real
   engineering record, not a changelog.
 - **Stdlib only.** No new dependencies, ever.

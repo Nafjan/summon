@@ -15,3 +15,8 @@ __pycache__/
 # It was ignored only via .git/info/exclude, which is local to one clone -- a fresh
 # checkout would not have ignored it.
 graphify-out/
+
+# Preserved local AGY acceptance evidence. It can contain prompts and runtime output;
+# retain it locally without allowing a broad staging command to publish it.
+tmp-agy-smoke/
+tmp_agy_smoke.py

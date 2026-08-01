@@ -15736,6 +15736,35 @@ def test_v10_parse_report_accepts_markdown_bold_fields():
     assert plain and plain["status"] == "DONE"
 
 
+def test_v10_public_docs_exclude_machine_identity_and_preserve_local_evidence():
+    """Public handovers must describe evidence without publishing a maintainer's machine.
+
+    Regression: the handover embedded actual profile paths and transcript/session IDs.
+    Those identifiers expose local account and activity metadata, and a broad ``git add``
+    could publish the preserved local evidence too. Bind the docs and ignore policy to the
+    privacy boundary rather than relying on a one-time manual scrub.
+    """
+    import json as _json
+    import re as _re
+    from urllib.parse import urlparse as _urlparse
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    handover = open(os.path.join(root, "docs", "HANDOVER.md"), encoding="utf-8").read()
+    assert not _re.search(r"[A-Za-z]:\\", handover), "handover contains a Windows absolute path"
+    assert not _re.search(r"(?i)(?:session|thread|run)_[0-9a-f-]{8,}", handover), "handover contains a session identifier"
+    assert not _re.search(r"(?i)[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", handover), "handover contains an email address"
+    assert "retained outside this\n  repository" in handover, "handover lacks the evidence-boundary guidance"
+
+    ignores = open(os.path.join(root, ".gitignore"), encoding="utf-8").read().splitlines()
+    assert "tmp-agy-smoke/" in ignores and "tmp_agy_smoke.py" in ignores, ignores
+
+    providers = _json.load(open(os.path.join(root, "providers.json.example"), encoding="utf-8"))
+    assert _urlparse(providers["local-vllm"]["base_url"]).hostname == "127.0.0.1", "example is not loopback-only"
+
+    changelog = open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8").read()
+    assert "handover material no longer publishes local profile paths" in changelog, "missing privacy release note"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

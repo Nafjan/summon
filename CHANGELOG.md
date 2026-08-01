@@ -17,6 +17,11 @@ regression notes, and test evidence, see the
   architecture/review worker, while `kimi-coder` pins K2.7 Coding for scoped implementation
   and debugging. Both retain Kimi's explicit full-authority worktree requirement.
 
+### Fixed
+
+- **Privacy hygiene:** handover material no longer publishes local profile paths or session
+  identifiers, and preserved AGY evidence is ignored by default.
+
 ## [1.1.0] - 2026-07-31
 
 **Kimi Code joins Summon, alongside a more dependable AGY path.**
