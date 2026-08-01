@@ -4,7 +4,7 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
-## [Unreleased]
+## [1.1.0] - 2026-07-31
 
 **Kimi Code joins Summon, alongside a more dependable AGY path.**
 
