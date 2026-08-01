@@ -34,3 +34,4 @@ COMMANDS: <key commands run>, or "none"
 CONFIDENCE: high | medium | low — <why>
 FOLLOW-UP: <what to investigate next, if anything>, or "none"
 HANDOFF: <facts/paths the orchestrator must pass into the next sub-agent call, since you keep no memory>, or "none"
+LEFT_BEHIND: <resources you created and left, with state/location and cleanup action>, or "none"

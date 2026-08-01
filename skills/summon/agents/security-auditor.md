@@ -46,3 +46,4 @@ COMMANDS: <scans/commands run (e.g. npm audit) + result>, or "none"
 VERIFICATION: <what you read/ran to ground the findings>
 FOLLOW-UP: <ordered remediation steps>, or "none"
 HANDOFF: <context for the next call, e.g. for the implementer who will remediate>, or "none"
+LEFT_BEHIND: <resources you created and left, with state/location and cleanup action>, or "none"

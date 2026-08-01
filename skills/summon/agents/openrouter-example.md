@@ -29,6 +29,7 @@ SUMMARY: <one sentence>
 FINDINGS: <your work product>, or "none"
 FOLLOW-UP: <recommended next actions>, or "none"
 HANDOFF: <context the orchestrator must pass into the next call>, or "none"
+LEFT_BEHIND: <resources you created and left, with state/location and cleanup action>, or "none"
 
 <!-- Model id follows OpenRouter's `vendor/model` convention. Their roster is
      their own and summon cannot enumerate it, so confirm the current id against

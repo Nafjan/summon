@@ -68,8 +68,34 @@ class AgentInvocation:
 # is the whole point) — this one line just keeps the contract on follow-ups.
 _RESUME_REMINDER = (
     "\n\n[Reminder] End your reply with the exact 'Final report' block from your "
-    "agent definition (every field present)."
+    "agent definition (every field present). Include LEFT_BEHIND: none, or describe "
+    "every resource you created and intentionally left for the caller to decide about."
 )
+
+
+_ENVIRONMENT_HANDOFF_CONTEXT = """## Environment handoff (required)
+Before your final report, account for everything YOU created outside the requested
+deliverables that still exists when you finish. This includes temporary files or paths,
+generated processes, listeners or web servers, VMs, containers, images, volumes, networks,
+and local or cloud service state. Do not stop or delete a resource merely to make this
+report empty: unless the task explicitly directs cleanup, the caller decides what to keep.
+
+Add `LEFT_BEHIND: none` to the Final report if nothing remains. Otherwise, use
+`LEFT_BEHIND:` to name each remaining resource, its location or identifier, its current
+state, why it remains, and the safe stop/removal action. Never include secret values,
+credentials, or tokens in that field.
+"""
+
+
+def environment_handoff_context(system_context: str) -> str:
+    """Append the universal, caller-owned environment handoff contract.
+
+    It belongs in the system context rather than a backend-specific argv builder so every
+    initial dispatch, including project-local agents, receives the same non-destructive
+    obligation. Resumes get the short equivalent in ``_RESUME_REMINDER`` above because the
+    original session already holds the complete context.
+    """
+    return f"{system_context.rstrip()}\n\n{_ENVIRONMENT_HANDOFF_CONTEXT}"
 
 
 def _resume_prompt(inv: AgentInvocation) -> str:

@@ -45,3 +45,4 @@ COMMANDS: <commands run to gather/verify the changes>, or "none"
 VERIFICATION: <what you read/ran to ground the findings>
 FOLLOW-UP: <ordered fixes>, or "none"
 HANDOFF: <context for the next call, e.g. for the implementer who will fix these>, or "none"
+LEFT_BEHIND: <resources you created and left, with state/location and cleanup action>, or "none"
