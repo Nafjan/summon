@@ -4,7 +4,7 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
-## [Unreleased]
+## [1.1.0] - 2026-07-31
 
 **Kimi Code joins Summon, alongside a more dependable AGY path.**
 
@@ -17,6 +17,19 @@ regression notes, and test evidence, see the
 
 ### Also improved
 
+- **ACP transport (phase 1):** `gemini`, `kimi`, and `cursor-agent` can run over the Agent
+  Client Protocol (JSON-RPC stdio) instead of a one-shot argv spawn. Three engagements:
+  automatic recovery attempt when a subprocess dispatch fails in a transport-fixable way
+  (narrow predicate — never for auth/spawn/structural failures), automatic routing for
+  prompts over the OS argv limit, and explicit opt-in via `transport: acp` frontmatter or
+  `--transport acp`. New flags: `--transport`, `--no-acp-fallback` (env
+  `SUMMON_ACP_FALLBACK=0`). Envelopes record `transport`, `fallback` (the recovery
+  attempt, doubling as telemetry for scoping ACP phase 2 — claude/codex adapters — on
+  measured fallback rates), and `acp.session_id` (telemetry only; the resume lane stays
+  empty). ACP is yolo-only: permission flags cannot travel over the protocol, so
+  `read-only`/`safe-edit` are refused rather than run with reactive-only containment
+  (within yolo, permission requests are auto-answered allow-once only, fail closed);
+  model pinning is best-effort with a warning. `--doctor` reports per-CLI ACP support.
 - Hardened debug argument redaction and boundary-flag handling.
 - Clarified wrapper readiness in diagnostics.
 - Accept markdown-bold report fields (`**STATUS:**`) from markdown-rendered backends such as

@@ -9,8 +9,12 @@ dict in `scripts/_builder.py`. There are two kinds; pick the one that fits.
 BACKENDS = {
     "claude":       {"kind": "subprocess", "build": _build_claude_args},
     "codex":        {"kind": "subprocess", "build": _build_codex_args},
-    "cursor-agent": {"kind": "subprocess", "build": _build_cursor_args},
-    "gemini":       {"kind": "subprocess", "build": _build_gemini_args},
+    "cursor-agent": {"kind": "subprocess", "build": _build_cursor_args,
+                     "acp": {"call": _acp_call}},
+    "gemini":       {"kind": "subprocess", "build": _build_gemini_args,
+                     "acp": {"call": _acp_call}},
+    "kimi":         {"kind": "subprocess", "build": _build_kimi_args, "side_effects": True,
+                     "acp": {"call": _acp_call}},
     "agy":          {"kind": "subprocess", "build": _build_agy_args, "side_effects": True},
     "openai-compat": {"kind": "api", "call": _api_call},
 }
@@ -28,6 +32,18 @@ things are NOT auto-wired and need a deliberate touch (they're per-backend by na
 - **api-backend config** — if `kind: "api"`, resolve your endpoint/frontmatter fields in
   `run_subagent` (like `openai-compat`'s `provider`/`base_url`) and add any fields to
   `AgentInvocation`. `--dry-run` renders any `api` backend generically.
+
+## The optional `"acp"` key (alternate transport)
+
+A subprocess backend with NATIVE Agent Client Protocol support can register
+`"acp": {"call": fn}` (shared `_acp_call` → `_acpbackend.call`, and the argv table
+in `_acpbackend.ACP_ARGV`). When `inv.transport == "acp"` — set by the
+`transport:` frontmatter field, `--transport acp`, the automatic failure
+fallback, or oversized-prompt routing — the executor calls that function
+instead of spawning argv. The call owns its process/session I/O and returns the
+same response shape as Kind 2 below. `supports_acp(cli)` reports presence; the
+envelope records `transport` and keeps the ACP session id under `acp.session_id`
+(never in the `resume` lane — it is not a subprocess resume handle).
 
 ## Kind 1 — `subprocess` (drive a CLI)
 

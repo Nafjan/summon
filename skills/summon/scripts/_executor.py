@@ -2206,6 +2206,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 f"both are kept in the `model` field (a pinned agent model may have "
                 f"been rerouted or fallen back)")
         resp["permission"] = inv.permission
+        resp["transport"] = inv.transport   # which path served the run (subprocess|acp)
         resp["effort"] = inv.effort   # reasoning effort actually applied (None = backend default)
         # True only for a caller-requested continuation. Automatic schema/report
         # repair retries have their own explicit fields and do not relabel the root run.
@@ -2286,6 +2287,48 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     if _ro_err:
         return _stamp(_enrich(_error_response(inv.cli, 1, _ro_err), None))
 
+    # ACP transport (gemini/kimi/cursor-agent): the backend speaks the Agent
+    # Client Protocol natively, so the turn runs over JSON-RPC stdio instead of
+    # a one-shot argv spawn. The call owns its session I/O and returns the
+    # standard shape, like the api kind above. Placed AFTER the read-only guard
+    # so an unenforceable tier fails closed identically on both transports.
+    if inv.transport == "acp":
+        from _builder import supports_acp as _supports_acp
+        if not _supports_acp(inv.cli):
+            return _stamp(_enrich(_error_response(
+                inv.cli, 2, f"backend {inv.cli!r} has no acp transport"), None))
+        if inv.permission != "yolo":
+            # Reactive-only enforcement: no permission flags travel to an ACP
+            # agent, so containment depends on the agent CHOOSING to send
+            # session/request_permission -- unverified on real CLIs (gemini is
+            # frozen for individuals, cursor untested, kimi is yolo-only
+            # everywhere anyway). Unverifiable containment is not containment:
+            # refuse rather than mislabel the tier.
+            return _stamp(_enrich(_error_response(
+                inv.cli, 2,
+                f"the ACP transport cannot enforce {inv.permission!r}: no "
+                "permission flags travel to the agent and containment depends on "
+                "the agent choosing to ask (reactive only, unverified on real "
+                "CLIs). summon refuses rather than mislabel the tier. Use yolo "
+                "over ACP, or the subprocess transport, which enforces tiers via "
+                "CLI flags."), None))
+        debug_argv = [inv.cli, "<acp>"]
+        resp = _enrich(BACKENDS[inv.cli]["acp"]["call"](inv, timeout_ms), None)
+        # Premortem T1: the ACP session id is NOT a resume handle for the
+        # subprocess path — _apply_schema re-dispatches the ORIGINAL invocation
+        # with resume_id=<that id>, a wrong-namespace resume on cursor-agent.
+        # Keep the resume lane dead; carry the id as telemetry only.
+        resp["acp"] = {"session_id": resp.get("session_id")}
+        resp["resume"] = {"cli": inv.cli, "session_id": None}
+        # Same artifact contract as the subprocess path: _debug_raw never ships
+        # inside the envelope, and every persisted/returned field is
+        # secret-redacted (backend stderr can echo credentials).
+        return _stamp(resp)
+    if inv.transport != "subprocess":
+        return _stamp(_enrich(_error_response(
+            inv.cli, 2, f"unknown transport {inv.transport!r} "
+                        f"(use 'subprocess' or 'acp')"), None))
+
     # timeout_ms is threaded to the builder so agy's wrapper deadline AND its
     # profile-TTL cleanup (which runs during build) both reflect the real request.
     try:
@@ -2310,6 +2353,26 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # matters is the one Popen receives -- overrides included, stripped keys excluded.
     _argv_err = argv_length_error(inv.cli, command, args, proc_env)
     if _argv_err:
+        # A prompt that cannot fit in argv can still go over ACP — the prompt is
+        # a JSON-RPC parameter on stdin there, with no OS command-line limit.
+        # Only for backends with NATIVE ACP support; the kill switch and the
+        # fallback envelope field apply even to an explicit --transport
+        # subprocess pin, because the alternative here is certain failure.
+        from _builder import supports_acp as _supports_acp
+        if (_supports_acp(inv.cli)
+                and os.environ.get("SUMMON_ACP_FALLBACK") != "0"):
+            from dataclasses import replace as _replace_inv
+            _routed = execute_agent(_replace_inv(inv, transport="acp"),
+                                    timeout_ms=timeout_ms, debug_dir=debug_dir,
+                                    max_tool_output_bytes=max_tool_output_bytes)
+            _routed.setdefault("warnings", []).append(
+                "the prompt exceeded the OS command-line length limit for the "
+                "subprocess transport, so summon routed this dispatch over ACP "
+                "(stdin JSON-RPC has no argv cap)")
+            _routed["fallback"] = {"from": "subprocess", "to": "acp",
+                                   "reason": "argv-length",
+                                   "primary_status": "not_dispatched"}
+            return _routed
         # exit 1, not 127: 127 means "CLI not found", and reporting this as a missing
         # binary is precisely the misdiagnosis being fixed.
         _resp = _error_response(inv.cli, 1, _argv_err)
