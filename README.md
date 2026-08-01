@@ -316,7 +316,9 @@ vendors.
   "status": "success",
   "result": "…the agent's full answer…",
   "report": { "status": "DONE", "summary": "Reviewed 4 files; 2 findings",
-              "handoff": "Fix the race in poller.py:88 first" },
+              "handoff": "Fix the race in poller.py:88 first",
+              "left_behind": "none" },
+  "environment_handoff": { "declared": true, "left_behind": "none" },
   "report_ok": true,
   "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
                "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
@@ -330,6 +332,9 @@ vendors.
 ```
 
 - `report.handoff` → the context to pass to the next call.
+- `environment_handoff` → resources the child created and intentionally left behind. It can
+  cover temporary paths, processes, servers, VMs, or container resources; the caller, not
+  summon, decides whether to retain or clean them. `declared: false` means no account was made.
 - `report_ok: false` on a "success" → also gets `suspect: true`. Agents that skip their
   contract don't get believed.
 - `model.served` → the model that actually did the work (evidence-based; `null` = no

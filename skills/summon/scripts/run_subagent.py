@@ -67,7 +67,7 @@ import _background  # noqa: E402
 import _cli  # noqa: E402
 import _executor  # noqa: E402
 import _receipt  # noqa: E402
-from _builder import AgentInvocation  # noqa: E402
+from _builder import AgentInvocation, environment_handoff_context  # noqa: E402
 from _builder import clamp_permission as _clamp  # noqa: E402
 from _executor import ENVELOPE_VERSION as _ENVELOPE_VERSION  # noqa: E402
 from _executor import (agent_def_sha, content_sha,  # noqa: E402
@@ -368,6 +368,12 @@ def _inject_memory(system_context: str, cwd: str, raw: bytes | None = None) -> s
     if len(mem) > _MEMORY_CAP:
         mem = mem[:_MEMORY_CAP] + "\n[memory truncated]"
     return f"{system_context}\n\n## Project memory (from .agents/memory.md)\n{mem}"
+
+
+def _initial_system_context(system_context: str, cwd: str,
+                            memory_raw: bytes | None = None) -> str:
+    """Build the system context for a fresh child, including caller-owned cleanup handoff."""
+    return environment_handoff_context(_inject_memory(system_context, cwd, memory_raw))
 
 
 def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
@@ -854,7 +860,7 @@ def main() -> None:
             _die("project memory (.agents/memory.md) changed between fingerprinting and "
                  f"dispatch ({_mem_expected} -> {_mem_actual}); re-run rather than record a "
                  "result under instructions the envelope does not name")
-        system_context = _inject_memory(system_context, args.cwd, _mem_raw)
+        system_context = _initial_system_context(system_context, args.cwd, _mem_raw)
 
     try:
         cli = args.cli or resolve_cli(run_agent_cli)
@@ -1105,6 +1111,13 @@ def main() -> None:
     sys.exit(0 if result["status"] == "success" else 1)
 
 
+def _dry_run_arg_preview(arg: str) -> str:
+    """Bound a dry-run argv preview without hiding a system-context-tail user prompt."""
+    if len(arg) <= 400:
+        return arg
+    return arg[:260] + f"...[+{len(arg) - 380} chars]..." + arg[-120:]
+
+
 def _dry_run_view(invocation, args, agents_dir: str,
                   agent_file: str | None = None,
                   artifact_manifest: dict | None = None) -> dict:
@@ -1219,7 +1232,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
         try:
             cmd, argv, env = build_invocation_args(invocation)
             view["command"] = cmd
-            view["args"] = [a if len(a) <= 400 else a[:400] + f"...[+{len(a)-400} chars]" for a in argv]
+            view["args"] = [_dry_run_arg_preview(a) for a in argv]
             view["env_overrides"] = sorted(env) if env else []
         except ValueError as e:
             view["error"] = str(e)

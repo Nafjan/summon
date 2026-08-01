@@ -35,3 +35,4 @@ TRADE_OFFS: <what each major choice costs vs the alternatives>
 RISKS: <ordered list of risks/unknowns; flag the single biggest>
 FOLLOW-UP: <implementation steps to delegate next (e.g. to coder/implementer)>, or "none"
 HANDOFF: <context the orchestrator must pass into the next sub-agent call, since you keep no memory>, or "none"
+LEFT_BEHIND: <resources you created and left, with state/location and cleanup action>, or "none"

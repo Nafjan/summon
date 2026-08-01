@@ -68,7 +68,14 @@ def _sanitize_argv(argv: list) -> str:
                 out.append(text)
                 redact_next = True
             continue
-        out.append(text if len(text) <= 2000 else text[:2000] + "...[truncated]")
+        # Keep both ends of a long argument. System-context-first backends put the user's
+        # actual prompt at the tail; preserving only the prefix made --dry-run conceal it
+        # after a universal operating contract was added. Redaction still runs on the joined
+        # preview below, so a named secret in either retained segment is not exposed.
+        if len(text) <= 2000:
+            out.append(text)
+        else:
+            out.append(text[:1400] + "...[truncated]..." + text[-600:])
     return _redact_output_secrets(" ".join(out))
 
 from _builder import (AgentInvocation, BACKENDS, advisory_warnings,
@@ -95,6 +102,7 @@ _REPORT_BOOKENDS = ("STATUS", "SUMMARY", "FOLLOW-UP", "HANDOFF")
 # truncate HANDOFF, the field carried into the next call).
 _REPORT_FIELDS = frozenset({
     "STATUS", "SUMMARY", "COMMANDS", "VERIFICATION", "FOLLOW-UP", "HANDOFF",
+    "LEFT_BEHIND",
     "FINDINGS", "VERDICT", "PLAN", "RISKS", "DESIGN", "TRADE_OFFS",
     "HYPOTHESES_TESTED", "ROOT_CAUSE", "CHANGES", "DESIGN_NOTES", "TESTS",
     "EDITS", "TONE_CHANGES", "DOCS", "EVIDENCE", "CONFIDENCE", "ANALYSIS",
@@ -234,7 +242,8 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
 
     Adds: ``session_id``, ``usage``, ``cost_usd`` (from stream events; None
     where the backend doesn't emit them), ``report`` (parsed contract block or
-    None), ``report_ok`` (all bookend fields present), and ``suspect: true``
+    None), ``environment_handoff`` (whether the agent declared retained resources),
+    ``report_ok`` (all bookend fields present), and ``suspect: true``
     when a run claims success but the contract block is missing/incomplete.
 
     One exception to "the parser never changes status": a run whose result ENDS
@@ -262,6 +271,15 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     response.setdefault("resume", {"cli": response.get("cli"), "session_id": response.get("session_id")})
     report = parse_report(response.get("result") or "")
     response["report"] = report
+    # Kept distinct from report_ok for compatibility with older/project-local definitions.
+    # New bundled definitions and initial dispatch context require LEFT_BEHIND, while a
+    # legacy report stays mechanically valid but tells callers it made no environmental
+    # declaration. This is visibility, not enforcement: cleanup authority remains outside
+    # the dispatcher and an agent's self-report is advisory.
+    response["environment_handoff"] = {
+        "declared": bool(report and "left_behind" in report),
+        "left_behind": report.get("left_behind") if report else None,
+    }
     response["report_ok"] = bool(
         report and all(b.lower().replace("-", "_") in report for b in _REPORT_BOOKENDS)
     )

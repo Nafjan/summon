@@ -37,3 +37,4 @@ COMMANDS: <any commands run to verify links/examples>, or "none"
 VERIFICATION: <how you confirmed the change reads well>
 FOLLOW-UP: <follow-up edits worth doing>, or "none"
 HANDOFF: <context the orchestrator must pass into the next sub-agent call, since you keep no memory>, or "none"
+LEFT_BEHIND: <resources you created and left, with state/location and cleanup action>, or "none"

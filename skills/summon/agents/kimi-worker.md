@@ -21,3 +21,4 @@ COMMANDS: <key commands run + pass/fail>, or "none"
 VERIFICATION: <what you actually checked>, or "none"
 FOLLOW-UP: <next action or "none">
 HANDOFF: <self-contained context for the next agent, or "none">
+LEFT_BEHIND: <resources you created and left, with state/location and cleanup action>, or "none"

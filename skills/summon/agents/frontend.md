@@ -53,3 +53,4 @@ COMMANDS: <build/lint/run commands + result>, or "none"
 VERIFICATION: <how you confirmed it renders/builds without errors>
 FOLLOW-UP: <recommended next actions>, or "none"
 HANDOFF: <context the orchestrator must pass into the next sub-agent call, since you keep no memory>, or "none"
+LEFT_BEHIND: <resources you created and left, with state/location and cleanup action>, or "none"
