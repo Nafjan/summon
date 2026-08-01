@@ -344,7 +344,8 @@ vendors.
   order), `result_from_repair` (the first attempt produced no text, so the repaired text is
   the answer), `result_path_conflict` (the envelope found at a shared `--results-dir` path
   answers a *different* request and was refused rather than served), and `gate`,
-  `gate_correction_refused` or `gate_repair_refused` under `--gate-with`.
+  `gate_correction_refused` or `gate_repair_refused` under `--gate-with`. A gate's own
+  retained-resource declaration is nested at `gate.environment_handoff`.
 - `summon.scripts_sha256` + `agent_def.sha256` → provenance: which dispatcher build and
   which agent definition produced this envelope.
 - `billing.source` → did this draw from a **subscription** or metered **api** credits.
