@@ -227,6 +227,85 @@ def test_environment_handoff_reaches_fresh_and_resumed_child_prompts():
     assert "LEFT_BEHIND: none" in resumed and "caller to decide" in resumed
 
 
+def test_environment_handoff_and_dry_run_previews_redact_secret_values():
+    """Parsed report fields and dry-run argv previews are envelope surfaces too.
+
+    The raw transcript is redacted during diagnostic finalization, but parsing happens
+    earlier. A secret in HANDOFF or LEFT_BEHIND must not survive in the independent
+    structured copies. Likewise a dry-run preview bypasses that finalizer entirely.
+    """
+    import json
+    import run_subagent as rs
+    from _executor import _enrich, _finalize_diagnostics
+
+    report_secret = "report-audit-secret"
+    preview_secret = "preview-audit-secret"
+    raw = ("STATUS: DONE\nSUMMARY: s\nFOLLOW-UP: none\n"
+           f"HANDOFF: api_key={report_secret}\n"
+           f"LEFT_BEHIND: authorization: bearer {report_secret}")
+    response = _enrich({"result": raw, "exit_code": 0, "status": "success",
+                        "cli": "codex"}, None)
+    _finalize_diagnostics(response, raw, None, [], None)
+    assert report_secret not in json.dumps(response), response
+    assert response["environment_handoff"]["left_behind"].endswith("<redacted>")
+
+    preview = rs._dry_run_arg_preview("x" * 420 + f" api_key={preview_secret}")
+    assert preview_secret not in preview and "api_key=<redacted>" in preview, preview
+
+
+def test_environment_handoff_reaches_and_survives_a_gate_dispatch():
+    """A gate is a fresh child, not an exception to the caller-owned handoff.
+
+    `_run_gate` constructs its invocation directly instead of passing through main's
+    fresh-dispatch setup. It must therefore add the universal context itself and retain
+    the gate's structured declaration in the decision that the caller actually receives.
+    """
+    import run_subagent as rs
+    from _builder import AgentInvocation
+
+    d = tempfile.mkdtemp(prefix="summon-gate-handoff-")
+    seen = {}
+    real_exec = rs.execute_agent
+    try:
+        with open(os.path.join(d, "gate.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: read-only\n---\n# Gate\n")
+
+        def fake_exec(inv, **kwargs):
+            seen["system_context"] = inv.system_context
+            return {
+                "status": "success",
+                "result": "VERDICT: APPROVE\nREASON: bounded review",
+                "environment_handoff": {
+                    "declared": True,
+                    "left_behind": "C:/tmp/gate-note.txt (stopped; delete safely)",
+                },
+            }
+
+        rs.execute_agent = fake_exec
+
+        class Args:
+            gate_with = "gate"
+            agent = "implementation"
+            cli = None
+            timeout = 60_000
+            gate_timeout = None
+            debug_dir = None
+
+        gated = AgentInvocation(cli="claude", prompt="review", cwd=d,
+                                 permission="safe-edit")
+        decision = rs._run_gate(Args(), d, gated)
+    finally:
+        rs.execute_agent = real_exec
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    assert "## Environment handoff (required)" in seen.get("system_context", ""), seen
+    assert decision["environment_handoff"] == {
+        "declared": True,
+        "left_behind": "C:/tmp/gate-note.txt (stopped; delete safely)",
+    }, decision
+
+
 def test_blocked_approval_downgrades_success():
     # A run that ENDS asking for interactive approval with no report contract
     # must become status:blocked (a 0 exit is not task completion).
@@ -11746,6 +11825,47 @@ def test_v8_stale_project_local_copy_shows_as_drift():
         import shutil as _sh
         _sh.rmtree(proj, ignore_errors=True)
         _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v10_timeout_diagnostics_do_not_duplicate_the_milliseconds_unit():
+    """A parsed Milliseconds value prints as ``Nms`` for argv round-tripping.
+    Human timeout diagnostics append their own unit, so they must use int(value)
+    or a 360-second timeout becomes the misleading ``360000msms``."""
+    from _cli import parse_timeout
+    from _stream import StreamProcessor
+    import _executor
+
+    resp = _executor._timeout_payload("claude", StreamProcessor(),
+                                      parse_timeout("360s"), [])
+    assert resp["error"] == "Timeout after 360000ms", resp["error"]
+    assert resp["timeout"] == {"budget_ms": 360000,
+                               "stage": "backend-execution",
+                               "partial_output": False}, resp["timeout"]
+
+
+def test_v10_kimi_review_docs_require_an_isolated_worktree():
+    """Kimi prompt mode is yolo-only. A doc that calls a Kimi job a review but
+    omits the worktree recipe invites callers to mistake it for read-only, so
+    bind both public entry points to the exact containment guidance."""
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    for path in (os.path.join(root, "README.md"),
+                 os.path.join(root, "skills", "summon", "SKILL.md")):
+        text = open(path, encoding="utf-8").read()
+        assert "review-only Kimi job,\n  use `--worktree`" in text, path
+        assert "enforceable read-only boundary" in text, path
+
+
+def test_v10_unreleased_changelog_binds_timeout_fix():
+    """The public release note describes this operator-visible repair.
+    Keep its claims tied to the regression guards rather than letting a focused
+    changelog drift into a promise the code no longer keeps."""
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    text = open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8").read()
+    unreleased = text.split("## [1.1.0]", 1)[0]
+    assert "ACP timeout cleanup" in unreleased, "missing ACP timeout release note"
+    assert "timeout_budget_ms = int(timeout_ms)" in open(
+        os.path.join(root, "skills", "summon", "scripts", "_acpbackend.py"),
+        encoding="utf-8").read(), "ACP timeout note drifted from its unit fix"
 
 
 def test_v8_gate_prompt_injection_cannot_forge_a_verdict():

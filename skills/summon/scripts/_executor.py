@@ -270,6 +270,15 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     # the agy profile on the normal path.
     response.setdefault("resume", {"cli": response.get("cli"), "session_id": response.get("session_id")})
     report = parse_report(response.get("result") or "")
+    # Report values are extracted before diagnostics redact ``result``. They are
+    # independently serialized into the envelope, so leaving them raw would let
+    # a model-echoed credential bypass the otherwise-redacted transcript through
+    # HANDOFF, LEFT_BEHIND, or any custom report field.
+    if report:
+        report = {
+            key: _redact_output_secrets(value) if isinstance(value, str) else value
+            for key, value in report.items()
+        }
     response["report"] = report
     # Kept distinct from report_ok for compatibility with older/project-local definitions.
     # New bundled definitions and initial dispatch context require LEFT_BEHIND, while a
@@ -1816,7 +1825,14 @@ def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
         which reads as total loss when `result` is empty.
     """
     result = processor.get_result()
-    resp = _partial_response(cli, result, 124, f"Timeout after {timeout_ms}ms")
+    # See _cli.Milliseconds: its string form carries a unit for safe argv
+    # forwarding. Diagnostic text owns its own unit, so format the numeric value
+    # explicitly rather than producing ``360000msms``.
+    timeout_budget_ms = int(timeout_ms)
+    resp = _partial_response(cli, result, 124, f"Timeout after {timeout_budget_ms}ms")
+    resp["timeout"] = {"budget_ms": timeout_budget_ms,
+                       "stage": "backend-execution",
+                       "partial_output": bool(result)}
     resp = _attach_raw(resp, stdout_lines)
 
     captured = "".join(stdout_lines or [])
@@ -1830,7 +1846,7 @@ def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
         hint = salient_error(captured)
         if hint:
             resp["error_hint"] = hint
-            resp["error"] = f"Timeout after {timeout_ms}ms -- likely cause: {hint}"
+            resp["error"] = f"Timeout after {timeout_budget_ms}ms -- likely cause: {hint}"
         resp.setdefault("warnings", []).append(
             "this run timed out with no parsed result; the captured output is in "
             "`output_tail` and usually names the real cause (a missing tool, a wrong "

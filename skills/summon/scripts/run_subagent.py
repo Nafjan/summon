@@ -1112,10 +1112,15 @@ def main() -> None:
 
 
 def _dry_run_arg_preview(arg: str) -> str:
-    """Bound a dry-run argv preview without hiding a system-context-tail user prompt."""
+    """Bound and redact a dry-run argv preview without hiding the prompt tail."""
     if len(arg) <= 400:
-        return arg
-    return arg[:260] + f"...[+{len(arg) - 380} chars]..." + arg[-120:]
+        preview = arg
+    else:
+        preview = arg[:260] + f"...[+{len(arg) - 380} chars]..." + arg[-120:]
+    # This preview is written directly into a dry-run envelope, bypassing the
+    # executor's diagnostic finalizer. Apply the same narrow named-secret
+    # redaction here so a retained prompt tail cannot become a log leak.
+    return _executor._redact_output_secrets(preview)
 
 
 def _dry_run_view(invocation, args, agents_dir: str,
@@ -1278,7 +1283,12 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
                          permission=gated_inv.permission, cli=gated_inv.cli,
                          model=gated_inv.model)
     gate_inv = AgentInvocation(
-        cli=gate_cli, prompt=prompt, cwd=gated_inv.cwd, system_context=gate_ctx,
+        cli=gate_cli, prompt=prompt, cwd=gated_inv.cwd,
+        # Gates are fresh child dispatches too. They normally only adjudicate, but
+        # their read-only tier is still a backend-specific capability rather than
+        # proof that no resource can be left behind. Keep the handoff obligation
+        # universal even for a project-local gate definition.
+        system_context=environment_handoff_context(gate_ctx),
         agent_file=gate_file,
         permission="read-only",   # FORCED: never inherit the gate definition's tier
         permission_forced=True,   # so the opt-in cannot turn the adjudicator advisory
