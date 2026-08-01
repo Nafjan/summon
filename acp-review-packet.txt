@@ -1,0 +1,1808 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d27b925..d58577c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,6 +17,17 @@ regression notes, and test evidence, see the
+ 
+ ### Also improved
+ 
++- **ACP transport (phase 1):** `gemini`, `kimi`, and `cursor-agent` can run over the Agent
++  Client Protocol (JSON-RPC stdio) instead of a one-shot argv spawn. Three engagements:
++  automatic recovery attempt when a subprocess dispatch fails in a transport-fixable way
++  (narrow predicate — never for auth/spawn/structural failures), automatic routing for
++  prompts over the OS argv limit, and explicit opt-in via `transport: acp` frontmatter or
++  `--transport acp`. New flags: `--transport`, `--no-acp-fallback` (env
++  `SUMMON_ACP_FALLBACK=0`). Envelopes record `transport`, `fallback` (the recovery
++  attempt, doubling as telemetry for scoping ACP phase 2 — claude/codex adapters — on
++  measured fallback rates), and `acp.session_id` (telemetry only; the resume lane stays
++  empty). Permission requests are auto-answered per tier (allow-once only, fail closed);
++  model pinning is best-effort with a warning. `--doctor` reports per-CLI ACP support.
+ - Hardened debug argument redaction and boundary-flag handling.
+ - Clarified wrapper readiness in diagnostics.
+ - Accept markdown-bold report fields (`**STATUS:**`) from markdown-rendered backends such as
+diff --git a/KNOWN_ISSUES.md b/KNOWN_ISSUES.md
+index 8cdcde5..298dc55 100644
+--- a/KNOWN_ISSUES.md
++++ b/KNOWN_ISSUES.md
+@@ -1,7 +1,27 @@
+ # Known issues
+ 
+-No open issues. Resolved entries are kept below with the measurement that closed them, so
+-the record shows what was actually verified rather than only what was claimed.
++## ACP transport: by-design limitations (phase 1)
++
++**BY DESIGN** (documented, not defects; candidates for phase 2):
++
++- The ACP session id is **not a resume handle** — `session/load` is unimplemented, so
++  `resume.session_id` is deliberately `None` for ACP-served runs and the id lives under
++  `acp.session_id`. (Letting it leak into the resume lane would re-dispatch the
++  subprocess path with a wrong-namespace id on cursor-agent.)
++- **No system-prompt channel** in ACP: the agent definition is prepended to the user
++  prompt rather than passed via a dedicated flag (an envelope warning says so).
++- **Model pinning is best-effort**: the stable ACP schema has no model on `session/new`;
++  summon tries `session/set_model` where the session advertises a model list and warns
++  otherwise. `usage`/`cost_usd` depend on what the backend emits over ACP and may be
++  absent.
++- **claude/codex have no native ACP** (adapter shims exist but are out of scope), and
++  **agy has none at all** — the agy PTY-scrape class of failures is not covered by the
++  ACP fallback.
++- **The failure fallback re-executes the prompt** (default on): like `--retries`, a
++  primary run that performed side effects before failing can perform them again over
++  ACP. The predicate is narrow by failure class (timeouts, output-shape losses, pipe
++  failures; never auth/CLI-missing/refusals), and the envelope records the attempt in
++  `fallback`/`attempts` — use `--no-acp-fallback` for non-idempotent tasks.
+ 
+ ## Windows: process-tree kill cannot reach descendants of an exited leader
+ 
+diff --git a/skills/summon/SKILL.md b/skills/summon/SKILL.md
+index b5de18a..bcc0be9 100644
+--- a/skills/summon/SKILL.md
++++ b/skills/summon/SKILL.md
+@@ -229,6 +229,8 @@ completed review returning `VERDICT: BLOCK` is successful execution and a reject
+ | `--gate-with AGENT` | No | Require AGENT to APPROVE this dispatch before it runs. The gate is dispatched **forced read-only** (regardless of its own definition, so a gate can never be a privilege-escalation path) and adjudicates the *request*: agent, prompt, permission, cwd. **Fails closed** -- a gate that denies, errors, times out, or emits no parseable `VERDICT:` line blocks the dispatch with `status:blocked`. `VERDICT: UNCERTAIN` additionally sets `requires_human_review:true`, routing the decision to a person. The decision lands in the envelope's `gate` field. Single dispatch only (rejected for `--manifest`/`--council`). |
+ | `--gate-timeout` | No | Timeout for the `--gate-with` dispatch (same grammar as `--timeout`; defaults to it) |
+ | `--retries N` | No | Re-dispatch up to N times on `error`/`partial` (exponential backoff; `blocked` is never retried — its cause is structural). Envelope gains `attempts` |
++| `--transport {subprocess,acp}` | No | Force the dispatch transport (default `subprocess`). `acp` runs the turn over the Agent Client Protocol — native support only: `gemini` (`--acp`), `kimi` (`acp`), `cursor-agent` (`acp`). Overrides the agent's `transport:` frontmatter. See "ACP transport" |
++| `--no-acp-fallback` | No | Disable the automatic ACP recovery attempt when a subprocess dispatch fails, and the oversized-prompt ACP routing. Env form: `SUMMON_ACP_FALLBACK=0` |
+ | `--allow-credit` | No | Authorize spending ACCOUNT CREDIT on an unconditionally credit-only model for this one dispatch (no model meets that definition today; Fable billing is plan-dependent and handled separately, so this currently authorizes nothing and is kept for compatibility); flag form of `SUMMON_ALLOW_CREDIT=1`. Single dispatch only: rejected for `--manifest`/`--council`, where env inheritance would silently authorize every child (set the env var deliberately for fan-out spend) |
+ | `--json-schema FILE` | No | Structured output contract: extract the agent's final JSON, validate against the schema, attach `parsed`/`parse_ok`/`parse_errors`; ONE corrective retry via resume on mismatch |
+ | `--artifact FILE` | No | Opt a loose input file under `--cwd` into the provenance receipt (repeatable). Records relative filename, bytes, SHA-256, and page count where stdlib exposes labeled metadata (DOCX; null rather than guessing for PDF). The manifest is part of request reuse and is re-hashed after dispatch; a changed baseline sets `artifacts.stable_during_dispatch:false` and `suspect:true`. Incompatible with `--worktree`; manifest jobs use an `artifacts` array |
+@@ -373,6 +375,34 @@ Enforced keywords: `type`, `properties`, `required`, `items`, `enum`, `const`,
+ enforced** and is reported in the envelope's `parse_warnings` — so `parse_ok: true`
+ never silently hides an unchecked constraint. Keep schemas within the subset.
+ 
++## ACP transport
++
++For the backends with **native** Agent Client Protocol support — `gemini`, `kimi`,
++`cursor-agent` — summon can run the turn over ACP (JSON-RPC over stdio) instead of a
++one-shot argv spawn. Three ways it engages:
++
++1. **Auto-fallback** (default on): when a subprocess dispatch ends `error`/`partial` in a
++   way a transport change can plausibly fix (timeouts, stream-shape losses), summon makes
++   ONE recovery attempt over ACP, re-gated under `--gate-with`. Structural failures
++   (CLI missing, auth, unenforceable tier, argv-length) never trigger it. The envelope
++   records `fallback: {from, to, reason, primary_status}` and the attempt counts in
++   `attempts`/spend. Disable with `--no-acp-fallback` or `SUMMON_ACP_FALLBACK=0`.
++2. **Oversized prompts**: a prompt over the OS argv limit routes to ACP automatically
++   (the prompt travels via stdin, no cap) with a warning, instead of erroring.
++3. **Opt-in**: `transport: acp` frontmatter or `--transport acp` makes ACP the primary
++   path for that agent.
++
++ACP caveats: no system-prompt channel (the agent definition is prepended to the prompt);
++model pinning is best-effort (`session/set_model` where advertised, otherwise a warning);
++permission is enforced by summon auto-answering `session/request_permission` per tier
++(allow-once only, never allow-always; a request whose options contain no safely
++classifiable choice cancels the turn — fail closed, and never an invented or positional
++optionId); the ACP
++session id is telemetry (`acp.session_id`) and NOT a resume handle (`resume.session_id`
++stays `None`, and `--resume` over ACP is refused); usage/cost fields depend on what the backend emits. Every ACP-served
++envelope carries `transport: "acp"`. `--doctor` reports whether each installed CLI
++actually speaks ACP.
++
+ ## Known limitations & caveats
+ 
+ Honest edges — plan around these, don't be surprised by them:
+@@ -506,6 +536,7 @@ permissions.
+ | `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.served` |
+ | `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning effort for this agent (claude + codex); overrides the default `high`. `--effort` at dispatch overrides it |
+ | `args` | shell-style string (optional) | Arbitrary extra backend flags passed verbatim, e.g. `args: -c model_reasoning_effort="high"` (codex). Model pinning stops being a special case |
++| `transport` | `subprocess` (default), `acp` (optional) | Dispatch transport. `acp` runs the turn over the Agent Client Protocol (native: gemini, kimi, cursor-agent); `--transport` at dispatch overrides it |
+ 
+ **`model:` per-CLI semantics** (the string is passed to the CLI verbatim):
+ 
+diff --git a/skills/summon/references/adding-a-backend.md b/skills/summon/references/adding-a-backend.md
+index 2cd8a68..a828c2c 100644
+--- a/skills/summon/references/adding-a-backend.md
++++ b/skills/summon/references/adding-a-backend.md
+@@ -9,8 +9,12 @@ dict in `scripts/_builder.py`. There are two kinds; pick the one that fits.
+ BACKENDS = {
+     "claude":       {"kind": "subprocess", "build": _build_claude_args},
+     "codex":        {"kind": "subprocess", "build": _build_codex_args},
+-    "cursor-agent": {"kind": "subprocess", "build": _build_cursor_args},
+-    "gemini":       {"kind": "subprocess", "build": _build_gemini_args},
++    "cursor-agent": {"kind": "subprocess", "build": _build_cursor_args,
++                     "acp": {"call": _acp_call}},
++    "gemini":       {"kind": "subprocess", "build": _build_gemini_args,
++                     "acp": {"call": _acp_call}},
++    "kimi":         {"kind": "subprocess", "build": _build_kimi_args, "side_effects": True,
++                     "acp": {"call": _acp_call}},
+     "agy":          {"kind": "subprocess", "build": _build_agy_args, "side_effects": True},
+     "openai-compat": {"kind": "api", "call": _api_call},
+ }
+@@ -29,6 +33,18 @@ things are NOT auto-wired and need a deliberate touch (they're per-backend by na
+   `run_subagent` (like `openai-compat`'s `provider`/`base_url`) and add any fields to
+   `AgentInvocation`. `--dry-run` renders any `api` backend generically.
+ 
++## The optional `"acp"` key (alternate transport)
++
++A subprocess backend with NATIVE Agent Client Protocol support can register
++`"acp": {"call": fn}` (shared `_acp_call` → `_acpbackend.call`, and the argv table
++in `_acpbackend.ACP_ARGV`). When `inv.transport == "acp"` — set by the
++`transport:` frontmatter field, `--transport acp`, the automatic failure
++fallback, or oversized-prompt routing — the executor calls that function
++instead of spawning argv. The call owns its process/session I/O and returns the
++same response shape as Kind 2 below. `supports_acp(cli)` reports presence; the
++envelope records `transport` and keeps the ACP session id under `acp.session_id`
++(never in the `resume` lane — it is not a subprocess resume handle).
++
+ ## Kind 1 — `subprocess` (drive a CLI)
+ 
+ Provide `build(inv) -> (command, args, env_override_or_None)`. The executor spawns
+diff --git a/skills/summon/scripts/_acpbackend.py b/skills/summon/scripts/_acpbackend.py
+new file mode 100644
+index 0000000..9740827
+--- /dev/null
++++ b/skills/summon/scripts/_acpbackend.py
+@@ -0,0 +1,598 @@
++"""ACP (Agent Client Protocol) backend — run a native-ACP CLI over JSON-RPC.
++
++Speaks ACP (JSON-RPC 2.0, newline-delimited JSON over stdio) to the backends
++with NATIVE support — ``gemini --acp``, ``kimi acp``, ``cursor-agent acp`` —
++instead of summon's usual one-shot spawn-and-drain. Registered as the ``"acp"``
++key on a BACKENDS entry (see ``_builder.BACKENDS``); the executor calls
++:func:`call` when ``inv.transport == "acp"`` exactly like it calls
++``_apibackend.call`` for the api kind, and the returned dict flows through the
++same ``_enrich``/``_stamp`` pipeline.
++
++What this transport changes, relative to the subprocess path:
++
++- The prompt travels as a JSON-RPC parameter over stdin, NOT as an argv token —
++  no Windows 32767-char CreateProcess limit, no .cmd shim quoting issues.
++- Output arrives as ONE normalized event schema (``session/update``), not
++  per-vendor NDJSON that ``_stream.StreamProcessor`` has to sniff.
++- Permissions are answered MID-RUN (``session/request_permission``) instead of
++  being pre-approved by argv flags; summon auto-answers from ``inv.permission``
++  (fail closed on anything it cannot classify).
++- ACP has no system-prompt channel, so ``inv.system_context`` is PREPENDED to
++  the user prompt text. Semantically different from ``--append-system-prompt``;
++  an envelope warning says so.
++- The session id is telemetry only. It is NOT a resume handle for the
++  subprocess path (premortem T1): the executor leaves ``resume.session_id``
++  None for ACP runs so ``_apply_schema`` takes its no-resume-lane branch.
++
++Pure stdlib. No SDK, no node adapter.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import subprocess
++import threading
++import time
++
++from _spawn import popen_flags, run_flags
++
++# The ONE place that knows how each backend enters ACP mode. One supported
++# spelling per backend, probed (see _probe_acp); legacy spellings (gemini's
++# --experimental-acp era) are deliberately NOT auto-used.
++ACP_ARGV = {
++    "gemini": ["--acp"],
++    "kimi": ["acp"],
++    "cursor-agent": ["acp"],
++}
++
++_PROTOCOL_VERSION = 1
++_TEARDOWN_GRACE_SEC = 3.0   # wait for exit after terminate() before kill-tree
++_PROBE_TIMEOUT_SEC = 10.0
++
++# ACP stopReason -> summon status. Anything unknown maps conservative: a run we
++# cannot classify is not a success.
++_STOP_REASON_STATUS = {
++    "end_turn": "success",
++    "max_tokens": "partial",
++    "max_turn_requests": "partial",
++    "refusal": "error",
++    "cancelled": "error",
++}
++
++# Tool-call kinds each permission tier lets through WITHOUT a human. Everything
++# else is rejected (fail closed). Mirrors what the argv permission flags buy on
++# the subprocess path: read-only = reads only, safe-edit = no shell execution.
++_ALLOWABLE_KINDS = {
++    "read-only": {"read", "fetch", "search", "think"},
++    "safe-edit": {"read", "fetch", "search", "think", "edit"},
++    "yolo": {"read", "fetch", "search", "think", "edit", "execute",
++             "switch_mode", "move", "other"},
++}
++
++
++class _AcpError(Exception):
++    """Protocol-level failure (JSON-RPC error result, broken pipe, bad spawn)."""
++
++
++class _AcpTimeout(Exception):
++    """A request did not answer inside its slice of the wall-clock deadline."""
++
++
++class _TurnState:
++    """Accumulates everything one prompt turn produces. Reader thread writes,
++    main thread reads at turn end — guarded by one lock.
++
++    Bounded like the subprocess path's output cap: a noisy or hostile child
++    must not exhaust dispatcher memory before the wall-clock deadline or the
++    downstream truncation runs."""
++
++    _MAX_TEXT_CHARS = 200_000
++    _MAX_DIAG_LINES = 2_000
++
++    def __init__(self) -> None:
++        self.lock = threading.Lock()
++        self.text: list = []        # agent_message_chunk content, in order
++        self.diag: list = []        # human-readable tool/plan/thought lines
++        self.usage: dict | None = None
++        self._text_chars = 0
++        self.truncated = False
++
++    def add_text(self, chunk: str) -> None:
++        with self.lock:
++            room = self._MAX_TEXT_CHARS - self._text_chars
++            if room <= 0:
++                self.truncated = True
++                return
++            if len(chunk) > room:
++                chunk = chunk[:room]
++                self.truncated = True
++            self.text.append(chunk)
++            self._text_chars += len(chunk)
++
++    def add_diag(self, line: str) -> None:
++        with self.lock:
++            if len(self.diag) < self._MAX_DIAG_LINES:
++                self.diag.append(line)
++            elif len(self.diag) == self._MAX_DIAG_LINES:
++                self.diag.append(
++                    f"... diagnostics truncated at {self._MAX_DIAG_LINES} lines")
++
++    def set_usage(self, usage: dict) -> None:
++        with self.lock:
++            self.usage = usage
++
++    def snapshot(self) -> tuple:
++        with self.lock:
++            text = "".join(self.text)
++            if self.truncated:
++                text += f"\n...[turn text truncated at {self._MAX_TEXT_CHARS} chars]"
++            return text, list(self.diag), self.usage
++
++
++class _AcpClient:
++    """Minimal JSON-RPC peer: one request in flight per id, notifications and
++    agent->client requests dispatched from a single daemon reader thread.
++
++    stdout is a PROTOCOL channel here — unlike the subprocess backends, stderr
++    is NOT merged into it (a vendor log line would corrupt framing); stderr is
++    drained by its own thread into diagnostics so a full pipe can never block
++    the child.
++    """
++
++    def __init__(self, process: subprocess.Popen, permission: str) -> None:
++        self._proc = process
++        self._permission = permission
++        self._write_lock = threading.Lock()
++        self._id_lock = threading.Lock()
++        self._next_id = 1
++        self._pending: dict = {}
++        self.turn = _TurnState()
++        self.stderr_lines: list = []
++        self._reader = threading.Thread(target=self._read_loop, daemon=True)
++        self._err_reader = threading.Thread(target=self._read_stderr, daemon=True)
++        self._reader.start()
++        self._err_reader.start()
++
++    # -- IO ---------------------------------------------------------------
++
++    def _send(self, msg: dict) -> None:
++        line = json.dumps(msg, ensure_ascii=False) + "\n"
++        with self._write_lock:
++            try:
++                self._proc.stdin.write(line)
++                self._proc.stdin.flush()
++            except (BrokenPipeError, OSError, ValueError) as e:
++                raise _AcpError(f"agent stdin pipe broken: {type(e).__name__}: {e}")
++
++    def _read_stderr(self) -> None:
++        try:
++            for line in self._proc.stderr:
++                # Bounded like the turn state: stderr is diagnostics, not a
++                # memory sink for a noisy child.
++                if len(self.stderr_lines) <= _TurnState._MAX_DIAG_LINES:
++                    self.stderr_lines.append(line.rstrip("\n"))
++        except (OSError, ValueError):
++            pass
++
++    def _read_loop(self) -> None:
++        try:
++            for line in self._proc.stdout:
++                line = line.strip()
++                if not line:
++                    continue
++                try:
++                    msg = json.loads(line)
++                except ValueError:
++                    # A non-JSON line on a protocol channel is vendor noise
++                    # (banner/log bleed). Diagnostics only, never fatal.
++                    self.turn.add_diag(f"non-JSON stdout line skipped: {line[:200]}")
++                    continue
++                if not isinstance(msg, dict):
++                    continue
++                try:
++                    self._dispatch(msg)
++                except Exception as e:  # noqa: BLE001 — the reader must not die
++                    self.turn.add_diag(f"dispatch error: {type(e).__name__}: {e}")
++        except (OSError, ValueError):
++            pass
++        finally:
++            # EOF on stdout: fail every in-flight request so waiters wake up
++            # instead of running out the full wall-clock deadline.
++            with self._id_lock:
++                pending = list(self._pending.values())
++            for slot in pending:
++                slot["response"] = {"error": {"code": -32000,
++                                              "message": "agent closed stdout (EOF)"}}
++                slot["event"].set()
++
++    def _dispatch(self, msg: dict) -> None:
++        if "method" in msg and "id" in msg:
++            self._handle_agent_request(msg)
++        elif "method" in msg:
++            self._handle_notification(msg)
++        elif "id" in msg:
++            with self._id_lock:
++                slot = self._pending.pop(msg["id"], None)
++            if slot is not None:
++                slot["response"] = msg
++                slot["event"].set()
++
++    # -- RPC --------------------------------------------------------------
++
++    def request(self, method: str, params: dict, timeout: float) -> dict:
++        """Send a request and wait for its result. Raises _AcpError on a
++        JSON-RPC error result, _AcpTimeout when the slice expires."""
++        with self._id_lock:
++            rid = self._next_id
++            self._next_id += 1
++            slot = {"event": threading.Event(), "response": None}
++            self._pending[rid] = slot
++        try:
++            self._send({"jsonrpc": "2.0", "id": rid, "method": method,
++                        "params": params})
++        except Exception:
++            with self._id_lock:
++                self._pending.pop(rid, None)
++            raise
++        if not slot["event"].wait(max(0.05, timeout)):
++            with self._id_lock:
++                self._pending.pop(rid, None)
++            raise _AcpTimeout(f"{method} did not answer within {timeout:.0f}s")
++        resp = slot["response"]
++        if "error" in resp:
++            err = resp["error"] or {}
++            raise _AcpError(f"{method} failed: {err.get('code')}: "
++                            f"{err.get('message', '?')}")
++        result = resp.get("result")
++        if result is not None and not isinstance(result, dict):
++            raise _AcpError(f"{method} returned a non-object result: protocol violation")
++        return result or {}
++
++    def notify(self, method: str, params: dict) -> None:
++        try:
++            self._send({"jsonrpc": "2.0", "method": method, "params": params})
++        except _AcpError:
++            pass  # notifications are best-effort (notably session/cancel)
++
++    # -- agent -> client traffic -------------------------------------------
++
++    def _handle_notification(self, msg: dict) -> None:
++        if msg.get("method") != "session/update":
++            return
++        params = msg.get("params") or {}
++        update = params.get("update") or {}
++        kind = update.get("sessionUpdate")
++        if kind == "agent_message_chunk":
++            content = update.get("content") or {}
++            if isinstance(content, dict) and isinstance(content.get("text"), str):
++                self.turn.add_text(content["text"])
++        elif kind == "usage_update":
++            self.turn.set_usage({k: v for k, v in update.items()
++                                 if k != "sessionUpdate"})
++        elif kind in ("tool_call", "tool_call_update"):
++            title = update.get("title") or update.get("toolCallId") or "?"
++            status = update.get("status") or ""
++            self.turn.add_diag(f"tool_call {title} {status}".strip())
++        elif kind in ("plan", "agent_thought_chunk", "available_commands_update",
++                      "current_mode_update"):
++            self.turn.add_diag(f"{kind} received")
++
++    def _handle_agent_request(self, msg: dict) -> None:
++        method = msg.get("method")
++        if method == "session/request_permission":
++            chosen = self._answer_permission(msg.get("params") or {})
++            if chosen is None:
++                # No offered option can be selected safely; the turn cannot
++                # proceed within the declared tier, so cancel it. Inventing or
++                # positionally guessing an optionId could GRANT authority.
++                outcome = {"outcome": "cancelled"}
++            else:
++                outcome = {"outcome": "selected", "optionId": chosen}
++            response = {"jsonrpc": "2.0", "id": msg["id"],
++                        "result": {"outcome": outcome}}
++        else:
++            # We declare no fs/terminal capability at initialize, so anything
++            # else is out of contract; refuse it rather than hanging the agent.
++            response = {"jsonrpc": "2.0", "id": msg["id"],
++                        "error": {"code": -32601,
++                                  "message": f"summon does not implement {method}"}}
++        try:
++            self._send(response)
++        except _AcpError:
++            pass
++
++    def _answer_permission(self, params: dict) -> str | None:
++        """Pick an optionId for session/request_permission from the invocation's
++        permission tier. Prefers *_once kinds — one dispatch must never grant
++        standing permission. Fail CLOSED: the only options ever selected are a
++        present allow_once (in-tier) or a present reject_*. The ACP option list
++        carries NO ordering guarantee, so position is not evidence: when
++        nothing offered can be classified safely, return None and let the
++        caller cancel the turn instead of guessing an optionId the agent never
++        offered."""
++        options = params.get("options") or []
++        tool_kind = ((params.get("toolCall") or {}).get("kind") or "other")
++        allowed = tool_kind in _ALLOWABLE_KINDS.get(self._permission, set())
++
++        def _find(*kinds: str) -> str | None:
++            for opt in options:
++                if str(opt.get("kind", "")) in kinds:
++                    return opt.get("optionId")
++            return None
++
++        if allowed:
++            # allow_once ONLY: one dispatch must never grant standing
++            # permission, so allow_always is treated as "no allow option".
++            chosen = _find("allow_once") or _find("reject_once", "reject_always")
++        else:
++            chosen = _find("reject_once", "reject_always")
++        if chosen is None:
++            self.turn.add_diag(
++                f"permission {self._permission}: tool kind {tool_kind!r} has no "
++                f"safely classifiable option; cancelling the turn (fail closed)")
++        else:
++            self.turn.add_diag(
++                f"permission {self._permission}: tool kind {tool_kind!r} -> "
++                f"{'allow' if allowed else 'reject'} (option {chosen!r})")
++        return chosen
++
++
++# -- capability probe ---------------------------------------------------------
++
++_probe_cache: dict = {}
++_probe_lock = threading.Lock()
++
++
++def _probe_acp(cli: str) -> str | None:
++    """Cheap up-front check that the installed CLI plausibly speaks ACP.
++
++    Returns an error string when ACP is clearly unsupported, None when the
++    probe passes or is inconclusive (a timed-out probe must not block a
++    dispatch — the handshake will surface a real failure). Cached per cli:
++    probing on every fallback would add a spawn to an already-slow path.
++    """
++    with _probe_lock:
++        if cli in _probe_cache:
++            return _probe_cache[cli]
++    verdict = None
++    path = shutil.which(cli)
++    if not path:
++        verdict = f"CLI not found on PATH: {cli}"
++    else:
++        # Windows: a .cmd/.bat shim cannot be exec'd directly — route through
++        # cmd.exe (same handling as _doctor._probe_version).
++        cmd = [path, "--help"]
++        if os.name == "nt" and path.lower().endswith((".cmd", ".bat")):
++            cmd = ["cmd", "/c", path, "--help"]
++        try:
++            r = subprocess.run(cmd, capture_output=True, text=True,
++                               encoding="utf-8", errors="replace",
++                               timeout=_PROBE_TIMEOUT_SEC, stdin=subprocess.DEVNULL,
++                               **run_flags())
++            blob = f"{r.stdout or ''}\n{r.stderr or ''}".lower()
++            if "acp" not in blob:
++                verdict = (f"installed {cli} does not advertise ACP support "
++                           f"(no 'acp' in --help); upgrade the CLI or use "
++                           f"--no-acp-fallback")
++        except (OSError, ValueError, subprocess.SubprocessError):
++            verdict = None  # inconclusive: let the handshake speak
++    with _probe_lock:
++        _probe_cache[cli] = verdict
++    return verdict
++
++
++def _reset_probe_cache() -> None:
++    """Test hook: probes cache per process, but tests install fake CLIs."""
++    with _probe_lock:
++        _probe_cache.clear()
++
++
++# -- main entry point -----------------------------------------------------------
++
++def _err(cli: str, code: int, msg: str, diag: list | None = None) -> dict:
++    resp = {"result": "", "exit_code": code, "status": "error", "cli": cli,
++            "error": msg}
++    if diag:
++        resp["_debug_raw"] = "\n".join(diag)
++    return resp
++
++
++def call(inv, timeout_ms: int) -> dict:
++    """Run one prompt turn over ACP. Returns a response dict in the same shape
++    the subprocess backends produce (result/status/exit_code/cli + session_id/
++    usage/_debug_raw), so it flows through _enrich/_stamp unchanged."""
++    cli = inv.cli
++    acp_args = ACP_ARGV.get(cli)
++    if acp_args is None:
++        return _err(cli, 2, f"backend {cli!r} has no acp transport")
++
++    if inv.resume_id:
++        # An ACP session id is telemetry, not a resume handle (premortem T1);
++        # starting a fresh session while the caller believes they resumed is
++        # worse than refusing.
++        return _err(cli, 2, "resume is not supported over the ACP transport: an "
++                            "ACP session id cannot continue a prior dispatch. Use the "
++                            "subprocess transport's resume, or a fresh run.")
++    # Lazy: _builder imports this module's call at dispatch time; importing the
++    # executor at module load would create an import cycle.
++    from _executor import _kill_tree, _resolve_launch
++
++    probe_err = _probe_acp(cli)
++    if probe_err:
++        return _err(cli, 2, probe_err)
++
++    command, args = _resolve_launch(cli, list(acp_args))
++    try:
++        process = subprocess.Popen(
++            [command, *args],
++            cwd=inv.cwd,
++            stdin=subprocess.PIPE,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,   # NOT merged: stdout is a protocol channel
++            text=True, encoding="utf-8", errors="replace", bufsize=1,
++            **popen_flags(),
++        )
++    except FileNotFoundError:
++        return _err(cli, 127, f"CLI not found: {command}")
++    except OSError as e:
++        return _err(cli, 1, f"{type(e).__name__}: {e}")
++
++    # Windows: kill-on-close Job Object, same reasoning as the subprocess path
++    # (an unexpected summon death must not orphan a paid backend).
++    try:
++        from _jobobj import attach as _job_attach
++        _job_attach(process)
++    except Exception:  # noqa: BLE001 — teardown plumbing never breaks dispatch
++        pass
++
++    deadline = time.monotonic() + timeout_ms / 1000
++    client = _AcpClient(process, inv.permission)
++    try:
++        def _remaining() -> float:
++            return deadline - time.monotonic()
++
++        # 1. Handshake. No fs/terminal capability: agents then use their own
++        # built-in tools instead of proxying I/O through us.
++        init = client.request("initialize", {
++            "protocolVersion": _PROTOCOL_VERSION,
++            "clientCapabilities": {
++                "fs": {"readTextFile": False, "writeTextFile": False},
++                "terminal": False,
++            },
++            "clientInfo": {"name": "summon", "version": "1"},
++        }, timeout=min(30.0, max(0.05, _remaining())))
++
++        # 2. Session.
++        session = client.request("session/new", {
++            "cwd": os.path.abspath(inv.cwd),
++            "mcpServers": [],
++        }, timeout=min(60.0, max(0.05, _remaining())))
++        session_id = session.get("sessionId")
++
++        # 3. Model pinning is best-effort: ACP's stable schema has no model on
++        # session/new; sessions that advertise a model list may accept
++        # session/set_model. Never FAKE the pin — an unverifiable request gets
++        # a warning, not a model_resolved claim.
++        model_targeted = None
++        warnings: list = []
++        if inv.model:
++            models = (session.get("models") or {})
++            available = models.get("availableModels") or []
++            wanted = str(inv.model).lower()
++            hit = next((m for m in available
++                        if str(m.get("modelId", "")).lower() == wanted
++                        or str(m.get("name", "")).lower() == wanted), None)
++            if hit:
++                try:
++                    client.request("session/set_model", {
++                        "sessionId": session_id,
++                        "modelId": hit["modelId"],
++                    }, timeout=min(15.0, max(0.05, _remaining())))
++                    model_targeted = inv.model
++                except (_AcpError, _AcpTimeout):
++                    warnings.append(
++                        f"model {inv.model!r} was advertised but session/set_model "
++                        f"was rejected over ACP; the backend default may run instead")
++            else:
++                warnings.append(
++                    f"model pinning over ACP is best-effort and {cli} advertised no "
++                    f"model list; requested {inv.model!r}, the backend default runs "
++                    f"(subprocess transport pins via argv)")
++
++        if inv.system_context:
++            warnings.append(
++                "ACP has no system-prompt channel; the agent definition was "
++                "prepended to the user prompt (subprocess transport uses a "
++                "dedicated flag)")
++        prompt_text = ((inv.system_context + "\n\n" + inv.prompt)
++                       if inv.system_context else inv.prompt)
++
++        # 4. The turn. Ends at the session/prompt RESPONSE, not at process
++        # exit — ACP agents are long-lived by design.
++        try:
++            result = client.request("session/prompt", {
++                "sessionId": session_id,
++                "prompt": [{"type": "text", "text": prompt_text}],
++            }, timeout=max(0.05, _remaining()))
++        except _AcpTimeout:
++            # Politeness first: cancel the turn so a cooperative agent stops
++            # spending tokens; the finally-block teardown kills the tree either
++            # way. The late "cancelled" prompt response is simply discarded
++            # (our pending slot is already gone).
++            client.notify("session/cancel", {"sessionId": session_id})
++            raise
++
++        if "stopReason" not in result:
++            raise _AcpError("session/prompt response carried no stopReason: "
++                            "protocol violation (a malformed success is not a success)")
++        stop = result["stopReason"]
++        text, diag, usage = client.turn.snapshot()
++        status = _STOP_REASON_STATUS.get(stop, "error")
++        resp = {
++            "result": text,
++            "exit_code": 0 if status == "success" else 1,
++            "status": status,
++            "cli": cli,
++            "session_id": session_id,
++        }
++        if status != "success":
++            resp["error"] = f"agent stopped: {stop}"
++        if usage:
++            resp["usage"] = usage
++        if model_targeted:
++            resp["model_targeted"] = model_targeted
++        if warnings:
++            resp["warnings"] = warnings
++        raw = diag + (["", "# stderr"] + client.stderr_lines
++                      if client.stderr_lines else [])
++        if raw:
++            resp["_debug_raw"] = "\n".join(raw)
++        return resp
++
++    except _AcpTimeout:
++        text, diag, _ = client.turn.snapshot()
++        resp = {
++            "result": text,
++            "exit_code": 124,
++            "status": "partial" if text else "error",
++            "cli": cli,
++            "error": f"timed out after {timeout_ms}ms over ACP"
++                     + ("; partial output preserved" if text else ""),
++            "normalization_reason": ("timed out; partial output preserved" if text
++                                     else "timed out before any usable output"),
++        }
++        raw = diag + (["", "# stderr"] + client.stderr_lines
++                      if client.stderr_lines else [])
++        if raw:
++            resp["_debug_raw"] = "\n".join(raw)
++        return resp
++    except _AcpError as e:
++        _, diag, _ = client.turn.snapshot()
++        tail = "\n".join(client.stderr_lines[-20:])
++        return _err(cli, 1, f"{e}" + (f" | stderr tail: {tail[:400]}" if tail else ""),
++                    diag or None)
++    finally:
++        # Premortem T4: NEVER wait on natural process exit after the turn ends —
++        # ACP agents stay alive for the next prompt. Close stdin, terminate,
++        # brief grace, kill the tree. Runs on every exit path (success, error,
++        # timeout) and costs milliseconds on a cooperative agent.
++        try:
++            if process.stdin:
++                process.stdin.close()
++        except Exception:  # noqa: BLE001
++            pass
++        try:
++            process.terminate()
++        except Exception:  # noqa: BLE001
++            pass
++        try:
++            process.wait(timeout=_TEARDOWN_GRACE_SEC)
++        except Exception:  # noqa: BLE001
++            _kill_tree(process)
++        try:
++            from _jobobj import close as _job_close
++            _job_close(process)
++        except Exception:  # noqa: BLE001
++            pass
+diff --git a/skills/summon/scripts/_builder.py b/skills/summon/scripts/_builder.py
+index 4e8b324..70664f9 100644
+--- a/skills/summon/scripts/_builder.py
++++ b/skills/summon/scripts/_builder.py
+@@ -37,6 +37,10 @@ class AgentInvocation:
+     system_context: str = ""
+     agent_file: str | None = None
+     permission: str = DEFAULT_PERMISSION
++    # "subprocess" (default: spawn the CLI one-shot) or "acp" (run the turn over
++    # the Agent Client Protocol, where the backend supports it natively). The
++    # executor dispatches on this; see _acpbackend.
++    transport: str = "subprocess"
+     model: str | None = None
+     effort: str | None = None          # reasoning effort (claude only): low..max
+     resume_id: str | None = None       # backend session/thread/chat id to resume
+@@ -1601,6 +1605,9 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
+ #                  to spawn (claude/codex/cursor/gemini/agy).
+ #   "api"        — the executor calls the backend's own request function instead
+ #                  of spawning a process (openai-compat: an HTTP call).
++# An optional "acp" key on a subprocess backend registers NATIVE Agent Client
++# Protocol support: {"call": fn} invoked when inv.transport == "acp" (fallback,
++# oversized prompts, or explicit opt-in — see _acpbackend).
+ # Adding a backend = add ONE entry here (+ its build/call fn). ``side_effects``
+ # flags a build that mutates the filesystem (agy creates a per-call profile), so
+ # callers like --dry-run know not to invoke build() as a pure preview.
+@@ -1612,12 +1619,23 @@ def _api_call(inv: AgentInvocation, timeout_ms: int) -> dict:
+     return _call(inv, timeout_ms)
+ 
+ 
++def _acp_call(inv: AgentInvocation, timeout_ms: int) -> dict:
++    from _acpbackend import call as _call    # lazy: keep _builder import-light
++    return _call(inv, timeout_ms)
++
++
+ BACKENDS: dict = {
+     "claude":       {"kind": "subprocess", "build": _build_claude_args},
+     "codex":        {"kind": "subprocess", "build": _build_codex_args},
+-    "cursor-agent": {"kind": "subprocess", "build": _build_cursor_args},
+-    "gemini":       {"kind": "subprocess", "build": _build_gemini_args},
+-    "kimi":         {"kind": "subprocess", "build": _build_kimi_args, "side_effects": True},
++    # The "acp" key marks NATIVE Agent Client Protocol support and provides the
++    # call the executor uses when inv.transport == "acp". The backend keeps its
++    # subprocess kind/build as the primary transport; ACP is the alternate.
++    "cursor-agent": {"kind": "subprocess", "build": _build_cursor_args,
++                     "acp": {"call": _acp_call}},
++    "gemini":       {"kind": "subprocess", "build": _build_gemini_args,
++                     "acp": {"call": _acp_call}},
++    "kimi":         {"kind": "subprocess", "build": _build_kimi_args, "side_effects": True,
++                     "acp": {"call": _acp_call}},
+     "agy":          {"kind": "subprocess", "build": _build_agy_args, "side_effects": True},
+     "openai-compat": {"kind": "api", "call": _api_call},
+ }
+@@ -1633,6 +1651,13 @@ def backend_kind(cli: str) -> str | None:
+     return b["kind"] if b else None
+ 
+ 
++def supports_acp(cli: str) -> bool:
++    """True when the backend has a NATIVE ACP entry point (the executor can
++    dispatch inv.transport == "acp" to it)."""
++    b = BACKENDS.get(cli)
++    return bool(b and b.get("acp"))
++
++
+ def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None
+                           ) -> tuple[str, list, dict | None]:
+     """Dispatch to a SUBPROCESS backend's argument builder.
+diff --git a/skills/summon/scripts/_cli.py b/skills/summon/scripts/_cli.py
+index c532391..008bbbf 100644
+--- a/skills/summon/scripts/_cli.py
++++ b/skills/summon/scripts/_cli.py
+@@ -331,6 +331,13 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
+     parser.add_argument("--effort", help="Reasoning effort (claude): low|medium|high|xhigh|max")
+     parser.add_argument("--resume", dest="resume", help="Backend session/thread/chat id to resume")
+     parser.add_argument("--resume-profile", help="agy only: profile dir of the session being resumed")
++    parser.add_argument("--transport", choices=["subprocess", "acp"], default=None,
++                        help="Force the dispatch transport. 'acp' runs the turn over the "
++                             "Agent Client Protocol (native support: gemini, kimi, "
++                             "cursor-agent). Overrides the agent's `transport:` frontmatter.")
++    parser.add_argument("--no-acp-fallback", dest="no_acp_fallback", action="store_true",
++                        help="Disable the automatic ACP recovery attempt (and oversized-prompt "
++                             "ACP routing) when the subprocess transport fails")
+     parser.add_argument("--worktree", nargs="?", const="", default=None,
+                         help="Run in an isolated git worktree (optional name; auto-named if bare)")
+     parser.add_argument("--background", action="store_true",
+diff --git a/skills/summon/scripts/_doctor.py b/skills/summon/scripts/_doctor.py
+index 9f59b5e..6be9764 100644
+--- a/skills/summon/scripts/_doctor.py
++++ b/skills/summon/scripts/_doctor.py
+@@ -156,6 +156,18 @@ def _check_backends() -> dict:
+         else:
+             entry["install"] = _BACKENDS[name]["install"]
+         entry["auth_hint"] = _BACKENDS[name]["auth"]
++        # Native ACP transport (gemini/kimi/cursor-agent): whether the INSTALLED
++        # version actually speaks it, so a too-old CLI is discovered here
++        # rather than when the automatic ACP fallback fires mid-incident.
++        if name in ("gemini", "kimi", "cursor-agent") and path:
++            try:
++                from _acpbackend import _probe_acp
++                _acp_err = _probe_acp(name)
++                entry["acp"] = {"supported": _acp_err is None}
++                if _acp_err:
++                    entry["acp"]["note"] = _acp_err
++            except Exception:  # noqa: BLE001 - advisory; never break doctor
++                pass
+         out[name] = entry
+     return out
+ 
+@@ -430,6 +442,13 @@ def render(report: dict) -> str:
+                     detail = f"{ver} - installed; eligibility unverified  ({b['path']})"
+         lines.append(f"  {mark} {name:<13} {detail}")
+         lines.append(f"       auth: {b['auth_hint']}")
++        # Native ACP support of the INSTALLED CLI (fallback/oversized prompts
++        # depend on it); shown only where the backend can speak ACP at all.
++        if b.get("acp"):
++            if b["acp"].get("supported"):
++                lines.append("       acp: [OK] native ACP transport available")
++            else:
++                lines.append(f"       acp: [--] {b['acp'].get('note', 'not supported')}")
+         # The disclosure reached --json and stopped there, so the person actually READING
+         # doctor saw "eligibility verified" with no hint that read-only was never exercised
+         # for this backend. Two outputs describing one probe, and only the one nobody reads
+diff --git a/skills/summon/scripts/_executor.py b/skills/summon/scripts/_executor.py
+index 8706ef5..4e3f1fc 100644
+--- a/skills/summon/scripts/_executor.py
++++ b/skills/summon/scripts/_executor.py
+@@ -2206,6 +2206,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
+                 f"both are kept in the `model` field (a pinned agent model may have "
+                 f"been rerouted or fallen back)")
+         resp["permission"] = inv.permission
++        resp["transport"] = inv.transport   # which path served the run (subprocess|acp)
+         resp["effort"] = inv.effort   # reasoning effort actually applied (None = backend default)
+         # True only for a caller-requested continuation. Automatic schema/report
+         # repair retries have their own explicit fields and do not relabel the root run.
+@@ -2276,6 +2277,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
+         debug_argv = [inv.cli, inv.base_url or "?", inv.model or "?"]
+         resp = _enrich(BACKENDS[inv.cli]["call"](inv, timeout_ms), None)
+         resp["resume"] = {"cli": inv.cli, "session_id": None}  # stateless: no resume
++        raw = resp.pop("_debug_raw", None)
++        _finalize_diagnostics(resp, raw, debug_dir, debug_argv, max_tool_output_bytes)
+         return _stamp(resp)
+ 
+     # BEFORE build_invocation_args, which has side effects: for agy it creates a
+@@ -2286,6 +2289,33 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
+     if _ro_err:
+         return _stamp(_enrich(_error_response(inv.cli, 1, _ro_err), None))
+ 
++    # ACP transport (gemini/kimi/cursor-agent): the backend speaks the Agent
++    # Client Protocol natively, so the turn runs over JSON-RPC stdio instead of
++    # a one-shot argv spawn. The call owns its session I/O and returns the
++    # standard shape, like the api kind above. Placed AFTER the read-only guard
++    # so an unenforceable tier fails closed identically on both transports.
++    if inv.transport == "acp":
++        from _builder import supports_acp as _supports_acp
++        if not _supports_acp(inv.cli):
++            return _stamp(_enrich(_error_response(
++                inv.cli, 2, f"backend {inv.cli!r} has no acp transport"), None))
++        debug_argv = [inv.cli, "<acp>"]
++        resp = _enrich(BACKENDS[inv.cli]["acp"]["call"](inv, timeout_ms), None)
++        # Premortem T1: the ACP session id is NOT a resume handle for the
++        # subprocess path — _apply_schema re-dispatches the ORIGINAL invocation
++        # with resume_id=<that id>, a wrong-namespace resume on cursor-agent.
++        # Keep the resume lane dead; carry the id as telemetry only.
++        resp["acp"] = {"session_id": resp.get("session_id")}
++        resp["resume"] = {"cli": inv.cli, "session_id": None}
++        # Same artifact contract as the subprocess path: _debug_raw never ships
++        # inside the envelope, and every persisted/returned field is
++        # secret-redacted (backend stderr can echo credentials).
++        return _stamp(resp)
++    if inv.transport != "subprocess":
++        return _stamp(_enrich(_error_response(
++            inv.cli, 2, f"unknown transport {inv.transport!r} "
++                        f"(use 'subprocess' or 'acp')"), None))
++
+     # timeout_ms is threaded to the builder so agy's wrapper deadline AND its
+     # profile-TTL cleanup (which runs during build) both reflect the real request.
+     try:
+@@ -2310,6 +2340,26 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
+     # matters is the one Popen receives -- overrides included, stripped keys excluded.
+     _argv_err = argv_length_error(inv.cli, command, args, proc_env)
+     if _argv_err:
++        # A prompt that cannot fit in argv can still go over ACP — the prompt is
++        # a JSON-RPC parameter on stdin there, with no OS command-line limit.
++        # Only for backends with NATIVE ACP support; the kill switch and the
++        # fallback envelope field apply even to an explicit --transport
++        # subprocess pin, because the alternative here is certain failure.
++        from _builder import supports_acp as _supports_acp
++        if (_supports_acp(inv.cli)
++                and os.environ.get("SUMMON_ACP_FALLBACK") != "0"):
++            from dataclasses import replace as _replace_inv
++            _routed = execute_agent(_replace_inv(inv, transport="acp"),
++                                    timeout_ms=timeout_ms, debug_dir=debug_dir,
++                                    max_tool_output_bytes=max_tool_output_bytes)
++            _routed.setdefault("warnings", []).append(
++                "the prompt exceeded the OS command-line length limit for the "
++                "subprocess transport, so summon routed this dispatch over ACP "
++                "(stdin JSON-RPC has no argv cap)")
++            _routed["fallback"] = {"from": "subprocess", "to": "acp",
++                                   "reason": "argv-length",
++                                   "primary_status": "not_dispatched"}
++            return _routed
+         # exit 1, not 127: 127 means "CLI not found", and reporting this as a missing
+         # binary is precisely the misdiagnosis being fixed.
+         _resp = _error_response(inv.cli, 1, _argv_err)
+diff --git a/skills/summon/scripts/run_subagent.py b/skills/summon/scripts/run_subagent.py
+index 2720359..0574fca 100644
+--- a/skills/summon/scripts/run_subagent.py
++++ b/skills/summon/scripts/run_subagent.py
+@@ -115,6 +115,27 @@ def _compat_endpoint(agent_file: str, agents_dir: str) -> tuple:
+     return resolve_endpoint(fm, agents_dir)
+ 
+ 
++def _transport_for_dispatch(agent_file: str | None, cli_arg: str | None) -> str:
++    """Resolve the dispatch transport: --transport flag > agent `transport:`
++    frontmatter > "subprocess". Raises ValueError on an unknown value.
++
++    Re-reads the frontmatter like _compat_endpoint (utf-8-sig, so a BOM cannot
++    hide the field) instead of widening load_agent's return tuple, which has
++    many callers."""
++    fm_transport = None
++    if agent_file:
++        from _loader import parse_frontmatter
++        with open(agent_file, encoding="utf-8-sig") as fh:
++            fm, _ = parse_frontmatter(fh.read())
++        raw = fm.get("transport")
++        if raw is not None:
++            fm_transport = str(raw).strip().lower()
++    transport = (cli_arg or fm_transport or "subprocess").lower()
++    if transport not in ("subprocess", "acp"):
++        raise ValueError(f"invalid transport {transport!r}: use 'subprocess' or 'acp'")
++    return transport
++
++
+ def _write_error_out(out_path: str, env: dict) -> None:
+     """Record a failure at the authoritative --out path WITHOUT ever destroying a stored
+     success.
+@@ -926,6 +947,23 @@ def main() -> None:
+         except (OSError, ValueError) as e:
+             _die(f"openai-compat agent {args.agent!r}: {e}")
+ 
++    # Transport: --transport flag > agent `transport:` frontmatter > subprocess.
++    # ACP requires NATIVE backend support; asking for it anywhere else is a
++    # configuration error, not a dispatch failure.
++    try:
++        transport = _transport_for_dispatch(agent_file, getattr(args, "transport", None))
++    except ValueError as e:
++        _die(str(e))
++    if transport == "acp":
++        from _builder import supports_acp as _supports_acp
++        if not _supports_acp(cli):
++            _die(f"backend {cli!r} has no acp transport "
++                 f"(native ACP: gemini, kimi, cursor-agent)")
++    # The kill switch is process-wide: the executor's oversized-prompt ACP
++    # routing reads the env var and never sees args, so the flag writes it here.
++    if getattr(args, "no_acp_fallback", False):
++        os.environ["SUMMON_ACP_FALLBACK"] = "0"
++
+     # A bare sub-second --timeout is a units mistake on a DISPATCH: bare values are
+     # milliseconds for backward compatibility, so `--timeout 300` means 0.3s and kills every
+     # agent almost immediately. A four-member council lost a whole run to this (field
+@@ -964,6 +1002,7 @@ def main() -> None:
+         extra_args=(() if getattr(args, "max_permission", None)
+                     else tuple(extra_args)),
+         base_url=base_url,
++        transport=transport,             # --transport > frontmatter > subprocess
+         # the account digest the identity recorded, so the dispatch can verify the profile
+         # it builds carries the SAME bytes
+         agy_account_sha256=_identity.get("agy_account_sha256"),
+@@ -1153,7 +1192,12 @@ def _dry_run_view(invocation, args, agents_dir: str,
+         view.update(receipt_agent(args, agent_file))
+     except Exception:  # noqa: BLE001
+         pass
+-    if backend_kind(invocation.cli) == "api":
++    if invocation.transport == "acp":
++        # ACP dispatches build no argv (the executor hands the turn to
++        # _acpbackend.call); render the transport, not a command line.
++        view["command"] = f"{invocation.cli} <acp>"
++        view["transport"] = "acp"
++    elif backend_kind(invocation.cli) == "api":
+         view["command"] = f"POST ({invocation.cli})"
+         view["base_url"] = invocation.base_url
+         view["endpoint"] = (invocation.base_url or "?") + "/chat/completions"
+@@ -1424,6 +1468,48 @@ def _is_agy_scrape_loss(result: dict) -> bool:
+                 ("agy backend:", "agy prompt is", "agy cannot enforce")))
+ 
+ 
++def _acp_fallback_enabled(args) -> bool:
++    """Kill switch: --no-acp-fallback, or SUMMON_ACP_FALLBACK=0 (which the flag
++    also sets so the executor's oversized-prompt routing sees it)."""
++    return (os.environ.get("SUMMON_ACP_FALLBACK") != "0"
++            and not getattr(args, "no_acp_fallback", False))
++
++
++def _acp_fallback_worthy(result: dict) -> bool:
++    """True only for failure classes a TRANSPORT change can fix (premortem T3).
++
++    Deliberately narrow, same philosophy as _is_agy_scrape_loss: a fallback that
++    fires on a structural failure spends a real paid dispatch to fail the same
++    way over a different wire. IN: timeouts, stream-sniffing/output-shape
++    losses, mid-stream pipe failures, backend-internal errors. OUT:
++    CLI-not-found (ACP spawns the same binary), auth/eligibility (a credential
++    problem, not a transport problem), structural refusals that never reached a
++    backend, argv-length (the executor routes those over ACP itself)."""
++    if result.get("status") not in ("error", "partial"):
++        return False
++    reason = (result.get("normalization_reason") or "").lower()
++    if result.get("exit_code") == 124 or "timed out" in reason:
++        return True
++    err = (result.get("error") or "").lower()
++    if "over the windows limit" in err or "a single argument is" in err:
++        return False
++    if result.get("exit_code") == 127 or "cli not found" in err:
++        return False
++    if "cannot enforce" in err:
++        return False
++    # Auth/eligibility signatures, shared with --doctor's classifier so a newly
++    # catalogued signature narrows fallback automatically. The result tail is
++    # included because an auth failure sometimes surfaces only in output text.
++    try:
++        from _doctor import classify_ineligibility
++        text = " ".join([err, reason, (result.get("result") or "")[:500]])
++        if classify_ineligibility(text, backend=result.get("cli")):
++            return False
++    except Exception:  # noqa: BLE001 — a broken classifier must not block recovery
++        pass
++    return True
++
++
+ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
+     """execute_agent with --retries: exponential backoff on error/partial only
+     (blocked won't improve by retrying — its cause is structural).
+@@ -1478,6 +1564,55 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
+             return result
+         time.sleep(min(30, 2 ** attempt))
+     result["attempts"] = attempt
++
++    # ACP fallback: ONE recovery attempt over the Agent Client Protocol when the
++    # subprocess path failed in a way a transport change can fix (premortem T3
++    # predicate keeps it narrow). Re-gated like any retry; spend and attempts
++    # stay honest whichever envelope is returned; the `fallback` field records
++    # the attempt either way (and doubles as Phase-2 scoping telemetry, E1).
++    from _builder import supports_acp as _supports_acp
++    if (result.get("status") in ("error", "partial")
++            and invocation.transport == "subprocess"
++            and _supports_acp(invocation.cli)
++            and _acp_fallback_enabled(args)
++            and _acp_fallback_worthy(result)):
++        refused = _regate_or_none(args, agents_dir, invocation)
++        if refused is not None:
++            from _gate import blocked_envelope
++            denied = _enrich_denial(
++                blocked_envelope(refused, agent=getattr(args, "agent", None),
++                                 cli=invocation.cli),
++                getattr(args, "_receipt", None), invocation)
++            # The primary attempt's spend happened whether or not the gate
++            # allows the recovery; folding it in keeps accounting honest.
++            _aggregate_spend(denied, result)
++            denied["attempts"] = attempt
++            return denied
++        from dataclasses import replace as _replace
++        fb = execute_agent(_replace(invocation, transport="acp"),
++                           timeout_ms=args.timeout, debug_dir=args.debug_dir,
++                           max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
++        if fb.get("status") == "success":
++            # Recovered: return the ACP envelope with the primary failure folded
++            # in (spend + provenance), never silently.
++            _aggregate_spend(fb, result)
++            fb["attempts"] = attempt + 1
++            fb["fallback"] = {
++                "from": "subprocess", "to": "acp",
++                "reason": result.get("error") or result.get("normalization_reason"),
++                "primary_status": result.get("status"),
++            }
++            fb.setdefault("warnings", []).append(
++                "the subprocess transport failed, so summon recovered this run over "
++                "ACP (see `fallback`). This spent an extra dispatch (see `attempts`). "
++                "Use --no-acp-fallback to control it.")
++            return fb
++        # Recovery failed too: keep the ORIGINAL envelope (richer primary-path
++        # diagnostics), but the spent fallback attempt is recorded and billed.
++        _aggregate_spend(result, fb)
++        result["attempts"] = attempt + 1
++        result["fallback"] = {"to": "acp", "status": fb.get("status"),
++                              "error": fb.get("error")}
+     return result
+ 
+ 
+diff --git a/tests/fixtures/fake_acp_agent.py b/tests/fixtures/fake_acp_agent.py
+new file mode 100644
+index 0000000..e9a035d
+--- /dev/null
++++ b/tests/fixtures/fake_acp_agent.py
+@@ -0,0 +1,144 @@
++#!/usr/bin/env python3
++"""Fake ACP agent for tests — speaks newline-delimited JSON-RPC over stdio.
++
++Usage: python fake_acp_agent.py acp [MODE]
++
++Modes:
++  happy            chunks + tool_call + report block, stopReason end_turn
++  permission-read  asks permission for a read-kind tool call first
++  permission-exec  asks permission for an execute-kind tool call first
++  permission-no-once  offers ONLY allow_always for a read-kind call
++  permission-empty   offers an empty options list for a read-kind call
++  no-stopreason      answers session/prompt with a result missing stopReason
++  slow             never answers session/prompt (timeout/cancel tests)
++  malformed        emits a non-JSON line on stdout mid-stream
++  lingering        answers the turn, then sleeps (teardown must not wait)
++  refusal          stopReason refusal
++
++`--help` prints text containing "acp" so _probe_acp passes; set env
++FAKE_ACP_NO_HELP=1 to print help WITHOUT the token (probe-failure test).
++"""
++import json
++import os
++import sys
++import time
++
++REPORT = ("Final report\nSTATUS: DONE\nSUMMARY: fake turn completed\n"
++          "FOLLOW-UP: none\nHANDOFF: none")
++
++
++def send(msg):
++    sys.stdout.write(json.dumps(msg) + "\n")
++    sys.stdout.flush()
++
++
++def main():
++    if "--help" in sys.argv:
++        if os.environ.get("FAKE_ACP_NO_HELP"):
++            print("usage: fake [options]\nA fake agent. No protocol flags here.")
++        else:
++            print("usage: fake [options]\n  acp    run in acp mode")
++        return
++    if "--version" in sys.argv:
++        print("fake-acp-agent 1.0")
++        return
++
++    mode = sys.argv[2] if len(sys.argv) > 2 else "happy"
++    session_id = "fake-session-1"
++    pending_permission = None
++
++    for line in sys.stdin:
++        line = line.strip()
++        if not line:
++            continue
++        msg = json.loads(line)
++        if "method" not in msg:
++            # A response to OUR request (the permission answer).
++            if pending_permission is not None and msg.get("id") == pending_permission:
++                send({"jsonrpc": "2.0", "method": "session/update", "params": {
++                    "sessionId": session_id,
++                    "update": {"sessionUpdate": "agent_message_chunk",
++                               "content": {"type": "text",
++                                           "text": "permission answered: "
++                                                   + json.dumps(msg.get("result")) + "\n"}}}})
++                pending_permission = None
++            continue
++
++        method, mid, params = msg["method"], msg.get("id"), msg.get("params") or {}
++
++        if method == "initialize":
++            send({"jsonrpc": "2.0", "id": mid, "result": {
++                "protocolVersion": 1, "agentCapabilities": {}}})
++        elif method == "session/new":
++            send({"jsonrpc": "2.0", "id": mid, "result": {
++                "sessionId": session_id,
++                "models": {"availableModels": [
++                    {"modelId": "fake-model", "name": "Fake Model"}],
++                    "currentModelId": "fake-model"}}})
++        elif method == "session/set_model":
++            send({"jsonrpc": "2.0", "id": mid, "result": {}})
++        elif method == "session/cancel":
++            print("cancel received", file=sys.stderr, flush=True)
++        elif method == "session/prompt":
++            if mode == "slow":
++                time.sleep(3600)  # kill-tree must reap us; never answer
++                continue
++            if mode == "malformed":
++                sys.stdout.write("this is not json\n")
++                sys.stdout.flush()
++            if mode.startswith("permission-"):
++                kind = "execute" if mode == "permission-exec" else "read"
++                if mode == "permission-no-once":
++                    options = [{"optionId": "allow_always", "name": "Always",
++                                "kind": "allow_always"}]
++                elif mode == "permission-empty":
++                    options = []
++                else:
++                    options = [
++                        {"optionId": "allow_always", "name": "Always",
++                         "kind": "allow_always"},
++                        {"optionId": "allow_once", "name": "Once",
++                         "kind": "allow_once"},
++                        {"optionId": "reject_once", "name": "No",
++                         "kind": "reject_once"}]
++                pending_permission = 999
++                send({"jsonrpc": "2.0", "id": 999,
++                      "method": "session/request_permission",
++                      "params": {"sessionId": session_id,
++                                 "toolCall": {"toolCallId": "t1", "kind": kind,
++                                              "title": "fake tool", "status": "pending"},
++                                 "options": options}})
++                # Wait for the answer before finishing the turn.
++                for ans in sys.stdin:
++                    amsg = json.loads(ans)
++                    if amsg.get("id") == 999:
++                        send({"jsonrpc": "2.0", "method": "session/update",
++                              "params": {"sessionId": session_id, "update": {
++                                  "sessionUpdate": "agent_message_chunk",
++                                  "content": {"type": "text",
++                                              "text": "permission answered: "
++                                                      + json.dumps(amsg.get("result"))
++                                                      + "\n"}}}})
++                        break
++            if mode == "no-stopreason":
++                # Protocol violation: PromptResponse MUST carry stopReason.
++                send({"jsonrpc": "2.0", "id": mid, "result": {}})
++                continue
++            for chunk in ("Hello ", "from the fake agent.\n\n", REPORT):
++                send({"jsonrpc": "2.0", "method": "session/update", "params": {
++                    "sessionId": session_id,
++                    "update": {"sessionUpdate": "agent_message_chunk",
++                               "content": {"type": "text", "text": chunk}}}})
++            send({"jsonrpc": "2.0", "method": "session/update", "params": {
++                "sessionId": session_id,
++                "update": {"sessionUpdate": "tool_call", "toolCallId": "t0",
++                           "title": "fake read", "kind": "read",
++                           "status": "completed"}}})
++            stop = "refusal" if mode == "refusal" else "end_turn"
++            send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": stop}})
++            if mode == "lingering":
++                time.sleep(3600)  # post-turn linger: teardown must not wait
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_acpbackend.py b/tests/test_acpbackend.py
+new file mode 100644
+index 0000000..ef95fb3
+--- /dev/null
++++ b/tests/test_acpbackend.py
+@@ -0,0 +1,512 @@
++#!/usr/bin/env python3
++"""ACP backend tests — protocol client, permission policy, teardown, fallback.
++
++Uses tests/fixtures/fake_acp_agent.py as the far end of the wire: a real
++subprocess speaking NDJSON JSON-RPC, so the client is exercised end-to-end
++(spawn, framing, permission round-trip, timeout, kill) without a vendor CLI.
++
++Run: python -m pytest tests/test_acpbackend.py -q   (or plain: python tests/test_acpbackend.py)
++"""
++from __future__ import annotations
++
++import os
++import json
++import stat
++import sys
++import tempfile
++import time
++import types
++
++REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++SCRIPTS = os.path.join(REPO, "skills", "summon", "scripts")
++sys.path.insert(0, SCRIPTS)
++
++import _acpbackend  # noqa: E402
++import _executor  # noqa: E402
++from _builder import AgentInvocation, supports_acp  # noqa: E402
++
++FIXTURE = os.path.join(REPO, "tests", "fixtures", "fake_acp_agent.py")
++
++
++# --- helpers ------------------------------------------------------------------
++
++def _patch_launch(monkeypatch=None):
++    """Point the ACP spawn at the fixture instead of a vendor CLI, and skip the
++    PATH capability probe (probe behavior has its own tests below). Restores on
++    teardown when a pytest monkeypatch is supplied; otherwise the caller must
++    restore via the returned tuple."""
++    orig_launch = _executor._resolve_launch
++    orig_probe = _acpbackend._probe_acp
++
++    def fake_launch(command, args):
++        return sys.executable, [FIXTURE, *args]
++
++    _executor._resolve_launch = fake_launch
++    _acpbackend._probe_acp = lambda cli: None
++    return orig_launch, orig_probe
++
++
++def _restore(patched):
++    _executor._resolve_launch, _acpbackend._probe_acp = patched
++
++
++def _inv(mode_cli="gemini", permission="yolo", model=None, prompt="say hi"):
++    return AgentInvocation(cli=mode_cli, prompt=prompt, cwd=os.getcwd(),
++                           permission=permission, transport="acp", model=model)
++
++
++def _call(mode="happy", timeout_ms=30000, **inv_kw):
++    patched = _patch_launch()
++    try:
++        # mode is passed to the fixture as the token after the acp flag: the
++        # fake launcher appends *args, and ACP_ARGV["gemini"] == ["--acp"], so
++        # inject the mode by rewriting ACP_ARGV for this call.
++        orig_argv = dict(_acpbackend.ACP_ARGV)
++        _acpbackend.ACP_ARGV["gemini"] = ["acp", mode]
++        try:
++            return _acpbackend.call(_inv(**inv_kw), timeout_ms)
++        finally:
++            _acpbackend.ACP_ARGV.update(orig_argv)
++    finally:
++        _restore(patched)
++
++
++# --- protocol client ----------------------------------------------------------
++
++def test_happy_path_envelope_shape():
++    resp = _call("happy")
++    assert resp["status"] == "success", resp
++    assert resp["exit_code"] == 0
++    assert "Hello from the fake agent." in resp["result"]
++    assert resp["session_id"] == "fake-session-1"
++    assert "tool_call fake read" in (resp.get("_debug_raw") or "")
++
++
++def test_full_executor_envelope_and_resume_lane():
++    """execute_agent(transport='acp') runs the enrich/stamp pipeline; the ACP
++    session id must NOT leak into the resume lane (premortem T1)."""
++    orig_argv = dict(_acpbackend.ACP_ARGV)
++    _acpbackend.ACP_ARGV["gemini"] = ["acp", "happy"]
++    patched = _patch_launch()
++    try:
++        resp = _executor.execute_agent(_inv(), timeout_ms=30000)
++    finally:
++        _acpbackend.ACP_ARGV.update(orig_argv)
++        _restore(patched)
++    assert resp["status"] == "success", resp.get("error")
++    assert resp["transport"] == "acp"
++    assert resp["report_ok"] is True          # report/verdict pipeline ran
++    assert resp["resume"] == {"cli": "gemini", "session_id": None}
++    assert resp["acp"] == {"session_id": "fake-session-1"}
++
++
++def test_model_pinning_best_effort():
++    resp = _call("happy", model="fake-model")
++    assert resp.get("model_targeted") == "fake-model"
++    resp = _call("happy", model="not-a-real-model")
++    assert "model_targeted" not in resp
++    assert any("model" in w for w in resp.get("warnings", []))
++
++
++def test_permission_yolo_allows_once_never_always():
++    resp = _call("permission-exec", permission="yolo")
++    raw = resp.get("_debug_raw") or ""
++    assert "-> allow" in raw and "'allow_once'" in raw, raw
++    assert "allow_always" not in raw.split("-> allow")[1].splitlines()[0]
++
++
++def test_permission_readonly_rejects_execute():
++    resp = _call("permission-exec", permission="read-only")
++    raw = resp.get("_debug_raw") or ""
++    assert "-> reject" in raw and "'reject_once'" in raw, raw
++
++
++def test_permission_readonly_allows_read():
++    resp = _call("permission-read", permission="read-only")
++    raw = resp.get("_debug_raw") or ""
++    assert "-> allow" in raw, raw
++
++
++def test_permission_unclassifiable_options_cancel_turn():
++    """Only allow_always is offered for an in-tier kind. Selecting it would
++    grant standing permission beyond one dispatch, and the ACP option list has
++    NO ordering guarantee, so picking by position can grant authority. The only
++    fail-closed answer is the spec's cancelled outcome."""
++    resp = _call("permission-no-once", permission="yolo")
++    assert '"outcome": "cancelled"' in (resp.get("result") or ""), resp.get("result")
++    assert "no safely classifiable option" in (resp.get("_debug_raw") or "")
++    assert "allow_always" not in (resp.get("result") or "")
++
++
++def test_permission_empty_options_cancel_turn():
++    """An empty options list has no valid optionId at all; inventing one
++    ('reject_once') answers with a value the agent never offered."""
++    resp = _call("permission-empty", permission="yolo")
++    assert '"outcome": "cancelled"' in (resp.get("result") or ""), resp.get("result")
++
++
++def test_executor_acp_redacts_and_drops_debug_raw():
++    """The ACP executor branch honors the same artifact contract as the
++    subprocess path: _debug_raw never ships inside the envelope, and backend
++    output is secret-redacted before any field persists (cross-vendor review:
++    it used to pass through untouched)."""
++    secret = "Authorization: Bearer live-secret"
++    orig = _acpbackend.call
++
++    def fake_call(inv, timeout_ms):
++        return {"status": "error", "exit_code": 1, "result": None,
++                "error": f"backend failed: {secret}",
++                "_debug_raw": f"noise\n{secret}\nmore"}
++
++    _acpbackend.call = fake_call
++    try:
++        resp = _executor.execute_agent(_inv(), timeout_ms=5000)
++    finally:
++        _acpbackend.call = orig
++    assert "_debug_raw" not in resp
++    assert "live-secret" not in json.dumps(resp), json.dumps(resp)[:400]
++
++
++def test_prompt_response_without_stopreason_is_structural_error():
++    """A session/prompt response missing stopReason is a protocol violation,
++    not an empty success (the default used to be end_turn)."""
++    resp = _call("no-stopreason")
++    assert resp["status"] == "error", resp
++    assert "stopReason" in (resp.get("error") or ""), resp.get("error")
++
++
++def test_resume_over_acp_is_refused_not_silent_fresh_session():
++    """An ACP session id is telemetry, not a resume handle; --resume with the
++    ACP transport must refuse loudly instead of starting fresh work."""
++    inv = AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd(),
++                          permission="yolo", transport="acp",
++                          resume_id="some-prior-session")
++    resp = _acpbackend.call(inv, 5000)
++    assert resp["status"] == "error"
++    assert "resume is not supported over the ACP transport" in resp["error"]
++
++
++def test_turn_state_accumulation_is_bounded():
++    """A noisy or hostile child must not exhaust dispatcher memory mid-turn."""
++    t = _acpbackend._TurnState()
++    for _ in range(30):
++        t.add_text("x" * 10_000)
++    text, _, _ = t.snapshot()
++    assert len(text) <= t._MAX_TEXT_CHARS + 100  # cap + marker
++    assert "truncated" in text
++    for i in range(t._MAX_DIAG_LINES + 50):
++        t.add_diag(f"d{i}")
++    _, diag, _ = t.snapshot()
++    assert len(diag) == t._MAX_DIAG_LINES + 1  # cap + truncation marker
++    assert "truncated" in diag[-1]
++
++
++def test_fallback_gate_denial_keeps_primary_spend():
++    """A gate that denies the ACP recovery must not erase the primary attempt's
++    cost: the dispatch happened either way."""
++    import run_subagent as rs
++    primary = {"status": "error", "exit_code": 1, "cli": "gemini",
++               "error": "backend exploded mid-stream",
++               "normalization_reason": "backend internal error",
++               "usage": {"total_tokens": 100}, "cost_usd": 0.5, "attempts": 0}
++    orig_exec = rs.execute_agent
++    orig_regate = rs._regate_or_none
++    rs.execute_agent = lambda *a, **kw: dict(primary)
++    rs._regate_or_none = lambda *a, **kw: {"approved": False, "reason": "gate said no"}
++
++    class _Args:
++        agent = "reviewer"
++        timeout = 5000
++        debug_dir = None
++        max_tool_output_bytes = None
++        _receipt = None
++        retries = 0
++        no_acp_fallback = False
++        gate_with = "some-gate"
++
++    try:
++        inv = AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd(),
++                              permission="safe-edit")
++        out = rs._dispatch_with_retries(inv, _Args())
++    finally:
++        rs.execute_agent = orig_exec
++        rs._regate_or_none = orig_regate
++    assert out.get("cost_usd") == 0.5, out
++    assert (out.get("usage") or {}).get("total_tokens") == 100, out
++
++
++def test_refusal_maps_to_error():
++    resp = _call("refusal")
++    assert resp["status"] == "error"
++    assert "refusal" in (resp.get("error") or "")
++
++
++def test_malformed_lines_tolerated():
++    resp = _call("malformed")
++    assert resp["status"] == "success"
++    assert "non-JSON stdout line skipped" in (resp.get("_debug_raw") or "")
++
++
++def test_timeout_sends_cancel_and_returns_124():
++    start = time.monotonic()
++    resp = _call("slow", timeout_ms=2500)
++    elapsed = time.monotonic() - start
++    assert resp["exit_code"] == 124, resp
++    assert resp["status"] == "error"
++    # 2.5s budget + teardown grace, never the fixture's 3600s sleep.
++    assert elapsed < 30, elapsed
++
++
++def test_post_turn_teardown_does_not_wait_for_exit():
++    """Premortem T4: a long-lived agent that answered its turn must not cost
++    the wall-clock timeout."""
++    start = time.monotonic()
++    resp = _call("lingering", timeout_ms=120000)
++    elapsed = time.monotonic() - start
++    assert resp["status"] == "success"
++    assert elapsed < 30, elapsed
++
++
++def test_supports_acp_gating():
++    assert supports_acp("gemini") and supports_acp("kimi") and supports_acp("cursor-agent")
++    assert not supports_acp("claude") and not supports_acp("agy")
++    resp = _executor.execute_agent(
++        AgentInvocation(cli="claude", prompt="x", cwd=os.getcwd(),
++                        transport="acp"), timeout_ms=5000)
++    assert resp["exit_code"] == 2 and "no acp transport" in resp["error"]
++
++
++def test_unknown_transport_rejected():
++    resp = _executor.execute_agent(
++        AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd(),
++                        transport="carrier-pigeon"), timeout_ms=5000)
++    assert resp["exit_code"] == 2 and "unknown transport" in resp["error"]
++
++
++def test_oversized_prompt_routes_over_acp():
++    """A subprocess dispatch whose argv would exceed the OS limit is routed to
++    the ACP transport instead of erroring (the executor's own routing, not the
++    retry-loop fallback)."""
++    orig_argv = dict(_acpbackend.ACP_ARGV)
++    _acpbackend.ACP_ARGV["gemini"] = ["acp", "happy"]
++    patched = _patch_launch()
++    orig_measure = _executor.argv_length_error
++    _executor.argv_length_error = lambda *a, **kw: "simulated argv overflow"
++    try:
++        resp = _executor.execute_agent(
++            AgentInvocation(cli="gemini", prompt="x" * 40000, cwd=os.getcwd()),
++            timeout_ms=30000)
++    finally:
++        _executor.argv_length_error = orig_measure
++        _acpbackend.ACP_ARGV.update(orig_argv)
++        _restore(patched)
++    assert resp["status"] == "success", resp.get("error")
++    assert resp["transport"] == "acp"
++    assert resp["fallback"]["reason"] == "argv-length"
++    assert any("command-line length limit" in w for w in resp.get("warnings", []))
++
++
++# --- capability probe (premortem T2) -------------------------------------------
++
++def _fake_cli_dir(with_acp_token: bool) -> str:
++    d = tempfile.mkdtemp(prefix="summon-acp-probe-")
++    if os.name == "nt":
++        body = "@echo " + ("usage: fake --acp flag" if with_acp_token
++                           else "usage: fake [options] no protocol here")
++        open(os.path.join(d, "gemini.cmd"), "w").write(body + "\n")
++    else:
++        body = "#!/bin/sh\necho " + ("usage: fake --acp flag" if with_acp_token
++                                     else "usage: fake [options] no protocol here")
++        p = os.path.join(d, "gemini")
++        open(p, "w").write(body + "\n")
++        os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
++    return d
++
++
++def test_probe_rejects_cli_without_acp_support():
++    _acpbackend._reset_probe_cache()
++    d = _fake_cli_dir(with_acp_token=False)
++    old_path = os.environ.get("PATH", "")
++    os.environ["PATH"] = d + os.pathsep + old_path
++    try:
++        verdict = _acpbackend._probe_acp("gemini")
++    finally:
++        os.environ["PATH"] = old_path
++        _acpbackend._reset_probe_cache()
++    assert verdict and "does not advertise ACP" in verdict
++
++
++def test_probe_passes_cli_with_acp_support():
++    _acpbackend._reset_probe_cache()
++    d = _fake_cli_dir(with_acp_token=True)
++    old_path = os.environ.get("PATH", "")
++    os.environ["PATH"] = d + os.pathsep + old_path
++    try:
++        verdict = _acpbackend._probe_acp("gemini")
++    finally:
++        os.environ["PATH"] = old_path
++        _acpbackend._reset_probe_cache()
++    assert verdict is None
++
++
++def test_probe_missing_cli():
++    _acpbackend._reset_probe_cache()
++    try:
++        assert "CLI not found" in _acpbackend._probe_acp("summon-nonexistent-cli")
++    finally:
++        _acpbackend._reset_probe_cache()
++
++
++# --- fallback predicate + wiring (premortem T3) ---------------------------------
++
++def _result(**kw):
++    base = {"status": "error", "exit_code": 1, "cli": "gemini",
++            "error": "stream exploded", "normalization_reason": "", "result": ""}
++    base.update(kw)
++    return base
++
++
++def test_fallback_predicate():
++    import run_subagent as rs
++    assert rs._acp_fallback_worthy(_result(exit_code=124))                       # timeout
++    assert rs._acp_fallback_worthy(_result(normalization_reason="timed out; partial"))
++    assert rs._acp_fallback_worthy(_result())                                    # stream/shape loss
++    assert not rs._acp_fallback_worthy(_result(status="success"))
++    assert not rs._acp_fallback_worthy(_result(status="blocked"))
++    assert not rs._acp_fallback_worthy(_result(exit_code=127, error="CLI not found: gemini"))
++    assert not rs._acp_fallback_worthy(_result(error="please log in to continue"))
++    assert not rs._acp_fallback_worthy(_result(error="agy cannot enforce read-only"))
++    assert not rs._acp_fallback_worthy(_result(
++        error="the assembled command line is 40000 characters, over the Windows limit of 32767"))
++
++
++def _args_ns(**kw):
++    base = dict(timeout=5000, debug_dir=None, retries=0, gate_with=None,
++                no_acp_fallback=False, agent=None, _receipt=None,
++                max_tool_output_bytes=None)
++    base.update(kw)
++    return types.SimpleNamespace(**base)
++
++
++def test_fallback_recovers_and_accounts_spend():
++    import run_subagent as rs
++    orig = rs.execute_agent
++    calls = []
++
++    def fake_execute(inv, **kw):
++        calls.append(inv.transport)
++        if inv.transport == "acp":
++            return {"result": "recovered", "status": "success", "exit_code": 0,
++                    "cli": inv.cli, "cost_usd": 0.50}
++        return _result(cost_usd=0.25)
++
++    rs.execute_agent = fake_execute
++    try:
++        out = rs._dispatch_with_retries(
++            AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd()), _args_ns())
++    finally:
++        rs.execute_agent = orig
++    assert calls == ["subprocess", "acp"]
++    assert out["status"] == "success"
++    assert out["attempts"] == 2
++    assert out["cost_usd"] == 0.75                      # both dispatches billed
++    assert out["fallback"]["from"] == "subprocess"
++    assert out["fallback"]["primary_status"] == "error"
++    assert any("--no-acp-fallback" in w for w in out.get("warnings", []))
++
++
++def test_fallback_failed_recovery_keeps_original():
++    import run_subagent as rs
++    orig = rs.execute_agent
++    rs.execute_agent = lambda inv, **kw: (
++        _result(error="acp also failed") if inv.transport == "acp" else _result())
++    try:
++        out = rs._dispatch_with_retries(
++            AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd()), _args_ns())
++    finally:
++        rs.execute_agent = orig
++    assert out["status"] == "error"
++    assert out["error"] == "stream exploded"            # original, richer envelope
++    assert out["fallback"]["to"] == "acp"
++    assert out["fallback"]["error"] == "acp also failed"
++    assert out["attempts"] == 2
++
++
++def test_fallback_skipped_for_structural_failures():
++    import run_subagent as rs
++    orig = rs.execute_agent
++    calls = []
++
++    def fake_execute(inv, **kw):
++        calls.append(inv.transport)
++        return _result(exit_code=127, error="CLI not found: gemini")
++
++    rs.execute_agent = fake_execute
++    try:
++        out = rs._dispatch_with_retries(
++            AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd()), _args_ns())
++    finally:
++        rs.execute_agent = orig
++    assert calls == ["subprocess"]                      # no wasted recovery dispatch
++    assert "fallback" not in out
++
++
++def test_no_acp_fallback_kill_switch():
++    import run_subagent as rs
++    orig = rs.execute_agent
++    calls = []
++    rs.execute_agent = lambda inv, **kw: (calls.append(inv.transport), _result())[1]
++    old_env = os.environ.get("SUMMON_ACP_FALLBACK")
++    os.environ["SUMMON_ACP_FALLBACK"] = "0"
++    try:
++        out = rs._dispatch_with_retries(
++            AgentInvocation(cli="gemini", prompt="x", cwd=os.getcwd()), _args_ns())
++    finally:
++        rs.execute_agent = orig
++        if old_env is None:
++            os.environ.pop("SUMMON_ACP_FALLBACK", None)
++        else:
++            os.environ["SUMMON_ACP_FALLBACK"] = old_env
++    assert calls == ["subprocess"]
++    assert "fallback" not in out
++
++
++# --- transport resolution (opt-in) ----------------------------------------------
++
++def _write_agent(text: str) -> str:
++    fd, path = tempfile.mkstemp(suffix=".md", prefix="summon-agent-")
++    with os.fdopen(fd, "w", encoding="utf-8") as fh:
++        fh.write(text)
++    return path
++
++
++def test_transport_frontmatter_and_flag():
++    import run_subagent as rs
++    agent = _write_agent("---\nrun-agent: gemini\ntransport: acp\n---\nDo things.\n")
++    assert rs._transport_for_dispatch(agent, None) == "acp"
++    assert rs._transport_for_dispatch(agent, "subprocess") == "subprocess"
++    agent2 = _write_agent("---\nrun-agent: gemini\n---\nDo things.\n")
++    assert rs._transport_for_dispatch(agent2, None) == "subprocess"
++    assert rs._transport_for_dispatch(None, None) == "subprocess"
++    bad = _write_agent("---\nrun-agent: gemini\ntransport: pigeon\n---\nDo things.\n")
++    try:
++        rs._transport_for_dispatch(bad, None)
++        raise AssertionError("expected ValueError")
++    except ValueError as e:
++        assert "invalid transport" in str(e)
++
++
++if __name__ == "__main__":
++    # Plain-assert runner (no pytest required), matching tests/test_install.py.
++    fns = [(n, f) for n, f in sorted(globals().items())
++           if n.startswith("test_") and callable(f)]
++    failed = 0
++    for name, fn in fns:
++        try:
++            fn()
++            print(f"PASS {name}")
++        except Exception as e:  # noqa: BLE001
++            failed += 1
++            print(f"FAIL {name}: {type(e).__name__}: {e}")
++    print(f"\n{len(fns) - failed}/{len(fns)} passed")
++    sys.exit(1 if failed else 0)

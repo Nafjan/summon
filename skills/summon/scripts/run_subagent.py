@@ -1573,6 +1573,7 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
     from _builder import supports_acp as _supports_acp
     if (result.get("status") in ("error", "partial")
             and invocation.transport == "subprocess"
+            and invocation.permission == "yolo"  # ACP refuses sub-yolo tiers
             and _supports_acp(invocation.cli)
             and _acp_fallback_enabled(args)
             and _acp_fallback_worthy(result)):

@@ -314,12 +314,15 @@ class _AcpClient:
         offered."""
         options = params.get("options") or []
         tool_kind = ((params.get("toolCall") or {}).get("kind") or "other")
-        allowed = tool_kind in _ALLOWABLE_KINDS.get(self._permission, set())
+        allowed = tool_kind in _ALLOWABLE_KINDS.get(str(self._permission).lower(), set())
 
         def _find(*kinds: str) -> str | None:
             for opt in options:
                 if str(opt.get("kind", "")) in kinds:
-                    return opt.get("optionId")
+                    oid = opt.get("optionId")
+                    # Only a string optionId can be echoed back lawfully.
+                    if isinstance(oid, str):
+                        return oid
             return None
 
         if allowed:
@@ -333,9 +336,10 @@ class _AcpClient:
                 f"permission {self._permission}: tool kind {tool_kind!r} has no "
                 f"safely classifiable option; cancelling the turn (fail closed)")
         else:
+            decision = "allow" if _find("allow_once") == chosen else "reject"
             self.turn.add_diag(
                 f"permission {self._permission}: tool kind {tool_kind!r} -> "
-                f"{'allow' if allowed else 'reject'} (option {chosen!r})")
+                f"{decision} (option {chosen!r})")
         return chosen
 
 
@@ -424,6 +428,22 @@ def call(inv, timeout_ms: int) -> dict:
         return _err(cli, 2, probe_err)
 
     command, args = _resolve_launch(cli, list(acp_args))
+    # The subprocess builders install the per-backend identity (kimi's isolated
+    # credential profile above all). Running ACP without that env would
+    # authenticate as the AMBIENT account with the full real profile (MCP
+    # config, sessions, logs) -- a different identity than the receipt records,
+    # and exactly what the isolation work exists to prevent. Reuse the
+    # builder's env, minus the channel ACP supersedes: GEMINI_SYSTEM_MD, since
+    # the system context is prepended to the prompt on this transport.
+    from _builder import build_invocation_args as _build_args
+    try:
+        _, _, env_override = _build_args(inv)
+    except ValueError as e:
+        return _err(cli, 2, str(e))
+    child_env = dict(os.environ)
+    for key, value in (env_override or {}).items():
+        if key != "GEMINI_SYSTEM_MD":
+            child_env[key] = value
     try:
         process = subprocess.Popen(
             [command, *args],
@@ -432,6 +452,7 @@ def call(inv, timeout_ms: int) -> dict:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,   # NOT merged: stdout is a protocol channel
             text=True, encoding="utf-8", errors="replace", bufsize=1,
+            env=child_env,
             **popen_flags(),
         )
     except FileNotFoundError:
@@ -464,12 +485,21 @@ def call(inv, timeout_ms: int) -> dict:
             "clientInfo": {"name": "summon", "version": "1"},
         }, timeout=min(30.0, max(0.05, _remaining())))
 
+        if init.get("protocolVersion") != _PROTOCOL_VERSION:
+            raise _AcpError(
+                f"agent negotiated ACP protocol {init.get('protocolVersion')!r}; "
+                f"summon speaks version {_PROTOCOL_VERSION}")
+
         # 2. Session.
         session = client.request("session/new", {
             "cwd": os.path.abspath(inv.cwd),
             "mcpServers": [],
         }, timeout=min(60.0, max(0.05, _remaining())))
         session_id = session.get("sessionId")
+
+        if not isinstance(session_id, str) or not session_id:
+            raise _AcpError("session/new returned no usable sessionId "
+                            "(protocol violation)")
 
         # 3. Model pinning is best-effort: ACP's stable schema has no model on
         # session/new; sessions that advertise a model list may accept
