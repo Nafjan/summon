@@ -34,3 +34,4 @@ COMMANDS: <test run command + result (pass/fail counts)>
 VERIFICATION: <confirmation the tests actually ran, and their outcome>
 FOLLOW-UP: <gaps or additional cases worth adding>, or "none"
 HANDOFF: <context the orchestrator must pass into the next sub-agent call, since you keep no memory>, or "none"
+LEFT_BEHIND: <resources you created and left, with state/location and cleanup action>, or "none"
