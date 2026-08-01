@@ -331,6 +331,13 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--effort", help="Reasoning effort (claude): low|medium|high|xhigh|max")
     parser.add_argument("--resume", dest="resume", help="Backend session/thread/chat id to resume")
     parser.add_argument("--resume-profile", help="agy only: profile dir of the session being resumed")
+    parser.add_argument("--transport", choices=["subprocess", "acp"], default=None,
+                        help="Force the dispatch transport. 'acp' runs the turn over the "
+                             "Agent Client Protocol (native support: gemini, kimi, "
+                             "cursor-agent). Overrides the agent's `transport:` frontmatter.")
+    parser.add_argument("--no-acp-fallback", dest="no_acp_fallback", action="store_true",
+                        help="Disable the automatic ACP recovery attempt (and oversized-prompt "
+                             "ACP routing) when the subprocess transport fails")
     parser.add_argument("--worktree", nargs="?", const="", default=None,
                         help="Run in an isolated git worktree (optional name; auto-named if bare)")
     parser.add_argument("--background", action="store_true",
