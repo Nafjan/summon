@@ -37,3 +37,4 @@ COMMANDS: <git/read commands run>, or "none"
 VERIFICATION: <what you actually read/ran>
 FOLLOW-UP: <e.g. follow-up PRs worth filing>, or "none"
 HANDOFF: <context the orchestrator must pass into the next sub-agent call, since you keep no memory>, or "none"
+LEFT_BEHIND: <resources you created and left, with state/location and cleanup action>, or "none"

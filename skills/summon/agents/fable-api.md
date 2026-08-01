@@ -33,3 +33,4 @@ COMMANDS: none  (API agent — no shell)
 VERIFICATION: <what you checked in the provided material>
 FOLLOW-UP: <recommended next actions>, or "none"
 HANDOFF: <context the orchestrator must pass into the next sub-agent call, since you keep no memory>, or "none"
+LEFT_BEHIND: <resources you created and left, with state/location and cleanup action>, or "none"

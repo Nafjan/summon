@@ -36,3 +36,4 @@ COMMANDS: <commands run>, or "none"
 VERIFICATION: <what you actually read/ran>
 FOLLOW-UP: <suggested next actions; e.g. delegate to adversarial-reviewer if depth needed>, or "none"
 HANDOFF: <context the orchestrator must pass into the next sub-agent call, since you keep no memory>, or "none"
+LEFT_BEHIND: <resources you created and left, with state/location and cleanup action>, or "none"

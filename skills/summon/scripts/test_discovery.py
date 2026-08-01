@@ -184,6 +184,49 @@ def test_report_captures_custom_third_party_fields():
     assert "lowercase detail" in rep2["handoff"] and "example.com" in rep2["handoff"]
 
 
+def test_environment_handoff_reaches_callers_without_breaking_legacy_reports():
+    """A child-created resource belongs to the caller's decision, not silent teardown.
+
+    The field must parse to a stable top-level receipt. A legacy/project-local report that
+    lacks it remains mechanically valid, but the receipt has to say that no environmental
+    account was made -- otherwise callers would mistake silence for `none`.
+    """
+    from _executor import _enrich
+    complete = ("STATUS: DONE\nSUMMARY: started a preview\nFOLLOW-UP: none\n"
+                "HANDOFF: caller should decide whether to keep it\n"
+                "LEFT_BEHIND: http://127.0.0.1:4173 (running preview server; stop with "
+                "the recorded process command)")
+    out = _enrich({"result": complete, "exit_code": 0, "status": "success",
+                   "cli": "codex"}, None)
+    assert out["report_ok"] is True
+    assert out["report"]["left_behind"].startswith("http://127.0.0.1:4173")
+    assert out["environment_handoff"] == {
+        "declared": True, "left_behind": out["report"]["left_behind"]}
+
+    legacy = ("STATUS: DONE\nSUMMARY: old definition\nFOLLOW-UP: none\n"
+              "HANDOFF: no environment field")
+    legacy_out = _enrich({"result": legacy, "exit_code": 0, "status": "success",
+                          "cli": "codex"}, None)
+    assert legacy_out["report_ok"] is True
+    assert legacy_out["environment_handoff"] == {"declared": False, "left_behind": None}
+
+
+def test_environment_handoff_reaches_fresh_and_resumed_child_prompts():
+    """The common fresh-dispatch helper and the resume path must carry the same rule.
+
+    Testing only the parser would let a future builder edit omit the obligation from actual
+    child instructions, the same wrong-layer regression this suite has caught before.
+    """
+    import run_subagent as rs
+    from _builder import AgentInvocation, _resume_prompt
+
+    fresh = rs._initial_system_context("Agent definition.", tempfile.gettempdir(), b"")
+    assert "## Environment handoff (required)" in fresh and "LEFT_BEHIND: none" in fresh
+    resumed = _resume_prompt(AgentInvocation(cli="codex", prompt="continue", cwd="/tmp",
+                                              resume_id="session-1"))
+    assert "LEFT_BEHIND: none" in resumed and "caller to decide" in resumed
+
+
 def test_blocked_approval_downgrades_success():
     # A run that ENDS asking for interactive approval with no report contract
     # must become status:blocked (a 0 exit is not task completion).
@@ -2759,8 +2802,8 @@ def test_prompt_file_load_conflicts_and_bom():
     script = os.path.join(here, "run_subagent.py")
     d = tempfile.mkdtemp(prefix="summon-pf-")
     try:
-        # A tiny probe agent: the dry-run view truncates argv tokens at 400
-        # chars, so the user prompt must land inside that window to be assertable.
+        # The dry-run view bounds argv tokens but preserves their tail, where a
+        # system-context-first backend carries the user prompt.
         agents = os.path.join(d, "roster")
         os.makedirs(agents)
         open(os.path.join(agents, "pf-probe.md"), "w", encoding="utf-8").write(
@@ -15139,6 +15182,30 @@ def test_v9_the_roster_doc_matches_the_agents_it_describes():
             assert dead not in val, (
                 "agent %r pins %r, which is a RETIRED model -- a copied example that 404s "
                 "on first use" % (fn, val))
+
+
+def test_v11_bundled_agents_require_an_environment_handoff():
+    """A shared operating rule belongs in every shipped agent definition.
+
+    The dispatcher injects it for fresh/project-local agents too, but definitions are
+    consumed directly by other hosts. Leaving a bundled definition without the field would
+    recreate the claim/code drift this repository has repeatedly shipped.
+    """
+    import re
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    agents_dir = os.path.join(here, "..", "agents")
+    files = sorted(fn for fn in os.listdir(agents_dir) if fn.endswith(".md"))
+    assert files, "the bundled roster is absent; this test has no subject"
+    missing = []
+    for fn in files:
+        with open(os.path.join(agents_dir, fn), encoding="utf-8") as fh:
+            text = fh.read()
+        if not re.search(r"^LEFT_BEHIND:[ \t]", text, re.M):
+            missing.append(fn)
+    assert not missing, (
+        "bundled agents must tell their caller what they created and left behind; "
+        "missing LEFT_BEHIND in %s" % missing)
 
 
 def test_v10_litter_sweep_requires_structural_glog_identity():

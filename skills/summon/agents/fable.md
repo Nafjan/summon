@@ -39,3 +39,4 @@ COMMANDS: <key commands run + result>, or "none"
 VERIFICATION: <what you actually checked>
 FOLLOW-UP: <recommended next actions>, or "none"
 HANDOFF: <context the orchestrator must pass into the next sub-agent call, since you keep no memory>, or "none"
+LEFT_BEHIND: <resources you created and left, with state/location and cleanup action>, or "none"

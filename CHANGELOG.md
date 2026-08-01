@@ -4,6 +4,15 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
+## [Unreleased]
+
+### Added
+
+- **Environment handoff:** every bundled agent now reports `LEFT_BEHIND`, and each envelope
+  exposes it as `environment_handoff` so its caller can decide what to retain or clean up.
+  This covers temporary paths, processes, servers, VMs, and container resources; summon
+  never deletes them automatically.
+
 ## [1.1.0] - 2026-07-31
 
 **Kimi Code joins Summon, alongside a more dependable AGY path.**
