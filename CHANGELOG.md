@@ -17,6 +17,12 @@ regression notes, and test evidence, see the
   architecture/review worker, while `kimi-coder` pins K2.7 Coding for scoped implementation
   and debugging. Both retain Kimi's explicit full-authority worktree requirement.
 
+### Fixed
+
+- **ACP timeout cleanup:** Kimi and other ACP children are tree-killed before their leader can
+  orphan a backend process; timeout envelopes now show one correct unit and the protocol phase
+  Summon can prove.
+
 ## [1.1.0] - 2026-07-31
 
 **Kimi Code joins Summon, alongside a more dependable AGY path.**

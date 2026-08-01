@@ -340,6 +340,21 @@ def test_timeout_sends_cancel_and_returns_124():
     assert elapsed < 30, elapsed
 
 
+def test_acp_timeout_uses_one_unit_and_names_the_protocol_stage():
+    """Milliseconds serializes with ``ms`` for detached argv forwarding. ACP's
+    human diagnostic owns its own unit, so it must render the numeric value and
+    identify the protocol stage rather than exposing the old ``msms`` typo."""
+    from _cli import parse_timeout
+    # Keep the live fixture fast; it is still a ``Milliseconds`` instance, so
+    # the test exercises the same custom-string path as a 360-second dispatch.
+    resp = _call("slow", timeout_ms=parse_timeout("2500ms"))
+    assert resp["exit_code"] == 124, resp
+    assert "2500msms" not in resp["error"], resp["error"]
+    assert "2500ms over ACP during session/prompt" in resp["error"], resp["error"]
+    assert resp["timeout"] == {"budget_ms": 2500, "stage": "session/prompt",
+                               "partial_output": False}, resp["timeout"]
+
+
 def test_post_turn_teardown_does_not_wait_for_exit():
     """Premortem T4: a long-lived agent that answered its turn must not cost
     the wall-clock timeout."""
@@ -348,6 +363,26 @@ def test_post_turn_teardown_does_not_wait_for_exit():
     elapsed = time.monotonic() - start
     assert resp["status"] == "success"
     assert elapsed < 30, elapsed
+
+
+def test_acp_teardown_kills_the_tree_before_the_leader_can_orphan_children():
+    """The ACP finally block once terminated the leader first, making the
+    taskkill fallback powerless if a Windows Job Object could not attach. The
+    tree killer must run while that leader is still alive."""
+    seen = []
+    real_kill = _executor._kill_tree
+
+    def observe_kill(process):
+        seen.append(process.poll() is None)
+        return real_kill(process)
+
+    _executor._kill_tree = observe_kill
+    try:
+        resp = _call("lingering", timeout_ms=30000)
+    finally:
+        _executor._kill_tree = real_kill
+    assert resp["status"] == "success", resp
+    assert seen and all(seen), "ACP teardown did not kill the live process tree"
 
 
 def test_supports_acp_gating():
