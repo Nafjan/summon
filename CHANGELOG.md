@@ -151,6 +151,10 @@ explicit MCP local-trust ADR section.
   identifiers, and preserved AGY evidence is ignored by default. BytePlus missing-key
   guidance no longer points at arkcli-private credential store paths or env var names.
 
+- **ACP timeout cleanup:** Kimi and other ACP children are tree-killed before their leader can
+  orphan a backend process; timeout envelopes now show one correct unit and the protocol phase
+  Summon can prove.
+
 ## [1.1.0] - 2026-07-31
 
 **Kimi Code joins Summon, alongside a more dependable AGY path.**
