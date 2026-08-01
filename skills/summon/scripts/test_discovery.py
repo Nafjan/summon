@@ -15191,6 +15191,8 @@ def test_v11_bundled_agents_require_an_environment_handoff():
     consumed directly by other hosts. Leaving a bundled definition without the field would
     recreate the claim/code drift this repository has repeatedly shipped.
     """
+    import re
+
     here = os.path.dirname(os.path.abspath(__file__))
     agents_dir = os.path.join(here, "..", "agents")
     files = sorted(fn for fn in os.listdir(agents_dir) if fn.endswith(".md"))
@@ -15199,7 +15201,7 @@ def test_v11_bundled_agents_require_an_environment_handoff():
     for fn in files:
         with open(os.path.join(agents_dir, fn), encoding="utf-8") as fh:
             text = fh.read()
-        if "LEFT_BEHIND:" not in text:
+        if not re.search(r"^LEFT_BEHIND:[ \t]", text, re.M):
             missing.append(fn)
     assert not missing, (
         "bundled agents must tell their caller what they created and left behind; "
