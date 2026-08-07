@@ -48,6 +48,7 @@ class AgentInvocation:
     extra_args: tuple = ()             # arbitrary backend flags (agent `args:` frontmatter)
     base_url: str | None = None        # openai-compat only: resolved API base url
     api_key_env: str | None = None     # openai-compat only: env var holding the API key
+    allow_payg: bool = False           # byteplus-coding: per-run consent for PAYG fallback
     # agy only: the account digest the REQUEST IDENTITY recorded, checked against the bytes
     # actually copied into the isolated profile so a swap in between cannot produce a result
     # stamped under the wrong account.

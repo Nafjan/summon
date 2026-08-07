@@ -136,6 +136,19 @@ def _transport_for_dispatch(agent_file: str | None, cli_arg: str | None) -> str:
     return transport
 
 
+def _allow_payg_from_frontmatter(agent_file: str | None) -> bool:
+    """Read ``allow_payg: true`` from agent frontmatter (if present)."""
+    if not agent_file:
+        return False
+    try:
+        from _loader import parse_frontmatter
+        with open(agent_file, encoding="utf-8-sig") as fh:
+            fm, _ = parse_frontmatter(fh.read())
+        return fm.get("allow_payg") is True or str(fm.get("allow_payg", "")).lower() == "true"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _write_error_out(out_path: str, env: dict) -> None:
     """Record a failure at the authoritative --out path WITHOUT ever destroying a stored
     success.
@@ -739,6 +752,12 @@ def main() -> None:
     if args.allow_credit:
         os.environ["SUMMON_ALLOW_CREDIT"] = "1"
 
+    # --allow-payg: per-dispatch only. Consent reaches call() via
+    # AgentInvocation.allow_payg and reaches --background children via
+    # child_argv("--allow-payg"). Do NOT mutate SUMMON_ALLOW_BYTEPLUS_PAYG
+    # from the flag — that would leak single-dispatch consent into later
+    # dispatches in the same process. Durable consent stays env/prefs only.
+
     # --json-schema: fail fast on an unloadable schema BEFORE paying for a run.
     schema = None
     if args.json_schema:
@@ -1014,6 +1033,7 @@ def main() -> None:
         agy_account_sha256=_identity.get("agy_account_sha256"),
         agy_account_checked=bool(_identity.get("_agy_account_checked")),
         api_key_env=api_key_env,
+        allow_payg=getattr(args, "allow_payg", False) or _allow_payg_from_frontmatter(agent_file),
     )
 
     if args.dry_run:
@@ -1217,6 +1237,24 @@ def _dry_run_view(invocation, args, agents_dir: str,
         view["api_key_env"] = invocation.api_key_env
         view["api_key_present"] = bool(invocation.api_key_env and os.environ.get(invocation.api_key_env))
         view["billing"] = {"source": "api"}
+        # Coding Plan: honest quota note + refuse known-bad model ids in preflight.
+        try:
+            from _apibackend import coding_plan_billing, coding_plan_model_error, \
+                payg_consent_allowed, is_coding_plan_endpoint
+            _cpb = coding_plan_billing(invocation.base_url)
+            if _cpb:
+                view["billing"] = dict(_cpb)
+                view["billing_predicted"] = dict(_cpb)
+            _cpm = coding_plan_model_error(invocation.base_url, invocation.model)
+            if _cpm:
+                view["would_refuse"] = True
+                view["refusal"] = _cpm
+            if is_coding_plan_endpoint(invocation.base_url):
+                _payg_flag = getattr(invocation, "allow_payg", False)
+                view["payg_consent"] = payg_consent_allowed(_payg_flag)
+                view["payg_fallback_eligible"] = True
+        except Exception:  # noqa: BLE001 - preflight must always render
+            pass
     elif BACKENDS.get(invocation.cli, {}).get("side_effects"):
         # A side-effecting build (agy builds a per-call profile) must NOT run
         # under --dry-run. Generic for any such backend; agy adds wrapper detail.

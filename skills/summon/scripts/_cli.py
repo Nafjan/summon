@@ -378,6 +378,12 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "SUMMON_ALLOW_CREDIT=1. Single dispatch only: rejected for "
                              "--manifest/--council (set the env var deliberately for "
                              "fan-out spend)")
+    parser.add_argument("--allow-payg", dest="allow_payg", action="store_true",
+                        help="Authorize BytePlus PAYG (/api/v3) fallback if the Coding "
+                             "Plan endpoint fails with quota/plan-limit/unsupported-model. "
+                             "Single dispatch only: rejected for --manifest/--council "
+                             "(set SUMMON_ALLOW_BYTEPLUS_PAYG=1 or ~/.agents/summon.json "
+                             "for fan-out)")
     parser.add_argument("--json-schema", dest="json_schema",
                         help="Validate the agent's final JSON against this schema file; attach "
                              "parsed/parse_ok; one corrective retry via resume on mismatch")
