@@ -28,3 +28,12 @@ a complete stdlib dispatcher (`run_subagent.py`). Phase C needs a second
   generation as root `plugin.json` when present.
 - Tool handlers must never return live API keys; onboard status reports
   credential **presence** only.
+
+## Trust model
+
+The MCP facade is a **local trusted-host** surface (stdio from a host the
+operator already trusts). Tools accept `cwd` / manifest paths and can run
+billable long dispatches. Do **not** expose this server on a network without
+an additional allowlist/jail. Prefer structured JSON payloads over raw CLI
+tails; when tails are returned they must be secret-scrubbed. Pin the Python
+launcher carefully on Windows (`python` Store aliases can skew versions).

@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "1.2.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "2.0.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -818,6 +818,17 @@ def main() -> None:
         # report, 2026-07-28 -- two of the offenders there were named reviewers).
         from _builder import roster_permission_lint
         _out = {"agents": agents, "agents_dir": agents_dir}
+        try:
+            from _loader import discover_agent_packs
+            _packs = discover_agent_packs()
+            if _packs:
+                _out["agent_packs"] = [
+                    {"path": p.get("path"), "name": p.get("name"),
+                     "agent_count": len(p.get("agents") or [])}
+                    for p in _packs
+                ]
+        except Exception:  # noqa: BLE001 — list must never fail on pack discovery
+            pass
         _lint = roster_permission_lint(agents)
         if _lint:
             _out["roster_warnings"] = _lint
