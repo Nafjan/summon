@@ -4,6 +4,7 @@
     python install.py                 # detect hosts, install skill + starter agents
     python install.py --dry-run       # show what would happen, touch nothing
     python install.py --hosts claude,codex
+    python install.py --profile t3    # Claude+Codex+Cursor roots T3 Code discovers
     python install.py --no-agents     # skill only, skip the starter agent roster
     python install.py --uninstall     # remove ONLY copies summon installed
 
@@ -65,6 +66,13 @@ HOSTS = {
     "antigravity-ide": os.path.join(HOME, ".gemini", "antigravity-ide"),
 }
 
+# Install profiles: named host subsets for a harness that does not own a skill
+# root of its own. T3 Code discovers Claude/Codex/Cursor skills — it is not a
+# Summon HOSTS entry (and must never become one).
+PROFILES = {
+    "t3": ("claude", "codex", "cursor"),
+}
+
 # The skill lives in skills/summon/ in the repo, so `npx skills add Nafjan/summon`
 # installs a self-contained, working skill. install.py sources the same folder.
 SKILL_SRC = os.path.join(HERE, "skills", "summon")
@@ -105,6 +113,52 @@ AGENTS_DIR = os.path.join(HOME, ".agents")
 
 def detect_hosts() -> list:
     return [name for name, root in HOSTS.items() if os.path.isdir(root)]
+
+
+def resolve_hosts(*, hosts_arg: str | None, profile: str | None) -> tuple[list, str | None]:
+    """Return (host list, advisory note). Profile selects a named subset.
+
+    ``--hosts`` further filters. A profile never invents missing host dirs —
+    only hosts whose root already exists are installed into.
+    """
+    if profile and profile not in PROFILES:
+        return [], f"unknown profile {profile!r} (valid: {', '.join(PROFILES)})"
+    if hosts_arg:
+        hosts = [h.strip() for h in hosts_arg.split(",") if h.strip()]
+        unknown = [h for h in hosts if h not in HOSTS]
+        if unknown:
+            return [], f"unknown host(s): {', '.join(unknown)}  (valid: {', '.join(HOSTS)})"
+        if profile:
+            allowed = set(PROFILES[profile])
+            off = [h for h in hosts if h not in allowed]
+            if off:
+                return [], (f"host(s) {', '.join(off)} not in profile {profile!r} "
+                            f"(profile hosts: {', '.join(PROFILES[profile])})")
+            hosts = [h for h in hosts if h in allowed]
+    elif profile:
+        hosts = [h for h in PROFILES[profile] if os.path.isdir(HOSTS[h])]
+    else:
+        hosts = detect_hosts()
+    note = None
+    if profile == "t3":
+        t3_dir = os.path.join(HOME, ".t3")
+        if not os.path.isdir(t3_dir):
+            note = ("T3 profile: ~/.t3 not found yet — install T3 Code from "
+                    "https://t3.codes, then re-run. Installing into Claude/Codex/"
+                    "Cursor skill roots T3 discovers anyway.")
+        else:
+            note = ("T3 profile: installing Summon into Claude/Codex/Cursor skill "
+                    "roots (T3 discovers those). See skills/summon/references/t3-code.md")
+        if hosts_arg:
+            # Keep caller filter, but warn if they omitted the profile set.
+            missing = [h for h in PROFILES["t3"] if h not in hosts]
+            if missing:
+                note = (note or "") + f"  (not requested: {', '.join(missing)})"
+        elif not hosts:
+            return [], ("T3 profile: none of ~/.claude, ~/.codex, ~/.cursor exist yet. "
+                        "Install and run Claude Code, Codex, or Cursor CLI once, then "
+                        "re-run: python install.py --profile t3")
+    return hosts, note
 
 
 def _owned(path: str) -> bool:
@@ -501,6 +555,9 @@ def _drift_check() -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--hosts", help="comma-separated subset (default: all detected)")
+    ap.add_argument("--profile", choices=sorted(PROFILES),
+                    help="named host subset for a harness without its own skill root "
+                         "(t3 = Claude+Codex+Cursor roots T3 Code discovers)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-agents", action="store_true", help="skip the starter agent roster")
     ap.add_argument("--with-alias", dest="with_alias", action="store_true",
@@ -509,19 +566,21 @@ def main() -> int:
     ap.add_argument("--uninstall", action="store_true")
     args = ap.parse_args()
 
-    if args.hosts:
-        hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
-        unknown = [h for h in hosts if h not in HOSTS]
-        if unknown:
-            print(f"unknown host(s): {', '.join(unknown)}  (valid: {', '.join(HOSTS)})")
-            return 2
-    else:
-        hosts = detect_hosts()
-        if not hosts:
+    hosts, note = resolve_hosts(hosts_arg=args.hosts, profile=args.profile)
+    if note and not hosts and args.profile:
+        print(note)
+        return 2
+    if not hosts:
+        if note:
+            print(note)
+        else:
             print("No AI-CLI host dirs found (~/.claude, ~/.codex, ~/.cursor, ~/.gemini, ~/.kimi-code, "
                   "~/.copilot, ~/.gemini/antigravity*).\nInstall and run at least one CLI "
-                  "first, or pass --hosts explicitly.")
-            return 2
+                  "first, or pass --hosts / --profile explicitly.")
+        return 2
+    if note:
+        print(note)
+        print()
 
     print(f"hosts: {', '.join(hosts)}\n")
     all_ok = True
@@ -555,6 +614,9 @@ def main() -> int:
     if not args.uninstall:
         shim = os.path.join(HERE, "summon.py")
         print(f"\nNext: check your setup ->  python \"{shim}\" --doctor")
+        if args.profile == "t3":
+            print("T3 Code: open a Claude or Codex session, type $summon (not /summon). "
+                  "Full guide: skills/summon/references/t3-code.md")
     return 0 if all_ok else 2
 
 

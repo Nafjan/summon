@@ -302,8 +302,20 @@ def run_onboard(
         "note": ("Pass --subscriptions cursor,claude,byteplus_coding_plan to record "
                  "active plans. Secrets are never written."),
     }
+    try:
+        from _t3 import t3_status
+        report["t3_code"] = t3_status()
+    except Exception:  # noqa: BLE001 — advisory
+        report["t3_code"] = None
     if not json_mode:
         report["text"] = render_detection(clis, creds)
+        t3 = report.get("t3_code") or {}
+        if t3.get("detected"):
+            report["text"] += (
+                "\n\nT3 Code detected on this machine.\n"
+                f"  {t3.get('hint', '')}\n"
+                "  Install for T3 skill discovery:  python install.py --profile t3\n"
+            )
         if write:
             report["text"] += f"\n\nWrote prefs: {path}\nSubscriptions recorded: {', '.join(subs) or '(none)'}\n"
     return report

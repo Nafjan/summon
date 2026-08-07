@@ -426,6 +426,11 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None,
         "byteplus_coding": _check_byteplus_coding(),
         "onboard_prefs": _check_onboard_prefs(),
     }
+    try:
+        from _t3 import t3_status
+        report["t3_code"] = t3_status()
+    except Exception:  # noqa: BLE001 — advisory; never break doctor
+        report["t3_code"] = {"detected": False, "ready": False, "hint": "t3 probe unavailable"}
     # Usable = on PATH + --version-verified, MINUS any the probe CONFIRMED
     # ineligible (account_eligible False) OR unauthenticated (auth_ok False) -- a
     # backend proven unable to authenticate must never read as "[OK] ready".
@@ -561,6 +566,20 @@ def render(report: dict) -> str:
     else:
         note = op.get("note") or "no ~/.agents/summon.json onboard section"
         lines.append(f"  [--] {note}")
+    t3 = report.get("t3_code") or {}
+    lines += ["", "t3 code:"]
+    if t3.get("detected"):
+        mark = "[OK]" if t3.get("ready") else "[~?]"
+        hosts = ",".join(t3.get("skill_hosts_with_summon") or []) or "none"
+        lines.append(f"  {mark} detected ({t3.get('marker', '~/.t3')}); "
+                     f"summon skill on: {hosts}")
+        prov = t3.get("providers_on_path") or {}
+        ready_p = [k for k, v in prov.items() if v]
+        lines.append(f"  providers on PATH: {', '.join(ready_p) if ready_p else '(none)'}")
+    else:
+        lines.append("  [--] not detected (~/.t3 absent)")
+    if t3.get("hint"):
+        lines.append(f"  hint: {t3['hint']}")
     inst = report.get("installs")
     if inst and inst.get("records"):
         dr = inst["drift"]

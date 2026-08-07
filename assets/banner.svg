@@ -39,25 +39,28 @@
   <rect x="76" y="278" width="452" height="46" rx="10" fill="#0E1430" stroke="#3B2E6E" stroke-width="1.5"/>
   <text x="96" y="307" class="mono" font-size="20" fill="#67E8F9">npx skills add<tspan fill="#E7ECFF"> Nafjan/summon</tspan></text>
 
-  <!-- hub -->
+  <!-- hub + seven backends (claude, codex, cursor, kimi, gemini, antigravity, modelark) -->
   <g>
-    <line x1="820" y1="180" x2="946" y2="70"  stroke="#3A3566" stroke-width="1.5"/>
-    <line x1="820" y1="180" x2="962" y2="124" stroke="#3A3566" stroke-width="1.5"/>
-    <line x1="820" y1="180" x2="968" y2="180" stroke="#3A3566" stroke-width="1.5"/>
-    <line x1="820" y1="180" x2="962" y2="236" stroke="#3A3566" stroke-width="1.5"/>
-    <line x1="820" y1="180" x2="946" y2="290" stroke="#3A3566" stroke-width="1.5"/>
+    <line x1="800" y1="180" x2="930" y2="42"  stroke="#3A3566" stroke-width="1.5"/>
+    <line x1="800" y1="180" x2="944" y2="88"  stroke="#3A3566" stroke-width="1.5"/>
+    <line x1="800" y1="180" x2="952" y2="134" stroke="#3A3566" stroke-width="1.5"/>
+    <line x1="800" y1="180" x2="956" y2="180" stroke="#3A3566" stroke-width="1.5"/>
+    <line x1="800" y1="180" x2="952" y2="226" stroke="#3A3566" stroke-width="1.5"/>
+    <line x1="800" y1="180" x2="944" y2="272" stroke="#3A3566" stroke-width="1.5"/>
+    <line x1="800" y1="180" x2="930" y2="318" stroke="#3A3566" stroke-width="1.5"/>
 
-    <circle cx="820" cy="180" r="52" fill="#160E33" stroke="#8B5CF6" stroke-width="2"/>
-    <text x="820" y="176" text-anchor="middle" class="sans" font-size="17" font-weight="700" fill="#C4B5FD">any</text>
-    <text x="820" y="196" text-anchor="middle" class="sans" font-size="17" font-weight="700" fill="#C4B5FD">host</text>
+    <circle cx="800" cy="180" r="48" fill="#160E33" stroke="#8B5CF6" stroke-width="2"/>
+    <text x="800" y="176" text-anchor="middle" class="sans" font-size="16" font-weight="700" fill="#C4B5FD">any</text>
+    <text x="800" y="196" text-anchor="middle" class="sans" font-size="16" font-weight="700" fill="#C4B5FD">host</text>
 
-    <!-- backend chips -->
-    <g class="sans" font-size="15" font-weight="600">
-      <g><rect x="948" y="52" width="118" height="34" rx="17" fill="#171E3E" stroke="#3B4570" stroke-width="1.3"/><text x="1007" y="74" text-anchor="middle" fill="#CDD6F4">claude</text></g>
-      <g><rect x="966" y="107" width="118" height="34" rx="17" fill="#171E3E" stroke="#3B4570" stroke-width="1.3"/><text x="1025" y="129" text-anchor="middle" fill="#CDD6F4">codex</text></g>
-      <g><rect x="972" y="163" width="118" height="34" rx="17" fill="#171E3E" stroke="#3B4570" stroke-width="1.3"/><text x="1031" y="185" text-anchor="middle" fill="#CDD6F4">cursor</text></g>
-      <g><rect x="966" y="219" width="118" height="34" rx="17" fill="#171E3E" stroke="#3B4570" stroke-width="1.3"/><text x="1025" y="241" text-anchor="middle" fill="#CDD6F4">gemini</text></g>
-      <g><rect x="948" y="274" width="134" height="34" rx="17" fill="#171E3E" stroke="#3B4570" stroke-width="1.3"/><text x="1015" y="296" text-anchor="middle" fill="#CDD6F4">antigravity</text></g>
+    <g class="sans" font-size="14" font-weight="600">
+      <g><rect x="932" y="26"  width="118" height="30" rx="15" fill="#171E3E" stroke="#3B4570" stroke-width="1.3"/><text x="991" y="46"  text-anchor="middle" fill="#CDD6F4">claude</text></g>
+      <g><rect x="946" y="72"  width="118" height="30" rx="15" fill="#171E3E" stroke="#3B4570" stroke-width="1.3"/><text x="1005" y="92" text-anchor="middle" fill="#CDD6F4">codex</text></g>
+      <g><rect x="954" y="118" width="118" height="30" rx="15" fill="#171E3E" stroke="#3B4570" stroke-width="1.3"/><text x="1013" y="138" text-anchor="middle" fill="#CDD6F4">cursor</text></g>
+      <g><rect x="958" y="164" width="118" height="30" rx="15" fill="#171E3E" stroke="#3B4570" stroke-width="1.3"/><text x="1017" y="184" text-anchor="middle" fill="#CDD6F4">kimi</text></g>
+      <g><rect x="954" y="210" width="118" height="30" rx="15" fill="#171E3E" stroke="#3B4570" stroke-width="1.3"/><text x="1013" y="230" text-anchor="middle" fill="#CDD6F4">gemini</text></g>
+      <g><rect x="946" y="256" width="134" height="30" rx="15" fill="#171E3E" stroke="#3B4570" stroke-width="1.3"/><text x="1013" y="276" text-anchor="middle" fill="#CDD6F4">antigravity</text></g>
+      <g><rect x="932" y="302" width="134" height="30" rx="15" fill="#171E3E" stroke="#3B4570" stroke-width="1.3"/><text x="999" y="322" text-anchor="middle" fill="#CDD6F4">modelark</text></g>
     </g>
   </g>
 </svg>

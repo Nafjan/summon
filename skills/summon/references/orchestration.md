@@ -38,8 +38,20 @@ When deciding **where** to spend a dispatch, use this mental model:
 | **Reviewer** | Summon cross-vendor CLI | Independent vendor, read-only |
 | **Chair / elite** | Summon pinned elite model | Synthesis, architecture, adversarial |
 
-`openai-compat` agents are a **single Chat Completions call** — fine for one-shot
-review text, not a multi-step coding loop; prefer a CLI backend for tool use.
+`openai-compat` / Summon `arkcli +chat` agents are **text seats** (single Chat
+Completions / +chat call — no FS or tool loop). Summon **refuses** them by
+default unless the caller opts in (`--allow-text-only`, `SUMMON_ALLOW_TEXT_ONLY=1`,
+or agent `capability: text-only`). Opt-in still emits a loud warning every run.
+On `blocked_reason: text_seat_no_tools`, re-dispatch deliberately — never
+auto-retry with the flag. Prefer a CLI backend for multi-step coding.
+
+**Council / manifest:** `capability: text-only` and `--allow-text-only` are
+**single-dispatch only**. Fan-out auto-rejects ModelArk / openai-compat / arkcli
+members unless `SUMMON_ALLOW_TEXT_ONLY=1` is set deliberately (pure-text councils
+with pasted context). Prefer toolful CLIs for repo deliberation.
+
+`SUMMON_ALLOW_TEXT_ONLY=1` in ambient CI/shell profiles rubber-stamps every text
+seat in that process; prefer the per-dispatch flag.
 
 ---
 

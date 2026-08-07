@@ -207,7 +207,7 @@ def read_json(path: str):
 # as a hash only; resume ids, profiles, schema/debug paths, and unknown flags
 # are omitted so no prompt text or secret is persisted.
 _FLAG_ALLOWLIST = ("agent", "cli", "model", "effort", "timeout", "cwd",
-                   "agents_dir", "worktree")
+                   "agents_dir", "worktree", "allow_text_only", "require_tools")
 
 
 def flags_projection(args) -> dict:

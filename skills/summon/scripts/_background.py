@@ -35,6 +35,10 @@ def child_argv(args: argparse.Namespace, result_file: str) -> list:
         out += ["--allow-credit"]
     if getattr(args, "allow_payg", False):
         out += ["--allow-payg"]
+    if getattr(args, "allow_text_only", False):
+        out += ["--allow-text-only"]
+    if getattr(args, "require_tools", False):
+        out += ["--require-tools"]
     if getattr(args, "no_contract_repair", False):
         out += ["--no-contract-repair"]     # honor the opt-out in the detached child
     if args.agents_dir:

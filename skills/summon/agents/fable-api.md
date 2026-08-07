@@ -3,6 +3,7 @@ run-agent: openai-compat
 provider: anthropic
 model: claude-fable-5
 api_key_env: ANTHROPIC_API_KEY
+capability: text-only
 ---
 
 # Fable (API key)

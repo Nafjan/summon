@@ -22,6 +22,9 @@ it's a tiny, dependency-free dispatcher, and it runs wherever your agent can exe
 command:
 
 - **Coding CLIs:** Claude Code, Codex, Cursor CLI, Gemini CLI, Antigravity.
+- **T3 Code:** works today — install Summon into the Claude/Codex/Cursor skill roots
+  T3 discovers (`python install.py --profile t3`). Not a native T3 plugin; see
+  [skills/summon/references/t3-code.md](skills/summon/references/t3-code.md).
 - **AI IDEs:** Cursor, Antigravity, or VS Code with an agent extension. The skill installs
   as a slash command, or the agent just shells out to the dispatcher.
 - **Desktop agent apps:** the Claude app and the ChatGPT app (formerly Codex), whose agent
@@ -40,8 +43,8 @@ OpenAI, Anthropic, Google, and local models (Ollama, LM Studio) work as agents t
    or your terminal)      │  no server, no pip   │ ───► gemini         (Google)
                           └──────────────────────┘ ───► kimi           (Moonshot AI)
                                                    └──► agy            (Antigravity)
-                                                   └──► openai-compat   (OpenRouter / OpenAI /
-                                                        Anthropic / Google / Ollama / …)
+                                                   └──► openai-compat   (ModelArk / OpenRouter /
+                                                        OpenAI / Anthropic / Google / Ollama / …)
 ```
 
 Most multi-agent tools assume one specific CLI is the orchestrator. Summon inverts that:
@@ -61,7 +64,9 @@ task, each billed to its own plan, instead of paying for four and using one at a
 
 - **Anyone stacking AI subscriptions.** Paying for Claude Max, ChatGPT, Cursor, or Gemini
   and only ever using one at a time? summon puts them on the same task together, each billed
-  to its own plan, so you get the full value of what you already pay for.
+  to its own plan, so you get the full value of what you already pay for. Using
+  [T3 Code](https://t3.codes) as the control plane? Same idea — Summon installs into the
+  skill roots T3's Claude/Codex sessions already load.
 - **Developers who live in Claude Code, Codex, or Cursor** (or any other AI coding tool)
   and want the *other* models one command away, without leaving the one they're in.
 - **Anyone who wants a real second opinion.** Cross-vendor review, where no model grades
@@ -145,6 +150,16 @@ python install.py            # install the skill into every detected AI CLI
 `install.py` stages atomically, never touches an agent file you already have, and uninstalls
 cleanly (`python install.py --uninstall`). Migrating from the old name? `--with-alias` adds a
 thin `/sub-agents` alias.
+
+**T3 Code:** T3 discovers Claude/Codex/Cursor skills — it has no Summon host entry of its
+own. Target those roots in one shot:
+
+```bash
+python install.py --profile t3
+python summon.py --doctor   # look for the "t3 code" section
+```
+
+Full smoke checklist: [skills/summon/references/t3-code.md](skills/summon/references/t3-code.md).
 
 <details>
 <summary><b>Or let your AI agent set it up for you</b> (it adapts to your machine)</summary>

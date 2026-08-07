@@ -1054,7 +1054,8 @@ _IDENTITY_LOCAL = ("_agent_def_state", "_unreadable", "_endpoint", "_agy_account
 def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, model=None,
                            effort=None, json_schema=None, resume=None, resume_profile=None,
                            worktree=None, allow_credit=False, gate_with=None,
-                           max_permission=None, artifacts=None) -> dict:
+                           max_permission=None, artifacts=None,
+                           allow_text_only=False, require_tools=False) -> dict:
     """THE request identity, built in ONE place from RAW inputs.
 
     The dispatcher and the manifest parent each used to build their own dict, so a field
@@ -1160,6 +1161,15 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # new request deliberately withheld. A gated request is not the same request.
         "gate_with": gate_with or None,
         "max_permission": max_permission or None,
+        # Text-seat consent is part of the request for openai-compat/arkcli: a
+        # stored --out success from an opted-in run must not satisfy a later
+        # request that withheld consent (same hole class as gate_with).
+        "allow_text_only": (
+            "1" if (allow_text_only or os.environ.get("SUMMON_ALLOW_TEXT_ONLY") == "1")
+            else None) if _rcli in ("openai-compat", "arkcli") else None,
+        "require_tools": (
+            "1" if (require_tools or os.environ.get("SUMMON_REQUIRE_TOOLS") == "1")
+            else None) if _rcli in ("openai-compat", "arkcli") else None,
         # Credit authorization changes the effective MODEL (it lifts the guard's
         # substitution) and arrives as either the flag or the env var the flag sets.
         # SUMMON_DEFAULT_EFFORT likewise changes effort without ever being a flag. A

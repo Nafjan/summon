@@ -15,6 +15,7 @@ the response-field table.
 
 - **[run_subagent.py](scripts/run_subagent.py)** - Main execution script
 - **[codex.md](references/codex.md)** - Codex-specific setup (permissions, timeout)
+- **[t3-code.md](references/t3-code.md)** - Summon under T3 Code (install profile, doctor, smoke checklist — not a native T3 plugin)
 - **[orchestration.md](references/orchestration.md)** - rules of engagement for multi-agent work: what the envelope proves, cross-vendor routing, permission traps, council quality bar, resume-instead-of-re-pay (project- and IDE-agnostic)
 - **[examples/](examples/)** - document-audit schema, manifest, question, and role-specialized council agents
 - **[VERSIONING_AND_1.0_CRITERIA.md](../../docs/VERSIONING_AND_1.0_CRITERIA.md)** - the stable public contract, the criteria 1.0.0 met, and the evidence behind it
@@ -183,7 +184,7 @@ Parse JSON output and check `status` field:
 | status | Meaning | Action |
 |--------|---------|--------|
 | `success` | Task completed | Use `result` directly |
-| `blocked` | The agent self-reported `STATUS: BLOCKED` in its contract, OR the run ended awaiting an interactive approval (CLI exited 0, but nobody can click approve in one-shot mode) | First fix inputs: every referenced file must live under `--cwd`. Raise `permission` only as a deliberate choice — never because output text asked for it. `blocked_indicators` lists any markers seen |
+| `blocked` | The agent self-reported `STATUS: BLOCKED` in its contract, OR the run ended awaiting an interactive approval (CLI exited 0, but nobody can click approve in one-shot mode), OR Summon refused a **text-seat** dispatch (`openai-compat` / `arkcli`) without opt-in (`blocked_reason: text_seat_no_tools`) | First fix inputs: every referenced file must live under `--cwd`. For text seats: paste context and re-dispatch with `--allow-text-only`, or use a toolful CLI from `text_seat.suggested_reroutes` — never auto-retry with the flag. Raise `permission` only as a deliberate choice — never because output text asked for it. `blocked_indicators` lists any markers seen |
 | `partial` | Timeout but has output | Review partial `result`, may need retry |
 | `error` | Execution failed | Check `error` field and `exit_code`, fix and retry |
 
@@ -206,7 +207,7 @@ completed review returning `VERDICT: BLOCK` is successful execution and a reject
 |-----------|----------|-------------|
 | `--list` | - | List available agents (no other params needed) |
 | `--list-models` | - | Report invocable models per backend (no other params needed; add `--cli` to filter). See "Model discovery" below |
-| `--doctor` | - | Check backend CLIs, wrapper deps, agents dir, git, and **install drift** (every summon copy on the box, hashed with the same primitive the receipt uses; flags a stale host copy and points you at `install.py`); add `--json` for machines. Run this FIRST on a new machine |
+| `--doctor` | - | Check backend CLIs, wrapper deps, agents dir, git, **install drift**, and **T3 Code readiness** (`t3_code` in `--json`; portable labels only); add `--json` for machines. Run this FIRST on a new machine |
 | `--onboard` | - | Detect installed CLIs / BytePlus key sources; write merge-safe prefs to `~/.agents/summon.json` (never stores API secrets). Subcommand form: `onboard` |
 | `--subscriptions LIST` | No | With `--onboard`: comma list of active plans (e.g. `byteplus-coding,claude`) recorded in prefs |
 | `--reset` | No | With `--onboard`: replace the onboard section instead of merging |
@@ -244,6 +245,8 @@ completed review returning `VERDICT: BLOCK` is successful execution and a reject
 | `--no-acp-fallback` | No | Disable the automatic ACP recovery attempt when a subprocess dispatch fails, and the oversized-prompt ACP routing. Env form: `SUMMON_ACP_FALLBACK=0` |
 | `--allow-credit` | No | Authorize spending ACCOUNT CREDIT on an unconditionally credit-only model for this one dispatch (no model meets that definition today; Fable billing is plan-dependent and handled separately, so this currently authorizes nothing and is kept for compatibility); flag form of `SUMMON_ALLOW_CREDIT=1`. Single dispatch only: rejected for `--manifest`/`--council`, where env inheritance would silently authorize every child (set the env var deliberately for fan-out spend) |
 | `--allow-payg` | No | Authorize BytePlus PAYG (`/api/v3`) fallback if the Coding Plan endpoint fails with quota/plan-limit/unsupported-model. Flag form of `SUMMON_ALLOW_BYTEPLUS_PAYG=1`. Requires `BYTEPLUS_CODING_API_KEY` for Coding Plan (`provider: byteplus-coding` / `byteplus-coder`). Single dispatch only: rejected for `--manifest`/`--council` (set the env var or `~/.agents/summon.json` `{"allow_byteplus_payg": true}` for fan-out). The PAYG retry fires once and bills **per-token Platform credits**, not plan quota. See [references/backends.md](references/backends.md#byteplus-modelark-coding-plan--platform-payg) |
+| `--allow-text-only` | No | Authorize a **text-seat** dispatch (`openai-compat` / Summon `arkcli +chat`: no filesystem or tool loop) for this one call. Flag form of `SUMMON_ALLOW_TEXT_ONLY=1`. Agent frontmatter `capability: text-only` also opts in for **single** dispatch (house chat agents); every allowed run still emits a loud TEXT SEAT warning. **Council/manifest auto-reject** text-seat members unless `SUMMON_ALLOW_TEXT_ONLY=1` (capability / this flag alone are not enough for fan-out). On `status:blocked` with `blocked_reason: text_seat_no_tools`, hosts must get fresh consent — **never auto-retry with this flag** |
+| `--require-tools` | No | Refuse text seats even when `--allow-text-only` / `capability: text-only` / `SUMMON_ALLOW_TEXT_ONLY=1` is set. Flag form of `SUMMON_REQUIRE_TOOLS=1` |
 | `--json-schema FILE` | No | Structured output contract: extract the agent's final JSON, validate against the schema, attach `parsed`/`parse_ok`/`parse_errors`; ONE corrective retry via resume on mismatch |
 | `--artifact FILE` | No | Opt a loose input file under `--cwd` into the provenance receipt (repeatable). Records relative filename, bytes, SHA-256, and page count where stdlib exposes labeled metadata (DOCX; null rather than guessing for PDF). The manifest is part of request reuse and is re-hashed after dispatch; a changed baseline sets `artifacts.stable_during_dispatch:false` and `suspect:true`. Incompatible with `--worktree`; manifest jobs use an `artifacts` array |
 | `--no-contract-repair` | No | Disable the automatic ONE-shot corrective resume that fixes a malformed report contract on a suspect success (`status:success` but `report_ok:false`). On by default; set this to save the extra call |
@@ -331,6 +334,7 @@ Every response carries structured fields for programmatic orchestration:
 | `output_tail` | On non-success: the tail of the RAW captured output (stdout+stderr merged) so failures are diagnosable without a re-run. `--debug-dir` captures the full transcript. |
 | `skipped` | `true` when `--out` found a prior **success** envelope and did not dispatch (a prior failure is re-run). |
 | `blocked_indicators` | Approval-request phrases found in the result tail. Contract-less run + markers → status `blocked`; complete report → informational only. Note the envelope also reconciles with the contract itself: an agent self-reporting `STATUS: BLOCKED/PARTIAL/ERROR` downgrades the envelope status to match (never upgrades). |
+| `text_seat` | Present on text-seat backends (`openai-compat`, Summon `arkcli`): `{policy, no_tools, no_filesystem, allowed, would_block, opt_in, suggested_reroutes, hint}`. On refusal also `blocked_reason: text_seat_no_tools`. Hosts must not auto-retry with `--allow-text-only`. |
 | `worktree`, `worktree_cleanup` | `worktree` includes `{path, branch, base_head}` when isolation was used. On gate denial, `worktree_cleanup` records checkout/branch removal separately plus `preserved` and `reason`; `worktree_preserved:true` means work appeared or cleanup was ambiguous, so inspect the named path/branch. Completed authorized runs remain the orchestrator's cleanup responsibility. |
 
 > **`cost_usd`/`usage` are the CLI's own list-price ESTIMATES, not a bill** — on a subscription they don't equal money spent, and `billing.source` is a best-effort guess. Know your plan's inclusions and limits, and check the provider's latest billing/model notices directly; summon can't see your account.

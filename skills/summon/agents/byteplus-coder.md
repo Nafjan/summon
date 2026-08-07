@@ -3,6 +3,7 @@ run-agent: openai-compat
 provider: byteplus-coding
 model: deepseek-v4-pro
 permission: read-only
+capability: text-only
 ---
 
 # BytePlus ModelArk Coding Plan coder (openai-compat)
@@ -30,7 +31,12 @@ minimal text call. (`auto` is an arkcli router and is **refused** by Summon's
 raw API backend.)
 
 All Coding Plan models are **text-only** — do not use this agent for tasks
-requiring image/vision input (Cursor screenshots, diagrams, etc.).
+requiring image/vision input (Cursor screenshots, diagrams, etc.). This
+definition declares `capability: text-only` so Summon may dispatch it without
+`--allow-text-only` on a **single** call; every such run still carries a loud
+TEXT SEAT warning. **Council/manifest** still require `SUMMON_ALLOW_TEXT_ONLY=1`
+(capability alone does not authorize fan-out). For repo/tool loops, use a
+toolful CLI agent instead.
 
 For other regions, override `byteplus-coding` in `providers.json` with your
 regional base URL (e.g. `ark.cn-beijing.volces.com/api/coding/v3`).

@@ -1719,7 +1719,8 @@ def test_openai_compat_http_roundtrip():
             f'api_key_env: ""\nmodel: test-model\n---\n# Bot\nrole.\n')
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
         r = sp.run([sys.executable, script, "--agent", "bot", "--prompt", "ping",
-                    "--cwd", d, "--agents-dir", d, "--timeout", "30s"],
+                    "--cwd", d, "--agents-dir", d, "--timeout", "30s",
+                    "--allow-text-only"],
                    capture_output=True, text=True, encoding="utf-8")
         env = _json.loads(r.stdout)
         assert env["status"] == "success" and env["result"].startswith("PONG")
@@ -1729,6 +1730,8 @@ def test_openai_compat_http_roundtrip():
                                 "models_used": []}
         assert env["usage"]["total_tokens"] == 9 and env["billing"]["source"] == "api"
         assert env["envelope"] == 1
+        assert env.get("text_seat", {}).get("allowed") is True
+        assert any("TEXT SEAT" in w for w in (env.get("warnings") or []))
     finally:
         srv.shutdown()
         import shutil as _sh
@@ -1766,14 +1769,16 @@ def test_openai_compat_redacts_key_and_survives_errors():
         # reflect: error envelope must NOT contain the secret
         H.mode = "reflect"
         r = sp.run([sys.executable, script, "--agent", "b", "--prompt", "x", "--cwd", d,
-                    "--agents-dir", d, "--timeout", "20s"], capture_output=True, text=True, env=env_with_key)
+                    "--agents-dir", d, "--timeout", "20s", "--allow-text-only"],
+                   capture_output=True, text=True, env=env_with_key)
         assert SECRET not in r.stdout and "REDACTED" in r.stdout, r.stdout[:300]
         assert _json.loads(r.stdout)["status"] == "error"
         # bad shape + non-string content: clean error / no crash
         for mode in ("badshape", "nonstr"):
             H.mode = mode
             r = sp.run([sys.executable, script, "--agent", "b", "--prompt", "x", "--cwd", d,
-                        "--agents-dir", d, "--timeout", "20s"], capture_output=True, text=True, env=env_with_key)
+                        "--agents-dir", d, "--timeout", "20s", "--allow-text-only"],
+                       capture_output=True, text=True, env=env_with_key)
             env = _json.loads(r.stdout)
             assert "Traceback" not in r.stderr and env["status"] in ("error", "success"), mode
     finally:
@@ -1795,6 +1800,11 @@ def test_openai_compat_dry_run_no_crash():
         assert view["permission_flags"] is None and "11434" in view["base_url"]
         # the dry-run must never surface a key value
         assert "api_key_present" in view and "api_key_env" in view
+        # text-seat honesty: dry-run previews the refuse
+        assert view.get("would_refuse") is True
+        assert view.get("blocked_reason") == "text_seat_no_tools"
+        assert view.get("text_seat", {}).get("would_block") is True
+        assert view["text_seat"]["policy"] == "text_seat"
     finally:
         import shutil as _sh; _sh.rmtree(d, ignore_errors=True)
 
@@ -3087,7 +3097,8 @@ def test_receipt_and_model_evidence_on_error_dispatch():
             "---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:9\n"
             "api_key_env:\nmodel: probe-model\n---\n# dead api\nrole.\n")
         r = sp.run([sys.executable, script, "--agent", "dead-api", "--prompt", "hello",
-                    "--cwd", os.getcwd(), "--agents-dir", d, "--timeout", "8s"],
+                    "--cwd", os.getcwd(), "--agents-dir", d, "--timeout", "8s",
+                    "--allow-text-only"],
                    capture_output=True, text=True, encoding="utf-8")
         env = _json.loads(r.stdout)
         assert env["status"] == "error", env
@@ -3100,6 +3111,8 @@ def test_receipt_and_model_evidence_on_error_dispatch():
         assert os.path.basename(s["script"]) == "run_subagent.py", s
         ad = env["agent_def"]
         assert ad["file"].endswith("dead-api.md") and ad["source"] == "explicit", ad
+        assert env.get("text_seat", {}).get("allowed") is True
+        assert any("TEXT SEAT" in w for w in (env.get("warnings") or []))
         import pathlib
         assert pathlib.Path(ad["agents_dir"]) == pathlib.Path(d).resolve(), ad
         with open(af, "rb") as fh:
@@ -5490,7 +5503,7 @@ def test_jobs_background_end_to_end():
             "api_key_env:\nmodel: probe\n---\n# dead\nrole.\n")
         r = sp.run([sys.executable, script, "--agent", "dead", "--prompt", "hello",
                     "--cwd", d, "--agents-dir", d, "--job-dir", jobs,
-                    "--background", "--timeout", "8s"],
+                    "--background", "--timeout", "8s", "--allow-text-only"],
                    capture_output=True, text=True, encoding="utf-8")
         handle = _json.loads(r.stdout)
         assert handle["status"] == "background" and os.path.isfile(handle["record_file"])
@@ -6301,9 +6314,115 @@ def test_v6_installs_hosts_match_installer():
             "host %r: the installer writes under %r but the drift detector probes %r -- the "
             "host would report present:False forever while still being installed" % (
                 key, root, detector_root))
+    # T3 is an install PROFILE, never a HOSTS key (would break this sync test + invent a
+    # fake skill root T3 does not own).
+    assert "t3" not in mod.HOSTS
+    assert "t3" in getattr(mod, "PROFILES", {})
+    assert mod.PROFILES["t3"] == ("claude", "codex", "cursor")
+
+
+def test_t3_status_absent_and_ready_under_fake_home():
+    import _t3
+    home = tempfile.mkdtemp(prefix="summon-t3-")
+    orig = _t3.providers_on_path
+    try:
+        st = _t3.t3_status(home=home)
+        assert st["detected"] is False
+        assert st["ready"] is False
+        assert st["marker"] == "~/.t3"
+        assert "not detected" in st["hint"].lower() or "absent" in st["hint"].lower()
+
+        os.makedirs(os.path.join(home, ".t3"))
+        # Skill present on claude, but no provider binary -> detected, not ready.
+        skill = os.path.join(home, ".claude", "skills", "summon")
+        os.makedirs(skill)
+        with open(os.path.join(skill, "SKILL.md"), "w", encoding="utf-8") as fh:
+            fh.write("# summon\n")
+        _t3.providers_on_path = lambda: {
+            "claude": False, "codex": False, "cursor": False, "grok": False, "opencode": False,
+        }
+        st = _t3.t3_status(home=home)
+        assert st["detected"] is True
+        assert st["ready"] is False
+        assert "claude" in st["skill_hosts_with_summon"]
+        assert "install.py --profile t3" in st["hint"] or "skill" in st["hint"].lower()
+
+        _t3.providers_on_path = lambda: {
+            "claude": True, "codex": False, "cursor": False, "grok": False, "opencode": False,
+        }
+        st = _t3.t3_status(home=home)
+        assert st["ready"] is True
+        assert "present" in st["hint"].lower() or "Claude" in st["hint"] or "Codex" in st["hint"]
+    finally:
+        _t3.providers_on_path = orig
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_install_profile_t3_resolve_hosts():
+    import importlib.util
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(os.path.dirname(os.path.dirname(scripts_dir)))
+    install_py = os.path.join(root, "install.py")
+    if not os.path.isfile(install_py):
+        return
+    spec = importlib.util.spec_from_file_location("_summon_install_t3", install_py)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    home = tempfile.mkdtemp(prefix="summon-t3-inst-")
+    try:
+        # Point installer HOME at the fake tree.
+        mod.HOME = home
+        for name in list(mod.HOSTS):
+            # Rebuild HOSTS paths under fake home (installer binds HOME at import).
+            if name.startswith("antigravity"):
+                mod.HOSTS[name] = os.path.join(home, ".gemini", name)
+            elif name == "gemini":
+                mod.HOSTS[name] = os.path.join(home, ".gemini")
+            elif name == "kimi":
+                mod.HOSTS[name] = os.path.join(home, ".kimi-code")
+            else:
+                mod.HOSTS[name] = os.path.join(home, f".{name}")
+
+        hosts, note = mod.resolve_hosts(hosts_arg=None, profile="t3")
+        assert hosts == []
+        assert note and "none of" in note.lower()
+
+        os.makedirs(os.path.join(home, ".claude"))
+        os.makedirs(os.path.join(home, ".codex"))
+        hosts, note = mod.resolve_hosts(hosts_arg=None, profile="t3")
+        assert hosts == ["claude", "codex"]
+        assert note and "T3" in note
+
+        hosts, note = mod.resolve_hosts(hosts_arg="claude", profile="t3")
+        assert hosts == ["claude"]
+        assert note  # still advisory
+
+        hosts, note = mod.resolve_hosts(hosts_arg="gemini", profile="t3")
+        assert hosts == []
+        assert note and "not in profile" in (note or "")
+
+        hosts, note = mod.resolve_hosts(hosts_arg=None, profile="nope")
+        assert hosts == []
+        assert "unknown profile" in (note or "")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def test_doctor_includes_t3_code_section():
+    import _doctor
+    report = _doctor.doctor(agents_dir=None, cwd=None)
+    assert "t3_code" in report
+    assert isinstance(report["t3_code"], dict)
+    assert "detected" in report["t3_code"]
+    assert "ready" in report["t3_code"]
+    text = _doctor.render(report)
+    assert "t3 code:" in text.lower()
 
 
 def test_v6_read_version_parser_robustness():
+
     # AST-based _read_version (review WARNING): a __version__ inside a docstring or a
     # trailing # "comment" must NOT be mistaken for the value; a computed value -> None;
     # a bad encoding must NEVER raise (the documented contract).
@@ -16572,6 +16691,490 @@ def test_arkcli_cmd_prefers_node_over_cmd_exe(monkeypatch=None):
             os.name = old_name
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_text_seat_blocks_without_opt_in():
+    """openai-compat refuses by default with machine-readable text_seat fields."""
+    import json as _json, subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-ts-block-")
+    try:
+        open(os.path.join(d, "t.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:9/v1\n"
+            "model: m\n---\n# T\n")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SUMMON_ALLOW_TEXT_ONLY", "SUMMON_REQUIRE_TOOLS")}
+        r = sp.run([sys.executable, script, "--agent", "t", "--prompt", "x",
+                    "--cwd", d, "--agents-dir", d, "--timeout", "5s"],
+                   capture_output=True, text=True, encoding="utf-8", env=env)
+        out = _json.loads(r.stdout)
+        assert out["status"] == "blocked", out
+        assert out["blocked_reason"] == "text_seat_no_tools", out
+        assert out["text_seat"]["policy"] == "text_seat"
+        assert out["text_seat"]["would_block"] is True
+        assert out["text_seat"]["allowed"] is False
+        assert out["text_seat"]["no_tools"] is True
+        assert isinstance(out["text_seat"]["suggested_reroutes"], list)
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_text_seat_capability_opts_in_but_warns():
+    import json as _json, subprocess as sp, http.server, threading
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = _json.dumps({
+                "model": "m",
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-ts-cap-")
+    try:
+        open(os.path.join(d, "t.md"), "w", encoding="utf-8").write(
+            f"---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:{port}/v1\n"
+            "model: m\ncapability: text-only\n---\n# T\n")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SUMMON_ALLOW_TEXT_ONLY", "SUMMON_REQUIRE_TOOLS")}
+        r = sp.run([sys.executable, script, "--agent", "t", "--prompt", "x",
+                    "--cwd", d, "--agents-dir", d, "--timeout", "20s"],
+                   capture_output=True, text=True, encoding="utf-8", env=env)
+        out = _json.loads(r.stdout)
+        assert out["status"] == "success", out
+        assert out["text_seat"]["allowed"] is True
+        assert out["text_seat"]["capability_text_only"] is True
+        assert any("TEXT SEAT" in w for w in (out.get("warnings") or [])), out.get("warnings")
+    finally:
+        srv.shutdown()
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_text_seat_require_tools_overrides_opt_in():
+    import json as _json, subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-ts-req-")
+    try:
+        open(os.path.join(d, "t.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:9/v1\n"
+            "model: m\ncapability: text-only\n---\n# T\n")
+        env = {k: v for k, v in os.environ.items() if k != "SUMMON_ALLOW_TEXT_ONLY"}
+        r = sp.run([sys.executable, script, "--agent", "t", "--prompt", "x",
+                    "--cwd", d, "--agents-dir", d, "--timeout", "5s",
+                    "--allow-text-only", "--require-tools"],
+                   capture_output=True, text=True, encoding="utf-8", env=env)
+        out = _json.loads(r.stdout)
+        assert out["status"] == "blocked", out
+        assert out["blocked_reason"] == "text_seat_no_tools"
+        assert out["text_seat"].get("require_tools") is True
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_text_seat_allow_flags_reach_background_child_argv():
+    import argparse
+    import run_subagent as r
+    ns = argparse.Namespace(agent="a", prompt="p", prompt_file=None,
+                            allow_credit=False, allow_payg=False,
+                            allow_text_only=True, require_tools=True,
+                            cwd="C:/w",
+                            agents_dir=None, timeout=600000, cli=None, model=None,
+                            effort=None, resume=None, resume_profile=None, out=None,
+                            json_schema=None, debug_dir=None, retries=0, worktree=None,
+                            no_contract_repair=False, gate_with=None, gate_timeout=None,
+                            max_permission=None, artifacts=None, transport=None)
+    argv = r._child_argv(ns, "res.json")
+    assert "--allow-text-only" in argv, argv
+    assert "--require-tools" in argv, argv
+    ns.allow_text_only = False
+    ns.require_tools = False
+    argv2 = r._child_argv(ns, "res.json")
+    assert "--allow-text-only" not in argv2
+    assert "--require-tools" not in argv2
+
+
+def test_text_seat_rejected_in_fanout_modes():
+    from _cli import MODE_FLAGS
+    for mode in ("manifest", "council", "council-resume"):
+        flags = MODE_FLAGS[mode]
+        assert "allow_text_only" not in flags, mode
+        assert "require_tools" not in flags, mode
+
+
+def test_text_seat_module_helpers():
+    from _text_seat import (is_text_seat, evaluate_text_seat, suggested_reroutes,
+                             BLOCKED_REASON)
+    assert is_text_seat("openai-compat") and is_text_seat("arkcli")
+    assert not is_text_seat("claude")
+    d = evaluate_text_seat(cli="openai-compat", allow_text_only=False)
+    assert d["would_block"] and d["text_seat"]["policy"] == "text_seat"
+    d2 = evaluate_text_seat(cli="openai-compat", allow_text_only=True)
+    assert d2["allowed"] and "TEXT SEAT" in d2["warning"]
+    d3 = evaluate_text_seat(cli="openai-compat", allow_text_only=True,
+                            require_tools_flag=True)
+    assert d3["would_block"] and d3["text_seat"].get("require_tools")
+    assert BLOCKED_REASON == "text_seat_no_tools"
+    routes = suggested_reroutes()
+    assert all("cli" in r and "reason" in r for r in routes)
+    assert not any(r["cli"] in ("openai-compat", "arkcli") for r in routes)
+
+
+def test_text_seat_env_opt_in_and_require_tools():
+    """SUMMON_ALLOW_TEXT_ONLY / SUMMON_REQUIRE_TOOLS env forms (documented channels)."""
+    import json as _json, subprocess as sp, http.server, threading
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = _json.dumps({
+                "model": "m",
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-ts-env-")
+    try:
+        open(os.path.join(d, "t.md"), "w", encoding="utf-8").write(
+            f"---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:{port}/v1\n"
+            "model: m\n---\n# T\n")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SUMMON_ALLOW_TEXT_ONLY", "SUMMON_REQUIRE_TOOLS")}
+        env["SUMMON_ALLOW_TEXT_ONLY"] = "1"
+        r = sp.run([sys.executable, script, "--agent", "t", "--prompt", "x",
+                    "--cwd", d, "--agents-dir", d, "--timeout", "20s"],
+                   capture_output=True, text=True, encoding="utf-8", env=env)
+        out = _json.loads(r.stdout)
+        assert out["status"] == "success", out
+        assert out["text_seat"]["allowed"] is True
+        assert r.returncode == 0
+        # require-tools env overrides allow env
+        env["SUMMON_REQUIRE_TOOLS"] = "1"
+        r2 = sp.run([sys.executable, script, "--agent", "t", "--prompt", "x",
+                     "--cwd", d, "--agents-dir", d, "--timeout", "5s"],
+                    capture_output=True, text=True, encoding="utf-8", env=env)
+        out2 = _json.loads(r2.stdout)
+        assert out2["status"] == "blocked", out2
+        assert out2["blocked_reason"] == "text_seat_no_tools"
+        assert r2.returncode == 0  # structural block matches gate exit contract
+    finally:
+        srv.shutdown()
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_text_seat_capability_list_form():
+    from _text_seat import _capability_values, capability_text_only
+    assert "text-only" in _capability_values(["read", "text-only"])
+    assert "text-only" in _capability_values("text-only, other")
+    d = tempfile.mkdtemp(prefix="summon-ts-list-")
+    try:
+        path = os.path.join(d, "t.md")
+        # Simple scalar list-like YAML without needing a full YAML lib in frontmatter
+        open(path, "w", encoding="utf-8").write(
+            "---\nrun-agent: openai-compat\ncapability: text-only\n---\n# T\n")
+        assert capability_text_only(path) is True
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_text_seat_background_refuses_in_parent():
+    """Parent must not return a background handle for a text seat that will block."""
+    import json as _json, subprocess as sp
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    d = tempfile.mkdtemp(prefix="summon-ts-bg-")
+    jobs = os.path.join(d, "jobs")
+    try:
+        open(os.path.join(d, "t.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:9/v1\n"
+            "model: m\n---\n# T\n")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SUMMON_ALLOW_TEXT_ONLY", "SUMMON_REQUIRE_TOOLS")}
+        r = sp.run([sys.executable, script, "--agent", "t", "--prompt", "x",
+                    "--cwd", d, "--agents-dir", d, "--job-dir", jobs,
+                    "--background", "--timeout", "5s"],
+                   capture_output=True, text=True, encoding="utf-8", env=env)
+        out = _json.loads(r.stdout)
+        assert out["status"] == "blocked", out
+        assert out["blocked_reason"] == "text_seat_no_tools"
+        assert not os.path.isdir(jobs) or not any(
+            n.endswith(".json") for n in os.listdir(jobs)
+            if not n.startswith(".")), "spawned a child for a refused text seat"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_byteplus_coder_declares_text_only_capability():
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(os.path.dirname(scripts_dir), "agents", "byteplus-coder.md")
+    text = open(path, encoding="utf-8").read()
+    assert "capability: text-only" in text.split("---", 2)[1]
+
+
+def test_fanout_text_seat_requires_env_not_capability():
+    """Council/manifest must not accept capability: text-only without env."""
+    from _text_seat import fanout_allows_text_seat, fanout_text_seat_refusal
+    prev = os.environ.pop("SUMMON_ALLOW_TEXT_ONLY", None)
+    prev_r = os.environ.pop("SUMMON_REQUIRE_TOOLS", None)
+    try:
+        assert fanout_allows_text_seat() is False
+        msg = fanout_text_seat_refusal("byteplus-coder", "openai-compat")
+        assert "SUMMON_ALLOW_TEXT_ONLY=1" in msg
+        os.environ["SUMMON_ALLOW_TEXT_ONLY"] = "1"
+        assert fanout_allows_text_seat() is True
+        os.environ["SUMMON_REQUIRE_TOOLS"] = "1"
+        assert fanout_allows_text_seat() is False
+    finally:
+        if prev is None:
+            os.environ.pop("SUMMON_ALLOW_TEXT_ONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_TEXT_ONLY"] = prev
+        if prev_r is None:
+            os.environ.pop("SUMMON_REQUIRE_TOOLS", None)
+        else:
+            os.environ["SUMMON_REQUIRE_TOOLS"] = prev_r
+
+
+def test_council_chairman_tag_clamps_read_only():
+    """Generation-prefixed chairman tags must still get --max-permission read-only."""
+    import _council, _manifest
+    from unittest import mock
+    seen = []
+
+    def fake_dispatch_child(cmd, watchdog, on_spawn=None, on_reap=None):
+        seen.append(list(cmd))
+        class P:
+            timed_out = False
+            returncode = 0
+        return P(), None
+
+    with mock.patch.object(_manifest, "_dispatch_child", fake_dispatch_child), \
+         mock.patch.object(_manifest, "_read_envelope", return_value={"status": "success"}), \
+         mock.patch.object(_manifest, "_existing_envelope", return_value=None):
+        d = tempfile.mkdtemp(prefix="summon-chair-")
+        try:
+            _council._dispatch("architect", "synth", d, d, 5000, d, "g2-chairman")
+            _council._dispatch("architect", "synth", d, d, 5000, d, "g2-chairman-fallback")
+            _council._dispatch("planner", "pos", d, d, 5000, d, "g2-r1-planner")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    assert len(seen) == 3, seen
+    assert any("--max-permission" in c and "read-only" in c for c in seen[:2]), seen
+    assert "--max-permission" not in seen[2], seen
+
+
+def test_text_seat_consent_in_request_fingerprint():
+    """Opt-in / require-tools must change identity for openai-compat --out reuse."""
+    from _executor import build_request_identity, request_fingerprint
+    d = tempfile.mkdtemp(prefix="summon-ts-fp-")
+    prev_a = os.environ.pop("SUMMON_ALLOW_TEXT_ONLY", None)
+    prev_r = os.environ.pop("SUMMON_REQUIRE_TOOLS", None)
+    try:
+        open(os.path.join(d, "t.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:9/v1\n"
+            "model: m\napi_key_env: \"\"\n---\n# T\n")
+        base = dict(agent="t", prompt="x", cwd=d, agents_dir=d)
+        a = request_fingerprint(**build_request_identity(**base, allow_text_only=False))
+        b = request_fingerprint(**build_request_identity(**base, allow_text_only=True))
+        c = request_fingerprint(**build_request_identity(**base, allow_text_only=True,
+                                                         require_tools=True))
+        assert a != b, "allow_text_only must change fingerprint"
+        assert b != c, "require_tools must change fingerprint"
+    finally:
+        if prev_a is None:
+            os.environ.pop("SUMMON_ALLOW_TEXT_ONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_TEXT_ONLY"] = prev_a
+        if prev_r is None:
+            os.environ.pop("SUMMON_REQUIRE_TOOLS", None)
+        else:
+            os.environ["SUMMON_REQUIRE_TOOLS"] = prev_r
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_manifest_rejects_text_seat_without_env():
+    import _manifest, argparse, io, contextlib, json as _json
+    d = tempfile.mkdtemp(prefix="summon-ts-man-")
+    prev = os.environ.pop("SUMMON_ALLOW_TEXT_ONLY", None)
+    try:
+        open(os.path.join(d, "ts.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:9/v1\n"
+            "model: m\napi_key_env: \"\"\ncapability: text-only\n---\n# TS\n")
+        open(os.path.join(d, "ok.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: claude\npermission: read-only\n---\n# OK\n")
+        man = os.path.join(d, "m.json")
+        json.dump({"jobs": [
+            {"id": "a", "agent": "ts", "prompt": "x"},
+            {"id": "b", "agent": "ok", "prompt": "y"},
+        ]}, open(man, "w", encoding="utf-8"))
+        ns = argparse.Namespace(manifest=man, concurrency=None, cwd=d,
+                                agents_dir=d, results_dir=os.path.join(d, "out"),
+                                retries=0)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            code = _manifest.run_manifest(ns)
+        env = _json.loads(buf.getvalue())
+        assert code == 1
+        assert env["status"] == "error"
+        assert "SUMMON_ALLOW_TEXT_ONLY" in env["error"]
+    finally:
+        if prev is None:
+            os.environ.pop("SUMMON_ALLOW_TEXT_ONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_TEXT_ONLY"] = prev
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_council_rejects_text_seat_member_without_env():
+    """capability: text-only house agent must fail council preflight without env."""
+    import _council, argparse, io, contextlib, json as _json
+    d = tempfile.mkdtemp(prefix="summon-ts-council-")
+    prev = os.environ.pop("SUMMON_ALLOW_TEXT_ONLY", None)
+    try:
+        open(os.path.join(d, "ts.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: openai-compat\nprovider: byteplus-coding\n"
+            "model: deepseek-v4-flash\ncapability: text-only\n---\n# TS\n")
+        open(os.path.join(d, "toolful.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: claude\npermission: read-only\n---\n# T\n")
+        ns = argparse.Namespace(
+            question="pure text?", question_file=None,
+            members="ts,toolful", chairman="toolful", rounds=1,
+            cwd=d, agents_dir=d, timeout=5000, run_dir=d)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            code = _council.run_council(ns)
+        env = _json.loads(buf.getvalue())
+        assert code == 1
+        assert env["status"] == "error"
+        assert "SUMMON_ALLOW_TEXT_ONLY" in env["error"]
+        assert "ts" in env["error"]
+    finally:
+        if prev is None:
+            os.environ.pop("SUMMON_ALLOW_TEXT_ONLY", None)
+        else:
+            os.environ["SUMMON_ALLOW_TEXT_ONLY"] = prev
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_council_clamped_stage_reserves_margin():
+    """Overall clamp must leave room for the parent watchdog margin."""
+    import _council
+    reg = _council._KillRegistry(30_000, None, time.monotonic())
+    reg.overall_deadline = time.monotonic() + 5.0  # 5s left (< 60s margin)
+    clamped = reg.clamped_stage_ms(600_000)
+    assert clamped == 0, clamped  # unaffordable — do not start a 1s child
+    reg.overall_deadline = time.monotonic() + 90.0  # 90s left -> ~30s usable
+    clamped = reg.clamped_stage_ms(600_000)
+    assert 25_000 <= clamped <= 35_000, clamped
+
+
+def test_payg_retry_uses_remaining_budget(monkeypatch=None):
+    """PAYG fallback must not spend a second full timeout_ms."""
+    import _apibackend as ab
+    calls = []
+
+    def fake_do(base_url, model, system_context, prompt, api_key, timeout_ms, cli):
+        calls.append({"url": base_url, "timeout_ms": timeout_ms})
+        if "coding" in base_url:
+            return {"status": "error", "error": "quota", "exit_code": 1, "cli": cli,
+                    "_payg_fallback_worthy": True, "_fallback_reason": "quota"}
+        return {"status": "success", "result": "ok", "exit_code": 0, "cli": cli,
+                "usage": {}, "model_resolved": model}
+
+    inv = types.SimpleNamespace(
+        model="deepseek-v4-flash",
+        base_url="https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        system_context="", prompt="hi", api_key_env="BYTEPLUS_CODING_API_KEY",
+        allow_payg=True)
+    prev_key = os.environ.get("BYTEPLUS_CODING_API_KEY")
+    prev_payg = os.environ.get("SUMMON_ALLOW_BYTEPLUS_PAYG")
+    orig = ab._do_request
+    try:
+        os.environ["BYTEPLUS_CODING_API_KEY"] = "test-key-not-real"
+        os.environ["SUMMON_ALLOW_BYTEPLUS_PAYG"] = "1"
+        ab._do_request = fake_do
+        resp = ab.call(inv, timeout_ms=10_000)
+        assert resp["status"] == "success"
+        assert len(calls) == 2
+        assert calls[0]["timeout_ms"] == 10_000
+        assert calls[1]["timeout_ms"] <= 10_000
+        assert calls[1]["timeout_ms"] >= 1000
+    finally:
+        ab._do_request = orig
+        if prev_key is None:
+            os.environ.pop("BYTEPLUS_CODING_API_KEY", None)
+        else:
+            os.environ["BYTEPLUS_CODING_API_KEY"] = prev_key
+        if prev_payg is None:
+            os.environ.pop("SUMMON_ALLOW_BYTEPLUS_PAYG", None)
+        else:
+            os.environ["SUMMON_ALLOW_BYTEPLUS_PAYG"] = prev_payg
+
+
+def test_payg_skipped_when_budget_exhausted():
+    """When primary consumed the wall clock, PAYG must not floor to 1s."""
+    import _apibackend as ab
+
+    def slow_primary(base_url, model, system_context, prompt, api_key, timeout_ms, cli):
+        time.sleep(0.05)
+        return {"status": "error", "error": "quota", "exit_code": 1, "cli": cli,
+                "_payg_fallback_worthy": True, "_fallback_reason": "quota"}
+
+    inv = types.SimpleNamespace(
+        model="deepseek-v4-flash",
+        base_url="https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        system_context="", prompt="hi", api_key_env="BYTEPLUS_CODING_API_KEY",
+        allow_payg=True)
+    prev_key = os.environ.get("BYTEPLUS_CODING_API_KEY")
+    prev_payg = os.environ.get("SUMMON_ALLOW_BYTEPLUS_PAYG")
+    orig = ab._do_request
+    try:
+        os.environ["BYTEPLUS_CODING_API_KEY"] = "test-key-not-real"
+        os.environ["SUMMON_ALLOW_BYTEPLUS_PAYG"] = "1"
+        ab._do_request = slow_primary
+        resp = ab.call(inv, timeout_ms=40)  # primary sleep eats the budget
+        assert resp["status"] == "error"
+        assert "PAYG fallback skipped" in (resp.get("error") or "")
+    finally:
+        ab._do_request = orig
+        if prev_key is None:
+            os.environ.pop("BYTEPLUS_CODING_API_KEY", None)
+        else:
+            os.environ["BYTEPLUS_CODING_API_KEY"] = prev_key
+        if prev_payg is None:
+            os.environ.pop("SUMMON_ALLOW_BYTEPLUS_PAYG", None)
+        else:
+            os.environ["SUMMON_ALLOW_BYTEPLUS_PAYG"] = prev_payg
+
+
+def test_banner_lists_kimi_and_modelark():
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    banner = os.path.join(root, "assets", "banner.svg")
+    if not os.path.isfile(banner):
+        return
+    text = open(banner, encoding="utf-8").read()
+    assert "kimi" in text and "modelark" in text
+    for name in ("claude", "codex", "cursor", "gemini", "antigravity"):
+        assert name in text
 
 
 if __name__ == "__main__":

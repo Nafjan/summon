@@ -4,6 +4,48 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
+## [2.0.1] — 2026-08-07
+
+Patch on 2.0.0: text-seat honesty, T3 Summon-side support, timeout/PAYG budget
+hardening, and adversarial-review fixes (Kimi K3 + GPT-5.6 Sol + Claude Opus).
+
+### Added
+
+- **T3 Code support (Summon-side):** `python install.py --profile t3` installs into
+  Claude/Codex/Cursor skill roots T3 discovers; `doctor` / `onboard` report a `t3_code`
+  readiness section; guide at `skills/summon/references/t3-code.md`. Not a native T3
+  plugin and not an upstream T3 PR — Summon rides provider skill discovery.
+  `--profile t3 --hosts` is intersected with the profile set (out-of-profile hosts refused).
+
+- **Council/manifest text-seat gate:** ModelArk / `openai-compat` / `arkcli` members
+  are auto-rejected in fan-out unless `SUMMON_ALLOW_TEXT_ONLY=1` (capability /
+  `--allow-text-only` remain single-dispatch only). Pure-text councils still work
+  with the env set deliberately. Fan-out children get `--require-tools` when that
+  env is unset (blocks mid-run definition mutation to `capability: text-only`).
+  `SUMMON_REQUIRE_TOOLS=1` also refuses fan-out text seats.
+
+- **Banner:** `assets/banner.svg` lists kimi and modelark alongside the other backends.
+
+- **Text-seat honesty:** `openai-compat` and Summon `arkcli` refuse by default
+  unless `--allow-text-only` / `SUMMON_ALLOW_TEXT_ONLY=1` / `capability: text-only`.
+  Machine-readable `blocked_reason: text_seat_no_tools` + `text_seat` recovery
+  object (PATH-filtered `suggested_reroutes`). Opt-in still warns every run;
+  `--require-tools` / `SUMMON_REQUIRE_TOOLS=1` overrides opt-in. House chat agents
+  (`byteplus-coder`, `openrouter-example`, `fable-api`) declare `capability: text-only`.
+  **Migration:** existing one-shot openai-compat scripts must pass the flag or set
+  capability; do not auto-retry blocked text seats with `--allow-text-only`.
+
+### Fixed
+
+- **Timeout hardening:** Coding Plan → PAYG retry spends only the *remaining*
+  wall-clock budget; skip PAYG when remaining is under 1s. Council
+  `--overall-timeout` clamp reserves the parent watchdog margin and excludes
+  stages that cannot afford child+margin.
+- **Chairman read-only clamp** now matches generation-prefixed tags (`gN-chairman`).
+- **Text-seat consent** is part of request identity for `--out` reuse (opt-in /
+  require-tools cannot be skipped via a cached success).
+- Manifest text-seat gate fails closed (no ImportError swallow; honest CLI resolve).
+
 ## [2.0.0] — 2026-08-07
 
 Product 2.0: Agent Plugin distribution + optional MCP facade + provider-driver SPI
