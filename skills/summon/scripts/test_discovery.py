@@ -16360,6 +16360,40 @@ def test_phase_c_discover_agent_packs_empty_safe():
         assert "agents" in entry
 
 
+def test_list_agents_includes_pack_source(monkeypatch=None):
+    """Pack agents appear in --list with source=pack after project/bundled."""
+    import tempfile
+    import shutil
+    from _loader import list_agents, discover_agent_packs
+    d = tempfile.mkdtemp(prefix="summon-pack-list-")
+    pack = Path(d) / "packs" / "demo" / "com.summon.agents"
+    pack.mkdir(parents=True)
+    (pack / "pack-only-agent.md").write_text(
+        "---\nrun-agent: openai-compat\nmodel: x\npermission: read-only\n---\n\nPack agent.\n",
+        encoding="utf-8")
+    project = Path(d) / "project-agents"
+    project.mkdir()
+    old_home = os.environ.get("USERPROFILE") or os.environ.get("HOME")
+    try:
+        # Point pack discovery at our temp packs home via expanduser monkeypatch.
+        import _loader as ld
+        real_discover = ld.discover_agent_packs
+
+        def _fake_discover(plugin_root=None):
+            return [{"path": str(pack), "agents": [str(pack / "pack-only-agent.md")],
+                     "name": "demo"}]
+
+        ld.discover_agent_packs = _fake_discover
+        agents = list_agents(str(project))
+        names = {a["name"]: a for a in agents}
+        assert "pack-only-agent" in names
+        assert names["pack-only-agent"]["source"] == "pack"
+        assert names["pack-only-agent"].get("pack") == "demo"
+    finally:
+        ld.discover_agent_packs = real_discover
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_phase_c_arkcli_backend_kind():
     from _builder import backend_kind, BACKENDS
     assert backend_kind("arkcli") == "api"

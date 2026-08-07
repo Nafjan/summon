@@ -284,6 +284,31 @@ def load_agent_snapshot(agents_dir: str, agent_name: str):
         if tup is not None:
             return tup, fm, sha
 
+    # Optional third-party packs (com.summon.agents) — after project + bundled.
+    try:
+        _project_resolved = Path(agents_dir).resolve()
+    except OSError:
+        _project_resolved = None
+    _bundled_resolved = None
+    if bundled:
+        try:
+            _bundled_resolved = Path(bundled).resolve()
+        except OSError:
+            _bundled_resolved = None
+    for pack in discover_agent_packs():
+        pack_dir = pack.get("path")
+        if not pack_dir:
+            continue
+        try:
+            _pack_resolved = Path(pack_dir).resolve()
+        except OSError:
+            continue
+        if _pack_resolved in (_project_resolved, _bundled_resolved):
+            continue
+        tup, fm, sha = _load_agent_snapshot_from(pack_dir, agent_name)
+        if tup is not None:
+            return tup, fm, sha
+
     raise FileNotFoundError(f"Agent definition not found: {agent_name}")
 
 
@@ -355,6 +380,18 @@ def list_agents(agents_dir: str) -> list[dict]:
                 # WHICH roster served each name, so a caller can tell a project definition
                 # from a bundled fallback without dispatching it (field report, 2026-07-28).
                 a["source"] = "bundled"
+                agents.append(a)
+
+    for pack in discover_agent_packs():
+        pack_dir = pack.get("path")
+        if not pack_dir:
+            continue
+        for a in _list_agents_in(pack_dir):
+            if a["name"] not in seen:
+                seen.add(a["name"])
+                a["source"] = "pack"
+                if pack.get("name"):
+                    a["pack"] = pack["name"]
                 agents.append(a)
 
     return sorted(agents, key=lambda a: a["name"])

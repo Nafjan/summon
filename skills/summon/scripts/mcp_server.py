@@ -189,7 +189,7 @@ def _handle(msg: dict):
         return _rpc_ok(mid, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "summon", "version": "1.2.0"},
+            "serverInfo": {"name": "summon", "version": "2.0.0"},
         })
     if method == "notifications/initialized":
         return None

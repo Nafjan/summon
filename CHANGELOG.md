@@ -4,7 +4,12 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
-## [1.2.0] — 2026-08-07
+## [2.0.0] — 2026-08-07
+
+Product 2.0: Agent Plugin distribution + optional MCP facade + provider-driver SPI
+on the same broker (envelope schema still `1`). Includes everything that landed as
+the 1.2 onboard train, plus pack discovery wired into `--list` / load paths and an
+explicit MCP local-trust ADR section.
 
 ### Added
 
