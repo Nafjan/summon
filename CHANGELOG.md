@@ -8,6 +8,13 @@ regression notes, and test evidence, see the
 
 ### Added
 
+- **BytePlus ModelArk:** built-in `byteplus-coding` provider for Coding Plan
+  (`/api/coding/v3`) with `BYTEPLUS_CODING_API_KEY`, bundled `byteplus-coder`
+  agent, subscription billing on successful Coding Plan calls, live roster cache
+  from arkcli, and consent-gated one-shot PAYG (`/api/v3`) fallback
+  (`--allow-payg` / frontmatter / env / prefs). Platform PAYG remains available
+  via inline `openai-compat` `base_url` without the Coding Plan provider.
+
 - **Environment handoff:** every bundled agent now reports `LEFT_BEHIND`, and each envelope
   exposes it as `environment_handoff` so its caller can decide what to retain or clean up.
   This covers temporary paths, processes, servers, VMs, and container resources; summon
@@ -20,7 +27,8 @@ regression notes, and test evidence, see the
 ### Fixed
 
 - **Privacy hygiene:** handover material no longer publishes local profile paths or session
-  identifiers, and preserved AGY evidence is ignored by default.
+  identifiers, and preserved AGY evidence is ignored by default. BytePlus missing-key
+  guidance no longer points at arkcli-private credential store paths or env var names.
 
 ## [1.1.0] - 2026-07-31
 

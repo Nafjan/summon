@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to your agents dir as providers.json (or ~/.agents/providers.json) to add OpenAI-compatible endpoints. Built-ins already include openrouter, openai, anthropic, google, groq, together, deepseek, ollama, lmstudio — you only need entries here for custom/self-hosted endpoints or to override a built-in.",
+  "_comment": "Copy to your agents dir as providers.json (or ~/.agents/providers.json) to add OpenAI-compatible endpoints. Built-ins already include openrouter, openai, anthropic, google, groq, together, deepseek, ollama, lmstudio, byteplus-coding — you only need entries here for custom/self-hosted endpoints or to override a built-in.",
 
   "local-vllm": {
     "base_url": "http://127.0.0.1:8000/v1",
@@ -12,5 +12,16 @@
   "local-ollama": {
     "base_url": "http://localhost:11434/v1",
     "api_key_env": ""
+  },
+
+  "_byteplus_comment": "Override the built-in byteplus-coding for a different region. The URL MUST contain /api/coding/ — Summon refuses /api/v3 (PAYG) for this provider. For always-PAYG Platform API, add a separate entry with .../api/v3 and your platform key env (e.g. BYTEPLUS_API_KEY) — do not reuse the byteplus-coding name.",
+  "byteplus-coding": {
+    "base_url": "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+    "api_key_env": "BYTEPLUS_CODING_API_KEY"
+  },
+  "_byteplus_payg_comment": "Optional always-PAYG Platform path (not Coding Plan). Use a distinct provider name.",
+  "byteplus-payg": {
+    "base_url": "https://ark.ap-southeast.bytepluses.com/api/v3",
+    "api_key_env": "BYTEPLUS_API_KEY"
   }
 }

@@ -1816,6 +1816,131 @@ def test_openai_compat_provider_resolution():
         pass
 
 
+def test_byteplus_coding_provider_resolution():
+    import _apibackend
+    bu, key = _apibackend.resolve_endpoint({"provider": "byteplus-coding", "model": "auto"}, None)
+    assert bu == "https://ark.ap-southeast.bytepluses.com/api/coding/v3"
+    assert key == "BYTEPLUS_CODING_API_KEY"
+
+
+def test_byteplus_coding_url_guardrail_rejects_payg():
+    import _apibackend
+    # A byteplus-coding provider overridden to /api/v3 (no /coding/) must be refused
+    import tempfile, shutil
+    d = tempfile.mkdtemp(prefix="summon-bp-guard-")
+    try:
+        import json as _json
+        with open(os.path.join(d, "providers.json"), "w", encoding="utf-8") as fh:
+            _json.dump({"byteplus-coding": {
+                "base_url": "https://ark.ap-southeast.bytepluses.com/api/v3",
+                "api_key_env": "BYTEPLUS_CODING_API_KEY"
+            }}, fh)
+        try:
+            _apibackend.resolve_endpoint({"provider": "byteplus-coding"}, d)
+            raise AssertionError("expected ValueError for PAYG URL")
+        except ValueError as e:
+            assert "/api/coding/" in str(e)
+            assert "pay-as-you-go" in str(e).lower()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_byteplus_coding_url_guardrail_accepts_valid():
+    import _apibackend
+    # The built-in URL passes the guardrail (contains /api/coding/)
+    bu, key = _apibackend.resolve_endpoint({"provider": "byteplus-coding"}, None)
+    assert "/api/coding/" in bu
+
+
+def test_byteplus_coder_agent_loads():
+    """The byteplus-coder.md example agent has valid frontmatter."""
+    import _apibackend
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    agents_dir = os.path.join(os.path.dirname(scripts_dir), "agents")
+    agent_path = os.path.join(agents_dir, "byteplus-coder.md")
+    assert os.path.isfile(agent_path), f"missing {agent_path}"
+    with open(agent_path, encoding="utf-8") as fh:
+        content = fh.read()
+    parts = content.split("---", 2)
+    assert len(parts) >= 3, "no frontmatter"
+    fm = {}
+    for line in parts[1].strip().splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            fm[k.strip()] = v.strip()
+    assert fm["run-agent"] == "openai-compat"
+    assert fm["provider"] == "byteplus-coding"
+    assert fm["model"] == "deepseek-v4-pro"
+    bu, key = _apibackend.resolve_endpoint(fm, agents_dir)
+    assert "/api/coding/" in bu
+
+
+def test_byteplus_coding_plan_refuses_auto_model():
+    import _apibackend
+    from _builder import AgentInvocation
+    bu = "https://ark.ap-southeast.bytepluses.com/api/coding/v3"
+    err = _apibackend.coding_plan_model_error(bu, "auto")
+    assert err and "arkcli-only" in err and "auto" in err
+    assert _apibackend.coding_plan_model_error(bu, "deepseek-v4-pro") is None
+    assert _apibackend.coding_plan_model_error("https://openrouter.ai/api/v1", "auto") is None
+    inv = AgentInvocation(cli="openai-compat", prompt="x", cwd=".",
+                          model="auto", base_url=bu, api_key_env="BYTEPLUS_CODING_API_KEY")
+    # Ensure the env is set so we don't short-circuit on missing key first
+    old = os.environ.get("BYTEPLUS_CODING_API_KEY")
+    os.environ["BYTEPLUS_CODING_API_KEY"] = "ark-test-key-not-used"
+    try:
+        resp = _apibackend.call(inv, 5000)
+    finally:
+        if old is None:
+            os.environ.pop("BYTEPLUS_CODING_API_KEY", None)
+        else:
+            os.environ["BYTEPLUS_CODING_API_KEY"] = old
+    assert resp["status"] == "error"
+    assert "arkcli-only" in resp["error"]
+
+
+def test_byteplus_coding_plan_billing_note():
+    import _apibackend
+    b = _apibackend.coding_plan_billing(
+        "https://ark.ap-southeast.bytepluses.com/api/coding/v3")
+    assert b and b["source"] == "subscription" and "subscription quota" in b["note"]
+    assert _apibackend.coding_plan_billing(
+        "https://ark.ap-southeast.bytepluses.com/api/v3") is None
+
+
+def test_byteplus_unsupported_model_error_rewrite():
+    import _apibackend
+    msg = _apibackend._rewrite_coding_plan_http_error(
+        "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        "nope-model", 404,
+        '{"error":{"code":"UnsupportedModel","message":"The requested model does not support the coding plan feature."}}')
+    assert msg and "Coding Plan rejected model" in msg and "arkcli plans model-list" in msg
+    assert "Roster presence is not proof" in msg
+    assert "deepseek-v4" in msg or "glm-5.2" in msg
+    assert "Avoid legacy/superseded" in msg
+    assert _apibackend._rewrite_coding_plan_http_error(
+        "https://openrouter.ai/api/v1", "x", 404, "UnsupportedModel") is None
+
+
+def test_byteplus_model_guidance_distinguishes_roster_from_recommendation():
+    """Docs must not present the dynamic plan roster as a known-good model list."""
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    skill_dir = os.path.dirname(scripts_dir)
+    docs = open(os.path.join(skill_dir, "references", "backends.md"),
+                encoding="utf-8").read()
+    agent = open(os.path.join(skill_dir, "agents", "byteplus-coder.md"),
+                 encoding="utf-8").read()
+    assert "eligibility catalog" in docs
+    assert "Listed" in docs and "Invocable" in docs and "Recommended" in docs
+    assert "last manually checked on **2026-08-07**" in docs
+    assert "byteplus-coding-roster.json" in docs
+    assert "arkcli helper configure opencode" in docs
+    for legacy in ("glm-5.1", "bytedance-seed-code", "gpt-oss-120b"):
+        assert legacy in docs and legacy in agent
+    assert "Strongly avoid legacy or superseded" in docs
+    assert "Roster presence is not proof of" in agent
+
+
 def test_subcommand_rewrite():
     import run_subagent as rs
     # subcommands translate to flat flags
@@ -15763,6 +15888,301 @@ def test_v10_public_docs_exclude_machine_identity_and_preserve_local_evidence():
 
     changelog = open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8").read()
     assert "handover material no longer publishes local profile paths" in changelog, "missing privacy release note"
+
+    # BytePlus / ModelArk surfaces: no maintainer profiles, local homes, or
+    # arkcli-private credential store paths in shipped docs/code.
+    byteplus_paths = [
+        os.path.join(root, "skills", "summon", "references", "backends.md"),
+        os.path.join(root, "skills", "summon", "agents", "byteplus-coder.md"),
+        os.path.join(root, "skills", "summon", "SKILL.md"),
+        os.path.join(root, "skills", "summon", "scripts", "_apibackend.py"),
+        os.path.join(root, "providers.json.example"),
+    ]
+    leak = _re.compile(
+        r"(?i)("
+        r"[A-Za-z]:\\Users\\"
+        r"|Antigravity projects"
+        r"|coding-plan_[A-Za-z0-9_-]+_personal"
+        r"|arkcli-bp"
+        r"|VOLCENGINE_ARK_API_KEY"
+        r"|ark-[a-z0-9]{20,}"
+        r")"
+    )
+    for path in byteplus_paths:
+        text = open(path, encoding="utf-8").read()
+        hit = leak.search(text)
+        assert hit is None, f"{os.path.relpath(path, root)} leaks local/private marker: {hit.group(0)!r}"
+
+
+
+# ---------------------------------------------------------------------------
+# BytePlus PAYG consent + fallback tests
+# ---------------------------------------------------------------------------
+
+def test_payg_consent_flag():
+    """payg_consent_allowed returns True only when one of the 3 consent surfaces fires."""
+    from _apibackend import payg_consent_allowed
+    old = os.environ.pop("SUMMON_ALLOW_BYTEPLUS_PAYG", None)
+    try:
+        assert payg_consent_allowed(False) is False
+        assert payg_consent_allowed(True) is True
+        os.environ["SUMMON_ALLOW_BYTEPLUS_PAYG"] = "1"
+        assert payg_consent_allowed(False) is True
+    finally:
+        os.environ.pop("SUMMON_ALLOW_BYTEPLUS_PAYG", None)
+        if old is not None:
+            os.environ["SUMMON_ALLOW_BYTEPLUS_PAYG"] = old
+
+
+def test_payg_consent_summon_json(tmp_path=None):
+    """payg_consent_allowed picks up ~/.agents/summon.json consent."""
+    import tempfile
+    from _apibackend import payg_consent_allowed
+    old_env = os.environ.pop("SUMMON_ALLOW_BYTEPLUS_PAYG", None)
+    old_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    tmp = tempfile.mkdtemp()
+    agents_dir = os.path.join(tmp, ".agents")
+    os.makedirs(agents_dir, exist_ok=True)
+    prefs_path = os.path.join(agents_dir, "summon.json")
+    import json as _json
+    with open(prefs_path, "w", encoding="utf-8") as f:
+        _json.dump({"allow_byteplus_payg": True}, f)
+    # Monkey-patch expanduser to point at our temp
+    import _apibackend
+    _orig_expanduser = os.path.expanduser
+    os.path.expanduser = lambda p: p.replace("~", tmp)
+    try:
+        assert payg_consent_allowed(False) is True
+    finally:
+        os.path.expanduser = _orig_expanduser
+        os.environ.pop("SUMMON_ALLOW_BYTEPLUS_PAYG", None)
+        if old_env is not None:
+            os.environ["SUMMON_ALLOW_BYTEPLUS_PAYG"] = old_env
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_coding_to_payg_url_rewrite():
+    """coding_to_payg_base_url always lands on /api/v3."""
+    from _apibackend import coding_to_payg_base_url, is_coding_plan_endpoint
+    out = coding_to_payg_base_url("https://ark.ap-southeast.bytepluses.com/api/coding/v3")
+    assert out == "https://ark.ap-southeast.bytepluses.com/api/v3", out
+    out2 = coding_to_payg_base_url("https://ark.ap-southeast.bytepluses.com/api/coding")
+    assert out2 == "https://ark.ap-southeast.bytepluses.com/api/v3", out2
+    out3 = coding_to_payg_base_url("https://ark.ap-southeast.bytepluses.com/api/coding/")
+    assert out3 == "https://ark.ap-southeast.bytepluses.com/api/v3", out3
+    # Query-string spoof must not count as a Coding Plan path.
+    assert is_coding_plan_endpoint(
+        "https://ark.ap-southeast.bytepluses.com/api/v3?x=/api/coding") is False
+    try:
+        coding_to_payg_base_url("https://api.openai.com/v1")
+        assert False, "should have raised"
+    except ValueError:
+        pass
+
+
+def test_is_payg_fallback_worthy_classification():
+    """is_payg_fallback_worthy classifies correctly."""
+    from _apibackend import is_payg_fallback_worthy
+    assert is_payg_fallback_worthy(429, "rate limit hit") is True
+    assert is_payg_fallback_worthy(404, '{"code":"UnsupportedModel"}') is True
+    assert is_payg_fallback_worthy(400, "model does not support the coding plan") is True
+    assert is_payg_fallback_worthy(400, "quota exceeded for plan") is True
+    assert is_payg_fallback_worthy(403, "plan limit exceeded") is False  # auth never falls back
+    assert is_payg_fallback_worthy(401, "Unauthorized quota") is False
+    assert is_payg_fallback_worthy(500, "quota exceeded") is False
+    assert is_payg_fallback_worthy(502, "rate limit") is False
+    assert is_payg_fallback_worthy(200, "UnsupportedModel") is False
+    assert is_payg_fallback_worthy(None, "timeout") is False
+    assert is_payg_fallback_worthy(403, "forbidden") is False
+
+
+def test_payg_retry_with_and_without_consent():
+    """UnsupportedModel + consent retries PAYG once; without consent never calls PAYG."""
+    import io
+    import json as _json
+    import urllib.error
+    from types import SimpleNamespace
+    import _apibackend as api
+
+    coding = "https://ark.ap-southeast.bytepluses.com/api/coding/v3"
+    payg = "https://ark.ap-southeast.bytepluses.com/api/v3"
+    urls = []
+
+    class _Resp:
+        def __init__(self, body):
+            self._body = body.encode("utf-8")
+        def read(self):
+            return self._body
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            url = req.full_url
+            urls.append(url)
+            if url.startswith(coding):
+                body = _json.dumps({"error": {"code": "UnsupportedModel",
+                                              "message": "does not support the coding plan"}}).encode()
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO(body))
+            payload = _json.dumps({
+                "choices": [{"message": {"content": "payg-ok"}}],
+                "usage": {"total_tokens": 3},
+                "model": "x",
+            })
+            return _Resp(payload)
+
+    old_env = os.environ.pop("SUMMON_ALLOW_BYTEPLUS_PAYG", None)
+    old_key = os.environ.get("BYTEPLUS_CODING_API_KEY")
+    os.environ["BYTEPLUS_CODING_API_KEY"] = "ark-test-key"
+    _orig_opener = api._opener
+    api._opener = lambda: _Opener()
+    try:
+        inv = SimpleNamespace(model="nope", base_url=coding,
+                              api_key_env="BYTEPLUS_CODING_API_KEY",
+                              system_context="", prompt="hi", allow_payg=False)
+        urls.clear()
+        refused = api.call(inv, 5000)
+        assert refused["status"] == "error"
+        assert "consent is missing" in refused["error"]
+        assert all(u.startswith(coding) for u in urls), urls
+        assert not any(u.startswith(payg) for u in urls)
+
+        inv.allow_payg = True
+        urls.clear()
+        ok = api.call(inv, 5000)
+        assert ok["status"] == "success", ok
+        assert ok["result"] == "payg-ok"
+        assert ok["fallback"]["from"] == "coding-plan"
+        assert ok["billing"]["note"].startswith("BytePlus PAYG")
+        assert any(u.startswith(payg) for u in urls), urls
+        assert sum(1 for u in urls if u.startswith(payg)) == 1
+    finally:
+        api._opener = _orig_opener
+        os.environ.pop("SUMMON_ALLOW_BYTEPLUS_PAYG", None)
+        if old_env is not None:
+            os.environ["SUMMON_ALLOW_BYTEPLUS_PAYG"] = old_env
+        if old_key is None:
+            os.environ.pop("BYTEPLUS_CODING_API_KEY", None)
+        else:
+            os.environ["BYTEPLUS_CODING_API_KEY"] = old_key
+
+
+def test_allow_payg_reaches_background_child_argv():
+    import argparse
+    import run_subagent as r
+    ns = argparse.Namespace(agent="a", prompt="p", prompt_file=None,
+                            allow_credit=False, allow_payg=True, cwd="C:/w",
+                            agents_dir=None, timeout=600000, cli=None, model=None,
+                            effort=None, resume=None, resume_profile=None, out=None,
+                            json_schema=None, debug_dir=None, retries=0, worktree=None,
+                            no_contract_repair=False, gate_with=None, gate_timeout=None,
+                            max_permission=None, artifacts=None, transport=None)
+    argv = r._child_argv(ns, "res.json")
+    assert "--allow-payg" in argv, argv
+    ns.allow_payg = False
+    assert "--allow-payg" not in r._child_argv(ns, "res.json")
+
+
+def test_payg_url_guardrail_still_refuses_primary():
+    """The primary URL guardrail still refuses /api/v3 for byteplus-coding."""
+    from _apibackend import _validate_coding_plan_url
+    try:
+        _validate_coding_plan_url("byteplus-coding",
+                                  "https://ark.ap-southeast.bytepluses.com/api/v3")
+        assert False, "should have raised"
+    except ValueError as e:
+        assert "/api/coding/" in str(e)
+    _validate_coding_plan_url("byteplus-coding",
+                              "https://ark.ap-southeast.bytepluses.com/api/coding/v3")
+
+
+def test_allow_payg_rejected_in_fanout_modes():
+    """--allow-payg is not in any fan-out mode's whitelist."""
+    from _cli import MODE_FLAGS
+    for mode, flags in MODE_FLAGS.items():
+        assert "allow_payg" not in flags, f"allow_payg should NOT be in {mode} whitelist"
+
+
+def test_coding_plan_roster_cache_and_guidance(tmp_path=None):
+    """Cached arkcli roster drives guidance and excludes legacy/broken names."""
+    import json as _json
+    import tempfile
+    import time
+    import _apibackend as api
+    old = api._roster_cache_path
+    d = tempfile.mkdtemp(prefix="summon-roster-")
+    path = os.path.join(d, "byteplus-coding-roster.json")
+    api._roster_cache_path = lambda: path
+    try:
+        assert api.coding_plan_model_guidance() == api._CODING_PLAN_MODEL_GUIDANCE
+        payload = {
+            "fetched_at": time.time(),
+            "plan": "coding-plan",
+            "models": [
+                {"output_name": "auto"},
+                {"output_name": "glm-5.1"},
+                {"output_name": "gpt-oss-120b"},
+                {"output_name": "bytedance-seed-code"},
+                {"output_name": "deepseek-v4-pro"},
+                {"output_name": "glm-5.2"},
+                {"output_name": "weird-new-model"},
+            ],
+            "source": "arkcli",
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            _json.dump(payload, fh)
+        hint = api.coding_plan_model_guidance()
+        assert "deepseek-v4-pro" in hint and "glm-5.2" in hint
+        assert "weird-new-model" in hint
+        assert "gpt-oss-120b" not in hint.split("Avoid")[0]
+        assert "auto" not in hint.split("Avoid")[0]
+    finally:
+        api._roster_cache_path = old
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_refresh_coding_plan_roster_parses_arkcli(monkeypatch=None):
+    """refresh_coding_plan_roster parses arkcli JSON and writes the cache."""
+    import json as _json
+    import tempfile
+    import types
+    import _apibackend as api
+    old = api._roster_cache_path
+    d = tempfile.mkdtemp(prefix="summon-roster-ref-")
+    path = os.path.join(d, "byteplus-coding-roster.json")
+    api._roster_cache_path = lambda: path
+
+    class _Proc:
+        returncode = 0
+        stdout = _json.dumps({
+            "plan": "coding-plan",
+            "selected_model_id": "auto",
+            "models": [
+                {"model_id": "glm-5-2-260617", "model_name": "glm-5-2",
+                 "output_name": "glm-5.2", "description": "flagship"},
+            ],
+        })
+        stderr = ""
+
+    import subprocess as sp
+    _orig = sp.run
+    sp.run = lambda *a, **k: _Proc()
+    try:
+        out = api.refresh_coding_plan_roster()
+        assert out["plan"] == "coding-plan"
+        assert out["models"][0]["output_name"] == "glm-5.2"
+        assert os.path.isfile(path)
+        cached = _json.load(open(path, encoding="utf-8"))
+        assert cached["models"][0]["id"] == "glm-5-2-260617"
+    finally:
+        sp.run = _orig
+        api._roster_cache_path = old
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":
