@@ -24,3 +24,4 @@
     "base_url": "https://ark.ap-southeast.bytepluses.com/api/v3",
     "api_key_env": "BYTEPLUS_API_KEY"
   }
+}

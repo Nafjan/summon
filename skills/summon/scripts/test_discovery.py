@@ -15889,6 +15889,31 @@ def test_v10_public_docs_exclude_machine_identity_and_preserve_local_evidence():
     changelog = open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8").read()
     assert "handover material no longer publishes local profile paths" in changelog, "missing privacy release note"
 
+    # BytePlus / ModelArk surfaces: no maintainer profiles, local homes, or
+    # arkcli-private credential store paths in shipped docs/code.
+    byteplus_paths = [
+        os.path.join(root, "skills", "summon", "references", "backends.md"),
+        os.path.join(root, "skills", "summon", "agents", "byteplus-coder.md"),
+        os.path.join(root, "skills", "summon", "SKILL.md"),
+        os.path.join(root, "skills", "summon", "scripts", "_apibackend.py"),
+        os.path.join(root, "providers.json.example"),
+    ]
+    leak = _re.compile(
+        r"(?i)("
+        r"[A-Za-z]:\\Users\\"
+        r"|Antigravity projects"
+        r"|coding-plan_[A-Za-z0-9_-]+_personal"
+        r"|arkcli-bp"
+        r"|VOLCENGINE_ARK_API_KEY"
+        r"|ark-[a-z0-9]{20,}"
+        r")"
+    )
+    for path in byteplus_paths:
+        text = open(path, encoding="utf-8").read()
+        hit = leak.search(text)
+        assert hit is None, f"{os.path.relpath(path, root)} leaks local/private marker: {hit.group(0)!r}"
+
+
 
 # ---------------------------------------------------------------------------
 # BytePlus PAYG consent + fallback tests

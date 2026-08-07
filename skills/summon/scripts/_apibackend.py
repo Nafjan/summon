@@ -503,9 +503,9 @@ def call(inv, timeout_ms: int) -> dict:
     if inv.api_key_env and not api_key:
         msg = f"openai-compat: ${inv.api_key_env} is not set"
         if inv.api_key_env == "BYTEPLUS_CODING_API_KEY":
-            msg += (" - export your Coding Plan profile API key "
-                    "(arkcli auth / VOLCENGINE_ARK_API_KEY in ~/.arkcli-bp/.env), "
-                    "not the short-lived SSO id_token")
+            msg += (" - set it to your Coding Plan profile API key "
+                    "(from `arkcli auth status` / `arkcli auth apikey`), "
+                    "not a short-lived SSO token")
         return _err(cli, msg)
 
     resp = _do_request(inv.base_url, inv.model, inv.system_context, inv.prompt,

@@ -27,7 +27,8 @@ regression notes, and test evidence, see the
 ### Fixed
 
 - **Privacy hygiene:** handover material no longer publishes local profile paths or session
-  identifiers, and preserved AGY evidence is ignored by default.
+  identifiers, and preserved AGY evidence is ignored by default. BytePlus missing-key
+  guidance no longer points at arkcli-private credential store paths or env var names.
 
 ## [1.1.0] - 2026-07-31
 
