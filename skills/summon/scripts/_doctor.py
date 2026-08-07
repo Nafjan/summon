@@ -8,13 +8,16 @@ on a machine with zero backends installed.
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 _VERSION_TIMEOUT = 10
 _PROBE_TIMEOUT = 25   # opt-in eligibility probe: a minimal real call, short leash
@@ -342,6 +345,66 @@ def _check_agents_dir(agents_dir: str | None, cwd: str | None) -> dict:
                 "note": f"{type(e).__name__}: {e}"}
 
 
+def _check_byteplus_coding() -> dict:
+    """BytePlus Coding Plan readiness: key presence/source only (never the key)."""
+    arkcli_bin = shutil.which("arkcli") or (
+        shutil.which("arkcli.cmd") if os.name == "nt" else None)
+    entry: dict = {
+        "api_key_present": False,
+        "api_key_source": None,
+        "arkcli_found": bool(arkcli_bin),
+        # Portable label only — never the expanded install path (privacy).
+        "arkcli_path": "arkcli" if arkcli_bin else None,
+        "roster_cache": {"present": False},
+    }
+    try:
+        from _arkcli_creds import resolve_byteplus_coding_api_key
+        _key, _source = resolve_byteplus_coding_api_key()
+        entry["api_key_present"] = bool(_key)
+        entry["api_key_source"] = _source
+    except Exception:  # noqa: BLE001 - doctor never raises
+        pass
+    cache_path = Path.home() / ".agents" / "byteplus-coding-roster.json"
+    if cache_path.is_file():
+        try:
+            raw = json.loads(cache_path.read_text(encoding="utf-8"))
+            fetched_at = raw.get("fetched_at") if isinstance(raw, dict) else None
+            age_s = None
+            if isinstance(fetched_at, (int, float)):
+                age_s = max(0, int(time.time() - fetched_at))
+            entry["roster_cache"] = {
+                "present": True,
+                # Use a portable label — never emit the expanded home path (privacy).
+                "path": "~/.agents/byteplus-coding-roster.json",
+                "fetched_at": fetched_at,
+                "age_s": age_s,
+                "model_count": len(raw.get("models") or []) if isinstance(raw, dict) else 0,
+            }
+        except Exception as e:  # noqa: BLE001
+            entry["roster_cache"] = {
+                "present": True,
+                "path": "~/.agents/byteplus-coding-roster.json",
+                "note": f"{type(e).__name__}: unreadable cache",
+            }
+    return entry
+
+
+def _check_onboard_prefs() -> dict:
+    """Onboard prefs summary (subscriptions only; no secrets)."""
+    try:
+        from _onboard import load_prefs
+        prefs = load_prefs()
+    except Exception as e:  # noqa: BLE001
+        return {"present": False, "note": f"{type(e).__name__}: could not load prefs"}
+    onboard = prefs.get("onboard") if isinstance(prefs, dict) else None
+    if not isinstance(onboard, dict):
+        return {"present": bool(prefs), "subscriptions": []}
+    subs = onboard.get("subscriptions")
+    if not isinstance(subs, list):
+        subs = []
+    return {"present": True, "subscriptions": subs}
+
+
 def doctor(agents_dir: str | None = None, cwd: str | None = None,
            probe: bool = False, probe_runner=None) -> dict:
     backends = _check_backends()
@@ -360,6 +423,8 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None,
             "note": "codex children get OPENAI_API_KEY stripped (subscription billing) "
                     "unless SUBAGENTS_ALLOW_OPENAI_KEY=1",
         },
+        "byteplus_coding": _check_byteplus_coding(),
+        "onboard_prefs": _check_onboard_prefs(),
     }
     # Usable = on PATH + --version-verified, MINUS any the probe CONFIRMED
     # ineligible (account_eligible False) OR unauthenticated (auth_ok False) -- a
@@ -466,6 +531,36 @@ def render(report: dict) -> str:
         lines.append("billing  : OPENAI_API_KEY is set - "
                      + ("guard ACTIVE (stripped for codex children)" if bg["guard_active"]
                         else "guard DISABLED (SUBAGENTS_ALLOW_OPENAI_KEY=1)"))
+    bp = report.get("byteplus_coding") or {}
+    lines += ["", "byteplus coding plan:"]
+    if bp.get("api_key_present"):
+        src = bp.get("api_key_source") or "?"
+        lines.append(f"  [OK] coding api key resolvable (source: {src})")
+    else:
+        lines.append("  [--] BYTEPLUS_CODING_API_KEY not set and not resolvable "
+                     "(set env or `arkcli auth apikey`)")
+    if bp.get("arkcli_found"):
+        lines.append(f"  [OK] arkcli on PATH  ({bp.get('arkcli_path')})")
+    else:
+        lines.append("  [--] arkcli not on PATH (optional; refreshes Coding Plan roster)")
+    rc = bp.get("roster_cache") or {}
+    if rc.get("present"):
+        age = rc.get("age_s")
+        if isinstance(age, int):
+            days = age // 86400
+            lines.append(f"  [~?] roster cache {days}d old  ({rc.get('model_count', 0)} models)")
+        else:
+            lines.append(f"  [~?] roster cache present  ({rc.get('path')})")
+    else:
+        lines.append("  [--] no roster cache at ~/.agents/byteplus-coding-roster.json")
+    op = report.get("onboard_prefs") or {}
+    lines += ["", "onboard prefs:"]
+    if op.get("present"):
+        subs = op.get("subscriptions") or []
+        lines.append(f"  subscriptions: {', '.join(subs) if subs else '(none recorded)'}")
+    else:
+        note = op.get("note") or "no ~/.agents/summon.json onboard section"
+        lines.append(f"  [--] {note}")
     inst = report.get("installs")
     if inst and inst.get("records"):
         dr = inst["drift"]

@@ -96,25 +96,45 @@ drive it, and it hands back structured results instead of a stream.
 
 ## Install
 
+Pick the path that matches your host. All three install the same `skills/summon/` skill tree;
+only the destination differs.
+
+### Agent Plugin (Cursor, VS Code, Copilot, Codex)
+
+For clients that support the open [Agent Plugins](https://agent-plugins.org) standard
+(Cursor Marketplace, VS Code agent extensions, GitHub Copilot agent plugins, Codex with
+plugin support):
+
+- **From a marketplace:** install the **summon** plugin from your client's plugin UI.
+- **From a checkout (local dev):** copy or symlink this repo into your client's local
+  plugin directory. On Cursor that is `~/.cursor/plugins/local/summon/` with `plugin.json`
+  at the plugin root (this repo already ships that layout). Reload the window after copying.
+
+The plugin bundles `skills/summon/` as-is — no `install.py` step required for plugin hosts.
+
+### Skills registry (`npx skills add`)
+
 **One command. The skill installs itself into your agent:**
 
 ```bash
 npx skills add Nafjan/summon
 ```
 
-That's the whole thing. Your AI agent now has the `summon` skill and knows how to drive it,
-so you never learn a flag. Just ask it: *"summon a cross-vendor review of my last commit,"*
-or *"convene a council on monorepo vs polyrepo."* Add `-g` to install globally (every
-project), or `-a <agent>` to target a specific one. Works with any skills-compatible agent:
-Claude Code, Codex, Cursor, Gemini, Antigravity, and claw-likes like openclaw and hermes.
-Powered by the open [`skills`](https://www.skills.sh) registry.
+Your AI agent now has the `summon` skill and knows how to drive it, so you never learn a
+flag. Just ask it: *"summon a cross-vendor review of my last commit,"* or *"convene a
+council on monorepo vs polyrepo."* Add `-g` to install globally (every project), or
+`-a <agent>` to target a specific one. Works with any skills-compatible agent: Claude Code,
+Codex, Cursor, Gemini, Antigravity, and claw-likes like openclaw and hermes. Powered by the
+open [`skills`](https://www.skills.sh) registry.
 
 You need **Node** (for `npx`), **Python 3.10+** on your PATH, and at least one AI CLI you're
 logged into. After installing, ask your agent to run summon's `doctor` check and it lists what's
 ready and what's missing. On Windows, if the install hits a symlink permission error, re-run
-with `--copy`. No Node? Use the `install.py` path below, which needs only Python.
+with `--copy`.
 
-**Or install into every AI CLI on your machine at once** (multi-host, ownership-safe):
+### Multi-host installer (`python install.py`)
+
+**Install into every AI CLI on your machine at once** (multi-host, ownership-safe):
 
 ```bash
 git clone https://github.com/Nafjan/summon && cd summon
@@ -156,9 +176,10 @@ Set up "summon" for me (github.com/Nafjan/summon), a cross-vendor AI sub-agent d
 You can also skip the skill install entirely and run the script directly:
 `python summon.py dispatch --agent reviewer --prompt "…" --cwd "$PWD"`.
 
-**Staying current:** the installed skill is a copy and never self-updates. Run
-`npx skills update` (for `skills add` installs) or re-run `python install.py` after a
-`git pull` (for installer installs). Every dispatch envelope carries
+**Staying current:** the installed skill is a copy and never self-updates. Re-install or
+update via your Agent Plugin client's UI (for plugin installs), run `npx skills update`
+(for `skills add` installs), or re-run `python install.py` after a `git pull` (for
+installer installs). Every dispatch envelope carries
 `summon.scripts_sha256`, so a stale or divergent copy is detectable from any single
 result; the version string alone is not enough.
 
@@ -322,7 +343,7 @@ vendors.
   "report_ok": true,
   "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
                "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
-  "summon":  { "version": "1.1.0", "scripts_sha256": "9f2c…" },
+  "summon":  { "version": "1.2.0", "scripts_sha256": "9f2c…" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },

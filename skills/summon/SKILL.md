@@ -22,6 +22,12 @@ the response-field table.
 
 **Script Path**: Use absolute path `{SKILL_DIR}/scripts/run_subagent.py` where `{SKILL_DIR}` is the directory containing this SKILL.md file.
 
+**Install**: This skill ships inside the summon repo at `skills/summon/`. Hosts that support
+[Agent Plugins](https://agent-plugins.org) (Cursor, VS Code, Copilot, Codex) load it from a
+plugin package with `plugin.json` at the repo root — no separate install step. Skill-dir hosts
+(Claude Code, Gemini, Antigravity, Kimi, …) use `npx skills add Nafjan/summon` or
+`python install.py` from the repo instead.
+
 **Command surface**: the script accepts git-style **subcommands** — `dispatch` (the
 default action), `list`, `models`, `doctor`, `manifest FILE`, `council`, `agent
 new|set NAME`, `version` — e.g. `run_subagent.py council --question "…" --cwd DIR`. The
@@ -201,6 +207,10 @@ completed review returning `VERDICT: BLOCK` is successful execution and a reject
 | `--list` | - | List available agents (no other params needed) |
 | `--list-models` | - | Report invocable models per backend (no other params needed; add `--cli` to filter). See "Model discovery" below |
 | `--doctor` | - | Check backend CLIs, wrapper deps, agents dir, git, and **install drift** (every summon copy on the box, hashed with the same primitive the receipt uses; flags a stale host copy and points you at `install.py`); add `--json` for machines. Run this FIRST on a new machine |
+| `--onboard` | - | Detect installed CLIs / BytePlus key sources; write merge-safe prefs to `~/.agents/summon.json` (never stores API secrets). Subcommand form: `onboard` |
+| `--subscriptions LIST` | No | With `--onboard`: comma list of active plans (e.g. `byteplus-coding,claude`) recorded in prefs |
+| `--reset` | No | With `--onboard`: replace the onboard section instead of merging |
+| `--no-write` | No | With `--onboard`: detect only; do not write prefs |
 | `--new-agent NAME` | - | Scaffold a new agent definition (house template); customize frontmatter with `--set`. Never overwrites |
 | `--set-agent NAME` | - | Edit an existing agent's frontmatter via `--set KEY=VALUE` (`KEY=` removes); body untouched, values validated |
 | `--set KEY=VALUE` | No | With the two above: `run-agent`, `model`, `permission`, `args` (repeatable) |
@@ -229,6 +239,7 @@ completed review returning `VERDICT: BLOCK` is successful execution and a reject
 | `--gate-with AGENT` | No | Require AGENT to APPROVE this dispatch before it runs. The gate is dispatched **forced read-only** (regardless of its own definition, so a gate can never be a privilege-escalation path) and adjudicates the *request*: agent, prompt, permission, cwd. **Fails closed** -- a gate that denies, errors, times out, or emits no parseable `VERDICT:` line blocks the dispatch with `status:blocked`. `VERDICT: UNCERTAIN` additionally sets `requires_human_review:true`, routing the decision to a person. The decision lands in the envelope's `gate` field. Single dispatch only (rejected for `--manifest`/`--council`). |
 | `--gate-timeout` | No | Timeout for the `--gate-with` dispatch (same grammar as `--timeout`; defaults to it) |
 | `--retries N` | No | Re-dispatch up to N times on `error`/`partial` (exponential backoff; `blocked` is never retried — its cause is structural). Envelope gains `attempts` |
+| `--transient-retries` | No | Also retry a short allowlist of transient transport failures (rate limit / 429 / connection reset) that `--retries` alone would leave alone. Off by default |
 | `--transport {subprocess,acp}` | No | Force the dispatch transport (default `subprocess`). `acp` runs the turn over the Agent Client Protocol — native support only: `gemini` (`--acp`), `kimi` (`acp`), `cursor-agent` (`acp`). Overrides the agent's `transport:` frontmatter. See "ACP transport" |
 | `--no-acp-fallback` | No | Disable the automatic ACP recovery attempt when a subprocess dispatch fails, and the oversized-prompt ACP routing. Env form: `SUMMON_ACP_FALLBACK=0` |
 | `--allow-credit` | No | Authorize spending ACCOUNT CREDIT on an unconditionally credit-only model for this one dispatch (no model meets that definition today; Fable billing is plan-dependent and handled separately, so this currently authorizes nothing and is kept for compatibility); flag form of `SUMMON_ALLOW_CREDIT=1`. Single dispatch only: rejected for `--manifest`/`--council`, where env inheritance would silently authorize every child (set the env var deliberately for fan-out spend) |
@@ -257,11 +268,11 @@ shell profile or host wrapper, not the dispatcher; `--out FILE` sidesteps parsin
 stdout entirely.
 
 \*Required for a **dispatch** (running an agent). Not needed for the query/management
-modes — `--list`, `--list-models`, `--doctor`, `--new-agent`, `--set-agent`, `--version`,
+modes — `--list`, `--list-models`, `--doctor`, `--onboard`, `--new-agent`, `--set-agent`, `--version`,
 or `--manifest` (which carries its own jobs).
 
-**Mode-scoped flags** (ignored/invalid outside their mode): `--json` → `--doctor` only;
-`--set` → `--new-agent`/`--set-agent` only; `--concurrency`/`--results-dir` → `--manifest`
+**Mode-scoped flags** (ignored/invalid outside their mode): `--json` → `--doctor`/`--onboard` only;
+`--subscriptions`/`--reset`/`--no-write` → `--onboard` only; `--set` → `--new-agent`/`--set-agent` only; `--concurrency`/`--results-dir` → `--manifest`
 only; `--resume-profile` → agy resume only. Mutually exclusive: `--dry-run` with
 `--background`/`--manifest`; `--background` with `--out` (background reports completion
 via its own `result_file`; use `--manifest` for fan-out with result files); `--prompt`
@@ -462,6 +473,9 @@ The installed skill is a COPY of the repo at install time; it never self-updates
 stale copies have caused real field failures (empty rosters, divergent behavior across
 hosts). When you start a significant orchestration, or roughly weekly, check for updates:
 
+- Installed as an **Agent Plugin** (Cursor / VS Code / Copilot / Codex): update or
+  re-install from your client's plugin UI; local dev copies live under
+  `~/.cursor/plugins/local/summon/`.
 - Installed via `npx skills add`: run `npx skills update` (there is no `skills check`;
   `update` both checks and applies).
 - Installed via `install.py`: `git pull` the repo, then re-run `python install.py`

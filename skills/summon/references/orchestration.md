@@ -9,9 +9,37 @@ Project-agnostic and host-agnostic. Adopt the parts you need; every section is
 written so a single orchestrator (human or agent) can act on it without a
 house style guide.
 
-Semantics below were verified against summon **1.1.0**. Model ids and alias
+Semantics below were verified against summon **1.2.0**. Model ids and alias
 behaviour are volatile: re-check with `doctor`, `list`, `models`, and
 `--dry-run` before a run you care about.
+
+---
+
+## 1a. Path chooser (native → arkcli → Summon)
+
+When deciding **where** to spend a dispatch, use this mental model:
+
+1. **Native host sub-agent** — when the IDE/CLI you are already in can reach a
+   model that is enough for the task (repo context, editor state, same account).
+   Summon dry-run surfaces `native_prefer_hint` when `SUMMON_HOST_CLI` matches
+   the target backend.
+2. **arkcli / BytePlus Coding Plan** — text-only council seats and high-volume
+   burn on Flash/GLM/Kimi ids the host lacks; profile auth via `arkcli`, not
+   stored secrets in summon prefs.
+3. **Summon** — cross-vendor isolation, worktrees, structured envelopes,
+   councils, gates, and backends the host does not expose (Fable, Sol 5.6, Kimi 3,
+   adversarial best-of-best).
+
+**Three-seat model (council / review):**
+
+| Seat | Typical path | Role |
+|---|---|---|
+| **Worker** | Native or arkcli Coding Plan | Fast implementation loops, text-only |
+| **Reviewer** | Summon cross-vendor CLI | Independent vendor, read-only |
+| **Chair / elite** | Summon pinned elite model | Synthesis, architecture, adversarial |
+
+`openai-compat` agents are a **single Chat Completions call** — fine for one-shot
+review text, not a multi-step coding loop; prefer a CLI backend for tool use.
 
 ---
 

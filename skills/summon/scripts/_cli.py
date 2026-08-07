@@ -189,7 +189,8 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 # rewrite. This keeps one battle-tested parser + all logic while giving a clean,
 # discoverable command surface.
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
-               "manifest", "council", "agent", "jobs", "version", "help", "--help", "-h"}
+               "onboard", "manifest", "council", "agent", "jobs", "version",
+               "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -199,7 +200,8 @@ Commands:
   dispatch  --agent NAME --prompt "…" --cwd DIR   run an agent (the default action)
   list                                            list available agents
   models    [--cli BACKEND]                       what each backend can run now
-  doctor    [--json]                              check backends / setup health
+  doctor    [--json] [--probe]                    check backends / setup health
+  onboard   [--subscriptions …] [--reset] [--json] detect CLIs; write merge-safe prefs
   manifest  FILE [--concurrency …] [--results-dir D]   run a batch swarm
   council   --question "…" [--members …] [--rounds 2]  decide by consensus
   agent new NAME [--set k=v …]                    scaffold an agent definition
@@ -238,6 +240,8 @@ def rewrite_subcommand(argv: list) -> tuple:
         return ["--list-models", *rest], None
     if head == "doctor":
         return ["--doctor", *rest], None
+    if head == "onboard":
+        return ["--onboard", *rest], None
     if head == "council":
         # `council resume <id>` and `council status <id>` are nested actions;
         # a bare `council …` stays the fresh-run form.
@@ -295,6 +299,21 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--list-models", dest="list_models", action="store_true",
                         help="Report invocable models per backend (live where the CLI exposes it; "
                              "filter with --cli)")
+    parser.add_argument("--onboard", action="store_true",
+                        help="Detect CLIs, print install hints, write merge-safe prefs to "
+                             "~/.agents/summon.json (never stores API secrets)")
+    parser.add_argument("--subscriptions", dest="subscriptions", default=None,
+                        help="With --onboard: comma list of active plans "
+                             "(cursor,claude,codex,gemini,antigravity,byteplus_coding_plan,"
+                             "kimi,other_api)")
+    parser.add_argument("--reset", dest="onboard_reset", action="store_true",
+                        help="With --onboard: replace onboard section instead of merging")
+    parser.add_argument("--no-write", dest="onboard_no_write", action="store_true",
+                        help="With --onboard: detect only; do not write prefs")
+    parser.add_argument("--transient-retries", dest="transient_retries", action="store_true",
+                        help="Enable one conservative retry on transient network/5xx/"
+                             "timeout errors (also SUMMON_TRANSIENT_RETRIES=1). Never retries "
+                             "ambiguous billable write failures")
     parser.add_argument("--doctor", action="store_true",
                         help="Check backend CLIs, agy wrapper deps, agents dir, and git; "
                              "human-readable (add --json for machines)")

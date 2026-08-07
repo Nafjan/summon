@@ -322,8 +322,8 @@ _PAYG_CONSENT_SURFACES = (
 def payg_consent_allowed(allow_payg_flag: bool = False) -> bool:
     """True when the operator has consented to PAYG fallback billing.
 
-    Sources (any one grants consent):
-    - ``allow_payg_flag`` (from --allow-payg or frontmatter allow_payg: true)
+    Sources (any one grants consent) — operator surfaces only:
+    - ``allow_payg_flag`` from ``--allow-payg`` (never agent frontmatter)
     - env ``SUMMON_ALLOW_BYTEPLUS_PAYG=1``
     - ~/.agents/summon.json ``{"allow_byteplus_payg": true}``
     """
@@ -500,6 +500,13 @@ def call(inv, timeout_ms: int) -> dict:
         return _err(cli, _cp_model)
 
     api_key = os.environ.get(inv.api_key_env) if inv.api_key_env else None
+    _key_source = "env" if api_key else None
+    if inv.api_key_env == "BYTEPLUS_CODING_API_KEY" and not api_key:
+        try:
+            from _arkcli_creds import resolve_byteplus_coding_api_key
+            api_key, _key_source = resolve_byteplus_coding_api_key()
+        except Exception:  # noqa: BLE001 — credential resolve is best-effort
+            api_key, _key_source = None, None
     if inv.api_key_env and not api_key:
         msg = f"openai-compat: ${inv.api_key_env} is not set"
         if inv.api_key_env == "BYTEPLUS_CODING_API_KEY":
@@ -510,6 +517,10 @@ def call(inv, timeout_ms: int) -> dict:
 
     resp = _do_request(inv.base_url, inv.model, inv.system_context, inv.prompt,
                        api_key, timeout_ms, cli)
+    if _key_source == "arkcli_profile" and resp.get("status") == "success":
+        resp.setdefault("warnings", []).append(
+            "BYTEPLUS_CODING_API_KEY was unset; used the local arkcli profile "
+            "API key for this dispatch (env still wins when set)")
 
     # --- PAYG consent-gated fallback ---
     if (resp["status"] == "error"
@@ -612,6 +623,11 @@ def _do_request(base_url: str, model: str, system_context: str | None,
     _bill = coding_plan_billing(base_url)
     if _bill:
         resp["billing"] = _bill
+    try:
+        from _drivers import enrich_envelope_from_cli
+        enrich_envelope_from_cli(resp, cli)
+    except Exception:  # noqa: BLE001 — additive telemetry only
+        pass
     return resp
 
 

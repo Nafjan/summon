@@ -1,6 +1,6 @@
 # Versioning, and what summon 1.0.0 means
 
-Status: **criteria met; 1.0.0 publication authorized on 2026-07-29.** Current line is 1.1.x.
+Status: **criteria met; 1.0.0 publication authorized on 2026-07-29.** Current line is 1.2.x.
 
 > This line drifted (it said 0.14.x through four minor releases). If you are editing
 > it, that is the eleventh instance of the defect this repo keeps hitting: a claim and

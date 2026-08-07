@@ -740,6 +740,9 @@ def infer_billing(cli: str) -> dict:
     default). Advisory only; the vendor's billing is the source of truth."""
     if cli == "openai-compat":
         return {"source": "api", "note": "OpenAI-compatible endpoint (API key / credits)"}
+    if cli == "arkcli":
+        return {"source": "subscription",
+                "note": "arkcli +chat via profile store (dual-wire with openai-compat HTTP)"}
     if cli == "agy":
         return {"source": "subscription", "note": "Google login (no API-key path)"}
     if cli == "codex":
@@ -1651,6 +1654,11 @@ def _acp_call(inv: AgentInvocation, timeout_ms: int) -> dict:
     return _call(inv, timeout_ms)
 
 
+def _arkcli_call(inv: AgentInvocation, timeout_ms: int) -> dict:
+    from _arkcli_backend import call as _call  # lazy: keep _builder import-light
+    return _call(inv, timeout_ms)
+
+
 BACKENDS: dict = {
     "claude":       {"kind": "subprocess", "build": _build_claude_args},
     "codex":        {"kind": "subprocess", "build": _build_codex_args},
@@ -1664,6 +1672,7 @@ BACKENDS: dict = {
     "kimi":         {"kind": "subprocess", "build": _build_kimi_args, "side_effects": True,
                      "acp": {"call": _acp_call}},
     "agy":          {"kind": "subprocess", "build": _build_agy_args, "side_effects": True},
+    "arkcli":       {"kind": "api", "call": _arkcli_call},
     "openai-compat": {"kind": "api", "call": _api_call},
 }
 BACKEND_CLIS = tuple(BACKENDS)
