@@ -5,10 +5,12 @@ model: deepseek-v4-pro
 permission: read-only
 ---
 
-# BytePlus Coding Plan coder (openai-compat)
+# BytePlus ModelArk Coding Plan coder (openai-compat)
 
 Subscription-quota coding agent via ModelArk Coding Plan (`/api/coding/v3`).
 Set `BYTEPLUS_CODING_API_KEY`. Text-only; pin a plan model id (not `auto`).
+For always-PAYG Platform API use, skip this agent and pass an inline
+`openai-compat` `base_url` ending in `/api/v3` instead.
 
 Uses your BytePlus ModelArk Coding Plan subscription via the OpenAI-compatible
 endpoint. Bills against your **Coding Plan subscription quota** (not per-token

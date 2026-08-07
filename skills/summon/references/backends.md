@@ -38,14 +38,24 @@ API access — and it makes `--council` a true multi-vendor board (à la OpenRou
 
 ---
 
-## BytePlus ModelArk Coding Plan
+## BytePlus ModelArk (Coding Plan + Platform PAYG)
 
-BytePlus ModelArk offers a **Coding Plan** subscription that bundles a roster of
-text-only coding models under a flat monthly fee (no per-token billing). Summon
-ships a built-in `byteplus-coding` provider so you can use it with zero config
-beyond an env var.
+ModelArk is BytePlus's model platform. You can reach it two ways — both work
+from Summon (`openai-compat`) and from `arkcli` (CLI chat / helpers):
 
-### Quick start
+| Path | Endpoint shape | Billing | Typical auth |
+|------|----------------|---------|--------------|
+| **Coding Plan** | `.../api/coding/v3` | Flat subscription quota | Coding Plan profile API key → `BYTEPLUS_CODING_API_KEY` |
+| **Platform PAYG** | `.../api/v3` (no `/coding/`) | Per-token API credits | Platform / inference API key |
+
+Mixing them up is the main footgun: pointing a Coding Plan key at `/api/v3`
+(or the reverse) silently changes billing. Summon's built-in `byteplus-coding`
+provider always targets `/api/coding/v3` and **refuses** a `byteplus-coding`
+`base_url` that lacks `/api/coding/`.
+
+### Path A — Coding Plan (subscription)
+
+Zero-config beyond the env var:
 
 ```markdown
 ---
@@ -55,21 +65,46 @@ model: deepseek-v4-pro
 ---
 ```
 
-Set `BYTEPLUS_CODING_API_KEY` in your environment (the profile API key from
-`arkcli auth status`, not the short-lived SSO id_token).
+Or the bundled agent: `python scripts/run_subagent.py --agent byteplus-coder --prompt "..."`.
 
-### Coding Plan vs PAYG — the `/api/coding/` trap
+Set `BYTEPLUS_CODING_API_KEY` to the **profile API key** from `arkcli auth status`
+(not the short-lived SSO `id_token`). List profiles with `arkcli auth status`;
+Coding Plan profiles are typically named like `coding-plan_<region>_<account>`.
 
-| Path | Billing |
-|------|---------|
-| `.../api/coding/v3` | **Coding Plan** subscription quota |
-| `.../api/v3` (no `/coding/`) | Pay-as-you-go, per-token — bypasses plan |
+### Path B — Platform PAYG (always per-token)
 
-The built-in provider hardcodes the correct Coding Plan endpoint. Summon
-**refuses** to dispatch a `byteplus-coding` provider whose `base_url` doesn't
-contain `/api/coding/` — this prevents silent PAYG billing.
+There is no separate built-in PAYG provider. Use inline OpenAI-compat config
+(or `providers.json`) with the **platform** base URL:
 
-### Model selection
+```markdown
+---
+run-agent: openai-compat
+base_url: https://ark.ap-southeast.bytepluses.com/api/v3
+api_key_env: BYTEPLUS_API_KEY
+model: deepseek-v4-pro
+---
+```
+
+Use your Platform / inference API key (not the Coding Plan key unless you
+intentionally accept PAYG). Region hosts differ (e.g. `ark.cn-beijing.volces.com`
+for CN). This path never goes through the Coding Plan guardrail or the
+consent-gated fallback — every successful call is `billing.source: api`.
+
+### Via `arkcli` (CLI)
+
+```powershell
+arkcli auth status --format json          # profiles, keys, plan membership
+arkcli +chat --model deepseek-v4-pro "..." # chat (uses active / chosen profile)
+arkcli helper list
+arkcli helper configure opencode --profile <coding-plan-or-platform-profile> --model deepseek-v4-pro
+```
+
+`arkcli helper` wires supported CLIs (Claude Code, Codex, OpenCode, Hermes).
+`arkcli +connect` only installs documentation skills — it does **not** configure
+providers. For Summon you only need the env var + provider / inline `base_url`.
+Reset with `arkcli helper reset <harness>` to undo only arkcli-managed bits.
+
+### Coding Plan model selection
 
 The plan roster is an **eligibility catalog**, not a guarantee that every listed
 model currently works through every API surface. Prefer models by task:
@@ -83,7 +118,7 @@ model currently works through every API surface. Prefer models by task:
 | Code/UI generation alternative | `kimi-k2.5` | Useful alternative when the primary choices underperform |
 | General reasoning, not coding-specialized | `dola-seed-2.0-pro` / `dola-seed-2.0-lite` | Use only when a general model fits better |
 
-**Strongly avoid legacy or superseded roster entries for new work:**
+**Strongly avoid legacy or superseded roster entries for new Coding Plan work:**
 
 - `glm-5.1` — superseded by `glm-5.2`.
 - `bytedance-seed-code` — older Seed 1.6 code preview; listed in the roster but
@@ -126,26 +161,15 @@ Only promote a model after all three are true. If a previously broken model
 starts working, update its status and the last-checked date rather than assuming
 that roster presence alone fixed it.
 
-### OpenCode model sync
+### Text-only constraint (Coding Plan)
 
-Prefer `arkcli helper` over hand-editing OpenCode's model catalog:
-
-```powershell
-arkcli helper list
-arkcli helper configure opencode --profile coding-plan_ap-southeast-1_personal --model deepseek-v4-pro
-```
-
-This writes the Coding Plan provider + model into OpenCode. Reset with
-`arkcli helper reset opencode` if you need to undo only arkcli-managed bits.
-
-### Text-only constraint
-
-All Coding Plan models are text-only. Do **not** send image/vision input — the
+Coding Plan models are text-only. Do **not** send image/vision input — the
 request will hard-fail with `Model do not support image input`. In Cursor, never
-set a BytePlus Coding Plan model as the default Agent model (Cursor sends
-screenshots as part of context).
+set a Coding Plan model as the default Agent model (Cursor sends screenshots as
+part of context). Platform PAYG multimodal endpoints are a separate product
+surface — pin those models only on Path B with an explicit `/api/v3` `base_url`.
 
-### Region override
+### Region override (Coding Plan)
 
 The built-in defaults to `ap-southeast` (BytePlus international). For other
 regions, add a `byteplus-coding` override in `providers.json`:
@@ -159,17 +183,6 @@ regions, add a `byteplus-coding` override in `providers.json`:
 }
 ```
 
-### `arkcli helper` vs `+connect`
-
-| Command | What it does |
-|---------|-------------|
-| `arkcli helper configure <harness>` | Writes model/provider config for supported CLIs (Claude Code, Codex, OpenCode, Hermes) |
-| `arkcli +connect` | Installs `arkcli-*` **documentation skills** into agents — not provider wiring |
-
-For Summon, you only need the built-in provider + env var. `arkcli helper` is for
-wiring other CLIs; `+connect` installs informational skills and is entirely
-optional (can pollute agent skill pickers if run broadly).
-
 ### Billing note
 
 When the resolved `base_url` contains `/api/coding/`, Summon reports
@@ -177,15 +190,20 @@ When the resolved `base_url` contains `/api/coding/`, Summon reports
 **subscription quota**, not per-token API credits. Consent-gated PAYG fallback
 overrides this to `source: api` with an explicit PAYG note.
 
-Generic `infer_billing("openai-compat")` remains `api` for other providers;
-Coding Plan overlays the subscription source on the response envelope.
+Generic `infer_billing("openai-compat")` remains `api` for other providers
+(including Path B inline `/api/v3`); Coding Plan overlays the subscription
+source on the response envelope.
 
-### PAYG fallback (consent-gated)
+### PAYG fallback from Coding Plan (consent-gated)
 
 When a Coding Plan dispatch fails with a **quota/rate/plan-limit** or
 **UnsupportedModel** error (model not on plan), Summon can automatically retry
-once against the PAYG endpoint (`/api/v3`) using the same key. This retry only
-fires when you've explicitly consented to PAYG billing through one of:
+once against the PAYG endpoint (`/api/v3`) using the same key. That retry is
+**Platform PAYG billing** (per-token credits), not Coding Plan quota. This is for
+Coding Plan users who occasionally need a model outside the plan — not a
+substitute for Path B if you always want PAYG. The retry only fires when you've
+explicitly consented through one of (any true wins; `--allow-payg` is
+per-dispatch only and does not persist):
 
 | Surface | Scope |
 |---------|-------|
@@ -193,6 +211,21 @@ fires when you've explicitly consented to PAYG billing through one of:
 | Agent frontmatter `allow_payg: true` | Per-agent durable consent (also applies under fan-out; prefer env/prefs for intentional fleet-wide PAYG) |
 | `SUMMON_ALLOW_BYTEPLUS_PAYG=1` env | Process / session (durable consent surface) |
 | `~/.agents/summon.json` `{"allow_byteplus_payg": true}` | Persistent (all sessions) |
+
+Examples:
+
+```powershell
+python scripts/run_subagent.py --agent byteplus-coder --prompt "..." --allow-payg
+```
+
+```markdown
+---
+run-agent: openai-compat
+provider: byteplus-coding
+model: deepseek-v4-pro
+allow_payg: true
+---
+```
 
 Without consent, the error message tells you how to enable it. The retry is
 **never** attempted for auth failures (401/403), network errors, timeouts, or
