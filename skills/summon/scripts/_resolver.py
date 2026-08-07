@@ -19,7 +19,8 @@ def _valid_clis() -> tuple:
         from _builder import BACKEND_CLIS
         return BACKEND_CLIS
     except ImportError:
-        return ("claude", "cursor-agent", "codex", "gemini", "agy", "openai-compat")
+        return ("claude", "cursor-agent", "codex", "gemini", "agy", "arkcli",
+                "openai-compat")
 
 
 _VALID_CLIS = _valid_clis()

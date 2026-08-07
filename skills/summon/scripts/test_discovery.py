@@ -15896,7 +15896,12 @@ def test_v10_public_docs_exclude_machine_identity_and_preserve_local_evidence():
         os.path.join(root, "skills", "summon", "agents", "byteplus-coder.md"),
         os.path.join(root, "skills", "summon", "SKILL.md"),
         os.path.join(root, "skills", "summon", "scripts", "_apibackend.py"),
+        os.path.join(root, "skills", "summon", "scripts", "_arkcli_creds.py"),
+        os.path.join(root, "skills", "summon", "scripts", "_drivers.py"),
         os.path.join(root, "providers.json.example"),
+        os.path.join(root, "docs", "ADR-provider-drivers.md"),
+        os.path.join(root, "docs", "ADR-mcp-facade.md"),
+        os.path.join(root, "com.summon.agents", "README.md"),
     ]
     leak = _re.compile(
         r"(?i)("
@@ -16182,6 +16187,356 @@ def test_refresh_coding_plan_roster_parses_arkcli(monkeypatch=None):
         sp.run = _orig
         api._roster_cache_path = old
         import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# --- Phase A (1.2 onboard): doctor, prefs, transient retries, envelope tags ---
+
+
+def test_onboard_merge_prefs_shallow_sections():
+    from _onboard import merge_prefs
+    base = {"onboard": {"completed": True, "subscriptions": ["cursor"]}, "payg": {"ok": False}}
+    out = merge_prefs(base, {"onboard": {"subscriptions": ["claude", "codex"]},
+                             "payg": {"note": "explicit"}})
+    assert out["onboard"]["completed"] is True
+    assert out["onboard"]["subscriptions"] == ["claude", "codex"]
+    assert out["payg"] == {"ok": False, "note": "explicit"}
+
+
+def test_byteplus_key_resolve_env_wins():
+    import tempfile
+    from _arkcli_creds import resolve_byteplus_coding_api_key
+    import _arkcli_creds as creds
+    d = tempfile.mkdtemp(prefix="summon-bp-key-")
+    store = Path(d) / ".env"
+    store.write_text('VOLCENGINE_ARK_API_KEY=ark-profile-key\n', encoding="utf-8")
+    old_file = creds._arkcli_env_file
+    creds._arkcli_env_file = lambda: store
+    old_env = os.environ.get("BYTEPLUS_CODING_API_KEY")
+    try:
+        os.environ.pop("BYTEPLUS_CODING_API_KEY", None)
+        key, source = resolve_byteplus_coding_api_key()
+        assert key == "ark-profile-key" and source == "arkcli_profile"
+        os.environ["BYTEPLUS_CODING_API_KEY"] = "ark-env-key"
+        key2, source2 = resolve_byteplus_coding_api_key()
+        assert key2 == "ark-env-key" and source2 == "env"
+    finally:
+        creds._arkcli_env_file = old_file
+        if old_env is None:
+            os.environ.pop("BYTEPLUS_CODING_API_KEY", None)
+        else:
+            os.environ["BYTEPLUS_CODING_API_KEY"] = old_env
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_doctor_byteplus_section_keys(monkeypatch=None):
+    import _doctor
+    old = _doctor._check_byteplus_coding
+    _doctor._check_byteplus_coding = lambda: {
+        "api_key_present": True,
+        "api_key_source": "env",
+        "arkcli_found": False,
+        "arkcli_path": None,
+        "roster_cache": {"present": False},
+    }
+    try:
+        rep = _doctor.doctor()
+        bp = rep["byteplus_coding"]
+        assert set(bp) >= {"api_key_present", "api_key_source", "arkcli_found", "roster_cache"}
+        assert bp["api_key_present"] is True and bp["api_key_source"] == "env"
+        text = _doctor.render(rep)
+        assert "byteplus coding plan" in text.lower()
+    finally:
+        _doctor._check_byteplus_coding = old
+
+
+def test_transient_dispatch_error_classifier():
+    import run_subagent as rs
+    assert rs._is_transient_dispatch_error(
+        {"status": "error", "error": "HTTP 503 from endpoint", "cli": "openai-compat"})
+    assert rs._is_transient_dispatch_error(
+        {"status": "error", "exit_code": 124, "error": "timed out", "cli": "codex"})
+    assert not rs._is_transient_dispatch_error(
+        {"status": "error", "error": "please log in first", "cli": "codex"})
+    assert not rs._is_transient_dispatch_error(
+        {"status": "success", "cli": "codex"})
+
+
+def test_enrich_envelope_from_cli_openai_compat():
+    from _drivers import enrich_envelope_from_cli, BACKEND_TYPE_CHAT
+    out = enrich_envelope_from_cli({"status": "success", "cli": "openai-compat"},
+                                   "openai-compat")
+    assert out["backend_type"] == BACKEND_TYPE_CHAT
+    assert out["served_via"] == "chat_completions"
+    assert out["provider"]["driver"] == "openai-compat"
+
+
+# --- Phase C: provider drivers, MCP facade, stream partials, agent packs ---
+
+
+def test_phase_c_driver_registry():
+    from _drivers import (
+        DRIVERS,
+        get_driver,
+        probe,
+        resolve_model,
+        stamp_driver_fields,
+        cancel,
+        BACKEND_TYPE_ARKCLI,
+    )
+    assert set(DRIVERS) == {"cli", "openai-compat", "arkcli", "acp"}
+    assert get_driver("arkcli").name == "arkcli"
+    health = probe("arkcli")
+    assert health["driver"] == "arkcli"
+    assert "ok" in health
+    assert resolve_model("openai-compat", "gpt-5") == "gpt-5"
+    resp = stamp_driver_fields(
+        {"status": "success"},
+        driver="arkcli",
+        backend_type=BACKEND_TYPE_ARKCLI,
+        served_via="subprocess",
+    )
+    assert resp["provider"]["driver"] == "arkcli"
+    assert resp["backend_type"] == BACKEND_TYPE_ARKCLI
+    assert resp["served"]["via"] == "subprocess"
+    assert cancel("handle-1")["cancelled"] is False
+
+
+def test_phase_c_mcp_json_matches_plugin_schema_generation():
+    root = Path(__file__).resolve().parents[3]
+    mcp_path = root / "mcp.json"
+    plugin_path = root / "plugin.json"
+    assert mcp_path.is_file(), "root mcp.json missing"
+    assert plugin_path.is_file(), "root plugin.json missing"
+    mcp = json.loads(mcp_path.read_text(encoding="utf-8"))
+    plugin = json.loads(plugin_path.read_text(encoding="utf-8"))
+    assert "1.0.0" in mcp.get("$schema", "")
+    assert "1.0.0" in plugin.get("$schema", "")
+    summon = mcp["mcpServers"]["summon"]
+    assert summon["type"] == "stdio"
+    assert summon["command"] == "python"
+    assert summon["args"] == ["./skills/summon/scripts/mcp_server.py"]
+    assert summon.get("cwd") == "${PLUGIN_ROOT}"
+
+
+def test_phase_c_stream_partials():
+    from _stream_partials import emit_partial, stream_partials_enabled, PARTIAL_TYPE
+    old = os.environ.pop("SUMMON_STREAM_PARTIALS", None)
+    try:
+        assert not stream_partials_enabled()
+        assert emit_partial("started", cli="test") is None
+        os.environ["SUMMON_STREAM_PARTIALS"] = "1"
+        assert stream_partials_enabled()
+        import io
+        buf = io.StringIO()
+        real_stderr = sys.stderr
+        sys.stderr = buf
+        try:
+            ev = emit_partial("progress", cli="arkcli", message="still running")
+            assert ev is not None
+            assert ev["type"] == PARTIAL_TYPE
+            assert ev["phase"] == "progress"
+            line = buf.getvalue().strip()
+            parsed = json.loads(line)
+            assert parsed["cli"] == "arkcli"
+        finally:
+            sys.stderr = real_stderr
+    finally:
+        if old is None:
+            os.environ.pop("SUMMON_STREAM_PARTIALS", None)
+        else:
+            os.environ["SUMMON_STREAM_PARTIALS"] = old
+
+
+def test_phase_c_discover_agent_packs_empty_safe():
+    from _loader import discover_agent_packs
+    with tempfile.TemporaryDirectory() as empty:
+        assert discover_agent_packs(plugin_root=empty) == []
+    packs = discover_agent_packs(plugin_root=str(Path(__file__).resolve().parents[3]))
+    assert isinstance(packs, list)
+    for entry in packs:
+        assert "path" in entry
+        assert "agents" in entry
+
+
+def test_phase_c_arkcli_backend_kind():
+    from _builder import backend_kind, BACKENDS
+    assert backend_kind("arkcli") == "api"
+    assert "call" in BACKENDS["arkcli"]
+
+
+def test_byteplus_ensure_does_not_mutate_environ():
+    """Adversarial: profile-store resolve must not sticky-hydrate os.environ."""
+    import tempfile
+    import shutil
+    import _arkcli_creds as creds
+    d = tempfile.mkdtemp(prefix="summon-bp-nomut-")
+    store = Path(d) / ".env"
+    store.write_text("VOLCENGINE_ARK_API_KEY=ark-profile-secret\n", encoding="utf-8")
+    old_file = creds._arkcli_env_file
+    creds._arkcli_env_file = lambda: store
+    old_env = os.environ.get("BYTEPLUS_CODING_API_KEY")
+    try:
+        os.environ.pop("BYTEPLUS_CODING_API_KEY", None)
+        src = creds.ensure_byteplus_coding_api_key_env()
+        assert src == "arkcli_profile"
+        assert "BYTEPLUS_CODING_API_KEY" not in os.environ
+        key, source = creds.resolve_byteplus_coding_api_key()
+        assert key == "ark-profile-secret" and source == "arkcli_profile"
+    finally:
+        creds._arkcli_env_file = old_file
+        if old_env is None:
+            os.environ.pop("BYTEPLUS_CODING_API_KEY", None)
+        else:
+            os.environ["BYTEPLUS_CODING_API_KEY"] = old_env
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_onboard_reset_preserves_sibling_prefs(monkeypatch=None):
+    """--reset replaces onboard section only; PAYG consent must survive."""
+    import tempfile
+    import shutil
+    import _onboard as ob
+    d = tempfile.mkdtemp(prefix="summon-prefs-")
+    prefs_file = Path(d) / "summon.json"
+    prefs_file.write_text(
+        json.dumps({"allow_byteplus_payg": True,
+                    "onboard": {"completed": True, "subscriptions": ["cursor"]}}),
+        encoding="utf-8")
+    old_path = ob.prefs_path
+    ob.prefs_path = lambda: prefs_file
+    try:
+        out = ob.build_onboard_prefs(["claude"], reset=True)
+        assert out["allow_byteplus_payg"] is True
+        assert out["onboard"]["subscriptions"] == ["claude"]
+        assert out["onboard"]["completed"] is True
+    finally:
+        ob.prefs_path = old_path
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_enrich_envelope_preserves_arkcli_chat_via():
+    from _drivers import enrich_envelope_from_cli, BACKEND_TYPE_ARKCLI
+    out = enrich_envelope_from_cli(
+        {"status": "success", "cli": "arkcli",
+         "backend_type": "arkcli_chat", "served_via": "arkcli_chat"},
+        "arkcli")
+    assert out["backend_type"] == BACKEND_TYPE_ARKCLI
+    assert out["served_via"] == "arkcli_chat"
+    assert out["served"]["via"] == "arkcli_chat"
+    assert out["provider"]["driver"] == "arkcli"
+
+
+def test_mcp_scrub_secretish_redacts_ark_keys():
+    import mcp_server as mcp
+    dirty = "Authorization: Bearer ark-ABCDEFGHijklmnop stderr leak"
+    clean = mcp._scrub_secretish(dirty)
+    assert "ark-ABCDEFGH" not in clean
+    assert "REDACTED" in clean
+
+
+def test_onboard_detect_clis_paths_are_portable():
+    from _onboard import detect_clis
+    for row in detect_clis():
+        p = row.get("path")
+        if p:
+            assert not os.path.isabs(p), p
+            assert "Users" not in p and "\\" not in p
+
+
+def test_frontmatter_allow_payg_does_not_grant_consent():
+    """Agent authors cannot authorize PAYG — only operator surfaces do."""
+    import tempfile
+    import run_subagent as rs
+    d = tempfile.mkdtemp(prefix="summon-payg-fm-")
+    agent = Path(d) / "payg-agent.md"
+    agent.write_text(
+        "---\nrun-agent: openai-compat\nprovider: byteplus-coding\n"
+        "model: deepseek-v4-flash\nallow_payg: true\n---\n\nbody\n",
+        encoding="utf-8")
+    old = os.environ.pop("SUMMON_ALLOW_BYTEPLUS_PAYG", None)
+    try:
+        assert rs._allow_payg_from_frontmatter(str(agent)) is True
+        from _apibackend import payg_consent_allowed
+        # Frontmatter alone must not satisfy consent.
+        assert payg_consent_allowed(False) is False
+        # Invocation wiring uses only args.allow_payg (operator flag).
+        assert getattr(rs, "_allow_payg_from_frontmatter")(str(agent)) is True
+    finally:
+        if old is not None:
+            os.environ["SUMMON_ALLOW_BYTEPLUS_PAYG"] = old
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_arkcli_prompt_uses_end_of_options():
+    """Prompts starting with '-' must not be parsed as arkcli flags."""
+    import _arkcli_backend as ab
+    class Inv:
+        model = "deepseek-v4-flash"
+        prompt = "--help"
+        system_context = ""
+        resume_id = None
+    # Don't actually spawn — build argv via a tiny monkeypatch of subprocess.run
+    seen = {}
+    import subprocess as sp
+    real_run = sp.run
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = list(cmd)
+        class P:
+            returncode = 0
+            stdout = '{"content":"ok"}'
+            stderr = ""
+        return P()
+
+    sp.run = fake_run
+    old_which = __import__("shutil").which
+    __import__("shutil").which = lambda n: "arkcli" if "arkcli" in n else old_which(n)
+    try:
+        ab.call(Inv(), 5000)
+        assert "--" in seen["cmd"], seen["cmd"]
+        assert seen["cmd"][seen["cmd"].index("--") + 1] == "--help"
+    finally:
+        sp.run = real_run
+        __import__("shutil").which = old_which
+
+
+def test_arkcli_cmd_prefers_node_over_cmd_exe(monkeypatch=None):
+    """Windows .cmd shim must not force cmd.exe when run.js is resolvable."""
+    import tempfile
+    import shutil
+    import _arkcli_backend as ab
+    d = tempfile.mkdtemp(prefix="summon-arkcli-node-")
+    try:
+        pkg = Path(d) / "node_modules" / "@byteplus" / "ark-cli" / "scripts"
+        pkg.mkdir(parents=True)
+        run_js = pkg / "run.js"
+        run_js.write_text("console.log('arkcli')\n", encoding="utf-8")
+        shim = Path(d) / "arkcli.cmd"
+        shim.write_text("@echo off\n", encoding="utf-8")
+        old_which = shutil.which
+        old_name = os.name
+
+        def _which(name):
+            if name in ("arkcli.cmd", "arkcli"):
+                return str(shim)
+            if name == "node":
+                return r"C:\fake\node.exe"
+            return old_which(name)
+
+        shutil.which = _which
+        os.name = "nt"
+        try:
+            cmd = ab._arkcli_cmd()
+            assert cmd[0].endswith("node.exe") or cmd[0] == "node" or "node" in cmd[0]
+            assert cmd[1] == str(run_js)
+            assert "cmd" not in cmd[:1] and "/c" not in cmd
+        finally:
+            shutil.which = old_which
+            os.name = old_name
+    finally:
         shutil.rmtree(d, ignore_errors=True)
 
 

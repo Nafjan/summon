@@ -116,6 +116,15 @@ def _read_version(scripts_dir: str):
 
 _SKILL_MD_MAX = 200_000   # a SKILL.md is small text; bound a foreign/corrupt one
 _MAX_SKILLS_SCAN = 10_000  # cap entries scanned in a skills dir (bound a hostile/huge one)
+# Agent Plugin installs (agent-plugins.org) use the same skills/summon/ tree as this repo.
+# Cursor loads local dev copies from ~/.cursor/plugins/local/<name>/ and marketplace
+# copies under ~/.cursor/plugins/cache/ — distinct from ~/.cursor/skills/summon that
+# install.py targets.
+_AGENT_PLUGIN_LOCAL_ROOT = os.path.join(".cursor", "plugins", "local", "summon")
+_AGENT_PLUGIN_CACHE_ROOT = os.path.join(".cursor", "plugins", "cache")
+_AGENT_PLUGIN_SCRIPTS_TAIL = os.path.join("skills", "summon", "scripts")
+_MAX_PLUGIN_CACHE_DIRS = 500   # bound a hostile/huge cache tree
+_MAX_PLUGIN_CACHE_DEPTH = 5    # cache/<id>/…/summon — shallow enough for known layouts
 
 
 def _skill_md_name(skill_dir: str):
@@ -240,6 +249,65 @@ def duplicate_summon_skills(skills_dir: str, skill_name: str = "summon") -> tupl
     return sorted(out), truncated
 
 
+def _is_summon_plugin_scripts(scripts_dir: str) -> bool:
+    """True when ``scripts_dir`` looks like a summon dispatcher (has run_subagent.py)."""
+    try:
+        return os.path.isfile(os.path.join(scripts_dir, "run_subagent.py"))
+    except OSError:
+        return False
+
+
+def _discover_agent_plugin_installs(home: str) -> list[tuple[str, str]]:
+    """Known Agent Plugin install roots -> ``(label, scripts_dir)``. Only PRESENT
+    installs are returned. Fail-soft; never raises."""
+    found: list[tuple[str, str]] = []
+    local_root = os.path.join(home, _AGENT_PLUGIN_LOCAL_ROOT)
+    local_scripts = os.path.join(local_root, _AGENT_PLUGIN_SCRIPTS_TAIL)
+    try:
+        if os.path.isdir(local_root) and _is_summon_plugin_scripts(local_scripts):
+            found.append(("cursor-plugin-local", local_scripts))
+    except OSError:
+        pass
+    # Marketplace / cached Agent Plugin copies: bounded shallow scan for a ``summon`` dir
+    # whose layout matches this repo (…/summon/skills/summon/scripts/run_subagent.py).
+    cache_root = os.path.join(home, _AGENT_PLUGIN_CACHE_ROOT)
+    try:
+        if not os.path.isdir(cache_root):
+            return found
+        queue: list[tuple[str, int]] = [(cache_root, 0)]
+        scanned = 0
+        seen_labels: set[str] = set()
+        while queue and scanned < _MAX_PLUGIN_CACHE_DIRS:
+            parent, depth = queue.pop(0)
+            try:
+                with os.scandir(parent) as it:
+                    for entry in it:
+                        if scanned >= _MAX_PLUGIN_CACHE_DIRS:
+                            break
+                        scanned += 1
+                        try:
+                            if not entry.is_dir(follow_symlinks=False):
+                                continue
+                        except OSError:
+                            continue
+                        d = entry.path
+                        if os.path.normcase(entry.name) == "summon":
+                            scripts = os.path.join(d, _AGENT_PLUGIN_SCRIPTS_TAIL)
+                            if _is_summon_plugin_scripts(scripts):
+                                rel = os.path.relpath(d, cache_root).replace("\\", "/")
+                                label = f"cursor-plugin-cache:{rel}"
+                                if label not in seen_labels:
+                                    seen_labels.add(label)
+                                    found.append((label, scripts))
+                        if depth < _MAX_PLUGIN_CACHE_DEPTH:
+                            queue.append((d, depth + 1))
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return found
+
+
 def _probe(label: str, scripts_dir: str, managed: bool) -> dict:
     """One install record for a ``.../skills/summon/scripts`` directory. Absent copies are
     reported (present=False) rather than dropped, so ``doctor`` can show what is NOT
@@ -300,6 +368,8 @@ def enumerate_installs(running_scripts_dir: str | None = None,
         for _label, _rel in (("project", (".agents", "skills", "summon", "scripts")),
                              ("project-claude", (".claude", "skills", "summon", "scripts"))):
             raw.append(_probe(_label, os.path.join(project_dir, *_rel), managed=False))
+    for label, scripts_dir in _discover_agent_plugin_installs(home):
+        raw.append(_probe(label, scripts_dir, managed=False))
     records: list = []
     by_key: dict = {}
     for r in raw:

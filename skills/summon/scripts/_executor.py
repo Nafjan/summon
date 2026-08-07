@@ -1935,8 +1935,14 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
     see the same telemetry/report keys.
     """
     if parse_stream is None:
-        parse_stream = cli != "agy"
+        # arkcli +chat emits plain / pretty JSON, not CLI stream-json events.
+        parse_stream = cli not in ("agy", "arkcli")
     processor = StreamProcessor()
+    try:
+        from _stream_partials import emit_partial as _emit_partial
+        _emit_partial("started", cli=cli, message="subprocess started")
+    except Exception:  # noqa: BLE001
+        pass
     response = _drive_process_loop(process, cli, timeout_ms, processor, parse_stream=parse_stream)
     return _enrich(response, processor)
 
@@ -2072,6 +2078,20 @@ def _resolve_launch(command, args):
                     _latest = max(_vs, key=_vkey)
                     return (os.path.join(_latest, "node.exe"),
                             [os.path.join(_latest, "index.js"), *args])
+    # arkcli npm shim: CreateProcess cannot exec .cmd without cmd.exe.
+    # Prefer node + scripts/run.js so user argv is NOT re-parsed by cmd.exe.
+    if os.name == "nt" and command in ("arkcli", "arkcli.cmd"):
+        _ark = shutil.which("arkcli.cmd") or shutil.which("arkcli") or command
+        if str(_ark).lower().endswith((".cmd", ".bat")):
+            try:
+                from _arkcli_backend import _arkcli_node_entry
+                _js = _arkcli_node_entry(_ark)
+            except Exception:  # noqa: BLE001
+                _js = None
+            if _js:
+                return (shutil.which("node") or "node"), [_js, *args]
+            return "cmd.exe", ["/c", _ark, *args]
+        return _ark, args
     resolved = shutil.which(command) or command
     if os.name != "nt" or not resolved.lower().endswith((".cmd", ".bat")):
         return resolved, args
@@ -2156,6 +2176,12 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # Wall-clock per dispatch — orchestrators need this for concurrency
         # tuning and it costs nothing to provide.
         resp["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+        # Additive SPI fields (provider.driver / backend_type / served.via).
+        try:
+            from _drivers import enrich_envelope_from_cli as _enrich_spi
+            _enrich_spi(resp, inv.cli, getattr(inv, "transport", "subprocess") or "subprocess")
+        except Exception:  # noqa: BLE001 — annotation must never break a dispatch
+            pass
         # Exit-code clarity on EVERY envelope (api-kind backends and other paths
         # build their own response and never touch build_final_response). The
         # response builders set the detailed reason first; this preserves it.
@@ -2286,6 +2312,11 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         raw = resp.pop("_debug_raw", None)
         _finalize_diagnostics(resp, raw, debug_dir, debug_argv, max_tool_output_bytes)
         _attach_eligibility(resp)
+        try:
+            from _drivers import enrich_envelope_from_cli
+            enrich_envelope_from_cli(resp, inv.cli, inv.transport)
+        except Exception:  # noqa: BLE001 — telemetry additive; never break dispatch
+            pass
         return resp
 
     # API-kind backends (e.g. openai-compat): the backend performs the request
@@ -2449,7 +2480,10 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         pass
 
     try:
-        parse_stream = inv.cli != "agy" or _agy_stream_wrapper(command, args)
+        parse_stream = (
+            (inv.cli != "agy" or _agy_stream_wrapper(command, args))
+            and inv.cli != "arkcli"
+        )
         response = _drive_process(process, inv.cli, timeout_ms, parse_stream=parse_stream)
     finally:
         # The dispatch is OVER here whichever way it ended. Closing the job releases the

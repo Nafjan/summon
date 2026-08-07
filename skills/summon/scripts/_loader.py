@@ -27,7 +27,7 @@ def last_parsed_sha(agent_file: str) -> str | None:
 # parse_frontmatter -- an unrecognized key that is not a near-miss is still accepted and
 # ignored, so an agent file can carry its own metadata.
 KNOWN_FRONTMATTER_KEYS = ("run-agent", "permission", "model", "args", "effort",
-                          "provider", "base_url", "api_key_env")
+                          "provider", "base_url", "api_key_env", "capability", "billing")
 
 
 def parse_frontmatter(content: str) -> tuple[dict, str]:
@@ -406,3 +406,73 @@ def get_agents_dir(args_agents_dir: str | None, args_cwd: str | None) -> str:
 
     # Fallback for --list without --cwd
     return str(Path.cwd() / ".agents")
+
+
+def discover_agent_packs(plugin_root: str | None = None) -> list[dict]:
+    """Fail-soft discovery of optional ``com.summon.agents`` roster packs.
+
+    When ``plugin_root`` is set, only that root's ``com.summon.agents/`` is
+    scanned. When omitted, checks ``$PLUGIN_ROOT`` (if set) and
+    ``~/.agents/packs/*/com.summon.agents``. Missing paths and bad
+    ``index.json`` are skipped — never raises for empty/absent packs.
+    """
+    roots: list[Path] = []
+    if plugin_root is not None:
+        roots.append(Path(plugin_root) / "com.summon.agents")
+    else:
+        env_root = os.environ.get("PLUGIN_ROOT")
+        if env_root:
+            roots.append(Path(env_root) / "com.summon.agents")
+        packs_home = Path.home() / ".agents" / "packs"
+        try:
+            if packs_home.is_dir():
+                for child in sorted(packs_home.iterdir()):
+                    roots.append(child / "com.summon.agents")
+        except OSError:
+            pass
+
+    found: list[dict] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+            key = str(root.resolve())
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        agents: list[str] = []
+        index_meta: dict = {}
+        index_path = root / "index.json"
+        try:
+            if index_path.is_file():
+                import json as _json
+                raw = _json.loads(index_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    index_meta = {k: raw[k] for k in ("name", "description") if k in raw}
+                    listed = raw.get("agents")
+                    if isinstance(listed, list):
+                        for item in listed:
+                            if isinstance(item, str) and item.endswith(".md"):
+                                p = root / item
+                                if p.is_file() and p.name.lower() != "readme.md":
+                                    agents.append(str(p))
+        except (OSError, ValueError, TypeError):
+            index_meta = {}
+            agents = []
+        if not agents:
+            try:
+                agents = sorted(
+                    str(p) for p in root.glob("*.md")
+                    if p.is_file() and p.name.lower() != "readme.md"
+                )
+            except OSError:
+                agents = []
+        found.append({
+            "path": str(root),
+            "agents": agents,
+            **index_meta,
+        })
+    return found

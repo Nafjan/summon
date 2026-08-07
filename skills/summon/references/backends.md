@@ -208,9 +208,10 @@ per-dispatch only and does not persist):
 | Surface | Scope |
 |---------|-------|
 | `--allow-payg` flag | Single dispatch only (rejected for `--manifest`/`--council`). Propagates to `--background` children via argv; does **not** mutate the durable env var |
-| Agent frontmatter `allow_payg: true` | Per-agent durable consent (also applies under fan-out; prefer env/prefs for intentional fleet-wide PAYG) |
 | `SUMMON_ALLOW_BYTEPLUS_PAYG=1` env | Process / session (durable consent surface) |
 | `~/.agents/summon.json` `{"allow_byteplus_payg": true}` | Persistent (all sessions) |
+
+Agent frontmatter `allow_payg: true` is **not** a consent grant (agent authors are not the bill payer). It may be noted as a request; operators still need one of the surfaces above.
 
 Examples:
 
@@ -218,15 +219,10 @@ Examples:
 python scripts/run_subagent.py --agent byteplus-coder --prompt "..." --allow-payg
 ```
 
-```markdown
----
-run-agent: openai-compat
-provider: byteplus-coding
-model: deepseek-v4-pro
-allow_payg: true
----
+```powershell
+$env:SUMMON_ALLOW_BYTEPLUS_PAYG = "1"
+python scripts/run_subagent.py --agent byteplus-coder --prompt "..."
 ```
-
 Without consent, the error message tells you how to enable it. The retry is
 **never** attempted for auth failures (401/403), network errors, timeouts, or
 generic 5xx.

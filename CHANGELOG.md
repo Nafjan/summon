@@ -4,15 +4,40 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
-## [Unreleased]
+## [1.2.0] — 2026-08-07
 
 ### Added
+
+- **Agent Plugin packaging:** root `plugin.json` (Agent Plugins 1.0.0) plus optional
+  `mcp.json` stdio facade; keep `install.py` for skill-dir hosts. See
+  [docs/ADR-mcp-facade.md](docs/ADR-mcp-facade.md).
+- **Provider-driver SPI:** thin `cli` / `openai-compat` / `arkcli` / `acp` registry with
+  additive envelope fields (`backend_type`, `served.via`, `provider.driver`) and a
+  dual-wire `run-agent: arkcli` backend (`arkcli +chat`). See
+  [docs/ADR-provider-drivers.md](docs/ADR-provider-drivers.md).
+- **Agent packs:** optional `com.summon.agents/` extension namespace for third-party
+  roster packs.
+- **Streaming partials:** `SUMMON_STREAM_PARTIALS=1` emits JSONL progress on stderr
+  without changing the final envelope.
+
+- **Onboard (`--onboard`):** detect CLIs, record subscription prefs in
+  `~/.agents/summon.json`, and surface them in `doctor` (never stores API secrets).
+- **BytePlus key auto-resolve:** `BYTEPLUS_CODING_API_KEY` from env or local
+  arkcli profile when unset; doctor reports presence and source only.
+- **Dry-run hints:** `native_prefer_hint` when the host CLI matches the target
+  backend, or when `openai-compat` is a single-shot chat seat.
+- **Envelope telemetry:** additive `backend_type`, `served_via`, and
+  `provider.driver` on dispatch results.
+- **Agent tags:** optional frontmatter `capability:` / `billing:` copied to
+  dry-run and result as `agent_tags`.
+- **Transient retries:** `--transient-retries` / `SUMMON_TRANSIENT_RETRIES=1`
+  for one conservative retry on timeout/5xx-style failures (never auth).
 
 - **BytePlus ModelArk:** built-in `byteplus-coding` provider for Coding Plan
   (`/api/coding/v3`) with `BYTEPLUS_CODING_API_KEY`, bundled `byteplus-coder`
   agent, subscription billing on successful Coding Plan calls, live roster cache
   from arkcli, and consent-gated one-shot PAYG (`/api/v3`) fallback
-  (`--allow-payg` / frontmatter / env / prefs). Platform PAYG remains available
+  (`--allow-payg` / env / prefs). Platform PAYG remains available
   via inline `openai-compat` `base_url` without the Coding Plan provider.
 
 - **Environment handoff:** every bundled agent now reports `LEFT_BEHIND`, and each envelope

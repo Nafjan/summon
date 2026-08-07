@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "1.1.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "1.2.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -137,7 +137,12 @@ def _transport_for_dispatch(agent_file: str | None, cli_arg: str | None) -> str:
 
 
 def _allow_payg_from_frontmatter(agent_file: str | None) -> bool:
-    """Read ``allow_payg: true`` from agent frontmatter (if present)."""
+    """Detect ``allow_payg: true`` in agent frontmatter (advisory only).
+
+    Frontmatter must NEVER grant PAYG billing consent — only operator surfaces
+    do (``--allow-payg``, ``SUMMON_ALLOW_BYTEPLUS_PAYG=1``, prefs). This helper
+    exists so callers can warn when an agent *requests* PAYG without consent.
+    """
     if not agent_file:
         return False
     try:
@@ -544,6 +549,20 @@ def main() -> None:
         report = doctor(args.agents_dir, args.cwd, probe=getattr(args, "probe", False))
         print(json.dumps(report, ensure_ascii=False) if args.json else render(report))
         sys.exit(0 if report["ok"] else 1)
+
+    if getattr(args, "onboard", False):
+        from _onboard import parse_subscription_list, run_onboard
+        report = run_onboard(
+            subscriptions=parse_subscription_list(getattr(args, "subscriptions", None)),
+            reset=getattr(args, "onboard_reset", False),
+            write=not getattr(args, "onboard_no_write", False),
+            json_mode=bool(args.json),
+        )
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False))
+        else:
+            print(report.get("text") or json.dumps(report, ensure_ascii=False, indent=2))
+        sys.exit(0 if report.get("ok") else 1)
 
     # jobs list/status/wait: read-only registry queries; no dispatch. Answer and
     # exit before any agent/prompt/cwd validation.
@@ -1033,8 +1052,21 @@ def main() -> None:
         agy_account_sha256=_identity.get("agy_account_sha256"),
         agy_account_checked=bool(_identity.get("_agy_account_checked")),
         api_key_env=api_key_env,
-        allow_payg=getattr(args, "allow_payg", False) or _allow_payg_from_frontmatter(agent_file),
+        allow_payg=getattr(args, "allow_payg", False),
     )
+
+    # Frontmatter may *request* PAYG; only operator surfaces grant it.
+    if _allow_payg_from_frontmatter(agent_file) and not invocation.allow_payg:
+        try:
+            from _apibackend import payg_consent_allowed
+            _op_ok = payg_consent_allowed(False)
+        except Exception:  # noqa: BLE001
+            _op_ok = False
+        if not _op_ok:
+            print("note: agent frontmatter has allow_payg: true, but PAYG consent "
+                  "requires --allow-payg, SUMMON_ALLOW_BYTEPLUS_PAYG=1, or "
+                  "~/.agents/summon.json {\"allow_byteplus_payg\": true}",
+                  file=sys.stderr)
 
     if args.dry_run:
         _emit(_dry_run_view(invocation, args, agents_dir, agent_file,
@@ -1125,10 +1157,31 @@ def main() -> None:
 
     if worktree_info:
         result["worktree"] = worktree_info
+    _tags = _agent_tags_from_file(agent_file)
+    if _tags:
+        result["agent_tags"] = _tags
     if args.out:
         _write_out(args.out, result)
     _emit(result)
     sys.exit(0 if result["status"] == "success" else 1)
+
+
+def _agent_tags_from_file(agent_file: str | None) -> dict | None:
+    """Optional frontmatter tags for orchestration (soft — never fails)."""
+    if not agent_file:
+        return None
+    try:
+        from _loader import parse_frontmatter
+        with open(agent_file, encoding="utf-8-sig") as fh:
+            fm, _ = parse_frontmatter(fh.read())
+        tags = {}
+        for key in ("capability", "billing"):
+            val = fm.get(key)
+            if val:
+                tags[key] = val
+        return tags or None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _dry_run_arg_preview(arg: str) -> str:
@@ -1274,6 +1327,17 @@ def _dry_run_view(invocation, args, agents_dir: str,
             view["env_overrides"] = sorted(env) if env else []
         except ValueError as e:
             view["error"] = str(e)
+    _tags = _agent_tags_from_file(agent_file)
+    if _tags:
+        view["agent_tags"] = _tags
+    _host_cli = os.environ.get("SUMMON_HOST_CLI")
+    if _host_cli and _host_cli == invocation.cli:
+        view["native_prefer_hint"] = (
+            "prefer native same-host sub-agent when the host model is already enough")
+    if invocation.cli == "openai-compat":
+        view["native_prefer_hint"] = (
+            "openai-compat is a single Chat Completions call — prefer a CLI agent "
+            "loop for multi-step coding")
     return view
 
 
@@ -1561,6 +1625,47 @@ def _acp_fallback_worthy(result: dict) -> bool:
     return True
 
 
+def _transient_retries_enabled(args) -> bool:
+    return bool(getattr(args, "transient_retries", False)
+                 or os.environ.get("SUMMON_TRANSIENT_RETRIES") == "1")
+
+
+def _is_transient_dispatch_error(result: dict) -> bool:
+    """True when a single conservative retry might help (network/5xx/timeout).
+
+    Never true for auth, permission, or structural failures."""
+    if result.get("status") not in ("error", "partial"):
+        return False
+    err = " ".join([
+        str(result.get("error") or ""),
+        str(result.get("normalization_reason") or ""),
+        (result.get("result") or "")[:500],
+    ]).lower()
+    if result.get("exit_code") == 127 or "cli not found" in err:
+        return False
+    if any(x in err for x in (
+        "not authenticated", "authentication failed", "please log in", "please login",
+        "login required", "not logged in", "permission denied", "unauthorized",
+        "invalid api key", "api key is not set", "401", "403",
+    )):
+        return False
+    try:
+        from _doctor import classify_ineligibility
+        if classify_ineligibility(err, backend=result.get("cli")):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    if result.get("exit_code") == 124 or "timed out" in err or "timeout" in err:
+        return True
+    if any(x in err for x in (
+        "connection reset", "connection refused", "broken pipe",
+        "temporarily unavailable", "http 502", "http 503", "http 504",
+        " 502 ", " 503 ", " 504 ",
+    )):
+        return True
+    return False
+
+
 def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
     """execute_agent with --retries: exponential backoff on error/partial only
     (blocked won't improve by retrying — its cause is structural).
@@ -1571,6 +1676,7 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
     envelope rather than the last failure."""
     attempt = 0
     _auto_scrape_retry = False
+    _transient_used = False
     _prev_result: dict = {}
     while True:
         result = execute_agent(invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
@@ -1592,7 +1698,14 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
             # the bill said one. _aggregate_spend already exists for exactly this.
             _aggregate_spend(result, _prev_result)
         _prev_result = dict(result)
-        if result.get("status") not in ("error", "partial") or attempt > _budget:
+        _done = result.get("status") not in ("error", "partial")
+        if not _done and attempt > _budget:
+            if (_transient_retries_enabled(args) and not _transient_used
+                    and _is_transient_dispatch_error(result)):
+                _transient_used = True
+            else:
+                _done = True
+        if _done:
             if _auto_scrape_retry:
                 # On the RETURNED envelope, not the discarded first attempt. Appending it
                 # inside the loop lost the warning the moment the retry replaced that dict,
@@ -1603,6 +1716,10 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
                     "automatically: on this backend an empty result is usually a lost frame "
                     "rather than an agent that declined. This spent an extra dispatch (see "
                     "`attempts`). Use --retries to control it.")
+            if _transient_used:
+                result.setdefault("warnings", []).append(
+                    "transient network/timeout error; summon retried once "
+                    "(--transient-retries / SUMMON_TRANSIENT_RETRIES=1)")
             break
         refused = _regate_or_none(args, agents_dir, invocation)
         if refused is not None:
