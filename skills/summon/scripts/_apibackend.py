@@ -26,6 +26,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -515,6 +516,7 @@ def call(inv, timeout_ms: int) -> dict:
                     "not a short-lived SSO token")
         return _err(cli, msg)
 
+    wall_deadline = time.monotonic() + max(1.0, timeout_ms / 1000.0)
     resp = _do_request(inv.base_url, inv.model, inv.system_context, inv.prompt,
                        api_key, timeout_ms, cli)
     if _key_source == "arkcli_profile" and resp.get("status") == "success":
@@ -542,8 +544,20 @@ def call(inv, timeout_ms: int) -> dict:
             resp.pop("_payg_fallback_worthy", None)
             return resp
         primary_error = resp.get("error", "")
+        # Do NOT spend a second full timeout_ms — that doubled wall clock past
+        # council/manifest parent watchdogs. Cap PAYG to remaining budget; skip
+        # when nothing meaningful remains (never floor upward past the deadline).
+        remaining_ms = int((wall_deadline - time.monotonic()) * 1000)
+        if remaining_ms < 1000:
+            resp.pop("_payg_fallback_worthy", None)
+            resp["error"] = (
+                f"{_redact(primary_error, api_key)}\n\n"
+                f"PAYG fallback skipped: wall-clock budget exhausted "
+                f"({remaining_ms}ms remaining after Coding Plan attempt)."
+            )
+            return resp
         payg_resp = _do_request(payg_url, inv.model, inv.system_context,
-                                inv.prompt, api_key, timeout_ms, cli)
+                                inv.prompt, api_key, remaining_ms, cli)
         payg_resp.pop("_payg_fallback_worthy", None)
         if payg_resp["status"] == "success":
             payg_resp["billing"] = dict(_PAYG_BILLING)

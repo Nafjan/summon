@@ -403,6 +403,18 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "Single dispatch only: rejected for --manifest/--council "
                              "(set SUMMON_ALLOW_BYTEPLUS_PAYG=1 or ~/.agents/summon.json "
                              "for fan-out)")
+    parser.add_argument("--allow-text-only", dest="allow_text_only", action="store_true",
+                        help="Authorize a text-seat dispatch (openai-compat / arkcli +chat: "
+                             "no FS/tools) for this one call. Flag form of "
+                             "SUMMON_ALLOW_TEXT_ONLY=1; agent frontmatter "
+                             "capability: text-only also opts in (still warns). "
+                             "Single dispatch only: rejected for --manifest/--council "
+                             "(set the env var deliberately for fan-out). Never auto-retry "
+                             "a text_seat block with this flag")
+    parser.add_argument("--require-tools", dest="require_tools", action="store_true",
+                        help="Refuse text seats even when --allow-text-only / "
+                             "capability: text-only / SUMMON_ALLOW_TEXT_ONLY=1 is set. "
+                             "Flag form of SUMMON_REQUIRE_TOOLS=1")
     parser.add_argument("--json-schema", dest="json_schema",
                         help="Validate the agent's final JSON against this schema file; attach "
                              "parsed/parse_ok; one corrective retry via resume on mismatch")

@@ -3,6 +3,7 @@ run-agent: openai-compat
 provider: openrouter
 model: anthropic/claude-sonnet-5
 permission: read-only
+capability: text-only
 ---
 
 # OpenRouter example (openai-compat backend)

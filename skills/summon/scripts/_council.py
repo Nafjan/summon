@@ -242,10 +242,18 @@ def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
     # it, rather than trusting every chairman definition to declare read-only. Members are
     # NOT clamped: forming a position can legitimately require running things, and that is
     # governed by the member definitions a council is configured with.
-    if str(tag).startswith("chairman"):
+    if str(tag).split("-", 1)[-1].startswith("chairman"):
         cmd += ["--max-permission", "read-only"]
     if agents_dir:
         cmd += ["--agents-dir", agents_dir]
+    # When fan-out did not deliberately allow text seats, force children to
+    # refuse them even if a definition is mutated mid-run to capability:text-only.
+    try:
+        from _text_seat import fanout_allows_text_seat
+        if not fanout_allows_text_seat():
+            cmd += ["--require-tools"]
+    except ImportError:
+        cmd += ["--require-tools"]
     watchdog = max(1.0, (timeout_ms + _CHILD_MARGIN_MS) / 1000)
     try:
         proc, spawn_err = _dispatch_child(cmd, watchdog, on_spawn=on_spawn, on_reap=on_reap)
@@ -369,10 +377,16 @@ class _KillRegistry:
         return int(max(0, (self.overall_deadline - time.monotonic()) * 1000))
 
     def clamped_stage_ms(self, base_ms: int) -> int:
-        """A stage's effective timeout, clamped to the remaining overall budget so no child can
-        run past the deadline (>=1s floor)."""
+        """A stage's effective timeout, clamped so child + parent margin fit the
+        remaining overall budget. Returns 0 when remaining cannot afford both
+        a 1s child and ``_CHILD_MARGIN_MS`` (caller must exclude / skip)."""
         rem = self.remaining_ms()
-        return base_ms if rem is None else max(1000, min(base_ms, rem))
+        if rem is None:
+            return base_ms
+        usable = rem - _CHILD_MARGIN_MS
+        if usable < 1000:
+            return 0
+        return min(base_ms, usable)
 
     def breached(self) -> bool:
         """True once the overall budget is spent -- by the AUTHORITATIVE monotonic deadline, NOT
@@ -655,6 +669,14 @@ def run_council(args) -> int:
                 _agent_shas[who] = None
         except Exception as e:  # noqa: BLE001
             return _fail(f"council member/chairman {who!r} not found: {e}", out_path)
+        # Text-seat fan-out gate: capability alone must not rubber-stamp
+        # ModelArk/openai-compat into a council. Env is deliberate consent.
+        from _resolver import resolve_cli
+        from _text_seat import (is_text_seat, fanout_allows_text_seat,
+                                fanout_text_seat_refusal)
+        _cli = resolve_cli(loaded[0])
+        if is_text_seat(_cli) and not fanout_allows_text_seat():
+            return _fail(fanout_text_seat_refusal(who, _cli), out_path)
     _exec_ctx = {"cwd": cwd, "agents_dir": os.path.abspath(agents_dir)}
 
     # --timeout arrives as whole milliseconds (argparse type). Pass it through as
@@ -773,6 +795,10 @@ def run_council(args) -> int:
         is the member or chair clock for this stage type, clamped to whatever
         remains of the overall budget so no child can outlive the deadline."""
         stage_timeout_ms = reg.clamped_stage_ms(stage_timeout_ms)
+        if stage_timeout_ms < 1000:
+            # Remaining overall budget cannot afford child + parent margin.
+            return {"status": "excluded",
+                    "error": "overall timeout: remaining budget below child+margin"}
         attempt_id = f"g{owner.generation}-{stage}-1"
         out_file = _rd.stage_path(rd_path, owner.generation, stage)
         try:  # a stale current-generation leftover (failed carry residue,

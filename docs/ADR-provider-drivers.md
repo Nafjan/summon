@@ -25,9 +25,20 @@ provider-driver SPI so new seats (notably `arkcli +chat`) and host facades
    `served.via` (and sibling `served_via`).
 4. Document Summon `read-only` / `safe-edit` / `full` (`yolo`) ↔ provider-native
    modes with honest fallbacks (chat seats are advisory; ACP non-yolo refused).
+5. **Text-seat honesty:** `openai-compat` and Summon's `arkcli` path are text-only
+   (no FS/tools). Live dispatches refuse by default with
+   `blocked_reason: text_seat_no_tools` and a `text_seat` recovery object
+   (`suggested_reroutes` from installed CLIs). Opt-in via `--allow-text-only`,
+   `SUMMON_ALLOW_TEXT_ONLY=1`, or `capability: text-only` (still warns).
+   `--require-tools` overrides opt-in. Never auto-reroute or auto-retry with the
+   flag. **Council/manifest** additionally require `SUMMON_ALLOW_TEXT_ONLY=1`
+   (capability alone does not authorize fan-out). Optional arkcli `--tools` is a
+   separate follow-up, not part of this gate.
 
 ## Consequences
 
 - New backends register in `BACKENDS` and map into a driver id.
 - MCP and future hosts may call `dispatch_via_driver` or the CLI unchanged.
 - Permission translation lives in `PERMISSION_MAP` — not silent upgrades.
+- Hosts that previously dispatched Coding Plan / openai-compat for repo work must
+  opt in or switch to a toolful CLI; treat `text_seat` blocks as structural.

@@ -76,7 +76,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "2.0.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "2.0.1"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -204,7 +204,9 @@ def _request_identity(args) -> dict:
         worktree=args.worktree, allow_credit=getattr(args, "allow_credit", False),
         gate_with=getattr(args, "gate_with", None),
         max_permission=getattr(args, "max_permission", None),
-        artifacts=getattr(args, "artifacts", None))
+        artifacts=getattr(args, "artifacts", None),
+        allow_text_only=bool(getattr(args, "allow_text_only", False)),
+        require_tools=bool(getattr(args, "require_tools", False)))
 
 
 def _complete_artifact_provenance(env: dict, args, before: dict | None) -> dict:
@@ -803,9 +805,58 @@ def main() -> None:
                      "validate against a contract the envelope does not name")
 
     # --background: hand off to a detached copy of ourselves and return at once.
+    # Text-seat honesty: refuse HERE when possible so the parent does not return a
+    # background handle for a child that will only emit blocked (Sonnet review).
+    # Fail CLOSED on text seats: evaluation/emit errors must not fall through to spawn
+    # (GLM adversarial C1). Agent-load failures stay soft so the child can report them.
     if args.background and not args.list:
         if not (args.agent and args.prompt and args.cwd):
             _die("--background requires --agent, --prompt, and --cwd")
+        from _text_seat import (evaluate_text_seat, blocked_envelope as _ts_blocked,
+                                is_text_seat as _is_text_seat, text_seat_info as _ts_info)
+        import _loader as _ts_loader
+        from _resolver import resolve_cli as _ts_resolve_cli
+        _bg_cli = _identity.get("resolved_cli") or args.cli
+        _bg_file = None
+        try:
+            _bg_dir = _ts_loader.get_agents_dir(args.agents_dir, args.cwd)
+            _bg_tup = _ts_loader.load_agent(_bg_dir, args.agent)
+            _bg_file = _bg_tup[3]
+            if not _bg_cli:
+                # Identity may omit resolved_cli in edge cases; fall back to
+                # frontmatter run-agent so we do not return a background handle
+                # for a child that will only emit blocked.
+                _bg_cli = _ts_resolve_cli(_bg_tup[0])
+        except Exception:  # noqa: BLE001 — child will surface load errors
+            _bg_file = None
+        if _bg_cli and _is_text_seat(_bg_cli):
+            try:
+                _bg_ts = evaluate_text_seat(
+                    cli=_bg_cli,
+                    allow_text_only=bool(getattr(args, "allow_text_only", False)),
+                    require_tools_flag=bool(getattr(args, "require_tools", False)),
+                    agent_file=_bg_file,
+                )
+            except Exception:  # noqa: BLE001 — fail closed rather than spawn
+                _bg_ts = {
+                    "would_block": True,
+                    "text_seat": _ts_info(
+                        cli=_bg_cli, allowed=False, would_block=True, capability=False),
+                }
+            if _bg_ts is not None and _bg_ts.get("would_block"):
+                _env = _ts_blocked(
+                    agent=args.agent, cli=_bg_cli,
+                    text_seat=_bg_ts["text_seat"])
+                _env.update(receipt)
+                try:
+                    _env.update(_receipt.receipt_agent(args, _bg_file))
+                except Exception:  # noqa: BLE001
+                    pass
+                if args.cwd:
+                    _env["cwd"] = args.cwd
+                finalize_exit_fields(_env)
+                _emit(_env)
+                sys.exit(0)
         print(json.dumps(_spawn_background(args), ensure_ascii=False))
         sys.exit(0)
 
@@ -1079,9 +1130,42 @@ def main() -> None:
                   "~/.agents/summon.json {\"allow_byteplus_payg\": true}",
                   file=sys.stderr)
 
+    # Text-seat honesty: openai-compat / arkcli have no FS/tools. Refuse by
+    # default; opt-in still warns. --require-tools overrides opt-in.
+    from _text_seat import evaluate_text_seat, blocked_envelope as _text_seat_blocked
+    _ts = evaluate_text_seat(
+        cli=invocation.cli,
+        allow_text_only=bool(getattr(args, "allow_text_only", False)),
+        require_tools_flag=bool(getattr(args, "require_tools", False)),
+        agent_file=agent_file,
+    )
+
     if args.dry_run:
         _emit(_dry_run_view(invocation, args, agents_dir, agent_file,
-                            artifact_manifest=_artifact_manifest))
+                            artifact_manifest=_artifact_manifest,
+                            text_seat_decision=_ts))
+        sys.exit(0)
+
+    if _ts is not None and _ts.get("would_block"):
+        _env = _enrich_denial(
+            _text_seat_blocked(
+                agent=args.agent, cli=invocation.cli,
+                text_seat=_ts["text_seat"]),
+            receipt, invocation)
+        if worktree_info:
+            _cleanup = _remove_worktree(worktree_info)
+            _env["worktree_removed"] = _cleanup["worktree_removed"]
+            _env["worktree_cleanup"] = _cleanup
+            if _cleanup["preserved"]:
+                _env["worktree_preserved"] = True
+                _env.setdefault("warnings", []).append(
+                    "text-seat refusal preserved --worktree because removing it "
+                    "could lose work (%s). Inspect %s and branch %s"
+                    % (_cleanup["reason"], _cleanup["path"], _cleanup["branch"]))
+        finalize_exit_fields(_env)
+        if args.out:
+            _write_out(args.out, _env)
+        _emit(_env)
         sys.exit(0)
 
     # --gate-with: another agent must APPROVE this dispatch before it runs. Placed
@@ -1129,6 +1213,13 @@ def main() -> None:
         result = _dispatch_with_retries(invocation, args, agents_dir)
     except ValueError as e:
         _die(str(e))
+    # Allowed text seats: stamp recovery object + loud warning every time
+    # (capability: text-only is opt-in, not a silent gate-off).
+    if _ts is not None and _ts.get("allowed"):
+        result["text_seat"] = _ts["text_seat"]
+        _w = _ts.get("warning")
+        if _w and _w not in (result.get("warnings") or []):
+            result.setdefault("warnings", []).append(_w)
     if getattr(args, "gate_with", None) and "gate" not in result:
         # Only stamp the INITIAL approval when the dispatch did not already carry a
         # gate decision. _dispatch_with_retries attaches its own when a RETRY gate
@@ -1204,7 +1295,8 @@ def _dry_run_arg_preview(arg: str) -> str:
 
 def _dry_run_view(invocation, args, agents_dir: str,
                   agent_file: str | None = None,
-                  artifact_manifest: dict | None = None) -> dict:
+                  artifact_manifest: dict | None = None,
+                  text_seat_decision: dict | None = None) -> dict:
     """The fully resolved dispatch, without executing. For agy the per-call
     profile is NOT built (that copies OAuth tokens = a mutation); the wrapper
     path is shown instead."""
@@ -1247,6 +1339,29 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "worktree": ("would create" if args.worktree is not None else None),
         "system_context_chars": len(invocation.system_context),
     }
+    # Text-seat parity with live: same text_seat shape + would_refuse when blocked.
+    if text_seat_decision is None:
+        try:
+            from _text_seat import evaluate_text_seat as _eval_ts
+            text_seat_decision = _eval_ts(
+                cli=invocation.cli,
+                allow_text_only=bool(getattr(args, "allow_text_only", False)),
+                require_tools_flag=bool(getattr(args, "require_tools", False)),
+                agent_file=agent_file,
+            )
+        except Exception:  # noqa: BLE001
+            text_seat_decision = None
+    if text_seat_decision is not None:
+        view["text_seat"] = text_seat_decision["text_seat"]
+        if text_seat_decision.get("would_block"):
+            view["would_refuse"] = True
+            view["blocked_reason"] = "text_seat_no_tools"
+            view["refusal"] = (
+                "text seat (no FS/tools): refused unless --allow-text-only / "
+                "SUMMON_ALLOW_TEXT_ONLY=1 / capability: text-only; "
+                "--require-tools always refuses")
+        if text_seat_decision.get("warning"):
+            view.setdefault("warnings", []).append(text_seat_decision["warning"])
     if artifact_manifest:
         view["artifacts"] = dict(artifact_manifest,
                                  stable_during_dispatch=None,

@@ -532,6 +532,14 @@ def _child_cmd(job: dict, args, out_file: str) -> list:
         cmd += ["--retries", str(retries)]
     for artifact in job.get("artifacts") or ():
         cmd += ["--artifact", artifact]
+    # Same TOCTOU harden as council: without deliberate text-seat fan-out
+    # consent, children must refuse capability:text-only seats.
+    try:
+        from _text_seat import fanout_allows_text_seat
+        if not fanout_allows_text_seat():
+            cmd += ["--require-tools"]
+    except ImportError:
+        cmd += ["--require-tools"]
     return cmd
 
 
@@ -565,6 +573,29 @@ def run_manifest(args) -> int:
     # backend's cap. Resolve each job's backend once here (also reused below).
     job_backends = {j["id"]: _job_backend(j, _job_agents_dir(j, args, base_cwd))
                     for j in jobs}
+    # Text-seat fan-out gate (same policy as council): capability alone is not
+    # enough; SUMMON_ALLOW_TEXT_ONLY=1 is deliberate consent for pure-text swarms.
+    # Fail CLOSED if the gate module is missing (never skip honesty).
+    from _text_seat import (is_text_seat, fanout_allows_text_seat,
+                            fanout_text_seat_refusal)
+    if not fanout_allows_text_seat():
+        from _loader import load_agent
+        from _resolver import resolve_cli
+        for j in jobs:
+            # Do NOT trust _job_backend's "codex" load-failure fallback — that
+            # would miss openai-compat/arkcli seats. Resolve honestly or refuse.
+            agents_for_job = _job_agents_dir(j, args, base_cwd)
+            try:
+                if j.get("cli"):
+                    cli = j["cli"]
+                else:
+                    cli = resolve_cli(load_agent(agents_for_job, j["agent"])[0])
+            except Exception as e:  # noqa: BLE001
+                return _fail(
+                    f"manifest job {j.get('id')!r}: cannot resolve CLI for "
+                    f"text-seat gate ({type(e).__name__}: {e})")
+            if is_text_seat(cli):
+                return _fail(fanout_text_seat_refusal(j.get("agent") or j["id"], cli))
     sems: dict = {b: threading.BoundedSemaphore(caps.get(b, caps["default"]))
                   for b in set(job_backends.values())}
 
