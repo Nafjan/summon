@@ -103,13 +103,14 @@ changes.
 
 #### Roster freshness and availability checks
 
-The recommendations above were last checked on **2026-08-07**. Re-check at
-least monthly, after an Ark CLI upgrade, or when a recommended model starts
-returning `UnsupportedModel`:
+The static recommendations above were last manually checked on **2026-08-07**.
+Summon also caches a live roster from arkcli at `~/.agents/byteplus-coding-roster.json`
+(14-day freshness). Refresh anytime:
 
 ```powershell
 arkcli auth status --format json
 arkcli plans model-list --plan coding-plan --format json
+python -c "import sys; sys.path.insert(0, r'<summon>/skills/summon/scripts'); from _apibackend import refresh_coding_plan_roster; print(refresh_coding_plan_roster())"
 ```
 
 Use `plans model-list`, not `arkcli models list`; the latter is the full
@@ -124,6 +125,18 @@ Treat these as separate facts:
 Only promote a model after all three are true. If a previously broken model
 starts working, update its status and the last-checked date rather than assuming
 that roster presence alone fixed it.
+
+### OpenCode model sync
+
+Prefer `arkcli helper` over hand-editing OpenCode's model catalog:
+
+```powershell
+arkcli helper list
+arkcli helper configure opencode --profile coding-plan_ap-southeast-1_personal --model deepseek-v4-pro
+```
+
+This writes the Coding Plan provider + model into OpenCode. Reset with
+`arkcli helper reset opencode` if you need to undo only arkcli-managed bits.
 
 ### Text-only constraint
 
@@ -159,11 +172,13 @@ optional (can pollute agent skill pickers if run broadly).
 
 ### Billing note
 
-`infer_billing("openai-compat")` still reports `source: api` for all
-openai-compat providers. When the resolved `base_url` contains `/api/coding/`,
-Summon overlays an honest note: the spend draws from Coding Plan **subscription
-quota**, not per-token API credits. A future change may set
-`billing.source: subscription` (Phase C).
+When the resolved `base_url` contains `/api/coding/`, Summon reports
+`billing.source: subscription` with a note that spend draws from Coding Plan
+**subscription quota**, not per-token API credits. Consent-gated PAYG fallback
+overrides this to `source: api` with an explicit PAYG note.
+
+Generic `infer_billing("openai-compat")` remains `api` for other providers;
+Coding Plan overlays the subscription source on the response envelope.
 
 ### PAYG fallback (consent-gated)
 

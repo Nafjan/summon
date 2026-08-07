@@ -74,6 +74,159 @@ _CODING_PLAN_MODEL_GUIDANCE = (
     "such as glm-5.1, bytedance-seed-code, and gpt-oss-120b for new work"
 )
 
+# Listed-but-discouraged / known-broken for new work (still may appear in roster).
+_CODING_PLAN_LEGACY_OR_BROKEN = frozenset({
+    "auto",
+    "ark-code-latest",
+    "glm-5.1",
+    "bytedance-seed-code",
+    "gpt-oss-120b",
+})
+
+# Preferred presentation order when a live roster is available.
+_CODING_PLAN_PREFERRED = (
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "glm-5.2",
+    "dola-seed-2.0-code",
+    "kimi-k2.5",
+    "dola-seed-2.0-pro",
+    "dola-seed-2.0-lite",
+)
+
+_ROSTER_CACHE_NAME = "byteplus-coding-roster.json"
+_ROSTER_MAX_AGE_S = 14 * 24 * 3600  # align with handoff refresh cadence
+
+
+def _roster_cache_path() -> str:
+    return os.path.join(os.path.expanduser("~"), ".agents", _ROSTER_CACHE_NAME)
+
+
+def refresh_coding_plan_roster(plan: str = "coding-plan",
+                               timeout_s: float = 45.0) -> dict:
+    """Fetch Coding Plan models via ``arkcli plans model-list`` and cache them.
+
+    Returns ``{"fetched_at", "plan", "models":[{"id","name","output_name",...}],
+    "source":"arkcli"}``. Raises RuntimeError when arkcli is missing or fails.
+    """
+    import subprocess
+    import time
+    from _spawn import run_flags
+    cmd = ["arkcli", "plans", "model-list", "--plan", plan, "--format", "json"]
+    # On Windows, prefer arkcli.cmd when PATH resolution is via npm shim.
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout_s, shell=False, **run_flags())
+    except FileNotFoundError:
+        # npm global shim
+        cmd0 = cmd[:]
+        cmd0[0] = "arkcli.cmd" if os.name == "nt" else "arkcli"
+        try:
+            proc = subprocess.run(
+                cmd0, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=timeout_s, shell=True, **run_flags())
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                "arkcli not found on PATH; install @byteplus/ark-cli to refresh "
+                "the Coding Plan roster") from e
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"arkcli plans model-list failed (exit {proc.returncode}): "
+            f"{(proc.stderr or proc.stdout or '')[:400]}")
+    try:
+        raw = json.loads(proc.stdout or "{}")
+    except ValueError as e:
+        raise RuntimeError("arkcli plans model-list returned non-JSON") from e
+    models = []
+    for m in (raw.get("models") or []):
+        if not isinstance(m, dict):
+            continue
+        models.append({
+            "id": m.get("model_id") or m.get("id") or "",
+            "name": m.get("model_name") or "",
+            "output_name": m.get("output_name") or m.get("model_name") or "",
+            "description": m.get("description") or "",
+            "enabled_thinking": bool(m.get("enabled_thinking")),
+            "selected": bool(m.get("selected")),
+        })
+    payload = {
+        "fetched_at": time.time(),
+        "plan": raw.get("plan") or plan,
+        "selected_model_id": raw.get("selected_model_id") or raw.get("ark_latest_model_id"),
+        "models": models,
+        "source": "arkcli",
+    }
+    path = _roster_cache_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+    return payload
+
+
+def load_coding_plan_roster(*, refresh_if_stale: bool = False) -> dict | None:
+    """Load cached Coding Plan roster; optionally refresh when older than 14 days.
+
+    Missing cache returns None unless ``refresh_if_stale`` is set (then one
+    arkcli fetch is attempted). Guidance callers should pass False so a cold
+    machine stays offline and uses the static hint.
+    """
+    import time
+    path = _roster_cache_path()
+    data = None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+            data = None
+    except (OSError, ValueError):
+        data = None
+    if data is None:
+        if not refresh_if_stale:
+            return None
+        try:
+            return refresh_coding_plan_roster()
+        except RuntimeError:
+            return None
+    stale = True
+    if isinstance(data.get("fetched_at"), (int, float)):
+        stale = (time.time() - float(data["fetched_at"])) > _ROSTER_MAX_AGE_S
+    if refresh_if_stale and stale:
+        try:
+            return refresh_coding_plan_roster()
+        except RuntimeError:
+            return data
+    return data
+
+
+def coding_plan_model_guidance(*, refresh_if_stale: bool = False) -> str:
+    """Task-oriented model hint, preferring a fresh arkcli roster when cached."""
+    roster = load_coding_plan_roster(refresh_if_stale=refresh_if_stale)
+    if not roster:
+        return _CODING_PLAN_MODEL_GUIDANCE
+    names = []
+    for m in roster.get("models") or []:
+        out = (m.get("output_name") or m.get("name") or "").strip()
+        if out and out.lower() not in {x.lower() for x in _CODING_PLAN_LEGACY_OR_BROKEN}:
+            names.append(out)
+    if not names:
+        return _CODING_PLAN_MODEL_GUIDANCE
+    # Prefer known task fits first, then any remaining non-legacy roster names.
+    ordered = [n for n in _CODING_PLAN_PREFERRED if n in names]
+    for n in names:
+        if n not in ordered:
+            ordered.append(n)
+    shown = ", ".join(ordered[:6])
+    legacy = ", ".join(sorted(_CODING_PLAN_LEGACY_OR_BROKEN - {"auto", "ark-code-latest"}))
+    return (
+        f"{shown}. Avoid legacy/superseded roster entries such as {legacy} "
+        f"for new work (roster cached from arkcli; refresh with "
+        f"arkcli plans model-list --plan coding-plan)"
+    )
+
 
 def is_coding_plan_endpoint(base_url: str | None) -> bool:
     """True when the OpenAI-compat base URL is a BytePlus Coding Plan path.
@@ -89,12 +242,11 @@ def is_coding_plan_endpoint(base_url: str | None) -> bool:
 
 
 def coding_plan_billing(base_url: str | None) -> dict | None:
-    """Honest billing note for Coding Plan URLs. Keeps source ``api`` until
-    provider-aware billing lands; the note is what operators actually need."""
+    """Honest billing for Coding Plan URLs: subscription quota, not API credits."""
     if not is_coding_plan_endpoint(base_url):
         return None
     return {
-        "source": "api",
+        "source": "subscription",
         "note": "BytePlus Coding Plan (/api/coding/) - draws from subscription "
                 "quota, not per-token API credits",
     }
@@ -113,7 +265,7 @@ def coding_plan_model_error(base_url: str | None, model: str | None) -> str | No
         return (
             "BytePlus Coding Plan raw API does not accept model 'auto' "
             "(that routing is arkcli-only). Pin a recommended plan model: "
-            f"{_CODING_PLAN_MODEL_GUIDANCE}. Refresh eligibility with: "
+            f"{coding_plan_model_guidance()}. Refresh eligibility with: "
             "arkcli plans model-list --plan coding-plan"
         )
     return None
@@ -143,7 +295,7 @@ def _rewrite_coding_plan_http_error(base_url: str, model: str, code: int, detail
         return None
     return (
         f"Coding Plan rejected model {model!r} (HTTP {code}). "
-        f"Pin a recommended plan model: {_CODING_PLAN_MODEL_GUIDANCE}. "
+        f"Pin a recommended plan model: {coding_plan_model_guidance()}. "
         f"'auto' is arkcli-only. Refresh eligibility with: "
         f"arkcli plans model-list --plan coding-plan. "
         f"Roster presence is not proof of live availability; validate a text call. "

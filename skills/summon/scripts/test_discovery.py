@@ -1903,7 +1903,7 @@ def test_byteplus_coding_plan_billing_note():
     import _apibackend
     b = _apibackend.coding_plan_billing(
         "https://ark.ap-southeast.bytepluses.com/api/coding/v3")
-    assert b and b["source"] == "api" and "subscription quota" in b["note"]
+    assert b and b["source"] == "subscription" and "subscription quota" in b["note"]
     assert _apibackend.coding_plan_billing(
         "https://ark.ap-southeast.bytepluses.com/api/v3") is None
 
@@ -1916,7 +1916,7 @@ def test_byteplus_unsupported_model_error_rewrite():
         '{"error":{"code":"UnsupportedModel","message":"The requested model does not support the coding plan feature."}}')
     assert msg and "Coding Plan rejected model" in msg and "arkcli plans model-list" in msg
     assert "Roster presence is not proof" in msg
-    assert "deepseek-v4-flash (fast terminal loops)" in msg
+    assert "deepseek-v4" in msg or "glm-5.2" in msg
     assert "Avoid legacy/superseded" in msg
     assert _apibackend._rewrite_coding_plan_http_error(
         "https://openrouter.ai/api/v1", "x", 404, "UnsupportedModel") is None
@@ -1932,7 +1932,9 @@ def test_byteplus_model_guidance_distinguishes_roster_from_recommendation():
                  encoding="utf-8").read()
     assert "eligibility catalog" in docs
     assert "Listed" in docs and "Invocable" in docs and "Recommended" in docs
-    assert "last checked on **2026-08-07**" in docs
+    assert "last manually checked on **2026-08-07**" in docs
+    assert "byteplus-coding-roster.json" in docs
+    assert "arkcli helper configure opencode" in docs
     for legacy in ("glm-5.1", "bytedance-seed-code", "gpt-oss-120b"):
         assert legacy in docs and legacy in agent
     assert "Strongly avoid legacy or superseded" in docs
@@ -16077,6 +16079,85 @@ def test_allow_payg_rejected_in_fanout_modes():
     from _cli import MODE_FLAGS
     for mode, flags in MODE_FLAGS.items():
         assert "allow_payg" not in flags, f"allow_payg should NOT be in {mode} whitelist"
+
+
+def test_coding_plan_roster_cache_and_guidance(tmp_path=None):
+    """Cached arkcli roster drives guidance and excludes legacy/broken names."""
+    import json as _json
+    import tempfile
+    import time
+    import _apibackend as api
+    old = api._roster_cache_path
+    d = tempfile.mkdtemp(prefix="summon-roster-")
+    path = os.path.join(d, "byteplus-coding-roster.json")
+    api._roster_cache_path = lambda: path
+    try:
+        assert api.coding_plan_model_guidance() == api._CODING_PLAN_MODEL_GUIDANCE
+        payload = {
+            "fetched_at": time.time(),
+            "plan": "coding-plan",
+            "models": [
+                {"output_name": "auto"},
+                {"output_name": "glm-5.1"},
+                {"output_name": "gpt-oss-120b"},
+                {"output_name": "bytedance-seed-code"},
+                {"output_name": "deepseek-v4-pro"},
+                {"output_name": "glm-5.2"},
+                {"output_name": "weird-new-model"},
+            ],
+            "source": "arkcli",
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            _json.dump(payload, fh)
+        hint = api.coding_plan_model_guidance()
+        assert "deepseek-v4-pro" in hint and "glm-5.2" in hint
+        assert "weird-new-model" in hint
+        assert "gpt-oss-120b" not in hint.split("Avoid")[0]
+        assert "auto" not in hint.split("Avoid")[0]
+    finally:
+        api._roster_cache_path = old
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_refresh_coding_plan_roster_parses_arkcli(monkeypatch=None):
+    """refresh_coding_plan_roster parses arkcli JSON and writes the cache."""
+    import json as _json
+    import tempfile
+    import types
+    import _apibackend as api
+    old = api._roster_cache_path
+    d = tempfile.mkdtemp(prefix="summon-roster-ref-")
+    path = os.path.join(d, "byteplus-coding-roster.json")
+    api._roster_cache_path = lambda: path
+
+    class _Proc:
+        returncode = 0
+        stdout = _json.dumps({
+            "plan": "coding-plan",
+            "selected_model_id": "auto",
+            "models": [
+                {"model_id": "glm-5-2-260617", "model_name": "glm-5-2",
+                 "output_name": "glm-5.2", "description": "flagship"},
+            ],
+        })
+        stderr = ""
+
+    import subprocess as sp
+    _orig = sp.run
+    sp.run = lambda *a, **k: _Proc()
+    try:
+        out = api.refresh_coding_plan_roster()
+        assert out["plan"] == "coding-plan"
+        assert out["models"][0]["output_name"] == "glm-5.2"
+        assert os.path.isfile(path)
+        cached = _json.load(open(path, encoding="utf-8"))
+        assert cached["models"][0]["id"] == "glm-5-2-260617"
+    finally:
+        sp.run = _orig
+        api._roster_cache_path = old
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":
