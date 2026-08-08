@@ -347,7 +347,12 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     )
     parser.add_argument("--cli", help="Force specific CLI (claude, cursor-agent, codex, gemini)")
     parser.add_argument("--model", help="Override the agent's frontmatter model for this call")
-    parser.add_argument("--effort", help="Reasoning effort (claude): low|medium|high|xhigh|max")
+    parser.add_argument(
+        "--effort",
+        help="Reasoning/thinking: low|medium|high|xhigh|max (or none). "
+             "Honored by claude+codex (default high); agy Gemini only when "
+             "explicit (model suffix); ignored elsewhere. See references/effort.md",
+    )
     parser.add_argument("--resume", dest="resume", help="Backend session/thread/chat id to resume")
     parser.add_argument("--resume-profile", help="agy only: profile dir of the session being resumed")
     parser.add_argument("--transport", choices=["subprocess", "acp"], default=None,
