@@ -135,6 +135,14 @@ def resolve_hosts(*, hosts_arg: str | None, profile: str | None) -> tuple[list, 
                 return [], (f"host(s) {', '.join(off)} not in profile {profile!r} "
                             f"(profile hosts: {', '.join(PROFILES[profile])})")
             hosts = [h for h in hosts if h in allowed]
+        # Explicit --hosts must still never invent missing host roots (same
+        # rule as the profile-only branch). Refuse when none of the requested
+        # roots exist yet so the caller gets a clear error instead of a no-op.
+        missing_roots = [h for h in hosts if not os.path.isdir(HOSTS[h])]
+        hosts = [h for h in hosts if os.path.isdir(HOSTS[h])]
+        if not hosts:
+            return [], (f"requested host root(s) not found: {', '.join(missing_roots)}. "
+                        "Install/run that host CLI once so its config dir exists, then re-run.")
     elif profile:
         hosts = [h for h in PROFILES[profile] if os.path.isdir(HOSTS[h])]
     else:

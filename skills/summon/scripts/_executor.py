@@ -563,6 +563,17 @@ class _DefnSnapshot:
         self.tup, self.fm, self.sha, self.state = tup, fm, sha, state
 
 
+def _fm_capability_text_only(fm) -> bool:
+    """True when frontmatter declares ``capability: text-only`` (snapshot form)."""
+    if not isinstance(fm, dict):
+        return False
+    try:
+        from _text_seat import _capability_values
+        return "text-only" in _capability_values(fm.get("capability"))
+    except ImportError:
+        return False
+
+
 def _defn_snapshot(agents_dir_arg, cwd, agent_name):
     """Load the definition ONCE (for the whole identity), or None if there is no agent.
 
@@ -1164,9 +1175,14 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # Text-seat consent is part of the request for openai-compat/arkcli: a
         # stored --out success from an opted-in run must not satisfy a later
         # request that withheld consent (same hole class as gate_with).
+        # Match text_only_opted_in(): flag, env, OR capability: text-only on the
+        # already-loaded definition snapshot (not a second file read).
         "allow_text_only": (
-            "1" if (allow_text_only or os.environ.get("SUMMON_ALLOW_TEXT_ONLY") == "1")
-            else None) if _rcli in ("openai-compat", "arkcli") else None,
+            "1" if (
+                allow_text_only
+                or os.environ.get("SUMMON_ALLOW_TEXT_ONLY") == "1"
+                or (_defn is not None and _fm_capability_text_only(_defn.fm))
+            ) else None) if _rcli in ("openai-compat", "arkcli") else None,
         "require_tools": (
             "1" if (require_tools or os.environ.get("SUMMON_REQUIRE_TOOLS") == "1")
             else None) if _rcli in ("openai-compat", "arkcli") else None,

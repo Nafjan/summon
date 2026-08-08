@@ -6398,6 +6398,11 @@ def test_install_profile_t3_resolve_hosts():
         assert hosts == ["claude"]
         assert note  # still advisory
 
+        # Explicit --hosts must not invent missing roots (isdir filter).
+        hosts, note = mod.resolve_hosts(hosts_arg="cursor", profile="t3")
+        assert hosts == []
+        assert note and "not found" in note.lower()
+
         hosts, note = mod.resolve_hosts(hosts_arg="gemini", profile="t3")
         assert hosts == []
         assert note and "not in profile" in (note or "")
@@ -12342,9 +12347,10 @@ def test_v8_council_chairman_stage_is_clamped_read_only():
     assert '"--max-permission", "read-only"' in src, (
         "the council never passes --max-permission: a chairman would run with whatever "
         "its definition declares, including safe-edit")
-    assert 'startswith("chairman")' in src, (
-        "the clamp is not scoped to chairman stages -- members must keep their declared "
-        "permission, since forming a position can require running things")
+    assert '("chairman", "chairman-fallback")' in src, (
+        "the clamp must match only known chairman stages (gN-chairman / "
+        "gN-chairman-fallback), not every tag whose suffix merely starts with "
+        "'chairman' — members must keep their declared permission")
 
 
 def test_v8_max_permission_drops_extra_args():
@@ -16980,6 +16986,17 @@ def test_council_chairman_tag_clamps_read_only():
     assert len(seen) == 3, seen
     assert any("--max-permission" in c and "read-only" in c for c in seen[:2]), seen
     assert "--max-permission" not in seen[2], seen
+    # A member stage that merely contains "chairman" as a prefix must NOT clamp.
+    seen.clear()
+    with mock.patch.object(_manifest, "_dispatch_child", fake_dispatch_child), \
+         mock.patch.object(_manifest, "_read_envelope", return_value={"status": "success"}), \
+         mock.patch.object(_manifest, "_existing_envelope", return_value=None):
+        d = tempfile.mkdtemp(prefix="summon-chair2-")
+        try:
+            _council._dispatch("planner", "pos", d, d, 5000, d, "g2-chairman-helper")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    assert len(seen) == 1 and "--max-permission" not in seen[0], seen
 
 
 def test_text_seat_consent_in_request_fingerprint():
@@ -16999,6 +17016,21 @@ def test_text_seat_consent_in_request_fingerprint():
                                                          require_tools=True))
         assert a != b, "allow_text_only must change fingerprint"
         assert b != c, "require_tools must change fingerprint"
+
+        # capability: text-only must fingerprint as opted-in (same as --allow-text-only)
+        # so --out cannot confuse capability consent with a no-consent identity.
+        open(os.path.join(d, "cap.md"), "w", encoding="utf-8").write(
+            "---\nrun-agent: openai-compat\nbase_url: http://127.0.0.1:9/v1\n"
+            "model: m\napi_key_env: \"\"\ncapability: text-only\n---\n# Cap\n")
+        cap_base = dict(agent="cap", prompt="x", cwd=d, agents_dir=d)
+        cap_none = request_fingerprint(**build_request_identity(**cap_base,
+                                                                allow_text_only=False))
+        cap_flag = request_fingerprint(**build_request_identity(**cap_base,
+                                                                allow_text_only=True))
+        assert cap_none == cap_flag, (
+            "capability: text-only must set allow_text_only in identity like the flag")
+        # Without capability, no-flag must still differ from flag (agent t above).
+        assert a != b
     finally:
         if prev_a is None:
             os.environ.pop("SUMMON_ALLOW_TEXT_ONLY", None)
