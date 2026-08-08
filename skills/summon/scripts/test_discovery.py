@@ -4197,7 +4197,9 @@ def test_v4_overall_timeout_kills_and_partials():
 
     ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
                             chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
-                            timeout=30000, out=None, run_dir=root, overall_timeout=1000)
+                            timeout=30000, out=None, run_dir=root, overall_timeout=2000)
+    orig_margin = _council._CHILD_MARGIN_MS
+    _council._CHILD_MARGIN_MS = 0
     orig_d, orig_k = _council._dispatch, _executor._kill_tree
     _council._dispatch, _executor._kill_tree = fake, fake_kill
     try:
@@ -4209,12 +4211,13 @@ def test_v4_overall_timeout_kills_and_partials():
         env = _json.loads(buf.getvalue())
     finally:
         _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        _council._CHILD_MARGIN_MS = orig_margin
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
     assert env.get("council_state") == "overall_timeout", f"state={env.get('council_state')}"
     assert env["status"] == "partial" and env.get("overall_timeout"), f"status={env.get('status')}"
     assert "summary" in env and env["summary"]["members_requested"] == 2, env.get("summary")
-    assert elapsed < 20, elapsed          # returned near the 1s budget, NOT the 30s member wait
+    assert elapsed < 20, elapsed          # returned near the 2s budget, NOT the 30s member wait
     # both members were process-tree-killed by the overall timeout (-> not success)
     assert env["summary"]["members_succeeded"] == 0, env["summary"]
     assert all(m.get("status") != "success" for m in env["members"]), \
@@ -4278,11 +4281,13 @@ def test_v4_overall_timeout_excludes_queued_wave():
     ns = argparse.Namespace(question="q", question_file=None,
                             members=",".join(names), chairman="chair", rounds=1,
                             cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
-                            # 4s, not 1s: on a loaded CI runner setup plus the two members
-                            # consumed the whole 1s budget, so the breach landed BEFORE the
+                            # 4s budget: on a loaded CI runner setup plus the two members
+                            # consumed the whole budget, so the breach landed BEFORE the
                             # chairman was ever dispatched and the scenario never happened.
                             # The chairman blocks up to 15s, so 4s still breaches inside it.
                             run_dir=root, overall_timeout=4000)
+    orig_margin = _council._CHILD_MARGIN_MS
+    _council._CHILD_MARGIN_MS = 0
     orig_d, orig_k = _council._dispatch, _executor._kill_tree
     _council._dispatch, _executor._kill_tree = fake, fake_kill
     try:
@@ -4294,9 +4299,10 @@ def test_v4_overall_timeout_excludes_queued_wave():
         env = _json.loads(buf.getvalue())
     finally:
         _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        _council._CHILD_MARGIN_MS = orig_margin
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
-    assert elapsed < 20, elapsed              # near the 1s budget, NOT the 30s member wait
+    assert elapsed < 20, elapsed              # near the 4s budget, NOT the 30s member wait
     assert env.get("council_state") == "overall_timeout", env.get("council_state")
     assert env["status"] == "partial", env["status"]
     # THE invariant: the queued wave never spawned -- at most `cap` children ever ran.
@@ -4368,7 +4374,9 @@ def test_v4_overall_timeout_skips_fallback_after_breach():
     ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
                             chairman="chair", chairman_fallback="chair2", rounds=1,
                             cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
-                            run_dir=root, overall_timeout=1000)
+                            run_dir=root, overall_timeout=2000)
+    orig_margin = _council._CHILD_MARGIN_MS
+    _council._CHILD_MARGIN_MS = 0
     orig_d, orig_k = _council._dispatch, _executor._kill_tree
     _council._dispatch, _executor._kill_tree = fake, fake_kill
     try:
@@ -4380,6 +4388,7 @@ def test_v4_overall_timeout_skips_fallback_after_breach():
         env = _json.loads(buf.getvalue())
     finally:
         _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        _council._CHILD_MARGIN_MS = orig_margin
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
     assert elapsed < 20, elapsed
@@ -4488,11 +4497,11 @@ def test_v4_monotonic_gate_without_watchdog():
     dispatched = []
 
     def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
-        # WIDE margin: 0.9s >> the 300ms budget and well above any plausible setup time, so
+        # WIDE margin: 2.5s >> the 2s budget and well above any plausible setup time, so
         # the POST-round monotonic gate (not the setup-overrun guard, not load timing) is
         # deterministically what cuts the council short before the chairman.
         dispatched.append(agent)
-        _t.sleep(0.9)
+        _t.sleep(2.5)
         return {"status": "success", "result": agent, "report": {"summary": agent}}
 
     # Neuter ONLY the overall-timeout watchdog. `_council.threading` IS the global
@@ -4516,7 +4525,9 @@ def test_v4_monotonic_gate_without_watchdog():
 
     ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
                             chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
-                            timeout=30000, out=None, run_dir=root, overall_timeout=300)
+                            timeout=30000, out=None, run_dir=root, overall_timeout=2000)
+    orig_margin = _council._CHILD_MARGIN_MS
+    _council._CHILD_MARGIN_MS = 0
     orig_d, orig_thread = _council._dispatch, _council.threading.Thread
     _council._dispatch = fake
     _council.threading.Thread = _sel_thread
@@ -4527,6 +4538,7 @@ def test_v4_monotonic_gate_without_watchdog():
         env = _json.loads(buf.getvalue())
     finally:
         _council._dispatch, _council.threading.Thread = orig_d, orig_thread
+        _council._CHILD_MARGIN_MS = orig_margin
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
     # partial emitted by the MONOTONIC gate, with the watchdog disabled the whole time
@@ -6916,6 +6928,8 @@ def test_v4b_early_exit_does_not_double_emit_with_overall_timeout():
                             overall_timeout=30000)   # generous; never breached
     orig_cap = _council._PER_BACKEND_CAP
     _council._PER_BACKEND_CAP = 10
+    orig_margin = _council._CHILD_MARGIN_MS
+    _council._CHILD_MARGIN_MS = 0
     orig_d, orig_k = _council._dispatch, _executor._kill_tree
     _council._dispatch, _executor._kill_tree = fake, fake_kill
     try:
@@ -6928,6 +6942,7 @@ def test_v4b_early_exit_does_not_double_emit_with_overall_timeout():
     finally:
         _council._PER_BACKEND_CAP = orig_cap
         _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        _council._CHILD_MARGIN_MS = orig_margin
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
     assert elapsed < 12, elapsed
@@ -16451,6 +16466,14 @@ def test_phase_c_mcp_json_matches_plugin_schema_generation():
     assert summon["command"] == "python"
     assert summon["args"] == ["./skills/summon/scripts/mcp_server.py"]
     assert summon.get("cwd") == "${PLUGIN_ROOT}"
+
+
+def test_mcp_server_version_matches_dispatcher_release():
+    import mcp_server as mcp
+    from run_subagent import __version__
+    response = mcp._handle({"jsonrpc": "2.0", "id": 1,
+                            "method": "initialize", "params": {}})
+    assert response["result"]["serverInfo"]["version"] == __version__
 
 
 def test_phase_c_stream_partials():

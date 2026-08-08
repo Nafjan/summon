@@ -15,6 +15,7 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
 RUN = SCRIPTS / "run_subagent.py"
+SERVER_VERSION = "2.0.4"
 
 
 def _rpc_ok(id_, result):
@@ -189,7 +190,7 @@ def _handle(msg: dict):
         return _rpc_ok(mid, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "summon", "version": "2.0.0"},
+            "serverInfo": {"name": "summon", "version": SERVER_VERSION},
         })
     if method == "notifications/initialized":
         return None

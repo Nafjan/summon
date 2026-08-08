@@ -506,12 +506,17 @@ def _job_identity(job: dict, args) -> dict:
     the child gained the env-backed credit/effort controls while this side did not, so with
     SUMMON_DEFAULT_EFFORT set every manifest restart re-dispatched every finished job.)
     """
+    try:
+        from _text_seat import fanout_allows_text_seat
+        _require_tools = not fanout_allows_text_seat()
+    except ImportError:
+        _require_tools = True
     return build_request_identity(
         agent=job["agent"], prompt=job["prompt"],
         cwd=os.path.abspath(job.get("cwd") or args.cwd or os.getcwd()),
         agents_dir=args.agents_dir, cli=job.get("cli"), model=job.get("model"),
         effort=job.get("effort"), json_schema=job.get("json_schema"),
-        artifacts=job.get("artifacts"))
+        artifacts=job.get("artifacts"), require_tools=_require_tools)
 
 
 def _child_cmd(job: dict, args, out_file: str) -> list:
@@ -590,10 +595,11 @@ def run_manifest(args) -> int:
                     cli = j["cli"]
                 else:
                     cli = resolve_cli(load_agent(agents_for_job, j["agent"])[0])
-            except Exception as e:  # noqa: BLE001
-                return _fail(
-                    f"manifest job {j.get('id')!r}: cannot resolve CLI for "
-                    f"text-seat gate ({type(e).__name__}: {e})")
+            except Exception:  # noqa: BLE001
+                # An unknown/malformed agent cannot dispatch a text seat. Keep
+                # it in the normal per-job error path so manifest callers still
+                # receive the jobs summary and preserve resume/archive behavior.
+                continue
             if is_text_seat(cli):
                 return _fail(fanout_text_seat_refusal(j.get("agent") or j["id"], cli))
     sems: dict = {b: threading.BoundedSemaphore(caps.get(b, caps["default"]))
