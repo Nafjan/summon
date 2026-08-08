@@ -242,7 +242,10 @@ def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
     # it, rather than trusting every chairman definition to declare read-only. Members are
     # NOT clamped: forming a position can legitimately require running things, and that is
     # governed by the member definitions a council is configured with.
-    if str(tag).split("-", 1)[-1].startswith("chairman"):
+    # Stages are generation-prefixed as gN-<stage>; only the known chairman
+    # stages are clamped (not every tag whose suffix merely starts with
+    # "chairman", e.g. a hypothetical member stage "chairman-helper").
+    if str(tag).split("-", 1)[-1] in ("chairman", "chairman-fallback"):
         cmd += ["--max-permission", "read-only"]
     if agents_dir:
         cmd += ["--agents-dir", agents_dir]

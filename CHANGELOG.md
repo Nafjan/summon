@@ -4,6 +4,22 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
+## [2.0.2] — 2026-08-08
+
+Patch on 2.0.1 from round-2 adversarial review (GLM-5.2 + DeepSeek-V4-Flash via
+arkcli, AGY Flash 3.6 via summon).
+
+### Fixed
+
+- **Text-seat `--out` fingerprint** now treats agent frontmatter `capability: text-only`
+  as opted-in (same as `--allow-text-only` / `SUMMON_ALLOW_TEXT_ONLY=1`), using the
+  already-loaded definition snapshot — so consent identity matches the gate.
+- **`install.py --hosts`** applies the same `os.path.isdir` host-root filter as the
+  profile-only path; refuses with a clear error when none of the requested roots exist.
+- **Council chairman clamp** matches only known stages (`chairman`,
+  `chairman-fallback`) after the `gN-` prefix — not every tag whose suffix merely
+  starts with `chairman`.
+
 ## [2.0.1] — 2026-08-07
 
 Patch on 2.0.0: text-seat honesty, T3 Summon-side support, timeout/PAYG budget
