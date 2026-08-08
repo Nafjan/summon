@@ -28,12 +28,16 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-# A deliberately vendor-DIVERSE default (a council of clones is pointless): Claude
-# Opus, Codex, Antigravity/Gemini, and Claude Sonnet — override with --members.
-# Vendor-diverse AND repo-capable by default: claude + codex + cursor all read
-# files under --cwd. `researcher` (agy) was removed from the defaults because the
-# agy backend runs in an isolated profile and CANNOT read --cwd — it errors out
-# of any repo-inspection council (use it only for pure-reasoning councils).
+# Default council is vendor-diverse AND repo-capable: Claude Opus (planner),
+# Codex (reviewer), Cursor (coder), Claude Sonnet (pair). Override with --members.
+# `researcher` (agy/Gemini) is omitted from the *default* set because:
+#   - Summon's default subprocess path does not surface agy usage / model.served
+#     (weaker evidence trail — stream-json can carry it, but we don't parse it for agy)
+#   - agy has no enforceable read-only seat (safe-edit/yolo only; read-only is refused
+#     unless SUMMON_ALLOW_UNENFORCED_READONLY=1)
+# agy IS repo-capable since 0.13.9 (`--add-dir <cwd>`); pass `--members …,researcher`
+# for a Gemini visual/reasoning seat — do NOT treat "not in DEFAULT_MEMBERS" as
+# "cannot read files".
 DEFAULT_MEMBERS = ["planner", "reviewer", "coder", "pair"]
 DEFAULT_CHAIRMAN = "architect"      # Opus 5 synthesis at half Fable's cost
 # Was "fable". Fable is roughly 2x Opus 5 and does not beat it on most synthesis, and

@@ -4,6 +4,20 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
+## [2.0.4] — 2026-08-08
+
+Kill the leftover "agy cannot read `--cwd`" myth in code comments; clarify why
+`researcher` is omitted from council defaults.
+
+### Fixed
+
+- **DEFAULT_MEMBERS comments** no longer list Antigravity in the default set or claim
+  agy "reports no telemetry" absolutely — Summon's default subprocess path simply does
+  not surface usage/`model.served`; read-only needs `SUMMON_ALLOW_UNENFORCED_READONLY=1`.
+- **Removed dead** `_AGY_FILE_READ_RE` / `_agy_prompt_references_file` (unused since the
+  retired no-cwd warning was deleted).
+- Tests assert the myth string and dead regex stay gone.
+
 ## [2.0.3] — 2026-08-08
 
 Docs clarity for reasoning effort / thinking levels (no runtime behavior change).

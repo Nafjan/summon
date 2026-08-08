@@ -2167,18 +2167,6 @@ def _write_debug(debug_dir: str, argv: list, raw: str, response: dict) -> str | 
         return None
 
 
-# agy can't read files under --cwd (isolated profile), so a "read <file>" prompt
-# makes it review the pointer sentence and return a confident-but-empty verdict.
-_AGY_FILE_READ_RE = re.compile(
-    r"(?i)\b(read|open|review|inspect|check|see|look\s+at)\b[^\n]{0,80}?"
-    r"[\w./\\-]+\.(md|txt|py|js|ts|tsx|jsx|json|ya?ml|toml|docx?|pdf|csv|html?|xml|"
-    r"rs|go|java|c|cpp|h|hpp|sh|ps1|sql|rb|php)\b")
-
-
-def _agy_prompt_references_file(prompt: str | None) -> bool:
-    return bool(prompt and _AGY_FILE_READ_RE.search(prompt))
-
-
 def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                   debug_dir: str | None = None,
                   max_tool_output_bytes: int | None = None) -> dict:

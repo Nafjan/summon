@@ -2602,7 +2602,9 @@ def test_council_model_label_and_repo_capable_defaults():
     assert c._model_label({"model": {"requested": "opus", "resolved": "claude-opus-4-7"}}) == "opus -> claude-opus-4-7"
     assert c._model_label({"model": {"requested": "m", "resolved": "m"}}) == "m"
     assert c._model_label({}) is None
-    # default council is repo-capable — no agy member (agy can't read --cwd)
+    # default council omits agy (subprocess path lacks usage/served-model surface;
+    # no enforceable read-only without SUMMON_ALLOW_UNENFORCED_READONLY) — not because
+    # agy cannot read --cwd (it can, since 0.13.9)
     assert "researcher" not in c.DEFAULT_MEMBERS, c.DEFAULT_MEMBERS
 
 
@@ -5451,6 +5453,12 @@ def test_field_feedback_docs_and_document_audit_templates_are_bound():
                                     "_council.py"), encoding="utf-8").read()
     assert "cannot read files under --cwd" not in council_src, (
         "council still emits the pre---add-dir claim that agy cannot read the workspace")
+    assert "CANNOT read --cwd" not in council_src, (
+        "council comment still claims agy CANNOT read --cwd")
+    exec_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "_executor.py"), encoding="utf-8").read()
+    assert "_AGY_FILE_READ_RE" not in exec_src, (
+        "retired agy file-read heuristic regex must stay deleted (was dead + myth-adjacent)")
 
 
 def test_jobs_facade_and_matrix():
