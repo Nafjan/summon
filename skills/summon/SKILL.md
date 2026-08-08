@@ -17,9 +17,10 @@ the response-field table.
 - **[codex.md](references/codex.md)** - Codex-specific setup (permissions, timeout)
 - **[t3-code.md](references/t3-code.md)** - Summon under T3 Code (install profile, doctor, smoke checklist — not a native T3 plugin)
 - **[orchestration.md](references/orchestration.md)** - rules of engagement for multi-agent work: what the envelope proves, cross-vendor routing, permission traps, council quality bar, resume-instead-of-re-pay (project- and IDE-agnostic)
+- **[effort.md](references/effort.md)** - reasoning effort / thinking levels: who honors `--effort`, defaults, agy Gemini suffixes, envelope fields
 - **[examples/](examples/)** - document-audit schema, manifest, question, and role-specialized council agents
 - **[VERSIONING_AND_1.0_CRITERIA.md](../../docs/VERSIONING_AND_1.0_CRITERIA.md)** - the stable public contract, the criteria 1.0.0 met, and the evidence behind it
-- **[references/](references/)** - deep-dive docs: models, backends, customizing agents, fan-out & council (read on demand)
+- **[references/](references/)** - deep-dive docs: models, backends, effort, customizing agents, fan-out & council (read on demand)
 
 **Script Path**: Use absolute path `{SKILL_DIR}/scripts/run_subagent.py` where `{SKILL_DIR}` is the directory containing this SKILL.md file.
 
@@ -223,7 +224,7 @@ completed review returning `VERDICT: BLOCK` is successful execution and a reject
 | `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
 | `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `kimi`, `agy`, `gemini` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
 | `--model` | No | Override the agent's frontmatter model for this call |
-| `--effort` | No | Reasoning effort `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none` = the backend's own default). **claude** → `--effort`; **codex** → `-c model_reasoning_effort` (xhigh/max clamp to high); **agy** → a Gemini model's thinking suffix (`Gemini 3.1 Pro (High)`), applied only when set explicitly (not all models have all levels). Precedence: `--effort` > agent `effort:` frontmatter > `SUMMON_DEFAULT_EFFORT` env > built-in default **`high`**. Surfaced in the envelope's `effort` field (claude/codex) or `model.requested` (agy) |
+| `--effort` | No | Reasoning / thinking intensity: `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none`/`default`/`off` = leave the backend alone). **Honored by claude + codex** (default **`high`**); **agy Gemini only when set explicitly** (rewrites model to `… (Low\|Medium\|High)`); **ignored** for cursor-agent / kimi / gemini CLI / openai-compat / arkcli (stderr note if you set it). Precedence: `--effort` > frontmatter `effort:` > `SUMMON_DEFAULT_EFFORT` > built-in `high` (claude/codex). Full matrix: [references/effort.md](references/effort.md) |
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy. Resume for implementation continuity; use a fresh context for final adversarial adjudication so a reviewer is not grading its own prior work. The envelope records `resumed:true|false` |
 | `--resume-profile` | No | agy only: the `resume.profile` path returned by the prior agy call |
 | `--worktree` | No | Run in an isolated git worktree (optional name; auto-named if bare). If `--gate-with` denies, summon removes only a pristine checkout whose HEAD still equals its creation commit. Any untracked/modified file, new commit, failed identity check, or cleanup race is preserved and reported in `worktree_cleanup`; no force-removal or force branch deletion is used |
@@ -328,7 +329,7 @@ Every response carries structured fields for programmatic orchestration:
 | `model` | `{requested, targeted, served, resolved, models_used}`, split by EVIDENCE. `requested` = what the caller asked for. `targeted` = what the session was POINTED AT (init handshake, else the post-credit-guard effective model, else the backend's knowable default). `served` = the model that actually did work, set ONLY on service evidence (a terminal-event model report, or output tokens with a known target). `served` is null whenever no service evidence was observed (typical for failed runs) even when `targeted` names a model, and task status is never used as evidence in either direction (a served run can be legitimately downgraded to `blocked`). `resolved` = LEGACY v1 semantics (handshake-or-terminal + codex config backfill), kept for compatibility; migrate to `targeted`/`served`. `models_used` lists every model id seen (a claude session often also runs a cheap auxiliary model). agy reports none of these beyond `targeted`. Aliases (`opus`/`sonnet`) can lag a launch; pin the explicit ID for a guaranteed-latest run. |
 | `summon`, `agent_def`, `prompt_sha256`, `git_head_before`, `artifacts` | Provenance receipt, built progressively on the dispatch path: `summon` identity is on EVERY envelope the path emits (validation errors, missing agent, preflight, results); the other fields join as they become known. `summon` = `{version, script, scripts_sha256}` (one SHA-256, length-prefixed framing, over every production module, so divergent installs become diagnosable from any envelope). `agent_def` = `{file, sha256, agents_dir, source: project\|bundled\|explicit\|env}`, where `agents_dir` is the absolute roster directory the definition was ACTUALLY loaded from. `prompt_sha256` hashes the ROOT prompt. `git_head_before` names tracked repo state. Repeatable `--artifact` adds an opt-in loose-file manifest `{files:[{path,sha256,bytes,page_count,page_count_source}],sha256,stable_during_dispatch,after_sha256,changed,after_error?}` and joins its manifest hash to request reuse. `changed` lists proven identity differences and is `null` when the after-read failed; `after_error` explains why stability is unknown. Either case makes a successful result suspect. Hashes and paths only, never content or secrets; paths are local-operator data. |
 | `permission`, `permission_flags` | The permission level and the EXACT CLI flags it mapped to for this run — no more black box. |
-| `effort` | The reasoning effort actually applied (claude/codex; `null` = the backend's own default) — so an orchestrator knows how hard it thought and can re-dispatch at a different level. |
+| `effort` | Reasoning effort actually applied on **claude/codex** (`null` = backend default, or cleared because this CLI ignores `--effort`). For **agy** Gemini thinking, read `model.requested` instead (suffix). See [references/effort.md](references/effort.md). |
 | `attempts` | How many dispatches this envelope took (`--retries`). |
 | `parsed`, `parse_ok`, `parse_errors` | With `--json-schema`: the agent's final JSON (validated), whether it satisfied the schema, and the specific violations. `parse_retry: true` marks the corrective follow-up. `parse_warnings` lists any schema keywords that were NOT enforced (see below). |
 | `output_tail` | On non-success: the tail of the RAW captured output (stdout+stderr merged) so failures are diagnosable without a re-run. `--debug-dir` captures the full transcript. |
@@ -499,6 +500,8 @@ The dispatch essentials are above. Deeper capabilities live in focused reference
 
 - **[Model discovery & roster](references/models.md)** — `--list-models`, alias-lag vs
   `model.resolved`, the bundled agent roster, and the cross-vendor review rule.
+- **[Effort & thinking](references/effort.md)** — who honors `--effort`, defaults,
+  agy Gemini suffixes, what the envelope reports.
 - **[Custom & API backends](references/backends.md)** — `run-agent: openai-compat` to
   reach any OpenAI-compatible API (OpenRouter, OpenAI, Anthropic, Google, Groq, local
   Ollama/LM Studio) and `providers.json`.
@@ -557,7 +560,7 @@ permissions.
 | `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `kimi`, `agy`, `openai-compat` | Which backend executes this agent (`openai-compat` = any OpenAI-compatible API — see "Custom & API backends") |
 | `permission` | `read-only`, `safe-edit` (default), `yolo` | Approval/sandbox level the sub-agent runs with |
 | `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.served` |
-| `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning effort for this agent (claude + codex); overrides the default `high`. `--effort` at dispatch overrides it |
+| `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning / thinking for this agent. Honored by **claude + codex** (overrides Summon default `high`); on **agy** + Gemini, counts as *explicit* and rewrites the model suffix. Ignored on other CLIs. `--effort` at dispatch overrides it. See [references/effort.md](references/effort.md) |
 | `args` | shell-style string (optional) | Arbitrary extra backend flags passed verbatim, e.g. `args: -c model_reasoning_effort="high"` (codex). Model pinning stops being a special case |
 | `transport` | `subprocess` (default), `acp` (optional) | Dispatch transport. `acp` runs the turn over the Agent Client Protocol (native: gemini, kimi, cursor-agent); `--transport` at dispatch overrides it |
 

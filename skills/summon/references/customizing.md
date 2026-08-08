@@ -13,8 +13,11 @@ and backend flags for a single call:
 run_subagent.py --agent reviewer --model claude-sonnet-5 --effort high \
   --prompt "…" --cwd <abs>
 ```
-`--model` accepts any model the backend supports (see [models.md](models.md));
-`--effort` is `low|medium|high|xhigh|max` (claude). The prompt itself is your main
+`--model` accepts any model the backend supports (see [models.md](models.md)).
+`--effort` is `low|medium|high|xhigh|max` (or `none` for the backend's own default).
+**Not every CLI honors it** — claude/codex do (default `high`); agy Gemini only when
+effort is set explicitly (model-name suffix); cursor/kimi/openai-compat/arkcli ignore
+Summon `--effort`. Full matrix: [effort.md](effort.md). The prompt itself is your main
 customization — the agent definition sets the role, the prompt sets the task.
 
 **2. Durably — manage the roster from the CLI** (no hand-authored markdown needed):

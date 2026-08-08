@@ -28,6 +28,8 @@ file to force a clean re-run), per-job retries, progress lines on stderr,
 and a single summary JSON on stdout (`total/succeeded/failed/skipped/suspect`).
 Job keys: `id, agent, prompt|prompt_file, cwd, cli, model, effort, timeout,
 retries, json_schema, debug_dir, artifacts` (defaults apply to all, per-job overrides win).
+Per-job `effort` is the same portable knob as `--effort` — only some backends honor
+it (see [effort.md](effort.md)).
 Relative `prompt_file`, `json_schema`, and `debug_dir` paths resolve against the
 **manifest file's directory** (so the examples above just work). The manifest uses
 the same agent discovery as a direct dispatch — you don't need `--agents-dir` if

@@ -4,6 +4,17 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
+## [2.0.3] — 2026-08-08
+
+Docs clarity for reasoning effort / thinking levels (no runtime behavior change).
+
+### Added
+
+- **[references/effort.md](skills/summon/references/effort.md):** per-backend matrix for
+  who honors `--effort`, Summon default `high` (claude/codex), agy Gemini explicit-only
+  suffixes, and backends that ignore the flag (cursor/kimi/openai-compat/arkcli). Linked
+  from SKILL.md, customizing, models, fan-out, and `--help`.
+
 ## [2.0.2] — 2026-08-08
 
 Patch on 2.0.1 from round-2 adversarial review (GLM-5.2 + DeepSeek-V4-Flash via

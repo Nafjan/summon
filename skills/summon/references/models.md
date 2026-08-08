@@ -86,7 +86,9 @@ run_subagent.py --agent coder --cli cursor-agent --model gpt-5.6-sol-high --prom
 ```
 
 Cursor's parameterized model syntax works too (the string is forwarded untouched):
-`--model '<cursor-model-id>[context=1m,effort=high,fast=false]'`. The ids above are
+`--model '<cursor-model-id>[context=1m,effort=high,fast=false]'`. That `[effort=…]`
+is **Cursor's** knob inside the model id — Summon's separate `--effort` flag does
+**not** rewrite cursor-agent dispatches (see [effort.md](effort.md)). The ids above are
 SYNTAX illustrations, not a current roster -- summon cannot enumerate cursor's models
 (`--list-models` reports `source: static` for it), so check Cursor's own model list.
 
