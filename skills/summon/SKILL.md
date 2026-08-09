@@ -616,6 +616,11 @@ Caveats worth knowing:
   and nested AGY process uses `CREATE_NO_WINDOW` plus `STARTUPINFO(SW_HIDE)`. A vendor CLI
   or custom wrapper that explicitly creates its own GUI window is outside this launch
   boundary; the built-in AGY stream proxy stays on the hidden subprocess path.
+- **Caller checklist when a popup persists:** have the calling agent invoke Summon directly,
+  not through `Start-Process`, `cmd /c start`, or a custom PTY/window launcher. Leave
+  `AGY_PTY_WRAPPER` unset so the bundled `agy_stream_proxy.py` is selected; if a custom
+  wrapper is unavoidable, it must hide its own children and be named in the handoff. A
+  PowerShell helper that must use `Start-Process` should pass `-WindowStyle Hidden`.
 - For investigation agents that only need to *read*, `yolo` +
   "do not modify files" in the agent body is often more reliable than
   `read-only` — several CLIs' plan modes end turns asking for approval.

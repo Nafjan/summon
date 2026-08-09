@@ -1535,6 +1535,28 @@ def test_doctor_reads_version_from_stderr():
     assert v == "mycli version 9.9", v
 
 
+def test_doctor_version_probe_allows_slow_cli_startup():
+    """The version check must not reject healthy cold-start CLIs on Windows.
+
+    AGY and Gemini took 28.4s and 16.4s respectively on the health-check host;
+    a mutation back to the former ten-second budget must make this guard fail.
+    """
+    import _doctor, types
+    seen = {}
+    orig = _doctor.subprocess.run
+
+    def fake_run(*args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return types.SimpleNamespace(returncode=0, stdout="slowcli 1.0", stderr="")
+
+    _doctor.subprocess.run = fake_run
+    try:
+        assert _doctor._probe_version("/fake/slowcli") == "slowcli 1.0"
+    finally:
+        _doctor.subprocess.run = orig
+    assert seen["timeout"] >= 30, seen
+
+
 def test_background_and_out_rejected():
     import json as _json, subprocess as sp
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
@@ -12030,6 +12052,20 @@ def test_v8_popen_flags_never_evaluates_windows_constants_on_posix():
         os.name = real_name
 
 
+def test_v10_headless_docs_include_caller_popup_guidance():
+    """The hidden-launch claim must include an actionable caller escape hatch.
+
+    Without this guard the implementation can be correct while calling agents keep
+    bypassing it with a visible Start-Process/cmd wrapper or the legacy AGY PTY hook.
+    """
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    for rel in ("README.md", os.path.join("skills", "summon", "SKILL.md")):
+        text = open(os.path.join(root, rel), encoding="utf-8").read()
+        for needle in ("AGY_PTY_WRAPPER", "agy_stream_proxy.py", "Start-Process",
+                       "cmd /c start", "-WindowStyle Hidden"):
+            assert needle in text, "%s is missing caller popup guidance in %s" % (needle, rel)
+
+
 def test_v8_project_local_copy_is_enumerated_and_reported():
     """A PROJECT-LOCAL copy (`<project>/.agents/skills/summon`) is a real layout: a project
     carries its own roster plus a vendored dispatcher. install.py never touches it (it
@@ -16172,7 +16208,8 @@ def test_v10_public_docs_exclude_machine_identity_and_preserve_local_evidence():
     assert _urlparse(providers["local-vllm"]["base_url"]).hostname == "127.0.0.1", "example is not loopback-only"
 
     changelog = open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8").read()
-    assert "handover material no longer publishes local profile paths" in changelog, "missing privacy release note"
+    assert "parsed handoff fields and dry-run previews are redacted" in changelog, (
+        "missing privacy release note")
 
     # BytePlus / ModelArk surfaces: no maintainer profiles, local homes, or
     # arkcli-private credential store paths in shipped docs/code.

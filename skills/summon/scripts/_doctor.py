@@ -19,7 +19,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-_VERSION_TIMEOUT = 10
+# Some vendor CLIs (notably AGY and Gemini on a cold Windows start) spend more
+# than ten seconds loading before answering a harmless --version request. Keep
+# this bounded, but do not label a healthy install broken merely because its
+# first process start is slow.
+_VERSION_TIMEOUT = 45
 _PROBE_TIMEOUT = 25   # opt-in eligibility probe: a minimal real call, short leash
 
 # Known "the binary runs but a real dispatch fails" signatures. A --version probe

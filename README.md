@@ -358,7 +358,7 @@ vendors.
   "report_ok": true,
   "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
                "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
-  "summon":  { "version": "2.0.4", "scripts_sha256": "9f2c…" },
+  "summon":  { "version": "2.0.5", "scripts_sha256": "9f2c…" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -475,6 +475,11 @@ a headless session.
   nested backend processes with hidden startup state plus `CREATE_NO_WINDOW`; routine
   dispatches do not open terminal windows. A vendor CLI or custom wrapper that explicitly
   creates its own GUI remains outside Summon's process-launch boundary.
+- **If a popup persists:** the calling agent should invoke Summon directly, leave
+  `AGY_PTY_WRAPPER` unset so the bundled `agy_stream_proxy.py` is used, and avoid wrapping
+  the call in `Start-Process` or `cmd /c start`. If a PowerShell helper must use
+  `Start-Process`, pass `-WindowStyle Hidden`; a custom wrapper must hide its own children
+  and be reported in the handoff.
 
 You bring the model access; summon just orchestrates the CLIs and APIs you already use.
 
