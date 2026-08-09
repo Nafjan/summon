@@ -609,6 +609,10 @@ Caveats worth knowing:
   Constrain agy agents by instruction, and treat any repo you point them at as trusted.
   Every agy `safe-edit` dispatch (and its `--dry-run`) carries a `warnings` entry saying
   exactly this, so the level name can never read as a real sandbox.
+- **Windows dispatches are headless.** Every Summon dispatcher, utility, detached launcher,
+  and nested AGY process uses `CREATE_NO_WINDOW` plus `STARTUPINFO(SW_HIDE)`. A vendor CLI
+  or custom wrapper that explicitly creates its own GUI window is outside this launch
+  boundary; the built-in AGY stream proxy stays on the hidden subprocess path.
 - For investigation agents that only need to *read*, `yolo` +
   "do not modify files" in the agent body is often more reliable than
   `read-only` — several CLIs' plan modes end turns asking for approval.

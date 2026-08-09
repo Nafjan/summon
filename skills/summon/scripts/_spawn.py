@@ -23,6 +23,24 @@ import os
 import subprocess
 
 
+def _hidden_startupinfo():
+    """Return a Windows startup descriptor that hides any GUI-capable child.
+
+    ``CREATE_NO_WINDOW`` handles console applications, but it does not prevent a
+    child that elects to create a GUI window (or launches one through a shell)
+    from flashing a window. Summon is always a headless broker, so every child
+    gets an explicit hidden startup state as well. Keep this in the shared
+    helper: a single missed launch site would reintroduce the intermittent
+    popup users see during nested AGY/shell work.
+    """
+    if os.name != "nt":
+        return None
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = subprocess.SW_HIDE
+    return info
+
+
 def popen_flags(*, detached: bool = False) -> dict:
     """Platform ``Popen`` kwargs for a spawned child.
 
@@ -37,10 +55,13 @@ def popen_flags(*, detached: bool = False) -> dict:
     """
     if os.name != "nt":
         return {"start_new_session": True}
+    hidden = {"startupinfo": _hidden_startupinfo()}
     if detached:
-        return {"creationflags": (subprocess.DETACHED_PROCESS
-                                  | subprocess.CREATE_NEW_PROCESS_GROUP)}
-    return {"creationflags": subprocess.CREATE_NO_WINDOW}
+        hidden["creationflags"] = (subprocess.DETACHED_PROCESS
+                                    | subprocess.CREATE_NEW_PROCESS_GROUP)
+        return hidden
+    hidden["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return hidden
 
 
 def run_flags() -> dict:
@@ -51,4 +72,7 @@ def run_flags() -> dict:
     POSIX gets nothing: unlike a spawned backend these are awaited inline and never need
     their own session, so start_new_session would be noise rather than protection.
     """
-    return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    if os.name != "nt":
+        return {}
+    return {"creationflags": subprocess.CREATE_NO_WINDOW,
+            "startupinfo": _hidden_startupinfo()}

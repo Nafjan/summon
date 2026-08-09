@@ -4,6 +4,14 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
+## [Unreleased]
+
+### Fixed
+
+- **Headless Windows launches:** dispatcher, utility, detached, and nested AGY
+  processes now request both `CREATE_NO_WINDOW` and a hidden startup state, so
+  routine Summon work no longer flashes black console windows.
+
 ## [2.0.4] — 2026-08-08
 
 Kill the leftover "agy cannot read `--cwd`" myth in code comments; clarify why

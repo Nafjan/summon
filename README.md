@@ -467,6 +467,10 @@ a headless session.
   a plain terminal. Anything that can invoke `python` and read the skill can drive it.
 - **OS:** Windows runs every backend (it's what I use daily). Linux and macOS run all of
   them except agy out of the box. CI covers Ubuntu and Windows.
+- **Headless Windows behavior:** Summon launches its dispatcher, utility, detached, and
+  nested backend processes with hidden startup state plus `CREATE_NO_WINDOW`; routine
+  dispatches do not open terminal windows. A vendor CLI or custom wrapper that explicitly
+  creates its own GUI remains outside Summon's process-launch boundary.
 
 You bring the model access; summon just orchestrates the CLIs and APIs you already use.
 

@@ -11876,16 +11876,27 @@ def test_v8_popen_flags_suppress_the_windows_console():
     _injected = []
     for _attr, _val in (("CREATE_NO_WINDOW", 0x08000000),
                         ("DETACHED_PROCESS", 0x00000008),
-                        ("CREATE_NEW_PROCESS_GROUP", 0x00000200)):
+                        ("CREATE_NEW_PROCESS_GROUP", 0x00000200),
+                        ("STARTF_USESHOWWINDOW", 0x00000001),
+                        ("SW_HIDE", 0x00000000)):
         if not hasattr(_sp, _attr):
             setattr(_sp, _attr, _val)
             _injected.append(_attr)
+    if not hasattr(_sp, "STARTUPINFO"):
+        class _FakeStartupInfo:
+            def __init__(self):
+                self.dwFlags = 0
+                self.wShowWindow = None
+        _sp.STARTUPINFO = _FakeStartupInfo
+        _injected.append("STARTUPINFO")
     try:
         os.name = "nt"
         # importlib.reload is not needed: popen_flags reads os.name at CALL time
         worker = _spawn.popen_flags()
         detached = _spawn.popen_flags(detached=True)
         assert "creationflags" in worker, worker
+        assert worker["startupinfo"].dwFlags & _sp.STARTF_USESHOWWINDOW, worker
+        assert worker["startupinfo"].wShowWindow == _sp.SW_HIDE, worker
         assert worker["creationflags"] & _sp.CREATE_NO_WINDOW, (
             "a waited-on worker must carry CREATE_NO_WINDOW or Windows allocates a "
             "console window for every console-app backend")
@@ -11894,6 +11905,12 @@ def test_v8_popen_flags_suppress_the_windows_console():
         # "no console", and Windows documents CREATE_NO_WINDOW as ignored with it
         assert detached["creationflags"] & _sp.DETACHED_PROCESS, detached
         assert detached["creationflags"] & _sp.CREATE_NEW_PROCESS_GROUP, detached
+        assert detached["startupinfo"].dwFlags & _sp.STARTF_USESHOWWINDOW, detached
+        assert detached["startupinfo"].wShowWindow == _sp.SW_HIDE, detached
+        utility = _spawn.run_flags()
+        assert utility["creationflags"] & _sp.CREATE_NO_WINDOW, utility
+        assert utility["startupinfo"].dwFlags & _sp.STARTF_USESHOWWINDOW, utility
+        assert utility["startupinfo"].wShowWindow == _sp.SW_HIDE, utility
 
         os.name = "posix"
         for kw in (_spawn.popen_flags(), _spawn.popen_flags(detached=True)):
