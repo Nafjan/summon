@@ -3236,7 +3236,8 @@ def test_receipt_and_model_evidence_on_error_dispatch():
         # sit under an enclosing repo, e.g. a dotfiles-managed home, and git's
         # walk-up semantics are the correct provenance there)
         r5 = sp.run([sys.executable, script, "--agent", "dead-api", "--prompt", "hello",
-                     "--cwd", d, "--agents-dir", d, "--timeout", "8s"],
+                     "--cwd", d, "--agents-dir", d, "--timeout", "8s",
+                     "--allow-text-only"],
                     capture_output=True, text=True, encoding="utf-8")
         env5 = _json.loads(r5.stdout)
         gh5 = sp.run(["git", "-C", d, "rev-parse", "HEAD"], capture_output=True, text=True)
