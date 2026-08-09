@@ -358,7 +358,7 @@ vendors.
   "report_ok": true,
   "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
                "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
-  "summon":  { "version": "2.0.4", "scripts_sha256": "9f2c…" },
+  "summon":  { "version": "2.0.5", "scripts_sha256": "9f2c…" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -375,12 +375,16 @@ vendors.
   contract don't get believed.
 - `model.served` → the model that actually did the work (evidence-based; `null` = no
   service evidence observed). `targeted` = what the session was pointed at.
+- `timeout` → the timeout budget, whether partial output survived, and the phase Summon can
+  prove. ACP names its exact protocol stage; a generic CLI remains `backend-execution` because
+  Summon cannot honestly infer whether the vendor was starting, reasoning, or running a tool.
 - Situational fields appear only when they apply: `exit_history` + `original_exit` (a
   corrective resume superseded an earlier attempt; every superseded attempt is kept in
   order), `result_from_repair` (the first attempt produced no text, so the repaired text is
   the answer), `result_path_conflict` (the envelope found at a shared `--results-dir` path
   answers a *different* request and was refused rather than served), and `gate`,
-  `gate_correction_refused` or `gate_repair_refused` under `--gate-with`.
+  `gate_correction_refused` or `gate_repair_refused` under `--gate-with`. A gate's own
+  retained-resource declaration is nested at `gate.environment_handoff`.
 - `summon.scripts_sha256` + `agent_def.sha256` → provenance: which dispatcher build and
   which agent definition produced this envelope.
 - `billing.source` → did this draw from a **subscription** or metered **api** credits.
@@ -467,6 +471,15 @@ a headless session.
   a plain terminal. Anything that can invoke `python` and read the skill can drive it.
 - **OS:** Windows runs every backend (it's what I use daily). Linux and macOS run all of
   them except agy out of the box. CI covers Ubuntu and Windows.
+- **Headless Windows behavior:** Summon launches its dispatcher, utility, detached, and
+  nested backend processes with hidden startup state plus `CREATE_NO_WINDOW`; routine
+  dispatches do not open terminal windows. A vendor CLI or custom wrapper that explicitly
+  creates its own GUI remains outside Summon's process-launch boundary.
+- **If a popup persists:** the calling agent should invoke Summon directly, leave
+  `AGY_PTY_WRAPPER` unset so the bundled `agy_stream_proxy.py` is used, and avoid wrapping
+  the call in `Start-Process` or `cmd /c start`. If a PowerShell helper must use
+  `Start-Process`, pass `-WindowStyle Hidden`; a custom wrapper must hide its own children
+  and be reported in the handoff.
 
 You bring the model access; summon just orchestrates the CLIs and APIs you already use.
 
@@ -480,7 +493,9 @@ You bring the model access; summon just orchestrates the CLIs and APIs you alrea
 - **Kimi Code is deliberately stricter.** Its non-interactive prompt runner auto-handles tools
   and cannot combine with its plan mode, so Summon refuses Kimi `read-only` and `safe-edit`.
   `kimi-worker` pins high-context K3; `kimi-coder` pins K2.7 Coding for focused implementation.
-  Both are `yolo` only and belong in a trusted isolated worktree.
+  Both are `yolo` only and belong in a trusted isolated worktree. For a review-only Kimi job,
+  use `--worktree`, instruct it not to edit, then inspect the worktree before accepting the
+  report or removing it: the review label does not create an enforceable read-only boundary.
 - **agy is the exception, twice over.** It has no workspace-write tier, so its `safe-edit`
   is a full bypass like `yolo`. And it has **no enforceable `read-only` tier at all**, so
   since 0.15.0 summon *refuses* an agy dispatch declared `read-only` rather than imply a

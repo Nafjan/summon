@@ -468,8 +468,14 @@ def call(inv, timeout_ms: int) -> dict:
     except Exception:  # noqa: BLE001 — teardown plumbing never breaks dispatch
         pass
 
-    deadline = time.monotonic() + timeout_ms / 1000
+    # ``Milliseconds`` deliberately renders as e.g. ``360000ms`` when it is
+    # forwarded to a detached child. Keep a plain integer for arithmetic and
+    # human diagnostics here: appending another unit to the rich int produced
+    # the unhelpful ``360000msms`` timeout report in the field.
+    timeout_budget_ms = int(timeout_ms)
+    deadline = time.monotonic() + timeout_budget_ms / 1000
     client = _AcpClient(process, inv.permission)
+    stage = "initialize"
     try:
         def _remaining() -> float:
             return deadline - time.monotonic()
@@ -491,6 +497,7 @@ def call(inv, timeout_ms: int) -> dict:
                 f"summon speaks version {_PROTOCOL_VERSION}")
 
         # 2. Session.
+        stage = "session/new"
         session = client.request("session/new", {
             "cwd": os.path.abspath(inv.cwd),
             "mcpServers": [],
@@ -516,6 +523,7 @@ def call(inv, timeout_ms: int) -> dict:
                         or str(m.get("name", "")).lower() == wanted), None)
             if hit:
                 try:
+                    stage = "session/set_model"
                     client.request("session/set_model", {
                         "sessionId": session_id,
                         "modelId": hit["modelId"],
@@ -541,6 +549,7 @@ def call(inv, timeout_ms: int) -> dict:
 
         # 4. The turn. Ends at the session/prompt RESPONSE, not at process
         # exit — ACP agents are long-lived by design.
+        stage = "session/prompt"
         try:
             result = client.request("session/prompt", {
                 "sessionId": session_id,
@@ -588,10 +597,12 @@ def call(inv, timeout_ms: int) -> dict:
             "exit_code": 124,
             "status": "partial" if text else "error",
             "cli": cli,
-            "error": f"timed out after {timeout_ms}ms over ACP"
+            "error": f"timed out after {timeout_budget_ms}ms over ACP during {stage}"
                      + ("; partial output preserved" if text else ""),
             "normalization_reason": ("timed out; partial output preserved" if text
                                      else "timed out before any usable output"),
+            "timeout": {"budget_ms": timeout_budget_ms, "stage": stage,
+                        "partial_output": bool(text)},
         }
         raw = diag + (["", "# stderr"] + client.stderr_lines
                       if client.stderr_lines else [])
@@ -605,18 +616,20 @@ def call(inv, timeout_ms: int) -> dict:
                     diag or None)
     finally:
         # Premortem T4: NEVER wait on natural process exit after the turn ends —
-        # ACP agents stay alive for the next prompt. Close stdin, terminate,
-        # brief grace, kill the tree. Runs on every exit path (success, error,
+        # ACP agents stay alive for the next prompt. Close stdin, then kill the
+        # TREE while its leader is still alive. Calling ``process.terminate()``
+        # first opens the exact Windows escape hatch the Job Object/taskkill
+        # fallback exists to close: an unassigned grandchild is orphaned as its
+        # leader exits, and the later tree walk cannot find it. ``_kill_tree``
+        # uses the Job Object when available and taskkill while the leader is
+        # still attached otherwise. Runs on every exit path (success, error,
         # timeout) and costs milliseconds on a cooperative agent.
         try:
             if process.stdin:
                 process.stdin.close()
         except Exception:  # noqa: BLE001
             pass
-        try:
-            process.terminate()
-        except Exception:  # noqa: BLE001
-            pass
+        _kill_tree(process)
         try:
             process.wait(timeout=_TEARDOWN_GRACE_SEC)
         except Exception:  # noqa: BLE001

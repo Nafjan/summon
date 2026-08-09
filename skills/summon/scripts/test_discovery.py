@@ -227,6 +227,85 @@ def test_environment_handoff_reaches_fresh_and_resumed_child_prompts():
     assert "LEFT_BEHIND: none" in resumed and "caller to decide" in resumed
 
 
+def test_environment_handoff_and_dry_run_previews_redact_secret_values():
+    """Parsed report fields and dry-run argv previews are envelope surfaces too.
+
+    The raw transcript is redacted during diagnostic finalization, but parsing happens
+    earlier. A secret in HANDOFF or LEFT_BEHIND must not survive in the independent
+    structured copies. Likewise a dry-run preview bypasses that finalizer entirely.
+    """
+    import json
+    import run_subagent as rs
+    from _executor import _enrich, _finalize_diagnostics
+
+    report_secret = "report-audit-secret"
+    preview_secret = "preview-audit-secret"
+    raw = ("STATUS: DONE\nSUMMARY: s\nFOLLOW-UP: none\n"
+           f"HANDOFF: api_key={report_secret}\n"
+           f"LEFT_BEHIND: authorization: bearer {report_secret}")
+    response = _enrich({"result": raw, "exit_code": 0, "status": "success",
+                        "cli": "codex"}, None)
+    _finalize_diagnostics(response, raw, None, [], None)
+    assert report_secret not in json.dumps(response), response
+    assert response["environment_handoff"]["left_behind"].endswith("<redacted>")
+
+    preview = rs._dry_run_arg_preview("x" * 420 + f" api_key={preview_secret}")
+    assert preview_secret not in preview and "api_key=<redacted>" in preview, preview
+
+
+def test_environment_handoff_reaches_and_survives_a_gate_dispatch():
+    """A gate is a fresh child, not an exception to the caller-owned handoff.
+
+    `_run_gate` constructs its invocation directly instead of passing through main's
+    fresh-dispatch setup. It must therefore add the universal context itself and retain
+    the gate's structured declaration in the decision that the caller actually receives.
+    """
+    import run_subagent as rs
+    from _builder import AgentInvocation
+
+    d = tempfile.mkdtemp(prefix="summon-gate-handoff-")
+    seen = {}
+    real_exec = rs.execute_agent
+    try:
+        with open(os.path.join(d, "gate.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: read-only\n---\n# Gate\n")
+
+        def fake_exec(inv, **kwargs):
+            seen["system_context"] = inv.system_context
+            return {
+                "status": "success",
+                "result": "VERDICT: APPROVE\nREASON: bounded review",
+                "environment_handoff": {
+                    "declared": True,
+                    "left_behind": "C:/tmp/gate-note.txt (stopped; delete safely)",
+                },
+            }
+
+        rs.execute_agent = fake_exec
+
+        class Args:
+            gate_with = "gate"
+            agent = "implementation"
+            cli = None
+            timeout = 60_000
+            gate_timeout = None
+            debug_dir = None
+
+        gated = AgentInvocation(cli="claude", prompt="review", cwd=d,
+                                 permission="safe-edit")
+        decision = rs._run_gate(Args(), d, gated)
+    finally:
+        rs.execute_agent = real_exec
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+    assert "## Environment handoff (required)" in seen.get("system_context", ""), seen
+    assert decision["environment_handoff"] == {
+        "declared": True,
+        "left_behind": "C:/tmp/gate-note.txt (stopped; delete safely)",
+    }, decision
+
+
 def test_blocked_approval_downgrades_success():
     # A run that ENDS asking for interactive approval with no report contract
     # must become status:blocked (a 0 exit is not task completion).
@@ -1454,6 +1533,28 @@ def test_doctor_reads_version_from_stderr():
     finally:
         _doctor.subprocess.run = orig
     assert v == "mycli version 9.9", v
+
+
+def test_doctor_version_probe_allows_slow_cli_startup():
+    """The version check must not reject healthy cold-start CLIs on Windows.
+
+    AGY and Gemini took 28.4s and 16.4s respectively on the health-check host;
+    a mutation back to the former ten-second budget must make this guard fail.
+    """
+    import _doctor, types
+    seen = {}
+    orig = _doctor.subprocess.run
+
+    def fake_run(*args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return types.SimpleNamespace(returncode=0, stdout="slowcli 1.0", stderr="")
+
+    _doctor.subprocess.run = fake_run
+    try:
+        assert _doctor._probe_version("/fake/slowcli") == "slowcli 1.0"
+    finally:
+        _doctor.subprocess.run = orig
+    assert seen["timeout"] >= 30, seen
 
 
 def test_background_and_out_rejected():
@@ -3135,7 +3236,8 @@ def test_receipt_and_model_evidence_on_error_dispatch():
         # sit under an enclosing repo, e.g. a dotfiles-managed home, and git's
         # walk-up semantics are the correct provenance there)
         r5 = sp.run([sys.executable, script, "--agent", "dead-api", "--prompt", "hello",
-                     "--cwd", d, "--agents-dir", d, "--timeout", "8s"],
+                     "--cwd", d, "--agents-dir", d, "--timeout", "8s",
+                     "--allow-text-only"],
                     capture_output=True, text=True, encoding="utf-8")
         env5 = _json.loads(r5.stdout)
         gh5 = sp.run(["git", "-C", d, "rev-parse", "HEAD"], capture_output=True, text=True)
@@ -4197,7 +4299,9 @@ def test_v4_overall_timeout_kills_and_partials():
 
     ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
                             chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
-                            timeout=30000, out=None, run_dir=root, overall_timeout=1000)
+                            timeout=30000, out=None, run_dir=root, overall_timeout=2000)
+    orig_margin = _council._CHILD_MARGIN_MS
+    _council._CHILD_MARGIN_MS = 0
     orig_d, orig_k = _council._dispatch, _executor._kill_tree
     _council._dispatch, _executor._kill_tree = fake, fake_kill
     try:
@@ -4209,12 +4313,13 @@ def test_v4_overall_timeout_kills_and_partials():
         env = _json.loads(buf.getvalue())
     finally:
         _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        _council._CHILD_MARGIN_MS = orig_margin
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
     assert env.get("council_state") == "overall_timeout", f"state={env.get('council_state')}"
     assert env["status"] == "partial" and env.get("overall_timeout"), f"status={env.get('status')}"
     assert "summary" in env and env["summary"]["members_requested"] == 2, env.get("summary")
-    assert elapsed < 20, elapsed          # returned near the 1s budget, NOT the 30s member wait
+    assert elapsed < 20, elapsed          # returned near the 2s budget, NOT the 30s member wait
     # both members were process-tree-killed by the overall timeout (-> not success)
     assert env["summary"]["members_succeeded"] == 0, env["summary"]
     assert all(m.get("status") != "success" for m in env["members"]), \
@@ -4278,11 +4383,13 @@ def test_v4_overall_timeout_excludes_queued_wave():
     ns = argparse.Namespace(question="q", question_file=None,
                             members=",".join(names), chairman="chair", rounds=1,
                             cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
-                            # 4s, not 1s: on a loaded CI runner setup plus the two members
-                            # consumed the whole 1s budget, so the breach landed BEFORE the
+                            # 4s budget: on a loaded CI runner setup plus the two members
+                            # consumed the whole budget, so the breach landed BEFORE the
                             # chairman was ever dispatched and the scenario never happened.
                             # The chairman blocks up to 15s, so 4s still breaches inside it.
                             run_dir=root, overall_timeout=4000)
+    orig_margin = _council._CHILD_MARGIN_MS
+    _council._CHILD_MARGIN_MS = 0
     orig_d, orig_k = _council._dispatch, _executor._kill_tree
     _council._dispatch, _executor._kill_tree = fake, fake_kill
     try:
@@ -4294,9 +4401,10 @@ def test_v4_overall_timeout_excludes_queued_wave():
         env = _json.loads(buf.getvalue())
     finally:
         _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        _council._CHILD_MARGIN_MS = orig_margin
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
-    assert elapsed < 20, elapsed              # near the 1s budget, NOT the 30s member wait
+    assert elapsed < 20, elapsed              # near the 4s budget, NOT the 30s member wait
     assert env.get("council_state") == "overall_timeout", env.get("council_state")
     assert env["status"] == "partial", env["status"]
     # THE invariant: the queued wave never spawned -- at most `cap` children ever ran.
@@ -4368,7 +4476,9 @@ def test_v4_overall_timeout_skips_fallback_after_breach():
     ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
                             chairman="chair", chairman_fallback="chair2", rounds=1,
                             cwd=os.getcwd(), agents_dir=root, timeout=30000, out=None,
-                            run_dir=root, overall_timeout=1000)
+                            run_dir=root, overall_timeout=2000)
+    orig_margin = _council._CHILD_MARGIN_MS
+    _council._CHILD_MARGIN_MS = 0
     orig_d, orig_k = _council._dispatch, _executor._kill_tree
     _council._dispatch, _executor._kill_tree = fake, fake_kill
     try:
@@ -4380,6 +4490,7 @@ def test_v4_overall_timeout_skips_fallback_after_breach():
         env = _json.loads(buf.getvalue())
     finally:
         _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        _council._CHILD_MARGIN_MS = orig_margin
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
     assert elapsed < 20, elapsed
@@ -4488,11 +4599,11 @@ def test_v4_monotonic_gate_without_watchdog():
     dispatched = []
 
     def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
-        # WIDE margin: 0.9s >> the 300ms budget and well above any plausible setup time, so
+        # WIDE margin: 2.5s >> the 2s budget and well above any plausible setup time, so
         # the POST-round monotonic gate (not the setup-overrun guard, not load timing) is
         # deterministically what cuts the council short before the chairman.
         dispatched.append(agent)
-        _t.sleep(0.9)
+        _t.sleep(2.5)
         return {"status": "success", "result": agent, "report": {"summary": agent}}
 
     # Neuter ONLY the overall-timeout watchdog. `_council.threading` IS the global
@@ -4516,7 +4627,9 @@ def test_v4_monotonic_gate_without_watchdog():
 
     ns = argparse.Namespace(question="q", question_file=None, members="m1,m2",
                             chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
-                            timeout=30000, out=None, run_dir=root, overall_timeout=300)
+                            timeout=30000, out=None, run_dir=root, overall_timeout=2000)
+    orig_margin = _council._CHILD_MARGIN_MS
+    _council._CHILD_MARGIN_MS = 0
     orig_d, orig_thread = _council._dispatch, _council.threading.Thread
     _council._dispatch = fake
     _council.threading.Thread = _sel_thread
@@ -4527,6 +4640,7 @@ def test_v4_monotonic_gate_without_watchdog():
         env = _json.loads(buf.getvalue())
     finally:
         _council._dispatch, _council.threading.Thread = orig_d, orig_thread
+        _council._CHILD_MARGIN_MS = orig_margin
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
     # partial emitted by the MONOTONIC gate, with the watchdog disabled the whole time
@@ -6916,6 +7030,8 @@ def test_v4b_early_exit_does_not_double_emit_with_overall_timeout():
                             overall_timeout=30000)   # generous; never breached
     orig_cap = _council._PER_BACKEND_CAP
     _council._PER_BACKEND_CAP = 10
+    orig_margin = _council._CHILD_MARGIN_MS
+    _council._CHILD_MARGIN_MS = 0
     orig_d, orig_k = _council._dispatch, _executor._kill_tree
     _council._dispatch, _executor._kill_tree = fake, fake_kill
     try:
@@ -6928,6 +7044,7 @@ def test_v4b_early_exit_does_not_double_emit_with_overall_timeout():
     finally:
         _council._PER_BACKEND_CAP = orig_cap
         _council._dispatch, _executor._kill_tree = orig_d, orig_k
+        _council._CHILD_MARGIN_MS = orig_margin
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
     assert elapsed < 12, elapsed
@@ -11861,16 +11978,27 @@ def test_v8_popen_flags_suppress_the_windows_console():
     _injected = []
     for _attr, _val in (("CREATE_NO_WINDOW", 0x08000000),
                         ("DETACHED_PROCESS", 0x00000008),
-                        ("CREATE_NEW_PROCESS_GROUP", 0x00000200)):
+                        ("CREATE_NEW_PROCESS_GROUP", 0x00000200),
+                        ("STARTF_USESHOWWINDOW", 0x00000001),
+                        ("SW_HIDE", 0x00000000)):
         if not hasattr(_sp, _attr):
             setattr(_sp, _attr, _val)
             _injected.append(_attr)
+    if not hasattr(_sp, "STARTUPINFO"):
+        class _FakeStartupInfo:
+            def __init__(self):
+                self.dwFlags = 0
+                self.wShowWindow = None
+        _sp.STARTUPINFO = _FakeStartupInfo
+        _injected.append("STARTUPINFO")
     try:
         os.name = "nt"
         # importlib.reload is not needed: popen_flags reads os.name at CALL time
         worker = _spawn.popen_flags()
         detached = _spawn.popen_flags(detached=True)
         assert "creationflags" in worker, worker
+        assert worker["startupinfo"].dwFlags & _sp.STARTF_USESHOWWINDOW, worker
+        assert worker["startupinfo"].wShowWindow == _sp.SW_HIDE, worker
         assert worker["creationflags"] & _sp.CREATE_NO_WINDOW, (
             "a waited-on worker must carry CREATE_NO_WINDOW or Windows allocates a "
             "console window for every console-app backend")
@@ -11879,6 +12007,12 @@ def test_v8_popen_flags_suppress_the_windows_console():
         # "no console", and Windows documents CREATE_NO_WINDOW as ignored with it
         assert detached["creationflags"] & _sp.DETACHED_PROCESS, detached
         assert detached["creationflags"] & _sp.CREATE_NEW_PROCESS_GROUP, detached
+        assert detached["startupinfo"].dwFlags & _sp.STARTF_USESHOWWINDOW, detached
+        assert detached["startupinfo"].wShowWindow == _sp.SW_HIDE, detached
+        utility = _spawn.run_flags()
+        assert utility["creationflags"] & _sp.CREATE_NO_WINDOW, utility
+        assert utility["startupinfo"].dwFlags & _sp.STARTF_USESHOWWINDOW, utility
+        assert utility["startupinfo"].wShowWindow == _sp.SW_HIDE, utility
 
         os.name = "posix"
         for kw in (_spawn.popen_flags(), _spawn.popen_flags(detached=True)):
@@ -11917,6 +12051,20 @@ def test_v8_popen_flags_never_evaluates_windows_constants_on_posix():
                 setattr(_sp, attr, val)
     finally:
         os.name = real_name
+
+
+def test_v10_headless_docs_include_caller_popup_guidance():
+    """The hidden-launch claim must include an actionable caller escape hatch.
+
+    Without this guard the implementation can be correct while calling agents keep
+    bypassing it with a visible Start-Process/cmd wrapper or the legacy AGY PTY hook.
+    """
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    for rel in ("README.md", os.path.join("skills", "summon", "SKILL.md")):
+        text = open(os.path.join(root, rel), encoding="utf-8").read()
+        for needle in ("AGY_PTY_WRAPPER", "agy_stream_proxy.py", "Start-Process",
+                       "cmd /c start", "-WindowStyle Hidden"):
+            assert needle in text, "%s is missing caller popup guidance in %s" % (needle, rel)
 
 
 def test_v8_project_local_copy_is_enumerated_and_reported():
@@ -12003,6 +12151,47 @@ def test_v8_stale_project_local_copy_shows_as_drift():
         import shutil as _sh
         _sh.rmtree(proj, ignore_errors=True)
         _sh.rmtree(home, ignore_errors=True)
+
+
+def test_v10_timeout_diagnostics_do_not_duplicate_the_milliseconds_unit():
+    """A parsed Milliseconds value prints as ``Nms`` for argv round-tripping.
+    Human timeout diagnostics append their own unit, so they must use int(value)
+    or a 360-second timeout becomes the misleading ``360000msms``."""
+    from _cli import parse_timeout
+    from _stream import StreamProcessor
+    import _executor
+
+    resp = _executor._timeout_payload("claude", StreamProcessor(),
+                                      parse_timeout("360s"), [])
+    assert resp["error"] == "Timeout after 360000ms", resp["error"]
+    assert resp["timeout"] == {"budget_ms": 360000,
+                               "stage": "backend-execution",
+                               "partial_output": False}, resp["timeout"]
+
+
+def test_v10_kimi_review_docs_require_an_isolated_worktree():
+    """Kimi prompt mode is yolo-only. A doc that calls a Kimi job a review but
+    omits the worktree recipe invites callers to mistake it for read-only, so
+    bind both public entry points to the exact containment guidance."""
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    for path in (os.path.join(root, "README.md"),
+                 os.path.join(root, "skills", "summon", "SKILL.md")):
+        text = open(path, encoding="utf-8").read()
+        assert "review-only Kimi job,\n  use `--worktree`" in text, path
+        assert "enforceable read-only boundary" in text, path
+
+
+def test_v10_unreleased_changelog_binds_timeout_fix():
+    """The public release note describes this operator-visible repair.
+    Keep its claims tied to the regression guards rather than letting a focused
+    changelog drift into a promise the code no longer keeps."""
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    text = open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8").read()
+    unreleased = text.split("## [1.1.0]", 1)[0]
+    assert "ACP timeout cleanup" in unreleased, "missing ACP timeout release note"
+    assert "timeout_budget_ms = int(timeout_ms)" in open(
+        os.path.join(root, "skills", "summon", "scripts", "_acpbackend.py"),
+        encoding="utf-8").read(), "ACP timeout note drifted from its unit fix"
 
 
 def test_v8_gate_prompt_injection_cannot_forge_a_verdict():
@@ -16020,7 +16209,8 @@ def test_v10_public_docs_exclude_machine_identity_and_preserve_local_evidence():
     assert _urlparse(providers["local-vllm"]["base_url"]).hostname == "127.0.0.1", "example is not loopback-only"
 
     changelog = open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8").read()
-    assert "handover material no longer publishes local profile paths" in changelog, "missing privacy release note"
+    assert "parsed handoff fields and dry-run previews are redacted" in changelog, (
+        "missing privacy release note")
 
     # BytePlus / ModelArk surfaces: no maintainer profiles, local homes, or
     # arkcli-private credential store paths in shipped docs/code.
@@ -16451,6 +16641,14 @@ def test_phase_c_mcp_json_matches_plugin_schema_generation():
     assert summon["command"] == "python"
     assert summon["args"] == ["./skills/summon/scripts/mcp_server.py"]
     assert summon.get("cwd") == "${PLUGIN_ROOT}"
+
+
+def test_mcp_server_version_matches_dispatcher_release():
+    import mcp_server as mcp
+    from run_subagent import __version__
+    response = mcp._handle({"jsonrpc": "2.0", "id": 1,
+                            "method": "initialize", "params": {}})
+    assert response["result"]["serverInfo"]["version"] == __version__
 
 
 def test_phase_c_stream_partials():

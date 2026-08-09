@@ -4,6 +4,34 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
+## [Unreleased]
+
+## [2.0.5] — 2026-08-09
+
+### Highlights
+
+- **Headless Windows launches:** dispatcher, utility, detached, and nested AGY
+  processes now request both `CREATE_NO_WINDOW` and a hidden startup state, so
+  routine Summon work no longer flashes black console windows. The skill and README
+  include a caller checklist for bypassing visible `Start-Process`/`cmd /c start`
+  wrappers and the legacy AGY PTY override.
+
+### Fixed
+
+- **ACP timeout cleanup:** Kimi and other ACP children are tree-killed before their leader can
+  orphan a backend process; timeout envelopes now show one correct unit and the protocol phase
+  Summon can prove.
+- **Privacy hygiene:** parsed handoff fields and dry-run previews are redacted before they enter
+  envelopes or debug artifacts; gate handoff declarations remain visible to the caller.
+- **Health checks:** `doctor` now allows up to 45 seconds for a CLI's first `--version`
+  response, preventing healthy but slow AGY/Gemini Windows starts from being reported as broken.
+
+### Install / upgrade
+
+```bash
+npx skills add Nafjan/summon
+```
+
 ## [2.0.4] — 2026-08-08
 
 Kill the leftover "agy cannot read `--cwd`" myth in code comments; clarify why
@@ -136,12 +164,6 @@ explicit MCP local-trust ADR section.
 - **Purposeful Kimi roster roles:** `kimi-worker` now identifies K3 as the high-context
   architecture/review worker, while `kimi-coder` pins K2.7 Coding for scoped implementation
   and debugging. Both retain Kimi's explicit full-authority worktree requirement.
-
-### Fixed
-
-- **Privacy hygiene:** handover material no longer publishes local profile paths or session
-  identifiers, and preserved AGY evidence is ignored by default. BytePlus missing-key
-  guidance no longer points at arkcli-private credential store paths or env var names.
 
 ## [1.1.0] - 2026-07-31
 

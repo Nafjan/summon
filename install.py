@@ -115,7 +115,8 @@ def detect_hosts() -> list:
     return [name for name, root in HOSTS.items() if os.path.isdir(root)]
 
 
-def resolve_hosts(*, hosts_arg: str | None, profile: str | None) -> tuple[list, str | None]:
+def resolve_hosts(*, hosts_arg: str | None, profile: str | None,
+                  allow_missing: bool = False) -> tuple[list, str | None]:
     """Return (host list, advisory note). Profile selects a named subset.
 
     ``--hosts`` further filters. A profile never invents missing host dirs —
@@ -135,14 +136,15 @@ def resolve_hosts(*, hosts_arg: str | None, profile: str | None) -> tuple[list, 
                 return [], (f"host(s) {', '.join(off)} not in profile {profile!r} "
                             f"(profile hosts: {', '.join(PROFILES[profile])})")
             hosts = [h for h in hosts if h in allowed]
-        # Explicit --hosts must still never invent missing host roots (same
-        # rule as the profile-only branch). Refuse when none of the requested
-        # roots exist yet so the caller gets a clear error instead of a no-op.
-        missing_roots = [h for h in hosts if not os.path.isdir(HOSTS[h])]
-        hosts = [h for h in hosts if os.path.isdir(HOSTS[h])]
-        if not hosts:
-            return [], (f"requested host root(s) not found: {', '.join(missing_roots)}. "
-                        "Install/run that host CLI once so its config dir exists, then re-run.")
+        # Explicit installs must never invent missing host roots. Uninstall is
+        # different: an absent root is an idempotent no-op handled by
+        # uninstall_skill(), so retain explicitly named hosts for that path.
+        if not allow_missing:
+            missing_roots = [h for h in hosts if not os.path.isdir(HOSTS[h])]
+            hosts = [h for h in hosts if os.path.isdir(HOSTS[h])]
+            if not hosts:
+                return [], (f"requested host root(s) not found: {', '.join(missing_roots)}. "
+                            "Install/run that host CLI once so its config dir exists, then re-run.")
     elif profile:
         hosts = [h for h in PROFILES[profile] if os.path.isdir(HOSTS[h])]
     else:
@@ -255,9 +257,13 @@ def _release_lock(lock: str, token: str) -> None:
             data = json.load(fh)
         if not (isinstance(data, dict) and data.get("token") == token):
             return
-        mtime = os.path.getmtime(lock)
-        if os.path.getmtime(lock) == mtime:  # unchanged since we read it
-            os.unlink(lock)
+        observed_mtime = os.path.getmtime(lock)
+        # Re-stat after reading the token. A replaced lock must survive even if
+        # it happens to carry a valid summon marker; the token check above and
+        # this meaningful mtime check close the ordinary replacement window.
+        if os.path.getmtime(lock) != observed_mtime:
+            return
+        os.unlink(lock)
     except (OSError, ValueError):
         pass
 
@@ -574,7 +580,8 @@ def main() -> int:
     ap.add_argument("--uninstall", action="store_true")
     args = ap.parse_args()
 
-    hosts, note = resolve_hosts(hosts_arg=args.hosts, profile=args.profile)
+    hosts, note = resolve_hosts(hosts_arg=args.hosts, profile=args.profile,
+                                allow_missing=args.uninstall)
     if note and not hosts and args.profile:
         print(note)
         return 2

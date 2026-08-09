@@ -9,7 +9,7 @@ Project-agnostic and host-agnostic. Adopt the parts you need; every section is
 written so a single orchestrator (human or agent) can act on it without a
 house style guide.
 
-Semantics below were verified against summon **2.0.0**. Model ids and alias
+Semantics below were verified against summon **2.0.5**. Model ids and alias
 behaviour are volatile: re-check with `doctor`, `list`, `models`, and
 `--dry-run` before a run you care about.
 
@@ -102,7 +102,7 @@ Record these from every dispatch that matters:
 | `report_ok`, `suspect` | Whether the contract block parsed. `status:success` with `report_ok:false` sets `suspect` -- re-dispatch rather than trust. |
 | `model.requested` / `.targeted` / `.served` | See below. These are three different claims. |
 | `billing.source` | `subscription` / `api` / `credit`. Advisory; the vendor's billing is truth. |
-| `gate` | Present when `--gate-with` ran: the verdict, the gate's own definition hash and model. A gated dispatch that reports NO gate field is indistinguishable from an ungated one, so treat its absence as unapproved. |
+| `gate` | Present when `--gate-with` ran: the verdict, the gate's own definition hash and model, plus `environment_handoff` if the gate retained a resource. A gated dispatch that reports NO gate field is indistinguishable from an ungated one, so treat its absence as unapproved. |
 
 ### The `model.served` trap
 

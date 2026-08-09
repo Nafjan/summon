@@ -23,6 +23,9 @@ sys.path.insert(0, os.path.join(REPO, "skills", "summon", "scripts"))
 
 def _run(home: str, *args: str) -> subprocess.CompletedProcess:
     env = {**os.environ, "HOME": home, "USERPROFILE": home}
+    # Kimi's portable data-home override belongs to the real operator profile,
+    # never to a fake-home installer test. Keep this subprocess hermetic.
+    env.pop("KIMI_CODE_HOME", None)
     return subprocess.run([sys.executable, os.path.join(REPO, "install.py"), *args],
                           capture_output=True, text=True, env=env, cwd=REPO)
 
@@ -274,6 +277,38 @@ def test_lock_release_only_removes_own_token():
         install._release_lock(lock, token)             # our token: removes
         assert not os.path.isfile(lock)
     finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_lock_release_keeps_replaced_lock_when_mtime_changes():
+    sys.path.insert(0, REPO)
+    import importlib
+    install = importlib.import_module("install")
+    d = tempfile.mkdtemp(prefix="summon-lock-mtime-")
+    try:
+        acq = install._acquire_lock(d)
+        assert acq is not None
+        lock, token = acq
+        real_getmtime = install.os.path.getmtime
+        calls = [0]
+
+        def changing_mtime(path):
+            calls[0] += 1
+            if calls[0] == 1:
+                return 1.0
+            return 2.0
+
+        install.os.path.getmtime = changing_mtime
+        install._release_lock(lock, token)
+        assert os.path.isfile(lock), "replaced lock was removed after mtime changed"
+        install.os.path.getmtime = real_getmtime
+        install._release_lock(lock, token)
+        assert not os.path.exists(lock)
+    finally:
+        try:
+            install.os.path.getmtime = real_getmtime
+        except UnboundLocalError:
+            pass
         shutil.rmtree(d, ignore_errors=True)
 
 
