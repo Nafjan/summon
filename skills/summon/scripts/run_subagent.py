@@ -83,6 +83,18 @@ __version__ = "2.0.5"  # summon dispatcher version (see CHANGELOG.md)
 _JOB_FILE: str | None = None
 
 
+def _dispatch_agent_snapshot(agents_dir: str, agent_name: str):
+    """Load the dispatch definition through one testable seam.
+
+    Request identity construction has its own loader snapshot.  Keeping this
+    small seam separate lets the mutation test replace only the dispatch read
+    and prove the identity attestation rejects an A -> B -> A swap; patching
+    the shared loader would change both sides and make the test vacuous.
+    """
+    from _loader import load_agent_snapshot
+    return load_agent_snapshot(agents_dir, agent_name)
+
+
 def _endpoint_for_dispatch(identity: dict, agent_file: str, agents_dir: str) -> tuple:
     """The endpoint this dispatch will call: the SNAPSHOT the request identity already
     resolved, if it has one.
@@ -206,7 +218,8 @@ def _request_identity(args) -> dict:
         max_permission=getattr(args, "max_permission", None),
         artifacts=getattr(args, "artifacts", None),
         allow_text_only=bool(getattr(args, "allow_text_only", False)),
-        require_tools=bool(getattr(args, "require_tools", False)))
+        require_tools=bool(getattr(args, "require_tools", False)),
+        profile=getattr(args, "profile", None))
 
 
 def _complete_artifact_provenance(env: dict, args, before: dict | None) -> dict:
@@ -297,7 +310,7 @@ def _print_error(error: str, exit_code: int = 1) -> None:
     _emit({"result": "", "exit_code": exit_code, "status": "error", "error": error})
 
 
-def _preflight_backend(cli: str) -> dict | None:
+def _preflight_backend(cli: str, command_override: str | None = None) -> dict | None:
     """Confirm the resolved backend is actually invocable before spawning it.
 
     A missing backend CLI becomes a clear setup message (the install and sign-in
@@ -310,7 +323,12 @@ def _preflight_backend(cli: str) -> dict | None:
     The `doctor` probe runs ONLY on the missing-backend path, so a normal
     dispatch pays just one PATH lookup.
     """
-    if cli == "openai-compat" or shutil.which(cli):
+    # A private named profile may pin a known-good executable (for example a
+    # native Claude install while an older machine-wide shim wins PATH).  The
+    # command has already been validated by the profile resolver, so it is a
+    # legitimate preflight success even when the bare backend name is absent
+    # from PATH.
+    if cli == "openai-compat" or command_override or shutil.which(cli):
         return None
     # Enrichment is best-effort: an incomplete install missing _doctor.py must
     # still yield a setup message, never an uncaught ImportError from this guard.
@@ -906,9 +924,14 @@ def main() -> None:
     agents_dir = get_agents_dir(args.agents_dir, args.cwd)
 
     try:
-        run_agent_cli, system_context, _, agent_file, permission, model, extra_args, effort_fm = load_agent(
-            agents_dir, args.agent
-        )
+        # Keep the frontmatter snapshot that supplied the tuple.  The profile selector is
+        # metadata, not backend prompt text, and re-reading the file later would open the
+        # same A->B->A window the definition hash attestation exists to close.
+        _loaded, _agent_fm, _agent_sha = _dispatch_agent_snapshot(agents_dir, args.agent)
+        if _loaded is None:
+            raise FileNotFoundError(f"Agent definition not found: {args.agent}")
+        run_agent_cli, system_context, _, agent_file, permission, model, extra_args, effort_fm = _loaded
+        _agent_fm = _agent_fm or {}
     except (FileNotFoundError, ValueError) as e:
         _die(str(e))
 
@@ -967,13 +990,30 @@ def main() -> None:
     except ValueError as e:
         _die(f"agent {args.agent!r}: {e}")
 
+    # Resolve a named private profile before backend preflight.  A profile can
+    # deliberately pin an executable that is not the one visible on PATH, so
+    # checking the bare backend first would reject the very fallback the
+    # operator selected.  The model guard is evaluated against the dispatch
+    # override/frontmatter before any side effect (worktree or profile build).
+    final_model = args.model or model
+    profile_name = getattr(args, "profile", None) or _agent_fm.get("profile")
+    profile_selection = None
+    if profile_name:
+        try:
+            from _profiles import resolve_profile, validate_model
+            profile_selection = resolve_profile(profile_name, cli, args.cwd)
+            validate_model(profile_selection, final_model)
+        except ValueError as e:
+            _die(str(e))
+
     # Pre-flight the backend BEFORE any side effects (e.g. creating a worktree):
     # a missing CLI becomes a clear setup message (install + sign-in + what IS
     # ready) instead of a raw spawn failure, so a first-time user, or an agent
     # that skipped `doctor`, is told exactly what to do. Skipped under --dry-run,
     # which must preview a dispatch even when the backend isn't installed yet.
     if not args.dry_run:
-        setup_error = _preflight_backend(cli)
+        setup_error = _preflight_backend(
+            cli, (profile_selection or {}).get("command") if profile_selection else None)
         if setup_error is not None:
             setup_error.update(receipt)   # provenance even on the no-backend path
             # --out is AUTHORITATIVE, and this path bypassed _die() (which writes there), so
@@ -1115,7 +1155,23 @@ def main() -> None:
         agy_account_checked=bool(_identity.get("_agy_account_checked")),
         api_key_env=api_key_env,
         allow_payg=getattr(args, "allow_payg", False),
+        profile=profile_name,
+        profile_env=(profile_selection or {}).get("env") if profile_selection else None,
+        profile_command=((profile_selection or {}).get("command")
+                         if profile_selection else None),
     )
+
+    if profile_selection:
+        # Receipt metadata is deliberately non-sensitive: a profile name plus digests are
+        # enough to audit which private account/config was selected without publishing its
+        # absolute path or any credential material.
+        receipt["profile"] = {
+            "name": profile_selection["name"],
+            "cli": profile_selection["cli"],
+            "path_sha256": profile_selection["path_sha256"],
+            "registry_sha256": profile_selection["registry_sha256"],
+            "command_sha256": profile_selection.get("command_sha256"),
+        }
 
     # Frontmatter may *request* PAYG; only operator surfaces grant it.
     if _allow_payg_from_frontmatter(agent_file) and not invocation.allow_payg:
@@ -1333,6 +1389,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "agents_dir": agents_dir,
         "model_requested": invocation.model,
         "model_effective": _eff_model,  # after any credit-only-model fallback
+        "profile": invocation.profile,
         "billing_predicted": _bill,     # subscription / credit / api / unknown
         "permission": invocation.permission,
         # openai-compat (and any future non-sandbox backend) has no permission
@@ -1453,7 +1510,13 @@ def _dry_run_view(invocation, args, agents_dir: str,
     else:
         try:
             cmd, argv, env = build_invocation_args(invocation)
-            view["command"] = cmd
+            if invocation.profile_command:
+                # The executable is private registry data.  Keep dry-run useful
+                # without placing the absolute machine path in a shareable
+                # envelope; the env override list below is already name-only.
+                view["command"] = f"{os.path.basename(cmd)} (private profile executable)"
+            else:
+                view["command"] = cmd
             view["args"] = [_dry_run_arg_preview(a) for a in argv]
             view["env_overrides"] = sorted(env) if env else []
         except ValueError as e:
@@ -1483,10 +1546,12 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
     """
     from _builder import AgentInvocation
     from _gate import decide, gate_prompt
-    from _loader import load_agent
+    from _loader import load_agent_snapshot
 
     try:
-        tup = load_agent(agents_dir, args.gate_with)
+        tup, gate_fm, _gate_sha = load_agent_snapshot(agents_dir, args.gate_with)
+        if tup is None:
+            raise FileNotFoundError(f"Agent definition not found: {args.gate_with}")
     except Exception as e:  # noqa: BLE001 — an unusable gate must REFUSE, not pass
         return decide(None, args.gate_with) | {
             "reason": f"gate agent {args.gate_with!r} could not be loaded: {e}"}
@@ -1501,6 +1566,17 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
         print(f"note: --gate-with {args.gate_with!r} resolves to the same backend "
               f"({gate_cli}) as the gated dispatch; a same-vendor gate shares the "
               f"caller's blind spots", file=sys.stderr)
+
+    gate_profile = (gate_fm or {}).get("profile")
+    gate_profile_selection = None
+    if gate_profile:
+        try:
+            from _profiles import resolve_profile, validate_model
+            gate_profile_selection = resolve_profile(gate_profile, gate_cli, gated_inv.cwd)
+            validate_model(gate_profile_selection, gate_model)
+        except ValueError as e:
+            return decide(None, args.gate_with) | {
+                "reason": f"gate profile {gate_profile!r} could not be resolved: {e}"}
 
     # EVERY field comes from the invocation actually being gated, not from args. Taking
     # prompt/cwd from args meant a re-gate (retry, schema correction, contract repair)
@@ -1521,6 +1597,11 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
         permission="read-only",   # FORCED: never inherit the gate definition's tier
         permission_forced=True,   # so the opt-in cannot turn the adjudicator advisory
         model=gate_model, effort=gate_effort,
+        profile=gate_profile,
+        profile_env=((gate_profile_selection or {}).get("env")
+                     if gate_profile_selection else None),
+        profile_command=((gate_profile_selection or {}).get("command")
+                         if gate_profile_selection else None),
         # extra_args are DELIBERATELY DROPPED. build_invocation_args appends an
         # agent's `args:` AFTER the permission flags, so a gate definition carrying
         # --dangerously-skip-permissions (claude), --sandbox danger-full-access

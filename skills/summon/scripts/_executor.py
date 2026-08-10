@@ -1068,14 +1068,14 @@ def _endpoint_state(agents_dir, cwd, agent, defn=None) -> tuple:
 # Keys an identity dict carries for the SKIP's benefit that are NOT part of the request
 # (they describe local state, not what was asked), so the fingerprint drops them.
 _IDENTITY_LOCAL = ("_agent_def_state", "_unreadable", "_endpoint", "_agy_account_checked",
-                   "_artifact_manifest", "_artifact_error")
+                   "_artifact_manifest", "_artifact_error", "_profile_error")
 
 
 def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, model=None,
                            effort=None, json_schema=None, resume=None, resume_profile=None,
                            worktree=None, allow_credit=False, gate_with=None,
                            max_permission=None, artifacts=None,
-                           allow_text_only=False, require_tools=False) -> dict:
+                           allow_text_only=False, require_tools=False, profile=None) -> dict:
     """THE request identity, built in ONE place from RAW inputs.
 
     The dispatcher and the manifest parent each used to build their own dict, so a field
@@ -1107,6 +1107,15 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
     _adef = (_defn.sha, _defn.state) if _defn is not None else (None, "missing")
     _rcli = _resolved_cli(cli, agents_dir, cwd, agent, _defn)
     _rperm = _resolved_permission(_defn, max_permission)
+    _profile_name = profile or ((_defn.fm or {}).get("profile") if _defn else None)
+    _profile_selection = None
+    _profile_error = None
+    if _profile_name:
+        try:
+            from _profiles import resolve_profile
+            _profile_selection = resolve_profile(_profile_name, _rcli, cwd)
+        except Exception as exc:  # dispatch reports the actionable error later
+            _profile_error = str(exc)
     _endpoint = (_endpoint_state(agents_dir, cwd, agent, _defn)
                  if _rcli == "openai-compat" else (None, "ok", None))
     _schema = content_state(json_schema or None)
@@ -1120,7 +1129,8 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
                                          ("memory", _memory[1]),
                                          ("agent_def", _adef[1]),
                                          ("endpoint", _endpoint[1]),
-                                         ("artifacts", "unreadable" if _artifact_error else "ok"))
+                                         ("artifacts", "unreadable" if _artifact_error else "ok"),
+                                         ("profile", "unreadable" if _profile_error else "ok"))
                           if st not in ("ok", "absent", "missing"))
     return {
         # not hashed (local facts, not part of the request); carried so the skip can refuse
@@ -1132,6 +1142,7 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         "_unreadable": ",".join(_unreadable) or None,
         "_artifact_manifest": _artifact_manifest,
         "_artifact_error": _artifact_error,
+        "_profile_error": _profile_error,
         "agent": agent, "prompt": prompt, "cwd": cwd,
         "cli": cli or None, "model": model or None, "effort": effort or None,
         # The EFFECTIVE model when summon supplies the default itself. Cursor's default is a
@@ -1150,6 +1161,13 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # that hashed identically -- the second could reuse the first backend's answer.
         "resolved_cli": _rcli,
         "backend_env_sha256": backend_env_sha(_rcli, allow_credit),
+        # A profile name alone is not enough: the private registry can retarget it to a
+        # different account. Hash the resolved directory and registry snapshot, never the
+        # path itself, so cached answers cannot cross profile changes.
+        "profile": _profile_name or None,
+        "profile_path_sha256": ((_profile_selection or {}).get("path_sha256")),
+        "profile_registry_sha256": ((_profile_selection or {}).get("registry_sha256")),
+        "profile_command_sha256": ((_profile_selection or {}).get("command_sha256")),
         # ONLY when this is an actual resume: --resume-profile without --resume still takes
         # the FRESH-profile branch at dispatch, so selecting the resumed profile's account
         # there made a perfectly good fresh profile look like an account swap and refused it.

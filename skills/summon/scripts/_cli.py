@@ -325,7 +325,7 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "(KEY= removes); body untouched")
     parser.add_argument("--set", dest="sets", action="append", default=[],
                         metavar="KEY=VALUE",
-                        help="With --new-agent/--set-agent: run-agent, model, permission, args")
+                        help="With --new-agent/--set-agent: run-agent, model, permission, args, profile")
     parser.add_argument("--json", action="store_true",
                         help="With --doctor: emit machine-readable JSON instead of the table")
     parser.add_argument("--probe", action="store_true",
@@ -347,6 +347,8 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     )
     parser.add_argument("--cli", help="Force specific CLI (claude, cursor-agent, codex, gemini)")
     parser.add_argument("--model", help="Override the agent's frontmatter model for this call")
+    parser.add_argument("--profile", help="Select a named private backend profile for this call; "
+                        "the name is resolved from ~/.agents/summon-profiles.json and never a path")
     parser.add_argument(
         "--effort",
         help="Reasoning/thinking: low|medium|high|xhigh|max (or none). "

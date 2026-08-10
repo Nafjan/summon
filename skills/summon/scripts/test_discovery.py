@@ -10749,8 +10749,7 @@ def test_v7_agent_definition_change_between_fingerprint_and_dispatch_is_refused(
         #     through while B is what actually loaded. Asserting on the hash helpers alone
         #     would NOT catch this -- reverting the dispatch to re-read the path leaves such
         #     assertions green -- so the swap is staged around the production load itself.
-        import _loader as _ld
-        real_load = _ld.load_agent
+        real_load = _rs._dispatch_agent_snapshot
         b_text = ("---" + chr(10) + "run-agent: openai-compat" + chr(10)
                   + "base_url: http://127.0.0.1:9/v1" + chr(10) + "model: B" + chr(10)
                   + "---" + chr(10) + "# B" + chr(10))
@@ -10767,11 +10766,11 @@ def test_v7_agent_definition_change_between_fingerprint_and_dispatch_is_refused(
                 with open(defn, "w", encoding="utf-8") as fh:
                     fh.write(a_text)                 # ...and A is back before the check
 
-        _rs.load_agent = swapping_load
+        _rs._dispatch_agent_snapshot = swapping_load
         try:
             text = run_main()
         finally:
-            _rs.load_agent = real_load
+            _rs._dispatch_agent_snapshot = real_load
             with open(defn, "w", encoding="utf-8") as fh:
                 fh.write(a_text)
         env = _json.loads(text)
@@ -17413,6 +17412,183 @@ def test_banner_lists_kimi_and_modelark():
     assert "kimi" in text and "modelark" in text
     for name in ("claude", "codex", "cursor", "gemini", "antigravity"):
         assert name in text
+
+
+def test_profile_registry_resolves_private_claude_home_and_command():
+    """A named profile supplies only the Claude config env and an optional pinned binary.
+
+    The registry is operator-owned input; the public agent definition carries only the
+    opaque name.  This test uses a fake registry and directories, then mutates the profile
+    restriction to prove the model guard is actually exercised rather than merely parsed.
+    """
+    import _profiles
+    root = tempfile.mkdtemp(prefix="summon-profile-")
+    try:
+        profile_dir = os.path.join(root, "profile")
+        os.makedirs(profile_dir)
+        command = os.path.join(root, "claude.exe")
+        with open(command, "wb") as fh:
+            fh.write(b"not executed")
+        registry = os.path.join(root, "profiles.json")
+        with open(registry, "w", encoding="utf-8") as fh:
+            json.dump({"profiles": {"fable": {
+                "cli": "claude", "config_dir": profile_dir,
+                "command": command, "models": ["claude-fable-5"]
+            }}}, fh)
+        old = os.environ.get("SUMMON_PROFILES_FILE")
+        os.environ["SUMMON_PROFILES_FILE"] = registry
+        try:
+            selected = _profiles.resolve_profile("fable", "claude", root + "-cwd")
+            assert selected["env"] == {"CLAUDE_CONFIG_DIR": os.path.realpath(profile_dir)}
+            assert selected["command"] == os.path.realpath(command)
+            assert selected["path_sha256"] and selected["command_sha256"]
+            _profiles.validate_model(selected, "claude-fable-5")
+            try:
+                _profiles.validate_model(selected, "claude-opus-5")
+                raise AssertionError("profile model restriction was not enforced")
+            except ValueError as exc:
+                assert "not allowed" in str(exc)
+        finally:
+            if old is None:
+                os.environ.pop("SUMMON_PROFILES_FILE", None)
+            else:
+                os.environ["SUMMON_PROFILES_FILE"] = old
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_profile_rejects_path_names_and_in_tree_config():
+    import _profiles
+    for bad in ("C:\\private", "../private", "", "fable name", "fable;evil"):
+        try:
+            _profiles.validate_profile_name(bad)
+            raise AssertionError(f"accepted unsafe profile name {bad!r}")
+        except ValueError:
+            pass
+    root = tempfile.mkdtemp(prefix="summon-profile-tree-")
+    try:
+        with open(os.path.join(root, "claude.exe"), "wb") as fh:
+            fh.write(b"x")
+        reg = os.path.join(root, "profiles.json")
+        with open(reg, "w", encoding="utf-8") as fh:
+            json.dump({"profiles": {"p": {"cli": "claude", "config_dir": root,
+                                               "command": os.path.join(root, "claude.exe")}}}, fh)
+        old = os.environ.get("SUMMON_PROFILES_FILE")
+        os.environ["SUMMON_PROFILES_FILE"] = reg
+        try:
+            try:
+                _profiles.resolve_profile("p", "claude", root)
+                raise AssertionError("accepted a profile inside the dispatch cwd")
+            except ValueError as exc:
+                assert "outside the dispatch cwd" in str(exc)
+            if os.name == "nt":
+                # Windows containment is case-insensitive.  A raw commonpath string
+                # comparison accepted this same in-tree profile when cwd was uppercased.
+                try:
+                    _profiles.resolve_profile("p", "claude", root.upper())
+                    raise AssertionError(
+                        "accepted an in-tree profile through a case variant")
+                except ValueError as exc:
+                    assert "outside the dispatch cwd" in str(exc)
+        finally:
+            if old is None:
+                os.environ.pop("SUMMON_PROFILES_FILE", None)
+            else:
+                os.environ["SUMMON_PROFILES_FILE"] = old
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_profile_is_part_of_request_identity_and_background_argv():
+    import _background
+    import _executor
+    root = tempfile.mkdtemp(prefix="summon-profile-id-")
+    try:
+        agents = os.path.join(root, ".agents")
+        os.makedirs(agents)
+        dispatch_cwd = os.path.join(root, "task")
+        os.makedirs(dispatch_cwd)
+        with open(os.path.join(agents, "p.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\nmodel: claude-fable-5\nprofile: fable\n---\n# P\n")
+        profile_dir = os.path.join(root, "profile")
+        os.makedirs(profile_dir)
+        reg = os.path.join(root, "profiles.json")
+        with open(reg, "w", encoding="utf-8") as fh:
+            json.dump({"profiles": {"fable": {"cli": "claude", "config_dir": profile_dir}}}, fh)
+        old = os.environ.get("SUMMON_PROFILES_FILE")
+        os.environ["SUMMON_PROFILES_FILE"] = reg
+        try:
+            ident = _executor.build_request_identity(
+                agent="p", prompt="x", cwd=dispatch_cwd, agents_dir=agents,
+                profile=None)
+            assert ident["profile"] == "fable"
+            assert ident["profile_path_sha256"]
+            ns = types.SimpleNamespace(
+                agent="p", prompt="x", prompt_file=None, cwd=root,
+                allow_credit=False, allow_payg=False, allow_text_only=False,
+                require_tools=False, no_contract_repair=False, agents_dir=agents,
+                timeout=600000, cli=None, model=None, effort=None, profile="fable",
+                resume=None, resume_profile=None, out=None, json_schema=None,
+                debug_dir=None, retries=0, max_permission=None, gate_with=None,
+                gate_timeout=None, worktree=None, artifacts=[])
+            child = _background.child_argv(ns, "C:/jobs/result.json")
+            assert "--profile" in child and child[child.index("--profile") + 1] == "fable"
+        finally:
+            if old is None:
+                os.environ.pop("SUMMON_PROFILES_FILE", None)
+            else:
+                os.environ["SUMMON_PROFILES_FILE"] = old
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_profile_pinned_command_satisfies_backend_preflight():
+    """A valid private command pin must bypass a stale/missing PATH shim."""
+    import run_subagent as _rs
+    root = tempfile.mkdtemp(prefix="summon-profile-preflight-")
+    try:
+        command = os.path.join(root, "claude.exe")
+        with open(command, "wb") as fh:
+            fh.write(b"fake")
+        real_which = _rs.shutil.which
+        try:
+            _rs.shutil.which = lambda _name: None
+            assert _rs._preflight_backend("claude", command) is None
+            assert _rs._preflight_backend("claude") is not None
+        finally:
+            _rs.shutil.which = real_which
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_profile_dry_run_hides_private_command_path():
+    """A shareable dry-run envelope must not publish the pinned binary path."""
+    import run_subagent as _rs
+    import _builder
+    root = tempfile.mkdtemp(prefix="summon-profile-preview-")
+    try:
+        profile_dir = os.path.join(root, "profile")
+        os.makedirs(profile_dir)
+        command = os.path.join(root, "claude.exe")
+        with open(command, "wb") as fh:
+            fh.write(b"fake")
+        agent_file = os.path.join(root, "p.md")
+        with open(agent_file, "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\nmodel: claude-fable-5\n---\n# P\n")
+        invocation = _builder.AgentInvocation(
+            cli="claude", prompt="p", cwd=root, system_context="c",
+            permission="read-only", model="claude-fable-5", profile="fable",
+            profile_env={"CLAUDE_CONFIG_DIR": profile_dir}, profile_command=command)
+        args = types.SimpleNamespace(
+            agent="p", cwd=root, agents_dir=root, worktree=None, timeout=600000,
+            allow_text_only=False, require_tools=False)
+        view = _rs._dry_run_view(invocation, args, root, agent_file=agent_file)
+        encoded = json.dumps(view)
+        assert str(Path(command).resolve()) not in encoded
+        assert view["command"] == "claude.exe (private profile executable)"
+        assert view["env_overrides"] == ["CLAUDE_CONFIG_DIR"]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":

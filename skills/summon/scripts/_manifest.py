@@ -12,7 +12,7 @@ Manifest format (JSON):
     }
 A bare JSON array is accepted as the jobs list. Per-job keys override defaults:
 id, agent, prompt | prompt_file, cwd, cli, model, effort, timeout, retries,
-json_schema, debug_dir, artifacts. Each job's envelope lands in
+json_schema, debug_dir, artifacts, profile. Each job's envelope lands in
 ``<results-dir>/<id>.json`` (atomic; an existing valid envelope skips the job —
 re-running a crashed swarm resumes where it stopped).
 
@@ -41,7 +41,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 _JOB_KEYS = ("id", "agent", "prompt", "prompt_file", "cwd", "cli", "model",
-             "effort", "timeout", "retries", "json_schema", "debug_dir", "artifacts")
+             "effort", "timeout", "retries", "json_schema", "debug_dir", "artifacts",
+             "profile")
 _DEFAULT_CAP = 3
 # The SAME duration ceiling --timeout enforces, so a manifest cannot size the parent
 # watchdog past what the child would ever accept.
@@ -291,7 +292,7 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
         # json_schema is deliberately absent: it has its own check further down whose
         # message explains WHY it must be a path, and that wording is worth keeping.
         for _k in ("agent", "prompt", "prompt_file", "cwd", "cli", "model", "effort", "id",
-                   "debug_dir"):
+                   "debug_dir", "profile"):
             if job.get(_k) is not None and not isinstance(job[_k], str):
                 return None, (f"job #{i}: {_k} must be a string, got "
                               f"{type(job[_k]).__name__}")
@@ -516,7 +517,8 @@ def _job_identity(job: dict, args) -> dict:
         cwd=os.path.abspath(job.get("cwd") or args.cwd or os.getcwd()),
         agents_dir=args.agents_dir, cli=job.get("cli"), model=job.get("model"),
         effort=job.get("effort"), json_schema=job.get("json_schema"),
-        artifacts=job.get("artifacts"), require_tools=_require_tools)
+        artifacts=job.get("artifacts"), require_tools=_require_tools,
+        profile=job.get("profile"))
 
 
 def _child_cmd(job: dict, args, out_file: str) -> list:
@@ -528,6 +530,7 @@ def _child_cmd(job: dict, args, out_file: str) -> list:
     if args.agents_dir:
         cmd += ["--agents-dir", args.agents_dir]
     for key, flag in (("cli", "--cli"), ("model", "--model"), ("effort", "--effort"),
+                      ("profile", "--profile"),
                       ("timeout", "--timeout"), ("json_schema", "--json-schema"),
                       ("debug_dir", "--debug-dir")):
         if job.get(key):

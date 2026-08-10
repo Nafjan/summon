@@ -204,10 +204,10 @@ def read_json(path: str):
 
 
 # Argv keys allowed into a launch record (default-DENY). The prompt is stored
-# as a hash only; resume ids, profiles, schema/debug paths, and unknown flags
+# as a hash only; resume ids, profile paths, schema/debug paths, and unknown flags
 # are omitted so no prompt text or secret is persisted.
 _FLAG_ALLOWLIST = ("agent", "cli", "model", "effort", "timeout", "cwd",
-                   "agents_dir", "worktree", "allow_text_only", "require_tools")
+                   "agents_dir", "worktree", "profile", "allow_text_only", "require_tools")
 
 
 def flags_projection(args) -> dict:

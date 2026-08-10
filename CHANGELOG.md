@@ -6,6 +6,17 @@ regression notes, and test evidence, see the
 
 ## [Unreleased]
 
+### Highlights
+
+- **Named local profiles:** route a Claude agent to an operator-owned config directory and,
+  when needed, a pinned executable without putting machine paths or credentials in the
+  public roster. Receipts carry the profile name and integrity digests.
+
+### Maintenance
+
+- Added request-identity and background forwarding coverage for profile selection. Automatic
+  cross-account retries remain intentionally out of scope because they can duplicate work.
+
 ## [2.0.5] — 2026-08-09
 
 ### Highlights

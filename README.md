@@ -96,6 +96,8 @@ drive it, and it hands back structured results instead of a stream.
 - **Structured extraction:** `--json-schema` validates an agent's final JSON and, on a
   backend that supports resume, spends one corrective retry when it does not match.
 - **Use local + frontier models together:** an Ollama model and Claude in the same council.
+- **Route named local logins:** keep multiple Claude config directories behind private
+  profile names, so a public agent definition never carries a machine path or credential.
 
 ---
 
@@ -190,6 +192,12 @@ Set up "summon" for me (github.com/Nafjan/summon), a cross-vendor AI sub-agent d
 
 You can also skip the skill install entirely and run the script directly:
 `python summon.py dispatch --agent reviewer --prompt "…" --cwd "$PWD"`.
+
+For a second local Claude login, define it in the private
+`~/.agents/summon-profiles.json` registry and select it with
+`--profile <name>` (or `profile: <name>` in a local agent definition). Summon records the
+profile name and integrity digests, not the config path. See
+[private backend profiles](skills/summon/SKILL.md#private-backend-profiles).
 
 **Staying current:** the installed skill is a copy and never self-updates. Re-install or
 update via your Agent Plugin client's UI (for plugin installs), run `npx skills update`
