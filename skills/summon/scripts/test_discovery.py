@@ -16059,7 +16059,7 @@ def test_v10_strict_agents_dir_refuses_bundled_and_pack_fallbacks():
     pack = tempfile.mkdtemp(prefix="summon-strict-pack-")
     try:
         normal, _, _ = _loader.load_agent_snapshot(empty, "planner")
-        assert normal and os.path.abspath(normal[3]).startswith(os.path.abspath(bundled)), normal
+        assert normal and Path(normal[3]).resolve().parent == Path(bundled).resolve(), normal
 
         try:
             _loader.load_agent_snapshot(empty, "planner", strict_agents_dir=True)
@@ -16078,7 +16078,7 @@ def test_v10_strict_agents_dir_refuses_bundled_and_pack_fallbacks():
         _loader.discover_agent_packs = lambda: [{"path": pack, "name": "fixture-pack"}]
         try:
             pack_normal, _, _ = _loader.load_agent_snapshot(empty, "planner")
-            assert pack_normal and os.path.abspath(pack_normal[3]).startswith(os.path.abspath(pack)), pack_normal
+            assert pack_normal and Path(pack_normal[3]).resolve().parent == Path(pack).resolve(), pack_normal
             try:
                 _loader.load_agent_snapshot(empty, "planner", strict_agents_dir=True)
             except _loader.AgentResolutionError as exc:
