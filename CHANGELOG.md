@@ -4,7 +4,7 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
-## [Unreleased]
+## [2.1.0] — 2026-08-11
 
 ### Highlights
 
@@ -25,6 +25,8 @@ regression notes, and test evidence, see the
   cross-account retries remain intentionally out of scope because they can duplicate work.
 - Background, manifest, and council role propagation is covered; malformed, chained, or
   retargeted aliases fail closed rather than silently falling back.
+
+## [Unreleased]
 
 ## [2.0.5] — 2026-08-09
 
