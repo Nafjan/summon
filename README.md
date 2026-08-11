@@ -203,6 +203,12 @@ For governance-controlled dispatches, add `--strict-agents-dir` alongside
 `--agents-dir`. A missing role then fails closed instead of falling through to the
 bundled or plugin roster; ordinary dispatches keep the convenience fallback.
 
+For operator-owned names that must survive roster changes, use the experimental private
+role registry: `summon role propose ALIAS TARGET`, then `summon role approve ALIAS`.
+Dispatch an approved alias only with `--enable-roles`; exact agent names still win, and
+target/approval hash changes fail closed. The registry lives outside the repository at
+`~/.claude/summon/roles.json` and receipts carry only names and digests.
+
 **Staying current:** the installed skill is a copy and never self-updates. Re-install or
 update via your Agent Plugin client's UI (for plugin installs), run `npx skills update`
 (for `skills add` installs), or re-run `python install.py` after a `git pull` (for
@@ -239,6 +245,7 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon manifest FILE` | run a batch swarm (per-backend concurrency, resumable) |
 | `summon council --question "…"` | **decide by consensus** of diverse models |
 | `summon agent new\|set NAME --set k=v` | scaffold / retune an agent definition |
+| `summon role propose\|approve\|list\|resolve …` | manage private, opt-in role aliases |
 | `summon version` · `summon help` | version · usage |
 
 `summon` (no args) prints the command list. Everything below is documented in

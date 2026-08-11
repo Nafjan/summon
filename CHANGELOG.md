@@ -14,11 +14,17 @@ regression notes, and test evidence, see the
 - **Strict roster provenance:** add `--strict-agents-dir` to make governance-controlled
   dispatch fail closed when a named role is absent, while keeping the normal bundled/plugin
   fallback convenient by default.
+- **Private role aliases (experimental):** propose and explicitly approve operator-owned
+  aliases for existing roster definitions, then opt into them with `--enable-roles`. Exact
+  names win; target and approval hashes are checked before dispatch and only digest-based
+  provenance appears in receipts.
 
 ### Maintenance
 
 - Added request-identity and background forwarding coverage for profile selection. Automatic
   cross-account retries remain intentionally out of scope because they can duplicate work.
+- Background, manifest, and council role propagation is covered; malformed, chained, or
+  retargeted aliases fail closed rather than silently falling back.
 
 ## [2.0.5] — 2026-08-09
 

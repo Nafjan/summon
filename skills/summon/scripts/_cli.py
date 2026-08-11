@@ -91,7 +91,7 @@ def parse_timeout(value: str) -> int:
 # explicitly supports it.
 MODE_FLAGS = {
     "manifest": {"manifest", "concurrency", "results_dir", "cwd", "agents_dir",
-                 "retries", "job_file", "strict_agents_dir"},
+                 "retries", "job_file", "strict_agents_dir", "enable_roles"},
     # Operation-level rows: a fresh council, a resume, and a read-only status
     # each consume a DIFFERENT set (v3.1). Changing members/rounds/question on a
     # resume would be a new run, so they are rejected there; status takes only
@@ -99,14 +99,15 @@ MODE_FLAGS = {
     "council": {"council", "question", "question_file", "members", "chairman",
                 "rounds", "cwd", "agents_dir", "timeout", "out", "run_dir", "results_dir",
                 "job_file", "quorum", "chairman_fallback", "member_timeout",
-                "chair_timeout", "overall_timeout", "min_successful", "strict_agents_dir"},
+                "chair_timeout", "overall_timeout", "min_successful", "strict_agents_dir",
+                "enable_roles"},
     # A resume may change how the SAME run's stages are gated/timed (quorum,
     # fallback, per-stage timeouts) without changing its identity; question,
     # members, chairman, and rounds still come from the receipt.
     "council-resume": {"council", "resume_run", "cwd", "agents_dir", "timeout",
                        "out", "run_dir", "results_dir", "job_file",
                        "quorum", "chairman_fallback", "member_timeout", "chair_timeout",
-                       "overall_timeout", "min_successful", "strict_agents_dir"},
+                       "overall_timeout", "min_successful", "strict_agents_dir", "enable_roles"},
     # Status takes ONLY its id, where to look, and the output format -- it never
     # dispatches, so it has no working directory (use --run-dir to point it).
     "council-status": {"council_status", "run_dir", "json", "job_file"},
@@ -190,7 +191,7 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 # discoverable command surface.
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
                "onboard", "manifest", "council", "agent", "jobs", "version",
-               "help", "--help", "-h"}
+               "role", "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -206,6 +207,9 @@ Commands:
   council   --question "…" [--members …] [--rounds 2]  decide by consensus
   agent new NAME [--set k=v …]                    scaffold an agent definition
   agent set NAME  --set k=v …                     retune an agent's frontmatter
+  role propose ALIAS TARGET                        propose a private global role alias
+  role approve ALIAS                              activate a proposed role alias
+  role list|resolve ALIAS                         inspect approved/proposed aliases
   jobs list|status|wait [ID] [--job-dir D] [--json]   inspect background jobs
   version                                         print version
 
@@ -280,6 +284,25 @@ def rewrite_subcommand(argv: list) -> tuple:
             return argv, f"error: unknown 'agent' action {rest[0]!r} (use 'new' or 'set')"
         flag = "--new-agent" if rest[0] == "new" else "--set-agent"
         return ([flag, *rest[1:]], None)
+    if head == "role":
+        if not rest:
+            return argv, "help"
+        action = rest[0]
+        if action == "propose":
+            if len(rest) < 3 or rest[1].startswith("-") or rest[2].startswith("-"):
+                return argv, "error: 'role propose' needs an alias and target agent"
+            return ["--role-propose", rest[1], rest[2], *rest[3:]], None
+        if action == "approve":
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, "error: 'role approve' needs a role name"
+            return ["--role-approve", rest[1], *rest[2:]], None
+        if action == "list":
+            return ["--role-list", *rest[1:]], None
+        if action == "resolve":
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, "error: 'role resolve' needs a role name"
+            return ["--role-resolve", rest[1], *rest[2:]], None
+        return argv, f"error: unknown 'role' action {action!r} (use propose/approve/list/resolve)"
     return argv, None
 
 
@@ -295,6 +318,18 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                                      allow_abbrev=False)
     parser.add_argument("--version", action="version",
                         version=f"summon {version} (envelope schema v{envelope_version})")
+    role_group = parser.add_mutually_exclusive_group()
+    role_group.add_argument("--role-propose", nargs=2, metavar=("ALIAS", "TARGET"),
+                             help="Propose a private global role alias; approval is required")
+    role_group.add_argument("--role-approve", metavar="ALIAS",
+                             help="Activate a previously proposed private role alias")
+    role_group.add_argument("--role-list", action="store_true",
+                             help="List private global role aliases and proposals")
+    role_group.add_argument("--role-resolve", metavar="ALIAS",
+                             help="Resolve and validate one approved private role alias")
+    parser.add_argument("--enable-roles", dest="enable_roles", action="store_true",
+                        help="Opt into approved user-global role aliases for this dispatch; "
+                             "disabled by default and never changes an exact agent match")
     parser.add_argument("--list", action="store_true", help="List available agents")
     parser.add_argument("--list-models", dest="list_models", action="store_true",
                         help="Report invocable models per backend (live where the CLI exposes it; "

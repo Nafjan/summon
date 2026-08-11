@@ -16200,6 +16200,145 @@ def test_v10_strict_agents_dir_parser_and_public_contract():
     assert "--strict-agents-dir" in changelog
 
 
+def test_v11_private_role_aliases_are_propose_approve_hash_bound_and_exact_wins():
+    """Role state is operator-global, explicit, and fail-closed on tampering."""
+    import _roles
+
+    root = tempfile.mkdtemp(prefix="summon-role-roster-")
+    registry = os.path.join(root, "roles.json")
+    pending = os.path.join(root, "roles.pending.json")
+    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agents",
+                          "reviewer.md")
+    shutil.copy2(source, os.path.join(root, "reviewer.md"))
+    old_registry = os.environ.get("SUMMON_ROLES_FILE")
+    old_pending = os.environ.get("SUMMON_ROLES_PENDING_FILE")
+    os.environ["SUMMON_ROLES_FILE"] = registry
+    os.environ["SUMMON_ROLES_PENDING_FILE"] = pending
+    try:
+        proposed = _roles.propose("security-gate", "reviewer", cwd=os.getcwd(),
+                                  agents_dir=root)
+        assert proposed["state"] == "proposed"
+        assert not os.path.exists(registry), "proposal activated before approval"
+        approved = _roles.approve("security-gate", cwd=os.getcwd(), agents_dir=root)
+        assert approved["state"] == "approved"
+        resolved = _roles.resolve_for_dispatch(
+            "security-gate", cwd=os.getcwd(), agents_dir=root, enabled=True)
+        assert resolved["resolved"] == "reviewer"
+        assert resolved["role"]["target_sha256"] == proposed["target_sha256"]
+        strict_empty = tempfile.mkdtemp(prefix="summon-role-strict-empty-")
+        try:
+            try:
+                _roles.resolve_for_dispatch(
+                    "security-gate", cwd=os.getcwd(), agents_dir=strict_empty,
+                    enabled=True, strict_agents_dir=True)
+            except ValueError as exc:
+                assert "valid agent definition" in str(exc)
+            else:
+                raise AssertionError("strict alias resolution fell through to bundled target")
+        finally:
+            shutil.rmtree(strict_empty, ignore_errors=True)
+        # An exact definition is authoritative even when an approved alias has the same
+        # spelling.  This test uses the target name to exercise the no-shadow branch.
+        exact = _roles.resolve_for_dispatch(
+            "reviewer", cwd=os.getcwd(), agents_dir=root, enabled=True)
+        assert exact["role"] is None and exact["resolved"] == "reviewer"
+
+        doc = json.loads(Path(registry).read_text(encoding="utf-8"))
+        doc["roles"]["security-gate"]["hash"] = "sha256:tampered"
+        Path(registry).write_text(json.dumps(doc), encoding="utf-8")
+        try:
+            _roles.resolve("security-gate", cwd=os.getcwd(), agents_dir=root)
+        except ValueError as exc:
+            assert "hash mismatch" in str(exc)
+        else:
+            raise AssertionError("tampered role approval was accepted")
+    finally:
+        if old_registry is None:
+            os.environ.pop("SUMMON_ROLES_FILE", None)
+        else:
+            os.environ["SUMMON_ROLES_FILE"] = old_registry
+        if old_pending is None:
+            os.environ.pop("SUMMON_ROLES_PENDING_FILE", None)
+        else:
+            os.environ["SUMMON_ROLES_PENDING_FILE"] = old_pending
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v11_role_aliases_join_request_identity_and_forward_to_children():
+    import argparse
+    import _background
+    import _cli
+    import _executor
+    import _manifest
+    import _roles
+
+    root = tempfile.mkdtemp(prefix="summon-role-identity-")
+    registry = os.path.join(root, "roles.json")
+    pending = os.path.join(root, "roles.pending.json")
+    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agents",
+                          "reviewer.md")
+    shutil.copy2(source, os.path.join(root, "reviewer.md"))
+    old_registry = os.environ.get("SUMMON_ROLES_FILE")
+    old_pending = os.environ.get("SUMMON_ROLES_PENDING_FILE")
+    os.environ["SUMMON_ROLES_FILE"] = registry
+    os.environ["SUMMON_ROLES_PENDING_FILE"] = pending
+    try:
+        _roles.propose("security-gate", "reviewer", cwd=os.getcwd(), agents_dir=root)
+        _roles.approve("security-gate", cwd=os.getcwd(), agents_dir=root)
+        prov = _roles.resolve_for_dispatch(
+            "security-gate", cwd=os.getcwd(), agents_dir=root, enabled=True)
+        base = dict(agent="reviewer", prompt="identity", cwd=os.getcwd(), agents_dir=root)
+        direct = _executor.build_request_identity(**base)
+        aliased = _executor.build_request_identity(
+            **base, role_provenance=prov)
+        assert _executor.request_fingerprint(**direct) != _executor.request_fingerprint(**aliased)
+        parser = _cli.build_parser("2.0.5", 1)
+        assert parser.parse_args(["--agent", "security-gate", "--enable-roles",
+                                  "--prompt", "p", "--cwd", os.getcwd()]).enable_roles
+        assert _cli.rewrite_subcommand(["role", "resolve", "security-gate"])[0] == [
+            "--role-resolve", "security-gate"]
+        ns = argparse.Namespace(
+            agent="security-gate", prompt="p", prompt_file=None, cwd=os.getcwd(),
+            allow_credit=False, allow_payg=False, allow_text_only=False, require_tools=False,
+            no_contract_repair=False, agents_dir=root, strict_agents_dir=False,
+            enable_roles=True, timeout=600000, cli=None, model=None, effort=None,
+            resume=None, resume_profile=None, profile=None, out=None, json_schema=None,
+            debug_dir=None, retries=0, max_permission=None, gate_with=None,
+            gate_timeout=None, worktree=None, artifacts=[])
+        child = _background.child_argv(ns, "result.json")
+        assert "--enable-roles" in child
+        cmd = _manifest._child_cmd({"id": "r", "agent": "security-gate", "prompt": "p"},
+                                    argparse.Namespace(cwd=os.getcwd(), agents_dir=root,
+                                                       strict_agents_dir=False,
+                                                       enable_roles=True, retries=0), "out.json")
+        assert "--enable-roles" in cmd
+    finally:
+        if old_registry is None:
+            os.environ.pop("SUMMON_ROLES_FILE", None)
+        else:
+            os.environ["SUMMON_ROLES_FILE"] = old_registry
+        if old_pending is None:
+            os.environ.pop("SUMMON_ROLES_PENDING_FILE", None)
+        else:
+            os.environ["SUMMON_ROLES_PENDING_FILE"] = old_pending
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v11_role_alias_docs_and_fanout_flags_are_publicly_bound():
+    import _cli
+
+    assert "enable_roles" in _cli.MODE_FLAGS["manifest"]
+    assert "enable_roles" in _cli.MODE_FLAGS["council"]
+    assert "enable_roles" in _cli.MODE_FLAGS["council-resume"]
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    skill = Path(os.path.join(root, "SKILL.md")).read_text(encoding="utf-8")
+    readme = Path(os.path.join(root, "..", "..", "README.md")).read_text(encoding="utf-8")
+    changelog = Path(os.path.join(root, "..", "..", "CHANGELOG.md")).read_text(encoding="utf-8")
+    for text in (skill, readme, changelog):
+        assert "role alias" in text.lower() or "role aliases" in text.lower()
+        assert "--enable-roles" in text
+
+
 def test_v10_timeout_envelope_surfaces_the_cause_not_just_the_clock():
     """FIELD REPORT (2026-07-28). A dispatch burned 480s and returned result="" with the
     real cause -- `rg` missing from the child's PATH -- visible only in `output_tail`, a

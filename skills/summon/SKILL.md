@@ -32,7 +32,8 @@ plugin package with `plugin.json` at the repo root — no separate install step.
 
 **Command surface**: the script accepts git-style **subcommands** — `dispatch` (the
 default action), `list`, `models`, `doctor`, `manifest FILE`, `council`, `agent
-new|set NAME`, `version` — e.g. `run_subagent.py council --question "…" --cwd DIR`. The
+new|set NAME`, `role propose|approve|list|resolve`, `version` — e.g. `run_subagent.py
+council --question "…" --cwd DIR`. The
 **legacy flat form still works unchanged** (`run_subagent.py --agent … --prompt …`,
 `--list`, `--manifest FILE`, …), and every flag below is valid in both. Bare
 `run_subagent.py` (or `help`) prints the command list.
@@ -149,6 +150,34 @@ strict_agents_dir_miss` and no bundled or plugin fallback is attempted. The defa
 resolution chain above is unchanged. Background, manifest, and council children inherit
 the flag; a resumed council inherits the boundary recorded in its run receipt.
 
+### Private role aliases (experimental)
+
+Role aliases are operator-owned names such as `security-gate` that map to one existing
+agent definition. They are separate from project rosters and disabled unless the caller
+passes `--enable-roles`. Manage them with:
+
+```text
+run_subagent.py role propose security-gate reviewer --cwd <project>
+run_subagent.py role approve security-gate --cwd <project>
+run_subagent.py role list
+run_subagent.py role resolve security-gate --cwd <project>
+```
+
+`propose` writes only a pending record; `approve` re-reads the target and activates it.
+The private registry is `~/.claude/summon/roles.json` (override with
+`SUMMON_ROLES_FILE` for an operator-managed location) and is never copied into a
+dispatch envelope. Exact agent names always win over aliases. Chaining, project-local
+role maps, malformed records, target hash changes, and approval hash changes fail closed.
+An alias cannot change a target's CLI, model, permission, prompt, or profile. Dispatch
+receipts carry only requested/resolved names and integrity digests; use those fields to
+audit which approved role was used. `--strict-agents-dir` is applied after alias
+resolution, so a governance dispatch must contain the target in its selected roster.
+Background, manifest, and council children inherit `--enable-roles`; keep this feature
+behind an explicit operator choice until its experimental release gate is retired.
+
+The equivalent flat flags are `--role-propose ALIAS TARGET`, `--role-approve ALIAS`,
+`--role-list`, and `--role-resolve ALIAS`.
+
 **Roster-wide lint:** `--list --json` and `doctor --json` carry `roster_warnings`, flagging
 definitions whose declared `permission:` their backend cannot enforce (per-dispatch refusal
 is correct but arrives too late for a roster maintained as a controlled artifact). Note the
@@ -240,6 +269,7 @@ repository-relative examples.
 | `--timeout` | No | Bare ms or with suffix: `600s`, `10m` (default: 600000 = 10m). A BARE sub-second value on a dispatch is refused as a units mistake -- `--timeout 300` means 0.3s and would kill every agent instantly; write `300s` (or `300ms` if you truly mean it). `jobs wait` still accepts short bare polls. Set your host tool's own timeout ABOVE this value — the script needs a few seconds of overhead beyond the CLI deadline |
 | `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
 | `--strict-agents-dir` | No | Governance mode: fail closed when the requested agent is absent from the selected roster; do not fall back to bundled or plugin definitions. Opt-in only; default resolution is unchanged |
+| `--enable-roles` | No | Opt into approved user-global role aliases. Exact roster names win; malformed, retargeted, chained, or unapproved aliases fail closed. Children inherit the flag |
 | `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `kimi`, `agy`, `gemini` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
 | `--model` | No | Override the agent's frontmatter model for this call |
 | `--profile` | No | Select a named private backend profile from `~/.agents/summon-profiles.json` (currently Claude only). The name is safe metadata; the registry keeps config/auth paths out of agent definitions and receipts. `--profile` overrides frontmatter `profile:` |

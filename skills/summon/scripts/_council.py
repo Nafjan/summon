@@ -223,7 +223,8 @@ def _chairman_prompt(question: str, members: list, ranking_note: str = "") -> st
 
 def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
               timeout_ms: int, out_dir: str, tag: str, on_spawn=None,
-              on_reap=None, strict_agents_dir: bool = False) -> dict:
+              on_reap=None, strict_agents_dir: bool = False,
+              enable_roles: bool = False) -> dict:
     """Run one agent via a run_subagent subprocess with --out (authoritative
     envelope). Returns the parsed envelope (or an error envelope). A parent
     watchdog (child deadline + margin) guarantees the council can't hang on a
@@ -255,6 +256,8 @@ def _dispatch(agent: str, prompt: str, cwd: str, agents_dir: str,
         cmd += ["--agents-dir", agents_dir]
     if strict_agents_dir:
         cmd += ["--strict-agents-dir"]
+    if enable_roles:
+        cmd += ["--enable-roles"]
     # When fan-out did not deliberately allow text seats, force children to
     # refuse them even if a definition is mutated mid-run to capability:text-only.
     try:
@@ -628,6 +631,9 @@ def run_council(args) -> int:
     strict_agents_dir = bool(
         getattr(args, "strict_agents_dir", False)
         or (receipt_doc or {}).get("strict_agents_dir", False))
+    enable_roles = bool(
+        getattr(args, "enable_roles", False)
+        or (receipt_doc or {}).get("enable_roles", False))
     if rounds not in (1, 2):
         return _fail("--rounds must be 1 or 2", out_path)
     if len(members) < 2:
@@ -668,11 +674,26 @@ def run_council(args) -> int:
                   or get_agents_dir(None, cwd))
     import _rundir as _rd
     _agent_shas: dict = {}
+    _resolved_by_name: dict = {}
+    _role_provenance_by_name: dict = {}
     # The fallback chairman (if any) is validated and hashed like every other agent.
     _to_validate = members + [chairman] + ([chairman_fallback] if chairman_fallback else [])
+    if enable_roles:
+        from _roles import resolve_for_dispatch
+        for who in dict.fromkeys(_to_validate):
+            try:
+                _role_provenance_by_name[who] = resolve_for_dispatch(
+                    who, cwd=cwd, agents_dir=agents_dir, enabled=True,
+                    strict_agents_dir=strict_agents_dir)
+                _resolved_by_name[who] = (_role_provenance_by_name[who].get("resolved")
+                                          or who)
+            except (ValueError, FileNotFoundError, OSError) as exc:
+                return _fail(f"council role {who!r} could not be resolved: {exc}", out_path)
+    else:
+        _resolved_by_name = {who: who for who in dict.fromkeys(_to_validate)}
     for who in dict.fromkeys(_to_validate):  # validate before any paid dispatch
         try:
-            loaded = load_agent(agents_dir, who,
+            loaded = load_agent(agents_dir, _resolved_by_name[who],
                                strict_agents_dir=strict_agents_dir)
             # Definition-identity hash: a changed agent definition (or a
             # different roster/repo) must invalidate carry-forward -- the field
@@ -693,7 +714,10 @@ def run_council(args) -> int:
         if is_text_seat(_cli) and not fanout_allows_text_seat():
             return _fail(fanout_text_seat_refusal(who, _cli), out_path)
     _exec_ctx = {"cwd": cwd, "agents_dir": os.path.abspath(agents_dir),
-                 "strict_agents_dir": strict_agents_dir}
+                 "strict_agents_dir": strict_agents_dir,
+                 "enable_roles": enable_roles,
+                 "roles": {k: v.get("role") for k, v in _role_provenance_by_name.items()
+                           if isinstance(v, dict) and isinstance(v.get("role"), dict)}}
 
     # --timeout arrives as whole milliseconds (argparse type). Pass it through as
     # ms to the children; never silently substitute a default. Member and
@@ -746,6 +770,9 @@ def run_council(args) -> int:
                 "question_sha256": _rd.content_sha256(question), "members": members,
                 "chairman": chairman, "rounds": rounds, "cwd": cwd,
                 "agents_dir": agents_dir, "strict_agents_dir": strict_agents_dir,
+                "enable_roles": enable_roles,
+                "roles": {k: v.get("role") for k, v in _role_provenance_by_name.items()
+                          if isinstance(v, dict) and isinstance(v.get("role"), dict)},
                 "created_at": time.time(),
             })
         except OSError as e:
@@ -762,7 +789,10 @@ def run_council(args) -> int:
 
     def backend_of(agent: str) -> str:
         from _manifest import _job_backend
-        return _job_backend({"agent": agent}, agents_dir)
+        return _job_backend(
+            {"agent": _resolved_by_name.get(agent, agent)}, agents_dir,
+            strict_agents_dir=strict_agents_dir,
+            resolved_agent=_resolved_by_name.get(agent, agent))
 
     member_backend = {m: backend_of(m) for m in members}
     sems = {b: threading.BoundedSemaphore(_PER_BACKEND_CAP)
@@ -851,6 +881,8 @@ def run_council(args) -> int:
         }
         if _exec_ctx.get("strict_agents_dir", False):
             _dispatch_kwargs["strict_agents_dir"] = True
+        if _exec_ctx.get("enable_roles", False):
+            _dispatch_kwargs["enable_roles"] = True
         env = _dispatch(agent, prompt, cwd, agents_dir, stage_timeout_ms, rd_path, _tag,
                         **_dispatch_kwargs)
         if isinstance(env, dict) and _rd.owner_still_current(owner):
@@ -1442,6 +1474,9 @@ def run_council(args) -> int:
         "generation": owner.generation,
         "question": question,
         "rounds": rounds,
+        "enable_roles": enable_roles,
+        "roles": {k: v.get("role") for k, v in _role_provenance_by_name.items()
+                  if isinstance(v, dict) and isinstance(v.get("role"), dict)},
         "council_state": "final",
         "members": results,
         "failed_members": failed,

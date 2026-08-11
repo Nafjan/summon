@@ -1082,7 +1082,7 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
                            worktree=None, allow_credit=False, gate_with=None,
                            max_permission=None, artifacts=None,
                            allow_text_only=False, require_tools=False, profile=None,
-                           strict_agents_dir=False) -> dict:
+                           strict_agents_dir=False, role_provenance=None) -> dict:
     """THE request identity, built in ONE place from RAW inputs.
 
     The dispatcher and the manifest parent each used to build their own dict, so a field
@@ -1130,6 +1130,8 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
     _memory = content_state(os.path.join(cwd, ".agents", "memory.md") if cwd else None)
     from _artifacts import build_manifest as _build_artifact_manifest
     _artifact_manifest, _artifact_error = _build_artifact_manifest(artifacts, cwd)
+    _role = role_provenance if isinstance(role_provenance, dict) else {}
+    _role_detail = _role.get("role") if isinstance(_role.get("role"), dict) else {}
     # Anything that EXISTS but could not be hashed leaves a hole in the identity, and a hole
     # is not a difference: two different unhashable schemas would hash alike. Record it so
     # the skip can fail closed rather than reuse on an identity it could not fully compute.
@@ -1180,6 +1182,17 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # keep it in the request identity so a cached fallback result cannot satisfy a
         # later governance request.
         "strict_agents_dir": "1" if strict_agents_dir else None,
+        # An approved role is part of the request identity, not merely a convenient
+        # spelling.  Hashing its approval fingerprint/record prevents a cached direct
+        # target result, or a result from a retargeted registry entry, from satisfying
+        # an opted-in role dispatch.  Names and digests only; never the private registry
+        # path or its contents.
+        "role_requested": _role.get("requested") if _role_detail else None,
+        "role_resolved": _role_detail.get("resolved_agent") if _role_detail else None,
+        "role_target_sha256": _role_detail.get("target_sha256") if _role_detail else None,
+        "role_fingerprint": _role_detail.get("fingerprint") if _role_detail else None,
+        "role_hash": _role_detail.get("hash") if _role_detail else None,
+        "role_registry_sha256": _role_detail.get("registry_sha256") if _role_detail else None,
         # ONLY when this is an actual resume: --resume-profile without --resume still takes
         # the FRESH-profile branch at dispatch, so selecting the resumed profile's account
         # there made a perfectly good fresh profile look like an account swap and refused it.

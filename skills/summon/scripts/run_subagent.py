@@ -213,7 +213,8 @@ def _request_identity(args) -> dict:
     (_manifest._job_identity) cannot drift apart by having different derived fields.
     """
     return _executor.build_request_identity(
-        agent=args.agent, prompt=args.prompt, cwd=args.cwd, agents_dir=args.agents_dir,
+        agent=getattr(args, "_resolved_agent", None) or args.agent,
+        prompt=args.prompt, cwd=args.cwd, agents_dir=args.agents_dir,
         cli=args.cli, model=args.model, effort=args.effort, json_schema=args.json_schema,
         resume=args.resume, resume_profile=getattr(args, "resume_profile", None),
         worktree=args.worktree, allow_credit=getattr(args, "allow_credit", False),
@@ -223,7 +224,8 @@ def _request_identity(args) -> dict:
         allow_text_only=bool(getattr(args, "allow_text_only", False)),
         require_tools=bool(getattr(args, "require_tools", False)),
         profile=getattr(args, "profile", None),
-        strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)))
+        strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)),
+        role_provenance=getattr(args, "_role_provenance", None))
 
 
 def _complete_artifact_provenance(env: dict, args, before: dict | None) -> dict:
@@ -588,6 +590,34 @@ def main() -> None:
             print(report.get("text") or json.dumps(report, ensure_ascii=False, indent=2))
         sys.exit(0 if report.get("ok") else 1)
 
+    # Private role management is deliberately outside dispatch receipts: these commands
+    # only validate/write the operator's global alias registry and never call a backend.
+    if (getattr(args, "role_propose", None) or getattr(args, "role_approve", None)
+            or getattr(args, "role_list", False) or getattr(args, "role_resolve", None)):
+        from _roles import (approve as _role_approve, list_roles as _role_list,
+                            propose as _role_propose, resolve as _role_resolve)
+        try:
+            _role_cwd = os.path.abspath(args.cwd or os.getcwd())
+            if not os.path.isdir(_role_cwd):
+                raise ValueError(f"role command cwd does not exist: {_role_cwd}")
+            if args.role_propose:
+                _alias, _target = args.role_propose
+                _role_result = _role_propose(_alias, _target, cwd=_role_cwd,
+                                             agents_dir=args.agents_dir)
+            elif args.role_approve:
+                _role_result = _role_approve(args.role_approve, cwd=_role_cwd,
+                                             agents_dir=args.agents_dir)
+            elif args.role_resolve:
+                _role_result = _role_resolve(args.role_resolve, cwd=_role_cwd,
+                                             agents_dir=args.agents_dir)
+            else:
+                _role_result = _role_list()
+            print(json.dumps(_role_result, ensure_ascii=False))
+            sys.exit(0)
+        except (ValueError, FileNotFoundError, OSError) as exc:
+            _print_error(str(exc))
+            sys.exit(1)
+
     # jobs list/status/wait: read-only registry queries; no dispatch. Answer and
     # exit before any agent/prompt/cwd validation.
     if args.jobs_list or args.jobs_status or args.jobs_wait:
@@ -726,6 +756,25 @@ def main() -> None:
         if not args.prompt.strip():
             _die(f"--prompt-file {args.prompt_file} is empty")
 
+    # Role aliases are an explicit, opt-in operator feature.  Keep the requested
+    # spelling on ``args`` for receipts and child argv, while every loader/identity
+    # path below uses the resolved target.  Exact agent definitions win inside the
+    # resolver, so enabling aliases cannot shadow a roster entry.
+    args._resolved_agent = args.agent
+    args._role_provenance = {
+        "requested": args.agent, "resolved": args.agent, "role": None}
+    if (getattr(args, "enable_roles", False) and args.agent and args.cwd):
+        try:
+            from _roles import resolve_for_dispatch
+            args._role_provenance = resolve_for_dispatch(
+                args.agent, cwd=args.cwd, agents_dir=args.agents_dir,
+                enabled=True,
+                strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)))
+            args._resolved_agent = args._role_provenance.get("resolved") or args.agent
+        except (ValueError, FileNotFoundError, OSError) as exc:
+            _die(str(exc), error_kind="role_resolution",
+                 details={"requested": args.agent, "enable_roles": True})
+
     # Root-prompt hash joins the receipt HERE, as soon as the prompt is final,
     # so even a missing-agent error downstream carries it.
     receipt.update(_receipt.receipt_prompt(args.prompt))
@@ -752,6 +801,13 @@ def main() -> None:
     _identity = _request_identity(args)
     request_sha = request_fingerprint(**_identity)
     receipt["request_sha256"] = request_sha
+    _role_info = (getattr(args, "_role_provenance", {}) or {}).get("role")
+    if isinstance(_role_info, dict):
+        # Role provenance is intentionally digest/name-only.  The registry path and
+        # approval document never cross the process boundary or enter an envelope.
+        receipt["agent_requested"] = args.agent
+        receipt["agent_resolved"] = getattr(args, "_resolved_agent", args.agent)
+        receipt["role"] = dict(_role_info)
     _artifact_manifest = _identity.get("_artifact_manifest")
     if _artifact_manifest:
         # Before-only on refusal/preflight paths; a completed dispatch replaces this
@@ -850,7 +906,7 @@ def main() -> None:
         try:
             _bg_dir = _ts_loader.get_agents_dir(args.agents_dir, args.cwd)
             _bg_tup = _ts_loader.load_agent(
-                _bg_dir, args.agent,
+                _bg_dir, getattr(args, "_resolved_agent", args.agent),
                 strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)))
             _bg_file = _bg_tup[3]
             if not _bg_cli:
@@ -942,11 +998,14 @@ def main() -> None:
         # same A->B->A window the definition hash attestation exists to close.
         if getattr(args, "strict_agents_dir", False):
             _loaded, _agent_fm, _agent_sha = _dispatch_agent_snapshot(
-                agents_dir, args.agent, strict_agents_dir=True)
+                agents_dir, getattr(args, "_resolved_agent", args.agent),
+                strict_agents_dir=True)
         else:
-            _loaded, _agent_fm, _agent_sha = _dispatch_agent_snapshot(agents_dir, args.agent)
+            _loaded, _agent_fm, _agent_sha = _dispatch_agent_snapshot(
+                agents_dir, getattr(args, "_resolved_agent", args.agent))
         if _loaded is None:
-            raise FileNotFoundError(f"Agent definition not found: {args.agent}")
+            raise FileNotFoundError(
+                f"Agent definition not found: {getattr(args, '_resolved_agent', args.agent)}")
         run_agent_cli, system_context, _, agent_file, permission, model, extra_args, effort_fm = _loaded
         _agent_fm = _agent_fm or {}
     except ValueError as e:
@@ -954,7 +1013,8 @@ def main() -> None:
     except FileNotFoundError as e:
         if getattr(e, "kind", None) == "strict_agents_dir_miss":
             _die(str(e), error_kind=e.kind, details={
-                "agent": getattr(e, "agent_name", args.agent),
+                "agent": getattr(e, "agent_name",
+                                  getattr(args, "_resolved_agent", args.agent)),
                 "strict_agents_dir": True,
                 "fallback_source": getattr(e, "fallback_source", "unknown"),
             })
@@ -979,9 +1039,16 @@ def main() -> None:
         # matched on the re-read while B was what got loaded.
         _def_actual = last_parsed_sha(agent_file) or _executor.content_sha(agent_file)
         if _def_actual != _def_expected:
-            _die(f"agent definition {args.agent!r} changed between fingerprinting and "
+            _die(f"agent definition {getattr(args, '_resolved_agent', args.agent)!r} "
+                 "changed between fingerprinting and "
                  f"dispatch ({_def_expected} -> {_def_actual}); re-run rather than record "
                  "a result under a definition that was not used")
+        _role_info = (getattr(args, "_role_provenance", {}) or {}).get("role")
+        _role_target_sha = (_role_info or {}).get("target_sha256") if isinstance(
+            _role_info, dict) else None
+        if _role_target_sha and _def_actual != _role_target_sha:
+            _die("role target changed between resolution and dispatch; re-propose and "
+                 "approve the alias before retrying", error_kind="role_resolution")
 
     receipt.update(_receipt.receipt_agent(args, agent_file))
 
@@ -1116,7 +1183,7 @@ def main() -> None:
         try:
             base_url, api_key_env = _endpoint_for_dispatch(_identity, agent_file, agents_dir)
         except (OSError, ValueError) as e:
-            _die(f"openai-compat agent {args.agent!r}: {e}")
+            _die(f"openai-compat agent {getattr(args, '_resolved_agent', args.agent)!r}: {e}")
 
     # Transport: --transport flag > agent `transport:` frontmatter > subprocess.
     # ACP requires NATIVE backend support; asking for it anywhere else is a
@@ -1409,6 +1476,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
     view = {
         "dry_run": True,
         "agent": args.agent,
+        "agent_resolved": getattr(args, "_resolved_agent", args.agent),
         "cli": invocation.cli,
         "cwd": invocation.cwd,
         "agents_dir": agents_dir,
@@ -1427,6 +1495,9 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "worktree": ("would create" if args.worktree is not None else None),
         "system_context_chars": len(invocation.system_context),
     }
+    _role_info = (getattr(args, "_role_provenance", {}) or {}).get("role")
+    if isinstance(_role_info, dict):
+        view["role"] = dict(_role_info)
     # Text-seat parity with live: same text_seat shape + would_refuse when blocked.
     if text_seat_decision is None:
         try:
@@ -1574,15 +1645,29 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
     from _gate import decide, gate_prompt
     from _loader import load_agent_snapshot
 
+    _gate_requested = args.gate_with
+    _gate_name = _gate_requested
+    if getattr(args, "enable_roles", False):
+        try:
+            from _roles import resolve_for_dispatch
+            _gate_name = resolve_for_dispatch(
+                _gate_requested, cwd=gated_inv.cwd, agents_dir=agents_dir,
+                enabled=True,
+                strict_agents_dir=bool(getattr(args, "strict_agents_dir", False))).get(
+                    "resolved", _gate_requested)
+        except (ValueError, FileNotFoundError, OSError) as exc:
+            return decide(None, _gate_requested) | {
+                "reason": f"gate role {_gate_requested!r} could not be resolved: {exc}"}
+
     try:
         tup, gate_fm, _gate_sha = load_agent_snapshot(
-            agents_dir, args.gate_with,
+            agents_dir, _gate_name,
             strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)))
         if tup is None:
-            raise FileNotFoundError(f"Agent definition not found: {args.gate_with}")
+            raise FileNotFoundError(f"Agent definition not found: {_gate_name}")
     except Exception as e:  # noqa: BLE001 — an unusable gate must REFUSE, not pass
-        return decide(None, args.gate_with) | {
-            "reason": f"gate agent {args.gate_with!r} could not be loaded: {e}"}
+        return decide(None, _gate_requested) | {
+            "reason": f"gate agent {_gate_requested!r} could not be loaded: {e}"}
 
     gate_cli, gate_ctx, _desc, gate_file, _perm, gate_model, gate_args, gate_effort = tup
     try:
@@ -1591,7 +1676,7 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
     except Exception:  # noqa: BLE001
         pass
     if gate_cli == args.cli and gate_cli is not None:
-        print(f"note: --gate-with {args.gate_with!r} resolves to the same backend "
+        print(f"note: --gate-with {_gate_requested!r} resolves to the same backend "
               f"({gate_cli}) as the gated dispatch; a same-vendor gate shares the "
               f"caller's blind spots", file=sys.stderr)
 
@@ -1603,7 +1688,7 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
             gate_profile_selection = resolve_profile(gate_profile, gate_cli, gated_inv.cwd)
             validate_model(gate_profile_selection, gate_model)
         except ValueError as e:
-            return decide(None, args.gate_with) | {
+            return decide(None, _gate_requested) | {
                 "reason": f"gate profile {gate_profile!r} could not be resolved: {e}"}
 
     # EVERY field comes from the invocation actually being gated, not from args. Taking
@@ -1645,7 +1730,7 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
     try:
         resp = execute_agent(gate_inv, timeout_ms=timeout, debug_dir=args.debug_dir)
     except Exception as e:  # noqa: BLE001 — a crashed gate REFUSES
-        return decide(None, args.gate_with) | {
+        return decide(None, _gate_requested) | {
             "reason": f"gate dispatch failed: {type(e).__name__}: {e}"}
     # Attach the gate's OWN definition hash. `agent_def` is normally added by main() via
     # _receipt, and _run_gate calls execute_agent directly -- so without this the field the
@@ -1658,7 +1743,7 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
                                       "sha256": last_parsed_sha(gate_file)})
     except Exception:  # noqa: BLE001 — evidence is best-effort; never fail the gate on it
         pass
-    return decide(resp, args.gate_with)
+    return decide(resp, _gate_requested)
 
 
 def _enrich_denial(env: dict, receipt, invocation) -> dict:
