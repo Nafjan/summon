@@ -14905,6 +14905,106 @@ def test_v9_a_completed_dispatch_releases_its_job_and_reaps_stragglers():
         "into the next retry.")
 
 
+def test_v9_lifecycle_fixture_blocks_late_grandchild_writes():
+    """Exercise the real teardown boundary with a child that exits before its grandchild.
+
+    Existing job-object tests prove the Win32 helper and executor hook independently. This
+    fixture binds the claim to the observed failure mode: the grandchild announces readiness,
+    the leader exits, and the grandchild would write a marker after teardown unless the
+    platform process-tree boundary actually reaches it. The marker is deliberately the only
+    assertion surface; no process enumeration or private path enters an envelope.
+
+    The helper is test-only and uses the same shared ``popen_flags`` as production. Windows
+    requires a successful Job Object attachment for this dead-leader guarantee; silently
+    falling back would make the test report a false clean result on a host that cannot prove
+    the invariant.
+    """
+    import subprocess as _sp
+    import _executor
+    import _jobobj
+    from _spawn import popen_flags
+
+    d = tempfile.mkdtemp(prefix="summon-lifecycle-")
+    root = Path(d)
+    helper = root / "fixture.py"
+    go = root / "go"
+    pid_file = root / "grandchild.pid"
+    ready = root / "ready"
+    marker = root / "late-write"
+    helper.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "mode = sys.argv[1]\n"
+        "if mode == 'leader':\n"
+        "    go, pid, ready, marker = map(pathlib.Path, sys.argv[2:6])\n"
+        "    while not go.exists(): time.sleep(0.005)\n"
+        "    flags = {'creationflags': getattr(subprocess, 'CREATE_NO_WINDOW', 0)} if "
+        "sys.platform == 'win32' else {}\n"
+        "    subprocess.Popen([sys.executable, __file__, 'grandchild', str(pid), "
+        "str(ready), str(marker)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, **flags)\n"
+        "    while not ready.exists(): time.sleep(0.005)\n"
+        "elif mode == 'grandchild':\n"
+        "    pid, ready, marker = map(pathlib.Path, sys.argv[2:5])\n"
+        "    pid.write_text(str(__import__('os').getpid()), encoding='ascii')\n"
+        "    ready.write_text('ready', encoding='ascii')\n"
+        "    time.sleep(0.8)\n"
+        "    marker.write_text('late', encoding='ascii')\n",
+        encoding="utf-8",
+    )
+    proc = None
+
+    def _wait_for(path: Path, seconds: float = 8.0) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if path.is_file():
+                return
+            time.sleep(0.01)
+        raise AssertionError("fixture did not produce %s within %.1fs" % (path.name, seconds))
+
+    try:
+        proc = _sp.Popen(
+            [sys.executable, str(helper), "leader", str(go), str(pid_file),
+             str(ready), str(marker)],
+            cwd=str(root), stdin=_sp.DEVNULL, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+            **popen_flags(),
+        )
+        attached = _jobobj.attach(proc)
+        if os.name == "nt":
+            assert attached, (
+                "the Windows lifecycle fixture requires Job Object attachment; a silent "
+                "nested-job fallback would not prove dead-leader teardown")
+
+        go.write_text("go", encoding="ascii")
+        _wait_for(ready)
+        _wait_for(pid_file)
+        proc.wait(timeout=10.0)      # leader is gone; grandchild remains at this point
+        assert not marker.exists(), "fixture wrote before teardown, so it cannot test the boundary"
+
+        if os.name == "nt":
+            assert _jobobj.close(proc), "the normal Windows close did not release its job"
+            assert _jobobj.close(proc) is False, "job close was not idempotent"
+        else:
+            # ``popen_flags`` gave the leader its own session; killpg remains valid after
+            # the leader has been reaped and reaches the grandchild through the dead leader.
+            _executor._kill_tree(proc)
+
+        time.sleep(1.1)             # grandchild would write at 0.8s if teardown missed it
+        assert not marker.exists(), (
+            "a grandchild wrote after teardown completed; the process-tree boundary is "
+            "not holding")
+    finally:
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    _executor._kill_tree(proc)
+                elif os.name == "nt":
+                    _jobobj.close(proc)
+                proc.wait(timeout=3.0)
+            except Exception:
+                pass
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_v9_close_is_idempotent_and_reports_whether_it_released():
     """Council teardown can race normal completion on the same Popen. The attribute is
     cleared BEFORE the handle is closed, so a second caller sees nothing to close rather
