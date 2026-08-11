@@ -2219,6 +2219,16 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     _requested_model = inv.model
     _guarded_inv, _, _guard_warnings = apply_credit_guard(inv)
     debug_argv = [inv.cli]  # what --debug-dir records; each path refines it
+    # Defer the initial workspace snapshot until an actual backend spawn is known to fit.
+    # An over-long argv must not cause any utility Popen merely to build its refusal
+    # envelope; the after snapshot is still taken by _stamp after cleanup.
+    try:
+        from _receipt import workspace_evidence, workspace_snapshot
+        _workspace_before = None
+    except Exception:  # noqa: BLE001 — mutation evidence is additive and fail-closed
+        workspace_evidence = None
+        workspace_snapshot = None
+        _workspace_before = {"coverage": "unavailable", "error": "workspace unavailable"}
 
     def _stamp(resp: dict) -> dict:
         # Wall-clock per dispatch — orchestrators need this for concurrency
@@ -2234,6 +2244,27 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # build their own response and never touch build_final_response). The
         # response builders set the detailed reason first; this preserves it.
         finalize_exit_fields(resp)
+        if "workspace_evidence" not in resp:
+            try:
+                if _workspace_before is None:
+                    # Pre-dispatch validation rejected the request before a safe
+                    # baseline could be captured. Do not run another utility child
+                    # merely to decorate that refusal; unknown is the honest result.
+                    resp["workspace_evidence"] = {
+                        "before": None, "after": None, "coverage": "unavailable",
+                        "child_commit": None, "mutation": None,
+                        "read_only_violation": None, "attribution": "unavailable",
+                    }
+                else:
+                    _after = workspace_snapshot(inv.cwd)
+                    resp["workspace_evidence"] = workspace_evidence(
+                        _workspace_before, _after, getattr(inv, "permission", None))
+            except Exception:  # noqa: BLE001 — never hide the terminal response
+                resp["workspace_evidence"] = {
+                    "before": None, "after": None, "coverage": "unavailable",
+                    "child_commit": None, "mutation": None,
+                    "read_only_violation": None, "attribution": "unavailable",
+                }
         # Trust fields, split by EVIDENCE (field case: a failed Fable dispatch
         # reported the handshake model as `resolved` with all-zero usage):
         #   requested  what the caller asked for (unchanged).
@@ -2371,6 +2402,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # itself instead of spawning a process. Flows through the same _enrich/_stamp
     # so the envelope shape is identical to a subprocess backend's.
     if backend_kind(inv.cli) == "api":
+        if workspace_snapshot is not None:
+            _workspace_before = workspace_snapshot(inv.cwd)
         debug_argv = [inv.cli, inv.base_url or "?", inv.model or "?"]
         resp = _enrich(BACKENDS[inv.cli]["call"](inv, timeout_ms), None)
         resp["resume"] = {"cli": inv.cli, "session_id": None}  # stateless: no resume
@@ -2382,6 +2415,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     _ro_err = readonly_unenforceable_error(inv.cli, inv.permission,
                                            forced=inv.permission_forced)
     if _ro_err:
+        if workspace_snapshot is not None:
+            _workspace_before = workspace_snapshot(inv.cwd)
         return _stamp(_enrich(_error_response(inv.cli, 1, _ro_err), None))
 
     # ACP transport (gemini/kimi/cursor-agent): the backend speaks the Agent
@@ -2390,6 +2425,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # standard shape, like the api kind above. Placed AFTER the read-only guard
     # so an unenforceable tier fails closed identically on both transports.
     if inv.transport == "acp":
+        if workspace_snapshot is not None:
+            _workspace_before = workspace_snapshot(inv.cwd)
         from _builder import supports_acp as _supports_acp
         if not _supports_acp(inv.cli):
             return _stamp(_enrich(_error_response(
@@ -2480,6 +2517,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             _resp["resume"] = {"cli": inv.cli, "session_id": None,
                                "profile": env_override.get("USERPROFILE")}
         return _stamp(_enrich(_resp, None))
+    if workspace_snapshot is not None and _workspace_before is None:
+        _workspace_before = workspace_snapshot(inv.cwd)
     debug_argv = [command, *args]
 
     # POSIX: put the child in its own session so _kill_tree can signal the whole

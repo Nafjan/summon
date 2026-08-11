@@ -3284,6 +3284,95 @@ def test_receipt_helper_deterministic_and_sources():
             os.environ["SUB_AGENTS_DIR"] = saved
 
 
+def test_workspace_status_parser_is_nul_safe_and_rejects_escapes():
+    import _receipt
+    payload = (
+        b" M file with spaces.txt\0"
+        + "?? unicode-\u03bb.txt\n".encode("utf-8") + b"\0"
+        b"R  renamed new\nname.txt\0old name.txt\0")
+    parsed = _receipt._parse_git_status_porcelain(payload)
+    assert parsed["unstaged"] == ["file with spaces.txt"], parsed
+    assert parsed["untracked"] == ["unicode-λ.txt\n"], parsed
+    assert parsed["renamed"] == [{"from": "old name.txt", "to": "renamed new\nname.txt"}], parsed
+    for hostile in (b"?? C:\\secret.txt\0", b"?? /secret.txt\0", b"?? ../secret.txt\0",
+                    b"R  new\0"):
+        assert _receipt._parse_git_status_porcelain(hostile) is None, hostile
+    exact = (b"?? " + b"x" * (_receipt._WORKSPACE_STATUS_MAX_BYTES - 4) + b"\0")
+    assert len(exact) == _receipt._WORKSPACE_STATUS_MAX_BYTES
+    assert _receipt._parse_git_status_porcelain(exact) is not None
+    assert _receipt._parse_git_status_porcelain(b"?? " + b"x" * (_receipt._WORKSPACE_STATUS_MAX_BYTES + 1) + b"\0") is None
+
+
+def test_workspace_evidence_real_git_catches_status_and_clean_child_commit():
+    import _receipt
+    import subprocess
+    if shutil.which("git") is None:
+        return
+    d = tempfile.mkdtemp(prefix="summon-evidence-")
+    try:
+        def git(*args, check=True):
+            return subprocess.run(["git", *args], cwd=d, check=check,
+                                  capture_output=True, text=True)
+        git("init", "-q")
+        git("config", "user.email", "summon@example.invalid")
+        git("config", "user.name", "Summon Test")
+        Path(d, "tracked.txt").write_text("base\n", encoding="utf-8")
+        git("add", "tracked.txt")
+        git("commit", "-qm", "base")
+        before = _receipt.workspace_snapshot(d)
+        assert before["coverage"] == "complete" and before["staged"] == [], before
+
+        # Index-only, unstaged, untracked, and a dirty baseline all remain visible as
+        # repo-relative names; the evidence never needs to inspect file contents.
+        Path(d, "staged.txt").write_text("staged\n", encoding="utf-8")
+        git("add", "staged.txt")
+        Path(d, "tracked.txt").write_text("changed\n", encoding="utf-8")
+        Path(d, "untracked λ.txt").write_text("new\n", encoding="utf-8")
+        dirty = _receipt.workspace_snapshot(d)
+        assert dirty["staged"] == ["staged.txt"], dirty
+        assert dirty["unstaged"] == ["tracked.txt"], dirty
+        assert dirty["untracked"] == ["untracked λ.txt"], dirty
+        ev = _receipt.workspace_evidence(before, dirty, "read-only")
+        assert ev["mutation"] is True and ev["read_only_violation"] is True, ev
+        assert ev["attribution"] == "exact", ev
+
+        # Commit the dirty state. A final clean status alone would look clean, but the
+        # before/after HEAD comparison must prove the child commit.
+        git("add", "-A")
+        git("commit", "-qm", "child")
+        after_commit = _receipt.workspace_snapshot(d)
+        clean_commit = _receipt.workspace_evidence(before, after_commit, "read-only")
+        assert clean_commit["coverage"] == "complete", clean_commit
+        assert clean_commit["child_commit"] is True
+        assert clean_commit["mutation"] is True
+        assert clean_commit["read_only_violation"] is True
+        assert after_commit["staged"] == [] and after_commit["unstaged"] == [], after_commit
+        assert d not in json.dumps(clean_commit, ensure_ascii=False)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_workspace_evidence_is_conservative_on_failures_and_dirty_baselines():
+    import _receipt
+    clean = {"coverage": "complete", "head": "a" * 40, "branch": "main",
+             "staged": [], "unstaged": [], "renamed": [], "untracked": []}
+    dirty = dict(clean, untracked=["pre-existing.txt"])
+    changed = dict(clean, head="b" * 40)
+    ev = _receipt.workspace_evidence(dirty, changed, "safe-edit")
+    assert ev["mutation"] is True and ev["attribution"] == "ambiguous", ev
+    unchanged_dirty = _receipt.workspace_evidence(dirty, dirty, "read-only")
+    assert unchanged_dirty["mutation"] is None
+    assert unchanged_dirty["read_only_violation"] is None
+    assert unchanged_dirty["attribution"] == "ambiguous"
+    unavailable = _receipt.workspace_evidence(
+        {"coverage": "unavailable"}, {"coverage": "complete"}, "read-only")
+    assert unavailable["coverage"] == "unavailable"
+    assert unavailable["mutation"] is None and unavailable["child_commit"] is None
+    assert unavailable["read_only_violation"] is None
+    assert _receipt._parse_git_status_porcelain(b"not porcelain\0") is None
+    assert _receipt._parse_git_status_porcelain(b"?? bad\xff\0") is None
+
+
 def test_mode_matrix_default_values_and_early_combos():
     # Presence-based detection: a flag equal to its default is still explicit;
     # and query modes must not run while silently dropping the fan-out mode.
