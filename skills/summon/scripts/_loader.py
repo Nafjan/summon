@@ -19,6 +19,23 @@ _AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 _LAST_PARSED_SHA: dict = {}
 
 
+class AgentResolutionError(FileNotFoundError):
+    """A requested roster definition was absent under an opted-in strict boundary.
+
+    The structured attributes let the dispatcher produce a machine-readable refusal
+    without copying private roster paths into the error text or envelope.
+    """
+
+    kind = "strict_agents_dir_miss"
+
+    def __init__(self, agent_name: str, fallback_source: str):
+        self.agent_name = agent_name
+        self.fallback_source = fallback_source
+        super().__init__(
+            f"strict agents-dir refusal: agent {agent_name!r} was not found in the "
+            "selected roster; bundled/pack fallback is disabled")
+
+
 def last_parsed_sha(agent_file: str) -> str | None:
     """sha256 of the bytes the last load of `agent_file` parsed, if it was this process."""
     return _LAST_PARSED_SHA.get(str(agent_file))
@@ -27,7 +44,8 @@ def last_parsed_sha(agent_file: str) -> str | None:
 # parse_frontmatter -- an unrecognized key that is not a near-miss is still accepted and
 # ignored, so an agent file can carry its own metadata.
 KNOWN_FRONTMATTER_KEYS = ("run-agent", "permission", "model", "args", "effort",
-                          "provider", "base_url", "api_key_env", "capability", "billing")
+                          "provider", "base_url", "api_key_env", "capability", "billing",
+                          "profile")
 
 
 def parse_frontmatter(content: str) -> tuple[dict, str]:
@@ -265,7 +283,28 @@ def _load_agent_from(agents_dir: str, agent_name: str):
     return _load_agent_snapshot_from(agents_dir, agent_name)[0]
 
 
-def load_agent_snapshot(agents_dir: str, agent_name: str):
+def _agent_file_present(agents_dir: str, agent_name: str) -> bool:
+    """Check whether a roster has a candidate file without parsing its contents.
+
+    Strict-resolution diagnostics use this existence-only probe so a malformed or
+    private fallback definition is never parsed merely to report why a selected roster
+    was refused. The normal loader remains the authority for whether the file is valid.
+    """
+    try:
+        root = Path(agents_dir).resolve()
+    except (OSError, TypeError, ValueError):
+        return False
+    for ext in (".md", ".txt"):
+        try:
+            candidate = (Path(agents_dir) / f"{agent_name}{ext}").resolve()
+            if candidate.is_relative_to(root) and candidate.is_file():
+                return True
+        except (OSError, TypeError, ValueError):
+            continue
+    return False
+
+
+def load_agent_snapshot(agents_dir: str, agent_name: str, *, strict_agents_dir: bool = False):
     """Load a definition ONCE and return ``(tuple, frontmatter, sha)`` from one byte buffer.
 
     Same lookup as :func:`load_agent` (project dir, then the bundled roster). Callers that
@@ -277,6 +316,25 @@ def load_agent_snapshot(agents_dir: str, agent_name: str):
     tup, fm, sha = _load_agent_snapshot_from(agents_dir, agent_name)
     if tup is not None:
         return tup, fm, sha
+
+    # An explicit governance boundary must not silently execute a bundled or plugin
+    # definition after a named role disappears from the selected roster. The default
+    # resolution chain below remains unchanged for ordinary callers.
+    if strict_agents_dir:
+        fallback_source = "none"
+        bundled = bundled_roster_dir()
+        if bundled and Path(bundled).resolve() != Path(agents_dir).resolve():
+            if _agent_file_present(bundled, agent_name):
+                fallback_source = "bundled"
+        if fallback_source == "none":
+            for pack in discover_agent_packs():
+                pack_dir = pack.get("path")
+                if not pack_dir:
+                    continue
+                if _agent_file_present(pack_dir, agent_name):
+                    fallback_source = "pack"
+                    break
+        raise AgentResolutionError(agent_name, fallback_source)
 
     bundled = bundled_roster_dir()
     if bundled and Path(bundled).resolve() != Path(agents_dir).resolve():
@@ -312,7 +370,7 @@ def load_agent_snapshot(agents_dir: str, agent_name: str):
     raise FileNotFoundError(f"Agent definition not found: {agent_name}")
 
 
-def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str, str, str, str, str | None, list, str | None]:
+def load_agent(agents_dir: str, agent_name: str, *, strict_agents_dir: bool = False) -> tuple[str | None, str, str, str, str, str | None, list, str | None]:
     """Load agent definition file and extract run-agent and permission settings.
 
     Looks in ``agents_dir`` first; if not found there, falls back to the starter
@@ -322,7 +380,8 @@ def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str, str, 
     Returns (run_agent_cli, system_context, description, file_path, permission,
     model, extra_args, effort).
     """
-    return load_agent_snapshot(agents_dir, agent_name)[0]
+    return load_agent_snapshot(agents_dir, agent_name,
+                               strict_agents_dir=strict_agents_dir)[0]
 
 
 def _list_agents_in(agents_dir: str) -> list[dict]:

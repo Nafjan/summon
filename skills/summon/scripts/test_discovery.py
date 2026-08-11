@@ -8,6 +8,7 @@ config.toml table-boundary parsing and the eager-agy-probe filter bug.
 from __future__ import annotations
 
 import json
+import ast
 import os
 import shutil
 import sys
@@ -3281,6 +3282,95 @@ def test_receipt_helper_deterministic_and_sources():
         os.environ.pop("SUB_AGENTS_DIR", None)
         if saved is not None:
             os.environ["SUB_AGENTS_DIR"] = saved
+
+
+def test_workspace_status_parser_is_nul_safe_and_rejects_escapes():
+    import _receipt
+    payload = (
+        b" M file with spaces.txt\0"
+        + "?? unicode-\u03bb.txt\n".encode("utf-8") + b"\0"
+        b"R  renamed new\nname.txt\0old name.txt\0")
+    parsed = _receipt._parse_git_status_porcelain(payload)
+    assert parsed["unstaged"] == ["file with spaces.txt"], parsed
+    assert parsed["untracked"] == ["unicode-λ.txt\n"], parsed
+    assert parsed["renamed"] == [{"from": "old name.txt", "to": "renamed new\nname.txt"}], parsed
+    for hostile in (b"?? C:\\secret.txt\0", b"?? /secret.txt\0", b"?? ../secret.txt\0",
+                    b"R  new\0"):
+        assert _receipt._parse_git_status_porcelain(hostile) is None, hostile
+    exact = (b"?? " + b"x" * (_receipt._WORKSPACE_STATUS_MAX_BYTES - 4) + b"\0")
+    assert len(exact) == _receipt._WORKSPACE_STATUS_MAX_BYTES
+    assert _receipt._parse_git_status_porcelain(exact) is not None
+    assert _receipt._parse_git_status_porcelain(b"?? " + b"x" * (_receipt._WORKSPACE_STATUS_MAX_BYTES + 1) + b"\0") is None
+
+
+def test_workspace_evidence_real_git_catches_status_and_clean_child_commit():
+    import _receipt
+    import subprocess
+    if shutil.which("git") is None:
+        return
+    d = tempfile.mkdtemp(prefix="summon-evidence-")
+    try:
+        def git(*args, check=True):
+            return subprocess.run(["git", *args], cwd=d, check=check,
+                                  capture_output=True, text=True)
+        git("init", "-q")
+        git("config", "user.email", "summon@example.invalid")
+        git("config", "user.name", "Summon Test")
+        Path(d, "tracked.txt").write_text("base\n", encoding="utf-8")
+        git("add", "tracked.txt")
+        git("commit", "-qm", "base")
+        before = _receipt.workspace_snapshot(d)
+        assert before["coverage"] == "complete" and before["staged"] == [], before
+
+        # Index-only, unstaged, untracked, and a dirty baseline all remain visible as
+        # repo-relative names; the evidence never needs to inspect file contents.
+        Path(d, "staged.txt").write_text("staged\n", encoding="utf-8")
+        git("add", "staged.txt")
+        Path(d, "tracked.txt").write_text("changed\n", encoding="utf-8")
+        Path(d, "untracked λ.txt").write_text("new\n", encoding="utf-8")
+        dirty = _receipt.workspace_snapshot(d)
+        assert dirty["staged"] == ["staged.txt"], dirty
+        assert dirty["unstaged"] == ["tracked.txt"], dirty
+        assert dirty["untracked"] == ["untracked λ.txt"], dirty
+        ev = _receipt.workspace_evidence(before, dirty, "read-only")
+        assert ev["mutation"] is True and ev["read_only_violation"] is True, ev
+        assert ev["attribution"] == "exact", ev
+
+        # Commit the dirty state. A final clean status alone would look clean, but the
+        # before/after HEAD comparison must prove the child commit.
+        git("add", "-A")
+        git("commit", "-qm", "child")
+        after_commit = _receipt.workspace_snapshot(d)
+        clean_commit = _receipt.workspace_evidence(before, after_commit, "read-only")
+        assert clean_commit["coverage"] == "complete", clean_commit
+        assert clean_commit["child_commit"] is True
+        assert clean_commit["mutation"] is True
+        assert clean_commit["read_only_violation"] is True
+        assert after_commit["staged"] == [] and after_commit["unstaged"] == [], after_commit
+        assert d not in json.dumps(clean_commit, ensure_ascii=False)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_workspace_evidence_is_conservative_on_failures_and_dirty_baselines():
+    import _receipt
+    clean = {"coverage": "complete", "head": "a" * 40, "branch": "main",
+             "staged": [], "unstaged": [], "renamed": [], "untracked": []}
+    dirty = dict(clean, untracked=["pre-existing.txt"])
+    changed = dict(clean, head="b" * 40)
+    ev = _receipt.workspace_evidence(dirty, changed, "safe-edit")
+    assert ev["mutation"] is True and ev["attribution"] == "ambiguous", ev
+    unchanged_dirty = _receipt.workspace_evidence(dirty, dirty, "read-only")
+    assert unchanged_dirty["mutation"] is None
+    assert unchanged_dirty["read_only_violation"] is None
+    assert unchanged_dirty["attribution"] == "ambiguous"
+    unavailable = _receipt.workspace_evidence(
+        {"coverage": "unavailable"}, {"coverage": "complete"}, "read-only")
+    assert unavailable["coverage"] == "unavailable"
+    assert unavailable["mutation"] is None and unavailable["child_commit"] is None
+    assert unavailable["read_only_violation"] is None
+    assert _receipt._parse_git_status_porcelain(b"not porcelain\0") is None
+    assert _receipt._parse_git_status_porcelain(b"?? bad\xff\0") is None
 
 
 def test_mode_matrix_default_values_and_early_combos():
@@ -10749,8 +10839,7 @@ def test_v7_agent_definition_change_between_fingerprint_and_dispatch_is_refused(
         #     through while B is what actually loaded. Asserting on the hash helpers alone
         #     would NOT catch this -- reverting the dispatch to re-read the path leaves such
         #     assertions green -- so the swap is staged around the production load itself.
-        import _loader as _ld
-        real_load = _ld.load_agent
+        real_load = _rs._dispatch_agent_snapshot
         b_text = ("---" + chr(10) + "run-agent: openai-compat" + chr(10)
                   + "base_url: http://127.0.0.1:9/v1" + chr(10) + "model: B" + chr(10)
                   + "---" + chr(10) + "# B" + chr(10))
@@ -10767,11 +10856,11 @@ def test_v7_agent_definition_change_between_fingerprint_and_dispatch_is_refused(
                 with open(defn, "w", encoding="utf-8") as fh:
                     fh.write(a_text)                 # ...and A is back before the check
 
-        _rs.load_agent = swapping_load
+        _rs._dispatch_agent_snapshot = swapping_load
         try:
             text = run_main()
         finally:
-            _rs.load_agent = real_load
+            _rs._dispatch_agent_snapshot = real_load
             with open(defn, "w", encoding="utf-8") as fh:
                 fh.write(a_text)
         env = _json.loads(text)
@@ -14816,6 +14905,106 @@ def test_v9_a_completed_dispatch_releases_its_job_and_reaps_stragglers():
         "into the next retry.")
 
 
+def test_v9_lifecycle_fixture_blocks_late_grandchild_writes():
+    """Exercise the real teardown boundary with a child that exits before its grandchild.
+
+    Existing job-object tests prove the Win32 helper and executor hook independently. This
+    fixture binds the claim to the observed failure mode: the grandchild announces readiness,
+    the leader exits, and the grandchild would write a marker after teardown unless the
+    platform process-tree boundary actually reaches it. The marker is deliberately the only
+    assertion surface; no process enumeration or private path enters an envelope.
+
+    The helper is test-only and uses the same shared ``popen_flags`` as production. Windows
+    requires a successful Job Object attachment for this dead-leader guarantee; silently
+    falling back would make the test report a false clean result on a host that cannot prove
+    the invariant.
+    """
+    import subprocess as _sp
+    import _executor
+    import _jobobj
+    from _spawn import popen_flags
+
+    d = tempfile.mkdtemp(prefix="summon-lifecycle-")
+    root = Path(d)
+    helper = root / "fixture.py"
+    go = root / "go"
+    pid_file = root / "grandchild.pid"
+    ready = root / "ready"
+    marker = root / "late-write"
+    helper.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "mode = sys.argv[1]\n"
+        "if mode == 'leader':\n"
+        "    go, pid, ready, marker = map(pathlib.Path, sys.argv[2:6])\n"
+        "    while not go.exists(): time.sleep(0.005)\n"
+        "    flags = {'creationflags': getattr(subprocess, 'CREATE_NO_WINDOW', 0)} if "
+        "sys.platform == 'win32' else {}\n"
+        "    subprocess.Popen([sys.executable, __file__, 'grandchild', str(pid), "
+        "str(ready), str(marker)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, **flags)\n"
+        "    while not ready.exists(): time.sleep(0.005)\n"
+        "elif mode == 'grandchild':\n"
+        "    pid, ready, marker = map(pathlib.Path, sys.argv[2:5])\n"
+        "    pid.write_text(str(__import__('os').getpid()), encoding='ascii')\n"
+        "    ready.write_text('ready', encoding='ascii')\n"
+        "    time.sleep(0.8)\n"
+        "    marker.write_text('late', encoding='ascii')\n",
+        encoding="utf-8",
+    )
+    proc = None
+
+    def _wait_for(path: Path, seconds: float = 8.0) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if path.is_file():
+                return
+            time.sleep(0.01)
+        raise AssertionError("fixture did not produce %s within %.1fs" % (path.name, seconds))
+
+    try:
+        proc = _sp.Popen(
+            [sys.executable, str(helper), "leader", str(go), str(pid_file),
+             str(ready), str(marker)],
+            cwd=str(root), stdin=_sp.DEVNULL, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+            **popen_flags(),
+        )
+        attached = _jobobj.attach(proc)
+        if os.name == "nt":
+            assert attached, (
+                "the Windows lifecycle fixture requires Job Object attachment; a silent "
+                "nested-job fallback would not prove dead-leader teardown")
+
+        go.write_text("go", encoding="ascii")
+        _wait_for(ready)
+        _wait_for(pid_file)
+        proc.wait(timeout=10.0)      # leader is gone; grandchild remains at this point
+        assert not marker.exists(), "fixture wrote before teardown, so it cannot test the boundary"
+
+        if os.name == "nt":
+            assert _jobobj.close(proc), "the normal Windows close did not release its job"
+            assert _jobobj.close(proc) is False, "job close was not idempotent"
+        else:
+            # ``popen_flags`` gave the leader its own session; killpg remains valid after
+            # the leader has been reaped and reaches the grandchild through the dead leader.
+            _executor._kill_tree(proc)
+
+        time.sleep(1.1)             # grandchild would write at 0.8s if teardown missed it
+        assert not marker.exists(), (
+            "a grandchild wrote after teardown completed; the process-tree boundary is "
+            "not holding")
+    finally:
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    _executor._kill_tree(proc)
+                elif os.name == "nt":
+                    _jobobj.close(proc)
+                proc.wait(timeout=3.0)
+            except Exception:
+                pass
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_v9_close_is_idempotent_and_reports_whether_it_released():
     """Council teardown can race normal completion on the same Popen. The attribute is
     cleared BEFORE the handle is closed, so a second caller sees nothing to close rather
@@ -15851,6 +16040,303 @@ def test_v10_explicit_agents_dir_falling_back_to_bundled_is_never_silent():
         assert explicit_dir_fallback_warning(bundled, served) is None
     finally:
         shutil.rmtree(empty, ignore_errors=True)
+
+
+def test_v10_strict_agents_dir_refuses_bundled_and_pack_fallbacks():
+    """An opted-in roster boundary must be a real boundary, not a warning.
+
+    The default lookup remains useful for a fresh install, while strict lookup refuses
+    the same missing name even when a bundled or third-party definition could answer it.
+    Both sources are exercised so deleting either strict guard cannot leave this test green.
+    """
+    import shutil
+    import _loader
+
+    bundled = _loader.bundled_roster_dir()
+    if not bundled or not os.path.isfile(os.path.join(bundled, "planner.md")):
+        return
+    empty = tempfile.mkdtemp(prefix="summon-strict-roster-")
+    pack = tempfile.mkdtemp(prefix="summon-strict-pack-")
+    try:
+        normal, _, _ = _loader.load_agent_snapshot(empty, "planner")
+        assert normal and Path(normal[3]).resolve().parent == Path(bundled).resolve(), normal
+
+        try:
+            _loader.load_agent_snapshot(empty, "planner", strict_agents_dir=True)
+        except _loader.AgentResolutionError as exc:
+            assert exc.kind == "strict_agents_dir_miss"
+            assert exc.fallback_source == "bundled"
+            assert os.path.abspath(bundled) not in str(exc)
+            assert os.path.abspath(empty) not in str(exc), (
+                "the public refusal must not leak private roster paths")
+        else:
+            raise AssertionError("strict lookup served a bundled definition")
+
+        shutil.copy2(os.path.join(bundled, "planner.md"), os.path.join(pack, "planner.md"))
+        old_bundled, old_packs = _loader.bundled_roster_dir, _loader.discover_agent_packs
+        _loader.bundled_roster_dir = lambda: None
+        _loader.discover_agent_packs = lambda: [{"path": pack, "name": "fixture-pack"}]
+        try:
+            pack_normal, _, _ = _loader.load_agent_snapshot(empty, "planner")
+            assert pack_normal and Path(pack_normal[3]).resolve().parent == Path(pack).resolve(), pack_normal
+            try:
+                _loader.load_agent_snapshot(empty, "planner", strict_agents_dir=True)
+            except _loader.AgentResolutionError as exc:
+                assert exc.fallback_source == "pack"
+                assert exc.kind == "strict_agents_dir_miss"
+            else:
+                raise AssertionError("strict lookup served a plugin-pack definition")
+            # The diagnostic probe must not parse a private fallback just to name its
+            # source. A malformed candidate still produces the same strict refusal.
+            with open(os.path.join(pack, "planner.md"), "w", encoding="utf-8") as fh:
+                fh.write("---\npermission: not-a-tier\n---\n# malformed\n")
+            try:
+                _loader.load_agent_snapshot(empty, "planner", strict_agents_dir=True)
+            except _loader.AgentResolutionError as exc:
+                assert exc.fallback_source == "pack"
+            else:
+                raise AssertionError("strict diagnostic parsed a malformed fallback")
+        finally:
+            _loader.bundled_roster_dir, _loader.discover_agent_packs = old_bundled, old_packs
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
+        shutil.rmtree(pack, ignore_errors=True)
+
+
+def test_v10_strict_agents_dir_identity_and_cache_refusal_are_distinct():
+    """Strict provenance is part of the request, and a strict miss cannot reuse a success."""
+    import shutil
+    from _executor import build_request_identity, envelope_answers_request, request_fingerprint
+
+    roster = tempfile.mkdtemp(prefix="summon-strict-identity-")
+    try:
+        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agents", "planner.md")
+        shutil.copy2(source, os.path.join(roster, "planner.md"))
+        common = dict(agent="planner", prompt="identity probe", cwd=os.getcwd(), agents_dir=roster)
+        relaxed = build_request_identity(**common, strict_agents_dir=False)
+        strict = build_request_identity(**common, strict_agents_dir=True)
+        assert request_fingerprint(**relaxed) != request_fingerprint(**strict), (
+            "strict roster provenance was dropped from the request identity")
+
+        missing = dict(agent="planner", prompt="identity probe", cwd=os.getcwd(), agents_dir=roster)
+        os.remove(os.path.join(roster, "planner.md"))
+        strict_miss = build_request_identity(**missing, strict_agents_dir=True)
+        prior = {"status": "success", "request_sha256": request_fingerprint(**relaxed)}
+        reusable, _ = envelope_answers_request(
+            prior, request_fingerprint(**strict_miss), identity=strict_miss)
+        assert reusable is False, "strict roster miss reused a prior success"
+    finally:
+        shutil.rmtree(roster, ignore_errors=True)
+
+
+def test_v10_strict_agents_dir_propagates_to_detached_fanout_children():
+    """Background, manifest, and council children must inherit the governance boundary."""
+    import argparse
+    import _background
+    import _council
+    import _manifest
+
+    ns = argparse.Namespace(
+        agent="planner", prompt="p", prompt_file=None, cwd=os.getcwd(),
+        allow_credit=False, allow_payg=False, allow_text_only=False, require_tools=False,
+        no_contract_repair=False, agents_dir="C:/roster", strict_agents_dir=True,
+        timeout=600000, cli=None, model=None, effort=None, resume=None,
+        resume_profile=None, profile=None, out=None, json_schema=None, debug_dir=None,
+        retries=0, max_permission=None, gate_with=None, gate_timeout=None,
+        worktree=None, artifacts=[])
+    background = _background.child_argv(ns, "result.json")
+    assert "--strict-agents-dir" in background, background
+
+    job = {"id": "audit", "agent": "planner", "prompt": "p"}
+    manifest = _manifest._child_cmd(job, argparse.Namespace(
+        cwd=os.getcwd(), agents_dir="C:/roster", strict_agents_dir=True, retries=0), "out.json")
+    assert "--strict-agents-dir" in manifest, manifest
+
+    captured = {}
+    old_dispatch, old_read, old_existing = (
+        _manifest._dispatch_child, _manifest._read_envelope, _manifest._existing_envelope)
+    try:
+        def fake_dispatch(cmd, timeout, on_spawn=None, on_reap=None):
+            captured["cmd"] = cmd
+            return types.SimpleNamespace(timed_out=False), None
+        _manifest._dispatch_child = fake_dispatch
+        _manifest._read_envelope = lambda path, proc: {"status": "success"}
+        _manifest._existing_envelope = lambda path: {"status": "success"}
+        out_dir = tempfile.mkdtemp(prefix="summon-strict-council-")
+        try:
+            result = _council._dispatch("planner", "p", os.getcwd(), "C:/roster", 1000,
+                                        out_dir, "g1-member", strict_agents_dir=True)
+            assert result["status"] == "success"
+            assert "--strict-agents-dir" in captured["cmd"], captured
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
+    finally:
+        _manifest._dispatch_child, _manifest._read_envelope, _manifest._existing_envelope = (
+            old_dispatch, old_read, old_existing)
+
+
+def test_v10_strict_agents_dir_parser_and_public_contract():
+    """The flag is parseable in direct/fan-out modes and documented as opt-in."""
+    import _cli
+
+    parser = _cli.build_parser("2.0.5", 1)
+    ns = parser.parse_args(["--agent", "planner", "--prompt", "p", "--cwd", os.getcwd(),
+                            "--strict-agents-dir"])
+    assert ns.strict_agents_dir is True
+    assert "strict_agents_dir" in _cli.MODE_FLAGS["manifest"]
+    assert "strict_agents_dir" in _cli.MODE_FLAGS["council"]
+    assert "strict_agents_dir" in _cli.MODE_FLAGS["council-resume"]
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    skill = open(os.path.join(root, "SKILL.md"), encoding="utf-8").read()
+    readme = open(os.path.join(root, "..", "..", "README.md"), encoding="utf-8").read()
+    changelog = open(os.path.join(root, "..", "..", "CHANGELOG.md"),
+                     encoding="utf-8").read()
+    assert "--strict-agents-dir" in skill
+    assert "strict_agents_dir_miss" in skill
+    assert "fallback" in skill.lower()
+    assert "--strict-agents-dir" in readme
+    assert "fallback" in readme.lower()
+    assert "--strict-agents-dir" in changelog
+
+
+def test_v11_private_role_aliases_are_propose_approve_hash_bound_and_exact_wins():
+    """Role state is operator-global, explicit, and fail-closed on tampering."""
+    import _roles
+
+    root = tempfile.mkdtemp(prefix="summon-role-roster-")
+    registry = os.path.join(root, "roles.json")
+    pending = os.path.join(root, "roles.pending.json")
+    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agents",
+                          "reviewer.md")
+    shutil.copy2(source, os.path.join(root, "reviewer.md"))
+    old_registry = os.environ.get("SUMMON_ROLES_FILE")
+    old_pending = os.environ.get("SUMMON_ROLES_PENDING_FILE")
+    os.environ["SUMMON_ROLES_FILE"] = registry
+    os.environ["SUMMON_ROLES_PENDING_FILE"] = pending
+    try:
+        proposed = _roles.propose("security-gate", "reviewer", cwd=os.getcwd(),
+                                  agents_dir=root)
+        assert proposed["state"] == "proposed"
+        assert not os.path.exists(registry), "proposal activated before approval"
+        approved = _roles.approve("security-gate", cwd=os.getcwd(), agents_dir=root)
+        assert approved["state"] == "approved"
+        resolved = _roles.resolve_for_dispatch(
+            "security-gate", cwd=os.getcwd(), agents_dir=root, enabled=True)
+        assert resolved["resolved"] == "reviewer"
+        assert resolved["role"]["target_sha256"] == proposed["target_sha256"]
+        strict_empty = tempfile.mkdtemp(prefix="summon-role-strict-empty-")
+        try:
+            try:
+                _roles.resolve_for_dispatch(
+                    "security-gate", cwd=os.getcwd(), agents_dir=strict_empty,
+                    enabled=True, strict_agents_dir=True)
+            except ValueError as exc:
+                assert "valid agent definition" in str(exc)
+            else:
+                raise AssertionError("strict alias resolution fell through to bundled target")
+        finally:
+            shutil.rmtree(strict_empty, ignore_errors=True)
+        # An exact definition is authoritative even when an approved alias has the same
+        # spelling.  This test uses the target name to exercise the no-shadow branch.
+        exact = _roles.resolve_for_dispatch(
+            "reviewer", cwd=os.getcwd(), agents_dir=root, enabled=True)
+        assert exact["role"] is None and exact["resolved"] == "reviewer"
+
+        doc = json.loads(Path(registry).read_text(encoding="utf-8"))
+        doc["roles"]["security-gate"]["hash"] = "sha256:tampered"
+        Path(registry).write_text(json.dumps(doc), encoding="utf-8")
+        try:
+            _roles.resolve("security-gate", cwd=os.getcwd(), agents_dir=root)
+        except ValueError as exc:
+            assert "hash mismatch" in str(exc)
+        else:
+            raise AssertionError("tampered role approval was accepted")
+    finally:
+        if old_registry is None:
+            os.environ.pop("SUMMON_ROLES_FILE", None)
+        else:
+            os.environ["SUMMON_ROLES_FILE"] = old_registry
+        if old_pending is None:
+            os.environ.pop("SUMMON_ROLES_PENDING_FILE", None)
+        else:
+            os.environ["SUMMON_ROLES_PENDING_FILE"] = old_pending
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v11_role_aliases_join_request_identity_and_forward_to_children():
+    import argparse
+    import _background
+    import _cli
+    import _executor
+    import _manifest
+    import _roles
+
+    root = tempfile.mkdtemp(prefix="summon-role-identity-")
+    registry = os.path.join(root, "roles.json")
+    pending = os.path.join(root, "roles.pending.json")
+    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agents",
+                          "reviewer.md")
+    shutil.copy2(source, os.path.join(root, "reviewer.md"))
+    old_registry = os.environ.get("SUMMON_ROLES_FILE")
+    old_pending = os.environ.get("SUMMON_ROLES_PENDING_FILE")
+    os.environ["SUMMON_ROLES_FILE"] = registry
+    os.environ["SUMMON_ROLES_PENDING_FILE"] = pending
+    try:
+        _roles.propose("security-gate", "reviewer", cwd=os.getcwd(), agents_dir=root)
+        _roles.approve("security-gate", cwd=os.getcwd(), agents_dir=root)
+        prov = _roles.resolve_for_dispatch(
+            "security-gate", cwd=os.getcwd(), agents_dir=root, enabled=True)
+        base = dict(agent="reviewer", prompt="identity", cwd=os.getcwd(), agents_dir=root)
+        direct = _executor.build_request_identity(**base)
+        aliased = _executor.build_request_identity(
+            **base, role_provenance=prov)
+        assert _executor.request_fingerprint(**direct) != _executor.request_fingerprint(**aliased)
+        parser = _cli.build_parser("2.0.5", 1)
+        assert parser.parse_args(["--agent", "security-gate", "--enable-roles",
+                                  "--prompt", "p", "--cwd", os.getcwd()]).enable_roles
+        assert _cli.rewrite_subcommand(["role", "resolve", "security-gate"])[0] == [
+            "--role-resolve", "security-gate"]
+        ns = argparse.Namespace(
+            agent="security-gate", prompt="p", prompt_file=None, cwd=os.getcwd(),
+            allow_credit=False, allow_payg=False, allow_text_only=False, require_tools=False,
+            no_contract_repair=False, agents_dir=root, strict_agents_dir=False,
+            enable_roles=True, timeout=600000, cli=None, model=None, effort=None,
+            resume=None, resume_profile=None, profile=None, out=None, json_schema=None,
+            debug_dir=None, retries=0, max_permission=None, gate_with=None,
+            gate_timeout=None, worktree=None, artifacts=[])
+        child = _background.child_argv(ns, "result.json")
+        assert "--enable-roles" in child
+        cmd = _manifest._child_cmd({"id": "r", "agent": "security-gate", "prompt": "p"},
+                                    argparse.Namespace(cwd=os.getcwd(), agents_dir=root,
+                                                       strict_agents_dir=False,
+                                                       enable_roles=True, retries=0), "out.json")
+        assert "--enable-roles" in cmd
+    finally:
+        if old_registry is None:
+            os.environ.pop("SUMMON_ROLES_FILE", None)
+        else:
+            os.environ["SUMMON_ROLES_FILE"] = old_registry
+        if old_pending is None:
+            os.environ.pop("SUMMON_ROLES_PENDING_FILE", None)
+        else:
+            os.environ["SUMMON_ROLES_PENDING_FILE"] = old_pending
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v11_role_alias_docs_and_fanout_flags_are_publicly_bound():
+    import _cli
+
+    assert "enable_roles" in _cli.MODE_FLAGS["manifest"]
+    assert "enable_roles" in _cli.MODE_FLAGS["council"]
+    assert "enable_roles" in _cli.MODE_FLAGS["council-resume"]
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    skill = Path(os.path.join(root, "SKILL.md")).read_text(encoding="utf-8")
+    readme = Path(os.path.join(root, "..", "..", "README.md")).read_text(encoding="utf-8")
+    changelog = Path(os.path.join(root, "..", "..", "CHANGELOG.md")).read_text(encoding="utf-8")
+    for text in (skill, readme, changelog):
+        assert "role alias" in text.lower() or "role aliases" in text.lower()
+        assert "--enable-roles" in text
 
 
 def test_v10_timeout_envelope_surfaces_the_cause_not_just_the_clock():
@@ -17413,6 +17899,307 @@ def test_banner_lists_kimi_and_modelark():
     assert "kimi" in text and "modelark" in text
     for name in ("claude", "codex", "cursor", "gemini", "antigravity"):
         assert name in text
+
+
+def test_profile_registry_resolves_private_claude_home_and_command():
+    """A named profile supplies only the Claude config env and an optional pinned binary.
+
+    The registry is operator-owned input; the public agent definition carries only the
+    opaque name.  This test uses a fake registry and directories, then mutates the profile
+    restriction to prove the model guard is actually exercised rather than merely parsed.
+    """
+    import _profiles
+    root = tempfile.mkdtemp(prefix="summon-profile-")
+    try:
+        profile_dir = os.path.join(root, "profile")
+        os.makedirs(profile_dir)
+        command = os.path.join(root, "claude.exe")
+        with open(command, "wb") as fh:
+            fh.write(b"not executed")
+        registry = os.path.join(root, "profiles.json")
+        with open(registry, "w", encoding="utf-8") as fh:
+            json.dump({"profiles": {"fable": {
+                "cli": "claude", "config_dir": profile_dir,
+                "command": command, "models": ["claude-fable-5"]
+            }}}, fh)
+        old = os.environ.get("SUMMON_PROFILES_FILE")
+        os.environ["SUMMON_PROFILES_FILE"] = registry
+        try:
+            selected = _profiles.resolve_profile("fable", "claude", root + "-cwd")
+            assert selected["env"] == {"CLAUDE_CONFIG_DIR": os.path.realpath(profile_dir)}
+            assert selected["command"] == os.path.realpath(command)
+            assert selected["path_sha256"] and selected["command_sha256"]
+            _profiles.validate_model(selected, "claude-fable-5")
+            try:
+                _profiles.validate_model(selected, "claude-opus-5")
+                raise AssertionError("profile model restriction was not enforced")
+            except ValueError as exc:
+                assert "not allowed" in str(exc)
+        finally:
+            if old is None:
+                os.environ.pop("SUMMON_PROFILES_FILE", None)
+            else:
+                os.environ["SUMMON_PROFILES_FILE"] = old
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_profile_rejects_path_names_and_in_tree_config():
+    import _profiles
+    for bad in ("C:\\private", "../private", "", "fable name", "fable;evil"):
+        try:
+            _profiles.validate_profile_name(bad)
+            raise AssertionError(f"accepted unsafe profile name {bad!r}")
+        except ValueError:
+            pass
+    root = tempfile.mkdtemp(prefix="summon-profile-tree-")
+    try:
+        with open(os.path.join(root, "claude.exe"), "wb") as fh:
+            fh.write(b"x")
+        reg = os.path.join(root, "profiles.json")
+        with open(reg, "w", encoding="utf-8") as fh:
+            json.dump({"profiles": {"p": {"cli": "claude", "config_dir": root,
+                                               "command": os.path.join(root, "claude.exe")}}}, fh)
+        old = os.environ.get("SUMMON_PROFILES_FILE")
+        os.environ["SUMMON_PROFILES_FILE"] = reg
+        try:
+            try:
+                _profiles.resolve_profile("p", "claude", root)
+                raise AssertionError("accepted a profile inside the dispatch cwd")
+            except ValueError as exc:
+                assert "outside the dispatch cwd" in str(exc)
+            if os.name == "nt":
+                # Windows containment is case-insensitive.  A raw commonpath string
+                # comparison accepted this same in-tree profile when cwd was uppercased.
+                try:
+                    _profiles.resolve_profile("p", "claude", root.upper())
+                    raise AssertionError(
+                        "accepted an in-tree profile through a case variant")
+                except ValueError as exc:
+                    assert "outside the dispatch cwd" in str(exc)
+        finally:
+            if old is None:
+                os.environ.pop("SUMMON_PROFILES_FILE", None)
+            else:
+                os.environ["SUMMON_PROFILES_FILE"] = old
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_profile_is_part_of_request_identity_and_background_argv():
+    import _background
+    import _executor
+    root = tempfile.mkdtemp(prefix="summon-profile-id-")
+    try:
+        agents = os.path.join(root, ".agents")
+        os.makedirs(agents)
+        dispatch_cwd = os.path.join(root, "task")
+        os.makedirs(dispatch_cwd)
+        with open(os.path.join(agents, "p.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\nmodel: claude-fable-5\nprofile: fable\n---\n# P\n")
+        profile_dir = os.path.join(root, "profile")
+        os.makedirs(profile_dir)
+        reg = os.path.join(root, "profiles.json")
+        with open(reg, "w", encoding="utf-8") as fh:
+            json.dump({"profiles": {"fable": {"cli": "claude", "config_dir": profile_dir}}}, fh)
+        old = os.environ.get("SUMMON_PROFILES_FILE")
+        os.environ["SUMMON_PROFILES_FILE"] = reg
+        try:
+            ident = _executor.build_request_identity(
+                agent="p", prompt="x", cwd=dispatch_cwd, agents_dir=agents,
+                profile=None)
+            assert ident["profile"] == "fable"
+            assert ident["profile_path_sha256"]
+            ns = types.SimpleNamespace(
+                agent="p", prompt="x", prompt_file=None, cwd=root,
+                allow_credit=False, allow_payg=False, allow_text_only=False,
+                require_tools=False, no_contract_repair=False, agents_dir=agents,
+                timeout=600000, cli=None, model=None, effort=None, profile="fable",
+                resume=None, resume_profile=None, out=None, json_schema=None,
+                debug_dir=None, retries=0, max_permission=None, gate_with=None,
+                gate_timeout=None, worktree=None, artifacts=[])
+            child = _background.child_argv(ns, "C:/jobs/result.json")
+            assert "--profile" in child and child[child.index("--profile") + 1] == "fable"
+        finally:
+            if old is None:
+                os.environ.pop("SUMMON_PROFILES_FILE", None)
+            else:
+                os.environ["SUMMON_PROFILES_FILE"] = old
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_profile_pinned_command_satisfies_backend_preflight():
+    """A valid private command pin must bypass a stale/missing PATH shim."""
+    import run_subagent as _rs
+    root = tempfile.mkdtemp(prefix="summon-profile-preflight-")
+    try:
+        command = os.path.join(root, "claude.exe")
+        with open(command, "wb") as fh:
+            fh.write(b"fake")
+        real_which = _rs.shutil.which
+        try:
+            _rs.shutil.which = lambda _name: None
+            assert _rs._preflight_backend("claude", command) is None
+            assert _rs._preflight_backend("claude") is not None
+        finally:
+            _rs.shutil.which = real_which
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_profile_dry_run_hides_private_command_path():
+    """A shareable dry-run envelope must not publish the pinned binary path."""
+    import run_subagent as _rs
+    import _builder
+    root = tempfile.mkdtemp(prefix="summon-profile-preview-")
+    try:
+        profile_dir = os.path.join(root, "profile")
+        os.makedirs(profile_dir)
+        command = os.path.join(root, "claude.exe")
+        with open(command, "wb") as fh:
+            fh.write(b"fake")
+        agent_file = os.path.join(root, "p.md")
+        with open(agent_file, "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\nmodel: claude-fable-5\n---\n# P\n")
+        invocation = _builder.AgentInvocation(
+            cli="claude", prompt="p", cwd=root, system_context="c",
+            permission="read-only", model="claude-fable-5", profile="fable",
+            profile_env={"CLAUDE_CONFIG_DIR": profile_dir}, profile_command=command)
+        args = types.SimpleNamespace(
+            agent="p", cwd=root, agents_dir=root, worktree=None, timeout=600000,
+            allow_text_only=False, require_tools=False)
+        view = _rs._dry_run_view(invocation, args, root, agent_file=agent_file)
+        encoded = json.dumps(view)
+        assert str(Path(command).resolve()) not in encoded
+        assert view["command"] == "claude.exe (private profile executable)"
+        assert view["env_overrides"] == ["CLAUDE_CONFIG_DIR"]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_review_first_contract_and_git_landing_guard():
+    """Bind the public workflow contract to the files and code it describes.
+
+    The negative fixture is deliberate mutation coverage for the source guard: a
+    future ``subprocess.run(["git", "commit", ...])`` must fail this test rather
+    than merely pass because today's production tree happens not to contain one.
+    """
+    root = Path(__file__).resolve().parents[3]
+    brief = (root / "docs" / "REVIEW_BRIEF_STANDARD.md").read_text(encoding="utf-8")
+    implementer = (root / "skills" / "summon" / "agents" / "implementer.md").read_text(
+        encoding="utf-8")
+    protocol = (root / "docs" / "PROTOCOL.md").read_text(encoding="utf-8")
+    skill = (root / "skills" / "summon" / "SKILL.md").read_text(encoding="utf-8")
+
+    for field in ("OBJECTIVE:", "FACTS AND EVIDENCE:", "SCOPE:", "EXCLUSIONS:",
+                  "GATE COMMANDS:", "ACTION SAFETY:", "REPORT:", "LEFT_BEHIND"):
+        assert field in brief, "review brief lost required field %r" % field
+    for phrase in ("git add", "git commit", "git push", "git merge", "git restore",
+                   "git stash", "create a PR",
+                   "LEFT_BEHIND"):
+        assert phrase in implementer, "implementer contract lost %r" % phrase
+    assert "REVIEW_BRIEF_STANDARD.md" in protocol
+    assert "review-first" in skill.lower() and "LEFT_BEHIND" in skill
+
+    forbidden = {"add", "commit", "push", "merge"}
+
+    def resolve(expr, names):
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return [expr.value]
+        if isinstance(expr, ast.Constant):
+            return [None]
+        if isinstance(expr, (ast.List, ast.Tuple)):
+            values = []
+            for item in expr.elts:
+                part = resolve(item, names)
+                if part is None:
+                    part = [None]
+                values.extend(part)
+            return values
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+            left, right = resolve(expr.left, names), resolve(expr.right, names)
+            return (left or [None]) + (right or [None])
+        if isinstance(expr, ast.IfExp):
+            # Preserve the branch with the most structural information. This
+            # keeps ``["git"] + (["-C", str(repo)] if repo else [])``
+            # inspectable without pretending the path value is known.
+            branches = [resolve(expr.body, names), resolve(expr.orelse, names)]
+            return max(branches, key=lambda value: (sum(x is not None for x in value), len(value)))
+        if isinstance(expr, ast.Name):
+            return names.get(expr.id, [None])
+        return [None]
+
+    def landing_calls(source):
+        tree = ast.parse(source)
+        names, found = {}, []
+
+        class Guard(ast.NodeVisitor):
+            def visit_Assign(self, node):
+                value = resolve(node.value, names)
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names[target.id] = value
+                self.generic_visit(node)
+
+            def visit_Call(self, node):
+                func = node.func
+                is_process_call = (isinstance(func, ast.Attribute)
+                                   and isinstance(func.value, ast.Name)
+                                   and func.value.id == "subprocess"
+                                   and func.attr in {"run", "Popen", "call", "check_call",
+                                                      "check_output"})
+                if is_process_call and node.args:
+                    argv = resolve(node.args[0], names)
+                    if argv and isinstance(argv[0], str) and os.path.basename(argv[0]).lower() in {"git", "git.exe"}:
+                        # Find the subcommand after options which consume a value.
+                        # Unknown tokens are a violation too: a future dynamic command
+                        # must be reviewed rather than silently escaping this guard.
+                        subcommand = None
+                        unknown = False
+                        skip_value = False
+                        for part in argv[1:]:
+                            if skip_value:
+                                skip_value = False
+                                continue
+                            if part is None:
+                                unknown = True
+                                break
+                            if part in {"-C", "--git-dir", "--work-tree", "--exec-path"}:
+                                skip_value = True
+                                continue
+                            if part.startswith("-"):
+                                continue
+                            subcommand = part.lower()
+                            break
+                        if subcommand in forbidden:
+                            found.append((node.lineno, [subcommand]))
+                        elif subcommand is None or unknown:
+                            found.append((node.lineno, ["unresolved-subcommand"]))
+                self.generic_visit(node)
+
+        Guard().visit(tree)
+        return found
+
+    mutation = "import subprocess\nsubprocess.run(['git', 'commit', '-m', 'bad'])\n"
+    assert landing_calls(mutation), "guard mutation fixture was not detected"
+    dynamic_mutation = ("import subprocess\noperation = 'commit'\n"
+                        "subprocess.run(['git', operation])\n")
+    assert landing_calls(dynamic_mutation), "dynamic git mutation escaped the guard"
+    safe = "import subprocess\nsubprocess.run(['git', 'status'])\n"
+    assert not landing_calls(safe), "safe git inspection was misclassified"
+
+    scripts = root / "skills" / "summon" / "scripts"
+    violations = []
+    for path in sorted(scripts.glob("*.py")):
+        if path.name.startswith("test_"):
+            continue
+        try:
+            found = landing_calls(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+            raise AssertionError("could not inspect production source %s: %s" % (path, exc))
+        violations.extend((path.name, line, hit) for line, hit in found)
+    assert not violations, "Summon contains an automatic git landing command: %r" % violations
 
 
 if __name__ == "__main__":

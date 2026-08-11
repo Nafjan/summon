@@ -62,6 +62,11 @@ class AgentInvocation:
     # which exists to waive a tier you chose for yourself. Carried on the invocation because
     # the executor is where the refusal happens and the distinction is invisible by then.
     permission_forced: bool = False
+    # Named private profile selected for this child.  The name is safe to carry in
+    # receipts; the resolved path is kept only in profile_env and is never serialized.
+    profile: str | None = None
+    profile_env: dict | None = None
+    profile_command: str | None = None
 
 
 # Short report-contract nudge appended to RESUME prompts. On resume the session
@@ -667,11 +672,12 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         # (a resumed editing agent must keep its --dangerously-skip-permissions,
         # or it hangs on an approval prompt). Just point at the session + new task.
         command, base_args = build_command(inv.cli, _resume_prompt(inv))
+        command = inv.profile_command or command
         return (command,
                 perm + model_flag + effort_flag
                 + strip_boundary_flags(inv.cli, inv.extra_args)
                 + ["--resume", inv.resume_id] + base_args,
-                None)
+                inv.profile_env)
 
     system_prompt = (
         f"cwd: {inv.cwd}\n\n{inv.system_context}\n\n"
@@ -680,11 +686,12 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         "present. Do not skip it, even for tiny or trivial tasks."
     )
     command, base_args = build_command(inv.cli, inv.prompt)
+    command = inv.profile_command or command
     return (command,
             perm + model_flag + effort_flag
             + strip_boundary_flags(inv.cli, inv.extra_args)
             + ["--append-system-prompt", system_prompt] + base_args,
-            None)
+            inv.profile_env)
 
 
 def _build_gemini_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:

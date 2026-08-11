@@ -583,7 +583,7 @@ def _fm_capability_text_only(fm) -> bool:
         return False
 
 
-def _defn_snapshot(agents_dir_arg, cwd, agent_name):
+def _defn_snapshot(agents_dir_arg, cwd, agent_name, strict_agents_dir: bool = False):
     """Load the definition ONCE (for the whole identity), or None if there is no agent.
 
     state: "ok" (loaded), "missing" (no such file), "malformed" (present but the loader
@@ -592,10 +592,10 @@ def _defn_snapshot(agents_dir_arg, cwd, agent_name):
     sha) and the dispatch's own ABA-safe last_parsed_sha matches it while the file is stable.
     `fm` is the frontmatter, for the endpoint field -- also from that one buffer.
     """
+    from _loader import (AgentResolutionError, bundled_roster_dir, get_agents_dir,
+                         load_agent_snapshot, validate_agent_name)
     if not agent_name:
         return None
-    from _loader import (bundled_roster_dir, get_agents_dir, load_agent_snapshot,
-                         validate_agent_name)
     try:
         validate_agent_name(agent_name)
     except Exception:  # noqa: BLE001 — an unusable NAME is not an absent definition
@@ -608,8 +608,14 @@ def _defn_snapshot(agents_dir_arg, cwd, agent_name):
         # ONE read: the tuple, the frontmatter and the hash all come from the SAME byte
         # buffer, so no definition-derived field can see a different byte version -- the
         # invariant that closes the A->B->A hybrid, not merely "one load_agent call".
-        tup, fm, sha = load_agent_snapshot(agents_dir, agent_name)
+        tup, fm, sha = load_agent_snapshot(
+            agents_dir, agent_name, strict_agents_dir=strict_agents_dir)
         return _DefnSnapshot(tup, fm or {}, sha, "ok" if sha else "unreadable")
+    except AgentResolutionError:
+        # Keep the strict governance miss distinct in the request identity so an old
+        # success served by a fallback roster cannot be reused before the real dispatch
+        # emits its machine-readable refusal.
+        return _DefnSnapshot(None, {}, None, "strict-miss")
     except Exception:  # noqa: BLE001 — the dispatch surfaces the real error
         pass
     # a file under that name EXISTS but did not load -> malformed, not absent
@@ -1068,14 +1074,15 @@ def _endpoint_state(agents_dir, cwd, agent, defn=None) -> tuple:
 # Keys an identity dict carries for the SKIP's benefit that are NOT part of the request
 # (they describe local state, not what was asked), so the fingerprint drops them.
 _IDENTITY_LOCAL = ("_agent_def_state", "_unreadable", "_endpoint", "_agy_account_checked",
-                   "_artifact_manifest", "_artifact_error")
+                   "_artifact_manifest", "_artifact_error", "_profile_error")
 
 
 def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, model=None,
                            effort=None, json_schema=None, resume=None, resume_profile=None,
                            worktree=None, allow_credit=False, gate_with=None,
                            max_permission=None, artifacts=None,
-                           allow_text_only=False, require_tools=False) -> dict:
+                           allow_text_only=False, require_tools=False, profile=None,
+                           strict_agents_dir=False, role_provenance=None) -> dict:
     """THE request identity, built in ONE place from RAW inputs.
 
     The dispatcher and the manifest parent each used to build their own dict, so a field
@@ -1103,16 +1110,28 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
     # ONE load of the definition for the WHOLE identity: every field derived from it reads
     # this snapshot, so an A -> B -> A swap mid-construction cannot produce a hybrid identity
     # (A's hash paired with B's resolved backend, which had turned agy attestation off).
-    _defn = _defn_snapshot(agents_dir, cwd, agent)
+    _defn = _defn_snapshot(agents_dir, cwd, agent,
+                           strict_agents_dir=bool(strict_agents_dir))
     _adef = (_defn.sha, _defn.state) if _defn is not None else (None, "missing")
     _rcli = _resolved_cli(cli, agents_dir, cwd, agent, _defn)
     _rperm = _resolved_permission(_defn, max_permission)
+    _profile_name = profile or ((_defn.fm or {}).get("profile") if _defn else None)
+    _profile_selection = None
+    _profile_error = None
+    if _profile_name:
+        try:
+            from _profiles import resolve_profile
+            _profile_selection = resolve_profile(_profile_name, _rcli, cwd)
+        except Exception as exc:  # dispatch reports the actionable error later
+            _profile_error = str(exc)
     _endpoint = (_endpoint_state(agents_dir, cwd, agent, _defn)
                  if _rcli == "openai-compat" else (None, "ok", None))
     _schema = content_state(json_schema or None)
     _memory = content_state(os.path.join(cwd, ".agents", "memory.md") if cwd else None)
     from _artifacts import build_manifest as _build_artifact_manifest
     _artifact_manifest, _artifact_error = _build_artifact_manifest(artifacts, cwd)
+    _role = role_provenance if isinstance(role_provenance, dict) else {}
+    _role_detail = _role.get("role") if isinstance(_role.get("role"), dict) else {}
     # Anything that EXISTS but could not be hashed leaves a hole in the identity, and a hole
     # is not a difference: two different unhashable schemas would hash alike. Record it so
     # the skip can fail closed rather than reuse on an identity it could not fully compute.
@@ -1120,7 +1139,8 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
                                          ("memory", _memory[1]),
                                          ("agent_def", _adef[1]),
                                          ("endpoint", _endpoint[1]),
-                                         ("artifacts", "unreadable" if _artifact_error else "ok"))
+                                         ("artifacts", "unreadable" if _artifact_error else "ok"),
+                                         ("profile", "unreadable" if _profile_error else "ok"))
                           if st not in ("ok", "absent", "missing"))
     return {
         # not hashed (local facts, not part of the request); carried so the skip can refuse
@@ -1132,6 +1152,7 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         "_unreadable": ",".join(_unreadable) or None,
         "_artifact_manifest": _artifact_manifest,
         "_artifact_error": _artifact_error,
+        "_profile_error": _profile_error,
         "agent": agent, "prompt": prompt, "cwd": cwd,
         "cli": cli or None, "model": model or None, "effort": effort or None,
         # The EFFECTIVE model when summon supplies the default itself. Cursor's default is a
@@ -1150,6 +1171,28 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # that hashed identically -- the second could reuse the first backend's answer.
         "resolved_cli": _rcli,
         "backend_env_sha256": backend_env_sha(_rcli, allow_credit),
+        # A profile name alone is not enough: the private registry can retarget it to a
+        # different account. Hash the resolved directory and registry snapshot, never the
+        # path itself, so cached answers cannot cross profile changes.
+        "profile": _profile_name or None,
+        "profile_path_sha256": ((_profile_selection or {}).get("path_sha256")),
+        "profile_registry_sha256": ((_profile_selection or {}).get("registry_sha256")),
+        "profile_command_sha256": ((_profile_selection or {}).get("command_sha256")),
+        # Strict roster provenance changes whether a bundled/pack definition is eligible;
+        # keep it in the request identity so a cached fallback result cannot satisfy a
+        # later governance request.
+        "strict_agents_dir": "1" if strict_agents_dir else None,
+        # An approved role is part of the request identity, not merely a convenient
+        # spelling.  Hashing its approval fingerprint/record prevents a cached direct
+        # target result, or a result from a retargeted registry entry, from satisfying
+        # an opted-in role dispatch.  Names and digests only; never the private registry
+        # path or its contents.
+        "role_requested": _role.get("requested") if _role_detail else None,
+        "role_resolved": _role_detail.get("resolved_agent") if _role_detail else None,
+        "role_target_sha256": _role_detail.get("target_sha256") if _role_detail else None,
+        "role_fingerprint": _role_detail.get("fingerprint") if _role_detail else None,
+        "role_hash": _role_detail.get("hash") if _role_detail else None,
+        "role_registry_sha256": _role_detail.get("registry_sha256") if _role_detail else None,
         # ONLY when this is an actual resume: --resume-profile without --resume still takes
         # the FRESH-profile branch at dispatch, so selecting the resumed profile's account
         # there made a perfectly good fresh profile look like an account swap and refused it.
@@ -2201,6 +2244,16 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     _requested_model = inv.model
     _guarded_inv, _, _guard_warnings = apply_credit_guard(inv)
     debug_argv = [inv.cli]  # what --debug-dir records; each path refines it
+    # Defer the initial workspace snapshot until an actual backend spawn is known to fit.
+    # An over-long argv must not cause any utility Popen merely to build its refusal
+    # envelope; the after snapshot is still taken by _stamp after cleanup.
+    try:
+        from _receipt import workspace_evidence, workspace_snapshot
+        _workspace_before = None
+    except Exception:  # noqa: BLE001 — mutation evidence is additive and fail-closed
+        workspace_evidence = None
+        workspace_snapshot = None
+        _workspace_before = {"coverage": "unavailable", "error": "workspace unavailable"}
 
     def _stamp(resp: dict) -> dict:
         # Wall-clock per dispatch — orchestrators need this for concurrency
@@ -2216,6 +2269,27 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # build their own response and never touch build_final_response). The
         # response builders set the detailed reason first; this preserves it.
         finalize_exit_fields(resp)
+        if "workspace_evidence" not in resp:
+            try:
+                if _workspace_before is None:
+                    # Pre-dispatch validation rejected the request before a safe
+                    # baseline could be captured. Do not run another utility child
+                    # merely to decorate that refusal; unknown is the honest result.
+                    resp["workspace_evidence"] = {
+                        "before": None, "after": None, "coverage": "unavailable",
+                        "child_commit": None, "mutation": None,
+                        "read_only_violation": None, "attribution": "unavailable",
+                    }
+                else:
+                    _after = workspace_snapshot(inv.cwd)
+                    resp["workspace_evidence"] = workspace_evidence(
+                        _workspace_before, _after, getattr(inv, "permission", None))
+            except Exception:  # noqa: BLE001 — never hide the terminal response
+                resp["workspace_evidence"] = {
+                    "before": None, "after": None, "coverage": "unavailable",
+                    "child_commit": None, "mutation": None,
+                    "read_only_violation": None, "attribution": "unavailable",
+                }
         # Trust fields, split by EVIDENCE (field case: a failed Fable dispatch
         # reported the handshake model as `resolved` with all-zero usage):
         #   requested  what the caller asked for (unchanged).
@@ -2353,6 +2427,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # itself instead of spawning a process. Flows through the same _enrich/_stamp
     # so the envelope shape is identical to a subprocess backend's.
     if backend_kind(inv.cli) == "api":
+        if workspace_snapshot is not None:
+            _workspace_before = workspace_snapshot(inv.cwd)
         debug_argv = [inv.cli, inv.base_url or "?", inv.model or "?"]
         resp = _enrich(BACKENDS[inv.cli]["call"](inv, timeout_ms), None)
         resp["resume"] = {"cli": inv.cli, "session_id": None}  # stateless: no resume
@@ -2364,6 +2440,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     _ro_err = readonly_unenforceable_error(inv.cli, inv.permission,
                                            forced=inv.permission_forced)
     if _ro_err:
+        if workspace_snapshot is not None:
+            _workspace_before = workspace_snapshot(inv.cwd)
         return _stamp(_enrich(_error_response(inv.cli, 1, _ro_err), None))
 
     # ACP transport (gemini/kimi/cursor-agent): the backend speaks the Agent
@@ -2372,6 +2450,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # standard shape, like the api kind above. Placed AFTER the read-only guard
     # so an unenforceable tier fails closed identically on both transports.
     if inv.transport == "acp":
+        if workspace_snapshot is not None:
+            _workspace_before = workspace_snapshot(inv.cwd)
         from _builder import supports_acp as _supports_acp
         if not _supports_acp(inv.cli):
             return _stamp(_enrich(_error_response(
@@ -2462,6 +2542,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             _resp["resume"] = {"cli": inv.cli, "session_id": None,
                                "profile": env_override.get("USERPROFILE")}
         return _stamp(_enrich(_resp, None))
+    if workspace_snapshot is not None and _workspace_before is None:
+        _workspace_before = workspace_snapshot(inv.cwd)
     debug_argv = [command, *args]
 
     # POSIX: put the child in its own session so _kill_tree can signal the whole

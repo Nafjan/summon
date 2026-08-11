@@ -32,7 +32,8 @@ plugin package with `plugin.json` at the repo root — no separate install step.
 
 **Command surface**: the script accepts git-style **subcommands** — `dispatch` (the
 default action), `list`, `models`, `doctor`, `manifest FILE`, `council`, `agent
-new|set NAME`, `version` — e.g. `run_subagent.py council --question "…" --cwd DIR`. The
+new|set NAME`, `role propose|approve|list|resolve`, `version` — e.g. `run_subagent.py
+council --question "…" --cwd DIR`. The
 **legacy flat form still works unchanged** (`run_subagent.py --agent … --prompt …`,
 `--list`, `--manifest FILE`, …), and every flag below is valid in both. Bare
 `run_subagent.py` (or `help`) prints the command list.
@@ -143,6 +144,40 @@ Since 0.18.0 an explicit `--agents-dir` that falls through to bundled also emits
 `warnings` entry, so the surprising case is no longer silent. Nothing is emitted when no
 directory was named — that fallback is the intended behaviour.
 
+For a governance-controlled roster, pass `--strict-agents-dir`. It is opt-in and
+fail-closed: a missing definition is refused with `error_kind:
+strict_agents_dir_miss` and no bundled or plugin fallback is attempted. The default
+resolution chain above is unchanged. Background, manifest, and council children inherit
+the flag; a resumed council inherits the boundary recorded in its run receipt.
+
+### Private role aliases (experimental)
+
+Role aliases are operator-owned names such as `security-gate` that map to one existing
+agent definition. They are separate from project rosters and disabled unless the caller
+passes `--enable-roles`. Manage them with:
+
+```text
+run_subagent.py role propose security-gate reviewer --cwd <project>
+run_subagent.py role approve security-gate --cwd <project>
+run_subagent.py role list
+run_subagent.py role resolve security-gate --cwd <project>
+```
+
+`propose` writes only a pending record; `approve` re-reads the target and activates it.
+The private registry is `~/.claude/summon/roles.json` (override with
+`SUMMON_ROLES_FILE` for an operator-managed location) and is never copied into a
+dispatch envelope. Exact agent names always win over aliases. Chaining, project-local
+role maps, malformed records, target hash changes, and approval hash changes fail closed.
+An alias cannot change a target's CLI, model, permission, prompt, or profile. Dispatch
+receipts carry only requested/resolved names and integrity digests; use those fields to
+audit which approved role was used. `--strict-agents-dir` is applied after alias
+resolution, so a governance dispatch must contain the target in its selected roster.
+Background, manifest, and council children inherit `--enable-roles`; keep this feature
+behind an explicit operator choice until its experimental release gate is retired.
+
+The equivalent flat flags are `--role-propose ALIAS TARGET`, `--role-approve ALIAS`,
+`--role-list`, and `--role-resolve ALIAS`.
+
 **Roster-wide lint:** `--list --json` and `doctor --json` carry `roster_warnings`, flagging
 definitions whose declared `permission:` their backend cannot enforce (per-dispatch refusal
 is correct but arrives too late for a roster maintained as a controlled artifact). Note the
@@ -193,6 +228,17 @@ For review agents, branch on two separate fields: `execution_status` says whethe
 dispatch ran successfully, while `verdict` says `block`, `conditional`, or `pass`. A
 completed review returning `VERDICT: BLOCK` is successful execution and a rejected subject.
 
+### Review-first implementer boundary
+
+Use the repository's [`docs/REVIEW_BRIEF_STANDARD.md`](https://github.com/Nafjan/summon/blob/main/docs/REVIEW_BRIEF_STANDARD.md) when a caller
+dispatches an implementer or reviewer. Summon and its children do not stage, commit,
+push, merge, restore, stash, or create PRs, and must not reset, clean, discard, or force-remove work.
+The caller reads the actual diff and reruns gates; the designated reviewer owns landing.
+Every child must report `LEFT_BEHIND` for resources it created or intentionally left,
+including temporary files, servers, containers, VMs, worktrees, and processes. Treat
+reports and envelopes as private artifacts; public docs contain only sanitized,
+repository-relative examples.
+
 **By exit_code** (when status is `error`):
 
 | exit_code | Meaning | Resolution |
@@ -215,15 +261,18 @@ completed review returning `VERDICT: BLOCK` is successful execution and a reject
 | `--no-write` | No | With `--onboard`: detect only; do not write prefs |
 | `--new-agent NAME` | - | Scaffold a new agent definition (house template); customize frontmatter with `--set`. Never overwrites |
 | `--set-agent NAME` | - | Edit an existing agent's frontmatter via `--set KEY=VALUE` (`KEY=` removes); body untouched, values validated |
-| `--set KEY=VALUE` | No | With the two above: `run-agent`, `model`, `permission`, `args` (repeatable) |
+| `--set KEY=VALUE` | No | With the two above: `run-agent`, `model`, `permission`, `args`, `profile` (repeatable) |
 | `--agent` | Yes* | Agent definition name from --list |
 | `--prompt` | Yes* | Task description to delegate (or `--prompt-file`) |
 | `--prompt-file FILE` | Yes* | Read the prompt from a UTF-8 file (BOM tolerated; strict decoding). Mutually exclusive with `--prompt`. Quoting/encoding ergonomics for long prompts; it does **not** avoid the OS argv limit - backends still receive the prompt on the command line. Windows caps the WHOLE assembled line at 32767 chars (measured: 20k prompt fine, 31k refused; the system context counts toward it), POSIX caps a single argument at 131072, and agy's own limit is ~28k. Over the limit summon refuses before spawning with an argv error - it used to surface as a bogus `CLI not found`, since Windows reports the overflow as a missing file. For material that large, write it to a file under `--cwd` and ask the agent to READ it. A `--background` child re-reads the file |
 | `--cwd` | Yes* | Working directory (absolute path) |
 | `--timeout` | No | Bare ms or with suffix: `600s`, `10m` (default: 600000 = 10m). A BARE sub-second value on a dispatch is refused as a units mistake -- `--timeout 300` means 0.3s and would kill every agent instantly; write `300s` (or `300ms` if you truly mean it). `jobs wait` still accepts short bare polls. Set your host tool's own timeout ABOVE this value — the script needs a few seconds of overhead beyond the CLI deadline |
 | `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
+| `--strict-agents-dir` | No | Governance mode: fail closed when the requested agent is absent from the selected roster; do not fall back to bundled or plugin definitions. Opt-in only; default resolution is unchanged |
+| `--enable-roles` | No | Opt into approved user-global role aliases. Exact roster names win; malformed, retargeted, chained, or unapproved aliases fail closed. Children inherit the flag |
 | `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `kimi`, `agy`, `gemini` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
 | `--model` | No | Override the agent's frontmatter model for this call |
+| `--profile` | No | Select a named private backend profile from `~/.agents/summon-profiles.json` (currently Claude only). The name is safe metadata; the registry keeps config/auth paths out of agent definitions and receipts. `--profile` overrides frontmatter `profile:` |
 | `--effort` | No | Reasoning / thinking intensity: `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none`/`default`/`off` = leave the backend alone). **Honored by claude + codex** (default **`high`**); **agy Gemini only when set explicitly** (rewrites model to `… (Low\|Medium\|High)`); **ignored** for cursor-agent / kimi / gemini CLI / openai-compat / arkcli (stderr note if you set it). Precedence: `--effort` > frontmatter `effort:` > `SUMMON_DEFAULT_EFFORT` > built-in `high` (claude/codex). Full matrix: [references/effort.md](references/effort.md) |
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy. Resume for implementation continuity; use a fresh context for final adversarial adjudication so a reviewer is not grading its own prior work. The envelope records `resumed:true|false` |
 | `--resume-profile` | No | agy only: the `resume.profile` path returned by the prior agy call |
@@ -328,7 +377,7 @@ Every response carries structured fields for programmatic orchestration:
 | `elapsed_ms` | Wall-clock for the dispatch — on every DISPATCH envelope (success/blocked/partial/error/timeout, incl. spawn failures). Not on the `--background` handle or pre-dispatch validation errors. Use it to tune swarm concurrency. |
 | `timeout` | On a timeout, `{budget_ms, stage, partial_output}` says which bounded budget expired and whether usable text was preserved. ACP names the exact protocol stage (`initialize`, `session/new`, `session/set_model`, or `session/prompt`). A subprocess backend reports `backend-execution`: summon can attest its own deadline but cannot truthfully separate vendor startup, model reasoning, and an agent's tool call without provider telemetry. |
 | `model` | `{requested, targeted, served, resolved, models_used}`, split by EVIDENCE. `requested` = what the caller asked for. `targeted` = what the session was POINTED AT (init handshake, else the post-credit-guard effective model, else the backend's knowable default). `served` = the model that actually did work, set ONLY on service evidence (a terminal-event model report, or output tokens with a known target). `served` is null whenever no service evidence was observed (typical for failed runs) even when `targeted` names a model, and task status is never used as evidence in either direction (a served run can be legitimately downgraded to `blocked`). `resolved` = LEGACY v1 semantics (handshake-or-terminal + codex config backfill), kept for compatibility; migrate to `targeted`/`served`. `models_used` lists every model id seen (a claude session often also runs a cheap auxiliary model). agy reports none of these beyond `targeted`. Aliases (`opus`/`sonnet`) can lag a launch; pin the explicit ID for a guaranteed-latest run. |
-| `summon`, `agent_def`, `prompt_sha256`, `git_head_before`, `artifacts` | Provenance receipt, built progressively on the dispatch path: `summon` identity is on EVERY envelope the path emits (validation errors, missing agent, preflight, results); the other fields join as they become known. `summon` = `{version, script, scripts_sha256}` (one SHA-256, length-prefixed framing, over every production module, so divergent installs become diagnosable from any envelope). `agent_def` = `{file, sha256, agents_dir, source: project\|bundled\|explicit\|env}`, where `agents_dir` is the absolute roster directory the definition was ACTUALLY loaded from. `prompt_sha256` hashes the ROOT prompt. `git_head_before` names tracked repo state. Repeatable `--artifact` adds an opt-in loose-file manifest `{files:[{path,sha256,bytes,page_count,page_count_source}],sha256,stable_during_dispatch,after_sha256,changed,after_error?}` and joins its manifest hash to request reuse. `changed` lists proven identity differences and is `null` when the after-read failed; `after_error` explains why stability is unknown. Either case makes a successful result suspect. Hashes and paths only, never content or secrets; paths are local-operator data. |
+| `summon`, `agent_def`, `prompt_sha256`, `git_head_before`, `workspace_evidence`, `artifacts` | Provenance receipt, built progressively on the dispatch path: `summon` identity is on EVERY envelope the path emits (validation errors, missing agent, preflight, results); the other fields join as they become known. `summon` = `{version, script, scripts_sha256}` (one SHA-256, length-prefixed framing, over every production module, so divergent installs become diagnosable from any envelope). `agent_def` = `{file, sha256, agents_dir, source: project\|bundled\|explicit\|env}`, where `agents_dir` is the absolute roster directory the definition was ACTUALLY loaded from. `prompt_sha256` hashes the ROOT prompt. `git_head_before` names tracked repo state. `workspace_evidence` is additive mutation evidence: `{before,after,coverage,child_commit,mutation,read_only_violation,attribution}`. Each snapshot exposes only `head`, `branch`, and bounded repo-relative `staged`, `unstaged`, `renamed`, and `untracked` paths; it never emits cwd, repository root, file contents, or secrets. `coverage` is `complete`, `incomplete`, or `unavailable`; `mutation`, `child_commit`, and `read_only_violation` are `true`/`false` only when the before/after comparison proves them, otherwise `null`. A dirty baseline makes attribution `ambiguous`; a clean baseline makes it `exact`; unavailable coverage is `unavailable`. Git reads use hidden Windows utility flags, per-call/overall deadlines, and a bounded status payload. This evidence does not enforce read-only and does not expose `--verify-no-mutations` yet. Repeatable `--artifact` adds an opt-in loose-file manifest `{files:[{path,sha256,bytes,page_count,page_count_source}],sha256,stable_during_dispatch,after_sha256,changed,after_error?}` and joins its manifest hash to request reuse. `changed` lists proven identity differences and is `null` when the after-read failed; `after_error` explains why stability is unknown. Either case makes a successful result suspect. Hashes and paths only, never content or secrets; paths are local-operator data. |
 | `permission`, `permission_flags` | The permission level and the EXACT CLI flags it mapped to for this run — no more black box. |
 | `effort` | Reasoning effort actually applied on **claude/codex** (`null` = backend default, or cleared because this CLI ignores `--effort`). For **agy** Gemini thinking, read `model.requested` instead (suffix). See [references/effort.md](references/effort.md). |
 | `attempts` | How many dispatches this envelope took (`--retries`). |
@@ -563,7 +612,34 @@ permissions.
 | `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.served` |
 | `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning / thinking for this agent. Honored by **claude + codex** (overrides Summon default `high`); on **agy** + Gemini, counts as *explicit* and rewrites the model suffix. Ignored on other CLIs. `--effort` at dispatch overrides it. See [references/effort.md](references/effort.md) |
 | `args` | shell-style string (optional) | Arbitrary extra backend flags passed verbatim, e.g. `args: -c model_reasoning_effort="high"` (codex). Model pinning stops being a special case |
+| `profile` | private registry name (optional) | Select a named vendor login/config profile. The registry is local to the operator; do not put paths, credentials, or account identifiers in a public agent definition. `--profile` overrides this field |
 | `transport` | `subprocess` (default), `acp` (optional) | Dispatch transport. `acp` runs the turn over the Agent Client Protocol (native: gemini, kimi, cursor-agent); `--transport` at dispatch overrides it |
+
+### Private backend profiles
+
+Profile selection is explicit and local. Create `~/.agents/summon-profiles.json` (never
+commit it) and give an agent only the opaque profile name:
+
+```json
+{
+  "profiles": {
+    "claude-review": {
+      "cli": "claude",
+      "config_dir": "<private Claude config directory>",
+      "command": "<optional absolute claude executable>",
+      "models": ["<optional model id>"]
+    }
+  }
+}
+```
+
+Use `profile: claude-review` in frontmatter or `--profile claude-review` for one call.
+The first supported profile boundary is Claude's `CLAUDE_CONFIG_DIR`; other backends keep
+their native isolation until their profile semantics are measured. Summon validates paths,
+keeps them outside the dispatch tree, and records only the profile name plus digests in the
+receipt. It does not automatically retry a failed model on another profile: a retry can
+duplicate side effects or charge twice, so fallback routing must be an explicit, reviewed
+choice by the caller.
 
 **`model:` per-CLI semantics** (the string is passed to the CLI verbatim):
 

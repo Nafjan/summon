@@ -12,7 +12,7 @@ Manifest format (JSON):
     }
 A bare JSON array is accepted as the jobs list. Per-job keys override defaults:
 id, agent, prompt | prompt_file, cwd, cli, model, effort, timeout, retries,
-json_schema, debug_dir, artifacts. Each job's envelope lands in
+json_schema, debug_dir, artifacts, profile. Each job's envelope lands in
 ``<results-dir>/<id>.json`` (atomic; an existing valid envelope skips the job —
 re-running a crashed swarm resumes where it stopped).
 
@@ -41,7 +41,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 _JOB_KEYS = ("id", "agent", "prompt", "prompt_file", "cwd", "cli", "model",
-             "effort", "timeout", "retries", "json_schema", "debug_dir", "artifacts")
+             "effort", "timeout", "retries", "json_schema", "debug_dir", "artifacts",
+             "profile")
 _DEFAULT_CAP = 3
 # The SAME duration ceiling --timeout enforces, so a manifest cannot size the parent
 # watchdog past what the child would ever accept.
@@ -238,7 +239,8 @@ def _job_agents_dir(job: dict, args, base_cwd: str) -> str:
     return get_agents_dir(args.agents_dir, job.get("cwd") or base_cwd)
 
 
-def _job_backend(job: dict, agents_dir: str) -> str:
+def _job_backend(job: dict, agents_dir: str, strict_agents_dir: bool = False,
+                 resolved_agent: str | None = None) -> str:
     """The backend a job will dispatch to (for the right semaphore): explicit
     cli > agent frontmatter run-agent > dispatcher default (codex)."""
     if job.get("cli"):
@@ -246,7 +248,8 @@ def _job_backend(job: dict, agents_dir: str) -> str:
     try:
         from _loader import load_agent
         from _resolver import resolve_cli
-        run_agent = load_agent(agents_dir, job["agent"])[0]
+        run_agent = load_agent(agents_dir, resolved_agent or job["agent"],
+                               strict_agents_dir=strict_agents_dir)[0]
         # resolve_cli, NOT `or "codex"`: with an UNPINNED agent the backend comes from
         # CALLER DETECTION, so under CLAUDE_CODE=1 every such job dispatched to claude while
         # the scheduler counted it as codex -- claude's concurrency cap was bypassed
@@ -291,7 +294,7 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
         # json_schema is deliberately absent: it has its own check further down whose
         # message explains WHY it must be a path, and that wording is worth keeping.
         for _k in ("agent", "prompt", "prompt_file", "cwd", "cli", "model", "effort", "id",
-                   "debug_dir"):
+                   "debug_dir", "profile"):
             if job.get(_k) is not None and not isinstance(job[_k], str):
                 return None, (f"job #{i}: {_k} must be a string, got "
                               f"{type(job[_k]).__name__}")
@@ -511,12 +514,19 @@ def _job_identity(job: dict, args) -> dict:
         _require_tools = not fanout_allows_text_seat()
     except ImportError:
         _require_tools = True
+    _role_map = getattr(args, "_role_provenance_by_job", {}) or {}
+    _role_provenance = _role_map.get(job.get("id"))
+    _resolved = ((_role_provenance or {}).get("resolved")
+                 if isinstance(_role_provenance, dict) else None) or job["agent"]
     return build_request_identity(
-        agent=job["agent"], prompt=job["prompt"],
+        agent=_resolved, prompt=job["prompt"],
         cwd=os.path.abspath(job.get("cwd") or args.cwd or os.getcwd()),
         agents_dir=args.agents_dir, cli=job.get("cli"), model=job.get("model"),
         effort=job.get("effort"), json_schema=job.get("json_schema"),
-        artifacts=job.get("artifacts"), require_tools=_require_tools)
+        artifacts=job.get("artifacts"), require_tools=_require_tools,
+        profile=job.get("profile"),
+        strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)),
+        role_provenance=_role_provenance)
 
 
 def _child_cmd(job: dict, args, out_file: str) -> list:
@@ -527,7 +537,12 @@ def _child_cmd(job: dict, args, out_file: str) -> list:
            "--out", out_file]
     if args.agents_dir:
         cmd += ["--agents-dir", args.agents_dir]
+    if getattr(args, "strict_agents_dir", False):
+        cmd += ["--strict-agents-dir"]
+    if getattr(args, "enable_roles", False):
+        cmd += ["--enable-roles"]
     for key, flag in (("cli", "--cli"), ("model", "--model"), ("effort", "--effort"),
+                      ("profile", "--profile"),
                       ("timeout", "--timeout"), ("json_schema", "--json-schema"),
                       ("debug_dir", "--debug-dir")):
         if job.get(key):
@@ -573,11 +588,33 @@ def run_manifest(args) -> int:
     from _loader import get_agents_dir
     agents_dir = get_agents_dir(args.agents_dir, base_cwd)
 
+    # Resolve approved global roles once for scheduler identity/backend selection.
+    # Children still receive the original alias plus --enable-roles and resolve it
+    # independently, so the direct-dispatch path remains the authority at execution.
+    args._role_provenance_by_job = {}
+    if getattr(args, "enable_roles", False):
+        from _roles import resolve_for_dispatch
+        for _job in jobs:
+            _job_cwd = os.path.abspath(_job.get("cwd") or base_cwd)
+            try:
+                args._role_provenance_by_job[_job["id"]] = resolve_for_dispatch(
+                    _job["agent"], cwd=_job_cwd,
+                    agents_dir=args.agents_dir, enabled=True,
+                    strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)))
+            except (ValueError, FileNotFoundError, OSError) as exc:
+                return _fail(f"job {_job['id']!r} role resolution failed: {exc}")
+
     # Pre-build one semaphore per backend BEFORE the pool starts — lazy creation
     # from multiple worker threads is a check-then-act race that can exceed a
     # backend's cap. Resolve each job's backend once here (also reused below).
-    job_backends = {j["id"]: _job_backend(j, _job_agents_dir(j, args, base_cwd))
-                    for j in jobs}
+    job_backends = {
+        j["id"]: _job_backend(
+            j, _job_agents_dir(j, args, base_cwd),
+            strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)),
+            resolved_agent=(((args._role_provenance_by_job.get(j["id"]) or {}).get(
+                "resolved")) or j["agent"]))
+        for j in jobs
+    }
     # Text-seat fan-out gate (same policy as council): capability alone is not
     # enough; SUMMON_ALLOW_TEXT_ONLY=1 is deliberate consent for pure-text swarms.
     # Fail CLOSED if the gate module is missing (never skip honesty).
@@ -594,7 +631,11 @@ def run_manifest(args) -> int:
                 if j.get("cli"):
                     cli = j["cli"]
                 else:
-                    cli = resolve_cli(load_agent(agents_for_job, j["agent"])[0])
+                    _resolved_job = (((args._role_provenance_by_job.get(j["id"]) or {}).get(
+                        "resolved")) or j["agent"])
+                    cli = resolve_cli(load_agent(
+                        agents_for_job, _resolved_job,
+                        strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)))[0])
             except Exception:  # noqa: BLE001
                 # An unknown/malformed agent cannot dispatch a text seat. Keep
                 # it in the normal per-job error path so manifest callers still

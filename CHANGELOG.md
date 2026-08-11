@@ -4,6 +4,28 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
+## [2.1.0] — 2026-08-11
+
+### Highlights
+
+- **Named local profiles:** route a Claude agent to an operator-owned config directory and,
+  when needed, a pinned executable without putting machine paths or credentials in the
+  public roster. Receipts carry the profile name and integrity digests.
+- **Strict roster provenance:** add `--strict-agents-dir` to make governance-controlled
+  dispatch fail closed when a named role is absent, while keeping the normal bundled/plugin
+  fallback convenient by default.
+- **Private role aliases (experimental):** propose and explicitly approve operator-owned
+  aliases for existing roster definitions, then opt into them with `--enable-roles`. Exact
+  names win; target and approval hashes are checked before dispatch and only digest-based
+  provenance appears in receipts.
+
+### Maintenance
+
+- Added request-identity and background forwarding coverage for profile selection. Automatic
+  cross-account retries remain intentionally out of scope because they can duplicate work.
+- Background, manifest, and council role propagation is covered; malformed, chained, or
+  retargeted aliases fail closed rather than silently falling back.
+
 ## [Unreleased]
 
 ## [2.0.5] — 2026-08-09

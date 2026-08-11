@@ -8,7 +8,7 @@ The bundled roster is a starting point, not a fixed menu. As the orchestrator yo
 have two levers — use them freely:
 
 **1. Per-dispatch, no files touched** — override an agent's model, reasoning effort,
-and backend flags for a single call:
+backend flags, or private login profile for a single call:
 ```bash
 run_subagent.py --agent reviewer --model claude-sonnet-5 --effort high \
   --prompt "…" --cwd <abs>
@@ -35,9 +35,34 @@ run_subagent.py --set-agent probe --set model=        # empty value REMOVES the 
 ```
 
 Settable keys: `run-agent` (claude/codex/cursor-agent/gemini/agy), `model`,
-`permission` (`read-only`/`safe-edit`/`yolo`), `args` (extra backend flags) —
+`permission` (`read-only`/`safe-edit`/`yolo`), `args` (extra backend flags), and
+`profile` (a private registry name) —
 values are validated before anything is written. `--new-agent` never overwrites;
 `--set-agent` edits frontmatter only, leaving the body byte-identical.
+
+### Private login profiles
+
+When one backend has multiple local accounts or installations, keep the paths and
+credentials out of the repository. Put named entries in `~/.agents/summon-profiles.json`:
+
+```json
+{
+  "profiles": {
+    "claude-review": {
+      "cli": "claude",
+      "config_dir": "<private config directory>",
+      "command": "<optional absolute claude executable>",
+      "models": ["claude-sonnet-5"]
+    }
+  }
+}
+```
+
+Then set `profile: claude-review` in a local agent or pass `--profile claude-review`.
+The profile name is safe to share; the registry is not. Summon currently applies this
+boundary to Claude's `CLAUDE_CONFIG_DIR` and can pin the executable, which is useful when
+an older machine-wide shim wins `PATH`. It records only names and digests in receipts and
+never silently retries a failed call on another account.
 
 Definitions are plain `.md` files in the agents dir (`--agents-dir`,
 `$SUB_AGENTS_DIR`, or `{cwd}/.agents/`) and register **instantly** — no reload; the
