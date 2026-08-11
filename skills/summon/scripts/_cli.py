@@ -91,7 +91,7 @@ def parse_timeout(value: str) -> int:
 # explicitly supports it.
 MODE_FLAGS = {
     "manifest": {"manifest", "concurrency", "results_dir", "cwd", "agents_dir",
-                 "retries", "job_file"},
+                 "retries", "job_file", "strict_agents_dir"},
     # Operation-level rows: a fresh council, a resume, and a read-only status
     # each consume a DIFFERENT set (v3.1). Changing members/rounds/question on a
     # resume would be a new run, so they are rejected there; status takes only
@@ -99,14 +99,14 @@ MODE_FLAGS = {
     "council": {"council", "question", "question_file", "members", "chairman",
                 "rounds", "cwd", "agents_dir", "timeout", "out", "run_dir", "results_dir",
                 "job_file", "quorum", "chairman_fallback", "member_timeout",
-                "chair_timeout", "overall_timeout", "min_successful"},
+                "chair_timeout", "overall_timeout", "min_successful", "strict_agents_dir"},
     # A resume may change how the SAME run's stages are gated/timed (quorum,
     # fallback, per-stage timeouts) without changing its identity; question,
     # members, chairman, and rounds still come from the receipt.
     "council-resume": {"council", "resume_run", "cwd", "agents_dir", "timeout",
                        "out", "run_dir", "results_dir", "job_file",
                        "quorum", "chairman_fallback", "member_timeout", "chair_timeout",
-                       "overall_timeout", "min_successful"},
+                       "overall_timeout", "min_successful", "strict_agents_dir"},
     # Status takes ONLY its id, where to look, and the output format -- it never
     # dispatches, so it has no working directory (use --run-dir to point it).
     "council-status": {"council_status", "run_dir", "json", "job_file"},
@@ -341,6 +341,9 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "argv, so backend argv limits (e.g. agy ~28k chars) apply")
     parser.add_argument("--cwd", help="Working directory (absolute path)")
     parser.add_argument("--agents-dir", help="Directory containing agent definitions")
+    parser.add_argument("--strict-agents-dir", dest="strict_agents_dir", action="store_true",
+                        help="Fail closed when an agent is absent from the selected roster; "
+                             "do not fall back to bundled or plugin definitions")
     parser.add_argument(
         "--timeout", type=parse_timeout, default=600000,
         help="Timeout: bare ms, or with suffix — 600s, 10m (default: 600000 ms = 10m)"

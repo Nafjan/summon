@@ -583,7 +583,7 @@ def _fm_capability_text_only(fm) -> bool:
         return False
 
 
-def _defn_snapshot(agents_dir_arg, cwd, agent_name):
+def _defn_snapshot(agents_dir_arg, cwd, agent_name, strict_agents_dir: bool = False):
     """Load the definition ONCE (for the whole identity), or None if there is no agent.
 
     state: "ok" (loaded), "missing" (no such file), "malformed" (present but the loader
@@ -592,10 +592,10 @@ def _defn_snapshot(agents_dir_arg, cwd, agent_name):
     sha) and the dispatch's own ABA-safe last_parsed_sha matches it while the file is stable.
     `fm` is the frontmatter, for the endpoint field -- also from that one buffer.
     """
+    from _loader import (AgentResolutionError, bundled_roster_dir, get_agents_dir,
+                         load_agent_snapshot, validate_agent_name)
     if not agent_name:
         return None
-    from _loader import (bundled_roster_dir, get_agents_dir, load_agent_snapshot,
-                         validate_agent_name)
     try:
         validate_agent_name(agent_name)
     except Exception:  # noqa: BLE001 — an unusable NAME is not an absent definition
@@ -608,8 +608,14 @@ def _defn_snapshot(agents_dir_arg, cwd, agent_name):
         # ONE read: the tuple, the frontmatter and the hash all come from the SAME byte
         # buffer, so no definition-derived field can see a different byte version -- the
         # invariant that closes the A->B->A hybrid, not merely "one load_agent call".
-        tup, fm, sha = load_agent_snapshot(agents_dir, agent_name)
+        tup, fm, sha = load_agent_snapshot(
+            agents_dir, agent_name, strict_agents_dir=strict_agents_dir)
         return _DefnSnapshot(tup, fm or {}, sha, "ok" if sha else "unreadable")
+    except AgentResolutionError:
+        # Keep the strict governance miss distinct in the request identity so an old
+        # success served by a fallback roster cannot be reused before the real dispatch
+        # emits its machine-readable refusal.
+        return _DefnSnapshot(None, {}, None, "strict-miss")
     except Exception:  # noqa: BLE001 — the dispatch surfaces the real error
         pass
     # a file under that name EXISTS but did not load -> malformed, not absent
@@ -1075,7 +1081,8 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
                            effort=None, json_schema=None, resume=None, resume_profile=None,
                            worktree=None, allow_credit=False, gate_with=None,
                            max_permission=None, artifacts=None,
-                           allow_text_only=False, require_tools=False, profile=None) -> dict:
+                           allow_text_only=False, require_tools=False, profile=None,
+                           strict_agents_dir=False) -> dict:
     """THE request identity, built in ONE place from RAW inputs.
 
     The dispatcher and the manifest parent each used to build their own dict, so a field
@@ -1103,7 +1110,8 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
     # ONE load of the definition for the WHOLE identity: every field derived from it reads
     # this snapshot, so an A -> B -> A swap mid-construction cannot produce a hybrid identity
     # (A's hash paired with B's resolved backend, which had turned agy attestation off).
-    _defn = _defn_snapshot(agents_dir, cwd, agent)
+    _defn = _defn_snapshot(agents_dir, cwd, agent,
+                           strict_agents_dir=bool(strict_agents_dir))
     _adef = (_defn.sha, _defn.state) if _defn is not None else (None, "missing")
     _rcli = _resolved_cli(cli, agents_dir, cwd, agent, _defn)
     _rperm = _resolved_permission(_defn, max_permission)
@@ -1168,6 +1176,10 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         "profile_path_sha256": ((_profile_selection or {}).get("path_sha256")),
         "profile_registry_sha256": ((_profile_selection or {}).get("registry_sha256")),
         "profile_command_sha256": ((_profile_selection or {}).get("command_sha256")),
+        # Strict roster provenance changes whether a bundled/pack definition is eligible;
+        # keep it in the request identity so a cached fallback result cannot satisfy a
+        # later governance request.
+        "strict_agents_dir": "1" if strict_agents_dir else None,
         # ONLY when this is an actual resume: --resume-profile without --resume still takes
         # the FRESH-profile branch at dispatch, so selecting the resumed profile's account
         # there made a perfectly good fresh profile look like an account swap and refused it.

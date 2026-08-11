@@ -83,7 +83,8 @@ __version__ = "2.0.5"  # summon dispatcher version (see CHANGELOG.md)
 _JOB_FILE: str | None = None
 
 
-def _dispatch_agent_snapshot(agents_dir: str, agent_name: str):
+def _dispatch_agent_snapshot(agents_dir: str, agent_name: str,
+                             strict_agents_dir: bool = False):
     """Load the dispatch definition through one testable seam.
 
     Request identity construction has its own loader snapshot.  Keeping this
@@ -92,6 +93,8 @@ def _dispatch_agent_snapshot(agents_dir: str, agent_name: str):
     the shared loader would change both sides and make the test vacuous.
     """
     from _loader import load_agent_snapshot
+    if strict_agents_dir:
+        return load_agent_snapshot(agents_dir, agent_name, strict_agents_dir=True)
     return load_agent_snapshot(agents_dir, agent_name)
 
 
@@ -219,7 +222,8 @@ def _request_identity(args) -> dict:
         artifacts=getattr(args, "artifacts", None),
         allow_text_only=bool(getattr(args, "allow_text_only", False)),
         require_tools=bool(getattr(args, "require_tools", False)),
-        profile=getattr(args, "profile", None))
+        profile=getattr(args, "profile", None),
+        strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)))
 
 
 def _complete_artifact_provenance(env: dict, args, before: dict | None) -> dict:
@@ -634,9 +638,16 @@ def main() -> None:
     # validated. Cheap (one hash over the scripts dir), so computing it even for
     # runs that turn out to be fan-out modes is fine.
     receipt: dict = _receipt_base()
+    if getattr(args, "strict_agents_dir", False):
+        receipt["strict_agents_dir"] = True
 
-    def _die(msg: str, exit_code: int = 1) -> None:
+    def _die(msg: str, exit_code: int = 1, *, error_kind: str | None = None,
+             details: dict | None = None) -> None:
         env = {"result": "", "exit_code": exit_code, "status": "error", "error": msg}
+        if error_kind:
+            env["error_kind"] = error_kind
+        if details:
+            env["agent_resolution"] = details
         env.update(receipt)
         # --out is the AUTHORITATIVE result path, so a pre-dispatch failure has to land
         # there too. Emitting only to stdout left that path EMPTY after a refused stale
@@ -838,7 +849,9 @@ def main() -> None:
         _bg_file = None
         try:
             _bg_dir = _ts_loader.get_agents_dir(args.agents_dir, args.cwd)
-            _bg_tup = _ts_loader.load_agent(_bg_dir, args.agent)
+            _bg_tup = _ts_loader.load_agent(
+                _bg_dir, args.agent,
+                strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)))
             _bg_file = _bg_tup[3]
             if not _bg_cli:
                 # Identity may omit resolved_cli in edge cases; fall back to
@@ -927,12 +940,24 @@ def main() -> None:
         # Keep the frontmatter snapshot that supplied the tuple.  The profile selector is
         # metadata, not backend prompt text, and re-reading the file later would open the
         # same A->B->A window the definition hash attestation exists to close.
-        _loaded, _agent_fm, _agent_sha = _dispatch_agent_snapshot(agents_dir, args.agent)
+        if getattr(args, "strict_agents_dir", False):
+            _loaded, _agent_fm, _agent_sha = _dispatch_agent_snapshot(
+                agents_dir, args.agent, strict_agents_dir=True)
+        else:
+            _loaded, _agent_fm, _agent_sha = _dispatch_agent_snapshot(agents_dir, args.agent)
         if _loaded is None:
             raise FileNotFoundError(f"Agent definition not found: {args.agent}")
         run_agent_cli, system_context, _, agent_file, permission, model, extra_args, effort_fm = _loaded
         _agent_fm = _agent_fm or {}
-    except (FileNotFoundError, ValueError) as e:
+    except ValueError as e:
+        _die(str(e))
+    except FileNotFoundError as e:
+        if getattr(e, "kind", None) == "strict_agents_dir_miss":
+            _die(str(e), error_kind=e.kind, details={
+                "agent": getattr(e, "agent_name", args.agent),
+                "strict_agents_dir": True,
+                "fallback_source": getattr(e, "fallback_source", "unknown"),
+            })
         _die(str(e))
 
     # The identity hashed this definition BEFORE dispatch; this is the copy that will
@@ -1387,6 +1412,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "cli": invocation.cli,
         "cwd": invocation.cwd,
         "agents_dir": agents_dir,
+        "strict_agents_dir": bool(getattr(args, "strict_agents_dir", False)),
         "model_requested": invocation.model,
         "model_effective": _eff_model,  # after any credit-only-model fallback
         "profile": invocation.profile,
@@ -1549,7 +1575,9 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
     from _loader import load_agent_snapshot
 
     try:
-        tup, gate_fm, _gate_sha = load_agent_snapshot(agents_dir, args.gate_with)
+        tup, gate_fm, _gate_sha = load_agent_snapshot(
+            agents_dir, args.gate_with,
+            strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)))
         if tup is None:
             raise FileNotFoundError(f"Agent definition not found: {args.gate_with}")
     except Exception as e:  # noqa: BLE001 — an unusable gate must REFUSE, not pass

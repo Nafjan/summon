@@ -43,6 +43,8 @@ def child_argv(args: argparse.Namespace, result_file: str) -> list:
         out += ["--no-contract-repair"]     # honor the opt-out in the detached child
     if args.agents_dir:
         out += ["--agents-dir", args.agents_dir]
+    if getattr(args, "strict_agents_dir", False):
+        out += ["--strict-agents-dir"]
     if args.timeout:
         out += ["--timeout", str(args.timeout)]
     for flag, val in (("--cli", args.cli), ("--model", args.model), ("--effort", args.effort),

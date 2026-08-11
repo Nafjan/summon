@@ -11,6 +11,9 @@ regression notes, and test evidence, see the
 - **Named local profiles:** route a Claude agent to an operator-owned config directory and,
   when needed, a pinned executable without putting machine paths or credentials in the
   public roster. Receipts carry the profile name and integrity digests.
+- **Strict roster provenance:** add `--strict-agents-dir` to make governance-controlled
+  dispatch fail closed when a named role is absent, while keeping the normal bundled/plugin
+  fallback convenient by default.
 
 ### Maintenance
 

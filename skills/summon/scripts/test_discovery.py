@@ -16042,6 +16042,164 @@ def test_v10_explicit_agents_dir_falling_back_to_bundled_is_never_silent():
         shutil.rmtree(empty, ignore_errors=True)
 
 
+def test_v10_strict_agents_dir_refuses_bundled_and_pack_fallbacks():
+    """An opted-in roster boundary must be a real boundary, not a warning.
+
+    The default lookup remains useful for a fresh install, while strict lookup refuses
+    the same missing name even when a bundled or third-party definition could answer it.
+    Both sources are exercised so deleting either strict guard cannot leave this test green.
+    """
+    import shutil
+    import _loader
+
+    bundled = _loader.bundled_roster_dir()
+    if not bundled or not os.path.isfile(os.path.join(bundled, "planner.md")):
+        return
+    empty = tempfile.mkdtemp(prefix="summon-strict-roster-")
+    pack = tempfile.mkdtemp(prefix="summon-strict-pack-")
+    try:
+        normal, _, _ = _loader.load_agent_snapshot(empty, "planner")
+        assert normal and os.path.abspath(normal[3]).startswith(os.path.abspath(bundled)), normal
+
+        try:
+            _loader.load_agent_snapshot(empty, "planner", strict_agents_dir=True)
+        except _loader.AgentResolutionError as exc:
+            assert exc.kind == "strict_agents_dir_miss"
+            assert exc.fallback_source == "bundled"
+            assert os.path.abspath(bundled) not in str(exc)
+            assert os.path.abspath(empty) not in str(exc), (
+                "the public refusal must not leak private roster paths")
+        else:
+            raise AssertionError("strict lookup served a bundled definition")
+
+        shutil.copy2(os.path.join(bundled, "planner.md"), os.path.join(pack, "planner.md"))
+        old_bundled, old_packs = _loader.bundled_roster_dir, _loader.discover_agent_packs
+        _loader.bundled_roster_dir = lambda: None
+        _loader.discover_agent_packs = lambda: [{"path": pack, "name": "fixture-pack"}]
+        try:
+            pack_normal, _, _ = _loader.load_agent_snapshot(empty, "planner")
+            assert pack_normal and os.path.abspath(pack_normal[3]).startswith(os.path.abspath(pack)), pack_normal
+            try:
+                _loader.load_agent_snapshot(empty, "planner", strict_agents_dir=True)
+            except _loader.AgentResolutionError as exc:
+                assert exc.fallback_source == "pack"
+                assert exc.kind == "strict_agents_dir_miss"
+            else:
+                raise AssertionError("strict lookup served a plugin-pack definition")
+            # The diagnostic probe must not parse a private fallback just to name its
+            # source. A malformed candidate still produces the same strict refusal.
+            with open(os.path.join(pack, "planner.md"), "w", encoding="utf-8") as fh:
+                fh.write("---\npermission: not-a-tier\n---\n# malformed\n")
+            try:
+                _loader.load_agent_snapshot(empty, "planner", strict_agents_dir=True)
+            except _loader.AgentResolutionError as exc:
+                assert exc.fallback_source == "pack"
+            else:
+                raise AssertionError("strict diagnostic parsed a malformed fallback")
+        finally:
+            _loader.bundled_roster_dir, _loader.discover_agent_packs = old_bundled, old_packs
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
+        shutil.rmtree(pack, ignore_errors=True)
+
+
+def test_v10_strict_agents_dir_identity_and_cache_refusal_are_distinct():
+    """Strict provenance is part of the request, and a strict miss cannot reuse a success."""
+    import shutil
+    from _executor import build_request_identity, envelope_answers_request, request_fingerprint
+
+    roster = tempfile.mkdtemp(prefix="summon-strict-identity-")
+    try:
+        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agents", "planner.md")
+        shutil.copy2(source, os.path.join(roster, "planner.md"))
+        common = dict(agent="planner", prompt="identity probe", cwd=os.getcwd(), agents_dir=roster)
+        relaxed = build_request_identity(**common, strict_agents_dir=False)
+        strict = build_request_identity(**common, strict_agents_dir=True)
+        assert request_fingerprint(**relaxed) != request_fingerprint(**strict), (
+            "strict roster provenance was dropped from the request identity")
+
+        missing = dict(agent="planner", prompt="identity probe", cwd=os.getcwd(), agents_dir=roster)
+        os.remove(os.path.join(roster, "planner.md"))
+        strict_miss = build_request_identity(**missing, strict_agents_dir=True)
+        prior = {"status": "success", "request_sha256": request_fingerprint(**relaxed)}
+        reusable, _ = envelope_answers_request(
+            prior, request_fingerprint(**strict_miss), identity=strict_miss)
+        assert reusable is False, "strict roster miss reused a prior success"
+    finally:
+        shutil.rmtree(roster, ignore_errors=True)
+
+
+def test_v10_strict_agents_dir_propagates_to_detached_fanout_children():
+    """Background, manifest, and council children must inherit the governance boundary."""
+    import argparse
+    import _background
+    import _council
+    import _manifest
+
+    ns = argparse.Namespace(
+        agent="planner", prompt="p", prompt_file=None, cwd=os.getcwd(),
+        allow_credit=False, allow_payg=False, allow_text_only=False, require_tools=False,
+        no_contract_repair=False, agents_dir="C:/roster", strict_agents_dir=True,
+        timeout=600000, cli=None, model=None, effort=None, resume=None,
+        resume_profile=None, profile=None, out=None, json_schema=None, debug_dir=None,
+        retries=0, max_permission=None, gate_with=None, gate_timeout=None,
+        worktree=None, artifacts=[])
+    background = _background.child_argv(ns, "result.json")
+    assert "--strict-agents-dir" in background, background
+
+    job = {"id": "audit", "agent": "planner", "prompt": "p"}
+    manifest = _manifest._child_cmd(job, argparse.Namespace(
+        cwd=os.getcwd(), agents_dir="C:/roster", strict_agents_dir=True, retries=0), "out.json")
+    assert "--strict-agents-dir" in manifest, manifest
+
+    captured = {}
+    old_dispatch, old_read, old_existing = (
+        _manifest._dispatch_child, _manifest._read_envelope, _manifest._existing_envelope)
+    try:
+        def fake_dispatch(cmd, timeout, on_spawn=None, on_reap=None):
+            captured["cmd"] = cmd
+            return types.SimpleNamespace(timed_out=False), None
+        _manifest._dispatch_child = fake_dispatch
+        _manifest._read_envelope = lambda path, proc: {"status": "success"}
+        _manifest._existing_envelope = lambda path: {"status": "success"}
+        out_dir = tempfile.mkdtemp(prefix="summon-strict-council-")
+        try:
+            result = _council._dispatch("planner", "p", os.getcwd(), "C:/roster", 1000,
+                                        out_dir, "g1-member", strict_agents_dir=True)
+            assert result["status"] == "success"
+            assert "--strict-agents-dir" in captured["cmd"], captured
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
+    finally:
+        _manifest._dispatch_child, _manifest._read_envelope, _manifest._existing_envelope = (
+            old_dispatch, old_read, old_existing)
+
+
+def test_v10_strict_agents_dir_parser_and_public_contract():
+    """The flag is parseable in direct/fan-out modes and documented as opt-in."""
+    import _cli
+
+    parser = _cli.build_parser("2.0.5", 1)
+    ns = parser.parse_args(["--agent", "planner", "--prompt", "p", "--cwd", os.getcwd(),
+                            "--strict-agents-dir"])
+    assert ns.strict_agents_dir is True
+    assert "strict_agents_dir" in _cli.MODE_FLAGS["manifest"]
+    assert "strict_agents_dir" in _cli.MODE_FLAGS["council"]
+    assert "strict_agents_dir" in _cli.MODE_FLAGS["council-resume"]
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    skill = open(os.path.join(root, "SKILL.md"), encoding="utf-8").read()
+    readme = open(os.path.join(root, "..", "..", "README.md"), encoding="utf-8").read()
+    changelog = open(os.path.join(root, "..", "..", "CHANGELOG.md"),
+                     encoding="utf-8").read()
+    assert "--strict-agents-dir" in skill
+    assert "strict_agents_dir_miss" in skill
+    assert "fallback" in skill.lower()
+    assert "--strict-agents-dir" in readme
+    assert "fallback" in readme.lower()
+    assert "--strict-agents-dir" in changelog
+
+
 def test_v10_timeout_envelope_surfaces_the_cause_not_just_the_clock():
     """FIELD REPORT (2026-07-28). A dispatch burned 480s and returned result="" with the
     real cause -- `rg` missing from the child's PATH -- visible only in `output_tail`, a

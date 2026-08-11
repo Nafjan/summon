@@ -199,6 +199,10 @@ For a second local Claude login, define it in the private
 profile name and integrity digests, not the config path. See
 [private backend profiles](skills/summon/SKILL.md#private-backend-profiles).
 
+For governance-controlled dispatches, add `--strict-agents-dir` alongside
+`--agents-dir`. A missing role then fails closed instead of falling through to the
+bundled or plugin roster; ordinary dispatches keep the convenience fallback.
+
 **Staying current:** the installed skill is a copy and never self-updates. Re-install or
 update via your Agent Plugin client's UI (for plugin installs), run `npx skills update`
 (for `skills add` installs), or re-run `python install.py` after a `git pull` (for
