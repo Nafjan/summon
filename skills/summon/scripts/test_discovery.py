@@ -8,6 +8,7 @@ config.toml table-boundary parsing and the eager-agy-probe filter bug.
 from __future__ import annotations
 
 import json
+import ast
 import os
 import shutil
 import sys
@@ -17589,6 +17590,130 @@ def test_profile_dry_run_hides_private_command_path():
         assert view["env_overrides"] == ["CLAUDE_CONFIG_DIR"]
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_review_first_contract_and_git_landing_guard():
+    """Bind the public workflow contract to the files and code it describes.
+
+    The negative fixture is deliberate mutation coverage for the source guard: a
+    future ``subprocess.run(["git", "commit", ...])`` must fail this test rather
+    than merely pass because today's production tree happens not to contain one.
+    """
+    root = Path(__file__).resolve().parents[3]
+    brief = (root / "docs" / "REVIEW_BRIEF_STANDARD.md").read_text(encoding="utf-8")
+    implementer = (root / "skills" / "summon" / "agents" / "implementer.md").read_text(
+        encoding="utf-8")
+    protocol = (root / "docs" / "PROTOCOL.md").read_text(encoding="utf-8")
+    skill = (root / "skills" / "summon" / "SKILL.md").read_text(encoding="utf-8")
+
+    for field in ("OBJECTIVE:", "FACTS AND EVIDENCE:", "SCOPE:", "EXCLUSIONS:",
+                  "GATE COMMANDS:", "ACTION SAFETY:", "REPORT:", "LEFT_BEHIND"):
+        assert field in brief, "review brief lost required field %r" % field
+    for phrase in ("git add", "git commit", "git push", "git merge", "git restore",
+                   "git stash", "create a PR",
+                   "LEFT_BEHIND"):
+        assert phrase in implementer, "implementer contract lost %r" % phrase
+    assert "REVIEW_BRIEF_STANDARD.md" in protocol
+    assert "review-first" in skill.lower() and "LEFT_BEHIND" in skill
+
+    forbidden = {"add", "commit", "push", "merge"}
+
+    def resolve(expr, names):
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return [expr.value]
+        if isinstance(expr, ast.Constant):
+            return [None]
+        if isinstance(expr, (ast.List, ast.Tuple)):
+            values = []
+            for item in expr.elts:
+                part = resolve(item, names)
+                if part is None:
+                    part = [None]
+                values.extend(part)
+            return values
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+            left, right = resolve(expr.left, names), resolve(expr.right, names)
+            return (left or [None]) + (right or [None])
+        if isinstance(expr, ast.IfExp):
+            # Preserve the branch with the most structural information. This
+            # keeps ``["git"] + (["-C", str(repo)] if repo else [])``
+            # inspectable without pretending the path value is known.
+            branches = [resolve(expr.body, names), resolve(expr.orelse, names)]
+            return max(branches, key=lambda value: (sum(x is not None for x in value), len(value)))
+        if isinstance(expr, ast.Name):
+            return names.get(expr.id, [None])
+        return [None]
+
+    def landing_calls(source):
+        tree = ast.parse(source)
+        names, found = {}, []
+
+        class Guard(ast.NodeVisitor):
+            def visit_Assign(self, node):
+                value = resolve(node.value, names)
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names[target.id] = value
+                self.generic_visit(node)
+
+            def visit_Call(self, node):
+                func = node.func
+                is_process_call = (isinstance(func, ast.Attribute)
+                                   and isinstance(func.value, ast.Name)
+                                   and func.value.id == "subprocess"
+                                   and func.attr in {"run", "Popen", "call", "check_call",
+                                                      "check_output"})
+                if is_process_call and node.args:
+                    argv = resolve(node.args[0], names)
+                    if argv and isinstance(argv[0], str) and os.path.basename(argv[0]).lower() in {"git", "git.exe"}:
+                        # Find the subcommand after options which consume a value.
+                        # Unknown tokens are a violation too: a future dynamic command
+                        # must be reviewed rather than silently escaping this guard.
+                        subcommand = None
+                        unknown = False
+                        skip_value = False
+                        for part in argv[1:]:
+                            if skip_value:
+                                skip_value = False
+                                continue
+                            if part is None:
+                                unknown = True
+                                break
+                            if part in {"-C", "--git-dir", "--work-tree", "--exec-path"}:
+                                skip_value = True
+                                continue
+                            if part.startswith("-"):
+                                continue
+                            subcommand = part.lower()
+                            break
+                        if subcommand in forbidden:
+                            found.append((node.lineno, [subcommand]))
+                        elif subcommand is None or unknown:
+                            found.append((node.lineno, ["unresolved-subcommand"]))
+                self.generic_visit(node)
+
+        Guard().visit(tree)
+        return found
+
+    mutation = "import subprocess\nsubprocess.run(['git', 'commit', '-m', 'bad'])\n"
+    assert landing_calls(mutation), "guard mutation fixture was not detected"
+    dynamic_mutation = ("import subprocess\noperation = 'commit'\n"
+                        "subprocess.run(['git', operation])\n")
+    assert landing_calls(dynamic_mutation), "dynamic git mutation escaped the guard"
+    safe = "import subprocess\nsubprocess.run(['git', 'status'])\n"
+    assert not landing_calls(safe), "safe git inspection was misclassified"
+
+    scripts = root / "skills" / "summon" / "scripts"
+    violations = []
+    for path in sorted(scripts.glob("*.py")):
+        if path.name.startswith("test_"):
+            continue
+        try:
+            found = landing_calls(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+            raise AssertionError("could not inspect production source %s: %s" % (path, exc))
+        violations.extend((path.name, line, hit) for line, hit in found)
+    assert not violations, "Summon contains an automatic git landing command: %r" % violations
 
 
 if __name__ == "__main__":

@@ -193,6 +193,17 @@ For review agents, branch on two separate fields: `execution_status` says whethe
 dispatch ran successfully, while `verdict` says `block`, `conditional`, or `pass`. A
 completed review returning `VERDICT: BLOCK` is successful execution and a rejected subject.
 
+### Review-first implementer boundary
+
+Use the repository's [`docs/REVIEW_BRIEF_STANDARD.md`](https://github.com/Nafjan/summon/blob/main/docs/REVIEW_BRIEF_STANDARD.md) when a caller
+dispatches an implementer or reviewer. Summon and its children do not stage, commit,
+push, merge, restore, stash, or create PRs, and must not reset, clean, discard, or force-remove work.
+The caller reads the actual diff and reruns gates; the designated reviewer owns landing.
+Every child must report `LEFT_BEHIND` for resources it created or intentionally left,
+including temporary files, servers, containers, VMs, worktrees, and processes. Treat
+reports and envelopes as private artifacts; public docs contain only sanitized,
+repository-relative examples.
+
 **By exit_code** (when status is `error`):
 
 | exit_code | Meaning | Resolution |

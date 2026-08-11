@@ -50,6 +50,11 @@ An OpenAI-compatible endpoint: add to `providers.json` (or a built-in in `BUILTI
 3. Docs updated (SKILL.md / references / CHANGELOG).
 4. No new runtime dependency.
 5. Secrets redacted; OS branches guarded.
+6. Use the review-first brief: inspect the real diff and rerun the gates before landing.
+7. Summon and dispatched children do not stage, commit, push, merge, restore, stash, or create PRs;
+   the designated reviewer owns those actions.
+8. Check reports and envelopes for private absolute paths, secrets, generated files,
+   child commits, and non-empty `LEFT_BEHIND` resources.
 
 ## Layout
 

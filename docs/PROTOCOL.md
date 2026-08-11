@@ -27,6 +27,19 @@ explicitly. On any follow-up, pass forward what the previous call learned (its
    agent definition. Parallel *editing* agents each get their own `--worktree`.
 5. **Track every delegation** (agent, backend, model, branch, finding) in your task list.
 
+## Review-first landing boundary
+
+Use [`REVIEW_BRIEF_STANDARD.md`](REVIEW_BRIEF_STANDARD.md) for implementer and reviewer
+prompts. A child may edit the supplied working directory when its declared permission
+and backend allow it, but it does not land work: no `git add`, `git commit`, `git push`,
+`git merge`, `git restore`, `git stash`, or PR creation, and no reset/clean/discard/force-removal. The caller reads
+the real diff, reruns the gates, and the designated reviewer owns every staging, commit,
+push, merge, and PR action. Every child reports `LEFT_BEHIND`, including temporary files,
+servers, containers, VMs, worktrees, and processes it created or intentionally left.
+
+The boundary is a workflow contract, not a backend sandbox claim. Verify it from the
+diff and receipt; do not infer it from a prompt or permission label.
+
 ## The report contract
 
 Every bundled agent ends its reply with a fenced report block:
