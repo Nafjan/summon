@@ -94,6 +94,13 @@ class FrozenRosterTests(unittest.TestCase):
                         encoding="utf-8")
         self.assertFalse(snap.revalidate())
 
+    def test_revalidation_inputs_are_immutable(self):
+        self.add_agent("worker")
+        snap = self.freeze()
+        with self.assertRaises(TypeError):
+            snap._kwargs["cli_overrides"]["one"] = "agy"
+        self.assertTrue(snap.revalidate())
+
     def test_worktree_proof_is_revalidated_after_freeze(self):
         self.add_agent("worker", permission="safe-edit")
         proof = self.proof()

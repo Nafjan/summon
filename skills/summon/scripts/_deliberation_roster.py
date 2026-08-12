@@ -466,6 +466,7 @@ class FrozenRoster:
     _kwargs: Mapping[str, object] = field(default_factory=dict, repr=False, compare=False)
     _runtime: Mapping[str, Mapping[str, object]] = field(default_factory=dict,
                                                        repr=False, compare=False)
+    root_cwd: str = field(default="", repr=True, compare=True)
 
     def __post_init__(self) -> None:
         if not self.seats:
@@ -482,6 +483,10 @@ class FrozenRoster:
             key: MappingProxyType(dict(value))
             for key, value in dict(self._runtime).items()
         }))
+        if self.root_cwd:
+            if not isinstance(self.root_cwd, str) or not os.path.isabs(self.root_cwd):
+                raise RosterResolutionError("frozen roster cwd must be absolute")
+            object.__setattr__(self, "root_cwd", os.path.abspath(self.root_cwd))
 
     def seat(self, seat_id: str) -> FrozenSeat:
         for seat in self.seats:
@@ -504,6 +509,7 @@ class FrozenRoster:
         result = {
             "schema_version": SCHEMA_VERSION,
             "roster_digest": self.roster_digest,
+            "root_cwd_sha256": _redacted_id(self.root_cwd),
             "full_authority_consent_sha256": [_redacted_id(value)
                                                for value in self.full_authority_consent],
             "text_only_consent_sha256": [_redacted_id(value)
@@ -774,15 +780,19 @@ def freeze_roster(
             "extra_args": tuple(extra_args),
         })
     roster_digest = _digest_mapping({"schema_version": SCHEMA_VERSION,
+                                     "root_cwd_sha256": _digest_text(os.path.abspath(cwd)),
                                      "seats": [_canonical_seat(seat) for seat in frozen]})
     kwargs = {
         "cwd": cwd, "agents_dir": agents_dir, "role_enabled": role_enabled,
         "strict_agents_dir": strict_agents_dir,
         "full_authority_consent": tuple(full), "text_only_consent": tuple(text),
-        "worktree_proofs": proofs, "cli_overrides": cli_overrides,
-        "model_overrides": model_overrides, "permission_ceilings": permission_ceilings,
-        "transport_overrides": transport_overrides, "profile_overrides": profile_overrides,
-        "effort_overrides": effort_overrides,
+        "worktree_proofs": MappingProxyType(dict(proofs)),
+        "cli_overrides": MappingProxyType(dict(cli_overrides)),
+        "model_overrides": MappingProxyType(dict(model_overrides)),
+        "permission_ceilings": MappingProxyType(dict(permission_ceilings)),
+        "transport_overrides": MappingProxyType(dict(transport_overrides)),
+        "profile_overrides": MappingProxyType(dict(profile_overrides)),
+        "effort_overrides": MappingProxyType(dict(effort_overrides)),
     }
     return FrozenRoster(tuple(frozen), roster_digest, tuple(sorted(full)), tuple(sorted(text)),
-                        requests_tuple, kwargs, private_runtime)
+                        requests_tuple, kwargs, private_runtime, os.path.abspath(cwd))

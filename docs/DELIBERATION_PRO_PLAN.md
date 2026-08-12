@@ -7,13 +7,15 @@ Owner: Summon maintainers
 This document is the implementation plan and current safety contract for a new bounded
 agent-deliberation mode and the product boundary it creates for a possible Summon Pro
 distribution. The current branch contains the kernel, durable command/status surface,
-one-launch adapter seams, a fake-only deterministic scheduler, and a side-effect-free
-frozen-roster resolver. The scheduler is deliberately injected and headless: it does
+one-launch adapter seams, a fake-only deterministic scheduler, a side-effect-free
+frozen-roster resolver, and a provider-inert invocation planner. The scheduler is deliberately injected and headless: it does
 not contact a provider. The roster phase loads each definition snapshot once, binds
 role/profile/memory/account/executable evidence, reports effective permission, and
 requires explicit per-seat consent plus disposable worktree evidence for writable or
-full-bypass seats. It creates no worktree, profile, process, provider request, or
-journal event. Fresh and resume execution remain explicitly blocked until durable
+full-bypass seats. The invocation planner binds exact prompt bytes to the scheduler
+request digest, copies mutable profile state defensively, and revalidates roster and
+worktree evidence before each turn; it creates no worktree, profile, process, provider
+request, or journal event. Fresh and resume execution remain explicitly blocked until durable
 replay plus participant snapshot/provider wiring are separately reviewed. It does not
 authorize a release or a pricing decision.
 
