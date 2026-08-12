@@ -520,6 +520,37 @@ def journal_read(run_dir: str):
     return all_records, torn
 
 
+def journal_read_tagged(run_dir: str):
+    """Read journal records while preserving their segment generation.
+
+    ``journal_read`` intentionally exposes the historical flat projection used
+    by status/report code.  Replay and resume validation need stronger evidence:
+    a record's self-reported generation is not enough because a stale process
+    could write a well-formed record into the wrong segment.  This additive
+    reader returns ``([(segment_generation, record), ...], torn_tail)`` and
+    refuses that mismatch before callers reconstruct state.
+    """
+    gens = _segment_generations(run_dir)
+    tagged: list[tuple[int, dict]] = []
+    torn = False
+    for i, generation in enumerate(gens):
+        records, segment_torn = _read_segment(_journal_path(run_dir, generation))
+        for record in records:
+            declared = record.get("generation")
+            if (isinstance(declared, bool) or not isinstance(declared, int)
+                    or declared != generation):
+                raise JournalCorruptError(
+                    f"journal-g{generation}.jsonl contains a generation mismatch")
+            tagged.append((generation, record))
+        if segment_torn:
+            if i == len(gens) - 1:
+                torn = True
+            else:
+                raise JournalCorruptError(
+                    f"journal-g{generation}.jsonl has a torn tail below the newest generation")
+    return tagged, torn
+
+
 def journal_repair(run_dir: str, owner: Owner) -> bool:
     """Owner-only: truncate a torn final line in the NEWEST EXISTING segment and
     record the repair. Returns whether a repair happened.

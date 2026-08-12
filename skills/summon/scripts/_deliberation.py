@@ -501,6 +501,7 @@ class BallotBook:
 class HumanCommand:
     sequence: int
     action: str
+    command_id: str | None = None
 
 
 @dataclass
@@ -709,6 +710,14 @@ class DeliberationEngine:
                  and isinstance(cmd.sequence, int) and not isinstance(cmd.sequence, bool)]
         if not valid:
             return
+        for index, command in enumerate(valid):
+            command_id = command.command_id
+            if command_id is None:
+                command_id = f"cmd-{command.sequence}-{index}"
+            if not isinstance(command_id, str) or not _ID_RE.fullmatch(command_id):
+                raise DeliberationError("human command id is invalid")
+            self._append({"event": "human_command", "command_id": command_id,
+                          "sequence": command.sequence, "action": command.action})
         first_sequence = min(cmd.sequence for cmd in valid)
         actions = {cmd.action for cmd in valid if cmd.sequence == first_sequence}
         if "cancel" in actions:

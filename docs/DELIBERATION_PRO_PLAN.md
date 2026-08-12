@@ -15,8 +15,12 @@ requires explicit per-seat consent plus disposable worktree evidence for writabl
 full-bypass seats. The invocation planner binds exact prompt bytes to the scheduler
 request digest, copies mutable profile state defensively, and revalidates roster and
 worktree evidence before each turn; it creates no worktree, profile, process, provider
-request, or journal event. Fresh and resume execution remain explicitly blocked until durable
-replay plus participant snapshot/provider wiring are separately reviewed. It does not
+request, or journal event. Fresh and resume execution remain explicitly blocked until
+durable replay plus participant snapshot/provider wiring are separately reviewed. A
+provider-inert replay slice now validates generation-tagged journal records, receipt
+identity, legal transitions, turn/attempt/ballot bindings, and recomputes consensus
+from accepted ballots; it reports unmatched starts as uncertain spend rather than
+silently retrying them. It does not
 authorize a release or a pricing decision.
 
 ## 1. Product decision
@@ -160,6 +164,14 @@ turn bodies are stored in bounded, owner-generation-fenced message files and ref
 by hash from journal records. A deposed owner must not be able to publish or overwrite
 material after takeover. The existing journal's generation fencing, owner checks,
 checksum validation, newest-tail repair, and fail-closed mid-file behavior are reused.
+
+Replay consumes tagged `(segment_generation, record)` pairs, not the flat status
+projection. It requires exactly one receipt-bound `run_prepared` record, rejects a
+record whose declared generation differs from its segment, and treats a durable start
+without a matching finish as an indeterminate physical attempt. Candidate and decision
+projection events are never authority: accepted ballots are revalidated and tallied
+again. The current slice only returns an immutable checkpoint; it does not claim that
+fresh/resume CLI execution or provider calls are enabled.
 
 ### 4.2 State machine
 
