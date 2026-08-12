@@ -20,10 +20,11 @@ import _acpbackend  # noqa: E402
 import _apibackend  # noqa: E402
 import _executor  # noqa: E402
 from _builder import AgentInvocation  # noqa: E402
-from _deliberation import (AttemptBinding, DeliberationError,
-                           DuplicateAttemptError, LaunchToken,
+from _deliberation import (AttemptBinding, CleanupReceipt, DeliberationError,
+                           DuplicateAttemptError, LaunchSpec, LaunchToken,
                            SnapshotDriftError, TurnContext)  # noqa: E402
-from _deliberation_adapter import FreshDispatchAdapter  # noqa: E402
+from _deliberation_adapter import (FreshDispatchAdapter,
+                                   SeatMultiplexAdapter)  # noqa: E402
 from _executor import ProviderLaunchControl, ProviderLaunchError  # noqa: E402
 
 
@@ -35,8 +36,9 @@ def turn() -> TurnContext:
                        hashlib.sha256(b"TOP SECRET").hexdigest())
 
 
-def turn_with_prompt(prompt: str, *, turn_id: str, ordinal: int) -> TurnContext:
-    return TurnContext("decision", "seat-a", turn_id, ordinal,
+def turn_with_prompt(prompt: str, *, turn_id: str, ordinal: int,
+                     seat: str = "seat-a") -> TurnContext:
+    return TurnContext("decision", seat, turn_id, ordinal,
                        hashlib.sha256(prompt.encode("utf-8")).hexdigest())
 
 
@@ -349,6 +351,118 @@ class AdapterBoundaryTests(unittest.TestCase):
                 owner_is_current=lambda: True,
                 timeout_ms=1000, generation=1,
                 executor=lambda *args, **kwargs: {})
+
+    def _multiplex_child(self, *, executor=None):
+        return FreshDispatchAdapter(
+            self.invocation(), snapshot_digest=SNAPSHOT,
+            current_snapshot_digest=lambda: SNAPSHOT,
+            owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+            executor=executor or (lambda *args, **kwargs: {
+                "result": "{}", "exit_code": 0}))
+
+    def test_seat_multiplex_routes_by_prepared_spec_and_rejects_cross_seat(self):
+        contacted = []
+
+        def executor(label):
+            def run(inv, **kwargs):
+                kwargs["launch_control"].before_provider_launch(
+                    {"backend": inv.cli, "transport": inv.transport})
+                contacted.append(label)
+                return {"result": "{}", "exit_code": 0}
+            return run
+
+        child_a = self._multiplex_child(executor=executor("seat-a"))
+        child_b = self._multiplex_child(executor=executor("seat-b"))
+        children = {"seat-a": child_a, "seat-b": child_b}
+        mux = SeatMultiplexAdapter(children)
+        context_a = turn_with_prompt(
+            "TOP SECRET", turn_id="turn-a", ordinal=0, seat="seat-a")
+        context_b = turn_with_prompt(
+            "TOP SECRET", turn_id="turn-b", ordinal=0, seat="seat-b")
+        spec_a = mux.prepare(context_a)
+        self.assertTrue(mux.revalidate(spec_a, context_a))
+        # The caller cannot switch the child by supplying another seat context;
+        # the spec remains bound to child-a and its own child fence rejects the
+        # forged token before provider contact.
+        self.assertFalse(mux.revalidate(spec_a, context_b))
+        forged = token_for_context(spec_a, context_b, "attempt-forged")
+        with self.assertRaisesRegex(DeliberationError, "prepared decision turn"):
+            mux.launch(spec_a, forged)
+        mux.launch(spec_a, token_for_context(spec_a, context_a, "attempt-a"))
+        self.assertEqual(contacted, ["seat-a"])
+
+    def test_seat_multiplex_rejects_unknown_spec_without_provider_contact(self):
+        contacted = []
+
+        def executor(inv, **kwargs):
+            contacted.append(True)
+            return {"result": "{}", "exit_code": 0}
+
+        child = self._multiplex_child(executor=executor)
+        mux = SeatMultiplexAdapter({"seat-a": child})
+        unknown = LaunchSpec("scripted", "unknown", b"opaque", SNAPSHOT)
+        context = turn()
+        self.assertFalse(mux.revalidate(unknown, context))
+        token = token_for_context(unknown, context, "unknown-attempt")
+        with self.assertRaisesRegex(DeliberationError, "not prepared"):
+            mux.launch(unknown, token)
+        self.assertEqual(contacted, [])
+
+    def test_seat_multiplex_rejects_duplicate_spec_digest_across_children(self):
+        child_a = self._multiplex_child()
+        child_b = self._multiplex_child()
+        mux = SeatMultiplexAdapter({"seat-a": child_a, "seat-b": child_b})
+        context_a = turn_with_prompt(
+            "TOP SECRET", turn_id="turn-a", ordinal=0, seat="seat-a")
+        context_b = turn_with_prompt(
+            "TOP SECRET", turn_id="turn-b", ordinal=0, seat="seat-b")
+        spec_a = mux.prepare(context_a)
+        with mock.patch.object(child_b, "prepare", return_value=spec_a):
+            with self.assertRaisesRegex(DeliberationError, "another seat adapter"):
+                mux.prepare(context_b)
+
+    def test_seat_multiplex_copies_seat_map_at_construction(self):
+        child_a = self._multiplex_child()
+        child_b = self._multiplex_child()
+        children = {"seat-a": child_a}
+        mux = SeatMultiplexAdapter(children)
+        children["seat-b"] = child_b
+        context_b = turn_with_prompt(
+            "TOP SECRET", turn_id="turn-b", ordinal=0, seat="seat-b")
+        with self.assertRaisesRegex(DeliberationError, "no deliberation adapter"):
+            mux.prepare(context_b)
+
+    def test_seat_multiplex_cleanup_aggregates_receipts_honestly(self):
+        child_a = self._multiplex_child()
+        child_b = self._multiplex_child()
+        mux = SeatMultiplexAdapter({"seat-b": child_b, "seat-a": child_a})
+        with mock.patch.object(
+                child_a, "cleanup",
+                return_value=CleanupReceipt(True, ("a-resource",), (11,))) as clean_a, \
+             mock.patch.object(
+                 child_b, "cleanup",
+                 return_value=CleanupReceipt(False, ("b-resource",), (22,))) as clean_b:
+            receipt = mux.cleanup()
+        clean_a.assert_called_once_with()
+        clean_b.assert_called_once_with()
+        self.assertFalse(receipt.verified)
+        self.assertFalse(receipt.clean)
+        self.assertEqual(receipt.retained_resources,
+                         ("a-resource", "b-resource"))
+        self.assertEqual(receipt.unverified_pids, (11, 22))
+
+    def test_seat_multiplex_cleanup_reports_child_exception_without_leak_claim(self):
+        child_a = self._multiplex_child()
+        child_b = self._multiplex_child()
+        mux = SeatMultiplexAdapter({"seat-a": child_a, "seat-b": child_b})
+        with mock.patch.object(child_a, "cleanup", return_value=CleanupReceipt(True)), \
+             mock.patch.object(child_b, "cleanup",
+                               side_effect=RuntimeError("private cleanup detail")):
+            receipt = mux.cleanup()
+        self.assertFalse(receipt.verified)
+        self.assertEqual(receipt.retained_resources,
+                         ("seat:seat-b:cleanup-unverified",))
+        self.assertNotIn("private", repr(receipt))
 
 
 class LaunchControlTests(unittest.TestCase):

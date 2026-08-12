@@ -16,6 +16,7 @@ import subprocess
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 
 from _builder import AgentInvocation
 from _deliberation import (AdapterResult, CleanupReceipt, DeliberationError,
@@ -295,3 +296,91 @@ class FreshDispatchAdapter:
                 retained.append("registered-provider-operation:cleanup-unverified")
         return CleanupReceipt(verified=not retained,
                               retained_resources=tuple(retained))
+
+
+class SeatMultiplexAdapter:
+    """Route one deliberation adapter port across immutable seat adapters.
+
+    The scheduler owns one :class:`FreshDispatchAdapter` per seat.  A prepared
+    launch spec is the routing capability: after ``prepare`` the multiplexer
+    never chooses a child from caller-supplied context, only from the exact
+    spec digest it recorded.  This prevents a cross-seat context substitution
+    from reaching the wrong provider and lets each child retain its own launch
+    and cleanup fences.
+    """
+
+    def __init__(self, children: Mapping[str, FreshDispatchAdapter]) -> None:
+        if not isinstance(children, Mapping):
+            raise TypeError("children must be a seat-to-adapter mapping")
+        copied = dict(children)
+        if not copied:
+            raise ValueError("at least one seat adapter is required")
+        for seat_id, child in copied.items():
+            if not isinstance(seat_id, str) or not seat_id:
+                raise ValueError("seat adapter ids must be non-empty strings")
+            if not isinstance(child, FreshDispatchAdapter):
+                raise TypeError("seat adapter values must be FreshDispatchAdapter instances")
+        # Keep the caller's dictionary from changing routing after construction.
+        self._children = MappingProxyType(copied)
+        self._lock = threading.Lock()
+        self._prepared: dict[str, FreshDispatchAdapter] = {}
+
+    def prepare(self, context: TurnContext) -> LaunchSpec:
+        """Prepare through the seat named by ``context`` and bind its digest."""
+        child = self._children.get(context.seat_id)
+        if child is None:
+            raise DeliberationError(
+                f"no deliberation adapter is configured for seat {context.seat_id!r}")
+        spec = child.prepare(context)
+        with self._lock:
+            previous = self._prepared.get(spec.digest)
+            if previous is not None and previous is not child:
+                raise DeliberationError(
+                    "launch spec digest is already bound to another seat adapter")
+            self._prepared[spec.digest] = child
+        return spec
+
+    def _child_for_spec(self, spec: LaunchSpec) -> FreshDispatchAdapter | None:
+        with self._lock:
+            return self._prepared.get(spec.digest)
+
+    def revalidate(self, spec: LaunchSpec, context: TurnContext) -> bool:
+        """Revalidate only through the child bound to ``spec.digest``."""
+        child = self._child_for_spec(spec)
+        if child is None:
+            return False
+        return child.revalidate(spec, context)
+
+    def launch(self, spec: LaunchSpec, token: LaunchToken) -> AdapterResult:
+        """Launch only through the child bound to ``spec.digest``."""
+        child = self._child_for_spec(spec)
+        if child is None:
+            raise DeliberationError("launch spec was not prepared by this adapter")
+        return child.launch(spec, token)
+
+    def cleanup(self) -> CleanupReceipt:
+        """Clean every child and report any unverified result or failure."""
+        verified = True
+        retained: list[str] = []
+        unverified_pids: list[int] = []
+        # Sorting makes the aggregate deterministic and keeps receipts stable
+        # across equivalent mapping construction orders.
+        for seat_id, child in sorted(self._children.items()):
+            try:
+                receipt = child.cleanup()
+            except Exception:  # noqa: BLE001 - cleanup must not hide a leak
+                verified = False
+                retained.append(f"seat:{seat_id}:cleanup-unverified")
+                continue
+            if not isinstance(receipt, CleanupReceipt):
+                verified = False
+                retained.append(f"seat:{seat_id}:cleanup-invalid-receipt")
+                continue
+            verified = verified and receipt.verified
+            retained.extend(receipt.retained_resources)
+            unverified_pids.extend(receipt.unverified_pids)
+        return CleanupReceipt(
+            verified=verified,
+            retained_resources=tuple(retained),
+            unverified_pids=tuple(unverified_pids),
+        )
