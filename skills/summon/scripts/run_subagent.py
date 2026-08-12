@@ -698,6 +698,20 @@ def main() -> None:
     if args.jobs_list or args.jobs_status or args.jobs_wait:
         sys.exit(_background.run_jobs_query(args, _print_error))
 
+    # Deliberation is a sibling run type, not an agent dispatch or a council
+    # alias.  Route its management/launch surface before ordinary agent,
+    # prompt, roster, and backend validation.  The storage handler is honest
+    # while provider launch-control integration is incomplete: fresh/resume
+    # return a structured block and perform no provider call; status/replay are
+    # journal-derived reads, and cancel only queues an exclusive typed command.
+    if (getattr(args, "deliberate", False)
+            or getattr(args, "deliberate_resume", None)
+            or getattr(args, "deliberate_status", None)
+            or getattr(args, "deliberate_replay", None)
+            or getattr(args, "deliberate_cancel", None)):
+        from _deliberation_store import run_command as _run_deliberation_command
+        sys.exit(_run_deliberation_command(args))
+
     # --new-agent / --set-agent: local roster management, no dispatch involved.
     if args.new_agent or args.set_agent:
         if args.new_agent and args.set_agent:

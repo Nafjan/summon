@@ -13,12 +13,70 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable, Mapping
 
 
 _SENSITIVE_ARG_KEYS = {
     "api", "api-key", "token", "secret", "password", "private-key",
     "access-token", "oauth-token", "auth-token", "authorization",
 }
+
+
+class ProviderLaunchError(RuntimeError):
+    """A controlled provider launch was refused before provider contact."""
+
+
+class ProviderLaunchControl:
+    """Single-use provider boundary used by durable orchestrators.
+
+    Ordinary dispatches do not create this object and retain their historical
+    retry/fallback behavior.  A deliberation creates one control per durably
+    committed physical attempt.  ``before_provider_launch`` is the only claim
+    point and is intentionally atomic, so duplicate or concurrent paths cannot
+    contact a provider twice under one attempt record.
+    """
+
+    def __init__(self, *, before_launch: Callable[[Mapping[str, object]], None],
+                 on_spawn: Callable[[object], None] | None = None,
+                 on_reap: Callable[[object], None] | None = None,
+                 cancelled: Callable[[], bool] | None = None,
+                 allow_secondary: bool = False) -> None:
+        if not callable(before_launch):
+            raise TypeError("before_launch must be callable")
+        self._before_launch = before_launch
+        self._on_spawn = on_spawn
+        self._on_reap = on_reap
+        self._cancelled = cancelled or (lambda: False)
+        self.allow_secondary = bool(allow_secondary)
+        self._lock = threading.Lock()
+        self._claimed = False
+
+    def is_cancelled(self) -> bool:
+        try:
+            return bool(self._cancelled())
+        except Exception as exc:  # fail closed: a broken cancellation source is unsafe
+            raise ProviderLaunchError(
+                f"provider cancellation check failed: {type(exc).__name__}") from exc
+
+    def before_provider_launch(self, evidence: Mapping[str, object]) -> None:
+        """Claim this attempt and run its durable acknowledgement callback."""
+        with self._lock:
+            if self._claimed:
+                raise ProviderLaunchError("provider launch control is single-use")
+            if self.is_cancelled():
+                raise ProviderLaunchError("provider launch cancelled before contact")
+            self._claimed = True
+        # Keep the callback outside the lock.  The claim remains consumed if it
+        # fails, which prevents a second path from retrying an ambiguous attempt.
+        self._before_launch(dict(evidence))
+
+    def spawned(self, handle: object) -> None:
+        if self._on_spawn is not None:
+            self._on_spawn(handle)
+
+    def reaped(self, handle: object) -> None:
+        if self._on_reap is not None:
+            self._on_reap(handle)
 
 # CLI transcripts are model/provider-controlled and can echo credentials from a
 # failed request or a tool response.  Keep this deliberately narrow: redact a
@@ -2012,7 +2070,8 @@ def _safe_communicate(process: subprocess.Popen, timeout: float = 3.0):
 
 
 def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
-                   parse_stream: bool | None = None) -> dict:
+                   parse_stream: bool | None = None,
+                   launch_control: ProviderLaunchControl | None = None) -> dict:
     """Drive the subprocess and enrich whatever response path it takes.
 
     Single choke point: every return from the read loop (success, timeout,
@@ -2028,13 +2087,16 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
         _emit_partial("started", cli=cli, message="subprocess started")
     except Exception:  # noqa: BLE001
         pass
-    response = _drive_process_loop(process, cli, timeout_ms, processor, parse_stream=parse_stream)
+    response = _drive_process_loop(process, cli, timeout_ms, processor,
+                                   parse_stream=parse_stream,
+                                   launch_control=launch_control)
     return _enrich(response, processor)
 
 
 def _drive_process_loop(
     process: subprocess.Popen, cli: str, timeout_ms: int, processor: StreamProcessor,
     parse_stream: bool = True,
+    launch_control: ProviderLaunchControl | None = None,
 ) -> dict:
     """Read process stdout via StreamProcessor, enforce a wall-clock deadline.
 
@@ -2059,6 +2121,24 @@ def _drive_process_loop(
 
     try:
         while True:
+            if launch_control is not None:
+                try:
+                    _controlled_cancel = launch_control.is_cancelled()
+                except Exception as exc:
+                    _kill_tree(process)
+                    _drain_to_eof(line_q)
+                    _safe_communicate(process)
+                    return _attach_raw(_error_response(
+                        cli, 130,
+                        f"provider cancellation check failed ({type(exc).__name__})",
+                        partial_result=processor.get_result()), stdout_lines)
+                if _controlled_cancel:
+                    _kill_tree(process)
+                    _drain_to_eof(line_q)
+                    _safe_communicate(process)
+                    return _attach_raw(_error_response(
+                        cli, 130, "provider launch cancelled by deliberation",
+                        partial_result=processor.get_result()), stdout_lines)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _kill_tree(process)
@@ -2067,8 +2147,12 @@ def _drive_process_loop(
                 return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
 
             try:
-                kind, line = line_q.get(timeout=remaining)
+                kind, line = line_q.get(timeout=(min(remaining, 0.1)
+                                                 if launch_control is not None
+                                                 else remaining))
             except queue.Empty:
+                if launch_control is not None and remaining > 0:
+                    continue
                 _kill_tree(process)
                 _drain_to_eof(line_q)
                 _safe_communicate(process)
@@ -2228,7 +2312,8 @@ def _write_debug(debug_dir: str, argv: list, raw: str, response: dict) -> str | 
 
 def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                   debug_dir: str | None = None,
-                  max_tool_output_bytes: int | None = None) -> dict:
+                  max_tool_output_bytes: int | None = None,
+                  *, launch_control: ProviderLaunchControl | None = None) -> dict:
     """Execute agent CLI for the given invocation. Returns a response dict.
 
     Response shape: ``{result, exit_code, status, cli, error?}`` plus the
@@ -2430,7 +2515,21 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         if workspace_snapshot is not None:
             _workspace_before = workspace_snapshot(inv.cwd)
         debug_argv = [inv.cli, inv.base_url or "?", inv.model or "?"]
-        resp = _enrich(BACKENDS[inv.cli]["call"](inv, timeout_ms), None)
+        # arkcli is registered as an API-kind backend for envelope routing, but
+        # it currently executes `arkcli +chat` via subprocess.run internally.
+        # It has no before-Popen port, so controlled deliberation must refuse it
+        # before contact instead of pretending that launch accounting applies.
+        if launch_control is not None and inv.cli != "openai-compat":
+            return _stamp(_enrich(_error_response(
+                inv.cli, 1,
+                f"backend {inv.cli!r} has no controlled provider-launch boundary; "
+                "deliberation refused it before contact"), None))
+        if launch_control is None:
+            _backend_resp = BACKENDS[inv.cli]["call"](inv, timeout_ms)
+        else:
+            _backend_resp = BACKENDS[inv.cli]["call"](
+                inv, timeout_ms, launch_control=launch_control)
+        resp = _enrich(_backend_resp, None)
         resp["resume"] = {"cli": inv.cli, "session_id": None}  # stateless: no resume
         return _stamp(resp)
 
@@ -2472,7 +2571,12 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 "over ACP, or the subprocess transport, which enforces tiers via "
                 "CLI flags."), None))
         debug_argv = [inv.cli, "<acp>"]
-        resp = _enrich(BACKENDS[inv.cli]["acp"]["call"](inv, timeout_ms), None)
+        if launch_control is None:
+            _acp_resp = BACKENDS[inv.cli]["acp"]["call"](inv, timeout_ms)
+        else:
+            _acp_resp = BACKENDS[inv.cli]["acp"]["call"](
+                inv, timeout_ms, launch_control=launch_control)
+        resp = _enrich(_acp_resp, None)
         # Premortem T1: the ACP session id is NOT a resume handle for the
         # subprocess path — _apply_schema re-dispatches the ORIGINAL invocation
         # with resume_id=<that id>, a wrong-namespace resume on cursor-agent.
@@ -2519,11 +2623,13 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # subprocess pin, because the alternative here is certain failure.
         from _builder import supports_acp as _supports_acp
         if (_supports_acp(inv.cli)
+                and (launch_control is None or launch_control.allow_secondary)
                 and os.environ.get("SUMMON_ACP_FALLBACK") != "0"):
             from dataclasses import replace as _replace_inv
             _routed = execute_agent(_replace_inv(inv, transport="acp"),
                                     timeout_ms=timeout_ms, debug_dir=debug_dir,
-                                    max_tool_output_bytes=max_tool_output_bytes)
+                                    max_tool_output_bytes=max_tool_output_bytes,
+                                    launch_control=launch_control)
             _routed.setdefault("warnings", []).append(
                 "the prompt exceeded the OS command-line length limit for the "
                 "subprocess transport, so summon routed this dispatch over ACP "
@@ -2551,6 +2657,13 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # stdout open, defeating the timeout). Windows walks the tree via taskkill /T.
     from _spawn import popen_flags
     try:
+        if launch_control is not None:
+            launch_control.before_provider_launch({
+                "backend": inv.cli,
+                "transport": "subprocess",
+                "command_sha256": hashlib.sha256(
+                    str(command).encode("utf-8", errors="replace")).hexdigest(),
+            })
         # stdin=DEVNULL: sub-agent CLIs (notably codex) probe stdin for "additional
         # input" and block reading from a TTY inherited from the parent. We never
         # have stdin to give them.
@@ -2580,6 +2693,30 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             _error_response(inv.cli, 127, f"CLI not found: {command}{_hint}"), None))
     except OSError as e:
         return _stamp(_enrich(_error_response(inv.cli, 1, f"{type(e).__name__}: {e}"), None))
+    except Exception as e:
+        # The callback is orchestrator-owned and may accidentally carry a
+        # secret in its exception text.  Refuse before contact and expose only
+        # the safe exception class.
+        return _stamp(_enrich(_error_response(
+            inv.cli, 1,
+            f"provider launch refused by control ({type(e).__name__})"), None))
+
+    if launch_control is not None:
+        try:
+            launch_control.spawned(process)
+        except Exception as e:
+            # Popen already succeeded.  A failed registration must not turn
+            # into an untracked paid child: kill/reap it before returning.
+            _kill_tree(process)
+            _safe_communicate(process)
+            try:
+                launch_control.reaped(process)
+            except Exception:
+                pass
+            return _stamp(_enrich(_error_response(
+                inv.cli, 1,
+                f"provider process registration failed ({type(e).__name__}); "
+                "child was terminated"), None))
 
     # Windows only: put the child in a kill-on-close Job Object so its whole tree can be
     # terminated even after this leader exits (issue #10) -- taskkill walks parent->child
@@ -2596,7 +2733,9 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             (inv.cli != "agy" or _agy_stream_wrapper(command, args))
             and inv.cli != "arkcli"
         )
-        response = _drive_process(process, inv.cli, timeout_ms, parse_stream=parse_stream)
+        response = _drive_process(process, inv.cli, timeout_ms,
+                                  parse_stream=parse_stream,
+                                  launch_control=launch_control)
     finally:
         # The dispatch is OVER here whichever way it ended. Closing the job releases the
         # kernel handle AND, via KILL_ON_JOB_CLOSE, reaps any descendant the backend left
@@ -2610,6 +2749,11 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             try:
                 _sweep_agy_litter(inv.cwd, _litter_before)
             except Exception:  # noqa: BLE001
+                pass
+        if launch_control is not None:
+            try:
+                launch_control.reaped(process)
+            except Exception:
                 pass
     # PROMPT ECHO GUARD. `error_hint` is picked out of UNTRUSTED captured output, so a
     # prompt that instructs the agent to print error-shaped text can put the caller's own

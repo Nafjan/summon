@@ -24,6 +24,7 @@ dir (or ``~/.agents/providers.json``): { "myprovider": {"base_url": "...",
 from __future__ import annotations
 
 import http.client
+import hashlib
 import json
 import os
 import time
@@ -487,7 +488,7 @@ def _opener():
     return urllib.request.build_opener(_NoCrossHostAuthRedirect)
 
 
-def call(inv, timeout_ms: int) -> dict:
+def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
     """Make one Chat Completions request for the invocation. Returns a response
     dict in the same shape the subprocess backends produce (result/status/
     exit_code/cli + usage/cost_usd/model_resolved), so it flows through _enrich."""
@@ -517,8 +518,12 @@ def call(inv, timeout_ms: int) -> dict:
         return _err(cli, msg)
 
     wall_deadline = time.monotonic() + max(1.0, timeout_ms / 1000.0)
-    resp = _do_request(inv.base_url, inv.model, inv.system_context, inv.prompt,
-                       api_key, timeout_ms, cli)
+    if launch_control is None:
+        resp = _do_request(inv.base_url, inv.model, inv.system_context, inv.prompt,
+                           api_key, timeout_ms, cli)
+    else:
+        resp = _do_request(inv.base_url, inv.model, inv.system_context, inv.prompt,
+                           api_key, timeout_ms, cli, launch_control=launch_control)
     if _key_source == "arkcli_profile" and resp.get("status") == "success":
         resp.setdefault("warnings", []).append(
             "BYTEPLUS_CODING_API_KEY was unset; used the local arkcli profile "
@@ -527,7 +532,8 @@ def call(inv, timeout_ms: int) -> dict:
     # --- PAYG consent-gated fallback ---
     if (resp["status"] == "error"
             and is_coding_plan_endpoint(inv.base_url)
-            and resp.get("_payg_fallback_worthy")):
+            and resp.get("_payg_fallback_worthy")
+            and (launch_control is None or launch_control.allow_secondary)):
         allow_payg = getattr(inv, "allow_payg", False)
         if not payg_consent_allowed(allow_payg):
             primary_err = resp.get("error", "")
@@ -556,8 +562,13 @@ def call(inv, timeout_ms: int) -> dict:
                 f"({remaining_ms}ms remaining after Coding Plan attempt)."
             )
             return resp
-        payg_resp = _do_request(payg_url, inv.model, inv.system_context,
-                                inv.prompt, api_key, remaining_ms, cli)
+        if launch_control is None:
+            payg_resp = _do_request(payg_url, inv.model, inv.system_context,
+                                    inv.prompt, api_key, remaining_ms, cli)
+        else:
+            payg_resp = _do_request(payg_url, inv.model, inv.system_context,
+                                    inv.prompt, api_key, remaining_ms, cli,
+                                    launch_control=launch_control)
         payg_resp.pop("_payg_fallback_worthy", None)
         if payg_resp["status"] == "success":
             payg_resp["billing"] = dict(_PAYG_BILLING)
@@ -581,7 +592,7 @@ def call(inv, timeout_ms: int) -> dict:
 
 def _do_request(base_url: str, model: str, system_context: str | None,
                 prompt: str, api_key: str | None, timeout_ms: int,
-                cli: str) -> dict:
+                cli: str, *, launch_control=None) -> dict:
     """Execute a single Chat Completions POST. Internal to call()."""
     body = json.dumps({
         "model": model,
@@ -596,6 +607,21 @@ def _do_request(base_url: str, model: str, system_context: str | None,
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(base_url + "/chat/completions", data=body,
                                  headers=headers, method="POST")
+    if launch_control is not None:
+        try:
+            launch_control.before_provider_launch({
+                "backend": cli,
+                "transport": "api",
+                "endpoint_origin_sha256": hashlib.sha256(
+                    base_url.encode("utf-8", errors="replace")).hexdigest(),
+            })
+            launch_control.spawned(req)
+        except Exception as e:  # callback text can contain secrets; class is enough
+            try:
+                launch_control.reaped(req)
+            except Exception:
+                pass
+            return _err(cli, f"provider launch refused by control ({type(e).__name__})")
     try:
         with _opener().open(req, timeout=max(1, timeout_ms / 1000)) as r:
             payload = json.loads(r.read().decode("utf-8", errors="replace"))
@@ -618,6 +644,12 @@ def _do_request(base_url: str, model: str, system_context: str | None,
     except (ValueError, http.client.HTTPException, OSError) as e:
         return _err(cli, _redact(f"bad/failed response from {base_url}: "
                                  f"{type(e).__name__}: {e}", api_key))
+    finally:
+        if launch_control is not None:
+            try:
+                launch_control.reaped(req)
+            except Exception:
+                pass
 
     try:
         text = payload["choices"][0]["message"]["content"]

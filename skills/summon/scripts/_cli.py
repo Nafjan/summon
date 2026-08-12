@@ -81,6 +81,19 @@ def parse_timeout(value: str) -> int:
     return out
 
 
+def parse_quorum(value: str) -> int | str:
+    """Keep council's integer form while accepting deliberation all/fractions."""
+    text = str(value).strip().lower()
+    if text.isdigit():
+        return int(text)
+    parts = text.split("/", 1)
+    if (text == "all" or (len(parts) == 2 and all(part.isdigit() for part in parts)
+                          and all(int(part) > 0 for part in parts))):
+        return text
+    raise argparse.ArgumentTypeError(
+        "quorum must be an integer, 'all', or a positive fraction such as 2/3")
+
+
 # --- Fan-out mode flag matrix --------------------------------------------------
 # The flags each fan-out mode actually CONSUMES. --manifest and --council branch
 # out of main() before most dispatch flags are read, so anything outside these
@@ -111,6 +124,19 @@ MODE_FLAGS = {
     # Status takes ONLY its id, where to look, and the output format -- it never
     # dispatches, so it has no working directory (use --run-dir to point it).
     "council-status": {"council_status", "run_dir", "json", "job_file"},
+    "deliberation": {"deliberate", "question", "question_file", "seats", "options",
+                     "quorum", "rounds", "max_attempts", "deadline", "cwd",
+                     "agents_dir", "run_dir", "results_dir", "strict_agents_dir",
+                     "enable_roles", "require_human_approval", "text_only_consent",
+                     "full_authority_consent", "json", "job_file"},
+    "deliberation-resume": {"deliberate_resume", "run_dir", "results_dir", "cwd",
+                            "retry_indeterminate", "json", "job_file"},
+    "deliberation-status": {"deliberate_status", "run_dir", "results_dir", "cwd",
+                            "json", "job_file"},
+    "deliberation-replay": {"deliberate_replay", "run_dir", "results_dir", "cwd",
+                            "json", "job_file"},
+    "deliberation-cancel": {"deliberate_cancel", "run_dir", "results_dir", "cwd",
+                            "command_id", "json", "job_file"},
     # jobs read commands: registry query only.
     "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
     "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
@@ -135,6 +161,16 @@ MODE_HINTS = {
                        "be changed here -- start a fresh council to change them."),
     "council-status": ("status is read-only: it takes only the run id, --run-dir, "
                        "and --json."),
+    "deliberation": ("a fresh deliberation takes only its immutable question, seats, "
+                     "options, policy, consent, and run-location flags."),
+    "deliberation-resume": ("resume takes the run id and may explicitly authorize "
+                            "retrying an indeterminate paid attempt."),
+    "deliberation-status": ("status is read-only and accepts only the run id, run "
+                            "location, and output format."),
+    "deliberation-replay": ("replay is read-only and accepts only the run id, run "
+                            "location, and output format."),
+    "deliberation-cancel": ("cancel queues one typed command; --command-id is an "
+                            "optional idempotency key."),
     "jobs-list": ("jobs list is read-only: it takes only --job-dir and --json."),
     "jobs-status": ("jobs status is read-only: it takes only the job id, --job-dir, "
                     "and --json."),
@@ -161,6 +197,16 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "jobs-wait"
     if getattr(args, "council_status", None):
         return "council-status"
+    if getattr(args, "deliberate_status", None):
+        return "deliberation-status"
+    if getattr(args, "deliberate_replay", None):
+        return "deliberation-replay"
+    if getattr(args, "deliberate_cancel", None):
+        return "deliberation-cancel"
+    if getattr(args, "deliberate_resume", None):
+        return "deliberation-resume"
+    if getattr(args, "deliberate", False):
+        return "deliberation"
     if args.council:
         return "council-resume" if getattr(args, "resume_run", None) else "council"
     if any(getattr(args, name, False) for name in
@@ -192,7 +238,11 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
     )
     if not offending:
         return None
-    label = {"council-resume": "council resume", "council-status": "council status"
+    label = {"council-resume": "council resume", "council-status": "council status",
+             "deliberation-resume": "deliberate resume",
+             "deliberation-status": "deliberate status",
+             "deliberation-replay": "deliberate replay",
+             "deliberation-cancel": "deliberate cancel",
              }.get(mode, f"--{mode}")
     return (f"{label} does not support {', '.join(offending)}: these flags would "
             f"have been silently ignored, so they are rejected instead. "
@@ -206,7 +256,7 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 # rewrite. This keeps one battle-tested parser + all logic while giving a clean,
 # discoverable command surface.
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
-               "onboard", "manifest", "council", "agent", "jobs", "version",
+               "onboard", "manifest", "council", "deliberate", "agent", "jobs", "version",
                "role", "telemetry", "bug-report", "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
@@ -221,6 +271,9 @@ Commands:
   onboard   [--subscriptions …] [--reset] [--json] detect CLIs; write merge-safe prefs
   manifest  FILE [--concurrency …] [--results-dir D]   run a batch swarm
   council   --question "…" [--members …] [--rounds 2]  decide by consensus
+  deliberate --question "…" --seats A,B --options X,Y  bounded agent deliberation
+  deliberate status|replay|cancel RUN_ID               inspect/control a run
+  deliberate resume RUN_ID [--retry-indeterminate]     resume with spend consent
   agent new NAME [--set k=v …]                    scaffold an agent definition
   agent set NAME  --set k=v …                     retune an agent's frontmatter
   role propose ALIAS TARGET                        propose a private global role alias
@@ -306,6 +359,19 @@ def rewrite_subcommand(argv: list) -> tuple:
             # whitelist would reject a stray --council).
             return ["--council-status", rest[1], *rest[2:]], None
         return ["--council", *rest], None
+    if head == "deliberate":
+        if rest and rest[0] in ("resume", "status", "replay", "cancel"):
+            action = rest[0]
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, f"error: 'deliberate {action}' needs a run id"
+            flag = {
+                "resume": "--deliberate-resume",
+                "status": "--deliberate-status",
+                "replay": "--deliberate-replay",
+                "cancel": "--deliberate-cancel",
+            }[action]
+            return [flag, rest[1], *rest[2:]], None
+        return ["--deliberate", *rest], None
     if head == "jobs":
         if not rest:
             return argv, "help"       # bare `summon jobs` -> usage, not a silent list
@@ -571,6 +637,38 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--question", help="With --council: the decision/question to deliberate")
     parser.add_argument("--question-file", dest="question_file",
                         help="With --council: read the question from a file")
+    parser.add_argument("--deliberate", action="store_true",
+                        help="Run a bounded headless deliberation (separate from council)")
+    parser.add_argument("--deliberate-resume", dest="deliberate_resume", metavar="RUN_ID",
+                        help="Resume a deliberation run by id")
+    parser.add_argument("--deliberate-status", dest="deliberate_status", metavar="RUN_ID",
+                        help="Read a deliberation run's journal-derived status")
+    parser.add_argument("--deliberate-replay", dest="deliberate_replay", metavar="RUN_ID",
+                        help="Replay a deliberation run's bounded checksummed journal")
+    parser.add_argument("--deliberate-cancel", dest="deliberate_cancel", metavar="RUN_ID",
+                        help="Queue a typed cancel command for a deliberation run")
+    parser.add_argument("--seats",
+                        help="With --deliberate: comma-separated immutable seat agent ids")
+    parser.add_argument("--options",
+                        help="With --deliberate: comma-separated immutable decision options")
+    parser.add_argument("--max-attempts", dest="max_attempts", type=int,
+                        help="With --deliberate: hard physical provider-launch budget")
+    parser.add_argument("--deadline", type=parse_timeout,
+                        help="With --deliberate: absolute run duration from start")
+    parser.add_argument("--require-human-approval", dest="require_human_approval",
+                        action="store_true",
+                        help="With --deliberate: require typed approval after consensus")
+    parser.add_argument("--retry-indeterminate", dest="retry_indeterminate",
+                        action="store_true",
+                        help="With deliberate resume: explicitly allow retry after uncertain spend")
+    parser.add_argument("--command-id", dest="command_id",
+                        help="With deliberate cancel: optional idempotency key")
+    parser.add_argument("--text-only-consent", dest="text_only_consent", action="append",
+                        default=[], metavar="SEAT",
+                        help="With --deliberate: receipt-bound consent for one text-only seat")
+    parser.add_argument("--full-authority-consent", dest="full_authority_consent",
+                        action="append", default=[], metavar="SEAT",
+                        help="With --deliberate: explicit consent for one full-authority seat")
     parser.add_argument("--members", help="With --council: comma-separated member agents "
                                           "(default: a vendor-diverse set)")
     parser.add_argument("--chairman", help="With --council: the synthesizer agent "
@@ -586,7 +684,7 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "changed stages (question/members come from its receipt)")
     parser.add_argument("--council-status", dest="council_status", metavar="RUN_ID",
                         help="Print a council run's durable state (read-only; add --json)")
-    parser.add_argument("--quorum", type=int, metavar="N",
+    parser.add_argument("--quorum", type=parse_quorum, metavar="N|all|FRACTION",
                         help="With --council: synthesize only if at least N members "
                              "succeeded (2..member-count); below N the chairman is skipped. "
                              "Never changes the top-level status, only synthesis")

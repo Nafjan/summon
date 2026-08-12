@@ -141,9 +141,11 @@ class _AcpClient:
     the child.
     """
 
-    def __init__(self, process: subprocess.Popen, permission: str) -> None:
+    def __init__(self, process: subprocess.Popen, permission: str,
+                 cancelled=None) -> None:
         self._proc = process
         self._permission = permission
+        self._cancelled = cancelled or (lambda: False)
         self._write_lock = threading.Lock()
         self._id_lock = threading.Lock()
         self._next_id = 1
@@ -236,7 +238,22 @@ class _AcpClient:
             with self._id_lock:
                 self._pending.pop(rid, None)
             raise
-        if not slot["event"].wait(max(0.05, timeout)):
+        deadline = time.monotonic() + max(0.05, timeout)
+        while not slot["event"].wait(min(0.1, max(0.0, deadline - time.monotonic()))):
+            try:
+                cancelled = self._cancelled()
+            except Exception as e:
+                with self._id_lock:
+                    self._pending.pop(rid, None)
+                raise _AcpError(
+                    f"{method} cancellation check failed ({type(e).__name__})") from e
+            if cancelled:
+                with self._id_lock:
+                    self._pending.pop(rid, None)
+                raise _AcpTimeout(f"{method} cancelled")
+            if time.monotonic() >= deadline:
+                break
+        if not slot["event"].is_set():
             with self._id_lock:
                 self._pending.pop(rid, None)
             raise _AcpTimeout(f"{method} did not answer within {timeout:.0f}s")
@@ -403,7 +420,7 @@ def _err(cli: str, code: int, msg: str, diag: list | None = None) -> dict:
     return resp
 
 
-def call(inv, timeout_ms: int) -> dict:
+def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
     """Run one prompt turn over ACP. Returns a response dict in the same shape
     the subprocess backends produce (result/status/exit_code/cli + session_id/
     usage/_debug_raw), so it flows through _enrich/_stamp unchanged."""
@@ -423,9 +440,10 @@ def call(inv, timeout_ms: int) -> dict:
     # executor at module load would create an import cycle.
     from _executor import _kill_tree, _resolve_launch
 
-    probe_err = _probe_acp(cli)
-    if probe_err:
-        return _err(cli, 2, probe_err)
+    if launch_control is None or launch_control.allow_secondary:
+        probe_err = _probe_acp(cli)
+        if probe_err:
+            return _err(cli, 2, probe_err)
 
     command, args = _resolve_launch(cli, list(acp_args))
     # The subprocess builders install the per-backend identity (kimi's isolated
@@ -445,6 +463,11 @@ def call(inv, timeout_ms: int) -> dict:
         if key != "GEMINI_SYSTEM_MD":
             child_env[key] = value
     try:
+        if launch_control is not None:
+            launch_control.before_provider_launch({
+                "backend": cli,
+                "transport": "acp",
+            })
         process = subprocess.Popen(
             [command, *args],
             cwd=inv.cwd,
@@ -459,6 +482,27 @@ def call(inv, timeout_ms: int) -> dict:
         return _err(cli, 127, f"CLI not found: {command}")
     except OSError as e:
         return _err(cli, 1, f"{type(e).__name__}: {e}")
+    except Exception as e:
+        return _err(cli, 1,
+                    f"provider launch refused by control ({type(e).__name__})")
+
+    if launch_control is not None:
+        try:
+            launch_control.spawned(process)
+        except Exception as e:
+            _kill_tree(process)
+            try:
+                process.wait(timeout=_TEARDOWN_GRACE_SEC)
+            except Exception:
+                _kill_tree(process)
+            try:
+                launch_control.reaped(process)
+            except Exception:
+                pass
+            return _err(
+                cli, 1,
+                f"provider process registration failed ({type(e).__name__}); "
+                "child was terminated")
 
     # Windows: kill-on-close Job Object, same reasoning as the subprocess path
     # (an unexpected summon death must not orphan a paid backend).
@@ -474,7 +518,9 @@ def call(inv, timeout_ms: int) -> dict:
     # the unhelpful ``360000msms`` timeout report in the field.
     timeout_budget_ms = int(timeout_ms)
     deadline = time.monotonic() + timeout_budget_ms / 1000
-    client = _AcpClient(process, inv.permission)
+    client = _AcpClient(
+        process, inv.permission,
+        cancelled=(launch_control.is_cancelled if launch_control is not None else None))
     stage = "initialize"
     try:
         def _remaining() -> float:
@@ -639,3 +685,8 @@ def call(inv, timeout_ms: int) -> dict:
             _job_close(process)
         except Exception:  # noqa: BLE001
             pass
+        if launch_control is not None:
+            try:
+                launch_control.reaped(process)
+            except Exception:
+                pass

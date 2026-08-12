@@ -322,9 +322,28 @@ repository-relative examples.
 | `--run-dir` | No | With `--council`: root for the durable run directory (default `{cwd}/.agents/runs`; env `SUMMON_RUNS_DIR`) |
 | `--resume-run RUN_ID` | - | Resume a council run: re-run only missing/failed/changed stages (question and members come from the run's `receipt.json`). Subcommand form: `council resume <run-id>` |
 | `--council-status RUN_ID` | - | Print a council run's durable state, read-only (add `--json`). Subcommand form: `council status <run-id>` |
+| `--deliberate` | - | Start the separate headless deliberation surface. This branch validates the immutable question/policy and refuses fresh execution until the scheduler is wired to the one-attempt adapter; it never silently falls back to council or ordinary dispatch |
+| `--deliberate-resume RUN_ID` | - | Resume a deliberation by id. A durable indeterminate attempt blocks with `uncertain_spend` unless `--retry-indeterminate` is explicit; the current preview remains `integration_pending` until scheduler wiring lands |
+| `--deliberate-status RUN_ID` | - | Read a checksum-verified, journal-derived deliberation status without dispatching an agent |
+| `--deliberate-replay RUN_ID` | - | Read a bounded, checksum-verified deliberation journal replay without dispatching an agent |
+| `--deliberate-cancel RUN_ID` | - | Queue a typed cancellation command through the exclusive run inbox; queued is not claimed as durably applied until the scheduler consumes it |
+| `--seats A,B` | With `--deliberate` | Immutable, unique seat agent ids; 2-10 seats |
+| `--options X,Y` | With `--deliberate` | Immutable, unique decision option ids; at least two |
+| `--max-attempts N` | With `--deliberate` | Hard physical provider-launch budget; every secondary launch must consume its own durable attempt (positive integer) |
+| `--deadline DURATION` | With `--deliberate` | Absolute deliberation wall-clock budget, using the same duration grammar as `--timeout` |
+| `--require-human-approval` | With `--deliberate` | Require a typed human approval after a valid consensus candidate; model prose cannot approve itself |
+| `--retry-indeterminate` | With `deliberate resume` | Explicitly authorize a fresh physical attempt after uncertain spend; ordinary resume performs zero provider calls |
+| `--command-id ID` | With `--deliberate-cancel` | Optional idempotency key for the queued cancellation command |
+| `--text-only-consent SEAT` | With `--deliberate` | Receipt-bound consent for a named text-only seat; consent is never inferred from role or environment |
+| `--full-authority-consent SEAT` | With `--deliberate` | Explicit receipt-bound consent for a named full-authority seat; use only with a disposable worktree and never treat that worktree as containment |
 | `--quorum N` | No | With `--council`: synthesize only if at least N members (2..member-count) succeeded; below N the chairman is skipped (a `skipped` tombstone is recorded). Never changes the top-level `status`, only whether synthesis runs; the result is in `synthesis.quorum` and `synthesis.decision_status` |
 | `--chairman-fallback AGENT` | No | With `--council`: a fallback synthesizer run once if the primary chairman ends non-success. Both outcomes appear in `synthesis.primary` / `synthesis.fallback` |
 | `--member-timeout` / `--chair-timeout` | No | With `--council`: per-stage timeouts for members and the chairman (same grammar as `--timeout`; each defaults to `--timeout`) |
+
+Deliberation's production adapter currently accepts cancellable CLI/ACP seats only.
+`openai-compat` HTTP seats are refused until the transport can interrupt an active
+request within the run deadline; the ordinary single-dispatch API backend remains
+available and unchanged.
 
 **Stdout contract:** for dispatch commands, stdout carries **exactly one JSON object** —
 nothing before it, nothing after. All diagnostics (manifest progress lines, argparse
@@ -349,7 +368,8 @@ with `--prompt-file`; `--question` with `--question-file`; manifest job `prompt`
 consumes only `--question`/`--question-file`, `--members`, `--chairman`, `--rounds`,
 `--cwd`, `--agents-dir`, `--timeout`, `--out`, `--run-dir`, `--results-dir`, `--quorum`,
 `--chairman-fallback`, `--member-timeout`, `--chair-timeout`, `--overall-timeout` and
-`--min-successful-members`. Any other dispatch flag passed to these
+`--min-successful-members`; `--deliberate` and its five operation forms consume only
+their documented question/policy, seat, consent, run-location, and output flags. Any other dispatch flag passed to these
 modes is rejected up front with a pointer to where the capability lives (per-job manifest
 keys, or the member agent's own definition).
 

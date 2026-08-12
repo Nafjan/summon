@@ -1651,14 +1651,18 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
 # See references/adding-a-backend.md.
 
 
-def _api_call(inv: AgentInvocation, timeout_ms: int) -> dict:
+def _api_call(inv: AgentInvocation, timeout_ms: int, *, launch_control=None) -> dict:
     from _apibackend import call as _call   # lazy: keep _builder import-light
-    return _call(inv, timeout_ms)
+    if launch_control is None:
+        return _call(inv, timeout_ms)
+    return _call(inv, timeout_ms, launch_control=launch_control)
 
 
-def _acp_call(inv: AgentInvocation, timeout_ms: int) -> dict:
+def _acp_call(inv: AgentInvocation, timeout_ms: int, *, launch_control=None) -> dict:
     from _acpbackend import call as _call    # lazy: keep _builder import-light
-    return _call(inv, timeout_ms)
+    if launch_control is None:
+        return _call(inv, timeout_ms)
+    return _call(inv, timeout_ms, launch_control=launch_control)
 
 
 def _arkcli_call(inv: AgentInvocation, timeout_ms: int) -> dict:
