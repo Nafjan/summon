@@ -53,7 +53,13 @@ _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _fail(msg: str) -> int:
-    print(json.dumps({"status": "error", "error": msg}, ensure_ascii=False))
+    env = {"status": "error", "error": msg, "cli": "summon", "transport": "manifest"}
+    try:
+        from _telemetry import record
+        record(env)
+    except Exception:  # noqa: BLE001 - diagnostics must never mask manifest errors
+        pass
+    print(json.dumps(env, ensure_ascii=False))
     return 1
 
 
@@ -781,5 +787,11 @@ def run_manifest(args) -> int:
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "jobs": outcomes,
     }
+    try:
+        from _telemetry import record
+        record({"status": "success" if not failed else "error", "cli": "summon",
+                "transport": "manifest", "warnings": failed})
+    except Exception:  # noqa: BLE001
+        pass
     print(json.dumps(summary, ensure_ascii=False))
     return 0 if not failed else 1

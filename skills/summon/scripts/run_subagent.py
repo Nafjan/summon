@@ -67,6 +67,7 @@ import _background  # noqa: E402
 import _cli  # noqa: E402
 import _executor  # noqa: E402
 import _receipt  # noqa: E402
+import _telemetry  # noqa: E402
 from _builder import AgentInvocation, environment_handoff_context  # noqa: E402
 from _builder import clamp_permission as _clamp  # noqa: E402
 from _executor import ENVELOPE_VERSION as _ENVELOPE_VERSION  # noqa: E402
@@ -76,7 +77,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "2.1.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "2.2.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -302,6 +303,12 @@ def _emit(obj: dict) -> None:
     # no-op on query envelopes (list/doctor/version have no exit_code).
     finalize_exit_fields(obj)
     _stamp_job(obj)
+    # Diagnostics are strictly opt-in and fail-soft. A malformed local telemetry
+    # file must never change dispatch behavior or hide the real envelope.
+    try:
+        _telemetry.record(obj)
+    except Exception:  # noqa: BLE001 - observability cannot block a dispatch
+        pass
     text = json.dumps(obj, ensure_ascii=False)
     if _JOB_FILE:
         tmp = _JOB_FILE + ".tmp"
@@ -538,8 +545,9 @@ def main() -> None:
     # Subcommand front-end: translate `summon <command> …` to flat flags; `summon`
     # / `summon help` prints usage. Legacy flat invocations pass through.
     argv, mode = _cli.rewrite_subcommand(sys.argv[1:])
-    if mode == "help":
-        print(_cli.USAGE)
+    if mode == "help" or (mode and mode.startswith("help:")):
+        command = mode.split(":", 1)[1] if mode and ":" in mode else None
+        print(_cli.command_usage(command))
         sys.exit(0)
     if mode and mode.startswith("error:"):
         _print_error(mode[len("error:"):].strip())
@@ -558,6 +566,73 @@ def main() -> None:
     if _bad_mode_flags:
         _print_error(_bad_mode_flags)
         sys.exit(1)
+
+    # Local diagnostics are management commands, not dispatches. Keep them
+    # ahead of backend/agent validation so a broken roster cannot prevent a
+    # user from inspecting or clearing their own evidence.
+    _bug_option_names = {"--from", "--output", "--submit-github", "--github-repo",
+                         "--bug-title", "--bug-description"}
+    _bug_option_used = (any(token.split("=", 1)[0] in _bug_option_names for token in argv)
+                        or getattr(args, "bug_report_from", None) is not None
+                        or getattr(args, "bug_report_output", None) is not None
+                        or getattr(args, "bug_report_submit", False)
+                        or getattr(args, "bug_title", None) is not None
+                        or getattr(args, "bug_description", None) is not None
+                        or getattr(args, "github_repo", "Nafjan/summon") != "Nafjan/summon")
+    if _bug_option_used and not getattr(args, "bug_report", False):
+        _print_error("bug-report options require the bug-report command")
+        sys.exit(1)
+    if (getattr(args, "telemetry_enable", False) or getattr(args, "telemetry_disable", False)
+            or getattr(args, "telemetry_status", False) or getattr(args, "telemetry_clear", False)):
+        try:
+            if args.telemetry_enable:
+                _diag = _telemetry.set_enabled(True)
+            elif args.telemetry_disable:
+                _diag = _telemetry.set_enabled(False)
+            elif args.telemetry_clear:
+                _diag = _telemetry.clear_events()
+            else:
+                _diag = _telemetry.status()
+            if args.json:
+                print(json.dumps(_diag, ensure_ascii=False))
+            else:
+                print(json.dumps(_diag, ensure_ascii=False, indent=2))
+            sys.exit(0)
+        except (OSError, ValueError) as exc:
+            _print_error(str(exc))
+            sys.exit(1)
+    if getattr(args, "bug_report", False):
+        try:
+            if args.bug_report_submit:
+                if not args.bug_report_from:
+                    raise ValueError("--submit-github requires --from REVIEWED_REPORT.md; generate and review a report first")
+                if args.bug_report_output or args.bug_description:
+                    raise ValueError("--submit-github accepts only the existing reviewed --from file; do not regenerate it")
+                _review = _telemetry.validate_report_file(args.bug_report_from)
+                _submitted_title = args.bug_title or _review["title"]
+                _report = _telemetry.submit_github(
+                    args.bug_report_from, repo=args.github_repo,
+                    title=_submitted_title, validated_report=_review)
+                _report.update({"report": _review["report"], "title": _submitted_title,
+                                "event_id": _review.get("event_id")})
+            else:
+                _event = _telemetry.source_event(args.bug_report_from)
+                _report = _telemetry.write_report(
+                    _event,
+                    output=args.bug_report_output,
+                    title=args.bug_title,
+                    description=args.bug_description,
+                )
+            if args.json:
+                print(json.dumps(_report, ensure_ascii=False))
+            else:
+                print(_report["report"])
+                if _report.get("submission_url"):
+                    print(_report["submission_url"])
+            sys.exit(0)
+        except (OSError, ValueError, FileNotFoundError, RuntimeError) as exc:
+            _print_error(str(exc))
+            sys.exit(1)
 
     # --list-models / --doctor: pure discovery queries. Need no agent/prompt/cwd —
     # answer and exit before any of those are validated.
@@ -2440,10 +2515,14 @@ if __name__ == "__main__":
         raise  # intentional exits (validation, normal completion) pass through
     except BaseException as e:  # noqa: BLE001 — last-resort net so a bg job never orphans
         err = _crash_envelope(e)
+        try:
+            _stamp_job(err)   # preserve background identity before telemetry projection
+            _telemetry.record(err)
+        except Exception:  # noqa: BLE001 - crash reporting must remain fail-soft
+            pass
         jf = _resolve_job_file()
         if jf:
             try:
-                _stamp_job(err)   # even a crash envelope carries its job identity
                 with open(jf + ".tmp", "w", encoding="utf-8") as fh:
                     json.dump(err, fh, ensure_ascii=False)
                 os.replace(jf + ".tmp", jf)

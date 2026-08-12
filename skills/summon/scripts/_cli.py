@@ -115,6 +115,13 @@ MODE_FLAGS = {
     "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
     "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
     "jobs-wait": {"jobs_wait", "job_dir", "timeout", "job_file"},
+    # Diagnostics are local management commands. They never dispatch an agent;
+    # bug-report submission is an explicit, user-authenticated gh invocation.
+    "telemetry": {"telemetry_enable", "telemetry_disable", "telemetry_status",
+                   "telemetry_clear", "json", "job_file"},
+    "bug-report": {"bug_report", "bug_report_from", "bug_report_output",
+                    "bug_report_submit", "github_repo", "bug_title",
+                    "bug_description", "json", "job_file"},
 }
 MODE_HINTS = {
     "manifest": ("Put per-job settings (model, effort, timeout, json_schema, "
@@ -133,9 +140,13 @@ MODE_HINTS = {
                     "and --json."),
     "jobs-wait": ("jobs wait is read-only: it takes only the job id, --job-dir, "
                   "and --timeout."),
+    "telemetry": ("telemetry is local-only and opt-in: it writes bounded, sanitized "
+                  "JSONL evidence and never phones home."),
+    "bug-report": ("bug-report writes a sanitized local report; review it before the "
+                   "explicit --submit-github action."),
 }
 FLAG_NAMES = {"sets": "--set"}  # dests whose flag spelling isn't dest.replace('_','-')
-TOKEN_DESTS = {"set": "sets"}   # the reverse mapping, for raw-argv presence detection
+TOKEN_DESTS = {"set": "sets", "from": "bug_report_from"}   # reverse mapping
 
 
 def fanout_mode(args: argparse.Namespace) -> str | None:
@@ -152,6 +163,11 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "council-status"
     if args.council:
         return "council-resume" if getattr(args, "resume_run", None) else "council"
+    if any(getattr(args, name, False) for name in
+           ("telemetry_enable", "telemetry_disable", "telemetry_status", "telemetry_clear")):
+        return "telemetry"
+    if getattr(args, "bug_report", False):
+        return "bug-report"
     return None
 
 
@@ -191,7 +207,7 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 # discoverable command surface.
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
                "onboard", "manifest", "council", "agent", "jobs", "version",
-               "role", "help", "--help", "-h"}
+               "role", "telemetry", "bug-report", "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -210,13 +226,43 @@ Commands:
   role propose ALIAS TARGET                        propose a private global role alias
   role approve ALIAS                              activate a proposed role alias
   role list|resolve ALIAS                         inspect approved/proposed aliases
-  jobs list|status|wait [ID] [--job-dir D] [--json]   inspect background jobs
+  jobs list|status [ID] [--job-dir D] [--json]      inspect background jobs
+  jobs wait ID [--job-dir D] [--timeout T]          wait for one background job
+  telemetry enable|disable|status|clear [--json]  manage opt-in local diagnostics
+  bug-report [--from FILE] [--output FILE] [--json] create a sanitized report
+             [--bug-title TEXT] [--bug-description TEXT]
+             --submit-github --from REVIEWED.md [--github-repo OWNER/REPO]
   version                                         print version
 
 Legacy flat flags still work: `summon --agent NAME --prompt … --cwd …`,
-`summon --list`, `summon --manifest FILE`, etc. Run any command with --help for
-its options. Full docs: SKILL.md.
+`summon --list`, `summon --manifest FILE`, etc. Run `summon --help` for the complete
+flat option list, or `summon telemetry --help` / `summon bug-report --help` for their command-specific forms. Full docs: SKILL.md.
 """
+
+
+COMMAND_USAGE = {
+    "telemetry": """summon telemetry enable|disable|status|clear [--json]
+
+Manage opt-in local diagnostics. `enable`/`disable` persist the choice; `status` reports
+the bounded JSONL spool; `clear` removes captured events without disabling collection.
+The `SUMMON_TELEMETRY` environment override is non-persistent and inherited by Summon
+children. No telemetry command dispatches an agent or makes a network call.
+""",
+    "bug-report": """summon bug-report [--from SOURCE] [--output REPORT.md] [--json]
+                     [--bug-title TEXT] [--bug-description TEXT]
+summon bug-report --submit-github --from REVIEWED.md
+                     [--github-repo OWNER/REPO] [--bug-title TEXT] [--json]
+
+Generate a sanitized local Markdown report from the latest event or SOURCE (envelope,
+telemetry JSONL, debug directory). Review the existing REPORT.md, then submit that exact
+file in the separate `--submit-github` form; submission never regenerates it.
+""",
+}
+
+
+def command_usage(command: str | None = None) -> str:
+    """Return specific help for the two management commands."""
+    return COMMAND_USAGE.get(command or "", USAGE)
 
 
 def rewrite_subcommand(argv: list) -> tuple:
@@ -232,10 +278,10 @@ def rewrite_subcommand(argv: list) -> tuple:
     if head in ("help", "--help", "-h"):
         return argv, "help"
     rest = argv[1:]
-    # `<subcommand> --help/-h`: the argv-rewrite facade has no per-command parser,
-    # so show the general usage rather than argparse erroring on a missing positional.
+    # Management commands have a compact, command-specific help block. Other
+    # subcommands retain the general usage because their flags are the full flat parser.
     if any(a in ("--help", "-h") for a in rest):
-        return argv, "help"
+        return argv, f"help:{head}" if head in COMMAND_USAGE else "help"
     if head in ("dispatch", "run"):
         return rest, None
     if head in ("list", "agents", "ls"):
@@ -303,6 +349,13 @@ def rewrite_subcommand(argv: list) -> tuple:
                 return argv, "error: 'role resolve' needs a role name"
             return ["--role-resolve", rest[1], *rest[2:]], None
         return argv, f"error: unknown 'role' action {action!r} (use propose/approve/list/resolve)"
+    if head == "telemetry":
+        if not rest or rest[0] not in ("enable", "disable", "status", "clear"):
+            return argv, "error: 'telemetry' needs enable/disable/status/clear"
+        flag = "--telemetry-" + rest[0]
+        return [flag, *rest[1:]], None
+    if head == "bug-report":
+        return ["--bug-report", *rest], None
     return argv, None
 
 
@@ -345,6 +398,29 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="With --onboard: replace onboard section instead of merging")
     parser.add_argument("--no-write", dest="onboard_no_write", action="store_true",
                         help="With --onboard: detect only; do not write prefs")
+    telemetry_group = parser.add_mutually_exclusive_group()
+    telemetry_group.add_argument("--telemetry-enable", dest="telemetry_enable",
+                                 action="store_true", help="Enable bounded local diagnostics")
+    telemetry_group.add_argument("--telemetry-disable", dest="telemetry_disable",
+                                 action="store_true", help="Disable local diagnostics")
+    telemetry_group.add_argument("--telemetry-status", dest="telemetry_status",
+                                 action="store_true", help="Show local diagnostics status")
+    telemetry_group.add_argument("--telemetry-clear", dest="telemetry_clear",
+                                 action="store_true", help="Delete captured local diagnostics")
+    parser.add_argument("--bug-report", dest="bug_report", action="store_true",
+                        help="Create a sanitized local bug report from the latest event or --from")
+    parser.add_argument("--from", dest="bug_report_from", metavar="FILE",
+                        help="Bug-report source: envelope, telemetry JSONL, debug directory, or reviewed Markdown when submitting")
+    parser.add_argument("--output", dest="bug_report_output", metavar="FILE",
+                        help="Bug-report output path (default ~/.agents/summon-reports)")
+    parser.add_argument("--submit-github", dest="bug_report_submit", action="store_true",
+                        help="Submit an existing reviewed Markdown report from --from through authenticated gh")
+    parser.add_argument("--github-repo", dest="github_repo", default="Nafjan/summon",
+                        metavar="OWNER/REPO", help="Repository for --submit-github")
+    parser.add_argument("--bug-title", dest="bug_title",
+                        help="Title for the generated or submitted issue")
+    parser.add_argument("--bug-description", dest="bug_description",
+                        help="Short sanitized description for the report")
     parser.add_argument("--transient-retries", dest="transient_retries", action="store_true",
                         help="Enable one conservative retry on transient network/5xx/"
                              "timeout errors (also SUMMON_TRANSIENT_RETRIES=1). Never retries "
@@ -362,7 +438,7 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         metavar="KEY=VALUE",
                         help="With --new-agent/--set-agent: run-agent, model, permission, args, profile")
     parser.add_argument("--json", action="store_true",
-                        help="With --doctor: emit machine-readable JSON instead of the table")
+                        help="Emit machine-readable JSON where supported by the selected command")
     parser.add_argument("--probe", action="store_true",
                         help="With --doctor: run a minimal LIVE call per backend to verify "
                              "account/client eligibility (catches e.g. Gemini IneligibleTierError "
