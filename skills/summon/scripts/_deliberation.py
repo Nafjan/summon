@@ -34,6 +34,7 @@ from typing import Callable, Iterable, Mapping, Protocol, Sequence
 SCHEMA_VERSION = 1
 MAX_SCHEDULE_ROUNDS = 10
 MAX_SIGNED64 = (1 << 63) - 1
+MAX_HUMAN_COMMANDS = 1024
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _FRACTION_RE = re.compile(r"^([1-9][0-9]*)/([1-9][0-9]*)$")
 
@@ -315,6 +316,7 @@ def _restore_digest(checkpoint: object) -> str:
     attempts = tuple(_field(checkpoint, "attempts", ()) or ())
     ballots = tuple(_field(checkpoint, "ballots", ()) or ())
     pending = _field(checkpoint, "pending_turn")
+    pending_command_batch = _field(checkpoint, "pending_command_batch")
     payload = {
         "receipt_sha256": _field(checkpoint, "receipt_sha256"),
         "run_id": _field(checkpoint, "run_id"),
@@ -341,6 +343,13 @@ def _restore_digest(checkpoint: object) -> str:
                              for item in tuple(_field(checkpoint, "applied_commands", ()) or ())],
         "pending_commands": [object_fields(item, ("command_id", "sequence", "action"))
                              for item in tuple(_field(checkpoint, "pending_commands", ()) or ())],
+        "pending_command_batch": (None if pending_command_batch is None else {
+            "batch_id": _field(pending_command_batch, "batch_id"),
+            "source_generation": _field(pending_command_batch, "source_generation"),
+            "commands": [object_fields(item, ("command_id", "sequence", "action"))
+                         for item in tuple(_field(pending_command_batch, "commands", ()) or ())],
+            "digest": _field(pending_command_batch, "digest"),
+        }),
         "transcript_events": thaw(tuple(
             _field(checkpoint, "transcript_events", ()) or ())),
         "uncertain_spend": _field(checkpoint, "uncertain_spend"),
@@ -359,6 +368,7 @@ def _snapshot_checkpoint(checkpoint: object) -> dict[str, object]:
     ballots = tuple(_field(checkpoint, "ballots", ()) or ())
     applied = tuple(_field(checkpoint, "applied_commands", ()) or ())
     pending_commands = tuple(_field(checkpoint, "pending_commands", ()) or ())
+    pending_command_batch = _field(checkpoint, "pending_command_batch")
     pending_turn = _field(checkpoint, "pending_turn")
     transcript = tuple(_field(checkpoint, "transcript_events", ()) or ())
     return {
@@ -388,6 +398,13 @@ def _snapshot_checkpoint(checkpoint: object) -> dict[str, object]:
                                   for item in applied),
         "pending_commands": tuple(copy_item(item, ("command_id", "sequence", "action"))
                                   for item in pending_commands),
+        "pending_command_batch": (None if pending_command_batch is None else {
+            "batch_id": _field(pending_command_batch, "batch_id"),
+            "source_generation": _field(pending_command_batch, "source_generation"),
+            "commands": tuple(copy_item(item, ("command_id", "sequence", "action"))
+                              for item in tuple(_field(pending_command_batch, "commands", ()) or ())),
+            "digest": _field(pending_command_batch, "digest"),
+        }),
         "transcript_events": transcript,
         "uncertain_spend": _field(checkpoint, "uncertain_spend"),
         "digest": _field(checkpoint, "digest"),
@@ -1299,17 +1316,39 @@ class DeliberationEngine:
             self._transition(RunState.TIMED_OUT, "deadline")
             return
         valid = [cmd for cmd in commands if cmd.action in {"cancel", "approve", "deny"}
-                 and isinstance(cmd.sequence, int) and not isinstance(cmd.sequence, bool)]
+                 and isinstance(cmd.sequence, int) and not isinstance(cmd.sequence, bool)
+                 and cmd.sequence >= 1]
         if not valid:
             return
+        if len(valid) > MAX_HUMAN_COMMANDS:
+            raise DeliberationError("human command batch exceeds the bounded limit")
+        values = []
+        seen_ids: set[str] = set()
         for index, command in enumerate(valid):
             command_id = command.command_id
             if command_id is None:
                 command_id = f"cmd-{command.sequence}-{index}"
-            if not isinstance(command_id, str) or not _ID_RE.fullmatch(command_id):
+            if (not isinstance(command_id, str) or not _ID_RE.fullmatch(command_id)
+                    or command_id in seen_ids):
                 raise DeliberationError("human command id is invalid")
-            self._append({"event": "human_command", "command_id": command_id,
-                          "sequence": command.sequence, "action": command.action})
+            seen_ids.add(command_id)
+            values.append({"command_id": command_id,
+                           "sequence": command.sequence,
+                           "action": command.action})
+        sequences = sorted({item["sequence"] for item in values})
+        if sequences[-1] - sequences[0] + 1 != len(sequences):
+            raise DeliberationError("human command batch sequences are not contiguous")
+        raw = json.dumps(values, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False).encode("utf-8")
+        batch_digest = hashlib.sha256(raw).hexdigest()
+        batch_id = "batch-" + batch_digest[:32]
+        # The entire operator boundary is one checksummed journal line.  A
+        # crash can therefore leave it absent, torn, or fully recoverable; it
+        # can never expose an arbitrary command prefix as a complete batch.
+        self._append({"event": "human_command_batch", "batch_id": batch_id,
+                      "source_generation": self.state.generation,
+                      "commands": values,
+                      "command_batch_sha256": batch_digest})
         first_sequence = min(cmd.sequence for cmd in valid)
         actions = {cmd.action for cmd in valid if cmd.sequence == first_sequence}
         if "cancel" in actions:

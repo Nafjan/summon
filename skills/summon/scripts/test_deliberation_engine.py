@@ -96,7 +96,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.next_action(), NextAction.DONE)
 
     def test_approval_gate_precedes_attempt_limit_and_cancel_wins_same_sequence(self):
-        engine, adapter, _ = self.make_engine([
+        engine, adapter, events = self.make_engine([
             result("s1", "t1", "a1", "green")], attempts=1, quorum=1, approval=True)
         engine.run_turn(context("s1", "t1", 0), "a1")
         self.assertEqual(adapter.spawn_count, 1)
@@ -104,6 +104,17 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.next_action(), NextAction.WAIT_FOR_HUMAN)
         engine.apply_human_commands([HumanCommand(9, "approve"), HumanCommand(9, "cancel")])
         self.assertEqual(engine.state.status, RunState.CANCELLED)
+        command_events = [item for item in events
+                          if item["event"].startswith("human_command")]
+        self.assertEqual(len(command_events), 1)
+        batch = command_events[0]
+        self.assertEqual(batch["event"], "human_command_batch")
+        self.assertEqual([item["action"] for item in batch["commands"]],
+                         ["approve", "cancel"])
+        self.assertRegex(batch["command_batch_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(batch["batch_id"],
+                         "batch-" + batch["command_batch_sha256"][:32])
+        self.assertEqual(batch["source_generation"], 4)
 
     def test_human_approval_decides_candidate(self):
         engine, _, _ = self.make_engine([result("s1", "t1", "a1", "green")],
@@ -112,6 +123,14 @@ class EngineTests(unittest.TestCase):
         engine.apply_human_commands([HumanCommand(1, "approve")])
         self.assertEqual(engine.state.status, RunState.DECIDED)
         self.assertEqual(engine.state.decision_option, "green")
+
+    def test_human_command_batch_may_use_an_arbitrary_bounded_sequence_origin(self):
+        engine, _, events = self.make_engine([result("s1", "t1", "a1", "green")],
+                                             attempts=1, quorum=1, approval=True)
+        engine.run_turn(context("s1", "t1", 0), "a1")
+        engine.apply_human_commands([HumanCommand(5, "approve")])
+        self.assertEqual(engine.state.status, RunState.DECIDED)
+        self.assertEqual(events[-2]["commands"][0]["sequence"], 5)
 
     def test_polling_waiting_human_at_deadline_times_out_without_approval(self):
         clock = Clock()

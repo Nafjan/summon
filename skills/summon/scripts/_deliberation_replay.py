@@ -27,6 +27,7 @@ MAX_REPLAY_RECORDS = 10_000
 MAX_REPLAY_BYTES = 4 * 1024 * 1024
 MAX_SCHEDULE_ROUNDS = 10
 MAX_SIGNED64 = (1 << 63) - 1
+MAX_HUMAN_COMMANDS = 1024
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -84,6 +85,16 @@ class ReplayCommand:
 
 
 @dataclass(frozen=True)
+class ReplayCommandBatch:
+    """One atomically journaled human-command boundary."""
+
+    batch_id: str
+    source_generation: int
+    commands: tuple[ReplayCommand, ...]
+    digest: str
+
+
+@dataclass(frozen=True)
 class ReplayCheckpoint:
     """Immutable, recomputed replay projection.
 
@@ -109,6 +120,7 @@ class ReplayCheckpoint:
     next_ordinal: int
     applied_commands: tuple[ReplayCommand, ...]
     pending_commands: tuple[ReplayCommand, ...]
+    pending_command_batch: ReplayCommandBatch | None
     transcript_events: tuple[Mapping[str, object], ...]
     uncertain_spend: bool
     digest: str
@@ -298,7 +310,7 @@ _TRANSCRIPT_FIELDS = {
                       "receipt_sha256"),
     "state_transition": ("event", "schema_version", "generation", "from", "to",
                           "reason", "decision_option", "recovery_kind",
-                          "command_batch_sha256"),
+                          "command_batch_sha256", "command_source_generation"),
     "turn_prepared": ("event", "schema_version", "generation", "decision_id",
                        "seat_id", "turn_id", "turn_ordinal", "request_digest"),
     "attempt_started": ("event", "schema_version", "generation", "attempt_id",
@@ -314,6 +326,9 @@ _TRANSCRIPT_FIELDS = {
                      "seat_id", "turn_id"),
     "human_command": ("event", "schema_version", "generation", "command_id",
                        "sequence", "action"),
+    "human_command_batch": ("event", "schema_version", "generation", "batch_id",
+                            "source_generation", "commands",
+                            "command_batch_sha256"),
     "cleanup_receipt": ("event", "schema_version", "generation", "verified", "clean"),
     "advisory_left_behind": ("event", "schema_version", "generation"),
     "journal_repaired": ("event", "schema_version", "generation",
@@ -349,6 +364,47 @@ def command_batch_sha256(commands: Iterable[ReplayCommand]) -> str:
     if not values:
         raise ReplayError("command batch is empty")
     return _sha(values)
+
+
+def _sealed_command_batch(record: Mapping[str, object],
+                          generation: int) -> ReplayCommandBatch:
+    """Validate one all-or-nothing command-batch journal record."""
+    batch_id = _id(record.get("batch_id"), "command batch id")
+    source_generation = _int(record.get("source_generation"),
+                             "command source generation", minimum=1)
+    if source_generation != generation:
+        raise ReplayError("command batch crossed an owner generation")
+    raw_commands = record.get("commands")
+    if (not isinstance(raw_commands, list) or not raw_commands or
+            len(raw_commands) > MAX_HUMAN_COMMANDS):
+        raise ReplayError("command batch commands are missing or unbounded")
+    commands = []
+    ids: set[str] = set()
+    for value in raw_commands:
+        if not isinstance(value, Mapping):
+            raise ReplayError("command batch entry is malformed")
+        if set(value) != {"command_id", "sequence", "action"}:
+            raise ReplayError("command batch entry has unsupported fields")
+        command_id = _id(value.get("command_id"), "command id")
+        sequence = _int(value.get("sequence"), "command sequence", minimum=1)
+        action = value.get("action")
+        if action not in {"cancel", "approve", "deny"}:
+            raise ReplayError("human command action is malformed")
+        if command_id in ids:
+            raise ReplayError("human command id was replayed")
+        ids.add(command_id)
+        commands.append(ReplayCommand(command_id, sequence, action))
+    sequences = sorted({command.sequence for command in commands})
+    if sequences[-1] - sequences[0] + 1 != len(sequences):
+        raise ReplayError("human command sequence is not contiguous")
+    digest = _sha256(record.get("command_batch_sha256"),
+                     "command batch digest")
+    if digest != command_batch_sha256(commands):
+        raise ReplayError("command batch digest does not match its commands")
+    if batch_id != "batch-" + digest[:32]:
+        raise ReplayError("command batch id does not match its digest")
+    return ReplayCommandBatch(batch_id, source_generation,
+                              tuple(commands), digest)
 
 
 def replay_checkpoint(receipt: Mapping[str, object],
@@ -439,6 +495,8 @@ def replay_checkpoint(receipt: Mapping[str, object],
     command_ids: set[str] = set()
     applied_commands: list[ReplayCommand] = []
     command_batch: list[ReplayCommand] = []
+    sealed_command_batch: ReplayCommandBatch | None = None
+    command_batch_kind: str | None = None
     last_command_sequence = 0
     transcript: list[Mapping[str, object]] = []
 
@@ -453,7 +511,8 @@ def replay_checkpoint(receipt: Mapping[str, object],
 
     for record_index, (generation, record) in enumerate(records[1:], start=1):
         event = record["event"]
-        if command_batch and event not in {"human_command", "state_transition"}:
+        if command_batch and event not in {
+                "human_command", "state_transition", "journal_repaired"}:
             raise ReplayError(
                 "human command batch was not immediately consumed by a transition")
         # Once a validated ballot produces a unique quorum candidate, the
@@ -503,6 +562,8 @@ def replay_checkpoint(receipt: Mapping[str, object],
             has_batch_digest = "command_batch_sha256" in record
             if has_recovery_kind != has_batch_digest:
                 raise ReplayError("recovery transition metadata is incomplete")
+            if not has_recovery_kind and "command_source_generation" in record:
+                raise ReplayError("non-recovery transition carries command metadata")
             recovery_batch_digest = None
             if has_recovery_kind:
                 if record.get("recovery_kind") != "human_command_eof":
@@ -514,6 +575,12 @@ def replay_checkpoint(receipt: Mapping[str, object],
                     "command batch digest")
                 if recovery_batch_digest != command_batch_sha256(command_batch):
                     raise ReplayError("recovery transition batch does not match commands")
+                source_generation = record.get("command_source_generation")
+                if sealed_command_batch is not None:
+                    if source_generation != sealed_command_batch.source_generation:
+                        raise ReplayError("recovery transition command generation differs")
+                elif source_generation is not None:
+                    raise ReplayError("legacy recovery has unexpected generation metadata")
             if (source == "PREPARED" and target == "CANCELLED"
                     and reason == "human_cancel" and not has_recovery_kind):
                 raise ReplayError("prepared human cancellation requires recovery metadata")
@@ -540,6 +607,8 @@ def replay_checkpoint(receipt: Mapping[str, object],
                         raise ReplayError("human command precedence was not honored")
                     applied_commands.extend(command_batch)
                     command_batch.clear()
+                    sealed_command_batch = None
+                    command_batch_kind = None
             elif "cancel" in actions:
                 minimum = min(command.sequence for command in command_batch)
                 if (target != "CANCELLED" or record.get("reason") != "human_cancel"
@@ -548,6 +617,8 @@ def replay_checkpoint(receipt: Mapping[str, object],
                     raise ReplayError("queued human cancellation was not honored")
                 applied_commands.extend(command_batch)
                 command_batch.clear()
+                sealed_command_batch = None
+                command_batch_kind = None
             elif command_batch:
                 raise ReplayError("human command batch cannot authorize this transition")
             elif status == "RUNNING" and target == "WAITING_HUMAN":
@@ -693,6 +764,8 @@ def replay_checkpoint(receipt: Mapping[str, object],
             transcript.append(_public_event(record))
             continue
         if event == "human_command":
+            if command_batch_kind == "sealed":
+                raise ReplayError("legacy command cannot extend a sealed command batch")
             command_id = _id(record.get("command_id"), "command id")
             sequence = _int(record.get("sequence"), "command sequence", minimum=1)
             action = record.get("action")
@@ -709,7 +782,24 @@ def replay_checkpoint(receipt: Mapping[str, object],
             command = ReplayCommand(command_id, sequence, action)
             command_ids.add(command_id)
             command_batch.append(command)
+            command_batch_kind = "legacy"
             last_command_sequence = sequence
+            transcript.append(_public_event(record))
+            continue
+        if event == "human_command_batch":
+            if command_batch:
+                raise ReplayError("command batch cannot extend another command boundary")
+            sealed = _sealed_command_batch(record, generation)
+            if any(command.command_id in command_ids for command in sealed.commands):
+                raise ReplayError("human command id was replayed")
+            if any(command.action in {"approve", "deny"}
+                   for command in sealed.commands) and status != "WAITING_HUMAN":
+                raise ReplayError("approval command was issued outside WAITING_HUMAN")
+            command_ids.update(command.command_id for command in sealed.commands)
+            command_batch.extend(sealed.commands)
+            sealed_command_batch = sealed
+            command_batch_kind = "sealed"
+            last_command_sequence = max(command.sequence for command in sealed.commands)
             transcript.append(_public_event(record))
             continue
         if event in {"attempt_finished", "ballot_inert", "cleanup_receipt",
@@ -810,6 +900,12 @@ def replay_checkpoint(receipt: Mapping[str, object],
         "next_ordinal": next_ordinal,
         "applied_commands": [command.__dict__ for command in applied_commands],
         "pending_commands": [command.__dict__ for command in command_batch],
+        "pending_command_batch": (None if sealed_command_batch is None else {
+            "batch_id": sealed_command_batch.batch_id,
+            "source_generation": sealed_command_batch.source_generation,
+            "commands": [command.__dict__ for command in sealed_command_batch.commands],
+            "digest": sealed_command_batch.digest,
+        }),
         "transcript_events": transcript,
         "uncertain_spend": uncertain,
     }
@@ -821,6 +917,7 @@ def replay_checkpoint(receipt: Mapping[str, object],
         termination_reason, candidate, decision_option,
         tuple(attempts.values()), tuple(accepted), pending, next_ordinal,
         tuple(applied_commands), tuple(command_batch),
+        sealed_command_batch,
         tuple(_freeze(record) for record in transcript),
         uncertain, checkpoint_digest,
     )

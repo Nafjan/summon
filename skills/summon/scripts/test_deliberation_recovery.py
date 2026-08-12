@@ -73,6 +73,20 @@ class RecoveryTests(unittest.TestCase):
         _rundir.journal_append(self.run_dir, event(name, owner.generation, **fields), owner)
 
     def command(self, owner, command_id, sequence, action):
+        self.commands(owner, [(command_id, sequence, action)])
+
+    def commands(self, owner, values):
+        commands = [{"command_id": command_id, "sequence": sequence,
+                     "action": action}
+                    for command_id, sequence, action in values]
+        typed = tuple(replay.ReplayCommand(**value) for value in commands)
+        digest = replay.command_batch_sha256(typed)
+        self.append(owner, "human_command_batch",
+                    batch_id="batch-" + digest[:32],
+                    source_generation=owner.generation,
+                    commands=commands, command_batch_sha256=digest)
+
+    def legacy_command(self, owner, command_id, sequence, action):
         self.append(owner, "human_command", command_id=command_id,
                     sequence=sequence, action=action)
 
@@ -161,10 +175,9 @@ class RecoveryTests(unittest.TestCase):
     def test_equal_sequence_priority_and_earlier_sequence_wins(self):
         self.new_run(approval=True)
         self.waiting_human(self.first)
-        self.command(self.first, "cmd-a", 1, "approve")
-        self.command(self.first, "cmd-c", 1, "cancel")
-        self.command(self.first, "cmd-d", 1, "deny")
-        self.command(self.first, "cmd-late", 2, "cancel")
+        self.commands(self.first, [
+            ("cmd-a", 1, "approve"), ("cmd-c", 1, "cancel"),
+            ("cmd-d", 1, "deny"), ("cmd-late", 2, "cancel")])
         owner = self.take_over()
         result = self.recover(owner, configured=self.value)
         self.assertEqual((result.target_state, result.reason),
@@ -173,8 +186,8 @@ class RecoveryTests(unittest.TestCase):
         # An earlier approve is authoritative even when a later cancel exists.
         self.new_run(approval=True)
         self.waiting_human(self.first)
-        self.command(self.first, "cmd-a", 1, "approve")
-        self.command(self.first, "cmd-late", 2, "cancel")
+        self.commands(self.first, [
+            ("cmd-a", 1, "approve"), ("cmd-late", 2, "cancel")])
         owner = self.take_over()
         result = self.recover(owner, configured=self.value)
         self.assertEqual((result.target_state, result.reason),
@@ -203,8 +216,8 @@ class RecoveryTests(unittest.TestCase):
             self.recover(owner, configured=self.value)
 
     def test_duplicate_or_gapped_commands_fail_before_append(self):
-        self.command(self.first, "cmd-1", 1, "cancel")
-        self.command(self.first, "cmd-1", 2, "cancel")
+        self.commands(self.first, [
+            ("cmd-1", 1, "cancel"), ("cmd-1", 2, "cancel")])
         owner = self.take_over()
         with self.assertRaises(recovery.RecoveryError):
             self.recover(owner)
@@ -313,6 +326,86 @@ class RecoveryTests(unittest.TestCase):
         })
         with self.assertRaises(recovery.RecoveryError):
             self.recover(owner)
+
+    def test_legacy_unsealed_eof_commands_are_never_guessed(self):
+        self.legacy_command(self.first, "cmd-cancel", 1, "cancel")
+        owner = self.take_over()
+        with self.assertRaisesRegex(recovery.RecoveryError,
+                                    "legacy unsealed EOF"):
+            self.recover(owner)
+        tagged, _torn = _rundir.journal_read_tagged(self.run_dir)
+        self.assertFalse(any(record.get("recovery_kind")
+                             for _generation, record in tagged))
+
+    def test_torn_atomic_batch_repairs_to_no_action_not_a_prefix(self):
+        path = _rundir._journal_path(self.run_dir, self.first.generation)
+        with open(path, "ab") as handle:
+            handle.write(b'{"event":"human_command_batch","commands":[')
+        owner = self.take_over()
+        self.assertTrue(_rundir.journal_repair(self.run_dir, owner))
+        with self.assertRaisesRegex(recovery.RecoveryError,
+                                    "no pending human command batch"):
+            self.recover(owner)
+        tagged, torn = _rundir.journal_read_tagged(self.run_dir)
+        self.assertFalse(torn)
+        self.assertFalse(any(record.get("event") == "state_transition"
+                             for _generation, record in tagged))
+
+    def test_recovery_preserves_batch_source_and_transition_generation(self):
+        self.command(self.first, "cmd-1", 1, "cancel")
+        source_generation = self.first.generation
+        owner = self.take_over()
+        result = self.recover(owner)
+        self.assertEqual(result.status, "recovered")
+        tagged, _torn = _rundir.journal_read_tagged(self.run_dir)
+        transition_generation, transition = tagged[-1]
+        self.assertEqual(transition_generation, owner.generation)
+        self.assertEqual(transition["generation"], owner.generation)
+        self.assertEqual(transition["command_source_generation"], source_generation)
+        # Re-validating as a predecessor of a successor retains both physical
+        # generations; no normalization to the batch's generation is needed.
+        replayed = replay.replay_checkpoint(self.value, tagged,
+                                            owner.generation + 1)
+        self.assertEqual(replayed.status, "CANCELLED")
+        self.assertEqual(replayed.prior_generation, owner.generation)
+
+    def test_post_recovery_torn_tail_repair_preserves_successor_idempotency(self):
+        self.command(self.first, "cmd-1", 1, "cancel")
+        recovering = self.take_over()
+        self.assertEqual(self.recover(recovering).status, "recovered")
+        with open(_rundir._journal_path(self.run_dir, recovering.generation),
+                  "ab") as handle:
+            handle.write(b"{torn-after-recovery")
+        _rundir.release_owner(recovering)
+        repairing = _rundir.acquire_owner(self.run_dir, 600)
+        self.assertTrue(_rundir.journal_repair(self.run_dir, repairing))
+        _rundir.release_owner(repairing)
+        successor = _rundir.acquire_owner(self.run_dir, 600)
+        result = self.recover(successor)
+        self.assertEqual(result.status, "already_recovered")
+        self.assertFalse(result.appended)
+        tagged, torn = _rundir.journal_read_tagged(self.run_dir)
+        self.assertFalse(torn)
+        self.assertEqual(sum(record.get("recovery_kind") == "human_command_eof"
+                             for _generation, record in tagged), 1)
+
+    def test_pending_batch_survives_intervening_pre_recovery_repair(self):
+        self.command(self.first, "cmd-1", 1, "cancel")
+        with open(_rundir._journal_path(self.run_dir, self.first.generation),
+                  "ab") as handle:
+            handle.write(b"{torn-after-sealed-batch")
+        repairing = self.take_over()
+        self.assertTrue(_rundir.journal_repair(self.run_dir, repairing))
+        _rundir.release_owner(repairing)
+        recovering = _rundir.acquire_owner(self.run_dir, 600)
+        result = self.recover(recovering)
+        self.assertEqual(result.status, "recovered")
+        self.assertEqual(result.target_state, "CANCELLED")
+        tagged, torn = _rundir.journal_read_tagged(self.run_dir)
+        self.assertFalse(torn)
+        replayed = replay.replay_checkpoint(self.value, tagged,
+                                            recovering.generation + 1)
+        self.assertEqual(replayed.status, "CANCELLED")
 
 
 if __name__ == "__main__":

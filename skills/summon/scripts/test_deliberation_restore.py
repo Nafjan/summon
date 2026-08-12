@@ -110,6 +110,7 @@ def checkpoint(**changes) -> SimpleNamespace:
     }, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
     values.setdefault("applied_commands", ())
     values.setdefault("pending_commands", ())
+    values.setdefault("pending_command_batch", None)
     values.setdefault("transcript_events", ())
     payload = {
         "receipt_sha256": values["receipt_sha256"], "run_id": values["run_id"],
@@ -135,6 +136,7 @@ def checkpoint(**changes) -> SimpleNamespace:
                              for item in values["applied_commands"]],
         "pending_commands": [fields(item, ("command_id", "sequence", "action"))
                              for item in values["pending_commands"]],
+        "pending_command_batch": values["pending_command_batch"],
         "transcript_events": list(values["transcript_events"]),
         "uncertain_spend": values["uncertain_spend"],
     }

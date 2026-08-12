@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
 import os
 import sys
 import tempfile
@@ -707,6 +708,89 @@ class ReplayTests(unittest.TestCase):
         checkpoint = self.run_replay(records, value=value)
         with self.assertRaises(TypeError):
             checkpoint.transcript_events[0]["event"] = "tampered"
+
+
+    def test_atomic_command_batch_is_typed_and_checkpoint_sealed(self):
+        commands = (replay.ReplayCommand("cmd-c", 1, "cancel"),)
+        digest = replay.command_batch_sha256(commands)
+        value, records = prepared()
+        records.append((1, event(
+            "human_command_batch", 1,
+            batch_id="batch-" + digest[:32], source_generation=1,
+            commands=[command.__dict__ for command in commands],
+            command_batch_sha256=digest)))
+        checkpoint = replay.replay_checkpoint(value, records, 2)
+        self.assertEqual(checkpoint.pending_commands, commands)
+        self.assertIsNotNone(checkpoint.pending_command_batch)
+        self.assertEqual(checkpoint.pending_command_batch.digest, digest)
+        self.assertEqual(checkpoint.pending_command_batch.source_generation, 1)
+        self.assertNotEqual(checkpoint.digest,
+                            replay.replay_checkpoint(value, prepared()[1], 2).digest)
+
+    def test_atomic_command_batch_rejects_mutated_identity_action_count_and_digest(self):
+        commands = (replay.ReplayCommand("cmd-a", 1, "approve"),
+                    replay.ReplayCommand("cmd-c", 1, "cancel"))
+        digest = replay.command_batch_sha256(commands)
+        original = event(
+            "human_command_batch", 1,
+            batch_id="batch-" + digest[:32], source_generation=1,
+            commands=[command.__dict__ for command in commands],
+            command_batch_sha256=digest)
+        mutations = []
+        changed = copy.deepcopy(original)
+        changed["commands"][0]["command_id"] = "cmd-other"
+        mutations.append(changed)
+        changed = copy.deepcopy(original)
+        changed["commands"][0]["action"] = "deny"
+        mutations.append(changed)
+        changed = copy.deepcopy(original)
+        changed["commands"].pop()
+        mutations.append(changed)
+        changed = copy.deepcopy(original)
+        changed["command_batch_sha256"] = "0" * 64
+        mutations.append(changed)
+        changed = copy.deepcopy(original)
+        changed["batch_id"] = "batch-" + "0" * 32
+        mutations.append(changed)
+        changed = copy.deepcopy(original)
+        changed["commands"][1]["sequence"] = 10 ** 12
+        far_commands = tuple(replay.ReplayCommand(**item)
+                             for item in changed["commands"])
+        changed["command_batch_sha256"] = replay.command_batch_sha256(far_commands)
+        changed["batch_id"] = "batch-" + changed["command_batch_sha256"][:32]
+        mutations.append(changed)
+        for index, mutation in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(replay.ReplayError):
+                replay.replay_checkpoint(receipt(), prepared()[1] + [(1, mutation)], 2)
+
+    def test_atomic_command_batch_cannot_cross_generation(self):
+        command = replay.ReplayCommand("cmd-1", 1, "cancel")
+        digest = replay.command_batch_sha256((command,))
+        record = event(
+            "human_command_batch", 1,
+            batch_id="batch-" + digest[:32], source_generation=2,
+            commands=[command.__dict__], command_batch_sha256=digest)
+        with self.assertRaises(replay.ReplayError):
+            replay.replay_checkpoint(receipt(), prepared()[1] + [(1, record)], 3)
+
+    def test_non_recovery_transition_rejects_command_generation_metadata(self):
+        value, records = prepared()
+        records.append((1, event(
+            "state_transition", 1, **{
+                "from": "PREPARED", "to": "RUNNING", "reason": "started",
+                "decision_option": None,
+                "command_source_generation": r"SECRET-C:\private",
+            })))
+        with self.assertRaises(replay.ReplayError):
+            replay.replay_checkpoint(value, records, 2)
+
+    def test_legacy_eof_commands_are_visible_but_not_typed_recoverable(self):
+        records = prepared()[1] + [(1, event(
+            "human_command", 1, command_id="cmd-1", sequence=1,
+            action="cancel"))]
+        checkpoint = replay.replay_checkpoint(receipt(), records, 2)
+        self.assertEqual(checkpoint.pending_commands[0].action, "cancel")
+        self.assertIsNone(checkpoint.pending_command_batch)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 This is deliberately a small, provider-inert boundary.  It completes the
 durable command transaction when a process died after appending the EOF
-``human_command`` records but before appending their state transition.  It
+an atomic ``human_command_batch`` record but before appending its state transition.  It
 does not read an inbox, construct an engine, invoke a scheduler, or contact a
 provider.  The held :class:`_rundir.Owner` is the only source of the run
 directory, generation, ownership fence, and journal append capability.
@@ -39,7 +39,9 @@ class CommandRecoveryReceipt:
     appended: bool = False
 
 
-_RECOVERY_AUDIT_SUFFIX = frozenset({"cleanup_receipt", "advisory_left_behind"})
+_RECOVERY_AUDIT_SUFFIX = frozenset({
+    "cleanup_receipt", "advisory_left_behind", "journal_repaired",
+})
 _MAX_RECOVERY_AUDIT_SUFFIX = 64
 
 
@@ -133,8 +135,8 @@ def _partition_records(owner: _rundir.Owner) -> tuple[list[tuple[int, dict]],
     return prior, current
 
 
-def _command_batch_from_records(records: list[tuple[int, dict]], index: int) -> tuple[replay.ReplayCommand, ...]:
-    """Read the contiguous command batch immediately before a recovery event."""
+def _legacy_command_batch_from_records(records: list[tuple[int, dict]], index: int) -> tuple[replay.ReplayCommand, ...]:
+    """Read a completed legacy command prefix for compatibility validation."""
     values: list[replay.ReplayCommand] = []
     cursor = index - 1
     while cursor >= 0 and records[cursor][1].get("event") == "human_command":
@@ -151,6 +153,23 @@ def _command_batch_from_records(records: list[tuple[int, dict]], index: int) -> 
     if not values:
         raise RecoveryError("recovery transition has no preceding command batch")
     return tuple(values)
+
+
+def _sealed_batch_before(records: list[tuple[int, dict]], index: int) -> replay.ReplayCommandBatch | None:
+    cursor = index - 1
+    # A successor can repair the predecessor's torn tail and then itself die
+    # before appending the recovery transition.  Canonical replay validates
+    # each repair record's generation and first-in-segment placement; skip
+    # those inert audits while locating the still-pending sealed boundary.
+    while cursor >= 0 and records[cursor][1].get("event") == "journal_repaired":
+        cursor -= 1
+    if cursor < 0 or records[cursor][1].get("event") != "human_command_batch":
+        return None
+    generation, record = records[cursor]
+    try:
+        return replay._sealed_command_batch(record, generation)
+    except replay.ReplayError as exc:
+        raise RecoveryError("durable command batch is malformed") from exc
 
 
 def _already_recovered(prior: list[tuple[int, dict]], checkpoint: replay.ReplayCheckpoint,
@@ -170,7 +189,9 @@ def _already_recovered(prior: list[tuple[int, dict]], checkpoint: replay.ReplayC
             record.get("event") not in _RECOVERY_AUDIT_SUFFIX
             for _generation, record in suffix):
         return None
-    batch = _command_batch_from_records(prior, recovery_index)
+    sealed = _sealed_batch_before(prior, recovery_index)
+    batch = (sealed.commands if sealed is not None else
+             _legacy_command_batch_from_records(prior, recovery_index))
     digest = replay.command_batch_sha256(batch)
     if last.get("command_batch_sha256") != digest:
         raise RecoveryError("durable recovery batch hash is inconsistent")
@@ -194,23 +215,19 @@ def _validate_current_recovery(prior: list[tuple[int, dict]], current: list[tupl
     recovery = current[0][1]
     if recovery.get("event") != "state_transition":
         raise RecoveryError("owner current material is not a recovery transition")
-    # Replay is the authoritative validator.  Temporarily attributing this
-    # already-durable line to the predecessor segment lets it validate the
-    # command boundary without granting the current segment launch authority.
-    predecessor_generation = max(generation for generation, _ in prior)
-    normalized_current = []
-    for _generation, record in current:
-        normalized = dict(record)
-        normalized["generation"] = predecessor_generation
-        normalized_current.append((predecessor_generation, normalized))
+    # Replay is the authoritative validator.  Validate the durable current
+    # segment as an immutable predecessor of a hypothetical successor while
+    # preserving every record's actual generation.
     try:
         validation = replay.replay_checkpoint(
-            receipt, prior + normalized_current, owner_generation)
+            receipt, prior + current, owner_generation + 1)
     except replay.ReplayError as exc:
         raise RecoveryError("current recovery transition is not valid") from exc
     if validation.pending_commands:
         raise RecoveryError("recovery transition did not consume its command batch")
-    batch = _command_batch_from_records(prior, len(prior))
+    sealed = _sealed_batch_before(prior, len(prior))
+    batch = (sealed.commands if sealed is not None else
+             _legacy_command_batch_from_records(prior, len(prior)))
     digest = replay.command_batch_sha256(batch)
     if recovery.get("command_batch_sha256") != digest:
         raise RecoveryError("current recovery batch hash differs from the command batch")
@@ -227,7 +244,7 @@ def recover_pending_human_commands(*, owner: _rundir.Owner,
     """Complete one durable EOF human-command boundary, or report its status.
 
     This operation never reevaluates a deadline.  Command admission already
-    happened before the journaled ``human_command`` records were written; this
+    happened before the journaled ``human_command_batch`` record was written; this
     function only makes the matching state transition durable and idempotent.
     """
     if not isinstance(owner, _rundir.Owner):
@@ -253,7 +270,11 @@ def recover_pending_human_commands(*, owner: _rundir.Owner,
     previous_result = _already_recovered(prior, checkpoint, run_id, owner.generation)
     if previous_result is not None:
         return previous_result
-    pending = tuple(checkpoint.pending_commands)
+    sealed = checkpoint.pending_command_batch
+    if sealed is None and checkpoint.pending_commands:
+        raise RecoveryError(
+            "legacy unsealed EOF human commands are not recoverable")
+    pending = () if sealed is None else tuple(sealed.commands)
     if not pending:
         raise RecoveryError("owner journal has no pending human command batch")
     minimum = min(command.sequence for command in pending)
@@ -287,6 +308,7 @@ def recover_pending_human_commands(*, owner: _rundir.Owner,
         "to": target, "reason": reason, "decision_option": decision,
         "recovery_kind": "human_command_eof",
         "command_batch_sha256": batch_digest,
+        "command_source_generation": sealed.source_generation,
     }
     try:
         _rundir.journal_append(owner.run_dir, event, owner=owner)
