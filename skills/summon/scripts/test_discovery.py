@@ -539,6 +539,10 @@ def test_current_version_claims_match_the_dispatcher():
     assert sample and sample.group(1) == rs.__version__, (
         "README sample envelope claims %s but the dispatcher is %s"
         % (sample.group(1) if sample else None, rs.__version__))
+    plugin = json.loads((repo / "plugin.json").read_text(encoding="utf-8"))
+    assert plugin.get("version") == rs.__version__, (
+        "plugin.json claims %s but the dispatcher is %s"
+        % (plugin.get("version"), rs.__version__))
 
 
 def test_elapsed_ms_present_even_on_spawn_failure():
@@ -2074,7 +2078,10 @@ def test_subcommand_rewrite():
     # an INVALID agent action is an error (exit 2), NOT success
     _, m = rs._rewrite_subcommand(["agent", "delete", "x"])
     assert m.startswith("error:") and "delete" in m
-    # <subcommand> --help -> general usage (facade has no per-command parser)
+    # Management subcommands expose their own accurate help; other subcommands
+    # retain the general usage facade.
+    assert rs._rewrite_subcommand(["telemetry", "--help"])[1] == "help:telemetry"
+    assert rs._rewrite_subcommand(["bug-report", "--help"])[1] == "help:bug-report"
     assert rs._rewrite_subcommand(["manifest", "--help"])[1] == "help"
     assert rs._rewrite_subcommand(["agent", "new", "--help"])[1] == "help"
     # an unknown leading token is left for the flat parser to reject
@@ -2628,6 +2635,319 @@ def test_fable_runs_unsubstituted_and_reports_plan_dependent_billing():
         assert eff2 == _CREDIT_PROBE and note2 is None, (eff2, note2)
     finally:
         del os.environ["SUMMON_ALLOW_CREDIT"]
+
+
+def test_telemetry_is_opt_in_bounded_and_private():
+    import _telemetry
+    d = tempfile.mkdtemp(prefix="summon-telemetry-")
+    keys = ("SUMMON_TELEMETRY", "SUMMON_TELEMETRY_CONFIG", "SUMMON_TELEMETRY_FILE",
+            "SUMMON_REPORTS_DIR")
+    old = {key: os.environ.get(key) for key in keys}
+    try:
+        os.environ["SUMMON_TELEMETRY_CONFIG"] = os.path.join(d, "config.json")
+        os.environ["SUMMON_TELEMETRY_FILE"] = os.path.join(d, "events.jsonl")
+        os.environ["SUMMON_REPORTS_DIR"] = os.path.join(d, "reports")
+        os.environ["SUMMON_TELEMETRY"] = "0"
+        envelope = {
+            "status": "error", "error": "api_key=sk-THIS_IS_NOT_REAL C:\\Users\\test\\private",
+            "error_hint": "token: abc123", "result": "private result",
+            "prompt": "private prompt", "output_tail": "raw output",
+            "cli": "claude", "model": {"requested": "opus", "served": "opus"},
+            "summon": {"version": "2.1.0", "scripts_sha256": "a" * 64},
+            "workspace_evidence": {"before": {"untracked": ["secret.txt"]}},
+        }
+        assert _telemetry.record(envelope) is None
+        assert not os.path.exists(os.environ["SUMMON_TELEMETRY_FILE"])
+        os.environ["SUMMON_TELEMETRY"] = "1"
+        event = _telemetry.record(envelope)
+        assert event and event["status"] == "error"
+        raw = Path(os.environ["SUMMON_TELEMETRY_FILE"]).read_text(encoding="utf-8")
+        assert len(raw.encode("utf-8")) <= _telemetry._MAX_EVENT_BYTES
+        assert "private prompt" not in raw and "private result" not in raw
+        assert "raw output" not in raw and "C:\\Users\\test" not in raw
+        assert "THIS_IS_NOT_REAL" not in raw and "abc123" not in raw
+        assert "event_id" in raw and "failure_class" in raw
+        assert "api_key" not in raw and "error_hint" not in raw and "prompt" not in raw
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_telemetry_toggle_status_and_clear_are_idempotent():
+    import _telemetry
+    d = tempfile.mkdtemp(prefix="summon-telemetry-toggle-")
+    keys = ("SUMMON_TELEMETRY", "SUMMON_TELEMETRY_CONFIG", "SUMMON_TELEMETRY_FILE")
+    old = {key: os.environ.get(key) for key in keys}
+    try:
+        os.environ.pop("SUMMON_TELEMETRY", None)
+        os.environ["SUMMON_TELEMETRY_CONFIG"] = os.path.join(d, "config.json")
+        os.environ["SUMMON_TELEMETRY_FILE"] = os.path.join(d, "events.jsonl")
+        assert _telemetry.set_enabled(True)["enabled"] is True
+        _telemetry.record({"status": "success", "cli": "codex"})
+        assert _telemetry.status()["event_count"] == 1
+        assert _telemetry.clear_events()["cleared"] is True
+        assert _telemetry.status()["event_count"] == 0
+        assert _telemetry.set_enabled(False)["enabled"] is False
+        assert _telemetry.clear_events()["cleared"] is False
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_telemetry_spool_is_bounded():
+    import _telemetry
+    d = tempfile.mkdtemp(prefix="summon-telemetry-bound-")
+    keys = ("SUMMON_TELEMETRY", "SUMMON_TELEMETRY_CONFIG", "SUMMON_TELEMETRY_FILE")
+    old_env = {key: os.environ.get(key) for key in keys}
+    old_cap = _telemetry._MAX_EVENT_FILE_BYTES
+    try:
+        os.environ["SUMMON_TELEMETRY"] = "1"
+        os.environ["SUMMON_TELEMETRY_CONFIG"] = os.path.join(d, "config.json")
+        os.environ["SUMMON_TELEMETRY_FILE"] = os.path.join(d, "events.jsonl")
+        _telemetry._MAX_EVENT_FILE_BYTES = 1200
+        for i in range(20):
+            _telemetry.record({"status": "error", "error": "failure-%d" % i,
+                               "cli": "codex", "warnings": ["w"] * 3})
+        assert os.path.getsize(os.environ["SUMMON_TELEMETRY_FILE"]) <= 1200
+        assert _telemetry.latest_event()["error_sha256"]
+    finally:
+        _telemetry._MAX_EVENT_FILE_BYTES = old_cap
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_telemetry_lock_does_not_remove_a_replacement_owner():
+    import _telemetry
+    d = tempfile.mkdtemp(prefix="summon-telemetry-lock-")
+    try:
+        spool = Path(d) / "events.jsonl"
+        lock = Path(str(spool) + ".lock")
+        with _telemetry._spool_lock(spool) as acquired:
+            assert acquired
+            lock.write_text("b" * 32, encoding="ascii")
+        assert lock.exists(), "a paused owner must not unlink a replacement lock"
+    finally:
+        try:
+            (Path(d) / "events.jsonl.lock").unlink()
+        except OSError:
+            pass
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_bug_report_sanitizes_envelope_and_marks_imported_identity():
+    import _telemetry
+    d = tempfile.mkdtemp(prefix="summon-bug-report-")
+    try:
+        source = {"status": "error", "error": "failed at C:\\Users\\test\\secret",
+                  "prompt": "private prompt", "result": "private result",
+                  "agent_def": {"file": "C:\\Users\\test\\agent.md"},
+                  "cwd": "C:\\Users\\test\\project", "cli": "agy"}
+        event = _telemetry.event_from_envelope(source)
+        assert event and event["event_id"]
+        path = os.path.join(d, "report.md")
+        report = _telemetry.write_report(event, output=path, title="A local failure")
+        text = Path(path).read_text(encoding="utf-8")
+        assert report["event_id"] != event["event_id"]
+        assert "Sanitized evidence" in text
+        assert "private prompt" not in text and "private result" not in text
+        assert "C:\\Users\\test" not in text and "agent_def" not in text
+        assert "A local failure" in text
+        assert '"source_trust": "unverified"' in text
+        assert "low-entropy" in text and "fingerprints" in text
+        forged = {"schema": 1, "event_id": "a" * 32, "recorded_at": "now",
+                  "status": "error", "error": "secret=DO_NOT_PUBLISH",
+                  "private_field": "must not appear"}
+        forged_path = os.path.join(d, "forged.md")
+        _telemetry.write_report(forged, output=forged_path)
+        forged_text = Path(forged_path).read_text(encoding="utf-8")
+        assert "DO_NOT_PUBLISH" not in forged_text and "private_field" not in forged_text
+        fenced_path = os.path.join(d, "fenced.md")
+        _telemetry.write_report(source, output=fenced_path,
+                                description="``` injected markdown")
+        fenced_text = Path(fenced_path).read_text(encoding="utf-8")
+        assert "``` injected markdown" not in fenced_text
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_cli_telemetry_and_bug_report_commands_are_local():
+    import subprocess as sp
+    d = tempfile.mkdtemp(prefix="summon-diag-cli-")
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
+    env = os.environ.copy()
+    env.update({"SUMMON_TELEMETRY_CONFIG": os.path.join(d, "config.json"),
+                "SUMMON_TELEMETRY_FILE": os.path.join(d, "events.jsonl"),
+                "SUMMON_REPORTS_DIR": os.path.join(d, "reports"),
+                "SUMMON_TELEMETRY": "0"})
+    try:
+        r = sp.run([sys.executable, script, "telemetry", "status", "--json"],
+                   capture_output=True, text=True, encoding="utf-8", env=env)
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout)["enabled"] is False
+        # The process-local opt-out wins over persisted state. Remove it before
+        # testing the explicit persistent enable command.
+        env.pop("SUMMON_TELEMETRY")
+        r = sp.run([sys.executable, script, "telemetry", "enable", "--json"],
+                   capture_output=True, text=True, encoding="utf-8", env=env)
+        assert r.returncode == 0 and json.loads(r.stdout)["enabled"] is True, r.stdout
+        envelope = os.path.join(d, "envelope.json")
+        Path(envelope).write_text(json.dumps({"status": "error", "error": "probe failure",
+                                               "cli": "codex"}), encoding="utf-8")
+        output = os.path.join(d, "bug.md")
+        r = sp.run([sys.executable, script, "bug-report", "--from", envelope,
+                    "--output", output, "--json"], capture_output=True, text=True,
+                   encoding="utf-8", env=env)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        result = json.loads(r.stdout)
+        assert result["ok"] is True and Path(output).is_file()
+        r = sp.run([sys.executable, script, "bug-report", "--submit-github",
+                    "--from", envelope, "--json"], capture_output=True, text=True,
+                   encoding="utf-8", env=env)
+        assert r.returncode == 1 and "reviewed Summon Markdown" in json.loads(r.stdout)["error"]
+        r = sp.run([sys.executable, script, "--github-repo", "Nafjan/summon"],
+                   capture_output=True, text=True, encoding="utf-8", env=env)
+        assert r.returncode == 1 and "bug-report options" in json.loads(r.stdout)["error"]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_github_submission_is_explicit_and_shell_free():
+    import _telemetry
+    d = tempfile.mkdtemp(prefix="summon-gh-report-")
+    old_which, old_run = _telemetry.shutil.which, _telemetry.subprocess.run
+    calls = []
+    try:
+        report = os.path.join(d, "report.md")
+        Path(report).write_text("# Summon diagnostic report\n\n## Summary\n\nReviewed diagnostic\n",
+                                encoding="utf-8")
+        _telemetry.shutil.which = lambda name: "gh.exe" if name == "gh" else None
+
+        def fake_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return types.SimpleNamespace(returncode=0,
+                                         stdout="https://github.com/Nafjan/summon/issues/7\n",
+                                         stderr="")
+
+        _telemetry.subprocess.run = fake_run
+        result = _telemetry.submit_github(report, title="diagnostic")
+        assert result["submission_url"].endswith("/issues/7")
+        call_args, kwargs = calls[0]
+        argv = call_args[0]
+        assert argv[1:4] == ["issue", "create", "--repo"]
+        assert "--body-file" in argv and kwargs.get("shell") is not True
+        assert kwargs.get("stdin") is not None
+    finally:
+        _telemetry.shutil.which, _telemetry.subprocess.run = old_which, old_run
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_telemetry_sanitizer_covers_unlabeled_secrets_paths_and_prompt_prose():
+    import _telemetry
+    sample = ("Authorization: Bearer TOPSECRET123456 \\fileserver\\private\\alice\\secret.txt "
+              "C:\\Users\\Jane Doe\\Private Project\\secret.txt "
+              "/home/jane doe/private/file.txt AKIAIOSFODNN7EXAMPLE "
+              "ghp_1234567890123456789012345678901234567890 "
+              "eyJaaaaaaaaaa.eyJbbbbbbbbbb.cccccccccccc "
+              "prompt=Project-Cedar launch plan message=Project Cedar launch plan")
+    cleaned = _telemetry._clean_text(sample, 4000)
+    assert "TOPSECRET" not in cleaned
+    assert "fileserver" not in cleaned and "Jane Doe" not in cleaned and "jane doe" not in cleaned
+    assert "AKIAIOSFODNN7EXAMPLE" not in cleaned and "ghp_" not in cleaned
+    assert "eyJaaaaaaaaaa" not in cleaned and "Project-Cedar" not in cleaned
+    assert "Project Cedar launch plan" not in cleaned and "launch plan" not in cleaned
+
+
+def test_debug_directory_source_reads_real_final_envelope_section():
+    import _telemetry
+    d = tempfile.mkdtemp(prefix="summon-debug-source-")
+    try:
+        log = os.path.join(d, "123-codex-7-abcd.log")
+        Path(log).write_text("# argv\n--prompt private\n# raw captured output\n"
+                             "# final envelope\n{\"status\": \"error\", \"cli\": \"wrong\"}\n"
+                             "raw line mentioning # final envelope inside captured output\n"
+                             "# final envelope\n{\n \"status\": \"error\", \"cli\": \"codex\","
+                             " \"error\": \"failure # final envelope\"\n}\n", encoding="utf-8")
+        event = _telemetry.source_event(d)
+        assert event["backend"] == "codex"
+        assert event["failure_class"] == "backend"
+        assert event["source_trust"] == "unverified"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_submit_requires_existing_reviewed_file_and_never_regenerates():
+    import _telemetry
+    d = tempfile.mkdtemp(prefix="summon-submit-review-")
+    old_which, old_run = _telemetry.shutil.which, _telemetry.subprocess.run
+    calls = []
+    try:
+        source = os.path.join(d, "source.json")
+        report = os.path.join(d, "reviewed.md")
+        Path(source).write_text(json.dumps({"status": "error", "cli": "codex",
+                                             "error": "private prompt echo"}), encoding="utf-8")
+        r = _telemetry.write_report(_telemetry.source_event(source), output=report)
+        assert _telemetry.validate_report_file(report)["title"] == r["title"]
+        _telemetry.shutil.which = lambda name: "gh.exe"
+
+        reviewed_bytes = Path(report).read_bytes()
+
+        def fake_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            argv = args[0]
+            # Simulate a concurrent edit immediately after validation. The
+            # submitted body must still be the exact bytes the user reviewed.
+            Path(report).write_text("# Summon diagnostic report\n\n## Summary\n\nATTACKER EDIT\n",
+                                    encoding="utf-8")
+            body_path = argv[argv.index("--body-file") + 1]
+            assert Path(body_path).read_bytes() == reviewed_bytes
+            return types.SimpleNamespace(returncode=0,
+                                         stdout="https://github.com/Nafjan/summon/issues/8", stderr="")
+
+        _telemetry.subprocess.run = fake_run
+        result = _telemetry.submit_github(report)
+        assert result["submitted"] is True and calls
+        argv = calls[0][0][0]
+        snapshot = argv[argv.index("--body-file") + 1]
+        assert snapshot != str(Path(report).resolve())
+        assert not Path(snapshot).exists(), "temporary reviewed snapshot must be removed"
+        try:
+            _telemetry.submit_github(source)
+        except ValueError as exc:
+            assert "reviewed Summon Markdown" in str(exc)
+        else:
+            raise AssertionError("raw envelope was accepted for direct submission")
+    finally:
+        _telemetry.shutil.which, _telemetry.subprocess.run = old_which, old_run
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_fanout_validation_errors_enter_opt_in_telemetry():
+    import contextlib
+    import io
+    import _council, _manifest, _telemetry
+    old = _telemetry.record
+    captured = []
+    _telemetry.record = lambda event: captured.append(event)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert _manifest._fail("bad manifest") == 1
+            assert _council._fail("bad council") == 1
+    finally:
+        _telemetry.record = old
+    assert [e["transport"] for e in captured] == ["manifest", "council"]
+    assert all(e["status"] == "error" for e in captured)
 
 def test_effort_frontmatter_backends_and_envelope():
     import _builder, _executor
@@ -4618,6 +4938,7 @@ def test_v4_overall_timeout_setup_overrun():
     import json as _json
     import threading
     import time as _t
+    import _telemetry
     root = tempfile.mkdtemp(prefix="summon-v4so-")
     _mk_agents(root, ["m1", "m2", "chair"])
     dispatched = []
@@ -4632,7 +4953,10 @@ def test_v4_overall_timeout_setup_overrun():
                             chairman="chair", rounds=1, cwd=os.getcwd(), agents_dir=root,
                             timeout=30000, out=None, run_dir=root, overall_timeout=1)
     orig_d = _council._dispatch
+    orig_record = _telemetry.record
+    telemetry_events = []
     _council._dispatch = fake
+    _telemetry.record = lambda event: telemetry_events.append(event)
     # Fake clock that ADVANCES 10s on every read. Order-independent by construction:
     # whichever call captures the run start, the very next read is already 10s later, so
     # any positive budget is spent. An earlier attempt special-cased "the first call is
@@ -4660,6 +4984,7 @@ def test_v4_overall_timeout_setup_overrun():
     finally:
         _council.time.monotonic = real_monotonic
         _council._dispatch = orig_d
+        _telemetry.record = orig_record
         import shutil as _sh
         _sh.rmtree(root, ignore_errors=True)
     assert rc == 2, rc
@@ -4667,6 +4992,7 @@ def test_v4_overall_timeout_setup_overrun():
     assert env["members"] == [], env["members"]
     assert not dispatched, dispatched         # no paid member launched past the deadline
     assert "setup" in (env.get("overall_timeout", {}).get("reason") or ""), env.get("overall_timeout")
+    assert any(event.get("failure_class") == "timeout" for event in telemetry_events), telemetry_events
     assert elapsed < 10, elapsed
 
 

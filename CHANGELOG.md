@@ -4,6 +4,34 @@ The important, user-visible changes to summon. For the complete certification re
 regression notes, and test evidence, see the
 [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
+## [Unreleased]
+
+No unreleased changes.
+
+## [2.2.0] — 2026-08-12
+
+### Highlights
+
+- **Opt-in diagnostics:** `summon telemetry enable` captures bounded, categorized local
+  dispatch metadata (including deterministic SHA-256 fingerprints for local correlation);
+  `summon bug-report` creates a reviewable Markdown report. A second,
+  explicit `--submit-github --from REVIEWED_REPORT.md` command submits that exact file through
+  authenticated `gh`. Telemetry is disabled by default, contains no prompt/result text or
+  credentials/absolute paths, and never phones home. Fingerprints can still correlate or
+  reveal low-entropy values, so review before sharing.
+
+### Fixed
+
+- Council setup and overall-timeout exits now leave categorized local diagnostic events when
+  telemetry is enabled; spool locking, bounded reads, and reviewed-report submission are
+  ownership- and snapshot-safe.
+
+### Install / upgrade
+
+```bash
+npx skills add Nafjan/summon
+```
+
 ## [2.1.0] — 2026-08-11
 
 ### Highlights
@@ -25,8 +53,6 @@ regression notes, and test evidence, see the
   cross-account retries remain intentionally out of scope because they can duplicate work.
 - Background, manifest, and council role propagation is covered; malformed, chained, or
   retargeted aliases fail closed rather than silently falling back.
-
-## [Unreleased]
 
 ## [2.0.5] — 2026-08-09
 

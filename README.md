@@ -246,6 +246,9 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon council --question "…"` | **decide by consensus** of diverse models |
 | `summon agent new\|set NAME --set k=v` | scaffold / retune an agent definition |
 | `summon role propose\|approve\|list\|resolve …` | manage private, opt-in role aliases |
+| `summon jobs list\|status [ID]` · `jobs wait ID` | inspect or wait for background jobs (`--json` on list/status) |
+| `summon telemetry enable\|disable\|status\|clear` | manage local opt-in diagnostics; `clear` does not disable |
+| `summon bug-report …` | generate a sanitized report; review it before the separate GitHub submission command |
 | `summon version` · `summon help` | version · usage |
 
 `summon` (no args) prints the command list. Everything below is documented in
@@ -377,7 +380,7 @@ vendors.
   "report_ok": true,
   "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
                "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
-  "summon":  { "version": "2.1.0", "scripts_sha256": "9f2c…" },
+  "summon":  { "version": "2.2.0", "scripts_sha256": "9f2c…" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -544,11 +547,27 @@ You bring the model access; summon just orchestrates the CLIs and APIs you alrea
   and refuses with an error that names argv as the cause. `--prompt-file` does **not** avoid
   this -- it is a quoting convenience and the content still travels on the command line. For
   material that large, write it to a file under `--cwd` and ask the agent to read it.
-- **No phone-home.** For the five CLI backends, summon sends no telemetry and makes no
-  network calls of its own; it just spawns the backend CLIs, plus supporting tools where a
-  feature needs them (`git`, `icacls`/`chmod`, the agy PTY wrapper, a detached copy of
-  itself for `--background`). The one exception is the `openai-compat` backend, whose whole
-  job is a direct HTTPS call to the `base_url` you configure.
+- **Diagnostics are opt-in and local.** Summon never collects telemetry by default. After
+  `summon telemetry enable`, it records only bounded, allow-listed metadata in a local
+  JSONL spool; every dispatch outcome (success, partial, blocked, or error) is represented
+  by bounded, allow-listed metadata. Prompt/result text, raw output, credentials, and
+  absolute paths are omitted.
+  It may retain deterministic SHA-256 fingerprints of the prompt and error for local
+  correlation; those are not plaintext, but can correlate or reveal low-entropy values.
+  Review generated reports with that in mind.
+  `summon bug-report` turns one event into a sanitized Markdown file for review. Nothing is
+  uploaded unless you explicitly run a second command,
+  `summon bug-report --submit-github --from REVIEWED_REPORT.md`, which sends that exact
+  reviewed file through your authenticated `gh issue create` command and never reads a
+  token or makes a direct HTTP call. The config is `~/.agents/summon-telemetry.json`, the JSONL spool is
+  `~/.agents/summon-telemetry.jsonl` (capped at 2 MiB), and reports go under
+  `~/.agents/summon-reports`; `telemetry clear` removes events but does not disable
+  collection. `summon telemetry disable` or `SUMMON_TELEMETRY=0` opts out; an environment
+  override is non-persistent and is inherited by Summon children in that invocation.
+  For the six CLI backends, all other network/process activity is the backend or a feature's supporting
+  tool (`git`, `icacls`/`chmod`, the agy PTY wrapper, a detached copy for `--background`).
+  The one exception is `openai-compat`, whose whole job is a direct HTTPS call to the
+  `base_url` you configure.
 
 ---
 
@@ -560,7 +579,7 @@ available, and the envelope's `model.served` confirms what ran (`resolved` is th
 field). Aliases can lag a launch by a day or two, so pin the explicit ID when you need
 the newest.
 
-**Does it need API keys?** For the five CLI backends, no. It drives the logins you already
+**Does it need API keys?** For the six CLI backends, no. It drives the logins you already
 have, and it strips `OPENAI_API_KEY` from codex children so you're not silently billed at
 API rates. The `openai-compat` backend uses your API key by design.
 

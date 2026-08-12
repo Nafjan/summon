@@ -8,8 +8,11 @@ allowed-tools: Bash Read
 
 Spawns external CLI AIs (claude, cursor-agent, codex, gemini, kimi, agy) as isolated sub-agents with dedicated
 context. Supports session resume, per-call model/effort overrides, isolated git worktrees, background
-dispatch, structured report parsing, loose-file provenance, and cost/usage telemetry -- see Parameters and
-the response-field table.
+dispatch, structured report parsing, loose-file provenance, and provider cost/usage telemetry -- see
+Parameters and the response-field table. Optional local diagnostics are separate: they are disabled by
+default, bounded/sanitized, and never sent anywhere without an explicit user action. They may include
+deterministic SHA-256 fingerprints of prompt/error values for local correlation; those are not plaintext,
+but can correlate or reveal low-entropy values, so review a report before sharing it.
 
 ## Resources
 
@@ -32,7 +35,8 @@ plugin package with `plugin.json` at the repo root — no separate install step.
 
 **Command surface**: the script accepts git-style **subcommands** — `dispatch` (the
 default action), `list`, `models`, `doctor`, `manifest FILE`, `council`, `agent
-new|set NAME`, `role propose|approve|list|resolve`, `version` — e.g. `run_subagent.py
+new|set NAME`, `role propose|approve|list|resolve`, `telemetry enable|disable|status|clear`,
+`bug-report`, `version` — e.g. `run_subagent.py
 council --question "…" --cwd DIR`. The
 **legacy flat form still works unchanged** (`run_subagent.py --agent … --prompt …`,
 `--list`, `--manifest FILE`, …), and every flag below is valid in both. Bare
@@ -255,6 +259,8 @@ repository-relative examples.
 | `--list` | - | List available agents (no other params needed) |
 | `--list-models` | - | Report invocable models per backend (no other params needed; add `--cli` to filter). See "Model discovery" below |
 | `--doctor` | - | Check backend CLIs, wrapper deps, agents dir, git, **install drift**, and **T3 Code readiness** (`t3_code` in `--json`; portable labels only); add `--json` for machines. Run this FIRST on a new machine |
+| `telemetry enable\|disable\|status\|clear` | - | Manage opt-in, local-only diagnostics. Every dispatch outcome is represented by bounded, allow-listed metadata; prompt/result text and raw output are omitted, but deterministic prompt/error SHA-256 fingerprints may remain for correlation. No network call is made. Add `--json` for machine-readable output |
+| `bug-report` | - | Generate a sanitized local Markdown report from the latest event or `--from FILE`; add `--output FILE` to choose the destination. Review it, then submit that exact file with `bug-report --submit-github --from REVIEWED_REPORT.md` (uses your authenticated `gh` CLI) |
 | `--onboard` | - | Detect installed CLIs / BytePlus key sources; write merge-safe prefs to `~/.agents/summon.json` (never stores API secrets). Subcommand form: `onboard` |
 | `--subscriptions LIST` | No | With `--onboard`: comma list of active plans (e.g. `byteplus-coding,claude`) recorded in prefs |
 | `--reset` | No | With `--onboard`: replace the onboard section instead of merging |
@@ -279,7 +285,7 @@ repository-relative examples.
 | `--worktree` | No | Run in an isolated git worktree (optional name; auto-named if bare). If `--gate-with` denies, summon removes only a pristine checkout whose HEAD still equals its creation commit. Any untracked/modified file, new commit, failed identity check, or cleanup race is preserved and reported in `worktree_cleanup`; no force-removal or force branch deletion is used |
 | `--background` | No | Dispatch detached; returns `{status:"background", job_id, result_file, job_dir, record_file}` at once. A launch record is written (fsynced) before the child spawns, so a job that dies before its result is still traceable |
 | `--job-dir DIR` | No | Where `--background` writes job records and results (default `{tempdir}/subagents_jobs`; env `SUMMON_JOBS_DIR`). Point it at a durable, private path. Single-user model: summon does not defend the registry against other local users on a shared host |
-| `jobs list` / `jobs status ID` / `jobs wait ID` | - | Read-only registry commands (flat: `--jobs-list` / `--jobs-status ID` / `--jobs-wait ID`; add `--job-dir`, `--json`, and `--timeout` for `wait`). `list` shows `prepared`, liveness-verified `running`, `stale` (pid gone with no result), `unverified` (probe unavailable), or a terminal status. `status` includes `liveness:alive|dead|unknown`; `wait` returns early on stale instead of burning its timeout. A result is `trusted` only when its `job_nonce` matches the launch record. Liveness proves that a pid exists, not that an old pid was never reused |
+| `jobs list` / `jobs status ID` / `jobs wait ID` | - | Read-only registry commands (flat: `--jobs-list` / `--jobs-status ID` / `--jobs-wait ID`; add `--job-dir` and `--json` for `list`/`status`, or `--job-dir` and `--timeout` for `wait`). `list` shows `prepared`, liveness-verified `running`, `stale` (pid gone with no result), `unverified` (probe unavailable), or a terminal status. `status` includes `liveness:alive|dead|unknown`; `wait` returns early on stale instead of burning its timeout. A result is `trusted` only when its `job_nonce` matches the launch record. Liveness proves that a pid exists, not that an old pid was never reused |
 | `--dry-run` | No | Print the fully resolved dispatch (command, model, permission flags) WITHOUT executing — catches wrong models/permissions/dead backends in zero paid runs |
 | `--out FILE` | No | Write the envelope atomically to FILE; if FILE already holds a **`status: success`** envelope the run is SKIPPED (`skipped: true`) — swarm resume for free. A prior error/blocked/partial is re-run (re-launching retries failures) |
 | `--probe` | No | With `doctor`: run a minimal LIVE call per backend to verify account/client eligibility (catches an ineligible-tier error that a `--version` check misses). Costs a tiny dispatch per backend. |
@@ -301,6 +307,12 @@ repository-relative examples.
 | `--artifact FILE` | No | Opt a loose input file under `--cwd` into the provenance receipt (repeatable). Records relative filename, bytes, SHA-256, and page count where stdlib exposes labeled metadata (DOCX; null rather than guessing for PDF). The manifest is part of request reuse and is re-hashed after dispatch; a changed baseline sets `artifacts.stable_during_dispatch:false` and `suspect:true`. Incompatible with `--worktree`; manifest jobs use an `artifacts` array |
 | `--no-contract-repair` | No | Disable the automatic ONE-shot corrective resume that fixes a malformed report contract on a suspect success (`status:success` but `report_ok:false`). On by default; set this to save the extra call |
 | `--debug-dir DIR` | No | Dump per-run argv + raw captured output + final envelope to DIR (adds `debug_file` to the envelope) |
+| `--telemetry-enable` / `--telemetry-disable` | - | Persist the local diagnostics choice. `SUMMON_TELEMETRY=1` opts in for the current process and inherited Summon children (or `0` opts out); the non-persistent environment override wins over the saved setting |
+| `--telemetry-status` / `--telemetry-clear` | - | Inspect or clear the local diagnostics spool (capped at 2 MiB; `clear` does not disable) without dispatching an agent |
+| `--bug-report --from FILE` | No | Read a dispatch envelope, telemetry JSONL file, or debug directory and create a sanitized report. Without `--from`, use the latest local event |
+| `--bug-report --output FILE` | No | Write the report to an explicit path; otherwise it goes under `~/.agents/summon-reports` |
+| `--bug-report --bug-description TEXT` | No | Add a short, manually supplied description to the generated report. It is not automatic telemetry; review it for private content before sharing |
+| `--bug-report --submit-github` | No | Submit an existing reviewed Markdown report from `--from REVIEWED_REPORT.md` through `gh issue create`; no report regeneration, direct HTTP, or token access. Optional `--github-repo OWNER/REPO` and `--bug-title` |
 | `--manifest FILE` | - | Batch fan-out: run all jobs in a JSON manifest (see [references/fan-out.md](references/fan-out.md)). Combine with `--concurrency` and `--results-dir` |
 | `--concurrency` | No | With `--manifest`: per-backend caps, e.g. `agy=2,codex=3,default=3` |
 | `--results-dir` | No | With `--manifest`: where job envelopes land (default `{cwd}/.agents/results`) |
@@ -322,9 +334,9 @@ stdout entirely.
 
 \*Required for a **dispatch** (running an agent). Not needed for the query/management
 modes — `--list`, `--list-models`, `--doctor`, `--onboard`, `--new-agent`, `--set-agent`, `--version`,
-or `--manifest` (which carries its own jobs).
+`telemetry`, `bug-report`, or `--manifest` (which carries its own jobs).
 
-**Mode-scoped flags** (ignored/invalid outside their mode): `--json` → `--doctor`/`--onboard` only;
+**Mode-scoped flags** (ignored/invalid outside their mode): `--json` → `--doctor`/`--onboard`/`council status`/`jobs list`/`jobs status`/`telemetry`/`bug-report` only;
 `--subscriptions`/`--reset`/`--no-write` → `--onboard` only; `--set` → `--new-agent`/`--set-agent` only; `--concurrency`/`--results-dir` → `--manifest`
 only; `--resume-profile` → agy resume only. Mutually exclusive: `--dry-run` with
 `--background`/`--manifest`; `--background` with `--out` (background reports completion
