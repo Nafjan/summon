@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -19,7 +20,8 @@ import _acpbackend  # noqa: E402
 import _apibackend  # noqa: E402
 import _executor  # noqa: E402
 from _builder import AgentInvocation  # noqa: E402
-from _deliberation import (AttemptBinding, DuplicateAttemptError, LaunchToken,
+from _deliberation import (AttemptBinding, DeliberationError,
+                           DuplicateAttemptError, LaunchToken,
                            SnapshotDriftError, TurnContext)  # noqa: E402
 from _deliberation_adapter import FreshDispatchAdapter  # noqa: E402
 from _executor import ProviderLaunchControl, ProviderLaunchError  # noqa: E402
@@ -33,9 +35,20 @@ def turn() -> TurnContext:
                        hashlib.sha256(b"TOP SECRET").hexdigest())
 
 
+def turn_with_prompt(prompt: str, *, turn_id: str, ordinal: int) -> TurnContext:
+    return TurnContext("decision", "seat-a", turn_id, ordinal,
+                       hashlib.sha256(prompt.encode("utf-8")).hexdigest())
+
+
 def token_for(spec, attempt_id="attempt-1") -> LaunchToken:
     return LaunchToken(AttemptBinding(attempt_id, 1, "decision", "seat-a",
                                       "turn-1", 0, spec.digest))
+
+
+def token_for_context(spec, context: TurnContext, attempt_id: str) -> LaunchToken:
+    return LaunchToken(AttemptBinding(
+        attempt_id, 1, context.decision_id, context.seat_id, context.turn_id,
+        context.turn_ordinal, spec.digest))
 
 
 class AdapterBoundaryTests(unittest.TestCase):
@@ -49,7 +62,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             FreshDispatchAdapter(
                 self.invocation(), snapshot_digest=SNAPSHOT,
                 current_snapshot_digest=lambda: SNAPSHOT,
-                timeout_ms=1000,
+                timeout_ms=1000, generation=1,
                 executor=lambda *args, **kwargs: {})
 
     def test_spec_and_launch_evidence_do_not_leak_prompt_path_or_model(self):
@@ -69,7 +82,7 @@ class AdapterBoundaryTests(unittest.TestCase):
         adapter = FreshDispatchAdapter(
             self.invocation(), snapshot_digest=SNAPSHOT,
             current_snapshot_digest=lambda: SNAPSHOT,
-            owner_is_current=lambda: True, timeout_ms=1000,
+            owner_is_current=lambda: True, timeout_ms=1000, generation=1,
             executor=executor)
         spec = adapter.prepare(turn())
         result = adapter.launch(spec, token_for(spec))
@@ -97,7 +110,7 @@ class AdapterBoundaryTests(unittest.TestCase):
         adapter = FreshDispatchAdapter(
             self.invocation(), snapshot_digest=SNAPSHOT,
             current_snapshot_digest=lambda: SNAPSHOT,
-            owner_is_current=lambda: True, timeout_ms=1000,
+            owner_is_current=lambda: True, timeout_ms=1000, generation=1,
             executor=executor)
         spec = adapter.prepare(turn())
         tok = token_for(spec)
@@ -132,7 +145,7 @@ class AdapterBoundaryTests(unittest.TestCase):
         adapter = FreshDispatchAdapter(
             self.invocation(), snapshot_digest=SNAPSHOT,
             current_snapshot_digest=lambda: current[0],
-            owner_is_current=lambda: True, timeout_ms=1000,
+            owner_is_current=lambda: True, timeout_ms=1000, generation=1,
             executor=executor)
         spec = adapter.prepare(turn())
         self.assertTrue(adapter.revalidate(spec, turn()))
@@ -153,7 +166,7 @@ class AdapterBoundaryTests(unittest.TestCase):
         adapter = FreshDispatchAdapter(
             self.invocation(), snapshot_digest=SNAPSHOT,
             current_snapshot_digest=lambda: SNAPSHOT,
-            owner_is_current=lambda: owner[0], timeout_ms=1000,
+            owner_is_current=lambda: owner[0], timeout_ms=1000, generation=1,
             executor=executor)
         spec = adapter.prepare(turn())
         # The scheduler/ledger may have already durably committed and claimed
@@ -168,18 +181,158 @@ class AdapterBoundaryTests(unittest.TestCase):
         adapter = FreshDispatchAdapter(
             self.invocation(), snapshot_digest=SNAPSHOT,
             current_snapshot_digest=lambda: SNAPSHOT,
-            owner_is_current=lambda: True, timeout_ms=1000,
+            owner_is_current=lambda: True, timeout_ms=1000, generation=1,
             executor=lambda *args, **kwargs: {"result": "{}", "exit_code": 0})
         forged = TurnContext("decision", "seat-a", "turn-1", 0,
                              hashlib.sha256(b"different prompt").hexdigest())
         spec = adapter.prepare(forged)
         self.assertFalse(adapter.revalidate(spec, forged))
 
+    def test_context_factory_binds_each_prompt_and_launch_uses_prepared_value(self):
+        base = self.invocation(prompt="base prompt")
+        prompts = []
+        calls = []
+
+        def factory(context):
+            calls.append(context.turn_id)
+            prompt = f"turn prompt {context.turn_id}"
+            return replace(base, prompt=prompt)
+
+        def executor(inv, **kwargs):
+            kwargs["launch_control"].before_provider_launch(
+                {"backend": inv.cli, "transport": inv.transport})
+            prompts.append(inv.prompt)
+            return {"result": "{}", "exit_code": 0}
+
+        adapter = FreshDispatchAdapter(
+            base, snapshot_digest=SNAPSHOT,
+            current_snapshot_digest=lambda: SNAPSHOT,
+            owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+            invocation_for_context=factory, executor=executor)
+        first = turn_with_prompt("turn prompt turn-1", turn_id="turn-1", ordinal=0)
+        second = turn_with_prompt("turn prompt turn-2", turn_id="turn-2", ordinal=1)
+        first_spec = adapter.prepare(first)
+        second_spec = adapter.prepare(second)
+        # Mutating the scheduler's prompt source after prepare must not change
+        # the exact invocation that was selected before the durable commit.
+        calls.append("factory-complete")
+        adapter.launch(first_spec, token_for_context(first_spec, first, "attempt-1"))
+        adapter.launch(second_spec, token_for_context(second_spec, second, "attempt-2"))
+        self.assertEqual(prompts, ["turn prompt turn-1", "turn prompt turn-2"])
+        self.assertEqual(calls, ["turn-1", "turn-2", "factory-complete"])
+
+    def test_context_factory_immutable_identity_drift_fails_before_provider(self):
+        base = self.invocation(prompt="base prompt")
+
+        def factory(context):
+            return replace(base, prompt="turn prompt",
+                           model="different-model")
+
+        adapter = FreshDispatchAdapter(
+            base, snapshot_digest=SNAPSHOT,
+            current_snapshot_digest=lambda: SNAPSHOT,
+            owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+            invocation_for_context=factory,
+            executor=lambda *args, **kwargs: self.fail("provider contact"))
+        context = turn_with_prompt("turn prompt", turn_id="turn-1", ordinal=0)
+        with self.assertRaisesRegex(SnapshotDriftError, "immutable execution identity"):
+            adapter.prepare(context)
+
+    def test_context_factory_output_is_not_recomputed_at_launch(self):
+        base = self.invocation(prompt="base prompt")
+        prompt = ["first prompt"]
+        seen = []
+
+        def factory(context):
+            return replace(base, prompt=prompt[0])
+
+        def executor(inv, **kwargs):
+            kwargs["launch_control"].before_provider_launch(
+                {"backend": inv.cli, "transport": inv.transport})
+            seen.append(inv.prompt)
+            return {"result": "{}", "exit_code": 0}
+
+        adapter = FreshDispatchAdapter(
+            base, snapshot_digest=SNAPSHOT,
+            current_snapshot_digest=lambda: SNAPSHOT,
+            owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+            invocation_for_context=factory, executor=executor)
+        context = turn_with_prompt("first prompt", turn_id="turn-1", ordinal=0)
+        spec = adapter.prepare(context)
+        prompt[0] = "second prompt"
+        adapter.launch(spec, token_for_context(spec, context, "attempt-1"))
+        self.assertEqual(seen, ["first prompt"])
+
+    def test_token_turn_binding_is_checked_before_provider_contact(self):
+        contacted = []
+
+        def executor(inv, **kwargs):
+            kwargs["launch_control"].before_provider_launch(
+                {"backend": inv.cli, "transport": inv.transport})
+            contacted.append(True)
+            return {"result": "{}", "exit_code": 0}
+
+        adapter = FreshDispatchAdapter(
+            self.invocation(), snapshot_digest=SNAPSHOT,
+            current_snapshot_digest=lambda: SNAPSHOT,
+            owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+            executor=executor)
+        spec = adapter.prepare(turn())
+        forged = LaunchToken(AttemptBinding(
+            "attempt-forged", 1, "decision", "seat-b", "turn-forged", 99,
+            spec.digest))
+        with self.assertRaisesRegex(DeliberationError, "prepared decision turn"):
+            adapter.launch(spec, forged)
+        self.assertEqual(contacted, [])
+
+    def test_one_prepared_spec_is_single_use_across_attempt_ids(self):
+        contacted = []
+
+        def executor(inv, **kwargs):
+            kwargs["launch_control"].before_provider_launch(
+                {"backend": inv.cli, "transport": inv.transport})
+            contacted.append(True)
+            return {"result": "{}", "exit_code": 0}
+
+        adapter = FreshDispatchAdapter(
+            self.invocation(), snapshot_digest=SNAPSHOT,
+            current_snapshot_digest=lambda: SNAPSHOT,
+            owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+            executor=executor)
+        context = turn()
+        spec = adapter.prepare(context)
+        adapter.launch(spec, token_for_context(spec, context, "attempt-1"))
+        with self.assertRaises(DuplicateAttemptError):
+            adapter.launch(spec, token_for_context(spec, context, "attempt-2"))
+        self.assertEqual(contacted, [True])
+
+    def test_profile_environment_is_deeply_sealed_before_prepare(self):
+        profile_env = {"SAFE": "1"}
+        base = replace(self.invocation(), profile_env=profile_env)
+        seen = []
+
+        def executor(inv, **kwargs):
+            kwargs["launch_control"].before_provider_launch(
+                {"backend": inv.cli, "transport": inv.transport})
+            seen.append(dict(inv.profile_env or {}))
+            return {"result": "{}", "exit_code": 0}
+
+        adapter = FreshDispatchAdapter(
+            base, snapshot_digest=SNAPSHOT,
+            current_snapshot_digest=lambda: SNAPSHOT,
+            owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+            executor=executor)
+        context = turn()
+        spec = adapter.prepare(context)
+        profile_env["INJECTED"] = "YES"
+        adapter.launch(spec, token_for(spec))
+        self.assertEqual(seen, [{"SAFE": "1"}])
+
     def test_cleanup_reports_non_process_handle_instead_of_killing_by_pid(self):
         adapter = FreshDispatchAdapter(
             self.invocation(), snapshot_digest=SNAPSHOT,
             current_snapshot_digest=lambda: SNAPSHOT,
-            owner_is_current=lambda: True, timeout_ms=1000,
+            owner_is_current=lambda: True, timeout_ms=1000, generation=1,
             executor=lambda *args, **kwargs: {})
         adapter._on_spawn(object())
         receipt = adapter.cleanup()
@@ -194,7 +347,7 @@ class AdapterBoundaryTests(unittest.TestCase):
                 snapshot_digest=SNAPSHOT,
                 current_snapshot_digest=lambda: SNAPSHOT,
                 owner_is_current=lambda: True,
-                timeout_ms=1000,
+                timeout_ms=1000, generation=1,
                 executor=lambda *args, **kwargs: {})
 
 
