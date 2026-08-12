@@ -1145,7 +1145,8 @@ class DeliberationEngine:
     def _append(self, event: dict) -> None:
         if not self._owner_is_current():
             raise OwnershipLostError("ownership lost before state journal append")
-        self._append_callback({**event, "generation": self.state.generation})
+        self._append_callback({**event, "schema_version": SCHEMA_VERSION,
+                               "generation": self.state.generation})
 
     def _transition(self, status: RunState, reason: str,
                     *, decision_option: str | None = None) -> None:

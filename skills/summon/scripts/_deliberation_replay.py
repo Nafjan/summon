@@ -520,7 +520,8 @@ def replay_checkpoint(receipt: Mapping[str, object],
         # Accepting another turn/attempt/ballot here would let a crash prefix
         # carry contradictory pending work after recovery.
         if (status == "RUNNING" and current_candidate() is not None and
-                event not in {"state_transition", "candidate_selected"}):
+                event not in {"state_transition", "candidate_selected",
+                              "journal_repaired"}):
             raise ReplayError("consensus candidate was not immediately transitioned")
         if status in {"DECIDED", "UNRESOLVED", "REJECTED", "CANCELLED", "TIMED_OUT",
                       "ATTEMPT_BUDGET_EXHAUSTED", "FAILED"} and event not in {

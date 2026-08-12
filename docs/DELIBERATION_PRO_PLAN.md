@@ -182,8 +182,12 @@ projection. It requires exactly one receipt-bound `run_prepared` record, rejects
 record whose declared generation differs from its segment, and treats a durable start
 without a matching finish as an indeterminate physical attempt. Candidate and decision
 projection events are never authority: accepted ballots are revalidated and tallied
-again. The current slice only returns an immutable checkpoint; it does not claim that
-fresh/resume CLI execution or provider calls are enabled.
+again. The headless kernel still returns an immutable checkpoint, while
+`_deliberation_resume.reconcile_run` is now the provider-inert crash-prefix boundary:
+it owns one fenced lease, repairs a newest torn tail, recovers only sealed command
+batches, and appends only a receipt-derived consensus/approval transition. It never
+launches a provider and it returns a bounded blocked receipt for uncertain or
+non-deterministic work. The fresh/resume CLI and live provider path remain disabled.
 
 Human command replay is boundary-atomic even though the journal is append-only. A
 checkpoint distinguishes immutable commands consumed by the immediately following legal
@@ -194,8 +198,10 @@ indeterminate physical start is uncertain spend, not a resumable pending turn. A
 recomputed-consensus prefix whose state transition was interrupted is now reconciled by
 the owner-bound restore path: it appends the deterministic `DECIDED/consensus` or
 `WAITING_HUMAN/approval_required` transition before exposing any next action. A pending
-human command batch still needs an explicit owner-bound recovery action; until that
-slice exists, restore refuses it and makes zero provider calls.
+human command batch is completed only by the separate provider-inert reconciliation
+boundary, which validates the sealed batch and writes the matching transition once;
+legacy unsealed EOF commands remain blocked and are never guessed. Both paths make
+zero provider calls.
 
 The public headless status and replay readers now rebuild their control projection from
 the tagged journal through the same canonical replay validator.  The generation-fenced
@@ -582,9 +588,11 @@ work proceeds before this gate.
 
 Current branch evidence: the injected fake-only scheduler and kernel/adapter/CLI tests
 pass locally, including round-robin prompt binding, cancellation/owner fences,
-terminal schedule exhaustion, cleanup handoff, and bounded `LEFT_BEHIND` reporting.
-This is not the P1 exit gate: no live roster resolution, provider execution, replay
-reconstruction, or CLI fresh/resume path is enabled yet.
+terminal schedule exhaustion, cleanup handoff, bounded `LEFT_BEHIND` reporting, and
+provider-inert crash-prefix reconciliation. The deliberation group is 240/240 green;
+the resume slice is 15/15 and replay/recovery remains mutation-reviewed. This is not
+the P1 exit gate: no live roster resolution, provider execution, or CLI fresh/resume
+path is enabled yet.
 
 Provider integration remains blocked on disposable credential-profile lifecycle evidence.
 Invocation argument construction may create credential profile directories before the
