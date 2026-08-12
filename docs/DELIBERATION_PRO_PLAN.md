@@ -1,12 +1,15 @@
 # Summon Deliberation and Pro Product Plan
 
-Status: implementation-ready design (feature code not authorized)
+Status: preview implementation (scheduler and browser execution still gated)
 Target branch: `codex/deliberation-pro-plan`
 Owner: Summon maintainers
 
-This document is the implementation plan for a new bounded agent-deliberation mode and
-the product boundary it creates for a possible Summon Pro distribution. It is a design
-artifact only. It does not authorize feature code, a release, or a pricing decision.
+This document is the implementation plan and current safety contract for a new bounded
+agent-deliberation mode and the product boundary it creates for a possible Summon Pro
+distribution. The current branch contains the kernel, durable command/status surface,
+and one-launch adapter seams, but fresh/resume execution remains explicitly blocked
+until the scheduler and participant snapshot wiring are complete. It does not authorize
+a release or a pricing decision.
 
 ## 1. Product decision
 
@@ -255,9 +258,16 @@ The first adapter implementations wrap existing executor paths:
 
 - subprocess adapter for Claude, Codex, Cursor, Gemini CLI, Kimi CLI, and agy;
 - ACP adapter only where current Summon supports ACP, inheriting yolo-only semantics;
-- openai-compat adapter for text-only API seats.
+- openai-compat adapter work is deferred: the current stdlib HTTP transport cannot
+  interrupt an active request, so the deliberation bridge refuses those seats until a
+  bounded cancellable transport exists. Ordinary single-dispatch API calls are unchanged.
 
-Each turn is a fresh bounded dispatch in v1. ACP session ids remain telemetry, not
+Each turn is a fresh bounded dispatch in v1. The current `FreshDispatchAdapter` requires
+the owner generation, rechecks decision/seat/turn binding at launch, consumes each
+prepared launch spec once, and deep-copies mutable invocation state. Its optional
+per-turn invocation factory may change only the prompt; production scheduler wiring
+must supply it and hash that exact prompt into `TurnContext.request_digest`. ACP session
+ids remain telemetry, not
 resume handles. The P1 adapter must disable implicit retries, transient retries, ACP
 fallback, approval gates, and automatic schema/report repair. It exposes a two-step
 launch boundary:
