@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _deliberation import (  # noqa: E402
     AdapterResult, AttemptBinding, AttemptLedger, CleanupReceipt,
-    DeliberationEngine, DeliberationPolicy, DuplicateAttemptError,
+    DeliberationEngine, DeliberationError, DeliberationPolicy, DuplicateAttemptError,
     ExecutionEvidence, HumanCommand, LaunchSpec, NextAction, OwnershipLostError,
     RunState, ScriptedAdapter, SnapshotDriftError, TurnContext,
 )
@@ -112,6 +112,24 @@ class EngineTests(unittest.TestCase):
         engine.apply_human_commands([HumanCommand(1, "approve")])
         self.assertEqual(engine.state.status, RunState.DECIDED)
         self.assertEqual(engine.state.decision_option, "green")
+
+    def test_polling_waiting_human_at_deadline_times_out_without_approval(self):
+        clock = Clock()
+        engine, _, events = self.make_engine([result("s1", "t1", "a1", "green")],
+                                             attempts=1, quorum=1, approval=True,
+                                             clock=clock)
+        engine.run_turn(context("s1", "t1", 0), "a1")
+        self.assertEqual(engine.next_action(), NextAction.WAIT_FOR_HUMAN)
+
+        clock.value = 100.0
+        self.assertEqual(engine.next_action(), NextAction.DONE)
+        self.assertEqual(engine.state.status, RunState.TIMED_OUT)
+        self.assertIsNone(engine.state.decision_option)
+        with self.assertRaises(DeliberationError):
+            engine.apply_human_commands([HumanCommand(1, "approve")])
+        self.assertEqual(events[-1]["event"], "state_transition")
+        self.assertEqual(events[-1]["from"], RunState.WAITING_HUMAN.value)
+        self.assertEqual(events[-1]["to"], RunState.TIMED_OUT.value)
 
     def test_adapter_exception_is_uncertain_spend_and_stops(self):
         engine, adapter, _ = self.make_engine([RuntimeError("ambiguous provider failure")])
@@ -214,6 +232,26 @@ class AttemptLedgerTests(unittest.TestCase):
             engine.run_turn(context("s1", "t1", 0), "a1")
         self.assertEqual(adapter.spawn_count, 0)
         self.assertTrue(engine.state.uncertain_spend)
+
+    def test_owner_loss_before_finish_is_indeterminate_and_not_durable(self):
+        current = {"value": True}
+        ledger = AttemptLedger(5, self.events.append,
+                               owner_is_current=lambda: current["value"])
+        token = ledger.commit(self.spec, self.binding)
+
+        def launch(spec, launch_token):
+            current["value"] = False
+            return result("s1", "t1", "a1", "red")
+
+        outcome = ledger.launch_once(self.spec, token, launch)
+        with self.assertRaises(OwnershipLostError):
+            ledger.finish(token, outcome.evidence, ballot_valid=True)
+
+        self.assertFalse(any(event["event"] == "attempt_finished"
+                             for event in self.events))
+        self.assertEqual(ledger.counts,
+                         {"started": 1, "finished": 0, "indeterminate": 1})
+        self.assertTrue(ledger.uncertain_spend)
 
 
 if __name__ == "__main__":

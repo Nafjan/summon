@@ -353,6 +353,9 @@ class AttemptLedger:
             entry = self._entries.get(attempt_id)
             if entry is None or entry.token is not token or entry.phase != "launching":
                 raise DuplicateAttemptError(f"attempt is not in flight: {attempt_id}")
+            if not self._owner_is_current():
+                entry.phase = "indeterminate"
+                raise OwnershipLostError("ownership lost before attempt finish")
             self._append({
                 "event": "attempt_finished", "schema_version": SCHEMA_VERSION,
                 "generation": token.binding.generation,
@@ -566,6 +569,9 @@ class DeliberationEngine:
         if self.state.status == RunState.PREPARED:
             return NextAction.START
         if self.state.status == RunState.WAITING_HUMAN:
+            if self.clock() >= self.deadline:
+                self._transition(RunState.TIMED_OUT, "deadline")
+                return NextAction.DONE
             return NextAction.WAIT_FOR_HUMAN
         if self.state.status in TERMINAL_STATES:
             return NextAction.DONE
