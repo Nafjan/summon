@@ -21,9 +21,11 @@ import _rundir
 def receipt(*, approval: bool = False, run_id: str = "run-1") -> dict:
     return {
         "mode": "deliberation", "schema_version": 1, "run_id": run_id,
+        "question_sha256": hashlib.sha256(b"question").hexdigest(),
         "decision_id": "decision-1", "seat_ids": ["a", "b"],
         "option_ids": ["yes", "no"], "quorum_rule": "all",
         "max_attempts": 4, "require_human_approval": approval,
+        "rounds": 1, "deadline_unix_ms": 4_000_000_000_000,
     }
 
 

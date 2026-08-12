@@ -32,6 +32,9 @@ def _receipt(run_id: str) -> dict:
         "mode": "deliberation", "schema_version": 1, "run_id": run_id,
         "decision_id": "decision-1", "question_sha256": hashlib.sha256(b"q").hexdigest(),
         "seat_ids": ["a", "b"], "option_ids": ["yes", "no"],
+        "quorum_rule": "all", "max_attempts": 4,
+        "require_human_approval": False,
+        "rounds": 1, "deadline_unix_ms": 4_000_000_000_000,
         "created_at": 1.0,
     }
 
@@ -152,8 +155,21 @@ class DeliberationCliTests(unittest.TestCase):
             root = os.path.join(base, "deliberations")
             path, owner = store.initialize_run(root, _receipt("run-3"))
             _rundir.journal_append(path, {
+                "event": "state_transition", "schema_version": 1,
+                "generation": owner.generation, "from": "PREPARED",
+                "to": "RUNNING", "reason": "started",
+            }, owner=owner)
+            _rundir.journal_append(path, {
+                "event": "turn_prepared", "schema_version": 1,
+                "generation": owner.generation, "decision_id": "decision-1",
+                "seat_id": "a", "turn_id": "turn-a-0", "turn_ordinal": 0,
+                "request_digest": "a" * 64,
+            }, owner=owner)
+            _rundir.journal_append(path, {
                 "event": "attempt_started", "schema_version": 1,
                 "generation": owner.generation, "attempt_id": "attempt-1",
+                "decision_id": "decision-1", "seat_id": "a",
+                "turn_id": "turn-a-0", "turn_ordinal": 0,
                 "launch_spec_sha256": "a" * 64,
             }, owner=owner)
             _rundir.release_owner(owner)
@@ -204,6 +220,113 @@ class DeliberationCliTests(unittest.TestCase):
                     side_effect=[1, 2, 3, 4]):
                 status = store.inspect_run(root, "run-6")
             self.assertFalse(status["consistent"])
+
+    def test_status_and_replay_ignore_tampered_projection_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "deliberations")
+            path, owner = store.initialize_run(root, _receipt("run-cache"))
+            _rundir.release_owner(owner)
+            _rundir.atomic_write_json(os.path.join(path, "state.json"), {
+                "state": "decided", "decision_option": "no",
+                "uncertain_spend": False,
+            })
+            status = store.inspect_run(root, "run-cache")
+            replayed = store.replay_run(root, "run-cache")
+            self.assertEqual(status["projection"]["state"], "prepared")
+            self.assertEqual(replayed["projection"]["state"], "prepared")
+            self.assertNotEqual(status["projection"]["decision_option"], "no")
+
+    def test_status_rejects_missing_canonical_replay_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "deliberations")
+            value = _receipt("run-missing")
+            value.pop("quorum_rule")
+            with self.assertRaises(store.DeliberationStoreError):
+                store.initialize_run(root, value)
+            self.assertFalse(os.path.exists(store.run_dir(root, "run-missing")))
+
+    def test_initialize_rejects_malformed_policy_before_creating_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "deliberations")
+            for field, invalid in (("quorum_rule", None),
+                                   ("seat_ids", "a,b"),
+                                   ("max_attempts", 0),
+                                   ("require_human_approval", "false")):
+                value = _receipt("run-invalid-" + field.replace("_", "-"))
+                value[field] = invalid
+                with self.subTest(field=field), self.assertRaises(
+                        (store.DeliberationStoreError, ValueError)):
+                    store.initialize_run(root, value)
+                self.assertFalse(os.path.exists(
+                    store.run_dir(root, value["run_id"])))
+
+    def test_replay_exposes_checkpoint_seal_not_projection_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "deliberations")
+            path, owner = store.initialize_run(root, _receipt("run-seal"))
+            _rundir.release_owner(owner)
+            replayed = store.replay_run(root, "run-seal")
+            self.assertRegex(replayed["checkpoint_digest"], r"^[0-9a-f]{64}$")
+            self.assertEqual(replayed["checkpoint_digest"],
+                             replayed["projection"]["replay_digest"])
+
+    def test_replay_records_are_allowlisted_and_private_paths_are_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "deliberations")
+            path, owner = store.initialize_run(root, _receipt("run-redact"))
+            _rundir.journal_append(path, {
+                "event": "state_transition", "schema_version": 1,
+                "generation": owner.generation, "from": "PREPARED",
+                "to": "CANCELLED", "reason": "cancelled",
+                "decision_option": None,
+            }, owner=owner)
+            _rundir.journal_append(path, {
+                "event": "cleanup_receipt", "schema_version": 1,
+                "generation": owner.generation, "verified": False, "clean": False,
+                "retained_resources": [r"C:\Users\nside\private-project"],
+                "secret": "TOKEN-DO-NOT-EXPORT", "argv": ["--password", "TOKEN"],
+            }, owner=owner)
+            _rundir.journal_append(path, {
+                "event": "advisory_left_behind", "schema_version": 1,
+                "generation": owner.generation,
+                "items": [r"C:\Users\nside\private-project", "TOKEN=secret"],
+                "source": "model_output",
+            }, owner=owner)
+            _rundir.release_owner(owner)
+            output = json.dumps(store.replay_run(root, "run-redact"))
+            self.assertNotIn("private-project", output)
+            self.assertNotIn("TOKEN", output)
+            self.assertNotIn("argv", output)
+            self.assertNotIn("run_dir", output)
+
+    def test_torn_tail_is_visible_and_not_reported_as_consistent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "deliberations")
+            path, owner = store.initialize_run(root, _receipt("run-torn"))
+            _rundir.release_owner(owner)
+            with open(_rundir._journal_path(path, 1), "ab") as handle:
+                handle.write(b"{torn")
+            status = store.inspect_run(root, "run-torn")
+            replayed = store.replay_run(root, "run-torn")
+            self.assertTrue(status["journal_torn_tail"])
+            self.assertTrue(status["recovery_required"])
+            self.assertFalse(status["consistent"])
+            self.assertEqual(status["status"], "blocked")
+            self.assertTrue(replayed["recovery_required"])
+            self.assertFalse(replayed["consistent"])
+
+    def test_empty_newer_journal_segment_does_not_hide_torn_predecessor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "deliberations")
+            path, owner = store.initialize_run(root, _receipt("run-empty-segment"))
+            _rundir.release_owner(owner)
+            with open(_rundir._journal_path(path, 1), "ab") as handle:
+                handle.write(b"{torn")
+            Path(_rundir._journal_path(path, 2)).touch()
+            successor = _rundir.acquire_owner(path, 600)
+            self.assertTrue(_rundir.journal_repair(path, successor))
+            _rundir.release_owner(successor)
+            self.assertTrue(store.inspect_run(root, "run-empty-segment")["consistent"])
 
 
 if __name__ == "__main__":

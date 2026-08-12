@@ -465,12 +465,18 @@ def _read_segment(path: str):
 
 
 def _segment_generations(run_dir: str):
-    """Generations that have a journal segment, ascending."""
+    """Non-empty journal generations, ascending.
+
+    A process can create its generation file before its first durable append
+    and die, leaving a zero-byte segment.  Such a file carries no journal
+    evidence and must not make a torn predecessor look like a mid-file
+    corruption during the next takeover.
+    """
     gens = []
     try:
         for name in os.listdir(run_dir):
             m = re.match(r"^journal-g(\d+)\.jsonl$", name)
-            if m:
+            if m and os.path.getsize(os.path.join(run_dir, name)) > 0:
                 gens.append(int(m.group(1)))
     except OSError:
         pass

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -24,6 +25,8 @@ from typing import Iterable, Mapping
 SCHEMA_VERSION = 1
 MAX_REPLAY_RECORDS = 10_000
 MAX_REPLAY_BYTES = 4 * 1024 * 1024
+MAX_SCHEDULE_ROUNDS = 10
+MAX_SIGNED64 = (1 << 63) - 1
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -94,6 +97,7 @@ class ReplayCheckpoint:
     run_id: str
     decision_id: str
     policy_digest: str
+    schedule_digest: str
     prior_generation: int
     status: str
     termination_reason: str | None
@@ -185,6 +189,51 @@ def _receipt_policy(receipt: Mapping[str, object]) -> tuple[tuple[str, ...], tup
     return seat_ids, option_ids, quorum, max_attempts, approval
 
 
+def _schedule_value(value: object, label: str, *, maximum: int) -> int:
+    if (isinstance(value, bool) or not isinstance(value, int) or
+            not 1 <= value <= maximum):
+        raise ReplayError(f"receipt {label} is invalid")
+    return value
+
+
+def schedule_digest(rounds: object, deadline_unix_ms: object) -> str:
+    """Return the immutable digest for a bounded absolute schedule.
+
+    The schedule is deliberately separate from the deliberation policy digest:
+    policy changes and schedule changes are distinct receipt mutations.  Keep
+    the canonical object tiny and numeric so no prompt, path, or provider data
+    can enter the checkpoint seal.
+    """
+    rounds = _schedule_value(rounds, "rounds", maximum=MAX_SCHEDULE_ROUNDS)
+    deadline_unix_ms = _schedule_value(deadline_unix_ms, "deadline_unix_ms",
+                                       maximum=MAX_SIGNED64)
+    return _sha({"rounds": rounds, "deadline_unix_ms": deadline_unix_ms})
+
+
+def receipt_schedule(receipt: Mapping[str, object]) -> tuple[int, int, str]:
+    """Validate and return ``(rounds, deadline_unix_ms, schedule_digest)``."""
+    if "rounds" not in receipt or "deadline_unix_ms" not in receipt:
+        raise ReplayError("receipt schedule fields are missing")
+    rounds = _schedule_value(receipt.get("rounds"), "rounds",
+                             maximum=MAX_SCHEDULE_ROUNDS)
+    deadline = _schedule_value(receipt.get("deadline_unix_ms"),
+                               "deadline_unix_ms", maximum=MAX_SIGNED64)
+    return rounds, deadline, schedule_digest(rounds, deadline)
+
+
+def _receipt_metadata(receipt: Mapping[str, object]) -> None:
+    """Validate immutable question/timestamp metadata before replaying turns."""
+    question_sha = receipt.get("question_sha256")
+    if not isinstance(question_sha, str) or not _SHA256_RE.fullmatch(question_sha):
+        raise ReplayError("receipt question_sha256 is missing or malformed")
+    if "created_at" in receipt:
+        created_at = receipt.get("created_at")
+        if (isinstance(created_at, bool) or
+                not isinstance(created_at, (int, float)) or
+                not math.isfinite(float(created_at)) or created_at < 0):
+            raise ReplayError("receipt created_at is malformed")
+
+
 def _policy_digest(decision_id: str, seat_ids: tuple[str, ...],
                    option_ids: tuple[str, ...], quorum: object,
                    max_attempts: int, approval: bool) -> str:
@@ -245,6 +294,8 @@ def _freeze(value: object) -> object:
 
 
 _TRANSCRIPT_FIELDS = {
+    "run_prepared": ("event", "schema_version", "generation", "run_id",
+                      "receipt_sha256"),
     "state_transition": ("event", "schema_version", "generation", "from", "to",
                           "reason", "decision_option", "recovery_kind",
                           "command_batch_sha256"),
@@ -320,6 +371,8 @@ def replay_checkpoint(receipt: Mapping[str, object],
     run_id = _id(receipt.get("run_id"), "run id")
     decision_id = _id(receipt.get("decision_id"), "decision id")
     seat_ids, option_ids, quorum, max_attempts, approval = _receipt_policy(receipt)
+    rounds, deadline_unix_ms, schedule_digest_value = receipt_schedule(receipt)
+    _receipt_metadata(receipt)
     receipt_sha256 = _sha(receipt)
     policy_digest = _policy_digest(decision_id, seat_ids, option_ids, quorum,
                                    max_attempts, approval)
@@ -398,7 +451,7 @@ def replay_checkpoint(receipt: Mapping[str, object],
                    if count >= _quorum_threshold(len(seat_ids), quorum)]
         return winners[0] if len(winners) == 1 else None
 
-    for generation, record in records[1:]:
+    for record_index, (generation, record) in enumerate(records[1:], start=1):
         event = record["event"]
         if command_batch and event not in {"human_command", "state_transition"}:
             raise ReplayError(
@@ -529,6 +582,10 @@ def replay_checkpoint(receipt: Mapping[str, object],
             digest = _sha256(record.get("request_digest"), "request digest")
             if d != decision_id or seat not in seat_ids:
                 raise ReplayError("turn is outside the immutable receipt")
+            if ordinal >= rounds * len(seat_ids):
+                raise ReplayError("turn ordinal is outside the immutable schedule")
+            if seat != seat_ids[ordinal % len(seat_ids)]:
+                raise ReplayError("turn seat does not match the immutable schedule")
             if ordinal != expected_turn_ordinal:
                 raise ReplayError("turn ordinals must be contiguous from zero")
             if pending_turn_key is not None:
@@ -579,9 +636,14 @@ def replay_checkpoint(receipt: Mapping[str, object],
             transport_ok = record.get("transport_ok")
             timed_out = record.get("timed_out")
             parser_valid = record.get("parser_valid")
+            exit_code = record.get("exit_code")
             if (not isinstance(transport_ok, bool) or not isinstance(timed_out, bool)
                     or not isinstance(parser_valid, bool)):
                 raise ReplayError("attempt executor evidence is malformed")
+            if (exit_code is not None and
+                    (isinstance(exit_code, bool) or not isinstance(exit_code, int)
+                     or not -(1 << 31) <= exit_code <= (1 << 31) - 1)):
+                raise ReplayError("attempt exit_code is malformed")
             if ballot_valid and (not transport_ok or timed_out or not parser_valid):
                 raise ReplayError("invalid executor evidence cannot validate a ballot")
             attempts[attempt_id] = ReplayAttempt(prior.attempt_id, prior.generation,
@@ -654,6 +716,43 @@ def replay_checkpoint(receipt: Mapping[str, object],
                      "advisory_left_behind", "journal_repaired"}:
             # These records are audit material.  Their control-bearing fields
             # were already validated above or have no effect on state.
+            if event == "cleanup_receipt":
+                if (not isinstance(record.get("verified"), bool) or
+                        not isinstance(record.get("clean"), bool)):
+                    raise ReplayError("cleanup receipt booleans are malformed")
+                retained = record.get("retained_resources", [])
+                if (not isinstance(retained, list) or len(retained) > 64 or
+                        any(not isinstance(item, str) or len(item) > 256
+                            for item in retained)):
+                    raise ReplayError("cleanup receipt resources are malformed")
+            elif event == "advisory_left_behind" and "items" in record:
+                items = record.get("items")
+                if (not isinstance(items, list) or len(items) > 32 or
+                        any(not isinstance(item, str) or len(item) > 256
+                            for item in items)):
+                    raise ReplayError("advisory resources are malformed")
+            elif event == "ballot_inert":
+                attempt_id = _id(record.get("attempt_id"), "inert attempt id")
+                seat_id = _id(record.get("seat_id"), "inert seat id")
+                turn_id = _id(record.get("turn_id"), "inert turn id")
+                prior = attempts.get(attempt_id)
+                if (seat_id not in seat_ids or prior is None or
+                        prior.phase != "finished" or prior.seat_id != seat_id or
+                        prior.turn_id != turn_id):
+                    raise ReplayError("inert ballot is not bound to a finished attempt")
+            elif event == "journal_repaired":
+                repaired_generation = record.get("repaired_generation")
+                first_in_segment = (record_index == 1 or
+                                    records[record_index - 1][0] != generation)
+                prior_generations = [prior_generation for prior_generation, _ in
+                                     records[:record_index]
+                                     if prior_generation < generation]
+                newest_prior = max(prior_generations, default=0)
+                if (not first_in_segment or isinstance(repaired_generation, bool) or
+                        not isinstance(repaired_generation, int) or
+                        not 1 <= repaired_generation < generation or
+                        repaired_generation != newest_prior):
+                    raise ReplayError("journal repair generation is malformed")
             transcript.append(_public_event(record))
             continue
         if event == "candidate_selected":
@@ -697,9 +796,12 @@ def replay_checkpoint(receipt: Mapping[str, object],
             pending = value
     uncertain = any(attempt.uncertain for attempt in attempts.values())
     next_ordinal = max(ordinals, default=-1) + 1
+    if next_ordinal > rounds * len(seat_ids):
+        raise ReplayError("replay consumed more turns than the immutable schedule")
     digest_payload = {
         "receipt_sha256": receipt_sha256, "run_id": run_id,
         "policy_digest": policy_digest,
+        "schedule_digest": schedule_digest_value,
         "prior_generation": last_generation, "status": status,
         "termination_reason": termination_reason, "candidate_option": candidate,
         "decision_option": decision_option, "attempts": [attempt.__dict__ for attempt in attempts.values()],
@@ -714,6 +816,7 @@ def replay_checkpoint(receipt: Mapping[str, object],
     checkpoint_digest = _sha(digest_payload)
     return ReplayCheckpoint(
         receipt_sha256, run_id, decision_id, policy_digest,
+        schedule_digest_value,
         last_generation, status,
         termination_reason, candidate, decision_option,
         tuple(attempts.values()), tuple(accepted), pending, next_ordinal,

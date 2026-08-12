@@ -22,9 +22,11 @@ import _rundir
 def receipt(run_id="run-1", *, max_attempts=4, quorum="all"):
     return {
         "mode": "deliberation", "schema_version": 1, "run_id": run_id,
+        "question_sha256": hashlib.sha256(b"question").hexdigest(),
         "decision_id": "decision-1", "seat_ids": ["a", "b"],
         "option_ids": ["yes", "no"], "quorum_rule": quorum,
         "max_attempts": max_attempts, "require_human_approval": False,
+        "rounds": 1, "deadline_unix_ms": 4_000_000_000_000,
     }
 
 
@@ -78,10 +80,135 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaises(replay.ReplayError):
             self.run_replay(wrong, value=value)
 
+    def test_receipt_question_and_created_at_metadata_are_bounded(self):
+        value, records = prepared()
+        missing = dict(value)
+        missing.pop("question_sha256")
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=missing)
+        bad_timestamp = dict(value, created_at="C:/private/secret")
+        records_bad = [(1, event("run_prepared", 1, run_id="run-1",
+                                 receipt_sha256=replay._sha(bad_timestamp)))]
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records_bad, value=bad_timestamp)
+
+    def test_public_audit_fields_are_schema_validated(self):
+        value, records = prepared()
+        records.append((1, event("state_transition", 1, **{
+            "from": "PREPARED", "to": "RUNNING", "reason": "started"})))
+        records.append((1, event("turn_prepared", 1, decision_id="decision-1",
+                                 seat_id="a", turn_id="turn-a-0", turn_ordinal=0,
+                                 request_digest="a" * 64)))
+        records.append((1, event("ballot_inert", 1, attempt_id="SECRET-TOKEN",
+                                 seat_id="a", turn_id="SECRET-TURN")))
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+
+        value, records = prepared()
+        records.append((1, event("state_transition", 1, **{
+            "from": "PREPARED", "to": "RUNNING", "reason": "started"})))
+        records.extend(turn_events(valid=False))
+        records[-1] = (1, event("ballot_inert", 1, attempt_id="g1-a0",
+                                 seat_id="a", turn_id="turn-a-0"))
+        checkpoint = self.run_replay(records, value=value)
+        self.assertEqual(checkpoint.status, "RUNNING")
+
+    def test_journal_repair_is_first_record_of_its_segment(self):
+        value, records = prepared()
+        records.append((1, event("state_transition", 1, **{
+            "from": "PREPARED", "to": "RUNNING", "reason": "started"})))
+        records.append((2, event("journal_repaired", 2,
+                                 repaired_generation=1)))
+        checkpoint = self.run_replay(records, value=value, owner_generation=3)
+        self.assertEqual(checkpoint.status, "RUNNING")
+
+        gapped = [records[0], records[1],
+                  (3, event("journal_repaired", 3, repaired_generation=1))]
+        checkpoint = self.run_replay(gapped, value=value, owner_generation=4)
+        self.assertEqual(checkpoint.status, "RUNNING")
+
+        value, records = prepared()
+        records.append((1, event("journal_repaired", 1,
+                                 repaired_generation="SECRET-C:/private")))
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+
+    def test_attempt_exit_code_is_bounded_before_public_projection(self):
+        value, records = prepared()
+        records.extend([*[(1, event("state_transition", 1, **{
+            "from": "PREPARED", "to": "RUNNING", "reason": "started"}))],
+            *[(1, event("turn_prepared", 1, decision_id="decision-1",
+                         seat_id="a", turn_id="turn-a-0", turn_ordinal=0,
+                         request_digest="a" * 64))],
+            *[(1, event("attempt_started", 1, attempt_id="g1-a0",
+                         decision_id="decision-1", seat_id="a",
+                         turn_id="turn-a-0", turn_ordinal=0,
+                         launch_spec_sha256="b" * 64))],
+            *[(1, event("attempt_finished", 1, attempt_id="g1-a0",
+                         launch_spec_sha256="b" * 64, ballot_valid=False,
+                         transport_ok=True, exit_code="SECRET-C:/private",
+                         timed_out=False, parser_valid=True))]])
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+
     def test_receipt_quorum_alias_is_not_an_alternate_schema(self):
         value, records = prepared()
         value.pop("quorum_rule")
         value["quorum"] = "all"
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+
+    def test_schedule_fields_are_canonical_and_sealed(self):
+        value, records = prepared()
+        first = self.run_replay(records, value=value)
+        changed_rounds = dict(value, rounds=2)
+        changed_deadline = dict(value, deadline_unix_ms=4_000_000_000_001)
+        second_records = [(1, event(
+            "run_prepared", 1, run_id=changed_rounds["run_id"],
+            receipt_sha256=replay._sha(changed_rounds)))]
+        third_records = [(1, event(
+            "run_prepared", 1, run_id=changed_deadline["run_id"],
+            receipt_sha256=replay._sha(changed_deadline)))]
+        second = self.run_replay(second_records, value=changed_rounds)
+        third = self.run_replay(third_records, value=changed_deadline)
+        self.assertNotEqual(first.schedule_digest, second.schedule_digest)
+        self.assertNotEqual(first.schedule_digest, third.schedule_digest)
+        self.assertNotEqual(first.digest, second.digest)
+        self.assertNotEqual(first.digest, third.digest)
+
+    def test_schedule_rejects_invalid_and_missing_fields(self):
+        value, records = prepared()
+        for field, bad in (("rounds", 0), ("rounds", True),
+                           ("rounds", 11), ("deadline_unix_ms", 0),
+                           ("deadline_unix_ms", True),
+                           ("deadline_unix_ms", 1 << 63),
+                           ("deadline_unix_ms", 1.5)):
+            changed = dict(value, **{field: bad})
+            with self.assertRaises(replay.ReplayError):
+                self.run_replay(records, value=changed)
+        for field in ("rounds", "deadline_unix_ms"):
+            changed = dict(value)
+            changed.pop(field)
+            with self.assertRaises(replay.ReplayError):
+                self.run_replay(records, value=changed)
+
+    def test_schedule_seat_order_and_round_bound_are_enforced(self):
+        value, records = prepared()
+        records.append((1, event("state_transition", 1, **{
+            "from": "PREPARED", "to": "RUNNING", "reason": "started"})))
+        records.extend(turn_events(seat="b", turn="wrong-seat", ordinal=0,
+                                    attempt="g1-wrong"))
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+        value = dict(value, rounds=1)
+        records = prepared()[1]
+        records.append((1, event("state_transition", 1, **{
+            "from": "PREPARED", "to": "RUNNING", "reason": "started"})))
+        records.extend(turn_events(seat="a", turn="a0", ordinal=0, attempt="g1-a0"))
+        records.extend(turn_events(seat="b", turn="b1", ordinal=1, attempt="g1-a1"))
+        records.append((1, event("turn_prepared", 1, decision_id="decision-1",
+                                  seat_id="a", turn_id="a2", turn_ordinal=2,
+                                  request_digest="a" * 64)))
         with self.assertRaises(replay.ReplayError):
             self.run_replay(records, value=value)
 
@@ -92,6 +219,37 @@ class ReplayTests(unittest.TestCase):
             "run_prepared", 1, run_id="run-1",
             receipt_sha256=replay._sha(value),
         ))
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+
+    def test_schedule_is_required_bounded_and_sealed(self):
+        value, records = prepared()
+        checkpoint = self.run_replay(records, value=value)
+        self.assertEqual(checkpoint.schedule_digest,
+                         replay.schedule_digest(1, 4_000_000_000_000))
+        for field, invalid in (("rounds", 0), ("rounds", 11),
+                               ("rounds", True), ("deadline_unix_ms", 0),
+                               ("deadline_unix_ms", 1 << 63),
+                               ("deadline_unix_ms", False)):
+            changed = dict(value)
+            changed[field] = invalid
+            with self.subTest(field=field, invalid=invalid), self.assertRaises(replay.ReplayError):
+                self.run_replay(records, value=changed)
+        missing = dict(value)
+        del missing["rounds"]
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=missing)
+
+    def test_schedule_digest_mutation_is_not_accepted(self):
+        value, records = prepared()
+        changed = dict(value)
+        changed["deadline_unix_ms"] = 4_000_000_000_001
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=changed)
+
+    def test_turn_ordinal_cannot_escape_receipt_schedule(self):
+        value, records = prepared()
+        records.extend(turn_events(ordinal=2, turn="turn-a-2", attempt="g1-a2"))
         with self.assertRaises(replay.ReplayError):
             self.run_replay(records, value=value)
 
@@ -286,13 +444,20 @@ class ReplayTests(unittest.TestCase):
 
     def test_later_ballot_revision_replaces_same_seat_not_cumulative(self):
         value, records = prepared(quorum="all")
+        value["rounds"] = 2
+        records[0] = (1, event("run_prepared", 1, run_id=value["run_id"],
+                               receipt_sha256=replay._sha(value)))
         records.append((1, event("state_transition", 1, **{
             "from": "PREPARED", "to": "RUNNING", "reason": "started"})))
         records.extend(turn_events(seat="a", turn="turn-a-0", ordinal=0,
                                    attempt="g1-a0", option="yes"))
-        records.extend(turn_events(seat="a", turn="turn-a-1", ordinal=1,
+        records.extend(turn_events(seat="b", turn="turn-b-1", ordinal=1,
                                    attempt="g1-a1", option="no"))
+        records.extend(turn_events(seat="a", turn="turn-a-2", ordinal=2,
+                                   attempt="g1-a2", option="yes"))
         checkpoint = self.run_replay(records, value=value)
+        # The latest a-seat revision is ``yes``; counting the stale first
+        # ballot cumulatively would incorrectly produce a unanimous candidate.
         self.assertIsNone(checkpoint.candidate_option)
 
     def test_human_cancel_precedes_later_approval_transition(self):

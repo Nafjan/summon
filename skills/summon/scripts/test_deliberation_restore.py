@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,10 +56,12 @@ def policy(*, max_attempts: int = 4) -> DeliberationPolicy:
 def receipt_for(value: DeliberationPolicy) -> dict:
     return {
         "mode": "deliberation", "schema_version": 1, "run_id": "run-1",
+        "question_sha256": hashlib.sha256(b"question").hexdigest(),
         "decision_id": value.decision_id, "seat_ids": list(value.seat_ids),
         "option_ids": list(value.option_ids), "quorum_rule": value.quorum_rule,
         "max_attempts": value.max_attempts,
         "require_human_approval": value.require_human_approval,
+        "rounds": 1, "deadline_unix_ms": 4_000_000_000_000,
     }
 
 
@@ -88,6 +91,9 @@ def checkpoint(**changes) -> SimpleNamespace:
         candidate_option=None, decision_option=None, termination_reason="started",
         attempts=(), ballots=(), pending_turn=None, next_ordinal=0,
         uncertain_spend=False,
+        schedule_digest=hashlib.sha256(json.dumps(
+            {"rounds": 1, "deadline_unix_ms": 4_000_000_000_000}, sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False).encode()).hexdigest(),
     )
     values.update(changes)
     def fields(value, names):
@@ -108,6 +114,7 @@ def checkpoint(**changes) -> SimpleNamespace:
     payload = {
         "receipt_sha256": values["receipt_sha256"], "run_id": values["run_id"],
         "policy_digest": values["policy_digest"],
+        "schedule_digest": values["schedule_digest"],
         "prior_generation": values["prior_generation"], "status": values["status"],
         "termination_reason": values["termination_reason"],
         "candidate_option": values["candidate_option"],
@@ -182,6 +189,37 @@ def _digest_for(value) -> str:
 
 
 class AttemptRestoreTests(unittest.TestCase):
+    def test_restore_deadline_is_derived_from_receipt_not_override(self) -> None:
+        value = checkpoint()
+        with mock.patch("_deliberation.time.time", return_value=100.0):
+            engine = DeliberationEngine._restore_sealed(
+                value, policy(), NoProviderAdapter(), 2, lambda event: None,
+                deadline=-999.0, clock=lambda: 50.0,
+                receipt=receipt_for(policy()), owner_is_current=lambda: True,
+                cancel_requested=lambda: False)
+        self.assertEqual(engine.deadline, 50.0 + 4_000_000_000.0 - 100.0)
+
+    def test_restore_requires_receipt_schedule_digest(self) -> None:
+        value = checkpoint()
+        value.schedule_digest = "0" * 64
+        value.digest = _digest_for(value)
+        with self.assertRaises(DeliberationError):
+            restore(value)
+
+    def test_restore_rejects_attempts_beyond_receipt_schedule(self) -> None:
+        value = checkpoint(
+            attempts=(attempt("a0", "a", 0), attempt("b1", "b", 1),
+                      attempt("a2", "a", 2)),
+            next_ordinal=3)
+        with self.assertRaises(DeliberationError):
+            restore(value)
+
+    def test_restore_rejects_wrong_seat_for_schedule_ordinal(self) -> None:
+        value = checkpoint(
+            attempts=(attempt("wrong", "b", 0),), next_ordinal=1)
+        with self.assertRaises(DeliberationError):
+            restore(value)
+
     def test_restored_attempts_count_but_have_no_launch_capability(self) -> None:
         restored = attempt("old-attempt", "a", 0, phase="indeterminate")
         ledger = AttemptLedger(2, lambda event: None,

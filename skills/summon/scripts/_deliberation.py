@@ -22,14 +22,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Iterable, Mapping, Protocol, Sequence
 
 
 SCHEMA_VERSION = 1
+MAX_SCHEDULE_ROUNDS = 10
+MAX_SIGNED64 = (1 << 63) - 1
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _FRACTION_RE = re.compile(r"^([1-9][0-9]*)/([1-9][0-9]*)$")
 
@@ -315,6 +319,7 @@ def _restore_digest(checkpoint: object) -> str:
         "receipt_sha256": _field(checkpoint, "receipt_sha256"),
         "run_id": _field(checkpoint, "run_id"),
         "policy_digest": _field(checkpoint, "policy_digest"),
+        "schedule_digest": _field(checkpoint, "schedule_digest"),
         "prior_generation": _field(checkpoint, "prior_generation"),
         "status": _field(checkpoint, "status"),
         "termination_reason": _field(checkpoint, "termination_reason"),
@@ -361,6 +366,7 @@ def _snapshot_checkpoint(checkpoint: object) -> dict[str, object]:
         "run_id": _field(checkpoint, "run_id"),
         "decision_id": _field(checkpoint, "decision_id"),
         "policy_digest": _field(checkpoint, "policy_digest"),
+        "schedule_digest": _field(checkpoint, "schedule_digest"),
         "prior_generation": _field(checkpoint, "prior_generation"),
         "status": _field(checkpoint, "status"),
         "termination_reason": _field(checkpoint, "termination_reason"),
@@ -400,6 +406,45 @@ def _policy_digest(policy: DeliberationPolicy) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _schedule_binding(receipt: Mapping[str, object]) -> tuple[int, int, str]:
+    """Validate the immutable receipt schedule without importing replay."""
+    if not isinstance(receipt, Mapping):
+        raise DeliberationError("verified receipt is not an object")
+    rounds = receipt.get("rounds")
+    deadline = receipt.get("deadline_unix_ms")
+    if (isinstance(rounds, bool) or not isinstance(rounds, int) or
+            not 1 <= rounds <= MAX_SCHEDULE_ROUNDS):
+        raise DeliberationError("verified receipt rounds are invalid")
+    if (isinstance(deadline, bool) or not isinstance(deadline, int) or
+            not 1 <= deadline <= MAX_SIGNED64):
+        raise DeliberationError("verified receipt deadline is invalid")
+    payload = {"rounds": rounds, "deadline_unix_ms": deadline}
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=False).encode("utf-8")
+    return rounds, deadline, hashlib.sha256(raw).hexdigest()
+
+
+def _runtime_deadline_from_receipt(receipt: Mapping[str, object],
+                                   clock: Callable[[], float]) -> float:
+    """Project the receipt's Unix-millisecond deadline into the engine clock.
+
+    Engine clocks are monotonic/test-injected while the durable receipt uses an
+    absolute Unix timestamp.  The caller-supplied legacy ``deadline`` argument
+    is intentionally not an authority at restore: accepting it would let a
+    resume extend the immutable schedule.  Capture both clocks once and keep
+    the conversion local to this provider-inert boundary.
+    """
+    _rounds, deadline_unix_ms, _digest = _schedule_binding(receipt)
+    try:
+        now_clock = float(clock())
+        now_unix = float(time.time())
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise DeliberationError("restore clocks are invalid") from exc
+    if not (math.isfinite(now_clock) and math.isfinite(now_unix)):
+        raise DeliberationError("restore clocks are not finite")
+    return now_clock + (deadline_unix_ms / 1000.0) - now_unix
+
+
 def _receipt_binding(receipt: Mapping[str, object],
                      policy: DeliberationPolicy) -> tuple[str, str]:
     """Canonicalize one verified receipt and bind its exact policy."""
@@ -425,6 +470,7 @@ def _receipt_binding(receipt: Mapping[str, object],
             snapshot.get("schema_version") != SCHEMA_VERSION or
             any(snapshot.get(key) != value for key, value in expected.items())):
         raise DeliberationError("restore policy differs from the verified receipt")
+    _schedule_binding(snapshot)
     receipt_sha = hashlib.sha256(raw).hexdigest()
     return receipt_sha, _policy_digest(policy)
 
@@ -871,6 +917,10 @@ class DeliberationEngine:
                 or not re.fullmatch(r"[0-9a-f]{64}", receipt_sha256)
                 or checkpoint_receipt_sha != receipt_sha256):
             raise DeliberationError("checkpoint is not bound to the verified receipt")
+        schedule_rounds, _deadline_unix_ms, schedule_digest = _schedule_binding(receipt)
+        if _field(checkpoint, "schedule_digest") != schedule_digest:
+            raise DeliberationError("checkpoint schedule differs from the verified receipt")
+        schedule_slots = schedule_rounds * len(policy.seat_ids)
         if (_field(checkpoint, "policy_digest") != policy_digest or
                 policy_digest != _policy_digest(policy)):
             raise DeliberationError("checkpoint policy differs from the verified receipt")
@@ -897,7 +947,7 @@ class DeliberationEngine:
         ballots = tuple(_field(checkpoint, "ballots", ()) or ())
         next_ordinal = _field(checkpoint, "next_ordinal", 0)
         if (isinstance(next_ordinal, bool) or not isinstance(next_ordinal, int)
-                or next_ordinal < 0):
+                or next_ordinal < 0 or next_ordinal > schedule_slots):
             raise DeliberationError("checkpoint next ordinal is invalid")
         if len(attempts) > policy.max_attempts:
             raise DeliberationError("checkpoint attempts exceed the policy budget")
@@ -932,8 +982,11 @@ class DeliberationEngine:
             if seat_id not in policy.seat_ids or not isinstance(turn_id, str):
                 raise DeliberationError("checkpoint attempt is outside the policy")
             if (isinstance(ordinal, bool) or not isinstance(ordinal, int)
-                    or ordinal < 0 or ordinal >= next_ordinal):
+                    or ordinal < 0 or ordinal >= next_ordinal
+                    or ordinal >= schedule_slots):
                 raise DeliberationError("checkpoint attempt ordinal is invalid")
+            if seat_id != policy.seat_ids[ordinal % len(policy.seat_ids)]:
+                raise DeliberationError("checkpoint attempt seat is outside the schedule")
             if ordinal in attempt_ordinals:
                 raise DeliberationError("checkpoint reuses a schedule ordinal")
             attempt_ordinals.add(ordinal)
@@ -968,8 +1021,12 @@ class DeliberationEngine:
                 raise DeliberationError("checkpoint pending turn already has a physical attempt")
             pending_ordinal = _field(pending_value, "turn_ordinal")
             if (isinstance(pending_ordinal, bool) or not isinstance(pending_ordinal, int)
-                    or pending_ordinal < 0 or pending_ordinal + 1 != next_ordinal):
+                    or pending_ordinal < 0 or pending_ordinal >= schedule_slots
+                    or pending_ordinal + 1 != next_ordinal):
                 raise DeliberationError("checkpoint pending turn is not the next schedule slot")
+            if (_field(pending_value, "seat_id") !=
+                    policy.seat_ids[pending_ordinal % len(policy.seat_ids)]):
+                raise DeliberationError("checkpoint pending seat is outside the schedule")
 
         # Replay schedules exactly one physical attempt per prepared turn and
         # permits at most one unattempted turn at the tail.  Requiring this
@@ -1001,8 +1058,12 @@ class DeliberationEngine:
         if status == RunState.WAITING_HUMAN:
             if not policy.require_human_approval or claimed_candidate is None or claimed_decision is not None:
                 raise DeliberationError("waiting-human checkpoint violates approval policy")
+        # The durable absolute deadline, not a caller-provided override, is
+        # the schedule authority.  ``deadline`` remains in the signature only
+        # for source compatibility with the pre-receipt restore seam.
+        effective_deadline = _runtime_deadline_from_receipt(receipt, clock)
         engine = cls(policy, adapter, generation, durable_append,
-                     deadline=deadline, clock=clock,
+                     deadline=effective_deadline, clock=clock,
                      owner_is_current=owner_is_current,
                      cancel_requested=cancel_requested)
         engine.attempts = AttemptLedger(

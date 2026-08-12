@@ -197,12 +197,27 @@ the owner-bound restore path: it appends the deterministic `DECIDED/consensus` o
 human command batch still needs an explicit owner-bound recovery action; until that
 slice exists, restore refuses it and makes zero provider calls.
 
+The public headless status and replay readers now rebuild their control projection from
+the tagged journal through the same canonical replay validator.  The generation-fenced
+projection cache remains a rebuildable convenience only; mutating it cannot change
+status, candidate, decision, attempt accounting, or the checkpoint seal.  Receipts that
+omit the canonical replay policy fields are refused rather than silently defaulted.
+The immutable receipt also requires a lowercase `question_sha256`; optional creation
+timestamps are finite non-negative numbers and are never included in public status.
+Concrete `LEFT_BEHIND` resource names remain an executor/native-envelope handoff. The
+public replay view intentionally exposes only cleanup booleans and bounded state, so
+private paths and model-supplied resource strings cannot become a browser/export leak.
+The receipt's absolute `deadline_unix_ms` is also the restore authority: the engine
+projects it into its injected monotonic clock and ignores the legacy caller deadline
+override, so a resume cannot extend the durable schedule.
+
 Restore is owner-bound: its public entry point derives generation, append destination,
 and current-owner fencing from one `_rundir.Owner`, then verifies that owner's
 `receipt.json` and tagged journal before accepting a checkpoint. It derives the receipt
-hash and policy fingerprint from one canonical receipt snapshot. Before scheduler resume
-can be enabled, the receipt/checkpoint must additionally bind the schedule rounds and a
-cross-process absolute deadline; these values must not be inferred from new CLI defaults.
+hash and policy fingerprint from one canonical receipt snapshot. Schedule rounds and a
+cross-process absolute deadline are now receipt-bound and sealed in replay/restore; the
+provider scheduler remains disabled until it derives its execution bounds from that same
+receipt rather than from new CLI defaults.
 
 ### 4.2 State machine
 

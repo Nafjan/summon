@@ -414,7 +414,7 @@ class SchedulerTests(unittest.TestCase):
     def test_report_left_behind_is_run_bounded_and_marks_elision(self):
         left = ["resource-" + ("x" * 248) + str(index) for index in range(32)]
         scheduler, _adapter, _events, _clock = make_scheduler(
-            policy_value=policy(attempts=128), rounds=64, left_behind=left)
+            policy_value=policy(attempts=32), rounds=10, left_behind=left)
         report = scheduler.run()
         self.assertTrue(report.left_behind_elided)
         self.assertIn(LEFT_BEHIND_ELISION, report.left_behind)

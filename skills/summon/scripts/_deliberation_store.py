@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Mapping
 
 import _rundir
-from _deliberation import RunState, TERMINAL_STATES, summarize_attempt_events
+import _deliberation_replay as _replay
+from _deliberation import TERMINAL_STATES
 
 
 SCHEMA_VERSION = 1
@@ -56,6 +57,35 @@ def _receipt(path: str, run_id: str) -> dict:
     return value
 
 
+def _replay_policy(receipt: Mapping[str, object]):
+    """Construct the exact replay policy from a canonical receipt.
+
+    Deliberation status/replay must not invent defaults.  Older/minimal
+    preview receipts are therefore rejected at this boundary until they are
+    migrated by a fresh run initializer.
+    """
+    required = ("decision_id", "seat_ids", "option_ids", "quorum_rule",
+                "max_attempts", "require_human_approval")
+    missing = [key for key in required if key not in receipt]
+    if missing:
+        raise DeliberationStoreError(
+            "deliberation receipt is missing canonical replay fields: " +
+            ", ".join(missing))
+    try:
+        # Reuse replay's strict JSON-shape validation.  Converting arbitrary
+        # iterables with tuple(value) would turn malformed strings into valid-
+        # looking seat/option sequences before the policy constructor sees
+        # them.
+        seat_ids, option_ids, quorum, max_attempts, approval = (
+            _replay._receipt_policy(receipt))
+        from _deliberation import DeliberationPolicy
+        return DeliberationPolicy(
+            receipt["decision_id"], seat_ids, option_ids, quorum,
+            max_attempts, approval)
+    except (KeyError, TypeError, ValueError, _replay.ReplayError) as exc:
+        raise DeliberationStoreError("deliberation receipt policy is invalid") from exc
+
+
 def _write_projection(path: str, generation: int, projection: dict) -> None:
     """Write only a generation-fenced cache; readers never trust it."""
     _rundir.atomic_write_json(
@@ -77,6 +107,18 @@ def initialize_run(root: str, receipt: Mapping[str, object], *,
     _rundir.validate_run_id(run_id)
     if value.get("mode") != "deliberation" or value.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("invalid deliberation receipt mode/schema")
+    # Freeze and validate the cross-process schedule before creating any run
+    # directory.  Missing or out-of-range values must not become implicit
+    # defaults that differ on resume.
+    try:
+        _replay.receipt_schedule(value)
+        # Validate the complete immutable policy at the same preflight boundary.
+        # A malformed receipt must fail before path creation or owner acquisition;
+        # otherwise a later status read would discover an unusable half-run.
+        _replay_policy(value)
+        _replay._receipt_metadata(value)
+    except _replay.ReplayError as exc:
+        raise DeliberationStoreError("deliberation receipt is invalid") from exc
     path = run_dir(root, run_id)
     if os.path.exists(path):
         raise FileExistsError(f"deliberation run already exists: {run_id}")
@@ -100,49 +142,85 @@ def initialize_run(root: str, receipt: Mapping[str, object], *,
         raise
 
 
-def _project(records: list[dict]) -> dict:
-    state = RunState.PREPARED.value
-    reason = decision = candidate = None
-    cleanup = None
-    for record in records:
-        event = record.get("event")
-        if event == "state_transition" and isinstance(record.get("to"), str):
-            state = record["to"]
-            reason = record.get("reason")
-            if record.get("decision_option") is not None:
-                decision = record.get("decision_option")
-        elif event == "candidate_selected":
-            candidate = record.get("option_id")
-        elif event == "cleanup_receipt":
-            cleanup = {
-                "verified": bool(record.get("verified")),
-                "clean": bool(record.get("clean")),
-                "retained_resources": list(record.get("retained_resources") or []),
-            }
-    attempts = summarize_attempt_events(records)
-    return {
-        "state": str(state).lower(), "termination_reason": reason,
-        "candidate_option": candidate, "decision_option": decision,
-        "physical_attempts": {
-            "started": attempts["started"], "finished": attempts["finished"],
-            "indeterminate": attempts["indeterminate"],
-        },
-        "uncertain_spend": attempts["uncertain_spend"],
-        "stale_attempts": list(attempts["stale_attempts"]),
-        "cleanup": cleanup,
-    }
-
-
-def _read_records(path: str) -> tuple[list[dict], bool]:
-    records, torn = _rundir.journal_read(path)
-    if len(records) > MAX_JOURNAL_RECORDS:
+def _authoritative_checkpoint(path: str, receipt: Mapping[str, object]):
+    """Read tagged journal bytes once and rebuild the replay checkpoint."""
+    try:
+        tagged, torn = _rundir.journal_read_tagged(path)
+    except _rundir.JournalCorruptError as exc:
+        raise DeliberationStoreError(f"deliberation journal is corrupt: {exc}") from exc
+    if len(tagged) > MAX_JOURNAL_RECORDS:
         raise DeliberationStoreError(
             f"deliberation journal exceeds {MAX_JOURNAL_RECORDS} records")
-    encoded = json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encoded = json.dumps([record for _generation, record in tagged],
+                         ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(encoded) > MAX_REPLAY_BYTES:
         raise DeliberationStoreError(
             f"deliberation journal exceeds {MAX_REPLAY_BYTES} replay bytes")
-    return records, torn
+    generations = [generation for generation, _record in tagged]
+    current = max(generations, default=0) + 1
+    if current < 1:
+        raise DeliberationStoreError("deliberation journal generation is invalid")
+    policy = _replay_policy(receipt)
+    try:
+        checkpoint = _replay.replay_checkpoint(receipt, tagged, current)
+    except _replay.ReplayError as exc:
+        raise DeliberationStoreError(
+            "deliberation journal cannot be reconstructed from its receipt") from exc
+    return tagged, torn, checkpoint, policy
+
+
+def _journal_signature(path: str) -> tuple[tuple[str, int, int, int], ...]:
+    """Cheap filesystem fingerprint used to detect same-generation appends."""
+    values = []
+    try:
+        for entry in os.scandir(path):
+            if not entry.name.startswith("journal-g") or not entry.name.endswith(".jsonl"):
+                continue
+            stat = entry.stat()
+            values.append((entry.name, int(stat.st_size), int(stat.st_mtime_ns),
+                           int(getattr(stat, "st_ino", 0))))
+    except OSError as exc:
+        raise DeliberationStoreError("cannot fingerprint deliberation journal") from exc
+    return tuple(sorted(values))
+
+
+def _project_checkpoint(checkpoint, records: list[dict]) -> dict:
+    """Expose only replay-derived control facts plus bounded cleanup evidence."""
+    cleanup = None
+    for record in checkpoint.transcript_events:
+        if record.get("event") == "cleanup_receipt":
+            cleanup = {
+                "verified": record.get("verified"),
+                "clean": record.get("clean"),
+            }
+    attempts = checkpoint.attempts
+    return {
+        "state": checkpoint.status.lower(),
+        "termination_reason": checkpoint.termination_reason,
+        "candidate_option": checkpoint.candidate_option,
+        "decision_option": checkpoint.decision_option,
+        "physical_attempts": {
+            "started": len(attempts),
+            "finished": sum(attempt.phase == "finished" for attempt in attempts),
+            "indeterminate": sum(attempt.phase != "finished" for attempt in attempts),
+        },
+        "uncertain_spend": checkpoint.uncertain_spend,
+        "stale_attempts": [attempt.attempt_id for attempt in attempts
+                           if attempt.phase != "finished"],
+        "cleanup": cleanup,
+        "replay_digest": checkpoint.digest,
+        "schedule_digest": checkpoint.schedule_digest,
+        "pending_journal_commands": len(checkpoint.pending_commands),
+    }
+
+
+def _public_transcript(checkpoint, records: list[dict]) -> list[dict]:
+    """Return replay's allowlisted transcript, never raw journal records."""
+    result = []
+    if records and records[0].get("event") == "run_prepared":
+        result.append(_replay._public_event(records[0]))
+    result.extend(dict(record) for record in checkpoint.transcript_events)
+    return result
 
 
 def _verify_receipt_binding(receipt: Mapping[str, object], records: list[dict]) -> None:
@@ -174,14 +252,14 @@ def inspect_run(root: str, run_id: str) -> dict:
     for _ in range(2):
         before = _rundir.read_owner(path)
         generation_before = _rundir._last_generation(path)
+        journal_before = _journal_signature(path)
         receipt = _receipt(path, run_id)
-        try:
-            records, torn = _read_records(path)
-        except _rundir.JournalCorruptError as exc:
-            raise DeliberationStoreError(f"run {run_id}: {exc}") from exc
+        tagged, torn, checkpoint, _policy = _authoritative_checkpoint(path, receipt)
+        records = [record for _generation, record in tagged]
         _verify_receipt_binding(receipt, records)
         after = _rundir.read_owner(path)
         generation_after = _rundir._last_generation(path)
+        journal_after = _journal_signature(path)
         # A lock-free reader must not return a receipt that changed while its
         # journal projection was being read.  Retry once; a persistent race is
         # reported as inconsistent rather than presented as a stable view.
@@ -191,12 +269,13 @@ def inspect_run(root: str, run_id: str) -> dict:
         consistent = ((before or {}).get("nonce") == (after or {}).get("nonce")
                       and (before or {}).get("generation") == (after or {}).get("generation")
                       and generation_before == generation_after
+                      and journal_before == journal_after
                       and receipt_consistent)
         pending = _pending_commands(path)
         view = {
             "mode": "deliberation-status", "status": "success",
             "schema_version": SCHEMA_VERSION, "run_id": run_id,
-            "run_dir": path, "current_generation": generation_after,
+            "current_generation": generation_after,
             "owner": None if after is None else {
                 "pid": after.get("pid"), "generation": after.get("generation"),
                 "lease_expires": after.get("lease_expires"),
@@ -204,13 +283,21 @@ def inspect_run(root: str, run_id: str) -> dict:
             "receipt": {
                 "decision_id": receipt.get("decision_id"),
                 "seat_ids": list(receipt.get("seat_ids") or []),
-                "option_ids": list(receipt.get("option_ids") or []),
-                "created_at": receipt_after.get("created_at"),
+            "option_ids": list(receipt.get("option_ids") or []),
             },
-            "projection": _project(records), "journal_records": len(records),
-            "journal_torn_tail": torn, "consistent": consistent,
+            "projection": _project_checkpoint(checkpoint, records),
+            "journal_records": len(records),
+            "journal_torn_tail": torn,
+            "recovery_required": torn,
+            "consistent": consistent and not torn,
             "pending_commands": pending,
         }
+        if torn:
+            view["status"] = "blocked"
+            view["error_kind"] = "torn_tail"
+        elif not consistent:
+            view["status"] = "blocked"
+            view["error_kind"] = "unstable_read"
         if consistent:
             break
     return view
@@ -218,13 +305,43 @@ def inspect_run(root: str, run_id: str) -> dict:
 
 def replay_run(root: str, run_id: str) -> dict:
     """Return a bounded, checksum-verified native-local journal replay."""
-    status = inspect_run(root, run_id)
-    records, torn = _read_records(status["run_dir"])
+    _rundir.validate_run_id(run_id)
+    path = run_dir(root, run_id)
+    if not os.path.isdir(path):
+        raise DeliberationStoreError(f"unknown deliberation run {run_id!r} under {root}")
+    # Deliberation replay and status must consume one authoritative read; do
+    # not call inspect_run and then reread a different generation.
+    for _attempt in range(2):
+        before = _rundir.read_owner(path)
+        generation_before = _rundir._last_generation(path)
+        journal_before = _journal_signature(path)
+        receipt = _receipt(path, run_id)
+        tagged, torn, checkpoint, _policy = _authoritative_checkpoint(path, receipt)
+        records = [record for _generation, record in tagged]
+        _verify_receipt_binding(receipt, records)
+        after = _rundir.read_owner(path)
+        generation_after = _rundir._last_generation(path)
+        journal_after = _journal_signature(path)
+        receipt_after = _receipt(path, run_id)
+        consistent = ((before or {}).get("nonce") == (after or {}).get("nonce")
+                      and (before or {}).get("generation") == (after or {}).get("generation")
+                      and generation_before == generation_after
+                      and journal_before == journal_after
+                      and _rundir.content_sha256(dict(receipt)) ==
+                      _rundir.content_sha256(dict(receipt_after)) and not torn)
+        if consistent or _attempt == 1:
+            break
     return {
-        "mode": "deliberation-replay", "status": "success",
+        "mode": "deliberation-replay",
+        "status": "success" if (not torn and consistent) else "blocked",
         "schema_version": SCHEMA_VERSION, "run_id": run_id,
-        "consistent": status["consistent"], "journal_torn_tail": torn,
-        "projection": _project(records), "records": records,
+        "consistent": consistent, "journal_torn_tail": torn,
+        "recovery_required": torn,
+        **({"error_kind": "torn_tail"} if torn else
+           ({"error_kind": "unstable_read"} if not consistent else {})),
+        "projection": _project_checkpoint(checkpoint, records),
+        "records": _public_transcript(checkpoint, records),
+        "checkpoint_digest": checkpoint.digest,
     }
 
 
@@ -251,13 +368,16 @@ def queue_cancel(root: str, run_id: str, command_id: str | None = None) -> dict:
     scheduler owner may append ``human_command`` and advance durable state.
     """
     status = inspect_run(root, run_id)
+    if status.get("recovery_required") or not status.get("consistent"):
+        raise DeliberationStoreError(
+            "run journal requires repair or a stable read before queuing a command")
     state = status["projection"]["state"].upper()
     if state in {item.value for item in TERMINAL_STATES}:
         raise DeliberationStoreError(f"run {run_id!r} is already terminal ({state})")
     command_id = command_id or ("cmd-" + uuid.uuid4().hex)
     if not _COMMAND_ID_RE.fullmatch(command_id) or ".." in command_id:
         raise DeliberationStoreError("invalid command id")
-    path = status["run_dir"]
+    path = run_dir(root, run_id)
     directory = _commands_dir(path)
     if os.path.lexists(directory) and os.path.islink(directory):
         raise DeliberationStoreError("commands inbox is a symbolic link; refusing it")
@@ -401,8 +521,9 @@ def _validate_fresh_args(args) -> None:
         raise ValueError(
             f"a seat cannot have both text-only and full-authority consent: "
             f"{sorted(overlap)[0]!r}")
-    if args.rounds < 1:
-        raise ValueError("--rounds must be positive")
+    if args.rounds < 1 or args.rounds > _replay.MAX_SCHEDULE_ROUNDS:
+        raise ValueError(
+            f"--rounds must be an integer in 1..{_replay.MAX_SCHEDULE_ROUNDS}")
     if args.quorum is not None:
         from _deliberation import resolve_quorum
         try:
