@@ -28,6 +28,15 @@ jobs:
       - name: Unit tests (installer safety, isolated fake homes)
         run: python tests/test_install.py
 
+      - name: Unit tests (deliberation preview kernel, adapter, scheduler, and CLI)
+        run: >-
+          python -m unittest
+          skills.summon.scripts.test_deliberation_engine
+          skills.summon.scripts.test_deliberation_policy
+          skills.summon.scripts.test_deliberation_adapter
+          skills.summon.scripts.test_deliberation_cli
+          skills.summon.scripts.test_deliberation_scheduler
+
       - name: Doctor runs clean on a bare machine (exit 1 = no backends, still valid JSON)
         shell: bash
         run: |

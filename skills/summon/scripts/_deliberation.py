@@ -522,12 +522,14 @@ class DeliberationEngine:
     def __init__(self, policy: DeliberationPolicy, adapter: DeliberationAdapter,
                  generation: int, durable_append: Callable[[dict], None],
                  *, deadline: float, clock: Callable[[], float],
-                 owner_is_current: Callable[[], bool] = lambda: True) -> None:
+                 owner_is_current: Callable[[], bool] = lambda: True,
+                 cancel_requested: Callable[[], bool] = lambda: False) -> None:
         if generation < 1:
             raise ValueError("generation must be positive")
         self.policy, self.adapter, self.deadline, self.clock = policy, adapter, deadline, clock
         self._append_callback = durable_append
         self._owner_is_current = owner_is_current
+        self._cancel_requested = cancel_requested
         self.state = DeliberationState(generation=generation)
         self.attempts = AttemptLedger(generation, durable_append, owner_is_current)
         self.ballots = BallotBook(policy)
@@ -583,8 +585,24 @@ class DeliberationEngine:
             return NextAction.DONE
         return NextAction.LAUNCH
 
+    def finish_schedule(self, reason: str = "max_rounds") -> None:
+        """Durably close a non-consensus schedule that has no turns left.
+
+        The scheduler, rather than a caller's report projection, owns this
+        terminal transition.  Leaving a bounded run in ``RUNNING`` would make
+        a completed process look resumable even though its fixed schedule was
+        exhausted.
+        """
+        if self.state.status == RunState.RUNNING:
+            self._transition(RunState.UNRESOLVED, reason)
+        elif self.state.status not in TERMINAL_STATES and self.state.status != RunState.WAITING_HUMAN:
+            raise DeliberationError("schedule cannot be finished from its current state")
+
     def run_turn(self, context: TurnContext, attempt_id: str) -> AdapterResult | None:
         if self.next_action() != NextAction.LAUNCH:
+            return None
+        if self._cancel_requested_safely():
+            self._transition(RunState.CANCELLED, "cancelled")
             return None
         if context.decision_id != self.policy.decision_id or context.seat_id not in self.policy.seat_ids:
             raise DeliberationError("turn is outside the immutable schedule")
@@ -609,8 +627,13 @@ class DeliberationEngine:
                     self.state.termination_reason = "ownership_lost"
             raise
 
+        # Capture cancellation at the physical-result boundary.  A callback
+        # may become true inside the provider call; that cancellation must win
+        # over a model ballot that has not yet been durably accepted.
+        cancel_before_finish = self._cancel_requested_safely()
         ballot = None
-        if result.evidence.parser_valid and isinstance(result.structured_output, Mapping):
+        if (not cancel_before_finish and result.evidence.parser_valid and
+                isinstance(result.structured_output, Mapping)):
             ballot = validate_ballot(result.structured_output.get("ballot"), binding, self.policy)
         try:
             self.attempts.finish(token, result.evidence, ballot is not None)
@@ -620,6 +643,10 @@ class DeliberationEngine:
             raise
 
         self._record_advisory_left_behind(result.structured_output)
+
+        if cancel_before_finish or self._cancel_requested_safely():
+            self._transition(RunState.CANCELLED, "cancelled")
+            return result
 
         # Absolute deadline is a safety boundary.  A result returned after it is
         # recorded for audit, but cannot become a decision candidate.
@@ -651,6 +678,14 @@ class DeliberationEngine:
         elif self.attempts.counts["started"] >= self.policy.max_attempts:
             self._transition(RunState.ATTEMPT_BUDGET_EXHAUSTED, "attempt_budget")
         return result
+
+    def _cancel_requested_safely(self) -> bool:
+        try:
+            return bool(self._cancel_requested())
+        except Exception:
+            # An unavailable cancellation channel must not grant the model a
+            # decision.  Fail closed at this boundary.
+            return True
 
     def _record_advisory_left_behind(self, output: Mapping[str, object] | None) -> None:
         if not isinstance(output, Mapping):

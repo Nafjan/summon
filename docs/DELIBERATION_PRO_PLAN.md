@@ -1,15 +1,17 @@
 # Summon Deliberation and Pro Product Plan
 
-Status: preview implementation (scheduler and browser execution still gated)
+Status: preview implementation (live provider scheduler and browser execution still gated)
 Target branch: `codex/deliberation-pro-plan`
 Owner: Summon maintainers
 
 This document is the implementation plan and current safety contract for a new bounded
 agent-deliberation mode and the product boundary it creates for a possible Summon Pro
 distribution. The current branch contains the kernel, durable command/status surface,
-and one-launch adapter seams, but fresh/resume execution remains explicitly blocked
-until the scheduler and participant snapshot wiring are complete. It does not authorize
-a release or a pricing decision.
+one-launch adapter seams, and a fake-only deterministic scheduler. The scheduler is
+deliberately injected and headless: it does not resolve a live roster or contact a
+provider. Fresh and resume execution remain explicitly blocked until durable replay
+plus participant snapshot/provider wiring are separately reviewed. It does not
+authorize a release or a pricing decision.
 
 ## 1. Product decision
 
@@ -513,6 +515,12 @@ real executor's before-spawn hook, exactly one process per committed attempt, di
 retry/fallback/repair paths, snapshot revalidation, single-use launch tokens, and no
 raw argv or prompt leakage into journals. No browser, chairman, background, or Pro UI
 work proceeds before this gate.
+
+Current branch evidence: the injected fake-only scheduler and kernel/adapter/CLI tests
+pass locally, including round-robin prompt binding, cancellation/owner fences,
+terminal schedule exhaustion, cleanup handoff, and bounded `LEFT_BEHIND` reporting.
+This is not the P1 exit gate: no live roster resolution, provider execution, replay
+reconstruction, or CLI fresh/resume path is enabled yet.
 
 ### P2: decision policy
 
