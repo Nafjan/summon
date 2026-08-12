@@ -95,6 +95,65 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaises(replay.ReplayError):
             self.run_replay(records, value=value)
 
+    def test_recovery_transition_seals_the_exact_command_batch(self):
+        value, records = prepared()
+        records.extend([
+            (1, event("human_command", 1, command_id="cmd-1",
+                      sequence=1, action="cancel")),
+            (1, event("state_transition", 1, **{
+                "from": "PREPARED", "to": "CANCELLED",
+                "reason": "human_cancel", "decision_option": None,
+                "recovery_kind": "human_command_eof",
+                "command_batch_sha256": replay.command_batch_sha256((
+                    replay.ReplayCommand("cmd-1", 1, "cancel"),)),
+            })),
+        ])
+        checkpoint = self.run_replay(records, value=value)
+        self.assertEqual(checkpoint.status, "CANCELLED")
+        self.assertEqual(checkpoint.applied_command_ids, ("cmd-1",))
+
+    def test_recovery_transition_batch_mutation_is_rejected(self):
+        value, records = prepared()
+        records.extend([
+            (1, event("human_command", 1, command_id="cmd-1",
+                      sequence=1, action="cancel")),
+            (1, event("state_transition", 1, **{
+                "from": "PREPARED", "to": "CANCELLED",
+                "reason": "human_cancel", "decision_option": None,
+                "recovery_kind": "human_command_eof",
+                "command_batch_sha256": "0" * 64,
+            })),
+        ])
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+
+    def test_recovery_metadata_must_be_all_or_none(self):
+        value, records = prepared()
+        records.extend([
+            (1, event("human_command", 1, command_id="cmd-1",
+                      sequence=1, action="cancel")),
+            (1, event("state_transition", 1, **{
+                "from": "PREPARED", "to": "CANCELLED",
+                "reason": "human_cancel", "decision_option": None,
+                "recovery_kind": "human_command_eof",
+            })),
+        ])
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+
+    def test_prepared_human_cancel_requires_recovery_metadata(self):
+        value, records = prepared()
+        records.extend([
+            (1, event("human_command", 1, command_id="cmd-1",
+                      sequence=1, action="cancel")),
+            (1, event("state_transition", 1, **{
+                "from": "PREPARED", "to": "CANCELLED",
+                "reason": "human_cancel", "decision_option": None,
+            })),
+        ])
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+
     def test_receipt_is_snapshotted_before_policy_and_hash_reads(self):
         class StatefulReceipt(dict):
             def __init__(self, value):

@@ -246,7 +246,8 @@ def _freeze(value: object) -> object:
 
 _TRANSCRIPT_FIELDS = {
     "state_transition": ("event", "schema_version", "generation", "from", "to",
-                          "reason", "decision_option"),
+                          "reason", "decision_option", "recovery_kind",
+                          "command_batch_sha256"),
     "turn_prepared": ("event", "schema_version", "generation", "decision_id",
                        "seat_id", "turn_id", "turn_ordinal", "request_digest"),
     "attempt_started": ("event", "schema_version", "generation", "attempt_id",
@@ -276,6 +277,27 @@ def _public_event(record: Mapping[str, object]) -> dict:
     if fields is None:
         raise ReplayError("cannot export unknown replay event")
     return {key: record[key] for key in fields if key in record}
+
+
+def command_batch_sha256(commands: Iterable[ReplayCommand]) -> str:
+    """Hash the exact ordered command batch at a durable EOF boundary.
+
+    Only the stable command identity, sequence, and action participate.  The
+    helper is shared by replay and the owner-bound recovery writer so a
+    recovery transition cannot describe a different batch than the one it
+    follows.  It intentionally accepts the typed replay command rather than
+    arbitrary mappings.
+    """
+    values = []
+    for command in commands:
+        if not isinstance(command, ReplayCommand):
+            raise ReplayError("command batch contains an invalid command")
+        values.append({"command_id": command.command_id,
+                       "sequence": command.sequence,
+                       "action": command.action})
+    if not values:
+        raise ReplayError("command batch is empty")
+    return _sha(values)
 
 
 def replay_checkpoint(receipt: Mapping[str, object],
@@ -400,7 +422,7 @@ def replay_checkpoint(receipt: Mapping[str, object],
             reason = record.get("reason")
             expected_reasons = {
                 ("PREPARED", "RUNNING"): {"started"},
-                ("PREPARED", "CANCELLED"): {"cancelled"},
+                ("PREPARED", "CANCELLED"): {"cancelled", "human_cancel"},
                 ("PREPARED", "TIMED_OUT"): {"deadline"},
                 ("PREPARED", "FAILED"): {"snapshot_drift", "ownership_lost"},
                 ("RUNNING", "WAITING_HUMAN"): {"approval_required"},
@@ -424,6 +446,24 @@ def replay_checkpoint(receipt: Mapping[str, object],
                     raise ReplayError("decided transition lacks an immutable option")
             elif proposed is not None:
                 raise ReplayError("non-decision transition carries a decision option")
+            has_recovery_kind = "recovery_kind" in record
+            has_batch_digest = "command_batch_sha256" in record
+            if has_recovery_kind != has_batch_digest:
+                raise ReplayError("recovery transition metadata is incomplete")
+            recovery_batch_digest = None
+            if has_recovery_kind:
+                if record.get("recovery_kind") != "human_command_eof":
+                    raise ReplayError("recovery transition kind is invalid")
+                if not command_batch:
+                    raise ReplayError("recovery transition has no command batch")
+                recovery_batch_digest = _sha256(
+                    record.get("command_batch_sha256"),
+                    "command batch digest")
+                if recovery_batch_digest != command_batch_sha256(command_batch):
+                    raise ReplayError("recovery transition batch does not match commands")
+            if (source == "PREPARED" and target == "CANCELLED"
+                    and reason == "human_cancel" and not has_recovery_kind):
+                raise ReplayError("prepared human cancellation requires recovery metadata")
             actions = [command.action for command in command_batch]
             if status == "WAITING_HUMAN":
                 if target == "TIMED_OUT" and not actions:

@@ -4,6 +4,11 @@ Status: preview implementation (live provider scheduler and browser execution st
 Target branch: `codex/deliberation-pro-plan`
 Owner: Summon maintainers
 
+Active root goal: deliver the first shippable local deliberation slice through the
+owner-safe headless gate, then add the optional loopback observer/control surface. The
+current UI direction contract is in `docs/DELIBERATION_UI_DESIGN.md`; it is a structural
+Operate design only and does not open browser or provider execution.
+
 This document is the implementation plan and current safety contract for a new bounded
 agent-deliberation mode and the product boundary it creates for a possible Summon Pro
 distribution. The current branch contains the kernel, durable command/status surface,
