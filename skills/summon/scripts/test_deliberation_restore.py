@@ -310,6 +310,44 @@ class EngineRestoreTests(unittest.TestCase):
             self.assertEqual(adapter.calls, [])
             _rundir.release_owner(owner)
 
+    def test_public_restore_accepts_owner_repair_prelude(self) -> None:
+        import time
+        configured = policy()
+        receipt = receipt_for(configured)
+        with tempfile.TemporaryDirectory() as temp:
+            _rundir.atomic_write_json(os.path.join(temp, "receipt.json"), receipt)
+            first = _rundir.acquire_owner(temp, 60.0)
+            _rundir.journal_append(temp, {
+                "event": "run_prepared", "schema_version": 1,
+                "generation": first.generation, "run_id": "run-1",
+                "receipt_sha256": _rundir.content_sha256(receipt),
+            }, owner=first)
+            _rundir.journal_append(temp, {
+                "event": "state_transition", "schema_version": 1,
+                "generation": first.generation, "from": "PREPARED",
+                "to": "RUNNING", "reason": "started",
+                "decision_option": None,
+            }, owner=first)
+            with open(_rundir._journal_path(temp, first.generation), "a",
+                      encoding="utf-8") as stream:
+                stream.write('{"event":"torn')
+            lock_path = os.path.join(temp, _rundir.OWNER_LOCK)
+            lock = json.loads(Path(lock_path).read_text(encoding="utf-8"))
+            lock["lease_expires"] = time.time() - 5
+            Path(lock_path).write_text(json.dumps(lock), encoding="utf-8")
+            owner = _rundir.acquire_owner(temp, 60.0)
+            self.assertTrue(_rundir.journal_repair(temp, owner))
+            tagged, torn = _rundir.journal_read_tagged(temp)
+            self.assertFalse(torn)
+            restored = replay.replay_checkpoint(receipt, tagged[:2], owner.generation)
+            adapter = NoProviderAdapter()
+            engine = DeliberationEngine.restore(
+                restored, configured, adapter, owner=owner, run_dir=temp,
+                deadline=100.0, clock=lambda: 0.0, receipt=receipt)
+            self.assertEqual(engine.state.status, RunState.RUNNING)
+            self.assertEqual(adapter.calls, [])
+            _rundir.release_owner(owner)
+
     def test_stateful_mapping_is_snapshotted_before_digest_and_semantics(self) -> None:
         base = vars(checkpoint())
 
@@ -417,6 +455,25 @@ class EngineRestoreTests(unittest.TestCase):
                     self.assertIsNone(engine.state.decision_option)
                 self.assertEqual(events[-1]["reason"], expected_reason)
                 self.assertEqual(adapter.calls, [])
+
+    def test_consensus_recovery_rejects_pending_work(self) -> None:
+        configured = DeliberationPolicy("decision-1", ("a", "b"),
+                                        ("yes", "no"), 1, 4, False)
+        restored = checkpoint(
+            attempts=(attempt("a0", "a", 0),),
+            ballots=(ballot("a0", "a", 0),),
+            candidate_option="yes",
+            pending_turn=SimpleNamespace(
+                decision_id="decision-1", seat_id="b", turn_id="turn-b-1",
+                turn_ordinal=1, request_digest="b" * 64),
+            next_ordinal=2,
+        )
+        adapter, events = NoProviderAdapter(), []
+        with self.assertRaises(DeliberationError):
+            restore(restored, configured_policy=configured,
+                    adapter=adapter, events=events)
+        self.assertEqual(adapter.calls, [])
+        self.assertEqual(events, [])
 
     def test_terminal_checkpoint_is_refused_without_provider_or_journal_calls(self) -> None:
         for status in ("DECIDED", "FAILED", "CANCELLED"):

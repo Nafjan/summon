@@ -189,6 +189,19 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(checkpoint.candidate_option, "yes")
         self.assertEqual(checkpoint.decision_option, "yes")
 
+    def test_consensus_candidate_must_be_followed_by_its_transition(self):
+        value, records = prepared(quorum=1)
+        records.append((1, event("state_transition", 1, **{
+            "from": "PREPARED", "to": "RUNNING", "reason": "started"})))
+        records.extend(turn_events())
+        # A second turn after a durable quorum ballot is an impossible crash
+        # prefix.  Recovery must not attach it as pending work.
+        records.append((1, event("turn_prepared", 1, decision_id="decision-1",
+                                  seat_id="b", turn_id="turn-b-1", turn_ordinal=1,
+                                  request_digest="b" * 64)))
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+
     def test_decided_without_recomputed_candidate_is_rejected(self):
         value, records = prepared()
         records.extend([

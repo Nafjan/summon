@@ -167,6 +167,10 @@ turn bodies are stored in bounded, owner-generation-fenced message files and ref
 by hash from journal records. A deposed owner must not be able to publish or overwrite
 material after takeover. The existing journal's generation fencing, owner checks,
 checksum validation, newest-tail repair, and fail-closed mid-file behavior are reused.
+The public restore boundary accepts the one `journal_repaired` audit record that owner
+acquisition writes after healing a predecessor tail, then replays only the prior
+generation prefix. Any other current-generation material is refused until a sealed
+resume-prelude contract exists.
 
 Replay consumes tagged `(segment_generation, record)` pairs, not the flat status
 projection. It requires exactly one receipt-bound `run_prepared` record, rejects a

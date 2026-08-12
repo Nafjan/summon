@@ -381,6 +381,13 @@ def replay_checkpoint(receipt: Mapping[str, object],
         if command_batch and event not in {"human_command", "state_transition"}:
             raise ReplayError(
                 "human command batch was not immediately consumed by a transition")
+        # Once a validated ballot produces a unique quorum candidate, the
+        # only legal next durable material is the derived state transition.
+        # Accepting another turn/attempt/ballot here would let a crash prefix
+        # carry contradictory pending work after recovery.
+        if (status == "RUNNING" and current_candidate() is not None and
+                event not in {"state_transition", "candidate_selected"}):
+            raise ReplayError("consensus candidate was not immediately transitioned")
         if status in {"DECIDED", "UNRESOLVED", "REJECTED", "CANCELLED", "TIMED_OUT",
                       "ATTEMPT_BUDGET_EXHAUSTED", "FAILED"} and event not in {
                           "cleanup_receipt", "advisory_left_behind", "journal_repaired"

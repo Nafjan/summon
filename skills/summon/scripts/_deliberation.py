@@ -805,6 +805,27 @@ class DeliberationEngine:
             raise DeliberationError("owner deliberation journal is not readable") from exc
         if torn or not tagged:
             raise DeliberationError("owner deliberation journal is incomplete")
+        # ``journal_repair`` records its audit event in the new owner's
+        # segment after healing the predecessor's torn tail.  That prelude is
+        # not deliberation material and must not be fed to replay (which
+        # intentionally rejects current-generation records).  Accept exactly
+        # one well-formed repair audit and reject every other current-owner
+        # record until a later runtime slice defines a sealed resume prelude.
+        prior_tagged = [(generation, record) for generation, record in tagged
+                        if generation < owner.generation]
+        current_tagged = [(generation, record) for generation, record in tagged
+                          if generation >= owner.generation]
+        if current_tagged:
+            if (len(current_tagged) != 1 or
+                    current_tagged[0][0] != owner.generation or
+                    current_tagged[0][1].get("event") != "journal_repaired" or
+                    current_tagged[0][1].get("generation") != owner.generation or
+                    current_tagged[0][1].get("repaired_generation") !=
+                    max((generation for generation, _record in prior_tagged), default=0)):
+                raise DeliberationError("owner journal has unsupported current-generation material")
+        tagged = prior_tagged
+        if not tagged:
+            raise DeliberationError("owner journal has no prior deliberation prefix")
         prepared = [record for _generation, record in tagged
                      if record.get("event") == "run_prepared"]
         if (len(prepared) != 1 or prepared[0].get("run_id") != disk_receipt.get("run_id")
@@ -993,6 +1014,8 @@ class DeliberationEngine:
             raise DeliberationError("checkpoint candidate differs from restored ballots")
         if status == RunState.WAITING_HUMAN and candidate is None:
             raise DeliberationError("waiting-human checkpoint has no candidate")
+        if status == RunState.RUNNING and candidate is not None and pending_value is not None:
+            raise DeliberationError("consensus checkpoint cannot carry pending work")
         claimed_uncertain = _field(checkpoint, "uncertain_spend")
         if not isinstance(claimed_uncertain, bool):
             raise DeliberationError("checkpoint uncertain-spend flag is invalid")
@@ -1018,6 +1041,8 @@ class DeliberationEngine:
                                     decision_option=candidate)
         pending = pending_value
         if pending is not None:
+            if engine.state.status != RunState.RUNNING:
+                raise DeliberationError("terminal recovery cannot attach pending work")
             try:
                 engine.pending_turn = TurnContext(
                     _field(pending, "decision_id"), _field(pending, "seat_id"),
@@ -1030,7 +1055,7 @@ class DeliberationEngine:
                 engine.pending_turn.seat_id not in policy.seat_ids):
                 raise DeliberationError("checkpoint pending turn is outside policy")
         if (engine.pending_turn is not None and
-                (status != RunState.RUNNING or
+                (engine.state.status != RunState.RUNNING or
                  engine.pending_turn.turn_ordinal + 1 != next_ordinal)):
             raise DeliberationError("checkpoint next ordinal does not follow pending turn")
         engine.next_ordinal = next_ordinal
