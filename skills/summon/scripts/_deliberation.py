@@ -301,12 +301,20 @@ def _restore_digest(checkpoint: object) -> str:
     def object_fields(value: object, names: Sequence[str]) -> dict:
         return {name: _field(value, name) for name in names}
 
+    def thaw(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {str(key): thaw(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [thaw(item) for item in value]
+        return value
+
     attempts = tuple(_field(checkpoint, "attempts", ()) or ())
     ballots = tuple(_field(checkpoint, "ballots", ()) or ())
     pending = _field(checkpoint, "pending_turn")
     payload = {
         "receipt_sha256": _field(checkpoint, "receipt_sha256"),
         "run_id": _field(checkpoint, "run_id"),
+        "policy_digest": _field(checkpoint, "policy_digest"),
         "prior_generation": _field(checkpoint, "prior_generation"),
         "status": _field(checkpoint, "status"),
         "termination_reason": _field(checkpoint, "termination_reason"),
@@ -324,13 +332,101 @@ def _restore_digest(checkpoint: object) -> str:
             pending, ("decision_id", "seat_id", "turn_id", "turn_ordinal",
                       "request_digest"))),
         "next_ordinal": _field(checkpoint, "next_ordinal"),
-        "commands": list(_field(checkpoint, "applied_command_ids", ()) or ()),
-        "command_sequences": list(_field(checkpoint, "applied_command_sequences", ()) or ()),
+        "applied_commands": [object_fields(item, ("command_id", "sequence", "action"))
+                             for item in tuple(_field(checkpoint, "applied_commands", ()) or ())],
+        "pending_commands": [object_fields(item, ("command_id", "sequence", "action"))
+                             for item in tuple(_field(checkpoint, "pending_commands", ()) or ())],
+        "transcript_events": thaw(tuple(
+            _field(checkpoint, "transcript_events", ()) or ())),
         "uncertain_spend": _field(checkpoint, "uncertain_spend"),
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"),
                      ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+def _snapshot_checkpoint(checkpoint: object) -> dict[str, object]:
+    """Read every restore field once so hostile/stateful mappings cannot race validation."""
+    def copy_item(value: object, names: Sequence[str]) -> dict[str, object]:
+        return {name: _field(value, name) for name in names}
+
+    attempts = tuple(_field(checkpoint, "attempts", ()) or ())
+    ballots = tuple(_field(checkpoint, "ballots", ()) or ())
+    applied = tuple(_field(checkpoint, "applied_commands", ()) or ())
+    pending_commands = tuple(_field(checkpoint, "pending_commands", ()) or ())
+    pending_turn = _field(checkpoint, "pending_turn")
+    transcript = tuple(_field(checkpoint, "transcript_events", ()) or ())
+    return {
+        "receipt_sha256": _field(checkpoint, "receipt_sha256"),
+        "run_id": _field(checkpoint, "run_id"),
+        "decision_id": _field(checkpoint, "decision_id"),
+        "policy_digest": _field(checkpoint, "policy_digest"),
+        "prior_generation": _field(checkpoint, "prior_generation"),
+        "status": _field(checkpoint, "status"),
+        "termination_reason": _field(checkpoint, "termination_reason"),
+        "candidate_option": _field(checkpoint, "candidate_option"),
+        "decision_option": _field(checkpoint, "decision_option"),
+        "attempts": tuple(copy_item(item, (
+            "attempt_id", "generation", "decision_id", "seat_id", "turn_id",
+            "turn_ordinal", "launch_spec_digest", "phase", "ballot_valid"))
+                          for item in attempts),
+        "ballots": tuple(copy_item(item, (
+            "decision_id", "seat_id", "turn_id", "attempt_id", "turn_ordinal",
+            "decision", "option_id", "confidence", "evidence_refs"))
+                         for item in ballots),
+        "pending_turn": (None if pending_turn is None else copy_item(
+            pending_turn, ("decision_id", "seat_id", "turn_id", "turn_ordinal",
+                           "request_digest"))),
+        "next_ordinal": _field(checkpoint, "next_ordinal"),
+        "applied_commands": tuple(copy_item(item, ("command_id", "sequence", "action"))
+                                  for item in applied),
+        "pending_commands": tuple(copy_item(item, ("command_id", "sequence", "action"))
+                                  for item in pending_commands),
+        "transcript_events": transcript,
+        "uncertain_spend": _field(checkpoint, "uncertain_spend"),
+        "digest": _field(checkpoint, "digest"),
+    }
+
+
+def _policy_digest(policy: DeliberationPolicy) -> str:
+    payload = {
+        "decision_id": policy.decision_id, "seat_ids": list(policy.seat_ids),
+        "option_ids": list(policy.option_ids), "quorum_rule": policy.quorum_rule,
+        "max_attempts": policy.max_attempts,
+        "require_human_approval": policy.require_human_approval,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _receipt_binding(receipt: Mapping[str, object],
+                     policy: DeliberationPolicy) -> tuple[str, str]:
+    """Canonicalize one verified receipt and bind its exact policy."""
+    if not isinstance(receipt, Mapping):
+        raise DeliberationError("restore requires a verified receipt object")
+    try:
+        raw = json.dumps(receipt, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False).encode("utf-8")
+        snapshot = json.loads(raw.decode("utf-8"))
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise DeliberationError("verified receipt is not canonical JSON") from exc
+    if not isinstance(snapshot, dict):
+        raise DeliberationError("verified receipt is not an object")
+    expected = {
+        "decision_id": policy.decision_id,
+        "seat_ids": list(policy.seat_ids),
+        "option_ids": list(policy.option_ids),
+        "quorum_rule": policy.quorum_rule,
+        "max_attempts": policy.max_attempts,
+        "require_human_approval": policy.require_human_approval,
+    }
+    if (snapshot.get("mode") != "deliberation" or
+            snapshot.get("schema_version") != SCHEMA_VERSION or
+            any(snapshot.get(key) != value for key, value in expected.items())):
+        raise DeliberationError("restore policy differs from the verified receipt")
+    receipt_sha = hashlib.sha256(raw).hexdigest()
+    return receipt_sha, _policy_digest(policy)
 
 
 class AttemptLedger:
@@ -671,25 +767,92 @@ class DeliberationEngine:
 
     @classmethod
     def restore(cls, checkpoint: object, policy: DeliberationPolicy,
-                adapter: DeliberationAdapter, generation: int,
-                durable_append: Callable[[dict], None], *, deadline: float,
-                clock: Callable[[], float],
-                owner_is_current: Callable[[], bool],
+                adapter: DeliberationAdapter, *, owner: object, run_dir: str,
+                deadline: float, clock: Callable[[], float],
+                receipt: Mapping[str, object],
                 cancel_requested: Callable[[], bool] = lambda: False) -> "DeliberationEngine":
-        """Restore validated accounting/state without creating launch authority.
+        """Restore through one indivisible owner/generation/journal binding.
 
         ``checkpoint`` is intentionally duck typed so this pure kernel does not
-        import the replay module.  Restoration performs no adapter or journal
-        calls and does not resume the pending turn.
+        import the replay module.  The owner supplies all three durability
+        capabilities: its generation, its current-owner fence, and its journal
+        segment.  Callers cannot accidentally mix those values across owners.
         """
-        if not callable(owner_is_current):
-            raise TypeError("restore requires an owner callback")
+        import os
+        import _rundir
+        checkpoint = _snapshot_checkpoint(checkpoint)
+        if not isinstance(owner, _rundir.Owner):
+            raise TypeError("restore requires a held rundir Owner")
+        if (not isinstance(run_dir, str) or
+                os.path.normcase(os.path.abspath(run_dir)) !=
+                os.path.normcase(os.path.abspath(owner.run_dir))):
+            raise DeliberationError("restore run directory differs from its owner")
+        # A checkpoint and receipt supplied by a caller are not enough to bind
+        # this operation to the owner.  Verify the owner directory's own
+        # immutable preparation record before any recovery transition can be
+        # appended.  The pure private seam remains available for unit tests;
+        # this public durable entry point is cross-run fenced.
+        disk_receipt = _rundir.read_json(os.path.join(owner.run_dir, "receipt.json"))
+        if not isinstance(disk_receipt, dict):
+            raise DeliberationError("owner run has no valid deliberation receipt")
+        supplied_sha, _ = _receipt_binding(receipt, policy)
+        disk_sha, _ = _receipt_binding(disk_receipt, policy)
+        if supplied_sha != disk_sha:
+            raise DeliberationError("supplied receipt differs from the owner run receipt")
+        try:
+            tagged, torn = _rundir.journal_read_tagged(owner.run_dir)
+        except (_rundir.JournalCorruptError, OSError) as exc:
+            raise DeliberationError("owner deliberation journal is not readable") from exc
+        if torn or not tagged:
+            raise DeliberationError("owner deliberation journal is incomplete")
+        prepared = [record for _generation, record in tagged
+                     if record.get("event") == "run_prepared"]
+        if (len(prepared) != 1 or prepared[0].get("run_id") != disk_receipt.get("run_id")
+                or prepared[0].get("receipt_sha256") != disk_sha):
+            raise DeliberationError("owner journal is not bound to its receipt")
+        # Recompute the immutable checkpoint from the exact on-disk prefix.  A
+        # checkpoint from another run or a caller-mutated projection cannot be
+        # used merely because it shares a policy or generation.
+        try:
+            from _deliberation_replay import replay_checkpoint
+            disk_checkpoint = replay_checkpoint(disk_receipt, tagged, owner.generation)
+        except Exception as exc:  # replay errors are deliberately redacted
+            raise DeliberationError("owner journal cannot reconstruct its checkpoint") from exc
+        if _field(checkpoint, "digest") != disk_checkpoint.digest:
+            raise DeliberationError("checkpoint does not match the owner journal")
+        owner_is_current = lambda: _rundir.owner_still_current(owner)
+        durable_append = lambda event: _rundir.journal_append(
+            owner.run_dir, event, owner=owner)
+        return cls._restore_sealed(
+            checkpoint, policy, adapter, owner.generation, durable_append,
+            deadline=deadline, clock=clock, receipt=receipt,
+            owner_is_current=owner_is_current,
+            cancel_requested=cancel_requested)
+
+    @classmethod
+    def _restore_sealed(cls, checkpoint: object, policy: DeliberationPolicy,
+                        adapter: DeliberationAdapter, generation: int,
+                        durable_append: Callable[[dict], None], *, deadline: float,
+                        clock: Callable[[], float], receipt: Mapping[str, object],
+                        owner_is_current: Callable[[], bool],
+                        cancel_requested: Callable[[], bool]) -> "DeliberationEngine":
+        """Validate replay state after the public owner capabilities are sealed."""
+        checkpoint = _snapshot_checkpoint(checkpoint)
+        receipt_sha256, policy_digest = _receipt_binding(receipt, policy)
         try:
             current = bool(owner_is_current())
         except Exception as exc:
             raise OwnershipLostError("ownership could not be verified for restore") from exc
         if not current:
             raise OwnershipLostError("ownership lost before restore")
+        checkpoint_receipt_sha = _field(checkpoint, "receipt_sha256")
+        if (not isinstance(receipt_sha256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", receipt_sha256)
+                or checkpoint_receipt_sha != receipt_sha256):
+            raise DeliberationError("checkpoint is not bound to the verified receipt")
+        if (_field(checkpoint, "policy_digest") != policy_digest or
+                policy_digest != _policy_digest(policy)):
+            raise DeliberationError("checkpoint policy differs from the verified receipt")
         try:
             status = RunState(_field(checkpoint, "status"))
         except (TypeError, ValueError) as exc:
@@ -701,6 +864,8 @@ class DeliberationEngine:
             raise DeliberationError("checkpoint digest is missing or invalid")
         if status in TERMINAL_STATES:
             raise DeliberationError("terminal checkpoint cannot be restored")
+        if tuple(_field(checkpoint, "pending_commands", ()) or ()):
+            raise DeliberationError("checkpoint has an unconsumed human command batch")
         prior_generation = _field(checkpoint, "prior_generation")
         if (isinstance(prior_generation, bool) or not isinstance(prior_generation, int)
                 or prior_generation < 1 or prior_generation >= generation):
@@ -810,7 +975,7 @@ class DeliberationEngine:
             raise DeliberationError("prepared checkpoint has a decision")
         if status == RunState.PREPARED and (attempts or ballots or pending_value is not None):
             raise DeliberationError("prepared checkpoint has durable execution material")
-        if status == RunState.RUNNING and (claimed_candidate is not None or claimed_decision is not None):
+        if status == RunState.RUNNING and claimed_decision is not None:
             raise DeliberationError("running checkpoint has a decision")
         if status == RunState.WAITING_HUMAN:
             if not policy.require_human_approval or claimed_candidate is None or claimed_decision is not None:
@@ -840,6 +1005,17 @@ class DeliberationEngine:
             termination_reason=termination_reason,
             uncertain_spend=claimed_uncertain,
         )
+        # A crash can leave a valid quorum ballot durable immediately before
+        # the derived state transition.  Reconcile that deterministic boundary
+        # through the current owner before exposing any launch action.  This is
+        # not model synthesis: the candidate was recomputed from validated
+        # ballots above.
+        if status == RunState.RUNNING and candidate is not None:
+            if policy.require_human_approval:
+                engine._transition(RunState.WAITING_HUMAN, "approval_required")
+            else:
+                engine._transition(RunState.DECIDED, "consensus",
+                                    decision_option=candidate)
         pending = pending_value
         if pending is not None:
             try:
@@ -858,6 +1034,9 @@ class DeliberationEngine:
                  engine.pending_turn.turn_ordinal + 1 != next_ordinal)):
             raise DeliberationError("checkpoint next ordinal does not follow pending turn")
         engine.next_ordinal = next_ordinal
+        # Explicit uncertain-spend authorization is a later runtime seam.  A
+        # restored indeterminate attempt is reportable but cannot relaunch.
+        engine._restored_launch_blocked = claimed_uncertain
         return engine
 
     def _append(self, event: dict) -> None:
@@ -902,6 +1081,8 @@ class DeliberationEngine:
                 return NextAction.DONE
             return NextAction.WAIT_FOR_HUMAN
         if self.state.status in TERMINAL_STATES:
+            return NextAction.DONE
+        if getattr(self, "_restored_launch_blocked", False):
             return NextAction.DONE
         if self.clock() >= self.deadline:
             self._transition(RunState.TIMED_OUT, "deadline")

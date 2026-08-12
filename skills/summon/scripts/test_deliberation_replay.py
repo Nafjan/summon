@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -77,6 +78,43 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaises(replay.ReplayError):
             self.run_replay(wrong, value=value)
 
+    def test_receipt_quorum_alias_is_not_an_alternate_schema(self):
+        value, records = prepared()
+        value.pop("quorum_rule")
+        value["quorum"] = "all"
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+
+    def test_receipt_requires_canonical_approval_field(self):
+        value, records = prepared()
+        value.pop("require_human_approval")
+        records[0] = (1, event(
+            "run_prepared", 1, run_id="run-1",
+            receipt_sha256=replay._sha(value),
+        ))
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+
+    def test_receipt_is_snapshotted_before_policy_and_hash_reads(self):
+        class StatefulReceipt(dict):
+            def __init__(self, value):
+                super().__init__(value)
+                self.flipped = False
+
+            def get(self, key, default=None):
+                if key == "seat_ids" and not self.flipped:
+                    self.flipped = True
+                    return ["a", "b"]
+                if self.flipped and key == "seat_ids":
+                    return ["evil", "other"]
+                return super().get(key, default)
+
+        value, records = prepared()
+        # A single canonical snapshot observes the underlying dict consistently;
+        # accessor tricks cannot split policy parsing from the receipt hash.
+        checkpoint = self.run_replay(records, value=StatefulReceipt(value))
+        self.assertEqual(checkpoint.decision_id, "decision-1")
+
     def test_segment_generation_is_authoritative(self):
         value, records = prepared()
         bad = [(2, records[0][1])]
@@ -126,7 +164,7 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaises(replay.ReplayError):
             self.run_replay(records, value=value)
 
-    def test_unmatched_start_is_uncertain_budget_consuming_and_pending(self):
+    def test_unmatched_start_is_uncertain_budget_consuming_and_not_pending(self):
         value, records = prepared()
         records.append((1, event("state_transition", 1, **{
             "from": "PREPARED", "to": "RUNNING", "reason": "started"})))
@@ -135,7 +173,7 @@ class ReplayTests(unittest.TestCase):
         self.assertTrue(checkpoint.uncertain_spend)
         self.assertEqual(checkpoint.attempts[0].phase, "indeterminate")
         self.assertEqual(checkpoint.next_ordinal, 1)
-        self.assertIsNotNone(checkpoint.pending_turn)
+        self.assertIsNone(checkpoint.pending_turn)
 
     def test_candidate_is_recomputed_not_copied_from_candidate_selected(self):
         value, records = prepared()
@@ -242,6 +280,65 @@ class ReplayTests(unittest.TestCase):
             "from": "WAITING_HUMAN", "to": "CANCELLED", "reason": "human_cancel"})))
         checkpoint = self.run_replay(equal, value=value)
         self.assertEqual(checkpoint.status, "CANCELLED")
+        self.assertEqual([(item.sequence, item.action)
+                          for item in checkpoint.applied_commands],
+                         [(1, "cancel"), (1, "approve")])
+        self.assertEqual(checkpoint.pending_commands, ())
+
+    def test_command_crash_prefix_is_pending_and_bound_into_digest(self):
+        value = receipt()
+        value["require_human_approval"] = True
+        records = [(1, event("run_prepared", 1, run_id=value["run_id"],
+                              receipt_sha256=replay._sha(value))),
+                   (1, event("state_transition", 1, **{
+                       "from": "PREPARED", "to": "RUNNING", "reason": "started"}))]
+        records.extend(turn_events(seat="a", turn="turn-a", ordinal=0,
+                                   attempt="g1-a0"))
+        records.extend(turn_events(seat="b", turn="turn-b", ordinal=1,
+                                   attempt="g1-a1"))
+        records.extend([
+            (1, event("state_transition", 1, **{
+                "from": "RUNNING", "to": "WAITING_HUMAN",
+                "reason": "approval_required"})),
+            (1, event("human_command", 1, command_id="cmd-1", sequence=1,
+                      action="cancel")),
+        ])
+        checkpoint = self.run_replay(records, value=value)
+        self.assertEqual(checkpoint.applied_commands, ())
+        self.assertEqual(checkpoint.pending_commands[0].action, "cancel")
+        changed = replace(
+            checkpoint,
+            pending_commands=(replay.ReplayCommand("cmd-1", 1, "approve"),))
+        from _deliberation import _restore_digest
+        self.assertNotEqual(changed.digest, _restore_digest(changed))
+
+    def test_command_batch_requires_contiguous_sequences_and_immediate_transition(self):
+        value, records = prepared()
+        records.append((1, event("state_transition", 1, **{
+            "from": "PREPARED", "to": "RUNNING", "reason": "started"})))
+        gap = records + [(1, event("human_command", 1, command_id="cmd-2",
+                                   sequence=2, action="cancel"))]
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(gap, value=value)
+        intervening = records + [
+            (1, event("human_command", 1, command_id="cmd-1",
+                      sequence=1, action="cancel")),
+            (1, event("journal_repaired", 1, repaired_generation=0)),
+        ]
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(intervening, value=value)
+
+    def test_transition_reason_and_decision_option_match_kernel_boundary(self):
+        value, records = prepared()
+        bad_reason = records + [(1, event("state_transition", 1, **{
+            "from": "PREPARED", "to": "RUNNING", "reason": "consensus"}))]
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(bad_reason, value=value)
+        bad_option = records + [(1, event("state_transition", 1, **{
+            "from": "PREPARED", "to": "CANCELLED", "reason": "cancelled",
+            "decision_option": "yes"}))]
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(bad_option, value=value)
 
     def test_turn_material_cannot_precede_running_transition(self):
         value, records = prepared()

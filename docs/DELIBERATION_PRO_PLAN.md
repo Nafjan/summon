@@ -176,6 +176,25 @@ projection events are never authority: accepted ballots are revalidated and tall
 again. The current slice only returns an immutable checkpoint; it does not claim that
 fresh/resume CLI execution or provider calls are enabled.
 
+Human command replay is boundary-atomic even though the journal is append-only. A
+checkpoint distinguishes immutable commands consumed by the immediately following legal
+state transition from an EOF command batch whose transition was interrupted. Command ids,
+contiguous sequence, actions, transcript projection, policy fingerprint, and both command
+sets are covered by the checkpoint seal. Restore refuses a pending command batch and an
+indeterminate physical start is uncertain spend, not a resumable pending turn. A valid
+recomputed-consensus prefix whose state transition was interrupted is now reconciled by
+the owner-bound restore path: it appends the deterministic `DECIDED/consensus` or
+`WAITING_HUMAN/approval_required` transition before exposing any next action. A pending
+human command batch still needs an explicit owner-bound recovery action; until that
+slice exists, restore refuses it and makes zero provider calls.
+
+Restore is owner-bound: its public entry point derives generation, append destination,
+and current-owner fencing from one `_rundir.Owner`, then verifies that owner's
+`receipt.json` and tagged journal before accepting a checkpoint. It derives the receipt
+hash and policy fingerprint from one canonical receipt snapshot. Before scheduler resume
+can be enabled, the receipt/checkpoint must additionally bind the schedule rounds and a
+cross-process absolute deadline; these values must not be inferred from new CLI defaults.
+
 ### 4.2 State machine
 
 Legal states:
@@ -542,6 +561,12 @@ pass locally, including round-robin prompt binding, cancellation/owner fences,
 terminal schedule exhaustion, cleanup handoff, and bounded `LEFT_BEHIND` reporting.
 This is not the P1 exit gate: no live roster resolution, provider execution, replay
 reconstruction, or CLI fresh/resume path is enabled yet.
+
+Provider integration remains blocked on disposable credential-profile lifecycle evidence.
+Invocation argument construction may create credential profile directories before the
+final launch-control/Popen boundary. A pre-spawn refusal must retain and report those
+directories or clean them with verified handles; cleanup must not claim `clean=true` while
+such pre-launch resources remain.
 
 ### P2: decision policy
 

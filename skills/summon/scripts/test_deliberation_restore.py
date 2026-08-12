@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +22,8 @@ from _deliberation import (  # noqa: E402
     DuplicateAttemptError, ExecutionEvidence, LaunchSpec, LaunchToken,
     NextAction, OwnershipLostError, RunState,
 )
+import _rundir  # noqa: E402
+import _deliberation_replay as replay  # noqa: E402
 
 
 class NoProviderAdapter:
@@ -46,6 +50,16 @@ class NoProviderAdapter:
 def policy(*, max_attempts: int = 4) -> DeliberationPolicy:
     return DeliberationPolicy("decision-1", ("a", "b"), ("yes", "no"),
                               "all", max_attempts, False)
+
+
+def receipt_for(value: DeliberationPolicy) -> dict:
+    return {
+        "mode": "deliberation", "schema_version": 1, "run_id": "run-1",
+        "decision_id": value.decision_id, "seat_ids": list(value.seat_ids),
+        "option_ids": list(value.option_ids), "quorum_rule": value.quorum_rule,
+        "max_attempts": value.max_attempts,
+        "require_human_approval": value.require_human_approval,
+    }
 
 
 def attempt(attempt_id: str, seat_id: str, ordinal: int, *,
@@ -78,12 +92,22 @@ def checkpoint(**changes) -> SimpleNamespace:
     values.update(changes)
     def fields(value, names):
         return {name: getattr(value, name, None) for name in names}
-    values["receipt_sha256"] = "0" * 64
-    values["run_id"] = "run-1"
-    values["applied_command_ids"] = ()
-    values["applied_command_sequences"] = ()
+    default_receipt = receipt_for(policy())
+    values.setdefault("receipt_sha256", hashlib.sha256(json.dumps(
+        default_receipt, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False).encode()).hexdigest())
+    values.setdefault("run_id", "run-1")
+    values.setdefault("policy_digest", hashlib.sha256(json.dumps({
+        "decision_id": "decision-1", "seat_ids": ["a", "b"],
+        "option_ids": ["yes", "no"], "quorum_rule": "all",
+        "max_attempts": 4, "require_human_approval": False,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
+    values.setdefault("applied_commands", ())
+    values.setdefault("pending_commands", ())
+    values.setdefault("transcript_events", ())
     payload = {
         "receipt_sha256": values["receipt_sha256"], "run_id": values["run_id"],
+        "policy_digest": values["policy_digest"],
         "prior_generation": values["prior_generation"], "status": values["status"],
         "termination_reason": values["termination_reason"],
         "candidate_option": values["candidate_option"],
@@ -99,8 +123,13 @@ def checkpoint(**changes) -> SimpleNamespace:
         "pending_turn": (None if values["pending_turn"] is None else fields(
             values["pending_turn"], ("decision_id", "seat_id", "turn_id",
                                       "turn_ordinal", "request_digest"))),
-        "next_ordinal": values["next_ordinal"], "commands": [],
-        "command_sequences": [], "uncertain_spend": values["uncertain_spend"],
+        "next_ordinal": values["next_ordinal"],
+        "applied_commands": [fields(item, ("command_id", "sequence", "action"))
+                             for item in values["applied_commands"]],
+        "pending_commands": [fields(item, ("command_id", "sequence", "action"))
+                             for item in values["pending_commands"]],
+        "transcript_events": list(values["transcript_events"]),
+        "uncertain_spend": values["uncertain_spend"],
     }
     values["digest"] = hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -112,11 +141,44 @@ def restore(value, *, configured_policy=None, owner=lambda: True,
             events=None, adapter=None):
     events = [] if events is None else events
     adapter = NoProviderAdapter() if adapter is None else adapter
-    engine = DeliberationEngine.restore(
-        value, configured_policy or policy(), adapter, 2, events.append,
-        deadline=100.0, clock=lambda: 0.0, owner_is_current=owner,
+    configured = configured_policy or policy()
+    if configured != policy():
+        configured_receipt = receipt_for(configured)
+        receipt_sha = hashlib.sha256(json.dumps(
+            configured_receipt, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False).encode()).hexdigest()
+        if isinstance(value, dict):
+            value["receipt_sha256"] = receipt_sha
+        else:
+            value.receipt_sha256 = receipt_sha
+        policy_sha = hashlib.sha256(json.dumps({
+            "decision_id": configured.decision_id,
+            "seat_ids": list(configured.seat_ids),
+            "option_ids": list(configured.option_ids),
+            "quorum_rule": configured.quorum_rule,
+            "max_attempts": configured.max_attempts,
+            "require_human_approval": configured.require_human_approval,
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if isinstance(value, dict):
+            value["policy_digest"] = policy_sha
+            value["digest"] = _digest_for(value)
+        else:
+            value.policy_digest = policy_sha
+            value.digest = _digest_for(value)
+    configured_receipt = receipt_for(configured)
+    engine = DeliberationEngine._restore_sealed(
+        value, configured, adapter, 2, events.append,
+        deadline=100.0, clock=lambda: 0.0,
+        receipt=configured_receipt,
+        owner_is_current=owner,
+        cancel_requested=lambda: False,
     )
     return engine, adapter, events
+
+
+def _digest_for(value) -> str:
+    from _deliberation import _restore_digest
+    return _restore_digest(value)
 
 
 class AttemptRestoreTests(unittest.TestCase):
@@ -218,6 +280,144 @@ class BallotRestoreTests(unittest.TestCase):
 
 
 class EngineRestoreTests(unittest.TestCase):
+    def test_public_restore_accepts_actual_replay_checkpoint(self) -> None:
+        configured = policy()
+        receipt = receipt_for(configured)
+        with tempfile.TemporaryDirectory() as temp:
+            _rundir.atomic_write_json(os.path.join(temp, "receipt.json"), receipt)
+            first = _rundir.acquire_owner(temp, 60.0)
+            _rundir.journal_append(temp, {
+                "event": "run_prepared", "schema_version": 1,
+                "generation": first.generation, "run_id": "run-1",
+                "receipt_sha256": _rundir.content_sha256(receipt),
+            }, owner=first)
+            _rundir.journal_append(temp, {
+                "event": "state_transition", "schema_version": 1,
+                "generation": first.generation, "from": "PREPARED",
+                "to": "RUNNING", "reason": "started",
+                "decision_option": None,
+            }, owner=first)
+            _rundir.release_owner(first)
+            owner = _rundir.acquire_owner(temp, 60.0)
+            tagged, torn = _rundir.journal_read_tagged(temp)
+            self.assertFalse(torn)
+            restored = replay.replay_checkpoint(receipt, tagged, owner.generation)
+            adapter = NoProviderAdapter()
+            engine = DeliberationEngine.restore(
+                restored, configured, adapter, owner=owner, run_dir=temp,
+                deadline=100.0, clock=lambda: 0.0, receipt=receipt)
+            self.assertEqual(engine.state.status, RunState.RUNNING)
+            self.assertEqual(adapter.calls, [])
+            _rundir.release_owner(owner)
+
+    def test_stateful_mapping_is_snapshotted_before_digest_and_semantics(self) -> None:
+        base = vars(checkpoint())
+
+        class FlippingCheckpoint(dict):
+            def __init__(self, value):
+                super().__init__(value)
+                self.next_reads = 0
+
+            def get(self, key, default=None):
+                if key == "next_ordinal":
+                    self.next_reads += 1
+                    return 0 if self.next_reads == 1 else 99
+                return super().get(key, default)
+
+        engine, adapter, events = restore(FlippingCheckpoint(base))
+        self.assertEqual(engine.next_ordinal, 0)
+        self.assertEqual(adapter.calls, [])
+        self.assertEqual(events, [])
+
+    def test_pending_command_batch_is_refused_before_provider_or_journal(self) -> None:
+        command = SimpleNamespace(command_id="cmd-1", sequence=1, action="cancel")
+        adapter, events = NoProviderAdapter(), []
+        with self.assertRaises(DeliberationError):
+            restore(checkpoint(pending_commands=(command,)),
+                    adapter=adapter, events=events)
+        self.assertEqual(adapter.calls, [])
+        self.assertEqual(events, [])
+
+    def test_policy_digest_rejects_same_decision_with_changed_policy(self) -> None:
+        changed = DeliberationPolicy("decision-1", ("a", "b"), ("yes", "other"),
+                                     "all", 4, False)
+        value = checkpoint()
+        # Even a caller that forges both public seal fields for the substituted
+        # policy cannot make it match the independently supplied receipt.
+        value.policy_digest = hashlib.sha256(json.dumps({
+            "decision_id": changed.decision_id,
+            "seat_ids": list(changed.seat_ids),
+            "option_ids": list(changed.option_ids),
+            "quorum_rule": changed.quorum_rule,
+            "max_attempts": changed.max_attempts,
+            "require_human_approval": changed.require_human_approval,
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        value.digest = _digest_for(value)
+        with self.assertRaises(DeliberationError):
+            DeliberationEngine._restore_sealed(
+                value, changed, NoProviderAdapter(), 2, lambda event: None,
+                deadline=100.0, clock=lambda: 0.0,
+                receipt=receipt_for(policy()),
+                owner_is_current=lambda: True, cancel_requested=lambda: False)
+
+    def test_transcript_is_part_of_checkpoint_seal(self) -> None:
+        transcript = ({"event": "ballot_accepted", "option_id": "yes"},)
+        value = checkpoint(transcript_events=transcript)
+        value.transcript_events = (
+            {"event": "ballot_accepted", "option_id": "no"},)
+        with self.assertRaises(DeliberationError):
+            restore(value)
+
+    def test_public_restore_binds_generation_append_and_owner_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            first = _rundir.acquire_owner(temp, 60.0)
+            _rundir.release_owner(first)
+            owner = _rundir.acquire_owner(temp, 60.0)
+            value = checkpoint()
+            adapter = NoProviderAdapter()
+            # An empty or foreign run cannot receive a checkpoint from another
+            # run, even when its owner generation happens to match.
+            with self.assertRaises(DeliberationError):
+                DeliberationEngine.restore(
+                    value, policy(), adapter, owner=owner, run_dir=temp,
+                    deadline=100.0, clock=lambda: 0.0,
+                    receipt=receipt_for(policy()))
+            _rundir.release_owner(owner)
+            self.assertEqual(adapter.calls, [])
+
+    def test_consensus_crash_prefix_is_recovered_before_any_launch(self) -> None:
+        import _deliberation_replay as replay
+        from test_deliberation_replay import event, prepared, turn_events
+        for approval, expected_state, expected_reason in (
+                (False, RunState.DECIDED, "consensus"),
+                (True, RunState.WAITING_HUMAN, "approval_required")):
+            with self.subTest(approval=approval):
+                configured = DeliberationPolicy("decision-1", ("a", "b"),
+                                                ("yes", "no"), 1, 4, approval)
+                receipt = receipt_for(configured)
+                value, records = prepared(quorum="all")
+                value["quorum_rule"] = 1
+                value["require_human_approval"] = approval
+                records[0] = (1, event("run_prepared", 1, run_id="run-1",
+                                       receipt_sha256=replay._sha(value)))
+                records.append((1, event("state_transition", 1, **{
+                    "from": "PREPARED", "to": "RUNNING", "reason": "started"})))
+                records.extend(turn_events())
+                checkpoint_value = replay.replay_checkpoint(value, records, 2)
+                adapter, events = NoProviderAdapter(), []
+                engine = DeliberationEngine._restore_sealed(
+                    checkpoint_value, configured, adapter, 2, events.append,
+                    deadline=100.0, clock=lambda: 0.0, receipt=receipt,
+                    owner_is_current=lambda: True, cancel_requested=lambda: False)
+                self.assertEqual(engine.state.status, expected_state)
+                self.assertEqual(engine.state.candidate_option, "yes")
+                if expected_state == RunState.DECIDED:
+                    self.assertEqual(engine.state.decision_option, "yes")
+                else:
+                    self.assertIsNone(engine.state.decision_option)
+                self.assertEqual(events[-1]["reason"], expected_reason)
+                self.assertEqual(adapter.calls, [])
+
     def test_terminal_checkpoint_is_refused_without_provider_or_journal_calls(self) -> None:
         for status in ("DECIDED", "FAILED", "CANCELLED"):
             adapter, events = NoProviderAdapter(), []

@@ -72,6 +72,15 @@ class ReplayBallot:
 
 
 @dataclass(frozen=True)
+class ReplayCommand:
+    """One immutable, operator-authored command at a durable boundary."""
+
+    command_id: str
+    sequence: int
+    action: str
+
+
+@dataclass(frozen=True)
 class ReplayCheckpoint:
     """Immutable, recomputed replay projection.
 
@@ -84,6 +93,7 @@ class ReplayCheckpoint:
     receipt_sha256: str
     run_id: str
     decision_id: str
+    policy_digest: str
     prior_generation: int
     status: str
     termination_reason: str | None
@@ -93,11 +103,19 @@ class ReplayCheckpoint:
     ballots: tuple[ReplayBallot, ...]
     pending_turn: ReplayTurn | None
     next_ordinal: int
-    applied_command_ids: tuple[str, ...]
-    applied_command_sequences: tuple[int, ...]
+    applied_commands: tuple[ReplayCommand, ...]
+    pending_commands: tuple[ReplayCommand, ...]
     transcript_events: tuple[Mapping[str, object], ...]
     uncertain_spend: bool
     digest: str
+
+    @property
+    def applied_command_ids(self) -> tuple[str, ...]:
+        return tuple(command.command_id for command in self.applied_commands)
+
+    @property
+    def applied_command_sequences(self) -> tuple[int, ...]:
+        return tuple(command.sequence for command in self.applied_commands)
 
 
 def _canonical(value: object) -> bytes:
@@ -143,11 +161,18 @@ def _receipt_policy(receipt: Mapping[str, object]) -> tuple[tuple[str, ...], tup
     option_ids = tuple(_id(item, "option id") for item in options)
     if len(set(seat_ids)) != len(seat_ids) or len(set(option_ids)) != len(option_ids):
         raise ReplayError("receipt ids are not unique")
-    quorum = receipt.get("quorum_rule", receipt.get("quorum"))
+    # The durable receipt schema has one spelling.  Accepting an alias here
+    # while another restore boundary requires the canonical key would let a
+    # replayed policy and a restored policy disagree.
+    if "quorum_rule" not in receipt:
+        raise ReplayError("receipt quorum_rule is missing")
+    quorum = receipt.get("quorum_rule")
     if quorum is None:
         raise ReplayError("receipt quorum is missing")
     max_attempts = _int(receipt.get("max_attempts"), "max_attempts", minimum=1)
-    approval = receipt.get("require_human_approval", False)
+    if "require_human_approval" not in receipt:
+        raise ReplayError("receipt require_human_approval is missing")
+    approval = receipt.get("require_human_approval")
     if not isinstance(approval, bool):
         raise ReplayError("receipt approval policy is malformed")
     # Importing the pure kernel is safe and keeps quorum grammar identical to
@@ -158,6 +183,17 @@ def _receipt_policy(receipt: Mapping[str, object]) -> tuple[tuple[str, ...], tup
     except (ImportError, ValueError, TypeError) as exc:
         raise ReplayError("receipt quorum is invalid") from exc
     return seat_ids, option_ids, quorum, max_attempts, approval
+
+
+def _policy_digest(decision_id: str, seat_ids: tuple[str, ...],
+                   option_ids: tuple[str, ...], quorum: object,
+                   max_attempts: int, approval: bool) -> str:
+    return _sha({
+        "decision_id": decision_id, "seat_ids": list(seat_ids),
+        "option_ids": list(option_ids), "quorum_rule": quorum,
+        "max_attempts": max_attempts,
+        "require_human_approval": approval,
+    })
 
 
 def _legal_transition(current: str, target: str) -> bool:
@@ -254,12 +290,17 @@ def replay_checkpoint(receipt: Mapping[str, object],
     """
     if not isinstance(receipt, Mapping):
         raise ReplayError("receipt must be an object")
+    # Snapshot potentially stateful Mapping implementations once.  All policy
+    # parsing and the preparation hash must observe identical receipt bytes.
+    receipt = _record_copy(receipt)
     if receipt.get("mode") != "deliberation" or receipt.get("schema_version") != SCHEMA_VERSION:
         raise ReplayError("receipt mode/schema is invalid")
     run_id = _id(receipt.get("run_id"), "run id")
     decision_id = _id(receipt.get("decision_id"), "decision id")
     seat_ids, option_ids, quorum, max_attempts, approval = _receipt_policy(receipt)
     receipt_sha256 = _sha(receipt)
+    policy_digest = _policy_digest(decision_id, seat_ids, option_ids, quorum,
+                                   max_attempts, approval)
     if not _SHA256_RE.fullmatch(receipt_sha256):  # defensive, keeps type explicit
         raise ReplayError("receipt hash could not be computed")
     current_generation = _int(current_owner_generation, "owner generation", minimum=1)
@@ -320,9 +361,10 @@ def replay_checkpoint(receipt: Mapping[str, object],
     latest_ballot: dict[str, ReplayBallot] = {}
     expected_turn_ordinal = 0
     pending_turn_key: tuple[str, str] | None = None
-    command_ids: list[str] = []
-    command_sequences: list[int] = []
-    command_actions: list[tuple[int, str]] = []
+    command_ids: set[str] = set()
+    applied_commands: list[ReplayCommand] = []
+    command_batch: list[ReplayCommand] = []
+    last_command_sequence = 0
     transcript: list[Mapping[str, object]] = []
 
     def current_candidate() -> str | None:
@@ -336,6 +378,9 @@ def replay_checkpoint(receipt: Mapping[str, object],
 
     for generation, record in records[1:]:
         event = record["event"]
+        if command_batch and event not in {"human_command", "state_transition"}:
+            raise ReplayError(
+                "human command batch was not immediately consumed by a transition")
         if status in {"DECIDED", "UNRESOLVED", "REJECTED", "CANCELLED", "TIMED_OUT",
                       "ATTEMPT_BUDGET_EXHAUSTED", "FAILED"} and event not in {
                           "cleanup_receipt", "advisory_left_behind", "journal_repaired"
@@ -345,7 +390,34 @@ def replay_checkpoint(receipt: Mapping[str, object],
             source, target = record.get("from"), record.get("to")
             if source != status or not isinstance(target, str) or not _legal_transition(status, target):
                 raise ReplayError("illegal deliberation state transition")
-            actions = [action for _sequence, action in command_actions]
+            reason = record.get("reason")
+            expected_reasons = {
+                ("PREPARED", "RUNNING"): {"started"},
+                ("PREPARED", "CANCELLED"): {"cancelled"},
+                ("PREPARED", "TIMED_OUT"): {"deadline"},
+                ("PREPARED", "FAILED"): {"snapshot_drift", "ownership_lost"},
+                ("RUNNING", "WAITING_HUMAN"): {"approval_required"},
+                ("RUNNING", "DECIDED"): {"consensus"},
+                ("RUNNING", "UNRESOLVED"): {"max_rounds"},
+                ("RUNNING", "CANCELLED"): {"cancelled", "human_cancel"},
+                ("RUNNING", "TIMED_OUT"): {"deadline"},
+                ("RUNNING", "ATTEMPT_BUDGET_EXHAUSTED"): {"attempt_budget"},
+                ("RUNNING", "FAILED"): {"snapshot_drift", "adapter_indeterminate",
+                                          "adapter_error", "ownership_lost"},
+                ("WAITING_HUMAN", "DECIDED"): {"human_approved"},
+                ("WAITING_HUMAN", "REJECTED"): {"human_denied"},
+                ("WAITING_HUMAN", "CANCELLED"): {"cancelled", "human_cancel"},
+                ("WAITING_HUMAN", "TIMED_OUT"): {"deadline"},
+            }
+            if reason not in expected_reasons.get((source, target), set()):
+                raise ReplayError("state transition reason does not match its boundary")
+            proposed = record.get("decision_option")
+            if target == "DECIDED":
+                if proposed not in option_ids:
+                    raise ReplayError("decided transition lacks an immutable option")
+            elif proposed is not None:
+                raise ReplayError("non-decision transition carries a decision option")
+            actions = [command.action for command in command_batch]
             if status == "WAITING_HUMAN":
                 if target == "TIMED_OUT" and not actions:
                     pass
@@ -354,23 +426,30 @@ def replay_checkpoint(receipt: Mapping[str, object],
                 elif not actions:
                     raise ReplayError("human-gated transition has no durable command")
                 else:
-                    minimum = min(sequence for sequence, _action in command_actions)
-                    at_boundary = [action for sequence, action in command_actions
-                                   if sequence == minimum]
+                    minimum = min(command.sequence for command in command_batch)
+                    at_boundary = [command.action for command in command_batch
+                                   if command.sequence == minimum]
                     chosen = ("cancel" if "cancel" in at_boundary else
                               "deny" if "deny" in at_boundary else "approve")
                     expected = {"cancel": "CANCELLED", "approve": "DECIDED",
                                 "deny": "REJECTED"}[chosen]
-                    if target != expected:
+                    expected_reason = {"cancel": "human_cancel",
+                                       "approve": "human_approved",
+                                       "deny": "human_denied"}[chosen]
+                    if target != expected or record.get("reason") != expected_reason:
                         raise ReplayError("human command precedence was not honored")
-                    command_actions.clear()
+                    applied_commands.extend(command_batch)
+                    command_batch.clear()
             elif "cancel" in actions:
-                minimum = min(sequence for sequence, _action in command_actions)
-                if target != "CANCELLED" or any(
-                        action != "cancel" for sequence, action in command_actions
-                        if sequence == minimum):
+                minimum = min(command.sequence for command in command_batch)
+                if (target != "CANCELLED" or record.get("reason") != "human_cancel"
+                        or any(command.action != "cancel" for command in command_batch
+                               if command.sequence == minimum)):
                     raise ReplayError("queued human cancellation was not honored")
-                command_actions.clear()
+                applied_commands.extend(command_batch)
+                command_batch.clear()
+            elif command_batch:
+                raise ReplayError("human command batch cannot authorize this transition")
             elif status == "RUNNING" and target == "WAITING_HUMAN":
                 if not approval or current_candidate() is None:
                     raise ReplayError("approval gate opened without policy and consensus")
@@ -381,11 +460,9 @@ def replay_checkpoint(receipt: Mapping[str, object],
                     and current_candidate() is not None):
                 raise ReplayError("a valid consensus was discarded at a terminal boundary")
             status = target
-            reason = record.get("reason")
             if reason not in _SAFE_REASONS:
                 raise ReplayError("state transition reason is not a safe enum")
             termination_reason = reason
-            proposed = record.get("decision_option")
             if proposed is not None:
                 if proposed not in option_ids:
                     raise ReplayError("state transition decision is not an option")
@@ -393,7 +470,7 @@ def replay_checkpoint(receipt: Mapping[str, object],
             transcript.append(_public_event(record))
             continue
         if event == "turn_prepared":
-            if status != "RUNNING" or any(action == "cancel" for _, action in command_actions):
+            if status != "RUNNING" or command_batch:
                 raise ReplayError("turn material appeared outside a running, uncancelled state")
             if any(key in record for key in ("prompt", "question", "cwd", "path",
                                               "argv", "env", "private_prompt")):
@@ -420,7 +497,7 @@ def replay_checkpoint(receipt: Mapping[str, object],
             transcript.append(_public_event(record))
             continue
         if event == "attempt_started":
-            if status != "RUNNING" or any(action == "cancel" for _, action in command_actions):
+            if status != "RUNNING" or command_batch:
                 raise ReplayError("attempt material appeared outside a running, uncancelled state")
             attempt_id = _id(record.get("attempt_id"), "attempt id")
             if attempt_id in attempts:
@@ -514,11 +591,16 @@ def replay_checkpoint(receipt: Mapping[str, object],
                 raise ReplayError("human command action is malformed")
             if action in {"approve", "deny"} and status != "WAITING_HUMAN":
                 raise ReplayError("approval command was issued outside WAITING_HUMAN")
-            if command_id in command_ids or (command_sequences and sequence < command_sequences[-1]):
-                raise ReplayError("human command sequence or id was replayed")
-            command_ids.append(command_id)
-            command_sequences.append(sequence)
-            command_actions.append((sequence, action))
+            if command_id in command_ids:
+                raise ReplayError("human command id was replayed")
+            if ((not command_batch and sequence != last_command_sequence + 1)
+                    or (command_batch and sequence not in {
+                        last_command_sequence, last_command_sequence + 1})):
+                raise ReplayError("human command sequence is not contiguous")
+            command = ReplayCommand(command_id, sequence, action)
+            command_ids.add(command_id)
+            command_batch.append(command)
+            last_command_sequence = sequence
             transcript.append(_public_event(record))
             continue
         if event in {"attempt_finished", "ballot_inert", "cleanup_receipt",
@@ -560,29 +642,35 @@ def replay_checkpoint(receipt: Mapping[str, object],
         raise ReplayError("durable attempts exceed the receipt budget")
     pending = None
     for value in turns.values():
+        # Only a durably prepared turn with no physical start is resumable.
+        # An unmatched start is uncertain spend, never a pending relaunch.
         if not any(attempt.turn_id == value.turn_id and
-                   attempt.turn_ordinal == value.turn_ordinal and
-                   attempt.phase == "finished"
+                   attempt.turn_ordinal == value.turn_ordinal
                    for attempt in attempts.values()):
             pending = value
     uncertain = any(attempt.uncertain for attempt in attempts.values())
     next_ordinal = max(ordinals, default=-1) + 1
     digest_payload = {
         "receipt_sha256": receipt_sha256, "run_id": run_id,
+        "policy_digest": policy_digest,
         "prior_generation": last_generation, "status": status,
         "termination_reason": termination_reason, "candidate_option": candidate,
         "decision_option": decision_option, "attempts": [attempt.__dict__ for attempt in attempts.values()],
         "ballots": [ballot.__dict__ for ballot in accepted],
         "pending_turn": None if pending is None else pending.__dict__,
-        "next_ordinal": next_ordinal, "commands": command_ids,
-        "command_sequences": command_sequences, "uncertain_spend": uncertain,
+        "next_ordinal": next_ordinal,
+        "applied_commands": [command.__dict__ for command in applied_commands],
+        "pending_commands": [command.__dict__ for command in command_batch],
+        "transcript_events": transcript,
+        "uncertain_spend": uncertain,
     }
     checkpoint_digest = _sha(digest_payload)
     return ReplayCheckpoint(
-        receipt_sha256, run_id, decision_id, last_generation, status,
+        receipt_sha256, run_id, decision_id, policy_digest,
+        last_generation, status,
         termination_reason, candidate, decision_option,
         tuple(attempts.values()), tuple(accepted), pending, next_ordinal,
-        tuple(command_ids), tuple(command_sequences),
+        tuple(applied_commands), tuple(command_batch),
         tuple(_freeze(record) for record in transcript),
         uncertain, checkpoint_digest,
     )
