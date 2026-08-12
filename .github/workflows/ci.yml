@@ -39,6 +39,7 @@ jobs:
           skills.summon.scripts.test_deliberation_roster
           skills.summon.scripts.test_deliberation_invocation
           skills.summon.scripts.test_deliberation_replay
+          skills.summon.scripts.test_deliberation_restore
 
       - name: Doctor runs clean on a bare machine (exit 1 = no backends, still valid JSON)
         shell: bash

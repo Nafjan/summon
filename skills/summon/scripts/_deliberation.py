@@ -271,15 +271,74 @@ class DeliberationAdapter(Protocol):
 
 @dataclass
 class _AttemptEntry:
-    token: LaunchToken
+    # Restored physical attempts are accounting evidence, never capabilities.
+    # Only commit() may create a launch token.
+    token: LaunchToken | None
     phase: str
+
+
+def _field(value: object, name: str, default: object = None) -> object:
+    """Read one field from a replay dataclass or a mapping without importing it."""
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+# Keep restore's public state projection on the same bounded vocabulary as
+# journal replay.  A restored reason is eventually observable in envelopes, so
+# accepting arbitrary text here would turn the restore boundary into a private
+# path/secret exfiltration channel.
+_SAFE_TERMINATION_REASONS = frozenset({
+    "started", "deadline", "attempt_budget", "max_rounds", "cancelled",
+    "snapshot_drift", "adapter_indeterminate", "adapter_error",
+    "approval_required", "consensus", "human_cancel", "human_denied",
+    "human_approved", "ownership_lost", "max_attempts", "timeout",
+})
+
+
+def _restore_digest(checkpoint: object) -> str:
+    """Recompute the replay checkpoint seal without importing the replay module."""
+    def object_fields(value: object, names: Sequence[str]) -> dict:
+        return {name: _field(value, name) for name in names}
+
+    attempts = tuple(_field(checkpoint, "attempts", ()) or ())
+    ballots = tuple(_field(checkpoint, "ballots", ()) or ())
+    pending = _field(checkpoint, "pending_turn")
+    payload = {
+        "receipt_sha256": _field(checkpoint, "receipt_sha256"),
+        "run_id": _field(checkpoint, "run_id"),
+        "prior_generation": _field(checkpoint, "prior_generation"),
+        "status": _field(checkpoint, "status"),
+        "termination_reason": _field(checkpoint, "termination_reason"),
+        "candidate_option": _field(checkpoint, "candidate_option"),
+        "decision_option": _field(checkpoint, "decision_option"),
+        "attempts": [object_fields(item, (
+            "attempt_id", "generation", "decision_id", "seat_id", "turn_id",
+            "turn_ordinal", "launch_spec_digest", "phase", "ballot_valid"))
+                     for item in attempts],
+        "ballots": [object_fields(item, (
+            "decision_id", "seat_id", "turn_id", "attempt_id", "turn_ordinal",
+            "decision", "option_id", "confidence", "evidence_refs"))
+                    for item in ballots],
+        "pending_turn": (None if pending is None else object_fields(
+            pending, ("decision_id", "seat_id", "turn_id", "turn_ordinal",
+                      "request_digest"))),
+        "next_ordinal": _field(checkpoint, "next_ordinal"),
+        "commands": list(_field(checkpoint, "applied_command_ids", ()) or ()),
+        "command_sequences": list(_field(checkpoint, "applied_command_sequences", ()) or ()),
+        "uncertain_spend": _field(checkpoint, "uncertain_spend"),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
 class AttemptLedger:
     """Thread-safe durable-before-launch and single-use attempt accounting."""
 
     def __init__(self, generation: int, durable_append: Callable[[dict], None],
-                 owner_is_current: Callable[[], bool] = lambda: True) -> None:
+                 owner_is_current: Callable[[], bool] = lambda: True,
+                 *, restored_entries: Iterable[object] = ()) -> None:
         if generation < 1:
             raise ValueError("generation must be positive")
         self.generation = generation
@@ -287,6 +346,32 @@ class AttemptLedger:
         self._owner_is_current = owner_is_current
         self._entries: dict[str, _AttemptEntry] = {}
         self._lock = threading.Lock()
+        for restored in restored_entries:
+            try:
+                phase = _field(restored, "phase")
+                if phase not in {"finished", "indeterminate"}:
+                    raise ValueError("restored attempt phase is invalid")
+                binding = AttemptBinding(
+                    _field(restored, "attempt_id"),
+                    _field(restored, "generation"),
+                    _field(restored, "decision_id"),
+                    _field(restored, "seat_id"),
+                    _field(restored, "turn_id"),
+                    _field(restored, "turn_ordinal"),
+                    _field(restored, "launch_spec_digest",
+                           _field(restored, "launch_spec_sha256")),
+                )
+            except (TypeError, ValueError) as exc:
+                raise DeliberationError("invalid restored attempt") from exc
+            if binding.generation >= generation:
+                raise DeliberationError(
+                    "restored attempt must belong to an earlier owner generation")
+            if binding.attempt_id in self._entries:
+                raise DuplicateAttemptError(
+                    f"restored attempt already exists: {binding.attempt_id}")
+            # Deliberately discard the reconstructed binding after validation:
+            # retaining it must never accidentally become launch authority.
+            self._entries[binding.attempt_id] = _AttemptEntry(None, phase)
 
     def commit(self, spec: LaunchSpec, binding: AttemptBinding) -> LaunchToken:
         if binding.generation != self.generation:
@@ -467,9 +552,54 @@ def validate_ballot(payload: object, binding: AttemptBinding,
 class BallotBook:
     """Latest valid scheduled ballot per fixed seat; duplicates are inert."""
 
-    def __init__(self, policy: DeliberationPolicy) -> None:
+    def __init__(self, policy: DeliberationPolicy,
+                 *, restored_ballots: Iterable[object] = ()) -> None:
         self.policy = policy
         self._latest: dict[str, tuple[int, Ballot]] = {}
+        for restored in restored_ballots:
+            try:
+                ordinal = _field(restored, "turn_ordinal")
+                if (isinstance(ordinal, bool) or not isinstance(ordinal, int)
+                        or ordinal < 0):
+                    raise ValueError("restored ballot ordinal is invalid")
+                decision_id = _field(restored, "decision_id")
+                seat_id = _field(restored, "seat_id")
+                decision = _field(restored, "decision")
+                option_id = _field(restored, "option_id")
+                confidence = _field(restored, "confidence", None) or "low"
+                raw_refs = _field(restored, "evidence_refs", ())
+                if raw_refs is None:
+                    raw_refs = ()
+                if (not isinstance(raw_refs, (tuple, list)) or len(raw_refs) > 32
+                        or any(not isinstance(ref, str) or
+                               len(ref.encode("utf-8")) > 128 for ref in raw_refs)):
+                    raise ValueError("restored ballot evidence refs are invalid")
+                evidence_refs = tuple(raw_refs)
+                ballot = Ballot(
+                    SCHEMA_VERSION, decision_id, seat_id,
+                    _field(restored, "turn_id"),
+                    _field(restored, "attempt_id"), decision, option_id,
+                    confidence, evidence_refs,
+                )
+                if decision_id != policy.decision_id:
+                    raise ValueError("restored ballot decision differs from policy")
+                if decision == "vote":
+                    if option_id not in policy.option_ids:
+                        raise ValueError("restored ballot option is invalid")
+                elif decision in {"abstain", "undecided"}:
+                    if option_id is not None:
+                        raise ValueError("restored non-vote ballot has an option")
+                else:
+                    raise ValueError("restored ballot decision is invalid")
+                if confidence not in {"low", "medium", "high"}:
+                    raise ValueError("restored ballot confidence is invalid")
+                _valid_id(ballot.seat_id, "seat id")
+                _valid_id(ballot.turn_id, "turn id")
+                _valid_id(ballot.attempt_id, "attempt id")
+            except (TypeError, ValueError) as exc:
+                raise DeliberationError("invalid restored ballot") from exc
+            if not self.record(ballot, ordinal):
+                raise DeliberationError("restored ballot is duplicate or out of order")
 
     def record(self, ballot: Ballot, turn_ordinal: int) -> bool:
         if ballot.seat_id not in self.policy.seat_ids:
@@ -534,6 +664,201 @@ class DeliberationEngine:
         self.state = DeliberationState(generation=generation)
         self.attempts = AttemptLedger(generation, durable_append, owner_is_current)
         self.ballots = BallotBook(policy)
+        # Resume wiring is deliberately outside this slice.  A restored pending
+        # turn is inert data until a future scheduler verifies its prompt digest.
+        self.pending_turn: TurnContext | None = None
+        self.next_ordinal = 0
+
+    @classmethod
+    def restore(cls, checkpoint: object, policy: DeliberationPolicy,
+                adapter: DeliberationAdapter, generation: int,
+                durable_append: Callable[[dict], None], *, deadline: float,
+                clock: Callable[[], float],
+                owner_is_current: Callable[[], bool],
+                cancel_requested: Callable[[], bool] = lambda: False) -> "DeliberationEngine":
+        """Restore validated accounting/state without creating launch authority.
+
+        ``checkpoint`` is intentionally duck typed so this pure kernel does not
+        import the replay module.  Restoration performs no adapter or journal
+        calls and does not resume the pending turn.
+        """
+        if not callable(owner_is_current):
+            raise TypeError("restore requires an owner callback")
+        try:
+            current = bool(owner_is_current())
+        except Exception as exc:
+            raise OwnershipLostError("ownership could not be verified for restore") from exc
+        if not current:
+            raise OwnershipLostError("ownership lost before restore")
+        try:
+            status = RunState(_field(checkpoint, "status"))
+        except (TypeError, ValueError) as exc:
+            raise DeliberationError("checkpoint state is invalid") from exc
+        checkpoint_digest = _field(checkpoint, "digest")
+        if (not isinstance(checkpoint_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", checkpoint_digest)
+                or _restore_digest(checkpoint) != checkpoint_digest):
+            raise DeliberationError("checkpoint digest is missing or invalid")
+        if status in TERMINAL_STATES:
+            raise DeliberationError("terminal checkpoint cannot be restored")
+        prior_generation = _field(checkpoint, "prior_generation")
+        if (isinstance(prior_generation, bool) or not isinstance(prior_generation, int)
+                or prior_generation < 1 or prior_generation >= generation):
+            raise DeliberationError("checkpoint generation is not older than the owner")
+        if _field(checkpoint, "decision_id") != policy.decision_id:
+            raise DeliberationError("checkpoint decision differs from policy")
+        attempts = tuple(_field(checkpoint, "attempts", ()) or ())
+        ballots = tuple(_field(checkpoint, "ballots", ()) or ())
+        next_ordinal = _field(checkpoint, "next_ordinal", 0)
+        if (isinstance(next_ordinal, bool) or not isinstance(next_ordinal, int)
+                or next_ordinal < 0):
+            raise DeliberationError("checkpoint next ordinal is invalid")
+        if len(attempts) > policy.max_attempts:
+            raise DeliberationError("checkpoint attempts exceed the policy budget")
+
+        termination_reason = _field(checkpoint, "termination_reason")
+        if status == RunState.PREPARED:
+            if (termination_reason is not None and
+                    termination_reason not in _SAFE_TERMINATION_REASONS):
+                raise DeliberationError("checkpoint termination reason is not a safe enum")
+        elif termination_reason not in _SAFE_TERMINATION_REASONS:
+            raise DeliberationError("checkpoint termination reason is not a safe enum")
+
+        attempt_by_id: dict[str, object] = {}
+        attempt_by_turn: dict[tuple[str, str], object] = {}
+        attempt_ordinals: set[int] = set()
+        for restored in attempts:
+            attempt_id = _field(restored, "attempt_id")
+            if (not isinstance(attempt_id, str) or not _ID_RE.fullmatch(attempt_id)
+                    or attempt_id in attempt_by_id):
+                raise DeliberationError("checkpoint attempt id is invalid or duplicated")
+            attempt_by_id[attempt_id] = restored
+            restored_generation = _field(restored, "generation")
+            if (isinstance(restored_generation, bool)
+                    or not isinstance(restored_generation, int)
+                    or not 1 <= restored_generation <= prior_generation):
+                raise DeliberationError("checkpoint attempt generation is invalid")
+            if _field(restored, "decision_id") != policy.decision_id:
+                raise DeliberationError("checkpoint attempt decision differs from policy")
+            seat_id = _field(restored, "seat_id")
+            turn_id = _field(restored, "turn_id")
+            ordinal = _field(restored, "turn_ordinal")
+            if seat_id not in policy.seat_ids or not isinstance(turn_id, str):
+                raise DeliberationError("checkpoint attempt is outside the policy")
+            if (isinstance(ordinal, bool) or not isinstance(ordinal, int)
+                    or ordinal < 0 or ordinal >= next_ordinal):
+                raise DeliberationError("checkpoint attempt ordinal is invalid")
+            if ordinal in attempt_ordinals:
+                raise DeliberationError("checkpoint reuses a schedule ordinal")
+            attempt_ordinals.add(ordinal)
+            phase = _field(restored, "phase")
+            if phase not in {"finished", "indeterminate"}:
+                raise DeliberationError("checkpoint attempt phase is invalid")
+            turn_key = (seat_id, turn_id)
+            if turn_key in attempt_by_turn:
+                raise DeliberationError("checkpoint has multiple attempts for one turn")
+            attempt_by_turn[turn_key] = restored
+
+        ballot_attempt_ids: set[str] = set()
+        for restored in ballots:
+            attempt_id = _field(restored, "attempt_id")
+            attempt = attempt_by_id.get(attempt_id)
+            if attempt is None or attempt_id in ballot_attempt_ids:
+                raise DeliberationError("checkpoint ballot has no unique matching attempt")
+            if _field(attempt, "phase") != "finished" or _field(attempt, "ballot_valid") is not True:
+                raise DeliberationError("checkpoint ballot is not backed by a valid finished attempt")
+            for name in ("decision_id", "seat_id", "turn_id", "turn_ordinal"):
+                if _field(restored, name) != _field(attempt, name):
+                    raise DeliberationError("checkpoint ballot binding differs from its attempt")
+            ballot_attempt_ids.add(attempt_id)
+
+        pending_value = _field(checkpoint, "pending_turn")
+        pending_key: tuple[str, str] | None = None
+        pending_ordinal: int | None = None
+        if pending_value is not None:
+            pending_key = (_field(pending_value, "seat_id"),
+                           _field(pending_value, "turn_id"))
+            if pending_key in attempt_by_turn:
+                raise DeliberationError("checkpoint pending turn already has a physical attempt")
+            pending_ordinal = _field(pending_value, "turn_ordinal")
+            if (isinstance(pending_ordinal, bool) or not isinstance(pending_ordinal, int)
+                    or pending_ordinal < 0 or pending_ordinal + 1 != next_ordinal):
+                raise DeliberationError("checkpoint pending turn is not the next schedule slot")
+
+        # Replay schedules exactly one physical attempt per prepared turn and
+        # permits at most one unattempted turn at the tail.  Requiring this
+        # shape prevents a forged checkpoint from skipping a turn merely by
+        # increasing next_ordinal or by attaching a distant pending turn.
+        expected_attempt_ordinals = set(range(len(attempts)))
+        if attempt_ordinals != expected_attempt_ordinals:
+            raise DeliberationError("checkpoint attempt ordinals are not contiguous")
+        if pending_ordinal is None:
+            if next_ordinal != len(attempts):
+                raise DeliberationError("checkpoint next ordinal skips an attempt slot")
+        elif (pending_ordinal != len(attempts) or
+              next_ordinal != len(attempts) + 1):
+            raise DeliberationError("checkpoint pending ordinal skips an attempt slot")
+        for restored in ballots:
+            if _field(restored, "turn_ordinal") >= next_ordinal:
+                raise DeliberationError("checkpoint ballot ordinal is beyond the schedule")
+
+        claimed_decision = _field(checkpoint, "decision_option")
+        if claimed_decision is not None and claimed_decision not in policy.option_ids:
+            raise DeliberationError("checkpoint decision is outside policy options")
+        claimed_candidate = _field(checkpoint, "candidate_option")
+        if status == RunState.PREPARED and (claimed_candidate is not None or claimed_decision is not None):
+            raise DeliberationError("prepared checkpoint has a decision")
+        if status == RunState.PREPARED and (attempts or ballots or pending_value is not None):
+            raise DeliberationError("prepared checkpoint has durable execution material")
+        if status == RunState.RUNNING and (claimed_candidate is not None or claimed_decision is not None):
+            raise DeliberationError("running checkpoint has a decision")
+        if status == RunState.WAITING_HUMAN:
+            if not policy.require_human_approval or claimed_candidate is None or claimed_decision is not None:
+                raise DeliberationError("waiting-human checkpoint violates approval policy")
+        engine = cls(policy, adapter, generation, durable_append,
+                     deadline=deadline, clock=clock,
+                     owner_is_current=owner_is_current,
+                     cancel_requested=cancel_requested)
+        engine.attempts = AttemptLedger(
+            generation, durable_append, owner_is_current,
+            restored_entries=attempts)
+        engine.ballots = BallotBook(policy, restored_ballots=ballots)
+        candidate = engine.ballots.candidate()
+        if claimed_candidate != candidate:
+            raise DeliberationError("checkpoint candidate differs from restored ballots")
+        if status == RunState.WAITING_HUMAN and candidate is None:
+            raise DeliberationError("waiting-human checkpoint has no candidate")
+        claimed_uncertain = _field(checkpoint, "uncertain_spend")
+        if not isinstance(claimed_uncertain, bool):
+            raise DeliberationError("checkpoint uncertain-spend flag is invalid")
+        if claimed_uncertain != engine.attempts.uncertain_spend:
+            raise DeliberationError("checkpoint uncertain-spend flag differs from attempts")
+        engine.state = DeliberationState(
+            generation=generation, status=status,
+            candidate_option=candidate,
+            decision_option=_field(checkpoint, "decision_option"),
+            termination_reason=termination_reason,
+            uncertain_spend=claimed_uncertain,
+        )
+        pending = pending_value
+        if pending is not None:
+            try:
+                engine.pending_turn = TurnContext(
+                    _field(pending, "decision_id"), _field(pending, "seat_id"),
+                    _field(pending, "turn_id"), _field(pending, "turn_ordinal"),
+                    _field(pending, "request_digest"),
+                )
+            except (TypeError, ValueError) as exc:
+                raise DeliberationError("checkpoint pending turn is invalid") from exc
+            if (engine.pending_turn.decision_id != policy.decision_id or
+                engine.pending_turn.seat_id not in policy.seat_ids):
+                raise DeliberationError("checkpoint pending turn is outside policy")
+        if (engine.pending_turn is not None and
+                (status != RunState.RUNNING or
+                 engine.pending_turn.turn_ordinal + 1 != next_ordinal)):
+            raise DeliberationError("checkpoint next ordinal does not follow pending turn")
+        engine.next_ordinal = next_ordinal
+        return engine
 
     def _append(self, event: dict) -> None:
         if not self._owner_is_current():

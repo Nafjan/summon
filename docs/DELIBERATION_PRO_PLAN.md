@@ -20,7 +20,10 @@ durable replay plus participant snapshot/provider wiring are separately reviewed
 provider-inert replay slice now validates generation-tagged journal records, receipt
 identity, legal transitions, turn/attempt/ballot bindings, and recomputes consensus
 from accepted ballots; it reports unmatched starts as uncertain spend rather than
-silently retrying them. It does not
+silently retrying them. The kernel now accepts only a sealed, relationally validated
+checkpoint for provider-inert restoration: restored attempts count against budget but
+cannot recreate launch tokens, and pending turns remain inert until a future scheduler
+regenerates and rehashes the prompt. It does not
 authorize a release or a pricing decision.
 
 ## 1. Product decision
