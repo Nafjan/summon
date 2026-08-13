@@ -602,19 +602,22 @@ retry/fallback/repair paths, snapshot revalidation, single-use launch tokens, an
 raw argv or prompt leakage into journals. No browser, chairman, background, or Pro UI
 work proceeds before this gate.
 
-Current branch evidence: the injected fake-only scheduler and kernel/adapter/CLI tests
-pass locally, including round-robin prompt binding, cancellation/owner fences,
-terminal schedule exhaustion, cleanup handoff, bounded `LEFT_BEHIND` reporting, and
-provider-inert crash-prefix reconciliation. The deliberation group is 240/240 green;
-the resume slice is 15/15 and replay/recovery remains mutation-reviewed. This is not
-the P1 exit gate: no live roster resolution, provider execution, or CLI fresh/resume
-path is enabled yet.
+Current branch evidence includes a provider-inert Phase-A composition harness. It binds
+rounds and the absolute deadline to a canonical receipt, requires the same owner, snapshot,
+profile revision, and generation at authorization and immediately before an injected fake
+contact, consumes each launch spec once, and treats an exception after contact becomes
+possible as uncertain spend. Fake resource cleanup uses an injected identity check; a
+replacement or unverifiable resource is quarantined and never passed to the cleanup port.
+Repeated cleanup is idempotent. This harness imports no executor, subprocess, network, PATH,
+or profile-discovery surface and is not wired into the CLI or live scheduler construction.
 
-Provider integration remains blocked on disposable credential-profile lifecycle evidence.
-Invocation argument construction may create credential profile directories before the
-final launch-control/Popen boundary. A pre-spawn refusal must retain and report those
-directories or clean them with verified handles; cleanup must not claim `clean=true` while
-such pre-launch resources remain.
+This is not the P1 exit gate: no live roster/provider execution or CLI fresh/resume path is
+enabled. Live activation still requires an owner-bound factory from the verified on-disk
+receipt/roster, a reviewed mapping from the Phase-A authority into the existing executor
+launch-control and disposable-profile tracking seams, crash injection at every durable
+boundary using a fake executable, and independent adversarial review. HTTP/openai-compat,
+ACP fallback/probes, implicit retries, gates, report repair, ambient provider/profile
+selection, and browser/UI work remain disabled.
 
 ### P2: decision policy
 
