@@ -272,6 +272,14 @@ class FrozenRosterTests(unittest.TestCase):
         self.assertEqual(env.call_count, 1)
         self.assertEqual(snap.seats[0].backend_env_sha256, "a" * 64)
 
+    def test_kimi_environment_revision_is_receipt_evidence(self):
+        with mock.patch.dict(os.environ, {"KIMI_API_KEY": "one"}, clear=False):
+            first = roster._backend_env_digest("kimi")
+        with mock.patch.dict(os.environ, {"KIMI_API_KEY": "two"}, clear=False):
+            second = roster._backend_env_digest("kimi")
+        self.assertIsNotNone(first)
+        self.assertNotEqual(first, second)
+
     def test_no_provider_or_worktree_side_effects(self):
         self.add_agent("worker")
         with mock.patch.object(roster.shutil, "which", return_value=None):

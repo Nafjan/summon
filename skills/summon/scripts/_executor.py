@@ -26,6 +26,10 @@ class ProviderLaunchError(RuntimeError):
     """A controlled provider launch was refused before provider contact."""
 
 
+class ProviderDeadlineError(ProviderLaunchError):
+    """A controlled provider attempt reached its immutable deadline."""
+
+
 class ProviderLaunchControl:
     """Single-use provider boundary used by durable orchestrators.
 
@@ -41,6 +45,7 @@ class ProviderLaunchControl:
                  on_reap: Callable[[object], None] | None = None,
                  on_resource: Callable[[object, str], None] | None = None,
                  cancelled: Callable[[], bool] | None = None,
+                 deadline_reached: Callable[[], bool] | None = None,
                  allow_secondary: bool = False) -> None:
         if not callable(before_launch):
             raise TypeError("before_launch must be callable")
@@ -49,6 +54,7 @@ class ProviderLaunchControl:
         self._on_reap = on_reap
         self._on_resource = on_resource
         self._cancelled = cancelled or (lambda: False)
+        self._deadline_reached = deadline_reached or (lambda: False)
         self.allow_secondary = bool(allow_secondary)
         self._lock = threading.Lock()
         self._claimed = False
@@ -60,6 +66,13 @@ class ProviderLaunchControl:
             raise ProviderLaunchError(
                 f"provider cancellation check failed: {type(exc).__name__}") from exc
 
+    def is_deadline_reached(self) -> bool:
+        try:
+            return bool(self._deadline_reached())
+        except Exception as exc:
+            raise ProviderDeadlineError(
+                f"provider deadline check failed: {type(exc).__name__}") from exc
+
     def before_provider_launch(self, evidence: Mapping[str, object]) -> None:
         """Claim this attempt and run its durable acknowledgement callback."""
         with self._lock:
@@ -67,6 +80,8 @@ class ProviderLaunchControl:
                 raise ProviderLaunchError("provider launch control is single-use")
             if self.is_cancelled():
                 raise ProviderLaunchError("provider launch cancelled before contact")
+            if self.is_deadline_reached():
+                raise ProviderDeadlineError("provider launch deadline exceeded")
             self._claimed = True
         # Keep the callback outside the lock.  The claim remains consumed if it
         # fails, which prevents a second path from retrying an ambiguous attempt.
@@ -2157,6 +2172,21 @@ def _drive_process_loop(
                     return _attach_raw(_error_response(
                         cli, 130, "provider launch cancelled by deliberation",
                         partial_result=processor.get_result()), stdout_lines)
+                try:
+                    if launch_control.is_deadline_reached():
+                        _kill_tree(process)
+                        _drain_to_eof(line_q)
+                        _safe_communicate(process)
+                        return _attach_raw(
+                            _timeout_payload(cli, processor, timeout_ms, stdout_lines),
+                            stdout_lines)
+                except ProviderDeadlineError as exc:
+                    _kill_tree(process)
+                    _drain_to_eof(line_q)
+                    _safe_communicate(process)
+                    return _attach_raw(_error_response(
+                        cli, 1, f"provider deadline check failed ({type(exc).__name__})",
+                        partial_result=processor.get_result()), stdout_lines)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _kill_tree(process)
@@ -2723,6 +2753,11 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             _error_response(inv.cli, 127, f"CLI not found: {command}{_hint}"), None))
     except OSError as e:
         return _stamp(_enrich(_error_response(inv.cli, 1, f"{type(e).__name__}: {e}"), None))
+    except ProviderDeadlineError:
+        _deadline_response = _error_response(
+            inv.cli, 124, "provider launch deadline exceeded", partial_result=None)
+        _deadline_response["timeout"] = True
+        return _stamp(_enrich(_deadline_response, None))
     except Exception as e:
         # The callback is orchestrator-owned and may accidentally carry a
         # secret in its exception text.  Refuse before contact and expose only

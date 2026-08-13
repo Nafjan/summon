@@ -37,6 +37,7 @@ _ENV_PREFIXES = {
     "cursor-agent": ("CURSOR_",),
     "gemini": ("GEMINI_", "GOOGLE_"),
     "agy": ("GEMINI_", "GOOGLE_", "AGY_"),
+    "kimi": ("KIMI_",),
 }
 
 

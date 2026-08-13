@@ -85,6 +85,7 @@ class FreshDispatchAdapter:
         generation: int,
         invocation_for_context: Callable[[TurnContext], AgentInvocation] | None = None,
         cancelled: Callable[[], bool] | None = None,
+        deadline_reached: Callable[[], bool] | None = None,
         parse_output: Callable[[str], Mapping[str, object] | None] | None = None,
         executor: Callable[..., dict] = execute_agent,
         debug_dir: str | None = None,
@@ -134,6 +135,9 @@ class FreshDispatchAdapter:
         self._owner_is_current = owner_is_current
         self._timeout_ms = timeout_ms
         self._cancelled = cancelled or (lambda: False)
+        if deadline_reached is not None and not callable(deadline_reached):
+            raise TypeError("deadline_reached must be callable")
+        self._deadline_reached = deadline_reached or (lambda: False)
         self._parse_output = parse_output or self._parse_json_object
         self._executor = executor
         self._debug_dir = debug_dir
@@ -337,6 +341,7 @@ class FreshDispatchAdapter:
             on_reap=self._on_reap,
             on_resource=self._on_resource,
             cancelled=self._cancelled,
+            deadline_reached=self._deadline_reached,
             allow_secondary=False,
         )
         response = self._executor(

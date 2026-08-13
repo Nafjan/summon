@@ -12,11 +12,12 @@ Operate design only and does not open browser or provider execution.
 This document is the implementation plan and current safety contract for a new bounded
 agent-deliberation mode and the product boundary it creates for a possible Summon Pro
 distribution. The current branch contains the kernel, durable command/status surface,
-one-launch adapter seams, a fake-only deterministic scheduler, a side-effect-free
-frozen-roster resolver, and a provider-inert invocation planner. The scheduler is deliberately injected and headless: it does
-not contact a provider. A controlled subprocess adapter smoke path now exercises one
-fake executable child through the existing executor, but it is integration-test-only: the CLI,
-resume command, and scheduler still refuse to enable live provider turns. The roster
+one-launch adapter seams, a deterministic scheduler, a side-effect-free frozen-roster
+resolver, and a provider-inert invocation planner. The scheduler is deliberately headless.
+A separate receipt-bound live seam now exercises one real controlled subprocess per seat
+through the existing executor, with no retries, fallback, ACP/HTTP, gates, or report repair;
+it is still a direct integration API rather than a CLI/default path. The CLI and resume
+command remain blocked from live provider turns. The roster
 phase loads each definition snapshot once, binds
 role/profile/memory/account/executable evidence, reports effective permission, and
 requires explicit per-seat consent plus disposable worktree evidence for writable or
@@ -24,7 +25,7 @@ full-bypass seats. The invocation planner binds exact prompt bytes to the schedu
 request digest, copies mutable profile state defensively, and revalidates roster and
 worktree evidence before each turn; it creates no worktree, profile, process, provider
 request, or journal event. Fresh and resume execution remain explicitly blocked until
-the full provider lifecycle and scheduler wiring are separately reviewed. A
+the live seam is wired to the durable coordinator. A
 provider-inert replay slice now validates generation-tagged journal records, receipt
 identity, legal transitions, turn/attempt/ballot bindings, and recomputes consensus
 from accepted ballots; it reports unmatched starts as uncertain spend rather than
@@ -611,11 +612,19 @@ replacement or unverifiable resource is quarantined and never passed to the clea
 Repeated cleanup is idempotent. This harness imports no executor, subprocess, network, PATH,
 or profile-discovery surface and is not wired into the CLI or live scheduler construction.
 
-This is not the P1 exit gate: no live roster/provider execution or CLI fresh/resume path is
-enabled. Live activation still requires an owner-bound factory from the verified on-disk
-receipt/roster, a reviewed mapping from the Phase-A authority into the existing executor
-launch-control and disposable-profile tracking seams, crash injection at every durable
-boundary using a fake executable, and independent adversarial review. HTTP/openai-compat,
+The bounded Phase-B live seam is now separately covered by the receipt-bound
+`_deliberation_live` integration API. Its focused contract tests cover 20 live cases and
+22 roster cases, including one controlled subprocess per seat, final owner/snapshot/
+receipt/worktree/deadline fences, cancellation, takeover, duplicate activation, lease
+budget, Kimi environment evidence, and redacted failures. Kimi live activation remains
+disabled until its source credential bytes are receipt-bound. This seam is not a fresh CLI,
+resume, ACP, HTTP, retry, fallback, gate, or report-repair path.
+
+This is not the CLI/resume activation gate: the direct live seam is deliberately narrower
+than the eventual coordinator and still requires owner-bound durable resume wiring,
+crash injection at every
+remaining integration boundary, and independent adversarial review before CLI activation.
+HTTP/openai-compat,
 ACP fallback/probes, implicit retries, gates, report repair, ambient provider/profile
 selection, and browser/UI work remain disabled.
 

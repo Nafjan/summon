@@ -26,7 +26,8 @@ from _deliberation import (AttemptBinding, CleanupReceipt, DeliberationError,
                            SnapshotDriftError, TurnContext)  # noqa: E402
 from _deliberation_adapter import (FreshDispatchAdapter,
                                    SeatMultiplexAdapter)  # noqa: E402
-from _executor import ProviderLaunchControl, ProviderLaunchError  # noqa: E402
+from _executor import (ProviderDeadlineError, ProviderLaunchControl,
+                       ProviderLaunchError)  # noqa: E402
 
 
 SNAPSHOT = "a" * 64
@@ -155,6 +156,24 @@ class AdapterBoundaryTests(unittest.TestCase):
         current[0] = "b" * 64
         with self.assertRaises(SnapshotDriftError):
             adapter.launch(spec, token_for(spec))
+
+    def test_deadline_is_revalidated_at_irreversible_boundary(self):
+        contacted = []
+
+        def executor(inv, **kwargs):
+            kwargs["launch_control"].before_provider_launch(
+                {"backend": inv.cli, "transport": inv.transport})
+            contacted.append(True)
+
+        adapter = FreshDispatchAdapter(
+            self.invocation(), snapshot_digest=SNAPSHOT,
+            current_snapshot_digest=lambda: SNAPSHOT,
+            owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+            deadline_reached=lambda: True, executor=executor)
+        spec = adapter.prepare(turn())
+        with self.assertRaises(ProviderDeadlineError):
+            adapter.launch(spec, token_for(spec))
+        self.assertEqual(contacted, [])
 
     def test_takeover_between_scheduler_claim_and_provider_contact_is_fenced(self):
         owner = [True]
