@@ -4175,7 +4175,7 @@ def test_rundir_id_validation_and_containment():
     import _rundir as rd
     for good in ("council-20260718-1200-ab12", "a", "run.1_x-Y"):
         assert rd.validate_run_id(good) == good
-    for bad in ("", "..", "a..b", "-lead", ".lead", "x" * 65, "a/b", "a\\b",
+    for bad in ("", "..", "a..b", "-lead", ".lead", "x" * 65, "a/b", "a\\b", "a\n",
                 "trailing.", "CON", "con", "NUL.txt", "com7", "LPT9.log", "prn.a.b"):
         try:
             rd.validate_run_id(bad)

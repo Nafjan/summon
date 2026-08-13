@@ -324,6 +324,7 @@ repository-relative examples.
 | `--council-status RUN_ID` | - | Print a council run's durable state, read-only (add `--json`). Subcommand form: `council status <run-id>` |
 | `--deliberate` | - | Start the separate headless deliberation surface. This branch validates the immutable question/policy and refuses fresh execution until the scheduler is wired to the one-attempt adapter; it never silently falls back to council or ordinary dispatch |
 | `--deliberate-resume RUN_ID` | - | Resume a deliberation by id. A durable indeterminate attempt blocks with `uncertain_spend` unless `--retry-indeterminate` is explicit; the current preview remains `integration_pending` until scheduler wiring lands |
+| `--deliberate-recover RUN_ID` | - | Reconcile only journal-proven crash boundaries (sealed human-command batches or receipt-derived consensus) under one owner; zero provider calls; uncertain, legacy-unsealed, or non-deterministic work remains blocked |
 | `--deliberate-status RUN_ID` | - | Read a checksum-verified, journal-derived deliberation status without dispatching an agent |
 | `--deliberate-replay RUN_ID` | - | Read a bounded, checksum-verified deliberation journal replay without dispatching an agent |
 | `--deliberate-cancel RUN_ID` | - | Queue a typed cancellation command through the exclusive run inbox; queued is not claimed as durably applied until the scheduler consumes it |
@@ -368,7 +369,7 @@ with `--prompt-file`; `--question` with `--question-file`; manifest job `prompt`
 consumes only `--question`/`--question-file`, `--members`, `--chairman`, `--rounds`,
 `--cwd`, `--agents-dir`, `--timeout`, `--out`, `--run-dir`, `--results-dir`, `--quorum`,
 `--chairman-fallback`, `--member-timeout`, `--chair-timeout`, `--overall-timeout` and
-`--min-successful-members`; `--deliberate` and its five operation forms consume only
+`--min-successful-members`; `--deliberate` and its six operation forms consume only
 their documented question/policy, seat, consent, run-location, and output flags. Any other dispatch flag passed to these
 modes is rejected up front with a pointer to where the capability lives (per-job manifest
 keys, or the member agent's own definition).

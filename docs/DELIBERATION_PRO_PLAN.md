@@ -225,6 +225,12 @@ cross-process absolute deadline are now receipt-bound and sealed in replay/resto
 provider scheduler remains disabled until it derives its execution bounds from that same
 receipt rather than from new CLI defaults.
 
+The explicit `deliberate recover RUN_ID` command exposes only the provider-inert
+reconciliation boundary. It may repair a newest torn tail and complete a sealed
+human-command or receipt-derived consensus boundary; it never consumes the command
+inbox or invokes an executor. `deliberate resume` remains `integration_pending` until
+the live one-attempt provider adapter and cleanup contract pass their separate gates.
+
 ### 4.2 State machine
 
 Legal states:

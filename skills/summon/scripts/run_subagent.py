@@ -706,6 +706,7 @@ def main() -> None:
     # journal-derived reads, and cancel only queues an exclusive typed command.
     if (getattr(args, "deliberate", False)
             or getattr(args, "deliberate_resume", None)
+            or getattr(args, "deliberate_recover", None)
             or getattr(args, "deliberate_status", None)
             or getattr(args, "deliberate_replay", None)
             or getattr(args, "deliberate_cancel", None)):

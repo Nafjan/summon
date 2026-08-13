@@ -92,7 +92,10 @@ def reconcile_run(root: str, run_id: str, *, lease_sec: float = 600.0) -> dict:
                            error_kind="invalid_run_id")
         if not isinstance(root, str) or not root:
             return _result("blocked", run_id, error_kind="invalid_root")
-        path = _store.run_dir(root, run_id)
+        try:
+            path = _store.run_dir(root, run_id)
+        except (TypeError, ValueError):
+            return _result("blocked", run_id, error_kind="invalid_root")
         if not os.path.isdir(path):
             return _result("blocked", run_id, error_kind="unknown_run")
         if (isinstance(lease_sec, bool) or not isinstance(lease_sec, (int, float))

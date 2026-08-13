@@ -109,12 +109,14 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(command_events), 1)
         batch = command_events[0]
         self.assertEqual(batch["event"], "human_command_batch")
+        self.assertEqual(batch["schema_version"], 1)
         self.assertEqual([item["action"] for item in batch["commands"]],
                          ["approve", "cancel"])
         self.assertRegex(batch["command_batch_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(batch["batch_id"],
                          "batch-" + batch["command_batch_sha256"][:32])
         self.assertEqual(batch["source_generation"], 4)
+        self.assertEqual(events[-1]["schema_version"], 1)
 
     def test_human_approval_decides_candidate(self):
         engine, _, _ = self.make_engine([result("s1", "t1", "a1", "green")],

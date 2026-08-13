@@ -44,7 +44,7 @@ class DeliberationCliTests(unittest.TestCase):
         self.assertEqual(
             _cli.rewrite_subcommand(["deliberate", "--question", "q"]),
             (["--deliberate", "--question", "q"], None))
-        for action in ("resume", "status", "replay", "cancel"):
+        for action in ("resume", "status", "replay", "cancel", "recover"):
             rewritten, mode = _cli.rewrite_subcommand(
                 ["deliberate", action, "run-1", "--json"])
             self.assertEqual(mode, None)
@@ -65,6 +65,12 @@ class DeliberationCliTests(unittest.TestCase):
                  "--options", "yes,no", "--max-attempts", "2", "--deadline", "30s"]
         self.assertIsNone(_cli.unsupported_mode_flags(
             fresh, parser.parse_args(fresh)))
+
+        recover = ["--deliberate-recover", "run-1", "--agent", "reviewer"]
+        args = parser.parse_args(recover)
+        message = _cli.unsupported_mode_flags(recover, args)
+        self.assertIn("--agent", message)
+        self.assertIn("deliberate recover", message)
 
     def test_quorum_parser_preserves_council_integer_and_deliberation_fraction(self) -> None:
         parser = _cli.build_parser("test", 1)
@@ -90,6 +96,54 @@ class DeliberationCliTests(unittest.TestCase):
             self.assertEqual(body["error_kind"], "integration_pending")
             self.assertIn("no provider was called", body["error"])
             self.assertFalse(os.path.exists(run_root))
+
+    def test_recover_subcommand_reconciles_sealed_batch_without_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = os.path.join(temp, "runs")
+            root = os.path.join(base, "deliberations")
+            path, owner = store.initialize_run(root, _receipt("run-recover"))
+            command = {"command_id": "cmd-1", "sequence": 1, "action": "cancel"}
+            typed = (store._replay.ReplayCommand(**command),)
+            digest = store._replay.command_batch_sha256(typed)
+            _rundir.journal_append(path, {
+                "event": "human_command_batch", "schema_version": 1,
+                "generation": owner.generation, "batch_id": "batch-" + digest[:32],
+                "source_generation": owner.generation, "commands": [command],
+                "command_batch_sha256": digest,
+            }, owner=owner)
+            _rundir.release_owner(owner)
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "deliberate", "recover", "run-recover",
+                 "--run-dir", base, "--cwd", temp, "--json"],
+                capture_output=True, text=True, timeout=20)
+            body = json.loads(result.stdout)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(body["status"], "recovered")
+            self.assertEqual(body["decision_status"], "cancelled")
+            self.assertEqual(body["provider_calls"], 0)
+
+    def test_management_commands_do_not_echo_path_like_invalid_ids(self) -> None:
+        parser = _cli.build_parser("test", 1)
+        for flag in ("--deliberate-status", "--deliberate-replay",
+                     "--deliberate-cancel", "--deliberate-resume"):
+            args = parser.parse_args([flag, r"C:\Users\nside\private-project"])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = store.run_command(args)
+            self.assertEqual(code, 1)
+            body = json.loads(output.getvalue())
+            self.assertEqual(body["error_kind"], "validation")
+            self.assertNotIn("private-project", output.getvalue())
+
+    def test_management_unknown_run_redacts_absolute_runs_root(self) -> None:
+        parser = _cli.build_parser("test", 1)
+        args = parser.parse_args(["--deliberate-status", "run-missing",
+                                  "--run-dir", r"C:\Users\nside\private-project"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = store.run_command(args)
+        self.assertEqual(code, 1)
+        self.assertNotIn("private-project", output.getvalue())
 
     def test_consents_are_bound_to_known_non_overlapping_seats(self) -> None:
         parser = _cli.build_parser("test", 1)

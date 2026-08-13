@@ -131,6 +131,8 @@ MODE_FLAGS = {
                      "full_authority_consent", "json", "job_file"},
     "deliberation-resume": {"deliberate_resume", "run_dir", "results_dir", "cwd",
                             "retry_indeterminate", "json", "job_file"},
+    "deliberation-recover": {"deliberate_recover", "run_dir", "results_dir", "cwd",
+                             "json", "job_file"},
     "deliberation-status": {"deliberate_status", "run_dir", "results_dir", "cwd",
                             "json", "job_file"},
     "deliberation-replay": {"deliberate_replay", "run_dir", "results_dir", "cwd",
@@ -165,6 +167,8 @@ MODE_HINTS = {
                      "options, policy, consent, and run-location flags."),
     "deliberation-resume": ("resume takes the run id and may explicitly authorize "
                             "retrying an indeterminate paid attempt."),
+    "deliberation-recover": ("recover completes only deterministic, journal-proven "
+                              "crash boundaries and performs zero provider calls."),
     "deliberation-status": ("status is read-only and accepts only the run id, run "
                             "location, and output format."),
     "deliberation-replay": ("replay is read-only and accepts only the run id, run "
@@ -199,6 +203,8 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "council-status"
     if getattr(args, "deliberate_status", None):
         return "deliberation-status"
+    if getattr(args, "deliberate_recover", None):
+        return "deliberation-recover"
     if getattr(args, "deliberate_replay", None):
         return "deliberation-replay"
     if getattr(args, "deliberate_cancel", None):
@@ -240,6 +246,7 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
         return None
     label = {"council-resume": "council resume", "council-status": "council status",
              "deliberation-resume": "deliberate resume",
+             "deliberation-recover": "deliberate recover",
              "deliberation-status": "deliberate status",
              "deliberation-replay": "deliberate replay",
              "deliberation-cancel": "deliberate cancel",
@@ -272,7 +279,7 @@ Commands:
   manifest  FILE [--concurrency …] [--results-dir D]   run a batch swarm
   council   --question "…" [--members …] [--rounds 2]  decide by consensus
   deliberate --question "…" --seats A,B --options X,Y  bounded agent deliberation
-  deliberate status|replay|cancel RUN_ID               inspect/control a run
+  deliberate status|replay|cancel|recover RUN_ID       inspect/control/recover a run
   deliberate resume RUN_ID [--retry-indeterminate]     resume with spend consent
   agent new NAME [--set k=v …]                    scaffold an agent definition
   agent set NAME  --set k=v …                     retune an agent's frontmatter
@@ -360,12 +367,13 @@ def rewrite_subcommand(argv: list) -> tuple:
             return ["--council-status", rest[1], *rest[2:]], None
         return ["--council", *rest], None
     if head == "deliberate":
-        if rest and rest[0] in ("resume", "status", "replay", "cancel"):
+        if rest and rest[0] in ("resume", "status", "replay", "cancel", "recover"):
             action = rest[0]
             if len(rest) < 2 or rest[1].startswith("-"):
                 return argv, f"error: 'deliberate {action}' needs a run id"
             flag = {
                 "resume": "--deliberate-resume",
+                "recover": "--deliberate-recover",
                 "status": "--deliberate-status",
                 "replay": "--deliberate-replay",
                 "cancel": "--deliberate-cancel",
@@ -641,6 +649,8 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Run a bounded headless deliberation (separate from council)")
     parser.add_argument("--deliberate-resume", dest="deliberate_resume", metavar="RUN_ID",
                         help="Resume a deliberation run by id")
+    parser.add_argument("--deliberate-recover", dest="deliberate_recover", metavar="RUN_ID",
+                        help="Recover deterministic journal boundaries without provider calls")
     parser.add_argument("--deliberate-status", dest="deliberate_status", metavar="RUN_ID",
                         help="Read a deliberation run's journal-derived status")
     parser.add_argument("--deliberate-replay", dest="deliberate_replay", metavar="RUN_ID",

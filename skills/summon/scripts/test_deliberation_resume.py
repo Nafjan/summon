@@ -299,6 +299,9 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(path_like["error_kind"], "invalid_run_id")
         self.assertEqual(path_like["run_id"], "<invalid>")
         self.assertNotIn("private", json.dumps(path_like).lower())
+        rooted = resume.reconcile_run(r"\\?\INVALID::", "run-1")
+        self.assertEqual((rooted["status"], rooted["error_kind"]),
+                         ("blocked", "invalid_root"))
 
     def test_coordinator_acquires_and_releases_exactly_one_identical_owner(self):
         _value, _path, owner = self.create()

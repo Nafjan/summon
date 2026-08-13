@@ -438,6 +438,23 @@ def run_command(args) -> int:
     cwd = os.path.abspath(getattr(args, "cwd", None) or os.getcwd())
     root = runs_root(args, cwd)
     try:
+        # Validate operation identifiers before calling helpers whose detailed
+        # ValueError includes the raw input.  CLI envelopes are public/native
+        # output and must never echo a path-like invalid run id.
+        for attr in ("deliberate_recover", "deliberate_status", "deliberate_replay",
+                     "deliberate_cancel", "deliberate_resume"):
+            candidate = getattr(args, attr, None)
+            if candidate is not None:
+                try:
+                    _rundir.validate_run_id(candidate)
+                except (TypeError, ValueError):
+                    return _error(attr.removeprefix("deliberate_"),
+                                  "invalid run id", kind="validation")
+        if getattr(args, "deliberate_recover", None):
+            from _deliberation_resume import reconcile_run
+            result = reconcile_run(root, args.deliberate_recover)
+            _emit(result, json_mode=bool(args.json))
+            return 0 if result.get("status") not in {"blocked", "error"} else 1
         if getattr(args, "deliberate_status", None):
             _emit(inspect_run(root, args.deliberate_status), json_mode=bool(args.json))
             return 0
@@ -472,7 +489,12 @@ def run_command(args) -> int:
                 "no provider was called",
                 kind="integration_pending", status="blocked")
     except (DeliberationStoreError, ValueError, OSError) as exc:
-        return _error("command", str(exc))
+        message = str(exc)
+        # Management errors may include the configured run root (for example,
+        # an unknown run). Keep the structured diagnostic useful without
+        # exporting a caller's absolute project path.
+        message = message.replace(os.path.abspath(root), "<runs-root>")
+        return _error("command", message)
     return _error("command", "no deliberation operation selected")
 
 

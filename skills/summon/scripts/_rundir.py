@@ -55,7 +55,7 @@ JOURNAL_FILE = "journal.jsonl"
 
 def validate_run_id(run_id: str) -> str:
     """Validate a run/job id BEFORE any filesystem access. Raises ValueError."""
-    if not run_id or not _ID_RE.match(run_id) or ".." in run_id:
+    if not run_id or not _ID_RE.fullmatch(run_id) or ".." in run_id:
         raise ValueError(f"invalid run id: {run_id!r} (letters/digits/._-, max 64, no '..')")
     if run_id[-1] in ".":
         # A trailing dot is silently stripped by Win32 path resolution, so
