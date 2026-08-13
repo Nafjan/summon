@@ -142,10 +142,11 @@ class _AcpClient:
     """
 
     def __init__(self, process: subprocess.Popen, permission: str,
-                 cancelled=None) -> None:
+                 cancelled=None, deadline_reached=None) -> None:
         self._proc = process
         self._permission = permission
         self._cancelled = cancelled or (lambda: False)
+        self._deadline_reached = deadline_reached or (lambda: False)
         self._write_lock = threading.Lock()
         self._id_lock = threading.Lock()
         self._next_id = 1
@@ -251,6 +252,18 @@ class _AcpClient:
                 with self._id_lock:
                     self._pending.pop(rid, None)
                 raise _AcpTimeout(f"{method} cancelled")
+            try:
+                if self._deadline_reached():
+                    with self._id_lock:
+                        self._pending.pop(rid, None)
+                    raise _AcpTimeout(f"{method} deadline exceeded")
+            except _AcpTimeout:
+                raise
+            except Exception as e:
+                with self._id_lock:
+                    self._pending.pop(rid, None)
+                raise _AcpError(
+                    f"{method} deadline check failed ({type(e).__name__})") from e
             if time.monotonic() >= deadline:
                 break
         if not slot["event"].is_set():
@@ -438,7 +451,7 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
                             "subprocess transport's resume, or a fresh run.")
     # Lazy: _builder imports this module's call at dispatch time; importing the
     # executor at module load would create an import cycle.
-    from _executor import _kill_tree, _resolve_launch
+    from _executor import ProviderDeadlineError, _kill_tree, _resolve_launch
 
     if launch_control is None or launch_control.allow_secondary:
         probe_err = _probe_acp(cli)
@@ -493,6 +506,8 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
         return _err(cli, 127, f"CLI not found: {command}")
     except OSError as e:
         return _err(cli, 1, f"{type(e).__name__}: {e}")
+    except ProviderDeadlineError:
+        return _err(cli, 124, "provider launch deadline exceeded")
     except Exception as e:
         return _err(cli, 1,
                     f"provider launch refused by control ({type(e).__name__})")
@@ -531,7 +546,9 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
     deadline = time.monotonic() + timeout_budget_ms / 1000
     client = _AcpClient(
         process, inv.permission,
-        cancelled=(launch_control.is_cancelled if launch_control is not None else None))
+        cancelled=(launch_control.is_cancelled if launch_control is not None else None),
+        deadline_reached=(launch_control.is_deadline_reached
+                          if launch_control is not None else None))
     stage = "initialize"
     try:
         def _remaining() -> float:
