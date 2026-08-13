@@ -288,13 +288,15 @@ class LiveIntegrationTests(unittest.TestCase):
         monotonic = [0.0]
 
         def executor(invocation, **kwargs):
-            contacts.append(True)
             kwargs["launch_control"].before_provider_launch(
                 {"backend": invocation.cli})
-            monotonic[0] = 1_000.0
-            return {"result": json.dumps({
-                "ballot": {"decision": "vote", "option_id": "yes"}
-            }), "exit_code": 0}
+            contacts.append(True)
+            with mock.patch.object(live.time, "time",
+                                   return_value=deadline_ms / 1000 + 1):
+                self.assertTrue(kwargs["launch_control"].is_deadline_reached())
+                return {"result": json.dumps({
+                    "ballot": {"decision": "vote", "option_id": "yes"}
+                }), "exit_code": 0}
 
         report = self.build(owner, receipt=changed, executor=executor,
                             clock=lambda: monotonic[0]).run()

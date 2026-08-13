@@ -504,7 +504,7 @@ release; weighted votes and chairman authority require a separate policy review.
 
 ### Human commands
 
-The CLI and UI may submit typed `message`, `approve`, `deny`, or `cancel` commands. The
+The eventual CLI and UI may submit typed `message`, `approve`, `deny`, or `cancel` commands. The
 handler validates the command, queues it, and acknowledges it only after the scheduler
 durably appends it. The scheduler stamps `actor: human`; submitted text cannot impersonate
 that actor or directly invoke tools.
@@ -518,6 +518,15 @@ The server uses stdlib HTTP on numeric `127.0.0.1` and an ephemeral port. Observ
 fetch-streamed SSE. Human actions use authenticated JSON POST. Native `EventSource` is not
 used because it cannot attach a bearer header; the browser uses `fetch()` with a streaming
 response and the per-run token.
+
+The current reference implementation is `skills/summon/scripts/_deliberation_ui.py`.
+It is an optional direct API (`DeliberationSurface`), not a CLI auto-start or browser
+launcher. It reads the store's redacted snapshot/replay contract, streams bounded SSE
+snapshots, and exposes only a typed cancel queue until the durable coordinator can apply
+approve/deny/message commands. It binds only to numeric loopback, requires an exact Host
+and bearer token, requires an exact Origin for POST, bounds bodies, uses a strict CSP with
+no remote assets, and renders model/journal fields as text. The UI is deliberately
+provider-inert and policy-inert.
 
 Required controls:
 
@@ -613,7 +622,7 @@ Repeated cleanup is idempotent. This harness imports no executor, subprocess, ne
 or profile-discovery surface and is not wired into the CLI or live scheduler construction.
 
 The bounded Phase-B live seam is now separately covered by the receipt-bound
-`_deliberation_live` integration API. Its focused contract tests cover 20 live cases and
+`_deliberation_live` integration API. Its focused contract tests cover 22 live cases and
 22 roster cases, including one controlled subprocess per seat, final owner/snapshot/
 receipt/worktree/deadline fences, cancellation, takeover, duplicate activation, lease
 budget, Kimi environment evidence, and redacted failures. Kimi live activation remains
