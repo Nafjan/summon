@@ -15,7 +15,7 @@ distribution. The current branch contains the kernel, durable command/status sur
 one-launch adapter seams, a fake-only deterministic scheduler, a side-effect-free
 frozen-roster resolver, and a provider-inert invocation planner. The scheduler is deliberately injected and headless: it does
 not contact a provider. A controlled subprocess adapter smoke path now exercises one
-real child through the existing executor, but it is integration-test-only: the CLI,
+fake executable child through the existing executor, but it is integration-test-only: the CLI,
 resume command, and scheduler still refuse to enable live provider turns. The roster
 phase loads each definition snapshot once, binds
 role/profile/memory/account/executable evidence, reports effective permission, and
