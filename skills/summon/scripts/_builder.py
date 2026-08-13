@@ -713,7 +713,8 @@ def _build_gemini_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         inv, perm + model_flag + strip_boundary_flags(inv.cli, inv.extra_args), env=None)
 
 
-def _build_kimi_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
+def _build_kimi_args(inv: AgentInvocation, *, resource_register=None
+                     ) -> tuple[str, list, dict | None]:
     """Build Kimi Code's native JSONL one-shot invocation.
 
     Kimi 0.31's ``--prompt`` runner is deliberately not combined with session,
@@ -726,6 +727,15 @@ def _build_kimi_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         raise ValueError("resume is not supported for the kimi backend yet: its JSONL output does not provide a stable session id")
     model_flag = ["--model", inv.model] if inv.model else []
     profile = _ensure_kimi_profile()
+    if resource_register is not None:
+        # The fresh profile is disposable; resumed/named profiles never reach
+        # this builder path.  Registration is before argv construction so a
+        # later refusal still leaves an adapter-owned cleanup receipt.
+        try:
+            resource_register(profile, "kimi-profile")
+        except Exception as exc:  # noqa: BLE001 - never orphan copied credentials
+            shutil.rmtree(profile, ignore_errors=True)
+            raise ValueError("kimi profile: controlled cleanup registration failed") from exc
     command, base_args = build_command(inv.cli, _concatenated_prompt(inv))
     return (command, model_flag + strip_boundary_flags(inv.cli, inv.extra_args) + base_args,
             {"KIMI_CODE_HOME": profile, "USERPROFILE": profile, "HOME": profile})
@@ -1545,7 +1555,8 @@ def _resume_agy_profile(profile: str | None) -> str:
     return profile
 
 
-def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
+def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
+                    resource_register=None
                     ) -> tuple[str, list, dict | None]:
     # Effective wrapper deadline in seconds: the real request if provided (don't
     # floor to int — keep sub-second precision), else the env/default. Used both
@@ -1590,6 +1601,14 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
         # effects, not after them.
         _reject_oversized_agy_prompt(prompt)
         profile = _ensure_agy_profile(inv.cwd, deadline_sec)
+        if resource_register is not None:
+            # Only freshly-created profiles are registered.  A resume reuses
+            # caller-selected conversation state and is never adapter-deleted.
+            try:
+                resource_register(profile, "agy-profile")
+            except Exception as exc:  # noqa: BLE001 - never orphan copied credentials
+                shutil.rmtree(profile, ignore_errors=True)
+                raise ValueError("agy profile: controlled cleanup registration failed") from exc
         _attest_agy_profile(profile, getattr(inv, "agy_account_sha256", None),
                             getattr(inv, "agy_account_checked", False))
         cont = []
@@ -1705,7 +1724,8 @@ def supports_acp(cli: str) -> bool:
     return bool(b and b.get("acp"))
 
 
-def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None
+def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
+                          resource_register=None
                           ) -> tuple[str, list, dict | None]:
     """Dispatch to a SUBPROCESS backend's argument builder.
 
@@ -1725,7 +1745,11 @@ def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None
     # and --dry-run enforce it identically. The executor surfaces the notes/billing.
     inv, credit_env, _ = apply_credit_guard(inv)
     if inv.cli == "agy":
-        cmd, args, env = _build_agy_args(inv, timeout_ms)
+        cmd, args, env = _build_agy_args(
+            inv, timeout_ms, resource_register=resource_register)
+    elif inv.cli == "kimi" and resource_register is not None:
+        cmd, args, env = _build_kimi_args(
+            inv, resource_register=resource_register)
     else:
         cmd, args, env = b["build"](inv)
     if credit_env:

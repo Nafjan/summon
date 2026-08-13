@@ -12,7 +12,11 @@ from __future__ import annotations
 import hashlib
 import json
 import copy
+import os
+import secrets
+import shutil
 import subprocess
+import tempfile
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -33,6 +37,29 @@ class _PreparedInvocation:
     context: TurnContext
     invocation: AgentInvocation
     prompt_digest: str
+
+
+@dataclass(frozen=True)
+class _TrackedResource:
+    path: str
+    kind: str
+    runs_root: str
+    marker_name: str
+    marker_value: str
+    identity: tuple[int, int]
+
+
+def _profile_runs_root(kind: str) -> str | None:
+    """Return the only disposable profile root controlled by a builder kind."""
+    if kind == "agy-profile":
+        base = os.environ.get("AGY_HEADLESS_PROFILE") or os.path.join(
+            os.path.expanduser("~"), ".agents", "state", "agy-headless-profile")
+    elif kind == "kimi-profile":
+        base = os.environ.get("KIMI_HEADLESS_PROFILE") or os.path.join(
+            tempfile.gettempdir(), "summon-kimi-headless-profile")
+    else:
+        return None
+    return os.path.realpath(os.path.join(base, "runs"))
 
 
 class FreshDispatchAdapter:
@@ -115,6 +142,8 @@ class FreshDispatchAdapter:
         self._launched: set[str] = set()
         self._consumed_specs: set[str] = set()
         self._live_handles: dict[int, object] = {}
+        self._resources: dict[str, _TrackedResource] = {}
+        self._cleanup_started = False
 
     @staticmethod
     def _parse_json_object(text: str) -> Mapping[str, object] | None:
@@ -204,6 +233,62 @@ class FreshDispatchAdapter:
         with self._lock:
             self._live_handles.pop(id(handle), None)
 
+    def _on_resource(self, resource: object, kind: str) -> None:
+        """Capture a builder-created disposable profile without journaling its path."""
+        with self._lock:
+            if self._cleanup_started:
+                raise ValueError("controlled provider resource arrived after cleanup")
+        if not isinstance(resource, str) or not os.path.isabs(resource):
+            raise ValueError("controlled provider resource is not an absolute path")
+        runs_root = _profile_runs_root(kind)
+        real = os.path.realpath(resource)
+        if (runs_root is None or os.path.islink(resource)
+                or not os.path.isdir(real)
+                or os.path.normcase(os.path.dirname(real)) != os.path.normcase(runs_root)
+                or not os.path.basename(real).startswith("run-")):
+            # Never accept a caller-selected profile or an arbitrary path as a
+            # deletion capability.  The error contains no path or credential.
+            raise ValueError("controlled provider resource is not a disposable profile")
+        marker_value = secrets.token_hex(24)
+        marker_name = ".summon-resource-marker-" + secrets.token_hex(12)
+        marker_path = os.path.join(real, marker_name)
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            fd = os.open(marker_path, flags, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="ascii") as marker:
+                    marker.write(marker_value)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            st = os.stat(real, follow_symlinks=False)
+        except Exception as exc:  # noqa: BLE001 - never grant an unmarked delete
+            try:
+                os.unlink(marker_path)
+            except OSError:
+                pass
+            raise ValueError("controlled provider resource marker could not be created") from exc
+        tracked = _TrackedResource(real, kind, runs_root, marker_name,
+                                   marker_value, (int(st.st_dev), int(st.st_ino)))
+        with self._lock:
+            if self._cleanup_started:
+                try:
+                    os.unlink(marker_path)
+                except OSError:
+                    pass
+                raise ValueError("controlled provider resource arrived after cleanup")
+            existing = self._resources.get(real)
+            if existing is not None and existing != tracked:
+                try:
+                    os.unlink(marker_path)
+                except OSError:
+                    pass
+                raise ValueError("controlled provider resource was rebound")
+            self._resources[real] = tracked
+
     def launch(self, spec: LaunchSpec, token: LaunchToken) -> AdapterResult:
         if token.binding.launch_spec_digest != spec.digest:
             raise DeliberationError("launch token does not bind this launch spec")
@@ -239,7 +324,9 @@ class FreshDispatchAdapter:
             # window between AttemptLedger.launch_once() and this callback.
             with self._lock:
                 current = self._prepared.get(spec.digest)
-            if (current is None or not self._owner_is_current()
+                cleanup_started = self._cleanup_started
+            if (current is None or cleanup_started
+                    or not self._owner_is_current()
                     or not self.revalidate(spec, current.context)):
                 raise SnapshotDriftError(
                     "owner or participant snapshot changed at provider launch boundary")
@@ -248,6 +335,7 @@ class FreshDispatchAdapter:
             before_launch=_before_launch,
             on_spawn=self._on_spawn,
             on_reap=self._on_reap,
+            on_resource=self._on_resource,
             cancelled=self._cancelled,
             allow_secondary=False,
         )
@@ -275,8 +363,9 @@ class FreshDispatchAdapter:
                              model_prose=prose)
 
     def cleanup(self) -> CleanupReceipt:
-        """Kill only still-registered process objects; never act on a bare PID."""
+        """Kill/reap handles and remove only validated disposable profiles."""
         with self._lock:
+            self._cleanup_started = True
             handles = list(self._live_handles.values())
         retained: list[str] = []
         for handle in handles:
@@ -294,6 +383,39 @@ class FreshDispatchAdapter:
                 # The executor normally unregisters them in a finally block;
                 # if one remains, report rather than claim cleanup.
                 retained.append("registered-provider-operation:cleanup-unverified")
+        with self._lock:
+            resources = list(self._resources.values())
+        for resource in resources:
+            real = os.path.realpath(resource.path)
+            safe = (not os.path.islink(resource.path)
+                    and os.path.normcase(os.path.dirname(real))
+                    == os.path.normcase(resource.runs_root)
+                    and os.path.basename(real).startswith("run-"))
+            marker_path = os.path.join(real, resource.marker_name)
+            if safe:
+                try:
+                    st = os.stat(real, follow_symlinks=False)
+                    identity_ok = ((int(st.st_dev), int(st.st_ino))
+                                   == resource.identity)
+                    with open(marker_path, "r", encoding="ascii") as marker:
+                        marker_ok = (not os.path.islink(marker_path)
+                                     and marker.read() == resource.marker_value)
+                    safe = identity_ok and marker_ok
+                except (OSError, UnicodeError):
+                    safe = False
+            if not safe:
+                retained.append(f"{resource.kind}:cleanup-unverified")
+                continue
+            try:
+                if os.path.exists(real):
+                    shutil.rmtree(real)
+                if os.path.lexists(real):
+                    raise OSError("profile remains")
+            except Exception:  # noqa: BLE001 - receipt must remain honest
+                retained.append(f"{resource.kind}:cleanup-unverified")
+            else:
+                with self._lock:
+                    self._resources.pop(resource.path, None)
         return CleanupReceipt(verified=not retained,
                               retained_resources=tuple(retained))
 

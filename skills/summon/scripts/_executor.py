@@ -39,6 +39,7 @@ class ProviderLaunchControl:
     def __init__(self, *, before_launch: Callable[[Mapping[str, object]], None],
                  on_spawn: Callable[[object], None] | None = None,
                  on_reap: Callable[[object], None] | None = None,
+                 on_resource: Callable[[object, str], None] | None = None,
                  cancelled: Callable[[], bool] | None = None,
                  allow_secondary: bool = False) -> None:
         if not callable(before_launch):
@@ -46,6 +47,7 @@ class ProviderLaunchControl:
         self._before_launch = before_launch
         self._on_spawn = on_spawn
         self._on_reap = on_reap
+        self._on_resource = on_resource
         self._cancelled = cancelled or (lambda: False)
         self.allow_secondary = bool(allow_secondary)
         self._lock = threading.Lock()
@@ -77,6 +79,22 @@ class ProviderLaunchControl:
     def reaped(self, handle: object) -> None:
         if self._on_reap is not None:
             self._on_reap(handle)
+
+    def register_resource(self, resource: object, kind: str = "provider-resource") -> None:
+        """Register a builder-created disposable resource before provider contact.
+
+        This is deliberately an internal callback, not journal data.  Controlled
+        deliberation adapters use it for per-invocation credential profiles that
+        builders create before the final provider boundary.  Ordinary dispatches
+        never construct a control and therefore never enter this path.
+        """
+        if self._on_resource is None:
+            raise ProviderLaunchError("controlled resource registration is unavailable")
+        if not isinstance(kind, str) or not kind or len(kind) > 64:
+            raise ProviderLaunchError("controlled resource kind is invalid")
+        # Keep the callback outside the launch lock: registration may perform
+        # filesystem validation, but the one-launch claim remains independent.
+        self._on_resource(resource, kind)
 
 # CLI transcripts are model/provider-controlled and can echo credentials from a
 # failed request or a tool response.  Keep this deliberately narrow: redact a
@@ -2595,14 +2613,26 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # timeout_ms is threaded to the builder so agy's wrapper deadline AND its
     # profile-TTL cleanup (which runs during build) both reflect the real request.
     try:
-        command, args, env_override = build_invocation_args(inv, timeout_ms)
-    except ValueError as _build_err:
+        if launch_control is None:
+            # Preserve the historical two-argument hook shape for ordinary
+            # dispatches and project-local test wrappers.
+            command, args, env_override = build_invocation_args(inv, timeout_ms)
+        else:
+            command, args, env_override = build_invocation_args(
+                inv, timeout_ms,
+                resource_register=launch_control.register_resource)
+    except (ValueError, ProviderLaunchError) as _build_err:
         # The dispatcher's contract is ONE JSON envelope on stdout, always. Build-time
         # guards (an oversized agy prompt, a missing ConPTY wrapper) raised straight through
         # execute_agent instead, so a caller parsing stdout got a traceback where an
         # envelope belongs -- and every orchestration path that branches on `status` saw an
         # exception rather than a status to branch on.
-        return _stamp(_enrich(_error_response(inv.cli, 1, str(_build_err)), None))
+        # Controlled builder errors must remain path- and secret-free.  Ordinary
+        # dispatch keeps its historical detail for compatibility; the
+        # deliberation envelope exposes only the exception class.
+        _detail = (f"provider preparation refused ({type(_build_err).__name__})"
+                   if launch_control is not None else str(_build_err))
+        return _stamp(_enrich(_error_response(inv.cli, 1, _detail), None))
     command, args = _resolve_launch(command, args)
     # AFTER _resolve_launch: on Windows a .cmd shim is rewritten to `node <path>/cli.js`,
     # which changes the length that actually gets measured by CreateProcess.

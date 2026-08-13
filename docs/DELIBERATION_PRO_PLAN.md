@@ -14,14 +14,17 @@ agent-deliberation mode and the product boundary it creates for a possible Summo
 distribution. The current branch contains the kernel, durable command/status surface,
 one-launch adapter seams, a fake-only deterministic scheduler, a side-effect-free
 frozen-roster resolver, and a provider-inert invocation planner. The scheduler is deliberately injected and headless: it does
-not contact a provider. The roster phase loads each definition snapshot once, binds
+not contact a provider. A controlled subprocess adapter smoke path now exercises one
+real child through the existing executor, but it is integration-test-only: the CLI,
+resume command, and scheduler still refuse to enable live provider turns. The roster
+phase loads each definition snapshot once, binds
 role/profile/memory/account/executable evidence, reports effective permission, and
 requires explicit per-seat consent plus disposable worktree evidence for writable or
 full-bypass seats. The invocation planner binds exact prompt bytes to the scheduler
 request digest, copies mutable profile state defensively, and revalidates roster and
 worktree evidence before each turn; it creates no worktree, profile, process, provider
 request, or journal event. Fresh and resume execution remain explicitly blocked until
-durable replay plus participant snapshot/provider wiring are separately reviewed. A
+the full provider lifecycle and scheduler wiring are separately reviewed. A
 provider-inert replay slice now validates generation-tagged journal records, receipt
 identity, legal transitions, turn/attempt/ballot bindings, and recomputes consensus
 from accepted ballots; it reports unmatched starts as uncertain spend rather than
@@ -367,7 +370,14 @@ bounded command identity and hash, never raw argv, prompts, environment secrets,
 resolved private paths. A future adapter may support secondary attempts only if each
 is separately prepared, journaled, budget-checked, and single-use. The adapter owns
 process-tree termination, pipe closure, temporary-file cleanup, verified cleanup
-receipts, and retained-resource reporting.
+receipts, and retained-resource reporting. In the controlled subprocess path, agy and
+Kimi fresh credential profiles register with launch control as disposable resources
+before the final provider boundary. The adapter validates that each path is a direct
+`run-*` child of the backend's Summon-owned profile root, removes it during cleanup, and
+reports only a bounded kind label if removal cannot be verified. Named/resumed profiles,
+arbitrary paths, symlinks, and HTTP/API resources are not deletion capabilities. This
+registration is not exposed to ordinary dispatches and does not make the live scheduler
+available.
 
 Deliberation permission policy is explicit per seat. P1 accepts enforceable read-only
 seats and text-only seats only when the caller supplies an explicit, receipt-bound

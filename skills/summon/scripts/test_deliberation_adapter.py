@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -341,6 +342,183 @@ class AdapterBoundaryTests(unittest.TestCase):
         self.assertFalse(receipt.verified)
         self.assertEqual(receipt.retained_resources,
                          ("registered-provider-operation:cleanup-unverified",))
+
+    def test_disposable_profile_is_registered_and_removed_without_path_receipt(self):
+        import _deliberation_adapter as adapter_module
+        with tempfile.TemporaryDirectory() as root:
+            runs = os.path.join(root, "runs")
+            os.makedirs(runs)
+            profile = tempfile.mkdtemp(prefix="run-", dir=runs)
+            with mock.patch.dict(os.environ, {"AGY_HEADLESS_PROFILE": root}, clear=False):
+                adapter = FreshDispatchAdapter(
+                    self.invocation(), snapshot_digest=SNAPSHOT,
+                    current_snapshot_digest=lambda: SNAPSHOT,
+                    owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+                    executor=lambda *args, **kwargs: {})
+                adapter._on_resource(profile, "agy-profile")
+                receipt = adapter.cleanup()
+            self.assertTrue(receipt.clean)
+            self.assertFalse(os.path.exists(profile))
+            self.assertNotIn(root, repr(receipt))
+            self.assertIsNotNone(adapter_module._profile_runs_root("agy-profile"))
+
+    def test_resource_registration_rejects_named_or_outside_profile(self):
+        with tempfile.TemporaryDirectory() as root:
+            outside = os.path.join(root, "named-profile")
+            os.makedirs(outside)
+            adapter = FreshDispatchAdapter(
+                self.invocation(), snapshot_digest=SNAPSHOT,
+                current_snapshot_digest=lambda: SNAPSHOT,
+                owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+                executor=lambda *args, **kwargs: {})
+            with self.assertRaisesRegex(ValueError, "disposable profile"):
+                adapter._on_resource(outside, "agy-profile")
+            self.assertTrue(os.path.isdir(outside))
+
+    def test_replaced_profile_is_not_deleted_by_cleanup(self):
+        with tempfile.TemporaryDirectory() as root:
+            runs = os.path.join(root, "runs")
+            os.makedirs(runs)
+            profile = tempfile.mkdtemp(prefix="run-", dir=runs)
+            adapter = FreshDispatchAdapter(
+                self.invocation(), snapshot_digest=SNAPSHOT,
+                current_snapshot_digest=lambda: SNAPSHOT,
+                owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+                executor=lambda *args, **kwargs: {})
+            with mock.patch.dict(os.environ, {"AGY_HEADLESS_PROFILE": root}, clear=False):
+                adapter._on_resource(profile, "agy-profile")
+            # Simulate a path replacement by another run.  Cleanup must not
+            # turn a stale path into deletion authority for the replacement.
+            shutil.rmtree(profile)
+            os.makedirs(profile)
+            receipt = adapter.cleanup()
+            self.assertFalse(receipt.clean)
+            self.assertTrue(os.path.isdir(profile))
+            self.assertIn("agy-profile:cleanup-unverified",
+                          receipt.retained_resources)
+
+    def test_late_resource_registration_is_rejected_after_cleanup(self):
+        with tempfile.TemporaryDirectory() as root:
+            runs = os.path.join(root, "runs")
+            os.makedirs(runs)
+            profile = tempfile.mkdtemp(prefix="run-", dir=runs)
+            adapter = FreshDispatchAdapter(
+                self.invocation(), snapshot_digest=SNAPSHOT,
+                current_snapshot_digest=lambda: SNAPSHOT,
+                owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+                executor=lambda *args, **kwargs: {})
+            with mock.patch.dict(os.environ, {"AGY_HEADLESS_PROFILE": root}, clear=False):
+                self.assertTrue(adapter.cleanup().clean)
+                with self.assertRaisesRegex(ValueError, "after cleanup"):
+                    adapter._on_resource(profile, "agy-profile")
+            self.assertTrue(os.path.isdir(profile))
+            shutil.rmtree(profile)
+
+    def test_controlled_builder_error_does_not_expose_private_path(self):
+        import _executor as executor_module
+        original = executor_module.build_invocation_args
+        try:
+            executor_module.build_invocation_args = lambda *args, **kwargs: (_ for _ in ()).throw(
+                ValueError(r"PermissionError: C:\Users\nside\private-project\secret"))
+            adapter = FreshDispatchAdapter(
+                replace(self.invocation(), cwd=os.getcwd()),
+                snapshot_digest=SNAPSHOT,
+                current_snapshot_digest=lambda: SNAPSHOT,
+                owner_is_current=lambda: True, timeout_ms=1000, generation=1)
+            context = turn_with_prompt("provider smoke", turn_id="turn-error", ordinal=0)
+            spec = adapter.prepare(context)
+            result = adapter.launch(
+                spec, token_for_context(spec, context, "attempt-error"))
+            self.assertNotIn("private-project", result.model_prose)
+        finally:
+            executor_module.build_invocation_args = original
+
+    def test_control_resource_callback_is_optional_for_legacy_control_users(self):
+        called = []
+        control = ProviderLaunchControl(
+            before_launch=lambda evidence: None,
+            on_resource=lambda path, kind: called.append((path, kind)))
+        control.register_resource("opaque-internal-path", "fixture")
+        self.assertEqual(called, [("opaque-internal-path", "fixture")])
+
+    def test_executor_path_tracks_builder_profile_before_real_subprocess(self):
+        """The controlled bridge owns a builder-created profile on the real Popen path."""
+        import _executor as executor_module
+        with tempfile.TemporaryDirectory() as root:
+            runs = os.path.join(root, "runs")
+            os.makedirs(runs)
+            created = []
+
+            def fake_build(inv, timeout_ms=None, *, resource_register=None):
+                profile = tempfile.mkdtemp(prefix="run-", dir=runs)
+                with open(os.path.join(profile, "credential.txt"), "w",
+                          encoding="utf-8") as fh:
+                    fh.write("PRIVATE-CREDENTIAL")
+                created.append(profile)
+                resource_register(profile, "agy-profile")
+                return sys.executable, [
+                    "-c",
+                    "print('STATUS: DONE\\nSUMMARY: fake\\nFOLLOW-UP: none\\n"
+                    "HANDOFF: none')",
+                ], None
+
+            inv = replace(self.invocation(cli="claude", prompt="provider smoke"),
+                          cwd=os.getcwd())
+            with mock.patch.dict(os.environ, {"AGY_HEADLESS_PROFILE": root}, clear=False), \
+                    mock.patch.object(executor_module, "build_invocation_args",
+                                      side_effect=fake_build):
+                adapter = FreshDispatchAdapter(
+                    inv, snapshot_digest=SNAPSHOT,
+                    current_snapshot_digest=lambda: SNAPSHOT,
+                    owner_is_current=lambda: True, timeout_ms=5000, generation=1)
+                context = turn_with_prompt(
+                    "provider smoke", turn_id="turn-provider", ordinal=0)
+                spec = adapter.prepare(context)
+                result = adapter.launch(
+                    spec, token_for_context(spec, context, "attempt-provider"))
+                receipt = adapter.cleanup()
+            self.assertEqual(result.evidence.exit_code, 0)
+            self.assertTrue(result.evidence.transport_ok)
+            self.assertEqual(len(created), 1)
+            self.assertFalse(os.path.exists(created[0]))
+            self.assertTrue(receipt.clean)
+            self.assertNotIn("PRIVATE-CREDENTIAL", repr(receipt))
+
+    def test_owner_refusal_after_profile_build_still_cleans_profile(self):
+        import _executor as executor_module
+        with tempfile.TemporaryDirectory() as root:
+            runs = os.path.join(root, "runs")
+            os.makedirs(runs)
+            created = []
+            owner = {"current": True}
+
+            def fake_build(inv, timeout_ms=None, *, resource_register=None):
+                profile = tempfile.mkdtemp(prefix="run-", dir=runs)
+                created.append(profile)
+                resource_register(profile, "agy-profile")
+                return sys.executable, ["-c", "print('CONTACT')"], None
+
+            with mock.patch.dict(os.environ, {"AGY_HEADLESS_PROFILE": root}, clear=False), \
+                    mock.patch.object(executor_module, "build_invocation_args",
+                                      side_effect=fake_build):
+                adapter = FreshDispatchAdapter(
+                    replace(self.invocation(cli="claude", prompt="owner smoke"),
+                            cwd=os.getcwd()),
+                    snapshot_digest=SNAPSHOT,
+                    current_snapshot_digest=lambda: SNAPSHOT,
+                    owner_is_current=lambda: owner["current"],
+                    timeout_ms=5000, generation=1)
+                context = turn_with_prompt(
+                    "owner smoke", turn_id="turn-owner", ordinal=0)
+                spec = adapter.prepare(context)
+                owner["current"] = False
+                result = adapter.launch(
+                    spec, token_for_context(spec, context, "attempt-owner"))
+                receipt = adapter.cleanup()
+            self.assertNotEqual(result.evidence.exit_code, 0)
+            self.assertEqual(len(created), 1)
+            self.assertFalse(os.path.exists(created[0]))
+            self.assertTrue(receipt.clean)
 
     def test_unbounded_http_transport_is_refused_for_deliberation(self):
         with self.assertRaisesRegex(ValueError, "cancellation is bounded"):

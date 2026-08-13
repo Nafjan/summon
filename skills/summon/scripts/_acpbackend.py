@@ -455,8 +455,19 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
     # the system context is prepended to the prompt on this transport.
     from _builder import build_invocation_args as _build_args
     try:
-        _, _, env_override = _build_args(inv)
-    except ValueError as e:
+        if launch_control is None:
+            _, _, env_override = _build_args(inv)
+        else:
+            # Kimi's ACP path also creates a fresh credential profile during
+            # builder setup.  Register it before the ACP provider boundary so
+            # controlled deliberation cleanup owns the same resource contract
+            # as the subprocess path.  Legacy calls keep the old signature.
+            _, _, env_override = _build_args(
+                inv, resource_register=launch_control.register_resource)
+    except (ValueError, TypeError) as e:
+        if launch_control is not None:
+            return _err(cli, 2,
+                        f"provider preparation refused ({type(e).__name__})")
         return _err(cli, 2, str(e))
     child_env = dict(os.environ)
     for key, value in (env_override or {}).items():
