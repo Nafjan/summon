@@ -1,7 +1,7 @@
 # Deliberation Control Surface
 
-Status: design contract for the post-headless-gate UI; no browser code is enabled by
-this document alone.
+Status: design contract for the optional post-headless-gate loopback observer; the
+reference surface is provider-inert and not a CLI auto-start.
 
 ## Direction
 
@@ -52,10 +52,11 @@ mechanism and must be validated against actual redacted run data before UI imple
 
 ## Sequencing gate
 
-This contract is structural only. Browser/server implementation starts after owner-bound
-command recovery, journal-authoritative store replay, receipt-bound rounds/deadline, and
-one-attempt provider cleanup gates pass. Until then, all UI-related code remains provider-
-inert and policy-inert.
+The reference stdlib surface now lives in `_deliberation_ui.py` and consumes only the
+redacted store contract. It remains provider-inert and policy-inert: browser commands can
+queue only typed cancel until the durable coordinator applies richer human commands.
+CLI/resume activation, hosted collaboration, and background/council composition remain
+outside this slice.
 
 <!--
   Impeccable direction contract for the eventual root layout:

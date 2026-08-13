@@ -51,8 +51,9 @@ LEFT_BEHIND/environment-handoff details.
   structured ballots.
 - Core runtime remains Python stdlib-only and cross-platform, including Windows hidden
   process launches.
-- The first UI slice is provider-inert until owner-bound command recovery, store resume,
-  permission/profile lifecycle gates, and live-provider integration are complete.
+- The first UI slice is a provider-inert observer over the redacted store; it queues only
+  typed cancel while owner-bound command recovery, store resume, and richer human-command
+  lifecycle gates remain pending.
 - No remote hosting, multi-user networking, `0.0.0.0` binding, model-rendered HTML, or
   model-controlled browser actions are allowed in the first release.
 - Backend identities, prompts, credentials, private paths, and raw provider output must

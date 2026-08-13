@@ -1,13 +1,14 @@
 # Summon Deliberation and Pro Product Plan
 
-Status: preview implementation (live provider scheduler and browser execution still gated)
+Status: preview implementation (direct live seam and optional loopback observer exist; CLI/resume activation remains gated)
 Target branch: `codex/deliberation-pro-plan`
 Owner: Summon maintainers
 
 Active root goal: deliver the first shippable local deliberation slice through the
 owner-safe headless gate, then add the optional loopback observer/control surface. The
 current UI direction contract is in `docs/DELIBERATION_UI_DESIGN.md`; it is a structural
-Operate design only and does not open browser or provider execution.
+Operate design, while the reference surface itself is an explicit direct API that does
+not auto-open a browser or launch providers.
 
 This document is the implementation plan and current safety contract for a new bounded
 agent-deliberation mode and the product boundary it creates for a possible Summon Pro
@@ -528,7 +529,14 @@ and bearer token, requires an exact Origin for POST, bounds bodies, uses a stric
 no remote assets, and renders model/journal fields as text. The UI is deliberately
 provider-inert and policy-inert.
 
-Required controls:
+The current reference slice implements the following subset: loopback-only binding,
+fragment-delivered bearer token, exact Host/Origin checks, bounded JSON, bounded SSE,
+strict CSP/no remote assets, text-only rendering, redacted store projections, and a
+typed cancel queue. It intentionally does not implement session-token exchange,
+approve/deny/message application, durable monotonic command IDs, cursor replay, or
+automatic token invalidation; those remain coordinator work.
+
+Full P3 exit controls (for the later richer surface) are:
 
 - 256-bit per-run random bootstrap token, delivered in a URL fragment and exchanged by
   browser code for a run-session token; the fragment never travels in an HTTP request;
