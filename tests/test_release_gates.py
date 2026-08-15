@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import hashlib
+import json
 from unittest import mock
 from pathlib import Path
 import unittest
@@ -53,6 +55,19 @@ class ReleaseGateRunnerTests(unittest.TestCase):
     def test_machine_result_digest_shape(self):
         digest = "a" * 64
         self.assertTrue(MODULE.re.fullmatch(r"[0-9a-f]{64}", digest))
+
+    def test_outer_artifact_hash_is_recomputable_with_gate_marker_hash(self):
+        artifact = MODULE._artifact(
+            "live_provider", status="pass", command="python tools/live_provider_gate.py",
+            source_hash="a" * 64, git_head="b" * 40, output="gate output\n",
+            marker={"artifact_sha256": "c" * 64,
+                    "evidence_file": "redacted-live-provider-receipt.json"},
+        )
+        payload = dict(artifact)
+        stored = payload.pop("artifact_sha256")
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+        self.assertEqual(stored, hashlib.sha256(encoded).hexdigest())
 
     def test_custom_and_unittest_counts_are_strict(self):
         self.assertEqual(MODULE._parse_count("x", "\n36/36 passed\n"), "36/36")

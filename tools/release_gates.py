@@ -205,7 +205,11 @@ def _artifact(name: str, *, status: str, command: str, source_hash: str,
     if marker:
         # Keep only the fixed marker fields; no provider output or arbitrary
         # environment/path data enters a release artifact.
-        for key in ("error_kind", "detail", "artifact_sha256", "evidence_file"):
+        # Never copy a producer's own artifact hash into the outer artifact:
+        # doing so makes the outer hash depend on a value that is not retained
+        # in the returned record, so release_manifest cannot recompute it.
+        # A gate may still expose a bounded evidence-file name and error detail.
+        for key in ("error_kind", "detail", "evidence_file"):
             if key in marker and isinstance(marker[key], str):
                 payload[key] = marker[key]
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
