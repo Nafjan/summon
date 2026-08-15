@@ -6,9 +6,8 @@ regression notes, and test evidence, see the
 
 ## [Unreleased]
 
-- **Release contract:** added a source-bound version/migration contract and fixed
-  release-contract test entry. A future 3.0 candidate must keep plugin, dispatcher,
-  MCP companion, and migration documentation converged; this does not claim GA.
+- **Release contract:** the source-bound version/migration contract, fixed gate
+  registry, and immutable release evidence are now part of the 3.0.0 GA path.
 
 - **One open product:** Summon deliberation is part of the same public product as
   dispatch, council, and the browser observer. The public `/summon deliberate` command and thin `/deliberate`
@@ -30,12 +29,13 @@ regression notes, and test evidence, see the
   now explicit display metadata; exact `model.served` evidence remains separate and
   unknown models never become dispatchable by implication.
 
-## [3.0.0] — release candidate, not GA
+## [3.0.0] — 2026-08-15
 
-- Synchronized the plugin, dispatcher, and MCP companion to the 3.0.0 candidate
-  contract. This version is not a GA claim: the source-bound manifest still requires
-  a clean immutable tree, converged managed installs, and one independently reviewed
-  live-provider receipt.
+- Synchronized the plugin, dispatcher, and MCP companion to the 3.0.0 contract.
+- Passed the fixed source-bound release suites and eight GA gates, including the
+  redacted Gemini 3.7 Flash High pilot receipt and converged managed installs.
+- Kept multi-provider live deliberation, automatic fallback/retry, remote hosting,
+  and unproven live continuation explicitly deferred.
 
 ## [2.2.0] — 2026-08-12
 

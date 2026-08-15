@@ -1,8 +1,10 @@
 # Summon product roadmap
 
 Status date: 2026-08-14
-Current source version: `3.0.0` (candidate; not GA)
-Readiness: the 3.0 candidate is under machine-gated release validation; provider-inert deliberation contracts and the local browser observer are exercised, while fresh/resume live-provider execution remains gated. Do not call this GA until the release manifest check passes.
+Current source version: `3.0.0` (GA)
+Readiness: the fixed suites and eight source-bound gates pass from an immutable
+release commit. One Gemini 3.7 Flash High pilot is receipt-bound; additional providers,
+live continuation, and remote execution remain explicitly gated or deferred.
 
 This is the release-facing roadmap for turning the current, well-tested kernel into a dependable open product. It records what is actually shipped, what was tested, and the gates that must pass before we describe a feature as shipped, preview, or live-provider-enabled.
 
@@ -14,9 +16,9 @@ This is the release-facing roadmap for turning the current, well-tested kernel i
 | Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; Fable and Gemini availability still require saved provider receipts with exact `model.served` and profile evidence | Recommended, but unverified models remain gated |
 | Deliberation kernel, journal replay/recovery, scheduler | Focused `test_deliberation_*.py` suite; provider-inert | Ready as a fake/injected integration surface |
 | Custom Agent manifests and roster binding | Strict parser, path fencing, consent/identity binding | Ready as provider-inert configuration |
-| Live provider composition | Receipt/plan/owner/deadline fences exist, but no default CLI activation | Gated; no paid provider call is claimed |
-| Browser observation surface | Deliberation ledger handoff/reuse and provider-inert conversation atlas are shipped; full real-journal lifecycle coverage remains incomplete | Beta/engineering preview |
-| Managed local installs | The release manifest can inspect owned copies and report drift; this working tree still requires a fresh convergence run before GA | Keep unmanaged Cursor plugins and archival worktrees intentionally untouched |
+| Live provider composition | Receipt/plan/owner/deadline fences exist; one disposable Gemini pilot is independently receipt-bound | One selected route evidenced; expansion remains gated |
+| Browser observation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, and visual evidence pass; richer multi-run lifecycle remains preview | GA safety surface; richer workflow preview |
+| Managed local installs | All eight managed host copies converge at 3.0.0; unmanaged Cursor plugin drift is reported and untouched | GA managed payload |
 | Unmanaged Cursor local plugin | Older 2.2.0 content hash; not installer-owned | Update through its plugin mechanism only |
 
 Telemetry is enabled for this workstation through `~/.agents/summon-telemetry.json`. “On” means bounded, allow-listed local JSONL diagnostics only; it does not transmit data. GitHub issue submission remains a separate explicit action.
@@ -24,8 +26,8 @@ Telemetry is enabled for this workstation through `~/.agents/summon-telemetry.js
 ## Summon 3.0 release contract
 
 The release council agrees that 3.0 must be a product-quality boundary, not a
-version-number rename. The current 3.0.0 candidate remains a release candidate until
-every gate below is green.
+version-number rename. The 3.0.0 release is GA only because every fixed suite and
+gate below is machine-recorded from a clean immutable commit.
 
 ### Must ship for 3.0
 
@@ -50,11 +52,11 @@ every gate below is green.
 7. Complete browser accessibility and visual regression evidence: WCAG 2.2 AA baseline,
    keyboard/focus/live-region/reduced-motion behavior, desktop/tablet/mobile screenshots,
    and Impeccable-clean output.
-8. Pass one independently gated live deliberation provider. The gate must prove exact
+8. Pass one independently gated live deliberation provider. The gate proves exact
    `model.served`, profile/backend/consent evidence, owner/deadline/process fencing,
    cancellation, kill-switch behavior, cleanup, and honest uncertain-spend handling with
-   no hidden retry or fallback. If no provider passes, the release remains 2.x/public
-   preview rather than being called stable 3.0.
+    no hidden retry or fallback. Gemini 3.7 Flash High is the selected 3.0.0 route;
+    additional providers must earn separate evidence and do not inherit this claim.
 9. Keep telemetry opt-in by default in clean installs, local-only, bounded, redacted,
    and covered by disable/clear/support-bundle tests.
 
@@ -69,11 +71,11 @@ to unmanaged Cursor plugins.
 ### Release decision rule
 
 No open P0/P1 reliability, security, privacy, migration, or evidence contradiction may
-remain. The release manifest must be generated from a clean, immutable source tree and
-must require the named suites and gates rather than accepting arbitrary caller-supplied
-labels. The current baseline is evidence for the preview only: deliberation 326/326,
-resume 15/15, discovery 547/547, conversation journal/UI 25/25, install 30/30,
-model catalog 6/6, release tooling 19 focused tests (12 manifest + 4 runner + 3 contract), and ACP 36/36.
+remain. The release manifest is generated from a clean, immutable source tree and
+requires the named suites and gates rather than accepting arbitrary caller-supplied
+labels. The 3.0.0 evidence baseline is: deliberation 327/327, resume 15/15,
+discovery 547/547, conversation 26/26, conversation UI 8/8, install 30/30, model
+catalog 6/6, model routing 4/4, release manifest 13/13, and ACP 36/36.
 
 ## Product direction
 
@@ -245,4 +247,6 @@ This is where Antigravity-style custom agents become useful to Summon: a named r
 
 Summon is a complete product when a new operator can install it on a supported host, validate the environment, define or select a governed agent, run a real deliberation in a disposable workspace, observe the durable journal in the browser, cancel or approve with an auditable command, recover after a crash or takeover without duplicate paid work, and export a redacted report—while CI proves the same invariants with fake providers and each live provider has an explicit, independently reviewed gate.
 
-Until then, use the current kernel, fake/injected adapters, ordinary dispatch, council, ACP fixtures, local telemetry, and browser preview confidently; keep live deliberation and provider-integration claims explicitly gated.
+For routes without their own receipt, use the kernel, fake/injected adapters, ordinary
+dispatch, council, ACP fixtures, local telemetry, and browser preview confidently;
+keep those live-deliberation and provider-integration claims explicitly gated.

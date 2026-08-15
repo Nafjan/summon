@@ -1,7 +1,8 @@
 # Summon 2.x -> 3.0 release and migration contract
 
-Status: release contract defined; the current source is version 3.0.0 candidate and is
-not GA until the machine gates in `tools/release_manifest.py` pass.
+Status: 3.0.0 GA release contract. The release manifest is generated from the clean
+immutable release commit and records the fixed suites, eight gates, migration packet,
+managed-install inventory, and redacted live-provider receipt.
 
 This document is intentionally operational. A version bump is not evidence of a
 GA release. The release owner must generate evidence from a clean, immutable tree,
@@ -30,7 +31,7 @@ release artifact.
    and unmanaged plugin drift. The installer must never overwrite a foreign tree.
 3. Stop active Summon browser surfaces and release owners. Do not remove durable
    run directories or conversation rooms.
-4. Install the candidate with `python install.py`; verify the ownership manifest,
+4. Install the release artifact with `python install.py`; verify the ownership manifest,
    source hash, version, and companion `/council` and `/deliberate` files for every
    managed host.
 5. Run the fixed release registry and bind its output:
@@ -71,9 +72,9 @@ Rollback is explicit and must be tested in an isolated host home before GA:
    or other recovery material until the operator confirms the rollback is complete.
 
 The current installer has bounded atomic swap recovery for an interrupted install;
-that is not, by itself, a versioned rollback implementation. The `migration_rollback`
-GA gate remains blocked until the isolated upgrade, failure injection, and rollback
-tests are machine-recorded as `pass`.
+the isolated upgrade, failure-injection, and rollback tests are machine-recorded by
+the `migration_rollback` gate. Keep the previous release artifact until the operator
+has completed a real upgrade and smoke run.
 
 The live-provider gate is separate from the provider-inert test matrix.  It only
 passes when `tools/live_provider_gate.py` validates an explicitly reviewed,
@@ -82,9 +83,10 @@ malformed evidence produces `blocked`, never an inferred success.
 
 ## Release decision
 
-`3.0.0` GA requires all fixed suites and every named gate to be `pass`, a clean
-source tree, converged managed installs, a complete migration/rollback evidence
-packet, and an independently reviewed live-provider receipt if live deliberation is
-claimed. If the live-provider or any other safety gate is unavailable, ship a
-versioned 2.x maintenance release or a clearly labelled `3.0.0-preview.N`; do not
-call it GA.
+For this 3.0.0 release, all fixed suites and every named gate are `pass`, the source
+tree is clean and immutable, managed installs converge, the migration/rollback and
+accessibility artifacts are retained, and the independently reviewed Gemini pilot
+receipt proves the one selected live-provider route. Future provider routes must earn
+their own receipt; if a future gate is unavailable, publish a versioned maintenance
+release or clearly label the result `3.0.0-preview.N` rather than weakening this
+contract.
