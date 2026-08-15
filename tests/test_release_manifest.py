@@ -156,6 +156,42 @@ class ReleaseManifestTests(unittest.TestCase):
             result = MODULE.main(["--root", temp, "--check"])
         self.assertEqual(result, 2)
 
+    def test_managed_install_gate_ignores_unmanaged_drift_but_blocks_managed_drift(self):
+        records = [
+            {"label": "host-a", "managed": True, "present": True},
+            {"label": "host-b", "managed": True, "present": True},
+            {"label": "local-plugin", "managed": False, "present": True},
+        ]
+        facts = [
+            {"label": "host-a", "ownership_valid": True, "payload_matches_source": True},
+            {"label": "host-b", "ownership_valid": True, "payload_matches_source": True},
+        ]
+        report = {
+            "drifted": [{"label": "local-plugin", "managed": False}],
+            "unknown": [], "duplicates": [], "scan_truncated": [],
+        }
+        classified = MODULE._managed_install_classification(records, report, facts)
+        self.assertTrue(classified["managed_converged"], classified)
+        self.assertEqual(classified["managed_drift"], [])
+
+        report["drifted"] = [{"label": "host-b", "managed": True}]
+        classified = MODULE._managed_install_classification(records, report, facts)
+        self.assertFalse(classified["managed_converged"], classified)
+        self.assertEqual(classified["managed_drift"], ["host-b"])
+
+    def test_managed_install_gate_blocks_missing_managed_host(self):
+        records = [
+            {"label": "host-a", "managed": True, "present": True},
+            {"label": "host-b", "managed": True, "present": False},
+        ]
+        facts = [
+            {"label": "host-a", "ownership_valid": True, "payload_matches_source": True},
+        ]
+        report = {"drifted": [], "unknown": [], "duplicates": [], "scan_truncated": []}
+        classified = MODULE._managed_install_classification(records, report, facts)
+        self.assertFalse(classified["managed_converged"], classified)
+        self.assertEqual(classified["managed_missing"], ["host-b"])
+
     def test_cli_expected_version_is_machine_checked(self):
         output = io.StringIO()
         errors = io.StringIO()

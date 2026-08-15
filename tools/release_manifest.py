@@ -306,6 +306,48 @@ def _git_facts(root: Path) -> dict[str, object]:
     }
 
 
+def _managed_install_classification(records: list[Mapping[str, object]],
+                                    report: Mapping[str, object],
+                                    managed: list[Mapping[str, object]]) -> dict[str, object]:
+    """Classify the managed host set without letting unmanaged drift mask it.
+
+    ``_installs.drift_report`` intentionally reports one global convergence bit. A
+    local/project/plugin copy is allowed to be different and is surfaced separately;
+    only missing, unknown, duplicate, truncated, drifted, or invalid *managed*
+    records block the managed-install release gate.
+    """
+    managed_records = [item for item in records if item.get("managed")]
+    managed_missing = [item.get("label") for item in managed_records
+                       if not item.get("present")]
+    managed_present = [item for item in managed_records if item.get("present")]
+    managed_labels = {item.get("label") for item in managed_present}
+    managed_unknown = [item.get("label") for item in report.get("unknown", ())
+                       if item.get("managed")]
+    managed_duplicates = [item for item in report.get("duplicates", ())
+                          if item.get("label") in managed_labels]
+    managed_scan_truncated = [item.get("label") for item in report.get("scan_truncated", ())
+                              if item.get("label") in managed_labels]
+    managed_drift = [item.get("label") for item in report.get("drifted", ())
+                     if item.get("managed")]
+    managed_invalid = [item.get("label") for item in managed
+                       if not item.get("ownership_valid") or not item.get("payload_matches_source")]
+    converged = (bool(managed_present) and not managed_missing and not managed_unknown
+                 and not managed_duplicates and not managed_scan_truncated
+                 and not managed_drift
+                 and all(item.get("ownership_valid") and item.get("payload_matches_source")
+                         for item in managed))
+    return {
+        "managed_converged": converged,
+        "managed_present": bool(managed_present) and not managed_missing,
+        "managed_missing": managed_missing,
+        "managed_unknown": managed_unknown,
+        "managed_duplicates": managed_duplicates,
+        "managed_scan_truncated": managed_scan_truncated,
+        "managed_drift": managed_drift,
+        "managed_invalid": managed_invalid,
+    }
+
+
 def _install_facts(root: Path) -> dict[str, object]:
     scripts = root / "skills" / "summon" / "scripts"
     # Do not import the running repository's _installs module for an arbitrary
@@ -333,11 +375,10 @@ def _install_facts(root: Path) -> dict[str, object]:
         _installs = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(_installs)
 
-        report = _installs.drift_report(
-            _installs.enumerate_installs(
-                running_scripts_dir=str(scripts), project_dir=str(root)
-            )
+        records = _installs.enumerate_installs(
+            running_scripts_dir=str(scripts), project_dir=str(root)
         )
+        report = _installs.drift_report(records)
     except Exception as exc:  # noqa: BLE001 - manifest remains useful if a host is odd
         return {"available": False, "error": type(exc).__name__}
     finally:
@@ -463,21 +504,12 @@ def _install_facts(root: Path) -> dict[str, object]:
     ]
     stale_managed = [item.get("label") for item in report.get("drifted", ())
                      if item.get("managed")]
-    invalid_managed = [item.get("label") for item in managed
-                       if not item.get("ownership_valid") or not item.get("payload_matches_source")]
+    classification = _managed_install_classification(records, report, managed)
     return {
         "available": True,
         "scripts_sha256": reference,
         "managed": managed,
-        # Trust the complete classifier rather than reconstructing convergence
-        # from only hashed/drifted records.  Unknown, duplicate, and truncated
-        # scans are deliberately blocking conditions in _installs.drift_report.
-        "managed_converged": bool(report.get("converged")) and bool(managed)
-        and all(item.get("ownership_valid") and item.get("payload_matches_source")
-                for item in managed),
-        "managed_present": bool(managed),
-        "managed_drift": stale_managed,
-        "managed_invalid": invalid_managed,
+        **classification,
         "unmanaged_drift": drifted,
         "unknown": [item.get("label") for item in report.get("unknown", ())],
         "duplicates": report.get("duplicates", ()),
