@@ -8869,12 +8869,30 @@ def test_v7_bare_worktree_never_resumes():
     out = os.path.join(tempfile.gettempdir(), f"summon-wt-{os.getpid()}.json")
     NL = chr(10)
     roster = tempfile.mkdtemp(prefix="summon-wtr-")
+    project = tempfile.mkdtemp(prefix="summon-wt-project-")
     with open(os.path.join(roster, "cheap.md"), "w", encoding="utf-8") as fh:
         fh.write("---" + NL + "run-agent: openai-compat" + NL + "base_url: http://127.0.0.1:9/v1" + NL + "---" + NL + "# Resolvable" + NL)
     try:
+        # Keep this identity/skip test independent of the developer checkout's
+        # archival worktrees.  Hundreds of unrelated worktrees can make a
+        # production-repo `git worktree add` take minutes or wait on a reset,
+        # turning a bounded test into a release-runner timeout.
+        sp.run(["git", "-C", project, "init", "-q"], check=True,
+               capture_output=True, text=True)
+        sp.run(["git", "-C", project, "config", "user.email", "summon-test@example.invalid"],
+               check=True, capture_output=True, text=True)
+        sp.run(["git", "-C", project, "config", "user.name", "Summon Test"],
+               check=True, capture_output=True, text=True)
+        with open(os.path.join(project, "seed.txt"), "w", encoding="utf-8") as fh:
+            fh.write("seed\n")
+        sp.run(["git", "-C", project, "add", "seed.txt"], check=True,
+               capture_output=True, text=True)
+        sp.run(["git", "-C", project, "commit", "-qm", "seed"], check=True,
+               capture_output=True, text=True)
         def _run(extra):
             r = sp.run([sys.executable, script, "--agent", "cheap", "--prompt", "p",
-                        "--cwd", os.getcwd(), "--out", out, "--agents-dir", roster, *extra],
+                        "--cwd", project, "--out", out, "--agents-dir", roster,
+                        "--timeout", "5s", *extra],
                        capture_output=True, text=True, encoding="utf-8")
             return _json.loads(r.stdout)
 
@@ -8883,7 +8901,7 @@ def test_v7_bare_worktree_never_resumes():
         from _cli import build_parser
         from _executor import request_fingerprint
         ns = build_parser("t", 1).parse_args(
-            ["--agent", "cheap", "--prompt", "p", "--cwd", os.getcwd(),
+            ["--agent", "cheap", "--prompt", "p", "--cwd", project,
              "--out", out, "--agents-dir", roster, "--worktree"])
         with open(out, "w", encoding="utf-8") as fh:
             _json.dump({"status": "success", "result": "from a PREVIOUS auto worktree",
@@ -8893,7 +8911,7 @@ def test_v7_bare_worktree_never_resumes():
                                                 "from a different tree", env)
         # a NAMED worktree is a stable location, so it resumes normally
         ns2 = build_parser("t", 1).parse_args(
-            ["--agent", "cheap", "--prompt", "p", "--cwd", os.getcwd(),
+            ["--agent", "cheap", "--prompt", "p", "--cwd", project,
              "--out", out, "--agents-dir", roster, "--worktree", "fixed-tree"])
         with open(out, "w", encoding="utf-8") as fh:
             _json.dump({"status": "success", "result": "from fixed-tree",
@@ -8906,6 +8924,9 @@ def test_v7_bare_worktree_never_resumes():
             os.remove(out)
         except OSError:
             pass
+        import shutil as _sh
+        _sh.rmtree(project, ignore_errors=True)
+        _sh.rmtree(roster, ignore_errors=True)
 
 
 def test_v7_agent_definition_edit_invalidates_a_stored_result():
