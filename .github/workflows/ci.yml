@@ -20,13 +20,37 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: Compile all modules
-        run: python -m py_compile skills/summon/scripts/run_subagent.py skills/summon/scripts/_loader.py skills/summon/scripts/_resolver.py skills/summon/scripts/_builder.py skills/summon/scripts/_executor.py skills/summon/scripts/_stream.py skills/summon/scripts/_doctor.py skills/summon/scripts/_rundir.py skills/summon/scripts/_council.py skills/summon/scripts/_manifest.py skills/summon/scripts/_jobs.py skills/summon/scripts/_receipt.py skills/summon/scripts/_installs.py skills/summon/scripts/_cli.py skills/summon/scripts/_background.py skills/summon/scripts/_telemetry.py skills/summon/scripts/_deliberation.py skills/summon/scripts/_deliberation_store.py skills/summon/scripts/_deliberation_scheduler.py skills/summon/scripts/_deliberation_roster.py skills/summon/scripts/_deliberation_invocation.py skills/summon/scripts/_deliberation_replay.py skills/summon/scripts/_deliberation_recovery.py skills/summon/scripts/_deliberation_resume.py skills/summon/scripts/_deliberation_adapter.py skills/summon/scripts/_deliberation_phase_a.py skills/summon/scripts/_deliberation_live.py skills/summon/scripts/_deliberation_ui.py summon.py install.py
+        run: python -m py_compile skills/summon/scripts/run_subagent.py skills/summon/scripts/_loader.py skills/summon/scripts/_resolver.py skills/summon/scripts/_builder.py skills/summon/scripts/_executor.py skills/summon/scripts/_stream.py skills/summon/scripts/_doctor.py skills/summon/scripts/_rundir.py skills/summon/scripts/_council.py skills/summon/scripts/_manifest.py skills/summon/scripts/_jobs.py skills/summon/scripts/_receipt.py skills/summon/scripts/_installs.py skills/summon/scripts/_cli.py skills/summon/scripts/_background.py skills/summon/scripts/_telemetry.py skills/summon/scripts/_deliberation.py skills/summon/scripts/_deliberation_agents.py skills/summon/scripts/_deliberation_store.py skills/summon/scripts/_deliberation_browser.py skills/summon/scripts/_deliberation_scheduler.py skills/summon/scripts/_deliberation_roster.py skills/summon/scripts/_deliberation_invocation.py skills/summon/scripts/_deliberation_replay.py skills/summon/scripts/_deliberation_recovery.py skills/summon/scripts/_deliberation_resume.py skills/summon/scripts/_deliberation_adapter.py skills/summon/scripts/_deliberation_phase_a.py skills/summon/scripts/_deliberation_live.py skills/summon/scripts/_deliberation_ui.py skills/summon/scripts/_conversation.py skills/summon/scripts/_conversation_browser.py skills/summon/scripts/_conversation_ui.py skills/summon/scripts/_model_catalog.py tools/release_manifest.py tools/release_gates.py tools/release_contract.py summon.py install.py
 
       - name: Unit tests (dispatcher)
         run: python skills/summon/scripts/test_discovery.py
 
       - name: Unit tests (installer safety, isolated fake homes)
         run: python tests/test_install.py
+
+      - name: Unit tests (release evidence manifest)
+        run: python -m unittest tests.test_release_manifest
+
+      - name: Unit tests (release version and migration contract)
+        run: python -m unittest tests.test_release_contract
+
+      - name: Unit tests (migration and telemetry GA gates)
+        run: >-
+          python -m unittest
+          tests.test_migration_gate
+          tests.test_telemetry_gate
+
+      - name: Unit tests (release evidence runner)
+        run: python -m unittest tests.test_release_gates
+
+      - name: Unit tests (ACP transport, fake subprocess only)
+        run: python tests/test_acpbackend.py
+
+      - name: Unit tests (conversation atlas)
+        run: >-
+          python -m unittest
+          skills.summon.scripts.test_conversation
+          skills.summon.scripts.test_conversation_ui
 
       - name: Unit tests (deliberation preview kernel, adapter, scheduler, and CLI)
         run: >-
@@ -36,6 +60,7 @@ jobs:
           skills.summon.scripts.test_deliberation_adapter
           skills.summon.scripts.test_deliberation_cli
           skills.summon.scripts.test_deliberation_scheduler
+          skills.summon.scripts.test_deliberation_agents
           skills.summon.scripts.test_deliberation_roster
           skills.summon.scripts.test_deliberation_invocation
           skills.summon.scripts.test_deliberation_replay
@@ -43,7 +68,17 @@ jobs:
           skills.summon.scripts.test_deliberation_recovery
           skills.summon.scripts.test_deliberation_phase_a
           skills.summon.scripts.test_deliberation_live
+          skills.summon.scripts.test_deliberation_browser
           skills.summon.scripts.test_deliberation_ui
+
+      - name: Unit tests (deliberation resume)
+        run: python -m unittest skills.summon.scripts.test_deliberation_resume
+
+      - name: Unit tests (model catalog)
+        run: python -m unittest skills.summon.scripts.test_model_catalog
+
+      - name: Unit tests (backend/model routing preflight)
+        run: python -m unittest skills.summon.scripts.test_model_routing
 
       - name: Doctor runs clean on a bare machine (exit 1 = no backends, still valid JSON)
         shell: bash
@@ -115,6 +150,8 @@ jobs:
           python install.py --hosts claude
           test -f "$HOME/.claude/skills/summon/SKILL.md"
           test -f "$HOME/.claude/skills/summon/.summon-install.json"
+          test -f "$HOME/.claude/skills/council/SKILL.md"
+          test -f "$HOME/.claude/skills/deliberate/SKILL.md"
           # agents/ MUST ship inside the installed skill — it is the bundled-fallback
           # source. (Guards against a regression that drops it from SKILL_PAYLOAD.)
           test -d "$HOME/.claude/skills/summon/agents"
@@ -127,4 +164,52 @@ jobs:
           python -c "import json; d=json.load(open('listed.json')); assert len(d['agents']) >= 20, d; print('bundled fallback lists', len(d['agents']), 'agents')"
           python install.py --hosts claude --uninstall
           test ! -d "$HOME/.claude/skills/summon"
+          test ! -d "$HOME/.claude/skills/council"
+          test ! -d "$HOME/.claude/skills/deliberate"
           echo "installed copy: bundled agents present + cold fallback dispatch + clean uninstall"
+
+  release-evidence:
+    # This job exercises the same machine-produced evidence path used for a
+    # release candidate, without pretending that the still-deferred live and
+    # migration gates have passed. The GA release job must add --check only
+    # after those fixed gate harnesses exist.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Generate and bind machine release evidence
+        shell: bash
+        run: |
+          python tools/release_gates.py --require-clean --output "$RUNNER_TEMP/release-evidence.json"
+          python tools/release_manifest.py \
+            --evidence-file "$RUNNER_TEMP/release-evidence.json" \
+            --output "$RUNNER_TEMP/release-manifest.json" \
+            --expected-version "3.0.0"
+          python - <<'PY'
+          import json
+          import os
+          evidence = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "release-evidence.json"), encoding="utf-8"))
+          manifest = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "release-manifest.json"), encoding="utf-8"))
+          assert set(evidence["tests"]) == {
+              "discovery", "install", "release_manifest", "acpbackend",
+              "deliberation", "deliberation_resume", "model_catalog",
+              "conversation", "conversation_ui", "model_routing", "release_contract",
+          }
+          assert manifest["evidence"]["source_tree_sha256"] == evidence["source_tree_sha256"]
+          assert manifest["version_contract"]["ready"]
+          expected_gates = {
+              "accessibility", "browser_security", "fake_lifecycle",
+              "live_provider", "managed_installs", "migration_rollback",
+              "model_identity", "telemetry_privacy",
+          }
+          assert set(evidence["known_gates"]) == expected_gates
+          assert evidence["known_gates"]["live_provider"] == "blocked"
+          assert all(
+              value == "pass"
+              for name, value in evidence["known_gates"].items()
+              if name != "live_provider"
+          ), evidence["known_gates"]
+          print("machine evidence bound; only the explicitly deferred live-provider gate is blocked")
+          PY

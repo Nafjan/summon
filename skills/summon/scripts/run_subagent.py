@@ -77,7 +77,7 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "2.2.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "3.0.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -698,6 +698,14 @@ def main() -> None:
     if args.jobs_list or args.jobs_status or args.jobs_wait:
         sys.exit(_background.run_jobs_query(args, _print_error))
 
+    # Conversation rooms are a provider-inert local context surface. They are
+    # deliberately routed before roster/backend validation: opening a room or
+    # posting a human message must never authenticate, launch, or mutate a
+    # council/deliberation ballot.
+    if getattr(args, "chat_action", None):
+        from _conversation import run_command as _run_conversation_command
+        sys.exit(_run_conversation_command(args))
+
     # Deliberation is a sibling run type, not an agent dispatch or a council
     # alias.  Route its management/launch surface before ordinary agent,
     # prompt, roster, and backend validation.  The storage handler is honest
@@ -709,7 +717,8 @@ def main() -> None:
             or getattr(args, "deliberate_recover", None)
             or getattr(args, "deliberate_status", None)
             or getattr(args, "deliberate_replay", None)
-            or getattr(args, "deliberate_cancel", None)):
+            or getattr(args, "deliberate_cancel", None)
+            or getattr(args, "deliberate_open", None)):
         from _deliberation_store import run_command as _run_deliberation_command
         sys.exit(_run_deliberation_command(args))
 
@@ -1546,7 +1555,8 @@ def _dry_run_view(invocation, args, agents_dir: str,
     from _builder import (BACKENDS, backend_kind, build_invocation_args,
                           permission_flags as _pf, _PERMISSION_MAPPING, _agy_wrapper,
                           advisory_warnings, apply_credit_guard, infer_dispatch_billing,
-                          credit_spend_allowed, selects_credit_only)
+                          credit_spend_allowed, selects_credit_only,
+                          model_backend_compatibility)
     _guarded, _, _guard_warnings = apply_credit_guard(invocation)
     _eff_model = _guarded.model
     # Predict the billing source so preflight can reveal a charge (mirrors _stamp).
@@ -1585,6 +1595,25 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "worktree": ("would create" if args.worktree is not None else None),
         "system_context_chars": len(invocation.system_context),
     }
+    # Keep dry-run and real dispatch routing decisions identical.  This is a pure namespace
+    # check: it does not probe or construct a provider profile.  Codex's configured default
+    # is read only when the caller did not pin a model, so the preview can still catch a bad
+    # backend/model pairing before any side effect.
+    _compat_model = _eff_model
+    if not _compat_model and invocation.cli == "codex":
+        try:
+            from _resolver import _codex_default_model
+            _compat_model = _codex_default_model()
+        except Exception:  # noqa: BLE001 - preflight view stays renderable
+            _compat_model = None
+    _compat = model_backend_compatibility(invocation.cli, _compat_model)
+    if _compat:
+        view["would_refuse"] = True
+        view["error_kind"] = _compat["error_kind"]
+        view["refusal"] = _compat["message"]
+        view["model_vendor"] = _compat["model_vendor"]
+        view["compatible_backends"] = list(_compat["compatible_backends"])
+        view["recommended_backend"] = _compat["recommended_backend"]
     _role_info = (getattr(args, "_role_provenance", {}) or {}).get("role")
     if isinstance(_role_info, dict):
         view["role"] = dict(_role_info)

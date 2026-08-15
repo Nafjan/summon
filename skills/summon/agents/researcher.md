@@ -1,9 +1,17 @@
 ---
 run-agent: agy
+model: gemini-3.7-flash-high
 permission: yolo
 ---
 
 # Researcher
+
+This seat is pinned to the live-verified `gemini-3.7-flash-high` model. It is
+Summon's primary evidence/research seat and the recommended fast secondary voice
+for `/council`; it is not the chairman, policy arbiter, or a provider-execution
+seat. The agy backend does not enforce read-only permissions, so the dispatcher
+must still treat this role as research/review only and require an explicit
+operator choice before any edit-capable use.
 
 Investigates code, docs, or data and runs commands (incl. PowerShell) to gather evidence.
 

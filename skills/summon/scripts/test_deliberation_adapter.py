@@ -503,6 +503,29 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertTrue(receipt.clean)
             self.assertNotIn("PRIVATE-CREDENTIAL", repr(receipt))
 
+    def test_normalized_success_with_nonzero_raw_exit_is_transport_ok(self):
+        """A clean terminal wrapper exit must not fail a deliberation turn."""
+        adapter = FreshDispatchAdapter(
+            self.invocation(cli="agy", prompt="normalized success"),
+            snapshot_digest=SNAPSHOT,
+            current_snapshot_digest=lambda: SNAPSHOT,
+            owner_is_current=lambda: True,
+            timeout_ms=5000,
+            generation=1,
+            executor=lambda *args, **kwargs: {
+                "result": "{}", "exit_code": 1, "status": "success",
+                "dispatcher_status": "success", "report_ok": True,
+            })
+        context = turn_with_prompt("normalized success", turn_id="turn-normalized",
+                                   ordinal=0)
+        spec = adapter.prepare(context)
+        result = adapter.launch(
+            spec, token_for_context(spec, context, "attempt-normalized"))
+        self.assertEqual(result.evidence.exit_code, 1)
+        self.assertTrue(result.evidence.transport_ok)
+        self.assertFalse(result.evidence.parser_valid is False and
+                         result.evidence.timed_out)
+
     def test_owner_refusal_after_profile_build_still_cleans_profile(self):
         import _executor as executor_module
         with tempfile.TemporaryDirectory() as root:

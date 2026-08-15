@@ -268,9 +268,28 @@ def _last_generation(run_dir: str) -> int:
 def _write_generation(run_dir: str, generation: int) -> None:
     import tempfile
     fd, tmp = tempfile.mkstemp(dir=run_dir, prefix=".summon-gen-", suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(str(generation))
-    os.replace(tmp, os.path.join(run_dir, GENERATION_FILE))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(str(generation))
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        target = os.path.join(run_dir, GENERATION_FILE)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, target)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def acquire_owner(run_dir: str, lease_sec: float) -> Owner:

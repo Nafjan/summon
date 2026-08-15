@@ -21,6 +21,7 @@ from typing import Mapping
 
 import _rundir
 import _deliberation_replay as _replay
+import _model_catalog
 from _deliberation import TERMINAL_STATES
 
 
@@ -29,6 +30,7 @@ MAX_JOURNAL_RECORDS = 10_000
 MAX_REPLAY_BYTES = 4 * 1024 * 1024
 MAX_PENDING_COMMANDS = 1_024
 _COMMAND_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class DeliberationStoreError(Exception):
@@ -55,6 +57,71 @@ def _receipt(path: str, run_id: str) -> dict:
         raise DeliberationStoreError(
             f"run {run_id!r} has no valid deliberation receipt.json")
     return value
+
+
+def _public_receipt(value: Mapping[str, object]) -> dict:
+    """Project only bounded receipt facts needed by the local observer.
+
+    The browser needs policy labels and agent transport labels to explain a
+    decision, but it must never receive the raw frozen plan (paths, argv,
+    profile names, prompts, or credentials).  Keep this allowlist in the
+    store boundary so every observer gets the same redacted envelope.
+    """
+    keys = (
+        "decision_id", "seat_ids", "option_ids", "quorum_rule", "max_attempts",
+        "require_human_approval", "rounds", "deadline_unix_ms", "roster_digest",
+    )
+    projected = {key: value[key] for key in keys if key in value}
+    plans = value.get("plan_identity_by_seat")
+    catalog_display: dict[str, dict[str, object]] = {}
+    if isinstance(plans, Mapping):
+        safe_plans: dict[str, dict[str, object]] = {}
+        for seat, plan in plans.items():
+            if not isinstance(seat, str) or not isinstance(plan, Mapping):
+                continue
+            safe = {
+                key: plan[key] for key in (
+                    "cli", "transport", "effective_permission", "authority_class",
+                    "custom_agent_definition_digest", "custom_agent_source_digest",
+                ) if key in plan and isinstance(plan[key], (str, int, bool))
+            }
+            if safe:
+                safe_plans[seat] = safe
+            display_identity = _model_catalog.display_for_hash(
+                plan.get("cli"), plan.get("model_sha256"))
+            if display_identity is not None:
+                catalog_display[seat] = display_identity
+        if safe_plans:
+            projected["plan_identity_by_seat"] = safe_plans
+    # Model identity is derived only from the exact redacted plan hash and the
+    # checked-in catalog.  Never trust a receipt-provided display row: otherwise
+    # a forged receipt could make the browser claim that an arbitrary model was
+    # frontier or served.  Service evidence is a separate hash-only field;
+    # absence means "not verified", equality means exact, and a different hash
+    # means mismatch.  The raw requested/served model strings never cross this
+    # projection boundary.
+    served_by_seat = value.get("model_served_sha256_by_seat")
+    if not isinstance(served_by_seat, Mapping):
+        served_by_seat = {}
+    for seat, display_identity in list(catalog_display.items()):
+        plan = plans.get(seat) if isinstance(plans, Mapping) else None
+        requested_hash = plan.get("model_sha256") if isinstance(plan, Mapping) else None
+        served_hash = served_by_seat.get(seat)
+        display_identity = dict(display_identity)
+        if isinstance(served_hash, str) and _SHA256_RE.fullmatch(served_hash):
+            if served_hash == requested_hash:
+                display_identity["availability"] = "served_exact"
+                display_identity["served_exact"] = True
+            else:
+                display_identity["availability"] = "served_mismatch"
+                display_identity["served_exact"] = False
+        else:
+            display_identity["availability"] = "catalog_listed"
+            display_identity["served_exact"] = False
+        catalog_display[seat] = display_identity
+    if catalog_display:
+        projected["model_display_by_seat"] = catalog_display
+    return projected
 
 
 def _replay_policy(receipt: Mapping[str, object]):
@@ -280,11 +347,7 @@ def inspect_run(root: str, run_id: str) -> dict:
                 "pid": after.get("pid"), "generation": after.get("generation"),
                 "lease_expires": after.get("lease_expires"),
             },
-            "receipt": {
-                "decision_id": receipt.get("decision_id"),
-                "seat_ids": list(receipt.get("seat_ids") or []),
-            "option_ids": list(receipt.get("option_ids") or []),
-            },
+            "receipt": _public_receipt(receipt),
             "projection": _project_checkpoint(checkpoint, records),
             "journal_records": len(records),
             "journal_torn_tail": torn,
@@ -441,8 +504,8 @@ def run_command(args) -> int:
         # Validate operation identifiers before calling helpers whose detailed
         # ValueError includes the raw input.  CLI envelopes are public/native
         # output and must never echo a path-like invalid run id.
-        for attr in ("deliberate_recover", "deliberate_status", "deliberate_replay",
-                     "deliberate_cancel", "deliberate_resume"):
+        for attr in ("deliberate_open", "deliberate_recover", "deliberate_status",
+                     "deliberate_replay", "deliberate_cancel", "deliberate_resume"):
             candidate = getattr(args, attr, None)
             if candidate is not None:
                 try:
@@ -450,6 +513,22 @@ def run_command(args) -> int:
                 except (TypeError, ValueError):
                     return _error(attr.removeprefix("deliberate_"),
                                   "invalid run id", kind="validation")
+        if getattr(args, "deliberate_open", None):
+            from _deliberation_browser import BrowserOpenError, ensure_surface, open_url
+            try:
+                surface = ensure_surface(root, args.deliberate_open)
+                browser = open_url(surface["url"],
+                                   mode=getattr(args, "browser", "auto") or "auto")
+            except BrowserOpenError as exc:
+                return _error("open", str(exc), kind="browser_unavailable")
+            result = {
+                "mode": "deliberation-open", "status": "success",
+                "schema_version": SCHEMA_VERSION, "run_id": args.deliberate_open,
+                "url": surface["url"], "surface_reused": bool(surface.get("reused")),
+                "browser": browser,
+            }
+            _emit(result, json_mode=bool(args.json))
+            return 0
         if getattr(args, "deliberate_recover", None):
             from _deliberation_resume import reconcile_run
             result = reconcile_run(root, args.deliberate_recover)
@@ -477,16 +556,17 @@ def run_command(args) -> int:
                     kind="uncertain_spend", status="blocked")
             return _error(
                 "resume",
-                "deliberation resume is not available until the one-attempt executor "
-                "adapter and before-spawn fence are integrated; no provider was called",
+                "deliberation resume is not publicly activated until the one-attempt "
+                "adapter is wired through the owner-bound durable coordinator and passes "
+                "resume/cancel/cleanup gates; no provider was called",
                 kind="integration_pending", status="blocked")
         if getattr(args, "deliberate", False):
             _validate_fresh_args(args)
             return _error(
                 "run",
-                "deliberation execution is not available until the one-attempt executor "
-                "adapter and before-spawn fence are integrated; no run was created and "
-                "no provider was called",
+                "deliberation execution is not publicly activated until the one-attempt "
+                "adapter is wired through the owner-bound durable coordinator and passes "
+                "resume/cancel/cleanup gates; no run was created and no provider was called",
                 kind="integration_pending", status="blocked")
     except (DeliberationStoreError, ValueError, OSError) as exc:
         message = str(exc)

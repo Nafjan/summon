@@ -164,8 +164,11 @@ def git_head(cwd: str) -> str | None:
 # cwd, or the repository root.
 _WORKSPACE_STATUS_MAX_BYTES = 128 * 1024
 _WORKSPACE_MAX_PATHS = 2048
-_WORKSPACE_CALL_TIMEOUT_S = 0.75
-_WORKSPACE_TOTAL_TIMEOUT_S = 2.0
+# Windows Defender/index locking can make the first status read after a temporary
+# commit exceed the POSIX budget. Keep the probe bounded, but give Windows enough
+# headroom for a real child commit so release repeatability does not depend on luck.
+_WORKSPACE_CALL_TIMEOUT_S = 2.0 if os.name == "nt" else 0.75
+_WORKSPACE_TOTAL_TIMEOUT_S = 6.0 if os.name == "nt" else 2.0
 _HEAD_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 
 
@@ -204,6 +207,28 @@ def _run_git_bounded(argv: list[str], cwd: str, deadline: float) -> tuple[bytes 
     chunks: queue.Queue[bytes] = queue.Queue(maxsize=64)
     done = threading.Event()
 
+    stream_lock = threading.Lock()
+    stream_closed = False
+
+    def _close_streams() -> None:
+        # A Windows pipe close can block while the reader thread is inside
+        # ``read``. Only the reader (after EOF) or a caller that observes it
+        # finished may close the handle; never trade a resource warning for a
+        # hung dispatch.
+        nonlocal stream_closed
+        if not done.is_set():
+            return
+        with stream_lock:
+            if stream_closed:
+                return
+            stream_closed = True
+            stream = proc.stdout
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+
     def _reader() -> None:
         try:
             while True:
@@ -216,6 +241,7 @@ def _run_git_bounded(argv: list[str], cwd: str, deadline: float) -> tuple[bytes 
             pass
         finally:
             done.set()
+            _close_streams()
 
     threading.Thread(target=_reader, daemon=True).start()
     data = bytearray()
@@ -240,6 +266,7 @@ def _run_git_bounded(argv: list[str], cwd: str, deadline: float) -> tuple[bytes 
             proc.wait(timeout=0.2)
         except (OSError, subprocess.TimeoutExpired):
             pass
+        _close_streams()
         return _workspace_git_error(reason)
     try:
         rc = proc.wait(timeout=max(0.001, min(call_deadline, deadline) - time.monotonic()))
@@ -248,7 +275,10 @@ def _run_git_bounded(argv: list[str], cwd: str, deadline: float) -> tuple[bytes 
             proc.kill()
         except OSError:
             pass
+        _close_streams()
         return _workspace_git_error("git timeout")
+    done.wait(timeout=0.2)
+    _close_streams()
     return bytes(data), rc, None
 
 

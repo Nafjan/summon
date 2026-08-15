@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import ast
 import json
 import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -51,6 +53,24 @@ class FrozenRosterTests(unittest.TestCase):
         path.write_text("\n".join(lines), encoding="utf-8")
         return path
 
+    def add_custom_agent(self, slug: str = "custom-worker", *, root: Path | None = None,
+                         cli: str = "claude", transport: str = "subprocess",
+                         permission: str = "read-only", model: str = "model-a",
+                         authority: str = "contained", consent: str = "none",
+                         worktree: str = "none", body: str = "Use bounded evidence.") -> Path:
+        package_root = root or (self.cwd / ".agents" / "agents")
+        path = package_root / slug / "agent.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join([
+            "---", "schema_version: 1", f"name: {slug}",
+            "description: Test custom participant", "role: participant",
+            f"model: {model}", f"cli: {cli}", f"transport: {transport}",
+            f"permission_ceiling: {permission}", f"authority_class: {authority}",
+            "skills: [analysis]", f"consent_class: {consent}",
+            f"worktree_mode: {worktree}", "---", body, "",
+        ]), encoding="utf-8")
+        return path
+
     def req(self, seat: str = "one", agent: str = "worker", **kwargs):
         return roster.SeatRequest(seat, agent, **kwargs)
 
@@ -86,6 +106,129 @@ class FrozenRosterTests(unittest.TestCase):
                          hashlib.sha256(path.read_bytes()).hexdigest())
         self.assertEqual(seat.authority_class, "enforceable")
         self.assertTrue(snap.revalidate())
+
+    def test_public_roster_exposes_catalog_display_identity_without_private_model_bytes(self):
+        self.add_agent("worker", model="claude-fable-5")
+        snap = self.freeze()
+        public = snap.as_dict(native=False)
+        display = public["model_display_by_seat"]["one"]
+        self.assertEqual(display["role"], "escalation")
+        self.assertEqual(display["name"], "Fable")
+        self.assertEqual(display["version"], "5")
+        self.assertEqual(display["label"], "frontier")
+        self.assertFalse(display["served_exact"])
+        self.assertNotIn("claude-fable-5", json.dumps(public))
+
+    def test_custom_agent_is_bound_as_redacted_immutable_evidence(self):
+        self.add_agent("worker", model="model-a")
+        package = self.add_custom_agent()
+        snap = self.freeze((self.req(custom_agent="custom-worker"),))
+        seat = snap.seat("one")
+        self.assertIsNotNone(seat.custom_agent_definition_digest)
+        self.assertEqual(seat.custom_agent_source_digest,
+                         hashlib.sha256(package.read_bytes()).hexdigest())
+        self.assertEqual(seat.custom_agent_identity["cli"], "claude")
+        self.assertEqual(snap.runtime_for("one")["custom_agent_definition_body"],
+                         "Use bounded evidence.")
+        receipt = json.dumps(snap.as_dict(native=False), sort_keys=True)
+        self.assertNotIn("custom-worker", receipt)
+        self.assertNotIn("Use bounded evidence", receipt)
+        self.assertIn(seat.custom_agent_definition_digest, receipt)
+        with self.assertRaises(TypeError):
+            seat.custom_agent_identity["cli"] = "agy"
+
+    def test_custom_agent_missing_and_implicit_global_root_are_refused(self):
+        self.add_agent("worker", model="model-a")
+        with self.assertRaises(roster.RosterResolutionError):
+            self.freeze((self.req(custom_agent="missing"),))
+        global_root = self.root / "explicit-global"
+        self.add_custom_agent(root=global_root)
+        with self.assertRaises(roster.RosterResolutionError):
+            self.freeze((self.req(custom_agent="custom-worker"),))
+        snap = self.freeze((self.req(custom_agent="custom-worker"),),
+                           custom_agents_root=str(global_root))
+        self.assertIsNotNone(snap.seat("one").custom_agent_definition_digest)
+
+    def test_custom_agent_root_must_be_absolute_and_is_revalidation_bound(self):
+        self.add_agent("worker", model="model-a")
+        global_root = self.root / "explicit-global"
+        self.add_custom_agent(root=global_root)
+        with self.assertRaises(roster.RosterResolutionError):
+            self.freeze((self.req(custom_agent="custom-worker"),),
+                        custom_agents_root="relative-agents")
+        snap = self.freeze((self.req(custom_agent="custom-worker"),),
+                           custom_agents_root=str(global_root))
+        self.assertTrue(snap.revalidate())
+
+    def test_custom_agent_identity_mismatch_fails_closed(self):
+        cases = (
+            {"cli": "codex"},
+            {"transport": "subprocess", "permission": "safe-edit",
+             "authority": "workspace-write", "worktree": "required"},
+            {"model": "model-b"},
+        )
+        for index, manifest_changes in enumerate(cases):
+            with self.subTest(case=index):
+                package = self.cwd / ".agents" / "agents" / "custom-worker"
+                if package.exists():
+                    import shutil
+                    shutil.rmtree(package)
+                self.add_agent("worker", model="model-a")
+                self.add_custom_agent(**manifest_changes)
+                with self.assertRaises(roster.RosterResolutionError):
+                    self.freeze((self.req(custom_agent="custom-worker"),))
+
+        package = self.cwd / ".agents" / "agents" / "custom-worker"
+        if package.exists():
+            import shutil
+            shutil.rmtree(package)
+        self.add_agent("worker", cli="kimi", transport="acp", permission="yolo",
+                       model="model-a")
+        self.add_custom_agent(cli="kimi", transport="subprocess", permission="yolo",
+                              authority="full-bypass", consent="full-authority",
+                              worktree="required")
+        with self.assertRaises(roster.RosterResolutionError):
+            self.freeze((self.req(custom_agent="custom-worker"),),
+                        full_authority_consent=("one",),
+                        worktree_proofs={"one": self.proof()})
+
+    def test_custom_agent_body_mutation_changes_receipt_and_revalidation(self):
+        self.add_agent("worker", model="model-a")
+        package = self.add_custom_agent(body="Original body.")
+        before = self.freeze((self.req(custom_agent="custom-worker"),))
+        package.write_text(package.read_text(encoding="utf-8").replace(
+            "Original body.", "Mutated body."), encoding="utf-8")
+        self.assertFalse(before.revalidate())
+        after = self.freeze((self.req(custom_agent="custom-worker"),))
+        self.assertNotEqual(before.roster_digest, after.roster_digest)
+        self.assertNotEqual(before.seat("one").custom_agent_definition_digest,
+                            after.seat("one").custom_agent_definition_digest)
+
+    def test_forged_replaced_seat_cannot_keep_the_old_roster_seal(self):
+        self.add_agent("worker", model="model-a")
+        self.add_custom_agent()
+        snap = self.freeze((self.req(custom_agent="custom-worker"),))
+        forged_seat = replace(
+            snap.seat("one"),
+            custom_agent_identity={
+                **dict(snap.seat("one").custom_agent_identity),
+                "skills_sha256": ["f" * 64],
+            },
+        )
+        forged = replace(snap, seats=(forged_seat,))
+        self.assertFalse(forged.revalidate())
+
+    def test_custom_agent_integration_has_no_provider_imports(self):
+        imports = set()
+        for filename in ("_deliberation_roster.py", "_deliberation_agents.py"):
+            tree = ast.parse((HERE / filename).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imports.update(alias.name.split(".", 1)[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imports.add(node.module.split(".", 1)[0])
+        self.assertTrue({"_executor", "_deliberation_live", "subprocess", "urllib",
+                         "requests"}.isdisjoint(imports))
 
     def test_definition_mutation_fails_revalidation(self):
         path = self.add_agent("worker")

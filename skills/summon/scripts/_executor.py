@@ -174,6 +174,7 @@ from _builder import (AgentInvocation, BACKENDS, advisory_warnings,
                       readonly_unenforceable_error,
                       agy_readonly_workspace_warning, agy_timeout_warning,
                       apply_credit_guard, backend_kind, build_invocation_args,
+                      model_backend_compatibility,
                       credit_spend_allowed, infer_dispatch_billing, permission_flags,
                       selects_credit_only)
 from _stream import StreamProcessor, _terminal_is_error
@@ -1789,6 +1790,19 @@ def _error_response(
     }
 
 
+def _blocked_response(
+    cli: str, error_kind: str, error: str, *, details: dict | None = None
+) -> dict:
+    """Build a structured, non-contact refusal for deterministic preflight failures."""
+    response = _error_response(cli, 1, error)
+    response["status"] = "blocked"
+    response["dispatcher_status"] = "blocked"
+    response["error_kind"] = error_kind
+    if details:
+        response.update(details)
+    return response
+
+
 def build_final_response(
     cli: str,
     returncode: int | None,
@@ -2555,6 +2569,25 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         except Exception:  # noqa: BLE001 — telemetry additive; never break dispatch
             pass
         return resp
+
+    # Deterministic model/backend routing preflight.  This must run after the effective
+    # model guard but before API calls, ACP setup, profile construction, worktree access, or
+    # subprocess creation.  An explicit Claude model sent to Codex is a caller-routing error,
+    # not a provider outage and must be visible as a structured block with zero contact.
+    _compat_model = _guarded_inv.model
+    if not _compat_model and inv.cli == "codex":
+        try:
+            from _resolver import _codex_default_model
+            _compat_model = _codex_default_model()
+        except Exception:  # noqa: BLE001 — preflight must remain non-fatal
+            _compat_model = None
+    _compat = model_backend_compatibility(inv.cli, _compat_model)
+    if _compat:
+        _compat_details = {k: v for k, v in _compat.items()
+                           if k not in {"message", "error_kind"}}
+        return _stamp(_enrich(_blocked_response(
+            inv.cli, _compat["error_kind"], _compat["message"],
+            details=_compat_details), None))
 
     # API-kind backends (e.g. openai-compat): the backend performs the request
     # itself instead of spawning a process. Flows through the same _enrich/_stamp

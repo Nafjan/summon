@@ -9,13 +9,15 @@
     python install.py --uninstall     # remove ONLY copies summon installed
 
 What it does:
-  1. Copies SKILL.md + scripts/ + references/ + agents/ into <host>/skills/summon/ for each
+  1. Copies SKILL.md + scripts/ + references/ + agents/ + examples/ into <host>/skills/summon/ for each
      detected host (~/.claude, ~/.codex, ~/.cursor, ~/.gemini, ~/.kimi-code, ~/.copilot, and each
      Antigravity profile under ~/.gemini/antigravity*), writing
      an ownership manifest (.summon-install.json) into each copy.
-  2. Copies the starter agent roster into ~/.agents/ with EXCLUSIVE creation —
+  2. Installs the thin /council and /deliberate companions at <host>/skills/ when
+     those names are unused; foreign skills are never replaced.
+  3. Copies the starter agent roster into ~/.agents/ with EXCLUSIVE creation —
      an agent file you already have is never touched, even under races.
-  3. Prints next steps (run --doctor).
+  4. Prints next steps (run --doctor).
 
 Safety model (every destructive operation is ownership-gated):
   - A directory counts as summon-owned ONLY if its manifest parses as JSON and
@@ -76,11 +78,30 @@ PROFILES = {
 # The skill lives in skills/summon/ in the repo, so `npx skills add Nafjan/summon`
 # installs a self-contained, working skill. install.py sources the same folder.
 SKILL_SRC = os.path.join(HERE, "skills", "summon")
+DELIBERATE_SKILL_SRC = os.path.join(HERE, "skills", "deliberate", "SKILL.md")
+COUNCIL_SKILL_SRC = os.path.join(HERE, "skills", "council", "SKILL.md")
 # agents/ ships INSIDE the skill too, so a copied skill carries a working starter
 # roster (the read-only fallback in _loader.bundled_roster_dir()); install_agents
 # ALSO seeds an editable copy into ~/.agents.
-SKILL_PAYLOAD = ["SKILL.md", "scripts", "references", "agents"]
+# Keep every shipped skill asset in the ownership manifest.  In particular,
+# ``examples`` is user-facing documentation/fixture material; omitting it from
+# this list makes an otherwise safe atomic refresh silently discard it from an
+# older managed copy.
+SKILL_PAYLOAD = ["SKILL.md", "scripts", "references", "agents", "examples"]
 MANIFEST = ".summon-install.json"
+
+
+def _source_version() -> str:
+    """Read the canonical plugin version for ownership/migration evidence."""
+    try:
+        with open(os.path.join(HERE, "plugin.json"), encoding="utf-8") as fh:
+            value = json.load(fh)
+        version = value.get("version") if isinstance(value, dict) else None
+        if isinstance(version, str) and version:
+            return version
+    except (OSError, ValueError, TypeError):
+        pass
+    return "unknown"
 
 # Optional backward-compat alias: a thin `sub-agents` skill that points at the
 # sibling `summon` skill's scripts (no duplication). Off by default for new
@@ -104,6 +125,9 @@ This alias runs the same dispatcher, which lives in the sibling `summon` skill:
 the directory containing this SKILL.md). All parameters, agents, and behavior are
 identical to `/summon` — see that skill for the complete reference.
 """
+
+_DELIBERATE_MARKER = "summon-managed: deliberate-companion"
+_COUNCIL_MARKER = "summon-managed: council-companion"
 # Installs/uninstalls take seconds, so an hour-old lock is unambiguously a
 # crashed holder — high enough that a LIVE lock is never mistaken for stale
 # (which is what makes breaking one, and the release race below, safe in practice).
@@ -185,7 +209,8 @@ def _owned(path: str) -> bool:
 
 def _write_manifest(dst: str, files: list) -> None:
     with open(os.path.join(dst, MANIFEST), "w", encoding="utf-8") as fh:
-        json.dump({"installed_by": "summon", "installed_at": int(time.time()),
+        json.dump({"installed_by": "summon", "version": _source_version(),
+                   "installed_at": int(time.time()),
                    "files": sorted(files)}, fh, indent=1)
 
 
@@ -285,6 +310,25 @@ def _build_tree(dst: str) -> list:
     return files
 
 
+def _rename_retry(src: str, dst: str, attempts: int = 5) -> None:
+    """Rename an owned installer tree with a short Windows handle-release retry.
+
+    Antivirus/indexer scans can briefly retain a just-written staging file. The
+    operation remains bounded and atomic; retries are only for transient
+    ``PermissionError`` and never broaden ownership or deletion authority.
+    """
+    delay = 0.03
+    for index in range(attempts):
+        try:
+            os.rename(src, dst)
+            return
+        except PermissionError:
+            if index + 1 >= attempts:
+                raise
+            time.sleep(delay)
+            delay *= 2
+
+
 def install_skill(host: str, dry: bool) -> tuple:
     """Returns (message, ok). Staged install: build in a unique temp dir, keep
     the old tree as an owned backup, swap by rename, restore on failure."""
@@ -316,7 +360,7 @@ def install_skill(host: str, dry: bool) -> tuple:
         # good tree aside and died before the swap. Put it back first.
         if not os.path.isdir(dest) and os.path.isdir(backup) and _owned(backup):
             try:
-                os.rename(backup, dest)
+                _rename_retry(backup, dest)
             except OSError:
                 pass
 
@@ -341,8 +385,8 @@ def install_skill(host: str, dry: bool) -> tuple:
         _write_manifest(staging, files)
 
         if os.path.isdir(dest):
-            os.rename(dest, backup)   # owned (checked above); becomes rollback copy
-        os.rename(staging, dest)
+            _rename_retry(dest, backup)   # owned (checked above); becomes rollback copy
+        _rename_retry(staging, dest)
         staging = None
         if os.path.isdir(backup) and _owned(backup):
             shutil.rmtree(backup, ignore_errors=True)
@@ -358,7 +402,7 @@ def install_skill(host: str, dry: bool) -> tuple:
         # Roll back: if the swap half-happened, restore the owned backup.
         if not os.path.isdir(dest) and os.path.isdir(backup) and _owned(backup):
             try:
-                os.rename(backup, dest)
+                _rename_retry(backup, dest)
             except OSError:
                 pass
         if staging and os.path.isdir(staging):
@@ -436,7 +480,23 @@ def _is_our_alias(skill_md: str) -> bool:
     return False
 
 
-def install_alias(host: str, dry: bool) -> tuple:
+def _run_companion_locked(host: str, dry: bool, action) -> tuple:
+    """Serialize sibling/alias writes with the canonical per-host lock."""
+    if dry:
+        return action()
+    if not os.path.isdir(HOSTS[host]):
+        return (None, True)
+    acq = _acquire_lock(HOSTS[host])
+    if acq is None:
+        return (f"[!!]  {host}: another summon install/uninstall appears to be running; retry shortly", False)
+    lock, token = acq
+    try:
+        return action()
+    finally:
+        _release_lock(lock, token)
+
+
+def _install_alias_unlocked(host: str, dry: bool) -> tuple:
     """Write the thin sub-agents alias next to the summon skill. Refuses to
     clobber a real (non-alias) sub-agents skill. Returns (message, ok)."""
     dest = os.path.join(HOSTS[host], "skills", "sub-agents")
@@ -455,7 +515,7 @@ def install_alias(host: str, dry: bool) -> tuple:
         return (f"[!!]  {host}: alias install failed ({e})", False)
 
 
-def uninstall_alias(host: str, dry: bool) -> tuple:
+def _uninstall_alias_unlocked(host: str, dry: bool) -> tuple:
     """Remove OUR sub-agents alias if present. Returns (message|None, ok)."""
     dest = os.path.join(HOSTS[host], "skills", "sub-agents")
     md = os.path.join(dest, "SKILL.md")
@@ -468,6 +528,194 @@ def uninstall_alias(host: str, dry: bool) -> tuple:
         return (f"[ok]  removed sub-agents alias -> {dest}", True)
     except OSError as e:
         return (f"[!!]  {host}: alias removal failed ({e})", False)
+
+
+def install_alias(host: str, dry: bool) -> tuple:
+    return _run_companion_locked(host, dry, lambda: _install_alias_unlocked(host, dry))
+
+
+def uninstall_alias(host: str, dry: bool) -> tuple:
+    return _run_companion_locked(host, dry, lambda: _uninstall_alias_unlocked(host, dry))
+
+
+def _is_our_deliberate(md: str) -> bool:
+    """Recognize only the source-marked thin deliberate companion."""
+    if os.path.islink(md) or not os.path.isfile(md):
+        return False
+    try:
+        with open(md, encoding="utf-8") as fh:
+            content = fh.read()
+    except OSError:
+        return False
+    if not content.startswith("---"):
+        return False
+    end = content.find("\n---", 3)
+    if end == -1 or _DELIBERATE_MARKER not in content[3:end]:
+        return False
+    for line in content[3:end].splitlines():
+        if line.strip().startswith("name:"):
+            return line.split(":", 1)[1].strip().strip("\"'") == "deliberate"
+    return False
+
+
+def _install_deliberate_companion_unlocked(host: str, dry: bool) -> tuple:
+    """Install the thin ``/deliberate`` companion without replacing a foreign skill."""
+    dest = os.path.join(HOSTS[host], "skills", "deliberate")
+    md = os.path.join(dest, "SKILL.md")
+    if os.path.lexists(dest) and os.path.islink(dest):
+        return (f"[!!]  {dest} is a link; refusing to follow it", False)
+    if os.path.exists(md) and not _is_our_deliberate(md):
+        return (f"[!!]  {md} exists and is not the summon deliberate companion; leaving it alone", False)
+    if os.path.isdir(dest):
+        extras = [name for name in os.listdir(dest) if name != "SKILL.md"]
+        if extras:
+            return (f"[!!]  {dest} contains foreign files ({', '.join(sorted(extras))}); leaving it alone", False)
+    if not os.path.isfile(DELIBERATE_SKILL_SRC):
+        return (f"[!!]  source companion missing: {DELIBERATE_SKILL_SRC}", False)
+    if dry:
+        return (f"[dry] would install deliberate companion -> {dest}", True)
+    tmp = None
+    try:
+        os.makedirs(dest, exist_ok=True)
+        with open(DELIBERATE_SKILL_SRC, encoding="utf-8") as fh:
+            content = fh.read()
+        tmp = md + f".tmp-{os.getpid()}-{uuid.uuid4().hex}"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, md)
+        return (f"[ok]  deliberate companion installed -> {dest}", True)
+    except OSError as e:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        return (f"[!!]  {host}: deliberate companion install failed ({e})", False)
+
+
+def _uninstall_deliberate_companion_unlocked(host: str, dry: bool) -> tuple:
+    """Remove only the managed companion file; preserve foreign siblings."""
+    dest = os.path.join(HOSTS[host], "skills", "deliberate")
+    md = os.path.join(dest, "SKILL.md")
+    if not os.path.exists(md):
+        return (None, True)
+    if not _is_our_deliberate(md):
+        return (f"[!!]  {md} exists and is not the summon deliberate companion; leaving it alone", False)
+    if dry:
+        return (f"[dry] would remove deliberate companion -> {dest}", True)
+    try:
+        os.unlink(md)
+        try:
+            os.rmdir(dest)
+        except OSError:
+            pass
+        return (f"[ok]  removed deliberate companion -> {dest}", True)
+    except OSError as e:
+        return (f"[!!]  {host}: deliberate companion removal failed ({e})", False)
+
+
+def install_deliberate_companion(host: str, dry: bool) -> tuple:
+    return _run_companion_locked(
+        host, dry, lambda: _install_deliberate_companion_unlocked(host, dry)
+    )
+
+
+def uninstall_deliberate_companion(host: str, dry: bool) -> tuple:
+    return _run_companion_locked(
+        host, dry, lambda: _uninstall_deliberate_companion_unlocked(host, dry)
+    )
+
+
+def _is_our_council(md: str) -> bool:
+    """Recognize only the source-marked thin council companion."""
+    if os.path.islink(md) or not os.path.isfile(md):
+        return False
+    try:
+        with open(md, encoding="utf-8") as fh:
+            content = fh.read()
+    except OSError:
+        return False
+    if not content.startswith("---"):
+        return False
+    end = content.find("\n---", 3)
+    if end == -1 or _COUNCIL_MARKER not in content[3:end]:
+        return False
+    for line in content[3:end].splitlines():
+        if line.strip().startswith("name:"):
+            return line.split(":", 1)[1].strip().strip("\"'") == "council"
+    return False
+
+
+def _install_council_companion_unlocked(host: str, dry: bool) -> tuple:
+    """Install the thin ``/council`` companion without replacing a foreign skill."""
+    dest = os.path.join(HOSTS[host], "skills", "council")
+    md = os.path.join(dest, "SKILL.md")
+    if os.path.lexists(dest) and os.path.islink(dest):
+        return (f"[!!]  {dest} is a link; refusing to follow it", False)
+    if os.path.exists(md) and not _is_our_council(md):
+        return (f"[!!]  {md} exists and is not the summon council companion; leaving it alone", False)
+    if os.path.isdir(dest):
+        extras = [name for name in os.listdir(dest) if name != "SKILL.md"]
+        if extras:
+            return (f"[!!]  {dest} contains foreign files ({', '.join(sorted(extras))}); leaving it alone", False)
+    if not os.path.isfile(COUNCIL_SKILL_SRC):
+        return (f"[!!]  source companion missing: {COUNCIL_SKILL_SRC}", False)
+    if dry:
+        return (f"[dry] would install council companion -> {dest}", True)
+    tmp = None
+    try:
+        os.makedirs(dest, exist_ok=True)
+        with open(COUNCIL_SKILL_SRC, encoding="utf-8") as fh:
+            content = fh.read()
+        tmp = md + f".tmp-{os.getpid()}-{uuid.uuid4().hex}"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, md)
+        return (f"[ok]  council companion installed -> {dest}", True)
+    except OSError as e:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        return (f"[!!]  {host}: council companion install failed ({e})", False)
+
+
+def _uninstall_council_companion_unlocked(host: str, dry: bool) -> tuple:
+    """Remove only the managed council companion file; preserve foreign siblings."""
+    dest = os.path.join(HOSTS[host], "skills", "council")
+    md = os.path.join(dest, "SKILL.md")
+    if not os.path.exists(md):
+        return (None, True)
+    if not _is_our_council(md):
+        return (f"[!!]  {md} exists and is not the summon council companion; leaving it alone", False)
+    if dry:
+        return (f"[dry] would remove council companion -> {dest}", True)
+    try:
+        os.unlink(md)
+        try:
+            os.rmdir(dest)
+        except OSError:
+            pass
+        return (f"[ok]  removed council companion -> {dest}", True)
+    except OSError as e:
+        return (f"[!!]  {host}: council companion removal failed ({e})", False)
+
+
+def install_council_companion(host: str, dry: bool) -> tuple:
+    return _run_companion_locked(
+        host, dry, lambda: _install_council_companion_unlocked(host, dry)
+    )
+
+
+def uninstall_council_companion(host: str, dry: bool) -> tuple:
+    return _run_companion_locked(
+        host, dry, lambda: _uninstall_council_companion_unlocked(host, dry)
+    )
 
 
 def install_agents(dry: bool) -> list:
@@ -604,6 +852,30 @@ def main() -> int:
                    else install_skill(h, args.dry_run))
         all_ok &= ok
         print(msg)
+        # `/deliberate` is a thin sibling companion, not a second runtime. Install
+        # it by default when the name is unused; on uninstall remove only our
+        # marked file and never a foreign skill.
+        # Do not create a sibling skill when the canonical summon install was
+        # refused for this host. A foreign/locked host must receive no partial
+        # product surface; uninstall remains independently safe and marked-only.
+        if args.uninstall:
+            dmsg, dok = uninstall_deliberate_companion(h, args.dry_run)
+        elif ok:
+            dmsg, dok = install_deliberate_companion(h, args.dry_run)
+        else:
+            dmsg, dok = None, True
+        all_ok &= dok
+        if dmsg:
+            print(dmsg)
+        if args.uninstall:
+            cmsg, cok = uninstall_council_companion(h, args.dry_run)
+        elif ok:
+            cmsg, cok = install_council_companion(h, args.dry_run)
+        else:
+            cmsg, cok = None, True
+        all_ok &= cok
+        if cmsg:
+            print(cmsg)
         # The sub-agents alias is a single sibling SKILL.md (points at summon's
         # scripts). Written on --with-alias; on --uninstall always removed IF it
         # is recognizably our alias (never a user's real sub-agents skill).

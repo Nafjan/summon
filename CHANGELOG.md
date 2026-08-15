@@ -6,7 +6,36 @@ regression notes, and test evidence, see the
 
 ## [Unreleased]
 
-No unreleased changes.
+- **Release contract:** added a source-bound version/migration contract and fixed
+  release-contract test entry. A future 3.0 candidate must keep plugin, dispatcher,
+  MCP companion, and migration documentation converged; this does not claim GA.
+
+- **One open product:** Summon deliberation is part of the same public product as
+  dispatch, council, and the browser observer. The public `/summon deliberate` command and thin `/deliberate`
+  companion skill share the same receipt, journal, replay, recovery, and browser
+  observer contracts.
+- **Explicit governed-decision guidance:** agent instructions now distinguish
+  dispatch, manifest, council, and deliberate, and require options, seats, quorum,
+  rounds, attempt budget, deadline, and human-approval policy to be stated rather
+  than inferred.
+- **Install convergence:** managed hosts receive the marked `/deliberate` companion
+  without clobbering a foreign skill; provider-inert and live-gated readiness labels
+  are now used consistently in the product docs.
+- **Conversation atlas:** provider-inert chat rooms now persist bounded redacted
+  events, group by project and initiating host/agent, support explicit council-round
+  context and human chimes, and expose an authenticated loopback atlas. `chat open
+  --chat-browser auto|builtin|ide|system|link` starts or reuses one surface; `link`
+  is non-launching for CI/SSH.
+- **Model identity catalog:** role, name, version, and editorial frontier labels are
+  now explicit display metadata; exact `model.served` evidence remains separate and
+  unknown models never become dispatchable by implication.
+
+## [3.0.0] — release candidate, not GA
+
+- Synchronized the plugin, dispatcher, and MCP companion to the 3.0.0 candidate
+  contract. This version is not a GA claim: the source-bound manifest still requires
+  a clean immutable tree, converged managed installs, and one independently reviewed
+  live-provider receipt.
 
 ## [2.2.0] — 2026-08-12
 

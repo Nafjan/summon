@@ -44,7 +44,7 @@ class DeliberationCliTests(unittest.TestCase):
         self.assertEqual(
             _cli.rewrite_subcommand(["deliberate", "--question", "q"]),
             (["--deliberate", "--question", "q"], None))
-        for action in ("resume", "status", "replay", "cancel", "recover"):
+        for action in ("resume", "status", "replay", "cancel", "recover", "open"):
             rewritten, mode = _cli.rewrite_subcommand(
                 ["deliberate", action, "run-1", "--json"])
             self.assertEqual(mode, None)
@@ -65,6 +65,10 @@ class DeliberationCliTests(unittest.TestCase):
                  "--options", "yes,no", "--max-attempts", "2", "--deadline", "30s"]
         self.assertIsNone(_cli.unsupported_mode_flags(
             fresh, parser.parse_args(fresh)))
+
+        opened = ["--deliberate-open", "run-1", "--browser", "link"]
+        self.assertIsNone(_cli.unsupported_mode_flags(
+            opened, parser.parse_args(opened)))
 
         recover = ["--deliberate-recover", "run-1", "--agent", "reviewer"]
         args = parser.parse_args(recover)
@@ -171,6 +175,8 @@ class DeliberationCliTests(unittest.TestCase):
             self.assertEqual(status["projection"]["state"], "prepared")
             self.assertEqual(status["journal_records"], 1)
             self.assertTrue(status["consistent"])
+            self.assertEqual(status["receipt"]["quorum_rule"], "all")
+            self.assertEqual(status["receipt"]["max_attempts"], 4)
             self.assertEqual(replay["records"][0]["event"], "run_prepared")
             self.assertEqual(before, after)
 

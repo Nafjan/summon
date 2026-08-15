@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "authority": "summon-editorial",
+  "as_of": "2026-08-14",
+  "definition": "frontier and near-frontier are editorial routing labels, not guarantees of quality, safety, cost, availability, or vendor endorsement",
+  "entries": [
+    {
+      "key": "claude/claude-fable-5",
+      "identity": {"vendor": "anthropic", "model_id": "claude-fable-5"},
+      "display": {"role": "escalation", "name": "Fable", "version": "5"},
+      "editorial": {"label": "frontier", "rank": 1, "lane": "high-stakes-escalation"},
+      "route": {"backend": "claude", "target": "claude-fable-5", "dispatchable": true}
+    },
+    {
+      "key": "codex/gpt-5.6-sol",
+      "identity": {"vendor": "openai", "model_id": "gpt-5.6-sol"},
+      "display": {"role": "architecture", "name": "Sol", "version": "5.6"},
+      "editorial": {"label": "frontier", "rank": 2, "lane": "architecture-implementation"},
+      "route": {"backend": "codex", "target": "gpt-5.6-sol", "dispatchable": true}
+    },
+    {
+      "key": "claude/claude-opus-5",
+      "identity": {"vendor": "anthropic", "model_id": "claude-opus-5"},
+      "display": {"role": "synthesis", "name": "Opus", "version": "5"},
+      "editorial": {"label": "frontier", "rank": 3, "lane": "architecture-synthesis"},
+      "route": {"backend": "claude", "target": "claude-opus-5", "dispatchable": true}
+    },
+    {
+      "key": "kimi/kimi-code/k3",
+      "identity": {"vendor": "moonshot", "model_id": "kimi-code/k3"},
+      "display": {"role": "high-context research", "name": "Kimi", "version": "K3"},
+      "editorial": {"label": "frontier", "rank": 4, "lane": "high-context-research"},
+      "route": {"backend": "kimi", "target": "kimi-code/k3", "dispatchable": true}
+    },
+    {
+      "key": "cursor-agent/grok-4.6",
+      "identity": {"vendor": "xai", "model_id": "grok-4.6"},
+      "display": {"role": "coding second opinion", "name": "Grok", "version": "4.6"},
+      "editorial": {"label": "near-frontier", "rank": 1, "lane": "coding-second-opinion"},
+      "route": {"backend": "cursor-agent", "target": "grok-4.6", "dispatchable": true}
+    },
+    {
+      "key": "agy/gemini-3.7-flash-high",
+      "identity": {"vendor": "google", "model_id": "gemini-3.7-flash-high"},
+      "display": {"role": "evidence research", "name": "Gemini Flash", "version": "3.7"},
+      "editorial": {"label": "near-frontier", "rank": 2, "lane": "evidence-research"},
+      "route": {"backend": "agy", "target": "gemini-3.7-flash-high", "dispatchable": true}
+    },
+    {
+      "key": "cursor-agent/glm-5.2",
+      "identity": {"vendor": "zhipu", "model_id": "glm-5.2"},
+      "display": {"role": "fast generalist", "name": "GLM", "version": "5.2"},
+      "editorial": {"label": "near-frontier", "rank": 3, "lane": "fast-secondary"},
+      "route": {"backend": "cursor-agent", "target": "glm-5.2", "dispatchable": true}
+    },
+    {
+      "key": "unverified/deepseek-v4-flash",
+      "identity": {"vendor": "deepseek", "model_id": "deepseek-v4-flash"},
+      "display": {"role": "fast coding", "name": "DeepSeek V4 Flash", "version": "V4 Flash"},
+      "editorial": {"label": "near-frontier", "rank": 4, "lane": "fast-secondary"},
+      "route": {"backend": "unverified", "target": "deepseek-v4-flash", "dispatchable": false}
+    },
+    {
+      "key": "unverified/deepseek-v4-pro",
+      "identity": {"vendor": "deepseek", "model_id": "deepseek-v4-pro"},
+      "display": {"role": "deep reasoning", "name": "DeepSeek V4 Pro", "version": "V4 Pro"},
+      "editorial": {"label": "near-frontier", "rank": 5, "lane": "deep-secondary"},
+      "route": {"backend": "unverified", "target": "deepseek-v4-pro", "dispatchable": false}
+    }
+  ]
+}

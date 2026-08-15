@@ -31,8 +31,8 @@ command:
   modes can run the dispatcher and read the skill.
 - **A plain terminal,** where you drive it yourself.
 
-From any of those you can hand a task to another model, run several at once, or convene a
-council to make a decision. It also reaches any OpenAI-compatible API, so OpenRouter,
+From any of those you can hand a task to another model, run several at once, convene a
+council, or start a governed deliberation. It also reaches any OpenAI-compatible API, so OpenRouter,
 OpenAI, Anthropic, Google, and local models (Ollama, LM Studio) work as agents too.
 
 ```
@@ -71,15 +71,23 @@ task, each billed to its own plan, instead of paying for four and using one at a
   and want the *other* models one command away, without leaving the one they're in.
 - **Anyone who wants a real second opinion.** Cross-vendor review, where no model grades
   its own homework, is built in rather than bolted on.
-- **People making decisions with AI** who want more than one model's take: council mode
-  gets you diverse positions, anonymized peer ranking, and a synthesized recommendation.
+- **People making decisions with AI** who need a governed answer: council mode gives
+  diverse positions and a chaired recommendation; `deliberate` adds fixed options,
+  quorum, hard attempt/deadline bounds, durable replay, and explicit human boundaries.
+- **People who want an actual multi-agent room:** the provider-inert conversation surface
+  keeps a persistent, project-grouped session across Codex, Claude Code, Cursor, and
+  terminal initiators, with human messages, resumable turns, interactive council rounds,
+  and a separate governed-decision view. See
+  [`docs/SUMMON_CONVERSATION_PLAN.md`](docs/SUMMON_CONVERSATION_PLAN.md).
 - **Power users running fleets of agents:** fan a task across N models in parallel, with
   per-backend throttling and resumable batches.
 - **Anyone unifying local + cloud models** behind one interface (subscription CLIs *and*
   OpenAI-compatible APIs, including self-hosted).
 
-If you just want a chat UI, this isn't it. Summon is a dispatcher: you or another agent
-drive it, and it hands back structured results instead of a stream.
+Summon remains a dispatcher first, with a provider-inert conversation room
+for brainstorming and interactive council work. That room shares the same redacted,
+durable event contracts; it does not turn ordinary chat into authority or silently
+promote a conversation into a governed decision.
 
 ---
 
@@ -95,6 +103,9 @@ drive it, and it hands back structured results instead of a stream.
   if it crashes. Good for reviewing, summarizing, or labeling at scale.
 - **Structured extraction:** `--json-schema` validates an agent's final JSON and, on a
   backend that supports resume, spends one corrective retry when it does not match.
+- **Governed deliberation:** `summon deliberate` records a receipt-bound, fixed-option
+  decision policy and journal. The local browser observer is public preview functionality;
+  fresh/resume provider execution remains live-gated until the owner-bound coordinator passes.
 - **Use local + frontier models together:** an Ollama model and Claude in the same council.
 - **Route named local logins:** keep multiple Claude config directories behind private
   profile names, so a public agent definition never carries a machine path or credential.
@@ -103,8 +114,9 @@ drive it, and it hands back structured results instead of a stream.
 
 ## Install
 
-Pick the path that matches your host. All three install the same `skills/summon/` skill tree;
-only the destination differs.
+Pick the path that matches your host. All three install the `skills/summon/` skill tree and
+the thin sibling `/council` and `/deliberate` companions; only the destination differs.
+Those companions reuse Summon's scripts and canonical references—there is no second runtime.
 
 ### Agent Plugin (Cursor, VS Code, Copilot, Codex)
 
@@ -117,7 +129,8 @@ plugin support):
   plugin directory. On Cursor that is `~/.cursor/plugins/local/summon/` with `plugin.json`
   at the plugin root (this repo already ships that layout). Reload the window after copying.
 
-The plugin bundles `skills/summon/` as-is — no `install.py` step required for plugin hosts.
+The plugin bundles `skills/` as-is, including the thin `council` and `deliberate` companions — no
+`install.py` step is required for plugin hosts.
 
 ### Skills registry (`npx skills add`)
 
@@ -148,6 +161,29 @@ git clone https://github.com/Nafjan/summon && cd summon
 python summon.py doctor      # which backends are ready? what's missing?
 python install.py            # install the skill into every detected AI CLI
 ```
+
+For a release or support bundle, generate a provider-inert evidence manifest after
+running the fixed release-test registry:
+
+```bash
+python tools/release_gates.py --require-clean --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json"
+python tools/release_manifest.py \
+  --evidence-file "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json" \
+  --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" --check
+```
+
+The runner executes the fixed suites, records output digests, strips backend credentials and
+proxies, and writes an atomic evidence file without contacting a provider. Release evidence must
+be generated from a clean checkout (`--require-clean`); a dirty local run is diagnostic only.
+Keep both evidence and manifest outside the checkout so their creation cannot make the source tree dirty
+before the manifest verifies Git cleanliness.
+`--check` is the
+GA gate: it additionally requires a clean tree, converged owned installs, and every named
+release gate to be machine-recorded as `pass`; the preview runner intentionally leaves gates
+as `not_run`, so a preview evidence file must not be presented as a release certification.
+Unmanaged host copies, such as a local Cursor plugin, are reported separately and are never
+overwritten. The version, migration, compatibility, and rollback contract is documented in
+[`docs/VERSIONING_AND_3.0.md`](docs/VERSIONING_AND_3.0.md).
 
 `install.py` stages atomically, never touches an agent file you already have, and uninstalls
 cleanly (`python install.py --uninstall`). Migrating from the old name? `--with-alias` adds a
@@ -243,7 +279,11 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon models [--cli B]` | invocable models per backend, with a `source` per entry (live query, local config, or static list) |
 | `summon doctor [--json]` | backend / setup health check (run this first) |
 | `summon manifest FILE` | run a batch swarm (per-backend concurrency, resumable) |
-| `summon council --question "…"` | **decide by consensus** of diverse models |
+| `summon council --question "…"` | **explore and synthesize** diverse positions |
+| `summon chat open|post|show|list …` | provider-inert shared room for brainstorming and human context; `chat open --chat-browser auto|link` starts/reuses or links the authenticated local atlas |
+| `summon deliberate --question "…" --seats A,B --options X,Y` | fixed-option, quorum-controlled, replayable decision |
+| `summon deliberate status\|replay\|recover\|cancel RUN_ID` | inspect, repair, or queue a typed command without provider work |
+| `summon deliberate open RUN_ID` | open/reuse the local browser ledger (provider-inert) |
 | `summon agent new\|set NAME --set k=v` | scaffold / retune an agent definition |
 | `summon role propose\|approve\|list\|resolve …` | manage private, opt-in role aliases |
 | `summon jobs list\|status [ID]` · `jobs wait ID` | inspect or wait for background jobs (`--json` on list/status) |
@@ -277,8 +317,11 @@ Git-style subcommands. The old flat `--flag` form still works too:
    hypotheses, consensus).
 5. **Put big inputs in files.** For long prompts, write a packet under `--cwd` and pass a
    short "read X and follow it" prompt (avoids arg-length limits and sandboxed reads).
-6. **Fan out with `manifest`; decide with `council`.** Independent tasks → a manifest
-   swarm; a judgment call → a council.
+6. **Fan out with `manifest`; choose the decision surface deliberately.** Independent
+   tasks → a manifest swarm; cross-examination plus a chairman → `council`; fixed options,
+   quorum, hard physical bounds, and replay → `deliberate`. Read
+   [`skills/summon/references/deliberation.md`](skills/summon/references/deliberation.md)
+   before choosing it.
 
 Full playbook: **[docs/PROTOCOL.md](docs/PROTOCOL.md)**.
 
@@ -301,16 +344,33 @@ dispatch it with the **summon** skill instead of doing everything yourself:
   reviewed only by the model that wrote it; it shares that model's blind spots. Route
   claude/cursor-written code to codex (`reviewer` / `adversarial-reviewer`); route
   codex-written code to a claude reviewer (`quick-reviewer`).
-- **High-stakes decisions → `--council`.** Convene a vendor-diverse council and let a
+- **Open-ended judgment → `--council`.** Convene a vendor-diverse council and let a
   chairman synthesize. Disagreement that survives round 2 is worth taking seriously.
+- **Fixed-option governed decisions → `--deliberate`.** Supply the question, named
+  seats, options, quorum, rounds, attempt budget, absolute deadline, and human-approval
+  policy explicitly. Never infer a missing policy field or silently fall back to council.
 - **Independent work → `--manifest`.** Fan several jobs out with per-backend
   concurrency; each writes its own result envelope you can inspect.
+- **Use the curated model bands deliberately.** Summon's current clear-frontier order is
+  Fable, Sol, Opus, then Kimi. The near-frontier/value band is Grok 4.6, Gemini Flash 3.7,
+  GLM 5.2, DeepSeek V4 Flash, then DeepSeek V4 Pro. These are editorial routing labels;
+  the model catalog and UI tooltips show the role/name/version, while only `model.served`
+  proves what actually ran.
 - **Escalate the hardest problems** to the top tier (an opus agent, or `fable`). Fable
   billing depends on the Claude seat and remaining usage: Max/premium seats may use it
   for up to 50% of their regular weekly limit at no extra cost, while Pro/standard seats
   use usage credits from the start. summon runs the requested model, warns before
   dispatch, and reports billing as unknown without a metered API-key route. Keep councils
   and swarms diverse; a council of clones is pointless.
+- **Use Gemini Flash 3.7 as the fast independent evidence lane.** The bundled
+  `researcher` seat is pinned to `gemini-3.7-flash-high` through agy and is the recommended
+  secondary voice for a cross-vendor council. Verify `model.served` in the envelope; agy
+  cannot enforce read-only, so keep this seat in research/review roles.
+- **Use Cursor Grok 4.6 as a near-frontier candidate, not a blind default.** Cursor
+  lists Grok 4.6 in its model pool for long-horizon coding and knowledge work. Probe it
+  with `--cli cursor-agent --model grok-4.6`, require the envelope's `model.served` to match,
+  and keep Gemini pinned until a local smoke proves eligibility, evidence quality, and the
+  required permission/retention contract. Never silently fall back to another Cursor model.
 
 Verify, don't trust: branch on the returned `status`; a `report_ok:false` or
 `suspect:true` "success" means re-dispatch. Read `warnings` (model fallback, premium
@@ -321,7 +381,8 @@ council you cannot afford to lose (the envelope is checkpointed each phase).
 ```
 
 Tune it to your workflow. The point is that your agent reaches for summon on purpose
-(delegate, review across vendors, decide by council) instead of forgetting it exists.
+(dispatch, review across vendors, open-ended council, or fixed-option deliberate)
+instead of forgetting it exists.
 The agent-led installer above can add a snippet like this for you.
 
 ### Orchestration practices that hold up
@@ -346,7 +407,7 @@ A few habits that keep multi-agent work fast, cheap, and trustworthy:
 
 ### Pairs well with your other skills
 
-summon just dispatches. It doesn't try to reimplement the thinking-discipline that
+summon coordinates dispatch and governed decision workflows. It doesn't try to reimplement the thinking-discipline that
 dedicated skills already do well; it composes with whatever your CLI has installed. Some
 categories that pair well (use what your ecosystem offers):
 
@@ -380,7 +441,7 @@ vendors.
   "report_ok": true,
   "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
                "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
-  "summon":  { "version": "2.2.0", "scripts_sha256": "9f2c…" },
+  "summon":  { "version": "3.0.0", "scripts_sha256": "9f2c…" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -453,8 +514,9 @@ board. These backends bill your API credits, not a subscription (see [TERMS.md](
 Planning/architecture on Claude (`planner`, `architect`, `deep-debugger`,
 `security-auditor`, `fable`), implementation + adversarial review on Codex (`implementer`,
 `reviewer`, `adversarial-reviewer`, `debugger`, `test-author`), coding on Cursor (`coder`,
-`bug-fixer`), research/docs/frontend on Antigravity (`researcher`, `docs-writer`,
-`frontend`), and balanced lanes on Sonnet 5 (`pair`, `editor`, `quick-reviewer`, `pr-prep`).
+`bug-fixer`), research on Gemini Flash 3.7 through agy (`researcher`), docs/frontend on
+Antigravity (`docs-writer`, `frontend`), and balanced lanes on Sonnet 5 (`pair`, `editor`,
+`quick-reviewer`, `pr-prep`).
 Each is a plain `.md` file: edit, delete, or add your own with `summon agent new`.
 `install.py` never overwrites an agent you already have.
 
@@ -604,6 +666,9 @@ every change tested, secrets redacted), and the PR checklist. Run
 
 ## Roadmap
 
+The release-facing product plan, readiness matrix, test gates, and live-provider roadmap are maintained in
+[docs/SUMMON_PRODUCT_ROADMAP.md](docs/SUMMON_PRODUCT_ROADMAP.md).
+
 Shaped by two extended field reports (a GTM-materials agent and a complex-coding-project
 agent). Every validated request is either shipped, scheduled below, or declined with a
 reason. Ordering is roughly by priority, not a commitment.
@@ -656,10 +721,29 @@ spend, not corrupted output), and it requires a process suspended past its lease
 inside that exact window; single-machine use does not hit it.
 This does **not** extend to manifests. Two manifest runs sharing one `--results-dir` are not
 serialized by anything: measured with two real processes, one parent read and reported the
-other's answer. summon now refuses an envelope whose `request_sha256` does not match the job
+other’s answer. summon now refuses an envelope whose `request_sha256` does not match the job
 being run (`result_path_conflict`), but that is a safety net, not a lock -- **give each
 concurrent run its own `--results-dir`.** Closing it fully would need OS advisory
 locks (with their own NFS / suspended-process gaps).
+
+### Open the public deliberation observer in a browser
+
+After a durable deliberation run exists, use:
+
+```text
+summon deliberate open RUN_ID
+```
+
+This is public, local, provider-inert preview functionality. Summon keeps one authenticated loopback surface per run and reuses its URL on later
+invocations. `--browser auto` prefers an IDE bridge configured through
+`SUMMON_BROWSER_BRIDGE` (also accepts `CODEX_BROWSER_BRIDGE`, `VSCODE_BROWSER_BRIDGE`,
+`CURSOR_BROWSER_BRIDGE`, or `ANTIGRAVITY_BROWSER_BRIDGE`) and otherwise asks the system
+browser to reuse an existing window. On Codex/IDE hosts advertising the optional `iab`
+backend, `auto` uses `browser-harness` to reuse a matching tab or open one. Use
+`--browser builtin` to require that path, `--browser link` for SSH/CI, `--browser ide`
+to require the executable bridge, or `--browser system` to skip both. The bridge is
+passed one URL argument with `shell=False`; it cannot execute a shell command. This is
+an observer and typed-cancel handoff only—it does not enable live provider execution.
 
 ## Credits
 

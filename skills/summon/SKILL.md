@@ -20,6 +20,10 @@ but can correlate or reveal low-entropy values, so review a report before sharin
 - **[codex.md](references/codex.md)** - Codex-specific setup (permissions, timeout)
 - **[t3-code.md](references/t3-code.md)** - Summon under T3 Code (install profile, doctor, smoke checklist — not a native T3 plugin)
 - **[orchestration.md](references/orchestration.md)** - rules of engagement for multi-agent work: what the envelope proves, cross-vendor routing, permission traps, council quality bar, resume-instead-of-re-pay (project- and IDE-agnostic)
+- **[deliberation.md](references/deliberation.md)** - when to choose governed `deliberate` versus dispatch, manifest, or council, plus safe run/status/recover/open recipes
+- **[SUMMON_CONVERSATION_PLAN.md](../../docs/SUMMON_CONVERSATION_PLAN.md)** - the shared provider-inert room contract for chat, interactive council, and deliberate discussion views
+- **[../council/SKILL.md](../council/SKILL.md)** - thin `/council` companion for open-ended positions and chaired synthesis
+- **[../deliberate/SKILL.md](../deliberate/SKILL.md)** - thin `/deliberate` companion for fixed-option governed decisions
 - **[effort.md](references/effort.md)** - reasoning effort / thinking levels: who honors `--effort`, defaults, agy Gemini suffixes, envelope fields
 - **[examples/](examples/)** - document-audit schema, manifest, question, and role-specialized council agents
 - **[VERSIONING_AND_1.0_CRITERIA.md](../../docs/VERSIONING_AND_1.0_CRITERIA.md)** - the stable public contract, the criteria 1.0.0 met, and the evidence behind it
@@ -34,13 +38,25 @@ plugin package with `plugin.json` at the repo root — no separate install step.
 `python install.py` from the repo instead.
 
 **Command surface**: the script accepts git-style **subcommands** — `dispatch` (the
-default action), `list`, `models`, `doctor`, `manifest FILE`, `council`, `agent
+default action), `list`, `models`, `doctor`, `manifest FILE`, `council`, `chat`, `deliberate
+QUESTION`, `deliberate status|replay|recover|cancel|open|resume RUN_ID`, `agent
 new|set NAME`, `role propose|approve|list|resolve`, `telemetry enable|disable|status|clear`,
 `bug-report`, `version` — e.g. `run_subagent.py
 council --question "…" --cwd DIR`. The
 **legacy flat form still works unchanged** (`run_subagent.py --agent … --prompt …`,
 `--list`, `--manifest FILE`, …), and every flag below is valid in both. Bare
 `run_subagent.py` (or `help`) prints the command list.
+
+The provider-inert chat commands are `chat open SESSION_ID`, `chat post SESSION_ID
+--message "…"`, `chat show SESSION_ID`, and `chat list`. They persist a redacted
+room journal grouped by project and initiating host/agent. Human messages are
+context only; they do not become council votes, deliberate ballots, approvals,
+or provider launches.
+
+For a local preview of all rooms, run `_conversation_ui.py --serve
+<conversation-root>` from the installed scripts. It prints one authenticated
+loopback URL and reuses no provider session; the browser atlas groups rooms by
+project digest and initiating host/agent.
 
 ## CLI-Specific Notes
 
@@ -189,6 +205,44 @@ direction that matters: on `agy`, `safe-edit` runs with the SAME full bypass as 
 capability census built from declared strings **understates** real capability. Report the
 `effective` field, never the declared one.
 
+### Recommended cross-vendor roster lanes
+
+The bundled `researcher` seat is pinned to `gemini-3.7-flash-high`, live-verified through
+agy on 2026-08-13. Use it as Summon's primary evidence extractor and the recommended fast
+secondary voice for `/council`:
+
+```text
+run_subagent.py dispatch --agent researcher --cwd <project> --prompt "..."
+run_subagent.py council --members planner,reviewer,researcher,pair --question "..." --cwd <project>
+```
+
+The envelope must be checked for `model.served == gemini-3.7-flash-high`; an unavailable
+model is a routing failure, not permission to silently float to another model. Gemini/agy
+is excellent for fast repository research, evidence extraction, and an independent UI or
+docs review. It is not the chairman, safety arbiter, or provider-execution seat. agy cannot
+enforce `read-only`, so keep this role research/review-only unless an operator explicitly
+chooses otherwise.
+
+### Fable profile health
+
+Fable is a separate Claude Code login profile, not an automatic fallback. Configure it once
+on the machine, then verify it before an expensive dispatch:
+
+```powershell
+$env:CLAUDE_CONFIG_DIR = "$env:USERPROFILE\.claude-fable"
+claude auth login
+claude auth status
+python skills/summon/scripts/run_subagent.py doctor --json
+python skills/summon/scripts/run_subagent.py dispatch --agent fable --profile fable-fallback --model claude-fable-5 --cwd <project> --prompt "Return the required Final report block."
+```
+
+The dispatch envelope is authoritative: check `status`, `model.served`, `profile`, and the
+structured final report. A Claude backend may expose a non-zero raw CLI event while Summon
+normalizes a clean terminal report to process exit 0; do not treat the raw backend field as
+the public result without checking `dispatcher_status` and `normalization_reason`. Never
+put credentials, config paths, bearer URLs, or profile contents into prompts, reports, or
+telemetry.
+
 ### Step 2: Execute Agent
 
 ```bash
@@ -243,6 +297,47 @@ including temporary files, servers, containers, VMs, worktrees, and processes. T
 reports and envelopes as private artifacts; public docs contain only sanitized,
 repository-relative examples.
 
+### Deliberate: choose it only for governed decisions
+
+Use `deliberate` when the user needs a bounded, receipt-bound decision: explicit
+options, named seats, fixed quorum, a hard physical-attempt budget, an absolute
+deadline, and an auditable journal or human approval boundary. Do not infer those
+fields from a vague request. If the user has not supplied options or seats, ask
+for them or use ordinary dispatch/council instead.
+
+Use this mode map (council and deliberate are a handoff, not one mixed run):
+
+| Request | Mode |
+|---|---|
+| One agent should do the work | ordinary dispatch |
+| Several independent jobs | manifest/fan-out |
+| Diverse positions, cross-examination, and a chairman | council |
+| Fixed-option, quorum-controlled, replayable decision | deliberate |
+| Read or repair an existing deliberate run | deliberate status/replay/recover |
+| Continue after a crash | deliberate resume, with explicit spend consent |
+| Open the local ledger | deliberate open |
+
+The conversation room is not a new authority mode. Use it when the human wants
+to brainstorm with several agents, continue a shared session, or participate in
+an interactive council. Group rooms by project and initiating host/agent, and
+resume a provider session only after its provider, model, profile, prompt, and
+permission evidence still match. If they do not, create an explicit fork and
+explain why. The provider-inert local commands are `summon chat open SESSION_ID`,
+`summon chat post SESSION_ID --message "…"`, `summon chat show SESSION_ID`, and
+`summon chat list`; they write only a bounded redacted room journal. A human
+message is context-only, not an approve/deny/cancel command. Never turn a chat
+message or council synthesis into a deliberate ballot; promotion requires a
+fresh, human-confirmed deliberate policy.
+
+The current fresh/resume provider path is deliberately `integration_pending`:
+the receipt and safety boundary are real, but the CLI must not silently launch a
+provider or fall back to another mode until the reviewed live coordinator gate is
+enabled. `status`, `replay`, `recover`, `cancel`, and `open` are provider-inert;
+`resume` treats an unmatched physical start as `uncertain_spend` and makes no
+provider call unless `--retry-indeterminate` is explicit. Read
+[references/deliberation.md](references/deliberation.md) before constructing a
+run or recommending it to a user.
+
 **By exit_code** (when status is `error`):
 
 | exit_code | Meaning | Resolution |
@@ -277,7 +372,7 @@ repository-relative examples.
 | `--strict-agents-dir` | No | Governance mode: fail closed when the requested agent is absent from the selected roster; do not fall back to bundled or plugin definitions. Opt-in only; default resolution is unchanged |
 | `--enable-roles` | No | Opt into approved user-global role aliases. Exact roster names win; malformed, retargeted, chained, or unapproved aliases fail closed. Children inherit the flag |
 | `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `kimi`, `agy`, `gemini` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
-| `--model` | No | Override the agent's frontmatter model for this call |
+| `--model` | No | Override the agent's frontmatter model for this call. Summon performs a side-effect-free backend/model namespace preflight first: a known cross-vendor pairing such as `--cli codex --model claude-opus-5` is returned as `status:blocked`, `error_kind:backend_model_incompatible`, with explicit compatible reroutes; it never builds a profile or spawns a provider. Unknown/future IDs are passed through rather than guessed. `--dry-run` reports the same refusal. |
 | `--profile` | No | Select a named private backend profile from `~/.agents/summon-profiles.json` (currently Claude only). The name is safe metadata; the registry keeps config/auth paths out of agent definitions and receipts. `--profile` overrides frontmatter `profile:` |
 | `--effort` | No | Reasoning / thinking intensity: `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none`/`default`/`off` = leave the backend alone). **Honored by claude + codex** (default **`high`**); **agy Gemini only when set explicitly** (rewrites model to `… (Low\|Medium\|High)`); **ignored** for cursor-agent / kimi / gemini CLI / openai-compat / arkcli (stderr note if you set it). Precedence: `--effort` > frontmatter `effort:` > `SUMMON_DEFAULT_EFFORT` > built-in `high` (claude/codex). Full matrix: [references/effort.md](references/effort.md) |
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy. Resume for implementation continuity; use a fresh context for final adversarial adjudication so a reviewer is not grading its own prior work. The envelope records `resumed:true|false` |
@@ -317,17 +412,20 @@ repository-relative examples.
 | `--concurrency` | No | With `--manifest`: per-backend caps, e.g. `agy=2,codex=3,default=3` |
 | `--results-dir` | No | With `--manifest`: where job envelopes land (default `{cwd}/.agents/results`) |
 | `--council` | - | Consensus deliberation: dispatch `--question` to diverse members, chairman synthesizes. See "Council mode" |
-| `--question` / `--question-file` | With `--council` | The decision to deliberate |
-| `--members` / `--chairman` / `--rounds` | No | With `--council`: member agents (default is a vendor-diverse, **repo-capable** set — claude+codex+cursor; `agy` members can read `--cwd` since 0.13.9, so they may serve as repo council members; they still report no usage or served model, which weakens their evidence trail), synthesizer (default `architect`, which is Opus 5; pass `fable` explicitly for the pricier escalation tier), 1 or 2 rounds |
-| `--run-dir` | No | With `--council`: root for the durable run directory (default `{cwd}/.agents/runs`; env `SUMMON_RUNS_DIR`) |
+| `--question` / `--question-file` | With `--council` or `--deliberate` | The decision question; deliberate requires the question to be fixed before the receipt is created |
+| `--members` / `--chairman` | No | With `--council`: member agents (default is a vendor-diverse, **repo-capable** set — claude+codex+cursor; `agy` members can read `--cwd` since 0.13.9, so they may serve as repo council members; they still report no usage or served model, which weakens their evidence trail), synthesizer (default `architect`, which is Opus 5; pass `fable` explicitly for the pricier escalation tier) |
+| `--rounds` | With `--deliberate`; optional with `--council` | Explicit bounded rounds for deliberate; council accepts 1 or 2 rounds. Do not rely on a deliberate parser default |
+| `--run-dir` | No | With `--council` or `--deliberate`: root for the durable run directory (default `{cwd}/.agents/runs`; env `SUMMON_RUNS_DIR`) |
 | `--resume-run RUN_ID` | - | Resume a council run: re-run only missing/failed/changed stages (question and members come from the run's `receipt.json`). Subcommand form: `council resume <run-id>` |
 | `--council-status RUN_ID` | - | Print a council run's durable state, read-only (add `--json`). Subcommand form: `council status <run-id>` |
-| `--deliberate` | - | Start the separate headless deliberation surface. This branch validates the immutable question/policy and refuses fresh execution until the scheduler is wired to the one-attempt adapter; it never silently falls back to council or ordinary dispatch |
+| `--deliberate` | - | Start the governed fixed-option deliberation surface. It validates the immutable question/policy and returns `integration_pending` before provider contact until the owner-bound coordinator gate is enabled; it never silently falls back to council or ordinary dispatch |
 | `--deliberate-resume RUN_ID` | - | Resume a deliberation by id. A durable indeterminate attempt blocks with `uncertain_spend` unless `--retry-indeterminate` is explicit; the current preview remains `integration_pending` until scheduler wiring lands |
 | `--deliberate-recover RUN_ID` | - | Reconcile only journal-proven crash boundaries (sealed human-command batches or receipt-derived consensus) under one owner; zero provider calls; uncertain, legacy-unsealed, or non-deterministic work remains blocked |
 | `--deliberate-status RUN_ID` | - | Read a checksum-verified, journal-derived deliberation status without dispatching an agent |
 | `--deliberate-replay RUN_ID` | - | Read a bounded, checksum-verified deliberation journal replay without dispatching an agent |
 | `--deliberate-cancel RUN_ID` | - | Queue a typed cancellation command through the exclusive run inbox; queued is not claimed as durably applied until the scheduler consumes it |
+| `--deliberate-open RUN_ID` | - | Open/reuse the authenticated loopback deliberation ledger; this starts no provider. Use `--browser auto` (default), `builtin`, `ide`, `system`, or `link` |
+| `--browser {auto,builtin,ide,system,link}` | With `--deliberate-open` | Select the integrated Browser Harness (`builtin`/`auto` when `iab` is advertised), an executable IDE bridge, the system browser, or a link-only result |
 | `--seats A,B` | With `--deliberate` | Immutable, unique seat agent ids; 2-10 seats |
 | `--options X,Y` | With `--deliberate` | Immutable, unique decision option ids; at least two |
 | `--max-attempts N` | With `--deliberate` | Hard physical provider-launch budget; every secondary launch must consume its own durable attempt (positive integer) |
@@ -337,13 +435,25 @@ repository-relative examples.
 | `--command-id ID` | With `--deliberate-cancel` | Optional idempotency key for the queued cancellation command |
 | `--text-only-consent SEAT` | With `--deliberate` | Receipt-bound consent for a named text-only seat; consent is never inferred from role or environment |
 | `--full-authority-consent SEAT` | With `--deliberate` | Explicit receipt-bound consent for a named full-authority seat; use only with a disposable worktree and never treat that worktree as containment |
-| `--quorum N` | No | With `--council`: synthesize only if at least N members (2..member-count) succeeded; below N the chairman is skipped (a `skipped` tombstone is recorded). Never changes the top-level `status`, only whether synthesis runs; the result is in `synthesis.quorum` and `synthesis.decision_status` |
+| `--quorum` | With `--deliberate`; optional with `--council` | With `--council`, synthesize only if at least N members (2..member-count) succeeded; with `--deliberate`, fix an integer/all/fraction quorum in the receipt. Never infer or lower the denominator |
 | `--chairman-fallback AGENT` | No | With `--council`: a fallback synthesizer run once if the primary chairman ends non-success. Both outcomes appear in `synthesis.primary` / `synthesis.fallback` |
 | `--member-timeout` / `--chair-timeout` | No | With `--council`: per-stage timeouts for members and the chairman (same grammar as `--timeout`; each defaults to `--timeout`) |
+| `--chat-action {open,post,show,list}` | - | Provider-inert conversation-room action. The ergonomic subcommands are `summon chat open|post|show|list`; this flag is the dispatcher form. |
+| `--chat-session SESSION_ID` | With `--chat-action` | Stable conversation-room id; the subcommand form accepts it positionally. |
+| `--chat-message TEXT` / `--message TEXT` | With `chat post` | Append a bounded human context message. It is never an approval, ballot, or provider instruction. |
+| `--chat-project-id ID` / `--project-id ID` | With `chat open` | Bounded project label for a new room. |
+| `--chat-project-root DIR` / `--project-root DIR` | With `chat open` | Existing project root whose canonical digest groups rooms; the path itself is not public room data. |
+| `--chat-initiator-host HOST` / `--initiator-host HOST` | With `chat open` | Host/application that initiated the room (for example `codex`, `claude-code`, or `cursor`). |
+| `--chat-initiator-agent AGENT` / `--initiator-agent AGENT` | With `chat open` | Initiating Summon agent id; the browser groups rooms by project and initiator. |
+| `--chat-mode {chat,council,deliberate}` / `--mode` | With `chat open` | Room display mode. `council` round events and `deliberate` discussion remain context-only until their separate authority paths are explicitly invoked. |
+| `--conversation-dir DIR` | With `chat` | Private root for local conversation journals (default `{cwd}/.agents/conversations`). |
+| `--chat-browser {auto,builtin,ide,system,link}` | With `chat open` | Start/reuse the authenticated local atlas; `link` returns a URL without launching a browser. This never contacts a provider. |
 
-Deliberation's production adapter currently accepts cancellable CLI/ACP seats only.
+The public deliberate CLI is currently provider-inert and reports
+`integration_pending` before provider contact. A reviewed live composition exists
+only behind an owner-bound test seam and currently permits cancellable CLI/ACP seats;
 `openai-compat` HTTP seats are refused until the transport can interrupt an active
-request within the run deadline; the ordinary single-dispatch API backend remains
+request within the run deadline. The ordinary single-dispatch API backend remains
 available and unchanged.
 
 **Stdout contract:** for dispatch commands, stdout carries **exactly one JSON object** —
@@ -683,7 +793,7 @@ choice by the caller.
 | cursor-agent | cursor model ids | `composer-2.5` | `composer-2.5` |
 | gemini | gemini model ids (`-m`) | `gemini-3.1-pro` | CLI's default |
 | kimi | Kimi provider/model id (`--model`) | `kimi-code/k3`, `kimi-code/kimi-for-coding` | Kimi's default |
-| agy | display name or slug (see `agy models`) | `Claude Opus 4.6 (Thinking)`, `gemini-3.1-pro` | Gemini Flash tier |
+| agy | display name or slug (see `agy models`) | `Claude Opus 4.6 (Thinking)`, `gemini-3.7-flash-high` | Gemini Flash tier |
 
 Run `--list-models` to see what each backend can run right now.
 

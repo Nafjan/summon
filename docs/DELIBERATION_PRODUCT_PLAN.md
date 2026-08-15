@@ -1,20 +1,31 @@
-# Summon Deliberation and Pro Product Plan
+# Summon Deliberation Product Plan
 
-Status: preview implementation (direct live seam and optional loopback observer exist; CLI/resume activation remains gated)
-Target branch: `codex/deliberation-pro-plan`
+Status: open-product preview (direct live seam and loopback observer exist; CLI/resume activation remains gated)
+Target branch: current working branch
 Owner: Summon maintainers
 
-Active root goal: deliver the first shippable local deliberation slice through the
-owner-safe headless gate, then add the optional loopback observer/control surface. The
+Active root goal: deliver the first shippable public deliberation slice through the
+owner-safe headless gate, then complete the loopback observer/control surface. The
 current UI direction contract is in `docs/DELIBERATION_UI_DESIGN.md`; it is a structural
-Operate design, while the reference surface itself is an explicit direct API that does
-not auto-open a browser or launch providers.
+Operate design. The reference surface does not launch providers. The CLI can hand off
+an already-created run with `summon deliberate open RUN_ID`: it reuses one authenticated
+loopback surface per run, prefers an explicit IDE bridge, and otherwise uses the system
+browser. `--browser link` prints a stable URL without launching anything.
 
 This document is the implementation plan and current safety contract for a new bounded
-agent-deliberation mode and the product boundary it creates for a possible Summon Pro
-distribution. The current branch contains the kernel, durable command/status surface,
+agent-deliberation mode in the open Summon product. The current branch contains the kernel, durable command/status surface,
 one-launch adapter seams, a deterministic scheduler, a side-effect-free frozen-roster
 resolver, and a provider-inert invocation planner. The scheduler is deliberately headless.
+A provider-inert Custom Agent manifest boundary is also available at
+`_deliberation_agents.py`: it discovers explicit workspace packages under
+`.agents/agents/<slug>/agent.md` (and an explicitly supplied global root), parses a
+bounded flat manifest, freezes a redacted identity/digest, and refuses authority
+directives in the untrusted body. `SeatRequest.custom_agent` can bind that evidence
+to a frozen roster; the manifest must exactly match the legacy-resolved CLI,
+transport, model, permission ceiling, and authority/consent/worktree contract. It
+does not select a provider, change prompts, create a worktree/profile, or activate a
+live seat. Custom Agent support is therefore an evidence and provenance layer, not
+an execution shortcut.
 A separate receipt-bound live seam now exercises one real controlled subprocess per seat
 through the existing executor, with no retries, fallback, ACP/HTTP, gates, or report repair;
 it is still a direct integration API rather than a CLI/default path. The CLI and resume
@@ -36,17 +47,17 @@ cannot recreate launch tokens, and pending turns remain inert until a future sch
 regenerates and rehashes the prompt. It does not
 authorize a release or a pricing decision.
 
-## 1. Product decision
+## 1. Product scope
 
-Agent deliberation is a credible foundation for Summon Pro, but the differentiator is
-not a chat window. The product value is governed, observable, replayable, cross-vendor
-work with explicit human control.
+Summon is an open, local-first product for governed cross-vendor work. Deliberation,
+the council-to-decision handoff,
+the browser control surface, reusable policy packs, run history, replay/export,
+verified routing presets, usage views, and policy workflows are parts of one product
+scope. They evolve with the safety-critical runtime and local API behind versioned
+contracts; no capability is defined as a paid, proprietary, hosted, or separately
+governed tier.
 
-The open Summon core should retain the safety-critical execution engine. An optional Pro
-layer can add a polished local control surface, reusable policy packs, run history, and
-team-oriented workflows without making the dispatcher cloud-dependent.
-
-### Open core
+### Product runtime
 
 - Bounded, headless `deliberate` execution.
 - Existing council, manifest, background, subprocess, ACP, and envelope primitives.
@@ -55,20 +66,9 @@ team-oriented workflows without making the dispatcher cloud-dependent.
 - Structured ballots and fixed quorum rules.
 - Durable journal, status, replay, resume, and cancellation.
 - Resource cleanup and `LEFT_BEHIND` / `environment_handoff` reporting.
-- A minimal local API contract that a third-party UI can consume.
-
-### Optional Pro layer
-
-- A polished local browser control surface.
-- Saved deliberation templates and role packs.
-- Visual run history, replay, filtering, and export.
-- Model routing and fallback policies based on verified capability evidence.
-- Spend and usage views using observed provider data.
-- Organization policy packs and review workflows, if a later product decision supports
-  them.
-
-Safety limits, process cleanup, provenance, and privacy must not be paywalled. The Pro
-layer must work without telemetry and must not require a hosted service for local runs.
+- A minimal local API contract for the built-in browser and third-party observers.
+- The same safety limits, cleanup, provenance, privacy, and offline operation for every
+  installation. Optional modules are technical packaging choices, not product tiers.
 
 ## 2. Goals and non-goals
 
@@ -81,7 +81,9 @@ layer must work without telemetry and must not require a hosted service for loca
 4. Preserve Summon's existing permission, hidden-process, cleanup, redaction, and
    envelope contracts.
 5. Make every run inspectable while it is live and after it terminates.
-6. Provide a stable boundary for council composition without changing council semantics.
+6. Provide a stable boundary for council composition without changing council semantics;
+   an explicit human handoff may seed a fresh deliberate receipt, but council prose never
+   becomes a ballot implicitly.
 7. Keep the core stdlib-only and usable from all supported hosts.
 
 ### Non-goals for the first release
@@ -144,7 +146,7 @@ Deliberation is a sibling run type. It shares infrastructure with council, but i
 not share council's mutable state machine or infer council semantics from its fields.
 
 ```text
-caller / optional browser
+caller / user-invoked browser observer
           |
           v
 validated command queue
@@ -521,8 +523,8 @@ used because it cannot attach a bearer header; the browser uses `fetch()` with a
 response and the per-run token.
 
 The current reference implementation is `skills/summon/scripts/_deliberation_ui.py`.
-It is an optional direct API (`DeliberationSurface`), not a CLI auto-start or browser
-launcher. It reads the store's redacted snapshot/replay contract, streams bounded SSE
+It remains an explicit direct API (`DeliberationSurface`); the CLI handoff is a thin
+registry/child-process wrapper, not provider activation. It reads the store's redacted snapshot/replay contract, streams bounded SSE
 snapshots, and exposes only a typed cancel queue until the durable coordinator can apply
 approve/deny/message commands. It binds only to numeric loopback, requires an exact Host
 and bearer token, requires an exact Origin for POST, bounds bodies, uses a strict CSP with
@@ -535,6 +537,24 @@ strict CSP/no remote assets, text-only rendering, redacted store projections, an
 typed cancel queue. It intentionally does not implement session-token exchange,
 approve/deny/message application, durable monotonic command IDs, cursor replay, or
 automatic token invalidation; those remain coordinator work.
+
+### Browser handoff contract
+
+Use `summon deliberate open RUN_ID` from a terminal. The command validates the durable
+run before starting a local child server, writes a 0600 per-run registry, and reuses a
+live registry entry on subsequent invocations. `--browser auto` (the default) invokes
+`SUMMON_BROWSER_BRIDGE` (or the `CODEX_BROWSER_BRIDGE`, `VSCODE_BROWSER_BRIDGE`,
+`CURSOR_BROWSER_BRIDGE`, or `ANTIGRAVITY_BROWSER_BRIDGE` aliases) when present, then
+uses the optional `browser-harness` integrated-browser backend when
+`BROWSER_USE_AVAILABLE_BACKENDS` advertises `iab`, and otherwise calls the system
+browser with `new=0`. `--browser builtin` requires that integrated backend;
+`--browser ide` requires a configured executable bridge; `--browser system` skips
+both; `--browser link` is safe for SSH, CI, and scripts. Bridge values are one
+executable path only and receive the URL as one argument with `shell=False`.
+
+The URL contains a local bearer token in its fragment. Do not paste it into tickets or
+telemetry. The handoff opens observation/control only; fresh/resume/live provider
+activation remains separately gated.
 
 Full P3 exit controls (for the later richer surface) are:
 
@@ -552,10 +572,10 @@ Full P3 exit controls (for the later richer surface) are:
 Beautiful UI is currently design inspiration only. The site presents useful primitives for
 chat, thinking, streaming, approval, tool chips, and task rows, but no authoritative
 license or source provenance was found during research. Do not copy or fetch its assets
-until the copyright owner provides a usable license and provenance. The Pro frontend will
-use a separately vetted, permissively licensed and independently branded component system.
-Beautiful UI remains inspiration only until its code and design provenance are cleared.
-The core remains dependency-free.
+until the copyright owner provides a usable license and provenance. The Summon frontend
+will use a separately vetted, permissively licensed and independently branded component
+system. Beautiful UI remains inspiration only until its code and design provenance are
+cleared. The product remains dependency-free.
 
 References:
 
@@ -564,13 +584,14 @@ References:
 - [LangChain subagent pattern](https://docs.langchain.com/oss/python/langchain/multi-agent/subagents)
 - [LangChain multi-agent patterns](https://docs.langchain.com/oss/python/langchain/multi-agent)
 
-## 7. Open core and Pro packaging
+## 7. Product packaging and delivery
 
-The dispatcher and headless deliberation mode remain in the public Summon repository.
-The Pro UI and product workflows should be a separate optional package or repository that
-consumes the stable local event/API contract. It must not fork the scheduler.
+The dispatcher, headless deliberation mode, browser observer, and product workflows are
+one public Summon product. They may be shipped as separate technical modules or host
+install payloads, but they consume the same stable local event/API contract and must not
+fork the scheduler.
 
-Pro candidates, in order:
+Planned product capabilities, in order:
 
 1. visual live transcript and controls;
 2. saved templates and role packs;
@@ -617,8 +638,8 @@ Exit gate: deterministic fake adapters pass all state, crash, replay, and termin
 tests on Windows and POSIX, and an isolated fake-CLI integration harness proves the
 real executor's before-spawn hook, exactly one process per committed attempt, disabled
 retry/fallback/repair paths, snapshot revalidation, single-use launch tokens, and no
-raw argv or prompt leakage into journals. No browser, chairman, background, or Pro UI
-work proceeds before this gate.
+raw argv or prompt leakage into journals. No browser, chairman, background, or product
+surface proceeds before this gate.
 
 Current branch evidence includes a provider-inert Phase-A composition harness. It binds
 rounds and the absolute deadline to a canonical receipt, requires the same owner, snapshot,
@@ -666,7 +687,7 @@ approval. Quorum tests cover missing, duplicate, malformed, and late ballots.
 Deliverables:
 
 - authenticated SSE and POST server;
-- versioned local API plus a minimal open-core reference client using a vetted component
+- versioned local API plus a minimal public Summon reference client using a vetted component
   system or approved licensed primitives;
 - live transcript, roles/capabilities, pending human gate, stop/cancel, and replay cursor;
 - UI lifecycle bound to run ownership.
@@ -693,16 +714,17 @@ present; otherwise the system must detect and report the orphan rather than prom
 prevention. A council stage that changes existing council semantics is explicitly out
 of scope.
 
-### P5: Pro product layer
+### P5: complete product surface
 
 Deliverables:
 
-- optional package consuming the stable event/API contract;
+- product modules consuming the stable event/API contract;
 - templates, run history, replay/export, routing presets, and policy packs;
 - release, license, SBOM, and privacy documentation.
 
-Exit gate: Pro can be removed without changing open-core behavior, safety tests remain
-green, and the polished frontend has no unreviewed source, asset, or design provenance.
+Exit gate: any optional UI module can be disabled without weakening runtime safety,
+the safety tests remain green, and the polished frontend has no unreviewed source,
+asset, or design provenance.
 
 ## 9. Verification matrix
 
@@ -763,8 +785,8 @@ Every phase requires targeted tests plus mutation checks.
 - all supported Python versions and Windows/Linux CI legs pass;
 - three independent adversarial rounds over the immutable implementation candidate;
 - public-data and secret scans pass;
-- release notes distinguish open-core and Pro capabilities without claiming hosted or
-  cost guarantees that do not exist.
+- release notes distinguish shipped, preview, provider-inert, and live-gated capabilities
+  without claiming hosted or cost guarantees that do not exist.
 
 ## 10. Risk register
 
@@ -781,11 +803,11 @@ Every phase requires targeted tests plus mutation checks.
 | Unverifiable model/tier evidence | Medium | declared/verified/observed separation | P2 |
 | Beautiful UI license ambiguity | High | No copying until written provenance/license | P0/P3 |
 | UI outlives run owner | Medium | Lease-aware shutdown, terminal event, and stale-token invalidation | P3/P4 |
-| Pro fork diverges from core | Medium | Stable event/API contract and removal test | P5 |
+| Product surface diverges from runtime | Medium | Stable event/API contract and module-disable test | P5 |
 
 ## 11. Review record
 
-The architecture was reviewed against the existing 2.2.0 implementation and the
+The architecture was reviewed against the pre-3.0 implementation and the
 following independent inputs:
 
 - Claude route requested Opus for the exact-plan pass but served
@@ -798,16 +820,19 @@ following independent inputs:
 - DeepSeek V4 Flash: replay tampering, context bombs, browser hijacking, and adapter
   boundary injection;
 - Kimi K3: attempted but unavailable due provider quota; no approval claimed;
-- Fable: attempted but unavailable due expired Claude OAuth; no approval claimed.
+- Fable: profile health was re-verified on 2026-08-13 through the separate
+  `fable-fallback` Claude Code login; this is a reachability smoke, not a claim that
+  every future run has the same quota or billing allowance.
 
 The reviewed draft incorporated the concrete blockers: physical-attempt accounting;
 executor-owned control evidence; generation-fenced message material; controlled-path
 cleanup plus stale-owner reaping; explicit decision options, ballot revisions, ties, and
 fixed-denominator unresolved outcomes; additive envelope-v1 mapping; explicit permission
 and consent gates; live-session token versus stale-token-after-restart semantics; equal
-voting weights with seniority labels only; and a separate open-core reference client
-boundary. Kimi and Fable were unavailable for this pass, so neither is cited as an
-approval. The final exact-draft Sol read-only review was CLEAN after the last revisions;
+voting weights with seniority labels only; and a separate public reference client
+boundary. Kimi remains unavailable due quota; Fable's later profile smoke confirms
+reachability but is not an architectural approval. The final exact-draft Sol read-only
+review was CLEAN after the last revisions;
 it confirmed the launch-token, snapshot-revalidation, quorum-rounding, permission,
 orphan, envelope, and integration-gate contracts. The implementation candidate still
 requires the phase gates and independent adversarial verification specified above.

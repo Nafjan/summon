@@ -1,7 +1,7 @@
 # Deliberation Control Surface
 
-Status: design contract for the optional post-headless-gate loopback observer; the
-reference surface is provider-inert and not a CLI auto-start.
+Status: design contract for the open-product loopback observer after the headless gate;
+the reference surface is provider-inert and not a CLI auto-start.
 
 ## Direction
 
@@ -11,9 +11,11 @@ seconds: what is durably true now, what evidence produced it, and what human act
 safe next.
 
 The direction is the third grounded Operate structure from the Impeccable concept round:
-an instrument panel whose persistent geometry makes state legible. The visual world is
-matte petrol and uncoated evidence-paper surfaces, graphite rules, and one vermilion
-commit signal. There is no neon glow, decorative glass, gradient text, or fake telemetry.
+an instrument panel whose persistent geometry makes state legible. The visual world is a
+near-black AI-native workspace: a quiet navigation rail, thin graphite separators, deep
+charcoal specimen cards, and a restrained blue-violet action signal. Beautiful UI is a
+reference for this rhythm and density only; no source, asset, token, or composition is
+copied. There is no neon glow, decorative glass, gradient text, or fake telemetry.
 Measurements use tabular numerals; prose uses a quiet workhorse sans. Color is never the
 only state channel.
 
@@ -27,13 +29,17 @@ only state channel.
 3. The evidence rail holds the fixed seat roster, capability/permission evidence,
    quorum rule, policy fingerprint, and cleanup/LEFT_BEHIND handoff. It becomes a drawer
    below the ledger on narrow screens.
-4. A persistent action shelf appears only for `WAITING_HUMAN`: approve, deny, cancel, and
-   bounded message actions show queued -> durable -> applied/rejected as distinct states.
+4. A compact action shelf appears only for `WAITING_HUMAN`: the current browser contract
+   exposes typed cancel only, with queued -> durable -> applied/rejected states. Approve,
+   deny, and message controls remain coordinator-owned until their durable command protocol
+   is enabled; the UI must say so instead of implying those controls exist.
 
 ## Interaction and states
 
 - Live updates arrive through a versioned redacted snapshot/event contract; the browser
-  never infers authority from model text.
+  never infers authority from model text. The current surface fetches a canonical snapshot
+  and replay, then follows the bounded loopback SSE stream; it must render a single coherent
+  blocked/reconnect state when either read fails.
 - Reconnect announces stale data and requests a canonical snapshot when a cursor gap is
   detected. A lost owner or terminal run visibly closes the action shelf.
 - Empty, loading, disconnected, expired, corrupt, cleanup-failed, uncertain-spend, and
@@ -61,8 +67,8 @@ outside this slice.
 <!--
   Impeccable direction contract for the eventual root layout:
   THESIS: A deliberation is a governed decision ledger, not a chat stream.
-  OWN-WORLD: Archival flight-recorder instrument: matte petrol, evidence paper, graphite rules, vermilion commit signal, no glow.
-  STORY: The operator sees durable truth, traces evidence, and performs only an explicit safe human action.
+  OWN-WORLD: Archival flight-recorder instrument in a near-black AI-native workspace: rail, specimen cards, graphite rules, blue-violet action signal, no glow.
+  STORY: The operator sees durable truth, traces evidence, and performs only an explicit safe human action (typed cancel in this slice).
   FIRST VIEWPORT: Run bar above round ledger, evidence rail at right, action shelf only in WAITING_HUMAN.
   FORM: Grounded Operate structure 3 from seed bf89d2b6; challengers were weighed as inspiration only.
   FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md

@@ -131,6 +131,8 @@ MODE_FLAGS = {
                      "full_authority_consent", "json", "job_file"},
     "deliberation-resume": {"deliberate_resume", "run_dir", "results_dir", "cwd",
                             "retry_indeterminate", "json", "job_file"},
+    "deliberation-open": {"deliberate_open", "run_dir", "results_dir", "cwd",
+                          "browser", "json", "job_file"},
     "deliberation-recover": {"deliberate_recover", "run_dir", "results_dir", "cwd",
                              "json", "job_file"},
     "deliberation-status": {"deliberate_status", "run_dir", "results_dir", "cwd",
@@ -139,6 +141,9 @@ MODE_FLAGS = {
                             "json", "job_file"},
     "deliberation-cancel": {"deliberate_cancel", "run_dir", "results_dir", "cwd",
                             "command_id", "json", "job_file"},
+    "chat": {"chat_action", "chat_session", "chat_message", "chat_project_id",
+              "chat_project_root", "chat_initiator_host", "chat_initiator_agent",
+              "chat_mode", "chat_browser", "conversation_dir", "json", "cwd", "job_file"},
     # jobs read commands: registry query only.
     "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
     "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
@@ -167,6 +172,8 @@ MODE_HINTS = {
                      "options, policy, consent, and run-location flags."),
     "deliberation-resume": ("resume takes the run id and may explicitly authorize "
                             "retrying an indeterminate paid attempt."),
+    "deliberation-open": ("open takes only the run id, run location, output format, "
+                          "and browser target; use 'link' for scripts or SSH."),
     "deliberation-recover": ("recover completes only deterministic, journal-proven "
                               "crash boundaries and performs zero provider calls."),
     "deliberation-status": ("status is read-only and accepts only the run id, run "
@@ -175,6 +182,10 @@ MODE_HINTS = {
                             "location, and output format."),
     "deliberation-cancel": ("cancel queues one typed command; --command-id is an "
                             "optional idempotency key."),
+    "chat": ("chat is a provider-inert local room: open/show/list rooms or post a "
+             "typed human context message. It never launches a provider or changes "
+             "a ballot. `chat open --chat-browser auto|builtin|ide|system|link` "
+             "starts or reuses the local atlas; `link` returns its URL."),
     "jobs-list": ("jobs list is read-only: it takes only --job-dir and --json."),
     "jobs-status": ("jobs status is read-only: it takes only the job id, --job-dir, "
                     "and --json."),
@@ -186,7 +197,11 @@ MODE_HINTS = {
                    "explicit --submit-github action."),
 }
 FLAG_NAMES = {"sets": "--set"}  # dests whose flag spelling isn't dest.replace('_','-')
-TOKEN_DESTS = {"set": "sets", "from": "bug_report_from"}   # reverse mapping
+TOKEN_DESTS = {"set": "sets", "from": "bug_report_from",
+               # ergonomic names used only by the `chat` subcommand
+               "project-id": "chat_project_id", "project-root": "chat_project_root",
+               "initiator-host": "chat_initiator_host", "initiator-agent": "chat_initiator_agent",
+               "message": "chat_message", "mode": "chat_mode"}   # reverse mapping
 
 
 def fanout_mode(args: argparse.Namespace) -> str | None:
@@ -211,6 +226,10 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "deliberation-cancel"
     if getattr(args, "deliberate_resume", None):
         return "deliberation-resume"
+    if getattr(args, "deliberate_open", None):
+        return "deliberation-open"
+    if getattr(args, "chat_action", None):
+        return "chat"
     if getattr(args, "deliberate", False):
         return "deliberation"
     if args.council:
@@ -250,6 +269,7 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
              "deliberation-status": "deliberate status",
              "deliberation-replay": "deliberate replay",
              "deliberation-cancel": "deliberate cancel",
+             "deliberation-open": "deliberate open",
              }.get(mode, f"--{mode}")
     return (f"{label} does not support {', '.join(offending)}: these flags would "
             f"have been silently ignored, so they are rejected instead. "
@@ -264,7 +284,7 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 # discoverable command surface.
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
                "onboard", "manifest", "council", "deliberate", "agent", "jobs", "version",
-               "role", "telemetry", "bug-report", "help", "--help", "-h"}
+               "chat", "role", "telemetry", "bug-report", "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -280,7 +300,11 @@ Commands:
   council   --question "…" [--members …] [--rounds 2]  decide by consensus
   deliberate --question "…" --seats A,B --options X,Y  bounded agent deliberation
   deliberate status|replay|cancel|recover RUN_ID       inspect/control/recover a run
+  deliberate open RUN_ID [--browser auto|builtin|ide|system|link]  open its local ledger
   deliberate resume RUN_ID [--retry-indeterminate]     resume with spend consent
+  chat open SESSION_ID [--mode chat|council|deliberate]  create/reuse a local room
+  chat post SESSION_ID --message "…"                    add a typed human context message
+  chat show|list SESSION_ID                             inspect rooms (provider-inert)
   agent new NAME [--set k=v …]                    scaffold an agent definition
   agent set NAME  --set k=v …                     retune an agent's frontmatter
   role propose ALIAS TARGET                        propose a private global role alias
@@ -301,6 +325,15 @@ flat option list, or `summon telemetry --help` / `summon bug-report --help` for 
 
 
 COMMAND_USAGE = {
+    "chat": """summon chat open SESSION_ID [--project-id ID --project-root DIR --mode chat|council|deliberate]
+summon chat post SESSION_ID --message TEXT [--initiator-agent ID]
+ summon chat show SESSION_ID | summon chat list
+summon chat open SESSION_ID --chat-browser auto|builtin|ide|system|link
+
+Manage provider-inert local conversation rooms. Rooms are grouped by project and
+initiating host/agent, human messages remain context-only, and no chat event can
+approve a deliberation or launch a provider.
+""",
     "telemetry": """summon telemetry enable|disable|status|clear [--json]
 
 Manage opt-in local diagnostics. `enable`/`disable` persist the choice; `status` reports
@@ -367,7 +400,7 @@ def rewrite_subcommand(argv: list) -> tuple:
             return ["--council-status", rest[1], *rest[2:]], None
         return ["--council", *rest], None
     if head == "deliberate":
-        if rest and rest[0] in ("resume", "status", "replay", "cancel", "recover"):
+        if rest and rest[0] in ("resume", "status", "replay", "cancel", "recover", "open"):
             action = rest[0]
             if len(rest) < 2 or rest[1].startswith("-"):
                 return argv, f"error: 'deliberate {action}' needs a run id"
@@ -377,9 +410,21 @@ def rewrite_subcommand(argv: list) -> tuple:
                 "status": "--deliberate-status",
                 "replay": "--deliberate-replay",
                 "cancel": "--deliberate-cancel",
+                "open": "--deliberate-open",
             }[action]
             return [flag, rest[1], *rest[2:]], None
         return ["--deliberate", *rest], None
+    if head == "chat":
+        if not rest:
+            return argv, "help:chat"
+        action = rest[0]
+        if action not in ("open", "post", "show", "list"):
+            return argv, f"error: unknown 'chat' action {action!r} (use open/post/show/list)"
+        if action == "list":
+            return ["--chat-action", "list", *rest[1:]], None
+        if len(rest) < 2 or rest[1].startswith("-"):
+            return argv, f"error: 'chat {action}' needs a session id"
+        return ["--chat-action", action, "--chat-session", rest[1], *rest[2:]], None
     if head == "jobs":
         if not rest:
             return argv, "help"       # bare `summon jobs` -> usage, not a silent list
@@ -657,6 +702,32 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Replay a deliberation run's bounded checksummed journal")
     parser.add_argument("--deliberate-cancel", dest="deliberate_cancel", metavar="RUN_ID",
                         help="Queue a typed cancel command for a deliberation run")
+    parser.add_argument("--deliberate-open", dest="deliberate_open", metavar="RUN_ID",
+                        help="Open/reuse the authenticated local deliberation ledger")
+    parser.add_argument("--chat-action", dest="chat_action", choices=("open", "post", "show", "list"),
+                        help="Provider-inert conversation room action")
+    parser.add_argument("--chat-session", dest="chat_session", metavar="SESSION_ID",
+                        help="Conversation room session id")
+    parser.add_argument("--chat-message", "--message", dest="chat_message",
+                        help="Typed human context message for a conversation room")
+    parser.add_argument("--chat-project-id", "--project-id", dest="chat_project_id",
+                        help="Bounded project label for a new room")
+    parser.add_argument("--chat-project-root", "--project-root", dest="chat_project_root",
+                        help="Project root used only to bind a redacted project digest")
+    parser.add_argument("--chat-initiator-host", "--initiator-host", dest="chat_initiator_host",
+                        help="Initiating host label (codex, claude-code, cursor, terminal)")
+    parser.add_argument("--chat-initiator-agent", "--initiator-agent", dest="chat_initiator_agent",
+                        help="Initiating Summon agent id")
+    parser.add_argument("--chat-mode", "--mode", dest="chat_mode", choices=("chat", "council", "deliberate"),
+                        default="chat", help="Conversation room mode")
+    parser.add_argument("--conversation-dir", dest="conversation_dir",
+                        help="Root for provider-inert conversation room journals")
+    parser.add_argument("--chat-browser", dest="chat_browser",
+                        choices=("auto", "builtin", "ide", "system", "link"),
+                        help="With chat open: reuse the local atlas in an IDE/browser, or return a link")
+    parser.add_argument("--browser", choices=("auto", "builtin", "ide", "system", "link"),
+                        default="auto",
+                        help="With --deliberate-open: built-in/IDE bridge, system browser, or link")
     parser.add_argument("--seats",
                         help="With --deliberate: comma-separated immutable seat agent ids")
     parser.add_argument("--options",

@@ -355,7 +355,15 @@ class FreshDispatchAdapter:
         timed_out = bool(response.get("timeout")) or exit_code == 124
         # Summon intentionally terminates some stream CLIs after their terminal
         # event.  Those two SIGTERM spellings are executor-owned success exits.
-        transport_ok = not timed_out and exit_code in (0, 143, -15)
+        # Some controlled CLI wrappers (notably Antigravity/agy on Windows)
+        # return a non-zero raw process code after emitting a clean terminal
+        # event.  The executor preserves that raw code but normalizes the
+        # durable response to status=success.  Treat that explicit normalized
+        # status as transport success; raw non-zero without it remains a
+        # transport failure and cannot reach ballot acceptance.
+        normalized_success = response.get("status") == "success"
+        transport_ok = (not timed_out and
+                        (exit_code in (0, 143, -15) or normalized_success))
         prose = response.get("result") if isinstance(response.get("result"), str) else ""
         structured = self._parse_output(prose)
         evidence = ExecutionEvidence(

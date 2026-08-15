@@ -22,9 +22,12 @@ need the control surface to remain unobtrusive beside their working application.
 
 Summon coordinates heterogeneous AI CLIs behind one structured dispatcher. The
 deliberation feature lets several bounded participants exchange auditable turns, produce
-structured ballots, and reach a fixed-policy outcome with optional human approval. The
-local view should make the live state, evidence, pending human actions, and retained
-resources understandable without becoming a chat-first product.
+structured ballots, and reach a fixed-policy outcome with optional human approval. A
+shared provider-inert conversation room will also support brainstorming, human messages,
+session continuation, and interactive council rounds; it must keep chat context separate
+from the deliberation control plane. The local view should make live state, evidence,
+pending human actions, and retained resources understandable without turning prose into
+authority.
 
 ## Positioning
 
@@ -37,15 +40,20 @@ not authority.
 
 Runs are initiated by a calling agent or terminal and may involve Claude, Codex, Cursor,
 Kimi, Antigravity, Gemini-compatible, or OpenAI-compatible backends. The control surface
-is loopback-only, offline, and optional. A single scheduler owner writes a checksummed,
+is loopback-only, offline, and user-invoked. A single scheduler owner writes a checksummed,
 generation-fenced journal; local browser handlers may queue typed commands but never
 launch providers or mutate policy. Users may inspect a run during execution, review a
-finished run, replay durable events, approve or deny a human gate, cancel, and see
-LEFT_BEHIND/environment-handoff details.
+finished run, replay durable events, queue typed cancellation, and see
+LEFT_BEHIND/environment-handoff details. Approve/deny and richer human-command
+application are target capabilities, not claims about the current provider-inert browser
+slice.
 
 ## Capabilities and Constraints
 
 - Existing council and dispatch modes remain behaviorally compatible.
+- Conversation rooms are a shared, project- and initiator-grouped substrate for chat,
+  interactive council, and deliberation discussion views; continuation requires explicit
+  compatibility evidence or an auditable fork.
 - Deliberation supports 2-10 fixed seats, bounded turns, immutable options, fixed quorum,
   physical launch limits, absolute deadlines, deterministic terminal precedence, and
   structured ballots.
@@ -53,7 +61,7 @@ LEFT_BEHIND/environment-handoff details.
   process launches.
 - The first UI slice is a provider-inert observer over the redacted store; it queues only
   typed cancel while owner-bound command recovery, store resume, and richer human-command
-  lifecycle gates remain pending.
+  lifecycle gates remain pending. This is open product functionality, not a premium tier.
 - No remote hosting, multi-user networking, `0.0.0.0` binding, model-rendered HTML, or
   model-controlled browser actions are allowed in the first release.
 - Backend identities, prompts, credentials, private paths, and raw provider output must
@@ -70,11 +78,12 @@ for its source, so no source or copied component is part of this product.
 
 - `README.md` documents the dispatcher, council, manifest, cross-vendor, and local-model
   workflows.
-- `docs/DELIBERATION_PRO_PLAN.md` is the current deliberation contract and safety plan.
+- `docs/DELIBERATION_PRODUCT_PLAN.md` is the current deliberation contract and safety plan.
 - The provider-inert kernel, scheduler, roster, invocation, replay, and restore modules
   and their focused tests are in `skills/summon/scripts/`.
-- No existing browser surface, design system, product screenshots, or production UI
-  assets are present in this repository.
+- A provider-inert stdlib loopback observer and browser handoff are present; richer
+  human-command application, production visual assets, and complete real-journal lifecycle
+  coverage remain preview work.
 
 ## Product Principles
 

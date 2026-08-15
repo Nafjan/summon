@@ -1724,6 +1724,68 @@ def supports_acp(cli: str) -> bool:
     return bool(b and b.get("acp"))
 
 
+# Explicit vendor namespaces that can be rejected before a backend is touched.  This is
+# deliberately conservative: unknown/future model IDs are left to the backend rather than
+# guessed, while a model that is unambiguously owned by another vendor fails closed with a
+# useful reroute.  In particular, sending ``claude-opus-*`` to Codex is a routing error, not
+# a provider failure, and must not create a profile or consume a process first.
+_MODEL_VENDOR_PREFIXES = {
+    "anthropic": ("claude-", "anthropic-", "opus", "sonnet", "haiku", "fable"),
+    "openai": ("gpt-", "o1", "o3", "o4", "o5", "codex-"),
+    "google": ("gemini-", "gemini_"),
+    "moonshot": ("kimi-", "moonshot-"),
+    "deepseek": ("deepseek-",),
+    "zhipu": ("glm-", "chatglm-"),
+    "xai": ("grok-",),
+}
+
+
+_MODEL_COMPATIBLE_BACKENDS = {
+    "anthropic": ("claude", "agy", "cursor-agent"),
+    "openai": ("agy", "codex", "cursor-agent", "openai-compat"),
+    "google": ("agy", "cursor-agent", "gemini", "openai-compat"),
+    "moonshot": ("agy", "kimi", "cursor-agent", "openai-compat"),
+    "deepseek": ("agy", "openai-compat"),
+    "zhipu": ("agy", "openai-compat"),
+    "xai": ("agy", "cursor-agent", "openai-compat"),
+}
+
+
+def model_backend_compatibility(cli: str, model: str | None) -> dict | None:
+    """Return a deterministic preflight refusal for known cross-vendor models.
+
+    ``None`` means the request is either compatible or intentionally unknown.  The helper
+    never probes a provider and never invents a model catalogue; it only recognizes explicit
+    vendor namespaces/aliases that summon already treats as named models.  The returned
+    payload is suitable for both the live envelope and the side-effect-free dry-run view.
+    """
+    if not isinstance(cli, str) or not isinstance(model, str) or not model.strip():
+        return None
+    normalized = model.strip().lower()
+    vendor = None
+    for candidate, prefixes in _MODEL_VENDOR_PREFIXES.items():
+        if any(normalized == prefix.rstrip("-") or normalized.startswith(prefix)
+               for prefix in prefixes):
+            vendor = candidate
+            break
+    if vendor is None:
+        return None
+    compatible = tuple(_MODEL_COMPATIBLE_BACKENDS[vendor])
+    if cli in compatible:
+        return None
+    return {
+        "error_kind": "backend_model_incompatible",
+        "backend": cli,
+        "model_requested": model,
+        "model_vendor": vendor,
+        "compatible_backends": list(compatible),
+        "recommended_backend": compatible[0] if compatible else None,
+        "message": (f"model {model!r} belongs to the {vendor} namespace and is not "
+                    f"compatible with backend {cli!r}; choose an explicit compatible "
+                    f"backend ({', '.join(compatible)})"),
+    }
+
+
 def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
                           resource_register=None
                           ) -> tuple[str, list, dict | None]:

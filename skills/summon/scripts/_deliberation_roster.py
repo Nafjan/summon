@@ -20,6 +20,8 @@ from pathlib import Path
 from types import MappingProxyType
 
 from _builder import BACKEND_CLIS, clamp_permission, effective_permission
+from _deliberation_agents import AgentManifestError, FrozenAgent, resolve_agent as resolve_custom_agent
+from _model_catalog import display_for as _model_display_for
 from _deliberation_scheduler import SeatDefinition
 from _loader import PERMISSION_VALUES, get_agents_dir, load_agent_snapshot
 from _resolver import resolve_cli
@@ -88,6 +90,18 @@ def _digest_mapping(values: Mapping[str, object]) -> str:
     encoded = json.dumps(dict(values), sort_keys=True, separators=(",", ":"),
                          ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _freeze_nested(value: object) -> object:
+    """Deep-freeze receipt evidence so nested caller containers cannot drift."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_nested(item)
+                                 for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_nested(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((_freeze_nested(item) for item in value), key=repr))
+    return value
 
 
 def _git_head(path: str) -> str | None:
@@ -279,6 +293,7 @@ class SeatRequest:
     role: str = "participant"
     persona: str = ""
     capabilities: tuple[str, ...] = ()
+    custom_agent: str | None = None
 
     def __post_init__(self) -> None:
         _validate_seat_id(self.seat_id)
@@ -291,6 +306,8 @@ class SeatRequest:
                                    for value in values):
             raise RosterResolutionError("seat capabilities are invalid")
         object.__setattr__(self, "capabilities", tuple(dict.fromkeys(values)))
+        if self.custom_agent is not None:
+            _bounded_text(self.custom_agent, "custom_agent", limit=64)
 
 
 @dataclass(frozen=True)
@@ -366,6 +383,9 @@ class FrozenSeat:
     worktree_head_sha256: str | None = None
     worktree_required: bool = False
     agy_account_checked: bool = False
+    custom_agent_definition_digest: str | None = None
+    custom_agent_source_digest: str | None = None
+    custom_agent_identity: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         _validate_seat_id(self.seat_id)
@@ -394,7 +414,15 @@ class FrozenSeat:
                                                "profile_command_sha256",
                                                "agy_account_sha256"})
         object.__setattr__(self, "role_provenance",
-                           MappingProxyType(dict(self.role_provenance or {})))
+                           _freeze_nested(self.role_provenance or {}))
+        for name in ("custom_agent_definition_digest", "custom_agent_source_digest"):
+            _validate_sha(getattr(self, name), name)
+        identity = self.custom_agent_identity
+        if identity is not None:
+            if not isinstance(identity, Mapping):
+                raise RosterResolutionError("custom agent identity is invalid")
+            object.__setattr__(self, "custom_agent_identity",
+                               _freeze_nested(identity))
 
     def as_dict(self, *, native: bool = False) -> dict[str, object]:
         """Return receipt evidence; private source paths are native-only."""
@@ -436,6 +464,10 @@ class FrozenSeat:
             "worktree_head_sha256": self.worktree_head_sha256,
             "worktree_required": self.worktree_required,
             "agy_account_checked": self.agy_account_checked,
+            "custom_agent_definition_digest": self.custom_agent_definition_digest,
+            "custom_agent_source_digest": self.custom_agent_source_digest,
+            "custom_agent_identity": (dict(self.custom_agent_identity)
+                                      if self.custom_agent_identity is not None else None),
         }
         if native:
             result["seat_id"] = self.seat_id
@@ -517,6 +549,17 @@ class FrozenRoster:
                                          for value in self.text_only_consent],
             "seats": [seat.as_dict(native=native) for seat in self.seats],
         }
+        if not native:
+            # Editorial model labels are presentation-only metadata.  They are
+            # derived from exact backend/model pairs in the catalog; unknown
+            # models remain hash-only and never become guessed identities.
+            display = {}
+            for seat in self.seats:
+                identity = _model_display_for(seat.cli, seat.model)
+                if identity is not None:
+                    display[seat.seat_id] = identity
+            if display:
+                result["model_display_by_seat"] = display
         if native:
             result["full_authority_consent"] = list(self.full_authority_consent)
             result["text_only_consent"] = list(self.text_only_consent)
@@ -528,7 +571,19 @@ class FrozenRoster:
             current = freeze_roster(self._requests, **dict(self._kwargs))
         except (RosterResolutionError, OSError, ValueError):
             return False
-        return current.roster_digest == self.roster_digest
+        if current.roster_digest != self.roster_digest:
+            return False
+        if current.root_cwd != self.root_cwd:
+            return False
+        if (current.full_authority_consent != self.full_authority_consent
+                or current.text_only_consent != self.text_only_consent):
+            return False
+        # Do not trust the stored digest alone: a caller can construct a
+        # dataclasses.replace copy with forged seat evidence while retaining
+        # the original roster_digest.  Re-resolved seat projections must also
+        # equal the frozen projections byte-for-byte.
+        return tuple(_canonical_seat(seat) for seat in current.seats) == tuple(
+            _canonical_seat(seat) for seat in self.seats)
 
 
 def _normalise_requests(requests: Iterable[SeatRequest | Mapping[str, object]]) -> tuple[SeatRequest, ...]:
@@ -544,6 +599,7 @@ def _normalise_requests(requests: Iterable[SeatRequest | Mapping[str, object]]) 
                 seat_id=item["seat_id"], agent=item["agent"],
                 role=item.get("role", "participant"), persona=item.get("persona", ""),
                 capabilities=tuple(item.get("capabilities", ())),
+                custom_agent=item.get("custom_agent"),
             ))
         except KeyError as exc:
             raise RosterResolutionError("seat request needs seat_id and agent") from exc
@@ -585,6 +641,15 @@ def _canonical_seat(seat: FrozenSeat) -> dict[str, object]:
     return value
 
 
+def _custom_identity(agent: FrozenAgent | None) -> Mapping[str, object] | None:
+    """Return a deeply immutable redacted projection of a manifest."""
+    if agent is None:
+        return None
+    value = agent.as_dict(internal=False)
+    value["skills_sha256"] = tuple(value["skills_sha256"])
+    return MappingProxyType(value)
+
+
 def freeze_roster(
     requests: Iterable[SeatRequest | Mapping[str, object]],
     *,
@@ -601,6 +666,7 @@ def freeze_roster(
     transport_overrides: Mapping[str, str] | None = None,
     profile_overrides: Mapping[str, str] | None = None,
     effort_overrides: Mapping[str, str] | None = None,
+    custom_agents_root: str | os.PathLike[str] | None = None,
 ) -> FrozenRoster:
     """Resolve and freeze seats without any provider or filesystem mutation.
 
@@ -612,6 +678,14 @@ def freeze_roster(
     requests_tuple = _normalise_requests(requests)
     if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
         raise RosterResolutionError("cwd must be an existing absolute directory")
+    if custom_agents_root is not None:
+        try:
+            custom_agents_root = os.fspath(custom_agents_root)
+        except TypeError as exc:
+            raise RosterResolutionError("custom agent root must be path-like") from exc
+        if not os.path.isabs(custom_agents_root):
+            raise RosterResolutionError("custom agent root must be absolute")
+        custom_agents_root = os.path.abspath(custom_agents_root)
     roster_dir = get_agents_dir(agents_dir, cwd)
     full = frozenset(_validate_seat_id(value) for value in full_authority_consent)
     text = frozenset(_validate_seat_id(value) for value in text_only_consent)
@@ -639,6 +713,13 @@ def freeze_roster(
     frozen: list[FrozenSeat] = []
     private_runtime: dict[str, Mapping[str, object]] = {}
     for request in requests_tuple:
+        custom_agent: FrozenAgent | None = None
+        if request.custom_agent is not None:
+            try:
+                custom_agent = resolve_custom_agent(
+                    request.custom_agent, cwd, custom_agents_root)
+            except (AgentManifestError, OSError, TypeError, ValueError) as exc:
+                raise RosterResolutionError("custom agent could not be resolved") from exc
         role_info = resolve_for_dispatch(
             request.agent, cwd=cwd, agents_dir=agents_dir,
             enabled=role_enabled, strict_agents_dir=strict_agents_dir)
@@ -697,6 +778,35 @@ def freeze_roster(
         # later live activation must preflight and refuse before creating the
         # run; the resolver itself remains useful on CI and offline hosts.
         effective, authority, needs_worktree = _authority(cli, declared, transport)
+        if custom_agent is not None:
+            expected = {
+                "cli": cli,
+                "transport": transport,
+                "permission_ceiling": declared,
+                "model": model,
+            }
+            actual = {
+                "cli": custom_agent.cli,
+                "transport": custom_agent.transport,
+                "permission_ceiling": custom_agent.permission_ceiling,
+                "model": custom_agent.model,
+            }
+            if actual != expected:
+                raise RosterResolutionError(
+                    "custom agent identity does not match the resolved roster seat")
+            # The manifest is immutable evidence, never a source of authority.
+            # Require its complete authority tuple to agree with the legacy
+            # resolver instead of permitting it to relax a consent/worktree gate.
+            authority_contract = {
+                "enforceable": ("contained", "none", "none"),
+                "writable": ("workspace-write", "none", "required"),
+                "full-bypass": ("full-bypass", "full-authority", "required"),
+            }.get(authority)
+            if authority_contract != (custom_agent.authority_class,
+                                      custom_agent.consent_class,
+                                      custom_agent.worktree_mode):
+                raise RosterResolutionError(
+                    "custom agent authority does not match the resolved roster seat")
         if effective == "unenforceable":
             raise RosterResolutionError(
                 f"{cli} cannot enforce declared permission {declared!r}; seat refused")
@@ -718,6 +828,7 @@ def freeze_roster(
             request.persona)
         role_provenance = MappingProxyType(role_provenance)
         backend_env_sha = _backend_env_digest(cli)
+        custom_identity = _custom_identity(custom_agent)
         snapshot_values = {
             "seat": request.seat_id,
             "requested_agent": request.agent,
@@ -751,6 +862,11 @@ def freeze_roster(
             "worktree_head_sha256": proof.head_sha256 if proof else None,
             "worktree_required": needs_worktree,
             "agy_account_checked": cli == "agy",
+            "custom_agent_definition_digest": (
+                custom_agent.definition_digest if custom_agent else None),
+            "custom_agent_source_digest": (
+                custom_agent.source_digest if custom_agent else None),
+            "custom_agent_identity": dict(custom_identity) if custom_identity else None,
         }
         snapshot_digest = _digest_mapping(snapshot_values)
         frozen.append(FrozenSeat(
@@ -771,6 +887,11 @@ def freeze_roster(
             worktree_path_sha256=proof.path_sha256 if proof else None,
             worktree_head_sha256=proof.head_sha256 if proof else None,
             worktree_required=needs_worktree, agy_account_checked=(cli == "agy"),
+            custom_agent_definition_digest=(
+                custom_agent.definition_digest if custom_agent else None),
+            custom_agent_source_digest=(
+                custom_agent.source_digest if custom_agent else None),
+            custom_agent_identity=custom_identity,
         ))
         profile_env = ((profile_selection or {}).get("env") or {})
         private_runtime[request.seat_id] = MappingProxyType({
@@ -779,6 +900,13 @@ def freeze_roster(
             "profile_env": MappingProxyType(dict(profile_env)),
             "profile_command": ((profile_selection or {}).get("command")),
             "extra_args": tuple(extra_args),
+            "custom_agent_definition_body": (
+                custom_agent.body if custom_agent is not None else None),
+            "custom_agent_definition_digest": (
+                custom_agent.definition_digest if custom_agent else None),
+            "custom_agent_source_digest": (
+                custom_agent.source_digest if custom_agent else None),
+            "custom_agent_identity": custom_identity,
         })
     roster_digest = _digest_mapping({"schema_version": SCHEMA_VERSION,
                                      "root_cwd_sha256": _digest_text(os.path.abspath(cwd)),
@@ -794,6 +922,7 @@ def freeze_roster(
         "transport_overrides": MappingProxyType(dict(transport_overrides)),
         "profile_overrides": MappingProxyType(dict(profile_overrides)),
         "effort_overrides": MappingProxyType(dict(effort_overrides)),
+        "custom_agents_root": custom_agents_root,
     }
     return FrozenRoster(tuple(frozen), roster_digest, tuple(sorted(full)), tuple(sorted(text)),
                         requests_tuple, kwargs, private_runtime, os.path.abspath(cwd))
