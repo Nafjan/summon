@@ -75,7 +75,8 @@ remain. The release manifest is generated from a clean, immutable source tree an
 requires the named suites and gates rather than accepting arbitrary caller-supplied
 labels. The 3.0.0 evidence baseline is: deliberation 327/327, resume 15/15,
 discovery 547/547, conversation 26/26, conversation UI 8/8, install 30/30, model
-catalog 6/6, model routing 4/4, release manifest 13/13, and ACP 36/36.
+catalog 6/6, model routing 4/4, release contract 3/3, release gates 6/6,
+release manifest 13/13, and ACP 36/36.
 
 ## Product direction
 

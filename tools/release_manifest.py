@@ -53,6 +53,7 @@ REQUIRED_TESTS = frozenset({
     "discovery", "install", "release_manifest", "acpbackend",
     "deliberation", "deliberation_resume", "model_catalog",
     "conversation", "conversation_ui", "model_routing", "release_contract",
+    "release_gates",
 })
 REQUIRED_GATES = frozenset({
     "fake_lifecycle", "browser_security", "model_identity",
@@ -67,6 +68,7 @@ REQUIRED_COMMANDS = {
     "conversation": "python -m unittest skills.summon.scripts.test_conversation skills.summon.scripts.test_conversation_ui",
     "conversation_ui": "python -m unittest skills.summon.scripts.test_conversation_ui",
     "release_contract": "python -m unittest tests.test_release_contract",
+    "release_gates": "python -m unittest tests.test_release_gates",
     "deliberation": "python -m unittest skills.summon.scripts.test_deliberation_engine skills.summon.scripts.test_deliberation_policy skills.summon.scripts.test_deliberation_adapter skills.summon.scripts.test_deliberation_cli skills.summon.scripts.test_deliberation_scheduler skills.summon.scripts.test_deliberation_agents skills.summon.scripts.test_deliberation_roster skills.summon.scripts.test_deliberation_invocation skills.summon.scripts.test_deliberation_replay skills.summon.scripts.test_deliberation_restore skills.summon.scripts.test_deliberation_recovery skills.summon.scripts.test_deliberation_phase_a skills.summon.scripts.test_deliberation_live skills.summon.scripts.test_deliberation_browser skills.summon.scripts.test_deliberation_ui",
     "deliberation_resume": "python -m unittest skills.summon.scripts.test_deliberation_resume",
     "model_catalog": "python -m unittest skills.summon.scripts.test_model_catalog",
