@@ -75,10 +75,14 @@ class ConversationUITests(unittest.TestCase):
         self.assertEqual(data["events"][-1]["payload"]["text_chars"], len("private context"))
 
     def test_post_requires_origin_and_only_appends_human_context(self):
-        with self.assertRaises(HTTPError) as refused:
-            self._request("/api/v1/rooms/session-1/messages", method="POST",
-                          body={"message": "no origin"})
-        self.assertEqual(refused.exception.code, 401)
+        # Repeatedly exercise the rejected-body path: on Windows an unread
+        # request body can otherwise race the response and surface as a socket
+        # reset instead of the intended structured 401.
+        for _ in range(3):
+            with self.assertRaises(HTTPError) as refused:
+                self._request("/api/v1/rooms/session-1/messages", method="POST",
+                              body={"message": "no origin"})
+            self.assertEqual(refused.exception.code, 401)
         with self._request("/api/v1/rooms/session-1/messages", method="POST",
                            body={"message": "hello from browser"}, origin=True) as response:
             posted = json.loads(response.read())

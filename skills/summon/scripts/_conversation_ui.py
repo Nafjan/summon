@@ -221,6 +221,32 @@ class _ConversationHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(data)))
         self.end_headers(); self.wfile.write(data)
 
+    def _drain_rejected_body(self) -> None:
+        """Consume a bounded rejected body so the client receives the error cleanly.
+
+        Returning a response while a small request body is still unread can make
+        Windows reset the connection instead of delivering the intended 401/400.  Do
+        not drain unbounded or malformed bodies: close those connections after the
+        bounded error response rather than turning rejection into a slowloris.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "-1"))
+        except (TypeError, ValueError):
+            self.close_connection = True
+            return
+        if length < 0 or length > MAX_BODY_BYTES:
+            self.close_connection = True
+            return
+        remaining = length
+        try:
+            while remaining:
+                chunk = self.rfile.read(min(remaining, 8192))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except (OSError, TimeoutError):
+            self.close_connection = True
+
     def _session(self) -> str:
         parts = [unquote(part) for part in urlsplit(self.path).path.split("/") if part]
         if len(parts) not in (4, 5) or parts[:3] != ["api", "v1", "rooms"]:
@@ -265,6 +291,7 @@ class _ConversationHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             if not self._authorized(require_origin=True):
+                self._drain_rejected_body()
                 raise ConversationUIError("unauthorized")
             session = self._session()
             if not self.path.split("?", 1)[0].endswith("/messages"):
