@@ -1,12 +1,13 @@
 # Summon product roadmap
 
-Status date: 2026-08-16
+Status date: 2026-08-17
 Current source version: `3.0.0` candidate
 Readiness: the immutable `3.0.0` tag remains the public-preview baseline, while the
-current candidate contains the authenticated chat/runtime and browser hardening described
-below. The candidate has a clean source-bound schema-2 Claude Opus receipt and all named
-machine gates pass; it is not yet a published GA tag. Additional provider receipts,
-remote execution, and multi-user hosting remain separately gated.
+working tree contains the authenticated chat/runtime, browser hardening, and narrow
+fresh read-only deliberation lane described below. This checkout is intentionally dirty
+after that implementation pass; evidence and managed-install convergence must be
+regenerated from a clean immutable commit before any GA tag. Additional provider
+receipts, remote execution, and multi-user hosting remain separately gated.
 
 This is the release-facing roadmap for turning the current, well-tested kernel into a dependable open product. It records what is actually shipped, what was tested, and the gates that must pass before we describe a feature as shipped, preview, or live-provider-enabled.
 
@@ -20,7 +21,7 @@ This is the release-facing roadmap for turning the current, well-tested kernel i
 | Custom Agent manifests and roster binding | Strict parser, path fencing, consent/identity binding | Ready as provider-inert configuration |
 | Live provider composition | Receipt/plan/owner/deadline fences exist; the current source-bound packet passes the schema-2 Claude Opus normal/cancel/deadline pilot | Claude Opus route is live-provider-gated; other routes remain provider-inert until independently reviewed |
 | Browser conversation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, visual evidence, and explicit cancellable roster-agent turns; richer multi-run lifecycle remains preview | Unreleased post-GA preview |
-| Managed local installs | Eight managed host copies converge on the candidate's 3.0.0 source payload; unmanaged Cursor plugin drift is reported and intentionally untouched | Candidate gate passed; unmanaged drift is not installer-owned |
+| Managed local installs | The last clean candidate check converged the eight managed host copies; this working tree has new deliberation changes and requires a refresh/evidence run. Unmanaged Cursor plugin drift remains intentionally untouched | Refresh after the release commit; unmanaged drift is not installer-owned |
 | Unmanaged Cursor local plugin | Older 2.2.0 content hash; not installer-owned | Update through its plugin mechanism only |
 
 Telemetry is enabled for this workstation through `~/.agents/summon-telemetry.json`. “On” means bounded, allow-listed local JSONL diagnostics only; it does not transmit data. GitHub issue submission remains a separate explicit action.
@@ -76,14 +77,14 @@ to unmanaged Cursor plugins.
 No open P0/P1 reliability, security, privacy, migration, or evidence contradiction may
 remain. The release manifest is generated from a clean, immutable source tree and
 requires the named suites and gates rather than accepting arbitrary caller-supplied
-labels. The latest local fixed-registry run (not a GA claim) recorded: deliberation
-335/335, resume 15/15, discovery 549/549, conversation 39/39, runtime 24/24, UI
+labels. The last clean-candidate fixed-registry run (historical, not a GA claim) recorded: deliberation
+354/354, resume 15/15, discovery 549/549, conversation 39/39, runtime 24/24, UI
 19/19, install 30/30, model catalog 6/6, model routing 4/4, release contract 3/3,
 release gates 7/7, release manifest 16/16, live-provider gate tests 3/3, swarm
-protocol 12/12, and ACP 36/36. The registry is source-bound and clean; every named
-machine gate passes, including the reviewed schema-2 Claude Opus receipt. The candidate
-still needs the final immutable GA tag/publication and any additional provider receipts
-we choose to advertise.
+protocol 12/12, and ACP 36/36. Those counts do not certify the current dirty working
+tree: the fresh-lane changes require a new source-bound evidence packet and managed
+install refresh. The candidate still needs a clean immutable GA tag/publication and
+any additional provider receipts we choose to advertise.
 
 ## Product direction
 
@@ -129,7 +130,7 @@ deliberation receipt.
 1. **Keep the ordinary dispatcher suite deterministic.** The two early-exit tests now use a dispatch barrier and the broad run is `549/549`; keep the repetition check in CI. Treat a timeout or missing stage as a test failure, never as a silent pass.
 2. **Close installer asset drift.** Keep `examples/` in the owned payload and manifest (now fixed); add a source-vs-install manifest check to CI. Never update archival worktrees or unmanaged plugin copies.
 3. **Remove resource warnings.** ✅ Closed the bounded Git-reader pipes in `_receipt.py`; the
-   fixed release registry (currently 335 deliberation, 15 resume, 39 conversation, 24 runtime,
+   fixed release registry (currently 354 deliberation, 15 resume, 39 conversation, 24 runtime,
    19 UI, 549 discovery, 30 install, 36 ACP, 6 catalog, 4 routing, 16 release-manifest,
    7 release-gates, 12 swarm, 3 live-provider-gate, and 3 release-contract tests) is now warning-clean rather than
    merely assertion-clean.

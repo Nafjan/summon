@@ -1,9 +1,9 @@
 """Receipt-bound one-attempt subprocess integration for deliberation.
 
-This module is an explicit integration seam, not a CLI entry point.  It is
-constructed only from a held run-directory owner, the owner's immutable
-receipt, and a frozen roster.  The caller must opt into this API directly;
-ordinary dispatch, the deliberation CLI, and resume remain unchanged.
+This module is an owner-bound integration seam for the deliberately narrow
+fresh CLI lane.  It is constructed only from a held run-directory owner, the
+owner's immutable receipt, and a frozen roster.  Broader approval, resume,
+fallback, and alternate-transport paths remain separate gates.
 """
 
 from __future__ import annotations
@@ -280,6 +280,7 @@ def build_live_scheduler(*, owner: _rundir.Owner,
                          clock: Callable[[], float], unix_now_ms: int,
                          worktree_proofs: Mapping[str, WorktreeProof] | None = None,
                          cancel_requested: Callable[[], bool] | None = None,
+                         cancel_command: Callable[[], object] | None = None,
                          deadline_clock: float | None = None,
                          _executor_for_tests=None) -> DeliberationScheduler:
     """Build one owner-bound scheduler using fresh subprocess adapters.
@@ -293,6 +294,8 @@ def build_live_scheduler(*, owner: _rundir.Owner,
         raise TypeError("clock must be callable")
     if cancel_requested is not None and not callable(cancel_requested):
         raise TypeError("cancel_requested must be callable")
+    if cancel_command is not None and not callable(cancel_command):
+        raise TypeError("cancel_command must be callable")
     if not roster.revalidate():
         raise LiveDeliberationError("live roster evidence is stale")
     cwd = roster.root_cwd
@@ -410,7 +413,8 @@ def build_live_scheduler(*, owner: _rundir.Owner,
         owner_is_current=owner_current,
         deadline=binding.deadline_clock,
         clock=authoritative_clock, rounds=binding.rounds,
-        cancel_requested=shared_cancel, live_provider=False)
+        cancel_requested=shared_cancel, cancel_command=cancel_command,
+        live_provider=False)
     activation = (os.path.realpath(owner.run_dir), owner.nonce)
     with _ACTIVATION_LOCK:
         if activation in _ACTIVATED_OWNERS:

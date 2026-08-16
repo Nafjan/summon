@@ -10,6 +10,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -107,7 +109,7 @@ class DeliberationCliTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["--deliberate", "--quorum", "0/3"])
 
-    def test_fresh_command_is_structurally_blocked_without_mutation(self) -> None:
+    def test_fresh_command_requires_a_resolvable_readonly_roster(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             run_root = os.path.join(temp, "runs")
             command = [
@@ -118,10 +120,206 @@ class DeliberationCliTests(unittest.TestCase):
             result = subprocess.run(command, capture_output=True, text=True, timeout=20)
             body = json.loads(result.stdout)
             self.assertEqual(result.returncode, 1)
-            self.assertEqual(body["status"], "blocked")
-            self.assertEqual(body["error_kind"], "integration_pending")
-            self.assertIn("no provider was called", body["error"])
+            self.assertEqual(body["status"], "error")
+            self.assertEqual(body["mode"], "deliberation-command")
+            self.assertNotEqual(body.get("error_kind"), "integration_pending")
             self.assertFalse(os.path.exists(run_root))
+
+    def test_fresh_live_lane_binds_receipt_before_scheduler(self) -> None:
+        class FakeReport:
+            status = "success"
+
+            def as_dict(self):
+                return {
+                    "mode": "deliberation-run", "status": "success",
+                    "state": "ATTEMPT_BUDGET_EXHAUSTED", "uncertain_spend": False,
+                }
+
+        class FakeScheduler:
+            def __init__(self):
+                self.cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+            def run(self):
+                return FakeReport()
+
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "project"
+            agents = project / "agents"
+            agents.mkdir(parents=True)
+            for name in ("one", "two"):
+                (agents / f"{name}.md").write_text(
+                    "---\nrun-agent: claude\npermission: read-only\n---\n",
+                    encoding="utf-8")
+            run_root = Path(temp) / "runs"
+            parser = _cli.build_parser("test", 1)
+            args = parser.parse_args([
+                "--deliberate", "--question", "q", "--seats", "one,two",
+                "--options", "yes,no", "--quorum", "all", "--max-attempts", "2",
+                "--deadline", "30s", "--cwd", str(project),
+                "--agents-dir", str(agents), "--run-dir", str(run_root), "--json",
+            ])
+            fake = FakeScheduler()
+            with mock.patch("_deliberation_live.build_live_scheduler",
+                            return_value=fake):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    code = store.run_command(args)
+            self.assertEqual(code, 0)
+            body = json.loads(output.getvalue())
+            self.assertEqual(body["status"], "success")
+            self.assertEqual(body["receipt"]["seat_ids"], ["one", "two"])
+            self.assertEqual(body["receipt"]["quorum_rule"], "all")
+            self.assertEqual(body["receipt"]["plan_identity_by_seat"]["one"][
+                "effective_permission"], "read-only")
+            self.assertNotIn(str(project), output.getvalue())
+            self.assertFalse(fake.cancelled)
+
+    def test_fresh_live_lane_rejects_authority_consent_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "project"
+            agents = project / "agents"
+            agents.mkdir(parents=True)
+            for name in ("one", "two"):
+                (agents / f"{name}.md").write_text(
+                    "---\nrun-agent: claude\npermission: read-only\n---\n",
+                    encoding="utf-8")
+            run_root = Path(temp) / "runs"
+            parser = _cli.build_parser("test", 1)
+            args = parser.parse_args([
+                "--deliberate", "--question", "q", "--seats", "one,two",
+                "--options", "yes,no", "--quorum", "all", "--max-attempts", "2",
+                "--deadline", "30s", "--text-only-consent", "one",
+                "--cwd", str(project), "--agents-dir", str(agents),
+                "--run-dir", str(run_root), "--json",
+            ])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = store.run_command(args)
+            body = json.loads(output.getvalue())
+            self.assertEqual(code, 1)
+            self.assertEqual(body["error_kind"], "integration_pending")
+            self.assertEqual(body["status"], "blocked")
+            self.assertFalse(run_root.exists())
+
+    def test_fresh_live_lane_runs_real_scheduler_with_fake_provider(self) -> None:
+        def fake_execute(invocation, **kwargs):
+            control = kwargs["launch_control"]
+            control.before_provider_launch({"backend": invocation.cli,
+                                            "transport": invocation.transport})
+            packet = json.loads(invocation.prompt.split(
+                "DELIBERATION_PACKET:\n", 1)[1])
+            ordinal = packet["turn_ordinal"]
+            ballot = {
+                "schema_version": 1, "decision_id": packet["decision_id"],
+                "seat_id": packet["seat"]["id"], "turn_id": packet["turn_id"],
+                "attempt_id": f"g1-a{ordinal}", "decision": "vote",
+                "option_id": "yes", "confidence": "high", "evidence_refs": [],
+            }
+            return {"status": "success", "exit_code": 0,
+                    "result": json.dumps({"ballot": ballot})}
+
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "project"
+            agents = project / "agents"
+            agents.mkdir(parents=True)
+            for name in ("one", "two"):
+                (agents / f"{name}.md").write_text(
+                    "---\nrun-agent: claude\npermission: read-only\n---\n",
+                    encoding="utf-8")
+            run_root = Path(temp) / "runs"
+            parser = _cli.build_parser("test", 1)
+            args = parser.parse_args([
+                "--deliberate", "--question", "q", "--seats", "one,two",
+                "--options", "yes,no", "--quorum", "all", "--max-attempts", "2",
+                "--deadline", "30s", "--cwd", str(project),
+                "--agents-dir", str(agents), "--run-dir", str(run_root), "--json",
+            ])
+            output = io.StringIO()
+            with mock.patch("_deliberation_live._executor.execute_agent",
+                            side_effect=fake_execute):
+                with contextlib.redirect_stdout(output):
+                    code = store.run_command(args)
+            self.assertEqual(code, 0)
+            body = json.loads(output.getvalue())
+            self.assertEqual(body["state"], "DECIDED")
+            self.assertEqual(body["decision_option"], "yes")
+            self.assertEqual(body["turns_started"], 2)
+            status = store.inspect_run(str(run_root / "deliberations"), body["run_id"])
+            self.assertEqual(status["projection"]["state"], "decided")
+            self.assertEqual(status["projection"]["physical_attempts"]["started"], 2)
+
+    def test_fresh_live_lane_consumes_durable_cancel(self) -> None:
+        provider_contacted = threading.Event()
+
+        def blocking_execute(invocation, **kwargs):
+            control = kwargs["launch_control"]
+            control.before_provider_launch({"backend": invocation.cli,
+                                            "transport": invocation.transport})
+            provider_contacted.set()
+            while not control.is_cancelled():
+                time.sleep(0.01)
+            return {"status": "error", "exit_code": 1, "result": ""}
+
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "project"
+            agents = project / "agents"
+            agents.mkdir(parents=True)
+            for name in ("one", "two"):
+                (agents / f"{name}.md").write_text(
+                    "---\nrun-agent: claude\npermission: read-only\n---\n",
+                    encoding="utf-8")
+            run_root = Path(temp) / "runs"
+            parser = _cli.build_parser("test", 1)
+            args = parser.parse_args([
+                "--deliberate", "--question", "q", "--seats", "one,two",
+                "--options", "yes,no", "--quorum", "all", "--max-attempts", "2",
+                "--deadline", "30s", "--cwd", str(project),
+                "--agents-dir", str(agents), "--run-dir", str(run_root), "--json",
+            ])
+            emitted = mock.Mock()
+            outcome: list[object] = []
+
+            def run() -> None:
+                with mock.patch.object(store, "_emit", emitted):
+                    try:
+                        outcome.append(store.run_command(args))
+                    except BaseException as exc:  # surface worker failures below
+                        outcome.append(exc)
+
+            with mock.patch("_deliberation_live._executor.execute_agent",
+                            side_effect=blocking_execute):
+                worker = threading.Thread(target=run, daemon=True)
+                worker.start()
+                self.assertTrue(provider_contacted.wait(10), "fake provider did not start")
+                deliberations = run_root / "deliberations"
+                run_id = None
+                for _ in range(200):
+                    candidates = [item for item in deliberations.iterdir()
+                                  if item.is_dir()] if deliberations.exists() else []
+                    if candidates:
+                        run_id = candidates[0].name
+                        break
+                    time.sleep(0.01)
+                self.assertIsNotNone(run_id)
+                queued = store.queue_cancel(str(deliberations), run_id, "stop-1")
+                self.assertFalse(queued["applied"])
+                worker.join(15)
+
+            self.assertFalse(worker.is_alive(), "live lane did not consume cancel")
+            self.assertEqual(outcome, [1])
+            self.assertTrue(emitted.called)
+            result = emitted.call_args.args[0]
+            self.assertEqual(result["state"], "CANCELLED")
+            self.assertEqual(result["cancel"], "applied")
+            status = store.inspect_run(str(deliberations), run_id)
+            self.assertEqual(status["projection"]["state"], "cancelled")
+            self.assertTrue(any(record.get("event") == "human_command"
+                                for record in store.replay_run(
+                                    str(deliberations), run_id)["records"]))
+            self.assertFalse((deliberations / run_id / "commands" / "stop-1.json").exists())
 
     def test_recover_subcommand_reconciles_sealed_batch_without_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

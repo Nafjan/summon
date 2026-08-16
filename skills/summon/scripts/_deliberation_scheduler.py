@@ -2,9 +2,10 @@
 
 This module owns the deterministic turn loop and prompt/context boundary, but
 deliberately has no provider construction or backend imports.  A caller must
-inject an adapter (normally a seat multiplexer) and a seat resolver.  The live
-provider bridge is a later, separately reviewed phase; ``live_provider=True``
-therefore fails closed here.
+inject an adapter (normally a seat multiplexer) and a seat resolver.  The
+``live_provider`` flag still fails closed for schedulers that would construct
+providers themselves; the reviewed owner-bound adapter seam is the only route
+that may supply controlled subprocess adapters.
 """
 
 from __future__ import annotations
@@ -158,6 +159,7 @@ class DeliberationScheduler:
         clock: Callable[[], float],
         rounds: int = 1,
         cancel_requested: Callable[[], bool] | None = None,
+        cancel_command: Callable[[], HumanCommand | None] | None = None,
         live_provider: bool = False,
     ) -> None:
         if live_provider:
@@ -217,6 +219,7 @@ class DeliberationScheduler:
         self._durable_append = durable_append
         self._owner_is_current = owner_is_current
         self._cancel_requested = cancel_requested or (lambda: False)
+        self._cancel_command = cancel_command or (lambda: None)
         self._cancel_event = threading.Event()
         self._events: list[dict] = []
         self._turn_prompts: dict[tuple[str, str], tuple[int, str]] = {}
@@ -400,7 +403,8 @@ class DeliberationScheduler:
             self.policy, self.adapter, self.generation, self._append,
             deadline=self.deadline, clock=self.clock,
             owner_is_current=self._owner_is_current,
-            cancel_requested=self._cancelled)
+            cancel_requested=self._cancelled,
+            cancel_command=self._cancel_command)
         cleanup: CleanupReceipt | None = None
         error_kind: str | None = None
         try:

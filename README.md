@@ -110,8 +110,10 @@ not installed or required.
 - **Structured extraction:** `--json-schema` validates an agent's final JSON and, on a
   backend that supports resume, spends one corrective retry when it does not match.
 - **Governed deliberation:** `summon deliberate` records a receipt-bound, fixed-option
-  decision policy and journal. The local browser observer is public preview functionality;
-  fresh/resume provider execution remains live-gated until the owner-bound coordinator passes.
+  decision policy and journal. The fresh CLI lane can run one bounded round of
+  enforceable read-only subprocess seats after durable receipt/owner fencing; approval,
+  resume, ACP/HTTP, and writable routes remain explicitly gated. The local browser is
+  an observer/control surface and never silently changes the decision policy.
 - **Use local + frontier models together:** an Ollama model and Claude in the same council.
 - **Route named local logins:** keep multiple Claude config directories behind private
   profile names, so a public agent definition never carries a machine path or credential.

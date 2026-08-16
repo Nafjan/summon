@@ -362,10 +362,12 @@ Recovery is deliberately explicit: `chat recover` closes an unmatched turn as
 `blocked` after human attestation and never claims that provider spend did not occur;
 it does not retry. `chat fork` creates a new context lineage without provider contact.
 
-The current fresh/resume provider path is deliberately `integration_pending`:
-the receipt and safety boundary are real, but the CLI must not silently launch a
-provider or fall back to another mode until the reviewed live coordinator gate is
-enabled. `status`, `replay`, `recover`, `cancel`, and `open` are provider-inert;
+The fresh provider path now has a deliberately narrow live lane: it launches only
+explicit one-round, one-attempt-per-seat, enforceable read-only subprocess seats after
+the receipt and owner lease are durable. It never silently falls back to another mode.
+Approval pauses, `resume`, ACP/HTTP, Kimi, text-only, writable, and full-bypass seats
+remain `integration_pending` until their own coordinator gates pass. `status`,
+`replay`, `recover`, `cancel`, and `open` remain safe management operations;
 `resume` treats an unmatched physical start as `uncertain_spend` and makes no
 provider call unless `--retry-indeterminate` is explicit. Read
 [references/deliberation.md](references/deliberation.md) before constructing a
@@ -451,8 +453,8 @@ run or recommending it to a user.
 | `--run-dir` | No | With `--council` or `--deliberate`: root for the durable run directory (default `{cwd}/.agents/runs`; env `SUMMON_RUNS_DIR`) |
 | `--resume-run RUN_ID` | - | Resume a council run: re-run only missing/failed/changed stages (question and members come from the run's `receipt.json`). Subcommand form: `council resume <run-id>` |
 | `--council-status RUN_ID` | - | Print a council run's durable state, read-only (add `--json`). Subcommand form: `council status <run-id>` |
-| `--deliberate` | - | Start the governed fixed-option deliberation surface. It validates the immutable question/policy and returns `integration_pending` before provider contact until the owner-bound coordinator gate is enabled; it never silently falls back to council or ordinary dispatch |
-| `--deliberate-resume RUN_ID` | - | Resume a deliberation by id. A durable indeterminate attempt blocks with `uncertain_spend` unless `--retry-indeterminate` is explicit; the current preview remains `integration_pending` until scheduler wiring lands |
+| `--deliberate` | - | Start the governed fixed-option deliberation lane. The current live path admits only explicit one-round, one-attempt-per-seat, read-only subprocess seats; unsupported approval/resume/provider routes fail closed and never fall back to council or ordinary dispatch |
+| `--deliberate-resume RUN_ID` | - | Resume a deliberation by id. A durable indeterminate attempt blocks with `uncertain_spend` unless `--retry-indeterminate` is explicit; provider resume remains gated until sealed restore wiring lands |
 | `--deliberate-recover RUN_ID` | - | Reconcile only journal-proven crash boundaries (sealed human-command batches or receipt-derived consensus) under one owner; zero provider calls; uncertain, legacy-unsealed, or non-deterministic work remains blocked |
 | `--deliberate-status RUN_ID` | - | Read a checksum-verified, journal-derived deliberation status without dispatching an agent |
 | `--deliberate-replay RUN_ID` | - | Read a bounded, checksum-verified deliberation journal replay without dispatching an agent |
@@ -461,9 +463,9 @@ run or recommending it to a user.
 | `--browser {auto,builtin,ide,system,link}` | With `--deliberate-open` | Select the integrated Browser Harness (`builtin`/`auto` when `iab` is advertised), an executable IDE bridge, the system browser, or a link-only result |
 | `--seats A,B` | With `--deliberate` | Immutable, unique seat agent ids; 2-10 seats |
 | `--options X,Y` | With `--deliberate` | Immutable, unique decision option ids; at least two |
-| `--max-attempts N` | With `--deliberate` | Hard physical provider-launch budget; every secondary launch must consume its own durable attempt (positive integer) |
+| `--max-attempts N` | With `--deliberate` | Hard physical provider-launch budget; the current live lane requires exactly one attempt per seat, while future rounds/resume must consume their own durable attempts |
 | `--deadline DURATION` | With `--deliberate` | Absolute deliberation wall-clock budget, using the same duration grammar as `--timeout` |
-| `--require-human-approval` | With `--deliberate` | Require a typed human approval after a valid consensus candidate; model prose cannot approve itself |
+| `--require-human-approval` | With `--deliberate` | Require a typed human approval after a valid consensus candidate; the current fresh live lane rejects this until the durable approval/resume coordinator is enabled |
 | `--retry-indeterminate` | With `deliberate resume` | Explicitly authorize a fresh physical attempt after uncertain spend; ordinary resume performs zero provider calls |
 | `--command-id ID` | With `--deliberate-cancel` | Optional idempotency key for the queued cancellation command |
 | `--text-only-consent SEAT` | With `--deliberate` | Receipt-bound consent for a named text-only seat; consent is never inferred from role or environment |
@@ -487,12 +489,10 @@ run or recommending it to a user.
 | `--chat-confirm` | With `chat recover` | Required human attestation for closing an unmatched turn as indeterminate; never retries or asserts zero spend. |
 | `--chat-reason TEXT` | With `chat fork` | Bounded explanation recorded on the parent fork event. |
 
-The public deliberate CLI is currently provider-inert and reports
-`integration_pending` before provider contact. A reviewed live composition exists
-only behind an owner-bound test seam and currently permits cancellable CLI/ACP seats;
-`openai-compat` HTTP seats are refused until the transport can interrupt an active
-request within the run deadline. The ordinary single-dispatch API backend remains
-available and unchanged.
+The public deliberate CLI has a narrow provider lane and reports a redacted durable
+run result after cleanup. It rejects unsupported approval/resume, ACP/HTTP, Kimi,
+text-only, writable, and full-bypass routes as `integration_pending`; it never silently
+falls back. The ordinary single-dispatch API backend remains available and unchanged.
 
 **Stdout contract:** for dispatch commands, stdout carries **exactly one JSON object** —
 nothing before it, nothing after. All diagnostics (manifest progress lines, argparse

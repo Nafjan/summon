@@ -827,13 +827,15 @@ class DeliberationEngine:
                  generation: int, durable_append: Callable[[dict], None],
                  *, deadline: float, clock: Callable[[], float],
                  owner_is_current: Callable[[], bool] = lambda: True,
-                 cancel_requested: Callable[[], bool] = lambda: False) -> None:
+                 cancel_requested: Callable[[], bool] = lambda: False,
+                 cancel_command: Callable[[], HumanCommand | None] = lambda: None) -> None:
         if generation < 1:
             raise ValueError("generation must be positive")
         self.policy, self.adapter, self.deadline, self.clock = policy, adapter, deadline, clock
         self._append_callback = durable_append
         self._owner_is_current = owner_is_current
         self._cancel_requested = cancel_requested
+        self._cancel_command = cancel_command
         self.state = DeliberationState(generation=generation)
         self.attempts = AttemptLedger(generation, durable_append, owner_is_current)
         self.ballots = BallotBook(policy)
@@ -847,7 +849,8 @@ class DeliberationEngine:
                 adapter: DeliberationAdapter, *, owner: object, run_dir: str,
                 deadline: float, clock: Callable[[], float],
                 receipt: Mapping[str, object],
-                cancel_requested: Callable[[], bool] = lambda: False) -> "DeliberationEngine":
+                cancel_requested: Callable[[], bool] = lambda: False,
+                cancel_command: Callable[[], HumanCommand | None] = lambda: None) -> "DeliberationEngine":
         """Restore through one indivisible owner/generation/journal binding.
 
         ``checkpoint`` is intentionally duck typed so this pure kernel does not
@@ -925,7 +928,8 @@ class DeliberationEngine:
             checkpoint, policy, adapter, owner.generation, durable_append,
             deadline=deadline, clock=clock, receipt=receipt,
             owner_is_current=owner_is_current,
-            cancel_requested=cancel_requested)
+            cancel_requested=cancel_requested,
+            cancel_command=cancel_command)
 
     @classmethod
     def _restore_sealed(cls, checkpoint: object, policy: DeliberationPolicy,
@@ -933,7 +937,8 @@ class DeliberationEngine:
                         durable_append: Callable[[dict], None], *, deadline: float,
                         clock: Callable[[], float], receipt: Mapping[str, object],
                         owner_is_current: Callable[[], bool],
-                        cancel_requested: Callable[[], bool]) -> "DeliberationEngine":
+                        cancel_requested: Callable[[], bool],
+                        cancel_command: Callable[[], HumanCommand | None] = lambda: None) -> "DeliberationEngine":
         """Validate replay state after the public owner capabilities are sealed."""
         checkpoint = _snapshot_checkpoint(checkpoint)
         receipt_sha256, policy_digest = _receipt_binding(receipt, policy)
@@ -1096,7 +1101,8 @@ class DeliberationEngine:
         engine = cls(policy, adapter, generation, durable_append,
                      deadline=effective_deadline, clock=clock,
                      owner_is_current=owner_is_current,
-                     cancel_requested=cancel_requested)
+                     cancel_requested=cancel_requested,
+                     cancel_command=cancel_command)
         engine.attempts = AttemptLedger(
             generation, durable_append, owner_is_current,
             restored_entries=attempts)
@@ -1227,7 +1233,9 @@ class DeliberationEngine:
         if self.next_action() != NextAction.LAUNCH:
             return None
         if self._cancel_requested_safely():
-            self._transition(RunState.CANCELLED, "cancelled")
+            reason = ("human_cancel" if self._durable_cancel_command()
+                      else "cancelled")
+            self._transition(RunState.CANCELLED, reason)
             return None
         if context.decision_id != self.policy.decision_id or context.seat_id not in self.policy.seat_ids:
             raise DeliberationError("turn is outside the immutable schedule")
@@ -1270,7 +1278,9 @@ class DeliberationEngine:
         self._record_advisory_left_behind(result.structured_output)
 
         if cancel_before_finish or self._cancel_requested_safely():
-            self._transition(RunState.CANCELLED, "cancelled")
+            reason = ("human_cancel" if self._durable_cancel_command()
+                      else "cancelled")
+            self._transition(RunState.CANCELLED, reason)
             return result
 
         # Absolute deadline is a safety boundary.  A result returned after it is
@@ -1311,6 +1321,36 @@ class DeliberationEngine:
             # An unavailable cancellation channel must not grant the model a
             # decision.  Fail closed at this boundary.
             return True
+
+    def _durable_cancel_command(self) -> bool:
+        """Append a queued cancel at the result boundary, before its transition.
+
+        A command cannot be appended in the middle of a physical attempt: the
+        replay contract requires a command to be immediately consumed by its
+        transition.  The live owner therefore holds the command in memory while
+        the provider is unwinding and hands it to this hook only after the
+        attempt has been durably finished.
+        """
+        try:
+            command = self._cancel_command()
+        except Exception as exc:
+            raise DeliberationError("durable cancel command could not be read") from exc
+        if command is None:
+            return False
+        if (not isinstance(command, HumanCommand)
+                or command.action != "cancel"
+                or isinstance(command.sequence, bool)
+                or not isinstance(command.sequence, int)
+                or command.sequence < 1
+                or command.command_id is None
+                or not isinstance(command.command_id, str)
+                or not _ID_RE.fullmatch(command.command_id)):
+            raise DeliberationError("durable cancel command is malformed")
+        self._append({"event": "human_command",
+                      "command_id": command.command_id,
+                      "sequence": command.sequence,
+                      "action": "cancel"})
+        return True
 
     def _record_advisory_left_behind(self, output: Mapping[str, object] | None) -> None:
         if not isinstance(output, Mapping):
@@ -1377,7 +1417,9 @@ class DeliberationEngine:
     def cancel(self) -> None:
         if self.state.status in TERMINAL_STATES:
             return
-        self._transition(RunState.CANCELLED, "cancelled")
+        reason = ("human_cancel" if self._durable_cancel_command()
+                  else "cancelled")
+        self._transition(RunState.CANCELLED, reason)
 
     def cleanup(self) -> CleanupReceipt:
         receipt = self.adapter.cleanup()

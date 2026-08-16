@@ -1,10 +1,11 @@
 """Durable storage and local command handlers for headless deliberation.
 
-The journal is authoritative.  This module never treats ``state.json`` as
-evidence and never launches a provider.  A future scheduler may initialize a
-run with :func:`initialize_run`, append through ``_rundir.journal_append``, and
-consume the bounded command inbox.  Status/replay are lock-free readers;
-cancel only queues a typed command and does not claim that it was applied.
+The journal is authoritative.  Management readers never treat ``state.json``
+as evidence.  The narrow fresh read-only lane may initialize a run with
+:func:`initialize_run`, append through ``_rundir.journal_append``, and consume
+the bounded command inbox; all broader approval/resume/provider paths remain
+gated.  Status/replay are lock-free readers; a standalone cancel command only
+queues a typed request and does not claim that it was applied.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -22,7 +24,7 @@ from typing import Mapping
 import _rundir
 import _deliberation_replay as _replay
 import _model_catalog
-from _deliberation import TERMINAL_STATES
+from _deliberation import DeliberationError, HumanCommand, TERMINAL_STATES
 
 
 SCHEMA_VERSION = 1
@@ -562,12 +564,9 @@ def run_command(args) -> int:
                 kind="integration_pending", status="blocked")
         if getattr(args, "deliberate", False):
             _validate_fresh_args(args)
-            return _error(
-                "run",
-                "deliberation execution is not publicly activated until the one-attempt "
-                "adapter is wired through the owner-bound durable coordinator and passes "
-                "resume/cancel/cleanup gates; no run was created and no provider was called",
-                kind="integration_pending", status="blocked")
+            return _run_fresh_live(args, root, cwd)
+    except DeliberationError as exc:
+        return _error("run", str(exc), kind="integration_pending", status="blocked")
     except (DeliberationStoreError, ValueError, OSError) as exc:
         message = str(exc)
         # Management errors may include the configured run root (for example,
@@ -638,3 +637,235 @@ def _validate_fresh_args(args) -> None:
         raise ValueError("--max-attempts must be positive")
     if getattr(args, "deadline", None) is None:
         raise ValueError("--deadline is required")
+
+
+def _fresh_question(args) -> str:
+    """Read the fresh question once, without echoing its bytes in errors."""
+    if args.question is not None and args.question_file is not None:
+        raise ValueError("give --question or --question-file, not both")
+    question = (args.question or "").strip()
+    if args.question_file is not None:
+        try:
+            question = Path(args.question_file).read_text(
+                encoding="utf-8-sig").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError("cannot read --question-file") from exc
+    if not question:
+        raise ValueError("deliberate needs --question or --question-file")
+    return question
+
+
+def _read_cancel_command(path: str) -> dict | None:
+    """Return one safe queued cancel command, or ``None``.
+
+    The inbox is an untrusted cross-process boundary.  The live runner only
+    consumes the exact bounded shape written by :func:`queue_cancel`; it never
+    treats arbitrary files as a cancellation signal.
+    """
+    directory = _commands_dir(path)
+    try:
+        if os.path.islink(directory):
+            raise DeliberationStoreError(
+                "commands inbox is a symbolic link; refusing it")
+        names = sorted(name for name in os.listdir(directory)
+                       if name.endswith(".json"))
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise DeliberationStoreError("cannot inspect commands inbox") from exc
+    for name in names[:MAX_PENDING_COMMANDS]:
+        command_id = name[:-5]
+        if not _COMMAND_ID_RE.fullmatch(command_id) or ".." in command_id:
+            continue
+        target = os.path.join(directory, name)
+        try:
+            if os.path.islink(target):
+                continue
+            value = _rundir.read_json(target)
+        except OSError:
+            continue
+        if (isinstance(value, dict) and value.get("schema_version") == SCHEMA_VERSION
+                and value.get("run_id") == os.path.basename(os.path.normpath(path))
+                and value.get("action") == "cancel"
+                and value.get("command_id") == command_id
+                and value.get("actor") == "human"):
+            return value
+    return None
+
+
+def _run_fresh_live(args, root: str, cwd: str) -> int:
+    """Run the deliberately narrow public live lane.
+
+    This lane is intentionally stricter than the general deliberation parser:
+    it only admits explicit quorum, one round, one physical attempt per seat,
+    read-only enforceable seats, and no human-approval pause.  The durable
+    receipt is created before the first provider launch and the owner is held
+    until the scheduler has cleaned up.  Resume/approval remain separate gates.
+    """
+    question = _fresh_question(args)
+    seats = _csv(getattr(args, "seats", None), "seats")
+    if getattr(args, "quorum", None) is None:
+        raise ValueError("live deliberation requires an explicit --quorum")
+    if getattr(args, "rounds", 1) != 1:
+        raise DeliberationError(
+            "live deliberation currently permits exactly one round")
+    if bool(getattr(args, "require_human_approval", False)):
+        raise DeliberationError(
+            "human approval is not activated in the fresh live lane; use the observer only")
+    if (getattr(args, "text_only_consent", ())
+            or getattr(args, "full_authority_consent", ())):
+        raise DeliberationError(
+            "authority-consent seats are not admitted by the read-only live lane")
+    max_attempts = getattr(args, "max_attempts", None)
+    if max_attempts != len(seats):
+        raise DeliberationError(
+            "live deliberation requires --max-attempts equal to the seat count")
+    duration_ms = getattr(args, "deadline", None)
+    if (isinstance(duration_ms, bool) or not isinstance(duration_ms, int)
+            or duration_ms < len(seats)):
+        raise ValueError("live deliberation deadline is too short for its seats")
+
+    from _deliberation import DeliberationPolicy
+    from _deliberation_invocation import build_invocation_plans
+    from _deliberation_live import (MAX_LIVE_TIMEOUT_MS, LiveDeliberationError,
+                                    _expected_plan_identity, build_live_scheduler)
+    from _deliberation_roster import SeatRequest, freeze_roster
+
+    permission_ceilings = {seat_id: "read-only" for seat_id in seats}
+    roster = freeze_roster(
+        tuple(SeatRequest(seat_id, seat_id, role="participant")
+              for seat_id in seats),
+        cwd=cwd,
+        agents_dir=getattr(args, "agents_dir", None),
+        role_enabled=bool(getattr(args, "enable_roles", False)),
+        strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)),
+        permission_ceilings=permission_ceilings,
+    )
+    unsupported = []
+    for seat in roster.seats:
+        if seat.transport != "subprocess":
+            unsupported.append(f"{seat.seat_id}: transport {seat.transport}")
+        elif seat.cli in {"kimi", "openai-compat", "arkcli"}:
+            unsupported.append(f"{seat.seat_id}: backend {seat.cli}")
+        elif (seat.effective_permission != "read-only"
+              or seat.authority_class != "enforceable"):
+            unsupported.append(f"{seat.seat_id}: permission {seat.effective_permission}")
+        elif not seat.executable_sha256:
+            unsupported.append(f"{seat.seat_id}: executable evidence unavailable")
+    if unsupported:
+        raise DeliberationError(
+            "live read-only lane could not verify its seats: " + "; ".join(unsupported))
+    # The decision id is part of every prompt and plan identity.  Resolve it
+    # before building the plans so the receipt and invocation agree.
+    decision_id = "decision-" + uuid.uuid4().hex
+    plans = build_invocation_plans(roster, decision_id=decision_id, cwd=cwd)
+    policy = DeliberationPolicy(
+        decision_id, tuple(seats), _csv(getattr(args, "options", None), "options"),
+        getattr(args, "quorum"), max_attempts, False)
+    now_ms = int(time.time() * 1000)
+    deadline_unix_ms = now_ms + int(duration_ms)
+    timeout_ms = max(1, int(duration_ms) // len(seats))
+    if timeout_ms > MAX_LIVE_TIMEOUT_MS:
+        raise DeliberationError(
+            "live deliberation per-seat timeout exceeds the supported bound")
+    lease_sec = max(600.0, duration_ms / 1000.0 + 30.0)
+    run_id = "deliberation-" + uuid.uuid4().hex
+    public_roster = roster.as_dict(native=False)
+    receipt = {
+        "mode": "deliberation", "schema_version": SCHEMA_VERSION,
+        "run_id": run_id, "decision_id": decision_id,
+        "question_sha256": hashlib.sha256(
+            question.encode("utf-8", errors="surrogatepass")).hexdigest(),
+        "seat_ids": list(seats), "option_ids": list(policy.option_ids),
+        "quorum_rule": policy.quorum_rule, "max_attempts": max_attempts,
+        "require_human_approval": False, "rounds": 1,
+        "deadline_unix_ms": deadline_unix_ms, "created_at": time.time(),
+        "roster_digest": roster.roster_digest,
+        "provider_integration": {"name": "live-deliberation", "version": 1},
+        "execution_contract": {
+            "timeout_ms": timeout_ms, "retries": False,
+            "acp_fallback": False, "gates": False,
+            "report_repair": False, "allow_payg": False,
+            "allow_secondary": False,
+        },
+        "plan_identity_by_seat": _expected_plan_identity(roster, plans),
+        "consent_hashes": {
+            "full_authority": public_roster["full_authority_consent_sha256"],
+            "text_only": public_roster["text_only_consent_sha256"],
+        },
+        # Native-only recovery material.  It is deliberately excluded by
+        # _public_receipt; it is required to re-resolve the same roster later.
+        "execution_scope": {"cwd": cwd,
+                             "agents_dir": getattr(args, "agents_dir", None)},
+        "seat_requests": [{"seat_id": seat_id, "agent": seat_id,
+                           "role": "participant"} for seat_id in seats],
+        "permission_ceilings": permission_ceilings,
+    }
+    path, owner = initialize_run(root, receipt, lease_sec=lease_sec)
+    scheduler = None
+    stop_watch = __import__("threading").Event()
+    consumed_command: dict | None = None
+    command_lock = threading.Lock()
+    pending_command: dict | None = None
+    watcher_error: list[BaseException] = []
+
+    def take_cancel_command() -> HumanCommand | None:
+        nonlocal pending_command
+        with command_lock:
+            command = pending_command
+            pending_command = None
+        if command is None:
+            return None
+        return HumanCommand(sequence=1, action="cancel",
+                            command_id=command["command_id"])
+
+    def watch_cancel() -> None:
+        nonlocal consumed_command, pending_command
+        while not stop_watch.wait(0.05):
+            try:
+                command = _read_cancel_command(path)
+                if command is None or consumed_command is not None:
+                    continue
+                # Hold the command while the provider unwinds.  The engine
+                # appends it only after attempt_finished and immediately before
+                # the CANCELLED transition, which keeps replay boundary-atomic.
+                with command_lock:
+                    consumed_command = command
+                    pending_command = command
+                scheduler.cancel()
+                return
+            except BaseException as exc:  # fail closed without killing the owner
+                watcher_error.append(exc)
+                return
+
+    watcher = threading.Thread(target=watch_cancel,
+                               name="summon-deliberation-cancel", daemon=True)
+    try:
+        scheduler = build_live_scheduler(
+            owner=owner, receipt=receipt, policy=policy, question=question,
+            roster=roster, timeout_ms=timeout_ms,
+            clock=time.monotonic, unix_now_ms=now_ms,
+            cancel_command=take_cancel_command)
+        watcher.start()
+        report = scheduler.run()
+        if watcher_error:
+            raise DeliberationStoreError("live cancel channel failed closed")
+        result = report.as_dict()
+        result.update({"run_id": run_id, "receipt": _public_receipt(receipt),
+                       "cancel": ("applied" if consumed_command
+                                  and result.get("state") == "CANCELLED" else "none")})
+        if consumed_command and result.get("state") == "CANCELLED":
+            try:
+                os.unlink(os.path.join(path, "commands",
+                                       consumed_command["command_id"] + ".json"))
+            except OSError:
+                pass
+        _emit(result, json_mode=bool(args.json))
+        return 0 if result.get("status") == "success" else 1
+    except LiveDeliberationError:
+        raise
+    finally:
+        stop_watch.set()
+        if watcher.ident is not None:
+            watcher.join(timeout=1.0)
+        _rundir.release_owner(owner)

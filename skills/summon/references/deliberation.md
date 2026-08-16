@@ -57,14 +57,18 @@ still cross this explicit policy boundary.
 ## Current live-provider gate
 
 The kernel, journal, replay, recovery, roster, invocation, and local observer
-contracts are implemented and tested. The default fresh/resume CLI path remains
-`integration_pending`: it validates the immutable receipt and refuses to launch
-providers until the live one-attempt adapter is wired through the reviewed
-owner-bound coordinator and passes the resume/cancel/cleanup gates. It never
-silently falls back to `council` or ordinary dispatch. For a real decision today,
-use `council` or ordinary dispatch; use `deliberate` for the approved
-provider-inert/injected test path, durable-run inspection, recovery, and UI
-validation.
+contracts are implemented and tested. The fresh CLI has a deliberately narrow
+owner-bound lane: it admits only an explicit quorum, one round, one physical
+attempt per seat, enforceable read-only subprocess seats with executable
+evidence, and a bounded typed-cancel watcher. The receipt and `run_prepared`
+record are durable before any provider contact, and the lane never retries,
+falls back, enables ACP/HTTP/Kimi/text-only/writable/full-bypass seats, or
+silently changes mode. `deliberate resume` and human approval remain
+`integration_pending` until sealed checkpoint restore, provider identity
+revalidation, and the command coordinator have their own gates. For a workflow
+outside that lane, use `council` or ordinary dispatch only with the user's
+consent; never treat a blocked result as an invitation to retry through another
+mode.
 
 ## Safe command recipes
 
@@ -75,20 +79,19 @@ summon doctor --json
 summon deliberate --question "Which option should we ship?" \
   --seats planner,security,operator \
   --options ship,hold \
-  --quorum all --rounds 1 --max-attempts 6 --deadline 30m \
+  --quorum all --rounds 1 --max-attempts 3 --deadline 30m \
   --run-dir <private-runs-root> --cwd <project>
 ```
 
-The command above is the canonical shape. Supply `--quorum`, `--rounds`,
-`--max-attempts`, and `--deadline` explicitly; do not rely on parser defaults.
-The approval policy is also an input: state that it is `false` when the command
-does not include `--require-human-approval`, or add that flag when a person must
-approve the model result. In the current preview the command may return
-`integration_pending` rather than contact a provider; treat that as a safety
-gate, not as an invitation to retry through another mode without the user's
-consent. Add `--require-human-approval` when a model consensus must pause for a
-person. Bind text-only or full-authority seats only with the explicit,
-receipt-bound consent flags and the required roster/worktree evidence.
+The command above is the canonical shape for the fresh read-only lane. Supply
+`--quorum`, `--rounds 1`, `--max-attempts` equal to the seat count, and
+`--deadline` explicitly; do not rely on parser defaults. It fails closed as
+`integration_pending` when a seat is not an enforceable read-only subprocess or
+its executable evidence is unavailable. `--require-human-approval`, text-only
+consent, and full-authority consent are intentionally rejected by this lane
+until their separate durable coordinators exist. Treat any blocked result as a
+safety gate, not as an invitation to retry through another mode without the
+user's consent.
 
 For an existing run:
 

@@ -244,12 +244,12 @@ body { background: var(--ink); color: var(--text); font-size: 14px; letter-spaci
 .system-chip strong { font-size: 12px; }
 .system-chip small { color: var(--muted); font-size: 9px; }
 .system-chip summary { color: var(--blue); font-size: 10px; }
-.system-event.round .system-chip { border-left: 3px solid var(--blue); background: #152633; }
-.system-event.position .system-chip { border-left: 3px solid var(--lime); background: #18251d; }
-.system-event.cross .system-chip { border-left: 3px solid var(--amber); background: #2a2118; }
-.system-event.synthesis .system-chip { border-left: 3px solid var(--violet); background: var(--violet-deep); }
-.system-event.turn .system-chip { border-left: 3px solid var(--blue); background: #152633; }
-.system-event.finish .system-chip { border-left: 3px solid var(--lime); background: #18251d; }
+.system-event.round .system-chip { border-left: 1px solid var(--blue); background: #152633; }
+.system-event.position .system-chip { border-left: 1px solid var(--lime); background: #18251d; }
+.system-event.cross .system-chip { border-left: 1px solid var(--amber); background: #2a2118; }
+.system-event.synthesis .system-chip { border-left: 1px solid var(--violet); background: var(--violet-deep); }
+.system-event.turn .system-chip { border-left: 1px solid var(--blue); background: #152633; }
+.system-event.finish .system-chip { border-left: 1px solid var(--lime); background: #18251d; }
 .system-event.round .event-mark, .system-event.turn .event-mark { color: var(--blue); border-color: #5b7b8f; }
 .system-event.position .event-mark, .system-event.finish .event-mark { color: var(--lime); border-color: #6a8d5b; }
 .system-event.cross .event-mark { color: var(--amber); border-color: #957645; }

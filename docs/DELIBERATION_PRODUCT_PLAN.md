@@ -1,6 +1,6 @@
 # Summon Deliberation Product Plan
 
-Status: open-product preview (direct live seam and loopback observer exist; CLI/resume activation remains gated)
+Status: open-product preview (fresh read-only live lane and loopback observer exist; approval/resume remain gated)
 Target branch: current working branch
 Owner: Summon maintainers
 
@@ -27,17 +27,19 @@ does not select a provider, change prompts, create a worktree/profile, or activa
 live seat. Custom Agent support is therefore an evidence and provenance layer, not
 an execution shortcut.
 A separate receipt-bound live seam now exercises one real controlled subprocess per seat
-through the existing executor, with no retries, fallback, ACP/HTTP, gates, or report repair;
-it is still a direct integration API rather than a CLI/default path. The CLI and resume
-command remain blocked from live provider turns. The roster
+through the existing executor, with no retries, fallback, ACP/HTTP, gates, or report repair.
+The fresh CLI lane now wires that seam through a durable owner-bound coordinator, but it
+is deliberately restricted to explicit one-round, one-attempt, enforceable read-only
+subprocess seats and no approval pause. `deliberate resume` and human approval remain
+blocked until the sealed restore/command coordinator is complete. The roster
 phase loads each definition snapshot once, binds
 role/profile/memory/account/executable evidence, reports effective permission, and
 requires explicit per-seat consent plus disposable worktree evidence for writable or
 full-bypass seats. The invocation planner binds exact prompt bytes to the scheduler
 request digest, copies mutable profile state defensively, and revalidates roster and
 worktree evidence before each turn; it creates no worktree, profile, process, provider
-request, or journal event. Fresh and resume execution remain explicitly blocked until
-the live seam is wired to the durable coordinator. A
+request, or journal event. Fresh execution is now available only through the narrow
+read-only lane described above; resume/approval execution remains gated. A
 provider-inert replay slice now validates generation-tagged journal records, receipt
 identity, legal transitions, turn/attempt/ballot bindings, and recomputes consensus
 from accepted ballots; it reports unmatched starts as uncertain spend rather than
@@ -195,7 +197,9 @@ again. The headless kernel still returns an immutable checkpoint, while
 it owns one fenced lease, repairs a newest torn tail, recovers only sealed command
 batches, and appends only a receipt-derived consensus/approval transition. It never
 launches a provider and it returns a bounded blocked receipt for uncertain or
-non-deterministic work. The fresh/resume CLI and live provider path remain disabled.
+non-deterministic work. The fresh CLI read-only lane is enabled only for the bounded
+one-round coordinator; resume, approval, and broader provider paths remain disabled
+until their dedicated restore and command gates pass.
 
 Human command replay is boundary-atomic even though the journal is append-only. A
 checkpoint distinguishes immutable commands consumed by the immediately following legal
@@ -237,7 +241,10 @@ The explicit `deliberate recover RUN_ID` command exposes only the provider-inert
 reconciliation boundary. It may repair a newest torn tail and complete a sealed
 human-command or receipt-derived consensus boundary; it never consumes the command
 inbox or invokes an executor. `deliberate resume` remains `integration_pending` until
-the live one-attempt provider adapter and cleanup contract pass their separate gates.
+the live one-attempt provider adapter is paired with a sealed checkpoint restore,
+provider/account/profile revalidation, and an explicit uncertain-spend policy. The
+fresh lane consumes only typed cancel commands while its owner is alive; approval and
+message commands are not silently accepted or inferred.
 
 ### 4.2 State machine
 
@@ -554,8 +561,9 @@ both; `--browser link` is safe for SSH, CI, and scripts. Bridge values are one
 executable path only and receive the URL as one argument with `shell=False`.
 
 The URL contains a local bearer token in its fragment. Do not paste it into tickets or
-telemetry. The handoff opens observation/control only; fresh/resume/live provider
-activation remains separately gated.
+telemetry. The handoff opens observation/control only; the fresh read-only lane and
+the broader resume/approval/live-provider routes remain separately gated by their
+own durable contracts.
 
 Full P3 exit controls (for the later richer surface) are:
 
@@ -652,17 +660,18 @@ Repeated cleanup is idempotent. This harness imports no executor, subprocess, ne
 or profile-discovery surface and is not wired into the CLI or live scheduler construction.
 
 The bounded Phase-B live seam is now separately covered by the receipt-bound
-`_deliberation_live` integration API. Its focused contract tests cover 22 live cases and
+`_deliberation_live` integration API and the narrow fresh CLI coordinator. Its focused
+contract tests cover 23 live cases and
 22 roster cases, including one controlled subprocess per seat, final owner/snapshot/
 receipt/worktree/deadline fences, cancellation, takeover, duplicate activation, lease
 budget, Kimi environment evidence, and redacted failures. Kimi live activation remains
-disabled until its source credential bytes are receipt-bound. This seam is not a fresh CLI,
-resume, ACP, HTTP, retry, fallback, gate, or report-repair path.
+disabled until its source credential bytes are receipt-bound. The fresh CLI lane is not
+an approval-capable resume, ACP, HTTP, retry, fallback, gate, or report-repair path.
 
-This is not the CLI/resume activation gate: the direct live seam is deliberately narrower
+This is not the full CLI/resume activation gate: the fresh lane is deliberately narrower
 than the eventual coordinator and still requires owner-bound durable resume wiring,
-crash injection at every
-remaining integration boundary, and independent adversarial review before CLI activation.
+crash injection at every remaining integration boundary, and independent adversarial
+review before we call the CLI fully live.
 HTTP/openai-compat,
 ACP fallback/probes, implicit retries, gates, report repair, ambient provider/profile
 selection, and browser/UI work remain disabled.

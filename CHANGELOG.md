@@ -22,6 +22,11 @@ regression notes, and test evidence, see the
   dispatch, manifest, council, and deliberate, and require options, seats, quorum,
   rounds, attempt budget, deadline, and human-approval policy to be stated rather
   than inferred.
+- **Fresh deliberation lane:** the public `deliberate` command now admits only a
+  receipt-bound, one-round, one-attempt-per-seat run of enforceable read-only
+  subprocess seats with executable evidence. The owner journals a queued cancel
+  at the replay-safe attempt boundary; approval, resume, ACP/HTTP, Kimi, text-only,
+  writable, and full-bypass routes remain explicitly gated.
 - **Install convergence:** managed hosts receive the marked `/deliberate` companion
   without clobbering a foreign skill; provider-inert and live-gated readiness labels
   are now used consistently in the product docs.
