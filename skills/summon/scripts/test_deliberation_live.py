@@ -111,6 +111,19 @@ class LiveIntegrationTests(unittest.TestCase):
         self.assertEqual(report.turns_started, 2)
         self.assertEqual(report.state, "ATTEMPT_BUDGET_EXHAUSTED")
 
+    def test_deliberation_invocation_uses_ballot_contract_not_report_reminder(self):
+        import _builder
+        invocation = self.plans["one"].template
+        self.assertEqual(invocation.output_contract, "deliberation")
+        _command, args, _env = _builder.build_invocation_args(invocation)
+        rendered = "\n".join(str(value) for value in args)
+        self.assertNotIn("Final report", rendered)
+        self.assertIn("Deliberation output contract", rendered)
+
+        ordinary = _builder.AgentInvocation(cli="claude", prompt="p", cwd=str(self.cwd))
+        _command, ordinary_args, _env = _builder.build_invocation_args(ordinary)
+        self.assertIn("Final report", "\n".join(str(value) for value in ordinary_args))
+
     def test_live_scheduler_default_executor_reaches_one_controlled_fake_subprocess(self):
         path, owner = self.init()
         marker = self.root / "child-marker.txt"

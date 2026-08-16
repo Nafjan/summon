@@ -114,6 +114,26 @@ class ReplayTests(unittest.TestCase):
         checkpoint = self.run_replay(records, value=value)
         self.assertEqual(checkpoint.status, "RUNNING")
 
+    def test_attempt_model_identity_is_public_bounded_evidence(self):
+        value, records = prepared()
+        records.append((1, event("state_transition", 1, **{
+            "from": "PREPARED", "to": "RUNNING", "reason": "started"})))
+        attempts = turn_events()
+        attempts.insert(-1, (1, event(
+            "attempt_model_identity", 1, attempt_id="g1-a0",
+            model_served="claude-opus-4-7", model_targeted="claude-opus-4-7")))
+        records.extend(attempts)
+        checkpoint = self.run_replay(records, value=value)
+        self.assertTrue(any(item.get("event") == "attempt_model_identity"
+                            for item in checkpoint.transcript_events))
+
+        bad = list(records)
+        bad[-2] = (1, event(
+            "attempt_model_identity", 1, attempt_id="g1-a0",
+            model_served=r"C:\\private\\secret", model_targeted=None))
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(bad, value=value)
+
     def test_journal_repair_is_first_record_of_its_segment(self):
         value, records = prepared()
         records.append((1, event("state_transition", 1, **{

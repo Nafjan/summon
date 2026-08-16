@@ -275,6 +275,11 @@ class DeliberationScheduler:
         packet = {
             "schema_version": SCHEMA_VERSION,
             "decision_id": self.policy.decision_id,
+            # These are explicit so a provider cannot invent numeric aliases
+            # for the schedule-bound ballot identity.
+            "turn_id": context.turn_id,
+            "attempt_id": f"g{self.generation}-a{context.turn_ordinal}",
+            "turn_ordinal": context.turn_ordinal,
             "round": context.turn_ordinal // len(self.policy.seat_ids) + 1,
             "seat": {
                 "id": definition.seat_id,
@@ -286,6 +291,7 @@ class DeliberationScheduler:
                 "options": list(self.policy.option_ids),
                 "quorum": self.policy.quorum_rule,
                 "require_human_approval": self.policy.require_human_approval,
+                "allowed_decisions": ["vote", "abstain", "undecided"],
             },
             "question": self.question,
             "prior_transcript": self._transcript_projection(context.turn_ordinal),

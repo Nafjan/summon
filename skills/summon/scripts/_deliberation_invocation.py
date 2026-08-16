@@ -24,6 +24,14 @@ from _deliberation_roster import FrozenRoster, WorktreeProof
 MAX_SYSTEM_CONTEXT = 24 * 1024
 MAX_EXTRA_ARGS = 64
 DELIBERATION_SYSTEM_SUFFIX = """
+This is a non-interactive ballot turn. Do not call tools, enter or exit plan
+mode, request approval, or describe a plan. The machine-readable ballot is the
+complete response; finish immediately after emitting it.
+Copy `decision_id`, `seat_id`, `turn_id`, and `attempt_id` exactly as strings
+from the packet. Use `decision`=`vote` with one listed `option_id` (or use
+`abstain`/`undecided` with a null option), and use only `low`, `medium`, or
+`high` for confidence.
+
 ## Deliberation output contract
 Return exactly one JSON object as your final machine-readable answer. It must
 contain a `ballot` object with `schema_version`, `decision_id`, `seat_id`,
@@ -215,6 +223,7 @@ def build_invocation_plans(
             agy_account_checked=seat.agy_account_checked, permission_forced=False,
             profile=seat.profile_name, profile_env=copy.deepcopy(dict(profile_env)),
             profile_command=runtime.get("profile_command"),
+            output_contract="deliberation",
         )
         plans[seat.seat_id] = InvocationPlan(
             decision_id=decision_id, seat_id=seat.seat_id,

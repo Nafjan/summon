@@ -526,6 +526,48 @@ class AdapterBoundaryTests(unittest.TestCase):
         self.assertFalse(result.evidence.parser_valid is False and
                          result.evidence.timed_out)
 
+    def test_served_model_identity_is_captured_as_bounded_attempt_evidence(self):
+        adapter = FreshDispatchAdapter(
+            self.invocation(cli="claude", prompt="model evidence"),
+            snapshot_digest=SNAPSHOT,
+            current_snapshot_digest=lambda: SNAPSHOT,
+            owner_is_current=lambda: True,
+            timeout_ms=5000,
+            generation=1,
+            executor=lambda *args, **kwargs: {
+                "result": "{}", "exit_code": 0,
+                "model": {"targeted": "claude-opus-4-7",
+                           "served": "claude-opus-4-7"},
+            })
+        context = turn_with_prompt("model evidence", turn_id="turn-model",
+                                   ordinal=0)
+        spec = adapter.prepare(context)
+        result = adapter.launch(
+            spec, token_for_context(spec, context, "attempt-model"))
+        self.assertEqual(result.evidence.model_targeted, "claude-opus-4-7")
+        self.assertEqual(result.evidence.model_served, "claude-opus-4-7")
+
+        invalid = FreshDispatchAdapter(
+            self.invocation(cli="claude", prompt="invalid model evidence"),
+            snapshot_digest=SNAPSHOT,
+            current_snapshot_digest=lambda: SNAPSHOT,
+            owner_is_current=lambda: True,
+            timeout_ms=5000,
+            generation=1,
+            executor=lambda *args, **kwargs: {
+                "result": "{}", "exit_code": 0,
+                "model": {"served": r"C:\\private\\credential"},
+            })
+        invalid_context = turn_with_prompt("invalid model evidence",
+                                           turn_id="turn-invalid-model",
+                                           ordinal=0)
+        invalid_spec = invalid.prepare(invalid_context)
+        invalid_result = invalid.launch(
+            invalid_spec,
+            token_for_context(invalid_spec, invalid_context, "attempt-invalid-model"))
+        self.assertIsNone(invalid_result.evidence.model_served)
+        self.assertNotIn("private", repr(invalid_result.evidence))
+
     def test_owner_refusal_after_profile_build_still_cleans_profile(self):
         import _executor as executor_module
         with tempfile.TemporaryDirectory() as root:

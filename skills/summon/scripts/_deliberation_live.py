@@ -45,7 +45,7 @@ _PLAN_FIELDS = frozenset({
     "authority_class", "model_sha256", "profile_name_sha256",
     "extra_args_sha256", "cwd_sha256", "worktree_path_sha256",
     "worktree_head_sha256", "custom_agent_definition_digest",
-    "custom_agent_source_digest",
+    "custom_agent_source_digest", "output_contract",
 })
 _ACTIVATION_LOCK = threading.Lock()
 _ACTIVATED_OWNERS: set[tuple[str, str]] = set()
@@ -199,6 +199,7 @@ def _expected_plan_identity(roster: FrozenRoster, plans: Mapping[str, object]) -
             "worktree_head_sha256": seat.worktree_head_sha256,
             "custom_agent_definition_digest": seat.custom_agent_definition_digest,
             "custom_agent_source_digest": seat.custom_agent_source_digest,
+            "output_contract": "deliberation",
         }
     return result
 

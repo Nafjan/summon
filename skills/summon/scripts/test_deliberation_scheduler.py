@@ -201,6 +201,17 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(packets[2][1])
         self.assertTrue(packets[3][1])
 
+    def test_prompt_binds_exact_ballot_identity_and_allowed_decisions(self):
+        scheduler, adapter, _events, _clock = make_scheduler(rounds=1)
+        context = scheduler._context("seat-a", 0)[0]
+        packet = json.loads(
+            scheduler.prompt_for(context).split("DELIBERATION_PACKET:\n", 1)[1])
+        self.assertEqual(packet["turn_id"], context.turn_id)
+        self.assertEqual(packet["attempt_id"], "g1-a0")
+        self.assertEqual(packet["turn_ordinal"], 0)
+        self.assertEqual(packet["policy"]["allowed_decisions"],
+                         ["vote", "abstain", "undecided"])
+
     def test_prepared_prompt_cannot_be_reused_with_a_different_ordinal(self):
         scheduler, adapter, _events, _clock = make_scheduler(
             policy_value=policy(attempts=1))

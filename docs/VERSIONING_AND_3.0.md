@@ -76,10 +76,13 @@ the isolated upgrade, failure-injection, and rollback tests are machine-recorded
 the `migration_rollback` gate. Keep the previous release artifact until the operator
 has completed a real upgrade and smoke run.
 
-The live-provider gate is separate from the provider-inert test matrix.  It only
+The live-provider gate is separate from the provider-inert test matrix. It only
 passes when `tools/live_provider_gate.py` validates an explicitly reviewed,
-redacted receipt supplied through `SUMMON_LIVE_PROVIDER_RECEIPT`; missing or
-malformed evidence produces `blocked`, never an inferred success.
+redacted schema-2 receipt supplied through `SUMMON_LIVE_PROVIDER_RECEIPT`. The
+receipt must bind one normal decision plus cancel and deadline safety cases,
+owner/deadline/cancel fences, kill-switch behavior, no fallback/retry, and clean
+process teardown. Missing, stale, or malformed evidence produces `blocked`,
+never an inferred success.
 
 ## Release decision
 

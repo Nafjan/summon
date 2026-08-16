@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -366,11 +367,26 @@ class FreshDispatchAdapter:
                         (exit_code in (0, 143, -15) or normalized_success))
         prose = response.get("result") if isinstance(response.get("result"), str) else ""
         structured = self._parse_output(prose)
+        model_served = None
+        model_targeted = None
+        model = response.get("model")
+        if isinstance(model, Mapping):
+            model_served = model.get("served")
+            model_targeted = model.get("targeted")
+        elif isinstance(model, str):
+            model_served = model
+        safe_model = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+() -]{0,159}$")
+        if not isinstance(model_served, str) or safe_model.fullmatch(model_served) is None:
+            model_served = None
+        if not isinstance(model_targeted, str) or safe_model.fullmatch(model_targeted) is None:
+            model_targeted = None
         evidence = ExecutionEvidence(
             transport_ok=transport_ok,
             exit_code=exit_code,
             timed_out=timed_out,
             parser_valid=structured is not None,
+            model_served=model_served,
+            model_targeted=model_targeted,
         )
         return AdapterResult(evidence=evidence, structured_output=structured,
                              model_prose=prose)

@@ -30,6 +30,7 @@ MAX_SIGNED64 = (1 << 63) - 1
 MAX_HUMAN_COMMANDS = 1024
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+() -]{0,159}$")
 
 
 class ReplayError(ValueError):
@@ -319,6 +320,8 @@ _TRANSCRIPT_FIELDS = {
     "attempt_finished": ("event", "schema_version", "generation", "attempt_id",
                           "launch_spec_sha256", "transport_ok", "exit_code",
                           "timed_out", "parser_valid", "ballot_valid"),
+    "attempt_model_identity": ("event", "schema_version", "generation",
+                                "attempt_id", "model_served", "model_targeted"),
     "ballot_accepted": ("event", "schema_version", "generation", "attempt_id",
                          "seat_id", "turn_id", "turn_ordinal", "decision",
                          "option_id"),
@@ -726,6 +729,17 @@ def replay_checkpoint(receipt: Mapping[str, object],
             if pending_turn_key == (prior.seat_id, prior.turn_id):
                 pending_turn_key = None
             finished.add(attempt_id)
+            transcript.append(_public_event(record))
+            continue
+        if event == "attempt_model_identity":
+            attempt_id = _id(record.get("attempt_id"), "model identity attempt id")
+            if attempt_id not in attempts:
+                raise ReplayError("model identity lacks a matching attempt")
+            for key in ("model_served", "model_targeted"):
+                value = record.get(key)
+                if value is not None and (not isinstance(value, str)
+                                          or _MODEL_RE.fullmatch(value) is None):
+                    raise ReplayError("attempt model identity is malformed")
             transcript.append(_public_event(record))
             continue
         if event == "ballot_accepted":

@@ -240,6 +240,11 @@ class ExecutionEvidence:
     exit_code: int | None
     timed_out: bool = False
     parser_valid: bool = True
+    # Provider-reported identity is evidence only. It never influences policy
+    # or ballot validation, but must survive the durable attempt boundary so a
+    # live-provider receipt can prove what actually served the turn.
+    model_served: str | None = None
+    model_targeted: str | None = None
 
 
 @dataclass(frozen=True)
@@ -611,6 +616,15 @@ class AttemptLedger:
                 "parser_valid": evidence.parser_valid,
                 "ballot_valid": ballot_valid,
             })
+            if evidence.model_served is not None:
+                self._append({
+                    "event": "attempt_model_identity",
+                    "schema_version": SCHEMA_VERSION,
+                    "generation": token.binding.generation,
+                    "attempt_id": attempt_id,
+                    "model_served": evidence.model_served,
+                    "model_targeted": evidence.model_targeted,
+                })
             entry.phase = "finished"
 
     def mark_indeterminate(self, token: LaunchToken) -> None:

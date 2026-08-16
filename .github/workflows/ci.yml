@@ -29,7 +29,7 @@ jobs:
         run: python tests/test_install.py
 
       - name: Unit tests (release evidence manifest)
-        run: python -m unittest tests.test_release_manifest
+        run: python -m unittest tests.test_release_manifest tests.test_live_provider_gate
 
       - name: Unit tests (release version and migration contract)
         run: python -m unittest tests.test_release_contract
@@ -200,7 +200,7 @@ jobs:
               "discovery", "install", "release_manifest", "acpbackend",
               "deliberation", "deliberation_resume", "model_catalog",
               "conversation", "conversation_runtime", "conversation_ui", "model_routing", "release_contract",
-              "swarm_protocol",
+              "swarm_protocol", "live_provider_gate",
           }
           assert manifest["evidence"]["source_tree_sha256"] == evidence["source_tree_sha256"]
           assert manifest["version_contract"]["ready"]

@@ -67,6 +67,9 @@ class AgentInvocation:
     profile: str | None = None
     profile_env: dict | None = None
     profile_command: str | None = None
+    # Ordinary dispatches use the report contract. Receipt-bound deliberation
+    # turns use a typed ballot contract and must not receive the report nudge.
+    output_contract: str = "report"
 
 
 # Short report-contract nudge appended to RESUME prompts. On resume the session
@@ -688,12 +691,13 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
                 + ["--resume", inv.resume_id] + base_args,
                 inv.profile_env)
 
-    system_prompt = (
-        f"cwd: {inv.cwd}\n\n{inv.system_context}\n\n"
-        "Reminder before responding: your final message MUST end with the exact "
-        "'Final report' block from your agent definition above, with every field "
-        "present. Do not skip it, even for tiny or trivial tasks."
-    )
+    system_prompt = f"cwd: {inv.cwd}\n\n{inv.system_context}"
+    if inv.output_contract != "deliberation":
+        system_prompt += (
+            "\n\nReminder before responding: your final message MUST end with the exact "
+            "'Final report' block from your agent definition above, with every field "
+            "present. Do not skip it, even for tiny or trivial tasks."
+        )
     command, base_args = build_command(inv.cli, inv.prompt)
     command = inv.profile_command or command
     return (command,
@@ -1595,13 +1599,14 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
         prompt = _resume_prompt(inv)
         cont = ["--continue"]
     else:
-        prompt = (
-            f"[System Context]\n{inv.system_context}\n\n"
-            f"[User Prompt]\n{inv.prompt}\n\n"
-            "[Reminder] Your final message MUST end with the exact 'Final report' "
-            "block from your agent definition above, with every field present "
-            "(use \"none\" where it does not apply). Do not skip it, even for tiny tasks."
-        )
+        prompt = (f"[System Context]\n{inv.system_context}\n\n"
+                  f"[User Prompt]\n{inv.prompt}")
+        if inv.output_contract != "deliberation":
+            prompt += (
+                "\n\n[Reminder] Your final message MUST end with the exact 'Final report' "
+                "block from your agent definition above, with every field present "
+                "(use \"none\" where it does not apply). Do not skip it, even for tiny tasks."
+            )
         # CHECK BEFORE BUILDING. The guard below used to run after _ensure_agy_profile, so a
         # prompt that was never going to dispatch still created a profile directory and
         # copied OAuth material into it before raising -- orphaning credentials for a run
