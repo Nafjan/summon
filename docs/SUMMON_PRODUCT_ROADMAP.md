@@ -4,9 +4,9 @@ Status date: 2026-08-16
 Current source version: `3.0.0` candidate
 Readiness: the immutable `3.0.0` tag remains the public-preview baseline, while the
 current candidate contains the authenticated chat/runtime and browser hardening described
-below. It is not a GA certification: the source-bound evidence must include a schema-2
-live-provider packet, and deliberation provider activation, remote execution, and
-multi-user hosting remain separately gated.
+below. The candidate has a clean source-bound schema-2 Claude Opus receipt and all named
+machine gates pass; it is not yet a published GA tag. Additional provider receipts,
+remote execution, and multi-user hosting remain separately gated.
 
 This is the release-facing roadmap for turning the current, well-tested kernel into a dependable open product. It records what is actually shipped, what was tested, and the gates that must pass before we describe a feature as shipped, preview, or live-provider-enabled.
 
@@ -15,12 +15,12 @@ This is the release-facing roadmap for turning the current, well-tested kernel i
 | Area | Current truth | Release posture |
 | --- | --- | --- |
 | Ordinary dispatch, council, ACP, telemetry | Implemented and locally exercised | Ready for continued public use |
-| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; Fable and Gemini availability still require saved provider receipts with exact `model.served` and profile evidence | Recommended, but unverified models remain gated |
+| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; Claude Opus has a reviewed receipt, while Fable and Gemini availability still require saved receipts with exact `model.served` and profile evidence | Claude Opus route verified; other live lanes remain gated |
 | Deliberation kernel, journal replay/recovery, scheduler | Focused `test_deliberation_*.py` suite; provider-inert | Ready as a fake/injected integration surface |
 | Custom Agent manifests and roster binding | Strict parser, path fencing, consent/identity binding | Ready as provider-inert configuration |
-| Live provider composition | Receipt/plan/owner/deadline fences exist; the current machine-bound release evidence has no accepted live-provider receipt | Provider-inert/fake-provider only until an independently reviewed receipt passes |
+| Live provider composition | Receipt/plan/owner/deadline fences exist; the current source-bound packet passes the schema-2 Claude Opus normal/cancel/deadline pilot | Claude Opus route is live-provider-gated; other routes remain provider-inert until independently reviewed |
 | Browser conversation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, visual evidence, and explicit cancellable roster-agent turns; richer multi-run lifecycle remains preview | Unreleased post-GA preview |
-| Managed local installs | Eight managed host copies are refreshed only by the release install gate; the current dirty working tree must be reinstalled and rechecked before certification; unmanaged Cursor plugin drift is reported and untouched | GA gate pending |
+| Managed local installs | Eight managed host copies converge on the candidate's 3.0.0 source payload; unmanaged Cursor plugin drift is reported and intentionally untouched | Candidate gate passed; unmanaged drift is not installer-owned |
 | Unmanaged Cursor local plugin | Older 2.2.0 content hash; not installer-owned | Update through its plugin mechanism only |
 
 Telemetry is enabled for this workstation through `~/.agents/summon-telemetry.json`. “On” means bounded, allow-listed local JSONL diagnostics only; it does not transmit data. GitHub issue submission remains a separate explicit action.
@@ -80,9 +80,10 @@ labels. The latest local fixed-registry run (not a GA claim) recorded: deliberat
 335/335, resume 15/15, discovery 549/549, conversation 39/39, runtime 24/24, UI
 19/19, install 30/30, model catalog 6/6, model routing 4/4, release contract 3/3,
 release gates 7/7, release manifest 16/16, live-provider gate tests 3/3, swarm
-protocol 12/12, and ACP 36/36. The registry is source-bound and clean; the
-live-provider gate remains the only blocked named gate until the reviewed schema-2
-Claude Opus receipt is supplied, so the 3.0.0 GA rule is not met yet.
+protocol 12/12, and ACP 36/36. The registry is source-bound and clean; every named
+machine gate passes, including the reviewed schema-2 Claude Opus receipt. The candidate
+still needs the final immutable GA tag/publication and any additional provider receipts
+we choose to advertise.
 
 ## Product direction
 
