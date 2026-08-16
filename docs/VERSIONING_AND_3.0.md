@@ -88,7 +88,7 @@ never an inferred success.
 
 For this 3.0.0 release, all fixed suites and every named gate are `pass`, the source
 tree is clean and immutable, managed installs converge, the migration/rollback and
-accessibility artifacts are retained, and the independently reviewed Gemini pilot
+accessibility artifacts are retained, and the independently reviewed Claude Opus pilot
 receipt proves the one selected live-provider route. Future provider routes must earn
 their own receipt; if a future gate is unavailable, publish a versioned maintenance
 release or clearly label the result `3.0.0-preview.N` rather than weakening this

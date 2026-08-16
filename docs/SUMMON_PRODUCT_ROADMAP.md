@@ -77,12 +77,12 @@ No open P0/P1 reliability, security, privacy, migration, or evidence contradicti
 remain. The release manifest is generated from a clean, immutable source tree and
 requires the named suites and gates rather than accepting arbitrary caller-supplied
 labels. The latest local fixed-registry run (not a GA claim) recorded: deliberation
-334/334, resume 15/15, discovery 549/549, conversation 20/20, runtime 24/24, UI
+335/335, resume 15/15, discovery 549/549, conversation 39/39, runtime 24/24, UI
 19/19, install 30/30, model catalog 6/6, model routing 4/4, release contract 3/3,
 release gates 7/7, release manifest 16/16, live-provider gate tests 3/3, swarm
-protocol 12/12, and ACP 36/36. Its live-provider gate is still `blocked` until an
-independently reviewed schema-2 receipt is supplied; the 3.0.0 GA rule is therefore
-not met.
+protocol 12/12, and ACP 36/36. The registry is source-bound and clean; the
+live-provider gate remains the only blocked named gate until the reviewed schema-2
+Claude Opus receipt is supplied, so the 3.0.0 GA rule is not met yet.
 
 ## Product direction
 
