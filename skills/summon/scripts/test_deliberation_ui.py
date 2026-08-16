@@ -253,6 +253,11 @@ class DeliberationUITests(unittest.TestCase):
             self.assertEqual(blocked["status"], "blocked")
             self.assertEqual(blocked["error_kind"], "torn_tail")
             self.assertFalse(blocked["consistent"])
+            # Close the live server before TemporaryDirectory removes the
+            # project tree.  unittest cleanups run after the context manager;
+            # relying on addCleanup alone leaves a Windows listener/thread
+            # holding the directory and makes the release registry flaky.
+            surface.close()
 
     def test_model_display_projection_is_bounded_and_redacts_hostile_values(self):
         receipt = {
