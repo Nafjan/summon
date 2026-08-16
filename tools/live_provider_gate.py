@@ -43,7 +43,7 @@ MATRIX_STATUSES = {
 
 def _blocked(kind: str, detail: str) -> int:
     print(json.dumps({
-        "schema": 1, "gate": "live_provider", "status": "blocked",
+        "schema": 2, "gate": "live_provider", "status": "blocked",
         "error_kind": kind, "detail": detail,
     }, sort_keys=True))
     return 3

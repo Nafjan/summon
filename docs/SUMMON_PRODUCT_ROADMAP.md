@@ -1,12 +1,12 @@
 # Summon product roadmap
 
 Status date: 2026-08-16
-Current source version: `3.0.0` plus an unreleased live-chat working tree
-Readiness: the immutable `3.0.0` tag is the public-preview baseline, not a GA
-certification. The current working tree adds the authenticated chat/runtime and browser
-hardening described below; it is not a release candidate until its evidence is generated
-from a clean commit. Deliberation provider activation, remote execution, and multi-user
-hosting remain separately gated.
+Current source version: `3.0.0` candidate
+Readiness: the immutable `3.0.0` tag remains the public-preview baseline, while the
+current candidate contains the authenticated chat/runtime and browser hardening described
+below. It is not a GA certification: the source-bound evidence must include a schema-2
+live-provider packet, and deliberation provider activation, remote execution, and
+multi-user hosting remain separately gated.
 
 This is the release-facing roadmap for turning the current, well-tested kernel into a dependable open product. It records what is actually shipped, what was tested, and the gates that must pass before we describe a feature as shipped, preview, or live-provider-enabled.
 
@@ -77,11 +77,12 @@ No open P0/P1 reliability, security, privacy, migration, or evidence contradicti
 remain. The release manifest is generated from a clean, immutable source tree and
 requires the named suites and gates rather than accepting arbitrary caller-supplied
 labels. The latest local fixed-registry run (not a GA claim) recorded: deliberation
-331/331, resume 15/15, discovery 549/549, conversation 20/20, runtime 24/24, UI
+334/334, resume 15/15, discovery 549/549, conversation 20/20, runtime 24/24, UI
 19/19, install 30/30, model catalog 6/6, model routing 4/4, release contract 3/3,
-release gates 7/7, release manifest 16/16, swarm protocol 12/12, and ACP 36/36. Its
-live-provider gate was `blocked` and the source tree was dirty; the 3.0.0 GA rule was
-therefore not met.
+release gates 7/7, release manifest 16/16, live-provider gate tests 3/3, swarm
+protocol 12/12, and ACP 36/36. Its live-provider gate is still `blocked` until an
+independently reviewed schema-2 receipt is supplied; the 3.0.0 GA rule is therefore
+not met.
 
 ## Product direction
 
@@ -127,9 +128,9 @@ deliberation receipt.
 1. **Keep the ordinary dispatcher suite deterministic.** The two early-exit tests now use a dispatch barrier and the broad run is `549/549`; keep the repetition check in CI. Treat a timeout or missing stage as a test failure, never as a silent pass.
 2. **Close installer asset drift.** Keep `examples/` in the owned payload and manifest (now fixed); add a source-vs-install manifest check to CI. Never update archival worktrees or unmanaged plugin copies.
 3. **Remove resource warnings.** ✅ Closed the bounded Git-reader pipes in `_receipt.py`; the
-   fixed release registry (currently 331 deliberation, 15 resume, 35 conversation, 23 runtime,
-   17 UI, 549 discovery, 30 install, 36 ACP, 6 catalog, 4 routing, 16 release-manifest,
-   7 release-gates, 11 swarm, and 3 release-contract tests) is now warning-clean rather than
+   fixed release registry (currently 334 deliberation, 15 resume, 20 conversation, 24 runtime,
+   19 UI, 549 discovery, 30 install, 36 ACP, 6 catalog, 4 routing, 16 release-manifest,
+   7 release-gates, 12 swarm, 3 live-provider-gate, and 3 release-contract tests) is now warning-clean rather than
    merely assertion-clean.
 4. **Publish one release manifest.** `python tools/release_gates.py` runs the fixed test and
    gate registries and emits source/Git-bound output digests plus one artifact per gate;
