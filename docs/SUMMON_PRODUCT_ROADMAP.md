@@ -124,12 +124,12 @@ deliberation receipt.
 | 2.8 — product operations | Supported-version matrix, rollback/install manifest, stable machine schemas, local diagnostics, sanitized support bundle | gated; contract defined in [`docs/VERSIONING_AND_3.0.md`](VERSIONING_AND_3.0.md) |
 | Later — provider expansion | Each transport earns its own independent evidence gate; no umbrella live-ready claim | live-provider-gated |
 
-## P0 — release hygiene and reliability (next)
+## P0 — release hygiene and reliability (candidate gate)
 
 1. **Keep the ordinary dispatcher suite deterministic.** The two early-exit tests now use a dispatch barrier and the broad run is `549/549`; keep the repetition check in CI. Treat a timeout or missing stage as a test failure, never as a silent pass.
 2. **Close installer asset drift.** Keep `examples/` in the owned payload and manifest (now fixed); add a source-vs-install manifest check to CI. Never update archival worktrees or unmanaged plugin copies.
 3. **Remove resource warnings.** ✅ Closed the bounded Git-reader pipes in `_receipt.py`; the
-   fixed release registry (currently 334 deliberation, 15 resume, 20 conversation, 24 runtime,
+   fixed release registry (currently 335 deliberation, 15 resume, 39 conversation, 24 runtime,
    19 UI, 549 discovery, 30 install, 36 ACP, 6 catalog, 4 routing, 16 release-manifest,
    7 release-gates, 12 swarm, 3 live-provider-gate, and 3 release-contract tests) is now warning-clean rather than
    merely assertion-clean.
@@ -153,7 +153,9 @@ deliberation receipt.
    never imply availability: exact `model.served` evidence remains separate and no lane
    silently falls back to another model.
 
-Exit gate: broad dispatcher suite is repeatable; install/doctor reports converged managed copies; no unexplained warnings; no dirty or foreign tree is overwritten.
+Exit gate: ✅ broad dispatcher suite is repeatable; install/doctor reports converged managed
+copies; no unexplained warnings; no dirty or foreign tree is overwritten. The final tag and
+publication remain an explicit release-owner action after this candidate review.
 
 ## P1 — make the deliberation product complete
 
