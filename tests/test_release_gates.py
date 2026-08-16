@@ -3,7 +3,9 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import hashlib
+import io
 import json
+import contextlib
 from unittest import mock
 from pathlib import Path
 import unittest
@@ -76,6 +78,14 @@ class ReleaseGateRunnerTests(unittest.TestCase):
             MODULE._parse_count("x", "0/0 passed\n")
         with self.assertRaises(RuntimeError):
             MODULE._parse_count("x", "Ran 0 tests\n\nOK\n")
+
+    def test_cli_rejects_in_tree_evidence_output(self):
+        output = ROOT / "tools" / ".release-gates-test-output.json"
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            result = MODULE.main(["--output", str(output)])
+        self.assertEqual(result, 2)
+        self.assertIn("release evidence output must be outside", errors.getvalue())
 
 
 if __name__ == "__main__":

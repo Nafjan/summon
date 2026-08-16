@@ -200,6 +200,23 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("--expected-version", errors.getvalue())
 
+    def test_cli_rejects_in_tree_artifact_paths(self):
+        output = ROOT / "tools" / ".release-manifest-test-output.json"
+        evidence = ROOT / "tools" / ".release-evidence-test-input.json"
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            with self.assertRaises(SystemExit) as raised:
+                MODULE.main(["--root", str(ROOT), "--output", str(output)])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("manifest output must be outside", errors.getvalue())
+
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            with self.assertRaises(SystemExit) as raised:
+                MODULE.main(["--root", str(ROOT), "--evidence-file", str(evidence)])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("evidence input must be outside", errors.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

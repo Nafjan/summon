@@ -2637,6 +2637,28 @@ def test_fable_runs_unsubstituted_and_reports_plan_dependent_billing():
         del os.environ["SUMMON_ALLOW_CREDIT"]
 
 
+def test_default_claude_dispatch_isolated_from_ambient_settings():
+    """A user-level third-party ANTHROPIC_* setting must not hijack Claude seats."""
+    from _builder import AgentInvocation, build_invocation_args
+
+    _, args, env = build_invocation_args(
+        AgentInvocation(cli="claude", prompt="smoke", cwd=".", model="claude-opus-5"))
+    index = args.index("--setting-sources")
+    assert args[index + 1] == "", args
+    assert env is None
+
+
+def test_named_claude_profile_keeps_explicit_settings_boundary():
+    """An explicitly selected profile is the operator's opt-in to its settings."""
+    from _builder import AgentInvocation, build_invocation_args
+
+    _, args, env = build_invocation_args(
+        AgentInvocation(cli="claude", prompt="smoke", cwd=".", model="claude-opus-5",
+                        profile_env={"CLAUDE_CONFIG_DIR": "C:\\private-profile"}))
+    assert "--setting-sources" not in args, args
+    assert env == {"CLAUDE_CONFIG_DIR": "C:\\private-profile"}
+
+
 def test_telemetry_is_opt_in_bounded_and_private():
     import _telemetry
     d = tempfile.mkdtemp(prefix="summon-telemetry-")

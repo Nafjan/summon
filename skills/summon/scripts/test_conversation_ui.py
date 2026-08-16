@@ -5,8 +5,11 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -15,6 +18,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from _conversation import ConversationJournal
+import _conversation_browser
 from _conversation_browser import ConversationBrowserError, ensure_surface, open_url
 from _conversation_ui import (ConversationSurface, MAX_ACTIVE_CLIENTS,
                                REQUEST_TIMEOUT_SECONDS, _surface_root_digest,
@@ -59,11 +63,30 @@ class ConversationUITests(unittest.TestCase):
         with urlopen(self.base.split("#", 1)[0], timeout=3) as response:
             page = response.read().decode()
         self.assertIn("Conversation atlas", page)
-        self.assertIn("provider-inert", page)
+        self.assertIn("Ask a roster agent", page)
+        self.assertIn("Cancel turn", page)
+        self.assertIn("context + explicit turns", page)
+        self.assertIn("/stream?after=", page)
+        self.assertIn("Live updates paused; retrying safely.", page)
+        self.assertIn("setInterval(refresh,10000)", page)
+        self.assertNotIn("setInterval(refresh,2000)", page)
+        # Embedded browser harnesses may omit URI decoding globals; the
+        # URL-safe fragment token must bootstrap auth without that optional
+        # dependency.
+        self.assertNotIn("decodeURIComponent", page)
         self.assertNotIn(self.token, page)
 
+    def test_page_uses_messenger_regions_and_incremental_cursor_reducer(self):
+        source = (HERE / "_conversation_page.py").read_text(encoding="utf-8")
+        for marker in ("Conversation atlas", "room-search", "timeline", "Room evidence",
+                       "Post context", "Ask a roster agent", "context + explicit turns",
+                       "appendRecord", "cursor !== state.cursor + 1",
+                       "timeline.append(renderEvent(record))"):
+            self.assertIn(marker, source)
+        self.assertNotIn("timeline.replaceChildren(); renderEvent", source)
+
     def test_rooms_and_room_events_are_authenticated_and_redacted(self):
-        self.room.append_human_message("private context")
+        self.room.append_human_message(r"private context C:\secret\repo SECRET_TOKEN")
         with self._request("/api/v1/rooms") as response:
             rooms = json.loads(response.read())
         key = next(iter(rooms["rooms"]))
@@ -71,8 +94,41 @@ class ConversationUITests(unittest.TestCase):
         with self._request("/api/v1/rooms/session-1") as response:
             data = json.loads(response.read())
         self.assertEqual(data["room"]["session_id"], "session-1")
-        self.assertNotIn("private context", json.dumps(data))
-        self.assertEqual(data["events"][-1]["payload"]["text_chars"], len("private context"))
+        public = json.dumps(data)
+        self.assertIn("private context", public)
+        self.assertNotIn(r"C:\secret\repo", public)
+        self.assertNotIn("SECRET_TOKEN", public)
+        self.assertEqual(data["events"][-1]["payload"]["text_chars"],
+                         len(r"private context C:\secret\repo SECRET_TOKEN"))
+
+    def test_authenticated_cursor_stream_emits_redacted_events(self):
+        self.room.append_human_message(r"stream secret C:\private\stream-token")
+        request = Request(
+            self.base.split("#", 1)[0].rstrip("/") + "/api/v1/rooms/session-1/stream?after=1",
+            headers={"Host": f"127.0.0.1:{self.surface.address[1]}",
+                     "Authorization": "Bearer " + self.token},
+        )
+        with urlopen(request, timeout=3) as response:
+            self.assertEqual(response.headers.get("Content-Type"),
+                             "text/event-stream; charset=utf-8")
+            lines = [response.readline().decode("utf-8") for _ in range(3)]
+        frame = "".join(lines)
+        self.assertIn("id: 2", frame)
+        self.assertIn("event: conversation", frame)
+        self.assertNotIn(r"C:\private\stream-token", frame)
+
+    def test_cursor_stream_requires_authentication_and_bounded_cursor(self):
+        for query, authenticated in (("after=-1", False), ("after=999999999", True)):
+            headers = {"Host": f"127.0.0.1:{self.surface.address[1]}"}
+            if authenticated:
+                headers["Authorization"] = "Bearer " + self.token
+            request = Request(
+                self.base.split("#", 1)[0].rstrip("/") + "/api/v1/rooms/session-1/stream?" + query,
+                headers=headers,
+            )
+            with self.assertRaises(HTTPError) as refused:
+                urlopen(request, timeout=3)
+            self.assertEqual(refused.exception.code, 401 if not authenticated else 400)
 
     def test_post_requires_origin_and_only_appends_human_context(self):
         # Repeatedly exercise the rejected-body path: on Windows an unread
@@ -91,6 +147,33 @@ class ConversationUITests(unittest.TestCase):
             data = json.loads(response.read())
         self.assertEqual(data["room"]["cursor"], 2)
 
+    def test_agent_turn_endpoint_uses_persistent_runtime_and_is_not_a_control_command(self):
+        calls = []
+
+        class FakeRuntime:
+            def start_turn(self, session, participant, prompt, *, wait=False):
+                calls.append(("turn", session, participant, prompt, wait))
+                return {"status": "started", "turn_id": "turn-1", "session_id": session,
+                        "participant": participant}
+
+            def cancel_turn(self, session, participant):
+                calls.append(("cancel", session, participant))
+                return {"status": "cancelling", "turn_id": "turn-1", "session_id": session,
+                        "participant": participant}
+
+        self.surface.runtime = FakeRuntime()
+        with self._request("/api/v1/rooms/session-1/turns", method="POST",
+                           body={"participant": "sol", "message": "inspect this"}, origin=True) as response:
+            started = json.loads(response.read())
+        self.assertEqual(response.status, 202)
+        self.assertEqual(started["status"], "started")
+        self.assertEqual(calls, [("turn", "session-1", "sol", "inspect this", False)])
+        with self._request("/api/v1/rooms/session-1/cancel", method="POST",
+                           body={"participant": "sol"}, origin=True) as response:
+            cancelling = json.loads(response.read())
+        self.assertEqual(cancelling["status"], "cancelling")
+        self.assertEqual(calls[-1], ("cancel", "session-1", "sol"))
+
     def test_bad_token_and_extra_route_are_refused(self):
         with self.assertRaises(HTTPError) as bad:
             self._request("/api/v1/rooms", token=False)
@@ -106,6 +189,66 @@ class ConversationUITests(unittest.TestCase):
         self.assertFalse(handoff["opened"])
         with self.assertRaises(ConversationBrowserError):
             open_url(self.base.replace("127.0.0.1", "example.com"), mode="link")
+
+    def test_surface_reuse_is_bound_to_project_and_explicit_roster(self):
+        root = Path(self.tmp.name) / "bound-root"
+        project_a = Path(self.tmp.name) / "project-a"
+        project_b = Path(self.tmp.name) / "project-b"
+        roster_a = Path(self.tmp.name) / "roster-a"
+        roster_b = Path(self.tmp.name) / "roster-b"
+        for path in (project_a, project_b, roster_a, roster_b):
+            path.mkdir()
+        surface = ConversationSurface(str(root), cwd=project_a, agents_dir=roster_a)
+        surface.start()
+        self.addCleanup(surface.close)
+        record = read_surface_record(root)
+        self.assertIsNotNone(record)
+        self.assertIn("cwd_sha256", record)
+        self.assertIn("agents_dir_sha256", record)
+        self.assertIsNotNone(read_surface_record(root, cwd=project_a,
+                                                 agents_dir=roster_a))
+        self.assertIsNone(read_surface_record(root, cwd=project_b,
+                                              agents_dir=roster_a))
+        self.assertTrue(ensure_surface(str(root), cwd=str(project_a),
+                                       agents_dir=str(roster_a))["reused"])
+        with self.assertRaisesRegex(ConversationBrowserError, "different project"):
+            ensure_surface(str(root), cwd=str(project_b), agents_dir=str(roster_a),
+                           timeout=0.2)
+        with self.assertRaisesRegex(ConversationBrowserError, "different agent roster"):
+            ensure_surface(str(root), cwd=str(project_a), agents_dir=str(roster_b),
+                           timeout=0.2)
+
+    def test_legacy_surface_record_is_not_reused_for_bound_project(self):
+        root = Path(self.tmp.name) / "legacy-bound-root"
+        project = Path(self.tmp.name) / "legacy-project"
+        project.mkdir()
+        surface = ConversationSurface(str(root), cwd=project)
+        surface.start()
+        self.addCleanup(surface.close)
+        record_path = root / ".summon-conversation-ui.json"
+        original = record_path.read_text(encoding="utf-8")
+        try:
+            legacy = json.loads(original)
+            legacy.pop("cwd_sha256", None)
+            legacy.pop("agents_dir_sha256", None)
+            record_path.write_text(json.dumps(legacy), encoding="utf-8")
+            with self.assertRaisesRegex(ConversationBrowserError, "different project"):
+                ensure_surface(str(root), cwd=str(project), timeout=0.2)
+        finally:
+            record_path.write_text(original, encoding="utf-8")
+
+    def test_parent_symlink_is_rejected_before_launch_lock_write(self):
+        real_parent = Path(self.tmp.name) / "real-parent"
+        real_parent.mkdir()
+        (real_parent / "rooms").mkdir()
+        alias_parent = Path(self.tmp.name) / "alias-parent"
+        try:
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"directory symlinks unavailable: {exc}")
+        with self.assertRaises(ConversationBrowserError):
+            ensure_surface(str(alias_parent / "rooms"), timeout=0.2)
+        self.assertFalse((real_parent / "rooms" / ".summon-conversation-ui.launch.lock").exists())
 
     def test_surface_record_is_bound_and_browser_rejects_userinfo(self):
         record_path = self.root / ".summon-conversation-ui.json"
@@ -128,10 +271,13 @@ class ConversationUITests(unittest.TestCase):
         token = "b" * 48
         (root / ".summon-conversation-ui.json").write_text(json.dumps({
             "schema_version": 1, "root_sha256": _surface_root_digest(root),
-            "pid": os.getpid(), "url": "http://127.0.0.1:54321/#token=" + token,
+            "pid": 999999, "url": "http://127.0.0.1:54321/#token=" + token,
             "token": token,
         }), encoding="utf-8")
-        started = ensure_surface(str(root), timeout=1.5)
+        # Full release runs start this child under a cold, hermetic Python
+        # environment; use the production startup budget rather than making
+        # readiness correctness depend on scheduler noise.
+        started = ensure_surface(str(root), timeout=5.0)
         self.assertFalse(started["reused"])
         self.assertNotIn(":54321/", str(started["url"]))
         pid = int(started["pid"])
@@ -145,10 +291,119 @@ class ConversationUITests(unittest.TestCase):
         else:
             os.kill(pid, 15)
 
+    def test_live_unreachable_record_is_not_unlinked_or_replaced(self):
+        root = Path(self.tmp.name) / "live-stale-root"
+        root.mkdir()
+        token = "c" * 48
+        record_path = root / ".summon-conversation-ui.json"
+        record_path.write_text(json.dumps({
+            "schema_version": 1, "root_sha256": _surface_root_digest(root),
+            "pid": os.getpid(), "url": "http://127.0.0.1:54321/#token=" + token,
+            "token": token,
+        }), encoding="utf-8")
+        with self.assertRaises(ConversationBrowserError):
+            ensure_surface(str(root), timeout=0.2)
+        self.assertTrue(record_path.exists())
+
+    def test_concurrent_surface_starts_share_one_server(self):
+        root = Path(self.tmp.name) / "concurrent-root"
+        root.mkdir()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(ensure_surface, str(root), timeout=5.0)
+                       for _ in range(2)]
+            results = [future.result(timeout=10) for future in futures]
+        self.assertEqual({item["pid"] for item in results}, {results[0]["pid"]})
+        self.assertEqual({item["url"] for item in results}, {results[0]["url"]})
+        pid = int(results[0]["pid"])
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, check=False)
+        else:
+            os.kill(pid, 15)
+
+    def test_direct_surface_starts_are_serialized_by_the_launch_guard(self):
+        """Direct callers cannot publish two sidecars for one atlas root."""
+        root = Path(self.tmp.name) / "direct-concurrent-root"
+        root.mkdir()
+        surfaces = [ConversationSurface(str(root), token=letter * 48)
+                    for letter in ("d", "e")]
+
+        def start(surface):
+            try:
+                return ("ok", surface.start())
+            except Exception as exc:  # noqa: BLE001 - assert the public failure
+                return ("error", exc)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = [future.result(timeout=5)
+                           for future in (pool.submit(start, surface) for surface in surfaces)]
+            self.assertEqual(sum(kind == "ok" for kind, _ in results), 1)
+            self.assertEqual(sum(kind == "error" for kind, _ in results), 1)
+            error = next(value for kind, value in results if kind == "error")
+            self.assertIsInstance(error, Exception)
+            self.assertIn("already running", str(error))
+        finally:
+            for surface in surfaces:
+                try:
+                    surface.close()
+                except Exception:
+                    pass
+
+    def test_surface_probe_never_follows_redirect_with_bearer(self):
+        received = []
+
+        class Sink(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - stdlib handler API
+                received.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                return
+
+        sink = HTTPServer(("127.0.0.1", 0), Sink)
+
+        class Redirect(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - stdlib handler API
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{sink.server_port}/api/v1/rooms")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                return
+
+        redirect = HTTPServer(("127.0.0.1", 0), Redirect)
+        threads = [threading.Thread(target=server.serve_forever, daemon=True)
+                   for server in (sink, redirect)]
+        for thread in threads:
+            thread.start()
+        token = "c" * 48
+        record = {
+            "url": f"http://127.0.0.1:{redirect.server_port}/#token={token}",
+            "token": token,
+        }
+        try:
+            self.assertFalse(_conversation_browser._surface_reachable(record))
+            self.assertEqual(received, [])
+        finally:
+            redirect.shutdown()
+            sink.shutdown()
+            redirect.server_close()
+            sink.server_close()
+            for thread in threads:
+                thread.join(timeout=1)
+
     def test_no_provider_import_surface(self):
-        source = (HERE / "_conversation_ui.py").read_text(encoding="utf-8")
-        for forbidden in ("subprocess", "socket", "requests", "Popen", "execute_agent"):
-            self.assertNotIn(forbidden, source)
+        sources = [(HERE / "_conversation_ui.py").read_text(encoding="utf-8"),
+                   (HERE / "_conversation_page.py").read_text(encoding="utf-8")]
+        for source in sources:
+            for forbidden in ("subprocess", "socket", "requests", "Popen", "execute_agent"):
+                self.assertNotIn(forbidden, source)
+        page_source = sources[1]
+        for forbidden in ("innerHTML", "localStorage", "sessionStorage", "document.cookie",
+                           "eval(", "WebSocket"):
+            self.assertNotIn(forbidden, page_source)
         self.assertGreaterEqual(REQUEST_TIMEOUT_SECONDS, 1.0)
         self.assertGreaterEqual(MAX_ACTIVE_CLIENTS, 8)
 

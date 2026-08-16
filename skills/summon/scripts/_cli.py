@@ -141,9 +141,12 @@ MODE_FLAGS = {
                             "json", "job_file"},
     "deliberation-cancel": {"deliberate_cancel", "run_dir", "results_dir", "cwd",
                             "command_id", "json", "job_file"},
-    "chat": {"chat_action", "chat_session", "chat_message", "chat_project_id",
+    "chat": {"chat_action", "chat_session", "chat_message", "chat_participant",
+              "chat_timeout", "chat_participants", "chat_project_id",
               "chat_project_root", "chat_initiator_host", "chat_initiator_agent",
-              "chat_mode", "chat_browser", "conversation_dir", "json", "cwd", "job_file"},
+              "chat_mode", "chat_browser", "chat_confirm", "chat_reason",
+              "conversation_dir", "agents_dir",
+              "strict_agents_dir", "json", "cwd", "job_file"},
     # jobs read commands: registry query only.
     "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
     "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
@@ -182,10 +185,11 @@ MODE_HINTS = {
                             "location, and output format."),
     "deliberation-cancel": ("cancel queues one typed command; --command-id is an "
                             "optional idempotency key."),
-    "chat": ("chat is a provider-inert local room: open/show/list rooms or post a "
-             "typed human context message. It never launches a provider or changes "
-             "a ballot. `chat open --chat-browser auto|builtin|ide|system|link` "
-             "starts or reuses the local atlas; `link` returns its URL."),
+    "chat": ("chat is a local room with explicit human context and bounded agent turns. "
+             "`turn` launches one selected roster agent after a durable turn_started "
+             "event and resumes its provider session only when identity evidence matches; "
+             "drift creates a visible fork. It never changes a ballot. `chat open "
+             "--chat-browser auto|builtin|ide|system|link` starts or reuses the atlas."),
     "jobs-list": ("jobs list is read-only: it takes only --job-dir and --json."),
     "jobs-status": ("jobs status is read-only: it takes only the job id, --job-dir, "
                     "and --json."),
@@ -201,7 +205,8 @@ TOKEN_DESTS = {"set": "sets", "from": "bug_report_from",
                # ergonomic names used only by the `chat` subcommand
                "project-id": "chat_project_id", "project-root": "chat_project_root",
                "initiator-host": "chat_initiator_host", "initiator-agent": "chat_initiator_agent",
-               "message": "chat_message", "mode": "chat_mode"}   # reverse mapping
+               "message": "chat_message", "mode": "chat_mode", "participant": "chat_participant",
+               "participants": "chat_participants"}   # reverse mapping
 
 
 def fanout_mode(args: argparse.Namespace) -> str | None:
@@ -293,6 +298,7 @@ Usage: summon <command> [options]
 Commands:
   dispatch  --agent NAME --prompt "…" --cwd DIR   run an agent (the default action)
   list                                            list available agents
+  agents validate [--cwd DIR] [--agents-dir D]   validate custom agent manifests
   models    [--cli BACKEND]                       what each backend can run now
   doctor    [--json] [--probe]                    check backends / setup health
   onboard   [--subscriptions …] [--reset] [--json] detect CLIs; write merge-safe prefs
@@ -304,7 +310,9 @@ Commands:
   deliberate resume RUN_ID [--retry-indeterminate]     resume with spend consent
   chat open SESSION_ID [--mode chat|council|deliberate]  create/reuse a local room
   chat post SESSION_ID --message "…"                    add a typed human context message
-  chat show|list SESSION_ID                             inspect rooms (provider-inert)
+  chat turn SESSION_ID AGENT --message "…"              run one resumable agent turn
+  chat cancel SESSION_ID AGENT                           cancel that active turn
+  chat show SESSION_ID | chat list                      inspect rooms
   agent new NAME [--set k=v …]                    scaffold an agent definition
   agent set NAME  --set k=v …                     retune an agent's frontmatter
   role propose ALIAS TARGET                        propose a private global role alias
@@ -325,14 +333,25 @@ flat option list, or `summon telemetry --help` / `summon bug-report --help` for 
 
 
 COMMAND_USAGE = {
-    "chat": """summon chat open SESSION_ID [--project-id ID --project-root DIR --mode chat|council|deliberate]
-summon chat post SESSION_ID --message TEXT [--initiator-agent ID]
- summon chat show SESSION_ID | summon chat list
+    "chat": """summon chat open SESSION_ID [--project-id ID --project-root DIR --participants A,B]
+summon chat post SESSION_ID --message TEXT
+summon chat turn SESSION_ID AGENT --message TEXT [--chat-timeout 10m]
+summon chat cancel SESSION_ID AGENT
+summon chat recover SESSION_ID AGENT --chat-confirm
+summon chat fork SESSION_ID AGENT --message TEXT
+summon chat show SESSION_ID | summon chat list
 summon chat open SESSION_ID --chat-browser auto|builtin|ide|system|link
 
-Manage provider-inert local conversation rooms. Rooms are grouped by project and
-initiating host/agent, human messages remain context-only, and no chat event can
-approve a deliberation or launch a provider.
+Open a local room, add human context, or start one bounded roster-agent turn.
+The turn is durably started before provider launch; compatible provider sessions
+resume, while identity drift creates an explicit fork. Chat output is context only:
+it cannot approve, vote, launch, or change a deliberate run.
+""",
+    "agents": """summon agents validate [--cwd DIR] [--agents-dir DIR] [--json]
+
+Validate workspace `.agents/agents/<slug>/agent.md` manifests and an optional explicit
+global agents root. This is provider-inert and returns only redacted identity,
+authority, and digest evidence.
 """,
     "telemetry": """summon telemetry enable|disable|status|clear [--json]
 
@@ -377,6 +396,8 @@ def rewrite_subcommand(argv: list) -> tuple:
         return argv, f"help:{head}" if head in COMMAND_USAGE else "help"
     if head in ("dispatch", "run"):
         return rest, None
+    if head == "agents" and rest and rest[0] == "validate":
+        return ["--validate-agents", *rest[1:]], None
     if head in ("list", "agents", "ls"):
         return ["--list", *rest], None
     if head == "models":
@@ -418,13 +439,30 @@ def rewrite_subcommand(argv: list) -> tuple:
         if not rest:
             return argv, "help:chat"
         action = rest[0]
-        if action not in ("open", "post", "show", "list"):
-            return argv, f"error: unknown 'chat' action {action!r} (use open/post/show/list)"
+        if action not in ("open", "post", "show", "list", "turn", "cancel", "recover", "fork"):
+            return argv, f"error: unknown 'chat' action {action!r} (use open/post/show/list/turn/cancel/recover/fork)"
         if action == "list":
             return ["--chat-action", "list", *rest[1:]], None
         if len(rest) < 2 or rest[1].startswith("-"):
             return argv, f"error: 'chat {action}' needs a session id"
-        return ["--chat-action", action, "--chat-session", rest[1], *rest[2:]], None
+        translated = ["--chat-action", action, "--chat-session", rest[1]]
+        if action in ("turn", "cancel", "recover", "fork"):
+            if len(rest) < 3 or rest[2].startswith("-"):
+                return argv, f"error: 'chat {action}' needs a participant id"
+            translated += ["--chat-participant", rest[2], *rest[3:]]
+        else:
+            translated += rest[2:]
+        # `--timeout` is a long-standing dispatch/jobs flag.  It must not be
+        # globally remapped in TOKEN_DESTS because the mode matrix needs to
+        # distinguish it from chat's bounded turn timeout.  Translate it only
+        # inside the chat subcommand so jobs/manifest/council keep their legacy
+        # meaning and validation.
+        translated = [
+            ("--chat-timeout" + token[len("--timeout"):])
+            if token == "--timeout" or token.startswith("--timeout=") else token
+            for token in translated
+        ]
+        return translated, None
     if head == "jobs":
         if not rest:
             return argv, "help"       # bare `summon jobs` -> usage, not a silent list
@@ -503,6 +541,8 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Opt into approved user-global role aliases for this dispatch; "
                              "disabled by default and never changes an exact agent match")
     parser.add_argument("--list", action="store_true", help="List available agents")
+    parser.add_argument("--validate-agents", dest="validate_agents", action="store_true",
+                        help="Validate provider-inert custom-agent manifests under the workspace")
     parser.add_argument("--list-models", dest="list_models", action="store_true",
                         help="Report invocable models per backend (live where the CLI exposes it; "
                              "filter with --cli)")
@@ -704,12 +744,25 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Queue a typed cancel command for a deliberation run")
     parser.add_argument("--deliberate-open", dest="deliberate_open", metavar="RUN_ID",
                         help="Open/reuse the authenticated local deliberation ledger")
-    parser.add_argument("--chat-action", dest="chat_action", choices=("open", "post", "show", "list"),
-                        help="Provider-inert conversation room action")
+    parser.add_argument("--chat-action", dest="chat_action",
+                        choices=("open", "post", "show", "list", "turn", "cancel", "recover", "fork"),
+                        help="Conversation room action; turn launches one bounded roster agent; "
+                             "recover/fork never retry a provider")
     parser.add_argument("--chat-session", dest="chat_session", metavar="SESSION_ID",
                         help="Conversation room session id")
+    parser.add_argument("--chat-participant", "--participant", dest="chat_participant", metavar="AGENT",
+                        help="With chat turn/cancel: participant roster agent id")
+    parser.add_argument("--chat-participants", "--participants", dest="chat_participants",
+                        help="With chat open: comma-separated participant roster ids")
+    parser.add_argument("--chat-timeout", dest="chat_timeout", type=parse_timeout,
+                        help="With chat turn: per-turn provider timeout")
     parser.add_argument("--chat-message", "--message", dest="chat_message",
                         help="Typed human context message for a conversation room")
+    parser.add_argument("--chat-confirm", dest="chat_confirm", action="store_true",
+                        help="With chat recover: explicitly attest that the unmatched turn was reviewed; "
+                             "never retries the provider")
+    parser.add_argument("--chat-reason", dest="chat_reason",
+                        help="With chat fork: bounded human-readable reason for the new lineage")
     parser.add_argument("--chat-project-id", "--project-id", dest="chat_project_id",
                         help="Bounded project label for a new room")
     parser.add_argument("--chat-project-root", "--project-root", dest="chat_project_root",

@@ -243,6 +243,7 @@ def _claim_open_lock(path: str) -> str | None:
                 data = _rundir.read_json(path)
                 if (isinstance(data, dict) and isinstance(data.get("token"), str)
                         and data.get("pid") is not None
+                        and not _ui._pid_is_alive(data.get("pid"))
                         and os.stat(path).st_mtime_ns == observed.st_mtime_ns):
                     os.unlink(path)
                     return _claim_open_lock(path)
@@ -304,6 +305,9 @@ def ensure_surface(root: str, run_id: str) -> dict[str, object]:
         if existing is not None and _surface_reachable(existing):
             return {"url": existing["url"], "run_id": run_id, "reused": True,
                     "pid": existing["pid"]}
+        if existing is not None and _ui._pid_is_alive(existing.get("pid")):
+            raise BrowserOpenError(
+                "deliberation surface is live but its endpoint is unavailable")
         _discard_stale_record(root, run_id, existing)
         script = str(Path(__file__).with_name("_deliberation_ui.py"))
         try:

@@ -74,20 +74,26 @@ task, each billed to its own plan, instead of paying for four and using one at a
 - **People making decisions with AI** who need a governed answer: council mode gives
   diverse positions and a chaired recommendation; `deliberate` adds fixed options,
   quorum, hard attempt/deadline bounds, durable replay, and explicit human boundaries.
-- **People who want an actual multi-agent room:** the provider-inert conversation surface
+- **People who want an actual multi-agent room:** the authenticated conversation atlas
   keeps a persistent, project-grouped session across Codex, Claude Code, Cursor, and
-  terminal initiators, with human messages, resumable turns, interactive council rounds,
-  and a separate governed-decision view. See
+  terminal initiators, with human messages and explicit, bounded roster-agent turns that
+  can resume a compatible provider session or fork visibly on drift. Interactive council
+  rounds and the separate governed-decision view remain context/control-plane boundaries.
+  See
   [`docs/SUMMON_CONVERSATION_PLAN.md`](docs/SUMMON_CONVERSATION_PLAN.md).
 - **Power users running fleets of agents:** fan a task across N models in parallel, with
   per-backend throttling and resumable batches.
 - **Anyone unifying local + cloud models** behind one interface (subscription CLIs *and*
   OpenAI-compatible APIs, including self-hosted).
 
-Summon remains a dispatcher first, with a provider-inert conversation room
-for brainstorming and interactive council work. That room shares the same redacted,
-durable event contracts; it does not turn ordinary chat into authority or silently
-promote a conversation into a governed decision.
+Summon remains a dispatcher first, with a local conversation atlas for brainstorming,
+interactive council work, and explicitly requested roster-agent turns. The atlas is a
+dependency-free, Chatpack-informed messenger: searchable project/initiator rooms, grouped
+human/agent/lifecycle events, a redacted evidence drawer, cursor-aware reconnect, and a
+composer that separates context from an explicit turn. Turns use the same redacted,
+durable event contracts and a pre-launch fence; they do not turn ordinary chat into
+authority or silently promote a conversation into a governed decision. Chatpack itself is
+not installed or required.
 
 ---
 
@@ -276,11 +282,16 @@ Git-style subcommands. The old flat `--flag` form still works too:
 |---|---|
 | `summon dispatch --agent N --prompt … --cwd D` | run one agent (the default action) |
 | `summon list` | list available agents |
+| `summon agents validate [--cwd D] [--agents-dir D]` | validate provider-inert custom-agent manifests and print redacted identity/digest evidence |
 | `summon models [--cli B]` | invocable models per backend, with a `source` per entry (live query, local config, or static list) |
 | `summon doctor [--json]` | backend / setup health check (run this first) |
 | `summon manifest FILE` | run a batch swarm (per-backend concurrency, resumable) |
 | `summon council --question "…"` | **explore and synthesize** diverse positions |
-| `summon chat open|post|show|list …` | provider-inert shared room for brainstorming and human context; `chat open --chat-browser auto|link` starts/reuses or links the authenticated local atlas |
+| `summon chat open|post|show|list …` | local shared room for brainstorming and human context; `chat open --chat-browser auto|link` starts/reuses or links the authenticated atlas |
+| `summon chat turn SESSION AGENT --message "…"` | explicit bounded roster-agent turn; CLI waits for durable finish, browser turns are cancellable and can run in parallel across participants |
+| `summon chat cancel SESSION AGENT` | append a durable cancel command and stop that participant's active turn when reachable; it never changes a ballot |
+| `summon chat recover SESSION AGENT --chat-confirm` | human-attested close for an unmatched turn; records indeterminate spend and never retries |
+| `summon chat fork SESSION AGENT --message "…"` | create a new context lineage without provider contact |
 | `summon deliberate --question "…" --seats A,B --options X,Y` | fixed-option, quorum-controlled, replayable decision |
 | `summon deliberate status\|replay\|recover\|cancel RUN_ID` | inspect, repair, or queue a typed command without provider work |
 | `summon deliberate open RUN_ID` | open/reuse the local browser ledger (provider-inert) |
@@ -290,6 +301,13 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon telemetry enable\|disable\|status\|clear` | manage local opt-in diagnostics; `clear` does not disable |
 | `summon bug-report …` | generate a sanitized report; review it before the separate GitHub submission command |
 | `summon version` · `summon help` | version · usage |
+
+`manifest` is Summon's current batch-fan-out surface. It is compatible with any
+host that can run the Summon CLI, but it is not a shared IDE swarm: workers do
+not yet share durable claims, leases, directed messages, or cancellation state.
+The proposed external-worker boundary is versioned and documented in
+[SUMMON_SWARM_PROTOCOL.md](docs/SUMMON_SWARM_PROTOCOL.md); it is contract-only
+until the coordinator and adapter conformance gates pass.
 
 `summon` (no args) prints the command list. Everything below is documented in
 [skills/summon/SKILL.md](skills/summon/SKILL.md).

@@ -23,9 +23,10 @@ need the control surface to remain unobtrusive beside their working application.
 Summon coordinates heterogeneous AI CLIs behind one structured dispatcher. The
 deliberation feature lets several bounded participants exchange auditable turns, produce
 structured ballots, and reach a fixed-policy outcome with optional human approval. A
-shared provider-inert conversation room will also support brainstorming, human messages,
-session continuation, and interactive council rounds; it must keep chat context separate
-from the deliberation control plane. The local view should make live state, evidence,
+shared conversation room supports provider-inert brainstorming/human context plus an
+explicit bounded roster-agent turn path, session continuation, and interactive council
+rounds; it must keep chat context separate from the deliberation control plane. The local
+view should make live state, evidence,
 pending human actions, and retained resources understandable without turning prose into
 authority.
 
@@ -59,9 +60,13 @@ slice.
   structured ballots.
 - Core runtime remains Python stdlib-only and cross-platform, including Windows hidden
   process launches.
-- The first UI slice is a provider-inert observer over the redacted store; it queues only
-  typed cancel while owner-bound command recovery, store resume, and richer human-command
-  lifecycle gates remain pending. This is open product functionality, not a premium tier.
+- The local UI is a redacted observer and an explicit live-chat surface. It can append human
+  context and, when the caller supplies a project/roster binding, start one durable agent turn
+  through the dispatcher with a pre-launch journal fence, continuation identity checks, and
+  process-tree cancellation. Chat turns are context work, not policy authority: they cannot
+  approve a deliberation, change its quorum/options, or silently activate a provider. The
+  deliberation control plane remains separately gated and provider-inert where its live
+  integration is not explicitly enabled. This is open product functionality, not a premium tier.
 - No remote hosting, multi-user networking, `0.0.0.0` binding, model-rendered HTML, or
   model-controlled browser actions are allowed in the first release.
 - Backend identities, prompts, credentials, private paths, and raw provider output must
@@ -81,9 +86,11 @@ for its source, so no source or copied component is part of this product.
 - `docs/DELIBERATION_PRODUCT_PLAN.md` is the current deliberation contract and safety plan.
 - The provider-inert kernel, scheduler, roster, invocation, replay, and restore modules
   and their focused tests are in `skills/summon/scripts/`.
-- A provider-inert stdlib loopback observer and browser handoff are present; richer
-  human-command application, production visual assets, and complete real-journal lifecycle
-  coverage remain preview work.
+- A stdlib loopback observer/browser handoff and durable chat-turn runtime are present. The
+  chat runtime is deliberately scoped to a persistent local surface: a CLI turn waits for its
+  child to finish, while the browser keeps one runtime for interactive turns and cancellation.
+  Full deliberation provider activation, richer human-command application, and complete
+  real-journal lifecycle coverage remain separately gated preview work.
 
 ## Product Principles
 

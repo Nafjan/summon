@@ -22,6 +22,7 @@ but can correlate or reveal low-entropy values, so review a report before sharin
 - **[orchestration.md](references/orchestration.md)** - rules of engagement for multi-agent work: what the envelope proves, cross-vendor routing, permission traps, council quality bar, resume-instead-of-re-pay (project- and IDE-agnostic)
 - **[deliberation.md](references/deliberation.md)** - when to choose governed `deliberate` versus dispatch, manifest, or council, plus safe run/status/recover/open recipes
 - **[SUMMON_CONVERSATION_PLAN.md](../../docs/SUMMON_CONVERSATION_PLAN.md)** - the shared provider-inert room contract for chat, interactive council, and deliberate discussion views
+- **[SUMMON_SWARM_PROTOCOL.md](../../docs/SUMMON_SWARM_PROTOCOL.md)** - the contract-only `summon.swarm/v1` boundary for future external worker/IDE adapters
 - **[../council/SKILL.md](../council/SKILL.md)** - thin `/council` companion for open-ended positions and chaired synthesis
 - **[../deliberate/SKILL.md](../deliberate/SKILL.md)** - thin `/deliberate` companion for fixed-option governed decisions
 - **[effort.md](references/effort.md)** - reasoning effort / thinking levels: who honors `--effort`, defaults, agy Gemini suffixes, envelope fields
@@ -38,8 +39,9 @@ plugin package with `plugin.json` at the repo root — no separate install step.
 `python install.py` from the repo instead.
 
 **Command surface**: the script accepts git-style **subcommands** — `dispatch` (the
-default action), `list`, `models`, `doctor`, `manifest FILE`, `council`, `chat`, `deliberate
-QUESTION`, `deliberate status|replay|recover|cancel|open|resume RUN_ID`, `agent
+default action), `list`, `agents validate`, `models`, `doctor`, `manifest FILE`, `council`,
+`chat`, `deliberate QUESTION`, `deliberate status|replay|recover|cancel|open|resume RUN_ID`,
+`agent
 new|set NAME`, `role propose|approve|list|resolve`, `telemetry enable|disable|status|clear`,
 `bug-report`, `version` — e.g. `run_subagent.py
 council --question "…" --cwd DIR`. The
@@ -47,16 +49,39 @@ council --question "…" --cwd DIR`. The
 `--list`, `--manifest FILE`, …), and every flag below is valid in both. Bare
 `run_subagent.py` (or `help`) prints the command list.
 
-The provider-inert chat commands are `chat open SESSION_ID`, `chat post SESSION_ID
---message "…"`, `chat show SESSION_ID`, and `chat list`. They persist a redacted
-room journal grouped by project and initiating host/agent. Human messages are
-context only; they do not become council votes, deliberate ballots, approvals,
-or provider launches.
+`agents validate` is provider-inert: it reads workspace `.agents/agents/<slug>/agent.md`
+packages (and an explicitly supplied `--agents-dir` root), freezes their source and
+definition digests, and prints only redacted identity/authority evidence. It never
+launches a backend or grants a manifest additional permission.
+The equivalent low-level dispatcher flag is `--validate-agents`; it has the same
+provider-inert, redacted output contract.
+
+The chat commands are `chat open SESSION_ID`, `chat post SESSION_ID --message "…"`,
+`chat turn SESSION_ID AGENT --message "…"`, `chat cancel SESSION_ID AGENT`,
+`chat recover SESSION_ID AGENT --chat-confirm`, `chat fork SESSION_ID AGENT --message "…"`,
+`chat show SESSION_ID`, and `chat list`. Room reads and human posts are provider-inert;
+`chat turn` is the explicit live exception. It writes a durable `turn_started` event
+before launching the named roster agent, appends a bounded redacted response and
+`turn_finished`, and resumes that participant's provider session only when the stored
+identity evidence still matches. Drift creates an explicit fork and makes no provider
+call. Human messages and agent output remain context only: they do not become council
+votes, deliberate ballots, approvals, or provider-policy changes. The authenticated
+browser atlas keeps one runtime for interactive turns and cancellation, and exposes
+bounded authenticated cursor reads plus `/stream` SSE frames for reconnecting observers;
+CLI turns wait for completion so the parent process cannot exit before the finish record
+is written.
 
 For a local preview of all rooms, run `_conversation_ui.py --serve
 <conversation-root>` from the installed scripts. It prints one authenticated
-loopback URL and reuses no provider session; the browser atlas groups rooms by
-project digest and initiating host/agent.
+loopback URL; observation and human context remain authority-inert, while an
+explicit `chat turn` may launch a bounded roster-agent process. The browser
+atlas groups rooms by project digest and initiating host/agent.
+
+Summon's existing `manifest` command is batch fan-out, not interoperable
+collaborative swarming. The versioned external-worker contract is documented in
+`SUMMON_SWARM_PROTOCOL.md`, but no durable swarm coordinator or native IDE
+session attachment is claimed until its lease, claim, message, artifact,
+cancellation, and reconnect gates are implemented.
 
 ## CLI-Specific Notes
 
@@ -207,9 +232,11 @@ capability census built from declared strings **understates** real capability. R
 
 ### Recommended cross-vendor roster lanes
 
-The bundled `researcher` seat is pinned to `gemini-3.7-flash-high`, live-verified through
-agy on 2026-08-13. Use it as Summon's primary evidence extractor and the recommended fast
-secondary voice for `/council`:
+The bundled `researcher` seat is pinned to `gemini-3.7-flash-high`. This is a declared
+roster target, not current release evidence: the fixed 3.0 gate remains blocked until a
+saved receipt proves the exact `model.served`, profile/account, consent, and cleanup
+facts. Use it as Summon's primary evidence extractor and the recommended fast secondary
+voice for `/council` when that receipt is available:
 
 ```text
 run_subagent.py dispatch --agent researcher --cwd <project> --prompt "..."
@@ -322,12 +349,18 @@ to brainstorm with several agents, continue a shared session, or participate in
 an interactive council. Group rooms by project and initiating host/agent, and
 resume a provider session only after its provider, model, profile, prompt, and
 permission evidence still match. If they do not, create an explicit fork and
-explain why. The provider-inert local commands are `summon chat open SESSION_ID`,
-`summon chat post SESSION_ID --message "…"`, `summon chat show SESSION_ID`, and
-`summon chat list`; they write only a bounded redacted room journal. A human
-message is context-only, not an approve/deny/cancel command. Never turn a chat
-message or council synthesis into a deliberate ballot; promotion requires a
+explain why. `summon chat open|post|show|list` remain local journal operations;
+`summon chat turn SESSION_ID AGENT --message "…"` is the explicit live turn seam and
+`chat cancel SESSION_ID AGENT` appends a durable `turn_cancel_requested` command before
+targeting a local active worker. A separate runtime can observe that command and stop
+its child; a durable owner/lease coordinator is still a GA follow-up. Both stay outside
+deliberation authority: agent output and human messages are context only. Never turn
+a chat message or council synthesis into a deliberate ballot; promotion requires a
 fresh, human-confirmed deliberate policy.
+
+Recovery is deliberately explicit: `chat recover` closes an unmatched turn as
+`blocked` after human attestation and never claims that provider spend did not occur;
+it does not retry. `chat fork` creates a new context lineage without provider contact.
 
 The current fresh/resume provider path is deliberately `integration_pending`:
 the receipt and safety boundary are real, but the CLI must not silently launch a
@@ -438,7 +471,7 @@ run or recommending it to a user.
 | `--quorum` | With `--deliberate`; optional with `--council` | With `--council`, synthesize only if at least N members (2..member-count) succeeded; with `--deliberate`, fix an integer/all/fraction quorum in the receipt. Never infer or lower the denominator |
 | `--chairman-fallback AGENT` | No | With `--council`: a fallback synthesizer run once if the primary chairman ends non-success. Both outcomes appear in `synthesis.primary` / `synthesis.fallback` |
 | `--member-timeout` / `--chair-timeout` | No | With `--council`: per-stage timeouts for members and the chairman (same grammar as `--timeout`; each defaults to `--timeout`) |
-| `--chat-action {open,post,show,list}` | - | Provider-inert conversation-room action. The ergonomic subcommands are `summon chat open|post|show|list`; this flag is the dispatcher form. |
+| `--chat-action {open,post,show,list,turn,cancel,recover,fork}` | - | Conversation-room action. `open|post|show|list` are local journal operations; `turn` and `cancel` are live-turn controls; `recover` and `fork` are no-provider recovery controls. The ergonomic subcommands are `summon chat open|post|show|list|turn|cancel|recover|fork`; this flag is the dispatcher form. |
 | `--chat-session SESSION_ID` | With `--chat-action` | Stable conversation-room id; the subcommand form accepts it positionally. |
 | `--chat-message TEXT` / `--message TEXT` | With `chat post` | Append a bounded human context message. It is never an approval, ballot, or provider instruction. |
 | `--chat-project-id ID` / `--project-id ID` | With `chat open` | Bounded project label for a new room. |
@@ -448,6 +481,11 @@ run or recommending it to a user.
 | `--chat-mode {chat,council,deliberate}` / `--mode` | With `chat open` | Room display mode. `council` round events and `deliberate` discussion remain context-only until their separate authority paths are explicitly invoked. |
 | `--conversation-dir DIR` | With `chat` | Private root for local conversation journals (default `{cwd}/.agents/conversations`). |
 | `--chat-browser {auto,builtin,ide,system,link}` | With `chat open` | Start/reuse the authenticated local atlas; `link` returns a URL without launching a browser. This never contacts a provider. |
+| `--chat-participant AGENT` / `--participant AGENT` | With `chat turn` or `chat cancel` | Select one roster participant for the live turn or cancellation. The participant identity, definition digest, permission, profile, and model evidence are frozen before launch. |
+| `--chat-participants A,B,…` / `--participants A,B,…` | With `chat open` | Seed the room with a bounded participant list for the browser roster picker; it does not launch anyone. |
+| `--chat-timeout DURATION` (or `--timeout` after `chat`) | With `chat turn` | Per-turn bounded child timeout. It is separate from the dispatch/jobs `--timeout`; the chat subcommand rewrites its alias safely. |
+| `--chat-confirm` | With `chat recover` | Required human attestation for closing an unmatched turn as indeterminate; never retries or asserts zero spend. |
+| `--chat-reason TEXT` | With `chat fork` | Bounded explanation recorded on the parent fork event. |
 
 The public deliberate CLI is currently provider-inert and reports
 `integration_pending` before provider contact. A reviewed live composition exists
@@ -783,6 +821,14 @@ keeps them outside the dispatch tree, and records only the profile name plus dig
 receipt. It does not automatically retry a failed model on another profile: a retry can
 duplicate side effects or charge twice, so fallback routing must be an explicit, reviewed
 choice by the caller.
+
+Default Claude dispatches are deliberately isolated from ambient Claude Code settings:
+Summon passes `--setting-sources ""` unless a named Claude profile was explicitly selected.
+This prevents an unrelated user-level `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, or auth
+override (for example a third-party coding endpoint) from silently hijacking a first-party
+Claude seat and producing misleading quota/model evidence. If a custom Claude-compatible
+endpoint is intentional, put it behind a named private profile and review its provider,
+model, billing, and retention boundary explicitly.
 
 **`model:` per-CLI semantics** (the string is passed to the CLI verbatim):
 

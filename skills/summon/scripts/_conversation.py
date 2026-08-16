@@ -46,7 +46,7 @@ _MODES = frozenset({"chat", "council", "deliberate"})
 _ACTOR_KINDS = frozenset({"human", "agent", "system"})
 _EVENTS = frozenset({
     "session_created", "message_posted", "human_message", "turn_started",
-    "turn_finished", "council_round_started", "position_submitted",
+    "turn_finished", "turn_cancel_requested", "council_round_started", "position_submitted",
     "cross_exam", "chair_synthesis", "deliberation_policy_bound",
     "ballot_accepted", "state_transition", "cleanup_receipt", "fork_created",
 })
@@ -116,6 +116,28 @@ def _redact_text(value: str) -> str:
     text = re.sub(r"(?<![\w])(?:[A-Za-z0-9_.-]+/){1,}[A-Za-z0-9_.-]+", "[path]", text)
     text = re.sub(r"(?i)(?:token|password|secret|api[_-]?key)\s*[=:]\s*[^\s,;]+",
                   "[redacted]", text)
+    # Common provider/token shapes are sensitive even when a pasted log does
+    # not label them.  Keep the patterns conservative so ordinary prose and
+    # model names remain readable while bearer/API material cannot enter a
+    # public room projection.
+    text = re.sub(r"(?i)\b(?:bearer\s+)?(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16})\b",
+                  "[redacted]", text)
+    # Generic HTTP credentials do not always use a provider-specific prefix.
+    # Redact the complete Authorization/Bearer/Basic token before it can reach
+    # a room projection, while leaving ordinary prose such as "bearer token"
+    # readable when no credential-shaped value follows it.
+    text = re.sub(
+        r"(?i)(?:\bauthorization\s*:\s*)?\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{16,}",
+        "[redacted]", text)
+    text = re.sub(r"(?i)\b(?:cookie|set-cookie)\s*:\s*[^\r\n]+", "[redacted]", text)
+    text = re.sub(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+                  "[redacted]", text)
+    # Also hide standalone fixture/credential labels that commonly appear in
+    # pasted logs (for example ``SECRET_TOKEN``) even when no ``key=value``
+    # separator is present.  This keeps bounded chat previews useful without
+    # turning the public projection into a raw provider transcript.
+    text = re.sub(r"\b(?:SECRET|TOKEN|PASSWORD|API[_-]?KEY)[A-Z0-9_-]{3,}\b",
+                  "[redacted]", text, flags=re.IGNORECASE)
     return text
 
 
@@ -167,11 +189,14 @@ def _public_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, An
         text = data.get("text")
         if not isinstance(text, str) or not text.strip() or len(text) > MAX_MESSAGE_CHARS:
             raise ConversationError("human message must be non-empty and bounded")
-        # Text remains in the local/native journal.  Public/export views receive
-        # a digest and length, so a secret pasted into chat cannot escape via the
-        # browser event envelope or telemetry.
+        # Keep native text for provider context, but give the browser a bounded,
+        # redacted preview so a room is actually readable. The preview is never
+        # the source of truth and never contains raw native text, credentials,
+        # or local paths.
+        preview = _redact_text(text)[:MAX_SUMMARY_CHARS]
         return {"message_id": message_id, "text_sha256": _text_sha256(text),
-                "text_chars": len(text)}
+                "text_chars": len(text),
+                "preview": preview, "summary": preview}
     if event_type == "message_posted":
         message_id = _safe_id(data.get("message_id"), "message id")
         summary = data.get("summary")
@@ -188,12 +213,22 @@ def _public_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, An
         participants = data.get("participants", [])
         if not isinstance(participants, list) or len(participants) > MAX_PARTICIPANTS:
             raise ConversationError("participants are invalid")
-        out["participants"] = [_project_participant(p) for p in participants]
+        projected = [_project_participant(p) for p in participants]
+        ids = [item["agent"] for item in projected]
+        if len(ids) != len(set(ids)):
+            raise ConversationError("duplicate conversation participant")
+        out["participants"] = projected
         return out
-    if event_type in {"turn_started", "turn_finished", "position_submitted", "cross_exam",
+    if event_type in {"turn_started", "turn_finished", "turn_cancel_requested",
+                      "position_submitted", "cross_exam",
                       "chair_synthesis", "council_round_started", "deliberation_policy_bound"}:
-        for key in ("turn_id", "round", "participant", "asker", "target", "role", "name", "version",
-                    "option_ids", "recommended_option", "evidence_sha256", "summary"):
+        keys = ("turn_id", "round", "participant", "asker", "target", "command_id",
+                "role", "name", "version",
+                "option_ids", "recommended_option", "evidence_sha256", "summary")
+        if event_type in {"turn_started", "turn_finished"}:
+            keys += ("status", "provider", "model_target", "model_served", "permission",
+                     "transport", "prompt_sha256", "result_sha256", "prompt_chars", "resumed")
+        for key in keys:
             value = data.get(key)
             if key.endswith("_sha256"):
                 if value is not None and (not isinstance(value, str) or not _SHA256_RE.fullmatch(value)):
@@ -208,10 +243,22 @@ def _public_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, An
             elif key == "round":
                 if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1 or value > 10):
                     raise ConversationError("invalid round")
+            elif key == "prompt_chars":
+                if value is not None and (not isinstance(value, int) or isinstance(value, bool)
+                                          or value < 0 or value > MAX_MESSAGE_CHARS * 3):
+                    raise ConversationError("invalid prompt length")
+                if value is not None:
+                    out[key] = value
+            elif key == "resumed":
+                if value is not None and not isinstance(value, bool):
+                    raise ConversationError("invalid resumed flag")
+                if value is not None:
+                    out[key] = value
             elif value is not None:
-                if key in {"turn_id", "participant", "asker", "target"}:
+                if key in {"turn_id", "participant", "asker", "target", "command_id"}:
                     out[key] = _safe_id(value, key)
-                elif key in {"role", "name", "version"}:
+                elif key in {"role", "name", "version", "provider", "model_target", "model_served",
+                             "permission", "transport", "status"}:
                     out[key] = _safe_display(value, key)
                 elif key == "option_ids":
                     if not isinstance(value, list) or len(value) > 32:
@@ -337,6 +384,9 @@ class ConversationJournal:
             raise ConversationError("project root does not exist")
         participant_list = [_project_participant(item) for item in
                             _bounded_items(participants, MAX_PARTICIPANTS, "participants")]
+        participant_ids = [item["agent"] for item in participant_list]
+        if len(participant_ids) != len(set(participant_ids)):
+            raise ConversationError("duplicate conversation participant")
         root_path = _root_path(root)
         path = root_path / f"{session}.jsonl"
         if path.exists():
@@ -365,13 +415,23 @@ class ConversationJournal:
         if not path.is_file():
             raise ConversationError("conversation session not found")
         try:
-            before = path.stat()
-            if before.st_size > MAX_JOURNAL_BYTES:
-                raise ConversationError("conversation journal is too large")
-            lines = path.read_bytes().splitlines()
-            after = path.stat()
-            if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-                    != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+            lines = None
+            for attempt in range(3):
+                before = path.stat()
+                if before.st_size > MAX_JOURNAL_BYTES:
+                    raise ConversationError("conversation journal is too large")
+                candidate = path.read_bytes().splitlines()
+                after = path.stat()
+                if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                        == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+                    lines = candidate
+                    break
+                if attempt < 2:
+                    # A live turn may append exactly one fsynced line between
+                    # the two fingerprints. Retry briefly, but never accept a
+                    # persistently changing or replaced journal.
+                    time.sleep(0.005)
+            if lines is None:
                 raise ConversationError("conversation journal changed during read")
         except OSError as exc:
             raise ConversationError("conversation session cannot be read") from exc
@@ -829,10 +889,17 @@ def continuation_decision(parent_session_id: str, existing: Mapping[str, Any],
                                           or not isinstance(right[field], str)
                                           or not _DISPLAY_RE.fullmatch(right[field])):
             mismatches.append(f"invalid_{field}")
-        elif field == "owner_generation" and (
-                not isinstance(left[field], int) or isinstance(left[field], bool) or left[field] < 1
-                or not isinstance(right[field], int) or isinstance(right[field], bool) or right[field] < 1):
-            mismatches.append("invalid_owner_generation")
+        elif field == "owner_generation":
+            if (not isinstance(left[field], int) or isinstance(left[field], bool) or left[field] < 1
+                    or not isinstance(right[field], int) or isinstance(right[field], bool)
+                    or right[field] < 1):
+                mismatches.append("invalid_owner_generation")
+            elif right[field] < left[field]:
+                # Owner generations are fencing evidence, not a provider
+                # session identity. A normal next owner may continue a
+                # completed provider session, but a stale process must never
+                # present an older generation as current.
+                mismatches.append("owner_generation_regressed")
         elif left[field] != right[field]:
             mismatches.append(field)
     if mismatches:
@@ -898,10 +965,20 @@ def list_rooms(root: str | os.PathLike[str]) -> dict[str, dict[str, list[dict[st
 
 
 def run_command(args: Any) -> int:
-    """Provider-inert CLI handler used by ``summon chat``."""
+    """CLI handler for local rooms and explicitly requested live agent turns.
+
+    Room reads and human context remain provider-inert.  ``turn`` and ``cancel``
+    are the only operations that cross into the runtime seam; the runtime owns
+    the durable-before-provider fence and continuation/fork decision.
+    """
     action = getattr(args, "chat_action", None)
     root = getattr(args, "conversation_dir", None) or os.path.join(
         getattr(args, "cwd", None) or os.getcwd(), ".agents", "conversations")
+    # Resolve this before the existing-room branch too.  Browser handoff is
+    # allowed for an already-created room, and the previous lazy assignment
+    # raised UnboundLocalError when --cwd was omitted on that path.
+    project_root = (getattr(args, "chat_project_root", None)
+                    or getattr(args, "cwd", None) or os.getcwd())
     try:
         if action == "open":
             session = _safe_id(getattr(args, "chat_session", None), "session id")
@@ -911,7 +988,15 @@ def run_command(args: Any) -> int:
             except ConversationError as exc:
                 if not any(token in str(exc) for token in ("not found", "root does not exist")):
                     raise
-                project_root = getattr(args, "chat_project_root", None) or getattr(args, "cwd", None) or os.getcwd()
+                raw_participants = getattr(args, "chat_participants", None)
+                participants = []
+                if raw_participants:
+                    if not isinstance(raw_participants, str):
+                        raise ConversationError("chat participants are invalid")
+                    names = [item.strip() for item in raw_participants.split(",") if item.strip()]
+                    if not names:
+                        raise ConversationError("chat participants are invalid")
+                    participants = [{"agent": _safe_id(item, "participant agent")} for item in names]
                 journal = ConversationJournal.create(
                     root, session_id=session,
                     project_id=getattr(args, "chat_project_id", None) or "default",
@@ -919,13 +1004,18 @@ def run_command(args: Any) -> int:
                     initiator_host=getattr(args, "chat_initiator_host", None) or "terminal",
                     initiator_agent=getattr(args, "chat_initiator_agent", None) or "human",
                     mode=getattr(args, "chat_mode", None) or "chat",
+                    participants=participants,
                 )
                 result = {"status": "created", **journal.as_dict()}
             browser_mode = getattr(args, "chat_browser", None)
             if browser_mode:
                 try:
                     from _conversation_browser import ensure_surface, open_url
-                    surface = ensure_surface(root)
+                    surface = ensure_surface(
+                        root,
+                        cwd=getattr(args, "cwd", None) or project_root,
+                        agents_dir=getattr(args, "agents_dir", None),
+                    )
                     result["browser"] = open_url(str(surface["url"]), mode=browser_mode)
                 except Exception as exc:  # bounded public CLI error, no provider path
                     from _conversation_browser import ConversationBrowserError
@@ -945,6 +1035,73 @@ def run_command(args: Any) -> int:
             result = {"status": "ok", **ConversationJournal.open(root, session).as_dict()}
         elif action == "list":
             result = {"status": "ok", "rooms": list_rooms(root)}
+        elif action == "turn":
+            from _conversation_runtime import ConversationRuntime
+            session = _safe_id(getattr(args, "chat_session", None), "session id")
+            participant = _safe_id(getattr(args, "chat_participant", None), "participant")
+            prompt = getattr(args, "chat_message", None)
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise ConversationError("chat turn requires --message")
+            runtime = ConversationRuntime(
+                root,
+                cwd=getattr(args, "cwd", None) or os.getcwd(),
+                agents_dir=getattr(args, "agents_dir", None),
+                timeout_ms=int(getattr(args, "chat_timeout", None) or getattr(args, "timeout", 600_000)),
+                strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)
+                                       or getattr(args, "agents_dir", None)),
+            )
+            result = runtime.start_turn(
+                session, participant, prompt,
+                timeout_ms=(int(getattr(args, "chat_timeout", None))
+                            if getattr(args, "chat_timeout", None) is not None else None),
+                # A CLI process must stay alive until the worker has journaled
+                # its finish event.  The browser uses the runtime object
+                # directly for asynchronous turns; a detached CLI thread would
+                # otherwise die with the parent process.
+                wait=True,
+            )
+        elif action == "cancel":
+            from _conversation_runtime import ConversationRuntime
+            session = _safe_id(getattr(args, "chat_session", None), "session id")
+            participant = _safe_id(getattr(args, "chat_participant", None), "participant")
+            runtime = ConversationRuntime(
+                root,
+                cwd=getattr(args, "cwd", None) or os.getcwd(),
+                agents_dir=getattr(args, "agents_dir", None),
+                timeout_ms=int(getattr(args, "chat_timeout", None) or getattr(args, "timeout", 600_000)),
+                strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)
+                                       or getattr(args, "agents_dir", None)),
+            )
+            result = runtime.cancel_turn(session, participant)
+        elif action == "recover":
+            from _conversation_runtime import ConversationRuntime
+            session = _safe_id(getattr(args, "chat_session", None), "session id")
+            participant = _safe_id(getattr(args, "chat_participant", None), "participant")
+            runtime = ConversationRuntime(
+                root,
+                cwd=getattr(args, "cwd", None) or os.getcwd(),
+                agents_dir=getattr(args, "agents_dir", None),
+                timeout_ms=int(getattr(args, "chat_timeout", None) or getattr(args, "timeout", 600_000)),
+                strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)
+                                       or getattr(args, "agents_dir", None)),
+            )
+            result = runtime.recover_turn(
+                session, participant, confirm=bool(getattr(args, "chat_confirm", False)))
+        elif action == "fork":
+            from _conversation_runtime import ConversationRuntime
+            session = _safe_id(getattr(args, "chat_session", None), "session id")
+            participant = _safe_id(getattr(args, "chat_participant", None), "participant")
+            runtime = ConversationRuntime(
+                root,
+                cwd=getattr(args, "cwd", None) or os.getcwd(),
+                agents_dir=getattr(args, "agents_dir", None),
+                timeout_ms=int(getattr(args, "chat_timeout", None) or getattr(args, "timeout", 600_000)),
+                strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)
+                                       or getattr(args, "agents_dir", None)),
+            )
+            result = runtime.fork_turn(
+                session, participant, getattr(args, "chat_message", None) or "",
+                reason=getattr(args, "chat_reason", None) or "manual fork")
         else:
             raise ConversationError("chat action is required")
         print(json.dumps(result, ensure_ascii=False))

@@ -1,4 +1,4 @@
-"""Browser handoff for the provider-inert conversation atlas."""
+"""Browser handoff for the local conversation atlas and bounded turn controls."""
 
 from __future__ import annotations
 
@@ -10,16 +10,88 @@ import subprocess
 import sys
 import time
 import webbrowser
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from _conversation_ui import MAX_SURFACE_RECORD_BYTES, SURFACE_RECORD, TOKEN_RE, read_surface_record
+from _conversation_ui import (MAX_SURFACE_RECORD_BYTES, SURFACE_RECORD, TOKEN_RE,
+                              _pid_is_alive, _surface_binding_digest,
+                              read_surface_record)
+from _conversation import _root_path
 from _spawn import popen_flags
 
 
 class ConversationBrowserError(Exception):
     """A local conversation surface could not be safely opened."""
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Keep bearer-bearing loopback probes on the exact endpoint.
+
+    ``urllib.request.urlopen`` follows redirects by default and reuses the
+    request headers.  A compromised local listener could therefore redirect a
+    readiness probe to another loopback port and receive the surface token.
+    Surface reachability is a proof of the exact authenticated endpoint, not a
+    navigation operation, so any redirect is a failed probe.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_NO_REDIRECT_OPENER = build_opener(_NoRedirect())
+_LAUNCH_LOCK = ".summon-conversation-ui.launch.lock"
+_LAUNCH_LOCK_STALE_SECONDS = 30.0
+
+
+@contextmanager
+def _launch_guard(root: str, timeout: float):
+    """Serialize cross-process surface starts without trusting a stale marker."""
+    path = Path(root) / _LAUNCH_LOCK
+    deadline = time.monotonic() + max(0.5, timeout)
+    token = secrets.token_hex(16)
+    fd = None
+    try:
+        while fd is None:
+            try:
+                fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                payload = json.dumps({"pid": os.getpid(), "token": token,
+                                      "started_at": time.time()},
+                                     sort_keys=True, separators=(",", ":")).encode("ascii")
+                os.write(fd, payload)
+                try:
+                    os.fsync(fd)
+                except OSError:
+                    pass
+            except FileExistsError:
+                try:
+                    stat = path.stat()
+                    marker = json.loads(path.read_text(encoding="ascii"))
+                    owner = marker.get("pid") if isinstance(marker, dict) else None
+                    if (time.time() - stat.st_mtime > _LAUNCH_LOCK_STALE_SECONDS
+                            and not _pid_is_alive(owner)
+                            and path.stat().st_mtime_ns == stat.st_mtime_ns):
+                        path.unlink()
+                        continue
+                except (OSError, ValueError, TypeError, UnicodeError):
+                    pass
+                if time.monotonic() >= deadline:
+                    raise ConversationBrowserError("conversation surface start is busy")
+                time.sleep(0.05)
+        yield
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            finally:
+                try:
+                    marker = json.loads(path.read_text(encoding="ascii"))
+                    if (isinstance(marker, dict) and marker.get("pid") == os.getpid()
+                            and marker.get("token") == token):
+                        path.unlink()
+                except (OSError, ValueError, TypeError, UnicodeError):
+                    pass
 
 
 def _validate_url(url: str) -> dict[str, object]:
@@ -107,46 +179,110 @@ def open_url(url: str, *, mode: str = "auto") -> dict[str, object]:
     return {"url": url, "target": "system", "opened": True, "reused": True}
 
 
-def ensure_surface(root: str, *, timeout: float = 5.0) -> dict[str, object]:
+def ensure_surface(root: str, *, timeout: float = 5.0,
+                   cwd: str | None = None, agents_dir: str | None = None,
+                   timeout_ms: int = 600_000) -> dict[str, object]:
+    try:
+        # Fence every parent component before the launch lock is created.  A
+        # symlinked child check alone still lets ``alias/rooms`` redirect the
+        # lock write through a symlinked parent.
+        canonical_root = _root_path(root, create=False)
+    except Exception as exc:  # noqa: BLE001 - public browser boundary
+        raise ConversationBrowserError("conversation root may not contain symlinks") from exc
+    root = str(canonical_root)
+    # The child is launched with the scripts directory as its working
+    # directory for deterministic imports.  Canonicalize caller bindings now
+    # so relative `--cwd`/`--agents-dir` values resolve identically in the
+    # parent, the sidecar digest, and the child runtime.
+    try:
+        binding_cwd = (str(Path(cwd).expanduser().resolve()) if cwd is not None else None)
+        binding_agents_dir = (
+            str(Path(agents_dir).expanduser().resolve()) if agents_dir is not None else None
+        )
+    except (OSError, RuntimeError) as exc:
+        raise ConversationBrowserError("surface binding path could not be resolved") from exc
     existing = read_surface_record(root)
-    if existing is not None and _surface_reachable(existing):
+    if existing is not None and _wait_surface_reachable(existing, timeout=timeout):
+        _require_surface_binding(existing, cwd=binding_cwd, agents_dir=binding_agents_dir)
         return {"url": existing["url"], "reused": True, "pid": existing["pid"]}
-    if existing is not None:
-        _discard_stale_record(root, existing)
-    script = str(Path(__file__).with_name("_conversation_ui.py"))
-    try:
-        process = subprocess.Popen([sys.executable, script, "--serve", root], shell=False,
-                                   cwd=str(Path(__file__).parent), stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, **popen_flags())
-    except OSError as exc:
-        raise ConversationBrowserError("conversation surface could not be started") from exc
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        record = read_surface_record(root)
-        if (record is not None and record.get("pid") == process.pid
-                and _surface_reachable(record)):
-            # The server is intentionally detached from this short-lived CLI
-            # process. Mark the readiness handoff complete so CPython does not
-            # emit a false ResourceWarning when the Popen wrapper is collected;
-            # the child owns its loopback surface and is tracked by its record.
-            process.returncode = 0
-            return {"url": record["url"], "reused": False, "pid": record["pid"]}
-        if process.poll() is not None:
-            break
-        time.sleep(0.05)
-    try:
-        process.terminate()
-    except OSError:
-        pass
-    try:
-        process.wait(timeout=1)
-    except (OSError, subprocess.TimeoutExpired):
+    with _launch_guard(root, timeout):
+        # Another process may have completed the start while this caller was
+        # waiting for the guard. Re-probe the authenticated endpoint before
+        # deciding to spawn another server.
+        existing = read_surface_record(root)
+        if existing is not None and _wait_surface_reachable(existing, timeout=timeout):
+            _require_surface_binding(existing, cwd=binding_cwd, agents_dir=binding_agents_dir)
+            return {"url": existing["url"], "reused": True, "pid": existing["pid"]}
+        if existing is not None:
+            # A shaped record with a live PID but an unreachable endpoint is
+            # not safe to overwrite: the old server may be transiently busy,
+            # and replacing it would create two untracked atlases.  Require
+            # explicit process shutdown/recovery instead of guessing.
+            if _pid_is_alive(existing.get("pid")):
+                raise ConversationBrowserError(
+                    "conversation surface is live but its endpoint is unavailable")
+            _discard_stale_record(root, existing)
+        script = str(Path(__file__).with_name("_conversation_ui.py"))
+        # We hold _launch_guard across child startup.  The child must not
+        # reacquire that same file lock or it would deadlock before publishing
+        # its authenticated sidecar.
+        command = [sys.executable, script, "--serve", root, "--timeout", str(int(timeout_ms)),
+                   "--launch-lock-held"]
+        if binding_cwd:
+            command.extend(["--cwd", binding_cwd])
+        if binding_agents_dir:
+            command.extend(["--agents-dir", binding_agents_dir])
         try:
-            process.kill()
+            process = subprocess.Popen(command, shell=False,
+                                       cwd=str(Path(__file__).parent), stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, **popen_flags())
+        except OSError as exc:
+            raise ConversationBrowserError("conversation surface could not be started") from exc
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            record = read_surface_record(root)
+            if (record is not None and record.get("pid") == process.pid
+                    and _surface_reachable(record)):
+                try:
+                    _require_surface_binding(record, cwd=binding_cwd,
+                                             agents_dir=binding_agents_dir)
+                except ConversationBrowserError:
+                    # A child that published a record for a different binding
+                    # is not a successful handoff.  Tear it down before
+                    # returning the explicit mismatch rather than leaving a
+                    # live, untracked browser process behind.
+                    try:
+                        process.terminate()
+                        process.wait(timeout=1)
+                    except (OSError, subprocess.TimeoutExpired):
+                        try:
+                            process.kill()
+                            process.wait(timeout=1)
+                        except (OSError, subprocess.TimeoutExpired):
+                            pass
+                    raise
+                # The server is intentionally detached from this short-lived CLI
+                # process. Mark the readiness handoff complete so CPython does not
+                # emit a false ResourceWarning when the Popen wrapper is collected;
+                # the child owns its loopback surface and is tracked by its record.
+                process.returncode = 0
+                return {"url": record["url"], "reused": False, "pid": record["pid"]}
+            if process.poll() is not None:
+                break
+            time.sleep(0.05)
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        try:
             process.wait(timeout=1)
         except (OSError, subprocess.TimeoutExpired):
-            pass
-    raise ConversationBrowserError("conversation surface did not become ready")
+            try:
+                process.kill()
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        raise ConversationBrowserError("conversation surface did not become ready")
 
 
 def _discard_stale_record(root: str, expected: dict[str, object]) -> None:
@@ -163,6 +299,27 @@ def _discard_stale_record(root: str, expected: dict[str, object]) -> None:
         return
 
 
+def _require_surface_binding(record: dict[str, object], *,
+                             cwd: str | None, agents_dir: str | None) -> None:
+    """Refuse silent atlas reuse across project or explicit roster bindings.
+
+    Pre-binding sidecars remain readable for callers that do not provide a
+    binding.  Once a caller supplies ``cwd`` or ``agents_dir``, however, an
+    old/missing digest is an explicit mismatch rather than permission to
+    launch a second server against the same atlas root.
+    """
+    if cwd is not None:
+        expected = _surface_binding_digest(cwd)
+        if record.get("cwd_sha256") != expected:
+            raise ConversationBrowserError(
+                "conversation surface is bound to a different project")
+    if agents_dir is not None:
+        expected = _surface_binding_digest(agents_dir)
+        if record.get("agents_dir_sha256") != expected:
+            raise ConversationBrowserError(
+                "conversation surface is bound to a different agent roster")
+
+
 def _surface_reachable(record: dict[str, object]) -> bool:
     """Prove a shaped surface record points at the authenticated local server."""
     url, token = record.get("url"), record.get("token")
@@ -175,10 +332,32 @@ def _surface_reachable(record: dict[str, object]) -> bool:
             "Host": f"127.0.0.1:{parsed['port']}",
             "Authorization": "Bearer " + token,
         })
-        with urlopen(request, timeout=0.35) as response:
+        with _NO_REDIRECT_OPENER.open(request, timeout=0.35) as response:
             return response.status == 200
     except Exception:  # noqa: BLE001 - stale/fake records fail closed
         return False
+
+
+def _wait_surface_reachable(record: dict[str, object], *, timeout: float) -> bool:
+    """Wait briefly for a freshly published sidecar's server thread to bind.
+
+    ``ConversationSurface.start`` writes its record immediately after starting
+    ``serve_forever``. A same-process caller can therefore observe a live PID
+    during the small scheduling window before the first authenticated request
+    succeeds. Wait only while that PID remains live; a genuinely dead or
+    unreachable record still fails closed and is never silently replaced.
+    """
+    try:
+        budget = max(0.05, min(float(timeout), 5.0))
+    except (TypeError, ValueError, OverflowError):
+        budget = 0.5
+    deadline = time.monotonic() + budget
+    while True:
+        if _surface_reachable(record):
+            return True
+        if not _pid_is_alive(record.get("pid")) or time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 __all__ = ["ConversationBrowserError", "ensure_surface", "open_url"]

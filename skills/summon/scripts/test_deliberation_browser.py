@@ -98,7 +98,7 @@ class DeliberationBrowserTests(unittest.TestCase):
             _rundir.release_owner(owner)
             record_url = "http://127.0.0.1:23456/runs/run-1/#token=" + "u" * 48
             _rundir.atomic_write_json(os.path.join(path, browser._ui.SURFACE_RECORD), {
-                "schema_version": 1, "run_id": "run-1", "pid": os.getpid(),
+                "schema_version": 1, "run_id": "run-1", "pid": 999999,
                 "url": record_url, "token": "u" * 48,
             })
             with mock.patch.object(browser.subprocess, "Popen") as process:
@@ -120,6 +120,22 @@ class DeliberationBrowserTests(unittest.TestCase):
             finally:
                 surface.close()
 
+    def test_surface_record_root_binding_rejects_tampering(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "deliberations")
+            path, owner = store.initialize_run(root, _receipt("run-1"))
+            _rundir.release_owner(owner)
+            surface = ui.DeliberationSurface(root, "run-1")
+            surface.start()
+            try:
+                record_path = os.path.join(path, ui.SURFACE_RECORD)
+                record = _rundir.read_json(record_path)
+                record["root_sha256"] = "0" * 64
+                _rundir.atomic_write_json(record_path, record)
+                self.assertIsNone(ui.read_surface_record(root, "run-1"))
+            finally:
+                surface.close()
+
     def test_open_lock_release_cannot_delete_replacement(self):
         with tempfile.TemporaryDirectory() as temp:
             lock = os.path.join(temp, "open.lock")
@@ -130,6 +146,25 @@ class DeliberationBrowserTests(unittest.TestCase):
             })
             browser._release_open_lock(lock, token)
             self.assertTrue(os.path.isfile(lock))
+
+    def test_run_path_rejects_symlinked_root_and_run_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            real_root = base / "real"
+            real_root.mkdir()
+            root_link = base / "root-link"
+            run_target = base / "run-target"
+            run_target.mkdir()
+            try:
+                root_link.symlink_to(real_root, target_is_directory=True)
+                with self.assertRaises(ValueError):
+                    _rundir.run_path(str(root_link), "run-1")
+                child = real_root / "run-1"
+                child.symlink_to(run_target, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory symlinks unavailable: {exc}")
+            with self.assertRaises(ValueError):
+                _rundir.run_path(str(real_root), "run-1")
 
 
 if __name__ == "__main__":

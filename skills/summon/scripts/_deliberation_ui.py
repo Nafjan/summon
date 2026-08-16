@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import argparse
+import hashlib
 import os
 import re
 import secrets
@@ -54,6 +55,11 @@ def _surface_record_path(root: str, run_id: str) -> str:
     return os.path.join(_store.run_dir(root, run_id), SURFACE_RECORD)
 
 
+def _surface_root_digest(root: str, run_id: str) -> str:
+    canonical = str(Path(_store.run_dir(root, run_id)).resolve())
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _pid_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -92,10 +98,12 @@ def read_surface_record(root: str, run_id: str) -> dict[str, object] | None:
         if path_obj.is_symlink() or path_obj.stat().st_size > MAX_SURFACE_RECORD_BYTES:
             return None
         value = _rundir.read_json(path)
+        expected_root = _surface_root_digest(root, run_id)
     except (OSError, ValueError):
         return None
     if (not isinstance(value, dict) or value.get("schema_version") != 1
-            or value.get("run_id") != run_id):
+            or value.get("run_id") != run_id
+            or value.get("root_sha256") != expected_root):
         return None
     pid = value.get("pid"); url = value.get("url"); token = value.get("token")
     if (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
@@ -121,7 +129,9 @@ def read_surface_record(root: str, run_id: str) -> dict[str, object] | None:
 
 def _write_surface_record(root: str, run_id: str, *, pid: int, url: str, token: str) -> None:
     _rundir.atomic_write_json(_surface_record_path(root, run_id), {
-        "schema_version": 1, "run_id": run_id, "pid": pid, "url": url,
+        "schema_version": 1, "run_id": run_id,
+        "root_sha256": _surface_root_digest(root, run_id),
+        "pid": pid, "url": url,
         "token": token, "started_at": time.time(),
     })
 

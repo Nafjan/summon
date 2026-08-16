@@ -52,7 +52,8 @@ _PAYLOAD_ROOTS = (
 REQUIRED_TESTS = frozenset({
     "discovery", "install", "release_manifest", "acpbackend",
     "deliberation", "deliberation_resume", "model_catalog",
-    "conversation", "conversation_ui", "model_routing", "release_contract",
+    "conversation", "conversation_runtime", "conversation_ui", "swarm_protocol",
+    "model_routing", "release_contract",
     "release_gates",
 })
 REQUIRED_GATES = frozenset({
@@ -66,6 +67,8 @@ REQUIRED_COMMANDS = {
     "release_manifest": "python -m unittest tests.test_release_manifest",
     "acpbackend": "python tests/test_acpbackend.py",
     "conversation": "python -m unittest skills.summon.scripts.test_conversation skills.summon.scripts.test_conversation_ui",
+    "conversation_runtime": "python -m unittest skills.summon.scripts.test_conversation_runtime",
+    "swarm_protocol": "python -m unittest skills.summon.scripts.test_swarm_protocol",
     "conversation_ui": "python -m unittest skills.summon.scripts.test_conversation_ui",
     "release_contract": "python -m unittest tests.test_release_contract",
     "release_gates": "python -m unittest tests.test_release_gates",
@@ -193,6 +196,26 @@ def _atomic_write_text(path: Path, text: str) -> None:
             os.unlink(tmp_name)
         except FileNotFoundError:
             pass
+
+
+def _assert_external_path(root: Path, path: Path, label: str) -> None:
+    """Reject release artifacts that would dirty the source checkout.
+
+    The release contract keeps evidence and manifests outside the checkout so
+    their creation cannot invalidate the clean-tree/source-hash proof.  Resolve
+    existing parents (including junctions/symlinks) before checking containment;
+    a lexical prefix check would allow an alias into the repository.
+    """
+    try:
+        root_real = root.resolve(strict=False)
+        path_real = path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{label} path cannot be resolved safely") from exc
+    try:
+        path_real.relative_to(root_real)
+    except ValueError:
+        return
+    raise ValueError(f"{label} must be outside the release source tree")
 
 
 def _tree_fingerprint(root: Path, *, exclude: frozenset[str] = frozenset()) -> tuple[str | None, set[str], str | None]:
@@ -773,9 +796,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         root = Path(os.path.abspath(args.root))
+        output_path = (Path(os.path.abspath(args.output))
+                       if args.output else None)
+        evidence_path = (Path(os.path.abspath(args.evidence_file))
+                         if args.evidence_file else None)
+        if output_path is not None:
+            _assert_external_path(root, output_path, "manifest output")
+        if evidence_path is not None:
+            _assert_external_path(root, evidence_path, "evidence input")
         source_hash = source_tree_sha256(root)
-        evidence = (_read_evidence(Path(os.path.abspath(args.evidence_file)), root, source_hash)
-                    if args.evidence_file else None)
+        evidence = (_read_evidence(evidence_path, root, source_hash)
+                    if evidence_path is not None else None)
         if evidence is not None and (args.test or args.gate):
             raise ValueError("--evidence-file cannot be combined with --test/--gate")
         manifest = build_manifest(
@@ -790,8 +821,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
         return 2
     encoded = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    if args.output:
-        _atomic_write_text(Path(os.path.abspath(args.output)), encoded)
+    if output_path is not None:
+        _atomic_write_text(output_path, encoded)
     else:
         sys.stdout.write(encoded)
     installs = manifest["installs"]

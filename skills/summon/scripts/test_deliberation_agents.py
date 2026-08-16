@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -64,6 +65,22 @@ class CustomAgentTests(unittest.TestCase):
         self.assertEqual(item.canonical_json(), json.dumps(
             public, ensure_ascii=False, sort_keys=True,
             separators=(",", ":"), allow_nan=False))
+
+    def test_agents_validate_cli_is_provider_inert_and_redacted(self):
+        path = self.add()
+        result = subprocess.run(
+            [sys.executable, str(HERE / "run_subagent.py"), "agents", "validate",
+             "--cwd", str(self.workspace), "--json"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["provider_calls"], 0)
+        self.assertEqual(report["count"], 1)
+        self.assertNotIn(str(path), result.stdout)
+        self.assertNotIn("Review the supplied evidence", result.stdout)
+        self.assertIn("definition_digest", result.stdout)
 
     def test_global_root_is_ignored_unless_explicitly_supplied(self):
         global_root = self.root / "global"

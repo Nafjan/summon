@@ -1,10 +1,12 @@
 # Summon product roadmap
 
-Status date: 2026-08-14
-Current source version: `3.0.0` (GA)
-Readiness: the fixed suites and eight source-bound gates pass from an immutable
-release commit. One Gemini 3.7 Flash High pilot is receipt-bound; additional providers,
-live continuation, and remote execution remain explicitly gated or deferred.
+Status date: 2026-08-16
+Current source version: `3.0.0` plus an unreleased live-chat working tree
+Readiness: the immutable `3.0.0` tag is the public-preview baseline, not a GA
+certification. The current working tree adds the authenticated chat/runtime and browser
+hardening described below; it is not a release candidate until its evidence is generated
+from a clean commit. Deliberation provider activation, remote execution, and multi-user
+hosting remain separately gated.
 
 This is the release-facing roadmap for turning the current, well-tested kernel into a dependable open product. It records what is actually shipped, what was tested, and the gates that must pass before we describe a feature as shipped, preview, or live-provider-enabled.
 
@@ -16,9 +18,9 @@ This is the release-facing roadmap for turning the current, well-tested kernel i
 | Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; Fable and Gemini availability still require saved provider receipts with exact `model.served` and profile evidence | Recommended, but unverified models remain gated |
 | Deliberation kernel, journal replay/recovery, scheduler | Focused `test_deliberation_*.py` suite; provider-inert | Ready as a fake/injected integration surface |
 | Custom Agent manifests and roster binding | Strict parser, path fencing, consent/identity binding | Ready as provider-inert configuration |
-| Live provider composition | Receipt/plan/owner/deadline fences exist; one disposable Gemini pilot is independently receipt-bound | One selected route evidenced; expansion remains gated |
-| Browser observation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, and visual evidence pass; richer multi-run lifecycle remains preview | GA safety surface; richer workflow preview |
-| Managed local installs | All eight managed host copies converge at 3.0.0; unmanaged Cursor plugin drift is reported and untouched | GA managed payload |
+| Live provider composition | Receipt/plan/owner/deadline fences exist; the current machine-bound release evidence has no accepted live-provider receipt | Provider-inert/fake-provider only until an independently reviewed receipt passes |
+| Browser conversation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, visual evidence, and explicit cancellable roster-agent turns; richer multi-run lifecycle remains preview | Unreleased post-GA preview |
+| Managed local installs | Eight managed host copies are refreshed only by the release install gate; the current dirty working tree must be reinstalled and rechecked before certification; unmanaged Cursor plugin drift is reported and untouched | GA gate pending |
 | Unmanaged Cursor local plugin | Older 2.2.0 content hash; not installer-owned | Update through its plugin mechanism only |
 
 Telemetry is enabled for this workstation through `~/.agents/summon-telemetry.json`. “On” means bounded, allow-listed local JSONL diagnostics only; it does not transmit data. GitHub issue submission remains a separate explicit action.
@@ -55,8 +57,9 @@ gate below is machine-recorded from a clean immutable commit.
 8. Pass one independently gated live deliberation provider. The gate proves exact
    `model.served`, profile/backend/consent evidence, owner/deadline/process fencing,
    cancellation, kill-switch behavior, cleanup, and honest uncertain-spend handling with
-    no hidden retry or fallback. Gemini 3.7 Flash High is the selected 3.0.0 route;
-    additional providers must earn separate evidence and do not inherit this claim.
+    no hidden retry or fallback. Gemini 3.7 Flash High is a candidate route, not a
+    current availability claim; additional providers must earn separate evidence and
+    do not inherit any claim.
 9. Keep telemetry opt-in by default in clean installs, local-only, bounded, redacted,
    and covered by disable/clear/support-bundle tests.
 
@@ -73,10 +76,12 @@ to unmanaged Cursor plugins.
 No open P0/P1 reliability, security, privacy, migration, or evidence contradiction may
 remain. The release manifest is generated from a clean, immutable source tree and
 requires the named suites and gates rather than accepting arbitrary caller-supplied
-labels. The 3.0.0 evidence baseline is: deliberation 327/327, resume 15/15,
-discovery 547/547, conversation 26/26, conversation UI 8/8, install 30/30, model
-catalog 6/6, model routing 4/4, release contract 3/3, release gates 6/6,
-release manifest 13/13, and ACP 36/36.
+labels. The latest local fixed-registry run (not a GA claim) recorded: deliberation
+331/331, resume 15/15, discovery 549/549, conversation 20/20, runtime 24/24, UI
+19/19, install 30/30, model catalog 6/6, model routing 4/4, release contract 3/3,
+release gates 7/7, release manifest 16/16, swarm protocol 12/12, and ACP 36/36. Its
+live-provider gate was `blocked` and the source tree was dirty; the 3.0.0 GA rule was
+therefore not met.
 
 ## Product direction
 
@@ -111,19 +116,21 @@ deliberation receipt.
 | 2.4 — governed agents | Custom Agent validation, migration diagnostics, receipt-bound prompt contributions, fake-provider end-to-end flow | implemented/provider-inert |
 | 2.4b — council handoff | `/council` companion, bounded recommendation artifact, explicit human promotion into a fresh `/deliberate` receipt | public preview |
 | 2.5 — one live-provider pilot | One explicitly gated provider with durable-before-spawn, cancellation, deadline, cleanup, kill switch, and takeover evidence | live-provider-gated |
-| 2.6 — conversation rooms | Provider-inert persistent chat substrate, authenticated loopback conversation atlas grouped by project and initiating host/agent, resumable rooms, human messages, and bounded council-round artifacts | public preview |
+| 2.6 — conversation rooms | Persistent chat substrate, authenticated loopback conversation atlas grouped by project and initiating host/agent, human messages, bounded roster-agent turns with explicit continuation/fork, and bounded council-round artifacts | public preview |
 | 2.7 — daily browser workflow | Round-oriented ledger, filters/export, keyboard/mobile actions, terminal summaries, WCAG 2.2 AA and visual regression | public preview |
+| 2.7b — swarm protocol contract | Versioned `summon.swarm/v1` stdio framing, worker/claim/message/artifact/cancel schemas, golden vectors, and fake-adapter conformance; no native IDE attachment yet | contract-only preview |
 | 2.8 — product operations | Supported-version matrix, rollback/install manifest, stable machine schemas, local diagnostics, sanitized support bundle | gated; contract defined in [`docs/VERSIONING_AND_3.0.md`](VERSIONING_AND_3.0.md) |
 | Later — provider expansion | Each transport earns its own independent evidence gate; no umbrella live-ready claim | live-provider-gated |
 
 ## P0 — release hygiene and reliability (next)
 
-1. **Keep the ordinary dispatcher suite deterministic.** The two early-exit tests now use a dispatch barrier and the broad run is `547/547`; keep the repetition check in CI. Treat a timeout or missing stage as a test failure, never as a silent pass.
+1. **Keep the ordinary dispatcher suite deterministic.** The two early-exit tests now use a dispatch barrier and the broad run is `549/549`; keep the repetition check in CI. Treat a timeout or missing stage as a test failure, never as a silent pass.
 2. **Close installer asset drift.** Keep `examples/` in the owned payload and manifest (now fixed); add a source-vs-install manifest check to CI. Never update archival worktrees or unmanaged plugin copies.
 3. **Remove resource warnings.** ✅ Closed the bounded Git-reader pipes in `_receipt.py`; the
-   the fixed release registry (currently 326 deliberation, 15 resume, 25 conversation, 8 UI,
-   547 discovery, 30 install, 36 ACP, 6 catalog, 12 release-manifest, and 3 release-contract tests) is now
-   warning-clean rather than merely assertion-clean.
+   fixed release registry (currently 331 deliberation, 15 resume, 35 conversation, 23 runtime,
+   17 UI, 549 discovery, 30 install, 36 ACP, 6 catalog, 4 routing, 16 release-manifest,
+   7 release-gates, 11 swarm, and 3 release-contract tests) is now warning-clean rather than
+   merely assertion-clean.
 4. **Publish one release manifest.** `python tools/release_gates.py` runs the fixed test and
    gate registries and emits source/Git-bound output digests plus one artifact per gate;
    `python tools/release_manifest.py --evidence-file ...` binds that evidence to the full
@@ -150,9 +157,10 @@ Exit gate: broad dispatcher suite is repeatable; install/doctor reports converge
 
 ### Shared conversation rooms
 
-Summon now has one provider-inert conversation substrate for ordinary
-brainstorming, interactive `/council`, and the discussion view around
-`/deliberate`. A room has a stable session ID, project identity, initiating
+Summon now has one conversation substrate for ordinary brainstorming, interactive
+`/council`, and the discussion view around `/deliberate`. Room reads and human context
+remain provider-inert; an explicitly requested roster-agent turn uses a bounded live
+runtime. A room has a stable session ID, project identity, initiating
 host/agent, participants, mode, monotonic cursor, and an append-only redacted
 event stream. The browser groups rooms by project and then by initiator so a
 Codex-started conversation cannot be confused with a Claude Code or Cursor
@@ -161,13 +169,15 @@ project and initiating host/agent; `chat open --chat-browser` starts or reuses
 one surface without opening duplicate tabs. See [`SUMMON_CONVERSATION_PLAN.md`](SUMMON_CONVERSATION_PLAN.md)
 for the event and continuation contract.
 
-Continuation resumes the same provider session only when provider/profile,
-model, prompt, permission, and owner evidence still match. Otherwise Summon
-creates an explicit fork and records why; it never silently opens a new chat or
-retries paid work. The first implementation is provider-inert and passes bounded
-cursor replay, reconnect-safe reads, grouping, redaction, and human-message tests.
-The larger two-project/three-initiator lifecycle fixture and any live continuation
-gate remain open work.
+Continuation resumes the same provider session only when provider/profile/account,
+model, prompt contract, permission, project, and agent-definition evidence still match.
+Otherwise Summon creates an explicit fork and records why; it never silently opens a new
+chat or retries paid work. Different participants may run in parallel, but each
+participant has one active turn and an unmatched start blocks the next turn. The larger
+two-project/three-initiator lifecycle fixture and provider-specific live evidence gates
+remain open work. Local OS-process cancellation now has birth-token fencing plus
+descendant cleanup coverage; cross-process takeover remains conservative when a native
+process handle cannot be transferred.
 
 Interactive council rounds may include independent positions, cross-examination,
 chair synthesis, and human messages between rounds. A council recommendation
@@ -220,10 +230,11 @@ Kimi, ACP secondary paths, retries, fallback, repair, and full-bypass authority 
 
 The current manifest work is deliberately provider-inert. The next step is to make a custom agent useful without weakening governance:
 
-- expose a documented workspace `.agents/agents/<slug>/agent.md` workflow;
+- expose a documented workspace `.agents/agents/<slug>/agent.md` workflow and the
+  provider-inert `summon agents validate` command;
 - resolve role/body/skills into a prompt contribution while keeping authority, model, transport, cwd, consent, and worktree fields receipt-bound;
 - show source, definition digest, and effective permission in local/native evidence while redacting bodies and paths from public views;
-- add migration/duplicate diagnostics and a `summon agents validate` command;
+- add migration/duplicate diagnostics around the validated manifest source;
 - add one fake provider end-to-end path before any live provider activation.
 
 This is where Antigravity-style custom agents become useful to Summon: a named role can be versioned, reviewed, and reused across hosts, while Summon remains the governance layer that decides what that role may actually do. A manifest is a role contract, not an authority grant.

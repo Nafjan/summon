@@ -70,8 +70,33 @@ def validate_run_id(run_id: str) -> str:
 def run_path(runs_root: str, run_id: str) -> str:
     """Containment-checked absolute path of a run dir under ``runs_root``."""
     validate_run_id(run_id)
-    root = Path(runs_root).resolve()
-    p = (root / run_id).resolve()
+    raw_root = Path(runs_root).expanduser()
+    # Inspect the supplied path before resolving it.  A junction or symlink
+    # would otherwise become an ordinary-looking directory and let callers
+    # redirect run journals, leases, and surface records outside the selected
+    # runs namespace.
+    for candidate in (raw_root, *raw_root.parents):
+        try:
+            attrs = getattr(candidate.stat(follow_symlinks=False), "st_file_attributes", 0)
+            if candidate.is_symlink() or bool(attrs & 0x400):
+                raise ValueError("runs root may not contain symlinks or junctions")
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError("runs root cannot be inspected") from exc
+    root = raw_root.resolve()
+    if root.exists() and not root.is_dir():
+        raise ValueError("runs root is not a directory")
+    raw_run = root / run_id
+    try:
+        attrs = getattr(raw_run.stat(follow_symlinks=False), "st_file_attributes", 0)
+        if raw_run.is_symlink() or bool(attrs & 0x400):
+            raise ValueError("run directory may not be a symlink or junction")
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise ValueError("run directory cannot be inspected") from exc
+    p = raw_run.resolve()
     if not p.is_relative_to(root):  # defense in depth; the regex already blocks separators
         raise ValueError(f"run id escapes the runs root: {run_id!r}")
     return str(p)

@@ -665,6 +665,16 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     perm = permission_flags(inv.cli, inv.permission)
     model_flag = ["--model", inv.model] if inv.model else []
     effort_flag = ["--effort", inv.effort] if inv.effort else []
+    # Claude Code loads user/project settings by default. Those settings may
+    # contain an unrelated ANTHROPIC_BASE_URL / ANTHROPIC_MODEL override (for
+    # example a BytePlus coding profile), which silently routes a default
+    # Summon Claude seat away from its declared first-party account. A named
+    # Summon profile is an explicit provider choice and keeps its own settings;
+    # the ambient/default profile is isolated.
+    setting_sources = [] if inv.profile_env is not None else ["--setting-sources", ""]
+    common = (perm + model_flag + effort_flag
+              + strip_boundary_flags(inv.cli, inv.extra_args)
+              + setting_sources)
 
     if inv.resume_id:
         # Resume: the session already carries the agent definition, so we don't
@@ -674,8 +684,7 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         command, base_args = build_command(inv.cli, _resume_prompt(inv))
         command = inv.profile_command or command
         return (command,
-                perm + model_flag + effort_flag
-                + strip_boundary_flags(inv.cli, inv.extra_args)
+                common
                 + ["--resume", inv.resume_id] + base_args,
                 inv.profile_env)
 
@@ -688,8 +697,7 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     command, base_args = build_command(inv.cli, inv.prompt)
     command = inv.profile_command or command
     return (command,
-            perm + model_flag + effort_flag
-            + strip_boundary_flags(inv.cli, inv.extra_args)
+            common
             + ["--append-system-prompt", system_prompt] + base_args,
             inv.profile_env)
 

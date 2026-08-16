@@ -1,8 +1,15 @@
 # Summon conversation rooms
 
-Status: provider-inert journal and authenticated loopback conversation atlas implemented;
-interactive provider continuation remains gated. This is not a claim that live provider
-chat is enabled.
+Status: durable local room journal, authenticated loopback atlas, and an explicit live
+agent-turn seam are implemented. The first safety/readability slice now also uses a
+cross-process cursor compare-and-swap before launch, emits bounded redacted human previews,
+and preserves the triggering prompt when identity drift creates a fork. Live turns are
+opt-in per room/participant and use the ordinary Summon dispatcher; they are not a new
+authority kernel. Council/deliberate control remains separate and model output is still
+context, never a ballot or approval. Cancellation now records a durable
+`turn_cancel_requested` command that a separate runtime can observe; owner leases,
+authenticated cursor streaming, and bounded reconnect are implemented. Directed
+agent-to-agent delivery and a durable swarm coordinator remain follow-up slices.
 
 Summon should have one conversation substrate shared by ordinary brainstorming,
 interactive councils, and governed deliberations. The substrate is a durable,
@@ -33,9 +40,36 @@ If any compatibility check fails, Summon creates an explicit fork and records
 the reason; it never silently starts a replacement conversation or retries paid
 work. A fork keeps the parent room and cursor visible.
 
-The first provider-inert slice must support continuation entirely from the local
-journal. Live provider resume remains behind the existing owner, deadline,
-cleanup, and provider gates.
+The room runtime writes `turn_started` durably before launching a provider subprocess,
+using the observed journal cursor as a compare-and-swap so a second process cannot claim
+the same turn after the scan. It then appends a bounded public-redacted `message_posted`
+and `turn_finished` record. Human messages retain native text only in the local journal
+and expose a bounded redacted preview in public/browser projections. If continuation
+identity drifts, the child fork carries the triggering prompt as a new human context event
+instead of dropping it.
+Each participant has one active turn at a time, while different participants may run in
+parallel in the same room. A compatible provider resume handle is reused only when
+provider/profile/account/model/prompt/permission/project/agent-definition evidence still
+matches. Any mismatch creates an explicit child fork and does not launch the provider. A
+crashed or killed process leaves an unmatched `turn_started` boundary; the next request
+refuses it rather than guessing whether the provider spent money. The browser keeps one
+runtime per surface and preserves independent active-participant state during refreshes,
+so cancellation remains available for the selected live turn. Browser/CLI chat turns
+are clamped to `read-only` by default; a caller may deliberately construct a runtime
+with a lower-risk explicit ceiling, but participant frontmatter can never widen it.
+The local runtime also fences process identity with a birth token; Windows uses a
+`KILL_ON_JOB_CLOSE` Job Object and POSIX uses a dedicated process group so a dispatcher
+that exits while a descendant still owns its pipes is reaped before `turn_finished`.
+On Windows, if the shared Job Object cannot be attached (for example, a host forbids
+nested jobs), the turn fails closed instead of claiming unconditional descendant
+cleanup. Cross-owner takeover still cannot transfer a native process handle, so the
+birth-token/taskkill path is conservative and remains a provider-specific GA gate.
+Every `.chat-runtime` lease component (root, session, and participant) is checked
+before and after creation; symlinks, junctions, and non-directory replacements are
+rejected so owner locks and process records cannot be redirected outside the room.
+Cross-process takeover cannot transfer a native process handle, so an expired-owner
+cleanup still requires a matching birth token and reports uncertainty rather than
+terminating an unverified PID.
 
 The first slice is available from the CLI:
 
@@ -43,15 +77,26 @@ The first slice is available from the CLI:
 summon chat open SESSION_ID --project-id PROJECT --project-root DIR \
   --initiator-host codex --initiator-agent sol
 summon chat post SESSION_ID --message "context for the room"
+summon chat turn SESSION_ID AGENT --message "ask the participant"
+summon chat cancel SESSION_ID AGENT
+summon chat recover SESSION_ID AGENT --chat-confirm
+summon chat fork SESSION_ID AGENT --message "continue this in a new lineage"
 summon chat show SESSION_ID
 summon chat list
 summon chat open SESSION_ID --conversation-dir DIR --chat-browser auto
 ```
 
 These commands use the local `.agents/conversations` journal (or
-`--conversation-dir`), expose only the public event projection, and make zero
-provider calls. The human message is context-only; it is never an approve,
-deny, cancel, or ballot command.
+`--conversation-dir`). `open`, `post`, `show`, and `list` make zero provider calls.
+`turn` is the explicit exception: it launches the named roster agent only after the
+durable start fence; `cancel` appends a durable typed command and targets the active
+worker when one is present, so another runtime can request cancellation without an
+in-memory handle. `recover` requires an explicit human attestation, closes an unmatched
+turn as indeterminate, and never retries; `fork` creates a new context lineage with no
+provider contact. The human message is context-only; it is never an approve, deny,
+cancel, or ballot command. CLI turns wait for the provider process to finish so the
+parent cannot exit before `turn_finished` is journaled; the browser keeps one runtime
+per surface for interactive cancellation.
 
 ## Modes
 
@@ -84,9 +129,19 @@ it does not create a receipt, cast a ballot, or contact a provider.
 The loopback conversation surface is available from `_conversation_ui.py` for a private
 conversation root. It groups rooms by full project-root digest and initiating host/agent,
 uses a bearer token in the URL fragment plus an authorization header for API requests,
-and supports only public-redacted room reads and typed human-context posts. It is a
-separate surface from the deliberation ledger and has no provider, ballot, or policy
-authority.
+and supports public-redacted room reads, bounded cursor `/events` reads, authenticated
+`/stream` SSE frames, typed human-context posts, and an explicit `turns`/`cancel`
+endpoint. The “Ask a roster agent” control shows participant role/name/
+version, records the durable turn lifecycle, and explains that output is context only.
+It is a separate surface from the deliberation ledger and has no ballot or policy
+authority. Start the atlas with `chat open ... --cwd PROJECT` when agent turns
+need to run against a project; a bare `--serve ROOT` invocation remains useful for
+observation but cannot safely bind rooms from multiple unknown project roots.
+The private surface handoff record stores SHA-256 digests for the requested `--cwd`
+and explicit `--agents-dir` (never their absolute paths). A live atlas is reused only
+when those bindings match; a legacy record without the digests is readable for an
+unbound observer, but a bound caller receives an explicit mismatch instead of
+silently attaching to another project's runtime.
 
 For a local preview, keep the conversation root private and run:
 
@@ -99,7 +154,11 @@ running; the fragment token is never sent to the server and must not be copied i
 prompt, ticket, report, or telemetry event. `summon chat open --chat-browser auto`
 now starts or reuses this atlas and prefers an explicit IDE bridge, then a built-in
 browser harness, then the system browser. Use `--chat-browser link` in CI/SSH to
-return the URL without launching a tab. The surface remains provider-inert.
+return the URL without launching a tab. Room reads and human posts remain
+provider-inert; the explicit Ask-a-roster-agent control is the only provider-backed
+exception and requires the surface's `--cwd`/roster binding. The surface close path
+durably cancels and joins locally owned turns before shutting down the HTTP server;
+cross-process cancellation remains bounded by the recorded owner/process lease.
 
 ### `deliberate`
 
@@ -113,7 +172,7 @@ synthesis cannot approve, deny, lower the denominator, or authorize a launch.
 The initial allowlist is:
 
 `session_created`, `message_posted`, `human_message`, `turn_started`,
-`turn_finished`, `council_round_started`, `position_submitted`, `cross_exam`,
+`turn_finished`, `turn_cancel_requested`, `council_round_started`, `position_submitted`, `cross_exam`,
 `chair_synthesis`, `deliberation_policy_bound`, `ballot_accepted`,
 `state_transition`, `cleanup_receipt`, and bounded `fork_created`.
 
@@ -128,23 +187,37 @@ existing durable command protocol and remain auditable.
 
 ## UI shape
 
-The browser room should provide:
+The browser room now uses a clean-room, Chatpack-informed messenger arrangement. Chatpack
+is inspiration only; Summon does not ship its Node packages, copy its source, or add a
+runtime dependency. The Python standard-library server, append-only journal, bearer
+fragment/header authentication, and public-redaction boundary remain authoritative.
 
-- a project/initiator conversation switcher;
-- a persistent room header with mode, owner/connection, cursor, and continuation
-  status;
-- grouped round cards for council and deliberate, with participant role/name/
-  version tooltips;
-- a human message composer with clear “context only” versus “typed command”
-  affordances;
-- a fork/continue action that explains compatibility evidence before proceeding;
-- progressive disclosure for evidence and raw technical details;
-- terminal closure showing decision, dissent, cleanup, and the redacted export
-  boundary.
+The atlas provides:
+
+- a searchable project → initiator → room rail with mode and cursor counts;
+- a persistent room header with connection, mode, cursor, and role/name/version
+  participant chips;
+- a grouped messenger timeline: operator context bubbles, agent context bubbles,
+  and compact lifecycle/evidence chips for council or deliberate records;
+- an explicit composer split between “Post context” and “Ask a roster agent”; context
+  is never a control command, while turns are durably fenced and visibly cancellable;
+- a redacted evidence drawer for root fingerprints, initiator, public cursor, and
+  authority boundaries; private prompts, paths, credentials, and native output never
+  enter the page;
+- incremental cursor rendering with duplicate suppression, gap refetch, reconnect,
+  and bounded polling fallback; an unread marker is held in memory only;
+- a responsive mobile rail and docked composer with keyboard focus, named controls,
+  reduced-motion behavior, and no forced autoscroll while the operator is reading;
+  the composer stays below the thread on phones so it never hides the latest event.
+
+Council and deliberate keep their authority distinction: council positions, cross-exams,
+and chair synthesis are context artifacts; deliberate policy, ballots, state transitions,
+and cleanup remain kernel receipts. The browser never infers a vote or approval from prose.
 
 ## Delivery gates
 
-1. Provider-inert session journal and strict event projection.
+1. Durable session journal, strict event projection, and the before/after-provider turn
+   fence with explicit continuation/fork behavior.
 2. Real loopback browser fixture with two projects and three initiators, cursor
    replay, reconnect, fork, human message, and redaction tests.
 3. Interactive council rounds and explicit human promotion into deliberate.

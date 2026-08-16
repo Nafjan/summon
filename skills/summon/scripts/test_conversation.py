@@ -44,6 +44,8 @@ class ConversationJournalTests(unittest.TestCase):
         event = room.append_human_message("do not leak SECRET_TOKEN", actor_id="human")
         self.assertEqual(event["event"], "human_message")
         self.assertNotIn("SECRET_TOKEN", json.dumps(event))
+        self.assertIn("do not leak", event["payload"]["preview"])
+        self.assertEqual(event["payload"]["preview"], event["payload"]["summary"])
         self.assertEqual(room.room.cursor, 2)
         reopened = ConversationJournal.open(self.root, "session-1")
         self.assertEqual(reopened.room.cursor, 2)
@@ -86,6 +88,18 @@ class ConversationJournalTests(unittest.TestCase):
         with self.assertRaises(ConversationError):
             deliberation.append("ballot_accepted", "agent", "fable",
                                 {"option_id": "yes"})
+
+    def test_duplicate_participant_ids_are_rejected_at_admission(self):
+        with self.assertRaises(ConversationError):
+            ConversationJournal.create(
+                self.root, session_id="duplicate-1", project_id="summon",
+                project_root=self.project, initiator_host="codex",
+                initiator_agent="sol", mode="chat",
+                participants=[
+                    {"agent": "worker", "role": "researcher", "name": "A", "version": "1"},
+                    {"agent": "worker", "role": "reviewer", "name": "B", "version": "1"},
+                ],
+            )
 
     def test_council_round_and_human_chime_are_context_only(self):
         room = self._room(mode="council")
@@ -148,6 +162,20 @@ class ConversationJournalTests(unittest.TestCase):
         )
         self.assertNotIn("private folder", json.dumps(artifact))
         self.assertNotIn("secret folder", json.dumps(artifact))
+
+    def test_generic_http_credentials_are_not_projected(self):
+        room = self._room()
+        message = (
+            "Authorization: Bearer abcdefghijklmnopQRSTUV0123456789 "
+            "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ== "
+            "Cookie: session=private-cookie-value"
+        )
+        event = room.append_human_message(message)
+        public = json.dumps(event)
+        self.assertNotIn("abcdefghijklmnopQRSTUV0123456789", public)
+        self.assertNotIn("QWxhZGRpbjpvcGVuIHNlc2FtZQ==", public)
+        self.assertNotIn("private-cookie-value", public)
+        self.assertIn("[redacted]", public)
 
     def test_after_cursor_is_bounded(self):
         room = self._room()
@@ -233,7 +261,7 @@ class ConversationJournalTests(unittest.TestCase):
                 initiator_agent="sol", participants=participants())
         self.assertEqual(len(consumed), 17)
 
-    def test_chat_open_browser_handoff_is_reused_and_provider_inert(self):
+    def test_chat_open_browser_handoff_is_reused_without_provider_contact(self):
         args = SimpleNamespace(
             chat_action="open", chat_session="browser-room",
             chat_project_id="summon", chat_project_root=str(self.project),
@@ -254,6 +282,20 @@ class ConversationJournalTests(unittest.TestCase):
         self.assertEqual(payload["browser"]["target"], "link")
         self.assertFalse(payload["browser"]["opened"])
 
+        # Existing-room browser handoff with the parser's default cwd must be
+        # a bounded result, not the old UnboundLocalError path.
+        args.cwd = None
+        with patch("_conversation_browser.ensure_surface",
+                   return_value={"url": "http://127.0.0.1:43123/#token=" + "a" * 48,
+                                 "reused": True, "pid": 123}), \
+             patch("_conversation_browser.open_url",
+                   return_value={"url": "http://127.0.0.1:43123/#token=" + "a" * 48,
+                                 "target": "link", "opened": False, "reused": True}):
+            from io import StringIO
+            with patch("sys.stdout", new_callable=StringIO) as output:
+                self.assertEqual(run_command(args), 0)
+            self.assertEqual(json.loads(output.getvalue())["status"], "opened")
+
 
 class ConversationPolicyTests(unittest.TestCase):
     def test_continuation_is_explicit_and_forks_on_identity_drift(self):
@@ -269,6 +311,12 @@ class ConversationPolicyTests(unittest.TestCase):
         decision = continuation_decision("session-1", common, changed)
         self.assertEqual(decision.action, "fork")
         self.assertIn("model_served_sha256", decision.reason)
+        newer_owner = dict(common)
+        newer_owner["owner_generation"] = 2
+        self.assertEqual(continuation_decision("session-1", common, newer_owner).action, "continue")
+        stale_owner = dict(common)
+        stale_owner["owner_generation"] = 0
+        self.assertEqual(continuation_decision("session-1", common, stale_owner).action, "fork")
         incomplete = dict(common)
         incomplete["account_evidence_sha256"] = None
         self.assertEqual(continuation_decision("session-1", common, incomplete).action, "fork")

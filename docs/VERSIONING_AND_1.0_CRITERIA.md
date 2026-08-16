@@ -1,8 +1,9 @@
 # Versioning, and what summon 1.0.0 means
 
-Status: **criteria met; 1.0.0 publication authorized on 2026-07-29.** This historical
-criteria document predates the current 3.0.0 GA release. Current line is 3.0.x;
-see `docs/VERSIONING_AND_3.0.md` for the active release contract.
+Status: **historical; criteria met and 1.0.0 publication authorized on 2026-07-29.**
+This document predates the current 3.0.0 public-preview baseline; it is not a 3.0 GA
+certification. Current line is 3.0.x; see `docs/VERSIONING_AND_3.0.md` for the active
+release contract.
 
 > This line drifted (it said 0.14.x through four minor releases). If you are editing
 > it, that is the eleventh instance of the defect this repo keeps hitting: a claim and

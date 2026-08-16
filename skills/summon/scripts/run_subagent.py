@@ -665,6 +665,29 @@ def main() -> None:
             print(report.get("text") or json.dumps(report, ensure_ascii=False, indent=2))
         sys.exit(0 if report.get("ok") else 1)
 
+    if getattr(args, "validate_agents", False):
+        # Custom-agent validation is deliberately provider-inert. It freezes
+        # workspace manifests and emits only the public identity/digest tuple;
+        # no roster entry is launched or resolved to an executable here.
+        try:
+            from _deliberation_agents import AgentManifestError, discover_agents
+            workspace = os.path.abspath(args.cwd or os.getcwd())
+            agents = discover_agents(workspace, args.agents_dir)
+            report = {
+                "status": "ok",
+                "workspace": os.path.basename(workspace),
+                "count": len(agents),
+                "agents": [agent.as_dict() for agent in agents.values()],
+                "provider_calls": 0,
+                "redaction": "public-agent-identity-only",
+            }
+            print(json.dumps(report, ensure_ascii=False,
+                             indent=None if args.json else 2))
+            sys.exit(0)
+        except (AgentManifestError, OSError, ValueError, TypeError) as exc:
+            _print_error(f"custom-agent validation refused ({type(exc).__name__})")
+            sys.exit(1)
+
     # Private role management is deliberately outside dispatch receipts: these commands
     # only validate/write the operator's global alias registry and never call a backend.
     if (getattr(args, "role_propose", None) or getattr(args, "role_approve", None)
@@ -698,10 +721,9 @@ def main() -> None:
     if args.jobs_list or args.jobs_status or args.jobs_wait:
         sys.exit(_background.run_jobs_query(args, _print_error))
 
-    # Conversation rooms are a provider-inert local context surface. They are
-    # deliberately routed before roster/backend validation: opening a room or
-    # posting a human message must never authenticate, launch, or mutate a
-    # council/deliberation ballot.
+    # Conversation rooms are a local context surface. Opening a room or
+    # posting human context is authority-inert; the explicit chat turn action
+    # is routed here too but owns its separate durable provider fence.
     if getattr(args, "chat_action", None):
         from _conversation import run_command as _run_conversation_command
         sys.exit(_run_conversation_command(args))

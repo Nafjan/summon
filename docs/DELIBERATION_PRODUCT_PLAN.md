@@ -813,16 +813,18 @@ following independent inputs:
 - Claude route requested Opus for the exact-plan pass but served
   `claude-haiku-4-5-20251001`; this is not valid Opus served-model evidence. The route
   still supplied useful per-run-type policy feedback, but no Opus approval is claimed;
-- Native Sol / GPT-5.6: uncertain paid work, fixed quorum denominator, cost honesty,
-  provenance taxonomy, and Beautiful UI licensing block;
-- GLM-5.2: deterministic scheduler, static provenance, bounded context, SSE, adapter
-  cleanup;
-- DeepSeek V4 Flash: replay tampering, context bombs, browser hijacking, and adapter
-  boundary injection;
-- Kimi K3: attempted but unavailable due provider quota; no approval claimed;
-- Fable: profile health was re-verified on 2026-08-13 through the separate
-  `fable-fallback` Claude Code login; this is a reachability smoke, not a claim that
-  every future run has the same quota or billing allowance.
+- Native review lane (the host did not expose a verifiable provider/model identity):
+  uncertain paid work, fixed quorum denominator, cost honesty, provenance taxonomy,
+  and Beautiful UI licensing block;
+- Additional adversarial review lanes: deterministic scheduler, static provenance,
+  bounded context, SSE, adapter cleanup, replay tampering, context bombs, browser
+  hijacking, and adapter-boundary injection;
+- Kimi lane: attempted but not evidenced in the current release packet; no approval
+  claimed;
+- Fable: a separate `fable-fallback` Claude Code profile has a historical reachability
+  smoke in the review record. That is not current served-model evidence, a quota
+  guarantee, or an architectural approval; the current release gate remains blocked
+  until a fresh, redacted receipt binds the exact profile and `model.served` value.
 
 The reviewed draft incorporated the concrete blockers: physical-attempt accounting;
 executor-owned control evidence; generation-fenced message material; controlled-path
@@ -830,9 +832,8 @@ cleanup plus stale-owner reaping; explicit decision options, ballot revisions, t
 fixed-denominator unresolved outcomes; additive envelope-v1 mapping; explicit permission
 and consent gates; live-session token versus stale-token-after-restart semantics; equal
 voting weights with seniority labels only; and a separate public reference client
-boundary. Kimi remains unavailable due quota; Fable's later profile smoke confirms
-reachability but is not an architectural approval. The final exact-draft Sol read-only
-review was CLEAN after the last revisions;
+boundary. No current Kimi or Fable live-provider approval is claimed from this document.
+The final exact-draft review was CLEAN after the last revisions;
 it confirmed the launch-token, snapshot-revalidation, quorum-rounding, permission,
 orphan, envelope, and integration-gate contracts. The implementation candidate still
 requires the phase gates and independent adversarial verification specified above.

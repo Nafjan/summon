@@ -53,6 +53,28 @@ class DeliberationCliTests(unittest.TestCase):
             _, missing = _cli.rewrite_subcommand(["deliberate", action])
             self.assertIn("needs a run id", missing)
 
+        for action, extra in (("recover", ["--chat-confirm"]),
+                              ("fork", ["--message", "new context", "--chat-reason", "manual"])):
+            rewritten, mode = _cli.rewrite_subcommand(
+                ["chat", action, "room-1", "worker", *extra])
+            self.assertIsNone(mode)
+            self.assertEqual(
+                rewritten,
+                ["--chat-action", action, "--chat-session", "room-1",
+                 "--chat-participant", "worker", *extra])
+
+    def test_chat_recovery_and_fork_flags_are_not_silently_dropped(self) -> None:
+        parser = _cli.build_parser("test", 1)
+        for argv in (
+            ["--chat-action", "recover", "--chat-session", "room-1",
+             "--chat-participant", "worker", "--chat-confirm"],
+            ["--chat-action", "fork", "--chat-session", "room-1",
+             "--chat-participant", "worker", "--chat-message", "next",
+             "--chat-reason", "manual"],
+        ):
+            args = parser.parse_args(argv)
+            self.assertIsNone(_cli.unsupported_mode_flags(argv, args))
+
     def test_operation_matrix_rejects_silent_flag_drops(self) -> None:
         parser = _cli.build_parser("test", 1)
         argv = ["--deliberate-status", "run-1", "--agent", "reviewer"]

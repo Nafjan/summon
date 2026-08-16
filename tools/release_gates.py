@@ -33,6 +33,24 @@ def _absolute_lexical(value: str | os.PathLike[str]) -> Path:
     return Path(os.path.abspath(os.fspath(value)))
 
 
+def _assert_external_path(path: Path, label: str) -> None:
+    """Reject evidence output inside the source checkout.
+
+    Release evidence is bound to a clean source tree.  Resolve existing
+    parents so a symlink/junction alias cannot bypass the containment check.
+    """
+    try:
+        root_real = ROOT.resolve(strict=False)
+        path_real = path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{label} path cannot be resolved safely") from exc
+    try:
+        path_real.relative_to(root_real)
+    except ValueError:
+        return
+    raise ValueError(f"{label} must be outside the release source tree")
+
+
 def _fsync_parent(path: Path) -> None:
     try:
         fd = os.open(str(path.parent), os.O_RDONLY)
@@ -342,26 +360,27 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         artifact_dir = None
+        output_path = None
         if args.output:
             output_path = _absolute_lexical(args.output)
+            _assert_external_path(output_path, "release evidence output")
             artifact_dir = output_path.with_name(output_path.stem + ".gates")
         evidence = build_evidence(args.timeout, require_clean=args.require_clean,
                                   artifact_dir=artifact_dir)
         encoded = json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-        if args.output:
-            output = _absolute_lexical(args.output)
-            if output.is_symlink():
+        if output_path is not None:
+            if output_path.is_symlink():
                 raise ValueError("refusing to replace a symlinked evidence output")
-            output.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp",
-                                             dir=str(output.parent))
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{output_path.name}.", suffix=".tmp",
+                                             dir=str(output_path.parent))
             try:
                 with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
                     fh.write(encoded)
                     fh.flush()
                     os.fsync(fh.fileno())
-                os.replace(tmp_name, output)
-                _fsync_parent(output)
+                os.replace(tmp_name, output_path)
+                _fsync_parent(output_path)
             finally:
                 try:
                     os.unlink(tmp_name)
