@@ -96,7 +96,8 @@ governed tier.
 - Recursive deliberations or arbitrary nested run graphs.
 - Model-rendered HTML, executable links, or model-controlled browser actions.
 - A replacement for the existing council mode.
-- Copying Beautiful UI source before authoritative licensing and provenance are proven.
+- Shipping third-party Beautiful UI source or assets without preserving the published MIT
+  notice and recording provenance.
 
 ## 3. Design invariants
 
@@ -569,13 +570,12 @@ Full P3 exit controls (for the later richer surface) are:
 - terminal event and lease-loss shutdown;
 - replay cursor based on durable sequence numbers.
 
-Beautiful UI is currently design inspiration only. The site presents useful primitives for
-chat, thinking, streaming, approval, tool chips, and task rows, but no authoritative
-license or source provenance was found during research. Do not copy or fetch its assets
-until the copyright owner provides a usable license and provenance. The Summon frontend
-will use a separately vetted, permissively licensed and independently branded component
-system. Beautiful UI remains inspiration only until its code and design provenance are
-cleared. The product remains dependency-free.
+Beautiful UI's published license page identifies the project as MIT-licensed. Summon uses
+that reference for visual research and adapts its compact workbench rhythm, card anatomy,
+and status language in an independently authored, dependency-free implementation. Summon
+does not vendor Beautiful UI source, assets, Node packages, or build output. If a future
+change reuses any third-party source or asset, the release must retain the MIT notice and
+record the exact upstream revision and provenance in the release packet.
 
 References:
 
@@ -613,7 +613,8 @@ Deliverables:
 - threat model covering model injection, local browser abuse, XSS, path traversal,
   process leaks, provider quota ambiguity, and journal corruption;
 - capability and model-evidence matrix for all supported backends;
-- Beautiful UI license/provenance request and a separate frontend licensing decision.
+- A recorded Beautiful UI MIT-license/provenance decision and a separate, independent
+  frontend implementation (no third-party runtime dependency).
 
 Exit gate: reviewers agree that no model output can affect control state and that every
 controlled terminal path has bounded cleanup behavior. Abrupt death is covered by a
@@ -801,7 +802,7 @@ Every phase requires targeted tests plus mutation checks.
 | Process or container leaks | High | Adapter cleanup contract and kill-tree tests | P1/P4 |
 | False quorum after failures | High | Fixed denominator and typed ballots | P2 |
 | Unverifiable model/tier evidence | Medium | declared/verified/observed separation | P2 |
-| Beautiful UI license ambiguity | High | No copying until written provenance/license | P0/P3 |
+| Third-party UI provenance drift | High | Keep the independent implementation; preserve MIT notice and pin any future reused source/asset | P0/P3 |
 | UI outlives run owner | Medium | Lease-aware shutdown, terminal event, and stale-token invalidation | P3/P4 |
 | Product surface diverges from runtime | Medium | Stable event/API contract and module-disable test | P5 |
 
