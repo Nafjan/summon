@@ -158,6 +158,147 @@ select { min-height: 44px; padding: 8px 10px; }
   .drawer-toggle { display: inline-flex; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; } }
+
+/* Beautiful UI-inspired workbench layer: compact cards, precise hairlines, and
+   component states that make the journal feel like a live instrument. This is
+   an independent stdlib implementation; no external UI package is loaded. */
+:root {
+  --ink: #0a0d11;
+  --rail: #0e1218;
+  --panel: #141a21;
+  --panel-2: #1a222c;
+  --panel-3: #202a35;
+  --line: #344252;
+  --line-soft: #222c37;
+  --text: #f3f7fa;
+  --muted: #b8c5cf;
+  --quiet: #91a1ad;
+  --blue: #6bcaff;
+  --blue-deep: #133447;
+  --lime: #b7f36b;
+  --lime-deep: #263b1b;
+  --amber: #ffd27e;
+  --amber-deep: #3b2b18;
+  --violet: #c7b1ff;
+  --violet-deep: #2b2340;
+  --coral: #ff9b8d;
+  --coral-deep: #3a1f24;
+  --focus: #e8f8ff;
+}
+body { background: var(--ink); color: var(--text); font-size: 14px; letter-spacing: -.008em; }
+.atlas { grid-template-columns: 272px minmax(0, 1fr) 312px; background: var(--ink); }
+.rail { padding: 24px 16px 28px; border-right-color: var(--line-soft); background: var(--rail); }
+.brand { align-items: center; gap: 10px; margin: 0 6px 29px; letter-spacing: .16em; }
+.brand-mark { width: 34px; height: 34px; border: 0; border-radius: 11px; background: var(--blue); color: var(--ink); box-shadow: 0 0 0 3px #6bcaff18; font-weight: 900; }
+.brand::after { content: "LOCAL WORKBENCH"; margin-left: auto; color: var(--quiet); font: 9px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; }
+.rail-heading { margin-bottom: 11px; }
+.rail-heading h2 { color: var(--text); font-size: 12px; letter-spacing: .01em; }
+.rail-heading span { color: var(--blue); font-size: 10px; }
+.search { min-height: 44px; margin-bottom: 18px; padding: 10px 12px; border-color: var(--line); border-radius: 10px; background: #0a0f14; }
+.search:focus-visible, textarea:focus-visible, select:focus-visible { border-color: var(--blue); outline-color: var(--blue); }
+.room-groups { gap: 22px; }
+.project-line { margin-bottom: 8px; color: var(--text); font-size: 11px; letter-spacing: .02em; }
+.project-line small { color: var(--blue); font-size: 9px; }
+.initiator-line { margin: 0 7px 5px; color: var(--quiet); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
+.room-button { min-height: 72px; margin: 4px 0; padding: 11px 12px 11px 14px; border-color: transparent; border-radius: 12px; }
+.room-button:hover, .room-button:focus-visible { border-color: var(--line); background: var(--panel); }
+.room-button.active { border-color: #39637b; background: var(--blue-deep); box-shadow: inset 0 0 0 1px #6bcaff16; }
+.room-button.active::before { width: 3px; top: 15px; bottom: 15px; background: var(--blue); }
+.room-name { font-size: 13px; }
+.room-detail { margin-top: 7px; gap: 8px; color: var(--quiet); font-size: 9px; }
+.mode-chip { min-height: 21px; border-color: #426c82; border-radius: 6px; color: var(--blue); font-size: 9px; letter-spacing: .1em; }
+.unread { width: 7px; height: 7px; background: var(--lime); box-shadow: 0 0 0 3px #b7f36b22; }
+.topbar { min-height: 88px; padding: 17px clamp(22px, 4vw, 54px); border-bottom-color: var(--line); background: #0a0d11f5; }
+.topbar::before { content: "ROOM / DURABLE JOURNAL"; position: absolute; top: 10px; left: clamp(22px, 4vw, 54px); color: var(--quiet); font: 9px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .16em; }
+.room-title { padding-top: 10px; }
+.room-title h1 { font-size: clamp(22px, 2.6vw, 34px); letter-spacing: -.045em; }
+.room-subtitle { margin-top: 8px; color: var(--muted); font-size: 12px; }
+.status { min-height: 34px; padding: 7px 11px; border-color: #4c6b59; border-radius: 9px; background: #16231b; color: var(--lime); font-size: 10px; letter-spacing: .03em; box-shadow: 0 0 0 3px #b7f36b0e; }
+.status::before { width: 7px; height: 7px; }
+.status.degraded { border-color: #735e34; background: #2a2117; color: var(--amber); }
+.status.blocked { border-color: #78464a; background: var(--coral-deep); color: var(--coral); }
+.status.offline { border-color: var(--line); background: var(--panel); color: var(--muted); }
+.thread-body { width: min(930px, 100%); padding: 25px clamp(22px, 4vw, 58px) 0; }
+.room-bar { padding: 0 0 18px; border-bottom-color: var(--line); }
+.room-bar-label strong { font-size: 14px; letter-spacing: -.01em; }
+.room-origin { margin-top: 5px; color: var(--blue); font-size: 9px; letter-spacing: .12em; }
+.facts { gap: 8px; color: var(--quiet); font-size: 9px; text-transform: uppercase; }
+.facts span { padding: 6px 8px; border: 1px solid var(--line-soft); border-radius: 7px; background: var(--panel); }
+.facts b { color: var(--text); margin-left: 3px; }
+.participants { gap: 7px; margin-top: 15px; }
+.participant { padding: 6px 9px; border-color: var(--line); border-radius: 8px; background: var(--panel); color: var(--text); font-size: 10px; }
+.participant::before { width: 7px; height: 7px; background: var(--lime); }
+.timeline { position: relative; gap: 17px; margin-top: 25px; }
+.timeline::before { content: ""; position: absolute; top: 4px; bottom: 4px; left: 17px; width: 1px; background: var(--line-soft); }
+.timeline > li { position: relative; z-index: 1; }
+.message { max-width: min(710px, 90%); }
+.message-head { margin: 0 10px 6px; color: var(--muted); font-size: 10px; }
+.message-head strong { font-size: 11px; }
+.message-head time { color: var(--quiet); font-size: 9px; }
+.bubble { padding: 14px 16px; border-color: #3a5668; border-radius: 14px 14px 14px 5px; background: var(--panel-2); box-shadow: 0 1px 0 #ffffff08; }
+.message.human .bubble { border-color: #8a6535; border-radius: 14px 14px 5px 14px; background: var(--amber-deep); color: #fff2d6; }
+.message-meta { margin-top: 7px; color: var(--quiet); font-size: 9px; }
+.system-event { width: min(710px, 100%); }
+.system-chip { min-height: 46px; padding: 9px 12px; border-color: var(--line); border-radius: 10px; background: var(--panel); box-shadow: 0 1px 0 #ffffff06; }
+.system-chip .event-mark { width: 23px; height: 23px; border-color: #5b7b8f; border-radius: 7px; color: var(--blue); font-size: 9px; }
+.system-chip strong { font-size: 12px; }
+.system-chip small { color: var(--muted); font-size: 9px; }
+.system-chip summary { color: var(--blue); font-size: 10px; }
+.system-event.round .system-chip { border-left: 3px solid var(--blue); background: #152633; }
+.system-event.position .system-chip { border-left: 3px solid var(--lime); background: #18251d; }
+.system-event.cross .system-chip { border-left: 3px solid var(--amber); background: #2a2118; }
+.system-event.synthesis .system-chip { border-left: 3px solid var(--violet); background: var(--violet-deep); }
+.system-event.turn .system-chip { border-left: 3px solid var(--blue); background: #152633; }
+.system-event.finish .system-chip { border-left: 3px solid var(--lime); background: #18251d; }
+.system-event.round .event-mark, .system-event.turn .event-mark { color: var(--blue); border-color: #5b7b8f; }
+.system-event.position .event-mark, .system-event.finish .event-mark { color: var(--lime); border-color: #6a8d5b; }
+.system-event.cross .event-mark { color: var(--amber); border-color: #957645; }
+.system-event.synthesis .event-mark { color: var(--violet); border-color: #8874ad; }
+.evidence { border-top-color: var(--line); color: var(--quiet); font-size: 9px; }
+.working { margin: 19px 0 0; }
+.working-row { padding: 10px 12px; border-color: #42647a; border-radius: 10px; background: var(--blue-deep); }
+.working-row button { min-height: 38px; border-color: var(--coral); border-radius: 8px; background: transparent; color: var(--coral); }
+.composer { position: relative; margin-top: 24px; padding: 15px 0 18px; border-top-color: var(--line); background: var(--ink); box-shadow: none; }
+.composer-tabs { gap: 7px; margin-bottom: 11px; }
+.tab { min-height: 44px; padding: 8px 12px; border-color: var(--line); border-radius: 9px; background: var(--panel); color: var(--muted); font-size: 11px; }
+.tab[aria-selected="true"] { border-color: var(--blue); background: var(--blue-deep); color: var(--text); }
+.tab.agent[aria-selected="true"] { border-color: var(--amber); background: var(--amber-deep); }
+textarea, select { border-color: var(--line); border-radius: 10px; background: #0d1319; }
+textarea { min-height: 88px; padding: 12px 13px; }
+select { min-height: 46px; }
+.primary { min-height: 46px; border: 0; border-radius: 9px; background: var(--blue); color: var(--ink); box-shadow: 0 5px 16px #6bcaff1c; }
+.primary.agent-action { background: var(--amber); }
+.primary:disabled { border: 1px solid var(--line); background: var(--panel-3); color: var(--quiet); box-shadow: none; }
+.composer-caption { margin-top: 8px; color: var(--muted); font-size: 10px; }
+.composer-caption span:last-child { color: var(--blue); font-size: 9px; }
+.composer-note { color: var(--amber); font-size: 11px; }
+.drawer { padding: 25px 18px; border-left-color: var(--line); background: var(--rail); }
+.drawer h2 { font-size: 14px; letter-spacing: -.01em; }
+.drawer-section { padding-bottom: 21px; margin-bottom: 21px; border-bottom-color: var(--line-soft); }
+.drawer-label { color: var(--blue); font-size: 9px; letter-spacing: .14em; }
+.boundary { padding: 14px; border-color: #876c3a; border-radius: 11px; background: var(--amber-deep); color: #fff0c8; font-size: 11px; box-shadow: inset 0 0 0 1px #ffd27e0e; }
+.boundary strong { color: var(--amber); font-size: 11px; }
+.fact-list { gap: 12px; }
+.fact-list dt { color: var(--quiet); font-size: 10px; }
+.fact-list dd { color: var(--text); font-size: 10px; }
+.drawer .muted { color: var(--muted); font-size: 11px; line-height: 1.6; }
+@media (max-width: 1120px) and (min-width: 761px) { .atlas { grid-template-columns: 250px minmax(0, 1fr); } }
+@media (max-width: 760px) {
+  .topbar { min-height: 78px; padding: 12px 16px; }
+  .topbar::before { top: 7px; left: 16px; font-size: 8px; }
+  .room-title { padding-top: 8px; }
+  .room-title h1 { font-size: 23px; }
+  .status { min-height: 32px; padding: 6px 8px; }
+  .thread-body { padding: 18px 16px 0; }
+  .room-bar { padding-bottom: 16px; }
+  .facts { margin-top: 12px; }
+  .facts span { padding: 6px 7px; }
+  .timeline { margin-top: 20px; }
+  .message { max-width: 95%; }
+  .composer { margin-top: 20px; padding-bottom: calc(18px + env(safe-area-inset-bottom)); }
+  .compose-grid { gap: 8px; }
+  .drawer { border-top-color: var(--line); }
+}
 """
 
 
@@ -170,10 +311,10 @@ _HTML = r'''<!doctype html>
 </head>
 <body>
 <!-- THESIS: A conversation is a chain of accountable handoffs, not a generic chat feed.
-OWN-WORLD: Carbon instrument surfaces, cyan live state, amber operator context, and evidence in the margins.
+OWN-WORLD: A Beautiful UI-inspired precision workbench: obsidian surfaces, electric blue live state, lime activity, amber operator context, and evidence in the margins.
 STORY: The operator sees who is speaking, what is durable, and what remains context versus authority.
 FIRST VIEWPORT: Rooms on the left, one grouped thread in the center, and its redacted evidence rail on the right.
-FORM: Operate / grounded structure 7; the messenger atlas is built around the journal cursor.
+FORM: Operate / precision-workbench messenger; compact component cards and a cursor spine make the journal feel alive without turning prose into authority.
 FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md -->
 <a class="skip" href="#composer">Skip to composer</a>
 <div class="atlas">
@@ -333,7 +474,8 @@ _JS = r'''(() => {
       const bubble = document.createElement('div'); bubble.className = 'bubble'; bubble.append(text(preview || 'Redacted event')); const meta = document.createElement('div'); meta.className = 'message-meta'; meta.append(text(event === 'human_message' ? String(payload.text_chars || 0) + ' chars · ' + shortHash(payload.text_sha256) : 'agent context · public redacted'));
       article.append(head, bubble, meta, detailFor(record)); return article;
     }
-    const item = document.createElement('li'); item.className = 'system-event'; const chip = document.createElement('div'); chip.className = 'system-chip'; const mark = document.createElement('span'); mark.className = 'event-mark'; mark.append(text(event === 'turn_started' ? 'RUN' : event === 'turn_finished' ? 'END' : event === 'fork_created' ? 'FORK' : 'LOG')); const copy = document.createElement('div'); const strong = document.createElement('strong'); strong.append(text(title(event))); const small = document.createElement('small'); const summary = preview || identityLabel(who, false) || 'journal event'; small.append(text(' · ' + summary)); copy.append(strong, small); chip.append(mark, copy, detailFor(record)); item.append(chip); return item;
+    const family = event === 'council_round_started' ? 'round' : event === 'position_submitted' ? 'position' : event === 'cross_exam' ? 'cross' : event === 'chair_synthesis' ? 'synthesis' : event === 'turn_started' ? 'turn' : event === 'turn_finished' ? 'finish' : 'default';
+    const item = document.createElement('li'); item.className = 'system-event ' + family; const chip = document.createElement('div'); chip.className = 'system-chip'; const mark = document.createElement('span'); mark.className = 'event-mark'; mark.append(text(event === 'turn_started' ? 'RUN' : event === 'turn_finished' ? 'END' : event === 'council_round_started' ? 'RND' : event === 'position_submitted' ? 'POS' : event === 'cross_exam' ? 'ASK' : event === 'chair_synthesis' ? 'SYN' : event === 'fork_created' ? 'FORK' : 'LOG')); const copy = document.createElement('div'); const strong = document.createElement('strong'); strong.append(text(title(event))); const small = document.createElement('small'); const summary = preview || identityLabel(who, false) || 'journal event'; small.append(text(' · ' + summary)); copy.append(strong, small); chip.append(mark, copy, detailFor(record)); item.append(chip); return item;
   }
   function renderTimeline() {
     const timeline = $('timeline'); timeline.replaceChildren();

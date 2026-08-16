@@ -223,7 +223,15 @@ class _ConversationHandler(BaseHTTPRequestHandler):
         if not self._client_slot:
             self.close_connection = True
             return
-        super().handle()
+        # Browsers routinely close an SSE connection while the handler is
+        # blocked in ``readline`` (tab switch, reconnect, or page teardown).
+        # Treat that as normal disconnect noise rather than emitting a server
+        # traceback that looks like a product failure.
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError,
+                TimeoutError, OSError):
+            self.close_connection = True
 
     def finish(self):
         try:

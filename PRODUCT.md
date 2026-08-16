@@ -75,9 +75,11 @@ slice.
 ## Brand Commitments
 
 The product name is Summon. The interface should feel precise, calm, trustworthy, and
-operational rather than like a generic chat client. Beautiful UI is an inspiration
-reference only; authoritative OSS/permissive licensing and provenance are not established
-for its source, so no source or copied component is part of this product.
+operational rather than like a generic chat client. [Beautiful UI's published license page](https://www.beautifului.dev/license)
+states an MIT license; Summon borrows its compact AI-workbench rhythm, card anatomy, and
+status language while keeping an independent, dependency-free implementation. No remote
+package, runtime, font, or copied component is loaded; if source code is ever copied, its
+MIT notice must be retained in the release notices.
 
 ## Evidence on Hand
 
