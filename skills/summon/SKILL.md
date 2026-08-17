@@ -473,7 +473,7 @@ run or recommending it to a user.
 | `--quorum` | With `--deliberate`; optional with `--council` | With `--council`, synthesize only if at least N members (2..member-count) succeeded; with `--deliberate`, fix an integer/all/fraction quorum in the receipt. Never infer or lower the denominator |
 | `--chairman-fallback AGENT` | No | With `--council`: a fallback synthesizer run once if the primary chairman ends non-success. Both outcomes appear in `synthesis.primary` / `synthesis.fallback` |
 | `--member-timeout` / `--chair-timeout` | No | With `--council`: per-stage timeouts for members and the chairman (same grammar as `--timeout`; each defaults to `--timeout`) |
-| `--chat-action {open,post,show,list,turn,cancel,recover,fork}` | - | Conversation-room action. `open|post|show|list` are local journal operations; `turn` and `cancel` are live-turn controls; `recover` and `fork` are no-provider recovery controls. The ergonomic subcommands are `summon chat open|post|show|list|turn|cancel|recover|fork`; this flag is the dispatcher form. |
+| `--chat-action {open,post,message,inbox,show,list,turn,cancel,recover,fork}` | - | Conversation-room action. `open|post|message|inbox|show|list` are local journal operations; `turn` and `cancel` are live-turn controls; `recover` and `fork` are no-provider recovery controls. The ergonomic subcommands are `summon chat open|post|message|inbox|show|list|turn|cancel|recover|fork`; this flag is the dispatcher form. |
 | `--chat-session SESSION_ID` | With `--chat-action` | Stable conversation-room id; the subcommand form accepts it positionally. |
 | `--chat-message TEXT` / `--message TEXT` | With `chat post` | Append a bounded human context message. It is never an approval, ballot, or provider instruction. |
 | `--chat-project-id ID` / `--project-id ID` | With `chat open` | Bounded project label for a new room. |
@@ -484,6 +484,8 @@ run or recommending it to a user.
 | `--conversation-dir DIR` | With `chat` | Private root for local conversation journals (default `{cwd}/.agents/conversations`). |
 | `--chat-browser {auto,builtin,ide,system,link}` | With `chat open` | Start/reuse the authenticated local atlas; `link` returns a URL without launching a browser. This never contacts a provider. |
 | `--chat-participant AGENT` / `--participant AGENT` | With `chat turn` or `chat cancel` | Select one roster participant for the live turn or cancellation. The participant identity, definition digest, permission, profile, and model evidence are frozen before launch. |
+| `--chat-to AGENT` / `--to AGENT` | With `chat message` | Address a provider-inert context message to one admitted participant (or `human`). It is durable and redacted in public projections; it cannot approve, vote, cancel, or launch work. |
+| `--chat-after CURSOR` / `--after CURSOR` | With `chat inbox` | Read only addressed messages after this durable journal cursor; native text is local CLI output and is never exposed by the browser/public projection. |
 | `--chat-participants A,B,…` / `--participants A,B,…` | With `chat open` | Seed the room with a bounded participant list for the browser roster picker; it does not launch anyone. |
 | `--chat-timeout DURATION` (or `--timeout` after `chat`) | With `chat turn` | Per-turn bounded child timeout. It is separate from the dispatch/jobs `--timeout`; the chat subcommand rewrites its alias safely. |
 | `--chat-confirm` | With `chat recover` | Required human attestation for closing an unmatched turn as indeterminate; never retries or asserts zero spend. |
