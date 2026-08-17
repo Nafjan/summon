@@ -6,10 +6,11 @@ Readiness: the immutable `3.0.0` tag remains the public-preview baseline. The cu
 working tree contains the authenticated chat/runtime, browser hardening, local swarm
 coordinator, and narrow fresh read-only deliberation lane described below. Focused suites
 are green, but this checkout is not a release candidate: the tree has local changes, the
-managed installs drift from the current source payload, no source-bound release evidence
-packet is present, and no accepted schema-2 live-provider receipt is available to the
-release checker. Publication therefore remains blocked until a clean immutable candidate
-is produced and independently evidenced.
+managed installs have been refreshed for the current candidate but still require final
+manifest verification, no source-bound release evidence packet is retained in the tree,
+and no accepted schema-2 live-provider receipt is available to the release checker.
+Publication therefore remains blocked until a clean immutable candidate is produced and
+independently evidenced.
 Additional provider receipts, remote execution, and multi-user hosting remain separately
 gated.
 
@@ -26,7 +27,7 @@ This is the release-facing roadmap for turning the current, well-tested kernel i
 | Live provider composition | Receipt/plan/owner/deadline fences exist, but the current checkout has no accepted schema-2 receipt bound to its source hash | Live-provider gate is blocked; no route is advertised as GA-ready |
 | Browser conversation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, visual evidence, and explicit cancellable roster-agent turns; richer multi-run lifecycle remains preview | Unreleased post-GA preview |
 | Local swarm coordinator | `_rundir`-backed owner/lease/claim journal, idempotent worker messages, claim-bound artifacts, cancellation, and explicit uncertain-spend recovery; no implicit provider or IDE attachment | Provider-neutral preview |
-| Managed local installs | The installer detects nine host profiles (eight managed records), but the current release check reports payload drift on all eight; the unmanaged Cursor plugin remains intentionally untouched | Not converged; refresh after the release candidate is finalized, then verify again from the immutable commit |
+| Managed local installs | The installer detects nine host profiles (eight managed records) and has refreshed all eight managed copies to the current candidate; the unmanaged Cursor plugin remains intentionally untouched | Convergence must be rechecked and bound to the final immutable release manifest |
 | Unmanaged Cursor local plugin | Older 2.2.0 content hash; not installer-owned | Update through its plugin mechanism only |
 
 Telemetry is enabled for this workstation through `~/.agents/summon-telemetry.json`. “On” means bounded, allow-listed local JSONL diagnostics only; it does not transmit data. GitHub issue submission remains a separate explicit action.
