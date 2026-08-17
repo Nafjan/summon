@@ -101,6 +101,7 @@ class ConversationRuntimeTests(unittest.TestCase):
                                                    "pid_start_token": "wrong-start"}))
             self.assertEqual(_record_process_state({"pid": child.pid,
                                                     "pid_start_token": None}), "unknown")
+            self.assertEqual(_record_process_state({"pid": child.pid}), "unknown")
         finally:
             child.terminate()
             child.wait(timeout=10)
@@ -275,6 +276,19 @@ class ConversationRuntimeTests(unittest.TestCase):
                 break
             __import__("time").sleep(0.05)
         self.assertEqual(len(finished), 2)
+
+    def test_participant_leases_do_not_regress_global_journal_generation(self):
+        with patch.dict(os.environ, {"FAKE_MARKER": str(self.marker)}):
+            runtime = self._runtime()
+            self.assertEqual(runtime.start_turn("room-1", "worker", "a1", wait=True)["status"], "success")
+            self.assertEqual(runtime.start_turn("room-1", "worker", "a2", wait=True)["status"], "success")
+            self.assertEqual(runtime.start_turn("room-1", "worker2", "b1", wait=True)["status"], "success")
+        events = ConversationJournal.open(self.root, "room-1").events(native=True)
+        generations = [event["generation"] for event in events]
+        self.assertEqual(generations, sorted(generations))
+        starts = [event for event in events if event["event"] == "turn_started"]
+        self.assertEqual([event["payload"]["participant"] for event in starts],
+                         ["worker", "worker", "worker2"])
 
     def test_definition_drift_creates_explicit_fork_without_provider_call(self):
         with patch.dict(os.environ, {"FAKE_MARKER": str(self.marker)}):

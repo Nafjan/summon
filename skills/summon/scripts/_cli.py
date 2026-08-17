@@ -148,6 +148,11 @@ MODE_FLAGS = {
               "chat_to", "chat_after",
               "conversation_dir", "agents_dir",
               "strict_agents_dir", "json", "cwd", "job_file"},
+    "swarm": {"swarm_action", "swarm_run_id", "swarm_dir", "swarm_tasks",
+               "swarm_project_root_sha256", "swarm_roster_sha256", "swarm_max_attempts",
+               "swarm_worker", "swarm_instance", "swarm_task_id", "swarm_request_sha256",
+               "swarm_lease_ms", "swarm_claim_id", "swarm_lease_generation",
+               "swarm_reason", "json", "job_file", "cwd"},
     # jobs read commands: registry query only.
     "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
     "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
@@ -291,7 +296,7 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 # discoverable command surface.
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
                "onboard", "manifest", "council", "deliberate", "agent", "jobs", "version",
-               "chat", "role", "telemetry", "bug-report", "help", "--help", "-h"}
+               "chat", "swarm", "role", "telemetry", "bug-report", "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -315,6 +320,13 @@ Commands:
   chat turn SESSION_ID AGENT --message "…"              run one resumable agent turn
   chat cancel SESSION_ID AGENT                           cancel that active turn
   chat show SESSION_ID | chat list                      inspect rooms
+  swarm create RUN_ID --swarm-tasks FILE               create a durable local coordinator
+  swarm status|events RUN_ID                            inspect coordinator state/events
+  swarm register RUN_ID WORKER INSTANCE                bind a worker to the run
+  swarm claim RUN_ID TASK_ID WORKER --request-sha256 H  claim one task lease
+  swarm renew RUN_ID CLAIM_ID WORKER --lease-generation N
+  swarm cancel RUN_ID TASK_ID                           queue typed cancellation
+  swarm close RUN_ID                                    close after terminal tasks
   agent new NAME [--set k=v …]                    scaffold an agent definition
   agent set NAME  --set k=v …                     retune an agent's frontmatter
   role propose ALIAS TARGET                        propose a private global role alias
@@ -350,6 +362,19 @@ Open a local room, add human context, or start one bounded roster-agent turn.
 The turn is durably started before provider launch; compatible provider sessions
 resume, while identity drift creates an explicit fork. Chat output is context only:
 it cannot approve, vote, launch, or change a deliberate run.
+""",
+    "swarm": """summon swarm create RUN_ID --swarm-tasks TASKS.json
+                     --swarm-project-root-sha256 HEX --swarm-roster-sha256 HEX
+summon swarm status|events RUN_ID
+summon swarm register RUN_ID WORKER INSTANCE
+summon swarm claim RUN_ID TASK_ID WORKER --request-sha256 HEX
+summon swarm renew RUN_ID CLAIM_ID WORKER --lease-generation N
+summon swarm cancel RUN_ID TASK_ID
+summon swarm close RUN_ID
+
+This is a local, provider-neutral coordinator. It durably fences claims,
+leases, cancellation, artifacts, and uncertain spend; it never launches a
+provider or attaches to an IDE-native swarm by itself.
 """,
     "agents": """summon agents validate [--cwd DIR] [--agents-dir DIR] [--json]
 
@@ -439,6 +464,34 @@ def rewrite_subcommand(argv: list) -> tuple:
             }[action]
             return [flag, rest[1], *rest[2:]], None
         return ["--deliberate", *rest], None
+    if head == "swarm":
+        if not rest:
+            return argv, "help:swarm"
+        action = rest[0]
+        if action not in ("create", "status", "events", "register", "claim", "renew", "cancel", "close"):
+            return argv, f"error: unknown 'swarm' action {action!r} (use create/status/events/register/claim/renew/cancel/close)"
+        if len(rest) < 2 or rest[1].startswith("-"):
+            return argv, f"error: 'swarm {action}' needs a run id"
+        translated = ["--swarm-action", action, "--swarm-run-id", rest[1]]
+        if action == "register":
+            if len(rest) < 4 or rest[2].startswith("-") or rest[3].startswith("-"):
+                return argv, "error: 'swarm register' needs worker and instance ids"
+            translated += ["--swarm-worker", rest[2], "--swarm-instance", rest[3], *rest[4:]]
+        elif action == "claim":
+            if len(rest) < 4 or rest[2].startswith("-") or rest[3].startswith("-"):
+                return argv, "error: 'swarm claim' needs task and worker ids"
+            translated += ["--swarm-task-id", rest[2], "--swarm-worker", rest[3], *rest[4:]]
+        elif action == "renew":
+            if len(rest) < 4 or rest[2].startswith("-") or rest[3].startswith("-"):
+                return argv, "error: 'swarm renew' needs claim and worker ids"
+            translated += ["--swarm-claim-id", rest[2], "--swarm-worker", rest[3], *rest[4:]]
+        elif action == "cancel":
+            if len(rest) < 3 or rest[2].startswith("-"):
+                return argv, "error: 'swarm cancel' needs a task id"
+            translated += ["--swarm-task-id", rest[2], *rest[3:]]
+        else:
+            translated += rest[2:]
+        return translated, None
     if head == "chat":
         if not rest:
             return argv, "help:chat"
@@ -792,6 +845,37 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--chat-browser", dest="chat_browser",
                         choices=("auto", "builtin", "ide", "system", "link"),
                         help="With chat open: reuse the local atlas in an IDE/browser, or return a link")
+    parser.add_argument("--swarm-action", dest="swarm_action",
+                        choices=("create", "status", "events", "register", "claim", "renew", "cancel", "close"),
+                        help="Local provider-neutral swarm coordinator action")
+    parser.add_argument("--swarm-run-id", dest="swarm_run_id", metavar="RUN_ID",
+                        help="Swarm coordinator run id")
+    parser.add_argument("--swarm-dir", dest="swarm_dir",
+                        help="Private root containing durable swarm runs")
+    parser.add_argument("--swarm-tasks", dest="swarm_tasks",
+                        help="JSON task array for swarm create")
+    parser.add_argument("--swarm-project-root-sha256", dest="swarm_project_root_sha256",
+                        help="Receipt-bound project root digest for swarm create")
+    parser.add_argument("--swarm-roster-sha256", dest="swarm_roster_sha256",
+                        help="Receipt-bound roster definition digest for swarm create")
+    parser.add_argument("--swarm-max-attempts", dest="swarm_max_attempts", type=int,
+                        help="Maximum physical attempts per swarm task")
+    parser.add_argument("--swarm-worker", dest="swarm_worker", metavar="WORKER",
+                        help="Authenticated swarm worker id")
+    parser.add_argument("--swarm-instance", dest="swarm_instance", metavar="INSTANCE",
+                        help="Worker instance id for swarm registration")
+    parser.add_argument("--swarm-task-id", dest="swarm_task_id", metavar="TASK_ID",
+                        help="Swarm task id")
+    parser.add_argument("--swarm-request-sha256", dest="swarm_request_sha256",
+                        help="Receipt-bound task request digest")
+    parser.add_argument("--swarm-lease-ms", dest="swarm_lease_ms", type=int,
+                        help="Swarm claim/renew lease duration in milliseconds")
+    parser.add_argument("--swarm-claim-id", dest="swarm_claim_id", metavar="CLAIM_ID",
+                        help="Swarm claim id")
+    parser.add_argument("--swarm-lease-generation", dest="swarm_lease_generation", type=int,
+                        help="Swarm claim lease generation")
+    parser.add_argument("--swarm-reason", dest="swarm_reason",
+                        help="Bounded reason for swarm cancellation")
     parser.add_argument("--browser", choices=("auto", "builtin", "ide", "system", "link"),
                         default="auto",
                         help="With --deliberate-open: built-in/IDE bridge, system browser, or link")

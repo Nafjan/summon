@@ -728,6 +728,13 @@ def main() -> None:
         from _conversation import run_command as _run_conversation_command
         sys.exit(_run_conversation_command(args))
 
+    # Swarm coordination is a local durable control plane. It validates and
+    # journals claims, leases, messages, artifacts, and cancellation, but it
+    # deliberately does not launch a provider or attach to an IDE-native swarm.
+    if getattr(args, "swarm_action", None):
+        from _swarm_coordinator import run_command as _run_swarm_command
+        sys.exit(_run_swarm_command(args))
+
     # Deliberation is a sibling run type, not an agent dispatch or a council
     # alias.  Route its management/launch surface before ordinary agent,
     # prompt, roster, and backend validation.  The storage handler is honest

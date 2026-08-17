@@ -89,6 +89,25 @@ class ConversationJournalTests(unittest.TestCase):
         self.assertEqual(reader.room.cursor, 2)
         self.assertEqual(len(reader.events()), 2)
 
+    def test_context_writers_follow_latest_owner_generation(self):
+        room = self._room()
+        room.append("message_posted", "agent", "sol",
+                    {"message_id": "m-generation", "summary": "turn", "turn_id": "t1"},
+                    generation=2)
+        human = room.append_human_message("context after takeover")
+        self.assertEqual(human["generation"], 2)
+        council = ConversationJournal.create(
+            self.root, session_id="council-1", project_id="summon",
+            project_root=self.project, initiator_host="codex", initiator_agent="sol",
+            mode="council", participants=[
+                {"agent": "sol", "role": "architect", "name": "Sol", "version": "5.6"},
+            ])
+        council.append("message_posted", "agent", "sol",
+                       {"message_id": "council-generation", "summary": "turn"}, generation=2)
+        round_events = council.append_council_round(
+            1, [{"participant": "sol", "role": "architect", "summary": "context"}])
+        self.assertTrue(all(event["generation"] == 2 for event in round_events))
+
     def test_cursor_conflict_and_event_id_are_idempotent(self):
         room = self._room()
         first = room.append("message_posted", "agent", "sol",

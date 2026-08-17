@@ -1,8 +1,9 @@
 # Summon swarm protocol
 
-Status: **contract-only preview**. This document and `_swarm_protocol.py` define
-the first versioned wire boundary; they do not claim that external IDE swarms
-are already attachable or that a durable coordinator has shipped.
+Status: **local coordinator shipped; external-adapter preview**. This document
+and `_swarm_protocol.py` define the versioned wire boundary, while
+`_swarm_coordinator.py` supplies a durable local owner/lease/claim journal. They
+do not claim that an external IDE-native swarm is already attachable.
 
 ## Why a separate protocol
 
@@ -65,15 +66,21 @@ within a major version, but state-changing fields must be explicitly versioned.
 
 ## Implementation gates
 
-The next implementation layers are deliberately staged:
+The implementation layers are deliberately staged:
 
-- fake/in-memory adapter conformance tests;
+- fake/in-memory adapter conformance tests; **passed** by the protocol and
+  coordinator suites;
 - a durable `_rundir`-backed coordinator with owner/lease/generation fences;
+  **shipped locally** with explicit uncertain-spend recovery, cancellation,
+  idempotent message IDs, and claim-bound artifacts;
 - manifest jobs bridged into coordinator claims without changing legacy CLI
   envelopes;
 - one local stdio adapter with process-tree cancellation;
 - host-specific IDE bridges, each with claim/renew/message/artifact/cancel/
   reconnect conformance tests.
 
-Until those gates pass, describe Summon as **batch fan-out plus council**, not
-as interoperable collaborative swarming.
+Until the adapter and process-tree gates pass, describe Summon as **batch
+fan-out plus a local durable coordinator**, not as interoperable collaborative
+swarming or native IDE session attachment. The coordinator is authority-safe:
+it never launches a provider, dereferences an artifact URI, or treats worker
+prose as approval.

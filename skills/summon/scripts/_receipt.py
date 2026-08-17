@@ -150,8 +150,15 @@ def git_head(cwd: str) -> str | None:
     Uses the shared ``subprocess`` module object so a test patching it is seen."""
     try:
         from _spawn import run_flags
+        # Git can take longer than the normal lightweight receipt budget on a
+        # Windows checkout under Defender/index contention.  A short timeout
+        # made the provenance field nondeterministically disappear in the broad
+        # discovery suite even though the same command was healthy in isolation.
+        # Keep POSIX tight, but give Windows a bounded retry window large enough
+        # to preserve the evidence instead of silently returning ``None``.
+        git_timeout = 6.0 if os.name == "nt" else 2.0
         r = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
-                           capture_output=True, text=True, timeout=2,
+                           capture_output=True, text=True, timeout=git_timeout,
                            stdin=subprocess.DEVNULL, **run_flags())
         head = (r.stdout or "").strip()
         return head if r.returncode == 0 and head else None

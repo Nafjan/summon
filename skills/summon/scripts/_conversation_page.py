@@ -299,6 +299,50 @@ select { min-height: 46px; }
   .compose-grid { gap: 8px; }
   .drawer { border-top-color: var(--line); }
 }
+
+/* Finish pass: make the atlas legible as an operator instrument, not a stream
+   of implementation details. These rules intentionally sit last so the
+   workbench tokens above remain the visual source of truth. */
+button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.rail-close { display: none; }
+.drawer-close { display: none; }
+.rail-backdrop { display: none; }
+.notice { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: min(930px, 100%); margin: 0 auto; padding: 10px clamp(22px, 4vw, 58px); border-bottom: 1px solid var(--line); background: var(--coral-deep); color: var(--coral); font-size: 12px; }
+.notice[hidden] { display: none; }
+.notice button { min-height: 44px; padding: 8px 11px; border: 1px solid currentColor; border-radius: 7px; background: transparent; color: inherit; font-size: 11px; }
+.timeline-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 24px 0 -7px; color: var(--muted); }
+.timeline-head strong { font-size: 12px; letter-spacing: .01em; }
+.timeline-head small { color: var(--quiet); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.latest { min-height: 44px; padding: 8px 10px; border: 1px solid var(--blue); border-radius: 7px; background: var(--blue-deep); color: var(--text); font-size: 11px; }
+.latest[hidden] { display: none; }
+.event-mark[aria-label] { cursor: help; }
+.system-chip summary, .message summary { display: inline-flex; align-items: center; min-height: 44px; padding: 6px 8px; }
+#run-cancel { min-height: 44px; padding: 8px 11px; border: 1px solid var(--coral); border-radius: 8px; background: transparent; color: var(--coral); font-size: 11px; }
+.room-title h1 { text-wrap: balance; }
+.room-subtitle .session-id { color: var(--quiet); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.room-intent { max-width: 62ch; margin-top: 6px; color: var(--muted); font-size: 12px; }
+.facts { flex-wrap: wrap; justify-content: flex-end; }
+.facts span[data-live="true"] { border-color: #42647a; color: var(--blue); }
+.working-summary { color: var(--lime); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.working-row button { min-height: 44px; padding: 8px 11px; }
+.skip { min-height: 44px; }
+.system-event.cancel .system-chip { border-left: 1px solid var(--coral); background: var(--coral-deep); }
+.system-event.cleanup .system-chip { border-left: 1px solid var(--lime); background: var(--lime-deep); }
+.system-event.context .system-chip { border-left: 1px solid var(--amber); background: var(--amber-deep); }
+@media (max-width: 760px) {
+  .rail { z-index: 11; overflow-y: auto; }
+  .rail-close { display: inline-flex; align-items: center; justify-content: center; float: right; min-width: 44px; min-height: 44px; margin: -8px 0 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); }
+  .drawer-close { display: inline-flex; align-items: center; justify-content: center; float: right; min-width: 44px; min-height: 44px; margin: -8px 0 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); }
+  .rail-backdrop { position: fixed; z-index: 10; inset: 0; display: block; background: #0009; }
+  .rail-backdrop[hidden] { display: none; }
+  .composer { position: relative; margin-left: -16px; margin-right: -16px; padding-left: 16px; padding-right: 16px; border-top-color: var(--line); }
+  .drawer { display: none; }
+  .drawer.open { position: fixed; z-index: 12; inset: auto 0 0; display: block; max-height: 78vh; overflow-y: auto; border-top: 1px solid var(--line); box-shadow: 0 -18px 36px #000b; }
+  .drawer-toggle { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); font-size: 11px; }
+  .notice { padding-left: 16px; padding-right: 16px; }
+  .timeline-head { margin-top: 18px; }
+  .latest { min-height: 44px; }
+}
 """
 
 
@@ -319,6 +363,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 <a class="skip" href="#composer">Skip to composer</a>
 <div class="atlas">
   <nav id="rail" class="rail" aria-label="Conversation rooms">
+    <button id="rail-close" class="rail-close" type="button" aria-label="Close conversation rooms">Close</button>
     <div class="brand"><span class="brand-mark" aria-hidden="true">S</span><span>SUMMON</span></div>
     <div class="rail-heading"><h2>Conversation atlas</h2><span id="room-count">0</span></div>
     <input id="room-search" class="search" type="search" autocomplete="off" placeholder="Filter rooms" aria-label="Filter rooms">
@@ -326,24 +371,26 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   </nav>
   <main class="thread" aria-labelledby="title">
     <header class="topbar">
-      <button id="rail-open" class="mobile-rail" type="button" aria-label="Open conversation rooms">Rooms</button>
-      <div class="room-title"><h1 id="title">Choose a conversation</h1><div id="room-subtitle" class="room-subtitle">Rooms are grouped by project and initiating agent.</div></div>
+      <button id="rail-open" class="mobile-rail" type="button" aria-label="Open conversation rooms" aria-controls="rail" aria-expanded="false">Rooms</button>
+      <div class="room-title"><h1 id="title">Choose a conversation</h1><div id="room-subtitle" class="room-subtitle">Rooms are grouped by project and initiating agent.</div><div id="room-intent" class="room-intent">Select a room to see its durable context and bounded work.</div></div>
       <div id="connection" class="status offline" role="status" aria-live="polite">Connecting</div>
     </header>
+    <div id="notice" class="notice" role="alert" hidden><span id="notice-text"></span><button id="notice-retry" type="button">Retry</button></div>
     <div class="thread-body">
-      <section class="room-bar" aria-label="Current conversation">
+        <section class="room-bar" aria-label="Current conversation">
         <div class="room-bar-label"><strong id="room-label">No room selected</strong><span id="room-origin" class="room-origin">LOCAL / REDACTED CONTEXT</span><div id="participants" class="participants"></div></div>
-        <div class="facts"><span>cursor <b id="cursor">—</b></span><span>mode <b id="mode">—</b></span></div>
+        <div class="facts"><span>cursor <b id="cursor">—</b></span><span>mode <b id="mode">—</b></span><span data-live="true">last sync <b id="updated">—</b></span><span><b id="working-count">0</b> working</span><button id="evidence-open" class="drawer-toggle" type="button" aria-controls="drawer" aria-expanded="false">Evidence</button></div>
       </section>
       <div id="working" class="working" aria-live="polite"></div>
+      <div class="timeline-head"><div><strong>Durable event stream</strong><small id="timeline-state"> waiting for a room</small></div><button id="latest" class="latest" type="button" hidden>Jump to latest</button></div>
       <ol id="timeline" class="timeline" role="log" aria-label="Conversation timeline" aria-live="off"><li class="timeline-empty">Select a room to inspect its bounded event stream.</li></ol>
       <section id="composer" class="composer" aria-labelledby="composer-title">
         <div class="composer-tabs" role="tablist" aria-label="Conversation action">
-          <button id="context-tab" class="tab" role="tab" aria-selected="true" type="button">Post context</button>
-          <button id="agent-tab" class="tab agent" role="tab" aria-selected="false" type="button">Ask a roster agent</button>
+          <button id="context-tab" class="tab" role="tab" aria-controls="composer-panel" aria-selected="true" tabindex="0" type="button">Post context</button>
+          <button id="agent-tab" class="tab agent" role="tab" aria-controls="composer-panel" aria-selected="false" tabindex="-1" type="button">Ask a roster agent</button>
         </div>
         <h2 id="composer-title" hidden>Conversation composer</h2>
-        <div class="compose-grid">
+        <div id="composer-panel" class="compose-grid" role="tabpanel" aria-labelledby="context-tab" tabindex="-1">
           <div>
             <select id="participant" aria-label="Conversation participant" hidden><option value="">Choose an agent</option></select>
             <textarea id="message" maxlength="12000" placeholder="Add context for this room…"></textarea>
@@ -355,12 +402,14 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       </section>
     </div>
   </main>
-  <aside class="drawer" aria-label="Conversation evidence">
-    <div class="drawer-section"><h2>Room evidence</h2><p class="drawer-label">public boundary</p><div class="boundary" data-authority="context + explicit turns"><strong>Context + explicit turns</strong>Human messages are context only. This surface cannot approve, vote, or change a deliberate run. An explicit roster-agent turn may launch one bounded provider process.</div></div>
+  <aside id="drawer" class="drawer" role="dialog" aria-modal="false" aria-labelledby="drawer-title" aria-label="Conversation evidence">
+    <button id="drawer-close" class="drawer-close" type="button" aria-label="Close evidence">Close</button>
+    <div class="drawer-section"><h2 id="drawer-title">Room evidence</h2><p class="drawer-label">public boundary</p><div class="boundary" data-authority="context + explicit turns"><strong>Context + explicit turns</strong>Human messages are context only. This surface cannot approve, vote, or change a deliberate run. An explicit roster-agent turn may launch one bounded provider process.</div></div>
     <div class="drawer-section"><p class="drawer-label">run facts</p><dl class="fact-list"><div><dt>Project</dt><dd id="fact-project">No room loaded</dd></div><div><dt>Root fingerprint</dt><dd id="fact-root">—</dd></div><div><dt>Initiator</dt><dd id="fact-initiator">—</dd></div><div><dt>Journal</dt><dd id="fact-journal">—</dd></div></dl></div>
     <div class="drawer-section"><p class="drawer-label">disclosure</p><p class="muted">Public redacted · local only. Private prompts, paths, credentials, native output, and provider controls stay outside this view.</p></div>
   </aside>
 </div>
+<div id="rail-backdrop" class="rail-backdrop" hidden></div>
 <div id="announce" class="visually-hidden" role="status" aria-live="polite"></div>
 <script nonce="__NONCE__">__JS__</script>
 </body>
@@ -372,8 +421,8 @@ _JS = r'''(() => {
   const headers = token ? {Authorization: 'Bearer ' + token} : {};
   const state = {
     selected: '', room: null, events: [], cursor: 0, rooms: {}, query: '', mode: 'context',
-    active: {}, streamAbort: null, streamRetry: null, refreshTimer: null, streamCursor: 0,
-    unread: {}, lastRoomIndex: ''
+    active: {}, streamAbort: null, streamRetry: null, refreshTimer: null, ageTimer: null, streamCursor: 0,
+    unread: {}, lastRoomIndex: '', drafts: {}, lastUpdated: null, railOpen: false, evidenceOpen: false
   };
   const $ = id => document.getElementById(id);
   const text = value => document.createTextNode(value == null ? '' : String(value));
@@ -383,6 +432,32 @@ _JS = r'''(() => {
   const shortHash = value => value ? String(value).slice(0, 12) + '…' : '—';
   function announce(value) { $('announce').replaceChildren(text(value || '')); }
   function setConnection(label, kind) { const node = $('connection'); node.className = 'status ' + (kind || 'offline'); node.replaceChildren(text(label)); }
+  function setNotice(message, retry = false) { const box = $('notice'); $('notice-text').replaceChildren(text(message || '')); box.hidden = !message; $('notice-retry').hidden = !retry; }
+  function setRailOpen(open) {
+    state.railOpen = Boolean(open);
+    if (state.railOpen && state.evidenceOpen) setEvidenceOpen(false, false);
+    $('rail').classList.toggle('open', state.railOpen);
+    $('rail-backdrop').hidden = !(state.railOpen || state.evidenceOpen);
+    $('rail-open').setAttribute('aria-expanded', state.railOpen ? 'true' : 'false');
+    if (state.railOpen) $('rail-close').focus();
+    else if (window.matchMedia('(max-width: 760px)').matches) $('rail-open').focus();
+  }
+  function setEvidenceOpen(open, restoreFocus = true) {
+    const mobile = window.matchMedia('(max-width: 760px)').matches;
+    state.evidenceOpen = mobile && Boolean(open);
+    const drawer = $('drawer'); drawer.classList.toggle('open', state.evidenceOpen);
+    $('evidence-open').setAttribute('aria-expanded', state.evidenceOpen ? 'true' : 'false');
+    $('drawer').setAttribute('aria-modal', state.evidenceOpen ? 'true' : 'false');
+    $('drawer').setAttribute('aria-hidden', mobile && !state.evidenceOpen ? 'true' : 'false');
+    $('rail-backdrop').hidden = !(state.railOpen || state.evidenceOpen);
+    if (state.evidenceOpen) $('drawer-close').focus();
+    else if (restoreFocus) $('evidence-open').focus();
+  }
+  function saveDraft() { if (state.selected) state.drafts[state.selected] = $('message').value; }
+  function loadDraft() { $('message').value = state.drafts[state.selected] || ''; $('counter').replaceChildren(text(String($('message').value.length) + ' / 12000')); }
+  function markUpdated() { state.lastUpdated = Date.now(); $('updated').replaceChildren(text('now')); }
+  function relativeAge() { if (!state.lastUpdated) return 'waiting for a room'; const seconds = Math.max(0, Math.floor((Date.now() - state.lastUpdated) / 1000)); return seconds < 5 ? ' just now' : ' ' + seconds + 's ago'; }
+  function updateAge() { if (!state.room || !state.lastUpdated) return; $('updated').replaceChildren(text(relativeAge().trim())); $('timeline-state').replaceChildren(text(' · cursor ' + String(state.cursor || 0) + relativeAge())); }
   async function getJSON(url, options = {}) {
     const requestHeaders = Object.assign({}, headers, options.headers || {});
     const response = await fetch(url, Object.assign({}, options, {headers: requestHeaders, cache: 'no-store'}));
@@ -399,9 +474,9 @@ _JS = r'''(() => {
     const item = identity(participant);
     return [item.role, item.name, includeVersion ? item.version : ''].filter(Boolean).join(' · ');
   }
-  function roomEntries() {
+  function roomEntries(groups = state.rooms) {
     const result = [];
-    Object.values(state.rooms || {}).forEach(initiators => Object.values(initiators || {}).forEach(entries => (entries || []).forEach(room => result.push(room))));
+    Object.values(groups || {}).forEach(initiators => Object.values(initiators || {}).forEach(entries => (entries || []).forEach(room => result.push(room))));
     return result;
   }
   function filteredRoom(room) {
@@ -424,12 +499,12 @@ _JS = r'''(() => {
         (rooms || []).filter(filteredRoom).forEach(room => {
           count += 1; if (!first) first = room.session_id;
           const who = document.createElement('div'); who.className = 'initiator-line'; who.append(text(initiator)); group.append(who);
-          const button = document.createElement('button'); button.type = 'button'; button.className = 'room-button' + (room.session_id === state.selected ? ' active' : ''); button.dataset.session = room.session_id;
+          const button = document.createElement('button'); button.type = 'button'; button.className = 'room-button' + (room.session_id === state.selected ? ' active' : ''); button.dataset.session = room.session_id; if (room.session_id === state.selected) button.setAttribute('aria-current', 'page');
           const name = document.createElement('span'); name.className = 'room-name'; name.append(text(room.session_id));
           const detail = document.createElement('span'); detail.className = 'room-detail'; const chip = document.createElement('span'); chip.className = 'mode-chip'; chip.append(text(modeLabel(room.mode))); detail.append(chip);
           const countText = document.createElement('span'); countText.append(text(String(room.cursor || 0) + ' events')); detail.append(countText);
           if (state.unread[room.session_id] && room.session_id !== state.selected) { const dot = document.createElement('span'); dot.className = 'unread'; dot.title = 'New events'; detail.append(dot); }
-          button.append(name, detail); button.addEventListener('click', () => select(room.session_id)); group.append(button);
+          button.setAttribute('aria-label', String(room.session_id) + ' · ' + modeLabel(room.mode) + ' · ' + String(room.cursor || 0) + ' events' + (state.unread[room.session_id] && room.session_id !== state.selected ? ' · unread events' : '')); button.append(name, detail); button.addEventListener('click', () => select(room.session_id)); group.append(button);
         });
       });
       list.append(group);
@@ -440,11 +515,16 @@ _JS = r'''(() => {
   }
   function updateHeader() {
     const room = state.room || {};
-    $('title').replaceChildren(text(room.session_id || 'Choose a conversation'));
+    const intent = room.subject || room.title || (room.project_id ? String(room.project_id) + ' · ' + modeLabel(room.mode) : 'Choose a conversation');
+    $('title').replaceChildren(text(intent));
     $('room-label').replaceChildren(text(room.project_id ? room.project_id + ' / ' + room.session_id : 'No room selected'));
-    $('room-subtitle').replaceChildren(text(room.session_id ? String(room.initiator_host || 'host') + ' · ' + String(room.initiator_agent || 'agent') : 'Rooms are grouped by project and initiating agent.'));
+    $('room-subtitle').replaceChildren();
+    if (room.session_id) { const session = document.createElement('span'); session.className = 'session-id'; session.append(text(String(room.session_id) + ' · ' + String(room.initiator_host || 'host') + ' / ' + String(room.initiator_agent || 'agent'))); $('room-subtitle').append(session); }
+    else $('room-subtitle').append(text('Rooms are grouped by project and initiating agent.'));
+    $('room-intent').replaceChildren(text(room.session_id ? 'Durable context and bounded turns · model output remains context, never control.' : 'Select a room to see its durable context and bounded work.'));
     $('cursor').replaceChildren(text(room.session_id ? String(state.cursor || 0) : '—'));
     $('mode').replaceChildren(text(room.session_id ? modeLabel(room.mode) : '—'));
+    $('timeline-state').replaceChildren(text(room.session_id ? ' · cursor ' + String(state.cursor || 0) + relativeAge() : ' waiting for a room'));
     $('fact-project').replaceChildren(text(room.project_id || 'No room loaded'));
     $('fact-root').replaceChildren(text(shortHash(room.project_root_sha256)));
     $('fact-initiator').replaceChildren(text(room.session_id ? String(room.initiator_host || 'host') + ' / ' + String(room.initiator_agent || 'agent') : '—'));
@@ -455,6 +535,10 @@ _JS = r'''(() => {
   function payloadPreview(record) {
     const payload = record && record.payload || {};
     return payload.preview || payload.summary || (payload.text_chars ? 'Human context · ' + String(payload.text_chars) + ' chars' : '');
+  }
+  function eventLabel(value) {
+    const labels = {session_created: 'Conversation opened', council_round_started: 'Council round started', position_submitted: 'Position recorded', cross_exam: 'Cross-examination', chair_synthesis: 'Chair synthesis', turn_started: 'Bounded turn started', turn_finished: 'Bounded turn finished', fork_created: 'Conversation forked', message_posted: 'Context note', turn_cancel_requested: 'Turn cancellation requested', cleanup_receipt: 'Cleanup receipt'};
+    return labels[String(value || '')] || title(value);
   }
   function detailFor(record) {
     const details = document.createElement('details'); const summary = document.createElement('summary'); summary.append(text('Evidence · cursor ' + String(record.cursor || '—'))); details.append(summary);
@@ -468,14 +552,15 @@ _JS = r'''(() => {
   }
   function renderEvent(record) {
     const event = String(record.event || 'event'); const payload = record.payload || {}; const who = eventIdentity(record); const preview = payloadPreview(record);
-    if (event === 'human_message' || event === 'message_posted' || event === 'agent_message') {
+    const agentPost = event === 'agent_message' || (event === 'message_posted' && Boolean(payload.sender || payload.recipient || payload.participant));
+    if (event === 'human_message' || agentPost) {
       const article = document.createElement('li'); article.className = 'message ' + (event === 'human_message' ? 'human' : 'agent');
-      const head = document.createElement('div'); head.className = 'message-head'; const strong = document.createElement('strong'); const heading = event === 'human_message' ? 'Operator context' : event === 'agent_message' ? identityLabel(payload.sender || who) : identityLabel(who); strong.append(text(heading)); const time = document.createElement('time'); time.append(text('cursor ' + String(record.cursor || '—'))); head.append(strong, time);
-      const bubble = document.createElement('div'); bubble.className = 'bubble'; bubble.append(text(preview || 'Redacted event')); const meta = document.createElement('div'); meta.className = 'message-meta'; meta.append(text(event === 'human_message' ? String(payload.text_chars || 0) + ' chars · ' + shortHash(payload.text_sha256) : event === 'agent_message' ? identityLabel(payload.sender || who, false) + ' → ' + identityLabel(payload.recipient || 'human', false) + ' · context only' : 'agent context · public redacted'));
+      const head = document.createElement('div'); head.className = 'message-head'; const strong = document.createElement('strong'); const heading = event === 'human_message' ? 'Operator context' : identityLabel(payload.sender || who); strong.append(text(heading)); const time = document.createElement('time'); time.append(text('cursor ' + String(record.cursor || '—'))); head.append(strong, time);
+      const bubble = document.createElement('div'); bubble.className = 'bubble'; bubble.append(text(preview || 'Redacted event')); const meta = document.createElement('div'); meta.className = 'message-meta'; meta.append(text(event === 'human_message' ? String(payload.text_chars || 0) + ' chars · ' + shortHash(payload.text_sha256) : identityLabel(payload.sender || who, false) + ' → ' + identityLabel(payload.recipient || 'human', false) + ' · context only'));
       article.append(head, bubble, meta, detailFor(record)); return article;
     }
-    const family = event === 'council_round_started' ? 'round' : event === 'position_submitted' ? 'position' : event === 'cross_exam' ? 'cross' : event === 'chair_synthesis' ? 'synthesis' : event === 'turn_started' ? 'turn' : event === 'turn_finished' ? 'finish' : 'default';
-    const item = document.createElement('li'); item.className = 'system-event ' + family; const chip = document.createElement('div'); chip.className = 'system-chip'; const mark = document.createElement('span'); mark.className = 'event-mark'; mark.append(text(event === 'turn_started' ? 'RUN' : event === 'turn_finished' ? 'END' : event === 'council_round_started' ? 'RND' : event === 'position_submitted' ? 'POS' : event === 'cross_exam' ? 'ASK' : event === 'chair_synthesis' ? 'SYN' : event === 'fork_created' ? 'FORK' : 'LOG')); const copy = document.createElement('div'); const strong = document.createElement('strong'); strong.append(text(title(event))); const small = document.createElement('small'); const summary = preview || identityLabel(who, false) || 'journal event'; small.append(text(' · ' + summary)); copy.append(strong, small); chip.append(mark, copy, detailFor(record)); item.append(chip); return item;
+    const family = event === 'council_round_started' ? 'round' : event === 'position_submitted' ? 'position' : event === 'cross_exam' ? 'cross' : event === 'chair_synthesis' ? 'synthesis' : event === 'turn_started' ? 'turn' : event === 'turn_finished' ? 'finish' : event === 'turn_cancel_requested' ? 'cancel' : event === 'cleanup_receipt' ? 'cleanup' : event === 'message_posted' ? 'context' : 'default';
+    const item = document.createElement('li'); item.className = 'system-event ' + family; const chip = document.createElement('div'); chip.className = 'system-chip'; const mark = document.createElement('span'); mark.className = 'event-mark'; const short = event === 'turn_started' ? 'RUN' : event === 'turn_finished' ? 'END' : event === 'turn_cancel_requested' ? 'STOP' : event === 'cleanup_receipt' ? 'CLEAN' : event === 'message_posted' ? 'NOTE' : event === 'council_round_started' ? 'RND' : event === 'position_submitted' ? 'POS' : event === 'cross_exam' ? 'ASK' : event === 'chair_synthesis' ? 'SYN' : event === 'fork_created' ? 'FORK' : 'LOG'; mark.setAttribute('aria-label', eventLabel(event)); mark.title = eventLabel(event); mark.append(text(short)); const copy = document.createElement('div'); const strong = document.createElement('strong'); strong.append(text(eventLabel(event))); const small = document.createElement('small'); const summary = preview || identityLabel(who, false) || 'public journal event'; small.append(text(' · ' + summary)); copy.append(strong, small); chip.append(mark, copy, detailFor(record)); item.append(chip); return item;
   }
   function renderTimeline() {
     const timeline = $('timeline'); timeline.replaceChildren();
@@ -487,24 +572,25 @@ _JS = r'''(() => {
     state.events.forEach(record => { const payload = record.payload || {}; const participant = payload.participant; if (!participant) return; const activeKey = key(state.selected, participant); if (record.event === 'turn_started') state.active[activeKey] = {participant: String(participant), turn_id: payload.turn_id || null}; if (record.event === 'turn_finished') delete state.active[activeKey]; });
   }
   function renderWorking() {
-    const box = $('working'); box.replaceChildren(); const active = Object.values(state.active);
+    const box = $('working'); box.replaceChildren(); const active = Object.values(state.active); $('working-count').replaceChildren(text(String(active.length)));
+    $('working-count').parentElement.dataset.live = active.length ? 'true' : 'false';
     active.forEach(item => { const row = document.createElement('div'); row.className = 'working-row'; const label = document.createElement('span'); const strong = document.createElement('strong'); strong.append(text(identityLabel(item.participant))); label.append(strong, text(' is working · durable turn in progress')); const cancel = document.createElement('button'); cancel.type = 'button'; cancel.append(text('Cancel turn')); cancel.addEventListener('click', () => cancelTurn(item.participant)); row.append(label, cancel); box.append(row); });
   }
   function renderRoom(data) {
-    state.room = data.room || {}; state.events = Array.isArray(data.events) ? data.events.slice() : []; state.cursor = Number(data.cursor || state.events.length || 0); state.streamCursor = state.cursor; state.unread[state.selected] = false; rebuildActive(); updateHeader();
+    state.room = data.room || {}; state.events = Array.isArray(data.events) ? data.events.slice() : []; state.cursor = Number(data.cursor || state.events.length || 0); state.streamCursor = state.cursor; state.unread[state.selected] = false; $('latest').hidden = true; markUpdated(); rebuildActive(); updateHeader(); loadDraft();
     const chooser = $('participant'); chooser.replaceChildren(); const emptyOption = document.createElement('option'); emptyOption.value = ''; emptyOption.append(text('Choose an agent')); chooser.append(emptyOption);
     (Array.isArray(state.room.participants) ? state.room.participants : []).forEach(item => { const option = document.createElement('option'); option.value = String(item.agent || ''); option.title = identityLabel(item.agent); option.append(text(identityLabel(item.agent))); chooser.append(option); });
-    renderTimeline(); renderWorking(); updateComposer(); announce('Opened conversation ' + String(state.room.session_id || ''));
+    renderTimeline(); renderWorking(); updateComposer(); setNotice(''); announce('Opened conversation ' + String(state.room.session_id || ''));
   }
   function appendRecord(record) {
     const cursor = Number(record && record.cursor); if (!Number.isSafeInteger(cursor)) return 'gap';
     if (cursor <= state.cursor) return 'duplicate';
     if (cursor !== state.cursor + 1) return 'gap';
-    state.events.push(record); state.cursor = cursor; state.streamCursor = cursor; rebuildActive(); updateHeader(); renderWorking();
-    const timeline = $('timeline'); if (timeline.firstElementChild && timeline.firstElementChild.classList.contains('timeline-empty')) timeline.replaceChildren(); timeline.append(renderEvent(record)); announce('New journal event ' + String(cursor)); return 'appended';
+    state.events.push(record); state.cursor = cursor; state.streamCursor = cursor; markUpdated(); rebuildActive(); updateHeader(); renderWorking();
+    const timeline = $('timeline'); if (timeline.firstElementChild && timeline.firstElementChild.classList.contains('timeline-empty')) timeline.replaceChildren(); timeline.append(renderEvent(record)); const nearBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 180; $('latest').hidden = nearBottom; announce('New journal event ' + eventLabel(record.event) + ', cursor ' + String(cursor)); return 'appended';
   }
   function updateComposer() {
-    const hasRoom = Boolean(state.selected); const context = state.mode === 'context'; $('context-tab').setAttribute('aria-selected', context ? 'true' : 'false'); $('agent-tab').setAttribute('aria-selected', context ? 'false' : 'true'); $('participant').hidden = context; $('participant').disabled = !hasRoom; $('send').hidden = false; $('send').disabled = !hasRoom || !$('message').value.trim() || (!context && !$('participant').value); $('run-cancel').hidden = context; $('run-cancel').disabled = context || !hasRoom || !Object.keys(state.active).length; $('message').placeholder = context ? 'Add context for this room…' : 'Send a message to this participant…'; $('caption').replaceChildren(text(context ? 'Saved as a human context event; never a control command.' : 'Each turn is durably recorded; output is context, not approval. Identity drift creates a visible fork.')); $('send').classList.toggle('agent-action', !context); $('send').replaceChildren(text(context ? 'Post context' : 'Start turn')); }
+    const hasRoom = Boolean(state.selected); const context = state.mode === 'context'; const participant = $('participant').value; const target = participant ? identityLabel(participant) : 'Choose a roster agent'; $('context-tab').setAttribute('aria-selected', context ? 'true' : 'false'); $('context-tab').setAttribute('tabindex', context ? '0' : '-1'); $('agent-tab').setAttribute('aria-selected', context ? 'false' : 'true'); $('agent-tab').setAttribute('tabindex', context ? '-1' : '0'); $('composer-panel').setAttribute('aria-labelledby', context ? 'context-tab' : 'agent-tab'); $('participant').hidden = context; $('participant').disabled = !hasRoom; $('send').hidden = false; $('send').disabled = !hasRoom || !$('message').value.trim() || (!context && !$('participant').value); $('run-cancel').hidden = context; $('run-cancel').disabled = context || !hasRoom || !Object.keys(state.active).length; $('message').placeholder = context ? 'Add context for this room…' : 'Send a message to this participant…'; $('caption').replaceChildren(text(context ? 'Saved as a human context event; never a control command.' : 'Bounded provider launch · ' + target + ' · output is context, not approval. Identity drift creates a visible fork.')); $('send').classList.toggle('agent-action', !context); $('send').replaceChildren(text(context ? 'Post context' : 'Start bounded turn')); }
   function stopStream() { if (state.streamAbort) { state.streamAbort.abort(); state.streamAbort = null; } if (state.streamRetry) { clearTimeout(state.streamRetry); state.streamRetry = null; } }
   async function syncRoom() { if (!state.selected) return; const room = await getJSON('/api/v1/rooms/' + encodeURIComponent(state.selected)); renderRoom(room); }
   async function watch(session, after) {
@@ -519,18 +605,21 @@ _JS = r'''(() => {
       }
       if (state.selected === session && !controller.signal.aborted) throw new Error('stream ended');
     } catch (error) {
-      if (controller.signal.aborted) return; setConnection('Live updates paused', 'degraded'); $('note').replaceChildren(text('Live updates paused; retrying safely.')); state.streamRetry = setTimeout(() => { if (state.selected === session) watch(session, state.cursor); }, 900);
+      if (controller.signal.aborted) return; setConnection('Live updates paused', 'degraded'); setNotice('Live updates paused; retrying safely. Resuming from cursor ' + String(state.cursor) + '.', true); $('note').replaceChildren(text('The journal stream paused; the last durable cursor is preserved.')); state.streamRetry = setTimeout(() => { if (state.selected === session) watch(session, state.cursor); }, 900);
     }
   }
-  async function select(session) { state.selected = String(session || ''); stopStream(); renderRooms(); try { const data = await getJSON('/api/v1/rooms/' + encodeURIComponent(state.selected)); renderRoom(data); setConnection('Live connected', ''); watch(state.selected, state.cursor); } catch (error) { setConnection('Reconnect needed', 'blocked'); $('note').replaceChildren(text('Room could not be read; retrying safely.')); announce('Room could not be read'); } }
-  async function loadRooms() { const data = await getJSON('/api/v1/rooms'); const serialized = JSON.stringify(data.rooms || {}); if (serialized !== state.lastRoomIndex) { state.rooms = data.rooms || {}; state.lastRoomIndex = serialized; renderRooms(); } setConnection(state.selected ? 'Live connected' : 'Owner connected', ''); }
-  async function refresh() { try { await loadRooms(); } catch (error) { setConnection('Reconnect needed', 'blocked'); $('note').replaceChildren(text('Conversation list could not be read; retrying safely.')); } }
-  async function postContext() { const value = $('message').value; if (!state.selected || !value.trim()) return; $('send').disabled = true; try { await getJSON('/api/v1/rooms/' + encodeURIComponent(state.selected) + '/messages', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({message: value})}); $('message').value = ''; $('note').replaceChildren(text('Context saved durably.')); updateComposer(); await syncRoom(); } catch (error) { $('note').className = 'composer-note error'; $('note').replaceChildren(text('Context could not be saved; retry when the owner is available.')); } finally { updateComposer(); } }
-  async function startTurn() { const participant = $('participant').value; const value = $('message').value; const activeKey = key(state.selected, participant); if (!state.selected || !participant || !value.trim() || state.active[activeKey]) return; state.active[activeKey] = {participant, turn_id: null}; renderWorking(); updateComposer(); $('note').className = 'composer-note'; $('note').replaceChildren(text('Turn is durably prepared; waiting for the agent…')); try { const result = await getJSON('/api/v1/rooms/' + encodeURIComponent(state.selected) + '/turns', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({participant, message: value})}); $('message').value = ''; if (result.status === 'forked') $('note').replaceChildren(text('A new conversation fork was created; the provider session was not resumed.')); else $('note').replaceChildren(text('Turn started; other participants can work in parallel.')); await syncRoom(); } catch (error) { delete state.active[activeKey]; renderWorking(); $('note').className = 'composer-note error'; $('note').replaceChildren(text('Turn could not be started; the journal was left unchanged.')); } finally { updateComposer(); } }
+  async function select(session) { const previous = state.selected; saveDraft(); state.selected = String(session || ''); stopStream(); renderRooms(); try { const data = await getJSON('/api/v1/rooms/' + encodeURIComponent(state.selected)); renderRoom(data); setConnection('Live connected', ''); setRailOpen(false); watch(state.selected, state.cursor); } catch (error) { state.selected = previous; renderRooms(); setConnection('Reconnect needed', 'blocked'); setNotice('Room could not be read; retry when the local owner is available.', true); announce('Room could not be read'); } }
+  async function loadRooms() { const data = await getJSON('/api/v1/rooms'); const nextRooms = data.rooms || {}; const previous = Object.fromEntries(roomEntries().map(room => [String(room.session_id || ''), room])); const serialized = JSON.stringify(nextRooms); if (serialized !== state.lastRoomIndex) { state.rooms = nextRooms; state.lastRoomIndex = serialized; roomEntries(nextRooms).forEach(room => { const id = String(room.session_id || ''); if (id && id !== state.selected && Number(room.cursor || 0) > Number(previous[id]?.cursor || 0)) state.unread[id] = true; }); renderRooms(); } if (!state.streamRetry) { setConnection(state.selected ? 'Live connected' : 'Owner connected', ''); setNotice(''); } }
+  async function refresh() { try { await loadRooms(); } catch (error) { setConnection('Reconnect needed', 'blocked'); setNotice('Conversation list could not be read; retry when the local owner is available.', true); } }
+  async function postContext() { const value = $('message').value; if (!state.selected || !value.trim()) return; $('send').disabled = true; try { await getJSON('/api/v1/rooms/' + encodeURIComponent(state.selected) + '/messages', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({message: value})}); $('message').value = ''; saveDraft(); $('note').replaceChildren(text('Context saved durably.')); updateComposer(); await syncRoom(); } catch (error) { $('note').className = 'composer-note error'; $('note').replaceChildren(text('Context could not be saved; retry when the owner is available.')); } finally { updateComposer(); } }
+  async function startTurn() { const participant = $('participant').value; const value = $('message').value; const activeKey = key(state.selected, participant); if (!state.selected || !participant || !value.trim() || state.active[activeKey]) return; state.active[activeKey] = {participant, turn_id: null}; renderWorking(); updateComposer(); $('note').className = 'composer-note'; $('note').replaceChildren(text('Bounded turn is durably prepared; waiting for the agent…')); try { const result = await getJSON('/api/v1/rooms/' + encodeURIComponent(state.selected) + '/turns', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({participant, message: value})}); $('message').value = ''; saveDraft(); if (result.status === 'forked') $('note').replaceChildren(text('A new conversation fork was created; the provider session was not resumed.')); else $('note').replaceChildren(text('Turn started; other participants can work in parallel.')); await syncRoom(); } catch (error) { delete state.active[activeKey]; renderWorking(); $('note').className = 'composer-note error'; $('note').replaceChildren(text('Turn could not be started; the journal was left unchanged.')); } finally { updateComposer(); } }
   async function cancelTurn(participant) { const activeKey = key(state.selected, participant); if (!state.selected || !participant || !state.active[activeKey]) return; try { await getJSON('/api/v1/rooms/' + encodeURIComponent(state.selected) + '/cancel', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({participant})}); $('note').className = 'composer-note'; $('note').replaceChildren(text('Cancellation requested; the provider process will be stopped safely.')); } catch (error) { $('note').className = 'composer-note error'; $('note').replaceChildren(text('No active turn could be cancelled.')); } }
-  $('context-tab').addEventListener('click', () => { state.mode = 'context'; updateComposer(); }); $('agent-tab').addEventListener('click', () => { state.mode = 'agent'; updateComposer(); }); $('send').addEventListener('click', () => state.mode === 'context' ? postContext() : startTurn()); $('run-cancel').addEventListener('click', () => { const first = Object.values(state.active)[0]; if (first) cancelTurn(first.participant); }); $('participant').addEventListener('change', updateComposer); $('message').addEventListener('input', () => { $('counter').replaceChildren(text(String($('message').value.length) + ' / 12000')); updateComposer(); }); $('message').addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); state.mode === 'context' ? postContext() : startTurn(); } }); $('room-search').addEventListener('input', event => { state.query = event.target.value; renderRooms(); }); $('rail-open').addEventListener('click', () => $('rail').classList.toggle('open'));
+  function chooseMode(mode) { state.mode = mode; updateComposer(); $('message').focus(); }
+  $('context-tab').addEventListener('click', () => chooseMode('context')); $('agent-tab').addEventListener('click', () => chooseMode('agent'));
+  [$('context-tab'), $('agent-tab')].forEach((tab, index, tabs) => tab.addEventListener('keydown', event => { if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return; event.preventDefault(); const next = tabs[(index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length]; next.click(); next.focus(); }));
+  $('send').addEventListener('click', () => state.mode === 'context' ? postContext() : startTurn()); $('run-cancel').addEventListener('click', () => { const first = Object.values(state.active)[0]; if (first) cancelTurn(first.participant); }); $('participant').addEventListener('change', updateComposer); $('message').addEventListener('input', () => { $('counter').replaceChildren(text(String($('message').value.length) + ' / 12000')); saveDraft(); updateComposer(); }); $('message').addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); state.mode === 'context' ? postContext() : startTurn(); } }); $('room-search').addEventListener('input', event => { state.query = event.target.value; renderRooms(); }); $('rail-open').addEventListener('click', () => setRailOpen(true)); $('rail-close').addEventListener('click', () => setRailOpen(false)); $('rail-backdrop').addEventListener('click', () => { if (state.railOpen) setRailOpen(false); if (state.evidenceOpen) setEvidenceOpen(false); }); $('evidence-open').addEventListener('click', () => setEvidenceOpen(!$('drawer').classList.contains('open'))); $('drawer-close').addEventListener('click', () => setEvidenceOpen(false)); $('latest').addEventListener('click', () => { $('timeline').lastElementChild?.scrollIntoView({behavior: 'smooth', block: 'end'}); $('latest').hidden = true; }); $('notice-retry').addEventListener('click', () => { setNotice(''); refresh(); if (state.selected) syncRoom().catch(() => {}); }); document.addEventListener('keydown', event => { if (state.evidenceOpen && event.key === 'Tab') { const focusable = Array.from($('drawer').querySelectorAll('button, a, input, select, textarea, [tabindex]:not([tabindex="-1"])')).filter(node => !node.disabled && node.offsetParent !== null); if (focusable.length) { const first = focusable[0]; const last = focusable[focusable.length - 1]; if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); } } } if (event.key === 'Escape') { if (state.railOpen) setRailOpen(false); else if (state.evidenceOpen) setEvidenceOpen(false); } });
   $('participant').replaceChildren(); const choose = document.createElement('option'); choose.value = ''; choose.append(text('Choose an agent')); $('participant').append(choose);
-  refresh(); state.refreshTimer = setInterval(refresh,10000); window.addEventListener('beforeunload', () => { clearInterval(state.refreshTimer); stopStream(); });
+  refresh(); state.refreshTimer = setInterval(refresh,10000); state.ageTimer = setInterval(updateAge,1000); window.addEventListener('beforeunload', () => { clearInterval(state.refreshTimer); clearInterval(state.ageTimer); stopStream(); });
 })();'''
 
 

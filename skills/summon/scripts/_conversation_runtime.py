@@ -324,7 +324,10 @@ def _record_process_state(record: Mapping[str, Any] | None) -> str:
     if not _pid_alive(pid):
         return "dead"
     if "pid_start_token" not in record:
-        return "live"  # pre-3.0 record; keep the migration fallback
+        # A legacy record has no process-birth identity.  Treating a reused
+        # PID as live would let cross-process cancellation taskkill an
+        # unrelated process, so migration is deliberately fail-closed.
+        return "unknown"
     expected = record.get("pid_start_token")
     if not isinstance(expected, str) or not expected:
         return "unknown"
@@ -746,11 +749,19 @@ class ConversationRuntime:
                 "permission": execution["permission"], "transport": execution["transport"],
                 "identity": identity, "resumed": resumed,
             }
+            journal_generation = max(
+                [int(record.get("generation", 1)) for record in records
+                 if isinstance(record.get("generation", 1), int)] or [1]
+            )
+            journal_generation = max(journal_generation, owner.generation)
             try:
+                if (not owner_still_current(owner)
+                        or not _owner_lease_live(owner.run_dir, owner.nonce, owner.generation)):
+                    raise ConversationRuntimeError("chat owner lease was lost before turn claim")
                 start_event = journal.append(
                     "turn_started", "system", "summon", start_payload,
                     expected_cursor=observed_cursor,
-                    event_id=f"turn-started-{turn_id}")
+                    event_id=f"turn-started-{turn_id}", generation=journal_generation)
             except ConversationError as exc:
                 release_owner(owner)
                 # Another owner won the journal race after our scan.  Do not
@@ -1023,12 +1034,47 @@ class ConversationRuntime:
                 return
             result_text = envelope.get("result") if isinstance(envelope.get("result"), str) else ""
             result_text = result_text[:MAX_AGENT_OUTPUT_CHARS]
+            records = journal.events(native=True)
+            owner_current = bool(
+                job.owner is not None and owner_still_current(job.owner)
+                and _owner_lease_live(job.owner.run_dir, job.owner.nonce,
+                                      job.owner.generation)
+            )
+            latest_start, latest_finish = self._last_turn(records, job.participant)
+            journal_generation = max(
+                [int(record.get("generation", 1)) for record in records
+                 if isinstance(record.get("generation", 1), int)] or [1]
+            )
+            latest_turn_matches = bool(
+                latest_start is not None and latest_finish is None
+                and isinstance(latest_start.get("payload"), Mapping)
+                and latest_start["payload"].get("turn_id") == job.turn_id
+            )
+            process_dead = bool(
+                job.process is None or job.process.poll() is not None
+                or not _pid_alive(job.process.pid)
+            )
+            stale_cancel_boundary = bool(
+                not owner_current and status == "cancelled" and process_dead
+                and self._cancel_requested(records, job.turn_id)
+                and latest_turn_matches
+                and job.owner is not None and journal_generation <= job.owner.generation
+            )
+            if not owner_current and not stale_cancel_boundary:
+                raise ConversationRuntimeError("chat owner lease was lost before journal finish")
+            if result_text and not owner_current:
+                raise ConversationRuntimeError("stale owner may only close a cancelled turn")
+            finish_generation = max(
+                [int(record.get("generation", 1)) for record in records
+                 if isinstance(record.get("generation", 1), int)]
+                + ([job.owner.generation] if job.owner is not None else [1])
+            )
             if result_text:
                 journal.append("message_posted", "agent", job.participant, {
                     "message_id": f"message-{job.turn_id}", "turn_id": job.turn_id,
                     "summary": _redact_text(result_text)[:MAX_SUMMARY_CHARS],
                     "text": result_text,
-                }, event_id=f"agent-message-{job.turn_id}")
+                }, event_id=f"agent-message-{job.turn_id}", generation=finish_generation)
             resume = envelope.get("resume") if isinstance(envelope.get("resume"), Mapping) else {}
             raw_resume_id = resume.get("session_id") if isinstance(resume.get("session_id"), str) else None
             resume_id = (raw_resume_id
@@ -1085,8 +1131,30 @@ class ConversationRuntime:
                 "resume_session_id": resume_id, "resume_profile": resume_profile,
                 "stderr_sha256": _sha_text(stderr[:4096]) if stderr else None,
             }
+            current_records = journal.events(native=True)
+            current_journal_generation = max(
+                [int(record.get("generation", 1)) for record in current_records
+                 if isinstance(record.get("generation", 1), int)] or [1]
+            )
+            owner_current = bool(
+                job.owner is not None and owner_still_current(job.owner)
+                and _owner_lease_live(job.owner.run_dir, job.owner.nonce,
+                                      job.owner.generation)
+            )
+            current_start, current_finish = self._last_turn(current_records, job.participant)
+            current_stale_cancel_boundary = bool(
+                not owner_current and status == "cancelled" and process_dead
+                and self._cancel_requested(current_records, job.turn_id)
+                and current_start is not None and current_finish is None
+                and isinstance(current_start.get("payload"), Mapping)
+                and current_start["payload"].get("turn_id") == job.turn_id
+                and job.owner is not None and current_journal_generation <= job.owner.generation
+            )
+            if not owner_current and not current_stale_cancel_boundary:
+                raise ConversationRuntimeError("chat owner lease was lost before journal finish")
             finish_event = journal.append("turn_finished", "system", "summon", payload,
-                                          event_id=f"turn-finished-{job.turn_id}")
+                                          event_id=f"turn-finished-{job.turn_id}",
+                                          generation=finish_generation)
             job.result = {"status": status, "turn_id": job.turn_id,
                           "session_id": job.session_id, "participant": job.participant,
                           "event": finish_event, "resumed": bool(payload["resumed"]),
@@ -1138,7 +1206,8 @@ class ConversationRuntime:
                     {"turn_id": turn_id, "participant": agent,
                      "command_id": command_id,
                      "summary": "operator requested cancellation"},
-                    expected_cursor=len(records), event_id=command_id)
+                    expected_cursor=len(records), event_id=command_id,
+                    generation=None)
             except ConversationError as exc:
                 raise ConversationRuntimeError(
                     "conversation changed before cancellation could be recorded") from exc
@@ -1233,7 +1302,7 @@ class ConversationRuntime:
             event = journal.append(
                 "turn_finished", "system", "summon", recovery_payload,
                 expected_cursor=len(records), event_id=f"turn-recovered-{turn_id}",
-                generation=recovery_owner.generation)
+                generation=None)
         except ConversationError as exc:
             raise ConversationRuntimeError("conversation changed before recovery could be recorded") from exc
         finally:

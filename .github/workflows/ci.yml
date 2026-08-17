@@ -20,7 +20,7 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: Compile all modules
-        run: python -m py_compile skills/summon/scripts/run_subagent.py skills/summon/scripts/_loader.py skills/summon/scripts/_resolver.py skills/summon/scripts/_builder.py skills/summon/scripts/_executor.py skills/summon/scripts/_stream.py skills/summon/scripts/_doctor.py skills/summon/scripts/_rundir.py skills/summon/scripts/_council.py skills/summon/scripts/_manifest.py skills/summon/scripts/_jobs.py skills/summon/scripts/_receipt.py skills/summon/scripts/_installs.py skills/summon/scripts/_cli.py skills/summon/scripts/_background.py skills/summon/scripts/_telemetry.py skills/summon/scripts/_deliberation.py skills/summon/scripts/_deliberation_agents.py skills/summon/scripts/_deliberation_store.py skills/summon/scripts/_deliberation_browser.py skills/summon/scripts/_deliberation_scheduler.py skills/summon/scripts/_deliberation_roster.py skills/summon/scripts/_deliberation_invocation.py skills/summon/scripts/_deliberation_replay.py skills/summon/scripts/_deliberation_recovery.py skills/summon/scripts/_deliberation_resume.py skills/summon/scripts/_deliberation_adapter.py skills/summon/scripts/_deliberation_phase_a.py skills/summon/scripts/_deliberation_live.py skills/summon/scripts/_deliberation_ui.py skills/summon/scripts/_conversation.py skills/summon/scripts/_conversation_page.py skills/summon/scripts/_conversation_runtime.py skills/summon/scripts/_swarm_protocol.py skills/summon/scripts/_conversation_browser.py skills/summon/scripts/_conversation_ui.py skills/summon/scripts/_model_catalog.py tools/release_manifest.py tools/release_gates.py tools/release_contract.py summon.py install.py
+        run: python -m py_compile skills/summon/scripts/run_subagent.py skills/summon/scripts/_loader.py skills/summon/scripts/_resolver.py skills/summon/scripts/_builder.py skills/summon/scripts/_executor.py skills/summon/scripts/_stream.py skills/summon/scripts/_doctor.py skills/summon/scripts/_rundir.py skills/summon/scripts/_council.py skills/summon/scripts/_manifest.py skills/summon/scripts/_jobs.py skills/summon/scripts/_receipt.py skills/summon/scripts/_installs.py skills/summon/scripts/_cli.py skills/summon/scripts/_background.py skills/summon/scripts/_telemetry.py skills/summon/scripts/_deliberation.py skills/summon/scripts/_deliberation_agents.py skills/summon/scripts/_deliberation_store.py skills/summon/scripts/_deliberation_browser.py skills/summon/scripts/_deliberation_scheduler.py skills/summon/scripts/_deliberation_roster.py skills/summon/scripts/_deliberation_invocation.py skills/summon/scripts/_deliberation_replay.py skills/summon/scripts/_deliberation_recovery.py skills/summon/scripts/_deliberation_resume.py skills/summon/scripts/_deliberation_adapter.py skills/summon/scripts/_deliberation_phase_a.py skills/summon/scripts/_deliberation_live.py skills/summon/scripts/_deliberation_ui.py skills/summon/scripts/_conversation.py skills/summon/scripts/_conversation_page.py skills/summon/scripts/_conversation_runtime.py skills/summon/scripts/_swarm_protocol.py skills/summon/scripts/_swarm_coordinator.py skills/summon/scripts/_conversation_browser.py skills/summon/scripts/_conversation_ui.py skills/summon/scripts/_model_catalog.py tools/release_manifest.py tools/release_gates.py tools/release_contract.py summon.py install.py
 
       - name: Unit tests (dispatcher)
         run: python skills/summon/scripts/test_discovery.py
@@ -54,7 +54,10 @@ jobs:
           skills.summon.scripts.test_conversation_ui
 
       - name: Unit tests (swarm protocol contract)
-        run: python -m unittest skills.summon.scripts.test_swarm_protocol
+        run: >-
+          python -m unittest
+          skills.summon.scripts.test_swarm_protocol
+          skills.summon.scripts.test_swarm_coordinator
 
       - name: Unit tests (deliberation preview kernel, adapter, scheduler, and CLI)
         run: >-
@@ -200,7 +203,7 @@ jobs:
               "discovery", "install", "release_manifest", "acpbackend",
               "deliberation", "deliberation_resume", "model_catalog",
               "conversation", "conversation_runtime", "conversation_ui", "model_routing", "release_contract",
-              "swarm_protocol", "live_provider_gate",
+              "swarm_protocol", "swarm_coordinator", "live_provider_gate",
           }
           assert manifest["evidence"]["source_tree_sha256"] == evidence["source_tree_sha256"]
           assert manifest["version_contract"]["ready"]

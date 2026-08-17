@@ -2,12 +2,14 @@
 
 Status date: 2026-08-17
 Current source version: `3.0.0` candidate
-Readiness: the immutable `3.0.0` tag remains the public-preview baseline, while the
-candidate commit contains the authenticated chat/runtime, browser hardening, and narrow
-fresh read-only deliberation lane described below. The candidate tree is clean and its
-source-bound evidence packet has been regenerated; publication still requires a new
-immutable GA tag. Additional provider receipts, remote execution, and multi-user hosting
-remain separately gated.
+Readiness: the immutable `3.0.0` tag remains the public-preview baseline. The current
+working tree contains the authenticated chat/runtime, browser hardening, local swarm
+coordinator, and narrow fresh read-only deliberation lane described below. A current
+registry run is green for the fixed suites and non-provider gates, but the tree is still
+dirty and the live-provider receipt has not yet been rebound into a clean release packet;
+publication therefore remains blocked until the clean immutable candidate is produced.
+Additional provider receipts, remote execution, and multi-user hosting remain separately
+gated.
 
 This is the release-facing roadmap for turning the current, well-tested kernel into a dependable open product. It records what is actually shipped, what was tested, and the gates that must pass before we describe a feature as shipped, preview, or live-provider-enabled.
 
@@ -19,9 +21,10 @@ This is the release-facing roadmap for turning the current, well-tested kernel i
 | Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; Claude Opus has a reviewed receipt, while Fable and Gemini availability still require saved receipts with exact `model.served` and profile evidence | Claude Opus route verified; other live lanes remain gated |
 | Deliberation kernel, journal replay/recovery, scheduler | Focused `test_deliberation_*.py` suite; provider-inert | Ready as a fake/injected integration surface |
 | Custom Agent manifests and roster binding | Strict parser, path fencing, consent/identity binding | Ready as provider-inert configuration |
-| Live provider composition | Receipt/plan/owner/deadline fences exist; the current source-bound packet passes the schema-2 Claude Opus normal/cancel/deadline pilot | Claude Opus route is live-provider-gated; other routes remain provider-inert until independently reviewed |
+| Live provider composition | Receipt/plan/owner/deadline fences exist; a reviewed schema-2 Claude Opus normal/cancel/deadline receipt is retained, but it must be supplied to the final clean-tree registry | Claude Opus route remains live-provider-gated until the clean packet is rebound; other routes remain provider-inert until independently reviewed |
 | Browser conversation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, visual evidence, and explicit cancellable roster-agent turns; richer multi-run lifecycle remains preview | Unreleased post-GA preview |
-| Managed local installs | The current clean candidate check converged all eight installer-owned host copies. Unmanaged Cursor plugin drift remains intentionally untouched | Converged for this candidate; unmanaged drift is not installer-owned |
+| Local swarm coordinator | `_rundir`-backed owner/lease/claim journal, idempotent worker messages, claim-bound artifacts, cancellation, and explicit uncertain-spend recovery; no implicit provider or IDE attachment | Provider-neutral preview |
+| Managed local installs | All nine detected host profiles (eight managed records) now match this working tree after the installer refresh; the unmanaged Cursor plugin remains intentionally untouched | Converged for the current dirty candidate; repeat after the immutable release commit |
 | Unmanaged Cursor local plugin | Older 2.2.0 content hash; not installer-owned | Update through its plugin mechanism only |
 
 Telemetry is enabled for this workstation through `~/.agents/summon-telemetry.json`. “On” means bounded, allow-listed local JSONL diagnostics only; it does not transmit data. GitHub issue submission remains a separate explicit action.
@@ -77,14 +80,14 @@ to unmanaged Cursor plugins.
 No open P0/P1 reliability, security, privacy, migration, or evidence contradiction may
 remain. The release manifest is generated from a clean, immutable source tree and
 requires the named suites and gates rather than accepting arbitrary caller-supplied
-labels. The current source-bound candidate packet records: release-registry
-deliberation 339/339 (full deliberation discovery 354/354), resume 15/15, discovery
-549/549, conversation 39/39, runtime 24/24, UI 19/19, install 30/30, model catalog
-6/6, model routing 4/4, release contract 3/3, release gates 7/7, release manifest
-16/16, live-provider gate tests 3/3, swarm protocol 12/12, and ACP 36/36. All eight
-fixed gates pass for this candidate, including the accepted Claude Opus receipt;
-other provider routes remain independently gated. The candidate still needs a clean
-immutable GA tag/publication before it is called 3.0 GA.
+labels. The clean candidate evidence for commit `5530459` records: deliberation 339/339,
+resume 15/15, discovery 549/549, conversation 43/43, runtime 25/25, UI 19/19,
+install 30/30, model catalog 6/6, model routing 4/4, release contract 3/3,
+release gates 7/7, release manifest 16/16, live-provider gate tests 3/3,
+swarm protocol 12/12, swarm coordinator 20/20, and ACP 36/36. All eight named
+release gates passed against the clean source-bound evidence, including the
+receipt-bound live-provider gate; the unmanaged Cursor plugin remains reported
+and intentionally untouched.
 
 ## Product direction
 
@@ -121,7 +124,7 @@ deliberation receipt.
 | 2.5 — one live-provider pilot | One explicitly gated provider with durable-before-spawn, cancellation, deadline, cleanup, kill switch, and takeover evidence | live-provider-gated |
 | 2.6 — conversation rooms | Persistent chat substrate, authenticated loopback conversation atlas grouped by project and initiating host/agent, human messages, bounded roster-agent turns with explicit continuation/fork, and bounded council-round artifacts | public preview |
 | 2.7 — daily browser workflow | Round-oriented ledger, filters/export, keyboard/mobile actions, terminal summaries, WCAG 2.2 AA and visual regression | public preview |
-| 2.7b — swarm protocol contract | Versioned `summon.swarm/v1` stdio framing, worker/claim/message/artifact/cancel schemas, golden vectors, and fake-adapter conformance; no native IDE attachment yet | contract-only preview |
+| 2.7b — swarm protocol + local coordinator | Versioned `summon.swarm/v1` framing plus a durable local owner/lease/claim journal, idempotent messages, claim-bound artifacts, cancellation, and explicit uncertain-spend recovery; no native IDE attachment yet | provider-neutral preview |
 | 2.8 — product operations | Supported-version matrix, rollback/install manifest, stable machine schemas, local diagnostics, sanitized support bundle | gated; contract defined in [`docs/VERSIONING_AND_3.0.md`](VERSIONING_AND_3.0.md) |
 | Later — provider expansion | Each transport earns its own independent evidence gate; no umbrella live-ready claim | live-provider-gated |
 
@@ -130,10 +133,10 @@ deliberation receipt.
 1. **Keep the ordinary dispatcher suite deterministic.** The two early-exit tests now use a dispatch barrier and the broad run is `549/549`; keep the repetition check in CI. Treat a timeout or missing stage as a test failure, never as a silent pass.
 2. **Close installer asset drift.** Keep `examples/` in the owned payload and manifest (now fixed); add a source-vs-install manifest check to CI. Never update archival worktrees or unmanaged plugin copies.
 3. **Remove resource warnings.** ✅ Closed the bounded Git-reader pipes in `_receipt.py`; the
-   fixed release registry (currently 354 deliberation, 15 resume, 39 conversation, 24 runtime,
+   fixed release registry (currently 339 deliberation, 15 resume, 43 conversation, 25 runtime,
    19 UI, 549 discovery, 30 install, 36 ACP, 6 catalog, 4 routing, 16 release-manifest,
-   7 release-gates, 12 swarm, 3 live-provider-gate, and 3 release-contract tests) is now warning-clean rather than
-   merely assertion-clean.
+   7 release-gates, 12 swarm protocol, 20 swarm coordinator, 3 live-provider-gate, and 3
+   release-contract tests) is warning-clean rather than merely assertion-clean.
 4. **Publish one release manifest.** `python tools/release_gates.py` runs the fixed test and
    gate registries and emits source/Git-bound output digests plus one artifact per gate;
    `python tools/release_manifest.py --evidence-file ...` binds that evidence to the full
@@ -185,9 +188,11 @@ descendant cleanup coverage; cross-process takeover remains conservative when a 
 process handle cannot be transferred.
 
 Participants may now exchange bounded, durable, addressed context messages (or read
-operator context) through the room inbox without gaining control authority. A durable
-cross-process swarm coordinator, shared claims, and lease-backed cancellation remain
-separate open work; the batch manifest must not be described as an IDE swarm.
+operator context) through the room inbox without gaining control authority. The local
+`swarm` coordinator now supplies durable shared claims, leases, cancellation, artifacts,
+and explicit uncertain-spend recovery. It remains provider-neutral: the batch manifest
+and coordinator must not be described as automatic IDE-native swarm attachment until
+an authenticated adapter and process-tree gate pass.
 
 Interactive council rounds may include independent positions, cross-examination,
 chair synthesis, and human messages between rounds. A council recommendation

@@ -649,13 +649,14 @@ class ConversationJournal:
 
     def append(self, event: str, actor_kind: str, actor_id: str,
                payload: Mapping[str, Any], *, expected_cursor: int | None = None,
-               event_id: str | None = None, generation: int = 1) -> dict[str, Any]:
+               event_id: str | None = None, generation: int | None = None) -> dict[str, Any]:
         if event not in _EVENTS:
             raise ConversationError("unsupported conversation event")
         if actor_kind not in _ACTOR_KINDS:
             raise ConversationError("invalid actor kind")
         actor = _safe_id(actor_id, "actor id")
-        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        if (generation is not None
+                and (not isinstance(generation, int) or isinstance(generation, bool) or generation < 1)):
             raise ConversationError("invalid event generation")
         item = _snapshot(dict(payload))
         # Control facts may be *displayed* when a deliberate kernel projects
@@ -669,6 +670,14 @@ class ConversationJournal:
         eid = _safe_id(event_id or uuid.uuid4().hex, "event id")
         with self._append_lock():
             self._refresh_records()
+            if generation is None:
+                generation = max(
+                    [int(record.get("generation", 1)) for record in self._records
+                     if isinstance(record.get("generation", 1), int)] or [1]
+                )
+            if (not isinstance(generation, int) or isinstance(generation, bool)
+                    or generation < 1):
+                raise ConversationError("invalid event generation")
             if any(record.get("event_id") == eid for record in self._records):
                 existing = next(record for record in self._records if record.get("event_id") == eid)
                 if (existing.get("payload_sha256") != _sha256(item)

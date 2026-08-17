@@ -287,7 +287,8 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon agents validate [--cwd D] [--agents-dir D]` | validate provider-inert custom-agent manifests and print redacted identity/digest evidence |
 | `summon models [--cli B]` | invocable models per backend, with a `source` per entry (live query, local config, or static list) |
 | `summon doctor [--json]` | backend / setup health check (run this first) |
-| `summon manifest FILE` | run a batch swarm (per-backend concurrency, resumable) |
+| `summon manifest FILE` | run a batch fan-out (per-backend concurrency, resumable) |
+| `summon swarm create|status|claim|renew|cancel|close …` | use the durable local swarm coordinator; provider/IDE adapters remain explicit |
 | `summon council --question "…"` | **explore and synthesize** diverse positions |
 | `summon chat open|post|show|list …` | local shared room for brainstorming and human context; `chat open --chat-browser auto|link` starts/reuses or links the authenticated atlas |
 | `summon chat turn SESSION AGENT --message "…"` | explicit bounded roster-agent turn; CLI waits for durable finish, browser turns are cancellable and can run in parallel across participants |
@@ -305,13 +306,13 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon bug-report …` | generate a sanitized report; review it before the separate GitHub submission command |
 | `summon version` · `summon help` | version · usage |
 
-`manifest` is Summon's current batch-fan-out surface. It is compatible with any
-host that can run the Summon CLI, but it is not yet a durable shared IDE swarm:
-workers have addressed conversation messages, but do not share coordinator claims,
-leases, or cancellation state across a manifest run.
-The proposed external-worker boundary is versioned and documented in
-[SUMMON_SWARM_PROTOCOL.md](docs/SUMMON_SWARM_PROTOCOL.md); it is contract-only
-until the coordinator and adapter conformance gates pass.
+`manifest` remains Summon's batch-fan-out surface. The local `swarm` coordinator
+now provides durable owner/lease/claim/cancellation state and explicit
+uncertain-spend recovery. It is not yet an automatic attachment to a
+host-native IDE swarm; external adapters must authenticate a worker connection
+and pass the protocol conformance/process-tree gates before they can launch
+providers. The boundary is documented in
+[SUMMON_SWARM_PROTOCOL.md](docs/SUMMON_SWARM_PROTOCOL.md).
 
 `summon` (no args) prints the command list. Everything below is documented in
 [skills/summon/SKILL.md](skills/summon/SKILL.md).

@@ -10,7 +10,8 @@ context, never a ballot or approval. Cancellation now records a durable
 `turn_cancel_requested` command that a separate runtime can observe; owner leases,
 authenticated cursor streaming, and bounded reconnect are implemented. Durable
 addressed agent messages are now available through a bounded local inbox; a durable
-swarm coordinator remains a separate follow-up slice.
+  swarm coordination remains a separate provider-neutral control plane; the local
+  `_rundir`-backed coordinator is shipped, while external IDE adapters remain gated.
 
 Summon should have one conversation substrate shared by ordinary brainstorming,
 interactive councils, and governed deliberations. The substrate is a durable,
@@ -215,9 +216,10 @@ The atlas provides:
   enter the page;
 - incremental cursor rendering with duplicate suppression, gap refetch, reconnect,
   and bounded polling fallback; an unread marker is held in memory only;
-- a responsive mobile rail and docked composer with keyboard focus, named controls,
-  reduced-motion behavior, and no forced autoscroll while the operator is reading;
-  the composer stays below the thread on phones so it never hides the latest event.
+- a responsive mobile rail/evidence sheet and non-overlapping composer with keyboard
+  focus, named controls, reduced-motion behavior, per-room drafts, a last-updated
+  marker, and a “jump to latest” affordance; the composer stays below the thread on
+  phones so it never hides the latest event.
 
 Council and deliberate keep their authority distinction: council positions, cross-exams,
 and chair synthesis are context artifacts; deliberate policy, ballots, state transitions,

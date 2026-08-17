@@ -22,7 +22,7 @@ but can correlate or reveal low-entropy values, so review a report before sharin
 - **[orchestration.md](references/orchestration.md)** - rules of engagement for multi-agent work: what the envelope proves, cross-vendor routing, permission traps, council quality bar, resume-instead-of-re-pay (project- and IDE-agnostic)
 - **[deliberation.md](references/deliberation.md)** - when to choose governed `deliberate` versus dispatch, manifest, or council, plus safe run/status/recover/open recipes
 - **[SUMMON_CONVERSATION_PLAN.md](../../docs/SUMMON_CONVERSATION_PLAN.md)** - the shared provider-inert room contract for chat, interactive council, and deliberate discussion views
-- **[SUMMON_SWARM_PROTOCOL.md](../../docs/SUMMON_SWARM_PROTOCOL.md)** - the contract-only `summon.swarm/v1` boundary for future external worker/IDE adapters
+- **[SUMMON_SWARM_PROTOCOL.md](../../docs/SUMMON_SWARM_PROTOCOL.md)** - the durable local `summon.swarm/v1` coordinator and the contract boundary for future external worker/IDE adapters
 - **[../council/SKILL.md](../council/SKILL.md)** - thin `/council` companion for open-ended positions and chaired synthesis
 - **[../deliberate/SKILL.md](../deliberate/SKILL.md)** - thin `/deliberate` companion for fixed-option governed decisions
 - **[effort.md](references/effort.md)** - reasoning effort / thinking levels: who honors `--effort`, defaults, agy Gemini suffixes, envelope fields
@@ -40,7 +40,7 @@ plugin package with `plugin.json` at the repo root — no separate install step.
 
 **Command surface**: the script accepts git-style **subcommands** — `dispatch` (the
 default action), `list`, `agents validate`, `models`, `doctor`, `manifest FILE`, `council`,
-`chat`, `deliberate QUESTION`, `deliberate status|replay|recover|cancel|open|resume RUN_ID`,
+`chat`, `swarm`, `deliberate QUESTION`, `deliberate status|replay|recover|cancel|open|resume RUN_ID`,
 `agent
 new|set NAME`, `role propose|approve|list|resolve`, `telemetry enable|disable|status|clear`,
 `bug-report`, `version` — e.g. `run_subagent.py
@@ -77,11 +77,12 @@ loopback URL; observation and human context remain authority-inert, while an
 explicit `chat turn` may launch a bounded roster-agent process. The browser
 atlas groups rooms by project digest and initiating host/agent.
 
-Summon's existing `manifest` command is batch fan-out, not interoperable
-collaborative swarming. The versioned external-worker contract is documented in
-`SUMMON_SWARM_PROTOCOL.md`, but no durable swarm coordinator or native IDE
-session attachment is claimed until its lease, claim, message, artifact,
-cancellation, and reconnect gates are implemented.
+Summon's existing `manifest` command is batch fan-out. The versioned
+external-worker contract is documented in `SUMMON_SWARM_PROTOCOL.md`, and
+`summon swarm` provides a local durable coordinator for claims, leases,
+messages, artifacts, cancellation, and explicit uncertain-spend recovery. It
+never launches a provider or silently attaches to a native IDE swarm; those
+adapters remain separately gated.
 
 ## CLI-Specific Notes
 
@@ -353,7 +354,9 @@ explain why. `summon chat open|post|show|list` remain local journal operations;
 `summon chat turn SESSION_ID AGENT --message "…"` is the explicit live turn seam and
 `chat cancel SESSION_ID AGENT` appends a durable `turn_cancel_requested` command before
 targeting a local active worker. A separate runtime can observe that command and stop
-its child; a durable owner/lease coordinator is still a GA follow-up. Both stay outside
+its child; the separate local swarm coordinator supplies durable provider-neutral
+owner/lease claims, while the chat runtime's provider-turn lease remains its own
+control path. Both stay outside
 deliberation authority: agent output and human messages are context only. Never turn
 a chat message or council synthesis into a deliberate ballot; promotion requires a
 fresh, human-confirmed deliberate policy.
@@ -490,6 +493,17 @@ run or recommending it to a user.
 | `--chat-timeout DURATION` (or `--timeout` after `chat`) | With `chat turn` | Per-turn bounded child timeout. It is separate from the dispatch/jobs `--timeout`; the chat subcommand rewrites its alias safely. |
 | `--chat-confirm` | With `chat recover` | Required human attestation for closing an unmatched turn as indeterminate; never retries or asserts zero spend. |
 | `--chat-reason TEXT` | With `chat fork` | Bounded explanation recorded on the parent fork event. |
+| `--swarm-action {create,status,events,register,claim,renew,cancel,close}` | With `swarm` | Provider-neutral local coordinator action. It journals claims, leases, cancellation, artifacts, and uncertain-spend recovery; it never launches a provider. |
+| `--swarm-run-id RUN_ID` | With `swarm` | Durable coordinator run id. The subcommand form accepts it positionally. |
+| `--swarm-dir DIR` | With `swarm` | Private root containing coordinator run directories. Defaults to `{cwd}/.agents/swarm`. |
+| `--swarm-tasks FILE` | With `swarm create` | JSON array of `{task_id,request_sha256}` objects; prompts and raw provider input stay outside the coordinator journal. |
+| `--swarm-project-root-sha256 HEX` / `--swarm-roster-sha256 HEX` | With `swarm create` | Bind the run to the canonical project and roster-definition digests. |
+| `--swarm-max-attempts N` | With `swarm create` | Maximum physical attempts per task; uncertain spend never retries without explicit human authorization. |
+| `--swarm-worker ID` / `--swarm-instance ID` | With `swarm register|claim|renew` | Bind a worker connection and instance before it can mutate claims. |
+| `--swarm-task-id ID` / `--swarm-request-sha256 HEX` | With `swarm claim|cancel` | Identify a task and bind a claim to its immutable request digest. |
+| `--swarm-lease-ms MS` | With `swarm claim|renew` | Bounded claim lease duration; lease renewal does not change the task request or worker identity. |
+| `--swarm-claim-id ID` / `--swarm-lease-generation N` | With `swarm renew` | Fenced claim identity and generation; stale workers are refused. |
+| `--swarm-reason TEXT` | With `swarm cancel` | Bounded, redacted cancellation reason recorded in the public journal. |
 
 The public deliberate CLI has a narrow provider lane and reports a redacted durable
 run result after cleanup. It rejects unsupported approval/resume, ACP/HTTP, Kimi,
