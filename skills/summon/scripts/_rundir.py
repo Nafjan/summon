@@ -55,7 +55,7 @@ JOURNAL_FILE = "journal.jsonl"
 
 def validate_run_id(run_id: str) -> str:
     """Validate a run/job id BEFORE any filesystem access. Raises ValueError."""
-    if not run_id or not _ID_RE.match(run_id) or ".." in run_id:
+    if not run_id or not _ID_RE.fullmatch(run_id) or ".." in run_id:
         raise ValueError(f"invalid run id: {run_id!r} (letters/digits/._-, max 64, no '..')")
     if run_id[-1] in ".":
         # A trailing dot is silently stripped by Win32 path resolution, so
@@ -70,8 +70,42 @@ def validate_run_id(run_id: str) -> str:
 def run_path(runs_root: str, run_id: str) -> str:
     """Containment-checked absolute path of a run dir under ``runs_root``."""
     validate_run_id(run_id)
-    root = Path(runs_root).resolve()
-    p = (root / run_id).resolve()
+    # Windows namespace/device prefixes are never valid run roots, even when a
+    # caller is running on POSIX (where backslashes and colons would otherwise be
+    # ordinary filename characters).  Rejecting them consistently keeps the
+    # public invalid_root contract platform-independent and prevents a path that
+    # would change meaning after migration to Windows.
+    if (not isinstance(runs_root, str) or not runs_root
+            or "\x00" in runs_root
+            or runs_root.startswith(("\\\\?\\", "\\\\.\\"))):
+        raise ValueError("runs root has an unsupported device/namespace form")
+    raw_root = Path(runs_root).expanduser()
+    # Inspect the supplied path before resolving it.  A junction or symlink
+    # would otherwise become an ordinary-looking directory and let callers
+    # redirect run journals, leases, and surface records outside the selected
+    # runs namespace.
+    for candidate in (raw_root, *raw_root.parents):
+        try:
+            attrs = getattr(candidate.stat(follow_symlinks=False), "st_file_attributes", 0)
+            if candidate.is_symlink() or bool(attrs & 0x400):
+                raise ValueError("runs root may not contain symlinks or junctions")
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError("runs root cannot be inspected") from exc
+    root = raw_root.resolve()
+    if root.exists() and not root.is_dir():
+        raise ValueError("runs root is not a directory")
+    raw_run = root / run_id
+    try:
+        attrs = getattr(raw_run.stat(follow_symlinks=False), "st_file_attributes", 0)
+        if raw_run.is_symlink() or bool(attrs & 0x400):
+            raise ValueError("run directory may not be a symlink or junction")
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise ValueError("run directory cannot be inspected") from exc
+    p = raw_run.resolve()
     if not p.is_relative_to(root):  # defense in depth; the regex already blocks separators
         raise ValueError(f"run id escapes the runs root: {run_id!r}")
     return str(p)
@@ -268,9 +302,28 @@ def _last_generation(run_dir: str) -> int:
 def _write_generation(run_dir: str, generation: int) -> None:
     import tempfile
     fd, tmp = tempfile.mkstemp(dir=run_dir, prefix=".summon-gen-", suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(str(generation))
-    os.replace(tmp, os.path.join(run_dir, GENERATION_FILE))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(str(generation))
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        target = os.path.join(run_dir, GENERATION_FILE)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, target)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def acquire_owner(run_dir: str, lease_sec: float) -> Owner:
@@ -465,12 +518,18 @@ def _read_segment(path: str):
 
 
 def _segment_generations(run_dir: str):
-    """Generations that have a journal segment, ascending."""
+    """Non-empty journal generations, ascending.
+
+    A process can create its generation file before its first durable append
+    and die, leaving a zero-byte segment.  Such a file carries no journal
+    evidence and must not make a torn predecessor look like a mid-file
+    corruption during the next takeover.
+    """
     gens = []
     try:
         for name in os.listdir(run_dir):
             m = re.match(r"^journal-g(\d+)\.jsonl$", name)
-            if m:
+            if m and os.path.getsize(os.path.join(run_dir, name)) > 0:
                 gens.append(int(m.group(1)))
     except OSError:
         pass
@@ -518,6 +577,37 @@ def journal_read(run_dir: str):
                 raise JournalCorruptError(
                     f"journal-g{g}.jsonl has a torn tail below the newest generation")
     return all_records, torn
+
+
+def journal_read_tagged(run_dir: str):
+    """Read journal records while preserving their segment generation.
+
+    ``journal_read`` intentionally exposes the historical flat projection used
+    by status/report code.  Replay and resume validation need stronger evidence:
+    a record's self-reported generation is not enough because a stale process
+    could write a well-formed record into the wrong segment.  This additive
+    reader returns ``([(segment_generation, record), ...], torn_tail)`` and
+    refuses that mismatch before callers reconstruct state.
+    """
+    gens = _segment_generations(run_dir)
+    tagged: list[tuple[int, dict]] = []
+    torn = False
+    for i, generation in enumerate(gens):
+        records, segment_torn = _read_segment(_journal_path(run_dir, generation))
+        for record in records:
+            declared = record.get("generation")
+            if (isinstance(declared, bool) or not isinstance(declared, int)
+                    or declared != generation):
+                raise JournalCorruptError(
+                    f"journal-g{generation}.jsonl contains a generation mismatch")
+            tagged.append((generation, record))
+        if segment_torn:
+            if i == len(gens) - 1:
+                torn = True
+            else:
+                raise JournalCorruptError(
+                    f"journal-g{generation}.jsonl has a torn tail below the newest generation")
+    return tagged, torn
 
 
 def journal_repair(run_dir: str, owner: Owner) -> bool:

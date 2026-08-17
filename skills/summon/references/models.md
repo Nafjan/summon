@@ -2,6 +2,27 @@
 
 > Part of the **summon** skill. See the main SKILL.md for core usage.
 
+## Summon model labels
+
+Summon keeps editorial ranking separate from service evidence. The machine-readable
+catalog is [`model-catalog.json`](model-catalog.json); it supplies display metadata
+for roster cards and tooltips, but it never authorizes a dispatch or proves that an
+account can serve a model. The dispatch envelope's exact `model.served` value remains
+the only service evidence.
+
+The current editorial bands are:
+
+| Band | Order | Models | Typical lane |
+|---|---:|---|---|
+| **Frontier** | 1–4 | Fable, Sol, Opus, Kimi | escalation, architecture, synthesis, high-context research |
+| **Near-frontier** | 1–5 | Grok 4.6, Gemini Flash 3.7, GLM 5.2, DeepSeek V4 Flash, DeepSeek V4 Pro | fast evidence, coding second opinions, and cost-efficient secondary work |
+
+These are Summon-curated labels as of 2026-08-14, not benchmark, safety, cost,
+availability, or vendor claims. A tooltip may show the role, model name, version,
+recommendation lane, catalog status, and whether an exact served-model match was
+observed. It must not show profiles, accounts, paths, prompts, credentials, or raw
+provider output. Unknown models remain `unverified` rather than being guessed.
+
 ## Model discovery (`--list-models`)
 
 The skill never hardcodes a model allowlist — a `model:` string (frontmatter) or
@@ -65,7 +86,16 @@ and response for Kimi:
 | `coder`, `bug-fixer` | cursor-agent | composer-2.5 | multi-step coding, bug fixing |
 | `kimi-worker` | kimi | `kimi-code/k3` (pinned, live verified) | high-context architecture, independent review, broad repository research, ambiguous multi-file work |
 | `kimi-coder` | kimi | `kimi-code/kimi-for-coding` (pinned, live verified) | scoped implementation, refactoring, debugging, focused verification |
-| `researcher`, `docs-writer`, `frontend`, `antigravity` | agy | Gemini default (pin via `model:`) | research, docs, frontend |
+| `researcher` | agy | `gemini-3.7-flash-high` (live verified 2026-08-13) | primary evidence extraction, repo research, UI review, fast `/council` secondary |
+| `docs-writer`, `frontend`, `antigravity` | agy | Gemini default (pin via `model:`) | docs, frontend, general agy work |
+
+`researcher` is intentionally pinned rather than floating with agy's default. The
+3.7 Flash High route was verified through the local agy roster and a real Summon
+dispatch; still inspect the envelope's `model.served` field because model IDs are
+account/endpoint-specific. Gemini/agy is a strong fast evidence extractor and
+cross-vendor reviewer, not a chairman, safety gate, or read-only guarantee: agy
+cannot enforce `read-only`, so do not silently use this seat for edits or provider
+execution.
 
 Cross-vendor routing rule of thumb: never have an agent's work reviewed by its own
 vendor — send claude/cursor-written code to a codex reviewer and codex-written code to
@@ -74,16 +104,30 @@ a claude reviewer (see [docs/PROTOCOL.md](https://github.com/Nafjan/summon/blob/
 ## Cursor as a cross-vendor model gateway (with a Cursor subscription)
 
 The `cursor-agent` backend is not limited to Composer. A Cursor subscription exposes a
-large, multi-vendor model roster through the SAME CLI: GPT-5.x (including the codex,
+large, multi-vendor model roster through the same CLI: GPT-5.x (including the codex,
 sol, terra, and luna families), Claude (Opus 4.5-4.8, Sonnet 4-5, Fable 5), Gemini 3.x,
-Grok 4.5, GLM 5.2, and Kimi K2.7. Query the live list with `cursor-agent models` (it
-changes as Cursor adds models). Because summon passes `--model` through verbatim, any of
-them is reachable through summon with no code change:
+Grok 4.5/4.6, GLM 5.2, and Kimi K2.7. Cursor's current model page lists Grok 4.6 as
+available in the Cursor model pool, but the installed Cursor CLI here exposes no
+machine-readable model list. Treat the exact CLI slug and account eligibility as live
+facts: pass the candidate through, then require `model.served` to match before ranking
+it or adding it to a pinned agent:
 
 ```
 run_subagent.py --agent coder --cli cursor-agent --model <cursor-model-id> --prompt "..."
 run_subagent.py --agent coder --cli cursor-agent --model gpt-5.6-sol-high --prompt "..."
+# Candidate probe; do not assume this slug or silently fall back:
+run_subagent.py --agent coder --cli cursor-agent --model grok-4.6 --prompt "..."
 ```
+
+**Grok 4.6 lane (candidate secondary).** Cursor describes Grok 4.6 as a high-capability,
+near-frontier model
+for long-horizon coding and knowledge work. That makes it a strong candidate for a
+second-opinion/coding seat, not an automatic replacement for the pinned Gemini Flash
+3.7 evidence lane: Cursor's transport has different billing, retention, permission, and
+read-only guarantees, and a local dispatch must prove `model.served`, `status`, and the
+expected permission envelope first. The local verification on 2026-08-13 could not
+complete because the Cursor team account reported its usage limit before serving a
+model, so Summon does **not** pin Grok 4.6 yet.
 
 Cursor's parameterized model syntax works too (the string is forwarded untouched):
 `--model '<cursor-model-id>[context=1m,effort=high,fast=false]'`. That `[effort=…]`

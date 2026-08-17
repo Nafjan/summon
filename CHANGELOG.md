@@ -6,7 +6,69 @@ regression notes, and test evidence, see the
 
 ## [Unreleased]
 
-No unreleased changes.
+- **Claude route isolation:** default Claude dispatches now pass an empty
+  `--setting-sources` boundary so unrelated user/project `ANTHROPIC_*` settings
+  (including a custom endpoint, model, or token) cannot silently reroute a
+  subscription-backed Claude invocation. Intentional custom Claude-compatible
+  routes remain available through an explicitly named private profile.
+- **Release contract:** the source-bound version/migration contract, fixed gate
+  registry, and immutable release evidence are now part of the 3.0.0 GA path.
+
+- **One open product:** Summon deliberation is part of the same public product as
+  dispatch, council, and the browser observer. The public `/summon deliberate` command and thin `/deliberate`
+  companion skill share the same receipt, journal, replay, recovery, and browser
+  observer contracts.
+- **Explicit governed-decision guidance:** agent instructions now distinguish
+  dispatch, manifest, council, and deliberate, and require options, seats, quorum,
+  rounds, attempt budget, deadline, and human-approval policy to be stated rather
+  than inferred.
+- **Fresh deliberation lane:** the public `deliberate` command now admits only a
+  receipt-bound, one-round, one-attempt-per-seat run of enforceable read-only
+  subprocess seats with executable evidence. The owner journals a queued cancel
+  at the replay-safe attempt boundary; approval, resume, ACP/HTTP, Kimi, text-only,
+  writable, and full-bypass routes remain explicitly gated.
+- **Install convergence:** managed hosts receive the marked `/deliberate` companion
+  without clobbering a foreign skill; provider-inert and live-gated readiness labels
+  are now used consistently in the product docs.
+- **Conversation atlas:** the authenticated loopback room now uses a dependency-free,
+  Chatpack-informed messenger layout: searchable project/initiator rooms, grouped
+  human/agent/lifecycle events, role/name/version identity chips, a redacted evidence
+  drawer, cursor-aware reconnect, and separate context versus roster-agent turn
+  composers. `chat open --chat-browser auto|builtin|ide|system|link` starts or reuses
+  one surface; `link` is non-launching for CI/SSH. Chatpack itself is not installed.
+- **Chat safety/readability slice:** live turn claims now use a journal cursor
+  compare-and-swap across runtime instances; human messages expose bounded redacted
+  previews to the atlas; continuation forks preserve the prompt that caused the fork;
+  generic Authorization/Bearer/Basic/Cookie material is redacted and cancellation is
+  recorded as a durable `turn_cancel_requested` command observable by another runtime.
+- **Chat lifecycle fencing:** participant leases and process records now reject
+  symlink/junction redirection, bind atlas reuse to project/explicit-roster digests,
+  fence PID reuse with birth tokens, serialize Python 3.13 pipe cleanup, and use the
+  shared Windows Job Object/POSIX process-group teardown path. Windows turns fail closed
+  when the Job Object cannot be attached; this remains a local preview capability gate.
+- **Transport evidence:** chat dispatch forwards the roster-declared subprocess/ACP
+  transport to the actual dispatcher boundary instead of silently defaulting to
+  subprocess while claiming ACP.
+- **Swarm contract preview:** documented and validated the versioned
+  `summon.swarm/v1` stdio frame boundary for future worker claims, leases, directed
+  messages, fenced artifacts, and cancellation. Completion/artifact frames carry the
+  task/attempt/lease-generation/request digest fence and unknown authority fields are
+  rejected. This is a protocol contract only; the
+  current `manifest` command remains batch fan-out and no native IDE swarm
+  attachment is implied.
+- **Model identity catalog:** role, name, version, and editorial frontier labels are
+  now explicit display metadata; exact `model.served` evidence remains separate and
+  unknown models never become dispatchable by implication.
+
+## [3.0.0] — 2026-08-15
+
+- Synchronized the plugin, dispatcher, and MCP companion to the 3.0.0 contract.
+- This immutable tag is the provider-inert/public-preview baseline. It is **not** a
+  GA certification: the live-provider gate was blocked and the working chat/runtime
+  tree was still being evidenced separately.
+- Kept multi-provider live deliberation, automatic fallback/retry, remote hosting,
+  and unproven live continuation explicitly deferred. A later GA must publish a
+  clean source-bound evidence packet with an independently reviewed provider receipt.
 
 ## [2.2.0] — 2026-08-12
 

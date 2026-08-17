@@ -2637,6 +2637,28 @@ def test_fable_runs_unsubstituted_and_reports_plan_dependent_billing():
         del os.environ["SUMMON_ALLOW_CREDIT"]
 
 
+def test_default_claude_dispatch_isolated_from_ambient_settings():
+    """A user-level third-party ANTHROPIC_* setting must not hijack Claude seats."""
+    from _builder import AgentInvocation, build_invocation_args
+
+    _, args, env = build_invocation_args(
+        AgentInvocation(cli="claude", prompt="smoke", cwd=".", model="claude-opus-5"))
+    index = args.index("--setting-sources")
+    assert args[index + 1] == "", args
+    assert env is None
+
+
+def test_named_claude_profile_keeps_explicit_settings_boundary():
+    """An explicitly selected profile is the operator's opt-in to its settings."""
+    from _builder import AgentInvocation, build_invocation_args
+
+    _, args, env = build_invocation_args(
+        AgentInvocation(cli="claude", prompt="smoke", cwd=".", model="claude-opus-5",
+                        profile_env={"CLAUDE_CONFIG_DIR": "C:\\private-profile"}))
+    assert "--setting-sources" not in args, args
+    assert env == {"CLAUDE_CONFIG_DIR": "C:\\private-profile"}
+
+
 def test_telemetry_is_opt_in_bounded_and_private():
     import _telemetry
     d = tempfile.mkdtemp(prefix="summon-telemetry-")
@@ -3028,6 +3050,16 @@ def test_council_model_label_and_repo_capable_defaults():
     # no enforceable read-only without SUMMON_ALLOW_UNENFORCED_READONLY) — not because
     # agy cannot read --cwd (it can, since 0.13.9)
     assert "researcher" not in c.DEFAULT_MEMBERS, c.DEFAULT_MEMBERS
+
+
+def test_researcher_is_pinned_to_gemini_flash_37():
+    """The evidence lane must not silently float to an unverified agy default."""
+    from pathlib import Path
+    definition = (Path(__file__).resolve().parents[1] / "agents" / "researcher.md").read_text(encoding="utf-8")
+    frontmatter = definition.split("---", 2)[1]
+    assert "run-agent: agy" in frontmatter
+    assert "model: gemini-3.7-flash-high" in frontmatter
+    assert "permission: yolo" in frontmatter
 
 
 def test_parse_report_keeps_real_status_with_pipe():
@@ -3661,6 +3693,7 @@ def test_workspace_evidence_real_git_catches_status_and_clean_child_commit():
         git("add", "-A")
         git("commit", "-qm", "child")
         after_commit = _receipt.workspace_snapshot(d)
+        assert after_commit["coverage"] == "complete", after_commit
         clean_commit = _receipt.workspace_evidence(before, after_commit, "read-only")
         assert clean_commit["coverage"] == "complete", clean_commit
         assert clean_commit["child_commit"] is True
@@ -4175,7 +4208,7 @@ def test_rundir_id_validation_and_containment():
     import _rundir as rd
     for good in ("council-20260718-1200-ab12", "a", "run.1_x-Y"):
         assert rd.validate_run_id(good) == good
-    for bad in ("", "..", "a..b", "-lead", ".lead", "x" * 65, "a/b", "a\\b",
+    for bad in ("", "..", "a..b", "-lead", ".lead", "x" * 65, "a/b", "a\\b", "a\n",
                 "trailing.", "CON", "con", "NUL.txt", "com7", "LPT9.log", "prn.a.b"):
         try:
             rd.validate_run_id(bad)
@@ -6296,10 +6329,13 @@ def test_jobs_record_reader_never_sees_partial():
             for _ in range(80):
                 with open(path2, "wb") as fh:      # non-atomic: visible truncated record
                     fh.write(blob[:12])
-                _t.sleep(0.001)
+                # Keep the deliberately torn window long enough for the polling
+                # reader to observe it on a busy Windows CI host; the production
+                # atomic writer has no such visible intermediate state.
+                _t.sleep(0.02)
                 with open(path2, "wb") as fh:      # then complete, in place
                     fh.write(blob)
-                _t.sleep(0.001)
+                _t.sleep(0.002)
         torn2, _saw = run_reader_while(broken_writer, jid2, path2)
         assert torn2, "reader failed to detect a deliberately non-atomic writer"
     finally:
@@ -7221,6 +7257,11 @@ def test_v4b_early_exit_kills_inflight_and_chairs_quorum():
     root = tempfile.mkdtemp(prefix="summon-v4bkill-")
     _mk_agents(root, ["f0", "f1", "s0", "s1", "chair"])
     killed = {}
+    # The production guarantee under test is that an in-flight member is registered before
+    # the quorum can trigger the early-exit sweep.  Without a barrier, the two fast fake
+    # members can finish before a slow fake reaches on_spawn; that is a scheduler race in
+    # the fixture, not evidence that the kill registry missed a registered process.
+    started = threading.Barrier(4)
 
     class FakeProc:
         def __init__(self, tag):
@@ -7233,11 +7274,14 @@ def test_v4b_early_exit_kills_inflight_and_chairs_quorum():
 
     def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
         if agent in ("f0", "f1", "chair"):
+            if agent != "chair":
+                started.wait(timeout=5)
             return {"status": "success", "result": agent, "report": {"summary": agent}}
         ev = threading.Event()          # s0, s1: block until the early-exit sweep kills them
         killed[tag] = ev
         if on_spawn:
             on_spawn(FakeProc(tag))
+        started.wait(timeout=5)
         stopped = ev.wait(15)
         return {"status": "error" if stopped else "success",
                 "result": agent + (" killed" if stopped else " done"),
@@ -7561,6 +7605,11 @@ def test_v4b_resume_reruns_early_exit_killed_members():
     dispatched = []
     dlock = threading.Lock()
     killed = {}
+    # The early-exit contract is about members that have actually entered the
+    # dispatch seam.  A thread-pool scheduler may otherwise let m1/m2 reach
+    # quorum before m3/m4 have even called the fake, making the stage-file
+    # assertion depend on worker scheduling rather than council behavior.
+    started = threading.Barrier(4)
 
     class FakeProc:
         def __init__(self, tag):
@@ -7574,6 +7623,8 @@ def test_v4b_resume_reruns_early_exit_killed_members():
     def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
         with dlock:
             dispatched.append(agent)
+        if phase["run"] == 1 and agent in ("m1", "m2", "m3", "m4"):
+            started.wait(timeout=5)
         if agent in ("m1", "m2", "chair") or phase["run"] == 2:
             return {"status": "success", "result": agent, "report": {"summary": agent}}
         ev = threading.Event()          # run 1: m3, m4 block -> killed by the early-exit sweep
@@ -7735,6 +7786,10 @@ def test_v4b_early_exit_pre_quorum_failure_stays_failed():
     _mk_agents(root, ["g0", "g1", "blk", "bad", "chair"])
     killed = {}
     quorum_ev = threading.Event()   # set when the sweep kills a straggler == the quorum has landed
+    # Force all four first-wave calls through the fake dispatch seam before
+    # g0/g1 can complete quorum.  This makes the test assert the intended
+    # dispatched-vs-never-dispatched distinction deterministically.
+    started = threading.Barrier(4)
 
     class FakeProc:
         def __init__(self, tag):
@@ -7746,6 +7801,8 @@ def test_v4b_early_exit_pre_quorum_failure_stays_failed():
             return None if self._alive else 0
 
     def fake(agent, prompt, cwd, agents_dir, timeout_ms, out_dir, tag, on_spawn=None, on_reap=None):
+        if agent in ("g0", "g1", "blk", "bad"):
+            started.wait(timeout=5)
         if agent in ("g0", "g1", "chair"):
             return {"status": "success", "result": agent, "report": {"summary": agent}}
         if agent == "blk":                       # a real in-flight straggler: registers, killed by the sweep
@@ -8834,12 +8891,30 @@ def test_v7_bare_worktree_never_resumes():
     out = os.path.join(tempfile.gettempdir(), f"summon-wt-{os.getpid()}.json")
     NL = chr(10)
     roster = tempfile.mkdtemp(prefix="summon-wtr-")
+    project = tempfile.mkdtemp(prefix="summon-wt-project-")
     with open(os.path.join(roster, "cheap.md"), "w", encoding="utf-8") as fh:
         fh.write("---" + NL + "run-agent: openai-compat" + NL + "base_url: http://127.0.0.1:9/v1" + NL + "---" + NL + "# Resolvable" + NL)
     try:
+        # Keep this identity/skip test independent of the developer checkout's
+        # archival worktrees.  Hundreds of unrelated worktrees can make a
+        # production-repo `git worktree add` take minutes or wait on a reset,
+        # turning a bounded test into a release-runner timeout.
+        sp.run(["git", "-C", project, "init", "-q"], check=True,
+               capture_output=True, text=True)
+        sp.run(["git", "-C", project, "config", "user.email", "summon-test@example.invalid"],
+               check=True, capture_output=True, text=True)
+        sp.run(["git", "-C", project, "config", "user.name", "Summon Test"],
+               check=True, capture_output=True, text=True)
+        with open(os.path.join(project, "seed.txt"), "w", encoding="utf-8") as fh:
+            fh.write("seed\n")
+        sp.run(["git", "-C", project, "add", "seed.txt"], check=True,
+               capture_output=True, text=True)
+        sp.run(["git", "-C", project, "commit", "-qm", "seed"], check=True,
+               capture_output=True, text=True)
         def _run(extra):
             r = sp.run([sys.executable, script, "--agent", "cheap", "--prompt", "p",
-                        "--cwd", os.getcwd(), "--out", out, "--agents-dir", roster, *extra],
+                        "--cwd", project, "--out", out, "--agents-dir", roster,
+                        "--timeout", "5s", *extra],
                        capture_output=True, text=True, encoding="utf-8")
             return _json.loads(r.stdout)
 
@@ -8848,7 +8923,7 @@ def test_v7_bare_worktree_never_resumes():
         from _cli import build_parser
         from _executor import request_fingerprint
         ns = build_parser("t", 1).parse_args(
-            ["--agent", "cheap", "--prompt", "p", "--cwd", os.getcwd(),
+            ["--agent", "cheap", "--prompt", "p", "--cwd", project,
              "--out", out, "--agents-dir", roster, "--worktree"])
         with open(out, "w", encoding="utf-8") as fh:
             _json.dump({"status": "success", "result": "from a PREVIOUS auto worktree",
@@ -8858,7 +8933,7 @@ def test_v7_bare_worktree_never_resumes():
                                                 "from a different tree", env)
         # a NAMED worktree is a stable location, so it resumes normally
         ns2 = build_parser("t", 1).parse_args(
-            ["--agent", "cheap", "--prompt", "p", "--cwd", os.getcwd(),
+            ["--agent", "cheap", "--prompt", "p", "--cwd", project,
              "--out", out, "--agents-dir", roster, "--worktree", "fixed-tree"])
         with open(out, "w", encoding="utf-8") as fh:
             _json.dump({"status": "success", "result": "from fixed-tree",
@@ -8871,6 +8946,9 @@ def test_v7_bare_worktree_never_resumes():
             os.remove(out)
         except OSError:
             pass
+        import shutil as _sh
+        _sh.rmtree(project, ignore_errors=True)
+        _sh.rmtree(roster, ignore_errors=True)
 
 
 def test_v7_agent_definition_edit_invalidates_a_stored_result():

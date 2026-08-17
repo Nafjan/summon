@@ -81,6 +81,19 @@ def parse_timeout(value: str) -> int:
     return out
 
 
+def parse_quorum(value: str) -> int | str:
+    """Keep council's integer form while accepting deliberation all/fractions."""
+    text = str(value).strip().lower()
+    if text.isdigit():
+        return int(text)
+    parts = text.split("/", 1)
+    if (text == "all" or (len(parts) == 2 and all(part.isdigit() for part in parts)
+                          and all(int(part) > 0 for part in parts))):
+        return text
+    raise argparse.ArgumentTypeError(
+        "quorum must be an integer, 'all', or a positive fraction such as 2/3")
+
+
 # --- Fan-out mode flag matrix --------------------------------------------------
 # The flags each fan-out mode actually CONSUMES. --manifest and --council branch
 # out of main() before most dispatch flags are read, so anything outside these
@@ -111,6 +124,35 @@ MODE_FLAGS = {
     # Status takes ONLY its id, where to look, and the output format -- it never
     # dispatches, so it has no working directory (use --run-dir to point it).
     "council-status": {"council_status", "run_dir", "json", "job_file"},
+    "deliberation": {"deliberate", "question", "question_file", "seats", "options",
+                     "quorum", "rounds", "max_attempts", "deadline", "cwd",
+                     "agents_dir", "run_dir", "results_dir", "strict_agents_dir",
+                     "enable_roles", "require_human_approval", "text_only_consent",
+                     "full_authority_consent", "json", "job_file"},
+    "deliberation-resume": {"deliberate_resume", "run_dir", "results_dir", "cwd",
+                            "retry_indeterminate", "json", "job_file"},
+    "deliberation-open": {"deliberate_open", "run_dir", "results_dir", "cwd",
+                          "browser", "json", "job_file"},
+    "deliberation-recover": {"deliberate_recover", "run_dir", "results_dir", "cwd",
+                             "json", "job_file"},
+    "deliberation-status": {"deliberate_status", "run_dir", "results_dir", "cwd",
+                            "json", "job_file"},
+    "deliberation-replay": {"deliberate_replay", "run_dir", "results_dir", "cwd",
+                            "json", "job_file"},
+    "deliberation-cancel": {"deliberate_cancel", "run_dir", "results_dir", "cwd",
+                            "command_id", "json", "job_file"},
+    "chat": {"chat_action", "chat_session", "chat_message", "chat_participant",
+              "chat_timeout", "chat_participants", "chat_project_id",
+              "chat_project_root", "chat_initiator_host", "chat_initiator_agent",
+              "chat_mode", "chat_browser", "chat_confirm", "chat_reason",
+              "chat_to", "chat_after",
+              "conversation_dir", "agents_dir",
+              "strict_agents_dir", "json", "cwd", "job_file"},
+    "swarm": {"swarm_action", "swarm_run_id", "swarm_dir", "swarm_tasks",
+               "swarm_project_root_sha256", "swarm_roster_sha256", "swarm_max_attempts",
+               "swarm_worker", "swarm_instance", "swarm_task_id", "swarm_request_sha256",
+               "swarm_lease_ms", "swarm_claim_id", "swarm_lease_generation",
+               "swarm_reason", "json", "job_file", "cwd"},
     # jobs read commands: registry query only.
     "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
     "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
@@ -135,6 +177,25 @@ MODE_HINTS = {
                        "be changed here -- start a fresh council to change them."),
     "council-status": ("status is read-only: it takes only the run id, --run-dir, "
                        "and --json."),
+    "deliberation": ("a fresh deliberation takes only its immutable question, seats, "
+                     "options, policy, consent, and run-location flags."),
+    "deliberation-resume": ("resume takes the run id and may explicitly authorize "
+                            "retrying an indeterminate paid attempt."),
+    "deliberation-open": ("open takes only the run id, run location, output format, "
+                          "and browser target; use 'link' for scripts or SSH."),
+    "deliberation-recover": ("recover completes only deterministic, journal-proven "
+                              "crash boundaries and performs zero provider calls."),
+    "deliberation-status": ("status is read-only and accepts only the run id, run "
+                            "location, and output format."),
+    "deliberation-replay": ("replay is read-only and accepts only the run id, run "
+                            "location, and output format."),
+    "deliberation-cancel": ("cancel queues one typed command; --command-id is an "
+                            "optional idempotency key."),
+    "chat": ("chat is a local room with explicit human context and bounded agent turns. "
+             "`turn` launches one selected roster agent after a durable turn_started "
+             "event and resumes its provider session only when identity evidence matches; "
+             "drift creates a visible fork. It never changes a ballot. `chat open "
+             "--chat-browser auto|builtin|ide|system|link` starts or reuses the atlas."),
     "jobs-list": ("jobs list is read-only: it takes only --job-dir and --json."),
     "jobs-status": ("jobs status is read-only: it takes only the job id, --job-dir, "
                     "and --json."),
@@ -146,7 +207,13 @@ MODE_HINTS = {
                    "explicit --submit-github action."),
 }
 FLAG_NAMES = {"sets": "--set"}  # dests whose flag spelling isn't dest.replace('_','-')
-TOKEN_DESTS = {"set": "sets", "from": "bug_report_from"}   # reverse mapping
+TOKEN_DESTS = {"set": "sets", "from": "bug_report_from",
+               # ergonomic names used only by the `chat` subcommand
+               "project-id": "chat_project_id", "project-root": "chat_project_root",
+               "initiator-host": "chat_initiator_host", "initiator-agent": "chat_initiator_agent",
+               "message": "chat_message", "mode": "chat_mode", "participant": "chat_participant",
+               "participants": "chat_participants", "to": "chat_to",
+               "after": "chat_after"}   # reverse mapping
 
 
 def fanout_mode(args: argparse.Namespace) -> str | None:
@@ -161,6 +228,22 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "jobs-wait"
     if getattr(args, "council_status", None):
         return "council-status"
+    if getattr(args, "deliberate_status", None):
+        return "deliberation-status"
+    if getattr(args, "deliberate_recover", None):
+        return "deliberation-recover"
+    if getattr(args, "deliberate_replay", None):
+        return "deliberation-replay"
+    if getattr(args, "deliberate_cancel", None):
+        return "deliberation-cancel"
+    if getattr(args, "deliberate_resume", None):
+        return "deliberation-resume"
+    if getattr(args, "deliberate_open", None):
+        return "deliberation-open"
+    if getattr(args, "chat_action", None):
+        return "chat"
+    if getattr(args, "deliberate", False):
+        return "deliberation"
     if args.council:
         return "council-resume" if getattr(args, "resume_run", None) else "council"
     if any(getattr(args, name, False) for name in
@@ -192,7 +275,13 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
     )
     if not offending:
         return None
-    label = {"council-resume": "council resume", "council-status": "council status"
+    label = {"council-resume": "council resume", "council-status": "council status",
+             "deliberation-resume": "deliberate resume",
+             "deliberation-recover": "deliberate recover",
+             "deliberation-status": "deliberate status",
+             "deliberation-replay": "deliberate replay",
+             "deliberation-cancel": "deliberate cancel",
+             "deliberation-open": "deliberate open",
              }.get(mode, f"--{mode}")
     return (f"{label} does not support {', '.join(offending)}: these flags would "
             f"have been silently ignored, so they are rejected instead. "
@@ -206,8 +295,8 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 # rewrite. This keeps one battle-tested parser + all logic while giving a clean,
 # discoverable command surface.
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
-               "onboard", "manifest", "council", "agent", "jobs", "version",
-               "role", "telemetry", "bug-report", "help", "--help", "-h"}
+               "onboard", "manifest", "council", "deliberate", "agent", "jobs", "version",
+               "chat", "swarm", "role", "telemetry", "bug-report", "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -216,11 +305,28 @@ Usage: summon <command> [options]
 Commands:
   dispatch  --agent NAME --prompt "…" --cwd DIR   run an agent (the default action)
   list                                            list available agents
+  agents validate [--cwd DIR] [--agents-dir D]   validate custom agent manifests
   models    [--cli BACKEND]                       what each backend can run now
   doctor    [--json] [--probe]                    check backends / setup health
   onboard   [--subscriptions …] [--reset] [--json] detect CLIs; write merge-safe prefs
   manifest  FILE [--concurrency …] [--results-dir D]   run a batch swarm
   council   --question "…" [--members …] [--rounds 2]  decide by consensus
+  deliberate --question "…" --seats A,B --options X,Y  bounded agent deliberation
+  deliberate status|replay|cancel|recover RUN_ID       inspect/control/recover a run
+  deliberate open RUN_ID [--browser auto|builtin|ide|system|link]  open its local ledger
+  deliberate resume RUN_ID [--retry-indeterminate]     resume with spend consent
+  chat open SESSION_ID [--mode chat|council|deliberate]  create/reuse a local room
+  chat post SESSION_ID --message "…"                    add a typed human context message
+  chat turn SESSION_ID AGENT --message "…"              run one resumable agent turn
+  chat cancel SESSION_ID AGENT                           cancel that active turn
+  chat show SESSION_ID | chat list                      inspect rooms
+  swarm create RUN_ID --swarm-tasks FILE               create a durable local coordinator
+  swarm status|events RUN_ID                            inspect coordinator state/events
+  swarm register RUN_ID WORKER INSTANCE                bind a worker to the run
+  swarm claim RUN_ID TASK_ID WORKER --request-sha256 H  claim one task lease
+  swarm renew RUN_ID CLAIM_ID WORKER --lease-generation N
+  swarm cancel RUN_ID TASK_ID                           queue typed cancellation
+  swarm close RUN_ID                                    close after terminal tasks
   agent new NAME [--set k=v …]                    scaffold an agent definition
   agent set NAME  --set k=v …                     retune an agent's frontmatter
   role propose ALIAS TARGET                        propose a private global role alias
@@ -241,6 +347,41 @@ flat option list, or `summon telemetry --help` / `summon bug-report --help` for 
 
 
 COMMAND_USAGE = {
+    "chat": """summon chat open SESSION_ID [--project-id ID --project-root DIR --participants A,B]
+summon chat post SESSION_ID --message TEXT
+summon chat turn SESSION_ID AGENT --message TEXT [--chat-timeout 10m]
+summon chat cancel SESSION_ID AGENT
+summon chat message SESSION_ID FROM_AGENT TO_AGENT --message TEXT
+summon chat inbox SESSION_ID AGENT [--chat-after CURSOR]
+summon chat recover SESSION_ID AGENT --chat-confirm
+summon chat fork SESSION_ID AGENT --message TEXT
+summon chat show SESSION_ID | summon chat list
+summon chat open SESSION_ID --chat-browser auto|builtin|ide|system|link
+
+Open a local room, add human context, or start one bounded roster-agent turn.
+The turn is durably started before provider launch; compatible provider sessions
+resume, while identity drift creates an explicit fork. Chat output is context only:
+it cannot approve, vote, launch, or change a deliberate run.
+""",
+    "swarm": """summon swarm create RUN_ID --swarm-tasks TASKS.json
+                     --swarm-project-root-sha256 HEX --swarm-roster-sha256 HEX
+summon swarm status|events RUN_ID
+summon swarm register RUN_ID WORKER INSTANCE
+summon swarm claim RUN_ID TASK_ID WORKER --request-sha256 HEX
+summon swarm renew RUN_ID CLAIM_ID WORKER --lease-generation N
+summon swarm cancel RUN_ID TASK_ID
+summon swarm close RUN_ID
+
+This is a local, provider-neutral coordinator. It durably fences claims,
+leases, cancellation, artifacts, and uncertain spend; it never launches a
+provider or attaches to an IDE-native swarm by itself.
+""",
+    "agents": """summon agents validate [--cwd DIR] [--agents-dir DIR] [--json]
+
+Validate workspace `.agents/agents/<slug>/agent.md` manifests and an optional explicit
+global agents root. This is provider-inert and returns only redacted identity,
+authority, and digest evidence.
+""",
     "telemetry": """summon telemetry enable|disable|status|clear [--json]
 
 Manage opt-in local diagnostics. `enable`/`disable` persist the choice; `status` reports
@@ -284,6 +425,8 @@ def rewrite_subcommand(argv: list) -> tuple:
         return argv, f"help:{head}" if head in COMMAND_USAGE else "help"
     if head in ("dispatch", "run"):
         return rest, None
+    if head == "agents" and rest and rest[0] == "validate":
+        return ["--validate-agents", *rest[1:]], None
     if head in ("list", "agents", "ls"):
         return ["--list", *rest], None
     if head == "models":
@@ -306,6 +449,83 @@ def rewrite_subcommand(argv: list) -> tuple:
             # whitelist would reject a stray --council).
             return ["--council-status", rest[1], *rest[2:]], None
         return ["--council", *rest], None
+    if head == "deliberate":
+        if rest and rest[0] in ("resume", "status", "replay", "cancel", "recover", "open"):
+            action = rest[0]
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, f"error: 'deliberate {action}' needs a run id"
+            flag = {
+                "resume": "--deliberate-resume",
+                "recover": "--deliberate-recover",
+                "status": "--deliberate-status",
+                "replay": "--deliberate-replay",
+                "cancel": "--deliberate-cancel",
+                "open": "--deliberate-open",
+            }[action]
+            return [flag, rest[1], *rest[2:]], None
+        return ["--deliberate", *rest], None
+    if head == "swarm":
+        if not rest:
+            return argv, "help:swarm"
+        action = rest[0]
+        if action not in ("create", "status", "events", "register", "claim", "renew", "cancel", "close"):
+            return argv, f"error: unknown 'swarm' action {action!r} (use create/status/events/register/claim/renew/cancel/close)"
+        if len(rest) < 2 or rest[1].startswith("-"):
+            return argv, f"error: 'swarm {action}' needs a run id"
+        translated = ["--swarm-action", action, "--swarm-run-id", rest[1]]
+        if action == "register":
+            if len(rest) < 4 or rest[2].startswith("-") or rest[3].startswith("-"):
+                return argv, "error: 'swarm register' needs worker and instance ids"
+            translated += ["--swarm-worker", rest[2], "--swarm-instance", rest[3], *rest[4:]]
+        elif action == "claim":
+            if len(rest) < 4 or rest[2].startswith("-") or rest[3].startswith("-"):
+                return argv, "error: 'swarm claim' needs task and worker ids"
+            translated += ["--swarm-task-id", rest[2], "--swarm-worker", rest[3], *rest[4:]]
+        elif action == "renew":
+            if len(rest) < 4 or rest[2].startswith("-") or rest[3].startswith("-"):
+                return argv, "error: 'swarm renew' needs claim and worker ids"
+            translated += ["--swarm-claim-id", rest[2], "--swarm-worker", rest[3], *rest[4:]]
+        elif action == "cancel":
+            if len(rest) < 3 or rest[2].startswith("-"):
+                return argv, "error: 'swarm cancel' needs a task id"
+            translated += ["--swarm-task-id", rest[2], *rest[3:]]
+        else:
+            translated += rest[2:]
+        return translated, None
+    if head == "chat":
+        if not rest:
+            return argv, "help:chat"
+        action = rest[0]
+        if action not in ("open", "post", "show", "list", "turn", "cancel", "message", "inbox", "recover", "fork"):
+            return argv, f"error: unknown 'chat' action {action!r} (use open/post/show/list/turn/cancel/message/inbox/recover/fork)"
+        if action == "list":
+            return ["--chat-action", "list", *rest[1:]], None
+        if len(rest) < 2 or rest[1].startswith("-"):
+            return argv, f"error: 'chat {action}' needs a session id"
+        translated = ["--chat-action", action, "--chat-session", rest[1]]
+        if action in ("turn", "cancel", "inbox", "recover", "fork"):
+            if len(rest) < 3 or rest[2].startswith("-"):
+                return argv, f"error: 'chat {action}' needs a participant id"
+            translated += ["--chat-participant", rest[2], *rest[3:]]
+        elif action == "message":
+            if len(rest) < 4 or rest[2].startswith("-") or rest[3].startswith("-"):
+                return argv, "error: 'chat message' needs sender and recipient ids"
+            translated += ["--chat-participant", rest[2], "--chat-to", rest[3], *rest[4:]]
+        else:
+            translated += rest[2:]
+        # `--timeout` is a long-standing dispatch/jobs flag.  It must not be
+        # globally remapped in TOKEN_DESTS because the mode matrix needs to
+        # distinguish it from chat's bounded turn timeout.  Translate it only
+        # inside the chat subcommand so jobs/manifest/council keep their legacy
+        # meaning and validation.
+        translated = [
+            ("--chat-timeout" + token[len("--timeout"):])
+            if token == "--timeout" or token.startswith("--timeout=") else token
+            if token != "--after" and not token.startswith("--after=") else
+            ("--chat-after" + token[len("--after"):])
+            for token in translated
+        ]
+        return translated, None
     if head == "jobs":
         if not rest:
             return argv, "help"       # bare `summon jobs` -> usage, not a silent list
@@ -384,6 +604,8 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Opt into approved user-global role aliases for this dispatch; "
                              "disabled by default and never changes an exact agent match")
     parser.add_argument("--list", action="store_true", help="List available agents")
+    parser.add_argument("--validate-agents", dest="validate_agents", action="store_true",
+                        help="Validate provider-inert custom-agent manifests under the workspace")
     parser.add_argument("--list-models", dest="list_models", action="store_true",
                         help="Report invocable models per backend (live where the CLI exposes it; "
                              "filter with --cli)")
@@ -571,6 +793,114 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--question", help="With --council: the decision/question to deliberate")
     parser.add_argument("--question-file", dest="question_file",
                         help="With --council: read the question from a file")
+    parser.add_argument("--deliberate", action="store_true",
+                        help="Run a bounded headless deliberation (separate from council)")
+    parser.add_argument("--deliberate-resume", dest="deliberate_resume", metavar="RUN_ID",
+                        help="Resume a deliberation run by id")
+    parser.add_argument("--deliberate-recover", dest="deliberate_recover", metavar="RUN_ID",
+                        help="Recover deterministic journal boundaries without provider calls")
+    parser.add_argument("--deliberate-status", dest="deliberate_status", metavar="RUN_ID",
+                        help="Read a deliberation run's journal-derived status")
+    parser.add_argument("--deliberate-replay", dest="deliberate_replay", metavar="RUN_ID",
+                        help="Replay a deliberation run's bounded checksummed journal")
+    parser.add_argument("--deliberate-cancel", dest="deliberate_cancel", metavar="RUN_ID",
+                        help="Queue a typed cancel command for a deliberation run")
+    parser.add_argument("--deliberate-open", dest="deliberate_open", metavar="RUN_ID",
+                        help="Open/reuse the authenticated local deliberation ledger")
+    parser.add_argument("--chat-action", dest="chat_action",
+                        choices=("open", "post", "show", "list", "turn", "cancel", "message", "inbox", "recover", "fork"),
+                        help="Conversation room action; turn launches one bounded roster agent; "
+                             "recover/fork never retry a provider")
+    parser.add_argument("--chat-session", dest="chat_session", metavar="SESSION_ID",
+                        help="Conversation room session id")
+    parser.add_argument("--chat-participant", "--participant", dest="chat_participant", metavar="AGENT",
+                        help="With chat turn/cancel/message/inbox: participant or sender roster agent id")
+    parser.add_argument("--chat-to", dest="chat_to", metavar="AGENT",
+                        help="With chat message: recipient roster agent id or human")
+    parser.add_argument("--chat-after", dest="chat_after", type=int, default=0, metavar="CURSOR",
+                        help="With chat inbox: return addressed messages after this cursor")
+    parser.add_argument("--chat-participants", "--participants", dest="chat_participants",
+                        help="With chat open: comma-separated participant roster ids")
+    parser.add_argument("--chat-timeout", dest="chat_timeout", type=parse_timeout,
+                        help="With chat turn: per-turn provider timeout")
+    parser.add_argument("--chat-message", "--message", dest="chat_message",
+                        help="Typed human context message for a conversation room")
+    parser.add_argument("--chat-confirm", dest="chat_confirm", action="store_true",
+                        help="With chat recover: explicitly attest that the unmatched turn was reviewed; "
+                             "never retries the provider")
+    parser.add_argument("--chat-reason", dest="chat_reason",
+                        help="With chat fork: bounded human-readable reason for the new lineage")
+    parser.add_argument("--chat-project-id", "--project-id", dest="chat_project_id",
+                        help="Bounded project label for a new room")
+    parser.add_argument("--chat-project-root", "--project-root", dest="chat_project_root",
+                        help="Project root used only to bind a redacted project digest")
+    parser.add_argument("--chat-initiator-host", "--initiator-host", dest="chat_initiator_host",
+                        help="Initiating host label (codex, claude-code, cursor, terminal)")
+    parser.add_argument("--chat-initiator-agent", "--initiator-agent", dest="chat_initiator_agent",
+                        help="Initiating Summon agent id")
+    parser.add_argument("--chat-mode", "--mode", dest="chat_mode", choices=("chat", "council", "deliberate"),
+                        default="chat", help="Conversation room mode")
+    parser.add_argument("--conversation-dir", dest="conversation_dir",
+                        help="Root for provider-inert conversation room journals")
+    parser.add_argument("--chat-browser", dest="chat_browser",
+                        choices=("auto", "builtin", "ide", "system", "link"),
+                        help="With chat open: reuse the local atlas in an IDE/browser, or return a link")
+    parser.add_argument("--swarm-action", dest="swarm_action",
+                        choices=("create", "status", "events", "register", "claim", "renew", "cancel", "close"),
+                        help="Local provider-neutral swarm coordinator action")
+    parser.add_argument("--swarm-run-id", dest="swarm_run_id", metavar="RUN_ID",
+                        help="Swarm coordinator run id")
+    parser.add_argument("--swarm-dir", dest="swarm_dir",
+                        help="Private root containing durable swarm runs")
+    parser.add_argument("--swarm-tasks", dest="swarm_tasks",
+                        help="JSON task array for swarm create")
+    parser.add_argument("--swarm-project-root-sha256", dest="swarm_project_root_sha256",
+                        help="Receipt-bound project root digest for swarm create")
+    parser.add_argument("--swarm-roster-sha256", dest="swarm_roster_sha256",
+                        help="Receipt-bound roster definition digest for swarm create")
+    parser.add_argument("--swarm-max-attempts", dest="swarm_max_attempts", type=int,
+                        help="Maximum physical attempts per swarm task")
+    parser.add_argument("--swarm-worker", dest="swarm_worker", metavar="WORKER",
+                        help="Authenticated swarm worker id")
+    parser.add_argument("--swarm-instance", dest="swarm_instance", metavar="INSTANCE",
+                        help="Worker instance id for swarm registration")
+    parser.add_argument("--swarm-task-id", dest="swarm_task_id", metavar="TASK_ID",
+                        help="Swarm task id")
+    parser.add_argument("--swarm-request-sha256", dest="swarm_request_sha256",
+                        help="Receipt-bound task request digest")
+    parser.add_argument("--swarm-lease-ms", dest="swarm_lease_ms", type=int,
+                        help="Swarm claim/renew lease duration in milliseconds")
+    parser.add_argument("--swarm-claim-id", dest="swarm_claim_id", metavar="CLAIM_ID",
+                        help="Swarm claim id")
+    parser.add_argument("--swarm-lease-generation", dest="swarm_lease_generation", type=int,
+                        help="Swarm claim lease generation")
+    parser.add_argument("--swarm-reason", dest="swarm_reason",
+                        help="Bounded reason for swarm cancellation")
+    parser.add_argument("--browser", choices=("auto", "builtin", "ide", "system", "link"),
+                        default="auto",
+                        help="With --deliberate-open: built-in/IDE bridge, system browser, or link")
+    parser.add_argument("--seats",
+                        help="With --deliberate: comma-separated immutable seat agent ids")
+    parser.add_argument("--options",
+                        help="With --deliberate: comma-separated immutable decision options")
+    parser.add_argument("--max-attempts", dest="max_attempts", type=int,
+                        help="With --deliberate: hard physical provider-launch budget")
+    parser.add_argument("--deadline", type=parse_timeout,
+                        help="With --deliberate: absolute run duration from start")
+    parser.add_argument("--require-human-approval", dest="require_human_approval",
+                        action="store_true",
+                        help="With --deliberate: require typed approval after consensus")
+    parser.add_argument("--retry-indeterminate", dest="retry_indeterminate",
+                        action="store_true",
+                        help="With deliberate resume: explicitly allow retry after uncertain spend")
+    parser.add_argument("--command-id", dest="command_id",
+                        help="With deliberate cancel: optional idempotency key")
+    parser.add_argument("--text-only-consent", dest="text_only_consent", action="append",
+                        default=[], metavar="SEAT",
+                        help="With --deliberate: receipt-bound consent for one text-only seat")
+    parser.add_argument("--full-authority-consent", dest="full_authority_consent",
+                        action="append", default=[], metavar="SEAT",
+                        help="With --deliberate: explicit consent for one full-authority seat")
     parser.add_argument("--members", help="With --council: comma-separated member agents "
                                           "(default: a vendor-diverse set)")
     parser.add_argument("--chairman", help="With --council: the synthesizer agent "
@@ -586,7 +916,7 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "changed stages (question/members come from its receipt)")
     parser.add_argument("--council-status", dest="council_status", metavar="RUN_ID",
                         help="Print a council run's durable state (read-only; add --json)")
-    parser.add_argument("--quorum", type=int, metavar="N",
+    parser.add_argument("--quorum", type=parse_quorum, metavar="N|all|FRACTION",
                         help="With --council: synthesize only if at least N members "
                              "succeeded (2..member-count); below N the chairman is skipped. "
                              "Never changes the top-level status, only synthesis")

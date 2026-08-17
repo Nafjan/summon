@@ -67,6 +67,9 @@ class AgentInvocation:
     profile: str | None = None
     profile_env: dict | None = None
     profile_command: str | None = None
+    # Ordinary dispatches use the report contract. Receipt-bound deliberation
+    # turns use a typed ballot contract and must not receive the report nudge.
+    output_contract: str = "report"
 
 
 # Short report-contract nudge appended to RESUME prompts. On resume the session
@@ -665,6 +668,16 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     perm = permission_flags(inv.cli, inv.permission)
     model_flag = ["--model", inv.model] if inv.model else []
     effort_flag = ["--effort", inv.effort] if inv.effort else []
+    # Claude Code loads user/project settings by default. Those settings may
+    # contain an unrelated ANTHROPIC_BASE_URL / ANTHROPIC_MODEL override (for
+    # example a BytePlus coding profile), which silently routes a default
+    # Summon Claude seat away from its declared first-party account. A named
+    # Summon profile is an explicit provider choice and keeps its own settings;
+    # the ambient/default profile is isolated.
+    setting_sources = [] if inv.profile_env is not None else ["--setting-sources", ""]
+    common = (perm + model_flag + effort_flag
+              + strip_boundary_flags(inv.cli, inv.extra_args)
+              + setting_sources)
 
     if inv.resume_id:
         # Resume: the session already carries the agent definition, so we don't
@@ -674,22 +687,21 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         command, base_args = build_command(inv.cli, _resume_prompt(inv))
         command = inv.profile_command or command
         return (command,
-                perm + model_flag + effort_flag
-                + strip_boundary_flags(inv.cli, inv.extra_args)
+                common
                 + ["--resume", inv.resume_id] + base_args,
                 inv.profile_env)
 
-    system_prompt = (
-        f"cwd: {inv.cwd}\n\n{inv.system_context}\n\n"
-        "Reminder before responding: your final message MUST end with the exact "
-        "'Final report' block from your agent definition above, with every field "
-        "present. Do not skip it, even for tiny or trivial tasks."
-    )
+    system_prompt = f"cwd: {inv.cwd}\n\n{inv.system_context}"
+    if inv.output_contract != "deliberation":
+        system_prompt += (
+            "\n\nReminder before responding: your final message MUST end with the exact "
+            "'Final report' block from your agent definition above, with every field "
+            "present. Do not skip it, even for tiny or trivial tasks."
+        )
     command, base_args = build_command(inv.cli, inv.prompt)
     command = inv.profile_command or command
     return (command,
-            perm + model_flag + effort_flag
-            + strip_boundary_flags(inv.cli, inv.extra_args)
+            common
             + ["--append-system-prompt", system_prompt] + base_args,
             inv.profile_env)
 
@@ -713,7 +725,8 @@ def _build_gemini_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         inv, perm + model_flag + strip_boundary_flags(inv.cli, inv.extra_args), env=None)
 
 
-def _build_kimi_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
+def _build_kimi_args(inv: AgentInvocation, *, resource_register=None
+                     ) -> tuple[str, list, dict | None]:
     """Build Kimi Code's native JSONL one-shot invocation.
 
     Kimi 0.31's ``--prompt`` runner is deliberately not combined with session,
@@ -726,6 +739,15 @@ def _build_kimi_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         raise ValueError("resume is not supported for the kimi backend yet: its JSONL output does not provide a stable session id")
     model_flag = ["--model", inv.model] if inv.model else []
     profile = _ensure_kimi_profile()
+    if resource_register is not None:
+        # The fresh profile is disposable; resumed/named profiles never reach
+        # this builder path.  Registration is before argv construction so a
+        # later refusal still leaves an adapter-owned cleanup receipt.
+        try:
+            resource_register(profile, "kimi-profile")
+        except Exception as exc:  # noqa: BLE001 - never orphan copied credentials
+            shutil.rmtree(profile, ignore_errors=True)
+            raise ValueError("kimi profile: controlled cleanup registration failed") from exc
     command, base_args = build_command(inv.cli, _concatenated_prompt(inv))
     return (command, model_flag + strip_boundary_flags(inv.cli, inv.extra_args) + base_args,
             {"KIMI_CODE_HOME": profile, "USERPROFILE": profile, "HOME": profile})
@@ -1545,7 +1567,8 @@ def _resume_agy_profile(profile: str | None) -> str:
     return profile
 
 
-def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
+def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
+                    resource_register=None
                     ) -> tuple[str, list, dict | None]:
     # Effective wrapper deadline in seconds: the real request if provided (don't
     # floor to int — keep sub-second precision), else the env/default. Used both
@@ -1576,13 +1599,14 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
         prompt = _resume_prompt(inv)
         cont = ["--continue"]
     else:
-        prompt = (
-            f"[System Context]\n{inv.system_context}\n\n"
-            f"[User Prompt]\n{inv.prompt}\n\n"
-            "[Reminder] Your final message MUST end with the exact 'Final report' "
-            "block from your agent definition above, with every field present "
-            "(use \"none\" where it does not apply). Do not skip it, even for tiny tasks."
-        )
+        prompt = (f"[System Context]\n{inv.system_context}\n\n"
+                  f"[User Prompt]\n{inv.prompt}")
+        if inv.output_contract != "deliberation":
+            prompt += (
+                "\n\n[Reminder] Your final message MUST end with the exact 'Final report' "
+                "block from your agent definition above, with every field present "
+                "(use \"none\" where it does not apply). Do not skip it, even for tiny tasks."
+            )
         # CHECK BEFORE BUILDING. The guard below used to run after _ensure_agy_profile, so a
         # prompt that was never going to dispatch still created a profile directory and
         # copied OAuth material into it before raising -- orphaning credentials for a run
@@ -1590,6 +1614,14 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
         # effects, not after them.
         _reject_oversized_agy_prompt(prompt)
         profile = _ensure_agy_profile(inv.cwd, deadline_sec)
+        if resource_register is not None:
+            # Only freshly-created profiles are registered.  A resume reuses
+            # caller-selected conversation state and is never adapter-deleted.
+            try:
+                resource_register(profile, "agy-profile")
+            except Exception as exc:  # noqa: BLE001 - never orphan copied credentials
+                shutil.rmtree(profile, ignore_errors=True)
+                raise ValueError("agy profile: controlled cleanup registration failed") from exc
         _attest_agy_profile(profile, getattr(inv, "agy_account_sha256", None),
                             getattr(inv, "agy_account_checked", False))
         cont = []
@@ -1651,14 +1683,18 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None
 # See references/adding-a-backend.md.
 
 
-def _api_call(inv: AgentInvocation, timeout_ms: int) -> dict:
+def _api_call(inv: AgentInvocation, timeout_ms: int, *, launch_control=None) -> dict:
     from _apibackend import call as _call   # lazy: keep _builder import-light
-    return _call(inv, timeout_ms)
+    if launch_control is None:
+        return _call(inv, timeout_ms)
+    return _call(inv, timeout_ms, launch_control=launch_control)
 
 
-def _acp_call(inv: AgentInvocation, timeout_ms: int) -> dict:
+def _acp_call(inv: AgentInvocation, timeout_ms: int, *, launch_control=None) -> dict:
     from _acpbackend import call as _call    # lazy: keep _builder import-light
-    return _call(inv, timeout_ms)
+    if launch_control is None:
+        return _call(inv, timeout_ms)
+    return _call(inv, timeout_ms, launch_control=launch_control)
 
 
 def _arkcli_call(inv: AgentInvocation, timeout_ms: int) -> dict:
@@ -1701,7 +1737,70 @@ def supports_acp(cli: str) -> bool:
     return bool(b and b.get("acp"))
 
 
-def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None
+# Explicit vendor namespaces that can be rejected before a backend is touched.  This is
+# deliberately conservative: unknown/future model IDs are left to the backend rather than
+# guessed, while a model that is unambiguously owned by another vendor fails closed with a
+# useful reroute.  In particular, sending ``claude-opus-*`` to Codex is a routing error, not
+# a provider failure, and must not create a profile or consume a process first.
+_MODEL_VENDOR_PREFIXES = {
+    "anthropic": ("claude-", "anthropic-", "opus", "sonnet", "haiku", "fable"),
+    "openai": ("gpt-", "o1", "o3", "o4", "o5", "codex-"),
+    "google": ("gemini-", "gemini_"),
+    "moonshot": ("kimi-", "moonshot-"),
+    "deepseek": ("deepseek-",),
+    "zhipu": ("glm-", "chatglm-"),
+    "xai": ("grok-",),
+}
+
+
+_MODEL_COMPATIBLE_BACKENDS = {
+    "anthropic": ("claude", "agy", "cursor-agent"),
+    "openai": ("agy", "codex", "cursor-agent", "openai-compat"),
+    "google": ("agy", "cursor-agent", "gemini", "openai-compat"),
+    "moonshot": ("agy", "kimi", "cursor-agent", "openai-compat"),
+    "deepseek": ("agy", "openai-compat"),
+    "zhipu": ("agy", "openai-compat"),
+    "xai": ("agy", "cursor-agent", "openai-compat"),
+}
+
+
+def model_backend_compatibility(cli: str, model: str | None) -> dict | None:
+    """Return a deterministic preflight refusal for known cross-vendor models.
+
+    ``None`` means the request is either compatible or intentionally unknown.  The helper
+    never probes a provider and never invents a model catalogue; it only recognizes explicit
+    vendor namespaces/aliases that summon already treats as named models.  The returned
+    payload is suitable for both the live envelope and the side-effect-free dry-run view.
+    """
+    if not isinstance(cli, str) or not isinstance(model, str) or not model.strip():
+        return None
+    normalized = model.strip().lower()
+    vendor = None
+    for candidate, prefixes in _MODEL_VENDOR_PREFIXES.items():
+        if any(normalized == prefix.rstrip("-") or normalized.startswith(prefix)
+               for prefix in prefixes):
+            vendor = candidate
+            break
+    if vendor is None:
+        return None
+    compatible = tuple(_MODEL_COMPATIBLE_BACKENDS[vendor])
+    if cli in compatible:
+        return None
+    return {
+        "error_kind": "backend_model_incompatible",
+        "backend": cli,
+        "model_requested": model,
+        "model_vendor": vendor,
+        "compatible_backends": list(compatible),
+        "recommended_backend": compatible[0] if compatible else None,
+        "message": (f"model {model!r} belongs to the {vendor} namespace and is not "
+                    f"compatible with backend {cli!r}; choose an explicit compatible "
+                    f"backend ({', '.join(compatible)})"),
+    }
+
+
+def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
+                          resource_register=None
                           ) -> tuple[str, list, dict | None]:
     """Dispatch to a SUBPROCESS backend's argument builder.
 
@@ -1721,7 +1820,11 @@ def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None
     # and --dry-run enforce it identically. The executor surfaces the notes/billing.
     inv, credit_env, _ = apply_credit_guard(inv)
     if inv.cli == "agy":
-        cmd, args, env = _build_agy_args(inv, timeout_ms)
+        cmd, args, env = _build_agy_args(
+            inv, timeout_ms, resource_register=resource_register)
+    elif inv.cli == "kimi" and resource_register is not None:
+        cmd, args, env = _build_kimi_args(
+            inv, resource_register=resource_register)
     else:
         cmd, args, env = b["build"](inv)
     if credit_env:

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # The dispatcher modules live under skills/summon/scripts/ (the self-contained
@@ -40,6 +41,14 @@ def _dest(home: str) -> str:
     return os.path.join(home, ".claude", "skills", "summon")
 
 
+def _deliberate_dest(home: str) -> str:
+    return os.path.join(home, ".claude", "skills", "deliberate")
+
+
+def _council_dest(home: str) -> str:
+    return os.path.join(home, ".claude", "skills", "council")
+
+
 def test_unowned_dir_survives_uninstall_and_reinstall():
     home = _fake_home()
     try:
@@ -52,6 +61,20 @@ def test_unowned_dir_survives_uninstall_and_reinstall():
         r = _run(home, "--hosts", "claude", "--no-agents")
         assert r.returncode == 2, (r.returncode, r.stdout)
         assert os.path.isfile(os.path.join(unowned, "USER_FILE"))
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_foreign_summon_refusal_does_not_create_deliberate_companion():
+    """A refused canonical install must not leave a partial sibling surface."""
+    home = _fake_home()
+    try:
+        unowned = _dest(home)
+        os.makedirs(unowned)
+        open(os.path.join(unowned, "USER_FILE"), "w").write("precious")
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 2, (r.returncode, r.stdout + r.stderr)
+        assert not os.path.exists(_deliberate_dest(home))
     finally:
         shutil.rmtree(home, ignore_errors=True)
 
@@ -162,6 +185,96 @@ def test_true_refresh_and_clean_uninstall():
         assert r.returncode == 0 and not os.path.exists(stale)
         r = _run(home, "--hosts", "claude", "--uninstall")
         assert r.returncode == 0 and not os.path.isdir(_dest(home))
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_shipped_examples_are_installed_and_owned():
+    """Every user-facing example is part of the managed payload.
+
+    This guards against a refresh silently deleting source-backed examples from
+    an older owned tree when the installer swaps the directory atomically.
+    """
+    home = _fake_home()
+    try:
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0, r.stdout + r.stderr
+        dest = _dest(home)
+        expected = os.path.join("examples", "document-audit.manifest.json")
+        assert os.path.isfile(os.path.join(dest, expected))
+        with open(os.path.join(dest, ".summon-install.json"), encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        normalized = {Path(name).as_posix() for name in manifest["files"]}
+        assert Path(expected).as_posix() in normalized
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_deliberate_companion_is_installed_and_points_to_canonical_skill():
+    home = _fake_home()
+    try:
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0, r.stdout + r.stderr
+        md = os.path.join(_deliberate_dest(home), "SKILL.md")
+        text = open(md, encoding="utf-8").read()
+        assert "name: deliberate" in text
+        assert "summon-managed: deliberate-companion" in text
+        assert "../summon/references/deliberation.md" in text
+        assert "../summon/scripts/run_subagent.py" in text
+        r = _run(home, "--hosts", "claude", "--uninstall")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert not os.path.exists(_deliberate_dest(home))
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_council_companion_is_installed_and_removed_safely():
+    home = _fake_home()
+    try:
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 0, r.stdout + r.stderr
+        md = os.path.join(_council_dest(home), "SKILL.md")
+        text = open(md, encoding="utf-8").read()
+        assert "name: council" in text
+        assert "summon-managed: council-companion" in text
+        assert "../summon/references/deliberation.md" in text
+        r = _run(home, "--hosts", "claude", "--uninstall")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert not os.path.exists(_council_dest(home))
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_council_companion_never_clobbers_foreign_skill():
+    home = _fake_home()
+    try:
+        d = _council_dest(home)
+        os.makedirs(d)
+        md = os.path.join(d, "SKILL.md")
+        open(md, "w", encoding="utf-8").write("---\nname: council\n---\nUSER SKILL\n")
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 2, r.stdout + r.stderr
+        assert "USER SKILL" in open(md, encoding="utf-8").read()
+        r = _run(home, "--hosts", "claude", "--uninstall")
+        assert r.returncode == 2, r.stdout + r.stderr
+        assert os.path.isfile(md)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_deliberate_companion_never_clobbers_foreign_skill():
+    home = _fake_home()
+    try:
+        d = _deliberate_dest(home)
+        os.makedirs(d)
+        md = os.path.join(d, "SKILL.md")
+        open(md, "w", encoding="utf-8").write("---\nname: deliberate\n---\nUSER SKILL\n")
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 2, r.stdout + r.stderr
+        assert "USER SKILL" in open(md, encoding="utf-8").read()
+        r = _run(home, "--hosts", "claude", "--uninstall")
+        assert r.returncode == 2, r.stdout + r.stderr
+        assert os.path.isfile(md)
     finally:
         shutil.rmtree(home, ignore_errors=True)
 

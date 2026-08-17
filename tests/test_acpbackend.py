@@ -621,15 +621,22 @@ def test_transport_frontmatter_and_flag():
 
 if __name__ == "__main__":
     # Plain-assert runner (no pytest required), matching tests/test_install.py.
+    # The fallback policy is part of each test's explicit fixture.  Do not let
+    # a developer/CI shell's ambient opt-in change the result of this suite.
+    _ambient_fallback = os.environ.pop("SUMMON_ACP_FALLBACK", None)
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]
     failed = 0
-    for name, fn in fns:
-        try:
-            fn()
-            print(f"PASS {name}")
-        except Exception as e:  # noqa: BLE001
-            failed += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-    print(f"\n{len(fns) - failed}/{len(fns)} passed")
-    sys.exit(1 if failed else 0)
+    try:
+        for name, fn in fns:
+            try:
+                fn()
+                print(f"PASS {name}")
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                print(f"FAIL {name}: {type(e).__name__}: {e}")
+        print(f"\n{len(fns) - failed}/{len(fns)} passed")
+        sys.exit(1 if failed else 0)
+    finally:
+        if _ambient_fallback is not None:
+            os.environ["SUMMON_ACP_FALLBACK"] = _ambient_fallback
