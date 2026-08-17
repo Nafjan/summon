@@ -75,7 +75,13 @@ For a local preview of all rooms, run `_conversation_ui.py --serve
 <conversation-root>` from the installed scripts. It prints one authenticated
 loopback URL; observation and human context remain authority-inert, while an
 explicit `chat turn` may launch a bounded roster-agent process. The browser
-atlas groups rooms by project digest and initiating host/agent.
+atlas groups rooms by project digest and initiating host/agent. A direct
+`--serve` process follows the lifetime of the terminal or task that launched it;
+Ctrl+C, task cleanup, or parent-process teardown stops it. Prefer `summon chat
+open --chat-browser auto`, which detaches the atlas server from the short-lived
+handoff command and tracks it with its authenticated sidecar. `--timeout` limits
+agent turns; it is not an atlas server TTL. Close the surface explicitly when
+finished.
 
 Summon's existing `manifest` command is batch fan-out. The versioned
 external-worker contract is documented in `SUMMON_SWARM_PROTOCOL.md`, and

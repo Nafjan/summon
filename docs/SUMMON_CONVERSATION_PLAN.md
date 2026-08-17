@@ -136,13 +136,13 @@ it does not create a receipt, cast a ballot, or contact a provider.
 The loopback conversation surface is available from `_conversation_ui.py` for a private
 conversation root. It groups rooms by full project-root digest and initiating host/agent,
 uses a bearer token in the URL fragment plus an authorization header for API requests,
-and supports public-redacted room reads, bounded cursor `/events` reads, authenticated
-`/stream` SSE frames, typed human-context posts, and an explicit `turns`/`cancel`
-endpoint. Room creation freezes safe roster identity facts when available: agent id,
-display name, role, provider route, and declared model/version. The “Ask a roster
-agent” control keeps that declared target distinct from `model_served` evidence on a
-finished turn, labels missing identity as “model not sealed,” records the durable turn
-lifecycle, and explains that output is context only.
+and supports public-redacted room reads, bounded event reads, authenticated `/stream`
+SSE frames, typed human-context posts, and an explicit `turns`/`cancel` endpoint. Room
+creation freezes safe roster identity facts when available: agent id, display name, role,
+provider route, and declared model/version. The “Ask an agent” control shows the role,
+name, version, roster model, and provider separately; it keeps the roster target distinct
+from `model_served` evidence on a finished turn, labels missing identity as “model not
+verified,” records the durable turn lifecycle, and explains that output is context only.
 It is a separate surface from the deliberation ledger and has no ballot or policy
 authority. Start the atlas with `chat open ... --cwd PROJECT` when agent turns
 need to run against a project; a bare `--serve ROOT` invocation remains useful for
@@ -159,16 +159,22 @@ For a local preview, keep the conversation root private and run:
 python skills/summon/scripts/_conversation_ui.py --serve <conversation-root>
 ```
 
-The process prints one authenticated loopback URL. Reuse that URL while the process is
-running; the fragment token is never sent to the server and must not be copied into a
-prompt, ticket, report, or telemetry event. `summon chat open --chat-browser auto`
-now starts or reuses this atlas and prefers an explicit IDE bridge, then a built-in
-browser harness, then the system browser. Use `--chat-browser link` in CI/SSH to
-return the URL without launching a tab. Room reads and human posts remain
-provider-inert; the explicit Ask-a-roster-agent control is the only provider-backed
-exception and requires the surface's `--cwd`/roster binding. The surface close path
-durably cancels and joins locally owned turns before shutting down the HTTP server;
-cross-process cancellation remains bounded by the recorded owner/process lease.
+The process prints one authenticated loopback URL. A direct `--serve` process lives only
+as long as the terminal/process that launched it; closing that process, sending
+Ctrl+C, or an IDE task cleanup will stop the server. Prefer `summon chat open
+--chat-browser auto` for a handoff: its server child is detached from the short-lived
+CLI/IDE command and tracked by the authenticated sidecar, so ending the initiating
+conversation does not close the atlas. The sidecar is not a heartbeat or a TTL; the
+atlas remains until an explicit surface close or process cleanup. The `--timeout`
+value controls agent-turn work, not atlas lifetime. The fragment token is never sent
+to the server and must not be copied into a prompt, ticket, report, or telemetry event.
+`chat open` prefers an explicit IDE bridge, then a built-in browser harness, then the
+system browser. Use `--chat-browser link` in CI/SSH to return the URL without launching
+a tab. Room reads and human posts remain provider-inert; the explicit Ask-an-agent
+control is the only provider-backed exception and requires the surface's `--cwd`/roster
+binding. The surface close path durably cancels and joins locally owned turns before
+shutting down the HTTP server; cross-process cancellation remains bounded by the
+recorded owner/process lease.
 
 ### `deliberate`
 

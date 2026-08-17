@@ -10,6 +10,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -64,11 +65,11 @@ class ConversationUITests(unittest.TestCase):
         with urlopen(self.base.split("#", 1)[0], timeout=3) as response:
             page = response.read().decode()
         self.assertIn("Conversation atlas", page)
-        self.assertIn("Ask a roster agent", page)
-        self.assertIn("Cancel turn", page)
-        self.assertIn("context + explicit turns", page)
+        self.assertIn("Ask an agent", page)
+        self.assertIn("Stop this turn", page)
+        self.assertIn("Context and agent turns", page)
         self.assertIn("/stream?after=", page)
-        self.assertIn("Live updates paused; retrying safely.", page)
+        self.assertIn("Live updates paused; retrying from recorded event", page)
         self.assertIn("setInterval(refresh,10000)", page)
         self.assertNotIn("setInterval(refresh,2000)", page)
         # Embedded browser harnesses may omit URI decoding globals; the
@@ -79,16 +80,16 @@ class ConversationUITests(unittest.TestCase):
 
     def test_page_uses_messenger_regions_and_incremental_cursor_reducer(self):
         source = (HERE / "_conversation_page.py").read_text(encoding="utf-8")
-        for marker in ("Conversation atlas", "room-search", "timeline", "Room evidence",
-                       "Post context", "Ask a roster agent", "context + explicit turns",
+        for marker in ("Conversation atlas", "room-search", "timeline", "Room details",
+                       "Post context", "Ask an agent", "Context and agent turns",
                        "appendRecord", "cursor !== state.cursor + 1",
                        "timeline.append(renderEvent(record))", "event === 'agent_message'",
-                       "Roster identities", "Model not sealed", "identityTooltip",
-                       "target = roster declaration · served = provider receipt", "Review bounded provider turn",
-                       "awaiting served receipt", "receipt matched", "target not sealed", "Live connected', 'connected'"):
+                       "Agents and models", "Model not verified", "identityTooltip",
+                       "Roster target · provider-served receipt", "Review agent request",
+                       "WAITING FOR MODEL RECEIPT", "MODEL MATCH", "target missing", "setConnection('Live', 'connected'"):
             self.assertIn(marker, source)
         self.assertIn("stops automatically after", source)
-        self.assertIn("Reconnect to the local owner before launching", source)
+        self.assertIn("Reconnect to the local owner before starting an agent turn", source)
         self.assertIn("action-dialog", source)
         self.assertNotIn("window.confirm", source)
         self.assertNotIn("window.prompt", source)
@@ -304,6 +305,21 @@ class ConversationUITests(unittest.TestCase):
         self.assertIsNotNone(ready)
         self.assertEqual(ready["pid"], pid)
         self.assertEqual(ready["url"], started["url"])
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, check=False)
+        else:
+            os.kill(pid, 15)
+
+    def test_new_surface_is_detached_from_short_lived_handoff_process(self):
+        root = Path(self.tmp.name) / "detached-root"
+        root.mkdir()
+        with patch.object(_conversation_browser, "popen_flags",
+                          wraps=_conversation_browser.popen_flags) as flags:
+            started = ensure_surface(str(root), timeout=5.0)
+        self.assertTrue(any(call.kwargs.get("detached") is True
+                             for call in flags.call_args_list))
+        pid = int(started["pid"])
         if os.name == "nt":
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
                            capture_output=True, check=False)

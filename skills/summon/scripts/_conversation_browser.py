@@ -233,9 +233,14 @@ def ensure_surface(root: str, *, timeout: float = 5.0,
         if binding_agents_dir:
             command.extend(["--agents-dir", binding_agents_dir])
         try:
+            # The atlas is a handoff from a short-lived CLI/IDE command to a
+            # local observer.  Detach the server itself from that caller so a
+            # terminal/agent session ending does not take the browser down.
+            # Its authenticated sidecar remains the lifetime record, and an
+            # explicit surface close still shuts it down.
             process = subprocess.Popen(command, shell=False,
                                        cwd=str(Path(__file__).parent), stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL, **popen_flags())
+                                       stderr=subprocess.DEVNULL, **popen_flags(detached=True))
         except OSError as exc:
             raise ConversationBrowserError("conversation surface could not be started") from exc
         deadline = time.monotonic() + timeout
