@@ -70,6 +70,15 @@ def validate_run_id(run_id: str) -> str:
 def run_path(runs_root: str, run_id: str) -> str:
     """Containment-checked absolute path of a run dir under ``runs_root``."""
     validate_run_id(run_id)
+    # Windows namespace/device prefixes are never valid run roots, even when a
+    # caller is running on POSIX (where backslashes and colons would otherwise be
+    # ordinary filename characters).  Rejecting them consistently keeps the
+    # public invalid_root contract platform-independent and prevents a path that
+    # would change meaning after migration to Windows.
+    if (not isinstance(runs_root, str) or not runs_root
+            or "\x00" in runs_root
+            or runs_root.startswith(("\\\\?\\", "\\\\.\\"))):
+        raise ValueError("runs root has an unsupported device/namespace form")
     raw_root = Path(runs_root).expanduser()
     # Inspect the supplied path before resolving it.  A junction or symlink
     # would otherwise become an ordinary-looking directory and let callers

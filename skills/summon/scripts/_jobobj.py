@@ -88,6 +88,28 @@ if _AVAILABLE:  # pragma: no cover - the import itself is platform-gated
 _ATTR = "_summon_job_handle"
 
 
+def _process_attr(process, name: str):
+    """Read an optional Popen attribute without triggering dynamic mock attributes.
+
+    ``unittest.mock.Mock`` manufactures a child object for any missing attribute.
+    That is normally harmless, but the child object's introspection on Python 3.10
+    can recurse until a native stack overflow when teardown asks for the optional
+    job handle.  Real ``subprocess.Popen`` instances keep these values in their
+    instance dictionary, so prefer that bounded lookup and only fall back for
+    slot-based process doubles.
+    """
+    try:
+        values = vars(process)
+    except TypeError:
+        values = None
+    if isinstance(values, dict):
+        return values.get(name)
+    try:
+        return getattr(process, name, None)
+    except Exception:  # noqa: BLE001 - optional teardown metadata
+        return None
+
+
 def available() -> bool:
     """True when Job Objects can be used on this platform/build."""
     return _AVAILABLE
@@ -104,7 +126,7 @@ def attach(process, *, detached: bool = False) -> bool:
     """
     if not _AVAILABLE or detached:
         return False
-    handle = getattr(process, "_handle", None)
+    handle = _process_attr(process, "_handle")
     if not handle:
         return False
     job = None
@@ -140,7 +162,7 @@ def terminate(process) -> bool:
 
     Returns True when the job handled it, so the caller can skip taskkill entirely.
     """
-    job = getattr(process, _ATTR, None)
+    job = _process_attr(process, _ATTR)
     if not _AVAILABLE or not job:
         return False
     terminated = False
@@ -170,7 +192,7 @@ def close(process) -> bool:
     Idempotent: the attribute is cleared first, so a concurrent second caller (council
     teardown racing normal completion) cannot double-close the same raw handle.
     """
-    job = getattr(process, _ATTR, None)
+    job = _process_attr(process, _ATTR)
     if not job:
         return False
     try:                      # clear FIRST: two threads must not both see the same handle
