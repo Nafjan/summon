@@ -29,6 +29,35 @@ import _rundir
 SCRIPT = HERE / "run_subagent.py"
 
 
+def _install_fake_claude_on_path(root: Path):
+    """Supply executable evidence while the provider executor is mocked.
+
+    CI deliberately has no real provider CLIs installed.  The fresh live lane
+    must still require executable evidence, so these tests install a tiny
+    inert launcher and replace PATH only for roster resolution.  No test ever
+    executes this file: the executor seam is patched below.
+    """
+    bin_dir = root / "fake-bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        launcher = bin_dir / "claude.cmd"
+        launcher.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
+    else:
+        launcher = bin_dir / "claude"
+        launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        launcher.chmod(0o755)
+    previous = os.environ.get("PATH")
+    os.environ["PATH"] = str(bin_dir) + os.pathsep + (previous or "")
+    return previous
+
+
+def _restore_path(previous: str | None):
+    if previous is None:
+        os.environ.pop("PATH", None)
+    else:
+        os.environ["PATH"] = previous
+
+
 def _receipt(run_id: str) -> dict:
     return {
         "mode": "deliberation", "schema_version": 1, "run_id": run_id,
@@ -171,6 +200,8 @@ class DeliberationCliTests(unittest.TestCase):
                 return FakeReport()
 
         with tempfile.TemporaryDirectory() as temp:
+            previous_path = _install_fake_claude_on_path(Path(temp))
+            self.addCleanup(_restore_path, previous_path)
             project = Path(temp) / "project"
             agents = project / "agents"
             agents.mkdir(parents=True)
@@ -247,6 +278,8 @@ class DeliberationCliTests(unittest.TestCase):
                     "result": json.dumps({"ballot": ballot})}
 
         with tempfile.TemporaryDirectory() as temp:
+            previous_path = _install_fake_claude_on_path(Path(temp))
+            self.addCleanup(_restore_path, previous_path)
             project = Path(temp) / "project"
             agents = project / "agents"
             agents.mkdir(parents=True)
@@ -289,6 +322,8 @@ class DeliberationCliTests(unittest.TestCase):
             return {"status": "error", "exit_code": 1, "result": ""}
 
         with tempfile.TemporaryDirectory() as temp:
+            previous_path = _install_fake_claude_on_path(Path(temp))
+            self.addCleanup(_restore_path, previous_path)
             project = Path(temp) / "project"
             agents = project / "agents"
             agents.mkdir(parents=True)
