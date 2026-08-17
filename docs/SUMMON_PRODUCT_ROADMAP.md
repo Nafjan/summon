@@ -4,10 +4,12 @@ Status date: 2026-08-17
 Current source version: `3.0.0` candidate
 Readiness: the immutable `3.0.0` tag remains the public-preview baseline. The current
 working tree contains the authenticated chat/runtime, browser hardening, local swarm
-coordinator, and narrow fresh read-only deliberation lane described below. A current
-registry run is green for the fixed suites and non-provider gates, but the tree is still
-dirty and the live-provider receipt has not yet been rebound into a clean release packet;
-publication therefore remains blocked until the clean immutable candidate is produced.
+coordinator, and narrow fresh read-only deliberation lane described below. Focused suites
+are green, but this checkout is not a release candidate: the tree has local changes, the
+managed installs drift from the current source payload, no source-bound release evidence
+packet is present, and no accepted schema-2 live-provider receipt is available to the
+release checker. Publication therefore remains blocked until a clean immutable candidate
+is produced and independently evidenced.
 Additional provider receipts, remote execution, and multi-user hosting remain separately
 gated.
 
@@ -18,13 +20,13 @@ This is the release-facing roadmap for turning the current, well-tested kernel i
 | Area | Current truth | Release posture |
 | --- | --- | --- |
 | Ordinary dispatch, council, ACP, telemetry | Implemented and locally exercised | Ready for continued public use |
-| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; Claude Opus has a reviewed receipt, while Fable and Gemini availability still require saved receipts with exact `model.served` and profile evidence | Claude Opus route verified; other live lanes remain gated |
+| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; exact `model.served` and profile evidence is required per route, and no current receipt is bound to this checkout | All live lanes remain gated until independently reviewed evidence is rebound |
 | Deliberation kernel, journal replay/recovery, scheduler | Focused `test_deliberation_*.py` suite; provider-inert | Ready as a fake/injected integration surface |
 | Custom Agent manifests and roster binding | Strict parser, path fencing, consent/identity binding | Ready as provider-inert configuration |
-| Live provider composition | Receipt/plan/owner/deadline fences exist; a reviewed schema-2 Claude Opus normal/cancel/deadline receipt is retained, but it must be supplied to the final clean-tree registry | Claude Opus route remains live-provider-gated until the clean packet is rebound; other routes remain provider-inert until independently reviewed |
+| Live provider composition | Receipt/plan/owner/deadline fences exist, but the current checkout has no accepted schema-2 receipt bound to its source hash | Live-provider gate is blocked; no route is advertised as GA-ready |
 | Browser conversation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, visual evidence, and explicit cancellable roster-agent turns; richer multi-run lifecycle remains preview | Unreleased post-GA preview |
 | Local swarm coordinator | `_rundir`-backed owner/lease/claim journal, idempotent worker messages, claim-bound artifacts, cancellation, and explicit uncertain-spend recovery; no implicit provider or IDE attachment | Provider-neutral preview |
-| Managed local installs | All nine detected host profiles (eight managed records) now match this working tree after the installer refresh; the unmanaged Cursor plugin remains intentionally untouched | Converged for the current dirty candidate; repeat after the immutable release commit |
+| Managed local installs | The installer detects nine host profiles (eight managed records), but the current release check reports payload drift on all eight; the unmanaged Cursor plugin remains intentionally untouched | Not converged; refresh after the release candidate is finalized, then verify again from the immutable commit |
 | Unmanaged Cursor local plugin | Older 2.2.0 content hash; not installer-owned | Update through its plugin mechanism only |
 
 Telemetry is enabled for this workstation through `~/.agents/summon-telemetry.json`. “On” means bounded, allow-listed local JSONL diagnostics only; it does not transmit data. GitHub issue submission remains a separate explicit action.
@@ -80,14 +82,12 @@ to unmanaged Cursor plugins.
 No open P0/P1 reliability, security, privacy, migration, or evidence contradiction may
 remain. The release manifest is generated from a clean, immutable source tree and
 requires the named suites and gates rather than accepting arbitrary caller-supplied
-labels. The clean candidate evidence for commit `5530459` records: deliberation 339/339,
-resume 15/15, discovery 549/549, conversation 43/43, runtime 25/25, UI 19/19,
-install 30/30, model catalog 6/6, model routing 4/4, release contract 3/3,
-release gates 7/7, release manifest 16/16, live-provider gate tests 3/3,
-swarm protocol 12/12, swarm coordinator 20/20, and ACP 36/36. All eight named
-release gates passed against the clean source-bound evidence, including the
-receipt-bound live-provider gate; the unmanaged Cursor plugin remains reported
-and intentionally untouched.
+labels. Earlier evidence packets, including the packet for commit `5530459`, are
+historical and must not be reused after source changes. The release owner must rerun
+every fixed suite and gate, bind the outputs to the final source hash, and provide an
+accepted schema-2 live-provider receipt before calling the candidate GA. Until then,
+the correct posture is public preview, with the unmanaged Cursor plugin reported and
+intentionally untouched.
 
 ## Product direction
 

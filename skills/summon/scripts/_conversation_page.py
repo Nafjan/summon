@@ -161,9 +161,10 @@ select { min-height: 44px; padding: 8px 10px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; } }
 
-/* Beautiful UI-inspired workbench layer: compact cards, precise hairlines, and
-   component states that make the journal feel like a live instrument. This is
-   an independent stdlib implementation; no external UI package is loaded. */
+/* Beautiful UI visual adaptation: the centered canvas, striped surround,
+   dashed hairlines, compact cards, and restrained state palette are adapted
+   from the MIT-licensed Beautiful UI reference. Summon keeps its own markup,
+   journal semantics, accessibility behavior, and dependency-free runtime. */
 :root {
   --ink: #0a0d11;
   --rail: #0e1218;
@@ -316,7 +317,7 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .timeline-head strong { font-size: 12px; letter-spacing: .01em; }
 .timeline-head small { color: var(--quiet); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .stream-filters { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
-.stream-filter { min-height: 44px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--muted); font-size: 10px; }
+.stream-filter { min-width: 44px; min-height: 44px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--muted); font-size: 10px; }
 .stream-filter[aria-pressed="true"] { border-color: var(--blue); background: var(--blue-deep); color: var(--text); }
 .latest { min-height: 44px; padding: 8px 10px; border: 1px solid var(--blue); border-radius: 7px; background: var(--blue-deep); color: var(--text); font-size: 11px; }
 .latest[hidden] { display: none; }
@@ -326,7 +327,7 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .room-title h1 { text-wrap: balance; }
 .room-title h1 { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; max-height: calc(2 * 1.18em); overflow: hidden; }
 .room-subtitle .session-id { color: var(--quiet); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
-.room-intent { max-width: 62ch; margin-top: 6px; color: var(--muted); font-size: 12px; }
+.room-intent { max-width: 62ch; margin-top: 8px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: inset 0 1px 0 var(--blue); color: var(--text); font-size: 12px; line-height: 1.42; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
 .facts { flex-wrap: wrap; justify-content: flex-end; }
 .facts span[data-live="true"] { border-color: #42647a; color: var(--blue); }
 .working-summary { color: var(--lime); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
@@ -350,6 +351,8 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .participant-model { overflow: hidden; color: var(--lime); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .participant.unresolved .participant-model { color: var(--quiet); }
 .participant-provider { color: var(--quiet); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.identity-summary { max-width: 34ch; }
+.identity-help { margin: 5px 0 0; color: var(--quiet); font-size: 10px; }
 .room-models { display: block; overflow: hidden; margin-top: 5px; color: var(--blue); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .message-model { color: var(--lime); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .message-model.drift { color: var(--coral); }
@@ -429,6 +432,228 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .glossary summary, .system-chip summary, .message summary { display: inline-flex; align-items: center; padding: 4px 6px; }
 .facts, .message-meta, .evidence { font-size: 11px; }
   .fact-list dd { font-size: 12px; }
+
+/* Beautiful UI adaptation layer. These are intentionally local tokens and
+   selectors rather than a remote stylesheet: the MIT credit lives in
+   THIRD_PARTY_NOTICES.md and no vendor runtime/font is loaded. */
+:root {
+  --ink: #17181a;
+  --rail: #1c1d1f;
+  --panel: #222326;
+  --panel-2: #252629;
+  --panel-3: #2b2c30;
+  --line: #383a3f;
+  --line-soft: #2c2e32;
+  --text: #f1f2f4;
+  --muted: #a2a5ac;
+  --quiet: #767a82;
+  --blue: #6c9dff;
+  --blue-deep: #273244;
+  --lime: #9fe4a7;
+  --lime-deep: #233128;
+  --amber: #f1bd7a;
+  --amber-deep: #30291f;
+  --violet: #c2b5ff;
+  --violet-deep: #2b2938;
+  --coral: #ff9b91;
+  --coral-deep: #352427;
+  --focus: #a9c5ff;
+}
+html, body {
+  background: #17181a;
+}
+body {
+  background-image: repeating-linear-gradient(135deg, #17181a 0 2px, #151618 2px 4px);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  letter-spacing: -.01em;
+}
+.atlas {
+  width: min(1240px, calc(100% - 32px));
+  margin: 0 auto;
+  grid-template-columns: 250px minmax(0, 1fr) 266px;
+  background: var(--rail);
+  border-inline: 1px dashed var(--line);
+}
+.rail, .drawer {
+  background: var(--rail);
+}
+.rail {
+  border-right: 1px dashed var(--line);
+}
+.drawer {
+  border-left: 1px dashed var(--line);
+}
+.thread {
+  background: var(--rail);
+}
+.brand {
+  margin-top: 4px;
+  margin-bottom: 31px;
+  letter-spacing: .12em;
+}
+.brand-mark {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--blue);
+  color: #15171a;
+  box-shadow: 0 0 0 1px #ffffff14, 0 2px 8px #0005;
+}
+.search, textarea, select {
+  background: var(--panel);
+  border-color: var(--line);
+  box-shadow: inset 0 1px 2px #0006;
+}
+.search { border-radius: 8px; }
+.room-button {
+  border-radius: 8px;
+}
+.room-button:hover, .room-button:focus-visible {
+  border-color: var(--line-strong, #4a4c52);
+  background: var(--panel);
+}
+.room-button.active {
+  border-color: #4a4c52;
+  background: var(--panel);
+  box-shadow: 0 0 0 1px #ffffff08, 0 2px 8px #0003;
+}
+.room-button.active::before {
+  width: 2px;
+  background: var(--blue);
+}
+.mode-chip {
+  border-color: #4b4e57;
+  color: var(--blue);
+}
+.topbar {
+  min-height: 96px;
+  background: var(--rail);
+  border-bottom: 1px dashed var(--line);
+}
+.topbar::before {
+  color: var(--quiet);
+}
+.room-title h1 {
+  font-size: clamp(22px, 2.35vw, 30px);
+  font-weight: 680;
+  -webkit-line-clamp: 1;
+  max-height: 1.2em;
+}
+.status {
+  border-radius: 999px;
+  background: var(--panel);
+  box-shadow: 0 0 0 1px #ffffff08, 0 2px 6px #0004;
+}
+.thread-body {
+  width: 100%;
+  padding-inline: 32px;
+}
+.room-bar {
+  border-bottom: 1px dashed var(--line);
+}
+.facts span, .participant, .tab, .stream-filter {
+  background: var(--panel);
+  border-color: var(--line);
+  box-shadow: 0 0 0 1px #ffffff05, 0 1px 2px #0003;
+}
+.facts span {
+  border-radius: 999px;
+}
+.facts span[data-live="true"] {
+  border-color: #4a638e;
+}
+.timeline {
+  gap: 19px;
+}
+.timeline::before {
+  background: repeating-linear-gradient(to bottom, var(--line) 0 3px, transparent 3px 7px);
+}
+.bubble, .system-chip, .working-row, .launch-review, .turn-recovery {
+  background: var(--panel);
+  border-color: var(--line);
+  box-shadow: 0 0 0 1px #ffffff06, 0 2px 8px #0003;
+}
+.message.human .bubble {
+  background: var(--amber-deep);
+  border-color: #6b583e;
+}
+.system-chip {
+  border-radius: 9px;
+}
+.system-event.round .system-chip, .system-event.turn .system-chip { background: #202a38; }
+.system-event.position .system-chip, .system-event.finish .system-chip { background: var(--lime-deep); }
+.system-event.cross .system-chip, .system-event.context .system-chip { background: var(--amber-deep); }
+.system-event.synthesis .system-chip, .system-event.fork .system-chip { background: var(--violet-deep); }
+.system-event.cancel .system-chip { background: var(--coral-deep); }
+.system-event.cleanup .system-chip { background: var(--lime-deep); }
+.composer {
+  border-top: 1px dashed var(--line);
+  background: var(--rail);
+}
+.tab[aria-selected="true"] {
+  background: var(--blue-deep);
+  border-color: var(--blue);
+}
+.primary {
+  border: 0;
+  border-radius: 8px;
+  background: var(--blue);
+  box-shadow: 0 2px 10px #0005;
+}
+.drawer-section {
+  border-bottom: 1px dashed var(--line);
+}
+.boundary {
+  background: var(--amber-deep);
+  border-color: #6b583e;
+  box-shadow: 0 0 0 1px #ffffff06, 0 2px 8px #0003;
+}
+.rail-credit {
+  margin: 28px 7px 0;
+  padding-top: 16px;
+  border-top: 1px dashed var(--line);
+  color: var(--quiet);
+  font-size: 10px;
+  line-height: 1.55;
+}
+.rail-credit strong { color: var(--muted); font-weight: 650; }
+.rail-credit a { color: var(--blue); text-decoration: none; }
+.rail-credit a:hover, .rail-credit a:focus-visible { text-decoration: underline; }
+.room-models { white-space: normal; line-height: 1.35; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.participant-model { color: var(--blue); font-size: 11px; }
+.participant-provider { color: var(--muted); font-size: 10px; letter-spacing: .02em; }
+.participant-name { font-size: 13px; }
+.participant-role { color: var(--quiet); }
+.agent-picker { position: relative; margin: 0 0 8px; }
+.agent-picker[hidden], .agent-picker-menu[hidden] { display: none; }
+.agent-picker-button { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px; width: 100%; min-height: 52px; padding: 8px 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--text); text-align: left; box-shadow: 0 0 0 1px #ffffff05, 0 2px 8px #0003; }
+.agent-picker-button:hover, .agent-picker-button:focus-visible, .agent-picker-button[aria-expanded="true"] { border-color: var(--blue); outline: none; box-shadow: 0 0 0 3px #6c9dff2b, 0 2px 8px #0003; }
+.agent-picker-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 680; }
+.agent-picker-meta { overflow: hidden; color: var(--blue); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.agent-picker-chevron { color: var(--muted); font-size: 16px; line-height: 1; }
+.agent-picker-menu { position: absolute; z-index: 20; top: calc(100% + 7px); right: 0; left: 0; display: grid; gap: 3px; max-height: 260px; overflow-y: auto; padding: 6px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); box-shadow: 0 14px 32px #000b, 0 0 0 1px #ffffff08; }
+.agent-option { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; width: 100%; min-height: 54px; padding: 8px 10px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--text); text-align: left; }
+.agent-option:hover, .agent-option:focus-visible, .agent-option[aria-selected="true"] { border-color: var(--line); background: var(--blue-deep); outline: none; }
+.agent-option-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 720; }
+.agent-option-role { overflow: hidden; color: var(--quiet); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.agent-option-model { grid-row: 1 / span 2; align-self: center; color: var(--blue); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; text-align: right; }
+@media (max-width: 760px) { .agent-picker-menu { position: fixed; top: auto; right: 16px; bottom: 16px; left: 16px; max-height: 45vh; } }
+@media (max-width: 1120px) and (min-width: 761px) {
+  .atlas { width: 100%; grid-template-columns: 250px minmax(0, 1fr); border-inline: 0; }
+  /* Give the tablet thread a full-width room header. Keeping the facts beside
+     the label at 768px leaves the label with a single-character column. */
+  .room-bar { display: block; }
+  .room-bar-label { max-width: 100%; }
+  .facts { margin-top: 9px; flex-wrap: wrap; }
+  .drawer-close { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; margin: -8px 0 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); }
+}
+@media (max-width: 760px) {
+  .atlas { width: 100%; border-inline: 0; }
+  .thread-body { padding-inline: 16px; }
+  .rail { border-right: 1px dashed var(--line); }
+  .room-intent { max-width: 100%; }
+  .room-title h1 { -webkit-line-clamp: 2; max-height: calc(2 * 1.18em); }
+}
 """
 
 
@@ -454,6 +679,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     <div class="rail-heading"><h2>Conversation atlas</h2><span id="room-count">0</span></div>
     <input id="room-search" class="search" type="search" autocomplete="off" placeholder="Filter rooms" aria-label="Filter rooms">
     <div id="rooms" class="room-groups"><p class="empty">Loading conversations…</p></div>
+    <p class="rail-credit"><strong>Built with a visual adaptation of <a href="https://www.beautifului.dev/" target="_blank" rel="noreferrer">Beautiful UI</a>.</strong><br>MIT-licensed reference; Summon keeps its own journal, security boundary, and runtime.</p>
   </nav>
   <main class="thread" aria-labelledby="title">
     <header class="topbar">
@@ -464,7 +690,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     <div id="notice" class="notice" role="alert" hidden><span id="notice-text"></span><button id="notice-retry" type="button">Retry</button></div>
     <div class="thread-body">
         <section class="room-bar" aria-label="Current conversation">
-        <div class="room-bar-label"><strong id="room-label">No conversation selected</strong><span id="room-origin" class="room-origin">LOCAL · REDACTED VIEW</span><div class="identity-heading"><span>Agents and models</span><span id="identity-summary">Roster target · provider-served receipt</span></div><div id="participants" class="participants"></div></div>
+        <div class="room-bar-label"><strong id="room-label">No conversation selected</strong><span id="room-origin" class="room-origin">LOCAL · REDACTED VIEW</span><div class="identity-heading"><span>Agents and models</span><span id="identity-summary">Role · name/version · model · provider</span></div><p class="identity-help">Select a card to ask that exact roster seat. The model line is the declared target; served identity appears in the timeline after a provider receipt.</p><div id="participants" class="participants"></div></div>
         <div class="facts"><span>events <b id="cursor">—</b></span><span>type <b id="mode">—</b></span><span data-live="true">updated <b id="updated">—</b></span><span><b id="working-count">0</b> working</span><button id="evidence-open" class="drawer-toggle" type="button" aria-controls="drawer" aria-expanded="false">Room details</button></div>
       </section>
       <div id="working" class="working" aria-live="off"></div>
@@ -484,6 +710,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         <h2 id="composer-title" hidden>Conversation composer</h2>
         <div id="composer-panel" class="compose-grid" role="tabpanel" aria-labelledby="context-tab" tabindex="-1">
           <div>
+            <div id="agent-picker" class="agent-picker" hidden><button id="agent-picker-button" class="agent-picker-button" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="agent-picker-menu"><span id="agent-picker-label" class="agent-picker-label">Choose an agent</span><span id="agent-picker-meta" class="agent-picker-meta">MODEL · —</span><span class="agent-picker-chevron" aria-hidden="true">⌄</span></button><div id="agent-picker-menu" class="agent-picker-menu" role="listbox" aria-label="Choose an agent" hidden></div></div>
             <select id="participant" aria-label="Conversation participant" hidden><option value="">Choose an agent</option></select>
             <textarea id="message" maxlength="12000" placeholder="Add context for this conversation…"></textarea>
             <div class="composer-caption"><span id="caption">Saved as room context. It cannot approve or change a run.</span><span id="counter">0 / 12000</span></div>
@@ -573,7 +800,7 @@ _JS = r'''(() => {
     $('drawer').setAttribute('aria-hidden', (mobile || tablet) && !state.evidenceOpen ? 'true' : 'false');
     $('rail-backdrop').hidden = !(state.railOpen || state.evidenceOpen);
     if (state.evidenceOpen && mobile) $('drawer-close').focus();
-    else if (state.evidenceOpen && tablet) { $('drawer').scrollIntoView({behavior: 'smooth', block: 'start'}); announce('Room evidence opened'); }
+    else if (state.evidenceOpen && tablet) { $('drawer').scrollIntoView({behavior: 'smooth', block: 'start'}); $('drawer-close').focus(); announce('Room evidence opened'); }
     else if (restoreFocus) $('evidence-open').focus();
   }
   function saveDraft() { if (state.selected) state.drafts[state.selected] = $('message').value; }
@@ -591,6 +818,15 @@ _JS = r'''(() => {
   }
   function publicError(error, fallback) { const raw = error && typeof error.message === 'string' ? error.message.replaceAll(/(?:[A-Za-z]:[\\/]|\/)[^\s]{2,}/g, '[path]').slice(0, 140) : ''; return raw && raw !== 'request refused' ? fallback + ' · ' + raw : fallback; }
   function humanizeAgent(value) { return String(value || 'agent').replaceAll(/[-_.]+/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase()); }
+  function compactText(value, limit = 72) {
+    const clean = String(value || '').replaceAll(/\s+/g, ' ').trim();
+    if (!clean) return '';
+    if (clean.length <= limit) return clean;
+    const clipped = clean.slice(0, limit + 1).replace(/\s+\S*$/, '').trim();
+    return (clipped || clean.slice(0, limit).trim()) + '…';
+  }
+  function roomSubject(room) { return compactText(room && (room.subject || room.title || ''), 50); }
+  function roomContext(room) { return compactText(room && (room.subject || room.title || ''), 180); }
   function identityFrom(found, fallback = 'agent') {
     const item = found && typeof found === 'object' ? found : {};
     const agent = String(item.agent || fallback || 'agent');
@@ -626,6 +862,40 @@ _JS = r'''(() => {
     if (item.provider) facts.push('provider ' + item.provider);
     return facts.join(' · ');
   }
+  function closeAgentPicker() {
+    const menu = $('agent-picker-menu'); const button = $('agent-picker-button');
+    if (!menu || menu.hidden) return;
+    menu.hidden = true; button.setAttribute('aria-expanded', 'false');
+  }
+  function selectParticipant(participant) {
+    const value = String(participant || ''); $('participant').value = value; state.reviewing = false; closeAgentPicker(); updateAgentPicker(); updateComposer(); $('message').focus(); if (value) announce('Selected ' + identityLabel(value) + ' · ' + identityModelLabel(value));
+  }
+  function updateAgentPicker() {
+    const box = $('agent-picker'); const menu = $('agent-picker-menu'); const button = $('agent-picker-button'); const chooser = $('participant');
+    const context = state.mode !== 'agent'; const item = chooser.value ? identity(chooser.value) : null;
+    box.hidden = context; button.disabled = !state.selected || !Array.isArray(state.room && state.room.participants) || !state.room.participants.length;
+    $('agent-picker-label').replaceChildren(text(item ? item.name + (item.version ? ' · ' + item.version : '') : 'Choose an agent'));
+    $('agent-picker-meta').replaceChildren(text(item ? 'MODEL · ' + (item.model || 'not verified') + ' · PROVIDER · ' + (item.provider || 'not recorded') : 'MODEL · —'));
+    menu.querySelectorAll('.agent-option').forEach(option => { const selected = option.dataset.agent === chooser.value; option.setAttribute('aria-selected', selected ? 'true' : 'false'); });
+    if (context) closeAgentPicker();
+  }
+  function renderAgentPicker() {
+    const menu = $('agent-picker-menu'); menu.replaceChildren();
+    const participants = Array.isArray(state.room && state.room.participants) ? state.room.participants : [];
+    participants.forEach(raw => {
+      const item = identityFrom(raw, raw && raw.agent); const option = document.createElement('button'); option.type = 'button'; option.className = 'agent-option'; option.setAttribute('role', 'option'); option.dataset.agent = item.agent; option.setAttribute('aria-selected', 'false'); option.title = identityTooltip(item.agent);
+      const name = document.createElement('span'); name.className = 'agent-option-name'; name.append(text(item.name + (item.version ? ' · ' + item.version : '')));
+      const role = document.createElement('span'); role.className = 'agent-option-role'; role.append(text(item.role));
+      const model = document.createElement('span'); model.className = 'agent-option-model'; model.append(text((item.model || 'MODEL · not verified') + (item.provider ? ' · ' + item.provider : '')));
+      option.append(name, role, model); option.addEventListener('click', () => selectParticipant(item.agent)); option.addEventListener('keydown', event => { if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return; event.preventDefault(); const options = Array.from(menu.querySelectorAll('.agent-option')); const index = options.indexOf(option); options[(index + (event.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length]?.focus(); }); menu.append(option);
+    });
+    updateAgentPicker();
+  }
+  function toggleAgentPicker() {
+    const menu = $('agent-picker-menu'); const button = $('agent-picker-button'); if (button.disabled) return;
+    const open = menu.hidden; menu.hidden = !open; button.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open) { const selected = menu.querySelector('[aria-selected="true"]') || menu.querySelector('.agent-option'); selected?.focus(); }
+  }
   function roomEntries(groups = state.rooms) {
     const result = [];
     Object.values(groups || {}).forEach(initiators => Object.values(initiators || {}).forEach(entries => (entries || []).forEach(room => result.push(room))));
@@ -654,12 +924,12 @@ _JS = r'''(() => {
         visibleRooms.forEach(room => {
           count += 1; if (!first) first = room.session_id;
           const button = document.createElement('button'); button.type = 'button'; button.className = 'room-button' + (room.session_id === state.selected ? ' active' : ''); button.dataset.session = room.session_id; if (room.session_id === state.selected) button.setAttribute('aria-current', 'page');
-          const name = document.createElement('span'); name.className = 'room-name'; name.append(text(room.subject || (modeLabel(room.mode) + ' · ' + String(room.initiator_agent || 'conversation'))));
+          const name = document.createElement('span'); name.className = 'room-name'; name.append(text(roomSubject(room) || (modeLabel(room.mode) + ' · ' + String(room.initiator_agent || 'conversation'))));
           const session = document.createElement('span'); session.className = 'room-session'; session.append(text(String(room.session_id || 'room')));
           const roomModels = document.createElement('span'); roomModels.className = 'room-models';
           const roster = Array.isArray(room.participants) ? room.participants : [];
-          const rosterSummary = roster.slice(0, 2).map(item => { const seat = identityFrom(item, item.agent); return seat.model ? seat.name + ' · ' + seat.model : seat.name + ' · model not verified'; });
-          roomModels.append(text(rosterSummary.length ? 'Models · ' + rosterSummary.join(' · ') + (roster.length > 2 ? ' +' + String(roster.length - 2) : '') : 'Models · none recorded'));
+          const rosterSummary = roster.slice(0, 3).map(item => { const seat = identityFrom(item, item.agent); return seat.name + ' · ' + (seat.model || 'model not verified') + ' · ' + (seat.provider || 'provider not recorded'); });
+          roomModels.append(text(rosterSummary.length ? 'MODEL · ' + rosterSummary.join('  /  ') + (roster.length > 3 ? '  /  +' + String(roster.length - 3) : '') : 'MODEL · none recorded'));
           const detail = document.createElement('span'); detail.className = 'room-detail'; const chip = document.createElement('span'); chip.className = 'mode-chip'; chip.append(text(modeLabel(room.mode))); detail.append(chip);
           const countText = document.createElement('span'); countText.append(text(String(room.cursor || 0) + ' events')); detail.append(countText);
           if (state.unread[room.session_id] && room.session_id !== state.selected) { const dot = document.createElement('span'); dot.className = 'unread'; dot.title = 'New events'; detail.append(dot); }
@@ -675,13 +945,18 @@ _JS = r'''(() => {
   function updateHeader() {
     const room = state.room || {};
     const roster = Array.isArray(room.participants) ? room.participants : [];
-    const intent = room.subject || room.title || (room.project_id ? String(room.project_id) + ' · ' + modeLabel(room.mode) : 'Choose a conversation');
-    $('title').replaceChildren(text(intent)); $('title').setAttribute('title', intent);
+    const rawSubject = room.subject || room.title || '';
+    const fallbackTitle = room.project_id ? String(room.project_id) + ' · ' + modeLabel(room.mode) : 'Choose a conversation';
+    const intent = roomSubject(room) || fallbackTitle;
+    $('title').replaceChildren(text(intent)); $('title').setAttribute('title', rawSubject || fallbackTitle);
     $('room-label').replaceChildren(text(room.session_id ? modeLabel(room.mode) + ' · ' + String(room.initiator_agent || 'conversation') : 'No room selected'));
     $('room-subtitle').replaceChildren();
     if (room.session_id) { const session = document.createElement('span'); session.className = 'session-id'; session.append(text(String(room.session_id) + ' · ' + String(room.initiator_host || 'host') + ' / ' + String(room.initiator_agent || 'agent'))); $('room-subtitle').append(session); }
     else $('room-subtitle').append(text('Conversations are grouped by project and the agent that started them.'));
-    $('room-intent').replaceChildren(text(room.session_id ? String(state.cursor || 0) + ' recorded events · ' + String(roster.length || 0) + ' agents · context plus optional agent turns.' : 'Choose a conversation to read its recorded timeline and, when needed, ask one agent for bounded help.'));
+    const contextSummary = roomContext(room);
+    const intentText = room.session_id ? (contextSummary ? 'Context: ' + contextSummary : 'Context: No opening prompt recorded.') : 'Choose a conversation to read its recorded timeline and, when needed, ask one roster agent for bounded help.';
+    $('room-intent').replaceChildren(text(room.session_id ? (contextSummary ? 'Context · ' + contextSummary : 'Context · No opening prompt recorded.') : 'Choose a conversation to read its recorded timeline and, when needed, ask one agent for bounded help.'));
+    $('room-intent').replaceChildren(text(intentText)); $('room-intent').setAttribute('title', rawSubject || intentText); $('room-intent').setAttribute('aria-label', rawSubject ? 'Conversation context: ' + rawSubject : intentText);
     $('cursor').replaceChildren(text(room.session_id ? String(state.cursor || 0) : '—'));
     $('mode').replaceChildren(text(room.session_id ? modeLabel(room.mode) : '—'));
     $('timeline-state').replaceChildren(text(room.session_id ? ' · cursor ' + String(state.cursor || 0) + relativeAge() : ' waiting for a room'));
@@ -691,15 +966,15 @@ _JS = r'''(() => {
     $('fact-journal').replaceChildren(text(room.session_id ? String(state.cursor || 0) + ' recorded events' : '—'));
     const unresolved = roster.filter(item => !item.model).length;
     $('fact-roster').replaceChildren(text(roster.length ? String(roster.length) + ' agents · ' + (unresolved ? String(unresolved) + ' model not verified' : 'models declared') : '—'));
-    $('identity-summary').replaceChildren(text(roster.length ? (unresolved ? String(unresolved) + ' model not verified · roster target · provider receipt' : 'roster target · provider-served receipt') : 'no agents recorded'));
+    $('identity-summary').replaceChildren(text(roster.length ? (unresolved ? String(unresolved) + ' model not verified · model shown per card' : 'model shown per card · served receipt in timeline') : 'no agents recorded'));
     const chips = $('participants'); chips.replaceChildren();
     roster.forEach(participant => {
       const item = identityFrom(participant, participant.agent);
-      const chip = document.createElement('button'); chip.type = 'button'; chip.className = 'participant' + (item.model ? '' : ' unresolved identity-tooltip'); chip.title = identityTooltip(item.agent); chip.setAttribute('aria-label', 'Ask ' + item.name + (item.model ? ' on ' + item.model : '') + ' to start an agent turn'); chip.addEventListener('click', () => { state.mode = 'agent'; state.reviewing = false; const chooser = $('participant'); chooser.value = item.agent; updateComposer(); $('message').focus(); announce('Selected ' + identityLabel(item.agent) + ' for an agent turn'); });
+      const chip = document.createElement('button'); chip.type = 'button'; chip.className = 'participant' + (item.model ? '' : ' unresolved identity-tooltip'); chip.title = identityTooltip(item.agent); chip.setAttribute('aria-label', 'Ask ' + item.name + (item.model ? ' on ' + item.model : '') + ' to start an agent turn'); chip.addEventListener('click', () => { state.mode = 'agent'; selectParticipant(item.agent); });
       const role = document.createElement('span'); role.className = 'participant-role'; if (item.role === 'roster seat') role.hidden = true; else role.append(text(item.role));
       const name = document.createElement('strong'); name.className = 'participant-name'; name.append(text(item.name + (item.version ? ' · ' + item.version : '')));
-      const model = document.createElement('span'); model.className = 'participant-model'; model.append(text(item.model ? 'Model · ' + item.model : 'Model not verified'));
-      const route = document.createElement('span'); route.className = 'participant-provider'; route.append(text(item.provider ? 'Provider · ' + item.provider : 'Provider · not recorded'));
+      const model = document.createElement('span'); model.className = 'participant-model'; model.append(text(item.model ? 'MODEL · ' + item.model : 'MODEL · not verified'));
+      const route = document.createElement('span'); route.className = 'participant-provider'; route.append(text(item.provider ? 'PROVIDER · ' + item.provider : 'PROVIDER · not recorded'));
       chip.append(role, name, model, route); chips.append(chip);
     });
   }
@@ -799,7 +1074,7 @@ _JS = r'''(() => {
     participants.forEach(item => { const option = document.createElement('option'); option.value = String(item.agent || ''); option.title = identityTooltip(item.agent); option.append(text(identityLabel(item.agent) + ' — model: ' + identityModelLabel(item.agent))); chooser.append(option); });
     if (previousRoom && String(previousRoom.session_id || '') === state.selected
         && participants.some(item => String(item.agent || '') === previousParticipant)) chooser.value = previousParticipant;
-    renderTimeline(); renderWorking(); renderRecovery(); updateComposer(); setNotice(''); announce('Opened conversation ' + String(state.room.session_id || ''));
+    renderAgentPicker(); renderTimeline(); renderWorking(); renderRecovery(); updateComposer(); setNotice(''); announce('Opened conversation ' + String(state.room.session_id || ''));
   }
   function appendRecord(record) {
     const cursor = Number(record && record.cursor); if (!Number.isSafeInteger(cursor)) return 'gap';
@@ -810,7 +1085,8 @@ _JS = r'''(() => {
   }
   function updateComposer() {
     const hasRoom = Boolean(state.selected); const context = state.mode === 'context'; const participant = $('participant').value; const item = participant ? identity(participant) : null; const target = item ? item.name + ' · ' + (item.model || 'model not verified') : 'Choose an agent'; const activeCount = Object.keys(state.active).length;
-    $('context-tab').setAttribute('aria-selected', context ? 'true' : 'false'); $('context-tab').setAttribute('tabindex', context ? '0' : '-1'); $('agent-tab').setAttribute('aria-selected', context ? 'false' : 'true'); $('agent-tab').setAttribute('tabindex', context ? '-1' : '0'); $('composer-panel').setAttribute('aria-labelledby', context ? 'context-tab' : 'agent-tab'); $('participant').hidden = context; $('participant').disabled = !hasRoom; $('send').hidden = false;
+    $('context-tab').setAttribute('aria-selected', context ? 'true' : 'false'); $('context-tab').setAttribute('tabindex', context ? '0' : '-1'); $('agent-tab').setAttribute('aria-selected', context ? 'false' : 'true'); $('agent-tab').setAttribute('tabindex', context ? '-1' : '0'); $('composer-panel').setAttribute('aria-labelledby', context ? 'context-tab' : 'agent-tab'); $('participant').hidden = true; $('participant').disabled = !hasRoom; $('send').hidden = false;
+    updateAgentPicker();
     const disconnected = state.connectionKind === 'blocked'; const launchBlocked = !context && disconnected; $('send').disabled = !hasRoom || !$('message').value.trim() || (!context && !$('participant').value) || launchBlocked; $('run-cancel').hidden = context || activeCount !== 1; $('run-cancel').disabled = context || !hasRoom || activeCount !== 1; $('message').placeholder = context ? 'Add context for this conversation…' : 'Send a message to this agent…';
     $('caption').replaceChildren(text(context ? 'Saved as room context. It cannot approve or change a run. Ctrl/Cmd+Enter posts it.' : 'Review before launch · ' + target + (item && item.provider ? ' via ' + item.provider : '') + ' · output is context, not approval. A model mismatch creates a visible fork. Ctrl/Cmd+Enter opens review.')); $('send').classList.toggle('agent-action', !context); $('send').replaceChildren(text(context ? 'Post context' : (state.reviewing ? 'Review open' : 'Review agent request')));
     const review = $('launch-review'); review.hidden = context || !state.reviewing; if (!review.hidden) { $('review-copy').replaceChildren(text(disconnected ? 'Reconnect to the local owner before starting an agent turn. The recorded timeline is not currently available.' : (item ? 'This starts one bounded provider process for the selected agent. Your message remains context only.' : 'Choose an agent before reviewing a request.'))); $('review-facts').replaceChildren(text(item ? ['agent ' + item.agent, 'role ' + item.role, 'model ' + (item.model || 'not verified'), 'provider ' + (item.provider || 'not recorded'), 'permission limited by room runtime', 'stops automatically after ' + formatDuration(ROOM_TIMEOUT_MS)].join(' · ') : 'No agent selected')); $('review-confirm').disabled = !hasRoom || !participant || !$('message').value.trim() || disconnected; }
@@ -855,6 +1131,7 @@ _JS = r'''(() => {
   $('context-tab').addEventListener('click', () => chooseMode('context')); $('agent-tab').addEventListener('click', () => chooseMode('agent')); $('turn-recover').addEventListener('click', recoverTurn); $('turn-fork').addEventListener('click', forkTurn);
   $('action-dialog-cancel').addEventListener('click', () => closeActionDialog(null)); $('action-dialog-confirm').addEventListener('click', () => { const field = $('action-dialog-input'); closeActionDialog(field.hidden ? true : field.value); }); $('action-dialog').addEventListener('click', event => { if (event.target === $('action-dialog')) closeActionDialog(null); });
   [$('context-tab'), $('agent-tab')].forEach((tab, index, tabs) => tab.addEventListener('keydown', event => { if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return; event.preventDefault(); const next = tabs[(index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length]; next.click(); next.focus(); }));
+  $('agent-picker-button').addEventListener('click', toggleAgentPicker); document.addEventListener('keydown', event => { if (event.key === 'Escape' && !$('agent-picker-menu').hidden) { event.preventDefault(); closeAgentPicker(); $('agent-picker-button').focus(); } });
   $('send').addEventListener('click', () => state.mode === 'context' ? postContext() : startTurn()); $('review-back').addEventListener('click', () => { state.reviewing = false; updateComposer(); $('message').focus(); }); $('review-confirm').addEventListener('click', launchTurn); $('run-cancel').addEventListener('click', () => { const first = Object.values(state.active)[0]; if (first) cancelTurn(first.participant); }); $('participant').addEventListener('change', () => { state.reviewing = false; updateComposer(); }); $('message').addEventListener('input', () => { $('counter').replaceChildren(text(String($('message').value.length) + ' / 12000')); if (state.reviewing) state.reviewing = false; saveDraft(); updateComposer(); }); $('message').addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); state.mode === 'context' ? postContext() : startTurn(); } }); $('room-search').addEventListener('input', event => { state.query = event.target.value; renderRooms(); }); $('room-search').addEventListener('keydown', event => { if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return; const buttons = Array.from(document.querySelectorAll('.room-button')); if (!buttons.length) return; event.preventDefault(); const current = buttons.indexOf(document.activeElement); const next = buttons[(current + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]; next.focus(); }); document.querySelectorAll('[data-event-filter]').forEach(button => button.addEventListener('click', () => { state.eventFilter = button.dataset.eventFilter || 'all'; updateEventFilters(); renderTimeline(); announce('Showing ' + state.eventFilter + ' events'); })); $('rail-open').addEventListener('click', () => setRailOpen(true)); $('rail-close').addEventListener('click', () => setRailOpen(false)); $('rail-backdrop').addEventListener('click', () => { if (state.railOpen) setRailOpen(false); if (state.evidenceOpen) setEvidenceOpen(false); }); $('evidence-open').addEventListener('click', () => setEvidenceOpen(!$('drawer').classList.contains('open'))); $('drawer-close').addEventListener('click', () => setEvidenceOpen(false)); $('latest').addEventListener('click', () => { $('timeline').lastElementChild?.scrollIntoView({behavior: 'smooth', block: 'end'}); $('latest').hidden = true; }); $('notice-retry').addEventListener('click', () => { setNotice(''); refresh(); if (state.selected) syncRoom().catch(() => {}); }); document.addEventListener('keydown', event => { const target = event.target; const typing = target && (target.matches('input, textarea, select, [contenteditable="true"]')); if (!typing && (event.key === '/' || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k'))) { event.preventDefault(); $('room-search').focus(); $('room-search').select(); } if (state.evidenceOpen && window.matchMedia('(max-width: 760px)').matches && event.key === 'Tab') { const focusable = Array.from($('drawer').querySelectorAll('button, a, input, select, textarea, [tabindex]:not([tabindex="-1"])')).filter(node => !node.disabled && node.offsetParent !== null); if (focusable.length) { const first = focusable[0]; const last = focusable[focusable.length - 1]; if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); } } } if (event.key === 'Escape') { if (!$('action-dialog').hidden) { event.preventDefault(); closeActionDialog(null); } else if (state.reviewing) { state.reviewing = false; updateComposer(); $('message').focus(); } else if (state.railOpen) setRailOpen(false); else if (state.evidenceOpen) setEvidenceOpen(false); } });
   $('participant').replaceChildren(); const choose = document.createElement('option'); choose.value = ''; choose.append(text('Choose an agent')); $('participant').append(choose);
   refresh(); state.refreshTimer = setInterval(refresh,10000); state.ageTimer = setInterval(updateAge,1000); window.addEventListener('beforeunload', () => { clearInterval(state.refreshTimer); clearInterval(state.ageTimer); stopStream(); });

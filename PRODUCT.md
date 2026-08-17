@@ -77,9 +77,12 @@ slice.
 The product name is Summon. The interface should feel precise, calm, trustworthy, and
 operational rather than like a generic chat client. [Beautiful UI's published license page](https://www.beautifului.dev/license)
 states an MIT license; Summon borrows its compact AI-workbench rhythm, card anatomy, and
-status language while keeping an independent, dependency-free implementation. No remote
-package, runtime, font, or copied component is loaded; if source code is ever copied, its
-MIT notice must be retained in the release notices.
+status language while keeping an independent, dependency-free implementation. The
+conversation atlas now includes a clearly attributed visual adaptation of Beautiful
+UI’s centered canvas, striped surround, dashed hairlines, and compact card rhythm.
+It remains a local rewrite: no remote package, runtime, font, or hosted asset is
+loaded. The full MIT notice is in `THIRD_PARTY_NOTICES.md`; any future source-level
+reuse must retain that notice.
 
 ## Evidence on Hand
 

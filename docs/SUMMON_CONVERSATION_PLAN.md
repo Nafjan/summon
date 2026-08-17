@@ -206,10 +206,14 @@ remain auditable.
 
 ## UI shape
 
-The browser room now uses a clean-room, Chatpack-informed messenger arrangement. Chatpack
-is inspiration only; Summon does not ship its Node packages, copy its source, or add a
-runtime dependency. The Python standard-library server, append-only journal, bearer
-fragment/header authentication, and public-redaction boundary remain authoritative.
+The browser room uses a clean-room messenger arrangement with a visual adaptation of
+Beautiful UI’s MIT-licensed centered canvas, striped surround, dashed hairlines, and
+compact card rhythm. The attribution and license text live in
+`THIRD_PARTY_NOTICES.md`; Summon does not load Beautiful UI’s hosted runtime, fonts,
+assets, or bundled JavaScript. Chatpack remains inspiration only: Summon does not ship
+its Node packages, copy its source, or add a runtime dependency. The Python
+standard-library server, append-only journal, bearer fragment/header authentication,
+and public-redaction boundary remain authoritative.
 
 The atlas provides:
 

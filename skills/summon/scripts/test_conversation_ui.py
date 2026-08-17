@@ -68,6 +68,12 @@ class ConversationUITests(unittest.TestCase):
         self.assertIn("Ask an agent", page)
         self.assertIn("Stop this turn", page)
         self.assertIn("Context and agent turns", page)
+        self.assertIn("Agents and models", page)
+        self.assertIn("MODEL ·", page)
+        self.assertIn("Context ·", page)
+        self.assertIn("Built with a visual adaptation of", page)
+        self.assertIn("agent-picker-button", page)
+        self.assertIn("agent-option", page)
         self.assertIn("/stream?after=", page)
         self.assertIn("Live updates paused; retrying from recorded event", page)
         self.assertIn("setInterval(refresh,10000)", page)
@@ -85,8 +91,10 @@ class ConversationUITests(unittest.TestCase):
                        "appendRecord", "cursor !== state.cursor + 1",
                        "timeline.append(renderEvent(record))", "event === 'agent_message'",
                        "Agents and models", "Model not verified", "identityTooltip",
-                       "Roster target · provider-served receipt", "Review agent request",
-                       "WAITING FOR MODEL RECEIPT", "MODEL MATCH", "target missing", "setConnection('Live', 'connected'"):
+                       "Role · name/version · model · provider", "Review agent request",
+                       "WAITING FOR MODEL RECEIPT", "MODEL MATCH", "target missing", "setConnection('Live', 'connected'",
+                       ".room-bar { display: block; }", "min-width: 44px; min-height: 44px",
+                       "$('drawer-close').focus();"):
             self.assertIn(marker, source)
         self.assertIn("stops automatically after", source)
         self.assertIn("Reconnect to the local owner before starting an agent turn", source)
