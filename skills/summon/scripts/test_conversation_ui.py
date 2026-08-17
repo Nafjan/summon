@@ -35,7 +35,8 @@ class ConversationUITests(unittest.TestCase):
             self.root, session_id="session-1", project_id="summon",
             project_root=project, initiator_host="codex", initiator_agent="sol",
             mode="chat", participants=[{"agent": "sol", "role": "architect",
-                                         "name": "Sol", "version": "5.6"}],
+                                         "name": "Sol", "version": "5.6",
+                                         "provider": "claude", "model": "claude-opus-5"}],
         )
         self.surface = ConversationSurface(str(self.root), token="a" * 48)
         self.base = self.surface.start()
@@ -81,8 +82,16 @@ class ConversationUITests(unittest.TestCase):
         for marker in ("Conversation atlas", "room-search", "timeline", "Room evidence",
                        "Post context", "Ask a roster agent", "context + explicit turns",
                        "appendRecord", "cursor !== state.cursor + 1",
-                       "timeline.append(renderEvent(record))", "event === 'agent_message'"):
+                       "timeline.append(renderEvent(record))", "event === 'agent_message'",
+                       "Roster identities", "Model not sealed", "identityTooltip",
+                       "target = roster declaration · served = provider receipt", "Review bounded provider turn",
+                       "awaiting served receipt", "receipt matched", "target not sealed", "Live connected', 'connected'"):
             self.assertIn(marker, source)
+        self.assertIn("stops automatically after", source)
+        self.assertIn("Reconnect to the local owner before launching", source)
+        self.assertIn("action-dialog", source)
+        self.assertNotIn("window.confirm", source)
+        self.assertNotIn("window.prompt", source)
         self.assertNotIn("timeline.replaceChildren(); renderEvent", source)
 
     def test_rooms_and_room_events_are_authenticated_and_redacted(self):
@@ -91,13 +100,19 @@ class ConversationUITests(unittest.TestCase):
             rooms = json.loads(response.read())
         key = next(iter(rooms["rooms"]))
         self.assertIn("codex/sol", rooms["rooms"][key])
+        self.assertEqual(rooms["rooms"][key]["codex/sol"][0]["participants"][0]["model"],
+                         "claude-opus-5")
+        self.assertIn("subject", rooms["rooms"][key]["codex/sol"][0])
         with self._request("/api/v1/rooms/session-1") as response:
             data = json.loads(response.read())
         self.assertEqual(data["room"]["session_id"], "session-1")
+        self.assertEqual(data["room"]["participants"][0]["provider"], "claude")
+        self.assertEqual(data["room"]["participants"][0]["model"], "claude-opus-5")
         public = json.dumps(data)
         self.assertIn("private context", public)
         self.assertNotIn(r"C:\secret\repo", public)
         self.assertNotIn("SECRET_TOKEN", public)
+        self.assertIn("subject", data["room"])
         self.assertEqual(data["events"][-1]["payload"]["text_chars"],
                          len(r"private context C:\secret\repo SECRET_TOKEN"))
 
@@ -162,8 +177,12 @@ class ConversationUITests(unittest.TestCase):
                         "participant": participant}
 
         self.surface.runtime = FakeRuntime()
+        with self.assertRaises(HTTPError) as unreviewed:
+            self._request("/api/v1/rooms/session-1/turns", method="POST",
+                          body={"participant": "sol", "message": "inspect this"}, origin=True)
+        self.assertEqual(unreviewed.exception.code, 400)
         with self._request("/api/v1/rooms/session-1/turns", method="POST",
-                           body={"participant": "sol", "message": "inspect this"}, origin=True) as response:
+                           body={"participant": "sol", "message": "inspect this", "reviewed": True}, origin=True) as response:
             started = json.loads(response.read())
         self.assertEqual(response.status, 202)
         self.assertEqual(started["status"], "started")

@@ -174,7 +174,10 @@ def _project_participant(value: Mapping[str, Any]) -> dict[str, str]:
     item = _snapshot(dict(value))
     agent = _safe_id(item.get("agent") or item.get("id"), "participant agent")
     out = {"agent": agent}
-    for key in ("role", "name", "version"):
+    # These are the only identity fields that may cross into the public room
+    # projection.  ``model`` is the roster-declared target; it is deliberately
+    # distinct from a later ``model_served`` receipt on a turn event.
+    for key in ("role", "name", "version", "model", "provider"):
         display = _safe_display(item.get(key), f"participant {key}")
         if display is not None:
             out[key] = display
@@ -212,9 +215,18 @@ def _public_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, An
         if not isinstance(text, str) or not text.strip() or len(text) > MAX_MESSAGE_CHARS:
             raise ConversationError("agent message must be non-empty and bounded")
         preview = _redact_text(text)[:MAX_SUMMARY_CHARS]
-        return {"message_id": message_id, "sender": sender, "recipient": recipient,
-                "text_sha256": _text_sha256(text), "text_chars": len(text),
-                "preview": preview, "summary": preview}
+        out = {"message_id": message_id, "sender": sender, "recipient": recipient,
+               "text_sha256": _text_sha256(text), "text_chars": len(text),
+               "preview": preview, "summary": preview}
+        # Agent context messages may carry the same safe identity evidence as
+        # an explicit turn.  Keep it optional for legacy rooms, but expose it
+        # when present so the browser can show declared target versus the
+        # provider-served identity without reaching into native journal data.
+        for key in ("provider", "model_target", "model_served", "transport"):
+            value = data.get(key)
+            if value is not None:
+                out[key] = _safe_display(value, key)
+        return out
     if event_type == "session_created":
         out["project_id"] = _safe_id(data.get("project_id"), "project id")
         out["initiator_host"] = _safe_display(data.get("initiator_host"), "initiator host", required=True)
@@ -366,6 +378,24 @@ class ConversationRoom:
                 "redaction": "local-native-allowlist" if native else "public-redacted"}
 
 
+def _room_subject(records: Iterable[Mapping[str, Any]]) -> str | None:
+    """Derive one bounded, redacted orientation label from the first context note."""
+    for record in records:
+        if not isinstance(record, Mapping) or record.get("event") != "human_message":
+            continue
+        try:
+            payload = _public_payload("human_message", record.get("payload", {}))
+        except ConversationError:
+            continue
+        preview = payload.get("preview")
+        if not isinstance(preview, str):
+            continue
+        subject = " ".join(preview.split()).strip()
+        if subject:
+            return subject[:95] + ("…" if len(subject) > 95 else "")
+    return None
+
+
 class ConversationJournal:
     """A small JSONL room journal with cursor/idempotency checks."""
 
@@ -499,6 +529,11 @@ class ConversationJournal:
                 raise ConversationError("conversation cursor is not contiguous")
             if record.get("session_id") != session_id:
                 raise ConversationError("conversation event belongs to another room")
+            if "created_at_ms" in record and (
+                    not isinstance(record.get("created_at_ms"), int)
+                    or isinstance(record.get("created_at_ms"), bool)
+                    or record.get("created_at_ms") < 0):
+                raise ConversationError("invalid conversation event timestamp")
             generation = record.get("generation")
             if (not isinstance(generation, int) or isinstance(generation, bool)
                     or generation < prior_generation):
@@ -694,7 +729,8 @@ class ConversationJournal:
                 raise ConversationError("conversation room event limit reached")
             record = {"record": "conversation_event", "schema_version": SCHEMA_VERSION,
                       "session_id": self.room.session_id, "cursor": len(self._records) + 1,
-                      "generation": generation, "event_id": eid, "event": event,
+                      "generation": generation, "created_at_ms": int(time.time() * 1000),
+                      "event_id": eid, "event": event,
                       "actor_kind": actor_kind, "actor_id": actor,
                       "payload_sha256": _sha256(item), "payload": item}
             encoded = (json.dumps(record, ensure_ascii=False, sort_keys=True,
@@ -716,6 +752,7 @@ class ConversationJournal:
         payload = _public_payload(str(record["event"]), record["payload"])
         return {"session_id": record["session_id"], "cursor": record["cursor"],
                 "generation": record["generation"], "event_id": record["event_id"],
+                "created_at_ms": record.get("created_at_ms"),
                 "event": record["event"], "actor_kind": record["actor_kind"],
                 "actor_id": record["actor_id"], "payload_sha256": record["payload_sha256"],
                 "payload": payload}
@@ -730,7 +767,11 @@ class ConversationJournal:
         return [self._public_record(record) for record in self._records if record["cursor"] > after_cursor]
 
     def as_dict(self, *, native: bool = False, after_cursor: int = 0) -> dict[str, Any]:
-        return {"room": self.room.as_dict(native=native),
+        room = self.room.as_dict(native=native)
+        subject = _room_subject(self._records)
+        if subject:
+            room["subject"] = subject
+        return {"room": room,
                 "events": self.events(native=native, after_cursor=after_cursor),
                 "cursor": len(self._records), "redaction": "native-local" if native else "public-redacted"}
 
@@ -764,9 +805,17 @@ class ConversationJournal:
         if not isinstance(text, str) or not text.strip():
             raise ConversationError("agent message must be non-empty text")
         mid = message_id or uuid.uuid4().hex
+        seat = next((item for item in self._header.get("participants", [])
+                     if item.get("agent") == sender_id), {})
+        identity_fields = {}
+        for key in ("provider", "model"):
+            value = seat.get(key)
+            if isinstance(value, str) and value:
+                identity_fields["provider" if key == "provider" else "model_target"] = value
         return self.append("agent_message", "agent", sender_id,
                            {"message_id": mid, "sender": sender_id,
-                            "recipient": recipient_id, "text": text},
+                            "recipient": recipient_id, "text": text,
+                            **identity_fields},
                            expected_cursor=expected_cursor,
                            event_id=f"agent-message-{mid}")
 
@@ -997,13 +1046,25 @@ def group_rooms(rooms: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, list[
         cursor = item.get("cursor", 0)
         if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
             raise ConversationError("invalid room cursor")
+        raw_participants = item.get("participants", [])
+        if raw_participants is None:
+            raw_participants = []
+        if not isinstance(raw_participants, list) or len(raw_participants) > MAX_PARTICIPANTS:
+            raise ConversationError("invalid room participants")
+        participants = [_project_participant(participant)
+                        for participant in raw_participants]
         key = f"{host}/{agent}"
         project_key = f"{project}@{root_digest}"
         public = {"session_id": _safe_id(item.get("session_id"), "session id"),
                   "project_id": project, "project_root_sha256": root_digest,
                   "initiator_host": host,
                   "initiator_agent": agent,
-                  "mode": mode, "cursor": cursor}
+                  "mode": mode, "cursor": cursor, "participants": participants}
+        subject = item.get("subject")
+        if subject is not None:
+            if not isinstance(subject, str) or not subject.strip() or len(subject) > 96:
+                raise ConversationError("invalid room subject")
+            public["subject"] = _redact_text(" ".join(subject.split()))
         grouped.setdefault(project_key, {}).setdefault(key, []).append(public)
     return grouped
 
@@ -1026,7 +1087,11 @@ def list_rooms(root: str | os.PathLike[str]) -> dict[str, dict[str, list[dict[st
             # Callers can inspect it by opening the exact id and receive the
             # structured error; the index remains safe and bounded.
             continue
-        rooms.append(journal.room.as_dict())
+        room = journal.room.as_dict()
+        subject = _room_subject(journal._records)
+        if subject:
+            room["subject"] = subject
+        rooms.append(room)
         if len(rooms) > MAX_ROOMS:
             raise ConversationError("too many conversation rooms")
     return group_rooms(rooms)
@@ -1048,6 +1113,46 @@ def run_command(args: Any) -> int:
     # raised UnboundLocalError when --cwd was omitted on that path.
     project_root = (getattr(args, "chat_project_root", None)
                     or getattr(args, "cwd", None) or os.getcwd())
+
+    def _roster_participant(name: str) -> dict[str, str]:
+        """Freeze safe roster identity metadata when a room is created.
+
+        Opening a room is still provider-inert: this reads one local roster file
+        and records only display-safe identity facts.  Missing or malformed
+        metadata never prevents a context room from opening; the UI will label
+        that seat ``model not sealed`` instead of guessing.
+        """
+        item: dict[str, str] = {"agent": name}
+        try:
+            from _loader import get_agents_dir, load_agent_snapshot
+            roster_dir = get_agents_dir(getattr(args, "agents_dir", None), project_root)
+            snapshot, frontmatter, _definition_sha = load_agent_snapshot(
+                roster_dir, name, strict_agents_dir=False)
+            if snapshot is None:
+                return item
+            run_agent, body, _description, _path, _permission, model, _extra, _effort = snapshot
+            if isinstance(run_agent, str) and run_agent:
+                item["provider"] = run_agent
+            if isinstance(model, str) and model:
+                item["model"] = model
+            if isinstance(frontmatter, Mapping):
+                for key in ("role", "name", "version"):
+                    value = frontmatter.get(key)
+                    if isinstance(value, str) and value.strip():
+                        item[key] = value.strip()
+                # A heading is a useful human label for existing starter rosters
+                # that predate structured ``name`` metadata.  It is not authority.
+                if "name" not in item and isinstance(body, str):
+                    for line in body.splitlines():
+                        candidate = line.strip()
+                        if candidate.startswith("# ") and not candidate.startswith("##"):
+                            heading = candidate[2:].strip()
+                            if heading:
+                                item["name"] = heading
+                            break
+        except Exception:  # noqa: BLE001 - unresolved identity is shown explicitly
+            return item
+        return item
     try:
         if action == "open":
             session = _safe_id(getattr(args, "chat_session", None), "session id")
@@ -1065,7 +1170,8 @@ def run_command(args: Any) -> int:
                     names = [item.strip() for item in raw_participants.split(",") if item.strip()]
                     if not names:
                         raise ConversationError("chat participants are invalid")
-                    participants = [{"agent": _safe_id(item, "participant agent")} for item in names]
+                    participants = [_roster_participant(_safe_id(item, "participant agent"))
+                                   for item in names]
                 journal = ConversationJournal.create(
                     root, session_id=session,
                     project_id=getattr(args, "chat_project_id", None) or "default",

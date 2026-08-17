@@ -139,8 +139,10 @@ class ConversationRuntimeTests(unittest.TestCase):
             child_pid = None
             while __import__("time").monotonic() < deadline:
                 if marker.exists():
-                    child_pid = int(marker.read_text(encoding="ascii"))
-                    break
+                    marker_text = marker.read_text(encoding="ascii").strip()
+                    if marker_text:
+                        child_pid = int(marker_text)
+                        break
                 __import__("time").sleep(0.05)
             self.assertIsNotNone(child_pid)
             deadline = __import__("time").monotonic() + 5

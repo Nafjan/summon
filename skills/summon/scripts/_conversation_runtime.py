@@ -1119,7 +1119,7 @@ class ConversationRuntime:
                     "model_target": execution.get("model"),
                     "model_served_sha256": _sha_text(
                         raw_served if isinstance(raw_served, str)
-                        else str(execution.get("model"))),
+                        else "unsealed"),
                     "prompt_contract_sha256": _sha256({"agent_definition_sha256": execution.get("agent_definition_sha256"),
                                                         "transport": execution.get("transport"),
                                                         "permission": execution.get("permission"),

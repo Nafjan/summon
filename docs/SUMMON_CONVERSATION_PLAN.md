@@ -138,8 +138,11 @@ conversation root. It groups rooms by full project-root digest and initiating ho
 uses a bearer token in the URL fragment plus an authorization header for API requests,
 and supports public-redacted room reads, bounded cursor `/events` reads, authenticated
 `/stream` SSE frames, typed human-context posts, and an explicit `turns`/`cancel`
-endpoint. The “Ask a roster agent” control shows participant role/name/
-version, records the durable turn lifecycle, and explains that output is context only.
+endpoint. Room creation freezes safe roster identity facts when available: agent id,
+display name, role, provider route, and declared model/version. The “Ask a roster
+agent” control keeps that declared target distinct from `model_served` evidence on a
+finished turn, labels missing identity as “model not sealed,” records the durable turn
+lifecycle, and explains that output is context only.
 It is a separate surface from the deliberation ledger and has no ballot or policy
 authority. Start the atlas with `chat open ... --cwd PROJECT` when agent turns
 need to run against a project; a bare `--serve ROOT` invocation remains useful for
