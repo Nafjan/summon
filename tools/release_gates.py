@@ -223,13 +223,19 @@ def _artifact(name: str, *, status: str, command: str, source_hash: str,
     if marker:
         # Keep only the fixed marker fields; no provider output or arbitrary
         # environment/path data enters a release artifact.
-        # Never copy a producer's own artifact hash into the outer artifact:
-        # doing so makes the outer hash depend on a value that is not retained
-        # in the returned record, so release_manifest cannot recompute it.
-        # A gate may still expose a bounded evidence-file name and error detail.
+        # Never copy a producer's own outer-artifact hash into this record:
+        # doing so would make the outer hash depend on a value that is not
+        # retained before it is computed.  The live-provider producer's hash
+        # is different: it is the digest of the reviewed receipt itself, so
+        # retain it under an explicit field for release-manifest binding.
+        # Gates may also expose bounded evidence-file names and error detail.
         for key in ("error_kind", "detail", "evidence_file"):
             if key in marker and isinstance(marker[key], str):
                 payload[key] = marker[key]
+        if (name == "live_provider" and marker.get("status") == "pass"
+                and isinstance(marker.get("artifact_sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", marker["artifact_sha256"])):
+            payload["evidence_sha256"] = marker["artifact_sha256"]
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
                          separators=(",", ":")).encode("utf-8")
     payload["artifact_sha256"] = hashlib.sha256(encoded).hexdigest()

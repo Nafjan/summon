@@ -667,6 +667,11 @@ def _check_facts(manifest: Mapping[str, object]) -> list[str]:
                     or not re.fullmatch(r"[0-9a-f]{64}", artifact["artifact_sha256"])
                     or _artifact_sha256(artifact) != artifact.get("artifact_sha256")):
                 failures.append(f"invalid machine gate artifact evidence: {name}")
+            if (name == "live_provider" and isinstance(artifact, Mapping)
+                    and artifact.get("status") == "pass"
+                    and (not isinstance(artifact.get("evidence_sha256"), str)
+                         or not re.fullmatch(r"[0-9a-f]{64}", artifact["evidence_sha256"]))):
+                failures.append("live_provider evidence receipt hash is missing")
     return failures
 
 
@@ -757,6 +762,10 @@ def _read_evidence(path: Path, root: Path, source_hash: str) -> dict[str, object
                 or not re.fullmatch(r"[0-9a-f]{64}", artifact["artifact_sha256"])
                 or _artifact_sha256(artifact) != artifact.get("artifact_sha256")):
             raise ValueError(f"invalid machine gate artifact evidence: {name}")
+        if (name == "live_provider" and artifact.get("status") == "pass"
+                and (not isinstance(artifact.get("evidence_sha256"), str)
+                     or not re.fullmatch(r"[0-9a-f]{64}", artifact["evidence_sha256"]))):
+            raise ValueError("live_provider evidence receipt hash is missing")
     git_head = value.get("git_head")
     current_git = _git_facts(root)
     current_head = current_git.get("head")

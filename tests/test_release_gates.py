@@ -62,11 +62,12 @@ class ReleaseGateRunnerTests(unittest.TestCase):
         artifact = MODULE._artifact(
             "live_provider", status="pass", command="python tools/live_provider_gate.py",
             source_hash="a" * 64, git_head="b" * 40, output="gate output\n",
-            marker={"artifact_sha256": "c" * 64,
+            marker={"status": "pass", "artifact_sha256": "c" * 64,
                     "evidence_file": "redacted-live-provider-receipt.json"},
         )
         payload = dict(artifact)
         stored = payload.pop("artifact_sha256")
+        self.assertEqual(artifact["evidence_sha256"], "c" * 64)
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
                              separators=(",", ":")).encode("utf-8")
         self.assertEqual(stored, hashlib.sha256(encoded).hexdigest())
