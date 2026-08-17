@@ -203,7 +203,7 @@ jobs:
               "discovery", "install", "release_manifest", "acpbackend",
               "deliberation", "deliberation_resume", "model_catalog",
               "conversation", "conversation_runtime", "conversation_ui", "model_routing", "release_contract",
-              "swarm_protocol", "swarm_coordinator", "live_provider_gate",
+              "swarm_protocol", "swarm_coordinator", "release_gates", "live_provider_gate",
           }
           assert manifest["evidence"]["source_tree_sha256"] == evidence["source_tree_sha256"]
           assert manifest["version_contract"]["ready"]
