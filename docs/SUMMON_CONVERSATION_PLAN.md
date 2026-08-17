@@ -8,8 +8,9 @@ opt-in per room/participant and use the ordinary Summon dispatcher; they are not
 authority kernel. Council/deliberate control remains separate and model output is still
 context, never a ballot or approval. Cancellation now records a durable
 `turn_cancel_requested` command that a separate runtime can observe; owner leases,
-authenticated cursor streaming, and bounded reconnect are implemented. Directed
-agent-to-agent delivery and a durable swarm coordinator remain follow-up slices.
+authenticated cursor streaming, and bounded reconnect are implemented. Durable
+addressed agent messages are now available through a bounded local inbox; a durable
+swarm coordinator remains a separate follow-up slice.
 
 Summon should have one conversation substrate shared by ordinary brainstorming,
 interactive councils, and governed deliberations. The substrate is a durable,
@@ -79,6 +80,8 @@ summon chat open SESSION_ID --project-id PROJECT --project-root DIR \
 summon chat post SESSION_ID --message "context for the room"
 summon chat turn SESSION_ID AGENT --message "ask the participant"
 summon chat cancel SESSION_ID AGENT
+summon chat message SESSION_ID FROM_AGENT TO_AGENT --message "context for the peer"
+summon chat inbox SESSION_ID AGENT [--chat-after CURSOR]
 summon chat recover SESSION_ID AGENT --chat-confirm
 summon chat fork SESSION_ID AGENT --message "continue this in a new lineage"
 summon chat show SESSION_ID
@@ -87,16 +90,19 @@ summon chat open SESSION_ID --conversation-dir DIR --chat-browser auto
 ```
 
 These commands use the local `.agents/conversations` journal (or
-`--conversation-dir`). `open`, `post`, `show`, and `list` make zero provider calls.
-`turn` is the explicit exception: it launches the named roster agent only after the
-durable start fence; `cancel` appends a durable typed command and targets the active
-worker when one is present, so another runtime can request cancellation without an
-in-memory handle. `recover` requires an explicit human attestation, closes an unmatched
-turn as indeterminate, and never retries; `fork` creates a new context lineage with no
-provider contact. The human message is context-only; it is never an approve, deny,
-cancel, or ballot command. CLI turns wait for the provider process to finish so the
-parent cannot exit before `turn_finished` is journaled; the browser keeps one runtime
-per surface for interactive cancellation.
+`--conversation-dir`). `open`, `post`, `show`, `list`, `message`, and `inbox` make zero
+provider calls. `turn` is the explicit exception: it launches the named roster agent
+only after the durable start fence; `cancel` appends a durable typed command and
+targets the active worker when one is present, so another runtime can request
+cancellation without an in-memory handle. `message` appends an addressed context event
+from one admitted participant to another participant or the human; `inbox` reads the
+local native message/context stream after a cursor for an agent process. These messages
+cannot approve, deny, cancel, vote, or launch. `recover` requires an explicit human
+attestation, closes an unmatched turn as indeterminate, and never retries; `fork` creates
+a new context lineage with no provider contact. The human message is context-only; it is
+never an approve, deny, cancel, or ballot command. CLI turns wait for the provider process
+to finish so the parent cannot exit before `turn_finished` is journaled; the browser keeps
+one runtime per surface for interactive cancellation.
 
 ## Modes
 
@@ -171,7 +177,7 @@ synthesis cannot approve, deny, lower the denominator, or authorize a launch.
 
 The initial allowlist is:
 
-`session_created`, `message_posted`, `human_message`, `turn_started`,
+`session_created`, `message_posted`, `human_message`, `agent_message`, `turn_started`,
 `turn_finished`, `turn_cancel_requested`, `council_round_started`, `position_submitted`, `cross_exam`,
 `chair_synthesis`, `deliberation_policy_bound`, `ballot_accepted`,
 `state_transition`, `cleanup_receipt`, and bounded `fork_created`.
@@ -182,8 +188,11 @@ bounded prose summaries, option IDs, and evidence fingerprints; they must omit
 prompts, argv, cwd, profiles, credentials, raw model output, and private paths.
 
 Human messages are explicitly typed and attributed to the initiator. They are
-never silently treated as approve/deny/cancel commands. Commands use the
-existing durable command protocol and remain auditable.
+never silently treated as approve/deny/cancel commands. `agent_message` is
+addressed to one admitted participant or `human`; the native journal retains the
+message for the recipient's local inbox while public projections expose only a
+redacted preview and digest. Commands use the existing durable command protocol and
+remain auditable.
 
 ## UI shape
 

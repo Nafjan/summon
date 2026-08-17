@@ -292,6 +292,7 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon chat open|post|show|list …` | local shared room for brainstorming and human context; `chat open --chat-browser auto|link` starts/reuses or links the authenticated atlas |
 | `summon chat turn SESSION AGENT --message "…"` | explicit bounded roster-agent turn; CLI waits for durable finish, browser turns are cancellable and can run in parallel across participants |
 | `summon chat cancel SESSION AGENT` | append a durable cancel command and stop that participant's active turn when reachable; it never changes a ballot |
+| `summon chat message SESSION FROM TO --message "…"` · `chat inbox SESSION AGENT` | durable addressed context between admitted participants (or the human); inbox reads are local-native and never control authority |
 | `summon chat recover SESSION AGENT --chat-confirm` | human-attested close for an unmatched turn; records indeterminate spend and never retries |
 | `summon chat fork SESSION AGENT --message "…"` | create a new context lineage without provider contact |
 | `summon deliberate --question "…" --seats A,B --options X,Y` | fixed-option, quorum-controlled, replayable decision |
@@ -305,8 +306,9 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon version` · `summon help` | version · usage |
 
 `manifest` is Summon's current batch-fan-out surface. It is compatible with any
-host that can run the Summon CLI, but it is not a shared IDE swarm: workers do
-not yet share durable claims, leases, directed messages, or cancellation state.
+host that can run the Summon CLI, but it is not yet a durable shared IDE swarm:
+workers have addressed conversation messages, but do not share coordinator claims,
+leases, or cancellation state across a manifest run.
 The proposed external-worker boundary is versioned and documented in
 [SUMMON_SWARM_PROTOCOL.md](docs/SUMMON_SWARM_PROTOCOL.md); it is contract-only
 until the coordinator and adapter conformance gates pass.

@@ -65,6 +65,22 @@ class DeliberationCliTests(unittest.TestCase):
                 ["--chat-action", action, "--chat-session", "room-1",
                  "--chat-participant", "worker", *extra])
 
+        rewritten, mode = _cli.rewrite_subcommand(
+            ["chat", "message", "room-1", "worker", "human", "--message", "context"])
+        self.assertIsNone(mode)
+        self.assertEqual(
+            rewritten,
+            ["--chat-action", "message", "--chat-session", "room-1",
+             "--chat-participant", "worker", "--chat-to", "human",
+             "--message", "context"])
+        rewritten, mode = _cli.rewrite_subcommand(
+            ["chat", "inbox", "room-1", "worker", "--after", "3"])
+        self.assertIsNone(mode)
+        self.assertEqual(
+            rewritten,
+            ["--chat-action", "inbox", "--chat-session", "room-1",
+             "--chat-participant", "worker", "--chat-after", "3"])
+
     def test_chat_recovery_and_fork_flags_are_not_silently_dropped(self) -> None:
         parser = _cli.build_parser("test", 1)
         for argv in (
@@ -73,6 +89,15 @@ class DeliberationCliTests(unittest.TestCase):
             ["--chat-action", "fork", "--chat-session", "room-1",
              "--chat-participant", "worker", "--chat-message", "next",
              "--chat-reason", "manual"],
+        ):
+            args = parser.parse_args(argv)
+            self.assertIsNone(_cli.unsupported_mode_flags(argv, args))
+        for argv in (
+            ["--chat-action", "message", "--chat-session", "room-1",
+             "--chat-participant", "worker", "--chat-to", "human",
+             "--chat-message", "context"],
+            ["--chat-action", "inbox", "--chat-session", "room-1",
+             "--chat-participant", "worker", "--chat-after", "3"],
         ):
             args = parser.parse_args(argv)
             self.assertIsNone(_cli.unsupported_mode_flags(argv, args))

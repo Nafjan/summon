@@ -468,10 +468,10 @@ _JS = r'''(() => {
   }
   function renderEvent(record) {
     const event = String(record.event || 'event'); const payload = record.payload || {}; const who = eventIdentity(record); const preview = payloadPreview(record);
-    if (event === 'human_message' || event === 'message_posted') {
+    if (event === 'human_message' || event === 'message_posted' || event === 'agent_message') {
       const article = document.createElement('li'); article.className = 'message ' + (event === 'human_message' ? 'human' : 'agent');
-      const head = document.createElement('div'); head.className = 'message-head'; const strong = document.createElement('strong'); strong.append(text(event === 'human_message' ? 'Operator context' : identityLabel(who))); const time = document.createElement('time'); time.append(text('cursor ' + String(record.cursor || '—'))); head.append(strong, time);
-      const bubble = document.createElement('div'); bubble.className = 'bubble'; bubble.append(text(preview || 'Redacted event')); const meta = document.createElement('div'); meta.className = 'message-meta'; meta.append(text(event === 'human_message' ? String(payload.text_chars || 0) + ' chars · ' + shortHash(payload.text_sha256) : 'agent context · public redacted'));
+      const head = document.createElement('div'); head.className = 'message-head'; const strong = document.createElement('strong'); const heading = event === 'human_message' ? 'Operator context' : event === 'agent_message' ? identityLabel(payload.sender || who) : identityLabel(who); strong.append(text(heading)); const time = document.createElement('time'); time.append(text('cursor ' + String(record.cursor || '—'))); head.append(strong, time);
+      const bubble = document.createElement('div'); bubble.className = 'bubble'; bubble.append(text(preview || 'Redacted event')); const meta = document.createElement('div'); meta.className = 'message-meta'; meta.append(text(event === 'human_message' ? String(payload.text_chars || 0) + ' chars · ' + shortHash(payload.text_sha256) : event === 'agent_message' ? identityLabel(payload.sender || who, false) + ' → ' + identityLabel(payload.recipient || 'human', false) + ' · context only' : 'agent context · public redacted'));
       article.append(head, bubble, meta, detailFor(record)); return article;
     }
     const family = event === 'council_round_started' ? 'round' : event === 'position_submitted' ? 'position' : event === 'cross_exam' ? 'cross' : event === 'chair_synthesis' ? 'synthesis' : event === 'turn_started' ? 'turn' : event === 'turn_finished' ? 'finish' : 'default';

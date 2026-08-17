@@ -81,7 +81,7 @@ class ConversationUITests(unittest.TestCase):
         for marker in ("Conversation atlas", "room-search", "timeline", "Room evidence",
                        "Post context", "Ask a roster agent", "context + explicit turns",
                        "appendRecord", "cursor !== state.cursor + 1",
-                       "timeline.append(renderEvent(record))"):
+                       "timeline.append(renderEvent(record))", "event === 'agent_message'"):
             self.assertIn(marker, source)
         self.assertNotIn("timeline.replaceChildren(); renderEvent", source)
 

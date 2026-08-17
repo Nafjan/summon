@@ -184,6 +184,11 @@ remain open work. Local OS-process cancellation now has birth-token fencing plus
 descendant cleanup coverage; cross-process takeover remains conservative when a native
 process handle cannot be transferred.
 
+Participants may now exchange bounded, durable, addressed context messages (or read
+operator context) through the room inbox without gaining control authority. A durable
+cross-process swarm coordinator, shared claims, and lease-backed cancellation remain
+separate open work; the batch manifest must not be described as an IDE swarm.
+
 Interactive council rounds may include independent positions, cross-examination,
 chair synthesis, and human messages between rounds. A council recommendation
 remains context, not a ballot. Promotion to deliberate is an explicit human

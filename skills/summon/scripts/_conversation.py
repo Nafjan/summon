@@ -49,6 +49,7 @@ _EVENTS = frozenset({
     "turn_finished", "turn_cancel_requested", "council_round_started", "position_submitted",
     "cross_exam", "chair_synthesis", "deliberation_policy_bound",
     "ballot_accepted", "state_transition", "cleanup_receipt", "fork_created",
+    "agent_message",
 })
 _CONTROL_EVENTS = frozenset({"ballot_accepted", "state_transition", "cleanup_receipt"})
 
@@ -203,6 +204,17 @@ def _public_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, An
         if not isinstance(summary, str) or len(summary) > MAX_SUMMARY_CHARS:
             raise ConversationError("message summary is missing or too long")
         return {"message_id": message_id, "summary": _redact_text(summary)}
+    if event_type == "agent_message":
+        message_id = _safe_id(data.get("message_id"), "message id")
+        sender = _safe_id(data.get("sender"), "message sender")
+        recipient = _safe_id(data.get("recipient"), "message recipient")
+        text = data.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > MAX_MESSAGE_CHARS:
+            raise ConversationError("agent message must be non-empty and bounded")
+        preview = _redact_text(text)[:MAX_SUMMARY_CHARS]
+        return {"message_id": message_id, "sender": sender, "recipient": recipient,
+                "text_sha256": _text_sha256(text), "text_chars": len(text),
+                "preview": preview, "summary": preview}
     if event_type == "session_created":
         out["project_id"] = _safe_id(data.get("project_id"), "project id")
         out["initiator_host"] = _safe_display(data.get("initiator_host"), "initiator host", required=True)
@@ -722,6 +734,53 @@ class ConversationJournal:
                            {"message_id": mid, "text": text},
                            expected_cursor=expected_cursor, event_id=f"message-{mid}")
 
+    def append_agent_message(self, sender: str, recipient: str, text: str, *,
+                             message_id: str | None = None,
+                             expected_cursor: int | None = None) -> dict[str, Any]:
+        """Append a durable context-only message addressed to one room member.
+
+        This is a delivery record, not a control channel: recipient text cannot
+        approve, cancel, vote, or launch anything.  Native text stays in the
+        private journal; public/browser projections expose only a redacted
+        preview and digest.
+        """
+        sender_id = _safe_id(sender, "message sender")
+        recipient_id = _safe_id(recipient, "message recipient")
+        participant_ids = {item["agent"] for item in self._header.get("participants", [])}
+        allowed = participant_ids | {"human"}
+        if sender_id not in participant_ids:
+            raise ConversationError("message sender is not a room participant")
+        if recipient_id not in allowed:
+            raise ConversationError("message recipient is not a room participant")
+        if not isinstance(text, str) or not text.strip():
+            raise ConversationError("agent message must be non-empty text")
+        mid = message_id or uuid.uuid4().hex
+        return self.append("agent_message", "agent", sender_id,
+                           {"message_id": mid, "sender": sender_id,
+                            "recipient": recipient_id, "text": text},
+                           expected_cursor=expected_cursor,
+                           event_id=f"agent-message-{mid}")
+
+    def agent_inbox(self, recipient: str, *, after_cursor: int = 0,
+                    native: bool = True) -> list[dict[str, Any]]:
+        """Read addressed messages plus operator context for one participant.
+
+        ``native=True`` is intentionally local-only for an agent caller; HTTP
+        and browser surfaces use the normal public-redacted ``events`` path.
+        """
+        recipient_id = _safe_id(recipient, "message recipient")
+        records = self.events(native=native, after_cursor=after_cursor)
+        result = []
+        for record in records:
+            event = record.get("event")
+            payload = record.get("payload", {})
+            if event == "agent_message" and payload.get("recipient") == recipient_id:
+                result.append(record)
+            elif event == "human_message" and recipient_id in {
+                    item.get("agent") for item in self._header.get("participants", [])}:
+                result.append(record)
+        return result
+
     def append_council_round(self, round_number: int,
                              positions: Iterable[Mapping[str, Any]], *,
                              cross_exams: Iterable[Mapping[str, Any]] = (),
@@ -967,9 +1026,10 @@ def list_rooms(root: str | os.PathLike[str]) -> dict[str, dict[str, list[dict[st
 def run_command(args: Any) -> int:
     """CLI handler for local rooms and explicitly requested live agent turns.
 
-    Room reads and human context remain provider-inert.  ``turn`` and ``cancel``
-    are the only operations that cross into the runtime seam; the runtime owns
-    the durable-before-provider fence and continuation/fork decision.
+    Room reads, human context, and addressed agent messages remain provider-inert.
+    ``turn`` and ``cancel`` are the only operations that cross into the runtime
+    seam; the runtime owns the durable-before-provider fence and continuation/fork
+    decision.  Message delivery is context-only and cannot mutate authority.
     """
     action = getattr(args, "chat_action", None)
     root = getattr(args, "conversation_dir", None) or os.path.join(
@@ -1073,6 +1133,26 @@ def run_command(args: Any) -> int:
                                        or getattr(args, "agents_dir", None)),
             )
             result = runtime.cancel_turn(session, participant)
+        elif action == "message":
+            session = _safe_id(getattr(args, "chat_session", None), "session id")
+            sender = _safe_id(getattr(args, "chat_participant", None), "message sender")
+            recipient = _safe_id(getattr(args, "chat_to", None), "message recipient")
+            message = getattr(args, "chat_message", None)
+            if not isinstance(message, str) or not message.strip():
+                raise ConversationError("chat message requires --message")
+            journal = ConversationJournal.open(root, session)
+            event = journal.append_agent_message(sender, recipient, message)
+            result = {"status": "sent", "room": journal.room.as_dict(), "event": event}
+        elif action == "inbox":
+            session = _safe_id(getattr(args, "chat_session", None), "session id")
+            recipient = _safe_id(getattr(args, "chat_participant", None), "message recipient")
+            after = getattr(args, "chat_after", 0)
+            journal = ConversationJournal.open(root, session)
+            events = journal.agent_inbox(recipient, after_cursor=after, native=True)
+            result = {"status": "ok", "session_id": session,
+                      "recipient": recipient, "after_cursor": after,
+                      "events": events, "cursor": journal.room.cursor,
+                      "delivery": "local-native"}
         elif action == "recover":
             from _conversation_runtime import ConversationRuntime
             session = _safe_id(getattr(args, "chat_session", None), "session id")

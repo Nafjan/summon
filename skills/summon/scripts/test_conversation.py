@@ -52,6 +52,35 @@ class ConversationJournalTests(unittest.TestCase):
         self.assertNotIn("SECRET_TOKEN", json.dumps(reopened.as_dict()))
         self.assertIn("SECRET_TOKEN", json.dumps(reopened.as_dict(native=True)))
 
+    def test_agent_message_is_addressed_durable_and_context_only(self):
+        room = self._room()
+        event = room.append_agent_message(
+            "sol", "human", "Please review this context SECRET_TOKEN C:\\private\\repo")
+        self.assertEqual(event["event"], "agent_message")
+        self.assertEqual(event["payload"]["sender"], "sol")
+        self.assertEqual(event["payload"]["recipient"], "human")
+        self.assertNotIn("SECRET_TOKEN", json.dumps(event))
+        self.assertNotIn(r"C:\private\repo", json.dumps(event))
+        inbox = room.agent_inbox("human")
+        self.assertEqual(len(inbox), 1)
+        self.assertIn("SECRET_TOKEN", inbox[0]["payload"]["text"])
+        self.assertEqual(room.agent_inbox("sol"), [])
+        with self.assertRaises(ConversationError):
+            room.append_agent_message("sol", "unknown", "not deliverable")
+
+    def test_agent_message_requires_a_room_sender_and_public_projection_is_bounded(self):
+        room = self._room()
+        with self.assertRaises(ConversationError):
+            room.append_agent_message("fable", "human", "not a member")
+        with self.assertRaises(ConversationError):
+            room.append_agent_message("sol", "human", "")
+        room.append_agent_message("sol", "human", "native context")
+        native = room.agent_inbox("human")[-1]
+        self.assertIn("text", native["payload"])
+        public = room.events()[-1]
+        self.assertNotIn("text", public["payload"])
+        self.assertIn("preview", public["payload"])
+
     def test_open_reader_refreshes_after_another_writer(self):
         room = self._room()
         reader = ConversationJournal.open(self.root, "session-1")
@@ -295,6 +324,25 @@ class ConversationJournalTests(unittest.TestCase):
             with patch("sys.stdout", new_callable=StringIO) as output:
                 self.assertEqual(run_command(args), 0)
             self.assertEqual(json.loads(output.getvalue())["status"], "opened")
+
+    def test_cli_agent_message_and_inbox_are_durable_without_provider_contact(self):
+        self._room()
+        base = dict(chat_session="session-1", conversation_dir=str(self.root),
+                    cwd=str(self.project), chat_participant="sol")
+        send = SimpleNamespace(chat_action="message", chat_to="human",
+                               chat_message="context from Sol", **base)
+        from io import StringIO
+        with patch("sys.stdout", new_callable=StringIO) as output:
+            self.assertEqual(run_command(send), 0)
+        sent = json.loads(output.getvalue())
+        self.assertEqual(sent["status"], "sent")
+        inbox_base = dict(base, chat_participant="human")
+        inbox = SimpleNamespace(chat_action="inbox", chat_after=0, **inbox_base)
+        with patch("sys.stdout", new_callable=StringIO) as output:
+            self.assertEqual(run_command(inbox), 0)
+        received = json.loads(output.getvalue())
+        self.assertEqual(received["delivery"], "local-native")
+        self.assertEqual(received["events"][0]["payload"]["text"], "context from Sol")
 
 
 class ConversationPolicyTests(unittest.TestCase):

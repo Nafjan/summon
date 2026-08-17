@@ -145,6 +145,7 @@ MODE_FLAGS = {
               "chat_timeout", "chat_participants", "chat_project_id",
               "chat_project_root", "chat_initiator_host", "chat_initiator_agent",
               "chat_mode", "chat_browser", "chat_confirm", "chat_reason",
+              "chat_to", "chat_after",
               "conversation_dir", "agents_dir",
               "strict_agents_dir", "json", "cwd", "job_file"},
     # jobs read commands: registry query only.
@@ -206,7 +207,8 @@ TOKEN_DESTS = {"set": "sets", "from": "bug_report_from",
                "project-id": "chat_project_id", "project-root": "chat_project_root",
                "initiator-host": "chat_initiator_host", "initiator-agent": "chat_initiator_agent",
                "message": "chat_message", "mode": "chat_mode", "participant": "chat_participant",
-               "participants": "chat_participants"}   # reverse mapping
+               "participants": "chat_participants", "to": "chat_to",
+               "after": "chat_after"}   # reverse mapping
 
 
 def fanout_mode(args: argparse.Namespace) -> str | None:
@@ -337,6 +339,8 @@ COMMAND_USAGE = {
 summon chat post SESSION_ID --message TEXT
 summon chat turn SESSION_ID AGENT --message TEXT [--chat-timeout 10m]
 summon chat cancel SESSION_ID AGENT
+summon chat message SESSION_ID FROM_AGENT TO_AGENT --message TEXT
+summon chat inbox SESSION_ID AGENT [--chat-after CURSOR]
 summon chat recover SESSION_ID AGENT --chat-confirm
 summon chat fork SESSION_ID AGENT --message TEXT
 summon chat show SESSION_ID | summon chat list
@@ -439,17 +443,21 @@ def rewrite_subcommand(argv: list) -> tuple:
         if not rest:
             return argv, "help:chat"
         action = rest[0]
-        if action not in ("open", "post", "show", "list", "turn", "cancel", "recover", "fork"):
-            return argv, f"error: unknown 'chat' action {action!r} (use open/post/show/list/turn/cancel/recover/fork)"
+        if action not in ("open", "post", "show", "list", "turn", "cancel", "message", "inbox", "recover", "fork"):
+            return argv, f"error: unknown 'chat' action {action!r} (use open/post/show/list/turn/cancel/message/inbox/recover/fork)"
         if action == "list":
             return ["--chat-action", "list", *rest[1:]], None
         if len(rest) < 2 or rest[1].startswith("-"):
             return argv, f"error: 'chat {action}' needs a session id"
         translated = ["--chat-action", action, "--chat-session", rest[1]]
-        if action in ("turn", "cancel", "recover", "fork"):
+        if action in ("turn", "cancel", "inbox", "recover", "fork"):
             if len(rest) < 3 or rest[2].startswith("-"):
                 return argv, f"error: 'chat {action}' needs a participant id"
             translated += ["--chat-participant", rest[2], *rest[3:]]
+        elif action == "message":
+            if len(rest) < 4 or rest[2].startswith("-") or rest[3].startswith("-"):
+                return argv, "error: 'chat message' needs sender and recipient ids"
+            translated += ["--chat-participant", rest[2], "--chat-to", rest[3], *rest[4:]]
         else:
             translated += rest[2:]
         # `--timeout` is a long-standing dispatch/jobs flag.  It must not be
@@ -460,6 +468,8 @@ def rewrite_subcommand(argv: list) -> tuple:
         translated = [
             ("--chat-timeout" + token[len("--timeout"):])
             if token == "--timeout" or token.startswith("--timeout=") else token
+            if token != "--after" and not token.startswith("--after=") else
+            ("--chat-after" + token[len("--after"):])
             for token in translated
         ]
         return translated, None
@@ -745,13 +755,17 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--deliberate-open", dest="deliberate_open", metavar="RUN_ID",
                         help="Open/reuse the authenticated local deliberation ledger")
     parser.add_argument("--chat-action", dest="chat_action",
-                        choices=("open", "post", "show", "list", "turn", "cancel", "recover", "fork"),
+                        choices=("open", "post", "show", "list", "turn", "cancel", "message", "inbox", "recover", "fork"),
                         help="Conversation room action; turn launches one bounded roster agent; "
                              "recover/fork never retry a provider")
     parser.add_argument("--chat-session", dest="chat_session", metavar="SESSION_ID",
                         help="Conversation room session id")
     parser.add_argument("--chat-participant", "--participant", dest="chat_participant", metavar="AGENT",
-                        help="With chat turn/cancel: participant roster agent id")
+                        help="With chat turn/cancel/message/inbox: participant or sender roster agent id")
+    parser.add_argument("--chat-to", dest="chat_to", metavar="AGENT",
+                        help="With chat message: recipient roster agent id or human")
+    parser.add_argument("--chat-after", dest="chat_after", type=int, default=0, metavar="CURSOR",
+                        help="With chat inbox: return addressed messages after this cursor")
     parser.add_argument("--chat-participants", "--participants", dest="chat_participants",
                         help="With chat open: comma-separated participant roster ids")
     parser.add_argument("--chat-timeout", dest="chat_timeout", type=parse_timeout,
