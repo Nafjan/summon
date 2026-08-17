@@ -278,6 +278,13 @@ class ConversationRuntimeTests(unittest.TestCase):
                 break
             __import__("time").sleep(0.05)
         self.assertEqual(len(finished), 2)
+        # The journal boundary can be durable a few instructions before the
+        # worker's final owner/process-record cleanup.  Explicitly close both
+        # runtimes before TemporaryDirectory teardown so Windows cannot race a
+        # late cleanup/read handle with shutil.rmtree (the product surface does
+        # the same on browser shutdown).
+        left.close(timeout=5)
+        right.close(timeout=5)
 
     def test_participant_leases_do_not_regress_global_journal_generation(self):
         with patch.dict(os.environ, {"FAKE_MARKER": str(self.marker)}):
