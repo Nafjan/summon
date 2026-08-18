@@ -38,7 +38,7 @@ class InvocationPlanTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def add_agent(self, *, cli="claude", permission="read-only", model=None,
-                  transport=None, args=None):
+                  transport=None, args=None, body="Definition body."):
         lines = ["---", f"run-agent: {cli}", f"permission: {permission}"]
         if model:
             lines.append(f"model: {model}")
@@ -46,7 +46,7 @@ class InvocationPlanTests(unittest.TestCase):
             lines.append(f"transport: {transport}")
         if args:
             lines.append(f"args: {args}")
-        lines += ["---", "# Seat", "Definition body.", ""]
+        lines += ["---", "# Seat", body, ""]
         (self.agents / "worker.md").write_text("\n".join(lines), encoding="utf-8")
 
     def proof(self, seat="one"):
@@ -91,6 +91,18 @@ class InvocationPlanTests(unittest.TestCase):
         self.assertEqual(result.model, "claude-sonnet-4-6")
         self.assertEqual(result.extra_args, ("--extra", "safe"))
         self.assertTrue(plan.as_dict()["snapshot_digest"])
+
+    def test_deliberation_contract_supersedes_conflicting_seat_report_contract(self):
+        self.add_agent(
+            body=("Every response MUST end with the exact Final report block. "
+                  "Never return machine JSON."))
+        frozen = roster.freeze_roster(
+            (roster.SeatRequest("one", "worker", role="reviewer"),),
+            cwd=str(self.cwd), agents_dir=str(self.agents), role_enabled=False)
+        plan = invplan.build_invocation_plans(
+            frozen, decision_id="decision", cwd=str(self.cwd))["one"]
+        self.assertIn("supersede any generic human-facing report", plan.template.system_context)
+        self.assertIn("Do not emit\nthat report block or prose", plan.template.system_context)
 
     def test_wrong_prompt_digest_is_refused_before_provider(self):
         frozen = self.freeze()
