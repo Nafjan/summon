@@ -13,6 +13,10 @@ regression notes, and test evidence, see the
   routes remain available through an explicitly named private profile.
 - **Release contract:** the source-bound version/migration contract, fixed gate
   registry, and immutable release evidence are now part of the 3.0.0 GA path.
+- **Claude live-provider gate:** a reviewed read-only Opus matrix now covers a decided
+  normal run, durable cancellation, and conservative deadline/uncertain-spend handling;
+  the redacted schema-2 receipt is source-bound and other providers remain independently
+  gated.
 
 - **One open product:** Summon deliberation is part of the same public product as
   dispatch, council, and the browser observer. The public `/summon deliberate` command and thin `/deliberate`

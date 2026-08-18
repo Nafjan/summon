@@ -2,7 +2,7 @@
 
 Status: 3.0.0 GA release contract. The release manifest is generated from the clean
 immutable release commit and records the fixed suites, eight gates, migration packet,
-managed-install inventory, and redacted live-provider receipt.
+managed installs inventory, and redacted live-provider receipt.
 
 This document is intentionally operational. A version bump is not evidence of a
 GA release. The release owner must generate evidence from a clean, immutable tree,
@@ -98,16 +98,20 @@ the profile metadata itself remains private and outside the release artifact.
 
 ## Release decision
 
-For the current 3.0.0 candidate, all fixed suites and every non-live gate are `pass`, the
-source tree is clean, managed installs converge, and the migration/rollback and
-accessibility artifacts are retained. A bounded Claude Opus pilot was then run with two
-read-only seats, one round, two physical attempts, and no retry/fallback. Both attempts
-reported `claude-opus-5`; one produced a valid ballot and the other produced no parseable
-ballot, so the `all` quorum was not met. The account digest matched before and after,
-uncertain spend was false, and cleanup was verified clean, but this is **partial pilot
-evidence**, not a GA receipt: it does not prove a decided normal case or the required
-live cancel/deadline matrix. The previously reviewed receipt also lacks
-`account_evidence_sha256`. A new reviewed account-bound receipt must pass the full schema-2
-gate before tagging. Future provider routes must earn their own receipt; if a future gate
-is unavailable, publish a versioned maintenance release or clearly label the result
-`3.0.0-preview.N` rather than weakening this contract.
+The 3.0.0 candidate now has a source-bound, reviewed Claude receipt. The normal case used
+two enforceable read-only seats (`planner` and `architect`) for one round with two physical
+attempts; both served `claude-opus-5`, the `all` quorum decided `pilot-receipt`, and cleanup
+was verified clean with no uncertain spend. A separate cancellation run queued a typed
+cancel from another process after an attempt had started and reached `CANCELLED` with one
+finished attempt and no retained resources. A separate three-second deadline run stopped
+at the deadline with `adapter_indeterminate`, preserved `uncertain_spend=true`, and left no
+orphaned resources or post-deadline contact. The default Claude account digest matched
+before and after (`account_evidence_sha256` is held in the redacted packet).
+
+The schema-2 packet validates through `tools/live_provider_gate.py`; its redacted artifact
+hash is `7663ccc5bb820de09d5fdee8c20615698cabbaa1cb5176bf7d0648087008bb70`. The final
+source-bound registry for the clean candidate records all 17 fixed suites and all eight
+gates as `pass`, with clean source and converged managed
+installs. This closes the Claude live-provider gate for 3.0.0. It does not certify Fable,
+Gemini, or any other route; each must earn an independent receipt. The published GA tag
+must point at this same clean commit, alongside the retained manifest/evidence packet.

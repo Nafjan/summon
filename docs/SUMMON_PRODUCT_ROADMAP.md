@@ -2,17 +2,18 @@
 
 Status date: 2026-08-18
 Current source version: `3.0.0` candidate
-Readiness: the immutable `3.0.0` tag remains the public-preview baseline. The current
-candidate contains the authenticated chat/runtime, browser hardening, local swarm
-coordinator, and narrow fresh read-only deliberation lane described below. The clean
-source-bound candidate passes every fixed suite and every non-live gate, and all eight
-managed installs match it. An authorized bounded Claude Opus pilot used two read-only
-seats and two physical attempts: both served `claude-opus-5`, one ballot parsed and one
-did not, so the required `all` quorum was not reached. Account evidence matched before
-and after, uncertain spend was false, and cleanup was clean; this is partial evidence,
-not a schema-2 GA receipt. The live-provider gate therefore remains blocked pending a
-reviewed account-bound normal/cancel/deadline packet. Additional provider receipts,
-remote execution, and multi-user hosting remain separately gated.
+Readiness: the immutable `3.0.0` tag remains the public-preview baseline while the final
+GA commit is prepared. The current candidate contains the authenticated chat/runtime,
+browser hardening, local swarm coordinator, and narrow fresh read-only deliberation lane
+described below. The final source-bound registry passes all 17 fixed suites and all eight
+gates, with clean source and all eight managed
+installs converged. The reviewed Claude matrix includes a normal decided run (two
+`claude-opus-5` attempts, `all` quorum), a durable cancellation after provider contact,
+and a three-second deadline that conservatively recorded `adapter_indeterminate` and
+`uncertain_spend=true`; all three cleaned up without orphans. The account digest matched
+before and after. The redacted schema-2 packet is retained outside the source tree;
+additional provider receipts, remote execution, and multi-user hosting remain separately
+gated.
 
 This is the release-facing roadmap for turning the current, well-tested kernel into a dependable open product. It records what is actually shipped, what was tested, and the gates that must pass before we describe a feature as shipped, preview, or live-provider-enabled.
 
@@ -21,10 +22,10 @@ This is the release-facing roadmap for turning the current, well-tested kernel i
 | Area | Current truth | Release posture |
 | --- | --- | --- |
 | Ordinary dispatch, council, ACP, telemetry | Implemented and locally exercised | Ready for continued public use |
-| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; the bounded Claude Opus pilot captured exact served-model and matched account-digest evidence but did not reach quorum; Fable, Gemini, and other routes remain unverified | All live lanes remain gated until account-bound evidence is reviewed |
+| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; the Claude route now has exact `model.served` and matched account-digest evidence; Fable, Gemini, and other routes remain unverified | Claude is live-provider-gated for 3.0.0; other lanes remain gated until their own receipts |
 | Deliberation kernel, journal replay/recovery, scheduler | Focused `test_deliberation_*.py` suite; provider-inert | Ready as a fake/injected integration surface |
 | Custom Agent manifests and roster binding | Strict parser, path fencing, consent/identity binding | Ready as provider-inert configuration |
-| Live provider composition | Receipt/plan/owner/deadline fences exist; the latest Claude Opus pilot is partial (one valid ballot, one parse failure, no quorum) and has no cancel/deadline matrix | Live-provider gate blocked pending a reviewed account-bound receipt |
+| Live provider composition | Receipt/plan/owner/deadline fences plus reviewed Claude normal/cancel/deadline matrix; deadline remains conservatively indeterminate with uncertain spend | Claude gate passes; provider expansion remains separately gated |
 | Browser conversation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, visual evidence, and explicit cancellable roster-agent turns; richer multi-run lifecycle remains preview | Unreleased post-GA preview |
 | Local swarm coordinator | `_rundir`-backed owner/lease/claim journal, idempotent worker messages, claim-bound artifacts, cancellation, and explicit uncertain-spend recovery; no implicit provider or IDE attachment | Provider-neutral preview |
 | Managed local installs | The installer detects nine host profiles (eight managed records) and all eight managed copies currently match the candidate; the unmanaged Cursor plugin remains intentionally untouched | Convergence is source-bound in the current clean registry; recheck after any source change |
@@ -85,10 +86,10 @@ remain. The release manifest is generated from a clean, immutable source tree an
 requires the named suites and gates rather than accepting arbitrary caller-supplied
 labels. Earlier evidence packets, including the packet for commit `5530459`, are
 historical and must not be reused after source changes. The current candidate's fixed
-suites and non-live gates pass, but the live-provider gate remains blocked until a
-reviewed schema-2 receipt includes `account_evidence_sha256`. Until that replacement
-receipt and the final immutable tag exist, the correct posture is public preview, with
-the unmanaged Cursor plugin reported and intentionally untouched.
+suites, non-live gates, and reviewed Claude live-provider gate pass; the published GA
+tag must point at this same clean candidate and ship with the retained manifest and
+redacted receipt. Fable, Gemini, and other provider lanes remain unverified, and the
+unmanaged Cursor plugin remains reported and intentionally untouched.
 
 ## Product direction
 
