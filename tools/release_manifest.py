@@ -55,7 +55,7 @@ REQUIRED_TESTS = frozenset({
     "conversation", "conversation_runtime", "conversation_ui", "swarm_protocol",
     "swarm_coordinator",
     "model_routing", "release_contract",
-    "live_provider_gate",
+    "account_evidence", "live_provider_gate",
     "release_gates",
 })
 REQUIRED_GATES = frozenset({
@@ -74,6 +74,7 @@ REQUIRED_COMMANDS = {
     "swarm_coordinator": "python -m unittest skills.summon.scripts.test_swarm_coordinator",
     "conversation_ui": "python -m unittest skills.summon.scripts.test_conversation_ui",
     "release_contract": "python -m unittest tests.test_release_contract",
+    "account_evidence": "python -m unittest tests.test_account_evidence",
     "live_provider_gate": "python -m unittest tests.test_live_provider_gate",
     "release_gates": "python -m unittest tests.test_release_gates",
     "deliberation": "python -m unittest skills.summon.scripts.test_deliberation_engine skills.summon.scripts.test_deliberation_policy skills.summon.scripts.test_deliberation_adapter skills.summon.scripts.test_deliberation_cli skills.summon.scripts.test_deliberation_scheduler skills.summon.scripts.test_deliberation_agents skills.summon.scripts.test_deliberation_roster skills.summon.scripts.test_deliberation_invocation skills.summon.scripts.test_deliberation_replay skills.summon.scripts.test_deliberation_restore skills.summon.scripts.test_deliberation_recovery skills.summon.scripts.test_deliberation_phase_a skills.summon.scripts.test_deliberation_live skills.summon.scripts.test_deliberation_browser skills.summon.scripts.test_deliberation_ui",

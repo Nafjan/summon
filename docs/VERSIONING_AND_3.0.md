@@ -86,6 +86,16 @@ account proof. Raw account identifiers, credentials, prompts, and output never
 belong in the release packet. Missing, stale, or malformed evidence produces
 `blocked`, never an inferred success.
 
+For the Claude route, generate the redacted digest locally before and after the
+pilot and require the two values to match:
+
+```text
+python tools/account_evidence.py --profile default --config-dir "%USERPROFILE%\\.claude"
+```
+
+The reviewer copies only the resulting `account_evidence_sha256` into the receipt;
+the profile metadata itself remains private and outside the release artifact.
+
 ## Release decision
 
 For the current 3.0.0 candidate, all fixed suites and every non-live gate are `pass`, the
