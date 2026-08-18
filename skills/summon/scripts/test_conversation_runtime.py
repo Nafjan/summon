@@ -428,20 +428,27 @@ class ConversationRuntimeTests(unittest.TestCase):
             self.root, cwd=self.project, agents_dir=self.roster,
             dispatcher=slow, timeout_ms=8_000, strict_agents_dir=True,
         )
-        started = runtime.start_turn("room-1", "worker", "cancel me", wait=False)
-        self.assertEqual(started["status"], "started")
-        runtime.cancel_turn("room-1", "worker")
-        deadline = __import__("time").monotonic() + 5
-        finished = None
-        while __import__("time").monotonic() < deadline:
-            events = ConversationJournal.open(self.root, "room-1").events(native=True)
-            finished = next((event for event in events
-                             if event["event"] == "turn_finished"), None)
-            if finished:
-                break
-            __import__("time").sleep(0.05)
-        self.assertIsNotNone(finished)
-        self.assertEqual(finished["payload"]["status"], "cancelled")
+        try:
+            started = runtime.start_turn("room-1", "worker", "cancel me", wait=False)
+            self.assertEqual(started["status"], "started")
+            runtime.cancel_turn("room-1", "worker")
+            deadline = __import__("time").monotonic() + 5
+            finished = None
+            while __import__("time").monotonic() < deadline:
+                events = ConversationJournal.open(self.root, "room-1").events(native=True)
+                finished = next((event for event in events
+                                 if event["event"] == "turn_finished"), None)
+                if finished:
+                    break
+                __import__("time").sleep(0.05)
+            self.assertIsNotNone(finished)
+            self.assertEqual(finished["payload"]["status"], "cancelled")
+        finally:
+            # The durable finish event is written before the worker removes its
+            # process record and releases the owner. Close the runtime before
+            # TemporaryDirectory cleanup so Windows cannot race that final
+            # bookkeeping and leave the test directory non-empty.
+            runtime.close(timeout=5)
 
     def test_runtime_close_cancels_and_joins_active_turn(self):
         slow = self.base / "surface_close_dispatcher.py"
