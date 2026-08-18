@@ -1,10 +1,15 @@
 # Changelog
 
-The important, user-visible changes to summon. For the complete certification record,
-regression notes, and test evidence, see the
-[detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
+This file lists user-visible changes to Summon. For the certification record, regression
+notes, and test evidence, see the [detailed engineering history](docs/ENGINEERING_CHANGELOG.md).
 
 ## [Unreleased]
+
+- **Documentation:** clarified the 3.0 GA boundary, unmanaged-copy policy, local-only
+  diagnostics, and the distinction between chat turns, council context, and deliberation
+  authority. Public docs no longer include workstation-specific drift details.
+
+## [3.0.0-ga] - 2026-08-18
 
 - **Claude route isolation:** default Claude dispatches now pass an empty
   `--setting-sources` boundary so unrelated user/project `ANTHROPIC_*` settings
@@ -13,6 +18,10 @@ regression notes, and test evidence, see the
   routes remain available through an explicitly named private profile.
 - **Release contract:** the source-bound version/migration contract, fixed gate
   registry, and immutable release evidence are now part of the 3.0.0 GA path.
+- **Claude live-provider gate:** a reviewed read-only Opus matrix now covers a decided
+  normal run, durable cancellation, and conservative deadline/uncertain-spend handling;
+  the redacted schema-2 receipt is source-bound and other providers remain independently
+  gated.
 
 - **One open product:** Summon deliberation is part of the same public product as
   dispatch, council, and the browser observer. The public `/summon deliberate` command and thin `/deliberate`
@@ -60,17 +69,37 @@ regression notes, and test evidence, see the
   now explicit display metadata; exact `model.served` evidence remains separate and
   unknown models never become dispatchable by implication.
 
-## [3.0.0] — 2026-08-15
+### Certification and installation
+
+- **GA certification:** published the clean source-bound `v3.0.0-ga` release
+  after all 17 fixed suites (1,138/1,138) and all eight release gates passed.
+- **Ark roster refresh:** the catalog now lists DeepSeek V4 Pro GA as the fifth editorial
+  frontier lane and GLM 5.2 and DeepSeek V4 Flash GA as near-frontier value lanes. These
+  labels are routing metadata, not live availability or served-model evidence.
+- **Reviewed Claude pilot:** certified the bounded `claude-opus-5` normal,
+  durable-cancel, and deadline/uncertain-spend cases with exact served-model,
+  profile, account-evidence, cleanup, and consent receipts.
+- **Install convergence:** all eight managed host copies match the release
+  payload at 3.0.0. Unmanaged local copies are preserved and reported by
+  `doctor`; this release record contains no workstation-specific drift data.
+- **Engineering record:** the full certification, migration, rollback, and
+  release-manifest evidence is recorded in
+  [`docs/ENGINEERING_CHANGELOG.md`](docs/ENGINEERING_CHANGELOG.md).
+
+The pre-existing `v3.0.0` entry below is retained as the historical
+provider-inert/public-preview baseline. Fable, Gemini, Kimi, and other provider
+routes remain independently gated.
+
+## [3.0.0] - 2026-08-15
 
 - Synchronized the plugin, dispatcher, and MCP companion to the 3.0.0 contract.
-- This immutable tag is the provider-inert/public-preview baseline. It is **not** a
-  GA certification: the live-provider gate was blocked and the working chat/runtime
-  tree was still being evidenced separately.
-- Kept multi-provider live deliberation, automatic fallback/retry, remote hosting,
-  and unproven live continuation explicitly deferred. A later GA must publish a
-  clean source-bound evidence packet with an independently reviewed provider receipt.
+- This immutable tag is the historical provider-inert/public-preview baseline.
+  The later `v3.0.0-ga` tag carries the clean source-bound GA certification.
+- Multi-provider live deliberation, automatic fallback/retry, remote hosting, and
+  unproven live continuation remain explicitly deferred. Provider expansion
+  still requires an independent receipt and gate.
 
-## [2.2.0] — 2026-08-12
+## [2.2.0] - 2026-08-12
 
 ### Highlights
 
@@ -94,7 +123,7 @@ regression notes, and test evidence, see the
 npx skills add Nafjan/summon
 ```
 
-## [2.1.0] — 2026-08-11
+## [2.1.0] - 2026-08-11
 
 ### Highlights
 
@@ -116,7 +145,7 @@ npx skills add Nafjan/summon
 - Background, manifest, and council role propagation is covered; malformed, chained, or
   retargeted aliases fail closed rather than silently falling back.
 
-## [2.0.5] — 2026-08-09
+## [2.0.5] - 2026-08-09
 
 ### Highlights
 
@@ -142,7 +171,7 @@ npx skills add Nafjan/summon
 npx skills add Nafjan/summon
 ```
 
-## [2.0.4] — 2026-08-08
+## [2.0.4] - 2026-08-08
 
 Kill the leftover "agy cannot read `--cwd`" myth in code comments; clarify why
 `researcher` is omitted from council defaults.
@@ -156,7 +185,7 @@ Kill the leftover "agy cannot read `--cwd`" myth in code comments; clarify why
   retired no-cwd warning was deleted).
 - Tests assert the myth string and dead regex stay gone.
 
-## [2.0.3] — 2026-08-08
+## [2.0.3] - 2026-08-08
 
 Docs clarity for reasoning effort / thinking levels (no runtime behavior change).
 
@@ -167,7 +196,7 @@ Docs clarity for reasoning effort / thinking levels (no runtime behavior change)
   suffixes, and backends that ignore the flag (cursor/kimi/openai-compat/arkcli). Linked
   from SKILL.md, customizing, models, fan-out, and `--help`.
 
-## [2.0.2] — 2026-08-08
+## [2.0.2] - 2026-08-08
 
 Patch on 2.0.1 from round-2 adversarial review (GLM-5.2 + DeepSeek-V4-Flash via
 arkcli, AGY Flash 3.6 via summon).
@@ -183,7 +212,7 @@ arkcli, AGY Flash 3.6 via summon).
   `chairman-fallback`) after the `gN-` prefix — not every tag whose suffix merely
   starts with `chairman`.
 
-## [2.0.1] — 2026-08-07
+## [2.0.1] - 2026-08-07
 
 Patch on 2.0.0: text-seat honesty, T3 Summon-side support, timeout/PAYG budget
 hardening, and adversarial-review fixes (Kimi K3 + GPT-5.6 Sol + Claude Opus).
@@ -225,7 +254,7 @@ hardening, and adversarial-review fixes (Kimi K3 + GPT-5.6 Sol + Claude Opus).
   require-tools cannot be skipped via a cached success).
 - Manifest text-seat gate fails closed (no ImportError swallow; honest CLI resolve).
 
-## [2.0.0] — 2026-08-07
+## [2.0.0] - 2026-08-07
 
 Product 2.0: Agent Plugin distribution + optional MCP facade + provider-driver SPI
 on the same broker (envelope schema still `1`). Includes everything that landed as

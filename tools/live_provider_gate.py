@@ -23,7 +23,7 @@ SAFE_TEXT_RE = re.compile(r"^[A-Za-z0-9_.:/@+() -]{1,160}$")
 REQUIRED = {
     "provider", "backend", "model_requested", "model_served", "profile",
     "transport", "owner_generation", "attempts", "provider_calls",
-    "consent", "cleanup", "uncertain_spend", "receipt_sha256",
+    "account_evidence_sha256", "consent", "cleanup", "uncertain_spend", "receipt_sha256",
     "no_retry_fallback", "owner_fence", "deadline_fence", "cancel_fence",
     "kill_switch", "no_orphans", "safety_matrix",
 }
@@ -124,6 +124,9 @@ def validate(path: Path) -> tuple[bool, str]:
     receipt_sha = value.get("receipt_sha256")
     if not isinstance(receipt_sha, str) or not HASH_RE.fullmatch(receipt_sha):
         return False, "receipt_sha256 must be a lowercase sha256"
+    account_evidence_sha = value.get("account_evidence_sha256")
+    if not isinstance(account_evidence_sha, str) or not HASH_RE.fullmatch(account_evidence_sha):
+        return False, "account_evidence_sha256 must be a lowercase sha256"
     # No raw prompts, paths, argv, credentials, or model output are accepted in
     # the release packet.  The packet is identity and safety evidence only.
     forbidden = {"prompt", "result", "output", "argv", "cwd", "env", "api_key", "token", "secret"}

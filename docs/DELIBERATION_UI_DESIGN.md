@@ -1,4 +1,4 @@
-# Deliberation Control Surface
+# Deliberation control surface
 
 Status: design contract for the open-product loopback observer after the headless gate;
 the reference surface is provider-inert and not a CLI auto-start.

@@ -14,6 +14,18 @@ default, bounded/sanitized, and never sent anywhere without an explicit user act
 deterministic SHA-256 fingerprints of prompt/error values for local correlation; those are not plaintext,
 but can correlate or reveal low-entropy values, so review a report before sharing it.
 
+## Public GitHub privacy boundary
+
+Keep local diagnostics out of public GitHub text. Do not publish usernames, email addresses,
+absolute paths, host names, process IDs, profile or plugin labels, account or billing details,
+telemetry state, session IDs, prompts, raw output, credentials, per-run receipts, machine
+hashes, drift inventories, or unsanitized screenshots. Use placeholders such as
+`<project-root>`, `<session-id>`, and `<sha256>`, and report aggregate results instead of a
+workstation inventory. Store release evidence outside the source tree. Before opening a PR
+or issue, inspect the staged diff and scan the exact public text; never paste `doctor`,
+telemetry, account-probe, or raw diagnostic output into GitHub. If a local finding matters,
+describe the behavior and remediation without identifying the machine that exposed it.
+
 ## Resources
 
 - **[run_subagent.py](scripts/run_subagent.py)** - Main execution script
@@ -75,7 +87,13 @@ For a local preview of all rooms, run `_conversation_ui.py --serve
 <conversation-root>` from the installed scripts. It prints one authenticated
 loopback URL; observation and human context remain authority-inert, while an
 explicit `chat turn` may launch a bounded roster-agent process. The browser
-atlas groups rooms by project digest and initiating host/agent.
+atlas groups rooms by project digest and initiating host/agent. A direct
+`--serve` process follows the lifetime of the terminal or task that launched it;
+Ctrl+C, task cleanup, or parent-process teardown stops it. Prefer `summon chat
+open --chat-browser auto`, which detaches the atlas server from the short-lived
+handoff command and tracks it with its authenticated sidecar. `--timeout` limits
+agent turns; it is not an atlas server TTL. Close the surface explicitly when
+finished.
 
 Summon's existing `manifest` command is batch fan-out. The versioned
 external-worker contract is documented in `SUMMON_SWARM_PROTOCOL.md`, and
@@ -253,15 +271,15 @@ chooses otherwise.
 
 ### Fable profile health
 
-Fable is a separate Claude Code login profile, not an automatic fallback. Configure it once
-on the machine, then verify it before an expensive dispatch:
+Fable is a separate Claude Code login profile, not an automatic fallback. Configure it in a
+private directory, then verify it before an expensive dispatch:
 
 ```powershell
-$env:CLAUDE_CONFIG_DIR = "$env:USERPROFILE\.claude-fable"
+$env:CLAUDE_CONFIG_DIR = Join-Path $env:USERPROFILE ".claude-fable"
 claude auth login
 claude auth status
 python skills/summon/scripts/run_subagent.py doctor --json
-python skills/summon/scripts/run_subagent.py dispatch --agent fable --profile fable-fallback --model claude-fable-5 --cwd <project> --prompt "Return the required Final report block."
+python skills/summon/scripts/run_subagent.py dispatch --agent fable --profile fable --model claude-fable-5 --cwd <project> --prompt "Return the required Final report block."
 ```
 
 The dispatch envelope is authoritative: check `status`, `model.served`, `profile`, and the

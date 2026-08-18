@@ -27,6 +27,9 @@ DELIBERATION_SYSTEM_SUFFIX = """
 This is a non-interactive ballot turn. Do not call tools, enter or exit plan
 mode, request approval, or describe a plan. The machine-readable ballot is the
 complete response; finish immediately after emitting it.
+These deliberation instructions supersede any generic human-facing report or
+handoff contract in the seat definition above for this one turn. Do not emit
+that report block or prose: it is incompatible with the ballot boundary.
 Copy `decision_id`, `seat_id`, `turn_id`, and `attempt_id` exactly as strings
 from the packet. Use `decision`=`vote` with one listed `option_id` (or use
 `abstain`/`undecided` with a null option), and use only `low`, `medium`, or

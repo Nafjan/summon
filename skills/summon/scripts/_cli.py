@@ -362,6 +362,28 @@ Open a local room, add human context, or start one bounded roster-agent turn.
 The turn is durably started before provider launch; compatible provider sessions
 resume, while identity drift creates an explicit fork. Chat output is context only:
 it cannot approve, vote, launch, or change a deliberate run.
+  """,
+    "council": """summon council --question TEXT [--members A,B,C] [--rounds N]
+                       [--chairman AGENT] [--quorum N|all|FRACTION]
+
+Run an open, vendor-diverse council. Positions, cross-examination, and the chair's
+recommendation are context-only; no prose can approve, vote, or change a governed
+`deliberate` run. Use an explicit human promotion to seed a fresh deliberate setup.
+""",
+    "deliberate": """summon deliberate --question TEXT --seats A,B [--options X,Y]
+                          [--quorum N|all|FRACTION] [--rounds N]
+                          [--max-attempts N] [--deadline D]
+                          [--require-human-approval]
+summon deliberate status|replay|cancel|recover RUN_ID
+summon deliberate open RUN_ID [--browser auto|builtin|ide|system|link]
+summon deliberate resume RUN_ID [--retry-indeterminate]
+
+Use only for a fixed-option, fixed-denominator, receipt-bound decision. Seats, options,
+quorum, rounds, attempts, deadline, approval policy, and authority are explicit inputs;
+they are never inferred from agent prose. Fresh live execution is provider-gated and
+returns a structured integration-pending block when no reviewed route is enabled; it
+does not silently fall back or retry. Status/replay/recover are provider-inert reads or
+deterministic repair, and cancel queues a typed command for the owner.
 """,
     "swarm": """summon swarm create RUN_ID --swarm-tasks TASKS.json
                      --swarm-project-root-sha256 HEX --swarm-roster-sha256 HEX
@@ -402,7 +424,7 @@ file in the separate `--submit-github` form; submission never regenerates it.
 
 
 def command_usage(command: str | None = None) -> str:
-    """Return specific help for the two management commands."""
+    """Return specific help for commands with a distinct safety contract."""
     return COMMAND_USAGE.get(command or "", USAGE)
 
 

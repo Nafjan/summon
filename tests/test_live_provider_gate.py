@@ -40,6 +40,7 @@ def _receipt() -> dict:
         "model_served": "claude-opus-4-7",
         "profile": "default",
         "transport": "subprocess",
+        "account_evidence_sha256": "b" * 64,
         "owner_generation": 1,
         "attempts": 2,
         "provider_calls": 2,
@@ -105,6 +106,21 @@ class LiveProviderGateTests(unittest.TestCase):
         ok, detail = MODULE.validate(path)
         self.assertFalse(ok)
         self.assertIn("unknown evidence fields", detail)
+
+        value = _receipt()
+        value["account_evidence_sha256"] = "not-a-digest"
+        path = self.write(value)
+        ok, detail = MODULE.validate(path)
+        self.assertFalse(ok)
+        self.assertIn("account_evidence_sha256", detail)
+
+    def test_account_evidence_is_required(self):
+        value = _receipt()
+        del value["account_evidence_sha256"]
+        path = self.write(value)
+        ok, detail = MODULE.validate(path)
+        self.assertFalse(ok)
+        self.assertIn("missing evidence fields", detail)
 
         value = _receipt()
         value["safety_matrix"]["normal"]["prompt"] = "private"

@@ -1,21 +1,20 @@
 # Terms of Service — read before you rely on summon
 
-The five CLI backends do not call any provider API directly: summon drives each vendor's
-**own official CLI** (`claude`, `codex`, `cursor-agent`, `gemini`, `agy`) using **your**
-logged-in account. The sixth, `openai-compat`, is the deliberate exception -- it makes a
-direct HTTPS request to the `base_url` you configure, billed to your API key (see
-[API-key backends](#api-key-backends-opt-in-and-cleaner-for-products) below).
+The six CLI backends do not call a provider API directly: Summon drives each vendor's
+official CLI (`claude`, `codex`, `cursor-agent`, `gemini`, `kimi`, and `agy`) using the
+account that you configured for that CLI. The API backends (`arkcli` and
+`openai-compat`) make direct requests using the credentials and endpoint that you
+configure. See [API-key backends](#api-key-backends-opt-in-and-cleaner-for-products).
 
-Those CLIs are built by the vendors for scripted/automated use, so basic personal and
-development automation is within their intended use — but a few things are genuinely your
-responsibility. This is guidance, not legal advice; the providers'
-terms are the source of truth and they change.
+Those CLIs support scripted or automated use, but the applicable provider terms and
+product documentation control. This document is operational guidance, not legal advice.
+Review the current terms before you automate a provider or use Summon with a shared,
+commercial, or high-volume service.
 
 ## Generally fine (the intended use)
-- **Driving the official CLIs headlessly.** Anthropic's Consumer terms explicitly exempt
-  Claude Code from the automated-access prohibition (it's their own tool for scripted
-  use); Codex, cursor-agent, Gemini CLI, and agy are likewise official first-party CLIs.
-  summon just invokes them with the flags they already support.
+- **Driving the official CLIs headlessly.** Summon invokes the vendor CLI with the flags
+  that the installed version supports. Check each vendor's current automation and usage
+  rules before enabling unattended or high-volume runs.
 - **Your own accounts, your own machine, your own work.** Personal, interactive-adjacent
   development automation on subscriptions you pay for.
 
@@ -47,6 +46,17 @@ The `openai-compat` backend (OpenRouter, OpenAI, Anthropic, Google, local Ollama
 Studio, …) uses **your API key and bills your API credits** — no subscription-ToS gray
 area, and the right choice for anything commercial or high-volume. You are responsible
 for those API costs and each provider's API terms.
+
+## Provider terms
+
+Provider terms change. Review the current source for the backend you use:
+
+- [Anthropic consumer terms](https://www.anthropic.com/legal/consumer-terms)
+- [OpenAI terms of use](https://openai.com/policies/terms-of-use/)
+- [Cursor terms of service](https://cursor.com/en-US/terms-of-service)
+- [Google terms of service](https://policies.google.com/terms)
+
+For other vendors, use the terms linked by that vendor's CLI or account portal.
 
 ## Bottom line
 Personal/dev use of the official CLIs on your own accounts is the intended path and is

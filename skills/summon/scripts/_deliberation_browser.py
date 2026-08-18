@@ -289,13 +289,11 @@ def ensure_surface(root: str, run_id: str) -> dict[str, object]:
         _store.inspect_run(root, run_id)
     except Exception as exc:  # noqa: BLE001 - convert store details at boundary
         raise BrowserOpenError("deliberation run is not available") from exc
-    existing = _ui.read_surface_record(root, run_id)
-    if existing is not None and _surface_reachable(existing):
-        return {"url": existing["url"], "run_id": run_id, "reused": True,
-                "pid": existing["pid"]}
     lock = _lock_path(root, run_id)
     claimed = _claim_open_lock(lock)
     if claimed is None:
+        # Another opener owns the lock. Wait for its authenticated sidecar
+        # rather than probing/reusing a record outside the start fence.
         existing = _wait_for_surface(root, run_id)
         return {"url": existing["url"], "run_id": run_id, "reused": True,
                 "pid": existing["pid"]}

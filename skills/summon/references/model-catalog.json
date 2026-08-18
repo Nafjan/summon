@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "authority": "summon-editorial",
-  "as_of": "2026-08-14",
-  "definition": "frontier and near-frontier are editorial routing labels, not guarantees of quality, safety, cost, availability, or vendor endorsement",
+  "as_of": "2026-08-18",
+  "definition": "frontier and near-frontier are editorial routing labels, not guarantees of quality, safety, cost, availability, or vendor endorsement; exact model.served evidence remains authoritative",
   "entries": [
     {
       "key": "claude/claude-fable-5",
@@ -47,25 +47,25 @@
       "route": {"backend": "agy", "target": "gemini-3.7-flash-high", "dispatchable": true}
     },
     {
-      "key": "cursor-agent/glm-5.2",
-      "identity": {"vendor": "zhipu", "model_id": "glm-5.2"},
-      "display": {"role": "fast generalist", "name": "GLM", "version": "5.2"},
-      "editorial": {"label": "near-frontier", "rank": 3, "lane": "fast-secondary"},
-      "route": {"backend": "cursor-agent", "target": "glm-5.2", "dispatchable": true}
+      "key": "arkcli/deepseek-v4-pro-ga-260813",
+      "identity": {"vendor": "deepseek", "model_id": "deepseek-v4-pro-ga-260813"},
+      "display": {"role": "deep reasoning", "name": "DeepSeek V4 Pro", "version": "V4 Pro GA"},
+      "editorial": {"label": "frontier", "rank": 5, "lane": "deep-reasoning"},
+      "route": {"backend": "arkcli", "target": "deepseek-v4-pro-ga-260813", "dispatchable": true}
     },
     {
-      "key": "unverified/deepseek-v4-flash",
-      "identity": {"vendor": "deepseek", "model_id": "deepseek-v4-flash"},
-      "display": {"role": "fast coding", "name": "DeepSeek V4 Flash", "version": "V4 Flash"},
+      "key": "arkcli/glm-5-2-260617",
+      "identity": {"vendor": "zhipu", "model_id": "glm-5-2-260617"},
+      "display": {"role": "long-context generalist", "name": "GLM", "version": "5.2"},
+      "editorial": {"label": "near-frontier", "rank": 3, "lane": "long-context-secondary"},
+      "route": {"backend": "arkcli", "target": "glm-5-2-260617", "dispatchable": true}
+    },
+    {
+      "key": "arkcli/deepseek-v4-flash-ga-260731",
+      "identity": {"vendor": "deepseek", "model_id": "deepseek-v4-flash-ga-260731"},
+      "display": {"role": "fast coding", "name": "DeepSeek V4 Flash", "version": "V4 Flash GA"},
       "editorial": {"label": "near-frontier", "rank": 4, "lane": "fast-secondary"},
-      "route": {"backend": "unverified", "target": "deepseek-v4-flash", "dispatchable": false}
-    },
-    {
-      "key": "unverified/deepseek-v4-pro",
-      "identity": {"vendor": "deepseek", "model_id": "deepseek-v4-pro"},
-      "display": {"role": "deep reasoning", "name": "DeepSeek V4 Pro", "version": "V4 Pro"},
-      "editorial": {"label": "near-frontier", "rank": 5, "lane": "deep-secondary"},
-      "route": {"backend": "unverified", "target": "deepseek-v4-pro", "dispatchable": false}
+      "route": {"backend": "arkcli", "target": "deepseek-v4-flash-ga-260731", "dispatchable": true}
     }
   ]
 }

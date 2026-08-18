@@ -1,7 +1,7 @@
 # Contributing to summon
 
-Thanks for helping. summon is deliberately small: one stdlib-Python dispatcher, no
-daemon, no deps. Keep it that way.
+Thanks for contributing. Summon is intentionally small: one standard-library Python
+dispatcher and no daemon. Keep it that way.
 
 ## Dev setup
 
@@ -27,6 +27,17 @@ Ubuntu + Windows.
 - **Windows + POSIX both matter.** Guard OS-specific branches; ASCII-only console output.
 - **Never log or echo secrets.** API keys come from env and must be redacted from errors
   (see `_redact` in `skills/summon/scripts/_apibackend.py`).
+
+## Documentation style
+
+Write for a developer who is scanning for an answer. Use short sentences, active voice,
+sentence-case headings, descriptive link text, and code formatting for commands, filenames,
+and identifiers. Prefer "you" when a procedure addresses the reader. Avoid filler, sales
+language, unexplained jargon, and machine-specific paths or account details. Follow the
+[Google developer documentation style guide](https://developers.google.com/style). Apply the
+Humanizer review to remove repetitive or artificial prose when that skill is available. Keep
+historical changelog entries factual; update current release notes when behavior or support
+status changes.
 
 ## Common contributions
 

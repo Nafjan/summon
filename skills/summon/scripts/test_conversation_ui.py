@@ -10,6 +10,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -35,7 +36,8 @@ class ConversationUITests(unittest.TestCase):
             self.root, session_id="session-1", project_id="summon",
             project_root=project, initiator_host="codex", initiator_agent="sol",
             mode="chat", participants=[{"agent": "sol", "role": "architect",
-                                         "name": "Sol", "version": "5.6"}],
+                                         "name": "Sol", "version": "5.6",
+                                         "provider": "claude", "model": "claude-opus-5"}],
         )
         self.surface = ConversationSurface(str(self.root), token="a" * 48)
         self.base = self.surface.start()
@@ -63,11 +65,17 @@ class ConversationUITests(unittest.TestCase):
         with urlopen(self.base.split("#", 1)[0], timeout=3) as response:
             page = response.read().decode()
         self.assertIn("Conversation atlas", page)
-        self.assertIn("Ask a roster agent", page)
-        self.assertIn("Cancel turn", page)
-        self.assertIn("context + explicit turns", page)
+        self.assertIn("Ask an agent", page)
+        self.assertIn("Stop this turn", page)
+        self.assertIn("Context and agent turns", page)
+        self.assertIn("Agents and models", page)
+        self.assertIn("MODEL ·", page)
+        self.assertIn("Context ·", page)
+        self.assertIn("Built with a visual adaptation of", page)
+        self.assertIn("agent-picker-button", page)
+        self.assertIn("agent-option", page)
         self.assertIn("/stream?after=", page)
-        self.assertIn("Live updates paused; retrying safely.", page)
+        self.assertIn("Live updates paused; retrying from recorded event", page)
         self.assertIn("setInterval(refresh,10000)", page)
         self.assertNotIn("setInterval(refresh,2000)", page)
         # Embedded browser harnesses may omit URI decoding globals; the
@@ -78,11 +86,21 @@ class ConversationUITests(unittest.TestCase):
 
     def test_page_uses_messenger_regions_and_incremental_cursor_reducer(self):
         source = (HERE / "_conversation_page.py").read_text(encoding="utf-8")
-        for marker in ("Conversation atlas", "room-search", "timeline", "Room evidence",
-                       "Post context", "Ask a roster agent", "context + explicit turns",
+        for marker in ("Conversation atlas", "room-search", "timeline", "Room details",
+                       "Post context", "Ask an agent", "Context and agent turns",
                        "appendRecord", "cursor !== state.cursor + 1",
-                       "timeline.append(renderEvent(record))", "event === 'agent_message'"):
+                       "timeline.append(renderEvent(record))", "event === 'agent_message'",
+                       "Agents and models", "Model not verified", "identityTooltip",
+                       "Role · name/version · model · provider", "Review agent request",
+                       "WAITING FOR MODEL RECEIPT", "MODEL MATCH", "target missing", "setConnection('Live', 'connected'",
+                       ".room-bar { display: block; }", "min-width: 44px; min-height: 44px",
+                       "$('drawer-close').focus();"):
             self.assertIn(marker, source)
+        self.assertIn("stops automatically after", source)
+        self.assertIn("Reconnect to the local owner before starting an agent turn", source)
+        self.assertIn("action-dialog", source)
+        self.assertNotIn("window.confirm", source)
+        self.assertNotIn("window.prompt", source)
         self.assertNotIn("timeline.replaceChildren(); renderEvent", source)
 
     def test_rooms_and_room_events_are_authenticated_and_redacted(self):
@@ -91,13 +109,19 @@ class ConversationUITests(unittest.TestCase):
             rooms = json.loads(response.read())
         key = next(iter(rooms["rooms"]))
         self.assertIn("codex/sol", rooms["rooms"][key])
+        self.assertEqual(rooms["rooms"][key]["codex/sol"][0]["participants"][0]["model"],
+                         "claude-opus-5")
+        self.assertIn("subject", rooms["rooms"][key]["codex/sol"][0])
         with self._request("/api/v1/rooms/session-1") as response:
             data = json.loads(response.read())
         self.assertEqual(data["room"]["session_id"], "session-1")
+        self.assertEqual(data["room"]["participants"][0]["provider"], "claude")
+        self.assertEqual(data["room"]["participants"][0]["model"], "claude-opus-5")
         public = json.dumps(data)
         self.assertIn("private context", public)
         self.assertNotIn(r"C:\secret\repo", public)
         self.assertNotIn("SECRET_TOKEN", public)
+        self.assertIn("subject", data["room"])
         self.assertEqual(data["events"][-1]["payload"]["text_chars"],
                          len(r"private context C:\secret\repo SECRET_TOKEN"))
 
@@ -162,8 +186,12 @@ class ConversationUITests(unittest.TestCase):
                         "participant": participant}
 
         self.surface.runtime = FakeRuntime()
+        with self.assertRaises(HTTPError) as unreviewed:
+            self._request("/api/v1/rooms/session-1/turns", method="POST",
+                          body={"participant": "sol", "message": "inspect this"}, origin=True)
+        self.assertEqual(unreviewed.exception.code, 400)
         with self._request("/api/v1/rooms/session-1/turns", method="POST",
-                           body={"participant": "sol", "message": "inspect this"}, origin=True) as response:
+                           body={"participant": "sol", "message": "inspect this", "reviewed": True}, origin=True) as response:
             started = json.loads(response.read())
         self.assertEqual(response.status, 202)
         self.assertEqual(started["status"], "started")
@@ -183,7 +211,10 @@ class ConversationUITests(unittest.TestCase):
         self.assertEqual(route.exception.code, 400)
 
     def test_surface_record_reuses_one_atlas_and_link_mode_is_nonlaunching(self):
-        reused = ensure_surface(str(self.root))
+        with patch("_conversation_browser._launch_guard",
+                   wraps=_conversation_browser._launch_guard) as guard:
+            reused = ensure_surface(str(self.root))
+        self.assertTrue(guard.called)
         self.assertTrue(reused["reused"])
         handoff = open_url(self.base, mode="link")
         self.assertFalse(handoff["opened"])
@@ -285,6 +316,21 @@ class ConversationUITests(unittest.TestCase):
         self.assertIsNotNone(ready)
         self.assertEqual(ready["pid"], pid)
         self.assertEqual(ready["url"], started["url"])
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, check=False)
+        else:
+            os.kill(pid, 15)
+
+    def test_new_surface_is_detached_from_short_lived_handoff_process(self):
+        root = Path(self.tmp.name) / "detached-root"
+        root.mkdir()
+        with patch.object(_conversation_browser, "popen_flags",
+                          wraps=_conversation_browser.popen_flags) as flags:
+            started = ensure_surface(str(root), timeout=5.0)
+        self.assertTrue(any(call.kwargs.get("detached") is True
+                             for call in flags.call_args_list))
+        pid = int(started["pid"])
         if os.name == "nt":
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
                            capture_output=True, check=False)

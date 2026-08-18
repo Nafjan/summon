@@ -1,8 +1,9 @@
 # Summon 2.x -> 3.0 release and migration contract
 
 Status: 3.0.0 GA release contract. The release manifest is generated from the clean
-immutable release commit and records the fixed suites, eight gates, migration packet,
-managed-install inventory, and redacted live-provider receipt.
+immutable release commit and records aggregate results for the fixed suites, eight gates,
+the migration packet, managed installs, and the redacted live-provider receipt. Keep the
+manifest, host inventory, and per-run evidence in the private release bundle.
 
 This document is intentionally operational. A version bump is not evidence of a
 GA release. The release owner must generate evidence from a clean, immutable tree,
@@ -26,7 +27,7 @@ release artifact.
 
 ## Upgrade procedure
 
-1. Run `summon doctor --json` and save the output as a local, reviewed artifact.
+1. Run `summon doctor --json` and save the output as a private, reviewed artifact.
 2. Run `python install.py --dry-run` and resolve foreign trees, duplicate copies,
    and unmanaged plugin drift. The installer must never overwrite a foreign tree.
 3. Stop active Summon browser surfaces and release owners. Do not remove durable
@@ -80,16 +81,26 @@ The live-provider gate is separate from the provider-inert test matrix. It only
 passes when `tools/live_provider_gate.py` validates an explicitly reviewed,
 redacted schema-2 receipt supplied through `SUMMON_LIVE_PROVIDER_RECEIPT`. The
 receipt must bind one normal decision plus cancel and deadline safety cases,
-owner/deadline/cancel fences, kill-switch behavior, no fallback/retry, and clean
-process teardown. Missing, stale, or malformed evidence produces `blocked`,
-never an inferred success.
+owner/deadline/cancel fences, kill-switch behavior, no fallback/retry, clean
+process teardown, and an `account_evidence_sha256` digest for reviewer-held
+account proof. Raw account identifiers, credentials, prompts, and output never
+belong in the release packet. Missing, stale, or malformed evidence produces
+`blocked`, never an inferred success.
+
+For the Claude route, generate the redacted digest locally before and after the
+pilot and require the two values to match:
+
+```text
+python tools/account_evidence.py --profile default --config-dir "%USERPROFILE%\\.claude"
+```
+
+The reviewer copies only the resulting `account_evidence_sha256` into the receipt;
+the profile metadata itself remains private and outside the release artifact.
 
 ## Release decision
 
-For this 3.0.0 release, all fixed suites and every named gate are `pass`, the source
-tree is clean and immutable, managed installs converge, the migration/rollback and
-accessibility artifacts are retained, and the independently reviewed Claude Opus pilot
-receipt proves the one selected live-provider route. Future provider routes must earn
-their own receipt; if a future gate is unavailable, publish a versioned maintenance
-release or clearly label the result `3.0.0-preview.N` rather than weakening this
-contract.
+The 3.0.0 candidate has a source-bound, reviewed Claude receipt. The fixed registry records
+all 17 suites and all eight gates as `pass`, with a clean source tree and converged managed
+installs. The Claude receipt closes that provider gate for 3.0.0. It does not certify Fable,
+Gemini, or any other route; each provider must earn an independent receipt. Keep the receipt,
+manifest, host inventory, and any account-evidence digest in the private release bundle.

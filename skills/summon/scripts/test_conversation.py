@@ -17,7 +17,8 @@ if str(HERE) not in os.sys.path:
 
 from _conversation import (ConversationError, ConversationJournal,
                            MAX_JOURNAL_BYTES, council_recommendation,
-                           continuation_decision, group_rooms, promote_recommendation)
+                           continuation_decision, group_rooms, list_rooms,
+                           promote_recommendation)
 from _conversation import run_command
 
 
@@ -52,6 +53,24 @@ class ConversationJournalTests(unittest.TestCase):
         self.assertNotIn("SECRET_TOKEN", json.dumps(reopened.as_dict()))
         self.assertIn("SECRET_TOKEN", json.dumps(reopened.as_dict(native=True)))
 
+    def test_room_subject_is_bounded_redacted_context_for_orientation(self):
+        room = self._room()
+        room.append_human_message("Decide the release gate for Summon SECRET_TOKEN")
+        public = room.as_dict()
+        subject = public["room"].get("subject")
+        self.assertIsInstance(subject, str)
+        self.assertIn("Decide the release gate", subject)
+        self.assertNotIn("SECRET_TOKEN", subject)
+        self.assertLessEqual(len(subject), 96)
+
+    def test_long_first_context_does_not_break_room_index(self):
+        room = self._room()
+        room.append_human_message("x" * 200)
+        rooms = list_rooms(self.root)
+        self.assertIn("session-1", json.dumps(rooms))
+        subject = rooms["summon@" + room.room.project_root_sha256]["codex/sol"][0]["subject"]
+        self.assertLessEqual(len(subject), 96)
+
     def test_agent_message_is_addressed_durable_and_context_only(self):
         room = self._room()
         event = room.append_agent_message(
@@ -67,6 +86,18 @@ class ConversationJournalTests(unittest.TestCase):
         self.assertEqual(room.agent_inbox("sol"), [])
         with self.assertRaises(ConversationError):
             room.append_agent_message("sol", "unknown", "not deliverable")
+
+    def test_agent_message_carries_safe_roster_model_evidence(self):
+        room = ConversationJournal.create(
+            self.root, session_id="model-room", project_id="summon",
+            project_root=self.project, initiator_host="codex",
+            initiator_agent="sol", participants=[{
+                "agent": "sol", "role": "architect", "name": "Sol",
+                "version": "5.6", "provider": "codex", "model": "gpt-5.6-sol",
+            }])
+        event = room.append_agent_message("sol", "human", "model evidence")
+        self.assertEqual(event["payload"]["provider"], "codex")
+        self.assertEqual(event["payload"]["model_target"], "gpt-5.6-sol")
 
     def test_agent_message_requires_a_room_sender_and_public_projection_is_bounded(self):
         room = self._room()
@@ -363,6 +394,34 @@ class ConversationJournalTests(unittest.TestCase):
         self.assertEqual(received["delivery"], "local-native")
         self.assertEqual(received["events"][0]["payload"]["text"], "context from Sol")
 
+    def test_chat_open_freezes_safe_roster_model_identity(self):
+        roster = self.project / ".agents"
+        roster.mkdir()
+        (roster / "researcher.md").write_text(
+            "---\nrun-agent: agy\nmodel: gemini-3.7-flash-high\n"
+            "role: research\nname: Researcher\nversion: 3.7\n---\n"
+            "# Researcher\n\nEvidence seat.\n",
+            encoding="utf-8",
+        )
+        args = SimpleNamespace(
+            chat_action="open", chat_session="identity-room",
+            chat_project_id="summon", chat_project_root=str(self.project),
+            chat_initiator_host="codex", chat_initiator_agent="human",
+            chat_mode="chat", chat_participants="researcher",
+            conversation_dir=str(self.root), cwd=str(self.project),
+            agents_dir=str(roster), chat_browser=None,
+        )
+        from io import StringIO
+        with patch("sys.stdout", new_callable=StringIO) as output:
+            self.assertEqual(run_command(args), 0)
+        payload = json.loads(output.getvalue())
+        participant = payload["room"]["participants"][0]
+        self.assertEqual(participant["name"], "Researcher")
+        self.assertEqual(participant["role"], "research")
+        self.assertEqual(participant["version"], "3.7")
+        self.assertEqual(participant["model"], "gemini-3.7-flash-high")
+        self.assertEqual(participant["provider"], "agy")
+
 
 class ConversationPolicyTests(unittest.TestCase):
     def test_continuation_is_explicit_and_forks_on_identity_drift(self):
@@ -398,7 +457,8 @@ class ConversationPolicyTests(unittest.TestCase):
         grouped = group_rooms([
             {"session_id": "a", "project_id": "one", "initiator_host": "codex",
              "initiator_agent": "sol", "mode": "chat", "cursor": 2,
-             "project_root_sha256": "a" * 64},
+             "project_root_sha256": "a" * 64,
+             "participants": [{"agent": "sol", "model": "claude-opus-5"}]},
             {"session_id": "b", "project_id": "one", "initiator_host": "cursor",
              "initiator_agent": "reviewer", "mode": "council", "cursor": 4,
              "project_root_sha256": "a" * 64},
@@ -409,6 +469,8 @@ class ConversationPolicyTests(unittest.TestCase):
         self.assertEqual(set(grouped), {"one@" + "a" * 64, "two@" + "b" * 64})
         self.assertEqual(set(grouped["one@" + "a" * 64]), {"codex/sol", "cursor/reviewer"})
         self.assertEqual(grouped["two@" + "b" * 64]["codex/sol"][0]["mode"], "deliberate")
+        self.assertEqual(grouped["one@" + "a" * 64]["codex/sol"][0]
+                         ["participants"][0]["model"], "claude-opus-5")
 
     def test_no_provider_or_process_imports(self):
         source = Path(__file__).with_name("_conversation.py").read_text(encoding="utf-8")

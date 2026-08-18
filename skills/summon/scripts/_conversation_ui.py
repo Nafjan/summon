@@ -204,8 +204,8 @@ def _write_surface_record(root: str, *, pid: int, url: str, token: str,
             pass
 
 
-def _page(*, nonce: str) -> bytes:
-    return page_bytes(nonce=nonce)
+def _page(*, nonce: str, timeout_ms: int = 600_000) -> bytes:
+    return page_bytes(nonce=nonce, timeout_ms=timeout_ms)
 
 class _ConversationHandler(BaseHTTPRequestHandler):
     server_version = "SummonConversationUI/1"
@@ -299,7 +299,7 @@ class _ConversationHandler(BaseHTTPRequestHandler):
         if len(parts) not in (4, 5) or parts[:3] != ["api", "v1", "rooms"]:
             raise ConversationUIError("unknown conversation route")
         session = _safe_id(parts[3], "session id")
-        if len(parts) == 5 and parts[4] not in {"messages", "events", "stream", "turns", "cancel"}:
+        if len(parts) == 5 and parts[4] not in {"messages", "events", "stream", "turns", "cancel", "recover", "fork"}:
             raise ConversationUIError("unknown conversation route")
         return session
 
@@ -308,7 +308,7 @@ class _ConversationHandler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             if self.headers.get("Host", "") != f"127.0.0.1:{self.server.server_port}":
                 self._send_json(_safe_error(ConversationUIError("host refused")), 400); return
-            nonce = secrets.token_urlsafe(18); data = _page(nonce=nonce)
+            nonce = secrets.token_urlsafe(18); data = _page(nonce=nonce, timeout_ms=self.surface.runtime.timeout_ms)
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Security-Policy", f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
             self.send_header("Referrer-Policy", "no-referrer"); self.send_header("Cache-Control", "no-store")
@@ -378,7 +378,7 @@ class _ConversationHandler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ConversationUIError("request body must be an object")
             route = self.path.split("?", 1)[0].rsplit("/", 1)[-1]
-            if route in {"messages", "turns"} and (
+            if route in {"messages", "turns", "fork"} and (
                     not isinstance(body.get("message"), str) or not body.get("message", "").strip()):
                 raise ConversationUIError("message must be text")
             event_id = body.get("message_id")
@@ -392,6 +392,9 @@ class _ConversationHandler(BaseHTTPRequestHandler):
                                  "redaction": "public-redacted"})
                 return
             if route == "turns":
+                if body.get("reviewed") is not True:
+                    raise ConversationUIError(
+                        "bounded turn requires explicit review confirmation")
                 participant = _safe_id(body.get("participant"), "participant")
                 result = self.surface.runtime.start_turn(
                     session, participant, body["message"], wait=False)
@@ -402,6 +405,24 @@ class _ConversationHandler(BaseHTTPRequestHandler):
                 participant = _safe_id(body.get("participant"), "participant")
                 result = self.surface.runtime.cancel_turn(session, participant)
                 self._send_json({"status": "cancelling", **result,
+                                 "redaction": "public-redacted"})
+                return
+            if route == "recover":
+                participant = _safe_id(body.get("participant"), "participant")
+                if body.get("confirm") is not True:
+                    raise ConversationUIError("recovery requires explicit confirmation")
+                result = self.surface.runtime.recover_turn(session, participant, confirm=True)
+                self._send_json({"status": "recovered", **result,
+                                 "redaction": "public-redacted"})
+                return
+            if route == "fork":
+                participant = _safe_id(body.get("participant"), "participant")
+                reason = body.get("reason", "operator recovery fork")
+                if not isinstance(reason, str) or not reason.strip() or len(reason) > 256:
+                    raise ConversationUIError("fork reason is invalid")
+                result = self.surface.runtime.fork_turn(
+                    session, participant, body["message"], reason=reason.strip())
+                self._send_json({"status": "forked", **result,
                                  "redaction": "public-redacted"})
                 return
             raise ConversationUIError("only context messages or agent turns may be posted")

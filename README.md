@@ -15,23 +15,22 @@
   <img src="https://img.shields.io/badge/install-npx_skills_add-8B5CF6.svg" alt="npx skills add">
 </p>
 
-<p align="center"><b>Install:</b> <code>npx skills add Nafjan/summon</code>, then just ask your agent.</p>
+<p align="center"><b>Install:</b> <code>npx skills add Nafjan/summon</code>, then ask your agent to use it.</p>
 
-Summon is a skill that turns one AI agent into a conductor for all of them. Under the hood
-it's a tiny, dependency-free dispatcher, and it runs wherever your agent can execute a shell
-command:
+Summon is a dependency-free dispatcher. It routes tasks from one agent CLI to supported CLIs
+and configured endpoints wherever the host can execute a shell command:
 
-- **Coding CLIs:** Claude Code, Codex, Cursor CLI, Gemini CLI, Antigravity.
-- **T3 Code:** works today — install Summon into the Claude/Codex/Cursor skill roots
+- **Coding CLIs:** Claude Code, Codex, Cursor CLI, Gemini CLI, Kimi, and Antigravity.
+- **T3 Code:** install Summon into the Claude, Codex, and Cursor skill roots
   T3 discovers (`python install.py --profile t3`). Not a native T3 plugin; see
-  [skills/summon/references/t3-code.md](skills/summon/references/t3-code.md).
+  [the T3 Code setup guide](skills/summon/references/t3-code.md).
 - **AI IDEs:** Cursor, Antigravity, or VS Code with an agent extension. The skill installs
-  as a slash command, or the agent just shells out to the dispatcher.
+  as a slash command, or the agent invokes the dispatcher.
 - **Desktop agent apps:** the Claude app and the ChatGPT app (formerly Codex), whose agent
   modes can run the dispatcher and read the skill.
 - **A plain terminal,** where you drive it yourself.
 
-From any of those you can hand a task to another model, run several at once, convene a
+From any of those hosts, you can hand a task to another model, run several at once, convene a
 council, or start a governed deliberation. It also reaches any OpenAI-compatible API, so OpenRouter,
 OpenAI, Anthropic, Google, and local models (Ollama, LM Studio) work as agents too.
 
@@ -50,27 +49,24 @@ OpenAI, Anthropic, Google, and local models (Ollama, LM Studio) work as agents t
 Most multi-agent tools assume one specific CLI is the orchestrator. Summon inverts that:
 **any CLI can be the boss.** Your Codex session can summon Claude for a review. Your Claude
 session can summon Codex for an adversarial pass. Your terminal can summon a whole council
-to decide something. They run in parallel -- add `--worktree` and each editing agent gets
-its own isolated branch -- and every result comes back as one JSON envelope you can branch
-on.
+to decide something. They run in parallel. Add `--worktree` to give each editing agent its
+own isolated branch, and inspect or branch on the resulting JSON envelopes.
 
-And because each backend runs on its own login, the subscriptions you already pay for
-finally pull together: Claude Max, ChatGPT, Cursor, Gemini, and Antigravity on the same
-task, each billed to its own plan, instead of paying for four and using one at a time.
+Each backend uses its own login, so Summon can combine Claude, ChatGPT, Cursor, Gemini,
+and Antigravity on one task. Each provider keeps its own billing and account boundary.
 
 ---
 
 ## Who it's for
 
-- **Anyone stacking AI subscriptions.** Paying for Claude Max, ChatGPT, Cursor, or Gemini
-  and only ever using one at a time? summon puts them on the same task together, each billed
-  to its own plan, so you get the full value of what you already pay for. Using
-  [T3 Code](https://t3.codes) as the control plane? Same idea — Summon installs into the
+- **Anyone stacking AI subscriptions.** If you use Claude Max, ChatGPT, Cursor, or Gemini,
+  Summon can put them on the same task while each provider keeps its own billing boundary. Using
+  [T3 Code](https://t3.codes) as the control plane? Summon installs into the
   skill roots T3's Claude/Codex sessions already load.
 - **Developers who live in Claude Code, Codex, or Cursor** (or any other AI coding tool)
   and want the *other* models one command away, without leaving the one they're in.
-- **Anyone who wants a real second opinion.** Cross-vendor review, where no model grades
-  its own homework, is built in rather than bolted on.
+- **Anyone who wants an independent review.** Cross-vendor review keeps the model that wrote
+  the work separate from the model that evaluates it.
 - **People making decisions with AI** who need a governed answer: council mode gives
   diverse positions and a chaired recommendation; `deliberate` adds fixed options,
   quorum, hard attempt/deadline bounds, durable replay, and explicit human boundaries.
@@ -97,7 +93,7 @@ not installed or required.
 
 ---
 
-## What you can actually do with it
+## What you can do with it
 
 - **Cross-vendor code review:** `summon dispatch --agent adversarial-reviewer` sends your
   diff to a *different* vendor than wrote the code.
@@ -124,11 +120,11 @@ not installed or required.
 
 Pick the path that matches your host. All three install the `skills/summon/` skill tree and
 the thin sibling `/council` and `/deliberate` companions; only the destination differs.
-Those companions reuse Summon's scripts and canonical references—there is no second runtime.
+Those companions reuse Summon's scripts and canonical references. There is no second runtime.
 
-### Agent Plugin (Cursor, VS Code, Copilot, Codex)
+### Agent plugin (Cursor, VS Code, Copilot, and Codex)
 
-For clients that support the open [Agent Plugins](https://agent-plugins.org) standard
+For clients that support the [Agent Plugins](https://agent-plugins.org) standard
 (Cursor Marketplace, VS Code agent extensions, GitHub Copilot agent plugins, Codex with
 plugin support):
 
@@ -137,28 +133,27 @@ plugin support):
   plugin directory. On Cursor that is `~/.cursor/plugins/local/summon/` with `plugin.json`
   at the plugin root (this repo already ships that layout). Reload the window after copying.
 
-The plugin bundles `skills/` as-is, including the thin `council` and `deliberate` companions — no
+The plugin bundles `skills/` as-is, including the thin `council` and `deliberate` companions. No
 `install.py` step is required for plugin hosts.
 
 ### Skills registry (`npx skills add`)
 
-**One command. The skill installs itself into your agent:**
+Use one command to install the skill into your agent:
 
 ```bash
 npx skills add Nafjan/summon
 ```
 
-Your AI agent now has the `summon` skill and knows how to drive it, so you never learn a
-flag. Just ask it: *"summon a cross-vendor review of my last commit,"* or *"convene a
-council on monorepo vs polyrepo."* Add `-g` to install globally (every project), or
+Your AI agent now has the `summon` skill. Ask it to "summon a cross-vendor review of my last
+commit" or "convene a council on monorepo versus polyrepo." Add `-g` to install globally (every project), or
 `-a <agent>` to target a specific one. Works with any skills-compatible agent: Claude Code,
 Codex, Cursor, Gemini, Antigravity, and claw-likes like openclaw and hermes. Powered by the
 open [`skills`](https://www.skills.sh) registry.
 
-You need **Node** (for `npx`), **Python 3.10+** on your PATH, and at least one AI CLI you're
+You need **Node** (for `npx`), **Python 3.10+** on your `PATH`, and at least one AI CLI you're
 logged into. After installing, ask your agent to run summon's `doctor` check and it lists what's
-ready and what's missing. On Windows, if the install hits a symlink permission error, re-run
-with `--copy`.
+ready and what's missing. On Windows, if the install reports a symlink permission error, run it
+again with `--copy`.
 
 ### Multi-host installer (`python install.py`)
 
@@ -183,32 +178,32 @@ python tools/release_manifest.py \
 The runner executes the fixed suites, records output digests, strips backend credentials and
 proxies, and writes an atomic evidence file without contacting a provider. Release evidence must
 be generated from a clean checkout (`--require-clean`); a dirty local run is diagnostic only.
-Keep both evidence and manifest outside the checkout so their creation cannot make the source tree dirty
-before the manifest verifies Git cleanliness.
-`--check` is the
-GA gate: it additionally requires a clean tree, converged owned installs, and every named
-release gate to be machine-recorded as `pass`; the preview runner intentionally leaves gates
-as `not_run`, so a preview evidence file must not be presented as a release certification.
-Unmanaged host copies, such as a local Cursor plugin, are reported separately and are never
-overwritten. The version, migration, compatibility, and rollback contract is documented in
+Keep both evidence and manifest outside the checkout. Otherwise, creating them can make the
+source tree dirty before the manifest verifies Git cleanliness.
+The `--check` option is the GA gate. It requires a clean tree, converged owned installs, and
+every named release gate recorded as `pass`. The preview runner leaves gates as `not_run`, so
+do not present preview evidence as a release certification.
+The installer preserves unmanaged host copies and reports local drift through `doctor`; it does
+not overwrite those copies automatically. The version, migration, compatibility, and rollback
+contract is documented in
 [`docs/VERSIONING_AND_3.0.md`](docs/VERSIONING_AND_3.0.md).
 
 `install.py` stages atomically, never touches an agent file you already have, and uninstalls
 cleanly (`python install.py --uninstall`). Migrating from the old name? `--with-alias` adds a
 thin `/sub-agents` alias.
 
-**T3 Code:** T3 discovers Claude/Codex/Cursor skills — it has no Summon host entry of its
-own. Target those roots in one shot:
+**T3 Code:** T3 discovers Claude, Codex, and Cursor skills. It has no Summon host entry of its
+own, so target those roots in one step:
 
 ```bash
 python install.py --profile t3
 python summon.py --doctor   # look for the "t3 code" section
 ```
 
-Full smoke checklist: [skills/summon/references/t3-code.md](skills/summon/references/t3-code.md).
+Full smoke checklist: [the T3 Code setup guide](skills/summon/references/t3-code.md).
 
 <details>
-<summary><b>Or let your AI agent set it up for you</b> (it adapts to your machine)</summary>
+<summary><b>Let your AI agent set it up</b> (it adapts to your machine)</summary>
 
 <br>Paste this into your favorite AI CLI (Claude Code, Codex, Cursor, Gemini, …) in a scratch folder:
 
@@ -312,10 +307,10 @@ uncertain-spend recovery. It is not yet an automatic attachment to a
 host-native IDE swarm; external adapters must authenticate a worker connection
 and pass the protocol conformance/process-tree gates before they can launch
 providers. The boundary is documented in
-[SUMMON_SWARM_PROTOCOL.md](docs/SUMMON_SWARM_PROTOCOL.md).
+[the swarm protocol](docs/SUMMON_SWARM_PROTOCOL.md).
 
 `summon` (no args) prints the command list. Everything below is documented in
-[skills/summon/SKILL.md](skills/summon/SKILL.md).
+[the Summon skill instructions](skills/summon/SKILL.md).
 
 ---
 
@@ -346,7 +341,7 @@ providers. The boundary is documented in
    [`skills/summon/references/deliberation.md`](skills/summon/references/deliberation.md)
    before choosing it.
 
-Full playbook: **[docs/PROTOCOL.md](docs/PROTOCOL.md)**.
+Full playbook: **[the dispatcher protocol](docs/PROTOCOL.md)**.
 
 ---
 
@@ -374,23 +369,24 @@ dispatch it with the **summon** skill instead of doing everything yourself:
   policy explicitly. Never infer a missing policy field or silently fall back to council.
 - **Independent work → `--manifest`.** Fan several jobs out with per-backend
   concurrency; each writes its own result envelope you can inspect.
-- **Use the curated model bands deliberately.** Summon's current clear-frontier order is
-  Fable, Sol, Opus, then Kimi. The near-frontier/value band is Grok 4.6, Gemini Flash 3.7,
-  GLM 5.2, DeepSeek V4 Flash, then DeepSeek V4 Pro. These are editorial routing labels;
-  the model catalog and UI tooltips show the role/name/version, while only `model.served`
-  proves what actually ran.
-- **Escalate the hardest problems** to the top tier (an opus agent, or `fable`). Fable
-  billing depends on the Claude seat and remaining usage: Max/premium seats may use it
-  for up to 50% of their regular weekly limit at no extra cost, while Pro/standard seats
-  use usage credits from the start. summon runs the requested model, warns before
-  dispatch, and reports billing as unknown without a metered API-key route. Keep councils
-  and swarms diverse; a council of clones is pointless.
-- **Use Gemini Flash 3.7 as the fast independent evidence lane.** The bundled
+- **Use the curated model bands deliberately.** The 2026-08-18 catalog snapshot places
+  Fable, Sol, Opus, Kimi, and DeepSeek V4 Pro GA in the editorial frontier lane for
+  maximum-thinking coding work. It places Grok 4.6, Gemini Flash 3.7, GLM 5.2, and
+  DeepSeek V4 Flash in a near-frontier/value lane. These are editorial labels, not benchmark
+  results or availability guarantees.
+  The Ark entries use exact versioned IDs (`deepseek-v4-pro-ga-260813`,
+  `deepseek-v4-flash-ga-260731`, and `glm-5-2-260617`) from the 2026-08-18 marketplace
+  check. These are editorial routing labels; the model catalog and UI tooltips show the
+  role/name/version, while only `model.served` proves what actually ran.
+- **Escalate the hardest problems** to a frontier-lane seat when the task justifies it.
+  Billing and quota depend on the provider account and route; Summon does not infer a plan's
+  allowance. Review the warning and envelope before you continue. Keep councils and swarms
+  diverse so that independent reviewers can expose different failure modes.
+- **Use Gemini Flash 3.7 as a fast independent evidence lane.** The bundled
   `researcher` seat is pinned to `gemini-3.7-flash-high` through agy and is the recommended
   secondary voice for a cross-vendor council. Verify `model.served` in the envelope; agy
   cannot enforce read-only, so keep this seat in research/review roles.
-- **Use Cursor Grok 4.6 as a near-frontier candidate, not a blind default.** Cursor
-  lists Grok 4.6 in its model pool for long-horizon coding and knowledge work. Probe it
+- **Use Grok 4.6 as a near-frontier candidate, not a blind default.** Probe it
   with `--cli cursor-agent --model grok-4.6`, require the envelope's `model.served` to match,
   and keep Gemini pinned until a local smoke proves eligibility, evidence quality, and the
   required permission/retention contract. Never silently fall back to another Cursor model.
@@ -464,12 +460,12 @@ vendors.
   "report_ok": true,
   "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
                "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
-  "summon":  { "version": "3.0.0", "scripts_sha256": "9f2c…" },
+  "summon":  { "version": "3.0.0", "scripts_sha256": "<sha256>" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
   "elapsed_ms": 7285,
-  "resume": { "cli": "claude", "session_id": "0197…" }
+  "resume": { "cli": "claude", "session_id": "<session-id>" }
 }
 ```
 
@@ -515,7 +511,7 @@ API's models.
 
 ---
 
-## Custom & local models (`openai-compat`)
+## Custom and local models (`openai-compat`)
 
 ```markdown
 ---
@@ -528,11 +524,11 @@ model: anthropic/claude-3.5-sonnet
 Built-in providers, plus your own in `providers.json` (or inline `base_url` + `api_key_env`,
 empty key for local servers). Same envelope, same `manifest`/`council`. This is how you add
 local models and multi-model API access, and how a council becomes a genuine multi-vendor
-board. These backends bill your API credits, not a subscription (see [TERMS.md](TERMS.md)).
+board. These backends bill your API credits, not a subscription (see the [provider terms](TERMS.md)).
 
 ---
 
-## The starter roster (20 agents, all editable)
+## The starter roster
 
 Planning/architecture on Claude (`planner`, `architect`, `deep-debugger`,
 `security-auditor`, `fable`), implementation + adversarial review on Codex (`implementer`,
@@ -545,39 +541,31 @@ Each is a plain `.md` file: edit, delete, or add your own with `summon agent new
 
 ---
 
-## How it compares
+## Design boundaries
 
-| | summon | agent-bridge / CCB / claude-codex-collab | cc-fleet | MCO |
-|---|---|---|---|---|
-| Vendors | **6** (incl. Antigravity headless + any OpenAI-compatible API) | 2–3 | Claude only | 2–3 |
-| Any CLI as host | **yes** | mostly Claude-hosted | no | no |
-| Structured envelope + lie-detection | **yes** | partial | no | no |
-| Consensus / council mode | **yes** (anonymized ranking + chairman) | no | no | no |
-| Cost/usage + billing source | **yes** | partial | no | no |
-| Worktree + background + manifest fan-out | **yes, from any host** | no | yes (Claude-hosted) | no |
-| Runtime footprint | **a folder of stdlib Python** | daemon / MCP / npm tree | plugin | server |
-
-Caveats: those tools have nicer streaming UIs and bigger communities, and summon is a
-dispatcher, not a dashboard. Gemini resume isn't supported, because its CLI can't re-target
-a headless session.
+Summon is a local dispatcher and durable coordination layer, not a hosted dashboard. It
+provides structured envelopes, cross-vendor dispatch, council and deliberation contracts,
+bounded fan-out, and authenticated local browser surfaces. It does not replace a provider's
+native streaming UI, account controls, or session manager. Provider capabilities vary; for
+example, Gemini CLI sessions cannot currently be resumed through Summon's headless route.
 
 ---
 
 ## System requirements
 
 - **Python 3.10+** (3.11+ recommended). Standard library only, so no `pip install` for the
-  dispatcher itself — the default **agy** path (a stream-json proxy) is stdlib too. Only the
+  dispatcher itself. The default **agy** path (a stream-json proxy) is standard library too. Only the
   legacy opt-in agy PTY wrapper needs `pywinpty` and `pyte`
   (tested with `pywinpty 3.0.3` and `pyte 0.8.2`).
 - **At least one backend:** a vendor CLI installed and logged in (`claude`, `codex`,
-  `cursor-agent`, `gemini`, `kimi`, or `agy`), and/or an API key for an `openai-compat` provider (or
-  a local Ollama/LM Studio server). `summon doctor` tells you which are installed;
+  `cursor-agent`, `gemini`, `kimi`, or `agy`), an API key for an `openai-compat` provider, or
+  a local Ollama/LM Studio server. `summon doctor` tells you which are installed;
   `doctor --probe` spends a small live call per backend to confirm sign-in and eligibility.
 - **`git`** if you use `--worktree`.
 - **A host that can run a shell command:** a coding CLI, an AI IDE, a desktop agent app, or
   a plain terminal. Anything that can invoke `python` and read the skill can drive it.
-- **OS:** Windows runs every backend (it's what I use daily). Linux and macOS run all of
-  them except agy out of the box. CI covers Ubuntu and Windows.
+- **OS:** Windows runs every backend. Linux and macOS run all of them except agy out of the
+  box. CI covers Ubuntu and Windows.
 - **Headless Windows behavior:** Summon launches its dispatcher, utility, detached, and
   nested backend processes with hidden startup state plus `CREATE_NO_WINDOW`; routine
   dispatches do not open terminal windows. A vendor CLI or custom wrapper that explicitly
@@ -588,11 +576,11 @@ a headless session.
   `Start-Process`, pass `-WindowStyle Hidden`; a custom wrapper must hide its own children
   and be reported in the handoff.
 
-You bring the model access; summon just orchestrates the CLIs and APIs you already use.
+You bring model access. Summon orchestrates the CLIs and APIs you already use.
 
 ---
 
-## Security, permissions, and terms (please read)
+## Security, permissions, and terms
 
 - **Permissions.** Each agent's `permission:` (`read-only` / `safe-edit` / `yolo`) maps to
   that CLI's own sandbox flags. Bundled agents ship `safe-edit` (auto-approve edits, no
@@ -623,7 +611,7 @@ You bring the model access; summon just orchestrates the CLIs and APIs you alrea
   on *your* accounts, which is the intended path for personal and dev work. Don't share
   accounts, build a product on subscription auth, or hammer parallel volume; use API-key
   backends for commercial or high-volume work. Providers can change programmatic-billing
-  rules. Full guidance in **[TERMS.md](TERMS.md)**.
+  rules. Read the full guidance in **[the provider terms](TERMS.md)**.
 - **Prompt size is bounded by the OS, not by summon.** Every CLI backend receives the
   prompt through `argv`. Windows caps the whole assembled command line at 32767 characters
   and reports the overflow as a *missing file*, which summon used to relay as a bogus
@@ -632,27 +620,11 @@ You bring the model access; summon just orchestrates the CLIs and APIs you alrea
   and refuses with an error that names argv as the cause. `--prompt-file` does **not** avoid
   this -- it is a quoting convenience and the content still travels on the command line. For
   material that large, write it to a file under `--cwd` and ask the agent to read it.
-- **Diagnostics are opt-in and local.** Summon never collects telemetry by default. After
-  `summon telemetry enable`, it records only bounded, allow-listed metadata in a local
-  JSONL spool; every dispatch outcome (success, partial, blocked, or error) is represented
-  by bounded, allow-listed metadata. Prompt/result text, raw output, credentials, and
-  absolute paths are omitted.
-  It may retain deterministic SHA-256 fingerprints of the prompt and error for local
-  correlation; those are not plaintext, but can correlate or reveal low-entropy values.
-  Review generated reports with that in mind.
-  `summon bug-report` turns one event into a sanitized Markdown file for review. Nothing is
-  uploaded unless you explicitly run a second command,
-  `summon bug-report --submit-github --from REVIEWED_REPORT.md`, which sends that exact
-  reviewed file through your authenticated `gh issue create` command and never reads a
-  token or makes a direct HTTP call. The config is `~/.agents/summon-telemetry.json`, the JSONL spool is
-  `~/.agents/summon-telemetry.jsonl` (capped at 2 MiB), and reports go under
-  `~/.agents/summon-reports`; `telemetry clear` removes events but does not disable
-  collection. `summon telemetry disable` or `SUMMON_TELEMETRY=0` opts out; an environment
-  override is non-persistent and is inherited by Summon children in that invocation.
-  For the six CLI backends, all other network/process activity is the backend or a feature's supporting
-  tool (`git`, `icacls`/`chmod`, the agy PTY wrapper, a detached copy for `--background`).
-  The one exception is `openai-compat`, whose whole job is a direct HTTPS call to the
-  `base_url` you configure.
+- **Diagnostics are opt-in and local.** Summon does not collect telemetry by default. When
+  enabled, it records bounded, allow-listed metadata locally and omits prompt text, result
+  text, raw output, credentials, and absolute paths. It may retain deterministic fingerprints
+  for local correlation; see [local diagnostics and telemetry](docs/TELEMETRY.md) for storage,
+  clearing, and report-submission details.
 
 ---
 
@@ -668,13 +640,13 @@ the newest.
 have, and it strips `OPENAI_API_KEY` from codex children so you're not silently billed at
 API rates. The `openai-compat` backend uses your API key by design.
 
-**Is it safe to let an agent install it for me?** Yes. The agent-led prompt clones the repo,
-runs `doctor` (read-only) and `install.py` (which never overwrites your files), and reports
-back. Read `install.py` first if you like; it's about 460 lines of stdlib.
+**Is it safe to let an agent install it for me?** The agent-led prompt clones the repo, runs
+`doctor` (read-only), and runs `install.py`, which preserves files outside the owned payload.
+Review `install.py` before you run it if you need to understand the ownership boundary.
 
-**Why not MCP?** MCP adds a server and a session dependency for what is fundamentally a
-one-shot subprocess/HTTP dispatch. A script you can read beats a protocol you must trust.
-(An MCP facade may come later; the envelope won't change.)
+**Why not MCP?** Summon's core path is a local subprocess or HTTP dispatch, so it does not
+need a server or a session layer. An optional MCP facade may be added later without changing
+the envelope.
 
 ---
 
@@ -682,19 +654,18 @@ one-shot subprocess/HTTP dispatch. A script you can read beats a protocol you mu
 
 Contributions are welcome. New backends, agents, and providers are the easy wins.
 A new backend is one entry in a registry
-([skills/summon/references/adding-a-backend.md](skills/summon/references/adding-a-backend.md));
-a new agent is a `.md` file. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for dev setup, ground rules (stdlib only,
+([the backend contribution guide](skills/summon/references/adding-a-backend.md));
+a new agent is a `.md` file. See **[the contribution guide](CONTRIBUTING.md)** for development setup, ground rules (stdlib only,
 every change tested, secrets redacted), and the PR checklist. Run
 `python skills/summon/scripts/test_discovery.py` and `python tests/test_install.py` before a PR.
 
 ## Roadmap
 
 The release-facing product plan, readiness matrix, test gates, and live-provider roadmap are maintained in
-[docs/SUMMON_PRODUCT_ROADMAP.md](docs/SUMMON_PRODUCT_ROADMAP.md).
+[the product roadmap](docs/SUMMON_PRODUCT_ROADMAP.md).
 
-Shaped by two extended field reports (a GTM-materials agent and a complex-coding-project
-agent). Every validated request is either shipped, scheduled below, or declined with a
-reason. Ordering is roughly by priority, not a commitment.
+The roadmap records validated requests and their current status. It is ordered by priority
+and is not a delivery commitment.
 
 **Shipped since this roadmap was written:** council quorum + `--chairman-fallback` +
 per-stage timeouts; the background job registry read path (`jobs list` / `status` / `wait`
@@ -766,17 +737,14 @@ backend, `auto` uses `browser-harness` to reuse a matching tab or open one. Use
 `--browser builtin` to require that path, `--browser link` for SSH/CI, `--browser ide`
 to require the executable bridge, or `--browser system` to skip both. The bridge is
 passed one URL argument with `shell=False`; it cannot execute a shell command. This is
-an observer and typed-cancel handoff only—it does not enable live provider execution.
+an observer and typed-cancel handoff only. It does not enable live provider execution.
 
 ## Credits
 
-Sharpened against the ecosystem: agent-bridge, CCB, claude-codex-collab, cc-fleet, MCO,
-swarms, Omnigent, and Karpathy's llm-council. I've run summon privately for months,
-dispatching real work across many CLIs every day, and sharpened it hard over the last few
-weeks. The results have been good enough that it was worth generalizing and hardening into
-this public repo.
+Summon was informed by agent-bridge, CCB, claude-codex-collab, cc-fleet, MCO, swarms,
+Omnigent, and Karpathy's llm-council. The project keeps the useful patterns from those tools
+while preserving a small, inspectable dispatcher.
 
 ## License
 
-[MIT](LICENSE). Do what you like, no warranty. See [TERMS.md](TERMS.md) for the
-provider-terms caveats, which are on *you*, not on this software.
+[MIT](LICENSE). See [the provider terms](TERMS.md) for provider terms and limitations.

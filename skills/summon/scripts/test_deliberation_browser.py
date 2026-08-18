@@ -114,7 +114,10 @@ class DeliberationBrowserTests(unittest.TestCase):
             surface = ui.DeliberationSurface(root, "run-1")
             surface.start()
             try:
-                result = browser.ensure_surface(root, "run-1")
+                with mock.patch.object(browser, "_claim_open_lock",
+                                       wraps=browser._claim_open_lock) as claim:
+                    result = browser.ensure_surface(root, "run-1")
+                self.assertTrue(claim.called)
                 self.assertTrue(result["reused"])
                 self.assertEqual(result["pid"], os.getpid())
             finally:

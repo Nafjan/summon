@@ -2082,6 +2082,10 @@ def test_subcommand_rewrite():
     # retain the general usage facade.
     assert rs._rewrite_subcommand(["telemetry", "--help"])[1] == "help:telemetry"
     assert rs._rewrite_subcommand(["bug-report", "--help"])[1] == "help:bug-report"
+    assert rs._rewrite_subcommand(["council", "--help"])[1] == "help:council"
+    assert rs._rewrite_subcommand(["deliberate", "--help"])[1] == "help:deliberate"
+    assert "Fresh live execution is provider-gated" in rs._cli.command_usage("deliberate")
+    assert "explicit human promotion" in rs._cli.command_usage("council")
     assert rs._rewrite_subcommand(["manifest", "--help"])[1] == "help"
     assert rs._rewrite_subcommand(["agent", "new", "--help"])[1] == "help"
     # an unknown leading token is left for the flat parser to reject
