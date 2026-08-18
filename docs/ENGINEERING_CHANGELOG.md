@@ -1,7 +1,7 @@
 # Detailed engineering release history
 
 This archive preserves the full certification record, regression notes, and test
-evidence behind the 1.0 line. For the reader-focused product changelog, see
+evidence behind each release. For the reader-focused product changelog, see
 [CHANGELOG.md](../CHANGELOG.md).
 
 All notable changes to summon, following [Keep a Changelog](https://keepachangelog.com)
@@ -9,6 +9,45 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 (`run_subagent.py --version`). The response envelope carries its own schema version in the
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
+
+## [3.0.0-ga] - 2026-08-18
+
+This is the source-bound 3.0 GA certification record. The immutable
+`v3.0.0-ga` tag points at the final documentation commit and regenerated
+evidence for this clean tree. The older `v3.0.0` tag remains the historical
+provider-inert preview baseline.
+
+### Certification and release gates
+
+- The fixed registry passed all 17 required suites: **1,138/1,138** tests.
+- All eight release gates passed: accessibility, browser security, fake
+  lifecycle, live provider, managed installs, migration/rollback, model
+  identity, and telemetry privacy.
+- The strict release manifest verified a clean source tree, source-bound
+  evidence, complete payload hashes, and convergence of all eight managed host
+  installs. The unmanaged Cursor local plugin is reported separately and is not
+  overwritten by the installer.
+
+### Reviewed Claude live-provider pilot
+
+The explicitly authorized pilot used two enforceable read-only seats,
+`claude-opus-5`, the `default` profile, and subprocess transport. The normal
+matrix reached a decided result after two attempts; a separate cross-process
+cancel reached `CANCELLED` after provider contact; and a three-second deadline
+ended conservatively as `adapter_indeterminate` with `uncertain_spend=true`.
+All cases verified cleanup and no orphaned resources. The account evidence
+digest matched before and after the pilot. The redacted schema-2 receipt is
+bound into the live-provider gate; Fable, Gemini, Kimi, and other routes remain
+independently gated rather than implied by the Claude result.
+
+### Documentation and compatibility
+
+- `docs/VERSIONING_AND_3.0.md` and `docs/3.0.0-MIGRATION-ROLLBACK.md` define
+  the 2.2.x upgrade, rollback, envelope compatibility, and evidence contract.
+- The product changelog, roadmap, conversation, council, deliberate, swarm,
+  and model-identity documentation describe the same GA boundary.
+- No provider call occurred after the authorized pilot; subsequent checks were
+  local or fake-provider verification only.
 
 ## [1.0.0] - 2026-07-29
 

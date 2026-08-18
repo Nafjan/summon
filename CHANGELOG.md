@@ -64,15 +64,33 @@ regression notes, and test evidence, see the
   now explicit display metadata; exact `model.served` evidence remains separate and
   unknown models never become dispatchable by implication.
 
+## [3.0.0-ga] — 2026-08-18
+
+- **GA certification:** published the clean source-bound `v3.0.0-ga` release
+  after all 17 fixed suites (1,138/1,138) and all eight release gates passed.
+- **Reviewed Claude pilot:** certified the bounded `claude-opus-5` normal,
+  durable-cancel, and deadline/uncertain-spend cases with exact served-model,
+  profile, account-evidence, cleanup, and consent receipts.
+- **Install convergence:** all eight managed host copies match the release
+  payload at 3.0.0. The unmanaged Cursor local plugin remains intentionally
+  outside installer ownership and must be updated through its own plugin
+  lifecycle after review/backup.
+- **Engineering record:** the full certification, migration, rollback, and
+  release-manifest evidence is recorded in
+  [`docs/ENGINEERING_CHANGELOG.md`](docs/ENGINEERING_CHANGELOG.md).
+
+The pre-existing `v3.0.0` entry below is retained as the historical
+provider-inert/public-preview baseline. Fable, Gemini, Kimi, and other provider
+routes remain independently gated.
+
 ## [3.0.0] — 2026-08-15
 
 - Synchronized the plugin, dispatcher, and MCP companion to the 3.0.0 contract.
-- This immutable tag is the provider-inert/public-preview baseline. It is **not** a
-  GA certification: the live-provider gate was blocked and the working chat/runtime
-  tree was still being evidenced separately.
+- This immutable tag is the historical provider-inert/public-preview baseline.
+  The later `v3.0.0-ga` tag carries the clean source-bound GA certification.
 - Kept multi-provider live deliberation, automatic fallback/retry, remote hosting,
-  and unproven live continuation explicitly deferred. A later GA must publish a
-  clean source-bound evidence packet with an independently reviewed provider receipt.
+  and unproven live continuation remain explicitly deferred. Provider expansion
+  still requires an independent receipt and gate.
 
 ## [2.2.0] — 2026-08-12
 

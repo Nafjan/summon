@@ -113,5 +113,6 @@ hash is `7663ccc5bb820de09d5fdee8c20615698cabbaa1cb5176bf7d0648087008bb70`. The 
 source-bound registry for the clean candidate records all 17 fixed suites and all eight
 gates as `pass`, with clean source and converged managed
 installs. This closes the Claude live-provider gate for 3.0.0. It does not certify Fable,
-Gemini, or any other route; each must earn an independent receipt. The published GA tag
-must point at this same clean commit, alongside the retained manifest/evidence packet.
+Gemini, or any other route; each must earn an independent receipt. The published
+`v3.0.0-ga` tag points at this same clean commit, alongside the retained
+manifest/evidence packet.

@@ -1,9 +1,9 @@
 # Summon product roadmap
 
 Status date: 2026-08-18
-Current source version: `3.0.0` candidate
-Readiness: the immutable `3.0.0` tag remains the public-preview baseline while the final
-GA commit is prepared. The current candidate contains the authenticated chat/runtime,
+Current source version: `3.0.0` GA
+Readiness: the immutable `v3.0.0-ga` tag is the source-bound GA release; the older
+`v3.0.0` tag remains the historical public-preview baseline. The GA release contains the authenticated chat/runtime,
 browser hardening, local swarm coordinator, and narrow fresh read-only deliberation lane
 described below. The final source-bound registry passes all 17 fixed suites and all eight
 gates, with clean source and all eight managed
@@ -15,7 +15,7 @@ before and after. The redacted schema-2 packet is retained outside the source tr
 additional provider receipts, remote execution, and multi-user hosting remain separately
 gated.
 
-This is the release-facing roadmap for turning the current, well-tested kernel into a dependable open product. It records what is actually shipped, what was tested, and the gates that must pass before we describe a feature as shipped, preview, or live-provider-enabled.
+This is the release-facing roadmap for the dependable open product. It records what is actually shipped, what was tested, and which provider lanes remain preview or independently live-provider-gated.
 
 ## Release snapshot
 
@@ -86,8 +86,8 @@ remain. The release manifest is generated from a clean, immutable source tree an
 requires the named suites and gates rather than accepting arbitrary caller-supplied
 labels. Earlier evidence packets, including the packet for commit `5530459`, are
 historical and must not be reused after source changes. The current candidate's fixed
-suites, non-live gates, and reviewed Claude live-provider gate pass; the published GA
-tag must point at this same clean candidate and ship with the retained manifest and
+suites, non-live gates, and reviewed Claude live-provider gate pass; `v3.0.0-ga`
+points at this clean release commit and ships with the retained manifest and
 redacted receipt. Fable, Gemini, and other provider lanes remain unverified, and the
 unmanaged Cursor plugin remains reported and intentionally untouched.
 
@@ -160,8 +160,8 @@ deliberation receipt.
    silently falls back to another model.
 
 Exit gate: ✅ broad dispatcher suite is repeatable; install/doctor reports converged managed
-copies; no unexplained warnings; no dirty or foreign tree is overwritten. The final tag and
-publication remain an explicit release-owner action after this candidate review.
+copies; no unexplained warnings; no dirty or foreign tree is overwritten. Publication is
+the explicit release-owner action; the local GA tag is already verified.
 
 ## P1 — make the deliberation product complete
 
