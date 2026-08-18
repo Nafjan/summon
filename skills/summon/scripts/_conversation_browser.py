@@ -201,14 +201,10 @@ def ensure_surface(root: str, *, timeout: float = 5.0,
         )
     except (OSError, RuntimeError) as exc:
         raise ConversationBrowserError("surface binding path could not be resolved") from exc
-    existing = read_surface_record(root)
-    if existing is not None and _wait_surface_reachable(existing, timeout=timeout):
-        _require_surface_binding(existing, cwd=binding_cwd, agents_dir=binding_agents_dir)
-        return {"url": existing["url"], "reused": True, "pid": existing["pid"]}
     with _launch_guard(root, timeout):
-        # Another process may have completed the start while this caller was
-        # waiting for the guard. Re-probe the authenticated endpoint before
-        # deciding to spawn another server.
+        # Reuse is deliberately inside the same cross-process guard as start.
+        # A fast-path probe outside the guard can race a concurrent close/start
+        # and return a sidecar that has already been replaced.
         existing = read_surface_record(root)
         if existing is not None and _wait_surface_reachable(existing, timeout=timeout):
             _require_surface_binding(existing, cwd=binding_cwd, agents_dir=binding_agents_dir)

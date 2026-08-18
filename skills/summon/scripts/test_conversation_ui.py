@@ -211,7 +211,10 @@ class ConversationUITests(unittest.TestCase):
         self.assertEqual(route.exception.code, 400)
 
     def test_surface_record_reuses_one_atlas_and_link_mode_is_nonlaunching(self):
-        reused = ensure_surface(str(self.root))
+        with patch("_conversation_browser._launch_guard",
+                   wraps=_conversation_browser._launch_guard) as guard:
+            reused = ensure_surface(str(self.root))
+        self.assertTrue(guard.called)
         self.assertTrue(reused["reused"])
         handoff = open_url(self.base, mode="link")
         self.assertFalse(handoff["opened"])
