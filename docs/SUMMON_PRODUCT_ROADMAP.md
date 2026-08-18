@@ -1,16 +1,18 @@
 # Summon product roadmap
 
-Status date: 2026-08-17
+Status date: 2026-08-18
 Current source version: `3.0.0` candidate
 Readiness: the immutable `3.0.0` tag remains the public-preview baseline. The current
-working tree contains the authenticated chat/runtime, browser hardening, local swarm
-coordinator, and narrow fresh read-only deliberation lane described below. The current
-candidate is clean, all fixed suites and non-live gates are source-bound and green, and
-all eight managed installs match it. No accepted schema-2 live-provider receipt is
-available to the release checker, so publication remains blocked until that final gate
-is independently evidenced and a new immutable tag is produced.
-Additional provider receipts, remote execution, and multi-user hosting remain separately
-gated.
+candidate contains the authenticated chat/runtime, browser hardening, local swarm
+coordinator, and narrow fresh read-only deliberation lane described below. The clean
+source-bound candidate at commit `a00cc1d` passes every fixed suite and named gate,
+including the reviewed schema-2 Claude Opus receipt (`5b0e0c28…9052d583`), and all
+eight managed installs match it. Publication still requires an explicit final GA tag.
+The accepted receipt proves provider/model/profile/consent and the normal, cancel, and
+deadline safety matrix; it does not expose a separate account identifier, so no account
+identity claim is made until that evidence is explicitly supplied or the release contract
+is amended. Additional provider receipts, remote execution, and multi-user hosting
+remain separately gated.
 
 This is the release-facing roadmap for turning the current, well-tested kernel into a dependable open product. It records what is actually shipped, what was tested, and the gates that must pass before we describe a feature as shipped, preview, or live-provider-enabled.
 
@@ -19,10 +21,10 @@ This is the release-facing roadmap for turning the current, well-tested kernel i
 | Area | Current truth | Release posture |
 | --- | --- | --- |
 | Ordinary dispatch, council, ACP, telemetry | Implemented and locally exercised | Ready for continued public use |
-| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; exact `model.served` and profile evidence is required per route, and no current receipt is bound to this checkout | All live lanes remain gated until independently reviewed evidence is rebound |
+| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; the source-bound Claude Opus route has exact served-model/profile/consent evidence, while Fable, Gemini, and other routes remain unverified | Claude Opus route verified; other live lanes remain gated |
 | Deliberation kernel, journal replay/recovery, scheduler | Focused `test_deliberation_*.py` suite; provider-inert | Ready as a fake/injected integration surface |
 | Custom Agent manifests and roster binding | Strict parser, path fencing, consent/identity binding | Ready as provider-inert configuration |
-| Live provider composition | Receipt/plan/owner/deadline fences exist, but the current checkout has no accepted schema-2 receipt bound to its source hash | Live-provider gate is blocked; no route is advertised as GA-ready |
+| Live provider composition | Receipt/plan/owner/deadline fences exist; the current source-bound packet passes the schema-2 Claude Opus normal/cancel/deadline pilot | Claude Opus route is live-provider-gated; account identity and other routes remain separately gated |
 | Browser conversation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, visual evidence, and explicit cancellable roster-agent turns; richer multi-run lifecycle remains preview | Unreleased post-GA preview |
 | Local swarm coordinator | `_rundir`-backed owner/lease/claim journal, idempotent worker messages, claim-bound artifacts, cancellation, and explicit uncertain-spend recovery; no implicit provider or IDE attachment | Provider-neutral preview |
 | Managed local installs | The installer detects nine host profiles (eight managed records) and all eight managed copies currently match the candidate; the unmanaged Cursor plugin remains intentionally untouched | Convergence is source-bound in the current clean registry; recheck after any source change |
@@ -82,11 +84,13 @@ No open P0/P1 reliability, security, privacy, migration, or evidence contradicti
 remain. The release manifest is generated from a clean, immutable source tree and
 requires the named suites and gates rather than accepting arbitrary caller-supplied
 labels. Earlier evidence packets, including the packet for commit `5530459`, are
-historical and must not be reused after source changes. The release owner must rerun
-every fixed suite and gate, bind the outputs to the final source hash, and provide an
-accepted schema-2 live-provider receipt before calling the candidate GA. Until then,
-the correct posture is public preview, with the unmanaged Cursor plugin reported and
-intentionally untouched.
+historical and must not be reused after source changes. The current packet is bound to
+`a00cc1d` and its source hash; it is the first candidate packet with all named gates
+passing. The release owner must still create the final immutable GA tag and decide
+whether the current schema-2 identity boundary (provider/model/profile/consent without
+a separate account identifier) satisfies the product's account-evidence requirement.
+Until that decision and tag exist, the correct posture is a GA candidate/public preview,
+with the unmanaged Cursor plugin reported and intentionally untouched.
 
 ## Product direction
 

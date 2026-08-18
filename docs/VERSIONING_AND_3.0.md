@@ -86,10 +86,12 @@ never an inferred success.
 
 ## Release decision
 
-For this 3.0.0 release, all fixed suites and every named gate are `pass`, the source
-tree is clean and immutable, managed installs converge, the migration/rollback and
+For the current 3.0.0 candidate, all fixed suites and every named gate are `pass`, the
+source tree is clean, managed installs converge, the migration/rollback and
 accessibility artifacts are retained, and the independently reviewed Claude Opus pilot
-receipt proves the one selected live-provider route. Future provider routes must earn
-their own receipt; if a future gate is unavailable, publish a versioned maintenance
-release or clearly label the result `3.0.0-preview.N` rather than weakening this
-contract.
+receipt proves the one selected live-provider route. The receipt's schema-2 identity
+boundary is provider/model/profile/consent; it does not carry a separate account
+identifier. If the product requires account-level evidence for GA, that requirement must
+be explicitly satisfied before tagging. Future provider routes must earn their own
+receipt; if a future gate is unavailable, publish a versioned maintenance release or
+clearly label the result `3.0.0-preview.N` rather than weakening this contract.
