@@ -94,9 +94,9 @@ consent-gated fallback — every successful call is `billing.source: api`.
 
 ```powershell
 arkcli auth status --format json          # profiles, keys, plan membership
-arkcli +chat --model deepseek-v4-pro "..." # chat (uses active / chosen profile)
+arkcli +chat --model deepseek-v4-pro-ga-260813 "..." # exact Ark marketplace ID
 arkcli helper list
-arkcli helper configure opencode --profile <coding-plan-or-platform-profile> --model deepseek-v4-pro
+arkcli helper configure opencode --profile <coding-plan-or-platform-profile> --model deepseek-v4-pro-ga-260813
 ```
 
 `arkcli helper` wires supported CLIs (Claude Code, Codex, OpenCode, Hermes).
@@ -138,7 +138,8 @@ changes.
 
 #### Roster freshness and availability checks
 
-The static recommendations above were last manually checked on **2026-08-07**.
+The static Coding Plan recommendations above were last manually checked on **2026-08-07**;
+the separate Ark marketplace editorial catalog was metadata-checked on **2026-08-18**.
 Summon also caches a live roster from arkcli at `~/.agents/byteplus-coding-roster.json`
 (14-day freshness). Refresh anytime:
 
@@ -150,7 +151,17 @@ python -c "import sys; sys.path.insert(0, r'<summon>/skills/summon/scripts'); fr
 
 Use `plans model-list`, not `arkcli models list`; the latter is the full
 marketplace and includes non-plan and multimodal models. After refreshing the
-roster, make one minimal **text-only** call before changing recommendations.
+roster, make one minimal **text-only** call before changing Coding Plan
+recommendations. The 2026-08-18 marketplace check confirms these exact public
+IDs and capabilities, but does not claim a successful inference or Coding Plan
+entitlement:
+
+| Editorial lane | Exact Ark marketplace ID | Metadata |
+|---|---|---|
+| Frontier / maximum thinking | `deepseek-v4-pro-ga-260813` | DeepSeek V4 Pro GA; thinking; 1M context |
+| Near-frontier / long context | `glm-5-2-260617` | GLM 5.2; thinking; 1M context |
+| Near-frontier / fast coding | `deepseek-v4-flash-ga-260731` | DeepSeek V4 Flash GA; thinking; 1M context |
+
 Treat these as separate facts:
 
 1. **Listed** — the plan catalog includes the model.

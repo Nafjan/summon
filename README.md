@@ -375,10 +375,12 @@ dispatch it with the **summon** skill instead of doing everything yourself:
 - **Independent work → `--manifest`.** Fan several jobs out with per-backend
   concurrency; each writes its own result envelope you can inspect.
 - **Use the curated model bands deliberately.** Summon's current clear-frontier order is
-  Fable, Sol, Opus, then Kimi. The near-frontier/value band is Grok 4.6, Gemini Flash 3.7,
-  GLM 5.2, DeepSeek V4 Flash, then DeepSeek V4 Pro. These are editorial routing labels;
-  the model catalog and UI tooltips show the role/name/version, while only `model.served`
-  proves what actually ran.
+  Fable, Sol, Opus, Kimi, then DeepSeek V4 Pro GA for maximum-thinking coding work. The
+  near-frontier/value band is Grok 4.6, Gemini Flash 3.7, GLM 5.2, and DeepSeek V4 Flash.
+  The Ark entries use exact versioned IDs (`deepseek-v4-pro-ga-260813`,
+  `deepseek-v4-flash-ga-260731`, and `glm-5-2-260617`) from the 2026-08-18 marketplace
+  check. These are editorial routing labels; the model catalog and UI tooltips show the
+  role/name/version, while only `model.served` proves what actually ran.
 - **Escalate the hardest problems** to the top tier (an opus agent, or `fable`). Fable
   billing depends on the Claude seat and remaining usage: Max/premium seats may use it
   for up to 50% of their regular weekly limit at no extra cost, while Pro/standard seats

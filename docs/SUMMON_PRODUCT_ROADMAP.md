@@ -151,8 +151,11 @@ deliberation receipt.
    preserve `--browser link`/`--chat-browser link` for non-interactive callers. These
    public observer paths remain separate from live-provider activation.
 6. **Keep model routing explicit.** The catalog records the current editorial order—Fable,
-   Sol, Opus, Kimi as clear frontier; Grok 4.6, Gemini Flash 3.7, GLM 5.2, DeepSeek V4
-   Flash, and DeepSeek V4 Pro as near-frontier/high-value. Pin `researcher` to
+   Sol, Opus, Kimi, then DeepSeek V4 Pro GA as the clear-frontier maximum-thinking lane;
+   Grok 4.6, Gemini Flash 3.7, GLM 5.2, and DeepSeek V4 Flash remain near-frontier/high-
+   value. The Ark entries are pinned to exact marketplace IDs and were metadata-checked on
+   2026-08-18; Coding Plan eligibility and live invocation still require their own
+   `plans model-list` plus minimal text smoke. Pin `researcher` to
    `gemini-3.7-flash-high` as the fast independent evidence lane; keep Fable behind its
    named `fable-fallback` profile and require `model.served`/profile evidence in every
    release smoke. Tooltips may show role/name/version and the editorial lane, but labels

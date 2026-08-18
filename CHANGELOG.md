@@ -68,6 +68,9 @@ regression notes, and test evidence, see the
 
 - **GA certification:** published the clean source-bound `v3.0.0-ga` release
   after all 17 fixed suites (1,138/1,138) and all eight release gates passed.
+- **Ark roster refresh:** exact marketplace metadata now places DeepSeek V4 Pro GA in
+  the fifth frontier lane; GLM 5.2 and DeepSeek V4 Flash GA remain near-frontier value
+  lanes. Static labels remain separate from live `model.served` evidence.
 - **Reviewed Claude pilot:** certified the bounded `claude-opus-5` normal,
   durable-cancel, and deadline/uncertain-spend cases with exact served-model,
   profile, account-evidence, cleanup, and consent receipts.

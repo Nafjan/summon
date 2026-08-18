@@ -21,14 +21,17 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual([item["label"] for item in entries[:4]], ["frontier"] * 4)
         near = [item for item in entries if item["label"] == "near-frontier"]
         self.assertEqual([item["name"] for item in near],
-                         ["Grok", "Gemini Flash", "GLM", "DeepSeek V4 Flash", "DeepSeek V4 Pro"])
+                         ["Grok", "Gemini Flash", "GLM", "DeepSeek V4 Flash"])
 
     def test_keys_and_routes_are_unique_and_dispatchability_is_explicit(self):
         value = catalog.load_catalog()
         keys = [item["key"] for item in value["entries"]]
         self.assertEqual(len(keys), len(set(keys)))
-        self.assertFalse(next(item for item in value["entries"]
-                              if item["name"] == "DeepSeek V4 Flash")["dispatchable"])
+        self.assertEqual(next(item for item in value["entries"]
+                              if item["name"] == "DeepSeek V4 Flash")["target"],
+                         "deepseek-v4-flash-ga-260731")
+        self.assertTrue(next(item for item in value["entries"]
+                             if item["name"] == "DeepSeek V4 Pro")["dispatchable"])
 
     def test_display_is_separate_from_served_evidence(self):
         display = catalog.display_for("agy", "gemini-3.7-flash-high")
@@ -51,8 +54,9 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertIsNone(catalog.display_for("cursor-agent", "not-in-catalog"))
         entry = next(item for item in catalog.load_catalog()["entries"]
                      if item["name"] == "DeepSeek V4 Pro")
-        self.assertEqual(entry["backend"], "unverified")
-        self.assertFalse(entry["dispatchable"])
+        self.assertEqual(entry["backend"], "arkcli")
+        self.assertEqual(entry["target"], "deepseek-v4-pro-ga-260813")
+        self.assertIsNone(catalog.display_for("unverified", "deepseek-v4-pro"))
 
     def test_catalog_digest_is_stable_and_json_is_valid(self):
         raw = json.loads(catalog._CATALOG_PATH.read_text(encoding="utf-8"))

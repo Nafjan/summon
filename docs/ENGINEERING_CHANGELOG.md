@@ -40,6 +40,12 @@ digest matched before and after the pilot. The redacted schema-2 receipt is
 bound into the live-provider gate; Fable, Gemini, Kimi, and other routes remain
 independently gated rather than implied by the Claude result.
 
+The editorial Ark roster was refreshed from exact marketplace metadata on 2026-08-18:
+`deepseek-v4-pro-ga-260813` is the fifth frontier lane, while
+`glm-5-2-260617` and `deepseek-v4-flash-ga-260731` are near-frontier value lanes.
+Marketplace metadata is not a live invocation receipt; Coding Plan eligibility and
+`model.served` evidence remain independently gated.
+
 ### Documentation and compatibility
 
 - `docs/VERSIONING_AND_3.0.md` and `docs/3.0.0-MIGRATION-ROLLBACK.md` define
