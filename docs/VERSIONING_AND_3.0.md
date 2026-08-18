@@ -100,9 +100,14 @@ the profile metadata itself remains private and outside the release artifact.
 
 For the current 3.0.0 candidate, all fixed suites and every non-live gate are `pass`, the
 source tree is clean, managed installs converge, and the migration/rollback and
-accessibility artifacts are retained. The previously reviewed Claude Opus receipt is
-not sufficient for the strengthened GA contract because it lacks
-`account_evidence_sha256`; an authorized account-bound pilot must produce a replacement
-receipt before tagging. Future provider routes must earn their own receipt; if a future
-gate is unavailable, publish a versioned maintenance release or clearly label the
-result `3.0.0-preview.N` rather than weakening this contract.
+accessibility artifacts are retained. A bounded Claude Opus pilot was then run with two
+read-only seats, one round, two physical attempts, and no retry/fallback. Both attempts
+reported `claude-opus-5`; one produced a valid ballot and the other produced no parseable
+ballot, so the `all` quorum was not met. The account digest matched before and after,
+uncertain spend was false, and cleanup was verified clean, but this is **partial pilot
+evidence**, not a GA receipt: it does not prove a decided normal case or the required
+live cancel/deadline matrix. The previously reviewed receipt also lacks
+`account_evidence_sha256`. A new reviewed account-bound receipt must pass the full schema-2
+gate before tagging. Future provider routes must earn their own receipt; if a future gate
+is unavailable, publish a versioned maintenance release or clearly label the result
+`3.0.0-preview.N` rather than weakening this contract.

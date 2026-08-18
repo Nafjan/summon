@@ -6,11 +6,13 @@ Readiness: the immutable `3.0.0` tag remains the public-preview baseline. The cu
 candidate contains the authenticated chat/runtime, browser hardening, local swarm
 coordinator, and narrow fresh read-only deliberation lane described below. The clean
 source-bound candidate passes every fixed suite and every non-live gate, and all eight
-managed installs match it. The previously reviewed schema-2 Claude Opus receipt lacks
-the newly required reviewer-held `account_evidence_sha256`, so the live-provider gate
-is intentionally blocked until an authorized account-bound replacement is supplied.
-Additional provider receipts, remote execution, and multi-user hosting remain separately
-gated.
+managed installs match it. An authorized bounded Claude Opus pilot used two read-only
+seats and two physical attempts: both served `claude-opus-5`, one ballot parsed and one
+did not, so the required `all` quorum was not reached. Account evidence matched before
+and after, uncertain spend was false, and cleanup was clean; this is partial evidence,
+not a schema-2 GA receipt. The live-provider gate therefore remains blocked pending a
+reviewed account-bound normal/cancel/deadline packet. Additional provider receipts,
+remote execution, and multi-user hosting remain separately gated.
 
 This is the release-facing roadmap for turning the current, well-tested kernel into a dependable open product. It records what is actually shipped, what was tested, and the gates that must pass before we describe a feature as shipped, preview, or live-provider-enabled.
 
@@ -19,10 +21,10 @@ This is the release-facing roadmap for turning the current, well-tested kernel i
 | Area | Current truth | Release posture |
 | --- | --- | --- |
 | Ordinary dispatch, council, ACP, telemetry | Implemented and locally exercised | Ready for continued public use |
-| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; Claude Opus has a reviewed served-model/profile/consent packet, but account evidence is still missing; Fable, Gemini, and other routes remain unverified | All live lanes remain gated until account-bound evidence is reviewed |
+| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; the bounded Claude Opus pilot captured exact served-model and matched account-digest evidence but did not reach quorum; Fable, Gemini, and other routes remain unverified | All live lanes remain gated until account-bound evidence is reviewed |
 | Deliberation kernel, journal replay/recovery, scheduler | Focused `test_deliberation_*.py` suite; provider-inert | Ready as a fake/injected integration surface |
 | Custom Agent manifests and roster binding | Strict parser, path fencing, consent/identity binding | Ready as provider-inert configuration |
-| Live provider composition | Receipt/plan/owner/deadline fences exist; the prior Claude Opus normal/cancel/deadline packet lacks the required account digest | Live-provider gate blocked pending an authorized account-bound receipt |
+| Live provider composition | Receipt/plan/owner/deadline fences exist; the latest Claude Opus pilot is partial (one valid ballot, one parse failure, no quorum) and has no cancel/deadline matrix | Live-provider gate blocked pending a reviewed account-bound receipt |
 | Browser conversation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, visual evidence, and explicit cancellable roster-agent turns; richer multi-run lifecycle remains preview | Unreleased post-GA preview |
 | Local swarm coordinator | `_rundir`-backed owner/lease/claim journal, idempotent worker messages, claim-bound artifacts, cancellation, and explicit uncertain-spend recovery; no implicit provider or IDE attachment | Provider-neutral preview |
 | Managed local installs | The installer detects nine host profiles (eight managed records) and all eight managed copies currently match the candidate; the unmanaged Cursor plugin remains intentionally untouched | Convergence is source-bound in the current clean registry; recheck after any source change |
