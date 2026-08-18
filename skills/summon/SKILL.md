@@ -14,6 +14,18 @@ default, bounded/sanitized, and never sent anywhere without an explicit user act
 deterministic SHA-256 fingerprints of prompt/error values for local correlation; those are not plaintext,
 but can correlate or reveal low-entropy values, so review a report before sharing it.
 
+## Public GitHub privacy boundary
+
+Keep local diagnostics out of public GitHub text. Do not publish usernames, email addresses,
+absolute paths, host names, process IDs, profile or plugin labels, account or billing details,
+telemetry state, session IDs, prompts, raw output, credentials, per-run receipts, machine
+hashes, drift inventories, or unsanitized screenshots. Use placeholders such as
+`<project-root>`, `<session-id>`, and `<sha256>`, and report aggregate results instead of a
+workstation inventory. Store release evidence outside the source tree. Before opening a PR
+or issue, inspect the staged diff and scan the exact public text; never paste `doctor`,
+telemetry, account-probe, or raw diagnostic output into GitHub. If a local finding matters,
+describe the behavior and remediation without identifying the machine that exposed it.
+
 ## Resources
 
 - **[run_subagent.py](scripts/run_subagent.py)** - Main execution script
