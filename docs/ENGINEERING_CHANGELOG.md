@@ -1,10 +1,11 @@
 # Detailed engineering release history
 
-This archive preserves the full certification record, regression notes, and test
-evidence behind each release. For the reader-focused product changelog, see
-[CHANGELOG.md](../CHANGELOG.md).
+This archive contains detailed engineering notes for selected releases. For the
+complete user-visible history, see [CHANGELOG.md](../CHANGELOG.md). Keep per-run
+evidence, host inventories, local paths, account identifiers, and raw diagnostics
+in the private release bundle rather than this public archive.
 
-All notable changes to summon, following [Keep a Changelog](https://keepachangelog.com)
+This file records notable changes to Summon and follows [Keep a Changelog](https://keepachangelog.com)
 and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 (`run_subagent.py --version`). The response envelope carries its own schema version in the
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
@@ -13,9 +14,10 @@ never on added fields.
 ## [3.0.0-ga] - 2026-08-18
 
 This is the source-bound 3.0 GA certification record. The immutable
-`v3.0.0-ga` tag points at the final documentation commit and regenerated
-evidence for this clean tree. The older `v3.0.0` tag remains the historical
-provider-inert preview baseline.
+`v3.0.0-ga` tag identifies the certified release commit and its regenerated
+evidence. The older `v3.0.0` tag remains the historical provider-inert preview
+baseline. Later editorial corrections are ordinary commits and do not change
+the certified runtime evidence.
 
 ### Certification and release gates
 
@@ -25,8 +27,8 @@ provider-inert preview baseline.
   identity, and telemetry privacy.
 - The strict release manifest verified a clean source tree, source-bound
   evidence, complete payload hashes, and convergence of all eight managed host
-  installs. The unmanaged Cursor local plugin is reported separately and is not
-  overwritten by the installer.
+  installs. Unmanaged local copies are preserved and reported by `doctor`; the
+  public release record contains no workstation-specific drift data.
 
 ### Reviewed Claude live-provider pilot
 
@@ -91,7 +93,7 @@ and no repository change occurred.
 
 ### Testing
 
-428/428 discovery tests pass on the final 1.0 metadata. The first installer invocation
+The pre-final 1.0 metadata run passed 428/428 discovery tests. The first installer invocation
 hit a transient Windows `WinError 5` while renaming a staging directory; rollback
 preserved the previous copy. Two complete serial reruns then passed 22/22, so the
 release records the transient rather than silently presenting a one-shot green run.
@@ -122,8 +124,8 @@ main Claude reviewer.
 
 All three certification findings have failure-first regressions: each failed
 against 0.19.1 before its production fix. The worktree case also proves Git is not
-invoked before a symlink escape is rejected. 428/428 discovery and 22/22
-installer tests pass.
+invoked before a symlink escape is rejected. The pre-final run passed 428/428
+discovery and 22/22 installer tests.
 
 ## [0.19.1] - 2026-07-29
 
@@ -1014,17 +1016,11 @@ why the 1.0 bar is not yet met.*
 ## [0.11.2] - 2026-07-25
 
 ### Added
-- **`doctor` now enumerates PROJECT-LOCAL copies (`<project>/.agents/skills/summon`).**
-  A project can carry its own agent roster plus a vendored dispatcher, and that layout is
-  in real use. `install.py` never touches it (it targets host roots), so nothing refreshed
-  it and it rotted invisibly: one such copy was found running v0.9.0 code behind a
-  hand-edited version string, and another kept the Windows console-window bug after every
-  host copy had been fixed. Drift detection could not see either, because it only probed
-  the host roots, `~/.agents`, and the running copy.
-  `enumerate_installs` takes a `project_dir` and `doctor` passes its `--cwd`, so the copy
-  is REPORTED with its version and hash. It stays **unmanaged** (no ownership manifest):
-  summon reports it and never writes it, so a project that deliberately pins a vendored
-  copy is surfaced rather than silently overwritten.
+- **`doctor` now reports project-local copies (`<project>/.agents/skills/summon`).**
+  A project can carry its own agent roster and vendored dispatcher. The managed installer
+  leaves that copy alone, so teams that deliberately pin a vendored version can review drift
+  before updating it. `enumerate_installs` accepts `project_dir` and records only bounded,
+  redacted version and digest metadata in local diagnostics.
 
 ## [0.11.1] - 2026-07-25
 
@@ -1124,13 +1120,10 @@ whole scripts dir, so a subprocess-flag-only difference is enough to flag it).
 ## [0.10.2] - 2026-07-23
 
 ### Security
-- **The API key no longer follows a cross-host redirect.** `urllib` replays every original header
-  on a redirect, so an `openai-compat` endpoint answering `302 Location: https://elsewhere/...`
-  received `Authorization: Bearer <key>` verbatim -- a configured, compromised, or merely mistaken
-  `base_url` could exfiltrate the credential with a single response. Same-origin redirects are
-  ordinary API routing and are still followed; a cross-origin one is refused outright, naming the
-  reason, rather than silently retried without the header (which would surface as a confusing 401).
-  Found by cross-vendor adversarial review of this branch and reproduced with two local servers.
+- **The API key no longer follows a cross-host redirect.** The `openai-compat` transport now
+  refuses a cross-origin redirect before it can forward an authorization header. Same-origin
+  routing remains supported. The regression test uses a local fixture; reproduction details stay
+  in the private security review.
 
 ### Fixed
 - **Env-authorized credit reaches the environment identity.** `env_override_for` recognized only
@@ -1420,7 +1413,7 @@ whole scripts dir, so a subprocess-flag-only difference is enough to flag it).
   invalidate every stored result on any unrelated commit, costing more than the staleness it
   prevents. It is recorded in the envelope as `git_head_before` for a caller that wants to enforce
   it.
-- **An apostrophe in a Windows path gives an actionable error.** `args: --path C:\Users\O'Brien\config`
+- **An apostrophe in a Windows path gives an actionable error.** `args: --path <user>\config`
   failed with a bare "No closing quotation", because POSIX splitting reads the apostrophe as an
   opening quote. Single-quote grouping is kept (long-standing behavior some rosters rely on), so the
   error now names the cause and shows the double-quoted form that works.

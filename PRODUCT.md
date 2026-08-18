@@ -18,7 +18,7 @@ desktop agent and need to observe and guide a multi-agent deliberation while it 
 running. They may be coding, researching, or making a design/architecture decision and
 need the control surface to remain unobtrusive beside their working application.
 
-## Product Purpose
+## Product purpose
 
 Summon coordinates heterogeneous AI CLIs behind one structured dispatcher. The
 deliberation feature lets several bounded participants exchange auditable turns, produce
@@ -37,19 +37,19 @@ prose, owns scheduling, permissions, physical launch budgets, durable replay, cl
 and the final control decision. A participant's identity or claimed verdict is evidence,
 not authority.
 
-## Operating Context
+## Operating context
 
 Runs are initiated by a calling agent or terminal and may involve Claude, Codex, Cursor,
 Kimi, Antigravity, Gemini-compatible, or OpenAI-compatible backends. The control surface
 is loopback-only, offline, and user-invoked. A single scheduler owner writes a checksummed,
-generation-fenced journal; local browser handlers may queue typed commands but never
-launch providers or mutate policy. Users may inspect a run during execution, review a
-finished run, replay durable events, queue typed cancellation, and see
-LEFT_BEHIND/environment-handoff details. Approve/deny and richer human-command
-application are target capabilities, not claims about the current provider-inert browser
-slice.
+generation-fenced journal. The browser can append human context, start a bounded roster-agent
+chat turn when the caller supplies a project and roster binding, and queue typed deliberation
+commands. It cannot change deliberation policy, approve a ballot, or activate a deliberation
+provider. Users may inspect a run during execution, review a finished run, replay durable
+events, queue typed cancellation, and see `LEFT_BEHIND` or environment-handoff details.
+Approve, deny, and richer human-command application remain separately gated capabilities.
 
-## Capabilities and Constraints
+## Capabilities and constraints
 
 - Existing council and dispatch modes remain behaviorally compatible.
 - Conversation rooms are a shared, project- and initiator-grouped substrate for chat,
@@ -72,7 +72,7 @@ slice.
 - Backend identities, prompts, credentials, private paths, and raw provider output must
   remain redacted from public exports and telemetry.
 
-## Brand Commitments
+## Brand commitments
 
 The product name is Summon. The interface should feel precise, calm, trustworthy, and
 operational rather than like a generic chat client. [Beautiful UI's published license page](https://www.beautifului.dev/license)
@@ -84,7 +84,7 @@ It remains a local rewrite: no remote package, runtime, font, or hosted asset is
 loaded. The full MIT notice is in `THIRD_PARTY_NOTICES.md`; any future source-level
 reuse must retain that notice.
 
-## Evidence on Hand
+## Evidence on hand
 
 - `README.md` documents the dispatcher, council, manifest, cross-vendor, and local-model
   workflows.
@@ -97,7 +97,7 @@ reuse must retain that notice.
   Full deliberation provider activation, richer human-command application, and complete
   real-journal lifecycle coverage remain separately gated preview work.
 
-## Product Principles
+## Product principles
 
 1. Show the durable truth, not model theater.
 2. Keep human control explicit, local, and reversible where possible.
@@ -105,9 +105,9 @@ reuse must retain that notice.
 4. Preserve privacy and offline operation by default.
 5. Let the task and state lead the interface; visual character must never obscure control.
 
-## Accessibility & Inclusion
+## Accessibility and inclusion
 
 The local surface must support keyboard navigation, visible focus, semantic headings and
 live-region updates, reduced motion, sufficient contrast, responsive layouts, and clear
-text alternatives for status/color/icon treatments. Exact conformance target remains an
-open decision; use WCAG 2.2 AA as the delegated baseline until the user specifies another.
+text alternatives for status, color, and icon treatments. WCAG 2.2 AA is the working
+baseline. Summon does not claim independent accessibility certification.

@@ -259,15 +259,15 @@ chooses otherwise.
 
 ### Fable profile health
 
-Fable is a separate Claude Code login profile, not an automatic fallback. Configure it once
-on the machine, then verify it before an expensive dispatch:
+Fable is a separate Claude Code login profile, not an automatic fallback. Configure it in a
+private directory, then verify it before an expensive dispatch:
 
 ```powershell
-$env:CLAUDE_CONFIG_DIR = "$env:USERPROFILE\.claude-fable"
+$env:CLAUDE_CONFIG_DIR = Join-Path $env:USERPROFILE ".claude-fable"
 claude auth login
 claude auth status
 python skills/summon/scripts/run_subagent.py doctor --json
-python skills/summon/scripts/run_subagent.py dispatch --agent fable --profile fable-fallback --model claude-fable-5 --cwd <project> --prompt "Return the required Final report block."
+python skills/summon/scripts/run_subagent.py dispatch --agent fable --profile fable --model claude-fable-5 --cwd <project> --prompt "Return the required Final report block."
 ```
 
 The dispatch envelope is authoritative: check `status`, `model.served`, `profile`, and the

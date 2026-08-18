@@ -1,8 +1,9 @@
 # Summon 2.x -> 3.0 release and migration contract
 
 Status: 3.0.0 GA release contract. The release manifest is generated from the clean
-immutable release commit and records the fixed suites, eight gates, migration packet,
-managed installs inventory, and redacted live-provider receipt.
+immutable release commit and records aggregate results for the fixed suites, eight gates,
+the migration packet, managed installs, and the redacted live-provider receipt. Keep the
+manifest, host inventory, and per-run evidence in the private release bundle.
 
 This document is intentionally operational. A version bump is not evidence of a
 GA release. The release owner must generate evidence from a clean, immutable tree,
@@ -26,7 +27,7 @@ release artifact.
 
 ## Upgrade procedure
 
-1. Run `summon doctor --json` and save the output as a local, reviewed artifact.
+1. Run `summon doctor --json` and save the output as a private, reviewed artifact.
 2. Run `python install.py --dry-run` and resolve foreign trees, duplicate copies,
    and unmanaged plugin drift. The installer must never overwrite a foreign tree.
 3. Stop active Summon browser surfaces and release owners. Do not remove durable
@@ -98,21 +99,8 @@ the profile metadata itself remains private and outside the release artifact.
 
 ## Release decision
 
-The 3.0.0 candidate now has a source-bound, reviewed Claude receipt. The normal case used
-two enforceable read-only seats (`planner` and `architect`) for one round with two physical
-attempts; both served `claude-opus-5`, the `all` quorum decided `pilot-receipt`, and cleanup
-was verified clean with no uncertain spend. A separate cancellation run queued a typed
-cancel from another process after an attempt had started and reached `CANCELLED` with one
-finished attempt and no retained resources. A separate three-second deadline run stopped
-at the deadline with `adapter_indeterminate`, preserved `uncertain_spend=true`, and left no
-orphaned resources or post-deadline contact. The default Claude account digest matched
-before and after (`account_evidence_sha256` is held in the redacted packet).
-
-The schema-2 packet validates through `tools/live_provider_gate.py`; its redacted artifact
-hash is `7663ccc5bb820de09d5fdee8c20615698cabbaa1cb5176bf7d0648087008bb70`. The final
-source-bound registry for the clean candidate records all 17 fixed suites and all eight
-gates as `pass`, with clean source and converged managed
-installs. This closes the Claude live-provider gate for 3.0.0. It does not certify Fable,
-Gemini, or any other route; each must earn an independent receipt. The published
-`v3.0.0-ga` tag points at this same clean commit, alongside the retained
-manifest/evidence packet.
+The 3.0.0 candidate has a source-bound, reviewed Claude receipt. The fixed registry records
+all 17 suites and all eight gates as `pass`, with a clean source tree and converged managed
+installs. The Claude receipt closes that provider gate for 3.0.0. It does not certify Fable,
+Gemini, or any other route; each provider must earn an independent receipt. Keep the receipt,
+manifest, host inventory, and any account-evidence digest in the private release bundle.

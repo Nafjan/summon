@@ -4,11 +4,11 @@
 
 ## Custom & API backends (`openai-compat`) — add any model
 
-Beyond the five CLIs, an agent can run against **any OpenAI-compatible
+Beyond the six CLI backends, an agent can run against **any OpenAI-compatible
 `/chat/completions` API** — OpenRouter, OpenAI, Anthropic, Google (Gemini compat),
 Groq, DeepSeek, Together, or a LOCAL server (Ollama, LM Studio, vLLM, llama.cpp).
 Pure stdlib HTTP, no SDK. This bills your **API key/credits**, not a subscription
-(cleaner for commercial/high-volume — see [TERMS.md](TERMS.md)).
+(cleaner for commercial or high-volume use; see [provider terms](../../../TERMS.md)).
 
 ```markdown
 ---

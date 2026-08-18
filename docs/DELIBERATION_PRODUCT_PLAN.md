@@ -1,8 +1,8 @@
-# Summon Deliberation Product Plan
+# Summon deliberation product plan
 
-Status: open-product preview (fresh read-only live lane and loopback observer exist; approval/resume remain gated)
-Target branch: current working branch
-Owner: Summon maintainers
+Status: public preview; approval and resume remain gated
+Last reviewed: 2026-08-18
+Audience: maintainers and contributors
 
 Active root goal: deliver the first shippable public deliberation slice through the
 owner-safe headless gate, then complete the loopback observer/control surface. The
@@ -831,7 +831,7 @@ following independent inputs:
   hijacking, and adapter-boundary injection;
 - Kimi lane: attempted but not evidenced in the current release packet; no approval
   claimed;
-- Fable: a separate `fable-fallback` Claude Code profile has a historical reachability
+- Fable: a separate `fable` Claude Code profile has a historical reachability
   smoke in the review record. That is not current served-model evidence, a quota
   guarantee, or an architectural approval; the current release gate remains blocked
   until a fresh, redacted receipt binds the exact profile and `model.served` value.
