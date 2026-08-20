@@ -547,6 +547,8 @@ def _child_cmd(job: dict, args, out_file: str) -> list:
         cmd += ["--strict-agents-dir"]
     if getattr(args, "enable_roles", False):
         cmd += ["--enable-roles"]
+    if getattr(args, "retry_nonretryable", False):
+        cmd += ["--retry-nonretryable"]
     for key, flag in (("cli", "--cli"), ("model", "--model"), ("effort", "--effort"),
                       ("profile", "--profile"),
                       ("timeout", "--timeout"), ("json_schema", "--json-schema"),
@@ -673,8 +675,8 @@ def run_manifest(args) -> int:
         # The parent skips WITHOUT spawning, so the child's own identity check never runs
         # for a manifest job -- the parent has to make the same check itself, or editing a
         # job's prompt while keeping its id silently returns the previous answer.
-        from _executor import (envelope_answers_request, is_terminal_success,
-                               request_fingerprint)
+        from _executor import (envelope_answers_request, is_terminal_nonretryable,
+                               is_terminal_success, request_fingerprint)
         prior = _existing_envelope(out_file)
         _ident = _job_identity(job, args)
         _fp = request_fingerprint(**_ident)
@@ -684,7 +686,10 @@ def run_manifest(args) -> int:
         _reusable, _note = envelope_answers_request(
             prior, _fp, hashlib.sha256(str(_ident["prompt"]).encode("utf-8")).hexdigest(),
             _ident["agent"], _ident)
-        if is_terminal_success(prior) and _reusable:
+        _terminal = (is_terminal_success(prior)
+                     or (is_terminal_nonretryable(prior)
+                         and not getattr(args, "retry_nonretryable", False)))
+        if _terminal and _reusable:
             if _note:
                 _pw = prior.get("warnings")
                 _pw = _pw if isinstance(_pw, list) else ([] if _pw is None else [str(_pw)])
@@ -760,8 +765,11 @@ def run_manifest(args) -> int:
                   f"backend={backend} status={status}"
                   f"{' (skipped)' if skipped else ''} "
                   f"elapsed={int(time.monotonic() - t0)}s", file=sys.stderr, flush=True)
+        _retry_suppressed = bool(envelope.get("retry_suppressed")) or (
+            skipped and is_terminal_nonretryable(envelope))
         return {"id": job["id"], "backend": backend, "status": status,
                 "skipped": skipped,
+                "retry_suppressed": _retry_suppressed,
                 # WHY it failed, in the summary itself. Without it a job that could not clear
                 # its own result path reported `status: error` while `result_file` still
                 # pointed at the STALE SUCCESS envelope, with nothing anywhere saying so.
@@ -783,6 +791,8 @@ def run_manifest(args) -> int:
         "failed": failed,
         "skipped": [o["id"] for o in outcomes if o["skipped"]],
         "suspect": [o["id"] for o in outcomes if o.get("suspect")],
+        "retry_suppressed": [o["id"] for o in outcomes
+                              if o.get("retry_suppressed")],
         "results_dir": results_dir,
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "jobs": outcomes,

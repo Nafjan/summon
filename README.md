@@ -460,7 +460,7 @@ vendors.
   "report_ok": true,
   "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
                "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
-  "summon":  { "version": "3.0.0", "scripts_sha256": "<sha256>" },
+  "summon":  { "version": "3.1.0-preview.1", "scripts_sha256": "<sha256>" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -477,6 +477,10 @@ vendors.
   contract don't get believed.
 - `model.served` → the model that actually did the work (evidence-based; `null` = no
   service evidence observed). `targeted` = what the session was pointed at.
+- `served_model_evidence` → `reported`, `inferred`, or `absent`: whether the served
+  model came from a terminal provider report, bounded telemetry inference, or no
+  service evidence. Missing provenance does not make a usable success retryable;
+  an empty terminal result is instead a typed non-retryable error.
 - `timeout` → the timeout budget, whether partial output survived, and the phase Summon can
   prove. ACP names its exact protocol stage; a generic CLI remains `backend-execution` because
   Summon cannot honestly infer whether the vendor was starting, reasoning, or running a tool.

@@ -17,6 +17,12 @@ hosting remain separately gated.
 This roadmap records what is shipped, what is tested, and which provider lanes remain preview
 or independently live-provider-gated.
 
+The next milestone is documented in [`SUMMON_3.1_PLAN.md`](SUMMON_3.1_PLAN.md). It is a
+trust-and-reliability release: the shared authority and durable execution contract comes
+first, followed by council-to-deliberate completion, a provider-neutral swarm adapter, and
+chat-atlas lifecycle/accessibility hardening. The plan does not promote preview surfaces or
+provider lanes without their own machine-recorded gates.
+
 ## Release snapshot
 
 | Area | Current truth | Release posture |

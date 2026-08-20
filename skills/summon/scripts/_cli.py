@@ -104,7 +104,8 @@ def parse_quorum(value: str) -> int | str:
 # explicitly supports it.
 MODE_FLAGS = {
     "manifest": {"manifest", "concurrency", "results_dir", "cwd", "agents_dir",
-                 "retries", "job_file", "strict_agents_dir", "enable_roles"},
+                 "retries", "retry_nonretryable", "job_file", "strict_agents_dir",
+                 "enable_roles"},
     # Operation-level rows: a fresh council, a resume, and a read-only status
     # each consume a DIFFERENT set (v3.1). Changing members/rounds/question on a
     # resume would be a new run, so they are rejected there; status takes only
@@ -733,6 +734,10 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                                       "holds a valid envelope, skip the run (swarm resume)")
     parser.add_argument("--retries", type=int, default=0,
                         help="Re-dispatch up to N times on error/partial, exponential backoff")
+    parser.add_argument("--retry-nonretryable", dest="retry_nonretryable", action="store_true",
+                        help="Explicitly retry a preserved typed non-retryable result (for "
+                             "example, after re-authenticating a provider); permits one "
+                             "fresh dispatch, then suppresses another empty result")
     parser.add_argument("--max-permission", dest="max_permission",
                         choices=["read-only", "safe-edit"],
                         help="CLAMP the dispatch to at most this permission tier. It can "

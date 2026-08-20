@@ -11,6 +11,30 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## Unreleased
+
+- Added the dispatch evidence guard. ACP protocol completion is now validated against
+  a usable result, so an empty terminal turn cannot be reported as completed work.
+- Added the optional `served_model_evidence` envelope field with `reported`, `inferred`,
+  and `absent` values. The field is additive and does not change envelope schema version 1.
+- Typed empty terminal results are marked non-retryable and preserved across manifest
+  resume until an operator explicitly removes the result file or uses the deliberate
+  `--retry-nonretryable` override after repairing provider state. The override permits
+  one fresh dispatch; a second empty result remains suppressed.
+
+## [3.1.0-preview.1] - 2026-08-20
+
+This preview contains the evidence-integrity slice from the 3.1 plan. It is source-bound
+only after the release manifest and fresh suite evidence are generated for the tagged
+commit; it does not close the broader 3.1-to-GA lifecycle gates.
+
+- `empty_terminal_result` is a typed, non-retryable failure with a consistent exit tuple
+  and preserved backend exit evidence.
+- `served_model_evidence` explicitly records `reported`, `inferred`, or `absent` model
+  provenance without treating a requested target as proof of service.
+- Fan-out and result reuse preserve typed empty failures; `--retry-nonretryable` is the
+  only explicit one-attempt override, and a second empty result remains suppressed.
+
 ## [3.0.0-ga] - 2026-08-18
 
 This is the source-bound 3.0 GA certification record. The immutable

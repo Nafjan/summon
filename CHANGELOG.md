@@ -5,9 +5,32 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+- **Dispatch evidence guard:** ACP turns and all final dispatch envelopes now reject
+  empty successful results as errors instead of presenting them as completed work.
+  Envelopes also expose additive `served_model_evidence` (`reported`, `inferred`, or
+  `absent`). Missing provenance does not turn a usable success into a repeated paid
+  retry; typed empty terminal results are preserved as non-retryable errors until an
+  operator explicitly removes the result file or uses `--retry-nonretryable` after
+  repairing provider state. The override permits one fresh dispatch; a second empty
+  result remains suppressed. Envelope version 1 is unchanged
+  because this is an additive field and existing consumers can ignore it safely.
 - **Documentation:** clarified the 3.0 GA boundary, unmanaged-copy policy, local-only
   diagnostics, and the distinction between chat turns, council context, and deliberation
   authority. Public docs no longer include workstation-specific drift details.
+
+## [3.1.0-preview.1] - 2026-08-20
+
+- **Dispatch evidence guard:** ACP and subprocess completions that claim success without
+  a usable result are now reported as the typed `empty_terminal_result` error instead of
+  silently completing.
+- **Model provenance:** envelopes distinguish `reported`, `inferred`, and `absent`
+  `served_model_evidence`; malformed model identifiers are omitted from public metadata.
+- **Retry safety:** typed empty results are not retried by fan-out or resume. The explicit
+  `--retry-nonretryable` control permits one deliberate fresh attempt; a second empty
+  result remains suppressed.
+- **Release posture:** this is a public preview of the evidence-integrity slice. The
+  deliberate, swarm, chat-lifecycle, custom-agent, and live-provider gates remain open;
+  this release is not a 3.1 GA claim.
 
 ## [3.0.0-ga] - 2026-08-18
 

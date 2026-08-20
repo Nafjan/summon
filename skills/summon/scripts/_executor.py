@@ -329,6 +329,37 @@ def parse_report(text: str) -> dict | None:
     return fields or None
 
 
+def normalize_empty_success(response: dict) -> dict:
+    """Fail closed on a protocol success that contains no usable result.
+
+    Provider transports may classify a turn as complete from a stop reason or
+    process exit alone.  Summon cannot treat that as completed work because the
+    public result (and any parsed schema value) is derived from ``result``.
+    The operation is idempotent so a backend can apply it at its protocol
+    boundary and the executor can apply it again as a contract firewall.
+    """
+    if not isinstance(response, dict):
+        return response
+    result = response.get("result")
+    if (response.get("status") != "success"
+            or (isinstance(result, str) and result.strip())):
+        return response
+    if "backend_exit_code" not in response:
+        response["backend_exit_code"] = response.get("exit_code")
+    response["status"] = "error"
+    response["exit_code"] = 1
+    response["dispatcher_status"] = "error"
+    response["normalization_reason"] = (
+        "empty terminal result cannot be accepted as a completed Summon result")
+    response["error_kind"] = "empty_terminal_result"
+    response["retryable"] = False
+    response["suspect"] = True
+    response.setdefault(
+        "error",
+        "provider reported success but returned no usable result")
+    return response
+
+
 def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     """Attach telemetry + parsed report to a response (all return paths).
 
@@ -344,6 +375,11 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     but in one-shot mode nobody is there to click approve, so the task did not
     happen. An orchestrator trusting ``status`` must not collect that as a win.
     """
+    # Normalize malformed provider completions before recording the execution
+    # status.  That keeps execution_status, dispatcher_status, and the public
+    # exit tuple aligned even when a backend only reported a protocol-level
+    # success (for example ACP end_turn) without a usable result.
+    normalize_empty_success(response)
     response["envelope"] = ENVELOPE_VERSION
     # Preserve the executor's outcome BEFORE report semantics reconcile the public
     # status. A successful review can legitimately return VERDICT: BLOCK; a failed
@@ -1523,6 +1559,21 @@ def is_terminal_success(env) -> bool:
                 and not env.get("suspect"))
 
 
+def is_terminal_nonretryable(env) -> bool:
+    """True for a typed failure that is complete evidence, not a retry cue.
+
+    Empty terminal results are preserved for diagnosis.  Re-running a manifest
+    against the same non-interactive failure would spend again without changing
+    the input; an operator can explicitly retry by removing the result file or
+    passing the deliberate retry override.
+    Other errors retain the historical retry-on-resume behavior.
+    """
+    return bool(isinstance(env, dict)
+                and env.get("status") == "error"
+                and env.get("error_kind") == "empty_terminal_result"
+                and env.get("retryable") is False)
+
+
 # Hook / launcher noise that a HOST environment injects ahead of the backend's own output.
 # Field report (2026-07-27): a third-party plugin hook put an unquoted Windows path into a
 # PowerShell command line, and its parse error was the FIRST thing in a failed gemini
@@ -1758,6 +1809,39 @@ def _model_mismatch(requested, ran) -> bool:
     if r in _CLAUDE_ALIASES and r in re.split(r"[-_/.:]+", s):
         return False
     return True
+
+
+_SAFE_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+() -]{0,159}$")
+_MODEL_SECRET_MARKERS = re.compile(
+    r"(?i)(?:^|[^a-z0-9])(?:bearer|basic|secret|token|password|"
+    r"(?:api|oauth|access|auth)[-_]?token|(?:api|private)[-_]?key)"
+    r"(?:$|[^a-z0-9])")
+_MODEL_PATH_PREFIXES = re.compile(
+    r"(?i)^(?:users|home|private|tmp|var|etc|program[ _-]+files)(?:/|$)")
+
+
+def _safe_model_id(value) -> str | None:
+    """Return a bounded provider model identifier, never arbitrary telemetry.
+
+    Model identity is provider input, not trusted application metadata.  Keep
+    the conservative character set already used by deliberation receipts and
+    reject URL/path/token-shaped values before they reach a public envelope.
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate or _SAFE_MODEL_ID.fullmatch(candidate) is None:
+        return None
+    lowered = candidate.lower()
+    if (candidate.startswith(("/", "\\"))
+            or re.match(r"^[A-Za-z]:[\\/]", candidate)
+            or lowered.startswith(("file:", "http:", "https:"))
+            or lowered.startswith(("sk-", "ghp_", "akia", "eyj"))
+            or _MODEL_PATH_PREFIXES.match(candidate)
+            or any(segment in (".", "..") for segment in candidate.split("/"))
+            or _MODEL_SECRET_MARKERS.search(candidate)):
+        return None
+    return candidate
 
 
 def _partial_response(cli: str, result: dict | None, exit_code: int, error: str) -> dict:
@@ -2449,18 +2533,25 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         #   resolved   LEGACY v1 semantics, byte-for-byte unchanged (handshake-
         #              or-terminal + the codex config backfill); consumers
         #              migrate to targeted/served; retired in envelope v2.
-        _terminal_model = resp.pop("model_resolved", None)
-        _handshake = resp.pop("model_targeted", None)
-        _mu = resp.pop("models_used", [])
-        _effective = _guarded_inv.model
+        _terminal_model_raw = resp.pop("model_resolved", None)
+        _terminal_model = _safe_model_id(_terminal_model_raw)
+        _terminal_model_invalid = (_terminal_model_raw is not None
+                                   and _terminal_model is None)
+        _handshake = _safe_model_id(resp.pop("model_targeted", None))
+        _mu_raw = resp.pop("models_used", [])
+        _mu = []
+        if isinstance(_mu_raw, (list, tuple)):
+            _mu = [model for model in (_safe_model_id(value) for value in _mu_raw)
+                   if model is not None]
+        _effective = _safe_model_id(_guarded_inv.model)
         if not _effective:
             if inv.cli == "cursor-agent":
                 from _builder import CURSOR_DEFAULT_MODEL as _cursor_default
-                _effective = _cursor_default
+                _effective = _safe_model_id(_cursor_default)
             elif inv.cli == "codex":
                 try:
                     from _resolver import _codex_default_model
-                    _effective = _codex_default_model()
+                    _effective = _safe_model_id(_codex_default_model())
                 except Exception:  # noqa: BLE001 — telemetry best-effort, never fatal
                     _effective = None
         _out_tokens = 0
@@ -2473,17 +2564,34 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # evidence and must never pollute what the session was pointed at
         # (they can legitimately differ, and that difference is the signal).
         _targeted = _handshake or _effective
-        if _terminal_model:
+        if _terminal_model and not _terminal_model_invalid:
             _served = _terminal_model
         elif _out_tokens > 0 and _targeted:
-            _served = _targeted
+            _served = None if _terminal_model_invalid else _targeted
         else:
             _served = None
+        # Provenance is separate from the model name.  A terminal provider
+        # report is reported evidence; output tokens plus a target are only an
+        # inference; neither is absent evidence.  Do not overload suspect/cache
+        # semantics for a valid success that lacks provider telemetry.
+        if _terminal_model and not _terminal_model_invalid:
+            resp["served_model_evidence"] = "reported"
+        elif _out_tokens > 0 and _targeted and not _terminal_model_invalid:
+            resp["served_model_evidence"] = "inferred"
+        else:
+            resp["served_model_evidence"] = "absent"
+        if resp.get("status") == "success" and resp["served_model_evidence"] == "absent":
+            _warning = (
+                "served model evidence was unavailable; model provenance is "
+                "not confirmed")
+            _warnings = resp.setdefault("warnings", [])
+            if _warning not in _warnings:
+                _warnings.append(_warning)
         _legacy = _terminal_model or _handshake
         if inv.cli == "codex" and not _legacy:
             try:
                 from _resolver import _codex_default_model
-                _legacy = _codex_default_model()
+                _legacy = _safe_model_id(_codex_default_model())
             except Exception:  # noqa: BLE001 — telemetry best-effort, never fatal
                 pass
         resp["model"] = {"requested": _requested_model, "targeted": _targeted,

@@ -650,8 +650,23 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
             "cli": cli,
             "session_id": session_id,
         }
+        if status == "success" and (not isinstance(text, str) or not text.strip()):
+            # ``end_turn`` describes protocol state, not result usefulness.
+            # Reuse the executor's idempotent contract firewall here so the
+            # backend and every other transport cannot diverge on the exit
+            # tuple.  The ACP-specific diagnostic remains bounded and avoids
+            # asserting an authentication failure as fact.
+            from _executor import normalize_empty_success
+            normalize_empty_success(resp)
+            resp["normalization_reason"] = (
+                "empty ACP completion cannot be accepted as a completed "
+                "Summon result")
+            resp["error"] = (
+                f"ACP stopReason {stop!r} reported success but returned no usable "
+                "result")
+            status = resp["status"]
         if status != "success":
-            resp["error"] = f"agent stopped: {stop}"
+            resp.setdefault("error", f"agent stopped: {stop}")
         if usage:
             resp["usage"] = usage
         if model_targeted:

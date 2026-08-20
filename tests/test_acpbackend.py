@@ -100,6 +100,35 @@ def test_full_executor_envelope_and_resume_lane():
     assert resp["acp"] == {"session_id": "fake-session-1"}
 
 
+def test_empty_end_turn_is_an_error_at_the_acp_boundary():
+    resp = _call("empty")
+    assert resp["status"] == "error", resp
+    assert resp["exit_code"] == 1
+    assert resp["error_kind"] == "empty_terminal_result"
+    assert resp["retryable"] is False
+    assert "empty ACP completion" in resp["normalization_reason"]
+
+
+def test_empty_end_turn_is_consistent_through_full_executor_path():
+    """The exact registered ACP callable must not leave stale exit fields."""
+    orig_argv = dict(_acpbackend.ACP_ARGV)
+    _acpbackend.ACP_ARGV["gemini"] = ["acp", "empty"]
+    patched = _patch_launch()
+    try:
+        resp = _executor.execute_agent(_inv(), timeout_ms=30000)
+    finally:
+        _acpbackend.ACP_ARGV.update(orig_argv)
+        _restore(patched)
+    assert resp["status"] == "error", resp
+    assert resp["execution_status"] == "error", resp
+    assert resp["dispatcher_status"] == "error", resp
+    assert resp["exit_code"] == 1
+    assert resp["backend_exit_code"] == 0
+    assert resp["error_kind"] == "empty_terminal_result"
+    assert resp["retryable"] is False
+    assert "empty" in resp["normalization_reason"]
+
+
 def test_model_pinning_best_effort():
     resp = _call("happy", model="fake-model")
     assert resp.get("model_targeted") == "fake-model"

@@ -5,6 +5,7 @@ Usage: python fake_acp_agent.py acp [MODE]
 
 Modes:
   happy            chunks + tool_call + report block, stopReason end_turn
+  empty            stopReason end_turn with no agent text
   permission-read  asks permission for a read-kind tool call first
   permission-exec  asks permission for an execute-kind tool call first
   permission-no-once  offers ONLY allow_always for a read-kind call
@@ -88,6 +89,12 @@ def main():
         elif method == "session/prompt":
             if mode == "slow":
                 time.sleep(3600)  # kill-tree must reap us; never answer
+                continue
+            if mode == "empty":
+                # Protocol-level completion without a usable result. This is
+                # the regression fixture for the dispatch evidence guard.
+                send({"jsonrpc": "2.0", "id": mid,
+                      "result": {"stopReason": "end_turn"}})
                 continue
             if mode == "malformed":
                 sys.stdout.write("this is not json\n")

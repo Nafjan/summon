@@ -535,7 +535,8 @@ def test_current_version_claims_match_the_dispatcher():
     assert current and current.group(1) == ".".join(rs.__version__.split(".")[:2])
 
     readme = (repo / "README.md").read_text(encoding="utf-8")
-    sample = re.search(r'"summon":\s*\{\s*"version":\s*"([0-9.]+)"', readme)
+    sample = re.search(
+        r'"summon":\s*\{\s*"version":\s*"([0-9A-Za-z.-]+)"', readme)
     assert sample and sample.group(1) == rs.__version__, (
         "README sample envelope claims %s but the dispatcher is %s"
         % (sample.group(1) if sample else None, rs.__version__))
@@ -13221,12 +13222,13 @@ def test_v8_orchestration_guide_version_stamp_is_current():
     if not os.path.isfile(guide):     # installed copies may omit references; skip
         return
     src = open(os.path.join(scripts, "run_subagent.py"), encoding="utf-8").read()
-    m = re.search(r'__version__ = "([0-9.]+)"', src)
+    m = re.search(r'__version__ = "([0-9A-Za-z.-]+)"', src)
     assert m, "could not read __version__"
     version = m.group(1)
 
     text = open(guide, encoding="utf-8").read()
-    stamped = re.search(r"verified against summon \*\*([0-9.]+)\*\*", text)
+    stamped = re.search(
+        r"verified against summon \*\*([0-9A-Za-z.-]+)\*\*", text)
     assert stamped, "the guide no longer carries a 'verified against summon X' stamp"
     assert stamped.group(1) == version, (
         "orchestration.md claims it was verified against %s but summon is %s -- re-verify "

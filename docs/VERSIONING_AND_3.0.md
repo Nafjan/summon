@@ -1,6 +1,6 @@
 # Summon 2.x -> 3.0 release and migration contract
 
-Status: 3.0.0 GA release contract. The release manifest is generated from the clean
+Status: 3.0.0 GA and 3.1 preview release contract. The release manifest is generated from the clean
 immutable release commit and records aggregate results for the fixed suites, eight gates,
 the migration packet, managed installs, and the redacted live-provider receipt. Keep the
 manifest, host inventory, and per-run evidence in the private release bundle.
@@ -9,6 +9,15 @@ This document is intentionally operational. A version bump is not evidence of a
 GA release. The release owner must generate evidence from a clean, immutable tree,
 bind it to the source hash and Git commit, and retain the manifest with the
 release artifact.
+
+## 3.1 preview boundary
+
+The `3.1.0-preview.1` artifact keeps `envelope: 1` and adds only optional evidence
+fields. It is a preview of the evidence-integrity slice, not a certification of the
+deliberate lifecycle, swarm worker conformance, chat lifecycle, custom-agent validation,
+or live-provider gates described in `docs/SUMMON_3.1_PLAN.md`. A preview tag may be
+published only from a clean commit with fresh source-bound suite evidence. Do not call
+the artifact GA or infer live-provider behavior from an editorial model label.
 
 ## Compatibility boundary
 

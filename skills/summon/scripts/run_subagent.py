@@ -73,11 +73,12 @@ from _builder import clamp_permission as _clamp  # noqa: E402
 from _executor import ENVELOPE_VERSION as _ENVELOPE_VERSION  # noqa: E402
 from _executor import (agent_def_sha, content_sha,  # noqa: E402
                        envelope_answers_request, execute_agent, finalize_exit_fields,
-                       is_terminal_success, request_fingerprint)
+                       is_terminal_nonretryable, is_terminal_success,
+                       request_fingerprint)
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "3.0.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "3.1.0-preview.1"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -951,7 +952,9 @@ def main() -> None:
                 prior = json.load(fh)
         except (OSError, ValueError):
             prior = None
-        if is_terminal_success(prior):
+        if (is_terminal_success(prior)
+                or (is_terminal_nonretryable(prior)
+                    and not getattr(args, "retry_nonretryable", False))):
             _reusable, _note = envelope_answers_request(
                 prior, request_sha, receipt.get("prompt_sha256"), args.agent, _identity)
             # A BARE --worktree auto-names a FRESH tree on every invocation, so no stored
@@ -977,7 +980,7 @@ def main() -> None:
                     prior["warnings"] = _pw + [_note]
                 prior["skipped"] = True
                 _emit(prior)
-                sys.exit(0)
+                sys.exit(0 if is_terminal_success(prior) else 1)
 
     # --allow-credit: per-dispatch credit authorization. Env form of the same
     # switch, set process-local so the credit guard and any --background child
@@ -2177,6 +2180,13 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
             _aggregate_spend(result, _prev_result)
         _prev_result = dict(result)
         _done = result.get("status") not in ("error", "partial")
+        if is_terminal_nonretryable(result):
+            # A typed empty terminal is preserved for diagnosis. Repeating the
+            # same manifest or --retries invocation cannot make a provider
+            # produce output; an operator must remove the result file or pass
+            # --retry-nonretryable to opt into another paid attempt.
+            result["retry_suppressed"] = True
+            _done = True
         if not _done and attempt > _budget:
             if (_transient_retries_enabled(args) and not _transient_used
                     and _is_transient_dispatch_error(result)):
@@ -2218,6 +2228,7 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
     # the attempt either way (and doubles as Phase-2 scoping telemetry, E1).
     from _builder import supports_acp as _supports_acp
     if (result.get("status") in ("error", "partial")
+            and not is_terminal_nonretryable(result)
             and invocation.transport == "subprocess"
             and invocation.permission == "yolo"  # ACP refuses sub-yolo tiers
             and _supports_acp(invocation.cli)

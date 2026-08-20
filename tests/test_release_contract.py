@@ -16,7 +16,7 @@ class ReleaseContractTests(unittest.TestCase):
     def test_current_companions_are_version_converged(self):
         facts = contract.version_facts(ROOT)
         self.assertTrue(facts["converged"], facts)
-        self.assertEqual(facts["canonical"], "3.0.0")
+        self.assertEqual(facts["canonical"], "3.1.0-preview.1")
         self.assertEqual(set(facts["versions"]), {"dispatcher", "mcp_server", "plugin"})
 
     def test_migration_contract_is_present_and_complete(self):
