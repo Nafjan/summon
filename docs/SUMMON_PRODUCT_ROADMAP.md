@@ -1,11 +1,11 @@
 # Summon product roadmap
 
-Last reviewed: 2026-08-18
-Current release: `3.0.0-ga`
+Last reviewed: 2026-08-20
+Current release: `3.1.0`
 Product status: dispatch and council are public. The local chat atlas and swarm coordinator
 are public preview surfaces. Deliberation and provider lanes use independent evidence gates.
 
-The immutable `v3.0.0-ga` tag is the source-bound GA release. The older `v3.0.0` tag remains
+The immutable `v3.1.0` tag is the source-bound GA release. The older `v3.0.0-ga` tag remains
 the historical provider-inert preview baseline. The certified source passed all 17 fixed
 suites and all eight release gates, with clean source and converged managed installs. The
 reviewed Claude matrix covered a normal decided run, durable cancellation after provider
@@ -17,24 +17,23 @@ hosting remain separately gated.
 This roadmap records what is shipped, what is tested, and which provider lanes remain preview
 or independently live-provider-gated.
 
-The next milestone is documented in [`SUMMON_3.1_PLAN.md`](SUMMON_3.1_PLAN.md). It is a
-trust-and-reliability release: the shared authority and durable execution contract comes
-first, followed by council-to-deliberate completion, a provider-neutral swarm adapter, and
-chat-atlas lifecycle/accessibility hardening. The plan does not promote preview surfaces or
-provider lanes without their own machine-recorded gates.
+The 3.1 milestone delivered the trust-and-reliability contract, evidence-integrity guard,
+local lifecycle hardening, and the bounded Claude deliberation gate. The remaining roadmap
+work is post-GA: richer chat/swarm workflows and additional provider lanes must earn their
+own machine-recorded gates and are not implied by this release.
 
 ## Release snapshot
 
 | Area | Current truth | Release posture |
 | --- | --- | --- |
 | Ordinary dispatch, council, ACP, telemetry | Implemented and locally exercised | Ready for continued public use |
-| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; the Claude route now has exact `model.served` and matched account-digest evidence; Fable, Gemini, and other routes remain unverified | Claude is live-provider-gated for 3.0.0; other lanes remain gated until their own receipts |
+| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; the Claude route has exact `model.served` and matched account-digest evidence; Fable, Gemini, and other routes remain unverified | Claude is live-provider-gated for 3.1.0; other lanes remain gated until their own receipts |
 | Deliberation kernel, journal replay/recovery, scheduler | Focused `test_deliberation_*.py` suite; provider-inert | Ready as a fake/injected integration surface |
 | Custom Agent manifests and roster binding | Strict parser, path fencing, consent/identity binding | Ready as provider-inert configuration |
 | Live provider composition | Receipt/plan/owner/deadline fences plus reviewed Claude normal/cancel/deadline matrix; deadline remains conservatively indeterminate with uncertain spend | Claude gate passes; provider expansion remains separately gated |
 | Browser conversation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, visual evidence, and explicit cancellable roster-agent turns; richer multi-run lifecycle remains preview | Unreleased post-GA preview |
 | Local swarm coordinator | `_rundir`-backed owner/lease/claim journal, idempotent worker messages, claim-bound artifacts, cancellation, and explicit uncertain-spend recovery; no implicit provider or IDE attachment | Provider-neutral preview |
-| Managed local installs | The installer detects nine host profiles (eight managed records) and all eight managed copies match the candidate | Convergence is source-bound in the clean release registry; `doctor` reports unmanaged local copies without publishing their identity or hashes |
+| Managed local installs | The installer detects nine host profiles (eight managed records) and all eight managed copies match 3.1.0 | Convergence is source-bound in the clean release registry; `doctor` reports unmanaged local copies without publishing their identity or hashes |
 
 Telemetry is opt-in and local-only. “On” means bounded, allow-listed JSONL diagnostics; it does not transmit data. See [local diagnostics and telemetry](TELEMETRY.md) for the privacy boundary. GitHub issue submission remains a separate explicit action. Release documents do not record any workstation's telemetry state.
 
@@ -90,8 +89,8 @@ No open P0/P1 reliability, security, privacy, migration, or evidence contradicti
 remain. The release manifest is generated from a clean, immutable source tree and
 requires the named suites and gates rather than accepting arbitrary caller-supplied
 labels. Earlier evidence packets, including the packet for commit `5530459`, are
-historical and must not be reused after source changes. The current candidate's fixed
-suites, non-live gates, and reviewed Claude live-provider gate pass; `v3.0.0-ga`
+historical and must not be reused after source changes. The 3.1.0 candidate's fixed
+suites, non-live gates, and reviewed Claude live-provider gate pass; `v3.1.0`
 points at the certified clean release commit. The public release page contains
 the source and release notes; redacted evidence remains outside the source tree.
 Fable, Gemini, and other provider lanes remain unverified, and

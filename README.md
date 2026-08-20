@@ -172,7 +172,8 @@ running the fixed release-test registry:
 python tools/release_gates.py --require-clean --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json"
 python tools/release_manifest.py \
   --evidence-file "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json" \
-  --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" --check
+  --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" \
+  --expected-version 3.1.0 --check
 ```
 
 The runner executes the fixed suites, records output digests, strips backend credentials and
@@ -181,8 +182,8 @@ be generated from a clean checkout (`--require-clean`); a dirty local run is dia
 Keep both evidence and manifest outside the checkout. Otherwise, creating them can make the
 source tree dirty before the manifest verifies Git cleanliness.
 The `--check` option is the GA gate. It requires a clean tree, converged owned installs, and
-every named release gate recorded as `pass`. The preview runner leaves gates as `not_run`, so
-do not present preview evidence as a release certification.
+every named release gate recorded as `pass`. A diagnostic run with missing gates is not release
+evidence and must not be presented as certification.
 The installer preserves unmanaged host copies and reports local drift through `doctor`; it does
 not overwrite those copies automatically. The version, migration, compatibility, and rollback
 contract is documented in
@@ -460,7 +461,7 @@ vendors.
   "report_ok": true,
   "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
                "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
-  "summon":  { "version": "3.1.0-preview.1", "scripts_sha256": "<sha256>" },
+  "summon":  { "version": "3.1.0", "scripts_sha256": "<sha256>" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },

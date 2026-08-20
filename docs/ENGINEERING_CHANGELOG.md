@@ -27,11 +27,11 @@ never on added fields.
   `--retry-nonretryable` override after repairing provider state. The override permits
   one fresh dispatch; a second empty result remains suppressed.
 
-## [3.1.0-preview.1] - 2026-08-20
+## [3.1.0] - 2026-08-20
 
-This preview contains the evidence-integrity slice from the 3.1 plan. It is source-bound
-only after the release manifest and fresh suite evidence are generated for the tagged
-commit; it does not close the broader 3.1-to-GA lifecycle gates.
+This release contains the evidence-integrity slice and the governed Claude deliberation
+pilot from the 3.1 plan. The release manifest and fresh suite evidence are generated from
+the tagged commit. Chat/swarm previews and other providers remain separately bounded.
 
 - `empty_terminal_result` is a typed, non-retryable failure with a consistent exit tuple
   and preserved backend exit evidence.
@@ -39,6 +39,9 @@ commit; it does not close the broader 3.1-to-GA lifecycle gates.
   provenance without treating a requested target as proof of service.
 - Fan-out and result reuse preserve typed empty failures; `--retry-nonretryable` is the
   only explicit one-attempt override, and a second empty result remains suppressed.
+- The live ballot system context is explicitly non-interactive and excludes ordinary
+  tool/plan/report instructions. A real Claude matrix covered normal decision, cancel,
+  and deadline/indeterminate cases with clean teardown and no fallback.
 
 ## [3.0.0-ga] - 2026-08-18
 

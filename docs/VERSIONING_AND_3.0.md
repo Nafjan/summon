@@ -1,6 +1,6 @@
 # Summon 2.x -> 3.0 release and migration contract
 
-Status: 3.0.0 GA and 3.1 preview release contract. The release manifest is generated from the clean
+Status: 3.0.0 and 3.1.0 GA release contract. The release manifest is generated from the clean
 immutable release commit and records aggregate results for the fixed suites, eight gates,
 the migration packet, managed installs, and the redacted live-provider receipt. Keep the
 manifest, host inventory, and per-run evidence in the private release bundle.
@@ -10,14 +10,14 @@ GA release. The release owner must generate evidence from a clean, immutable tre
 bind it to the source hash and Git commit, and retain the manifest with the
 release artifact.
 
-## 3.1 preview boundary
+## 3.1 GA boundary
 
-The `3.1.0-preview.1` artifact keeps `envelope: 1` and adds only optional evidence
-fields. It is a preview of the evidence-integrity slice, not a certification of the
-deliberate lifecycle, swarm worker conformance, chat lifecycle, custom-agent validation,
-or live-provider gates described in `docs/SUMMON_3.1_PLAN.md`. A preview tag may be
-published only from a clean commit with fresh source-bound suite evidence. Do not call
-the artifact GA or infer live-provider behavior from an editorial model label.
+The `3.1.0` artifact keeps `envelope: 1` and adds only optional evidence fields. Its
+source-bound release evidence covers the evidence-integrity slice, fake lifecycle, local
+browser/chat safety suites, and one bounded Claude live-provider matrix. The matrix proves
+one normal decision, durable cancellation after provider contact, and a conservative
+deadline/indeterminate outcome. Chat/swarm previews and other provider routes remain
+separately labeled; no live behavior is inferred from an editorial model label.
 
 ## Compatibility boundary
 
@@ -52,7 +52,7 @@ the artifact GA or infer live-provider behavior from an editorial model label.
    python tools/release_manifest.py \
      --evidence-file "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json" \
      --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" \
-     --expected-version 3.0.0 --check
+     --expected-version 3.1.0 --check
    ```
 
    The runner also writes one immutable `gate.<name>.json` artifact for each
@@ -108,8 +108,8 @@ the profile metadata itself remains private and outside the release artifact.
 
 ## Release decision
 
-The 3.0.0 candidate has a source-bound, reviewed Claude receipt. The fixed registry records
-all 17 suites and all eight gates as `pass`, with a clean source tree and converged managed
-installs. The Claude receipt closes that provider gate for 3.0.0. It does not certify Fable,
-Gemini, or any other route; each provider must earn an independent receipt. Keep the receipt,
+The 3.1.0 candidate has a source-bound Claude receipt generated from the bounded pilot. The
+fixed registry records all 17 suites and all eight gates as `pass`, with a clean source tree
+and converged managed installs. The Claude receipt closes that provider gate for 3.1.0. It
+does not certify Fable, Gemini, or any other route; each provider must earn an independent receipt. Keep the receipt,
 manifest, host inventory, and any account-evidence digest in the private release bundle.

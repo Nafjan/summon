@@ -1,8 +1,8 @@
 # Summon 3.1 plan
 
-Status: candidate planning target. Summon 3.0.0 remains the current GA release;
-no 3.1 tag or release exists until the gates below are recorded on one clean
-source commit.
+Status: 3.1.0 GA release contract. The evidence-integrity and governed Claude
+deliberation gates are recorded on one clean source commit; chat/swarm previews and
+other provider routes remain independently bounded.
 
 Summon 3.1 is a trust-and-reliability release. It should make the preview
 surfaces durable and useful without turning preview behavior into an implied
@@ -147,8 +147,9 @@ SSE, DOM, and telemetry projections.
   cancellation, deadline, cleanup, and uncertain-spend evidence is complete.
 
 Acceptance: clean immutable source, reproducible release manifest, no open P0/P1,
-and truthful GA/preview labels. If the live-provider gate is blocked, publish a
-3.1 preview rather than calling the gated lane GA.
+and truthful GA/preview labels. The 3.1.0 candidate met this bar with the bounded
+Claude live-provider gate; a future provider or surface without its own evidence stays
+preview.
 
 ## 5. Release gates
 
@@ -197,12 +198,12 @@ that actually completed:
 | GLM 5.2 | Preview only | Text-seat review of the supplied release brief; no filesystem access |
 | Kimi K3 | No report | No endorsement is inferred from an unavailable review lane |
 
-The consensus is therefore: land the evidence slice only after local
-verification, and publish at most a `3.1` preview. Do not call it GA, do not
-claim live-provider behavior, and do not describe an unavailable reviewer as an
-approval.
+The release decision is now: the evidence slice and bounded Claude lane passed local
+verification and the fixed release registry. Publish 3.1.0 GA with the private,
+source-bound receipt. Do not infer Fable, Gemini, Kimi, or any other provider from this
+receipt, and keep chat/swarm/other-provider boundaries visible in public docs.
 
-Before a preview tag or GitHub release, the release owner must record all of
+Before the GA tag or GitHub release, the release owner must record all of
 the following against the exact commit being tagged:
 
 1. A clean tree and synchronized version/changelog metadata.
@@ -219,6 +220,6 @@ the following against the exact commit being tagged:
    does not include private prompts, receipts, paths, account data, or
    telemetry.
 
-The deliberate lifecycle, swarm conformance, chat lifecycle, custom-agent
-validation, and live-provider evidence gates remain separate 3.1-to-GA work;
-passing this evidence slice does not close them.
+The remaining chat/swarm enhancements, richer continuation, and additional provider
+receipts are post-GA work. They must earn their own gates and do not silently inherit
+the Claude receipt.
