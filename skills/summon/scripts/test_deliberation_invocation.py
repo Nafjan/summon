@@ -104,6 +104,27 @@ class InvocationPlanTests(unittest.TestCase):
         self.assertIn("supersede any generic human-facing report", plan.template.system_context)
         self.assertIn("Do not emit\nthat report block or prose", plan.template.system_context)
 
+    def test_live_ballot_context_excludes_interactive_seat_instructions(self):
+        self.add_agent(
+            body=("Inspect the repository with tools, enter plan mode, and end "
+                  "with a long Final report block."))
+        frozen = roster.freeze_roster(
+            (roster.SeatRequest("one", "worker", role="reviewer"),),
+            cwd=str(self.cwd), agents_dir=str(self.agents), role_enabled=False)
+        plan = invplan.build_invocation_plans(
+            frozen, decision_id="decision", cwd=str(self.cwd), ballot_only=True)["one"]
+        context = plan.template.system_context
+        self.assertIn("Return exactly one JSON object", context)
+        self.assertIn("Do not call tools", context)
+        self.assertNotIn("Inspect the repository with tools", context)
+        self.assertNotIn("Final report block", context)
+
+    def test_ballot_only_requires_a_boolean(self):
+        frozen = self.freeze()
+        with self.assertRaises(invplan.InvocationPlanningError):
+            invplan.build_invocation_plans(
+                frozen, decision_id="decision", cwd=str(self.cwd), ballot_only="yes")
+
     def test_wrong_prompt_digest_is_refused_before_provider(self):
         frozen = self.freeze()
         plan = invplan.build_invocation_plans(frozen, decision_id="decision",

@@ -758,7 +758,8 @@ def _run_fresh_live(args, root: str, cwd: str) -> int:
     # The decision id is part of every prompt and plan identity.  Resolve it
     # before building the plans so the receipt and invocation agree.
     decision_id = "decision-" + uuid.uuid4().hex
-    plans = build_invocation_plans(roster, decision_id=decision_id, cwd=cwd)
+    plans = build_invocation_plans(
+        roster, decision_id=decision_id, cwd=cwd, ballot_only=True)
     policy = DeliberationPolicy(
         decision_id, tuple(seats), _csv(getattr(args, "options", None), "options"),
         getattr(args, "quorum"), max_attempts, False)

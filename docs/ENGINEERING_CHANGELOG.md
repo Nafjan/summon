@@ -13,6 +13,11 @@ never on added fields.
 
 ## Unreleased
 
+- **Live deliberation prompt boundary:** the real provider lane now strips ordinary
+  seat operating instructions from its system context and sends only the bounded
+  ballot contract. Generic agents can still use tools and report contracts in
+  ordinary dispatch; live deliberation remains read-only, non-interactive, and
+  receipt-bound. Added regression coverage for the isolation and boolean flag.
 - Added the dispatch evidence guard. ACP protocol completion is now validated against
   a usable result, so an empty terminal turn cannot be reported as completed work.
 - Added the optional `served_model_evidence` envelope field with `reported`, `inferred`,

@@ -5,6 +5,11 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+- **Deliberation ballot isolation:** live provider turns now use a compact,
+  non-interactive ballot-only system context instead of inheriting ordinary agent
+  instructions for tools, plan mode, or long report blocks. This prevents provider
+  calls from hanging at the live boundary while preserving the frozen roster and
+  receipt identity used for ordinary deliberation planning.
 - **Dispatch evidence guard:** ACP turns and all final dispatch envelopes now reject
   empty successful results as errors instead of presenting them as completed work.
   Envelopes also expose additive `served_model_evidence` (`reported`, `inferred`, or

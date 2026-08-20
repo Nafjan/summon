@@ -304,7 +304,7 @@ def build_live_scheduler(*, owner: _rundir.Owner,
     try:
         plans = build_invocation_plans(
             roster, decision_id=policy.decision_id, cwd=cwd,
-            worktree_proofs=worktree_proofs)
+            worktree_proofs=worktree_proofs, ballot_only=True)
     except Exception as exc:  # no mutable roster details cross the boundary
         raise LiveDeliberationError("live invocation planning was refused") from exc
     binding = bind_live_receipt(
