@@ -109,10 +109,17 @@ class DeliberationUITests(unittest.TestCase):
         body = ui._page(nonce="syntax-test").decode("utf-8")
         scripts = re.findall(r"<script[^>]*>(.*?)</script>", body, flags=re.S)
         self.assertTrue(scripts)
-        checked = subprocess.run(
-            [node, "--check", "-"], input=scripts[-1], text=True,
-            capture_output=True, timeout=10, check=False,
-        )
+        # ``node --check -`` is reliable on POSIX but can wait for stdin on
+        # Windows runners even after Python has supplied the input.  Check a
+        # temporary file instead so the test exercises the same parser without
+        # a platform-specific pipe/EOF race.
+        with tempfile.TemporaryDirectory(prefix="summon-node-check-") as td:
+            script = Path(td) / "page.js"
+            script.write_text(scripts[-1], encoding="utf-8")
+            checked = subprocess.run(
+                [node, "--check", str(script)], text=True,
+                capture_output=True, timeout=30, check=False,
+            )
         self.assertEqual(checked.returncode, 0, checked.stderr)
 
     def test_flight_recorder_truth_and_responsive_polish_contract(self):

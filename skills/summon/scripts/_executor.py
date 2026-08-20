@@ -575,10 +575,27 @@ def _attach_eligibility(resp: dict) -> dict:
         verdict = None
     if verdict is not None:
         resp["eligibility"] = verdict
-        issue = ("is not eligible" if verdict["kind"] == "eligibility"
-                 else "is not authenticated")
-        resp.setdefault("warnings", []).append(
-            f"backend '{verdict['backend']}' {issue}: {verdict['guidance']}")
+        if verdict["kind"] == "auth":
+            # Authentication failures are actionable but must never trigger a
+            # silent provider retry. The safe repair plan tells an agent or
+            # operator exactly how to recover, while the explicit auth command
+            # remains opt-in and may still require browser approval.
+            resp["error_kind"] = "authentication_failed"
+            resp["auth"] = {
+                "backend": verdict["backend"],
+                "state": "expired_or_invalid",
+                "repair": verdict.get("repair"),
+                "requires_user_approval": True,
+                "retry_required": True,
+                "retry_safe": False,
+            }
+            resp.setdefault("warnings", []).append(
+                f"backend '{verdict['backend']}' authentication is unavailable: "
+                f"{verdict['guidance']} Run the documented login command, complete any "
+                "browser approval, then explicitly retry; Summon did not retry automatically.")
+        else:
+            resp.setdefault("warnings", []).append(
+                f"backend '{verdict['backend']}' is not eligible: {verdict['guidance']}")
     return resp
 
 

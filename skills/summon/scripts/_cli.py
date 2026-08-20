@@ -163,8 +163,10 @@ MODE_FLAGS = {
     "telemetry": {"telemetry_enable", "telemetry_disable", "telemetry_status",
                    "telemetry_clear", "json", "job_file"},
     "bug-report": {"bug_report", "bug_report_from", "bug_report_output",
-                    "bug_report_submit", "github_repo", "bug_title",
-                    "bug_description", "json", "job_file"},
+                     "bug_report_submit", "github_repo", "bug_title",
+                     "bug_description", "json", "job_file"},
+    "auth": {"auth_action", "auth_backend", "allow_auth_repair", "auth_timeout",
+              "probe", "cli", "json", "job_file"},
 }
 MODE_HINTS = {
     "manifest": ("Put per-job settings (model, effort, timeout, json_schema, "
@@ -205,7 +207,10 @@ MODE_HINTS = {
     "telemetry": ("telemetry is local-only and opt-in: it writes bounded, sanitized "
                   "JSONL evidence and never phones home."),
     "bug-report": ("bug-report writes a sanitized local report; review it before the "
-                   "explicit --submit-github action."),
+                    "explicit --submit-github action."),
+    "auth": ("auth status is read-only. auth repair never runs unless --allow-auth-repair "
+             "is explicit; a successful login still requires an explicit retry of the "
+             "original dispatch."),
 }
 FLAG_NAMES = {"sets": "--set"}  # dests whose flag spelling isn't dest.replace('_','-')
 TOKEN_DESTS = {"set": "sets", "from": "bug_report_from",
@@ -252,6 +257,8 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "telemetry"
     if getattr(args, "bug_report", False):
         return "bug-report"
+    if getattr(args, "auth_action", None):
+        return "auth"
     return None
 
 
@@ -297,7 +304,7 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 # discoverable command surface.
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
                "onboard", "manifest", "council", "deliberate", "agent", "jobs", "version",
-               "chat", "swarm", "role", "telemetry", "bug-report", "help", "--help", "-h"}
+               "chat", "swarm", "role", "telemetry", "bug-report", "auth", "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -310,6 +317,8 @@ Commands:
   models    [--cli BACKEND]                       what each backend can run now
   doctor    [--json] [--probe]                    check backends / setup health
   onboard   [--subscriptions …] [--reset] [--json] detect CLIs; write merge-safe prefs
+  auth      status [--cli BACKEND] [--probe]      show auth state and safe repair commands
+            repair BACKEND [--allow-auth-repair]  run one explicit vendor login flow
   manifest  FILE [--concurrency …] [--results-dir D]   run a batch swarm
   council   --question "…" [--members …] [--rounds 2]  decide by consensus
   deliberate --question "…" --seats A,B --options X,Y  bounded agent deliberation
@@ -421,6 +430,13 @@ Generate a sanitized local Markdown report from the latest event or SOURCE (enve
 telemetry JSONL, debug directory). Review the existing REPORT.md, then submit that exact
 file in the separate `--submit-github` form; submission never regenerates it.
 """,
+    "auth": """summon auth status [--cli BACKEND] [--probe] [--json]
+summon auth repair BACKEND [--allow-auth-repair] [--auth-timeout 5m] [--json]
+
+Show provider authentication state without exposing credentials. `repair` is blocked
+unless `--allow-auth-repair` is explicit; it starts only the vendor login command,
+may open a browser, never captures credentials, and never retries the original task.
+""",
 }
 
 
@@ -453,11 +469,27 @@ def rewrite_subcommand(argv: list) -> tuple:
     if head in ("list", "agents", "ls"):
         return ["--list", *rest], None
     if head == "models":
-        return ["--list-models", *rest], None
+        # Keep the public subcommand spelling ergonomic while the flat parser
+        # retains its explicit destination name.  Without this translation,
+        # `summon models --refresh` is rejected as an unknown flag even though
+        # the command is documented as the model-roster refresh entry point.
+        translated = ["--refresh-models" if item == "--refresh" else item for item in rest]
+        return ["--list-models", *translated], None
     if head == "doctor":
         return ["--doctor", *rest], None
     if head == "onboard":
         return ["--onboard", *rest], None
+    if head == "auth":
+        if not rest:
+            return argv, "help:auth"
+        action = rest[0]
+        if action not in ("status", "repair"):
+            return argv, f"error: unknown 'auth' action {action!r} (use status/repair)"
+        if action == "status":
+            return ["--auth-action", "status", *rest[1:]], None
+        if len(rest) < 2 or rest[1].startswith("-"):
+            return argv, "error: 'auth repair' needs a backend (for example kimi)"
+        return ["--auth-action", "repair", "--auth-backend", rest[1], *rest[2:]], None
     if head == "council":
         # `council resume <id>` and `council status <id>` are nested actions;
         # a bare `council …` stays the fresh-run form.
@@ -632,6 +664,9 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--list-models", dest="list_models", action="store_true",
                         help="Report invocable models per backend (live where the CLI exposes it; "
                              "filter with --cli)")
+    parser.add_argument("--refresh-models", dest="refresh_models", action="store_true",
+                        help="With --list-models: refresh live provider rosters where supported "
+                             "(may contact agy/arkcli; never changes the editorial catalog)")
     parser.add_argument("--onboard", action="store_true",
                         help="Detect CLIs, print install hints, write merge-safe prefs to "
                              "~/.agents/summon.json (never stores API secrets)")
@@ -643,6 +678,15 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="With --onboard: replace onboard section instead of merging")
     parser.add_argument("--no-write", dest="onboard_no_write", action="store_true",
                         help="With --onboard: detect only; do not write prefs")
+    parser.add_argument("--auth-action", choices=["status", "repair"],
+                        help="Provider authentication management action")
+    parser.add_argument("--auth-backend", dest="auth_backend",
+                        help="With --auth-action repair/status: backend name")
+    parser.add_argument("--allow-auth-repair", dest="allow_auth_repair", action="store_true",
+                        help="Explicitly authorize one vendor login command; it may open a "
+                             "browser, never captures credentials, and never retries a dispatch")
+    parser.add_argument("--auth-timeout", dest="auth_timeout", type=parse_timeout, default=300000,
+                        help="With auth repair: bounded login window (default: 300s)")
     telemetry_group = parser.add_mutually_exclusive_group()
     telemetry_group.add_argument("--telemetry-enable", dest="telemetry_enable",
                                  action="store_true", help="Enable bounded local diagnostics")

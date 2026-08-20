@@ -21,7 +21,8 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual([item["label"] for item in entries[:4]], ["frontier"] * 4)
         near = [item for item in entries if item["label"] == "near-frontier"]
         self.assertEqual([item["name"] for item in near],
-                         ["Grok", "Gemini Flash", "GLM", "DeepSeek V4 Flash"])
+                         ["Grok", "Gemini Flash", "GLM", "DeepSeek V4 Flash",
+                          "Luna", "Terra", "Spark"])
 
     def test_keys_and_routes_are_unique_and_dispatchability_is_explicit(self):
         value = catalog.load_catalog()
@@ -32,6 +33,11 @@ class ModelCatalogTests(unittest.TestCase):
                          "deepseek-v4-flash-ga-260731")
         self.assertTrue(next(item for item in value["entries"]
                              if item["name"] == "DeepSeek V4 Pro")["dispatchable"])
+        luna = next(item for item in value["entries"] if item["name"] == "Luna")
+        self.assertEqual(luna["availability"], "config_observed")
+        self.assertTrue(luna["dispatchable"])
+        self.assertFalse(next(item for item in value["entries"]
+                              if item["name"] == "Spark")["dispatchable"])
 
     def test_display_is_separate_from_served_evidence(self):
         display = catalog.display_for("agy", "gemini-3.7-flash-high")

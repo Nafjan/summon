@@ -729,7 +729,7 @@ def test_doctor_json_roundtrip():
     import _doctor
     rep = _doctor.doctor()
     parsed = _json.loads(_json.dumps(rep, ensure_ascii=False))
-    assert set(parsed["backends"]) == {"claude", "codex", "cursor-agent", "gemini", "kimi", "agy"}
+    assert set(parsed["backends"]) == {"claude", "codex", "cursor-agent", "gemini", "kimi", "agy", "arkcli"}
     assert isinstance(parsed["ok"], bool)
 
 
@@ -17704,6 +17704,46 @@ def test_onboard_detect_clis_paths_are_portable():
         if p:
             assert not os.path.isabs(p), p
             assert "Users" not in p and "\\" not in p
+
+
+def test_auth_failure_has_explicit_repair_plan_and_no_silent_retry():
+    import _doctor
+    import _executor
+    verdict = _doctor.classify_ineligibility("OAuth token expired", backend="kimi")
+    assert verdict and verdict["kind"] == "auth"
+    plan = verdict.get("repair")
+    assert plan and plan["command"] == "kimi login"
+    assert plan["requires_user_approval"] is True
+    assert plan["authorized_command"] == "summon auth repair kimi --allow-auth-repair"
+    envelope = {"status": "error", "cli": "kimi", "error": "token expired",
+                "output_tail": ""}
+    _executor._attach_eligibility(envelope)
+    assert envelope["error_kind"] == "authentication_failed"
+    assert envelope["auth"]["retry_safe"] is False
+    assert "did not retry" in " ".join(envelope.get("warnings", [])).lower()
+
+
+def test_auth_repair_is_blocked_without_explicit_authorization():
+    from _auth import run_auth_action
+    report = run_auth_action("repair", backend="kimi", allow=False)
+    assert report["status"] == "blocked"
+    assert report["error_kind"] == "authentication_repair_not_authorized"
+    assert "--allow-auth-repair" in report["message"]
+
+
+def test_model_discovery_refresh_is_explicit_and_includes_advisory_catalog():
+    import _resolver
+    original = _resolver._agy_live_models
+    _resolver._agy_live_models = lambda: ("live", ["stub-model"], None)
+    try:
+        out = _resolver.discover_models("codex", refresh=True)
+        assert out["codex"]["refresh_requested"] is True
+        assert out["codex"]["source"] in ("config", "static")
+        candidates = {item["id"] for item in out["codex"].get("catalog_candidates", [])}
+        assert "gpt-5.6-luna" in candidates
+        assert "gpt-5.3-spark" in candidates
+    finally:
+        _resolver._agy_live_models = original
 
 
 def test_frontmatter_allow_payg_does_not_grant_consent():

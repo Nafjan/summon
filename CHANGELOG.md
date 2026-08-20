@@ -5,7 +5,17 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
-Development changes after 3.1.0 will be recorded here.
+- **Authentication recovery:** expired or invalid provider credentials now produce a typed,
+  actionable repair plan. `summon auth status` is read-only; `summon auth repair BACKEND`
+  requires `--allow-auth-repair`, never captures credentials, and never retries the failed
+  dispatch implicitly.
+- **Roster freshness:** `summon models --refresh` explicitly refreshes provider rosters where
+  supported. Cached, configured, static, and live sources are distinguished, while exact
+  `model.served` evidence remains the authority for what ran. ArkCLI is now a first-class
+  discovery/auth lane; Codex candidates remain advisory when its CLI cannot enumerate models.
+- **CI reliability:** release evidence now checks the current 3.1.0 version, and the Windows
+  deliberation UI syntax test validates a temporary JavaScript file instead of waiting on a
+  stdin EOF path that can hang on Windows.
 
 ## [3.1.0] - 2026-08-20
 

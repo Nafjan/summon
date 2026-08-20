@@ -637,9 +637,22 @@ def main() -> None:
 
     # --list-models / --doctor: pure discovery queries. Need no agent/prompt/cwd —
     # answer and exit before any of those are validated.
+    if getattr(args, "auth_action", None):
+        from _auth import run_auth_action
+        report = run_auth_action(
+            args.auth_action,
+            backend=getattr(args, "auth_backend", None) or getattr(args, "cli", None),
+            allow=bool(getattr(args, "allow_auth_repair", False)),
+            probe=bool(getattr(args, "probe", False)),
+            timeout_s=max(1.0, int(getattr(args, "auth_timeout", 300000)) / 1000.0),
+        )
+        print(json.dumps(report, ensure_ascii=False) if args.json
+              else (report.get("message") or json.dumps(report, ensure_ascii=False, indent=2)))
+        sys.exit(0 if report.get("status") == "success" else 1)
+
     if args.list_models:
         print(json.dumps({
-            "models": discover_models(args.cli),
+            "models": discover_models(args.cli, refresh=bool(getattr(args, "refresh_models", False))),
             "note": "model lists are static/config- or live-endpoint-derived and do NOT verify "
                     "ACCOUNT eligibility; a listed backend can still fail a real dispatch "
                     "(e.g. an ineligible client tier). Run `doctor --probe` to confirm eligibility.",

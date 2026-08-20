@@ -1,12 +1,12 @@
 ---
 name: summon
-description: Summon another AI CLI — Claude, Codex, Cursor, Gemini, Kimi, or Antigravity — as a sub-agent to run a task, in parallel when useful. Use whenever the user names an agent or sub-agent to run, asks to delegate work to another AI or a specific model, wants a second opinion or a cross-vendor code review, wants to fan several models out over a task, or references an agent definition. One dispatcher over six CLI backends returns a structured JSON result and supports isolated git worktrees, background and manifest-driven swarms, JSON-schema-validated output, model discovery, and per-agent model/permission config. Formerly named "sub-agents".
+description: Summon another AI CLI — Claude, Codex, Cursor, Gemini, Kimi, Antigravity, or ArkCLI — as a sub-agent to run a task, in parallel when useful. Use whenever the user names an agent or sub-agent to run, asks to delegate work to another AI or a specific model, wants a second opinion or a cross-vendor code review, wants to fan several models out over a task, or references an agent definition. One dispatcher over seven CLI backends returns a structured JSON result and supports isolated git worktrees, background and manifest-driven swarms, JSON-schema-validated output, model discovery, and per-agent model/permission config. Formerly named "sub-agents".
 allowed-tools: Bash Read
 ---
 
 # Summon — Cross-Vendor Sub-Agents for Any AI CLI
 
-Spawns external CLI AIs (claude, cursor-agent, codex, gemini, kimi, agy) as isolated sub-agents with dedicated
+Spawns external CLI AIs (claude, cursor-agent, codex, gemini, kimi, agy, and arkcli) as isolated sub-agents with dedicated
 context. Supports session resume, per-call model/effort overrides, isolated git worktrees, background
 dispatch, structured report parsing, loose-file provenance, and provider cost/usage telemetry -- see
 Parameters and the response-field table. Optional local diagnostics are separate: they are disabled by
@@ -155,6 +155,17 @@ backend that isn't set up already returns a clear `error` carrying the same inst
 guidance plus the list of backends that ARE ready, never a crash, so relay that to the user
 instead of retrying.)
 
+**Authentication failures are a repair workflow, not a retry signal.** When a dispatch
+returns `error_kind: authentication_failed`, inspect its structured `auth.repair` plan and
+show the caller the vendor command. You may run the repair only when the caller has explicitly
+authorized it with `summon auth repair BACKEND --allow-auth-repair`; otherwise stop and give
+the exact command (for example, `kimi login` or `arkcli auth login`). A login may open a
+browser and still needs the user to approve it. After login, check `summon auth status --cli
+BACKEND` or `doctor --probe`, then retry the original task explicitly. Never silently retry,
+switch providers, capture credentials, or claim that a login succeeded because a browser was
+opened. `summon auth status` is read-only; `summon auth repair` runs only the allowlisted vendor
+login command and never replays the failed dispatch.
+
 For any significant orchestration, use `doctor --json` and inspect `installs.drift` too.
 It enumerates every known summon copy, identifies the running copy, and reports duplicates
 or stale hashes. Do not trust the version string alone: a field machine had seven current
@@ -252,9 +263,9 @@ capability census built from declared strings **understates** real capability. R
 ### Recommended cross-vendor roster lanes
 
 The bundled `researcher` seat is pinned to `gemini-3.7-flash-high`. This is a declared
-roster target, not current release evidence: the fixed 3.0 gate remains blocked until a
-saved receipt proves the exact `model.served`, profile/account, consent, and cleanup
-facts. Use it as Summon's primary evidence extractor and the recommended fast secondary
+roster target, not a provider guarantee: refresh the live roster and require a saved receipt
+that proves the exact `model.served`, profile/account, consent, and cleanup facts before
+calling it verified. Use it as Summon's primary evidence extractor and the recommended fast secondary
 voice for `/council` when that receipt is available:
 
 ```text
@@ -409,6 +420,10 @@ run or recommending it to a user.
 |-----------|----------|-------------|
 | `--list` | - | List available agents (no other params needed) |
 | `--list-models` | - | Report invocable models per backend (no other params needed; add `--cli` to filter). See "Model discovery" below |
+| `auth status [--cli BACKEND] [--probe]` | - | Read-only authentication status and safe repair guidance; `--probe` performs the minimal live check |
+| `auth repair BACKEND [--allow-auth-repair]` | - | Run one allowlisted vendor login flow only after explicit authorization; never retries the original task |
+| `--refresh-models` | No | With `--list-models`/`models`: refresh live provider rosters where supported; never changes the editorial catalog |
+| `--auth-action` / `--auth-backend` / `--allow-auth-repair` / `--auth-timeout` | No | Flat equivalents for the `auth` subcommands; repair remains blocked without explicit authorization |
 | `--doctor` | - | Check backend CLIs, wrapper deps, agents dir, git, **install drift**, and **T3 Code readiness** (`t3_code` in `--json`; portable labels only); add `--json` for machines. Run this FIRST on a new machine |
 | `telemetry enable\|disable\|status\|clear` | - | Manage opt-in, local-only diagnostics. Every dispatch outcome is represented by bounded, allow-listed metadata; prompt/result text and raw output are omitted, but deterministic prompt/error SHA-256 fingerprints may remain for correlation. No network call is made. Add `--json` for machine-readable output |
 | `bug-report` | - | Generate a sanitized local Markdown report from the latest event or `--from FILE`; add `--output FILE` to choose the destination. Review it, then submit that exact file with `bug-report --submit-github --from REVIEWED_REPORT.md` (uses your authenticated `gh` CLI) |
@@ -427,7 +442,7 @@ run or recommending it to a user.
 | `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
 | `--strict-agents-dir` | No | Governance mode: fail closed when the requested agent is absent from the selected roster; do not fall back to bundled or plugin definitions. Opt-in only; default resolution is unchanged |
 | `--enable-roles` | No | Opt into approved user-global role aliases. Exact roster names win; malformed, retargeted, chained, or unapproved aliases fail closed. Children inherit the flag |
-| `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `kimi`, `agy`, `gemini` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
+| `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `kimi`, `agy`, `gemini`, `arkcli` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
 | `--model` | No | Override the agent's frontmatter model for this call. Summon performs a side-effect-free backend/model namespace preflight first: a known cross-vendor pairing such as `--cli codex --model claude-opus-5` is returned as `status:blocked`, `error_kind:backend_model_incompatible`, with explicit compatible reroutes; it never builds a profile or spawns a provider. Unknown/future IDs are passed through rather than guessed. `--dry-run` reports the same refusal. |
 | `--profile` | No | Select a named private backend profile from `~/.agents/summon-profiles.json` (currently Claude only). The name is safe metadata; the registry keeps config/auth paths out of agent definitions and receipts. `--profile` overrides frontmatter `profile:` |
 | `--effort` | No | Reasoning / thinking intensity: `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none`/`default`/`off` = leave the backend alone). **Honored by claude + codex** (default **`high`**); **agy Gemini only when set explicitly** (rewrites model to `… (Low\|Medium\|High)`); **ignored** for cursor-agent / kimi / gemini CLI / openai-compat / arkcli (stderr note if you set it). Precedence: `--effort` > frontmatter `effort:` > `SUMMON_DEFAULT_EFFORT` > built-in `high` (claude/codex). Full matrix: [references/effort.md](references/effort.md) |
@@ -875,8 +890,13 @@ model, billing, and retention boundary explicitly.
 | gemini | gemini model ids (`-m`) | `gemini-3.1-pro` | CLI's default |
 | kimi | Kimi provider/model id (`--model`) | `kimi-code/k3`, `kimi-code/kimi-for-coding` | Kimi's default |
 | agy | display name or slug (see `agy models`) | `Claude Opus 4.6 (Thinking)`, `gemini-3.7-flash-high` | Gemini Flash tier |
+| arkcli | Coding Plan model id | `glm-5-2-260617` | ArkCLI plan selection |
 
-Run `--list-models` to see what each backend can run right now.
+Run `--list-models` to see what each backend can run right now. Use `summon models --refresh`
+when a provider roster may have changed. Treat `source: live` as a fresh provider response,
+`source: cache` as a cached response, `source: config` as a local default, and `source: static`
+as documentation only. A listed or cataloged model is not proof of account eligibility: only a
+successful dispatch envelope with exact `model.served` evidence establishes what ran.
 
 **`permission` → exact per-CLI flags** (what the script actually passes — the
 levels are NOT identical across CLIs; when behavior surprises you, check this table):

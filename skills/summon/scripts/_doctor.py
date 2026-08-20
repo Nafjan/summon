@@ -46,6 +46,20 @@ _BACKEND_ISSUE_SIGNS = (
      "GEMINI_API_KEY (metered), or switch to the agy (Antigravity) backend"),
     ("not authenticated", None, "auth", "run the backend's login/auth command"),
     ("authentication failed", None, "auth", "re-run the backend's login/auth command"),
+    ("authentication token expired", None, "auth", "refresh the backend login before retrying"),
+    ("oauth token expired", None, "auth", "refresh the backend login before retrying"),
+    ("refresh token expired", None, "auth", "refresh the backend login before retrying"),
+    ("token has expired", None, "auth", "refresh the backend login before retrying"),
+    ("token expired", None, "auth", "refresh the backend login before retrying"),
+    ("session has expired", None, "auth", "refresh the backend login before retrying"),
+    ("session expired", None, "auth", "refresh the backend login before retrying"),
+    ("invalid credentials", None, "auth", "refresh the backend login before retrying"),
+    ("invalid api key", None, "auth", "check the backend login or API-key configuration"),
+    ("api key not valid", None, "auth", "check the backend login or API-key configuration"),
+    ("401 unauthorized", None, "auth", "refresh the backend login before retrying"),
+    ("http 401", None, "auth", "refresh the backend login before retrying"),
+    ("status code 401", None, "auth", "refresh the backend login before retrying"),
+    ("403 forbidden", None, "auth", "check the backend account and refresh its login"),
     ("please log in", None, "auth", "run the backend's login/auth command"),
     ("please login", None, "auth", "run the backend's login/auth command"),
     ("login required", None, "auth", "run the backend's login/auth command"),
@@ -77,8 +91,14 @@ def classify_ineligibility(text, backend=None):
     low = text.lower()
     for sign, sbk, kind, guidance in _BACKEND_ISSUE_SIGNS:
         if sign in low and (sbk is None or backend is None or sbk == backend):
-            return {"kind": kind, "backend": sbk or backend or "?",
-                    "reason": sign, "guidance": guidance}
+            resolved_backend = sbk or backend or "?"
+            verdict = {"kind": kind, "backend": resolved_backend,
+                       "reason": sign, "guidance": guidance}
+            if kind == "auth":
+                plan = auth_repair_plan(resolved_backend)
+                if plan:
+                    verdict["repair"] = plan
+            return verdict
     return None
 
 
@@ -109,7 +129,54 @@ _BACKENDS = {
         "auth": "agy login  - Windows-only out of the box (ConPTY wrapper); "
                 "POSIX needs AGY_PTY_WRAPPER (see docs)",
     },
+    "arkcli": {
+        "install": "npm install -g @byteplus/ark-cli",
+        "auth": "arkcli auth login",
+    },
 }
+
+
+# Safe, vendor-specific repair plans. These are command names only: no token,
+# profile path, account identifier, or browser URL is ever persisted or emitted.
+# ``supports_autonomous`` means Summon can start the vendor's documented login
+# command when an operator explicitly grants ``--allow-auth-repair``. It does
+# not mean that Summon can approve a browser prompt or bypass user consent.
+_AUTH_REPAIR_PLANS = {
+    "claude": {"command": "claude auth login", "argv": ["claude", "auth", "login"],
+               "interaction": "browser", "supports_autonomous": True},
+    "codex": {"command": "codex login", "argv": ["codex", "login"],
+              "interaction": "browser", "supports_autonomous": True},
+    "cursor-agent": {"command": "cursor-agent login", "argv": ["cursor-agent", "login"],
+                      "interaction": "browser_or_terminal", "supports_autonomous": True},
+    # Gemini's first login is an interactive invocation rather than a stable
+    # login subcommand. Offer the instruction, but do not auto-start it.
+    "gemini": {"command": "gemini", "argv": ["gemini"],
+                "interaction": "browser_or_terminal", "supports_autonomous": False,
+                "note": "Gemini authentication is completed during its first interactive run."},
+    "kimi": {"command": "kimi login", "argv": ["kimi", "login"],
+              "interaction": "browser", "supports_autonomous": True},
+    "agy": {"command": "agy login", "argv": ["agy", "login"],
+            "interaction": "browser_or_terminal", "supports_autonomous": True},
+    "arkcli": {"command": "arkcli auth login", "argv": ["arkcli", "auth", "login"],
+               "interaction": "browser", "supports_autonomous": True},
+}
+
+
+def auth_repair_plan(backend: str | None) -> dict | None:
+    """Return safe, actionable auth metadata for ``backend``.
+
+    The returned value contains no resolved executable path, profile path, or
+    credential state, so it is safe to place in an error envelope or agent
+    context. Callers receive a fresh copy and cannot mutate the registry.
+    """
+    if not isinstance(backend, str) or backend not in _AUTH_REPAIR_PLANS:
+        return None
+    plan = dict(_AUTH_REPAIR_PLANS[backend])
+    plan["backend"] = backend
+    plan["requires_user_approval"] = True
+    plan["retry_required"] = True
+    plan["authorized_command"] = f"summon auth repair {backend} --allow-auth-repair"
+    return plan
 
 
 def _probe_version(path: str) -> str | None:
@@ -516,6 +583,12 @@ def render(report: dict) -> str:
                     detail = f"{ver} - installed; eligibility unverified  ({b['path']})"
         lines.append(f"  {mark} {name:<13} {detail}")
         lines.append(f"       auth: {b['auth_hint']}")
+        _auth_plan = auth_repair_plan(name)
+        if _auth_plan:
+            lines.append("       repair: "
+                         f"`{_auth_plan['command']}` (browser/terminal approval may be "
+                         "required); authorized: "
+                         f"`{_auth_plan['authorized_command']}`")
         # Native ACP support of the INSTALLED CLI (fallback/oversized prompts
         # depend on it); shown only where the backend can speak ACP at all.
         if b.get("acp"):

@@ -17,6 +17,7 @@ from typing import Mapping
 
 SCHEMA_VERSION = 1
 _LABELS = frozenset({"frontier", "near-frontier"})
+_AVAILABILITY = frozenset({"catalog_listed", "config_observed", "declared_unverified"})
 _SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/+()@-]{0,95}$")
 _CATALOG_PATH = Path(__file__).resolve().parents[1] / "references" / "model-catalog.json"
 
@@ -87,10 +88,13 @@ def load_catalog(path: str | Path = _CATALOG_PATH) -> dict[str, object]:
             raise ModelCatalogError(f"catalog entry {key} route is invalid")
         backend = route.get("backend")
         target = route.get("target")
+        availability = route.get("availability", "catalog_listed")
         if backend != "unverified" and (not isinstance(backend, str) or not backend):
             raise ModelCatalogError(f"catalog entry {key} backend is invalid")
         if target != model_id:
             raise ModelCatalogError(f"catalog entry {key} target must match model_id")
+        if availability not in _AVAILABILITY:
+            raise ModelCatalogError(f"catalog entry {key} availability is invalid")
         entries.append({
             "key": key, "vendor": vendor, "model_id": model_id,
             "role": _text(display.get("role"), "role"),
@@ -98,6 +102,7 @@ def load_catalog(path: str | Path = _CATALOG_PATH) -> dict[str, object]:
             "version": _text(display.get("version"), "version"),
             "label": label, "rank": rank, "lane": lane,
             "backend": backend, "target": target, "dispatchable": dispatchable,
+            "availability": availability,
         })
     raw["entries"] = entries
     return raw
@@ -125,6 +130,7 @@ def display_for(backend: str | None, model_id: str | None, *,
                 role=entry["role"],
                 name=entry["name"], version=entry["version"], label=entry["label"],
                 lane=entry["lane"],
+                availability=entry.get("availability", "catalog_listed"),
             )
             value = item.as_dict()
             value["catalog_schema"] = SCHEMA_VERSION

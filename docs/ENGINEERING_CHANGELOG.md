@@ -13,6 +13,20 @@ never on added fields.
 
 ## Unreleased
 
+- **Auth and onboarding contract:** added a read-only `auth status` path and an explicitly
+  authorized `auth repair BACKEND --allow-auth-repair` path. The repair executor is limited to
+  the registered vendor login command, inherits the shared platform spawn flags, bounds its
+  lifetime, does not capture credentials, and returns `retry_required` without replaying the
+  original dispatch. Auth signatures now cover expired OAuth/session tokens, invalid keys, and
+  common HTTP 401/403 forms.
+- **Model roster freshness:** added explicit `models --refresh` routing, ArkCLI Coding Plan
+  roster discovery with bounded cache/live source labels, and advisory Codex catalog candidates
+  for Luna, Terra, and Spark. Catalog metadata remains separate from served-model evidence;
+  unverified candidates are not pinned or treated as dispatch proof.
+- **Release/CI corrections:** synchronized the release-evidence workflow with 3.1.0 and made
+  the Windows JavaScript syntax test validate a temporary file rather than stdin, avoiding the
+  platform-specific Node EOF timeout. The new auth module is included in compile coverage.
+
 - **Live deliberation prompt boundary:** the real provider lane now strips ordinary
   seat operating instructions from its system context and sends only the bounded
   ballot contract. Generic agents can still use tools and report contracts in

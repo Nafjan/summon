@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 
 # Valid backends come from the single registry in _builder (imported lazily to
 # avoid an import cycle: _builder imports _loader, not _resolver).
@@ -91,7 +92,7 @@ def resolve_cli(frontmatter_cli: str | None, default: str = "codex") -> str:
 
 
 # --- Model discovery ----------------------------------------------------------
-# Only ONE backend (agy) exposes a machine-readable model list; the others pick
+# Only a subset of backends exposes a machine-readable model list; the others pick
 # a model via --model/-m with no `models` subcommand. discover_models() is honest
 # about this: it live-queries where it can, reads the CLI's own config where the
 # default lives (codex), and otherwise returns the documented aliases/defaults
@@ -157,8 +158,8 @@ def _codex_default_model_scan(cfg: str) -> str | None:
 
 
 def _agy_live_models() -> tuple[str, list, str | None]:
-    """(source, models, note). Live `agy models` — the only backend with a
-    machine-readable list. Fails soft: a missing/slow/erroring agy yields
+    """(source, models, note). Live `agy models` exposes a machine-readable list.
+    Fails soft: a missing/slow/erroring agy yields
     ("unavailable", [], reason) rather than raising."""
     exe = shutil.which("agy")
     if not exe:
@@ -178,17 +179,40 @@ def _agy_live_models() -> tuple[str, list, str | None]:
     return "live", models, None
 
 
-def discover_models(cli: str | None = None) -> dict:
+def _catalog_candidates(backend: str) -> list[dict]:
+    """Return advisory catalog candidates without turning them into evidence."""
+    try:
+        from _model_catalog import load_catalog
+        out = []
+        for entry in load_catalog().get("entries", []):
+            if entry.get("backend") != backend:
+                continue
+            out.append({
+                "id": entry.get("target"),
+                "name": entry.get("name"),
+                "version": entry.get("version"),
+                "label": entry.get("label"),
+                "availability": entry.get("availability", "catalog_listed"),
+                "dispatchable": bool(entry.get("dispatchable")),
+            })
+        return out
+    except Exception:  # noqa: BLE001 - discovery is advisory and fail-soft
+        return []
+
+
+def discover_models(cli: str | None = None, *, refresh: bool = False) -> dict:
     """Report, per backend, what models are invocable and how new ones surface.
 
     Each entry carries a ``source`` so the caller knows how much to trust the list:
-      - ``live``        queried from the CLI just now (only agy exposes this)
+      - ``live``        queried from the CLI just now (agy or ArkCLI refresh)
       - ``config``      read from the CLI's own default config (codex)
       - ``static``      documented aliases/defaults to pass via --model (the CLI
                         has no machine-readable list); NOT a live enumeration
       - ``unavailable`` a live query was attempted and failed (see ``note``)
 
     Pass ``cli`` (accepts "cursor" or "cursor-agent") to limit to one backend.
+    ``refresh=True`` may contact a provider roster endpoint where one exists;
+    it never rewrites the editorial catalog and never proves account eligibility.
     """
     # Normalize + validate FIRST, before any import or backend work, so a
     # single-backend query never does another backend's work — critically,
@@ -205,56 +229,67 @@ def discover_models(cli: str | None = None) -> dict:
         return key is None or key == backend
 
     info: dict = {}
+    checked_at = int(time.time())
+
+    def stamp(entry: dict, backend: str) -> dict:
+        entry.setdefault("checked_at", checked_at)
+        entry.setdefault("refresh_requested", bool(refresh))
+        candidates = _catalog_candidates(backend)
+        if candidates:
+            entry.setdefault("catalog_candidates", candidates)
+        return entry
 
     # claude: no `models` subcommand. Model is chosen via --model, and the
     # opus/sonnet/haiku ALIASES auto-resolve to the latest release, so an
     # alias-pinned agent floats for free — no skill edit when a new model ships.
     if want("claude"):
-        info["claude"] = {
+        info["claude"] = stamp({
             "source": "static",
             "aliases": list(_CLAUDE_ALIASES),
             "note": "Aliases auto-resolve to the latest model (float for free). "
                     "Full IDs (e.g. claude-opus-5, claude-fable-5) also accepted via --model. "
                     "NOTE: the aliases can LAG the newest release -- pin a full id to be sure.",
-        }
+        }, "claude")
 
     # codex: no `models` subcommand. Unpinned agents inherit ~/.codex/config.toml's
     # top-level `model`; -m/--model overrides per call.
     if want("codex"):
         codex_default = _codex_default_model()
-        info["codex"] = {
+        info["codex"] = stamp({
             "source": "config" if codex_default else "static",
             "default": codex_default,
             "note": "Unpinned codex agents use ~/.codex/config.toml `model`. Any codex "
-                    "model id works via --model; edit config.toml to move the default.",
-        }
+                    "model id works via --model; edit config.toml to move the default. "
+                    "The CLI does not expose a complete model enumeration; catalog candidates "
+                    "are advisory until a dispatch envelope proves model.served.",
+        }, "codex")
 
-    # agy: the one backend with a live, machine-readable list (only probed when
+    # agy: a backend with a live, machine-readable list (only probed when
     # in scope, per the early filter above).
     if want("agy"):
         src, models, note = _agy_live_models()
-        info["agy"] = {"source": src, "models": models,
-                       "note": note or "Live from `agy models` (Claude + Gemini + GPT-OSS lanes on the Google sub)."}
+        info["agy"] = stamp({"source": src, "models": models,
+                       "note": note or "Live from `agy models` (Claude + Gemini + GPT-OSS lanes on the Google sub)."}, "agy")
 
     # cursor-agent: no model list, no floating alias -> pinned default constant.
     if want("cursor-agent"):
         # Imported here (only when actually needed) so an unknown-cli or
         # non-cursor query never depends on _builder importing cleanly.
         from _builder import CURSOR_DEFAULT_MODEL
-        info["cursor-agent"] = {
+        info["cursor-agent"] = stamp({
             "source": "static",
             "default": CURSOR_DEFAULT_MODEL,
             "note": "cursor-agent exposes no model list; --model accepts cursor model ids "
                     "(default = CURSOR_DEFAULT_MODEL in _builder.py, the single bump-point).",
-        }
+        }, "cursor-agent")
 
     # gemini: -m accepts model ids; only --list-extensions/--list-sessions exist.
     if want("gemini"):
-        info["gemini"] = {
+        info["gemini"] = stamp({
             "source": "static",
             "note": "gemini exposes no model list; -m/--model accepts gemini model ids; "
                     "unpinned uses gemini's own default.",
-        }
+        }, "gemini")
 
     # Kimi Code has no model-list command.  The selected default is in its own
     # TOML profile, but it can be an alias/provider-local identifier, so report
@@ -270,11 +305,51 @@ def discover_models(cli: str | None = None) -> dict:
             default = value if isinstance(value, str) else None
         except (ImportError, OSError, ValueError):
             pass
-        info["kimi"] = {
+        info["kimi"] = stamp({
             "source": "config" if default else "static",
             "default": default,
             "note": "Kimi Code accepts --model aliases but exposes no model-list command; "
                     "the unpinned default comes from ~/.kimi-code/config.toml.",
-        }
+        }, "kimi")
+
+    # ArkCLI/ModelArk exposes a Coding Plan roster. Keep the normal query
+    # offline by reading the existing bounded cache; `--refresh` explicitly
+    # asks arkcli to update it and may therefore require auth/network access.
+    if want("arkcli"):
+        try:
+            from _apibackend import load_coding_plan_roster, refresh_coding_plan_roster
+            note = None
+            if refresh:
+                # An explicit refresh means a fresh provider query, not merely
+                # a stale-age check. Fall back to the bounded cache if the
+                # provider is unavailable so discovery remains useful offline.
+                try:
+                    roster = refresh_coding_plan_roster()
+                except Exception as exc:  # noqa: BLE001 - preserve cache on refresh failure
+                    roster = load_coding_plan_roster(refresh_if_stale=False)
+                    note = f"refresh unavailable: {type(exc).__name__}; using cache"
+            else:
+                roster = load_coding_plan_roster(refresh_if_stale=False)
+        except Exception as exc:  # noqa: BLE001 - model discovery is fail-soft
+            roster = None
+            note = f"roster query unavailable: {type(exc).__name__}"
+        if roster:
+            fetched_at = roster.get("fetched_at")
+            age_s = (max(0, int(time.time() - fetched_at))
+                     if isinstance(fetched_at, (int, float)) else None)
+            info["arkcli"] = stamp({
+                "source": "live" if refresh and age_s is not None and age_s < 10 else "cache",
+                "models": roster.get("models") or [],
+                "selected_model_id": roster.get("selected_model_id"),
+                "cache_age_s": age_s,
+                "note": ("Coding Plan roster from arkcli; listed is not the same as "
+                         "invocable or recommended. Verify model.served."),
+            }, "arkcli")
+        else:
+            info["arkcli"] = stamp({
+                "source": "unavailable", "models": [],
+                "note": note or ("No Coding Plan roster cache. Run `summon models --cli "
+                                  "arkcli --refresh` after `arkcli auth login`."),
+            }, "arkcli")
 
     return info

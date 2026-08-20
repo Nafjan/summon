@@ -142,6 +142,10 @@ def _install_hint(entry: dict) -> str:
 
 
 def detect_clis() -> list[dict[str, Any]]:
+    try:
+        from _doctor import auth_repair_plan
+    except Exception:  # noqa: BLE001 - onboarding must remain usable standalone
+        auth_repair_plan = lambda _backend: None
     rows = []
     for entry in _CLI_CATALOG:
         found_path = None
@@ -161,6 +165,8 @@ def detect_clis() -> list[dict[str, Any]]:
             "path": found_bin if found_path else None,
             "install": _install_hint(entry),
             "auth": entry["auth"],
+            "auth_state": "unverified",
+            "auth_plan": auth_repair_plan(entry["id"]),
         })
     return rows
 
@@ -194,6 +200,12 @@ def render_detection(clis: list[dict[str, Any]], creds: dict[str, Any]) -> str:
     for row in clis:
         if row["found"]:
             lines.append(f"  [OK] {row['id']:14} {row['path']}")
+            lines.append("       auth:    unverified (run `summon auth status --cli "
+                         f"{row['id']}` or `doctor --probe`)")
+            plan = row.get("auth_plan") or {}
+            if plan.get("command"):
+                lines.append(f"       repair:  `{plan['command']}`; authorized flow: "
+                             f"`{plan.get('authorized_command', '')}`")
         else:
             lines.append(f"  [--] {row['id']:14} not found")
             lines.append(f"       install: {row['install']}")

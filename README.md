@@ -11,7 +11,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/core-stdlib_only-brightgreen.svg" alt="core: stdlib only">
-  <img src="https://img.shields.io/badge/backends-6-brightgreen.svg" alt="6 backends">
+  <img src="https://img.shields.io/badge/backends-7-brightgreen.svg" alt="7 backends">
   <img src="https://img.shields.io/badge/install-npx_skills_add-8B5CF6.svg" alt="npx skills add">
 </p>
 
@@ -20,7 +20,7 @@
 Summon is a dependency-free dispatcher. It routes tasks from one agent CLI to supported CLIs
 and configured endpoints wherever the host can execute a shell command:
 
-- **Coding CLIs:** Claude Code, Codex, Cursor CLI, Gemini CLI, Kimi, and Antigravity.
+- **Coding CLIs:** Claude Code, Codex, Cursor CLI, Gemini CLI, Kimi, Antigravity, and ArkCLI.
 - **T3 Code:** install Summon into the Claude, Codex, and Cursor skill roots
   T3 discovers (`python install.py --profile t3`). Not a native T3 plugin; see
   [the T3 Code setup guide](skills/summon/references/t3-code.md).
@@ -38,10 +38,11 @@ OpenAI, Anthropic, Google, and local models (Ollama, LM Studio) work as agents t
                           ┌──────────────────────┐
    any host CLI ────────► │       summon         │ ───► claude         (Anthropic)
    (claude, codex,        │  stdlib dispatcher   │ ───► codex          (OpenAI)
-   cursor, gemini, kimi,  │  one JSON envelope   │ ───► cursor-agent   (Cursor)
+   cursor, gemini, kimi,   │  one JSON envelope   │ ───► cursor-agent   (Cursor)
    or your terminal)      │  no server, no pip   │ ───► gemini         (Google)
                           └──────────────────────┘ ───► kimi           (Moonshot AI)
-                                                   └──► agy            (Antigravity)
+                                                   ├──► agy            (Antigravity)
+                                                   ├──► arkcli         (BytePlus Coding Plan)
                                                    └──► openai-compat   (ModelArk / OpenRouter /
                                                         OpenAI / Anthropic / Google / Ollama / …)
 ```
@@ -53,7 +54,7 @@ to decide something. They run in parallel. Add `--worktree` to give each editing
 own isolated branch, and inspect or branch on the resulting JSON envelopes.
 
 Each backend uses its own login, so Summon can combine Claude, ChatGPT, Cursor, Gemini,
-and Antigravity on one task. Each provider keeps its own billing and account boundary.
+Antigravity, and ArkCLI on one task. Each provider keeps its own billing and account boundary.
 
 ---
 
@@ -165,6 +166,45 @@ python summon.py doctor      # which backends are ready? what's missing?
 python install.py            # install the skill into every detected AI CLI
 ```
 
+### Expired login recovery
+
+Provider logins expire independently. If a dispatch fails with an authentication error,
+Summon returns a safe, vendor-specific repair plan instead of silently retrying or switching
+models. Check a backend without launching a task:
+
+```bash
+python summon.py auth status --cli kimi
+python summon.py auth status --cli arkcli --probe
+```
+
+If the caller explicitly authorizes a login flow, Summon can start the vendor command (which
+may open a browser), but it never captures credentials and never retries the failed task:
+
+```bash
+python summon.py auth repair kimi --allow-auth-repair
+# finish browser approval, then retry the original command explicitly
+```
+
+Without that authorization, run the vendor command yourself (`kimi login`, `arkcli auth
+login`, or the command shown in the error). A successful login command is not proof that a
+model was served; inspect the next dispatch envelope's `model.served` field.
+
+### Keep the model roster fresh
+
+The model catalog supplies editorial names and roles, not service guarantees. Refresh provider
+rosters when onboarding, before a high-stakes review, or after a vendor announces a model:
+
+```bash
+python summon.py models --refresh
+python summon.py models --cli arkcli --refresh
+```
+
+`source: live` is a fresh provider response, `source: cache` is a cached roster, `source:
+config` is a local CLI default, and `source: static` is documentation only. Codex does not
+expose a complete enumeration command, so its configured default and catalog candidates are
+advisory. Pin a candidate only after a real dispatch proves the exact `model.served` value;
+never infer a new model from a display label or a task name.
+
 For a release or support bundle, generate a provider-inert evidence manifest after
 running the fixed release-test registry:
 
@@ -213,7 +253,7 @@ Set up "summon" for me (github.com/Nafjan/summon), a cross-vendor AI sub-agent d
 
 1. Clone https://github.com/Nafjan/summon and cd into it.
 2. Run `python summon.py doctor` and tell me which backends are installed (claude, codex,
-   cursor-agent, gemini, agy) and which are missing. That check reads versions only -- if I
+   cursor-agent, gemini, kimi, agy, arkcli) and which are missing. That check reads versions only -- if I
    approve a small live call per backend, run `doctor --probe` to verify sign-in and
    account eligibility too.
 3. Run `python install.py` to install the summon skill into every AI CLI on this machine
@@ -281,7 +321,8 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon dispatch --agent N --prompt … --cwd D` | run one agent (the default action) |
 | `summon list` | list available agents |
 | `summon agents validate [--cwd D] [--agents-dir D]` | validate provider-inert custom-agent manifests and print redacted identity/digest evidence |
-| `summon models [--cli B]` | invocable models per backend, with a `source` per entry (live query, local config, or static list) |
+| `summon models [--cli B] [--refresh]` | invocable models per backend, with a `source` per entry; refresh live provider rosters explicitly |
+| `summon auth status|repair BACKEND` | inspect auth state or run one explicitly authorized vendor login flow; never silently retries |
 | `summon doctor [--json]` | backend / setup health check (run this first) |
 | `summon manifest FILE` | run a batch fan-out (per-backend concurrency, resumable) |
 | `summon swarm create|status|claim|renew|cancel|close …` | use the durable local swarm coordinator; provider/IDE adapters remain explicit |
@@ -641,7 +682,7 @@ available, and the envelope's `model.served` confirms what ran (`resolved` is th
 field). Aliases can lag a launch by a day or two, so pin the explicit ID when you need
 the newest.
 
-**Does it need API keys?** For the six CLI backends, no. It drives the logins you already
+**Does it need API keys?** For the seven CLI backends, no. It drives the logins you already
 have, and it strips `OPENAI_API_KEY` from codex children so you're not silently billed at
 API rates. The `openai-compat` backend uses your API key by design.
 

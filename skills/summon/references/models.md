@@ -14,10 +14,10 @@ The current editorial bands are:
 
 | Band | Order | Models | Typical lane |
 |---|---:|---|---|
-| **Frontier** | 1–4 | Fable, Sol, Opus, Kimi | escalation, architecture, synthesis, high-context research |
-| **Near-frontier** | 1–5 | Grok 4.6, Gemini Flash 3.7, GLM 5.2, DeepSeek V4 Flash, DeepSeek V4 Pro | fast evidence, coding second opinions, and cost-efficient secondary work |
+| **Frontier** | 1–5 | Fable, Sol, Opus, Kimi, DeepSeek V4 Pro | escalation, architecture, synthesis, high-context research, deep reasoning |
+| **Near-frontier** | 1–7 | Grok 4.6, Gemini Flash 3.7, GLM 5.2, DeepSeek V4 Flash, Luna 5.6, Terra 5.6, Spark 5.3 | fast evidence, coding second opinions, and cost-efficient secondary work |
 
-These are Summon-curated labels as of 2026-08-14, not benchmark, safety, cost,
+These are Summon-curated labels as of 2026-08-20, not benchmark, safety, cost,
 availability, or vendor claims. A tooltip may show the role, model name, version,
 recommendation lane, catalog status, and whether an exact served-model match was
 observed. It must not show profiles, accounts, paths, prompts, credentials, or raw
@@ -52,11 +52,21 @@ reaches an agent depends only on how that agent names its model:
 > to claude-opus-5).
 
 `--list-models` answers "what can each backend run *right now*" live where the CLI
-exposes it. Each entry is tagged with a `source` so you know how much to trust it:
-- `live` — queried just now (`agy models` — the only backend with a real list)
+exposes it. Add `--refresh` in the subcommand form (`summon models --refresh`) or
+`--refresh-models` in the flat form when a provider roster may have changed. Each entry is
+tagged with a `source` so you know how much to trust it:
+- `live` — queried just now (`agy models` or an explicit ArkCLI refresh)
+- `cache` — read from a provider roster cache; refresh explicitly when it is stale
 - `config` — read from the CLI's own default config (`codex` → config.toml)
 - `static` — documented aliases/defaults to pass via `--model` (CLI has no list)
 - `unavailable` — a live query was attempted and failed (reason in `note`)
+
+ArkCLI's Coding Plan roster is live when the CLI exposes it and otherwise comes from its
+bounded local cache. Use `summon models --cli arkcli --refresh` after `arkcli auth login` to
+refresh it. Codex does not expose a complete enumeration command, so its config default and
+catalog candidates are advisory. In every case, the dispatch envelope's exact
+`model.served` field is the authority for what actually ran; a catalog label or candidate
+never proves account eligibility.
 
 Discover with `--list-models`, invoke with `--model`, verify with `model.served` —
 using a new model never requires editing the skill code itself.
@@ -82,12 +92,16 @@ and response for Kimi:
 | `planner`, `architect`, `deep-debugger`, `security-auditor` | claude | `claude-opus-5` (pinned) | planning, architecture, gnarly debugging, security audits |
 | `fable` | claude | `claude-fable-5` | escalation tier: hardest problems, highest-stakes calls |
 | `pair`, `editor`, `quick-reviewer`, `pr-prep` | claude | `claude-sonnet-5` | balanced general work, prose, fast reviews, PR prep |
-| `reviewer`, `adversarial-reviewer`, `implementer`, `debugger`, `test-author` | codex | config default (gpt-5.6-sol at snapshot) | code review, adversarial passes, implementation, tests |
+| `reviewer`, `adversarial-reviewer`, `implementer`, `debugger`, `test-author` | codex | CLI config default (inspect `summon models --cli codex --refresh`) | code review, adversarial passes, implementation, tests |
+| `luna` / explicit Codex candidate | codex | `gpt-5.6-luna` (config-observed; verify `model.served`) | cost-efficient, high-reasoning secondary lane |
+| `terra` / explicit Codex candidate | codex | `gpt-5.6-terra` (declared, unverified) | balanced secondary lane; do not pin until served evidence |
+| `spark` / explicit Codex candidate | codex | `gpt-5.3-spark` (declared, unverified) | fast/quota-isolated candidate; do not pin until served evidence |
 | `coder`, `bug-fixer` | cursor-agent | composer-2.5 | multi-step coding, bug fixing |
-| `kimi-worker` | kimi | `kimi-code/k3` (pinned, live verified) | high-context architecture, independent review, broad repository research, ambiguous multi-file work |
-| `kimi-coder` | kimi | `kimi-code/kimi-for-coding` (pinned, live verified) | scoped implementation, refactoring, debugging, focused verification |
-| `researcher` | agy | `gemini-3.7-flash-high` (live verified 2026-08-13) | primary evidence extraction, repo research, UI review, fast `/council` secondary |
+| `kimi-worker` | kimi | `kimi-code/k3` (pinned target; reverify `model.served`) | high-context architecture, independent review, broad repository research, ambiguous multi-file work |
+| `kimi-coder` | kimi | `kimi-code/kimi-for-coding` (pinned target; reverify `model.served`) | scoped implementation, refactoring, debugging, focused verification |
+| `researcher` | agy | `gemini-3.7-flash-high` (pinned target; refresh and reverify) | primary evidence extraction, repo research, UI review, fast `/council` secondary |
 | `docs-writer`, `frontend`, `antigravity` | agy | Gemini default (pin via `model:`) | docs, frontend, general agy work |
+| explicit ArkCLI Coding Plan seat | arkcli | refreshable plan roster (for example `glm-5-2-260617`) | fast value/coding-plan secondary; verify `model.served` |
 
 `researcher` is intentionally pinned rather than floating with agy's default. The
 3.7 Flash High route was verified through the local agy roster and a real Summon
