@@ -105,7 +105,7 @@ jobs:
         shell: bash
         run: |
           python summon.py --list-models > models.json
-          python -c "import json; m=json.load(open('models.json'))['models']; assert set(m) == {'claude','codex','agy','cursor-agent','gemini','kimi','arkcli'}; print({k: v['source'] for k, v in m.items()})"
+          python -c "import json; m=json.load(open('models.json'))['models']; assert set(m) == {'claude','codex','agy','cursor-agent','gemini','kimi','opencode','arkcli'}; print({k: v['source'] for k, v in m.items()})"
 
       - name: Dry-run resolves without executing (no backend needed)
         shell: bash
@@ -190,11 +190,12 @@ jobs:
       - name: Generate and bind machine release evidence
         shell: bash
         run: |
+          VERSION="$(python -c 'import json; print(json.load(open("plugin.json", encoding="utf-8"))["version"])')"
           python tools/release_gates.py --require-clean --output "$RUNNER_TEMP/release-evidence.json"
           python tools/release_manifest.py \
             --evidence-file "$RUNNER_TEMP/release-evidence.json" \
             --output "$RUNNER_TEMP/release-manifest.json" \
-            --expected-version "3.2.0"
+            --expected-version "$VERSION"
           python - <<'PY'
           import json
           import os
