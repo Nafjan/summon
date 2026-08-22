@@ -116,7 +116,8 @@ def _fail(msg: str, out_path: str | None = None) -> int:
             env["out_error"] = werr
     try:
         from _telemetry import record
-        record({"status": "error", "error": msg, "cli": "summon", "transport": "council"})
+        record({"status": "error", "error": msg, "cli": "summon", "transport": "council"},
+               operation="council")
     except Exception:  # noqa: BLE001 - diagnostics must never mask council errors
         pass
     print(json.dumps(env, ensure_ascii=False))
@@ -1068,7 +1069,7 @@ def run_council(args) -> int:
                 from _telemetry import record
                 record({**_env, "failure_class": "timeout", "error_kind": "timeout",
                         "timeout": {"stage": "council_setup"}, "cli": "summon",
-                        "transport": "council"})
+                        "transport": "council"}, operation="council")
             except Exception:  # noqa: BLE001 - diagnostics must never mask council errors
                 pass
             print(json.dumps(_env, ensure_ascii=False))
@@ -1153,7 +1154,7 @@ def run_council(args) -> int:
                 from _telemetry import record
                 record({**env, "failure_class": "timeout", "error_kind": "timeout",
                         "timeout": {"stage": "council_overall"}, "cli": "summon",
-                        "transport": "council"})
+                        "transport": "council"}, operation="council")
             except Exception:  # noqa: BLE001 - diagnostics must never mask council errors
                 pass
             print(json.dumps(env, ensure_ascii=False))
@@ -1557,7 +1558,7 @@ def run_council(args) -> int:
                 "failure_class": "timeout" if envelope.get("council_state") == "overall_timeout"
                                   else status,
                 "cli": "summon", "transport": "council",
-                "warnings": envelope.get("warnings")})
+                "warnings": envelope.get("warnings")}, operation="council")
     except Exception:  # noqa: BLE001
         pass
     return 0 if status == "success" else 1

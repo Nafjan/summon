@@ -42,7 +42,9 @@ reaches an agent depends only on how that agent names its model:
 > resolved to `claude-sonnet-4-6` while `claude-sonnet-5` was already available. Every
 > dispatch envelope reports `model.served` (the model that actually did the work, on
 > evidence; `model.targeted` is what the session was pointed at, and `resolved` is the
-> legacy field) — check it. For **guaranteed-latest**, pin the explicit version ID
+> legacy field) — check it. For an explicit Codex pin, `resolved` is never filled from
+> the ambient config default when the provider emits no identity; that default is not
+> evidence about the turn. For **guaranteed-latest**, pin the explicit version ID
 > (`claude-sonnet-5`, `claude-opus-5`) and re-verify when a new model ships; for
 > **auto-float-when-it-works**, use the alias but confirm `model.served` is what you
 > expect. This roster pins EVERY claude agent to a full version id -- both aliases were
@@ -93,6 +95,9 @@ and response for Kimi:
 | `fable` | claude | `claude-fable-5` | escalation tier: hardest problems, highest-stakes calls |
 | `pair`, `editor`, `quick-reviewer`, `pr-prep` | claude | `claude-sonnet-5` | balanced general work, prose, fast reviews, PR prep |
 | `reviewer`, `adversarial-reviewer`, `implementer`, `debugger`, `test-author` | codex | CLI config default (inspect `summon models --cli codex --refresh`) | code review, adversarial passes, implementation, tests |
+| `sol-review` | codex | `gpt-5.6-sol` (pinned) | adversarial architecture and release review |
+| `terra-review` | codex | `gpt-5.6-terra` (pinned candidate; require `model.served`) | balanced, cost-conscious review |
+| `luna-review` | codex | `gpt-5.6-luna` (pinned candidate; require `model.served`) | cheap, high-reasoning secondary review |
 | `luna` / explicit Codex candidate | codex | `gpt-5.6-luna` (config-observed; verify `model.served`) | cost-efficient, high-reasoning secondary lane |
 | `terra` / explicit Codex candidate | codex | `gpt-5.6-terra` (declared, unverified) | balanced secondary lane; do not pin until served evidence |
 | `spark` / explicit Codex candidate | codex | `gpt-5.3-spark` (declared, unverified) | fast/quota-isolated candidate; do not pin until served evidence |
@@ -110,6 +115,19 @@ account/endpoint-specific. Gemini/agy is a strong fast evidence extractor and
 cross-vendor reviewer, not a chairman, safety gate, or read-only guarantee: agy
 cannot enforce `read-only`, so do not silently use this seat for edits or provider
 execution.
+
+The named Codex review seats are pinned on purpose. A seat named for Sol or Terra
+must not inherit the account's default model; if the provider cannot serve the
+requested target, the dispatch is a routing failure and the envelope must be treated
+as such. `summon --list --json` also exposes each seat's declared `model` and
+`effort`, while a completed dispatch remains the only proof of `model.served`.
+
+Luna is a separate, intentionally selectable cost-efficient lane. “Luna Max” refers
+to the `gpt-5.6-luna` model at the provider's maximum reasoning setting, not a second
+model ID. Summon's portable Codex effort mapping currently clamps `max` to `high`,
+so a seat must not advertise Max unless its receipt proves the provider setting that
+was applied. Keep Luna available as a distinct seat rather than using it as a silent
+fallback for Sol or Terra.
 
 Cross-vendor routing rule of thumb: never have an agent's work reviewed by its own
 vendor — send claude/cursor-written code to a codex reviewer and codex-written code to

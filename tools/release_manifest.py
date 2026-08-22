@@ -56,7 +56,7 @@ REQUIRED_TESTS = frozenset({
     "swarm_coordinator",
     "model_routing", "release_contract",
     "account_evidence", "live_provider_gate",
-    "release_gates",
+    "release_gates", "telemetry_audit",
 })
 REQUIRED_GATES = frozenset({
     "fake_lifecycle", "browser_security", "model_identity",
@@ -81,6 +81,7 @@ REQUIRED_COMMANDS = {
     "deliberation_resume": "python -m unittest skills.summon.scripts.test_deliberation_resume",
     "model_catalog": "python -m unittest skills.summon.scripts.test_model_catalog",
     "model_routing": "python -m unittest skills.summon.scripts.test_model_routing",
+    "telemetry_audit": "python -m unittest tests.test_telemetry_audit",
 }
 # Gate commands are part of the release contract too.  They are intentionally
 # fixed in source rather than accepted from the CLI, so a release evidence file
@@ -91,7 +92,7 @@ REQUIRED_GATE_COMMANDS = {
     "model_identity": "python -m unittest skills.summon.scripts.test_model_catalog skills.summon.scripts.test_model_routing skills.summon.scripts.test_deliberation_roster -q",
     "migration_rollback": "python -m unittest tests.test_migration_gate -q",
     "managed_installs": "python tests/test_install.py",
-    "telemetry_privacy": "python -m unittest tests.test_telemetry_gate -q",
+    "telemetry_privacy": "python -m unittest tests.test_telemetry_gate tests.test_telemetry_audit -q",
     "accessibility": "python -m unittest skills.summon.scripts.test_conversation_ui skills.summon.scripts.test_deliberation_ui -q",
     "live_provider": "python tools/live_provider_gate.py",
 }

@@ -654,6 +654,64 @@ body {
   .room-intent { max-width: 100%; }
   .room-title h1 { -webkit-line-clamp: 2; max-height: calc(2 * 1.18em); }
 }
+
+/* Atlas geometry contract: the browser window never owns the conversation
+   scroll. A fixed shell plus one feed scroller keeps notices, activity, and
+   the composer from moving the operator's reading position. */
+html, body { height: 100%; min-height: 0; overflow: hidden; }
+body { overscroll-behavior: none; }
+.atlas { height: 100dvh; min-height: 0; overflow: hidden; }
+.thread { height: 100%; min-height: 0; display: grid; grid-template-rows: 96px 48px minmax(0, 1fr); overflow: hidden; }
+.topbar { position: relative; min-height: 96px; height: 96px; overflow: hidden; }
+.status-stack { display: grid; gap: 5px; min-width: 184px; flex: none; }
+.turn-status { min-height: 27px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.turn-status.active { border-color: #426c82; color: var(--blue); }
+.turn-status.attention { border-color: #705a36; color: var(--amber); }
+.notice { width: 100%; height: 48px; min-height: 48px; margin: 0; padding: 7px clamp(22px, 4vw, 54px); overflow: hidden; }
+.notice[hidden] { display: flex; visibility: hidden; }
+.thread-body { height: 100%; min-height: 0; width: min(930px, 100%); margin: 0 auto; display: grid; grid-template-rows: auto minmax(52px, auto) auto minmax(0, 1fr) auto; overflow: hidden; padding: 18px clamp(22px, 4vw, 58px) 0; }
+.room-bar { max-height: 240px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.activity-dock { min-height: 52px; max-height: 138px; overflow-y: auto; overscroll-behavior: contain; padding: 7px 0; scrollbar-gutter: stable; }
+.working { min-height: 0; max-height: 92px; overflow-y: auto; margin: 0; }
+.turn-recovery { max-height: 118px; overflow-y: auto; margin: 0; }
+.timeline-head { position: relative; min-height: 48px; max-height: 112px; margin: 10px 0 0; padding: 8px 0; overflow: hidden; }
+.timeline-head > div { min-width: 0; padding-right: 160px; }
+.latest { position: absolute; top: 5px; right: 0; min-width: 146px; }
+.event-legend { max-height: 36px; overflow: hidden; }
+.glossary { max-height: 36px; overflow: hidden; }
+.timeline { min-height: 0; height: auto; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; margin: 0; padding: 12px 8px 24px 0; contain: layout paint; }
+.composer { min-height: 142px; max-height: 246px; overflow-y: auto; margin: 0; padding: 12px 0 calc(14px + env(safe-area-inset-bottom)); }
+.composer textarea { max-height: 120px; }
+.message summary, .system-chip summary, .notice button, .latest { min-height: 44px; padding-top: 10px; padding-bottom: 10px; }
+.drawer { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+@media (max-width: 1120px) and (min-width: 761px) {
+  .atlas { height: 100dvh; grid-template-columns: 250px minmax(0, 1fr); grid-template-rows: 100%; }
+  .drawer.open { position: fixed; z-index: 12; inset: 18px 18px 18px 268px; display: block; max-height: none; overflow-y: auto; border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 18px 36px #000b; }
+  .thread-body { width: 100%; padding-inline: 22px; }
+  .room-bar { max-height: 160px; }
+  .timeline-head { max-height: 96px; }
+}
+@media (max-width: 760px) {
+  .atlas { display: grid; grid-template-columns: minmax(0, 1fr); height: 100dvh; }
+  .thread { grid-template-rows: 96px 48px minmax(0, 1fr); }
+  .topbar { padding-inline: 16px; }
+  .status-stack { min-width: 0; max-width: 47%; }
+  .turn-status { overflow: hidden; text-overflow: ellipsis; }
+  .thread-body { width: 100%; padding: 10px 16px min(300px, 45dvh); }
+  .room-bar { display: block; max-height: 172px; overflow: hidden; }
+  .identity-help { display: none; }
+  .identity-heading { margin-top: 7px; }
+  .participants { display: flex; flex-wrap: nowrap; max-height: 82px; margin-top: 7px; padding-bottom: 4px; overflow-x: auto; overscroll-behavior: contain; }
+  .participant { flex: 0 0 220px; min-height: 66px; }
+  .facts { flex-wrap: wrap; gap: 6px 10px; margin-top: 8px; }
+  .timeline-head { min-height: 58px; max-height: 72px; margin-top: 4px; padding-block: 4px; }
+  .timeline-head > div { padding-right: 0; overflow: hidden; }
+  .stream-filters { display: flex; flex-wrap: nowrap; max-width: 100%; margin-top: 4px; overflow-x: auto; overscroll-behavior: contain; }
+  .event-legend, .glossary { display: none; }
+  .latest { position: relative; top: auto; right: auto; min-width: 0; margin-left: auto; }
+  .composer { position: fixed; left: 0; right: 0; bottom: 0; width: 100%; min-height: 164px; max-height: min(300px, 45dvh); margin: 0; padding: 12px 16px calc(14px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); box-shadow: 0 -12px 28px #0008; }
+  .drawer.open { position: fixed; z-index: 12; inset: 76px 12px 12px; display: block; max-height: none; overflow-y: auto; border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 18px 36px #000b; }
+}
 """
 
 
@@ -685,7 +743,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     <header class="topbar">
       <button id="rail-open" class="mobile-rail" type="button" aria-label="Open conversation rooms" aria-controls="rail" aria-expanded="false">Rooms</button>
       <div class="room-title"><h1 id="title">Choose a conversation</h1><div id="room-subtitle" class="room-subtitle">Conversations are grouped by project and the agent that started them.</div><div id="room-intent" class="room-intent">Choose a conversation to read its recorded timeline and, when needed, ask one roster agent for bounded help.</div></div>
-      <div id="connection" class="status offline" role="status" aria-live="polite">Connecting to local owner</div>
+      <div class="status-stack"><div id="connection" class="status offline" role="status" aria-live="polite">Connecting to local owner</div><div id="turn-status" class="turn-status" role="status" aria-live="polite">No active provider turn</div></div>
     </header>
     <div id="notice" class="notice" role="alert" hidden><span id="notice-text"></span><button id="notice-retry" type="button">Retry</button></div>
     <div class="thread-body">
@@ -693,13 +751,12 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         <div class="room-bar-label"><strong id="room-label">No conversation selected</strong><span id="room-origin" class="room-origin">LOCAL · REDACTED VIEW</span><div class="identity-heading"><span>Agents and models</span><span id="identity-summary">Role · name/version · model · provider</span></div><p class="identity-help">Select a card to ask that exact roster seat. The model line is the declared target; served identity appears in the timeline after a provider receipt.</p><div id="participants" class="participants"></div></div>
         <div class="facts"><span>events <b id="cursor">—</b></span><span>type <b id="mode">—</b></span><span data-live="true">updated <b id="updated">—</b></span><span><b id="working-count">0</b> working</span><button id="evidence-open" class="drawer-toggle" type="button" aria-controls="drawer" aria-expanded="false">Room details</button></div>
       </section>
-      <div id="working" class="working" aria-live="off"></div>
-      <section id="turn-recovery" class="turn-recovery" hidden aria-live="polite" aria-labelledby="turn-recovery-title">
+      <div class="activity-dock" aria-label="Active provider work"><div id="working" class="working" aria-live="off"></div><section id="turn-recovery" class="turn-recovery" hidden aria-live="polite" aria-labelledby="turn-recovery-title">
         <strong id="turn-recovery-title">This agent turn needs attention</strong>
         <p id="turn-recovery-copy">The last agent turn did not close cleanly. Choose how to close it; Summon will not retry the provider automatically.</p>
         <div id="turn-recovery-facts" class="turn-recovery-facts"></div>
         <div class="turn-recovery-actions"><button id="turn-recover" class="recover" type="button">Mark blocked and close</button><button id="turn-fork" class="fork" type="button">Start a fresh conversation</button></div>
-      </section>
+      </section></div>
       <div class="timeline-head"><div><strong>Recorded timeline</strong><small id="timeline-state"> waiting for a conversation</small><div class="stream-filters" role="group" aria-label="Filter recorded events"><button class="stream-filter" type="button" data-event-filter="all" aria-pressed="true">All</button><button class="stream-filter" type="button" data-event-filter="context" aria-pressed="false">Context</button><button class="stream-filter" type="button" data-event-filter="run" aria-pressed="false">Agent work</button><button class="stream-filter" type="button" data-event-filter="receipt" aria-pressed="false">Receipts</button></div><div class="event-legend" aria-label="Event legend"><span><b>Context</b> operator and agent notes</span><span><b>Agent work</b> provider turn started or finished</span><span><b>Receipt</b> recorded evidence and cleanup</span><span class="proof-match"><b>✓</b> model matches roster</span><span class="proof-drift"><b>↗</b> model differs from roster</span><span class="proof-awaiting"><b>…</b> waiting for provider receipt</span></div><details class="glossary"><summary>How to read this conversation</summary><p><b>Events</b> is the number of recorded entries. <b>Roster model</b> is what Summon expected; <b>served model</b> is what the provider reported. “Not verified” means one is missing, so Summon makes no match claim. A <b>fresh conversation</b> means continuation was refused and no provider session was resumed. <b>Shortcuts</b>: Ctrl/Cmd+Enter submits or opens review; / or Ctrl/Cmd+K focuses room search; Esc closes overlays.</p></details></div><button id="latest" class="latest" type="button" hidden>Jump to latest event</button></div>
       <ol id="timeline" class="timeline" role="log" aria-label="Recorded conversation timeline" aria-live="off"><li class="timeline-empty">Choose a conversation to read its recorded timeline.</li></ol>
       <section id="composer" class="composer" aria-labelledby="composer-title">
@@ -712,7 +769,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <div>
             <div id="agent-picker" class="agent-picker" hidden><button id="agent-picker-button" class="agent-picker-button" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="agent-picker-menu"><span id="agent-picker-label" class="agent-picker-label">Choose an agent</span><span id="agent-picker-meta" class="agent-picker-meta">MODEL · —</span><span class="agent-picker-chevron" aria-hidden="true">⌄</span></button><div id="agent-picker-menu" class="agent-picker-menu" role="listbox" aria-label="Choose an agent" hidden></div></div>
             <select id="participant" aria-label="Conversation participant" hidden><option value="">Choose an agent</option></select>
-            <textarea id="message" maxlength="12000" placeholder="Add context for this conversation…"></textarea>
+            <label class="visually-hidden" for="message">Message</label><textarea id="message" maxlength="12000" placeholder="Add context for this conversation…"></textarea>
             <div class="composer-caption"><span id="caption">Saved as room context. It cannot approve or change a run.</span><span id="counter">0 / 12000</span></div>
             <div id="launch-review" class="launch-review" hidden aria-live="polite"><strong>Review agent request</strong><p id="review-copy">Choose an agent and review the model target before starting.</p><p id="review-facts" class="review-facts"></p><div class="review-actions"><button id="review-back" type="button">Keep editing</button><button id="review-confirm" class="confirm" type="button">Start this agent turn</button></div></div>
           </div>
@@ -751,7 +808,7 @@ _JS = r'''(() => {
   const state = {
     selected: '', room: null, events: [], cursor: 0, rooms: {}, query: '', mode: 'context', eventFilter: 'all',
     active: {}, streamAbort: null, streamRetry: null, refreshTimer: null, ageTimer: null, streamCursor: 0,
-    unread: {}, lastRoomIndex: '', drafts: {}, lastUpdated: null, streamLive: false, connectionKind: 'offline', railOpen: false, evidenceOpen: false, reviewing: false, recovery: null,
+    unread: {}, lastRoomIndex: '', drafts: {}, lastUpdated: null, streamLive: false, connectionKind: 'offline', feedPinned: true, railOpen: false, evidenceOpen: false, reviewing: false, recovery: null,
     dialogResolve: null, dialogReturnFocus: null
   };
   const $ = id => document.getElementById(id);
@@ -800,7 +857,7 @@ _JS = r'''(() => {
     $('drawer').setAttribute('aria-hidden', (mobile || tablet) && !state.evidenceOpen ? 'true' : 'false');
     $('rail-backdrop').hidden = !(state.railOpen || state.evidenceOpen);
     if (state.evidenceOpen && mobile) $('drawer-close').focus();
-    else if (state.evidenceOpen && tablet) { $('drawer').scrollIntoView({behavior: 'smooth', block: 'start'}); $('drawer-close').focus(); announce('Room evidence opened'); }
+    else if (state.evidenceOpen && tablet) { $('drawer-close').focus(); announce('Room evidence opened'); }
     else if (restoreFocus) $('evidence-open').focus();
   }
   function saveDraft() { if (state.selected) state.drafts[state.selected] = $('message').value; }
@@ -874,7 +931,7 @@ _JS = r'''(() => {
     const box = $('agent-picker'); const menu = $('agent-picker-menu'); const button = $('agent-picker-button'); const chooser = $('participant');
     const context = state.mode !== 'agent'; const item = chooser.value ? identity(chooser.value) : null;
     box.hidden = context; button.disabled = !state.selected || !Array.isArray(state.room && state.room.participants) || !state.room.participants.length;
-    $('agent-picker-label').replaceChildren(text(item ? item.name + (item.version ? ' · ' + item.version : '') : 'Choose an agent'));
+    $('agent-picker-label').replaceChildren(text(item ? item.role + ' · ' + item.name + (item.version ? ' · ' + item.version : '') : 'Choose an agent'));
     $('agent-picker-meta').replaceChildren(text(item ? 'MODEL · ' + (item.model || 'not verified') + ' · PROVIDER · ' + (item.provider || 'not recorded') : 'MODEL · —'));
     menu.querySelectorAll('.agent-option').forEach(option => { const selected = option.dataset.agent === chooser.value; option.setAttribute('aria-selected', selected ? 'true' : 'false'); });
     if (context) closeAgentPicker();
@@ -928,11 +985,11 @@ _JS = r'''(() => {
           const session = document.createElement('span'); session.className = 'room-session'; session.append(text(String(room.session_id || 'room')));
           const roomModels = document.createElement('span'); roomModels.className = 'room-models';
           const roster = Array.isArray(room.participants) ? room.participants : [];
-          const rosterSummary = roster.slice(0, 3).map(item => { const seat = identityFrom(item, item.agent); return seat.name + ' · ' + (seat.model || 'model not verified') + ' · ' + (seat.provider || 'provider not recorded'); });
+          const rosterSummary = roster.slice(0, 3).map(item => { const seat = identityFrom(item, item.agent); return seat.role + ' · ' + seat.name + ' · ' + (seat.model || 'model not verified') + ' · ' + (seat.provider || 'provider not recorded'); });
           roomModels.append(text(rosterSummary.length ? 'MODEL · ' + rosterSummary.join('  /  ') + (roster.length > 3 ? '  /  +' + String(roster.length - 3) : '') : 'MODEL · none recorded'));
           const detail = document.createElement('span'); detail.className = 'room-detail'; const chip = document.createElement('span'); chip.className = 'mode-chip'; chip.append(text(modeLabel(room.mode))); detail.append(chip);
           const countText = document.createElement('span'); countText.append(text(String(room.cursor || 0) + ' events')); detail.append(countText);
-          if (state.unread[room.session_id] && room.session_id !== state.selected) { const dot = document.createElement('span'); dot.className = 'unread'; dot.title = 'New events'; detail.append(dot); }
+          if (state.unread[room.session_id] && room.session_id !== state.selected) { const dot = document.createElement('span'); dot.className = 'unread'; dot.title = 'New events'; dot.setAttribute('aria-label', 'Unread events'); const unreadText = document.createElement('span'); unreadText.className = 'visually-hidden'; unreadText.append(text('Unread events')); detail.append(dot, unreadText); }
           button.setAttribute('aria-label', modeLabel(room.mode) + ' conversation by ' + String(room.initiator_agent || 'initiator') + ' · session ' + String(room.session_id) + ' · ' + (rosterSummary.length ? rosterSummary.join(', ') : 'no models recorded') + ' · ' + String(room.cursor || 0) + ' recorded events' + (state.unread[room.session_id] && room.session_id !== state.selected ? ' · unread events' : '')); button.append(name, session, roomModels, detail); button.addEventListener('click', () => select(room.session_id)); group.append(button);
         });
       });
@@ -970,8 +1027,8 @@ _JS = r'''(() => {
     const chips = $('participants'); chips.replaceChildren();
     roster.forEach(participant => {
       const item = identityFrom(participant, participant.agent);
-      const chip = document.createElement('button'); chip.type = 'button'; chip.className = 'participant' + (item.model ? '' : ' unresolved identity-tooltip'); chip.title = identityTooltip(item.agent); chip.setAttribute('aria-label', 'Ask ' + item.name + (item.model ? ' on ' + item.model : '') + ' to start an agent turn'); chip.addEventListener('click', () => { state.mode = 'agent'; selectParticipant(item.agent); });
-      const role = document.createElement('span'); role.className = 'participant-role'; if (item.role === 'roster seat') role.hidden = true; else role.append(text(item.role));
+      const chip = document.createElement('button'); chip.type = 'button'; chip.className = 'participant' + (item.model ? '' : ' unresolved identity-tooltip'); chip.title = identityTooltip(item.agent); chip.setAttribute('aria-label', 'Ask ' + item.role + ' ' + item.name + (item.model ? ' on ' + item.model : '') + (item.provider ? ' via ' + item.provider : '') + ' to start an agent turn'); chip.addEventListener('click', () => { state.mode = 'agent'; selectParticipant(item.agent); });
+      const role = document.createElement('span'); role.className = 'participant-role'; role.append(text(item.role));
       const name = document.createElement('strong'); name.className = 'participant-name'; name.append(text(item.name + (item.version ? ' · ' + item.version : '')));
       const model = document.createElement('span'); model.className = 'participant-model'; model.append(text(item.model ? 'MODEL · ' + item.model : 'MODEL · not verified'));
       const route = document.createElement('span'); route.className = 'participant-provider'; route.append(text(item.provider ? 'PROVIDER · ' + item.provider : 'PROVIDER · not recorded'));
@@ -996,6 +1053,34 @@ _JS = r'''(() => {
   function eventIdentity(record) {
     const payload = record.payload || {}; return payload.participant || record.actor_id || payload.asker || 'system';
   }
+  function feedPinned() {
+    const feed = $('timeline'); if (!feed) return true;
+    return feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 96;
+  }
+  function captureFeedAnchor() {
+    const feed = $('timeline'); if (!feed) return {pinned: true, cursor: null, offset: 0};
+    const feedRect = feed.getBoundingClientRect();
+    const row = Array.from(feed.querySelectorAll('[data-cursor]')).find(node => {
+      const rect = node.getBoundingClientRect(); return rect.bottom > feedRect.top + 1;
+    });
+    return {pinned: feedPinned(), cursor: row ? String(row.dataset.cursor || '') : null,
+      offset: row ? row.getBoundingClientRect().top - feedRect.top : 0,
+      scrollTop: feed.scrollTop, scrollHeight: feed.scrollHeight};
+  }
+  function restoreFeedAnchor(anchor) {
+    const feed = $('timeline'); if (!feed || !anchor) return;
+    requestAnimationFrame(() => {
+      if (anchor.pinned) { feed.scrollTop = feed.scrollHeight; state.feedPinned = true; return; }
+      const row = anchor.cursor && feed.querySelector('[data-cursor="' + CSS.escape(anchor.cursor) + '"]');
+      if (row) {
+        const feedRect = feed.getBoundingClientRect();
+        feed.scrollTop += row.getBoundingClientRect().top - feedRect.top - anchor.offset;
+      } else {
+        feed.scrollTop = Math.max(0, Math.min(feed.scrollHeight - feed.clientHeight, anchor.scrollTop));
+      }
+      state.feedPinned = feedPinned();
+    });
+  }
   function renderEvent(record) {
     const event = String(record.event || 'event'); const payload = record.payload || {}; const who = eventIdentity(record); const preview = payloadPreview(record);
     const agentPost = event === 'agent_message' || (event === 'message_posted' && Boolean(payload.sender || payload.recipient || payload.participant));
@@ -1006,7 +1091,7 @@ _JS = r'''(() => {
       else { const proof = modelProof(payload, payload.sender || who); model.className = 'message-model ' + proof.className; model.title = proof.title; model.append(text(proof.label)); }
       const stamp = eventTime(record.created_at_ms); if (stamp) { const time = document.createElement('time'); time.className = 'event-time'; time.dateTime = new Date(Number(record.created_at_ms)).toISOString(); time.append(text(stamp)); head.append(strong, model, time); } else head.append(strong, model);
       const bubble = document.createElement('div'); bubble.className = 'bubble'; bubble.append(text(preview || 'Redacted event')); const meta = document.createElement('div'); meta.className = 'message-meta'; meta.append(text(event === 'human_message' ? String(payload.text_chars || 0) + ' chars · ' + shortHash(payload.text_sha256) : identity(payload.sender || who).role + ' · ' + (identity(payload.sender || who).provider || 'route not recorded') + ' → ' + identityLabel(payload.recipient || 'human', false) + ' · context only'));
-      article.append(head, bubble, meta, detailFor(record)); return article;
+      article.dataset.cursor = String(record.cursor || ''); article.append(head, bubble, meta, detailFor(record)); return article;
     }
     const familyMap = {council_round_started: 'round', position_submitted: 'position', cross_exam: 'cross', chair_synthesis: 'synthesis', turn_started: 'turn', turn_finished: 'finish', turn_cancel_requested: 'cancel', cleanup_receipt: 'cleanup', fork_created: 'fork', message_posted: 'context'};
     const family = familyMap[event] || 'default';
@@ -1024,7 +1109,7 @@ _JS = r'''(() => {
       const proofNode = document.createElement('span'); proofNode.className = 'system-proof ' + proof.className; proofNode.title = proof.title; proofNode.append(text(proof.label)); copy.append(proofNode);
       const captionNode = document.createElement('span'); captionNode.className = 'proof-caption'; captionNode.append(text(proof.caption)); copy.append(captionNode);
     }
-    chip.append(mark, copy, detailFor(record)); item.append(chip); return item;
+    item.dataset.cursor = String(record.cursor || ''); chip.append(mark, copy, detailFor(record)); item.append(chip); return item;
   }
   function eventBucket(record) {
     const event = String(record && record.event || '');
@@ -1034,11 +1119,13 @@ _JS = r'''(() => {
   }
   function visibleEvents() { return state.eventFilter === 'all' ? state.events : state.events.filter(record => eventBucket(record) === state.eventFilter); }
   function updateEventFilters() { document.querySelectorAll('[data-event-filter]').forEach(button => button.setAttribute('aria-pressed', button.dataset.eventFilter === state.eventFilter ? 'true' : 'false')); }
-  function renderTimeline() {
+  function renderTimeline(preserve = true) {
+    const anchor = preserve ? captureFeedAnchor() : null;
     const timeline = $('timeline'); timeline.replaceChildren();
     const events = visibleEvents();
-    if (!events.length) { const empty = document.createElement('li'); empty.className = 'timeline-empty'; empty.append(text(state.events.length ? 'No events match this filter.' : 'No events yet. Add context or ask a roster agent to begin.')); timeline.append(empty); return; }
+    if (!events.length) { const empty = document.createElement('li'); empty.className = 'timeline-empty'; empty.append(text(state.events.length ? 'No events match this filter.' : 'No events yet. Add context or ask a roster agent to begin.')); timeline.append(empty); restoreFeedAnchor(anchor); return; }
     const fragment = document.createDocumentFragment(); events.forEach(record => fragment.append(renderEvent(record))); timeline.append(fragment);
+    restoreFeedAnchor(anchor);
   }
   function rebuildActive() {
     const previous = state.active || {}; state.active = {};
@@ -1046,6 +1133,7 @@ _JS = r'''(() => {
   }
   function renderWorking() {
     const box = $('working'); box.replaceChildren(); const active = Object.values(state.active); $('working-count').replaceChildren(text(String(active.length)));
+    const turnStatus = $('turn-status'); if (turnStatus) { turnStatus.className = 'turn-status' + (active.length ? ' active' : (state.recovery ? ' attention' : '')); turnStatus.replaceChildren(text(active.length ? String(active.length) + ' provider turn' + (active.length === 1 ? '' : 's') + ' in progress' : (state.recovery ? 'Turn needs attention' : 'No active provider turn'))); }
     $('working-count').parentElement.dataset.live = active.length ? 'true' : 'false';
     active.forEach(item => { const row = document.createElement('div'); row.className = 'working-row'; row.dataset.participant = item.participant; const label = document.createElement('span'); label.className = 'working-identity'; const strong = document.createElement('strong'); strong.append(text(identityLabel(item.participant))); const model = document.createElement('span'); model.className = 'working-model'; const elapsed = Math.max(0, Math.floor((Date.now() - Number(item.startedAt || Date.now())) / 1000)); model.append(text(identityModelLabel(item.participant) + ' · working ' + elapsed + 's · durable turn in progress')); label.append(strong, model); const cancel = document.createElement('button'); cancel.type = 'button'; cancel.append(text('Cancel turn')); cancel.addEventListener('click', () => cancelTurn(item.participant)); row.append(label, cancel); box.append(row); });
   }
@@ -1074,14 +1162,17 @@ _JS = r'''(() => {
     participants.forEach(item => { const option = document.createElement('option'); option.value = String(item.agent || ''); option.title = identityTooltip(item.agent); option.append(text(identityLabel(item.agent) + ' — model: ' + identityModelLabel(item.agent))); chooser.append(option); });
     if (previousRoom && String(previousRoom.session_id || '') === state.selected
         && participants.some(item => String(item.agent || '') === previousParticipant)) chooser.value = previousParticipant;
-    renderAgentPicker(); renderTimeline(); renderWorking(); renderRecovery(); updateComposer(); setNotice(''); announce('Opened conversation ' + String(state.room.session_id || ''));
+    renderAgentPicker(); renderTimeline(false); renderRecovery(); renderWorking(); updateComposer(); setNotice('');
+    requestAnimationFrame(() => { const feed = $('timeline'); if (feed) feed.scrollTop = feed.scrollHeight; state.feedPinned = true; });
+    announce('Opened conversation ' + String(state.room.session_id || ''));
   }
   function appendRecord(record) {
     const cursor = Number(record && record.cursor); if (!Number.isSafeInteger(cursor)) return 'gap';
     if (cursor <= state.cursor) return 'duplicate';
     if (cursor !== state.cursor + 1) return 'gap';
-    state.events.push(record); state.cursor = cursor; state.streamCursor = cursor; markUpdated(); rebuildActive(); updateHeader(); renderWorking(); renderRecovery();
-    if (state.eventFilter === 'all') { const timeline = $('timeline'); if (timeline.firstElementChild && timeline.firstElementChild.classList.contains('timeline-empty')) timeline.replaceChildren(); timeline.append(renderEvent(record)); } else renderTimeline(); const nearBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 180; $('latest').hidden = nearBottom; announce('New journal event ' + eventLabel(record.event) + ', cursor ' + String(cursor)); return 'appended';
+    const anchor = captureFeedAnchor(); state.events.push(record); state.cursor = cursor; state.streamCursor = cursor; markUpdated(); rebuildActive(); updateHeader(); renderRecovery(); renderWorking();
+    if (state.eventFilter === 'all') { const timeline = $('timeline'); if (timeline.firstElementChild && timeline.firstElementChild.classList.contains('timeline-empty')) timeline.replaceChildren(); const sentinel = timeline.querySelector('.feed-sentinel'); const node = renderEvent(record); if (sentinel) timeline.insertBefore(node, sentinel); else timeline.append(node); } else renderTimeline(false);
+    restoreFeedAnchor(anchor); $('latest').hidden = Boolean(anchor.pinned); announce('New journal event ' + eventLabel(record.event) + ', cursor ' + String(cursor)); return 'appended';
   }
   function updateComposer() {
     const hasRoom = Boolean(state.selected); const context = state.mode === 'context'; const participant = $('participant').value; const item = participant ? identity(participant) : null; const target = item ? item.name + ' · ' + (item.model || 'model not verified') : 'Choose an agent'; const activeCount = Object.keys(state.active).length;
@@ -1132,7 +1223,7 @@ _JS = r'''(() => {
   $('action-dialog-cancel').addEventListener('click', () => closeActionDialog(null)); $('action-dialog-confirm').addEventListener('click', () => { const field = $('action-dialog-input'); closeActionDialog(field.hidden ? true : field.value); }); $('action-dialog').addEventListener('click', event => { if (event.target === $('action-dialog')) closeActionDialog(null); });
   [$('context-tab'), $('agent-tab')].forEach((tab, index, tabs) => tab.addEventListener('keydown', event => { if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return; event.preventDefault(); const next = tabs[(index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length]; next.click(); next.focus(); }));
   $('agent-picker-button').addEventListener('click', toggleAgentPicker); document.addEventListener('keydown', event => { if (event.key === 'Escape' && !$('agent-picker-menu').hidden) { event.preventDefault(); closeAgentPicker(); $('agent-picker-button').focus(); } });
-  $('send').addEventListener('click', () => state.mode === 'context' ? postContext() : startTurn()); $('review-back').addEventListener('click', () => { state.reviewing = false; updateComposer(); $('message').focus(); }); $('review-confirm').addEventListener('click', launchTurn); $('run-cancel').addEventListener('click', () => { const first = Object.values(state.active)[0]; if (first) cancelTurn(first.participant); }); $('participant').addEventListener('change', () => { state.reviewing = false; updateComposer(); }); $('message').addEventListener('input', () => { $('counter').replaceChildren(text(String($('message').value.length) + ' / 12000')); if (state.reviewing) state.reviewing = false; saveDraft(); updateComposer(); }); $('message').addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); state.mode === 'context' ? postContext() : startTurn(); } }); $('room-search').addEventListener('input', event => { state.query = event.target.value; renderRooms(); }); $('room-search').addEventListener('keydown', event => { if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return; const buttons = Array.from(document.querySelectorAll('.room-button')); if (!buttons.length) return; event.preventDefault(); const current = buttons.indexOf(document.activeElement); const next = buttons[(current + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]; next.focus(); }); document.querySelectorAll('[data-event-filter]').forEach(button => button.addEventListener('click', () => { state.eventFilter = button.dataset.eventFilter || 'all'; updateEventFilters(); renderTimeline(); announce('Showing ' + state.eventFilter + ' events'); })); $('rail-open').addEventListener('click', () => setRailOpen(true)); $('rail-close').addEventListener('click', () => setRailOpen(false)); $('rail-backdrop').addEventListener('click', () => { if (state.railOpen) setRailOpen(false); if (state.evidenceOpen) setEvidenceOpen(false); }); $('evidence-open').addEventListener('click', () => setEvidenceOpen(!$('drawer').classList.contains('open'))); $('drawer-close').addEventListener('click', () => setEvidenceOpen(false)); $('latest').addEventListener('click', () => { $('timeline').lastElementChild?.scrollIntoView({behavior: 'smooth', block: 'end'}); $('latest').hidden = true; }); $('notice-retry').addEventListener('click', () => { setNotice(''); refresh(); if (state.selected) syncRoom().catch(() => {}); }); document.addEventListener('keydown', event => { const target = event.target; const typing = target && (target.matches('input, textarea, select, [contenteditable="true"]')); if (!typing && (event.key === '/' || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k'))) { event.preventDefault(); $('room-search').focus(); $('room-search').select(); } if (state.evidenceOpen && window.matchMedia('(max-width: 760px)').matches && event.key === 'Tab') { const focusable = Array.from($('drawer').querySelectorAll('button, a, input, select, textarea, [tabindex]:not([tabindex="-1"])')).filter(node => !node.disabled && node.offsetParent !== null); if (focusable.length) { const first = focusable[0]; const last = focusable[focusable.length - 1]; if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); } } } if (event.key === 'Escape') { if (!$('action-dialog').hidden) { event.preventDefault(); closeActionDialog(null); } else if (state.reviewing) { state.reviewing = false; updateComposer(); $('message').focus(); } else if (state.railOpen) setRailOpen(false); else if (state.evidenceOpen) setEvidenceOpen(false); } });
+  $('send').addEventListener('click', () => state.mode === 'context' ? postContext() : startTurn()); $('review-back').addEventListener('click', () => { state.reviewing = false; updateComposer(); $('message').focus(); }); $('review-confirm').addEventListener('click', launchTurn); $('run-cancel').addEventListener('click', () => { const first = Object.values(state.active)[0]; if (first) cancelTurn(first.participant); }); $('participant').addEventListener('change', () => { state.reviewing = false; updateComposer(); }); $('message').addEventListener('input', () => { $('counter').replaceChildren(text(String($('message').value.length) + ' / 12000')); if (state.reviewing) state.reviewing = false; saveDraft(); updateComposer(); }); $('message').addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); state.mode === 'context' ? postContext() : startTurn(); } }); $('room-search').addEventListener('input', event => { state.query = event.target.value; renderRooms(); }); $('room-search').addEventListener('keydown', event => { if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return; const buttons = Array.from(document.querySelectorAll('.room-button')); if (!buttons.length) return; event.preventDefault(); const current = buttons.indexOf(document.activeElement); const next = buttons[(current + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]; next.focus(); }); document.querySelectorAll('[data-event-filter]').forEach(button => button.addEventListener('click', () => { state.eventFilter = button.dataset.eventFilter || 'all'; updateEventFilters(); renderTimeline(); announce('Showing ' + state.eventFilter + ' events'); })); $('rail-open').addEventListener('click', () => setRailOpen(true)); $('rail-close').addEventListener('click', () => setRailOpen(false)); $('rail-backdrop').addEventListener('click', () => { if (state.railOpen) setRailOpen(false); if (state.evidenceOpen) setEvidenceOpen(false); }); $('evidence-open').addEventListener('click', () => setEvidenceOpen(!$('drawer').classList.contains('open'))); $('drawer-close').addEventListener('click', () => setEvidenceOpen(false)); $('latest').addEventListener('click', () => { const feed = $('timeline'); feed.scrollTo({top: feed.scrollHeight, behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'}); state.feedPinned = true; $('latest').hidden = true; }); $('notice-retry').addEventListener('click', () => { setNotice(''); refresh(); if (state.selected) syncRoom().catch(() => {}); }); document.addEventListener('keydown', event => { const target = event.target; const typing = target && (target.matches('input, textarea, select, [contenteditable="true"]')); if (!typing && (event.key === '/' || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k'))) { event.preventDefault(); $('room-search').focus(); $('room-search').select(); } if (state.evidenceOpen && window.matchMedia('(max-width: 760px)').matches && event.key === 'Tab') { const focusable = Array.from($('drawer').querySelectorAll('button, a, input, select, textarea, [tabindex]:not([tabindex="-1"])')).filter(node => !node.disabled && node.offsetParent !== null); if (focusable.length) { const first = focusable[0]; const last = focusable[focusable.length - 1]; if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); } } } if (event.key === 'Escape') { if (!$('action-dialog').hidden) { event.preventDefault(); closeActionDialog(null); } else if (state.reviewing) { state.reviewing = false; updateComposer(); $('message').focus(); } else if (state.railOpen) setRailOpen(false); else if (state.evidenceOpen) setEvidenceOpen(false); } });
   $('participant').replaceChildren(); const choose = document.createElement('option'); choose.value = ''; choose.append(text('Choose an agent')); $('participant').append(choose);
   refresh(); state.refreshTimer = setInterval(refresh,10000); state.ageTimer = setInterval(updateAge,1000); window.addEventListener('beforeunload', () => { clearInterval(state.refreshTimer); clearInterval(state.ageTimer); stopStream(); });
 })();'''

@@ -45,6 +45,32 @@ class EvidenceGuardTests(unittest.TestCase):
         popen.assert_not_called()
         return result
 
+    def _execute_codex_stream(self, *, served_model=None,
+                              handshake_model="gpt-5.6-sol") -> dict:
+        """Run the real subprocess stream parser against a deterministic fake Codex."""
+        import subprocess
+        lines = [
+            {"type": "thread.started", "thread_id": "thread-test",
+             "model": handshake_model},
+            {"type": "item.completed", "item": {
+                "type": "agent_message", "text": self._REPORT}},
+            {"type": "turn.completed", "usage": {"output_tokens": 3}},
+        ]
+        if served_model is not None:
+            lines[-1]["model"] = served_model
+        code = "import json; " + "; ".join(
+            f"print({json.dumps(json.dumps(line))})" for line in lines)
+        invocation = AgentInvocation(
+            cli="codex", model="gpt-5.6-sol", prompt="review",
+            cwd=tempfile.gettempdir(), permission="read-only")
+        with mock.patch.object(_executor, "build_invocation_args",
+                               return_value=(sys.executable, ("-c", code), None)), \
+             mock.patch("_receipt.workspace_snapshot",
+                        return_value={"coverage": "none"}), \
+             mock.patch("_receipt.workspace_evidence", return_value={}):
+            result = _executor.execute_agent(invocation, timeout_ms=5000)
+        return result
+
     def test_acp_empty_success_is_normalized_as_one_consistent_error_tuple(self):
         result = self._execute_acp({
             "result": "", "exit_code": 0, "status": "success", "cli": "kimi",
@@ -73,6 +99,62 @@ class EvidenceGuardTests(unittest.TestCase):
         self.assertNotIn("suspect", result)
         self.assertTrue(any("provenance is not confirmed" in w
                             for w in result.get("warnings", [])))
+
+    def test_explicit_codex_model_without_terminal_receipt_is_blocked(self):
+        result = self._execute_codex_stream()
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error_kind"], "served_model_unverified")
+        self.assertFalse(result["result_usable"])
+        self.assertTrue(result["provider_contacted"])
+        self.assertEqual(result["model"]["requested"], "gpt-5.6-sol")
+        self.assertEqual(result["model"]["targeted"], "gpt-5.6-sol")
+        self.assertIsNone(result["model"]["served"])
+        # A handshake is retained for legacy consumers, but it is not treated
+        # as served evidence (the exact request is still blocked).
+        self.assertEqual(result["model"]["resolved"], "gpt-5.6-sol")
+
+    def test_explicit_codex_model_without_any_identity_does_not_inherit_default(self):
+        result = self._execute_codex_stream(handshake_model=None)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error_kind"], "served_model_unverified")
+        self.assertIsNone(result["model"]["served"])
+        # The ambient Codex default is not evidence about this invocation and
+        # must not make an explicit Sol request look like it ran on Luna.
+        self.assertIsNone(result["model"]["resolved"])
+
+    def test_explicit_codex_model_mismatch_is_blocked_and_not_retryable(self):
+        result = self._execute_codex_stream(served_model="gpt-5.6-luna")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error_kind"], "served_model_mismatch")
+        self.assertFalse(result["retryable"])
+        self.assertFalse(result["result_usable"])
+        self.assertEqual(result["model"]["served"], "gpt-5.6-luna")
+        self.assertTrue(_executor.is_terminal_nonretryable(result))
+
+    def test_explicit_codex_handshake_mismatch_is_blocked(self):
+        result = self._execute_codex_stream(handshake_model="gpt-5.6-luna",
+                                            served_model="gpt-5.6-sol")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error_kind"], "target_model_mismatch")
+        self.assertFalse(result["retryable"])
+        self.assertFalse(result["result_usable"])
+        self.assertEqual(result["model"]["targeted"], "gpt-5.6-luna")
+
+    def test_codex_model_mismatch_never_retries(self):
+        import run_subagent
+        result = self._execute_codex_stream(served_model="gpt-5.6-luna")
+        args = mock.Mock(retries=3, timeout=5000, debug_dir=None,
+                         max_tool_output_bytes=None, transient_retries=True,
+                         no_acp_fallback=False)
+        invocation = AgentInvocation(
+            cli="codex", model="gpt-5.6-sol", prompt="review",
+            cwd=tempfile.gettempdir(), permission="read-only")
+        with mock.patch.object(run_subagent, "execute_agent",
+                               return_value=result) as execute:
+            final = run_subagent._dispatch_with_retries(invocation, args)
+        execute.assert_called_once()
+        self.assertEqual(final["error_kind"], "served_model_mismatch")
+        self.assertTrue(final["retry_suppressed"])
 
     def test_success_with_terminal_model_is_reported(self):
         result = self._execute_acp({

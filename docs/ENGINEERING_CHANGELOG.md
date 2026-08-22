@@ -13,18 +13,59 @@ never on added fields.
 
 ## Unreleased
 
+No changes yet.
+
+## [3.2.0] - 2026-08-22
+
+- **Codex selector/evidence hardening:** centralized Codex model-selector parsing so
+  explicit and legacy selectors cannot disagree or override one another after dispatch
+  identity is frozen. Dry-run reports the selector source and refuses conflicts without
+  contacting a provider. Explicit pins now require a terminal served-model receipt;
+  handshake-only, missing, malformed, or mismatched evidence is typed as a terminal
+  non-retryable trust failure.
+- **Codex identity display:** the legacy `model.resolved` compatibility field no longer
+  backfills the ambient Codex default for an explicit pin that emitted no handshake or
+  served-model identity. That prevents an unverified Sol request from being presented as
+  Luna while preserving the config backfill for genuinely unpinned runs.
+- **Roster identity hardening:** the bundled roster now includes explicit Sol, Terra, and
+  Luna review seats, and `--list --json` exposes declared model and effort metadata. A named
+  seat no longer has to be inferred from a generic agent label; provider service remains
+  unverified until the dispatch envelope records exact `model.served` evidence.
+- **Conversation atlas geometry:** added a fixed `100dvh` shell, reserved notice/activity
+  rows, a dedicated feed scroller, cursor-aware anchor restoration, and stable role/name/
+  version/model/provider presentation. This is a first implementation slice; rendered
+  browser geometry, long-journal, owner-loss, and accessibility evidence remain release
+  gates.
+- **3.2 contract:** recorded the next-version routing, resume-fencing, roster, privacy,
+  and chat acceptance contract in [`SUMMON_3.2_PLAN.md`](SUMMON_3.2_PLAN.md). No local
+  paths, account identifiers, raw provider output, or workstation inventory belongs in
+  this public engineering history.
 - **Auth and onboarding contract:** added a read-only `auth status` path and an explicitly
   authorized `auth repair BACKEND --allow-auth-repair` path. The repair executor is limited to
   the registered vendor login command, inherits the shared platform spawn flags, bounds its
   lifetime, does not capture credentials, and returns `retry_required` without replaying the
   original dispatch. Auth signatures now cover expired OAuth/session tokens, invalid keys, and
   common HTTP 401/403 forms.
+- **Kimi refresh persistence:** isolated Kimi homes now return validated OAuth rotations to the
+  source credential store with an exclusive lock, source-version compare, restrictive mode,
+  and atomic replacement. A concurrent `kimi login` wins over a stale child. Kimi auth and
+  rate-limit outcomes are marked terminal so retry/fallback loops cannot multiply failures;
+  permission-tier refusals are typed separately from authentication failures.
+- **Telemetry failure taxonomy:** added a distinct `permission` class for typed
+  `permission_unsupported` outcomes, keeping local diagnostics useful without conflating
+  provider capability limits with authentication or generic backend errors.
+- **Operation-terminal telemetry hardening:** added schema-2 bounded local events, immutable
+  operation contexts, per-install HMAC correlation, strict public-report shape/type checks,
+  fail-soft malformed-input handling, and a provider-inert audit that excludes unbound
+  reported model/auth evidence. The release intentionally defers signed evidence-registry
+  binding and production attempt/turn emission.
 - **Model roster freshness:** added explicit `models --refresh` routing, ArkCLI Coding Plan
   roster discovery with bounded cache/live source labels, and advisory Codex catalog candidates
   for Luna, Terra, and Spark. Catalog metadata remains separate from served-model evidence;
   unverified candidates are not pinned or treated as dispatch proof.
-- **Release/CI corrections:** synchronized the release-evidence workflow with 3.1.0 and made
-  the Windows JavaScript syntax test validate a temporary file rather than stdin, avoiding the
+- **Release/CI corrections:** synchronized the release-evidence workflow with 3.2.0, added
+  telemetry-audit coverage, and made the Windows JavaScript syntax test validate a temporary
+  file rather than stdin, avoiding the
   platform-specific Node EOF timeout. The new auth module is included in compile coverage.
 
 - **Live deliberation prompt boundary:** the real provider lane now strips ordinary

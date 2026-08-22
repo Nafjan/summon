@@ -63,6 +63,8 @@ _BACKEND_ISSUE_SIGNS = (
     ("please log in", None, "auth", "run the backend's login/auth command"),
     ("please login", None, "auth", "run the backend's login/auth command"),
     ("login required", None, "auth", "run the backend's login/auth command"),
+    ("login_required", None, "auth", "run the backend's login/auth command"),
+    ("requires login before", None, "auth", "run the backend's login/auth command"),
     ("not logged in", None, "auth", "run the backend's login/auth command"),
 )
 

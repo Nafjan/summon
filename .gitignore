@@ -20,3 +20,10 @@ graphify-out/
 # retain it locally without allowing a broad staging command to publish it.
 tmp-agy-smoke/
 tmp_agy_smoke.py
+
+# Local UI critiques and live conversation experiments. These may contain
+# prompts, provider output, or machine-specific runtime state and must never
+# enter a public release commit.
+.impeccable/
+.tmp-roadmap-live-conversations/
+.tmp-roadmap-live-roster/

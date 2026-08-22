@@ -21,6 +21,7 @@ _SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-
 _VERSION_FILES = {
     "plugin": Path("plugin.json"),
     "dispatcher": Path("skills/summon/scripts/run_subagent.py"),
+    "telemetry": Path("skills/summon/scripts/_telemetry.py"),
     "mcp_server": Path("skills/summon/scripts/mcp_server.py"),
 }
 
@@ -54,6 +55,9 @@ def version_facts(root: Path = ROOT) -> dict[str, object]:
         versions["plugin"] = None
     versions["dispatcher"] = _module_string_assignment(
         root / _VERSION_FILES["dispatcher"], "__version__"
+    )
+    versions["telemetry"] = _module_string_assignment(
+        root / _VERSION_FILES["telemetry"], "SUMMON_VERSION"
     )
     versions["mcp_server"] = _module_string_assignment(
         root / _VERSION_FILES["mcp_server"], "SERVER_VERSION"

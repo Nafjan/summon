@@ -78,11 +78,15 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
 from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
-__version__ = "3.1.0"  # summon dispatcher version (see CHANGELOG.md)
+# Keep a literal assignment: the release-contract parser uses the dispatcher
+# source as a machine-checkable companion.  `_telemetry.SUMMON_VERSION` must be
+# updated in the same release; the release contract checks both literals.
+__version__ = "3.2.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
 _JOB_FILE: str | None = None
+_EMIT_OPERATION = "dispatch"
 
 
 def _dispatch_agent_snapshot(agents_dir: str, agent_name: str,
@@ -294,7 +298,8 @@ def _stamp_job(env: dict) -> dict:
     return env
 
 
-def _emit(obj: dict) -> None:
+def _emit(obj: dict, *, operation: str | None = None,
+          trusted_executor_result: bool = False) -> None:
     """Write the response as JSON — to the job file (background) or stdout."""
     # Primary emission point: guarantee the exit-code-clarity fields on EVERY
     # dispatch-shaped envelope routed here, including the pre-dispatch validation/
@@ -307,7 +312,24 @@ def _emit(obj: dict) -> None:
     # Diagnostics are strictly opt-in and fail-soft. A malformed local telemetry
     # file must never change dispatch behavior or hide the real envelope.
     try:
-        _telemetry.record(obj)
+        # The executor's stream parser is the source of served-model evidence.
+        # Bind that result to a private telemetry capability here; raw envelope
+        # fields are intentionally ignored by the projector.  Keep the marker
+        # on a copy so it can never leak into the public JSON envelope or job
+        # file.
+        _telemetry_obj = dict(obj)
+        if trusted_executor_result:
+            # Only the in-process executor result may mint this marker.  A
+            # reused --out envelope, a --resume input, or a hand-built JSON
+            # object remains unverified even when it contains
+            # served_model_evidence="reported".
+            _marker = _executor.trusted_telemetry_model_evidence(obj)
+            if _marker is not None:
+                _telemetry_obj["_telemetry_model_evidence"] = _marker
+            _auth_marker = _executor.trusted_telemetry_auth_lifecycle(obj)
+            if _auth_marker is not None:
+                _telemetry_obj["_telemetry_auth_lifecycle"] = _auth_marker
+        _telemetry.record(_telemetry_obj, operation=operation or _EMIT_OPERATION)
     except Exception:  # noqa: BLE001 - observability cannot block a dispatch
         pass
     text = json.dumps(obj, ensure_ascii=False)
@@ -321,7 +343,8 @@ def _emit(obj: dict) -> None:
 
 
 def _print_error(error: str, exit_code: int = 1) -> None:
-    _emit({"result": "", "exit_code": exit_code, "status": "error", "error": error})
+    _emit({"result": "", "exit_code": exit_code, "status": "error", "error": error},
+          operation=_EMIT_OPERATION)
 
 
 def _preflight_backend(cli: str, command_override: str | None = None) -> dict | None:
@@ -557,8 +580,9 @@ def main() -> None:
     parser = _cli.build_parser(__version__, _ENVELOPE_VERSION)
     args = parser.parse_args(argv)
 
-    global _JOB_FILE
+    global _JOB_FILE, _EMIT_OPERATION
     _JOB_FILE = args.job_file
+    _EMIT_OPERATION = "resume" if args.resume else "dispatch"
 
     # Fan-out modes consume a fixed flag set; anything else present in argv is
     # rejected FIRST -- before the query handlers below, so `--manifest --doctor`
@@ -834,7 +858,7 @@ def main() -> None:
                 _write_error_out(args.out, env)
             except Exception:  # noqa: BLE001 — reporting the original error matters more
                 pass
-        _emit(env)
+        _emit(env, operation=_EMIT_OPERATION)
         sys.exit(exit_code)
 
     if args.resume and args.worktree is not None:
@@ -992,7 +1016,7 @@ def main() -> None:
                     _pw = _pw if isinstance(_pw, list) else ([] if _pw is None else [str(_pw)])
                     prior["warnings"] = _pw + [_note]
                 prior["skipped"] = True
-                _emit(prior)
+                _emit(prior, operation=_EMIT_OPERATION)
                 sys.exit(0 if is_terminal_success(prior) else 1)
 
     # --allow-credit: per-dispatch credit authorization. Env form of the same
@@ -1086,7 +1110,7 @@ def main() -> None:
                 if args.cwd:
                     _env["cwd"] = args.cwd
                 finalize_exit_fields(_env)
-                _emit(_env)
+                _emit(_env, operation=_EMIT_OPERATION)
                 sys.exit(0)
         print(json.dumps(_spawn_background(args), ensure_ascii=False))
         sys.exit(0)
@@ -1261,7 +1285,7 @@ def main() -> None:
                     _write_out(args.out, setup_error)
                 except Exception:  # noqa: BLE001 — reporting the error matters more
                     pass
-            _emit(setup_error)
+            _emit(setup_error, operation=_EMIT_OPERATION)
             sys.exit(setup_error.get("exit_code", 1))
 
     # --worktree: run the agent in an isolated git worktree instead of the cwd.
@@ -1358,6 +1382,7 @@ def main() -> None:
              f"values are milliseconds for backward compatibility (600000 == 10m); write "
              f"{_ms}ms explicitly if you really want it.")
 
+    _model_source = "cli" if args.model else "frontmatter" if model else None
     invocation = AgentInvocation(
         cli=cli,
         prompt=args.prompt,
@@ -1378,6 +1403,7 @@ def main() -> None:
             getattr(args, "max_permission", None)
             and _clamp(permission, args.max_permission) != permission),
         model=final_model,               # incl. agy Gemini thinking-mode suffix
+        model_source=_model_source,
         effort=effort,                    # --effort > frontmatter > env > default(high)
         resume_id=args.resume,
         resume_profile=args.resume_profile,
@@ -1435,7 +1461,7 @@ def main() -> None:
     if args.dry_run:
         _emit(_dry_run_view(invocation, args, agents_dir, agent_file,
                             artifact_manifest=_artifact_manifest,
-                            text_seat_decision=_ts))
+                            text_seat_decision=_ts), operation=_EMIT_OPERATION)
         sys.exit(0)
 
     if _ts is not None and _ts.get("would_block"):
@@ -1457,7 +1483,7 @@ def main() -> None:
         finalize_exit_fields(_env)
         if args.out:
             _write_out(args.out, _env)
-        _emit(_env)
+        _emit(_env, operation=_EMIT_OPERATION)
         sys.exit(0)
 
     # --gate-with: another agent must APPROVE this dispatch before it runs. Placed
@@ -1490,7 +1516,7 @@ def main() -> None:
             finalize_exit_fields(_env)
             if args.out:
                 _write_out(args.out, _env)
-            _emit(_env)
+            _emit(_env, operation=_EMIT_OPERATION)
             sys.exit(0)
 
     # Effective-tree provenance: recompute HEAD after any worktree rewrite,
@@ -1556,7 +1582,8 @@ def main() -> None:
         result["agent_tags"] = _tags
     if args.out:
         _write_out(args.out, result)
-    _emit(result)
+    _emit(result, operation="resume" if args.resume else "dispatch",
+          trusted_executor_result=True)
     sys.exit(0 if result["status"] == "success" else 1)
 
 
@@ -1601,9 +1628,17 @@ def _dry_run_view(invocation, args, agents_dir: str,
                           permission_flags as _pf, _PERMISSION_MAPPING, _agy_wrapper,
                           advisory_warnings, apply_credit_guard, infer_dispatch_billing,
                           credit_spend_allowed, selects_credit_only,
-                          model_backend_compatibility)
+                          model_backend_compatibility, codex_model_selection)
     _guarded, _, _guard_warnings = apply_credit_guard(invocation)
-    _eff_model = _guarded.model
+    _codex_selection = (codex_model_selection(
+                            invocation.model, invocation.extra_args,
+                            getattr(invocation, "model_source", None))
+                        if invocation.cli == "codex" else None)
+    _selection_conflict = (_codex_selection.get("conflict")
+                           if _codex_selection else None)
+    _eff_model = (_codex_selection.get("canonical")
+                  if _codex_selection and _codex_selection.get("canonical")
+                  else _guarded.model)
     # Predict the billing source so preflight can reveal a charge (mirrors _stamp).
     _bill = infer_dispatch_billing(invocation.cli, invocation.model,
                                    invocation.extra_args)
@@ -1626,7 +1661,8 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "cwd": invocation.cwd,
         "agents_dir": agents_dir,
         "strict_agents_dir": bool(getattr(args, "strict_agents_dir", False)),
-        "model_requested": invocation.model,
+        "model_requested": (_codex_selection.get("requested")
+                             if _codex_selection else invocation.model),
         "model_effective": _eff_model,  # after any credit-only-model fallback
         "profile": invocation.profile,
         "billing_predicted": _bill,     # subscription / credit / api / unknown
@@ -1640,6 +1676,19 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "worktree": ("would create" if args.worktree is not None else None),
         "system_context_chars": len(invocation.system_context),
     }
+    if _codex_selection:
+        # This is deliberately additive and safe to share: selectors contain
+        # only model ids, never profile paths or config contents.
+        view["model_selection_source"] = _codex_selection.get("source")
+        view["model_exact_required"] = bool(_codex_selection.get("exact_required"))
+        view["model_selectors"] = [item.get("value") for item in
+                                    _codex_selection.get("selectors", [])]
+        if _selection_conflict:
+            view["would_refuse"] = True
+            view["error_kind"] = "model_selection_conflict"
+            view["refusal"] = _selection_conflict
+            view["provider_contacted"] = False
+            view["result_usable"] = False
     # Keep dry-run and real dispatch routing decisions identical.  This is a pure namespace
     # check: it does not probe or construct a provider profile.  Codex's configured default
     # is read only when the caller did not pin a model, so the preview can still catch a bad
@@ -1768,7 +1817,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 view["wrapper"] = _agy_wrapper()
             except ValueError as e:
                 view["error"] = str(e)
-    else:
+    elif not _selection_conflict:
         try:
             cmd, argv, env = build_invocation_args(invocation)
             if invocation.profile_command:

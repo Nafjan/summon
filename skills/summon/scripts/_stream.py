@@ -140,6 +140,24 @@ class StreamProcessor:
         if self.is_codex and data.get("type") == "turn.completed":
             if isinstance(data.get("usage"), dict):
                 self.usage = data["usage"]
+            # Newer Codex builds may expose the provider-served identity on the
+            # terminal event. A thread.started model is only a handshake target;
+            # never promote it to served evidence. Accept the documented/common
+            # spellings but keep malformed values out of the processor state so
+            # the executor can classify the result as unverified.
+            containers = [data]
+            for nested_key in ("result", "turn", "metadata", "response"):
+                nested = data.get(nested_key)
+                if isinstance(nested, dict):
+                    containers.append(nested)
+            for container in containers:
+                for key in ("model", "served_model", "servedModel", "model_id"):
+                    value = container.get(key)
+                    if isinstance(value, str) and value.strip():
+                        self.model = value.strip()
+                        break
+                if self.model:
+                    break
             self.result_json = {
                 "type": "result",
                 "result": "\n".join(self.codex_messages),

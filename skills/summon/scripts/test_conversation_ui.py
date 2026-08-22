@@ -89,12 +89,14 @@ class ConversationUITests(unittest.TestCase):
         for marker in ("Conversation atlas", "room-search", "timeline", "Room details",
                        "Post context", "Ask an agent", "Context and agent turns",
                        "appendRecord", "cursor !== state.cursor + 1",
-                       "timeline.append(renderEvent(record))", "event === 'agent_message'",
+                       "fragment.append(renderEvent(record))", "event === 'agent_message'",
                        "Agents and models", "Model not verified", "identityTooltip",
                        "Role · name/version · model · provider", "Review agent request",
                        "WAITING FOR MODEL RECEIPT", "MODEL MATCH", "target missing", "setConnection('Live', 'connected'",
                        ".room-bar { display: block; }", "min-width: 44px; min-height: 44px",
-                       "$('drawer-close').focus();"):
+                       "$('drawer-close').focus();", "height: 100dvh", "overflow: hidden",
+                       "grid-template-rows: 96px 48px minmax(0, 1fr)", "captureFeedAnchor",
+                       "state.feedPinned", "position: fixed; left: 0"):
             self.assertIn(marker, source)
         self.assertIn("stops automatically after", source)
         self.assertIn("Reconnect to the local owner before starting an agent turn", source)

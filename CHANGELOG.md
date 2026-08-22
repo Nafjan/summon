@@ -5,16 +5,55 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+No changes yet.
+
+## [3.2.0] - 2026-08-22
+
+- **Codex model routing guard:** explicit Codex model requests now collapse agreeing
+  `-m`/`--model`/`-c model=...` selectors into one canonical launch selector. Conflicting
+  selectors are refused before provider contact. An explicit pin without an authoritative
+  terminal served-model receipt is blocked rather than reported as a successful,
+  verified run; these trust failures are not retried or silently rerouted.
+- **Codex identity display:** an explicit model request no longer inherits the ambient
+  Codex default in legacy `model.resolved` when no handshake or served-model identity is
+  emitted. The envelope now makes the missing evidence visible instead of making a Sol
+  request appear to have run on Luna.
+- **Named model seats:** added explicitly pinned `sol-review` (`gpt-5.6-sol`),
+  `terra-review` (`gpt-5.6-terra`), and `luna-review` (`gpt-5.6-luna`) seats.
+  `--list --json` now shows each seat's
+  declared backend, permission, model, and effort so an unpinned seat cannot be
+  mistaken for a named model. Terra remains a candidate until its receipt proves
+  `model.served`; Luna remains a separate, explicit cost-efficient lane.
+- **Conversation atlas stability:** the local chat surface now reserves status and activity
+  space, gives the timeline its own scroll owner, preserves a visible feed anchor during
+  updates, and keeps role/name/version/model/provider identity together in agent choices.
+  The atlas remains subject to rendered-browser and lifecycle gates before chat GA.
+- **Next-release contract:** added [`docs/SUMMON_3.2_PLAN.md`](docs/SUMMON_3.2_PLAN.md),
+  which defines Codex resume fencing, live served-model evidence, roster freshness,
+  privacy boundaries, and the fixed-shell chat acceptance gates.
 - **Authentication recovery:** expired or invalid provider credentials now produce a typed,
   actionable repair plan. `summon auth status` is read-only; `summon auth repair BACKEND`
   requires `--allow-auth-repair`, never captures credentials, and never retries the failed
   dispatch implicitly.
+- **Kimi OAuth refreshes:** isolated Kimi dispatch homes now persist a validated provider
+  token rotation back to the source credential file atomically, while refusing to overwrite
+  a newer login or concurrent refresh. Kimi authentication failures and rate limits are
+  terminal, clearly explained, and never trigger a hidden retry or provider switch.
+- **Telemetry clarity:** permission-tier refusals now have their own bounded failure class,
+  so local diagnostics distinguish an unenforceable permission request from authentication,
+  quota, and generic backend failures.
+- **Telemetry operation audit:** added a schema-2, opt-in, local-only operation-terminal
+  event contract with immutable operation context, bounded HMAC correlation, strict public
+  report validation, malformed-input fail-soft handling, and an offline audit that rejects
+  unbound model/auth evidence. This release does not claim signed evidence provenance or
+  production attempt/turn metrics.
 - **Roster freshness:** `summon models --refresh` explicitly refreshes provider rosters where
   supported. Cached, configured, static, and live sources are distinguished, while exact
   `model.served` evidence remains the authority for what ran. ArkCLI is now a first-class
   discovery/auth lane; Codex candidates remain advisory when its CLI cannot enumerate models.
-- **CI reliability:** release evidence now checks the current 3.1.0 version, and the Windows
-  deliberation UI syntax test validates a temporary JavaScript file instead of waiting on a
+- **CI reliability:** release evidence now checks the current 3.2.0 version, includes the
+  telemetry audit suite, and the Windows deliberation UI syntax test validates a temporary
+  JavaScript file instead of waiting on a
   stdin EOF path that can hang on Windows.
 
 ## [3.1.0] - 2026-08-20

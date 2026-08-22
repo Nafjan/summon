@@ -16,6 +16,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
+import hashlib
 from dataclasses import dataclass, replace
 
 from _loader import DEFAULT_PERMISSION
@@ -42,6 +44,9 @@ class AgentInvocation:
     # executor dispatches on this; see _acpbackend.
     transport: str = "subprocess"
     model: str | None = None
+    # Where a model pin came from. This is diagnostic provenance only; the
+    # canonical selector remains the authority for launch behavior.
+    model_source: str | None = None
     effort: str | None = None          # reasoning effort (claude only): low..max
     resume_id: str | None = None       # backend session/thread/chat id to resume
     resume_profile: str | None = None  # agy only: profile dir of the session to resume
@@ -334,6 +339,131 @@ _BOUNDARY_TAKES_VALUE = {"--permission-mode", "-s", "--sandbox", "--mode", "--ap
                          "--add-dir", "--session", "-S", "--agent", "--agent-file", "--skills-dir"}
 # codex configures approval policy through `-c key=value`, so the KEY decides, not the flag.
 _CODEX_CONFIG_KEYS = ("approval_policy", "sandbox_mode", "sandbox_permissions")
+
+# Codex model selectors are special: unlike ordinary passthrough flags, a second
+# selector can change the provider's effective model after Summon has frozen its
+# request identity. Keep the parser here next to argv construction so identity,
+# dry-run, and the actual child command share one precedence rule.
+_CODEX_MODEL_FLAGS = ("-m", "--model")
+_CODEX_CONFIG_FLAGS = ("-c", "--config")
+
+
+def _codex_model_selectors(extra_args) -> list[dict]:
+    """Extract Codex model selectors from passthrough arguments.
+
+    Supported forms are ``-m value``, ``--model=value``, ``-c model=value`` and
+    their ``--config`` equivalents. Other ``-c`` settings remain untouched. The
+    returned values are descriptive and bounded only by the normal model-id
+    validation performed by the executor; this function never guesses a model.
+    """
+    values: list[dict] = []
+    items = list(extra_args or ())
+    i = 0
+    while i < len(items):
+        token = str(items[i])
+        if token in _CODEX_MODEL_FLAGS:
+            if i + 1 < len(items):
+                values.append({"flag": token, "value": str(items[i + 1]), "index": i})
+                i += 2
+            else:
+                values.append({"flag": token, "value": None, "index": i,
+                               "invalid": True})
+                i += 1
+            continue
+        for flag in _CODEX_MODEL_FLAGS:
+            prefix = flag + "="
+            if token.startswith(prefix):
+                values.append({"flag": flag, "value": token[len(prefix):], "index": i})
+                break
+        else:
+            if token in _CODEX_CONFIG_FLAGS and i + 1 < len(items):
+                candidate = str(items[i + 1])
+                if candidate.startswith("model="):
+                    values.append({"flag": token, "value": candidate[6:], "index": i})
+                    i += 2
+                    continue
+            matched_config = False
+            for flag in _CODEX_CONFIG_FLAGS:
+                prefix = flag + "=model="
+                if token.startswith(prefix):
+                    values.append({"flag": flag, "value": token[len(prefix):], "index": i})
+                    matched_config = True
+                    break
+            if matched_config:
+                i += 1
+                continue
+        i += 1
+    return values
+
+
+def codex_model_selection(model: str | None, extra_args=(), source: str | None = None) -> dict:
+    """Resolve one canonical Codex model selection without contacting Codex.
+
+    ``model`` is the already-resolved CLI/frontmatter value. A model selector in
+    ``args:`` is accepted only when it agrees with that value; conflicting or
+    duplicate distinct selectors are refused rather than allowing backend
+    "last flag wins" behavior. A missing selection is intentionally unpinned and
+    leaves the provider/config default in charge.
+    """
+    explicit = model.strip() if isinstance(model, str) and model.strip() else None
+    selectors = _codex_model_selectors(extra_args)
+    values = [item["value"].strip() for item in selectors
+              if isinstance(item.get("value"), str) and item["value"].strip()]
+    unique: list[str] = []
+    for value in values:
+        if value.casefold() not in {v.casefold() for v in unique}:
+            unique.append(value)
+    conflict = None
+    if any(item.get("invalid") or
+           (isinstance(item.get("value"), str) and not item["value"].strip())
+           for item in selectors):
+        conflict = "a Codex model selector is missing its model value"
+    elif explicit and any(value.casefold() != explicit.casefold() for value in unique):
+        conflict = "the invocation model conflicts with a Codex model selector in agent args"
+    elif len(unique) > 1:
+        conflict = "agent args contain conflicting Codex model selectors"
+    canonical = explicit or (unique[0] if unique else None)
+    source_name = source if source in {
+        "cli", "frontmatter", "legacy_args", "profile_default",
+        "ambient_config", "provider_default", "invocation"
+    } else ("invocation" if explicit else "legacy_args" if unique else "ambient_config")
+    return {
+        "requested": canonical,
+        "source": source_name,
+        "selectors": selectors,
+        "canonical": canonical,
+        "exact_required": bool(canonical),
+        "conflict": conflict,
+    }
+
+
+def strip_codex_model_selectors(extra_args) -> list:
+    """Remove model-bearing passthrough tokens after they were attested.
+
+    Non-model ``-c``/``--config`` settings are preserved. The caller emits one
+    canonical ``-m`` when ``codex_model_selection`` returns a pinned model.
+    """
+    items = list(extra_args or ())
+    out: list = []
+    selectors = {(item["index"], item["flag"]) for item in _codex_model_selectors(items)}
+    i = 0
+    while i < len(items):
+        token = str(items[i])
+        if any(index == i and flag in _CODEX_MODEL_FLAGS for index, flag in selectors):
+            if token in _CODEX_MODEL_FLAGS:
+                i += 2
+            else:
+                i += 1
+            continue
+        if any(index == i and flag in _CODEX_CONFIG_FLAGS for index, flag in selectors):
+            if token in _CODEX_CONFIG_FLAGS:
+                i += 2
+            else:
+                i += 1
+            continue
+        out.append(items[i])
+        i += 1
+    return out
 
 
 def strip_boundary_flags(cli: str, extra_args) -> list:
@@ -746,6 +876,7 @@ def _build_kimi_args(inv: AgentInvocation, *, resource_register=None
         try:
             resource_register(profile, "kimi-profile")
         except Exception as exc:  # noqa: BLE001 - never orphan copied credentials
+            _forget_kimi_profile(profile)
             shutil.rmtree(profile, ignore_errors=True)
             raise ValueError("kimi profile: controlled cleanup registration failed") from exc
     command, base_args = build_command(inv.cli, _concatenated_prompt(inv))
@@ -1061,7 +1192,16 @@ def _codex_env_override() -> dict | None:
 
 def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     perm = permission_flags(inv.cli, inv.permission)
-    model_flag = ["-m", inv.model] if inv.model else []
+    selection = codex_model_selection(inv.model, inv.extra_args)
+    if selection["conflict"]:
+        raise ValueError(
+            f"codex model selection conflict: {selection['conflict']}; "
+            "remove the conflicting model selector and retry")
+    # Emit exactly one selector. This prevents a later agent-defined -m/-c from
+    # silently overriding an explicit Sol request while preserving ordinary
+    # Codex config overrides such as model_reasoning_effort.
+    model_flag = (["-m", selection["canonical"]]
+                  if selection["canonical"] else [])
     # Reasoning effort -> codex config override. gpt supports low|medium|high, so
     # clamp claude's xhigh/max down to high. Global `-c` flags precede the subcommand.
     effort_flag = []
@@ -1069,8 +1209,9 @@ def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         _e = "high" if inv.effort in ("xhigh", "max") else inv.effort
         effort_flag = ["-c", f"model_reasoning_effort={_e}"]
     env = env_override_for("codex")
+    passthrough = strip_codex_model_selectors(inv.extra_args)
     head = (perm + model_flag + effort_flag
-            + strip_boundary_flags(inv.cli, inv.extra_args))
+            + strip_boundary_flags(inv.cli, passthrough))
     if inv.resume_id:
         # `codex exec resume <id>`: the thread holds the agent definition, so send
         # only the task + reminder (no [System Context] prefix). Permission/model
@@ -1472,6 +1613,198 @@ def _ensure_agy_profile(cwd: str, deadline_sec: float = 300.0) -> str:
 
 _KIMI_RUN_TTL_SEC = 24 * 3600
 
+# Kimi refreshes OAuth tokens in the home it is running under.  Summon gives
+# each invocation an isolated home so sessions/MCP state cannot bleed between
+# projects, but a disposable home must not make a successful refresh vanish.
+# Keep this registry process-local: it contains only private filesystem
+# bookkeeping and never crosses the provider or envelope boundary.
+_KIMI_PROFILE_META_LOCK = threading.RLock()
+_KIMI_PROFILE_META: dict[str, tuple[str, dict[str, str]]] = {}
+_KIMI_CREDENTIAL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json$")
+_KIMI_CREDENTIAL_MAX_BYTES = 1024 * 1024
+_KIMI_SYNC_LOCK_MAX_AGE_SEC = 120
+_KIMI_SYNC_LOCK_WAIT_SEC = 8.0
+
+
+def _kimi_credential_payload(path: str) -> tuple[dict, bytes] | None:
+    """Read one Kimi OAuth JSON file, returning only a valid credential object.
+
+    The provider has changed the filename across CLI releases, so the allowlist
+    is schema-based rather than a single hard-coded basename.  We still reject
+    links, oversized files, malformed JSON, and objects without both OAuth
+    tokens.  This helper never logs or returns token values outside this module.
+    """
+    try:
+        if (not _KIMI_CREDENTIAL_NAME_RE.fullmatch(os.path.basename(path))
+                or os.path.islink(path) or not os.path.isfile(path)):
+            return None
+        if os.path.getsize(path) > _KIMI_CREDENTIAL_MAX_BYTES:
+            return None
+        with open(path, "rb") as fh:
+            raw = fh.read(_KIMI_CREDENTIAL_MAX_BYTES + 1)
+        if len(raw) > _KIMI_CREDENTIAL_MAX_BYTES:
+            return None
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict):
+            return None
+        access = value.get("access_token")
+        refresh = value.get("refresh_token")
+        if (not isinstance(access, str) or not access or len(access) > 16_384
+                or not isinstance(refresh, str) or not refresh or len(refresh) > 16_384):
+            return None
+        return value, raw
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+
+
+def _kimi_credential_snapshot(credentials_dir: str) -> dict[str, str]:
+    """Hash valid source credential files before a child receives its copy."""
+    if os.path.islink(credentials_dir) or not os.path.isdir(credentials_dir):
+        return {}
+    snapshot: dict[str, str] = {}
+    try:
+        names = os.listdir(credentials_dir)
+    except OSError:
+        return snapshot
+    for name in names:
+        path = os.path.join(credentials_dir, name)
+        parsed = _kimi_credential_payload(path)
+        if parsed is not None:
+            snapshot[name] = hashlib.sha256(parsed[1]).hexdigest()
+    return snapshot
+
+
+def _forget_kimi_profile(profile: str | None) -> None:
+    if not isinstance(profile, str):
+        return
+    with _KIMI_PROFILE_META_LOCK:
+        _KIMI_PROFILE_META.pop(os.path.realpath(profile), None)
+
+
+def _kimi_sync_lock(credentials_dir: str):
+    """Acquire a short-lived cross-process lock for credential replacement.
+
+    A crashed parent must not permanently disable refresh.  Stale lock
+    reclamation is age- and path-bounded, and failure to acquire is a safe
+    no-op: the next dispatch can still refresh or the explicit login repair can
+    replace the source credentials.
+    """
+    if os.path.islink(credentials_dir) or not os.path.isdir(credentials_dir):
+        return None
+    lock_path = os.path.join(credentials_dir, ".summon-kimi-refresh.lock")
+    deadline = time.monotonic() + _KIMI_SYNC_LOCK_WAIT_SEC
+    while time.monotonic() < deadline:
+        try:
+            if os.path.islink(lock_path):
+                return None
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, f"{os.getpid()}\n{time.time():.6f}\n".encode("ascii"))
+            except OSError:
+                pass
+            return fd, lock_path
+        except FileExistsError:
+            try:
+                age = time.time() - os.stat(lock_path, follow_symlinks=False).st_mtime
+                if age > _KIMI_SYNC_LOCK_MAX_AGE_SEC:
+                    os.unlink(lock_path)
+                    continue
+            except OSError:
+                continue
+            time.sleep(0.05)
+        except OSError:
+            return None
+    return None
+
+
+def _kimi_release_sync_lock(lock):
+    if not lock:
+        return
+    fd, path = lock
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        if not os.path.islink(path):
+            os.unlink(path)
+    except OSError:
+        pass
+
+
+def sync_kimi_profile_credentials(profile: str | None) -> int:
+    """Persist provider-refreshed Kimi OAuth material back to its source home.
+
+    The source is updated only when the exact source file copied at profile
+    creation is still present and unchanged.  This prevents a concurrent
+    ``kimi login`` or another dispatch from being overwritten by an older child.
+    Writes are validated, mode-restricted, locked, and atomic.  The return
+    value is an internal count for tests/diagnostics; token contents never leave
+    this function.
+    """
+    if not isinstance(profile, str):
+        return 0
+    with _KIMI_PROFILE_META_LOCK:
+        meta = _KIMI_PROFILE_META.pop(os.path.realpath(profile), None)
+    if meta is None:
+        return 0
+    source, snapshot = meta
+    source_credentials = os.path.join(source, "credentials")
+    child_credentials = os.path.join(profile, "credentials")
+    if (os.path.islink(source) or os.path.islink(source_credentials)
+            or os.path.islink(child_credentials)
+            or not os.path.isdir(source_credentials)
+            or not os.path.isdir(child_credentials)):
+        return 0
+    lock = _kimi_sync_lock(source_credentials)
+    if lock is None:
+        return 0
+    synced = 0
+    try:
+        try:
+            names = os.listdir(child_credentials)
+        except OSError:
+            return 0
+        for name in names:
+            child_path = os.path.join(child_credentials, name)
+            parsed = _kimi_credential_payload(child_path)
+            if parsed is None:
+                continue
+            source_path = os.path.join(source_credentials, name)
+            expected = snapshot.get(name)
+            current = _kimi_credential_payload(source_path)
+            if expected is None:
+                # Do not resurrect a file that did not exist when this child
+                # was created; a login/other process may own this new file.
+                continue
+            if current is None or hashlib.sha256(current[1]).hexdigest() != expected:
+                continue
+            temporary = os.path.join(
+                source_credentials,
+                f".summon-kimi-refresh-{os.getpid()}-{threading.get_ident()}-{synced}.tmp")
+            try:
+                fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(fd, "wb") as fh:
+                    body = json.dumps(parsed[0], ensure_ascii=False,
+                                      sort_keys=True, separators=(",", ":"))
+                    fh.write(body.encode("utf-8") + b"\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(temporary, source_path)
+                try:
+                    os.chmod(source_path, 0o600)
+                except OSError:
+                    pass
+                synced += 1
+            except (OSError, UnicodeError, ValueError):
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+    finally:
+        _kimi_release_sync_lock(lock)
+    return synced
+
 
 def _kimi_cleanup_old_runs(runs_dir: str) -> None:
     """Best-effort expiry for isolated Kimi profiles.
@@ -1536,13 +1869,18 @@ def _ensure_kimi_profile() -> str:
         if os.path.isfile(device_id):
             shutil.copy2(device_id, os.path.join(profile, "device_id"))
         _agy_lock_down(profile)
+        with _KIMI_PROFILE_META_LOCK:
+            _KIMI_PROFILE_META[os.path.realpath(profile)] = (
+                source, _kimi_credential_snapshot(credentials))
         return profile
     except ValueError:
         if 'profile' in locals():
+            _forget_kimi_profile(profile)
             shutil.rmtree(profile, ignore_errors=True)
         raise
     except OSError as e:
         if 'profile' in locals():
+            _forget_kimi_profile(profile)
             shutil.rmtree(profile, ignore_errors=True)
         raise ValueError(f"kimi profile: build failed: {type(e).__name__}: {e}") from e
 

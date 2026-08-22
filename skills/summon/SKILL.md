@@ -166,6 +166,13 @@ switch providers, capture credentials, or claim that a login succeeded because a
 opened. `summon auth status` is read-only; `summon auth repair` runs only the allowlisted vendor
 login command and never replays the failed dispatch.
 
+Kimi dispatches use an isolated home for each call. If Kimi refreshes an OAuth access or
+refresh token, Summon persists that rotation back to the source credential file atomically
+only when the source has not changed since the call began; an explicit concurrent `kimi login`
+wins. A Kimi `authentication_failed` or `rate_limited` envelope is terminal: explain the
+repair/wait action and do not retry or switch providers silently. Kimi `read-only` and
+`safe-edit` refusals are reported as `permission_unsupported`, not as auth failures.
+
 For any significant orchestration, use `doctor --json` and inspect `installs.drift` too.
 It enumerates every known summon copy, identifies the running copy, and reports duplicates
 or stale hashes. Do not trust the version string alone: a field machine had seven current
@@ -184,8 +191,13 @@ scripts/run_subagent.py --list
 
 Output:
 ```json
-{"agents": [{"name": "code-reviewer", "description": "Reviews code..."}], "agents_dir": "/path/.agents"}
+{"agents": [{"name": "sol-review", "description": "Adversarial review...", "run_agent": "codex", "permission": "read-only", "model": "gpt-5.6-sol", "effort": "high", "source": "bundled"}], "agents_dir": "/path/.agents"}
 ```
+
+Each listed seat includes its declared backend, permission, model pin, and effort when
+those fields are present. A missing `model` is an explicit unpinned seat, not evidence
+that the backend default is Sol, Terra, Luna, or any other named model. Use a dispatch
+envelope's `model.served` to verify what actually ran.
 
 A starter roster (planner, reviewer, coder, pair, …) ships bundled inside the
 skill, so `--list` is normally populated even in a brand-new project — you do
@@ -538,6 +550,12 @@ run or recommending it to a user.
 | `--swarm-claim-id ID` / `--swarm-lease-generation N` | With `swarm renew` | Fenced claim identity and generation; stale workers are refused. |
 | `--swarm-reason TEXT` | With `swarm cancel` | Bounded, redacted cancellation reason recorded in the public journal. |
 
+Telemetry is an operator-level local setting and spool, shared by the installed skill
+copies on that machine. Refreshing a host copy never changes the setting or uploads the
+spool; keep telemetry disabled unless the operator explicitly opts in. `doctor --json`
+can report install drift, while `telemetry status --json` reports the effective setting
+and bounded spool health.
+
 The public deliberate CLI has a narrow provider lane and reports a redacted durable
 run result after cleanup. It rejects unsupported approval/resume, ACP/HTTP, Kimi,
 text-only, writable, and full-bypass routes as `integration_pending`; it never silently
@@ -606,7 +624,7 @@ Every response carries structured fields for programmatic orchestration:
 | `billing` | `{source, note}` — did this run draw from a vendor **subscription** (CLI login), metered **api** credits, account **credit** (a subscription-CLI model that bills like API), or is the source **unknown**? Pairs with `usage`/`cost_usd` to attribute spend. Advisory (the vendor's billing is truth). |
 | `elapsed_ms` | Wall-clock for the dispatch — on every DISPATCH envelope (success/blocked/partial/error/timeout, incl. spawn failures). Not on the `--background` handle or pre-dispatch validation errors. Use it to tune swarm concurrency. |
 | `timeout` | On a timeout, `{budget_ms, stage, partial_output}` says which bounded budget expired and whether usable text was preserved. ACP names the exact protocol stage (`initialize`, `session/new`, `session/set_model`, or `session/prompt`). A subprocess backend reports `backend-execution`: summon can attest its own deadline but cannot truthfully separate vendor startup, model reasoning, and an agent's tool call without provider telemetry. |
-| `model` | `{requested, targeted, served, resolved, models_used}`, split by EVIDENCE. `requested` = what the caller asked for. `targeted` = what the session was POINTED AT (init handshake, else the post-credit-guard effective model, else the backend's knowable default). `served` = the model that actually did work, set ONLY on service evidence (a terminal-event model report, or output tokens with a known target). `served` is null whenever no service evidence was observed (typical for failed runs) even when `targeted` names a model, and task status is never used as evidence in either direction (a served run can be legitimately downgraded to `blocked`). `resolved` = LEGACY v1 semantics (handshake-or-terminal + codex config backfill), kept for compatibility; migrate to `targeted`/`served`. `models_used` lists every model id seen (a claude session often also runs a cheap auxiliary model). agy reports none of these beyond `targeted`. Use `served_model_evidence` to distinguish a provider report from an inference. Aliases (`opus`/`sonnet`) can lag a launch; pin the explicit ID for a guaranteed-latest run. |
+| `model` | `{requested, targeted, served, resolved, models_used}`, split by EVIDENCE. `requested` = what the caller asked for. `targeted` = what the session was POINTED AT (init handshake, else the post-credit-guard effective model, else the backend's knowable default). `served` = the model that actually did work, set ONLY on service evidence (a terminal-event model report, or output tokens with a known target). `served` is null whenever no service evidence was observed (typical for failed runs) even when `targeted` names a model, and task status is never used as evidence in either direction (a served run can be legitimately downgraded to `blocked`). `resolved` = LEGACY v1 compatibility: handshake-or-terminal, plus the Codex config backfill only for unpinned requests. An explicit Codex pin never inherits the ambient default into `resolved`; that default is not evidence about the turn. Migrate to `targeted`/`served`. `models_used` lists every model id seen (a claude session often also runs a cheap auxiliary model). agy reports none of these beyond `targeted`. Use `served_model_evidence` to distinguish a provider report from an inference. Aliases (`opus`/`sonnet`) can lag a launch; pin the explicit ID for a guaranteed-latest run. |
 | `served_model_evidence` | `reported`, `inferred`, or `absent`. How Summon established `model.served`: `reported` is a non-empty, bounded terminal provider model report; `inferred` is output-token evidence paired with a known target; `absent` means neither was observed. Unsafe or malformed provider values are discarded and never become provenance. This field never invents a model. Missing evidence does not make an otherwise usable success nonterminal; provenance-required workflows must reject `absent` or `inferred` explicitly. A success with an empty or missing result is normalized to `status:"error"` with a consistent exit tuple and `error_kind:"empty_terminal_result"`. |
 | `summon`, `agent_def`, `prompt_sha256`, `git_head_before`, `workspace_evidence`, `artifacts` | Provenance receipt, built progressively on the dispatch path: `summon` identity is on EVERY envelope the path emits (validation errors, missing agent, preflight, results); the other fields join as they become known. `summon` = `{version, script, scripts_sha256}` (one SHA-256, length-prefixed framing, over every production module, so divergent installs become diagnosable from any envelope). `agent_def` = `{file, sha256, agents_dir, source: project\|bundled\|explicit\|env}`, where `agents_dir` is the absolute roster directory the definition was ACTUALLY loaded from. `prompt_sha256` hashes the ROOT prompt. `git_head_before` names tracked repo state. `workspace_evidence` is additive mutation evidence: `{before,after,coverage,child_commit,mutation,read_only_violation,attribution}`. Each snapshot exposes only `head`, `branch`, and bounded repo-relative `staged`, `unstaged`, `renamed`, and `untracked` paths; it never emits cwd, repository root, file contents, or secrets. `coverage` is `complete`, `incomplete`, or `unavailable`; `mutation`, `child_commit`, and `read_only_violation` are `true`/`false` only when the before/after comparison proves them, otherwise `null`. A dirty baseline makes attribution `ambiguous`; a clean baseline makes it `exact`; unavailable coverage is `unavailable`. Git reads use hidden Windows utility flags, per-call/overall deadlines, and a bounded status payload. This evidence does not enforce read-only and does not expose `--verify-no-mutations` yet. Repeatable `--artifact` adds an opt-in loose-file manifest `{files:[{path,sha256,bytes,page_count,page_count_source}],sha256,stable_during_dispatch,after_sha256,changed,after_error?}` and joins its manifest hash to request reuse. `changed` lists proven identity differences and is `null` when the after-read failed; `after_error` explains why stability is unknown. Either case makes a successful result suspect. Hashes and paths only, never content or secrets; paths are local-operator data. |
 | `permission`, `permission_flags` | The permission level and the EXACT CLI flags it mapped to for this run — no more black box. |
@@ -842,7 +860,7 @@ permissions.
 | `permission` | `read-only`, `safe-edit` (default), `yolo` | Approval/sandbox level the sub-agent runs with |
 | `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.served` |
 | `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning / thinking for this agent. Honored by **claude + codex** (overrides Summon default `high`); on **agy** + Gemini, counts as *explicit* and rewrites the model suffix. Ignored on other CLIs. `--effort` at dispatch overrides it. See [references/effort.md](references/effort.md) |
-| `args` | shell-style string (optional) | Arbitrary extra backend flags passed verbatim, e.g. `args: -c model_reasoning_effort="high"` (codex). Model pinning stops being a special case |
+| `args` | shell-style string (optional) | Arbitrary extra backend flags. Codex model-bearing `-m`/`--model`/`-c model=...` selectors are parsed, compared, and collapsed into one canonical selector; other flags remain subject to the permission boundary |
 | `profile` | private registry name (optional) | Select a named vendor login/config profile. The registry is local to the operator; do not put paths, credentials, or account identifiers in a public agent definition. `--profile` overrides this field |
 | `transport` | `subprocess` (default), `acp` (optional) | Dispatch transport. `acp` runs the turn over the Agent Client Protocol (native: gemini, kimi, cursor-agent); `--transport` at dispatch overrides it |
 
@@ -897,6 +915,15 @@ when a provider roster may have changed. Treat `source: live` as a fresh provide
 `source: cache` as a cached response, `source: config` as a local default, and `source: static`
 as documentation only. A listed or cataloged model is not proof of account eligibility: only a
 successful dispatch envelope with exact `model.served` evidence establishes what ran.
+
+For an explicit Codex pin, Summon emits one canonical `-m` selector and refuses
+conflicting `-m`/`--model`/`-c model=...` values before contacting Codex. The run
+is blocked with a terminal model-trust error when Codex reports a different
+handshake/served model or no authoritative terminal served-model receipt. Summon
+does not retry or silently switch such a request; inspect `model.requested`,
+`model.targeted`, `model.served`, `served_model_evidence`, `error_kind`, and
+`result_usable` together. See [`docs/SUMMON_3.2_PLAN.md`](../../docs/SUMMON_3.2_PLAN.md)
+for the next-release resume and live-evidence contract.
 
 **`permission` → exact per-CLI flags** (what the script actually passes — the
 levels are NOT identical across CLIs; when behavior surprises you, check this table):

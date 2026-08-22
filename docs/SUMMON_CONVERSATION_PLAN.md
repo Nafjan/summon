@@ -13,6 +13,14 @@ addressed agent messages are now available through a bounded local inbox; a dura
   swarm coordination remains a separate provider-neutral control plane; the local
   `_rundir`-backed coordinator is shipped, while external IDE adapters remain gated.
 
+The atlas shell now uses a fixed `100dvh` layout with reserved status/activity
+space and a dedicated feed scroller. The browser window is not the conversation
+scroll owner; notices, working state, recovery, and latest controls must not move
+the feed or composer. Mobile keeps the composer in a stable bottom shell and
+compresses roster identity into an independently scrollable strip. Rendered browser
+geometry, long-journal anchoring, and owner/stream failure evidence remain 3.2
+release gates; this document does not claim chat GA by itself.
+
 Summon should have one conversation substrate shared by ordinary brainstorming,
 interactive councils, and governed deliberations. The substrate is a durable,
 redacted event stream—not a second scheduler and not a replacement for the

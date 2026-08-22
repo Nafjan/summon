@@ -205,6 +205,14 @@ expose a complete enumeration command, so its configured default and catalog can
 advisory. Pin a candidate only after a real dispatch proves the exact `model.served` value;
 never infer a new model from a display label or a task name.
 
+The next-release contract makes an explicit Codex pin stricter: Summon emits one canonical
+model selector, refuses conflicting selectors before provider contact, and blocks a pinned run
+when the provider does not return an authoritative terminal served-model receipt. A handshake
+target, output-token estimate, or catalog entry is not proof that Sol (or any other model) was
+served. See [`docs/SUMMON_3.2_PLAN.md`](docs/SUMMON_3.2_PLAN.md) for the routing and chat
+acceptance gates. The fixed-shell chat atlas is still preview-only until its rendered-browser
+and owner-lifecycle gates pass.
+
 For a release or support bundle, generate a provider-inert evidence manifest after
 running the fixed release-test registry:
 
@@ -213,7 +221,7 @@ python tools/release_gates.py --require-clean --output "${RUNNER_TEMP:-${TMPDIR:
 python tools/release_manifest.py \
   --evidence-file "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json" \
   --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" \
-  --expected-version 3.1.0 --check
+  --expected-version 3.2.0 --check
 ```
 
 The runner executes the fixed suites, records output digests, strips backend credentials and
@@ -502,7 +510,7 @@ vendors.
   "report_ok": true,
   "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
                "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
-  "summon":  { "version": "3.1.0", "scripts_sha256": "<sha256>" },
+  "summon":  { "version": "3.2.0", "scripts_sha256": "<sha256>" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -519,6 +527,10 @@ vendors.
   contract don't get believed.
 - `model.served` → the model that actually did the work (evidence-based; `null` = no
   service evidence observed). `targeted` = what the session was pointed at.
+- For an explicit Codex model pin, `status: "blocked"` with `error_kind` such as
+  `model_selection_conflict`, `target_model_mismatch`, `served_model_mismatch`, or
+  `served_model_unverified` is a terminal trust result. It is not automatically retried or
+  rerouted, and `result_usable` is false.
 - `served_model_evidence` → `reported`, `inferred`, or `absent`: whether the served
   model came from a terminal provider report, bounded telemetry inference, or no
   service evidence. Missing provenance does not make a usable success retryable;
@@ -670,7 +682,10 @@ You bring model access. Summon orchestrates the CLIs and APIs you already use.
   enabled, it records bounded, allow-listed metadata locally and omits prompt text, result
   text, raw output, credentials, and absolute paths. It may retain deterministic fingerprints
   for local correlation; see [local diagnostics and telemetry](docs/TELEMETRY.md) for storage,
-  clearing, and report-submission details.
+  clearing, and report-submission details. The setting and spool belong to the operator
+  profile, not to each installed skill copy: updating or reinstalling a host copy does not
+  enable telemetry, disable it, or transmit anything. Use `summon telemetry status` to
+  inspect the effective local setting.
 
 ---
 
@@ -718,6 +733,10 @@ per-stage timeouts; the background job registry read path (`jobs list` / `status
 with nonce-verified results); install-drift detection in `doctor` and `install.py`;
 `--gate-with` approval gating across every execution path; and the argv preflight that
 turned an OS command-line overflow from a bogus `CLI not found` into an accurate error.
+The bundled roster now also includes explicit target seats for Sol, Terra, and Luna reviews;
+the dispatch receipt still verifies the exact served model. `--list --json` shows each
+seat's declared model and effort. Luna is deliberately separate from Sol and Terra, so a
+cost-efficient Luna turn cannot be mistaken for a Sol review.
 
 **Next (scoped):**
 - **Honest fan-out rollups**: a durable attempt journal (already present for councils)
@@ -734,7 +753,7 @@ turned an OS command-line overflow from a bogus `CLI not found` into an accurate
   sibling install has drifted (using the envelope's `summon.scripts_sha256`).
 - **Layered roster resolution**: merge `--agents-dir` / `SUB_AGENTS_DIR` > project
   `.agents` > user `~/.agents` > bundled, with a `source` per agent, plus neutral
-  model-tier agents (e.g. a Sol reviewer, an Opus architect) to layer task personas on.
+  model-tier seats for additional providers and model families to layer task personas on.
 - **Spend governance**: `--max-cost-usd` / `--max-tokens` accumulated caps with
   stop-before-chair behavior. (Pre-dispatch cost *estimates* are declined: summon has no
   pricing table and won't guess a bill.)

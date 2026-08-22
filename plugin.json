@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "summon",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "Cross-vendor sub-agent broker with structured envelopes, council, governed deliberation, and authenticated local browser surfaces; optional MCP facade and provider drivers (CLI + openai-compat + arkcli).",
   "license": "MIT",
   "keywords": [

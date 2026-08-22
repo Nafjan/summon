@@ -2792,7 +2792,7 @@ def test_bug_report_sanitizes_envelope_and_marks_imported_identity():
         assert "C:\\Users\\test" not in text and "agent_def" not in text
         assert "A local failure" in text
         assert '"source_trust": "unverified"' in text
-        assert "low-entropy" in text and "fingerprints" in text
+        assert "deterministic fingerprints were omitted" in text
         forged = {"schema": 1, "event_id": "a" * 32, "recorded_at": "now",
                   "status": "error", "error": "secret=DO_NOT_PUBLISH",
                   "private_field": "must not appear"}
@@ -2857,8 +2857,9 @@ def test_github_submission_is_explicit_and_shell_free():
     calls = []
     try:
         report = os.path.join(d, "report.md")
-        Path(report).write_text("# Summon diagnostic report\n\n## Summary\n\nReviewed diagnostic\n",
-                                encoding="utf-8")
+        generated, _ = _telemetry.make_report({"status": "error", "cli": "codex"},
+                                               title="Reviewed diagnostic")
+        Path(report).write_text(generated, encoding="utf-8")
         _telemetry.shutil.which = lambda name: "gh.exe" if name == "gh" else None
 
         def fake_run(*args, **kwargs):
@@ -2914,6 +2915,17 @@ def test_debug_directory_source_reads_real_final_envelope_section():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_telemetry_classifies_permission_refusals_separately_from_backend_errors():
+    import _telemetry
+    event = _telemetry.event_from_envelope({
+        "status": "error",
+        "error_kind": "permission_unsupported",
+        "error": "provider cannot enforce read-only permission",
+        "cli": "kimi",
+    })
+    assert event["failure_class"] == "permission"
+
+
 def test_submit_requires_existing_reviewed_file_and_never_regenerates():
     import _telemetry
     d = tempfile.mkdtemp(prefix="summon-submit-review-")
@@ -2966,15 +2978,16 @@ def test_fanout_validation_errors_enter_opt_in_telemetry():
     import _council, _manifest, _telemetry
     old = _telemetry.record
     captured = []
-    _telemetry.record = lambda event: captured.append(event)
+    _telemetry.record = lambda event, **kwargs: captured.append((event, kwargs))
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             assert _manifest._fail("bad manifest") == 1
             assert _council._fail("bad council") == 1
     finally:
         _telemetry.record = old
-    assert [e["transport"] for e in captured] == ["manifest", "council"]
-    assert all(e["status"] == "error" for e in captured)
+    assert [e["transport"] for e, _ in captured] == ["manifest", "council"]
+    assert [kw.get("operation") for _, kw in captured] == ["manifest", "council"]
+    assert all(e["status"] == "error" for e, _ in captured)
 
 def test_effort_frontmatter_backends_and_envelope():
     import _builder, _executor
@@ -3541,6 +3554,10 @@ def test_stream_handshake_separate_from_terminal_model():
     p3.process_line('{"type":"system","subtype":"init","model":"claude-h"}')
     p3.process_line('{"type":"result","result":"ok","model":"claude-t"}')
     assert p3.handshake_model == "claude-h" and p3.model == "claude-t"
+    p4 = StreamProcessor()
+    p4.process_line('{"type":"thread.started","thread_id":"t2","model":"gpt-sol"}')
+    p4.process_line('{"type":"turn.completed","result":{"served_model":"gpt-sol"}}')
+    assert p4.model == "gpt-sol" and p4.handshake_model == "gpt-sol"
 
 
 def test_receipt_and_model_evidence_on_error_dispatch():
@@ -4994,7 +5011,7 @@ def test_v4_overall_timeout_setup_overrun():
     orig_record = _telemetry.record
     telemetry_events = []
     _council._dispatch = fake
-    _telemetry.record = lambda event: telemetry_events.append(event)
+    _telemetry.record = lambda event, **kwargs: telemetry_events.append((event, kwargs))
     # Fake clock that ADVANCES 10s on every read. Order-independent by construction:
     # whichever call captures the run start, the very next read is already 10s later, so
     # any positive budget is spent. An earlier attempt special-cased "the first call is
@@ -5030,7 +5047,8 @@ def test_v4_overall_timeout_setup_overrun():
     assert env["members"] == [], env["members"]
     assert not dispatched, dispatched         # no paid member launched past the deadline
     assert "setup" in (env.get("overall_timeout", {}).get("reason") or ""), env.get("overall_timeout")
-    assert any(event.get("failure_class") == "timeout" for event in telemetry_events), telemetry_events
+    assert any(event.get("failure_class") == "timeout" and kw.get("operation") == "council"
+               for event, kw in telemetry_events), telemetry_events
     assert elapsed < 10, elapsed
 
 
@@ -16949,6 +16967,91 @@ def test_v10_kimi_builder_isolated_and_boundary_safe():
         shutil.rmtree(state, ignore_errors=True)
 
 
+def test_v10_kimi_refresh_credentials_persists_rotation_without_clobbering_login():
+    """A disposable Kimi home must return OAuth refreshes to the source home.
+
+    The source-file compare is important: a concurrent explicit ``kimi login``
+    wins over an older child that exits afterward.  This test uses synthetic
+    tokens and never contacts a provider.
+    """
+    import _builder as b
+    root = tempfile.mkdtemp(prefix="summon-kimi-source-refresh-")
+    state = tempfile.mkdtemp(prefix="summon-kimi-state-refresh-")
+    saved = {k: os.environ.get(k) for k in ("KIMI_CODE_HOME", "KIMI_HEADLESS_PROFILE")}
+    source_credential = os.path.join(root, "credentials", "kimi-code.json")
+    try:
+        os.makedirs(os.path.dirname(source_credential))
+        with open(os.path.join(root, "config.toml"), "w", encoding="utf-8") as fh:
+            fh.write('default_model = "kimi-code/k3"\n')
+        original = {
+            "access_token": "access-old", "refresh_token": "refresh-old",
+            "expires_at": 1, "expires_in": 900, "scope": "coding",
+            "token_type": "Bearer",
+        }
+        with open(source_credential, "w", encoding="utf-8") as fh:
+            json.dump(original, fh)
+        os.environ["KIMI_CODE_HOME"] = root
+        os.environ["KIMI_HEADLESS_PROFILE"] = state
+        inv = b.AgentInvocation(cli="kimi", prompt="refresh test", cwd=".",
+                                permission="yolo", model="kimi-code/k3")
+        _command, _args, env = b.build_invocation_args(inv)
+        profile = env["KIMI_CODE_HOME"]
+        child_credential = os.path.join(profile, "credentials", "kimi-code.json")
+        rotated = dict(original, access_token="access-new",
+                       refresh_token="refresh-new", expires_at=2)
+        with open(child_credential, "w", encoding="utf-8") as fh:
+            json.dump(rotated, fh)
+        assert b.sync_kimi_profile_credentials(profile) == 1
+        with open(source_credential, encoding="utf-8") as fh:
+            assert json.load(fh)["access_token"] == "access-new"
+
+        # A newer login/source writer wins. The stale child must not overwrite it.
+        _command, _args, env2 = b.build_invocation_args(inv)
+        profile2 = env2["KIMI_CODE_HOME"]
+        child2 = os.path.join(profile2, "credentials", "kimi-code.json")
+        logged_in = dict(rotated, access_token="access-login",
+                         refresh_token="refresh-login", expires_at=3)
+        with open(source_credential, "w", encoding="utf-8") as fh:
+            json.dump(logged_in, fh)
+        with open(child2, "w", encoding="utf-8") as fh:
+            json.dump(dict(rotated, access_token="access-stale"), fh)
+        assert b.sync_kimi_profile_credentials(profile2) == 0
+        with open(source_credential, encoding="utf-8") as fh:
+            assert json.load(fh)["access_token"] == "access-login"
+        shutil.rmtree(profile, ignore_errors=True)
+        shutil.rmtree(profile2, ignore_errors=True)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(state, ignore_errors=True)
+
+
+def test_v10_kimi_auth_and_rate_limit_failures_are_terminal():
+    import _doctor
+    import _executor
+    auth = {"status": "error", "cli": "kimi",
+            "error": 'auth.login_required: OAuth provider requires login before use',
+            "output_tail": ""}
+    _executor._attach_eligibility(auth)
+    assert auth["error_kind"] == "authentication_failed", auth
+    assert auth["retryable"] is False and auth["result_usable"] is False
+    assert auth["auth_outcome"] == "login_required"
+    assert auth["remediation_code"] == "provider_login_required"
+    assert _executor.is_terminal_nonretryable(auth)
+    assert _doctor.classify_ineligibility(
+        "OAuth provider requires login before use", backend="kimi")["kind"] == "auth"
+    limited = {"status": "error", "cli": "kimi",
+               "error": "HTTP 429: too many requests", "output_tail": ""}
+    _executor._attach_eligibility(limited)
+    assert limited["error_kind"] == "rate_limited", limited
+    assert limited["retryable"] is False and _executor.is_terminal_nonretryable(limited)
+    assert limited["remediation_code"] == "provider_quota_wait"
+
+
 def test_v10_kimi_stream_finalizes_only_at_eof():
     import _executor as ex
     from _stream import StreamProcessor
@@ -17720,6 +17823,10 @@ def test_auth_failure_has_explicit_repair_plan_and_no_silent_retry():
     _executor._attach_eligibility(envelope)
     assert envelope["error_kind"] == "authentication_failed"
     assert envelope["auth"]["retry_safe"] is False
+    assert envelope["auth_stage"] == "terminal"
+    assert envelope["auth_outcome"] == "login_required"
+    assert envelope["interactive_required"] is True
+    assert envelope["remediation_code"] == "provider_login_required"
     assert "did not retry" in " ".join(envelope.get("warnings", [])).lower()
 
 

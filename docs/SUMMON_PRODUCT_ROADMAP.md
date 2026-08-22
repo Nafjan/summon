@@ -22,6 +22,16 @@ local lifecycle hardening, and the bounded Claude deliberation gate. The remaini
 work is post-GA: richer chat/swarm workflows and additional provider lanes must earn their
 own machine-recorded gates and are not implied by this release.
 
+## Next milestone: 3.2
+
+The 3.2 contract is recorded in [`SUMMON_3.2_PLAN.md`](SUMMON_3.2_PLAN.md). Its P0
+trust lane makes explicit Codex model selection and terminal served-model evidence
+fail closed, including the Sol-versus-Luna routing case. Its chat lane replaces
+window-owned scrolling and variable-height state insertion with a fixed shell,
+cursor-aware anchoring, compact identity presentation, and separate owner, stream,
+and turn states. These are implementation targets, not 3.1 release claims; 3.2 GA
+requires fresh rendered-browser evidence and a current live Codex receipt.
+
 ## Release snapshot
 
 | Area | Current truth | Release posture |

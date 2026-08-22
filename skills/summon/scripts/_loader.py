@@ -405,9 +405,17 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
                 content = agent_file.read_text(encoding="utf-8-sig")
                 fm, body = parse_frontmatter(content)
                 description = extract_description(body)
+                # Keep the roster listing useful for humans and provider-safe for
+                # callers: a model pin and reasoning effort are harmless display
+                # metadata, while the actual served model still belongs to the
+                # dispatch receipt.  Returning an explicit null for an unpinned
+                # seat prevents a UI from mistaking the backend default for a
+                # verified model.
                 agents.append({"name": name, "description": description,
                                "run_agent": (fm or {}).get("run-agent"),
-                               "permission": (fm or {}).get("permission")})
+                               "permission": (fm or {}).get("permission"),
+                               "model": (fm or {}).get("model"),
+                               "effort": (fm or {}).get("effort")})
             except (OSError, UnicodeDecodeError, ValueError):
                 # Unreadable / binary / malformed-frontmatter file: still list it so the
                 # caller sees it exists. ValueError matters since duplicate frontmatter keys
@@ -421,10 +429,11 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
 def list_agents(agents_dir: str) -> list[dict]:
     """List all available agents, sorted by name.
 
-    Returns {"name", "description"} for every agent in ``agents_dir``, plus any
-    from the skill's bundled starter roster that aren't already present (the
-    project dir wins on a name collision). Files that fail to parse are still
-    listed with an empty description.
+    Returns name/description plus safe declared backend, permission, model, and
+    effort metadata for every agent in ``agents_dir``, plus any from the skill's
+    bundled starter roster that aren't already present (the project dir wins on
+    a name collision). Files that fail to parse are still listed with an empty
+    description.
     """
     agents = _list_agents_in(agents_dir)
     for a in agents:

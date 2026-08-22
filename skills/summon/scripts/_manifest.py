@@ -56,7 +56,7 @@ def _fail(msg: str) -> int:
     env = {"status": "error", "error": msg, "cli": "summon", "transport": "manifest"}
     try:
         from _telemetry import record
-        record(env)
+        record(env, operation="manifest")
     except Exception:  # noqa: BLE001 - diagnostics must never mask manifest errors
         pass
     print(json.dumps(env, ensure_ascii=False))
@@ -800,7 +800,7 @@ def run_manifest(args) -> int:
     try:
         from _telemetry import record
         record({"status": "success" if not failed else "error", "cli": "summon",
-                "transport": "manifest", "warnings": failed})
+                "transport": "manifest", "warnings": failed}, operation="manifest")
     except Exception:  # noqa: BLE001
         pass
     print(json.dumps(summary, ensure_ascii=False))

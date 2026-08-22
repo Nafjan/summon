@@ -589,6 +589,16 @@ def _attach_eligibility(resp: dict) -> dict:
                 "retry_required": True,
                 "retry_safe": False,
             }
+            resp["retryable"] = False
+            resp["result_usable"] = False
+            resp["provider_contacted"] = True
+            # Flat, bounded lifecycle fields are the telemetry contract.  The
+            # nested auth plan remains user-facing data and is never projected
+            # into the local spool.
+            resp["auth_stage"] = "terminal"
+            resp["auth_outcome"] = "login_required"
+            resp["interactive_required"] = True
+            resp["remediation_code"] = "provider_login_required"
             resp.setdefault("warnings", []).append(
                 f"backend '{verdict['backend']}' authentication is unavailable: "
                 f"{verdict['guidance']} Run the documented login command, complete any "
@@ -596,6 +606,27 @@ def _attach_eligibility(resp: dict) -> dict:
         else:
             resp.setdefault("warnings", []).append(
                 f"backend '{verdict['backend']}' is not eligible: {verdict['guidance']}")
+    # Kimi's CLI reports rate limiting with several vendor-specific spellings
+    # rather than a stable JSON error object.  Mark it terminal so --retries and
+    # ACP fallback cannot turn a transient-looking provider response into a
+    # burst of duplicate paid calls.  The operator can retry explicitly after
+    # the provider's window has elapsed.
+    if (resp.get("cli") == "kimi" and resp.get("status") != "success"):
+        low = text.lower()
+        if any(marker in low for marker in (
+                "too many requests", "rate limit", "rate_limited",
+                "http 429", "status code 429", " 429 ", "quota exceeded")):
+            resp["error_kind"] = "rate_limited"
+            resp["retryable"] = False
+            resp["result_usable"] = False
+            resp["provider_contacted"] = True
+            resp["auth_stage"] = "terminal"
+            resp["auth_outcome"] = "not_needed"
+            resp["interactive_required"] = False
+            resp["remediation_code"] = "provider_quota_wait"
+            resp.setdefault("warnings", []).append(
+                "Kimi reported a rate limit; Summon did not retry or switch providers. "
+                "Wait for the provider window to reset, then retry explicitly.")
     return resp
 
 
@@ -1586,9 +1617,21 @@ def is_terminal_nonretryable(env) -> bool:
     Other errors retain the historical retry-on-resume behavior.
     """
     return bool(isinstance(env, dict)
-                and env.get("status") == "error"
-                and env.get("error_kind") == "empty_terminal_result"
-                and env.get("retryable") is False)
+                and env.get("status") in ("error", "blocked", "partial")
+                and env.get("retryable") is False
+                and env.get("error_kind") in {
+                    "empty_terminal_result",
+                    "authentication_failed",
+                    "rate_limited",
+                    "provider_forbidden",
+                    "permission_unsupported",
+                    "model_selection_conflict",
+                    "target_model_mismatch",
+                    "served_model_mismatch",
+                    "served_model_unverified",
+                    "resume_model_mismatch",
+                    "resume_model_unverified",
+                })
 
 
 # Hook / launcher noise that a HOST environment injects ahead of the backend's own output.
@@ -1826,6 +1869,43 @@ def _model_mismatch(requested, ran) -> bool:
     if r in _CLAUDE_ALIASES and r in re.split(r"[-_/.:]+", s):
         return False
     return True
+
+
+def trusted_telemetry_model_evidence(response: object):
+    """Return a private evidence marker only for an executor-produced result.
+
+    The JSON envelope is caller-visible and therefore cannot be its own proof.
+    Keeping marker construction behind the executor result path lets the
+    dispatcher distinguish a fresh in-process response from a disk-loaded
+    ``--out``/resume object.  Telemetry is optional and this helper is fail-soft.
+    """
+    if not isinstance(response, dict) or response.get("served_model_evidence") != "reported":
+        return None
+    model = response.get("model")
+    model = model if isinstance(model, dict) else {}
+    try:
+        import _telemetry
+        mismatch = _model_mismatch(model.get("requested"), model.get("served"))
+        return _telemetry._trusted_model_evidence(
+            "reported", mismatch, _capability=_telemetry._EVIDENCE_CAPABILITY)
+    except Exception:  # noqa: BLE001 - telemetry must never affect execution
+        return None
+
+
+def trusted_telemetry_auth_lifecycle(response: object):
+    """Return an executor-only marker for bounded auth lifecycle fields."""
+    if not isinstance(response, dict):
+        return None
+    keys = ("auth_stage", "auth_outcome", "interactive_required", "remediation_code")
+    if not any(response.get(key) is not None for key in keys):
+        return None
+    try:
+        import _telemetry
+        return _telemetry._trusted_auth_lifecycle(
+            *(response.get(key) for key in keys),
+            _capability=_telemetry._AUTH_CAPABILITY)
+    except Exception:  # noqa: BLE001 - telemetry must never affect execution
+        return None
 
 
 _SAFE_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+() -]{0,159}$")
@@ -2219,7 +2299,8 @@ def _safe_communicate(process: subprocess.Popen, timeout: float = 3.0):
 
 def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
                    parse_stream: bool | None = None,
-                   launch_control: ProviderLaunchControl | None = None) -> dict:
+                   launch_control: ProviderLaunchControl | None = None,
+                   expected_model: str | None = None) -> dict:
     """Drive the subprocess and enrich whatever response path it takes.
 
     Single choke point: every return from the read loop (success, timeout,
@@ -2237,7 +2318,8 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
         pass
     response = _drive_process_loop(process, cli, timeout_ms, processor,
                                    parse_stream=parse_stream,
-                                   launch_control=launch_control)
+                                   launch_control=launch_control,
+                                   expected_model=expected_model)
     return _enrich(response, processor)
 
 
@@ -2245,6 +2327,7 @@ def _drive_process_loop(
     process: subprocess.Popen, cli: str, timeout_ms: int, processor: StreamProcessor,
     parse_stream: bool = True,
     launch_control: ProviderLaunchControl | None = None,
+    expected_model: str | None = None,
 ) -> dict:
     """Read process stdout via StreamProcessor, enforce a wall-clock deadline.
 
@@ -2343,6 +2426,28 @@ def _drive_process_loop(
                 # but keep looping so the reader thread can drain stdout to EOF.
                 process.terminate()
                 saw_terminal = True
+            if (parse_stream and cli == "codex" and expected_model
+                    and processor.handshake_model
+                    and _model_mismatch(expected_model, processor.handshake_model)):
+                # A Codex handshake that points at a different model is already
+                # enough to reject an exact request. Stop the provider tree now;
+                # do not spend the rest of the turn or let later output make the
+                # mismatch look like a successful run.
+                _kill_tree(process)
+                _drain_to_eof(line_q)
+                _safe_communicate(process)
+                blocked = _error_response(
+                    cli, 1,
+                    f"requested Codex model {expected_model!r}, but the provider "
+                    f"handshake targeted {processor.handshake_model!r}")
+                blocked.update({
+                    "status": "blocked", "dispatcher_status": "blocked",
+                    "execution_status": "blocked",
+                    "error_kind": "target_model_mismatch",
+                    "retryable": False, "result_usable": False,
+                    "provider_contacted": True,
+                })
+                return _attach_raw(blocked, stdout_lines)
 
         # stdout fully drained by reader; communicate() only needs stderr.
         # Floor at 100ms: even if the deadline expired, give the process a
@@ -2489,7 +2594,27 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # argv/env (so --dry-run and real dispatch agree); here we keep the ORIGINAL
     # request, the GUARDED effective model (feeds model.targeted), and the guard
     # warnings for the envelope's transparency.
-    _requested_model = inv.model
+    try:
+        from _builder import codex_model_selection
+        _codex_selection = (codex_model_selection(
+                                inv.model, inv.extra_args,
+                                getattr(inv, "model_source", None))
+                            if inv.cli == "codex" else {
+                                "requested": inv.model,
+                                "canonical": inv.model,
+                                "exact_required": False,
+                                "conflict": None,
+                                "source": "invocation" if inv.model else "ambient_config",
+                            })
+    except Exception:  # noqa: BLE001 — malformed legacy invocation is handled below
+        _codex_selection = {
+            "requested": inv.model,
+            "canonical": inv.model,
+            "exact_required": bool(inv.model),
+            "conflict": None,
+            "source": "invocation" if inv.model else "ambient_config",
+        }
+    _requested_model = _codex_selection.get("requested")
     _guarded_inv, _, _guard_warnings = apply_credit_guard(inv)
     debug_argv = [inv.cli]  # what --debug-dir records; each path refines it
     # Defer the initial workspace snapshot until an actual backend spawn is known to fit.
@@ -2547,9 +2672,10 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         #   served     ONLY on service evidence — a terminal-event model report,
         #              or output tokens with a known target. Task status is NOT
         #              evidence (a served run can be downgraded to blocked).
-        #   resolved   LEGACY v1 semantics, byte-for-byte unchanged (handshake-
-        #              or-terminal + the codex config backfill); consumers
-        #              migrate to targeted/served; retired in envelope v2.
+        #   resolved   LEGACY compatibility field: handshake-or-terminal, with
+        #              the codex config backfill only for unpinned requests.
+        #              An explicit pin never inherits that ambient default;
+        #              consumers should migrate to targeted/served.
         _terminal_model_raw = resp.pop("model_resolved", None)
         _terminal_model = _safe_model_id(_terminal_model_raw)
         _terminal_model_invalid = (_terminal_model_raw is not None
@@ -2560,7 +2686,9 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         if isinstance(_mu_raw, (list, tuple)):
             _mu = [model for model in (_safe_model_id(value) for value in _mu_raw)
                    if model is not None]
-        _effective = _safe_model_id(_guarded_inv.model)
+        _effective = _safe_model_id(
+            _codex_selection.get("canonical") if inv.cli == "codex"
+            else _guarded_inv.model)
         if not _effective:
             if inv.cli == "cursor-agent":
                 from _builder import CURSOR_DEFAULT_MODEL as _cursor_default
@@ -2583,7 +2711,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         _targeted = _handshake or _effective
         if _terminal_model and not _terminal_model_invalid:
             _served = _terminal_model
-        elif _out_tokens > 0 and _targeted:
+        elif (_out_tokens > 0 and _targeted
+              and not (inv.cli == "codex" and _codex_selection.get("exact_required"))):
             _served = None if _terminal_model_invalid else _targeted
         else:
             _served = None
@@ -2593,7 +2722,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # semantics for a valid success that lacks provider telemetry.
         if _terminal_model and not _terminal_model_invalid:
             resp["served_model_evidence"] = "reported"
-        elif _out_tokens > 0 and _targeted and not _terminal_model_invalid:
+        elif (_out_tokens > 0 and _targeted and not _terminal_model_invalid
+              and not (inv.cli == "codex" and _codex_selection.get("exact_required"))):
             resp["served_model_evidence"] = "inferred"
         else:
             resp["served_model_evidence"] = "absent"
@@ -2605,7 +2735,15 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             if _warning not in _warnings:
                 _warnings.append(_warning)
         _legacy = _terminal_model or _handshake
-        if inv.cli == "codex" and not _legacy:
+        # An explicit Codex model is a trust contract.  If Codex emits neither
+        # a handshake nor a terminal model, do not backfill ``resolved`` from
+        # the user's ambient config: that default is not evidence about this
+        # invocation and makes an explicitly requested Sol turn look as if it
+        # silently ran on Luna.  Keep the historical config backfill only for
+        # unpinned Codex runs, where it describes the default that was actually
+        # selected by the resolver.  ``served`` remains the authoritative field
+        # for provider service evidence in both cases.
+        if inv.cli == "codex" and not _legacy and not _codex_selection.get("exact_required"):
             try:
                 from _resolver import _codex_default_model
                 _legacy = _safe_model_id(_codex_default_model())
@@ -2613,6 +2751,11 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 pass
         resp["model"] = {"requested": _requested_model, "targeted": _targeted,
                          "served": _served, "resolved": _legacy, "models_used": _mu}
+        if inv.cli == "codex":
+            resp["model"].update({
+                "request_source": _codex_selection.get("source"),
+                "exact_required": bool(_codex_selection.get("exact_required")),
+            })
         # Model-mismatch warning: if an EXPLICIT request differs from what actually
         # ran (served, else the legacy resolved), surface it prominently -- a pinned
         # agent model silently downgraded/rerouted is a spend + fidelity surprise.
@@ -2625,6 +2768,46 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 f"requested model {_requested_model!r} but the backend ran {_ran!r}; "
                 f"both are kept in the `model` field (a pinned agent model may have "
                 f"been rerouted or fallen back)")
+        # Explicit Codex pins are a trust contract, not a best-effort hint. A
+        # successful response without an exact terminal receipt, or with a
+        # different served model, is useful audit evidence but must not be
+        # consumed as a successful answer or sent through any retry/fallback
+        # path. The provider may already have spent; preserve that fact.
+        if (inv.cli == "codex" and _codex_selection.get("exact_required")
+                and resp.get("status") == "success"):
+            if _handshake and _model_mismatch(_requested_model, _handshake):
+                _trust_kind = "target_model_mismatch"
+                _trust_message = (
+                    f"requested Codex model {_requested_model!r}, but the provider "
+                    f"handshake targeted {_handshake!r}; the run is blocked before "
+                    "model identity can be trusted")
+            elif _terminal_model_invalid or not _terminal_model:
+                _trust_kind = "served_model_unverified"
+                _trust_message = (
+                    f"explicit Codex model {_requested_model!r} completed without "
+                    "an authoritative terminal served-model receipt; the result "
+                    "is blocked and cannot be treated as verified")
+            elif _model_mismatch(_requested_model, _terminal_model):
+                _trust_kind = "served_model_mismatch"
+                _trust_message = (
+                    f"requested Codex model {_requested_model!r}, but the provider "
+                    f"reported {_terminal_model!r}; the result is blocked and no "
+                    "automatic retry or fallback will be attempted")
+            else:
+                _trust_kind = None
+                _trust_message = None
+            if _trust_kind:
+                resp["status"] = "blocked"
+                resp["dispatcher_status"] = "blocked"
+                resp["execution_status"] = "blocked"
+                resp["error_kind"] = _trust_kind
+                resp["retryable"] = False
+                resp["result_usable"] = False
+                resp["provider_contacted"] = True
+                resp["error"] = _trust_message
+                resp.setdefault("warnings", []).append(
+                    "model identity trust failure is terminal; no retry, provider "
+                    "fallback, ACP fallback, repair, or resume was attempted")
         resp["permission"] = inv.permission
         resp["transport"] = inv.transport   # which path served the run (subprocess|acp)
         resp["effort"] = inv.effort   # reasoning effort actually applied (None = backend default)
@@ -2699,7 +2882,23 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # model guard but before API calls, ACP setup, profile construction, worktree access, or
     # subprocess creation.  An explicit Claude model sent to Codex is a caller-routing error,
     # not a provider outage and must be visible as a structured block with zero contact.
-    _compat_model = _guarded_inv.model
+    if inv.cli == "codex" and _codex_selection.get("conflict"):
+        _detail = _codex_selection["conflict"]
+        return _stamp(_enrich(_blocked_response(
+            inv.cli,
+            "model_selection_conflict",
+            f"codex model selection conflict: {_detail}; remove the conflicting "
+            "selector and retry",
+            details={
+                "model_requested": _requested_model,
+                "model_selection_source": _codex_selection.get("source"),
+                "provider_contacted": False,
+                "retryable": False,
+                "result_usable": False,
+            }), None))
+
+    _compat_model = (_codex_selection.get("canonical")
+                     if inv.cli == "codex" else _guarded_inv.model)
     if not _compat_model and inv.cli == "codex":
         try:
             from _resolver import _codex_default_model
@@ -2747,7 +2946,14 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     if _ro_err:
         if workspace_snapshot is not None:
             _workspace_before = workspace_snapshot(inv.cwd)
-        return _stamp(_enrich(_error_response(inv.cli, 1, _ro_err), None))
+        _permission_refusal = _error_response(inv.cli, 1, _ro_err)
+        _permission_refusal.update({
+            "error_kind": "permission_unsupported",
+            "provider_contacted": False,
+            "retryable": False,
+            "result_usable": False,
+        })
+        return _stamp(_enrich(_permission_refusal, None))
 
     # ACP transport (gemini/kimi/cursor-agent): the backend speaks the Agent
     # Client Protocol natively, so the turn runs over JSON-RPC stdio instead of
@@ -2768,14 +2974,21 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             # frozen for individuals, cursor untested, kimi is yolo-only
             # everywhere anyway). Unverifiable containment is not containment:
             # refuse rather than mislabel the tier.
-            return _stamp(_enrich(_error_response(
+            _permission_refusal = _error_response(
                 inv.cli, 2,
                 f"the ACP transport cannot enforce {inv.permission!r}: no "
                 "permission flags travel to the agent and containment depends on "
                 "the agent choosing to ask (reactive only, unverified on real "
                 "CLIs). summon refuses rather than mislabel the tier. Use yolo "
                 "over ACP, or the subprocess transport, which enforces tiers via "
-                "CLI flags."), None))
+                "CLI flags.")
+            _permission_refusal.update({
+                "error_kind": "permission_unsupported",
+                "provider_contacted": False,
+                "retryable": False,
+                "result_usable": False,
+            })
+            return _stamp(_enrich(_permission_refusal, None))
         debug_argv = [inv.cli, "<acp>"]
         if launch_control is None:
             _acp_resp = BACKENDS[inv.cli]["acp"]["call"](inv, timeout_ms)
@@ -2958,8 +3171,24 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         )
         response = _drive_process(process, inv.cli, timeout_ms,
                                   parse_stream=parse_stream,
-                                  launch_control=launch_control)
+                                  launch_control=launch_control,
+                                  expected_model=(
+                                      _requested_model
+                                      if inv.cli == "codex"
+                                      and _codex_selection.get("exact_required")
+                                      else None))
     finally:
+        # Kimi receives a disposable isolated home.  Its OAuth refresh token
+        # rotation happens in that child home, so persist a validated refresh
+        # before the controlled adapter removes the profile.  A failed sync is
+        # intentionally non-fatal: the provider response remains truthful and
+        # the next attempt can use the explicit auth-repair workflow.
+        if inv.cli == "kimi" and env_override:
+            try:
+                from _builder import sync_kimi_profile_credentials
+                sync_kimi_profile_credentials(env_override.get("KIMI_CODE_HOME"))
+            except Exception:  # noqa: BLE001 - credential sync must not mask result
+                pass
         # The dispatch is OVER here whichever way it ended. Closing the job releases the
         # kernel handle AND, via KILL_ON_JOB_CLOSE, reaps any descendant the backend left
         # running -- the case that let a retry overlap with the previous attempt's tree.

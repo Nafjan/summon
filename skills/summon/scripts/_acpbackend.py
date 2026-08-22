@@ -728,6 +728,12 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
             _job_close(process)
         except Exception:  # noqa: BLE001
             pass
+        if cli == "kimi" and env_override:
+            try:
+                from _builder import sync_kimi_profile_credentials
+                sync_kimi_profile_credentials(env_override.get("KIMI_CODE_HOME"))
+            except Exception:  # noqa: BLE001 - credential sync must not mask result
+                pass
         if launch_control is not None:
             try:
                 launch_control.reaped(process)
