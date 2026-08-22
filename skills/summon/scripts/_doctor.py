@@ -131,6 +131,10 @@ _BACKENDS = {
         "auth": "agy login  - Windows-only out of the box (ConPTY wrapper); "
                 "POSIX needs AGY_PTY_WRAPPER (see docs)",
     },
+    "opencode": {
+        "install": "npm install -g opencode-ai",
+        "auth": "opencode auth login  (or `opencode providers login`)",
+    },
     "arkcli": {
         "install": "npm install -g @byteplus/ark-cli",
         "auth": "arkcli auth login",
@@ -159,6 +163,9 @@ _AUTH_REPAIR_PLANS = {
               "interaction": "browser", "supports_autonomous": True},
     "agy": {"command": "agy login", "argv": ["agy", "login"],
             "interaction": "browser_or_terminal", "supports_autonomous": True},
+    "opencode": {"command": "opencode auth login", "argv": ["opencode", "auth", "login"],
+                  "interaction": "terminal", "supports_autonomous": False,
+                  "note": "OpenCode auth login may require selecting a provider and entering a key."},
     "arkcli": {"command": "arkcli auth login", "argv": ["arkcli", "auth", "login"],
                "interaction": "browser", "supports_autonomous": True},
 }

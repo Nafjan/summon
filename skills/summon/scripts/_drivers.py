@@ -42,6 +42,7 @@ PERMISSION_MAP = {
         "agy": "refused-unless-opt-in",
         "openai-compat": "n/a",
         "arkcli": "n/a",
+        "opencode": "deny-by-default policy",
     },
     "safe-edit": {
         "claude": "default",
@@ -50,6 +51,7 @@ PERMISSION_MAP = {
         "agy": "dangerously-skip-permissions+add-dir",
         "openai-compat": "n/a",
         "arkcli": "n/a",
+        "opencode": "edit-only policy",
     },
     "full": {
         "claude": "bypassPermissions",
@@ -58,6 +60,7 @@ PERMISSION_MAP = {
         "agy": "dangerously-skip-permissions",
         "openai-compat": "n/a",
         "arkcli": "n/a",
+        "opencode": "auto/full-access",
     },
 }
 
@@ -108,7 +111,7 @@ def probe(driver: str) -> dict[str, Any]:
                 "note": "native ACP for gemini/kimi/cursor-agent when supported"}
     if driver == "cli":
         return {"driver": driver, "ok": True, "found": True, "kind": "subprocess",
-                "note": "argv backends: claude/codex/cursor-agent/gemini/kimi/agy"}
+                "note": "argv backends: claude/codex/cursor-agent/gemini/kimi/agy/opencode"}
     return {"driver": driver, "ok": False, "found": False,
             "error": "unknown driver"}
 

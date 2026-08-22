@@ -31,20 +31,22 @@ and configured endpoints wherever the host can execute a shell command:
 - **A plain terminal,** where you drive it yourself.
 
 From any of those hosts, you can hand a task to another model, run several at once, convene a
-council, or start a governed deliberation. It also reaches any OpenAI-compatible API, so OpenRouter,
-OpenAI, Anthropic, Google, and local models (Ollama, LM Studio) work as agents too.
+council, or start a governed deliberation. It also reaches any OpenAI-compatible API directly,
+or through OpenCode's toolful gateway when the agent needs a file/tool loop. OpenRouter, OpenAI,
+Anthropic, Google, and local models (Ollama, LM Studio) work as agents too.
 
 ```
                           ┌──────────────────────┐
    any host CLI ────────► │       summon         │ ───► claude         (Anthropic)
    (claude, codex,        │  stdlib dispatcher   │ ───► codex          (OpenAI)
-   cursor, gemini, kimi,   │  one JSON envelope   │ ───► cursor-agent   (Cursor)
-   or your terminal)      │  no server, no pip   │ ───► gemini         (Google)
+    cursor, gemini, kimi,   │  one JSON envelope   │ ───► cursor-agent   (Cursor)
+    opencode, or terminal) │  no server, no pip   │ ───► gemini         (Google)
                           └──────────────────────┘ ───► kimi           (Moonshot AI)
                                                    ├──► agy            (Antigravity)
-                                                   ├──► arkcli         (BytePlus Coding Plan)
-                                                   └──► openai-compat   (ModelArk / OpenRouter /
-                                                        OpenAI / Anthropic / Google / Ollama / …)
+                                                    ├──► arkcli         (BytePlus Coding Plan)
+                                                    ├──► opencode       (OpenCode gateway)
+                                                    └──► openai-compat  (ModelArk / OpenRouter /
+                                                         OpenAI / Anthropic / Google / Ollama / …)
 ```
 
 Most multi-agent tools assume one specific CLI is the orchestrator. Summon inverts that:
@@ -54,7 +56,8 @@ to decide something. They run in parallel. Add `--worktree` to give each editing
 own isolated branch, and inspect or branch on the resulting JSON envelopes.
 
 Each backend uses its own login, so Summon can combine Claude, ChatGPT, Cursor, Gemini,
-Antigravity, and ArkCLI on one task. Each provider keeps its own billing and account boundary.
+Antigravity, ArkCLI, and OpenCode on one task. Each provider keeps its own billing and account
+boundary.
 
 ---
 
@@ -213,6 +216,16 @@ served. See [`docs/SUMMON_3.2_PLAN.md`](docs/SUMMON_3.2_PLAN.md) for the routing
 acceptance gates. The fixed-shell chat atlas is still preview-only until its rendered-browser
 and owner-lifecycle gates pass.
 
+This does **not** make the Codex backend preview-only. Ordinary Codex dispatch remains a
+supported first-class path. The restriction applies to provenance-required named-model claims
+such as the `sol-review` seat: if Codex completes a turn without an authoritative terminal
+identity, Summon returns `status: "blocked"`, `error_kind: "served_model_unverified"`,
+`model.targeted: "gpt-5.6-sol"`, and `model.served: null`. That means “the requested model
+was not certified,” not “Luna ran instead.” Summon does not infer or silently reroute the
+turn. The certification path is a Codex CLI/adapter receipt that reports the provider-served
+model, a parser fixture for match/mismatch/missing cases, and a fresh live receipt before a
+named Sol seat can be called certified.
+
 For a release or support bundle, generate a provider-inert evidence manifest after
 running the fixed release-test registry:
 
@@ -221,7 +234,7 @@ python tools/release_gates.py --require-clean --output "${RUNNER_TEMP:-${TMPDIR:
 python tools/release_manifest.py \
   --evidence-file "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json" \
   --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" \
-  --expected-version 3.2.0 --check
+  --expected-version 3.2.1 --check
 ```
 
 The runner executes the fixed suites, records output digests, strips backend credentials and
@@ -510,7 +523,7 @@ vendors.
   "report_ok": true,
   "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
                "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
-  "summon":  { "version": "3.2.0", "scripts_sha256": "<sha256>" },
+  "summon":  { "version": "3.2.1", "scripts_sha256": "<sha256>" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -569,7 +582,59 @@ API's models.
 
 ---
 
-## Custom and local models (`openai-compat`)
+## OpenCode gateway and custom models
+
+When a compatible provider needs a real tool/file loop, route it through
+OpenCode instead of using the direct text seat:
+
+```markdown
+---
+run-agent: opencode
+model: openrouter/stealth/ox-alpha
+permission: safe-edit
+---
+```
+
+Authenticate OpenCode and verify the live roster with `opencode auth login` and
+`opencode models`. The OpenCode path still respects the provider's context,
+output, quota, and model limits; put large inputs in the workspace and ask the
+agent to read them. See the [OpenCode backend reference](skills/summon/references/backends.md#opencode-cli-gateway--toolful-access-to-compatible-providers).
+
+Headless Summon dispatches disable OpenCode project configuration, external
+plugins, external skills, and Claude-compatible project discovery for the child.
+This prevents repository-controlled startup code from retargeting the provider
+or seeing a credential bridged for that one turn.
+
+OpenRouter's routers are available through the same gateway. Use the exact
+selectors shown by `opencode models openrouter`:
+
+```markdown
+---
+run-agent: opencode
+model: openrouter/openrouter/auto       # task-aware paid routing
+permission: safe-edit
+---
+```
+
+The free router is `openrouter/openrouter/free`; pin a concrete `:free` model
+when you need reproducible behavior. Fusion is
+`openrouter/openrouter/fusion` and accepts a bounded preset setting:
+
+```markdown
+---
+run-agent: opencode
+model: openrouter/openrouter/fusion
+permission: safe-edit
+openrouter_options: '{"plugins":[{"id":"fusion","preset":"general-budget"}]}'
+---
+```
+
+Fusion presets are `general-high`, `general-budget`, and `general-fast`. They
+run a panel and judge, so expect higher cost and latency than a single model.
+Always inspect `model.served` and provider evidence: aliases and live roster
+entries do not identify the model that answered.
+
+The direct `openai-compat` path remains useful for a stateless text seat:
 
 ```markdown
 ---
@@ -616,7 +681,7 @@ example, Gemini CLI sessions cannot currently be resumed through Summon's headle
   legacy opt-in agy PTY wrapper needs `pywinpty` and `pyte`
   (tested with `pywinpty 3.0.3` and `pyte 0.8.2`).
 - **At least one backend:** a vendor CLI installed and logged in (`claude`, `codex`,
-  `cursor-agent`, `gemini`, `kimi`, or `agy`), an API key for an `openai-compat` provider, or
+  `cursor-agent`, `gemini`, `kimi`, `agy`, or `opencode`), an API key for an `openai-compat` provider, or
   a local Ollama/LM Studio server. `summon doctor` tells you which are installed;
   `doctor --probe` spends a small live call per backend to confirm sign-in and eligibility.
 - **`git`** if you use `--worktree`.
@@ -645,8 +710,9 @@ You bring model access. Summon orchestrates the CLIs and APIs you already use.
   bypass). Raise anything to `yolo` deliberately, and only in repos you trust.
 - **Kimi Code is deliberately stricter.** Its non-interactive prompt runner auto-handles tools
   and cannot combine with its plan mode, so Summon refuses Kimi `read-only` and `safe-edit`.
-  `kimi-worker` pins high-context K3; `kimi-coder` pins K2.7 Coding for focused implementation.
-  Both are `yolo` only and belong in a trusted isolated worktree. For a review-only Kimi job,
+  `kimi-worker` and `kimi-coder` pin K3 with maximum supported thinking through the isolated
+  profile; `kimi-k27-coder` is the explicit lower-context K2.7 seat. All three are `yolo` only
+  and belong in a trusted isolated worktree. For a review-only Kimi job,
   use `--worktree`, instruct it not to edit, then inspect the worktree before accepting the
   report or removing it: the review label does not create an enforceable read-only boundary.
 - **agy is the exception, twice over.** It has no workspace-write tier, so its `safe-edit`
@@ -664,7 +730,9 @@ You bring model access. Summon orchestrates the CLIs and APIs you already use.
   guard as defense-in-depth. **Don't run summon in a repository you don't trust.**
 - **Secrets.** The agy backend copies OAuth tokens into a per-invocation profile locked to
   your user (icacls / `0700`) and isolated from your real profile. `openai-compat` reads
-  API keys from env only and redacts them from any error output.
+  API keys from env (or the documented local OpenRouter credential fallback) and redacts
+  them from any error output. OpenCode uses its own auth/configuration; Summon's optional
+  OpenRouter bridge passes a key only to that child process and never records it.
 - **Terms of service.** Summon drives each vendor's *official* CLI (built for scripted use)
   on *your* accounts, which is the intended path for personal and dev work. Don't share
   accounts, build a product on subscription auth, or hammer parallel volume; use API-key
@@ -697,9 +765,10 @@ available, and the envelope's `model.served` confirms what ran (`resolved` is th
 field). Aliases can lag a launch by a day or two, so pin the explicit ID when you need
 the newest.
 
-**Does it need API keys?** For the seven CLI backends, no. It drives the logins you already
+**Does it need API keys?** For the eight CLI backends, no. It drives the logins you already
 have, and it strips `OPENAI_API_KEY` from codex children so you're not silently billed at
-API rates. The `openai-compat` backend uses your API key by design.
+API rates. The `openai-compat` backend uses your API key by design; OpenCode uses the
+provider credentials configured for OpenCode (with the optional private OpenRouter bridge).
 
 **Is it safe to let an agent install it for me?** The agent-led prompt clones the repo, runs
 `doctor` (read-only), and runs `install.py`, which preserves files outside the owned payload.

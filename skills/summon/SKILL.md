@@ -1,12 +1,12 @@
 ---
 name: summon
-description: Summon another AI CLI — Claude, Codex, Cursor, Gemini, Kimi, Antigravity, or ArkCLI — as a sub-agent to run a task, in parallel when useful. Use whenever the user names an agent or sub-agent to run, asks to delegate work to another AI or a specific model, wants a second opinion or a cross-vendor code review, wants to fan several models out over a task, or references an agent definition. One dispatcher over seven CLI backends returns a structured JSON result and supports isolated git worktrees, background and manifest-driven swarms, JSON-schema-validated output, model discovery, and per-agent model/permission config. Formerly named "sub-agents".
+description: Summon another AI CLI — Claude, Codex, Cursor, Gemini, Kimi, Antigravity, ArkCLI, or OpenCode — as a sub-agent to run a task, in parallel when useful. Use whenever the user names an agent or sub-agent to run, asks to delegate work to another AI or a specific model, wants a second opinion or a cross-vendor code review, wants to fan several models out over a task, or references an agent definition. One dispatcher over eight CLI backends returns a structured JSON result and supports isolated git worktrees, background and manifest-driven swarms, JSON-schema-validated output, model discovery, and per-agent model/permission config. Formerly named "sub-agents".
 allowed-tools: Bash Read
 ---
 
 # Summon — Cross-Vendor Sub-Agents for Any AI CLI
 
-Spawns external CLI AIs (claude, cursor-agent, codex, gemini, kimi, agy, and arkcli) as isolated sub-agents with dedicated
+Spawns external CLI AIs (claude, cursor-agent, codex, gemini, kimi, agy, arkcli, and opencode) as isolated sub-agents with dedicated
 context. Supports session resume, per-call model/effort overrides, isolated git worktrees, background
 dispatch, structured report parsing, loose-file provenance, and provider cost/usage telemetry -- see
 Parameters and the response-field table. Optional local diagnostics are separate: they are disabled by
@@ -454,10 +454,10 @@ run or recommending it to a user.
 | `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
 | `--strict-agents-dir` | No | Governance mode: fail closed when the requested agent is absent from the selected roster; do not fall back to bundled or plugin definitions. Opt-in only; default resolution is unchanged |
 | `--enable-roles` | No | Opt into approved user-global role aliases. Exact roster names win; malformed, retargeted, chained, or unapproved aliases fail closed. Children inherit the flag |
-| `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `kimi`, `agy`, `gemini`, `arkcli` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
+| `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `kimi`, `agy`, `gemini`, `arkcli`, `opencode` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
 | `--model` | No | Override the agent's frontmatter model for this call. Summon performs a side-effect-free backend/model namespace preflight first: a known cross-vendor pairing such as `--cli codex --model claude-opus-5` is returned as `status:blocked`, `error_kind:backend_model_incompatible`, with explicit compatible reroutes; it never builds a profile or spawns a provider. Unknown/future IDs are passed through rather than guessed. `--dry-run` reports the same refusal. |
 | `--profile` | No | Select a named private backend profile from `~/.agents/summon-profiles.json` (currently Claude only). The name is safe metadata; the registry keeps config/auth paths out of agent definitions and receipts. `--profile` overrides frontmatter `profile:` |
-| `--effort` | No | Reasoning / thinking intensity: `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none`/`default`/`off` = leave the backend alone). **Honored by claude + codex** (default **`high`**); **agy Gemini only when set explicitly** (rewrites model to `… (Low\|Medium\|High)`); **ignored** for cursor-agent / kimi / gemini CLI / openai-compat / arkcli (stderr note if you set it). Precedence: `--effort` > frontmatter `effort:` > `SUMMON_DEFAULT_EFFORT` > built-in `high` (claude/codex). Full matrix: [references/effort.md](references/effort.md) |
+| `--effort` | No | Reasoning / thinking intensity: `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none`/`default`/`off` = leave the backend alone). **Honored by claude + codex** (default **`high`**); **agy Gemini only when set explicitly** (rewrites model to `… (Low\|Medium\|High)`); **Kimi supported models via the isolated `config.toml` profile** (K3 maps `max` directly); **OpenCode maps the tier to its provider `variant`**; ignored for cursor-agent / gemini CLI / openai-compat / arkcli. Precedence: `--effort` > frontmatter `effort:` > `SUMMON_DEFAULT_EFFORT` > built-in `high`. Full matrix: [references/effort.md](references/effort.md) |
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy. Resume for implementation continuity; use a fresh context for final adversarial adjudication so a reviewer is not grading its own prior work. The envelope records `resumed:true|false` |
 | `--resume-profile` | No | agy only: the `resume.profile` path returned by the prior agy call |
 | `--worktree` | No | Run in an isolated git worktree (optional name; auto-named if bare). If `--gate-with` denies, summon removes only a pristine checkout whose HEAD still equals its creation commit. Any untracked/modified file, new commit, failed identity check, or cleanup race is preserved and reported in `worktree_cleanup`; no force-removal or force branch deletion is used |
@@ -628,7 +628,7 @@ Every response carries structured fields for programmatic orchestration:
 | `served_model_evidence` | `reported`, `inferred`, or `absent`. How Summon established `model.served`: `reported` is a non-empty, bounded terminal provider model report; `inferred` is output-token evidence paired with a known target; `absent` means neither was observed. Unsafe or malformed provider values are discarded and never become provenance. This field never invents a model. Missing evidence does not make an otherwise usable success nonterminal; provenance-required workflows must reject `absent` or `inferred` explicitly. A success with an empty or missing result is normalized to `status:"error"` with a consistent exit tuple and `error_kind:"empty_terminal_result"`. |
 | `summon`, `agent_def`, `prompt_sha256`, `git_head_before`, `workspace_evidence`, `artifacts` | Provenance receipt, built progressively on the dispatch path: `summon` identity is on EVERY envelope the path emits (validation errors, missing agent, preflight, results); the other fields join as they become known. `summon` = `{version, script, scripts_sha256}` (one SHA-256, length-prefixed framing, over every production module, so divergent installs become diagnosable from any envelope). `agent_def` = `{file, sha256, agents_dir, source: project\|bundled\|explicit\|env}`, where `agents_dir` is the absolute roster directory the definition was ACTUALLY loaded from. `prompt_sha256` hashes the ROOT prompt. `git_head_before` names tracked repo state. `workspace_evidence` is additive mutation evidence: `{before,after,coverage,child_commit,mutation,read_only_violation,attribution}`. Each snapshot exposes only `head`, `branch`, and bounded repo-relative `staged`, `unstaged`, `renamed`, and `untracked` paths; it never emits cwd, repository root, file contents, or secrets. `coverage` is `complete`, `incomplete`, or `unavailable`; `mutation`, `child_commit`, and `read_only_violation` are `true`/`false` only when the before/after comparison proves them, otherwise `null`. A dirty baseline makes attribution `ambiguous`; a clean baseline makes it `exact`; unavailable coverage is `unavailable`. Git reads use hidden Windows utility flags, per-call/overall deadlines, and a bounded status payload. This evidence does not enforce read-only and does not expose `--verify-no-mutations` yet. Repeatable `--artifact` adds an opt-in loose-file manifest `{files:[{path,sha256,bytes,page_count,page_count_source}],sha256,stable_during_dispatch,after_sha256,changed,after_error?}` and joins its manifest hash to request reuse. `changed` lists proven identity differences and is `null` when the after-read failed; `after_error` explains why stability is unknown. Either case makes a successful result suspect. Hashes and paths only, never content or secrets; paths are local-operator data. |
 | `permission`, `permission_flags` | The permission level and the EXACT CLI flags it mapped to for this run — no more black box. |
-| `effort` | Reasoning effort actually applied on **claude/codex** (`null` = backend default, or cleared because this CLI ignores `--effort`). For **agy** Gemini thinking, read `model.requested` instead (suffix). See [references/effort.md](references/effort.md). |
+| `effort` | Requested/applied reasoning effort. Claude/Codex pass it to the CLI; supported Kimi models apply it in the isolated profile and add `effort_transport: "kimi-profile-config"`; OpenCode passes it as a provider `variant` and adds `effort_transport: "opencode-variant"`; agy Gemini exposes the tier in `model.requested`. Kimi/OpenCode local configuration is not provider-authored served-model evidence. |
 | `attempts` | How many dispatches this envelope took (`--retries`). |
 | `parsed`, `parse_ok`, `parse_errors` | With `--json-schema`: the agent's final JSON (validated), whether it satisfied the schema, and the specific violations. `parse_retry: true` marks the corrective follow-up. `parse_warnings` lists any schema keywords that were NOT enforced (see below). |
 | `output_tail` | On non-success: the tail of the RAW captured output (stdout+stderr merged) so failures are diagnosable without a re-run. `--debug-dir` captures the full transcript. |
@@ -768,6 +768,20 @@ Honest edges — plan around these, don't be surprised by them:
   your API key in the `Authorization` header. Never point an `openai-compat` agent (or a
   manifest that inlines `base_url`) at an untrusted host — that beams your key to it. Its
   timeout is per-socket-operation, so a slow-drip server can exceed the nominal deadline.
+- **OpenCode is a toolful gateway, not an unlimited transport.** An `opencode` seat can
+  use OpenCode's file and tool loop, including OpenRouter models such as
+  `openrouter/stealth/ox-alpha`, but the model context/output limits, provider quotas,
+  OpenCode compaction, and OS/CLI transport limits still apply. Put large inputs under
+  `--cwd` and ask the seat to read them instead of pasting them into argv. The direct
+  `openai-compat` and `arkcli +chat` seats remain text-only by design; use `opencode` when
+  a tool loop is required. OpenRouter's `auto`, `free`, and `fusion` aliases can also run
+  through OpenCode; Fusion presets use the bounded `openrouter_options` field documented in
+  [references/backends.md](references/backends.md#openrouter-routers-through-opencode).
+- **OpenCode startup isolation is part of the permission boundary.** Headless dispatches set
+  `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `OPENCODE_PURE=1`,
+  `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`, and `OPENCODE_DISABLE_CLAUDE_CODE=1` so repository
+  config/plugins or external skill files cannot retarget a provider or observe a credential
+  bridged into the child. Do not remove these guards from a gateway invocation.
 - **`doctor` probes the CLI backends only** (install + login), not `openai-compat` API
   endpoints — an API-only setup reads as "no usable backends" even when it works.
 
@@ -801,8 +815,9 @@ The dispatch essentials are above. Deeper capabilities live in focused reference
   `model.resolved`, the bundled agent roster, and the cross-vendor review rule.
 - **[Effort & thinking](references/effort.md)** — who honors `--effort`, defaults,
   agy Gemini suffixes, what the envelope reports.
-- **[Custom & API backends](references/backends.md)** — `run-agent: openai-compat` to
-  reach any OpenAI-compatible API (OpenRouter, OpenAI, Anthropic, Google, Groq, local
+- **[Custom & API backends](references/backends.md)** — `run-agent: opencode` for a
+  toolful OpenCode gateway (including OpenRouter) or `run-agent: openai-compat` to reach
+  any direct OpenAI-compatible API (OpenRouter, OpenAI, Anthropic, Google, Groq, local
   Ollama/LM Studio) and `providers.json`.
 - **[Customizing agents & the roster](references/customizing.md)** — override model/
   effort per call, and `--new-agent`/`--set-agent` to scaffold and retune definitions.
@@ -856,10 +871,11 @@ permissions.
 
 | Field | Values | Description |
 |-------|--------|-------------|
-| `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `kimi`, `agy`, `openai-compat` | Which backend executes this agent (`openai-compat` = any OpenAI-compatible API — see "Custom & API backends") |
+| `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `kimi`, `agy`, `opencode`, `openai-compat` | Which backend executes this agent (`opencode` = OpenCode's toolful CLI gateway; `openai-compat` = any direct OpenAI-compatible API — see "Custom & API backends") |
 | `permission` | `read-only`, `safe-edit` (default), `yolo` | Approval/sandbox level the sub-agent runs with |
 | `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.served` |
-| `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning / thinking for this agent. Honored by **claude + codex** (overrides Summon default `high`); on **agy** + Gemini, counts as *explicit* and rewrites the model suffix. Ignored on other CLIs. `--effort` at dispatch overrides it. See [references/effort.md](references/effort.md) |
+| `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning / thinking for this agent. Honored by **claude + codex**; on **agy** + Gemini, counts as *explicit* and rewrites the model suffix; on supported **Kimi** models, writes the isolated profile config; on **OpenCode**, maps to its `variant`. Ignored on other CLIs. `--effort` at dispatch overrides it. See [references/effort.md](references/effort.md) |
+| `openrouter_options` | JSON object (OpenCode only, optional) | Bounded OpenRouter `fusion`/`auto-router` plugin settings. Unknown fields, arbitrary request-body overrides, and mismatched router aliases are rejected. See [references/backends.md](references/backends.md#openrouter-routers-through-opencode) |
 | `args` | shell-style string (optional) | Arbitrary extra backend flags. Codex model-bearing `-m`/`--model`/`-c model=...` selectors are parsed, compared, and collapsed into one canonical selector; other flags remain subject to the permission boundary |
 | `profile` | private registry name (optional) | Select a named vendor login/config profile. The registry is local to the operator; do not put paths, credentials, or account identifiers in a public agent definition. `--profile` overrides this field |
 | `transport` | `subprocess` (default), `acp` (optional) | Dispatch transport. `acp` runs the turn over the Agent Client Protocol (native: gemini, kimi, cursor-agent); `--transport` at dispatch overrides it |
@@ -906,7 +922,7 @@ model, billing, and retention boundary explicitly.
 | codex | any codex model id (`-m`) | `gpt-5.6-sol` | `~/.codex/config.toml` `model` |
 | cursor-agent | cursor model ids | `composer-2.5` | `composer-2.5` |
 | gemini | gemini model ids (`-m`) | `gemini-3.1-pro` | CLI's default |
-| kimi | Kimi provider/model id (`--model`) | `kimi-code/k3`, `kimi-code/kimi-for-coding` | Kimi's default |
+| kimi | Kimi provider/model id (`--model`) | `kimi-code/k3`, `kimi-code/kimi-for-coding` | K3 Max in the bundled seats; K2.7 is explicit |
 | agy | display name or slug (see `agy models`) | `Claude Opus 4.6 (Thinking)`, `gemini-3.7-flash-high` | Gemini Flash tier |
 | arkcli | Coding Plan model id | `glm-5-2-260617` | ArkCLI plan selection |
 
@@ -925,6 +941,13 @@ does not retry or silently switch such a request; inspect `model.requested`,
 `result_usable` together. See [`docs/SUMMON_3.2_PLAN.md`](../../docs/SUMMON_3.2_PLAN.md)
 for the next-release resume and live-evidence contract.
 
+This gate applies to provenance-required named-model claims, not to Codex as a backend.
+Ordinary Codex dispatch remains supported. A blocked explicit pin means that the provider
+did not prove the requested identity; it is not evidence that another model (for example,
+Luna) served the turn. The Sol seat becomes certifiable only after the Codex CLI or adapter
+emits a provider-authored terminal model receipt and the live match/mismatch/missing-receipt
+matrix passes.
+
 **`permission` → exact per-CLI flags** (what the script actually passes — the
 levels are NOT identical across CLIs; when behavior surprises you, check this table):
 
@@ -940,9 +963,10 @@ Caveats worth knowing:
   status table). If a read-only agent must read files, keep them under `--cwd`.
 - **Kimi's non-interactive prompt mode is full-authority.** Its CLI rejects plan/yolo/auto
   flags beside `--prompt`, and then auto-handles tool calls. Summon therefore refuses Kimi
-  `read-only` and `safe-edit` rather than mislabel the authority. `kimi-worker` pins
-  high-context K3, while `kimi-coder` pins K2.7 Coding for focused implementation; both are
-  explicit `yolo` agents for trusted isolated worktrees only. For a review-only Kimi job,
+  `read-only` and `safe-edit` rather than mislabel the authority. `kimi-worker` and
+  `kimi-coder` pin K3 at maximum supported thinking through the isolated profile; the
+  explicit `kimi-k27-coder` seat pins K2.7 Coding. All are `yolo` agents for trusted isolated
+  worktrees only. For a review-only Kimi job,
   use `--worktree`, instruct it not to edit, and inspect the worktree before accepting its report
   or removing it: a review request is not an enforceable read-only boundary.
 - **agy has no workspace-write tier AND no enforceable read-only tier.** `safe-edit`

@@ -386,7 +386,7 @@ class FrozenRosterTests(unittest.TestCase):
             self.freeze(worktree_proofs={"one": self.proof()})
 
     def test_roster_and_seat_receipts_are_redaction_safe(self):
-        self.add_agent("worker", extra="--secret-path C:\\Users\\nside\\private")
+        self.add_agent("worker", extra="--secret-path C:\\Users\\test-user\\private")
         request = self.req(role="TOP_SECRET_ROLE", persona="TOP_SECRET_PERSONA",
                            capabilities=("TOP_SECRET_CAPABILITY",))
         snap = self.freeze((request,))

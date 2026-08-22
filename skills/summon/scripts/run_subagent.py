@@ -68,8 +68,8 @@ import _cli  # noqa: E402
 import _executor  # noqa: E402
 import _receipt  # noqa: E402
 import _telemetry  # noqa: E402
-from _builder import AgentInvocation, environment_handoff_context  # noqa: E402
-from _builder import clamp_permission as _clamp  # noqa: E402
+from _builder import (AgentInvocation, clamp_permission as _clamp,
+                      environment_handoff_context, parse_openrouter_options)  # noqa: E402
 from _executor import ENVELOPE_VERSION as _ENVELOPE_VERSION  # noqa: E402
 from _executor import (agent_def_sha, content_sha,  # noqa: E402
                        envelope_answers_request, execute_agent, finalize_exit_fields,
@@ -81,7 +81,7 @@ from _resolver import discover_models, resolve_cli  # noqa: E402
 # Keep a literal assignment: the release-contract parser uses the dispatcher
 # source as a machine-checkable companion.  `_telemetry.SUMMON_VERSION` must be
 # updated in the same release; the release contract checks both literals.
-__version__ = "3.2.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "3.2.1"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -1317,7 +1317,8 @@ def main() -> None:
     # SUMMON_DEFAULT_EFFORT env > the built-in default (high — summon delegates the
     # hard problems, so it defaults to deep reasoning). `none`/`default`/`off` = the
     # backend's own default. claude/codex take an effort flag; agy encodes thinking
-    # in the model NAME (Gemini Low/Medium/High); others don't have the knob.
+    # in the model NAME (Gemini Low/Medium/High); Kimi receives it through its
+    # isolated config.toml profile.
     _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
     final_model = args.model or model       # dispatch-time override wins over frontmatter
     effort = (args.effort or effort_fm or os.environ.get("SUMMON_DEFAULT_EFFORT") or "high")
@@ -1338,9 +1339,21 @@ def main() -> None:
                   "--effort maps only Gemini agy models — set it in `model:` / see --list-models",
                   file=sys.stderr)
         effort = None
-    elif effort and cli not in ("claude", "codex"):
+    elif cli == "kimi":
+        # Kimi's K3 family advertises low/high/max in config.toml.  The
+        # K2.7 Coding seat does not, so do not expose the generic built-in
+        # `high` as if it were applied there.
+        _kimi_model = (final_model or "").strip().lower()
+        _kimi_supports_effort = bool(re.fullmatch(
+            r"(?:kimi-code/)?k3(?:-256k)?", _kimi_model))
+        if effort and not _kimi_supports_effort:
+            if _explicit_effort:
+                print("note: effort is only applied to Kimi K3/K3-256k; "
+                      "ignored for the selected Kimi model", file=sys.stderr)
+            effort = None
+    elif effort and cli not in ("claude", "codex", "opencode"):
         if _explicit_effort:
-            print(f"note: effort is only honored by claude/codex/agy; ignored for {cli}",
+            print(f"note: effort is only honored by claude/codex/kimi/opencode/agy; ignored for {cli}",
                   file=sys.stderr)
         effort = None
 
@@ -1382,6 +1395,12 @@ def main() -> None:
              f"values are milliseconds for backward compatibility (600000 == 10m); write "
              f"{_ms}ms explicitly if you really want it.")
 
+    try:
+        _openrouter_options = parse_openrouter_options(
+            _agent_fm.get("openrouter_options"), final_model)
+    except ValueError as e:
+        _die(str(e))
+
     _model_source = "cli" if args.model else "frontmatter" if model else None
     invocation = AgentInvocation(
         cli=cli,
@@ -1421,6 +1440,7 @@ def main() -> None:
         profile_env=(profile_selection or {}).get("env") if profile_selection else None,
         profile_command=((profile_selection or {}).get("command")
                          if profile_selection else None),
+        openrouter_options=_openrouter_options,
     )
 
     if profile_selection:
@@ -1531,6 +1551,14 @@ def main() -> None:
         result = _dispatch_with_retries(invocation, args, agents_dir)
     except ValueError as e:
         _die(str(e))
+    # Effort is request-level evidence. Kimi's builder applies it to the
+    # disposable profile config; the provider may still omit a served-effort
+    # receipt, so keep the transport explicit instead of implying provider proof.
+    result.setdefault("effort", invocation.effort)
+    if invocation.cli == "kimi" and invocation.effort:
+        result.setdefault("effort_transport", "kimi-profile-config")
+    elif invocation.cli == "opencode" and invocation.effort:
+        result.setdefault("effort_transport", "opencode-variant")
     # Allowed text seats: stamp recovery object + loud warning every time
     # (capability: text-only is opt-in, not a silent gate-off).
     if _ts is not None and _ts.get("allowed"):
@@ -1664,6 +1692,11 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "model_requested": (_codex_selection.get("requested")
                              if _codex_selection else invocation.model),
         "model_effective": _eff_model,  # after any credit-only-model fallback
+        "effort": invocation.effort,
+        "effort_transport": (
+            "kimi-profile-config" if invocation.cli == "kimi" and invocation.effort
+            else "opencode-variant" if invocation.cli == "opencode" and invocation.effort
+            else None),
         "profile": invocation.profile,
         "billing_predicted": _bill,     # subscription / credit / api / unknown
         "permission": invocation.permission,
@@ -1786,7 +1819,13 @@ def _dry_run_view(invocation, args, agents_dir: str,
         view["base_url"] = invocation.base_url
         view["endpoint"] = (invocation.base_url or "?") + "/chat/completions"
         view["api_key_env"] = invocation.api_key_env
-        view["api_key_present"] = bool(invocation.api_key_env and os.environ.get(invocation.api_key_env))
+        try:
+            from _apibackend import api_key_available
+            view["api_key_present"] = api_key_available(
+                invocation.api_key_env, invocation.base_url)
+        except Exception:  # noqa: BLE001 - preflight must never fail on diagnostics
+            view["api_key_present"] = bool(
+                invocation.api_key_env and os.environ.get(invocation.api_key_env))
         view["billing"] = {"source": "api"}
         # Coding Plan: honest quota note + refuse known-bad model ids in preflight.
         try:

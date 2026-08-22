@@ -879,6 +879,7 @@ _BACKEND_ENV_PREFIXES = {
     # AGY_* too: the PTY wrapper, the headless-profile root and the interpreter all change
     # how (and as whom) agy runs.
     "agy": ("GEMINI_", "GOOGLE_", "AGY_"),
+    "opencode": ("OPENCODE_", "OPENROUTER_"),
     # openai-compat is deliberately ABSENT: it spawns no child and reads only the endpoint
     # and credential its provider resolves to, both already in the identity. Hashing every
     # OPENAI_* variable there meant an unrelated key change forced a fresh paid request.
@@ -897,6 +898,11 @@ _BACKEND_ENV_OVERWRITTEN = {
     # the child and two values are two different requests.
     "agy": ("AGY_PTY_DEADLINE",),
     "gemini": ("GEMINI_SYSTEM_MD",),
+    # The builder supplies a per-tier inline JSON policy; an ambient value must
+    # never change the child while leaving the request identity looking equal.
+    "opencode": ("OPENCODE_PERMISSION", "OPENCODE_CONFIG_CONTENT",
+                  "OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_PURE",
+                  "OPENCODE_DISABLE_EXTERNAL_SKILLS", "OPENCODE_DISABLE_CLAUDE_CODE"),
 }
 
 
@@ -930,7 +936,7 @@ def _agy_account_sha(resume_profile=None) -> str | None:
     return h.hexdigest()[:32] if seen_any else None
 
 
-def backend_env_sha(resolved_cli, allow_credit=False) -> str | None:
+def backend_env_sha(resolved_cli, allow_credit=False, model=None) -> str | None:
     """A one-way digest of the environment that configures `resolved_cli`.
 
     VALUES are hashed, never stored: several of these ARE credentials, and the same reasoning
@@ -970,6 +976,12 @@ def backend_env_sha(resolved_cli, allow_credit=False) -> str | None:
                 effective.pop(k, None)
             else:
                 effective[k] = v
+        if resolved_cli == "opencode":
+            # The optional Windows Credential Manager bridge is model-scoped and
+            # process-local. Include its one-way digest in request identity so a
+            # rotated OpenRouter key cannot reuse an older cached answer.
+            from _builder import opencode_env_override
+            effective.update(opencode_env_override(model))
     except Exception:  # noqa: BLE001 — identity must never fail on an import edge
         pass
     items = sorted(effective.items())
@@ -1033,7 +1045,8 @@ def _args_pin_model(args) -> bool:
 # Backends where SUMMON_DEFAULT_EFFORT can still decide the effort. agy is excluded on
 # purpose: it applies a thinking-mode suffix only when effort was given EXPLICITLY (CLI or
 # frontmatter), never from the default, so fingerprinting the default there was pure churn.
-_EFFORT_BACKENDS = ("claude", "codex")
+# Kimi applies the setting inside its disposable config.toml profile.
+_EFFORT_BACKENDS = ("claude", "codex", "kimi", "opencode")
 
 
 def _effort_default_applies(effort, resolved_cli, agents_dir, cwd, agent, defn=None) -> bool:
@@ -1318,6 +1331,12 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
                                          ("artifacts", "unreadable" if _artifact_error else "ok"),
                                          ("profile", "unreadable" if _profile_error else "ok"))
                           if st not in ("ok", "absent", "missing"))
+    _backend_model = model
+    if not _backend_model and _defn is not None:
+        try:
+            _backend_model = _defn.tup[5]
+        except (AttributeError, IndexError, TypeError):
+            _backend_model = None
     return {
         # not hashed (local facts, not part of the request); carried so the skip can refuse
         # a MALFORMED definition or an identity it could not fully compute, and so dispatch
@@ -1346,7 +1365,7 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # same command under CLAUDE_CODE=1 and under CODEX_CLI=1 is two different requests
         # that hashed identically -- the second could reuse the first backend's answer.
         "resolved_cli": _rcli,
-        "backend_env_sha256": backend_env_sha(_rcli, allow_credit),
+        "backend_env_sha256": backend_env_sha(_rcli, allow_credit, _backend_model),
         # A profile name alone is not enough: the private registry can retarget it to a
         # different account. Hash the resolved directory and registry snapshot, never the
         # path itself, so cached answers cannot cross profile changes.
@@ -2529,6 +2548,19 @@ def _resolve_launch(command, args):
                 return (shutil.which("node") or "node"), [_js, *args]
             return "cmd.exe", ["/c", _ark, *args]
         return _ark, args
+    # OpenCode's npm install exposes an .cmd/.ps1 shim that launches the
+    # bundled native binary.  CreateProcess cannot execute the shim directly;
+    # resolve the binary so multiline prompts and JSON event output travel
+    # through argv unchanged.
+    if os.name == "nt" and command == "opencode":
+        _oc = shutil.which("opencode.cmd") or shutil.which("opencode") or command
+        _oc_dir = os.path.dirname(_oc) if _oc else ""
+        _oc_exe = os.path.join(_oc_dir, "node_modules", "opencode-ai", "bin", "opencode.exe")
+        if os.path.isfile(_oc_exe):
+            return _oc_exe, args
+        if str(_oc).lower().endswith((".cmd", ".bat")):
+            return "cmd.exe", ["/c", _oc, *args]
+        return _oc, args
     resolved = shutil.which(command) or command
     if os.name != "nt" or not resolved.lower().endswith((".cmd", ".bat")):
         return resolved, args

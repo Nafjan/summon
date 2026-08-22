@@ -503,6 +503,17 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
 
     api_key = os.environ.get(inv.api_key_env) if inv.api_key_env else None
     _key_source = "env" if api_key else None
+    # OpenRouter is the one built-in API provider with a private local
+    # Credential Manager convention.  Environment variables still win; the
+    # store fallback is Windows-only, opt-in by the presence of the target,
+    # and never copies the secret into a child environment or an envelope.
+    if (not api_key and inv.api_key_env == "OPENROUTER_API_KEY"
+            and _is_openrouter_endpoint(inv.base_url)):
+        try:
+            from _windows_credentials import resolve_openrouter_api_key
+            api_key, _key_source = resolve_openrouter_api_key()
+        except Exception:  # noqa: BLE001 — local store is best-effort
+            api_key, _key_source = None, None
     if inv.api_key_env == "BYTEPLUS_CODING_API_KEY" and not api_key:
         try:
             from _arkcli_creds import resolve_byteplus_coding_api_key
@@ -528,6 +539,10 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
         resp.setdefault("warnings", []).append(
             "BYTEPLUS_CODING_API_KEY was unset; used the local arkcli profile "
             "API key for this dispatch (env still wins when set)")
+    if _key_source == "windows_credential" and resp.get("status") == "success":
+        resp.setdefault("warnings", []).append(
+            "OPENROUTER_API_KEY was unset; used the local Windows credential "
+            "store for this dispatch (env still wins when set)")
 
     # --- PAYG consent-gated fallback ---
     if (resp["status"] == "error"
@@ -675,6 +690,42 @@ def _do_request(base_url: str, model: str, system_context: str | None,
     except Exception:  # noqa: BLE001 — additive telemetry only
         pass
     return resp
+
+
+def _is_openrouter_endpoint(base_url: str | None) -> bool:
+    """Return True only for the configured OpenRouter origin."""
+    if not isinstance(base_url, str) or not base_url:
+        return False
+    from urllib.parse import urlsplit
+    try:
+        return (urlsplit(base_url).hostname or "").lower() in {
+            "openrouter.ai", "www.openrouter.ai"
+        }
+    except ValueError:
+        return False
+
+
+def api_key_available(api_key_env: str | None, base_url: str | None) -> bool:
+    """Return whether dispatch can resolve an API credential without exposing it."""
+    if not api_key_env:
+        return True
+    if os.environ.get(api_key_env):
+        return True
+    if api_key_env == "OPENROUTER_API_KEY" and _is_openrouter_endpoint(base_url):
+        try:
+            from _windows_credentials import resolve_openrouter_api_key
+            key, _source = resolve_openrouter_api_key()
+            return bool(key)
+        except Exception:  # noqa: BLE001 — dry-run must remain diagnostic-only
+            return False
+    if api_key_env == "BYTEPLUS_CODING_API_KEY":
+        try:
+            from _arkcli_creds import resolve_byteplus_coding_api_key
+            key, _source = resolve_byteplus_coding_api_key()
+            return bool(key)
+        except Exception:  # noqa: BLE001 — dry-run must remain diagnostic-only
+            return False
+    return False
 
 
 def _classify_fallback_reason(http_code: int, detail: str) -> str:

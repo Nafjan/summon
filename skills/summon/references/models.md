@@ -57,7 +57,7 @@ reaches an agent depends only on how that agent names its model:
 exposes it. Add `--refresh` in the subcommand form (`summon models --refresh`) or
 `--refresh-models` in the flat form when a provider roster may have changed. Each entry is
 tagged with a `source` so you know how much to trust it:
-- `live` — queried just now (`agy models` or an explicit ArkCLI refresh)
+- `live` — queried just now (`agy models`, `opencode models`, or an explicit ArkCLI refresh)
 - `cache` — read from a provider roster cache; refresh explicitly when it is stale
 - `config` — read from the CLI's own default config (`codex` → config.toml)
 - `static` — documented aliases/defaults to pass via `--model` (CLI has no list)
@@ -69,6 +69,21 @@ refresh it. Codex does not expose a complete enumeration command, so its config 
 catalog candidates are advisory. In every case, the dispatch envelope's exact
 `model.served` field is the authority for what actually ran; a catalog label or candidate
 never proves account eligibility.
+
+OpenCode discovery delegates to `opencode models` and returns provider/model selectors such
+as `openrouter/stealth/ox-alpha` when the local OpenCode configuration and credentials expose
+them. A live list proves only that OpenCode listed the selector; it does not prove that the
+account can serve it or that a gateway policy will permit it. Confirm a real dispatch and
+inspect `model.served` plus `served_model_evidence`.
+
+OpenRouter aliases exposed by OpenCode commonly appear as
+`openrouter/openrouter/auto`, `openrouter/openrouter/free`, and
+`openrouter/openrouter/fusion`. `free` is random and `auto` is task-aware; both
+must be audited from the provider's served model. Fusion presets are request
+plugins and are available through the bounded `openrouter_options` field on an
+OpenCode agent, not by inventing a model suffix. See
+[backends.md](backends.md#openrouter-routers-through-opencode) for the exact
+selectors and examples.
 
 Discover with `--list-models`, invoke with `--model`, verify with `model.served` —
 using a new model never requires editing the skill code itself.
@@ -102,8 +117,9 @@ and response for Kimi:
 | `terra` / explicit Codex candidate | codex | `gpt-5.6-terra` (declared, unverified) | balanced secondary lane; do not pin until served evidence |
 | `spark` / explicit Codex candidate | codex | `gpt-5.3-spark` (declared, unverified) | fast/quota-isolated candidate; do not pin until served evidence |
 | `coder`, `bug-fixer` | cursor-agent | composer-2.5 | multi-step coding, bug fixing |
-| `kimi-worker` | kimi | `kimi-code/k3` (pinned target; reverify `model.served`) | high-context architecture, independent review, broad repository research, ambiguous multi-file work |
-| `kimi-coder` | kimi | `kimi-code/kimi-for-coding` (pinned target; reverify `model.served`) | scoped implementation, refactoring, debugging, focused verification |
+| `kimi-worker` | kimi | `kimi-code/k3` + `effort: max` (pinned target; reverify `model.served`) | maximum-thinking architecture, independent review, broad repository research, ambiguous multi-file work |
+| `kimi-coder` | kimi | `kimi-code/k3` + `effort: max` (pinned target; reverify `model.served`) | maximum-thinking scoped implementation, refactoring, debugging, focused verification |
+| `kimi-k27-coder` | kimi | `kimi-code/kimi-for-coding` (explicit lower-context seat; reverify `model.served`) | deliberate K2.7 implementation/debugging trade-off |
 | `researcher` | agy | `gemini-3.7-flash-high` (pinned target; refresh and reverify) | primary evidence extraction, repo research, UI review, fast `/council` secondary |
 | `docs-writer`, `frontend`, `antigravity` | agy | Gemini default (pin via `model:`) | docs, frontend, general agy work |
 | explicit ArkCLI Coding Plan seat | arkcli | refreshable plan roster (for example `glm-5-2-260617`) | fast value/coding-plan secondary; verify `model.served` |

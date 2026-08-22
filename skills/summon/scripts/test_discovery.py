@@ -729,7 +729,7 @@ def test_doctor_json_roundtrip():
     import _doctor
     rep = _doctor.doctor()
     parsed = _json.loads(_json.dumps(rep, ensure_ascii=False))
-    assert set(parsed["backends"]) == {"claude", "codex", "cursor-agent", "gemini", "kimi", "agy", "arkcli"}
+    assert set(parsed["backends"]) == {"claude", "codex", "cursor-agent", "gemini", "kimi", "agy", "opencode", "arkcli"}
     assert isinstance(parsed["ok"], bool)
 
 
@@ -16957,6 +16957,43 @@ def test_v10_kimi_builder_isolated_and_boundary_safe():
         assert os.path.isfile(os.path.join(profile, "device_id"))
         assert not os.path.exists(os.path.join(profile, "mcp.json"))
         assert env["HOME"] == profile and env["USERPROFILE"] == profile
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(state, ignore_errors=True)
+
+
+def test_v10_kimi_effort_is_applied_to_supported_model_profile():
+    """Kimi effort must be written to the disposable profile, not dropped."""
+    import _builder as b
+    root = tempfile.mkdtemp(prefix="summon-kimi-source-effort-")
+    state = tempfile.mkdtemp(prefix="summon-kimi-state-effort-")
+    saved = {k: os.environ.get(k) for k in ("KIMI_CODE_HOME", "KIMI_HEADLESS_PROFILE")}
+    try:
+        os.makedirs(os.path.join(root, "credentials"))
+        with open(os.path.join(root, "config.toml"), "w", encoding="utf-8") as fh:
+            fh.write(
+                'default_model = "kimi-code/k3"\n'
+                '[models."kimi-code/k3"]\n'
+                'support_efforts = [ "low", "high", "max" ]\n'
+                'default_effort = "high"\n'
+                '[thinking]\n'
+                'enabled = true\n'
+                'effort = "high"\n')
+        os.environ["KIMI_CODE_HOME"] = root
+        os.environ["KIMI_HEADLESS_PROFILE"] = state
+        inv = b.AgentInvocation(cli="kimi", prompt="effort test", cwd=".",
+                                permission="yolo", model="kimi-code/k3", effort="max")
+        _command, _args, env = b.build_invocation_args(inv)
+        profile_config = os.path.join(env["KIMI_CODE_HOME"], "config.toml")
+        text = open(profile_config, encoding="utf-8").read()
+        assert '[models."kimi-code/k3"]' in text
+        assert 'default_effort = "max"' in text
+        assert '[thinking]' in text and 'effort = "max"' in text
     finally:
         for key, value in saved.items():
             if value is None:

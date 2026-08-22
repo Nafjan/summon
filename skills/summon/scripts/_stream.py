@@ -41,6 +41,12 @@ class StreamProcessor:
         self.is_codex = False
         self.is_kimi = False
         self.kimi_parts = []
+        # OpenCode's `run --format json` emits step_start/text/step_finish
+        # events and defines success at clean EOF rather than a terminal result
+        # object.  Keep a separate accumulator so those events are not mistaken
+        # for an incomplete stream.
+        self.is_opencode = False
+        self.opencode_parts = []
         # Telemetry captured from stream events (None when the CLI doesn't emit it):
         self.session_id = None  # claude session_id / codex thread_id / cursor chat id
         self.usage = None       # token usage dict
@@ -135,6 +141,36 @@ class StreamProcessor:
                         part.get("text", "") for part in content
                         if isinstance(part, dict) and isinstance(part.get("text"), str))
             return False
+
+        # OpenCode's JSON event protocol (v1.x) uses step_start, text,
+        # tool_use/tool_result, and step_finish packets.  There is no final
+        # result packet; a clean EOF is the terminal signal.  Capture model and
+        # usage telemetry wherever a provider/part exposes it, without turning
+        # the handshake into served-model evidence.
+        if data.get("type") in {
+            "step_start", "text", "reasoning", "tool_use", "tool_result",
+            "step_finish", "session_created", "message_updated",
+        } and (data.get("sessionID") or data.get("session_id")
+               or data.get("part") is not None):
+            self.is_opencode = True
+            self._capture_opencode_metadata(data)
+            if data.get("type") == "text":
+                part = data.get("part")
+                text = part.get("text") if isinstance(part, dict) else data.get("text")
+                if isinstance(text, str):
+                    self.opencode_parts.append(text)
+            return False
+
+        if data.get("type") in {"error", "session_error", "message_error"}:
+            self.is_opencode = True
+            self.is_error = True
+            self._capture_opencode_metadata(data)
+            detail = data.get("error") or data.get("message") or data.get("text") or "OpenCode provider error"
+            self.result_json = {
+                "type": "result", "result": "", "status": "error",
+                "error": str(detail)[:2000],
+            }
+            return True
 
         # Codex: turn.completed signals end (and carries token usage)
         if self.is_codex and data.get("type") == "turn.completed":
@@ -249,6 +285,51 @@ class StreamProcessor:
             self.models_used = sorted(data["modelUsage"])
             self.model = max(data["modelUsage"], key=lambda k: _out(data["modelUsage"][k]))
 
+    def _capture_opencode_metadata(self, data: dict) -> None:
+        """Capture bounded telemetry from an OpenCode JSON event."""
+        if not isinstance(data, dict):
+            return
+        for key in ("sessionID", "session_id"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                self.session_id = value.strip()
+                break
+        containers = [data]
+        part = data.get("part")
+        if isinstance(part, dict):
+            containers.append(part)
+        for container in containers:
+            for key in ("model", "modelID", "model_id", "served_model", "servedModel"):
+                value = container.get(key)
+                if isinstance(value, str) and value.strip():
+                    self.model = value.strip()
+                    break
+            if self.model:
+                break
+        for container in containers:
+            tokens = container.get("tokens")
+            if isinstance(tokens, dict):
+                self.usage = {
+                    "input_tokens": tokens.get("input", 0),
+                    "output_tokens": tokens.get("output", 0),
+                    "total_tokens": tokens.get("total", 0),
+                    "reasoning_tokens": tokens.get("reasoning", 0),
+                }
+                cache = tokens.get("cache")
+                if isinstance(cache, dict):
+                    self.usage["cache_read_tokens"] = cache.get("read", 0)
+                    self.usage["cache_write_tokens"] = cache.get("write", 0)
+                break
+            usage = container.get("usage")
+            if isinstance(usage, dict):
+                self.usage = usage
+                break
+        for container in containers:
+            cost = container.get("cost")
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                self.cost_usd = cost
+                break
+
     def get_result(self):
         return self.result_json
 
@@ -259,4 +340,10 @@ class StreamProcessor:
                 "type": "result",
                 "result": "\n".join(p for p in self.kimi_parts if p),
                 "status": "success",
+            }
+        if self.result_json is None and self.is_opencode:
+            self.result_json = {
+                "type": "result",
+                "result": "".join(self.opencode_parts),
+                "status": "error" if self.is_error else "success",
             }

@@ -20,8 +20,8 @@ def _valid_clis() -> tuple:
         from _builder import BACKEND_CLIS
         return BACKEND_CLIS
     except ImportError:
-        return ("claude", "cursor-agent", "codex", "gemini", "agy", "arkcli",
-                "openai-compat")
+        return ("claude", "cursor-agent", "codex", "gemini", "kimi", "agy",
+                "opencode", "arkcli", "openai-compat")
 
 
 _VALID_CLIS = _valid_clis()
@@ -179,6 +179,34 @@ def _agy_live_models() -> tuple[str, list, str | None]:
     return "live", models, None
 
 
+def _opencode_live_models() -> tuple[str, list, str | None]:
+    """(source, models, note) from OpenCode's configured model roster.
+
+    OpenCode exposes a provider/model list through ``opencode models``.  Keep
+    this fail-soft and treat the result as discovery only: a listed model may
+    still be unavailable for the account or require a provider-specific key.
+    """
+    exe = shutil.which("opencode")
+    if not exe:
+        return "unavailable", [], "opencode not on PATH"
+    try:
+        from _spawn import run_flags
+        cmd = (["cmd", "/c", exe, "models"] if os.name == "nt"
+               and exe.lower().endswith((".cmd", ".bat")) else [exe, "models"])
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           timeout=_AGY_MODELS_TIMEOUT, stdin=subprocess.DEVNULL,
+                           **run_flags())
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return "unavailable", [], f"{type(e).__name__}: {e}"
+    if r.returncode != 0:
+        return "unavailable", [], ((r.stderr or r.stdout or "").strip()[:200]
+                                    or "non-zero exit")
+    models = [ln.strip() for ln in (r.stdout or "").splitlines()
+              if "/" in ln and not ln.lstrip().startswith(("Error", "Warning"))]
+    return "live", models, None
+
+
 def _catalog_candidates(backend: str) -> list[dict]:
     """Return advisory catalog candidates without turning them into evidence."""
     try:
@@ -311,6 +339,14 @@ def discover_models(cli: str | None = None, *, refresh: bool = False) -> dict:
             "note": "Kimi Code accepts --model aliases but exposes no model-list command; "
                     "the unpinned default comes from ~/.kimi-code/config.toml.",
         }, "kimi")
+
+    if want("opencode"):
+        src, models, note = _opencode_live_models()
+        info["opencode"] = stamp({
+            "source": src,
+            "models": models,
+            "note": note or "Live from `opencode models`; listed is not proof of account access.",
+        }, "opencode")
 
     # ArkCLI/ModelArk exposes a Coding Plan roster. Keep the normal query
     # offline by reading the existing bounded cache; `--refresh` explicitly

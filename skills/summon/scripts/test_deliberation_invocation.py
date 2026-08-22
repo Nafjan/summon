@@ -239,14 +239,14 @@ class InvocationPlanTests(unittest.TestCase):
                         text_only_consent=("one",))
 
     def test_redacted_plan_contains_no_prompt_cwd_or_private_args(self):
-        frozen = self.freeze(args="--private-path C:\\Users\\nside\\secret")
+        frozen = self.freeze(args="--private-path C:\\Users\\test-user\\secret")
         plan = invplan.build_invocation_plans(frozen, decision_id="secret-decision",
                                               cwd=str(self.cwd))["one"]
         raw = json.dumps(plan.as_dict(), sort_keys=True)
         self.assertNotIn("secret-decision", raw)
         self.assertNotIn(str(self.cwd), raw)
         self.assertNotIn("private-path", raw)
-        self.assertNotIn("nside", raw)
+        self.assertNotIn("test-user", raw)
 
     def test_planner_has_no_executor_or_subprocess_contact(self):
         self.add_agent()

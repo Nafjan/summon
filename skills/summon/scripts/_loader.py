@@ -45,7 +45,7 @@ def last_parsed_sha(agent_file: str) -> str | None:
 # ignored, so an agent file can carry its own metadata.
 KNOWN_FRONTMATTER_KEYS = ("run-agent", "permission", "model", "args", "effort",
                           "provider", "base_url", "api_key_env", "capability", "billing",
-                          "profile")
+                          "profile", "openrouter_options")
 
 
 def parse_frontmatter(content: str) -> tuple[dict, str]:

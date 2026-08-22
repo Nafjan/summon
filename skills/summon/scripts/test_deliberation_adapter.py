@@ -438,7 +438,7 @@ class AdapterBoundaryTests(unittest.TestCase):
         original = executor_module.build_invocation_args
         try:
             executor_module.build_invocation_args = lambda *args, **kwargs: (_ for _ in ()).throw(
-                ValueError(r"PermissionError: C:\Users\nside\private-project\secret"))
+                ValueError(r"PermissionError: C:\Users\test-user\private-project\secret"))
             adapter = FreshDispatchAdapter(
                 replace(self.invocation(), cwd=os.getcwd()),
                 snapshot_digest=SNAPSHOT,

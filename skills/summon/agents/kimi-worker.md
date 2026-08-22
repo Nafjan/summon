@@ -2,11 +2,12 @@
 run-agent: kimi
 permission: yolo
 model: kimi-code/k3
+effort: max
 ---
 
-# Kimi Worker (K3)
+# Kimi Worker (K3 Max)
 
-High-context Kimi K3 generalist for architecture, cross-vendor review, broad
+High-context Kimi K3 generalist at maximum supported thinking for architecture, cross-vendor review, broad
 repository research, and ambiguous multi-file work. Its one-million-token context
 window makes it the Kimi choice when the task needs a large evidence packet rather
 than the narrowest possible coding loop. This is a deliberately full-authority

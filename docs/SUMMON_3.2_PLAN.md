@@ -1,7 +1,8 @@
 # Summon 3.2 plan
 
-Status: release contract for Summon 3.2.0. The bounded routing, roster, privacy,
-and chat-shell work described here is shipped in 3.2.0; rendered-browser,
+Status: release contract for Summon 3.2.x. The bounded routing, roster, privacy,
+and chat-shell work described here shipped in 3.2.0; the 3.2.1 patch adds the
+OpenCode gateway and startup-isolation hardening. Rendered-browser,
 provider-specific, and signed-evidence gates remain explicitly separate.
 
 Summon 3.2 has two linked goals:
@@ -148,10 +149,14 @@ Provider-inert CI must cover:
 Live release evidence must be generated against the exact candidate commit and
 installed CLI. A Codex Sol claim requires a real provider-reported served Sol
 receipt in that artifact. If the CLI cannot emit authoritative served identity,
-the strict lane remains blocked/preview; the release must not infer Sol from
-`-m`, `thread.started`, output tokens, or a catalog label.
+the named-model certification lane remains blocked; the release must not infer Sol from
+`-m`, `thread.started`, output tokens, or a catalog label. This does not make the Codex
+backend preview-only: ordinary Codex dispatch remains supported, with named-model
+provenance clearly marked unavailable when the receipt is absent. The lane graduates when
+the CLI or adapter exposes a provider-authored terminal model receipt and the live
+match/mismatch/missing-receipt matrix passes.
 
 3.2 GA requires a clean immutable source tree, synchronized metadata, all fixed
 suites and browser gates, converged managed installs, and no open P0/P1 review
-finding. Until the rendered browser and live Codex gates pass, ship only a
-clearly labelled preview or a narrowly scoped 3.1.x hotfix.
+finding. The release may ship supported Codex dispatch while keeping the explicit
+named-model certification lane honestly gated.

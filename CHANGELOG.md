@@ -5,7 +5,32 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
-No changes yet.
+No unreleased changes.
+
+## [3.2.1] - 2026-08-22
+
+- **Codex certification scope clarified:** Codex remains a supported first-class backend.
+  Only provenance-required named-model claims, such as `sol-review`, are blocked when the
+  CLI does not emit authoritative `model.served` evidence. Summon records the requested and
+  targeted model, leaves `served` unset, and never silently substitutes Luna. Certification
+  requires a provider-authored terminal receipt plus match, mismatch, and missing-receipt
+  fixtures and a fresh live run.
+- **Kimi K3 defaults:** `kimi-worker` and `kimi-coder` now pin K3 with maximum supported
+  thinking through the isolated profile. The former K2.7 coding seat remains available as
+  `kimi-k27-coder`. Kimi effort is now exposed as requested profile configuration rather than
+  silently discarded; it is not treated as provider-authored served-model evidence.
+- **OpenCode gateway:** added an `opencode` subprocess backend with JSON event parsing,
+  model/variant/session boundary enforcement, per-tier permission policies, live model
+  discovery, and a bundled OpenRouter OX Alpha seat. OpenCode provides a tool/file loop for
+  compatible providers; direct `openai-compat` seats remain text-only. Model and provider
+  context limits still apply.
+- **OpenRouter routers through OpenCode:** OpenCode seats can use the OpenRouter `auto`,
+  `free`, and `fusion` aliases. A bounded `openrouter_options` field carries documented
+  Auto Router and Fusion plugin settings, including `general-high`, `general-budget`, and
+  `general-fast`, without allowing arbitrary request-body or permission overrides.
+- **OpenCode startup isolation:** headless OpenCode dispatches now disable repository-level
+  config/plugins and external skill discovery before any private provider credential is
+  bridged into the child process.
 
 ## [3.2.0] - 2026-08-22
 

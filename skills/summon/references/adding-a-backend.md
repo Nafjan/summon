@@ -16,6 +16,7 @@ BACKENDS = {
     "kimi":         {"kind": "subprocess", "build": _build_kimi_args, "side_effects": True,
                      "acp": {"call": _acp_call}},
     "agy":          {"kind": "subprocess", "build": _build_agy_args, "side_effects": True},
+    "opencode":     {"kind": "subprocess", "build": _build_opencode_args, "side_effects": True},
     "openai-compat": {"kind": "api", "call": _api_call},
 }
 ```
@@ -64,8 +65,9 @@ Provide `call(inv, timeout_ms) -> response_dict`. No subprocess is spawned; you 
 request and return a dict shaped like `{result, status, exit_code, cli, usage?,
 model_resolved?, error?}`. It flows through the same `_enrich`/`_stamp`, so the final
 envelope (report parsing, `billing`, `model`, `elapsed_ms`, …) is identical to a
-subprocess backend's. `openai-compat` in `_apibackend.py` is the reference implementation
-(one stdlib HTTP POST). Read config from the agent frontmatter fields you add to
+subprocess backend's. `openai-compat` in `_apibackend.py` is the direct HTTP reference
+implementation (one stdlib HTTP POST); `opencode` is the toolful CLI-gateway reference.
+Read config from the agent frontmatter fields you add to
 `AgentInvocation` (like `base_url`/`api_key_env`), resolved in `run_subagent` before
 dispatch. **Redact secrets** from any error string you return (see `_apibackend._redact`).
 
@@ -76,3 +78,7 @@ dispatch. **Redact secrets** from any error string you return (see `_apibackend.
 3. `permission`/`billing` mappings if relevant.
 4. A test (mock a server for `api`, assert argv for `subprocess`).
 5. Document any new frontmatter fields.
+
+The OpenCode backend also owns the bounded `openrouter_options` frontmatter
+field. Keep it restricted to provider-documented router plugin settings; do not
+pass arbitrary request bodies or OpenCode config through an agent definition.

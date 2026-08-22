@@ -1,10 +1,114 @@
-# Custom & API backends (openai-compat)
+# Custom, CLI, and API backends
 
 > Part of the **summon** skill. See the main SKILL.md for core usage.
 
-## Custom & API backends (`openai-compat`) — add any model
+## OpenCode CLI gateway — toolful access to compatible providers
 
-Beyond the six CLI backends, an agent can run against **any OpenAI-compatible
+OpenCode can act as a local gateway for providers it knows how to call. This
+is different from Summon's direct `openai-compat` seat: OpenCode runs its own
+agent/tool loop, so an OpenCode-backed seat can inspect and edit the workspace
+when its Summon permission tier allows it. The selected model still needs to
+support the tool-calling features that the task requires; OpenRouter maintains
+a [tool-support model filter](https://openrouter.ai/docs/guides/features/tool-calling).
+
+For example, this pins OpenRouter's OX Alpha through OpenCode:
+
+```markdown
+---
+run-agent: opencode
+model: openrouter/stealth/ox-alpha
+permission: safe-edit
+---
+```
+
+The equivalent command is `opencode run --format json --model
+openrouter/stealth/ox-alpha "…"`. Summon supplies the working directory,
+strips agent arguments that could change the model or directory, and maps its
+permission tiers to OpenCode's `OPENCODE_PERMISSION` policy. `yolo` is the only
+tier that passes OpenCode's `--auto` flag. A local `OPENROUTER_API_KEY` takes
+precedence; on Windows, Summon may bridge the private `summonOpenRouter`
+Credential Manager entry into this child process for an OpenRouter model. The
+secret is never written to the agent definition, command line, receipt,
+telemetry, or debug file.
+
+Summon also starts the child with OpenCode's project-discovery and external-code
+guards: `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `OPENCODE_PURE=1`,
+`OPENCODE_DISABLE_EXTERNAL_SKILLS=1`, and `OPENCODE_DISABLE_CLAUDE_CODE=1`.
+This prevents a repository's `opencode.json`, `.opencode` plugins, or external
+skill files from changing the provider or observing a bridged credential before
+the turn starts. Keep these guards intact for headless dispatches; update an
+older OpenCode installation if it does not support the documented flags.
+
+Authenticate OpenCode with its provider flow (`opencode auth login` or
+`/connect`), configure the provider in `opencode.json`, and verify with
+`opencode models` before dispatching. OpenCode's official documentation covers
+[providers](https://opencode.ai/docs/providers/), the
+[CLI](https://opencode.ai/docs/cli/), and
+[permissions](https://opencode.ai/docs/permissions/).
+
+This gateway removes the *direct-seat* limitation that caused `stealth/ox-alpha`
+to be labelled text-only. It does not remove model or service limits: the
+provider's context window and output cap still apply, OpenCode may compact long
+sessions, and operating-system/CLI transport limits still apply to the initial
+prompt. For large inputs, put files under `--cwd` and ask the agent to read
+them; do not paste an unbounded document into the prompt. Check
+`model.served` in the Summon envelope; a requested model or OpenCode roster
+entry is not provider-authored proof.
+
+### OpenRouter routers through OpenCode
+
+OpenCode can use OpenRouter's concrete models and router aliases as model
+selectors. Because OpenCode prefixes the OpenRouter model ID with its provider
+ID, the selectors shown by `opencode models openrouter` are normally:
+
+| OpenCode selector | OpenRouter behavior | Use it for |
+|---|---|---|
+| `openrouter/stealth/ox-alpha` | A pinned model | Reproducible tool/file work |
+| `openrouter/openrouter/auto` | Auto Router | Let OpenRouter choose a paid model |
+| `openrouter/openrouter/free` | Free Models Router | Low-volume experiments |
+| `openrouter/openrouter/fusion` | Fusion model alias | Panel-and-judge synthesis |
+
+`free` is deliberately non-deterministic: it chooses an available free model at
+random after filtering for the request's capabilities. Pin a concrete `:free`
+model when reproducibility matters. `auto` also resolves to a concrete model;
+the provider's response, not the alias, is the source of truth. See the
+[Free Models Router](https://openrouter.ai/docs/guides/routing/routers/free-router),
+[Auto Router](https://openrouter.ai/docs/guides/routing/routers/auto-router), and
+[Fusion](https://openrouter.ai/docs/guides/features/plugins/fusion) documentation.
+
+Fusion presets are request settings, not model names. A Summon OpenCode seat
+may declare a bounded `openrouter_options` JSON value; Summon converts it into
+an OpenCode child-only config overlay and uses OpenCode's OpenRouter provider
+adapter so the plugin reaches the request body:
+
+```markdown
+---
+run-agent: opencode
+model: openrouter/openrouter/fusion
+permission: safe-edit
+openrouter_options: '{"plugins":[{"id":"fusion","preset":"general-budget"}]}'
+---
+```
+
+The accepted Fusion presets are `general-high`, `general-budget`, and
+`general-fast`. Auto Router settings use the matching `auto-router` plugin and
+can constrain the model pool or set a `cost_tier` (`low`, `medium`, `high`,
+`xhigh`, or `max`). Summon rejects unknown fields, mismatched router plugins,
+and arbitrary request-body overrides; it never lets this setting change the
+OpenCode working directory or permission policy. Fusion runs several underlying
+completions, so reserve it for research, critique, and synthesis rather than
+every short coding turn. Its panel, judge, and final model can differ from the
+requested alias; record the provider response and `model.served` when auditing.
+
+When `openrouter_options` is present, Summon asks OpenCode to use
+`@openrouter/ai-sdk-provider` for that model. Supported OpenCode releases bundle
+the adapter; if a local release does not, the dispatch fails clearly instead of
+silently dropping the router settings. A normal concrete-model or alias seat
+does not require this override.
+
+## Custom & API backends (`openai-compat`) — direct text seat
+
+The direct API backend can run against **any OpenAI-compatible
 `/chat/completions` API** — OpenRouter, OpenAI, Anthropic, Google (Gemini compat),
 Groq, DeepSeek, Together, or a LOCAL server (Ollama, LM Studio, vLLM, llama.cpp).
 Pure stdlib HTTP, no SDK. This bills your **API key/credits**, not a subscription
@@ -35,6 +139,26 @@ var at dispatch (never stored). Everything else is identical: same envelope, sam
 `--new-agent NAME --set run-agent=openai-compat --set model=...`. Resume isn't
 supported (the API call is stateless). This is how you add local AI and multi-model
 API access — and it makes `--council` a true multi-vendor board (à la OpenRouter).
+
+### OpenRouter credentials on Windows
+
+For the built-in OpenRouter provider, `OPENROUTER_API_KEY` still takes precedence.
+On Windows, when that variable is unset, Summon may read a local Credential Manager
+entry named `summonOpenRouter`. For the direct API seat, the credential is used only
+for the current HTTP request. For an OpenCode OpenRouter seat, it is bridged only into
+that child process because OpenCode is the provider gateway. In both cases it is never
+placed in an agent definition, receipt, telemetry record, command line, or debug file.
+Other providers continue to use their configured environment variable or local
+credential mechanism.
+
+Create the entry without putting the key in shell history:
+
+```powershell
+cmdkey /generic:summonOpenRouter /user:ApiKey
+```
+
+When prompted, enter the OpenRouter key. Check presence with
+`cmdkey /list:summonOpenRouter`; that command does not display the secret.
 
 ---
 

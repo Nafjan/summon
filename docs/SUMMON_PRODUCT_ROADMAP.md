@@ -1,13 +1,13 @@
 # Summon product roadmap
 
 Last reviewed: 2026-08-22
-Current release: `3.2.0`
+Current release: `3.2.1`
 Product status: dispatch and council are public. The local chat atlas and swarm coordinator
 are public preview surfaces. Deliberation and provider lanes use independent evidence gates.
 
-The immutable `v3.1.0` tag remains the prior source-bound GA release. The 3.2.0 candidate
-extends that baseline; its immutable tag and fresh evidence are created only after the
-release gates pass. The older `v3.0.0-ga` tag remains the historical provider-inert preview
+The immutable `v3.1.0` tag remains the prior source-bound GA release. The published `v3.2.0`
+release established the routing, roster, and chat baseline; `v3.2.1` is the non-destructive
+security and OpenCode gateway patch on that line. The older `v3.0.0-ga` tag remains the historical provider-inert preview
 baseline. The certified source passed all 17 fixed
 suites and all eight release gates, with clean source and converged managed installs. The
 reviewed Claude matrix covered a normal decided run, durable cancellation after provider
@@ -39,13 +39,13 @@ not inferred from this release.
 | Area | Current truth | Release posture |
 | --- | --- | --- |
 | Ordinary dispatch, council, ACP, telemetry | Implemented and locally exercised | Ready for continued public use |
-| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; the Claude route has exact `model.served` and matched account-digest evidence; Fable, Gemini, and other routes remain unverified | Claude is live-provider-gated for 3.1.0; other lanes remain gated until their own receipts |
+| Cross-vendor roster lanes | Frontier/near-frontier labels are editorial catalog metadata; the Claude route has exact `model.served` and matched account-digest evidence; ordinary Codex dispatch is supported, while explicit Sol/Terra/Luna claims remain receipt-gated | Claude is live-provider-gated for 3.1.0; named Codex model claims remain gated until their own receipts |
 | Deliberation kernel, journal replay/recovery, scheduler | Focused `test_deliberation_*.py` suite; provider-inert | Ready as a fake/injected integration surface |
 | Custom Agent manifests and roster binding | Strict parser, path fencing, consent/identity binding | Ready as provider-inert configuration |
 | Live provider composition | Receipt/plan/owner/deadline fences plus reviewed Claude normal/cancel/deadline matrix; deadline remains conservatively indeterminate with uncertain spend | Claude gate passes; provider expansion remains separately gated |
 | Browser conversation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, visual evidence, and explicit cancellable roster-agent turns; richer multi-run lifecycle remains preview | Unreleased post-GA preview |
 | Local swarm coordinator | `_rundir`-backed owner/lease/claim journal, idempotent worker messages, claim-bound artifacts, cancellation, and explicit uncertain-spend recovery; no implicit provider or IDE attachment | Provider-neutral preview |
-| Managed local installs | The installer detects nine host profiles (eight managed records); 3.2.0 convergence is verified by the clean release registry | Unmanaged local copies are reported locally without publishing their identity or hashes |
+| Managed local installs | The installer detects nine host profiles (eight managed records); 3.2.1 convergence is verified by the clean release registry | Unmanaged local copies are reported locally without publishing their identity or hashes |
 
 Telemetry is opt-in and local-only. “On” means bounded, allow-listed JSONL diagnostics; it does not transmit data. See [local diagnostics and telemetry](TELEMETRY.md) for the privacy boundary. GitHub issue submission remains a separate explicit action. Release documents do not record any workstation's telemetry state.
 

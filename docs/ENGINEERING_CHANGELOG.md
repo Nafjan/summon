@@ -13,7 +13,38 @@ never on added fields.
 
 ## Unreleased
 
-No changes yet.
+No unreleased changes.
+
+## [3.2.1] - 2026-08-22
+
+- **Codex certification scope clarified:** the Codex backend remains supported for ordinary
+  dispatch. The evidence gate applies only to explicit named-model claims: when a Codex CLI
+  completion lacks an authoritative terminal model receipt, Summon records the target,
+  leaves `model.served` unset, and returns the non-retryable `served_model_unverified`
+  outcome instead of inferring Luna or another default. The next certification step is a
+  provider-authored terminal receipt plus match/mismatch/missing-receipt fixtures and a
+  fresh live receipt for the Sol seat.
+- **Kimi effort routing:** Kimi effort is now applied to the disposable provider profile for
+  models that advertise thinking levels. The default K3 seats pin `effort: max`; K2.7 remains
+  an explicit lower-context seat. Receipts expose the requested level and identify profile
+  configuration as local evidence, without claiming a provider-authored effort receipt.
+- **OpenCode gateway backend:** added a subprocess path for OpenCode's JSON CLI, including
+  strict model/directory/session argument boundaries, `OPENCODE_PERMISSION` mapping for
+  read-only/safe-edit/yolo, provider-variant effort routing, live `opencode models`
+  discovery, and OpenCode event/usage parsing. The OpenRouter OX Alpha example uses this
+  toolful gateway; the direct OpenRouter seat remains explicitly text-only. A Windows
+  `summonOpenRouter` credential, when available, is bridged only into the child process and
+  never into public or diagnostic artifacts. Provider context, output, quota, and transport
+  limits remain in force.
+- **Bounded OpenRouter router settings:** OpenCode can now apply validated `auto-router` and
+  `fusion` plugin options through a child-only `OPENCODE_CONFIG_CONTENT` overlay. Summon
+  selects OpenCode's OpenRouter AI SDK adapter for these calls, rejects arbitrary request
+  body fields and mismatched aliases, and preserves the parent OpenCode configuration. The
+  dispatch still requires provider-authored served-model evidence for reproducible claims.
+- **OpenCode startup isolation:** headless dispatches disable repository project configuration,
+  external plugins, external skills, and Claude-compatible project discovery before a private
+  provider credential can enter the child. This closes the boundary where a repository-local
+  OpenCode plugin or config could retarget the provider or observe the credential.
 
 ## [3.2.0] - 2026-08-22
 

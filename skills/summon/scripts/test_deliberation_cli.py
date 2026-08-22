@@ -410,7 +410,7 @@ class DeliberationCliTests(unittest.TestCase):
         parser = _cli.build_parser("test", 1)
         for flag in ("--deliberate-status", "--deliberate-replay",
                      "--deliberate-cancel", "--deliberate-resume"):
-            args = parser.parse_args([flag, r"C:\Users\nside\private-project"])
+            args = parser.parse_args([flag, r"C:\Users\test-user\private-project"])
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 code = store.run_command(args)
@@ -422,7 +422,7 @@ class DeliberationCliTests(unittest.TestCase):
     def test_management_unknown_run_redacts_absolute_runs_root(self) -> None:
         parser = _cli.build_parser("test", 1)
         args = parser.parse_args(["--deliberate-status", "run-missing",
-                                  "--run-dir", r"C:\Users\nside\private-project"])
+                                  "--run-dir", r"C:\Users\test-user\private-project"])
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             code = store.run_command(args)
@@ -623,13 +623,13 @@ class DeliberationCliTests(unittest.TestCase):
             _rundir.journal_append(path, {
                 "event": "cleanup_receipt", "schema_version": 1,
                 "generation": owner.generation, "verified": False, "clean": False,
-                "retained_resources": [r"C:\Users\nside\private-project"],
+                "retained_resources": [r"C:\Users\test-user\private-project"],
                 "secret": "TOKEN-DO-NOT-EXPORT", "argv": ["--password", "TOKEN"],
             }, owner=owner)
             _rundir.journal_append(path, {
                 "event": "advisory_left_behind", "schema_version": 1,
                 "generation": owner.generation,
-                "items": [r"C:\Users\nside\private-project", "TOKEN=secret"],
+                "items": [r"C:\Users\test-user\private-project", "TOKEN=secret"],
                 "source": "model_output",
             }, owner=owner)
             _rundir.release_owner(owner)

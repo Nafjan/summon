@@ -47,7 +47,7 @@ class AgentInvocation:
     # Where a model pin came from. This is diagnostic provenance only; the
     # canonical selector remains the authority for launch behavior.
     model_source: str | None = None
-    effort: str | None = None          # reasoning effort (claude only): low..max
+    effort: str | None = None          # reasoning effort: low..max (Kimi uses profile config)
     resume_id: str | None = None       # backend session/thread/chat id to resume
     resume_profile: str | None = None  # agy only: profile dir of the session to resume
     extra_args: tuple = ()             # arbitrary backend flags (agent `args:` frontmatter)
@@ -72,6 +72,10 @@ class AgentInvocation:
     profile: str | None = None
     profile_env: dict | None = None
     profile_command: str | None = None
+    # Optional, validated OpenRouter request settings for the OpenCode gateway.
+    # Only router/plugin fields are accepted; arbitrary OpenCode config is never
+    # copied from an agent definition into the child process.
+    openrouter_options: dict | None = None
     # Ordinary dispatches use the report contract. Receipt-bound deliberation
     # turns use a typed ballot contract and must not receive the report nudge.
     output_contract: str = "report"
@@ -146,6 +150,13 @@ def build_command(cli: str, prompt: str) -> tuple[str, list]:
         # --yolo, or --plan here: its current CLI rejects those with --prompt.
         return "kimi", ["--output-format", "stream-json", "--prompt", prompt]
 
+    if cli == "opencode":
+        # OpenCode's scripting surface is `run --format json`; the executor's
+        # StreamProcessor consumes its newline-delimited event stream.  The
+        # working directory, model, permission policy, and variant are added by
+        # _build_opencode_args so this helper stays a pure command template.
+        return "opencode", ["run", "--format", "json", prompt]
+
     raise ValueError(f"Unknown CLI: {cli}")
 
 
@@ -191,6 +202,15 @@ _PERMISSION_MAPPING = {
         "read-only": [],
         "safe-edit": [],
         "yolo": [],
+    },
+    "opencode": {
+        # OpenCode's permission boundary is supplied through the documented
+        # OPENCODE_PERMISSION JSON environment variable (see
+        # _build_opencode_args).  `--auto` is reserved for an explicit yolo
+        # dispatch; read-only and safe-edit never rely on auto-approval.
+        "read-only": [],
+        "safe-edit": [],
+        "yolo": ["--auto"],
     },
 }
 
@@ -332,11 +352,17 @@ _BOUNDARY_FLAGS = {
     "agy": ("--add-dir", "--mode", "--sandbox", "--dangerously-skip-permissions", "--yolo"),
     "kimi": ("--auto", "--yolo", "--plan", "--session", "-S", "--continue", "-c",
              "--agent", "--agent-file", "--add-dir", "--skills-dir"),
+    # OpenCode can change model, session, working directory, agent, output
+    # format, variant, or auto-approval through argv.  Strip those values from
+    # agent-defined passthrough so the frozen Summon identity remains truthful.
+    "opencode": ("--auto", "--model", "-m", "--session", "-s", "--continue",
+                 "--agent", "--dir", "--format", "--variant"),
 }
 # Flags that consume the NEXT token as their value; dropping the flag must drop the value
 # too, or the bare value becomes a stray positional argument.
 _BOUNDARY_TAKES_VALUE = {"--permission-mode", "-s", "--sandbox", "--mode", "--approval-mode",
-                         "--add-dir", "--session", "-S", "--agent", "--agent-file", "--skills-dir"}
+                         "--add-dir", "--session", "-S", "--agent", "--agent-file", "--skills-dir",
+                         "--model", "-m", "--dir", "--format", "--variant"}
 # codex configures approval policy through `-c key=value`, so the KEY decides, not the flag.
 _CODEX_CONFIG_KEYS = ("approval_policy", "sandbox_mode", "sandbox_permissions")
 
@@ -869,6 +895,12 @@ def _build_kimi_args(inv: AgentInvocation, *, resource_register=None
         raise ValueError("resume is not supported for the kimi backend yet: its JSONL output does not provide a stable session id")
     model_flag = ["--model", inv.model] if inv.model else []
     profile = _ensure_kimi_profile()
+    try:
+        _configure_kimi_effort(profile, inv.model, inv.effort)
+    except Exception:
+        _forget_kimi_profile(profile)
+        shutil.rmtree(profile, ignore_errors=True)
+        raise
     if resource_register is not None:
         # The fresh profile is disposable; resumed/named profiles never reach
         # this builder path.  Registration is before argv construction so a
@@ -1233,6 +1265,262 @@ def _build_cursor_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
             "-p", _resume_prompt(inv)], env_override
     return "cursor-agent", perm + strip_boundary_flags(inv.cli, inv.extra_args) + [
         "--model", model, "--output-format", "json", "-p", _concatenated_prompt(inv)], env_override
+
+
+def _opencode_permission_env(permission: str) -> str:
+    """Return a strict OpenCode permission policy for a Summon tier.
+
+    OpenCode defaults most tools to ``allow``.  Passing ``--auto`` alone would
+    therefore make a supposedly bounded run full-authority, and merely omitting
+    it would leave a user/project config in charge.  The CLI documents
+    ``OPENCODE_PERMISSION`` as an inline JSON override, so use it to make the
+    three Summon tiers explicit for every invocation.
+    """
+    if permission == "yolo":
+        return json.dumps({"*": "allow"}, separators=(",", ":"))
+    allowed = {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "lsp": "allow",
+    }
+    if permission == "safe-edit":
+        allowed["edit"] = "allow"
+    # A deny-by-default policy is the important part.  Explicitly deny tools
+    # that can escape the requested read/edit boundary even if a future
+    # OpenCode release changes a default from ask to allow.
+    allowed["*"] = "deny"
+    allowed["external_directory"] = "deny"
+    return json.dumps(allowed, separators=(",", ":"))
+
+
+def opencode_env_override(model: str | None) -> dict[str, str]:
+    """Return private credential material OpenCode needs for an OpenRouter model.
+
+    OpenCode normally stores provider credentials in its own auth store.  Summon
+    also supports the local ``summonOpenRouter`` Windows credential convention
+    used by the direct OpenRouter seat.  Bridge that credential only into the
+    child process, and only for an ``openrouter/`` model; it never enters an
+    agent definition, argv, receipt, telemetry, or debug file.
+    """
+    if not isinstance(model, str) or not model.strip().lower().startswith("openrouter/"):
+        return {}
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return {}
+    try:
+        from _windows_credentials import resolve_openrouter_api_key
+        key, _source = resolve_openrouter_api_key()
+    except Exception:  # noqa: BLE001 - local credential store is best-effort
+        key = None
+    return {"OPENROUTER_API_KEY": key} if key else {}
+
+
+_OPENROUTER_ROUTER_PLUGIN_FIELDS = {
+    "fusion": {"id", "preset", "analysis_models", "model", "enabled"},
+    "auto-router": {"id", "allowed_models", "excluded_models", "cost_tier",
+                     "cost_quality_tradeoff"},
+    "auto-beta-router": {"id", "allowed_models", "excluded_models", "cost_tier",
+                         "cost_quality_tradeoff"},
+}
+_OPENROUTER_FUSION_PRESETS = {"general-high", "general-budget", "general-fast"}
+_OPENROUTER_COST_TIERS = {"low", "medium", "high", "xhigh", "max"}
+
+
+def _validate_openrouter_string_list(value, field: str, *, maximum: int) -> list[str]:
+    if not isinstance(value, list) or not value or len(value) > maximum:
+        raise ValueError(
+            f"openrouter_options: {field} must be a non-empty list of at most "
+            f"{maximum} strings")
+    out = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip() or len(item) > 240:
+            raise ValueError(
+                f"openrouter_options: {field} entries must be non-empty strings "
+                "of at most 240 characters")
+        out.append(item.strip())
+    return out
+
+
+def parse_openrouter_options(value, model: str | None = None) -> dict | None:
+    """Parse the bounded OpenRouter plugin settings used by an OpenCode seat.
+
+    OpenCode model options are powerful enough to replace the request body, so a
+    roster definition must not be able to pass arbitrary options through.  Summon
+    accepts only the documented Auto Router and Fusion plugin fields.  The
+    returned object is safe to merge into an OpenCode model config and contains no
+    credential or filesystem setting.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "openrouter_options must be a JSON object containing router plugin settings") from exc
+    if not isinstance(value, dict):
+        raise ValueError("openrouter_options must be a JSON object")
+    if not isinstance(model, str) or not model.strip().lower().startswith("openrouter/"):
+        raise ValueError("openrouter_options requires an OpenRouter model selector")
+
+    unknown = set(value) - {"plugins"}
+    if unknown:
+        raise ValueError(
+            "openrouter_options contains unsupported fields: "
+            + ", ".join(sorted(str(k) for k in unknown)))
+    plugins = value.get("plugins")
+    if not isinstance(plugins, list) or not plugins or len(plugins) > 8:
+        raise ValueError("openrouter_options.plugins must contain 1 to 8 plugin objects")
+
+    selector_model = model.strip().lower().split("/", 1)[1]
+    normalized_plugins = []
+    for plugin in plugins:
+        if not isinstance(plugin, dict):
+            raise ValueError("openrouter_options.plugins entries must be objects")
+        plugin_id = plugin.get("id")
+        if plugin_id not in _OPENROUTER_ROUTER_PLUGIN_FIELDS:
+            raise ValueError(
+                "openrouter_options supports only the fusion, auto-router, and "
+                "auto-beta-router plugins")
+        unknown_plugin = set(plugin) - _OPENROUTER_ROUTER_PLUGIN_FIELDS[plugin_id]
+        if unknown_plugin:
+            raise ValueError(
+                f"openrouter_options plugin {plugin_id!r} contains unsupported fields: "
+                + ", ".join(sorted(str(k) for k in unknown_plugin)))
+        out = {"id": plugin_id}
+        if plugin_id == "fusion":
+            if "preset" in plugin:
+                preset = plugin["preset"]
+                if preset not in _OPENROUTER_FUSION_PRESETS:
+                    raise ValueError(
+                        "openrouter_options fusion.preset must be one of "
+                        + ", ".join(sorted(_OPENROUTER_FUSION_PRESETS)))
+                out["preset"] = preset
+            if "analysis_models" in plugin:
+                out["analysis_models"] = _validate_openrouter_string_list(
+                    plugin["analysis_models"], "fusion.analysis_models", maximum=16)
+            if "model" in plugin:
+                if not isinstance(plugin["model"], str) or not plugin["model"].strip():
+                    raise ValueError("openrouter_options fusion.model must be a non-empty string")
+                out["model"] = plugin["model"].strip()
+            if "enabled" in plugin:
+                if not isinstance(plugin["enabled"], bool):
+                    raise ValueError("openrouter_options fusion.enabled must be boolean")
+                out["enabled"] = plugin["enabled"]
+        else:
+            expected = "auto-beta" if plugin_id == "auto-beta-router" else "auto"
+            if selector_model not in {expected, f"openrouter/{expected}"}:
+                raise ValueError(
+                    f"{plugin_id} settings require model selector "
+                    f"openrouter/openrouter/{expected}")
+            for field in ("allowed_models", "excluded_models"):
+                if field in plugin:
+                    out[field] = _validate_openrouter_string_list(
+                        plugin[field], field, maximum=64)
+            if "cost_tier" in plugin:
+                tier = plugin["cost_tier"]
+                if tier not in _OPENROUTER_COST_TIERS:
+                    raise ValueError(
+                        "openrouter_options cost_tier must be one of "
+                        + ", ".join(sorted(_OPENROUTER_COST_TIERS)))
+                out["cost_tier"] = tier
+            if "cost_quality_tradeoff" in plugin:
+                tradeoff = plugin["cost_quality_tradeoff"]
+                if (isinstance(tradeoff, bool) or not isinstance(tradeoff, (int, float))
+                        or not 0 <= tradeoff <= 10):
+                    raise ValueError(
+                        "openrouter_options cost_quality_tradeoff must be a number from 0 to 10")
+                out["cost_quality_tradeoff"] = tradeoff
+        normalized_plugins.append(out)
+    return {"plugins": normalized_plugins}
+
+
+def _deep_merge_opencode_config(base: dict, overlay: dict) -> dict:
+    """Merge the child-only router overlay without replacing user config."""
+    result = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_opencode_config(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def opencode_router_env_override(inv: AgentInvocation) -> dict[str, str]:
+    """Return a child-only OpenCode config overlay for validated router options."""
+    options = parse_openrouter_options(getattr(inv, "openrouter_options", None), inv.model)
+    if not options:
+        return {}
+    model = inv.model
+    if not isinstance(model, str) or "/" not in model:
+        raise ValueError("OpenRouter router options require a provider/model selector")
+    provider, model_id = model.split("/", 1)
+    if provider.lower() != "openrouter" or not model_id:
+        raise ValueError("OpenRouter router options require an openrouter/<model> selector")
+    overlay = {
+        "provider": {
+            "openrouter": {
+                # The OpenRouter AI SDK adapter is what carries plugin settings
+                # into the request body.  OpenCode bundles it in supported builds.
+                "npm": "@openrouter/ai-sdk-provider",
+                "models": {model_id: {"options": options}},
+            }
+        }
+    }
+    existing = os.environ.get("OPENCODE_CONFIG_CONTENT")
+    if existing:
+        try:
+            parsed = json.loads(existing)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "OPENCODE_CONFIG_CONTENT is not valid JSON; cannot safely add "
+                "OpenRouter router settings") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("OPENCODE_CONFIG_CONTENT must be a JSON object")
+        overlay = _deep_merge_opencode_config(parsed, overlay)
+    return {"OPENCODE_CONFIG_CONTENT": json.dumps(overlay, separators=(",", ":"))}
+
+
+def _build_opencode_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
+    """Build OpenCode's headless CLI turn.
+
+    OpenCode has no separate system-prompt flag on ``run``; concatenate the
+    frozen agent context into the user message just like Kimi/Cursor.  Its
+    JSON event stream is parsed by ``_stream.StreamProcessor`` and preserves
+    session/usage telemetry where OpenCode emits it.
+    """
+    perm = permission_flags(inv.cli, inv.permission)
+    if inv.resume_id:
+        prompt = _resume_prompt(inv)
+    else:
+        prompt = _concatenated_prompt(inv)
+    model_flag = ["--model", inv.model] if inv.model else []
+    variant_flag = ["--variant", inv.effort] if inv.effort else []
+    session_flag = ["--session", inv.resume_id] if inv.resume_id else []
+    command, _base_args = build_command(inv.cli, prompt)
+    # `--dir` keeps OpenCode's project root aligned with Summon's cwd even when
+    # the parent process was launched from another directory.  Permission JSON
+    # is process-local and never writes the user's OpenCode config.
+    args = (["run", "--format", "json"] + perm + model_flag
+            + variant_flag + session_flag + ["--dir", inv.cwd]
+            + strip_boundary_flags(inv.cli, inv.extra_args) + [prompt])
+    # OpenCode discovers repository-local config, rules, agents, skills, and
+    # plugins before it enters the model loop. A Summon dispatch may bridge a
+    # private provider credential into this child, so repository-controlled
+    # startup code must not be allowed to observe or retarget that child. These
+    # documented OpenCode flags preserve the injected config while disabling
+    # project discovery and external plugin/skill loading for this invocation.
+    env = {
+        "OPENCODE_PERMISSION": _opencode_permission_env(inv.permission),
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+        "OPENCODE_PURE": "1",
+        "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
+        "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+    }
+    env.update(opencode_router_env_override(inv))
+    env.update(opencode_env_override(inv.model))
+    return inv.profile_command or command, args, env
 
 
 # --- Antigravity (agy) headless one-shot support -------------------------------
@@ -1885,6 +2173,113 @@ def _ensure_kimi_profile() -> str:
         raise ValueError(f"kimi profile: build failed: {type(e).__name__}: {e}") from e
 
 
+def _kimi_set_toml_value(text: str, section: str, key: str, value: str) -> str:
+    """Set one scalar in a Kimi TOML section without a third-party parser.
+
+    Kimi's config is copied into a disposable profile before every dispatch.  A
+    tiny section-aware rewrite is safer here than adding a TOML dependency (and
+    preserves comments and provider-specific keys that Summon does not own).
+    """
+    lines = text.splitlines(keepends=True)
+    section_start = None
+    section_end = len(lines)
+    header_re = re.compile(r"^\s*\[([^\[\]]+)\]\s*$")
+    for index, line in enumerate(lines):
+        match = header_re.match(line.rstrip("\r\n"))
+        if not match:
+            continue
+        if section_start is not None:
+            section_end = index
+            break
+        if match.group(1).strip() == section:
+            section_start = index
+    if section_start is None:
+        if text and not text.endswith(("\n", "\r")):
+            text += "\n"
+        return text + f"\n[{section}]\n{key} = \"{value}\"\n"
+
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    for index in range(section_start + 1, section_end):
+        if key_re.match(lines[index].rstrip("\r\n")):
+            newline = "\r\n" if lines[index].endswith("\r\n") else "\n"
+            lines[index] = f'{key} = "{value}"{newline}'
+            return "".join(lines)
+
+    newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
+    lines.insert(section_start + 1, f'{key} = "{value}"{newline}')
+    return "".join(lines)
+
+
+def _kimi_model_key(model: str | None, config: str) -> str | None:
+    """Resolve a Kimi model alias to the config section name, if known."""
+    selected = (model or "").strip()
+    if not selected:
+        match = re.search(r'^\s*default_model\s*=\s*["\']([^"\']+)["\']',
+                          config, flags=re.MULTILINE)
+        selected = match.group(1).strip() if match else ""
+    if not selected:
+        return None
+    if "/" not in selected:
+        selected = f"kimi-code/{selected}"
+    return selected
+
+
+def _configure_kimi_effort(profile: str, model: str | None, effort: str | None) -> str | None:
+    """Apply a requested thinking level to the isolated Kimi profile.
+
+    Kimi has no ``--effort`` flag.  Its supported models declare effort levels
+    in ``config.toml`` and the CLI reads the selected model's ``default_effort``
+    plus the global ``[thinking]`` value.  Only models that advertise
+    ``support_efforts`` are changed; K2.7 Coding remains on its provider default
+    rather than receiving a level it does not claim to support.
+
+    Returns the effective provider value (``low``, ``high``, or ``max``) when a
+    change was made, otherwise ``None``.  This is local configuration evidence,
+    not a claim about the provider's eventual served-model receipt.
+    """
+    if not effort:
+        return None
+    mapped = {"low": "low", "medium": "high", "high": "high",
+              "xhigh": "max", "max": "max"}.get(str(effort).strip().lower())
+    if mapped is None:
+        raise ValueError("kimi effort must be low, medium, high, xhigh, or max")
+    config_path = os.path.join(profile, "config.toml")
+    try:
+        with open(config_path, encoding="utf-8") as fh:
+            config = fh.read()
+    except OSError as exc:
+        raise ValueError("kimi profile: cannot read copied config for effort") from exc
+
+    selected = _kimi_model_key(model, config)
+    section = f'models."{selected}"' if selected else None
+    section_text = ""
+    if section:
+        match = re.search(
+            rf"(?ms)^\[{re.escape(section)}\]\s*$.*?(?=^\s*\[[^\[\]]+\]\s*$|\Z)",
+            config)
+        section_text = match.group(0) if match else ""
+    supports = bool(section_text and re.search(
+        rf"support_efforts\s*=.*[\"']{re.escape(mapped)}[\"']", section_text))
+    # Minimal configs used by older Kimi installs may omit the model table; the
+    # two K3 aliases are still safe to configure because the provider advertises
+    # these levels. Unknown/K2.7 models are intentionally left alone.
+    supports = supports or selected in {"kimi-code/k3", "kimi-code/k3-256k"}
+    if not supports:
+        return None
+
+    updated = config
+    if section:
+        updated = _kimi_set_toml_value(updated, section, "default_effort", mapped)
+    updated = _kimi_set_toml_value(updated, "thinking", "effort", mapped)
+    if updated != config:
+        try:
+            with open(config_path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(updated)
+        except OSError as exc:
+            raise ValueError("kimi profile: cannot write thinking effort") from exc
+    return mapped
+
+
 def _resume_agy_profile(profile: str | None) -> str:
     """Validate + refresh a profile dir being resumed. Extends its mtime so the
     TTL cleanup won't reap it mid-use. Fails closed if it's gone (its short-lived
@@ -2009,7 +2404,7 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
 # --- Backend registry --------------------------------------------------------
 # The ONE place that knows every backend and how it runs. Two kinds:
 #   "subprocess" — build() returns (command, args, env_override) for the executor
-#                  to spawn (claude/codex/cursor/gemini/agy).
+#                  to spawn (claude/codex/cursor/gemini/kimi/agy/opencode).
 #   "api"        — the executor calls the backend's own request function instead
 #                  of spawning a process (openai-compat: an HTTP call).
 # An optional "acp" key on a subprocess backend registers NATIVE Agent Client
@@ -2052,6 +2447,8 @@ BACKENDS: dict = {
                      "acp": {"call": _acp_call}},
     "kimi":         {"kind": "subprocess", "build": _build_kimi_args, "side_effects": True,
                      "acp": {"call": _acp_call}},
+    "opencode":     {"kind": "subprocess", "build": _build_opencode_args,
+                     "side_effects": True},
     "agy":          {"kind": "subprocess", "build": _build_agy_args, "side_effects": True},
     "arkcli":       {"kind": "api", "call": _arkcli_call},
     "openai-compat": {"kind": "api", "call": _api_call},
@@ -2092,13 +2489,13 @@ _MODEL_VENDOR_PREFIXES = {
 
 
 _MODEL_COMPATIBLE_BACKENDS = {
-    "anthropic": ("claude", "agy", "cursor-agent"),
-    "openai": ("agy", "codex", "cursor-agent", "openai-compat"),
-    "google": ("agy", "cursor-agent", "gemini", "openai-compat"),
-    "moonshot": ("agy", "kimi", "cursor-agent", "openai-compat"),
-    "deepseek": ("agy", "openai-compat"),
-    "zhipu": ("agy", "openai-compat"),
-    "xai": ("agy", "cursor-agent", "openai-compat"),
+    "anthropic": ("claude", "agy", "cursor-agent", "opencode"),
+    "openai": ("agy", "codex", "cursor-agent", "openai-compat", "opencode"),
+    "google": ("agy", "cursor-agent", "gemini", "openai-compat", "opencode"),
+    "moonshot": ("agy", "kimi", "cursor-agent", "openai-compat", "opencode"),
+    "deepseek": ("agy", "openai-compat", "opencode"),
+    "zhipu": ("agy", "openai-compat", "opencode"),
+    "xai": ("agy", "cursor-agent", "openai-compat", "opencode"),
 }
 
 

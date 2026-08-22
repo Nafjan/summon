@@ -295,7 +295,7 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(invalid["error_kind"], "invalid_run_id")
         self.assertNotIn(self.temp.name, json.dumps(invalid))
         path_like = resume.reconcile_run(
-            self.root, r"C:\Users\nside\private\project")
+            self.root, r"C:\Users\test-user\private\project")
         self.assertEqual(path_like["error_kind"], "invalid_run_id")
         self.assertEqual(path_like["run_id"], "<invalid>")
         self.assertNotIn("private", json.dumps(path_like).lower())
