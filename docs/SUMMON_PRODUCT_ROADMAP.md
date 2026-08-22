@@ -1,12 +1,14 @@
 # Summon product roadmap
 
-Last reviewed: 2026-08-20
-Current release: `3.1.0`
+Last reviewed: 2026-08-22
+Current release: `3.2.0`
 Product status: dispatch and council are public. The local chat atlas and swarm coordinator
 are public preview surfaces. Deliberation and provider lanes use independent evidence gates.
 
-The immutable `v3.1.0` tag is the source-bound GA release. The older `v3.0.0-ga` tag remains
-the historical provider-inert preview baseline. The certified source passed all 17 fixed
+The immutable `v3.1.0` tag remains the prior source-bound GA release. The 3.2.0 candidate
+extends that baseline; its immutable tag and fresh evidence are created only after the
+release gates pass. The older `v3.0.0-ga` tag remains the historical provider-inert preview
+baseline. The certified source passed all 17 fixed
 suites and all eight release gates, with clean source and converged managed installs. The
 reviewed Claude matrix covered a normal decided run, durable cancellation after provider
 contact, and a deadline that recorded `adapter_indeterminate` with `uncertain_spend=true`.
@@ -18,19 +20,19 @@ This roadmap records what is shipped, what is tested, and which provider lanes r
 or independently live-provider-gated.
 
 The 3.1 milestone delivered the trust-and-reliability contract, evidence-integrity guard,
-local lifecycle hardening, and the bounded Claude deliberation gate. The remaining roadmap
-work is post-GA: richer chat/swarm workflows and additional provider lanes must earn their
-own machine-recorded gates and are not implied by this release.
+local lifecycle hardening, and the bounded Claude deliberation gate. The 3.2 release adds
+model-routing, roster, onboarding, and telemetry hardening; richer chat/swarm workflows and
+additional provider lanes must still earn their own machine-recorded gates.
 
-## Next milestone: 3.2
+## 3.2 release scope
 
 The 3.2 contract is recorded in [`SUMMON_3.2_PLAN.md`](SUMMON_3.2_PLAN.md). Its P0
 trust lane makes explicit Codex model selection and terminal served-model evidence
 fail closed, including the Sol-versus-Luna routing case. Its chat lane replaces
 window-owned scrolling and variable-height state insertion with a fixed shell,
 cursor-aware anchoring, compact identity presentation, and separate owner, stream,
-and turn states. These are implementation targets, not 3.1 release claims; 3.2 GA
-requires fresh rendered-browser evidence and a current live Codex receipt.
+and turn states. Rendered-browser and live-provider evidence remain separate gates and are
+not inferred from this release.
 
 ## Release snapshot
 
@@ -43,7 +45,7 @@ requires fresh rendered-browser evidence and a current live Codex receipt.
 | Live provider composition | Receipt/plan/owner/deadline fences plus reviewed Claude normal/cancel/deadline matrix; deadline remains conservatively indeterminate with uncertain spend | Claude gate passes; provider expansion remains separately gated |
 | Browser conversation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, visual evidence, and explicit cancellable roster-agent turns; richer multi-run lifecycle remains preview | Unreleased post-GA preview |
 | Local swarm coordinator | `_rundir`-backed owner/lease/claim journal, idempotent worker messages, claim-bound artifacts, cancellation, and explicit uncertain-spend recovery; no implicit provider or IDE attachment | Provider-neutral preview |
-| Managed local installs | The installer detects nine host profiles (eight managed records) and all eight managed copies match 3.1.0 | Convergence is source-bound in the clean release registry; `doctor` reports unmanaged local copies without publishing their identity or hashes |
+| Managed local installs | The installer detects nine host profiles (eight managed records); 3.2.0 convergence is verified by the clean release registry | Unmanaged local copies are reported locally without publishing their identity or hashes |
 
 Telemetry is opt-in and local-only. “On” means bounded, allow-listed JSONL diagnostics; it does not transmit data. See [local diagnostics and telemetry](TELEMETRY.md) for the privacy boundary. GitHub issue submission remains a separate explicit action. Release documents do not record any workstation's telemetry state.
 
