@@ -285,7 +285,7 @@ def load_agent(path: str | os.PathLike[str]) -> FrozenAgent:
         hashlib.sha256(raw).hexdigest(), body, str(resolved))
 
 
-def _discover_root(root: Path) -> list[FrozenAgent]:
+def _discover_root(root: Path, *, allow_legacy_flat: bool = False) -> list[FrozenAgent]:
     try:
         if not root.exists():
             return []
@@ -297,22 +297,75 @@ def _discover_root(root: Path) -> list[FrozenAgent]:
         raise AgentManifestError("agent discovery root could not be read") from exc
     result = []
     for child in children:
-        if _is_reparse_point(child) or not child.is_dir() or not _ID.fullmatch(child.name):
-            raise AgentManifestError("agent discovery contains an unsafe package")
+        if _is_reparse_point(child):
+            raise AgentManifestError(
+                f"agent discovery contains an unsafe package ({child.name})")
+        # Older global rosters store role definitions as direct ``*.md`` files
+        # rather than modern package directories. They are reported separately
+        # and are not treated as modern manifests. Workspace discovery remains
+        # strict by default.
+        if allow_legacy_flat and child.is_file():
+            # The explicit global root is also the home of legacy flat role
+            # files and operational documents. They are reported separately;
+            # only modern package directories are parsed here.
+            continue
+        if allow_legacy_flat and child.is_dir():
+            if (not _ID.fullmatch(child.name)
+                    or not (child / "agent.md").is_file()):
+                continue
+        if not child.is_dir() or not _ID.fullmatch(child.name):
+            raise AgentManifestError(
+                f"agent discovery contains an invalid package entry ({child.name}); "
+                "expected <agent-slug>/agent.md")
         try:
             child_resolved = child.resolve(strict=True)
             root_key = os.path.normcase(os.path.abspath(str(root_resolved)))
             child_key = os.path.normcase(os.path.abspath(str(child_resolved)))
             if os.path.commonpath((root_key, child_key)) != root_key:
-                raise AgentManifestError("agent package escaped the discovery root")
+                raise AgentManifestError(
+                    f"agent package escaped the discovery root ({child.name})")
         except (OSError, ValueError) as exc:
-            raise AgentManifestError("agent package cannot be contained") from exc
-        result.append(load_agent(child / "agent.md"))
+            raise AgentManifestError(
+                f"agent package cannot be contained ({child.name})") from exc
+        try:
+            result.append(load_agent(child / "agent.md"))
+        except AgentManifestError as exc:
+            raise AgentManifestError(
+                f"agent manifest {child.name}/agent.md is invalid: {exc}") from exc
     return result
 
 
+def legacy_flat_roster(global_root: str | os.PathLike[str] | None
+                       ) -> tuple[str, ...]:
+    """Return names of direct legacy ``*.md`` roster files.
+
+    This is metadata-only: file contents are never read or returned. The
+    legacy format is reported separately from modern packaged agents so
+    validation cannot silently claim that it validated the old format.
+    """
+    if global_root is None:
+        return ()
+    if not isinstance(global_root, (str, os.PathLike)):
+        raise TypeError("global_root must be path-like")
+    root = Path(global_root)
+    try:
+        if not root.exists():
+            return ()
+        if _is_reparse_point(root) or not root.is_dir():
+            raise AgentManifestError("agent discovery root is unsafe")
+        return tuple(sorted(
+            child.name for child in root.iterdir()
+            if not _is_reparse_point(child)
+            and child.is_file()
+            and child.suffix.lower() == ".md"
+        ))
+    except OSError as exc:
+        raise AgentManifestError("agent discovery root could not be read") from exc
+
+
 def discover_agents(workspace_root: str | os.PathLike[str],
-                    global_root: str | os.PathLike[str] | None = None
+                    global_root: str | os.PathLike[str] | None = None,
+                    *, allow_legacy_flat: bool = False
                     ) -> Mapping[str, FrozenAgent]:
     """Discover workspace packages, plus an explicitly supplied global root."""
     if not isinstance(workspace_root, (str, os.PathLike)):
@@ -327,7 +380,8 @@ def discover_agents(workspace_root: str | os.PathLike[str],
     if global_root is not None:
         if not isinstance(global_root, (str, os.PathLike)):
             raise TypeError("global_root must be path-like")
-        agents.extend(_discover_root(Path(global_root)))
+        agents.extend(_discover_root(Path(global_root),
+                                     allow_legacy_flat=allow_legacy_flat))
     result: dict[str, FrozenAgent] = {}
     for agent in agents:
         if agent.name in result:

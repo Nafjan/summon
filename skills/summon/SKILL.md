@@ -42,7 +42,10 @@ describe the behavior and remediation without identifying the machine that expos
 - **[VERSIONING_AND_1.0_CRITERIA.md](../../docs/VERSIONING_AND_1.0_CRITERIA.md)** - the stable public contract, the criteria 1.0.0 met, and the evidence behind it
 - **[references/](references/)** - deep-dive docs: models, backends, effort, customizing agents, fan-out & council (read on demand)
 
-**Script Path**: Use absolute path `{SKILL_DIR}/scripts/run_subagent.py` where `{SKILL_DIR}` is the directory containing this SKILL.md file.
+**Script Path**: On Windows, use `{SKILL_DIR}\scripts\summon.cmd`; it selects a
+compatible Python through the Windows launcher and must be preferred over invoking
+`run_subagent.py` directly. On macOS/Linux, use `python3 {SKILL_DIR}/scripts/run_subagent.py`.
+The dispatcher requires Python 3.10 or later.
 
 **Install**: This skill ships inside the summon repo at `skills/summon/`. Hosts that support
 [Agent Plugins](https://agent-plugins.org) (Cursor, VS Code, Copilot, Codex) load it from a
@@ -288,9 +291,9 @@ run_subagent.py council --members planner,reviewer,researcher,pair --question ".
 The envelope must be checked for `model.served == gemini-3.7-flash-high`; an unavailable
 model is a routing failure, not permission to silently float to another model. Gemini/agy
 is excellent for fast repository research, evidence extraction, and an independent UI or
-docs review. It is not the chairman, safety arbiter, or provider-execution seat. agy cannot
-enforce `read-only`, so keep this role research/review-only unless an operator explicitly
-chooses otherwise.
+docs review. It is not the chairman, safety arbiter, or provider-execution seat. Because
+agy cannot enforce `read-only`, use it in a disposable clone/worktree for any task that
+may need file or shell access; inspect the resulting diff and report before accepting it.
 
 ### Fable profile health
 
@@ -301,8 +304,8 @@ private directory, then verify it before an expensive dispatch:
 $env:CLAUDE_CONFIG_DIR = Join-Path $env:USERPROFILE ".claude-fable"
 claude auth login
 claude auth status
-python skills/summon/scripts/run_subagent.py doctor --json
-python skills/summon/scripts/run_subagent.py dispatch --agent fable --profile fable --model claude-fable-5 --cwd <project> --prompt "Return the required Final report block."
+skills\summon\scripts\summon.cmd doctor --json
+skills\summon\scripts\summon.cmd dispatch --agent fable --profile fable --model claude-fable-5 --cwd <project> --prompt "Return the required Final report block."
 ```
 
 The dispatch envelope is authoritative: check `status`, `model.served`, `profile`, and the
@@ -428,6 +431,16 @@ run or recommending it to a user.
 
 ## Parameters
 
+### Timeout units
+
+Use an explicit unit in every invocation: `ms` for milliseconds, `s` for seconds, or
+`m` for minutes (for example, `--timeout 900s` or `--timeout 600000ms`). A bare numeric
+value is retained only for backward compatibility and is interpreted as milliseconds.
+Dispatches reject a bare value below one second because it is almost always a units
+mistake; write the intended unit instead. The read-only `jobs wait` poll still accepts
+short bare millisecond values for compatibility. The host tool's own timeout must be
+longer than this child timeout so Summon can clean up and write its result envelope.
+
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `--list` | - | List available agents (no other params needed) |
@@ -450,7 +463,8 @@ run or recommending it to a user.
 | `--prompt` | Yes* | Task description to delegate (or `--prompt-file`) |
 | `--prompt-file FILE` | Yes* | Read the prompt from a UTF-8 file (BOM tolerated; strict decoding). Mutually exclusive with `--prompt`. Quoting/encoding ergonomics for long prompts; it does **not** avoid the OS argv limit - backends still receive the prompt on the command line. Windows caps the WHOLE assembled line at 32767 chars (measured: 20k prompt fine, 31k refused; the system context counts toward it), POSIX caps a single argument at 131072, and agy's own limit is ~28k. Over the limit summon refuses before spawning with an argv error - it used to surface as a bogus `CLI not found`, since Windows reports the overflow as a missing file. For material that large, write it to a file under `--cwd` and ask the agent to READ it. A `--background` child re-reads the file |
 | `--cwd` | Yes* | Working directory (absolute path) |
-| `--timeout` | No | Bare ms or with suffix: `600s`, `10m` (default: 600000 = 10m). A BARE sub-second value on a dispatch is refused as a units mistake -- `--timeout 300` means 0.3s and would kill every agent instantly; write `300s` (or `300ms` if you truly mean it). `jobs wait` still accepts short bare polls. Set your host tool's own timeout ABOVE this value — the script needs a few seconds of overhead beyond the CLI deadline |
+| `--read-root DIR` | No | Repeatable additional **absolute** directory for an enforceable read-only Claude or Gemini turn. The directory must already exist and is passed through the backend's native allowlist (`--add-dir` / `--include-directories`). Other backends refuse the dispatch rather than silently ignoring it. Background children receive the same canonical roots, and the launch record keeps them for audit. Agent definitions can persist the same list with `read-roots` |
+| `--timeout` | No | Explicit `ms`, `s`, or `m` is recommended: `900s`, `10m`, or `600000ms` (default: `600000ms` = 10m). Bare numbers remain milliseconds for backward compatibility. A bare sub-second value on a dispatch is refused as a likely units mistake; write `300s` (or `300ms` if you truly mean it). `jobs wait` still accepts short bare polls. Set your host tool's own timeout ABOVE this value — the script needs a few seconds of overhead beyond the CLI deadline |
 | `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
 | `--strict-agents-dir` | No | Governance mode: fail closed when the requested agent is absent from the selected roster; do not fall back to bundled or plugin definitions. Opt-in only; default resolution is unchanged |
 | `--enable-roles` | No | Opt into approved user-global role aliases. Exact roster names win; malformed, retargeted, chained, or unapproved aliases fail closed. Children inherit the flag |
@@ -461,9 +475,11 @@ run or recommending it to a user.
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy. Resume for implementation continuity; use a fresh context for final adversarial adjudication so a reviewer is not grading its own prior work. The envelope records `resumed:true|false` |
 | `--resume-profile` | No | agy only: the `resume.profile` path returned by the prior agy call |
 | `--worktree` | No | Run in an isolated git worktree (optional name; auto-named if bare). If `--gate-with` denies, summon removes only a pristine checkout whose HEAD still equals its creation commit. Any untracked/modified file, new commit, failed identity check, or cleanup race is preserved and reported in `worktree_cleanup`; no force-removal or force branch deletion is used |
-| `--background` | No | Dispatch detached; returns `{status:"background", job_id, result_file, job_dir, record_file}` at once. A launch record is written (fsynced) before the child spawns, so a job that dies before its result is still traceable |
+| `--isolated-lane` | No | Explicitly acknowledge a disposable-copy or separate-OS boundary for a broad-authority OpenCode turn. `--worktree` also satisfies the mutation-isolation requirement, but is not an OS security sandbox |
+| `--allow-tool-credentials` | No | Explicitly allow a yolo OpenCode child to receive a bridged provider credential. Requires `--isolated-lane` and a separate clone/Git directory, account, container, or VM; `--worktree` may add mutation isolation but never substitutes for the OS-boundary acknowledgement. Otherwise Summon scrubs inherited provider variables and fails closed |
+| `--background` | No | Dispatch detached; returns `{status:"background", job_id, result_file, job_dir, record_file}` at once. A launch record is written (fsynced) before the child spawns, so a job that dies before its result is still traceable. Managed installs freeze an immutable per-job scripts bundle before spawn; the record preserves both launcher and execution identities, and an install briefly refuses while that bundle is prepared |
 | `--job-dir DIR` | No | Where `--background` writes job records and results (default `{tempdir}/subagents_jobs`; env `SUMMON_JOBS_DIR`). Point it at a durable, private path. Single-user model: summon does not defend the registry against other local users on a shared host |
-| `jobs list` / `jobs status ID` / `jobs wait ID` | - | Read-only registry commands (flat: `--jobs-list` / `--jobs-status ID` / `--jobs-wait ID`; add `--job-dir` and `--json` for `list`/`status`, or `--job-dir` and `--timeout` for `wait`). `list` shows `prepared`, liveness-verified `running`, `stale` (pid gone with no result), `unverified` (probe unavailable), or a terminal status. `status` includes `liveness:alive|dead|unknown`; `wait` returns early on stale instead of burning its timeout. A result is `trusted` only when its `job_nonce` matches the launch record. Liveness proves that a pid exists, not that an old pid was never reused |
+| `jobs list` / `jobs status ID` / `jobs wait ID` | - | Read-only registry commands (flat: `--jobs-list` / `--jobs-status ID` / `--jobs-wait ID`; add `--job-dir` and `--json` for `list`/`status`, or `--job-dir` and `--timeout` for `wait`). `list` shows `prepared`, liveness-verified `running`, `stale` (pid gone with no result), `identity_mismatch` (nonce matches but the terminal scripts digest differs from the frozen execution bundle), `unverified` (probe unavailable), or a terminal status. `status` includes `liveness:alive|dead|unknown`; `wait` returns early on stale or identity mismatch instead of burning its timeout. A result is `trusted` only when its `job_nonce` and, for frozen jobs, its scripts digest match the launch record. Liveness proves that a pid exists, not that an old pid was never reused |
 | `--dry-run` | No | Print the fully resolved dispatch (command, model, permission flags) WITHOUT executing — catches wrong models/permissions/dead backends in zero paid runs |
 | `--out FILE` | No | Write the envelope atomically to FILE; if FILE already holds a **`status: success`** envelope the run is SKIPPED (`skipped: true`) — swarm resume for free. A prior error/blocked/partial is re-run (re-launching retries failures) |
 | `--probe` | No | With `doctor`: run a minimal LIVE call per backend to verify account/client eligibility (catches an ineligible-tier error that a `--version` check misses). Costs a tiny dispatch per backend. |
@@ -626,6 +642,8 @@ Every response carries structured fields for programmatic orchestration:
 | `timeout` | On a timeout, `{budget_ms, stage, partial_output}` says which bounded budget expired and whether usable text was preserved. ACP names the exact protocol stage (`initialize`, `session/new`, `session/set_model`, or `session/prompt`). A subprocess backend reports `backend-execution`: summon can attest its own deadline but cannot truthfully separate vendor startup, model reasoning, and an agent's tool call without provider telemetry. |
 | `model` | `{requested, targeted, served, resolved, models_used}`, split by EVIDENCE. `requested` = what the caller asked for. `targeted` = what the session was POINTED AT (init handshake, else the post-credit-guard effective model, else the backend's knowable default). `served` = the model that actually did work, set ONLY on service evidence (a terminal-event model report, or output tokens with a known target). `served` is null whenever no service evidence was observed (typical for failed runs) even when `targeted` names a model, and task status is never used as evidence in either direction (a served run can be legitimately downgraded to `blocked`). `resolved` = LEGACY v1 compatibility: handshake-or-terminal, plus the Codex config backfill only for unpinned requests. An explicit Codex pin never inherits the ambient default into `resolved`; that default is not evidence about the turn. Migrate to `targeted`/`served`. `models_used` lists every model id seen (a claude session often also runs a cheap auxiliary model). agy reports none of these beyond `targeted`. Use `served_model_evidence` to distinguish a provider report from an inference. Aliases (`opus`/`sonnet`) can lag a launch; pin the explicit ID for a guaranteed-latest run. |
 | `served_model_evidence` | `reported`, `inferred`, or `absent`. How Summon established `model.served`: `reported` is a non-empty, bounded terminal provider model report; `inferred` is output-token evidence paired with a known target; `absent` means neither was observed. Unsafe or malformed provider values are discarded and never become provenance. This field never invents a model. Missing evidence does not make an otherwise usable success nonterminal; provenance-required workflows must reject `absent` or `inferred` explicitly. A success with an empty or missing result is normalized to `status:"error"` with a consistent exit tuple and `error_kind:"empty_terminal_result"`. |
+| `opencode_stream` | OpenCode subprocess completion evidence: `{event_count, step_finish_seen, completion_evidence, finish_reason?, zero_output_finish?, zero_token_finish?}`. `completion_evidence:"clean_eof_without_step_finish"` means the child ended before its normal final event; `finish_reason:"unknown"` with `zero_token_finish:true` identifies a no-output completion. Summon marks an empty result as an error and callers must not use it as a review verdict. |
+| `opencode_diagnostic` | Bounded OpenCode failure classification. `unknown_finish_zero_tokens` means the child emitted `step_finish(reason=unknown)` with all-zero usage and no usable text; it is a provider/model no-output symptom, not a permission approval result. |
 | `summon`, `agent_def`, `prompt_sha256`, `git_head_before`, `workspace_evidence`, `artifacts` | Provenance receipt, built progressively on the dispatch path: `summon` identity is on EVERY envelope the path emits (validation errors, missing agent, preflight, results); the other fields join as they become known. `summon` = `{version, script, scripts_sha256}` (one SHA-256, length-prefixed framing, over every production module, so divergent installs become diagnosable from any envelope). `agent_def` = `{file, sha256, agents_dir, source: project\|bundled\|explicit\|env}`, where `agents_dir` is the absolute roster directory the definition was ACTUALLY loaded from. `prompt_sha256` hashes the ROOT prompt. `git_head_before` names tracked repo state. `workspace_evidence` is additive mutation evidence: `{before,after,coverage,child_commit,mutation,read_only_violation,attribution}`. Each snapshot exposes only `head`, `branch`, and bounded repo-relative `staged`, `unstaged`, `renamed`, and `untracked` paths; it never emits cwd, repository root, file contents, or secrets. `coverage` is `complete`, `incomplete`, or `unavailable`; `mutation`, `child_commit`, and `read_only_violation` are `true`/`false` only when the before/after comparison proves them, otherwise `null`. A dirty baseline makes attribution `ambiguous`; a clean baseline makes it `exact`; unavailable coverage is `unavailable`. Git reads use hidden Windows utility flags, per-call/overall deadlines, and a bounded status payload. This evidence does not enforce read-only and does not expose `--verify-no-mutations` yet. Repeatable `--artifact` adds an opt-in loose-file manifest `{files:[{path,sha256,bytes,page_count,page_count_source}],sha256,stable_during_dispatch,after_sha256,changed,after_error?}` and joins its manifest hash to request reuse. `changed` lists proven identity differences and is `null` when the after-read failed; `after_error` explains why stability is unknown. Either case makes a successful result suspect. Hashes and paths only, never content or secrets; paths are local-operator data. |
 | `permission`, `permission_flags` | The permission level and the EXACT CLI flags it mapped to for this run — no more black box. |
 | `effort` | Requested/applied reasoning effort. Claude/Codex pass it to the CLI; supported Kimi models apply it in the isolated profile and add `effort_transport: "kimi-profile-config"`; OpenCode passes it as a provider `variant` and adds `effort_transport: "opencode-variant"`; agy Gemini exposes the tier in `model.requested`. Kimi/OpenCode local configuration is not provider-authored served-model evidence. |
@@ -743,9 +761,13 @@ Honest edges — plan around these, don't be surprised by them:
   withhold the file tools; and withholding the workspace only breaks RELATIVE paths — a
   **declared** read-only agy agent read a secret file and created another by ABSOLUTE path,
   both confirmed on disk. agy at any tier can read and write anything your user account can.
-  Use `safe-edit` as a deliberate choice (on agy that is a full bypass; point it only at
-  repos you can afford to have written to), pick a backend that enforces the tier
-  (claude/codex/cursor-agent), or set `SUMMON_ALLOW_UNENFORCED_READONLY=1` to dispatch
+  For code, UI, research, and review work, an explicitly isolated disposable
+  worktree/clone is the preferred agy lane: choose `yolo` when the agent needs
+  unrestricted tools, then inspect `workspace_evidence`, the worktree diff, and
+  verification output before keeping anything. `safe-edit` is also a full bypass on
+  agy, so it is not a safer substitute. For a genuinely read-only task, pick a backend
+  that enforces the tier (claude/codex/cursor-agent), or set
+  `SUMMON_ALLOW_UNENFORCED_READONLY=1` to dispatch
   anyway — which marks the tier advisory and says so in `warnings`. `--dry-run` reports
   `would_refuse` so you learn this before spending anything.
   (agy still never reports token usage or a resolved model, and its `safe-edit` tier is a
@@ -768,22 +790,94 @@ Honest edges — plan around these, don't be surprised by them:
   your API key in the `Authorization` header. Never point an `openai-compat` agent (or a
   manifest that inlines `base_url`) at an untrusted host — that beams your key to it. Its
   timeout is per-socket-operation, so a slow-drip server can exceed the nominal deadline.
+- OpenRouter credential lookup checks the named `summonOpenRouter` Windows credential first;
+  when it is absent, it may read only `OPENROUTER_API_KEY` from the explicit local Hermes
+  `.env` source (or `SUMMON_HERMES_ENV`/`HERMES_ENV`). The key is request-scoped and never
+  enters a public agent definition, receipt, telemetry event, or persistent OpenCode config.
+- The built-in `nous` provider uses `https://inference-api.nousresearch.com/v1` and
+  `NOUS_API_KEY`. On Windows, when that variable is not already set, Summon reads only
+  `NOUS_API_KEY` from the local Hermes `profiles/main/nous.env` file (or an explicit
+  `SUMMON_NOUS_ENV`/`HERMES_NOUS_ENV` override). The key is request-scoped and never enters
+  an agent definition, receipt, telemetry event, or persistent OpenCode config. Current
+  Hermes releases use a short-lived Nous Portal credential; if this legacy profile key is
+  rejected, Summon returns a non-retryable auth diagnostic with `hermes auth status nous` /
+  `hermes auth add nous` guidance and never falls back to another provider.
 - **OpenCode is a toolful gateway, not an unlimited transport.** An `opencode` seat can
-  use OpenCode's file and tool loop, including OpenRouter models such as
-  `openrouter/stealth/ox-alpha`, but the model context/output limits, provider quotas,
+  use OpenCode's file and tool loop, including currently available OpenRouter models such as
+  `openrouter/stealth/ox-alpha`; model names and availability can change or disappear
+  without a Summon release. The model context/output limits, provider quotas,
   OpenCode compaction, and OS/CLI transport limits still apply. Put large inputs under
   `--cwd` and ask the seat to read them instead of pasting them into argv. The direct
   `openai-compat` and `arkcli +chat` seats remain text-only by design; use `opencode` when
   a tool loop is required. OpenRouter's `auto`, `free`, and `fusion` aliases can also run
-  through OpenCode; Fusion presets use the bounded `openrouter_options` field documented in
-  [references/backends.md](references/backends.md#openrouter-routers-through-opencode).
-- **OpenCode startup isolation is part of the permission boundary.** Headless dispatches set
-  `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `OPENCODE_PURE=1`,
+   through OpenCode; Fusion presets use the bounded `openrouter_options` field documented in
+   [references/backends.md](references/backends.md#openrouter-routers-through-opencode).
+  OpenCode seats pinned to `nous/<model>` receive the same child-only Nous provider overlay.
+- Headless OpenCode read-only and safe-edit seats pass `--auto` only alongside Summon's
+  deny-by-default `OPENCODE_PERMISSION` policy. This lets explicitly allowed read/list/
+  edit tools run without a human prompt; explicit denies, including `external_directory`
+  and the catch-all `*`, still win. If OpenCode exits at clean EOF without a `step_finish`
+  event, Summon marks the result `suspect` and records incomplete stream evidence; do not
+  treat a lone progress sentence as a completed review. Summon's tests verify the policy
+  and launch arguments; they do not certify every installed OpenCode release. After an
+  OpenCode upgrade, run `doctor`, inspect the yolo/safe-edit `--dry-run`, and perform a
+  provider-inert acceptance against the installed binary before relying on its permission
+  behavior. If that acceptance is unavailable or mismatches the dry-run, treat the route
+  as unverified and use an enforcing backend or a separately isolated OS boundary.
+- If OpenCode emits `step_finish` with `reason: unknown`, zero tokens, and no text,
+  Summon rejects the empty completion and records
+  `opencode_diagnostic=unknown_finish_zero_tokens`. This is a provider/model no-output
+  symptom seen in headless OpenCode, not evidence that `--auto` caused the turn to end.
+- **OpenCode startup isolation is part of the permission boundary.** Headless dispatches pass
+  the documented `--pure` flag and set `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `OPENCODE_PURE=1`,
   `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`, and `OPENCODE_DISABLE_CLAUDE_CODE=1` so repository
   config/plugins or external skill files cannot retarget a provider or observe a credential
   bridged into the child. Do not remove these guards from a gateway invocation.
+- **OpenCode yolo is an explicit isolated lane.** The optional Ox seat requires
+  `--worktree` or `--isolated-lane` while its provider route is available; use a disposable
+  clone/worktree and inspect the
+  mutation evidence before keeping changes. If Summon must bridge a private OpenRouter or
+  Nous credential into that unrestricted child, also pass `--isolated-lane` and
+  `--allow-tool-credentials` only when a separate clone/Git directory, OS account,
+  container, or VM protects the credential. A `--worktree` may add mutation isolation but
+  never substitutes for the explicit OS-boundary acknowledgement.
+  Without both explicit consents, inherited provider variables are scrubbed and the dispatch
+  fails closed rather than handing a key to arbitrary shell tools. A Git worktree alone is
+  mutation isolation, not an OS security boundary.
 - **`doctor` probes the CLI backends only** (install + login), not `openai-compat` API
   endpoints — an API-only setup reads as "no usable backends" even when it works.
+
+## Broad-authority isolated lanes
+
+High-capability tool agents are useful precisely because they can inspect a repository,
+run checks, edit code or UI, and test a hypothesis in one turn. Do not sideline Kimi,
+OpenCode/Ox, agy/Antigravity, or a similar agent merely because its CLI cannot provide a
+perfect read-only sandbox. For implementation, UI, research, and review work, the normal
+fast lane is:
+
+1. Create a disposable clone or an isolated `--worktree`; never use the active shared
+   checkout for an unreviewed full-authority run. A Git worktree isolates the checkout
+   path and makes ordinary edits discardable, but it is not an OS sandbox: it can still
+   share Git metadata, the operator account, environment variables, and other resources
+   visible to the child.
+2. Select `permission: yolo` when the task needs unrestricted tools. Put the scope,
+   no-secrets rule, expected report, and cleanup expectation in the prompt.
+3. Let the agent work, then inspect `workspace_evidence`, the worktree status/diff,
+   artifact hashes, tests, and the required report contract. A self-reported DONE is not
+   sufficient.
+4. Keep only verified changes; otherwise discard the disposable worktree or reverse the
+   specific changes. Never auto-merge or copy an unreviewed result into a shared checkout.
+
+This workflow treats edits as reversible and makes capable agents productive. Keep the
+stricter boundary for actions whose reversal is unreliable or whose blast radius is not
+local: client or private data, credentials and auth repair, provider spend, databases and
+migrations, deployments, shared Git/index/worktree state, protected artifacts, and running
+demo or production stacks. For those actions, use explicit operator approval, a dry run,
+or a backend with a genuinely enforceable boundary. If those resources must be protected
+from a tool-capable child, use a sanitized packet in a separate clone with its own Git
+directory, OS account, container, or VM; a worktree alone is not containment. Broad file
+authority does not grant permission to expose secrets, contact a provider unexpectedly,
+mutate shared state, or weaken served-model/evidence gates.
 
 ## Keeping summon current
 
@@ -879,6 +973,24 @@ permissions.
 | `args` | shell-style string (optional) | Arbitrary extra backend flags. Codex model-bearing `-m`/`--model`/`-c model=...` selectors are parsed, compared, and collapsed into one canonical selector; other flags remain subject to the permission boundary |
 | `profile` | private registry name (optional) | Select a named vendor login/config profile. The registry is local to the operator; do not put paths, credentials, or account identifiers in a public agent definition. `--profile` overrides this field |
 | `transport` | `subprocess` (default), `acp` (optional) | Dispatch transport. `acp` runs the turn over the Agent Client Protocol (native: gemini, kimi, cursor-agent); `--transport` at dispatch overrides it |
+| `read-roots` | JSON array or semicolon-separated absolute directories (optional) | Additional roots for an enforceable **read-only** Claude or Gemini turn. Summon validates each path, rejects symlinks/junctions and missing directories, and reports `read_allowlist.effective_paths` in `--dry-run` before any provider call. Do not put file contents or credentials in this field; use a file's parent directory and name the file in the prompt |
+
+### Read-only roots
+
+The working directory is the default readable root. When a review needs material in more
+than one local directory, add each directory explicitly with repeated `--read-root` flags or
+persist them in the seat definition:
+
+```yaml
+read-roots: '["D:\\project\\oracle", "D:\\project\\board"]'
+```
+
+Run `--dry-run` first. It reports `read_allowlist.requested_paths`, the effective paths,
+the backend mechanism, and whether the allowlist is enforced. Claude uses `--add-dir` and
+Gemini uses `--include-directories`; Codex, OpenCode, Kimi, and agy currently refuse extra
+roots because their available controls do not provide the same enforceable read-only
+boundary. A refusal is safer than telling a reviewer it could inspect a path that the
+backend could not actually read.
 
 ### Private backend profiles
 
@@ -965,10 +1077,17 @@ Caveats worth knowing:
   flags beside `--prompt`, and then auto-handles tool calls. Summon therefore refuses Kimi
   `read-only` and `safe-edit` rather than mislabel the authority. `kimi-worker` and
   `kimi-coder` pin K3 at maximum supported thinking through the isolated profile; the
-  explicit `kimi-k27-coder` seat pins K2.7 Coding. All are `yolo` agents for trusted isolated
-  worktrees only. For a review-only Kimi job,
-  use `--worktree`, instruct it not to edit, and inspect the worktree before accepting its report
-  or removing it: a review request is not an enforceable read-only boundary.
+  explicit `kimi-k27-coder` seat pins K2.7 Coding. All are `yolo` agents. This is intentional:
+  use Kimi freely for coding, UI, research, and review in a disposable clone/worktree,
+  monitor its mutation evidence, run the required checks, and keep or discard the result
+  yourself. For a review-only Kimi job,
+  use `--worktree`, instruct it not to change product files (scratch notes are fine), and
+  inspect the worktree before accepting its report or
+  removing it: a review request is not an enforceable read-only boundary. Kimi may emit
+  `model.served` on a particular CLI/transport, but a local profile or requested `k3`
+  target is not provider evidence. If `model.served` is null or
+  `served_model_evidence` is absent, the turn may still have produced useful advisory
+  content; keep the provenance unverified and reproduce or corroborate it locally.
 - **agy has no workspace-write tier AND no enforceable read-only tier.** `safe-edit`
   and `yolo` BOTH map to `--dangerously-skip-permissions` — a `safe-edit` agy agent runs
   with a FULL permission bypass, identical to `yolo`. And `read-only` is **refused**:
@@ -990,8 +1109,11 @@ Caveats worth knowing:
 - **Caller checklist when a popup persists:** have the calling agent invoke Summon directly,
   not through `Start-Process`, `cmd /c start`, or a custom PTY/window launcher. Leave
   `AGY_PTY_WRAPPER` unset so the bundled `agy_stream_proxy.py` is selected; if a custom
-  wrapper is unavoidable, it must hide its own children and be named in the handoff. A
-  PowerShell helper that must use `Start-Process` should pass `-WindowStyle Hidden`.
+  wrapper is unavoidable, it must hide its own children and be named in the handoff. The
+  legacy winpty wrapper (`agy_pty_pyte.py`) is disabled on Windows because it can create a
+  visible pseudo-console; `AGY_ALLOW_LEGACY_PTY=1` is an explicit opt-in for operators who
+  accept that behavior. A PowerShell helper that must use `Start-Process` should pass
+  `-WindowStyle Hidden`.
 - For investigation agents that only need to *read*, `yolo` +
   "do not modify files" in the agent body is often more reliable than
   `read-only` — several CLIs' plan modes end turns asking for approval.

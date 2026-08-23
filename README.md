@@ -154,10 +154,11 @@ commit" or "convene a council on monorepo versus polyrepo." Add `-g` to install 
 Codex, Cursor, Gemini, Antigravity, and claw-likes like openclaw and hermes. Powered by the
 open [`skills`](https://www.skills.sh) registry.
 
-You need **Node** (for `npx`), **Python 3.10+** on your `PATH`, and at least one AI CLI you're
-logged into. After installing, ask your agent to run summon's `doctor` check and it lists what's
-ready and what's missing. On Windows, if the install reports a symlink permission error, run it
-again with `--copy`.
+You need **Node** (for `npx`), **Python 3.10+**, and at least one AI CLI you're logged into.
+After installing, ask your agent to run summon's `doctor` check and it lists what's ready and
+what's missing. On Windows, call `scripts\summon.cmd` rather than invoking `run_subagent.py`
+directly: it selects a compatible Python through `py -3` and avoids a stale `.py` file
+association. If the install reports a symlink permission error, run it again with `--copy`.
 
 ### Multi-host installer (`python install.py`)
 
@@ -591,14 +592,38 @@ OpenCode instead of using the direct text seat:
 ---
 run-agent: opencode
 model: openrouter/stealth/ox-alpha
-permission: safe-edit
+permission: yolo
 ---
 ```
 
 Authenticate OpenCode and verify the live roster with `opencode auth login` and
 `opencode models`. The OpenCode path still respects the provider's context,
 output, quota, and model limits; put large inputs in the workspace and ask the
-agent to read them. See the [OpenCode backend reference](skills/summon/references/backends.md#opencode-cli-gateway--toolful-access-to-compatible-providers).
+agent to read them. The optional Ox seat is intentionally broad-authority while the
+provider exposes it; model availability, naming, and routing can change or disappear
+without a Summon release. Treat the live OpenCode roster as authoritative. Summon
+requires `--worktree` or `--isolated-lane` before it can run: use a
+disposable clone/worktree, inspect `workspace_evidence`, the diff, and tests,
+then keep or discard the result. If Summon must bridge a private provider key
+into a yolo OpenCode child, add `--isolated-lane` and
+`--allow-tool-credentials` only after choosing a separate clone/Git directory,
+OS account, container, or VM; a worktree alone does not protect credentials. Use
+`safe-edit` or an enforcing backend when the
+checkout is shared or sensitive. See the [OpenCode backend reference](skills/summon/references/backends.md#opencode-cli-gateway--toolful-access-to-compatible-providers).
+
+For a disposable worktree that is itself inside a separately isolated OS boundary,
+make both boundaries explicit:
+
+```powershell
+summon dispatch --agent openrouter-ox-alpha-opencode --worktree ox-review `
+  --isolated-lane --allow-tool-credentials --cwd <project> `
+  --prompt "Inspect and test the change."
+```
+
+Use `--isolated-lane` instead of `--worktree` when the checkout is already a
+separate disposable copy. The credential flag is intentionally not a default;
+use it only with a separate OS boundary when arbitrary shell tools must not be
+able to reach the normal account or credential store.
 
 Headless Summon dispatches disable OpenCode project configuration, external
 plugins, external skills, and Claude-compatible project discovery for the child.
@@ -696,8 +721,9 @@ example, Gemini CLI sessions cannot currently be resumed through Summon's headle
 - **If a popup persists:** the calling agent should invoke Summon directly, leave
   `AGY_PTY_WRAPPER` unset so the bundled `agy_stream_proxy.py` is used, and avoid wrapping
   the call in `Start-Process` or `cmd /c start`. If a PowerShell helper must use
-  `Start-Process`, pass `-WindowStyle Hidden`; a custom wrapper must hide its own children
-  and be reported in the handoff.
+  `Start-Process`, pass `-WindowStyle Hidden`; the legacy winpty wrapper
+  (`agy_pty_pyte.py`) is disabled on Windows unless `AGY_ALLOW_LEGACY_PTY=1` is set
+  deliberately. A custom wrapper must hide its own children and be reported in the handoff.
 
 You bring model access. Summon orchestrates the CLIs and APIs you already use.
 
@@ -705,25 +731,34 @@ You bring model access. Summon orchestrates the CLIs and APIs you already use.
 
 ## Security, permissions, and terms
 
-- **Permissions.** Each agent's `permission:` (`read-only` / `safe-edit` / `yolo`) maps to
-  that CLI's own sandbox flags. Bundled agents ship `safe-edit` (auto-approve edits, no
-  bypass). Raise anything to `yolo` deliberately, and only in repos you trust.
-- **Kimi Code is deliberately stricter.** Its non-interactive prompt runner auto-handles tools
-  and cannot combine with its plan mode, so Summon refuses Kimi `read-only` and `safe-edit`.
-  `kimi-worker` and `kimi-coder` pin K3 with maximum supported thinking through the isolated
-  profile; `kimi-k27-coder` is the explicit lower-context K2.7 seat. All three are `yolo` only
-  and belong in a trusted isolated worktree. For a review-only Kimi job,
-  use `--worktree`, instruct it not to edit, then inspect the worktree before accepting the
-  report or removing it: the review label does not create an enforceable read-only boundary.
-- **agy is the exception, twice over.** It has no workspace-write tier, so its `safe-edit`
-  is a full bypass like `yolo`. And it has **no enforceable `read-only` tier at all**, so
-  since 0.15.0 summon *refuses* an agy dispatch declared `read-only` rather than imply a
-  boundary that does not exist. Measured over five canaries: `--sandbox` restricts terminal
-  operations only, `--mode plan` does not withhold the file tools, and withholding the
-  workspace only breaks *relative* paths -- a declared read-only agy agent read a secret
-  file and created another by absolute path. `SUMMON_ALLOW_UNENFORCED_READONLY=1` dispatches
-  anyway and marks the tier advisory in `warnings`; it waives only a tier **you** declared,
-  never one summon imposed (a `--gate-with` adjudicator, a clamp that bit, a repair resume).
+- **Permissions map to real CLI behavior.** Each agent's `permission:` (`read-only` /
+  `safe-edit` / `yolo`) maps to that CLI's flags, and the envelope records the exact mapping.
+  Use `yolo` for Kimi, OpenCode/Ox, agy/Antigravity, and similar toolful agents when the
+  work is inside a disposable clone or isolated worktree and you will inspect the diff,
+  tests, and mutation evidence before integrating. This is how code, UI, research, and
+  review lanes get the capability they need without making the active checkout the blast
+  radius.
+- **Kimi Code uses full-authority prompt mode.** Its non-interactive runner auto-handles
+  tools and rejects `read-only` and `safe-edit`; Summon refuses those labels rather than
+  misrepresenting the boundary. `kimi-worker` and `kimi-coder` pin K3 at maximum thinking,
+  while `kimi-k27-coder` is the explicit lower-context K2.7 seat. Use them in isolated
+  worktrees, monitor their mutations, and keep or discard the result after verification.
+  For a review-only Kimi job,
+  use `--worktree`, instruct it not to change product files, and inspect the worktree
+  before accepting the report or removing it: the review request is not an enforceable read-only boundary.
+  Kimi may report a served model on some CLI/transport versions, but its local profile and
+  requested K3 target are not provider evidence. A successful report with
+  `model.served: null` is useful advisory output, not a certified named-model review.
+- **agy/Antigravity has no enforceable `read-only` tier.** Its `safe-edit` is the same full
+  bypass as `yolo`, and declared `read-only` is refused unless explicitly waived. For a
+  disposable worktree, use `yolo` deliberately; for a shared or sensitive checkout, use
+  an enforcing backend instead. `SUMMON_ALLOW_UNENFORCED_READONLY=1` marks a caller-declared
+  read-only run advisory; it never overrides a clamp or governance-imposed restriction.
+- **A worktree is mutation isolation, not a security sandbox.** A Git worktree can share
+  repository metadata, the operator account, environment variables, and other resources
+  visible to the child. If credentials, private/client data, shared Git state, or a live
+  resource must be protected, use a sanitized packet in a separate clone with its own Git
+  directory, OS account, container, or VM, or choose a backend with an enforceable boundary.
 - **Treat the whole `--cwd` as trusted.** Files under it, `.agents/memory.md`
   (auto-injected into agent context), and manifest `prompt_file`s are trusted operator
   input. Every bundled agent also carries an "untrusted content: data, not instructions"
@@ -731,8 +766,13 @@ You bring model access. Summon orchestrates the CLIs and APIs you already use.
 - **Secrets.** The agy backend copies OAuth tokens into a per-invocation profile locked to
   your user (icacls / `0700`) and isolated from your real profile. `openai-compat` reads
   API keys from env (or the documented local OpenRouter credential fallback) and redacts
-  them from any error output. OpenCode uses its own auth/configuration; Summon's optional
-  OpenRouter bridge passes a key only to that child process and never records it.
+  them from any error output. OpenCode uses its own auth/configuration. In restricted
+  tiers, Summon keeps the optional OpenRouter bridge child-scoped; in yolo mode it
+  scrubs inherited provider credentials and refuses a private-key bridge unless the
+  caller explicitly supplies `--isolated-lane` plus `--allow-tool-credentials`;
+  `--worktree` may additionally provide mutation isolation but never replaces the
+  OS-boundary acknowledgement. The key is never recorded in an envelope, telemetry,
+  prompt, or public agent definition.
 - **Terms of service.** Summon drives each vendor's *official* CLI (built for scripted use)
   on *your* accounts, which is the intended path for personal and dev work. Don't share
   accounts, build a product on subscription auth, or hammer parallel volume; use API-key

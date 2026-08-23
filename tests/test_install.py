@@ -308,6 +308,18 @@ def test_lock_blocks_concurrent_install():
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_install_refuses_background_snapshot_lease():
+    home = _fake_home()
+    try:
+        os.makedirs(os.path.join(home, ".claude", "skills"))
+        with open(os.path.join(home, ".claude", "summon.execution.lock"), "w", encoding="utf-8") as fh:
+            json.dump({"installed_by": "summon", "purpose": "background_snapshot"}, fh)
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 2 and "background dispatch" in r.stdout.lower(), (r.returncode, r.stdout)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_manifest_non_object_json_fails_closed():
     # Valid JSON of the wrong shape ([]) must refuse cleanly - exit 2, no traceback.
     home = _fake_home()
@@ -449,6 +461,7 @@ def test_alias_off_by_default_and_optional():
         r = _run(home, "--hosts", "claude", "--no-agents", "--with-alias")
         md = os.path.join(alias, "SKILL.md")
         assert os.path.isfile(md) and "Legacy alias" in open(md, encoding="utf-8").read()
+        assert os.path.isfile(os.path.join(_dest(home), "scripts", "summon.cmd"))
         # points at the sibling summon scripts (no duplication)
         assert "/../summon/scripts/run_subagent.py" in open(md, encoding="utf-8").read()
     finally:

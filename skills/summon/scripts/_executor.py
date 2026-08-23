@@ -393,6 +393,43 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     response.setdefault("model_resolved", processor.model if processor else None)
     response.setdefault("model_targeted", processor.handshake_model if processor else None)
     response.setdefault("models_used", processor.models_used if processor else [])
+    if processor and processor.is_opencode:
+        # OpenCode's JSON CLI normally emits step_finish before idle/EOF.  Some
+        # releases can dispose the non-interactive server while the model is
+        # still working, leaving only a progress sentence.  Preserve the clean
+        # process status for diagnosis, but make the missing completion evidence
+        # explicit so a review/council cannot consume it as a verdict.
+        response["opencode_stream"] = {
+            "event_count": processor.opencode_event_count,
+            "step_finish_seen": bool(processor.opencode_step_finish_seen),
+            "completion_evidence": (
+                "step_finish" if processor.opencode_step_finish_seen
+                else "clean_eof_without_step_finish"),
+        }
+        if processor.opencode_finish_reason is not None:
+            response["opencode_stream"]["finish_reason"] = (
+                processor.opencode_finish_reason)
+        if processor.opencode_step_finish_seen:
+            response["opencode_stream"]["zero_output_finish"] = bool(
+                processor.opencode_zero_output_finish)
+            response["opencode_stream"]["zero_token_finish"] = bool(
+                processor.opencode_zero_token_finish)
+        # OpenCode 1.18.x has a known headless failure shape: it emits
+        # step_finish(reason=unknown) with zero usage and no text, then exits 0
+        # without an error event. Keep the stable empty_terminal_result kind,
+        # but make the actionable upstream/provider symptom explicit instead of
+        # attributing it to Summon's permission mode or treating it as a verdict.
+        if (response.get("error_kind") == "empty_terminal_result"
+                and processor.opencode_finish_reason == "unknown"
+                and processor.opencode_zero_token_finish):
+            response["opencode_diagnostic"] = "unknown_finish_zero_tokens"
+            response["error"] = (
+                "OpenCode reported finish reason 'unknown' with zero tokens and "
+                "no usable output; this is a provider/model no-output completion, "
+                "not a permission approval result")
+            response["normalization_reason"] = (
+                "OpenCode emitted step_finish(reason=unknown) with zero tokens; "
+                "Summon rejected the empty completion")
     # Baseline resume handle on EVERY path (incl. spawn-failure) so orchestrators
     # can read response["resume"] unconditionally. execute_agent enriches it with
     # the agy profile on the normal path.
@@ -451,6 +488,16 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
             )
     if response.get("status") == "success" and not response["report_ok"]:
         response["suspect"] = True
+    if (processor and processor.is_opencode
+            and response.get("status") == "success"
+            and not processor.opencode_step_finish_seen):
+        response["suspect"] = True
+        warning = (
+            "OpenCode ended at clean EOF without a step_finish event; output may be "
+            "truncated before the agent completed its turn")
+        warnings = response.setdefault("warnings", [])
+        if warning not in warnings:
+            warnings.append(warning)
     # Keep compact structured findings ahead of the potentially long narrative in
     # serialized envelopes. JSON object order is not semantic, but this makes the
     # common human/tool streaming path useful without scanning the transcript first.
@@ -1271,7 +1318,9 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
                            worktree=None, allow_credit=False, gate_with=None,
                            max_permission=None, artifacts=None,
                            allow_text_only=False, require_tools=False, profile=None,
-                           strict_agents_dir=False, role_provenance=None) -> dict:
+                           strict_agents_dir=False, role_provenance=None,
+                           read_roots=None, isolated_lane=False,
+                           allow_tool_credentials=False) -> dict:
     """THE request identity, built in ONE place from RAW inputs.
 
     The dispatcher and the manifest parent each used to build their own dict, so a field
@@ -1350,6 +1399,10 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         "_profile_error": _profile_error,
         "agent": agent, "prompt": prompt, "cwd": cwd,
         "cli": cli or None, "model": model or None, "effort": effort or None,
+        # Additional read-only roots are request controls. Keep canonical paths in the
+        # fingerprint so a cached answer from a narrower or different allowlist cannot
+        # satisfy this dispatch. The envelope reports the effective paths separately.
+        "read_roots": tuple(read_roots or ()),
         # The EFFECTIVE model when summon supplies the default itself. Cursor's default is a
         # constant in _builder, so a request with no `model:` dispatched whatever that
         # constant currently is while the identity recorded only `model=None` -- changing it
@@ -1413,6 +1466,12 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # that differ only by an unused profile argument re-pay for the same work.
         "resume_profile": (resume_profile or None) if resume else None,
         "worktree": ("<auto>" if worktree == "" else (worktree or None)),
+        # OpenCode yolo is an explicit isolated-lane operation.  These controls
+        # are part of the identity so a cached unrestricted result cannot satisfy
+        # a later request with a different credential/tool boundary.
+        "isolated_lane": ("1" if isolated_lane else None) if _rcli == "opencode" else None,
+        "allow_tool_credentials": (
+            "1" if allow_tool_credentials else None) if _rcli == "opencode" else None,
         # The CONTROLS are part of the request. Without them a stored --out success
         # from an UNGATED, UNCLAMPED run satisfied a later gated+clamped request for
         # the "same" task: the skip handed back a result produced under authority the
@@ -1640,6 +1699,7 @@ def is_terminal_nonretryable(env) -> bool:
                 and env.get("retryable") is False
                 and env.get("error_kind") in {
                     "empty_terminal_result",
+                    "provider_timeout",
                     "authentication_failed",
                     "rate_limited",
                     "provider_forbidden",
@@ -2225,6 +2285,27 @@ def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
             "this run timed out with no parsed result; the captured output is in "
             "`output_tail` and usually names the real cause (a missing tool, a wrong "
             "shell, or a prompt waiting for input).")
+    elif _empty and cli == "opencode":
+        # OpenCode can wait for an interactive provider-auth flow while running
+        # headlessly. With no output there is no evidence that the provider was
+        # contacted, so do not label this an authentication failure or silently
+        # spend another turn. Make the operator-visible recovery explicit and
+        # require an intentional retry after local auth is checked.
+        resp.update({
+            "error_kind": "provider_timeout",
+            "retryable": False,
+            "result_usable": False,
+            "remediation_code": "opencode_output_timeout",
+        })
+        resp["error"] = (
+            f"Timeout after {timeout_budget_ms}ms; OpenCode produced no usable "
+            "output. For an OpenRouter model, verify the provider credential "
+            "with `opencode auth login` (or the configured local credential), "
+            "then retry explicitly; Summon did not retry or switch providers."
+        )
+        resp.setdefault("warnings", []).append(
+            "OpenCode emitted no output before the deadline; authentication or "
+            "transport state is unproven, so no automatic retry was attempted.")
     return resp
 
 
@@ -2553,11 +2634,22 @@ def _resolve_launch(command, args):
     # resolve the binary so multiline prompts and JSON event output travel
     # through argv unchanged.
     if os.name == "nt" and command == "opencode":
+        # Resolve the npm shim's *own* bundled binary first.  A standalone
+        # Windows installation may also put an ``opencode.exe`` on PATH, but
+        # that executable is commonly the desktop launcher and exits cleanly
+        # without emitting the CLI's JSON stream.  Selecting it merely because
+        # it sorts before the npm shim makes a Summon turn wait until timeout.
         _oc = shutil.which("opencode.cmd") or shutil.which("opencode") or command
         _oc_dir = os.path.dirname(_oc) if _oc else ""
         _oc_exe = os.path.join(_oc_dir, "node_modules", "opencode-ai", "bin", "opencode.exe")
         if os.path.isfile(_oc_exe):
             return _oc_exe, args
+        # If an operator supplies a direct executable (rather than the npm
+        # shim), preserve that explicit path.  Do not guess from a generic
+        # ``opencode.exe`` PATH hit: it may be the desktop launcher described
+        # above.
+        if str(_oc).lower().endswith(".exe") and os.path.isfile(_oc):
+            return _oc, args
         if str(_oc).lower().endswith((".cmd", ".bat")):
             return "cmd.exe", ["/c", _oc, *args]
         return _oc, args

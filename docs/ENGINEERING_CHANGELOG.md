@@ -13,7 +13,102 @@ never on added fields.
 
 ## Unreleased
 
-No unreleased changes.
+- **Windows AGY popup guard:** the default AGY stream proxy now remains on the shared
+  `CREATE_NO_WINDOW`/`SW_HIDE` launch path, while the legacy winpty-based
+  `agy_pty_pyte.py` wrapper is fail-closed on Windows unless an operator explicitly sets
+  `AGY_ALLOW_LEGACY_PTY=1`. This prevents an old/project-local wrapper from silently
+  creating a visible pseudo-console. Custom wrappers and vendor-created GUI windows remain
+  outside Summon's launch boundary and must hide their own children.
+- **Credential/tool boundary for OpenCode yolo:** broad Ox/OpenCode turns now require
+  `--worktree` or `--isolated-lane`. Summon refuses to bridge a private OpenRouter/Nous key
+  into an unrestricted child unless the caller supplies both `--isolated-lane` and
+  `--allow-tool-credentials`; a worktree alone is mutation isolation, not an OS boundary.
+  Inherited provider variables are scrubbed otherwise. The public contract requires a
+  separate clone/Git directory, account, container, or VM when credentials or shared state
+  must be protected, because a Git worktree is mutation isolation rather than an OS sandbox.
+  The optional Ox definition now carries an explicit untrusted-content guard; its
+  provider availability is intentionally not a permanent Summon contract.
+- **Kimi roster evidence contract:** K3/max remains the deliberate bundled Kimi target, but
+  roster text now says provider-served evidence may be absent. A successful Kimi envelope with
+  `model.served: null` remains useful advisory output while named-model attestation stays
+  fail-closed; Summon never manufactures evidence.
+- **Isolated full-authority workflow:** documented and rostered a broad-authority Ox/OpenCode
+  lane for disposable clones and isolated worktrees, and clarified that Kimi and
+  agy/Antigravity are intentionally useful yolo agents for code, UI, research, and review.
+  The integration gate remains local: inspect `workspace_evidence`, diffs, tests, artifact
+  stability, and report contracts before accepting changes. A Git worktree is explicitly
+  documented as mutation isolation rather than an OS security boundary; use a separate
+  clone/Git directory, account, container, or VM for protected resources. OpenCode's
+  `--auto` behavior remains conditional on a versioned provider-inert acceptance, and
+  Kimi served-model nulls remain advisory rather than fabricated provenance. Credentials,
+  private/client data, provider spend, databases/migrations, deployments, shared Git,
+  protected artifacts, and running stacks remain outside this lane.
+- **Terminal and isolation hardening:** Codex `turn.failed` is now parsed as a bounded
+  structured terminal error, preserving fail-closed model evidence and actionable provider
+  diagnostics. OpenCode dispatches now pass its documented `--pure` flag, and external-drive
+  cwd preflight remains enforced when extra roots are present.
+- **Windows interpreter selection:** added a `scripts\\summon.cmd` dispatcher launcher.
+  It verifies Python 3.10+ through the Windows launcher before running the dispatcher and is
+  now the documented Windows invocation path. This prevents an arbitrary `.py` association
+  from selecting a legacy interpreter that cannot parse the installed scripts.
+- **Background execution provenance:** a managed `--background` launcher now takes a
+  durable immutable copy of its scripts before spawning the child. The parent launch
+  identity and the child's execution-bundle identity are recorded separately; registry
+  trust requires both the nonce and scripts digest to match. `jobs` surfaces a terminal
+  `identity_mismatch` instead of accepting a mismatched result, and `jobs wait` returns
+  that condition rather than reporting it as a generic stale job. A host-root execution
+  lease serializes the short snapshot/spawn phase with the atomic installer; neither side
+  replaces or deletes the other's marker. Provider-inert regression coverage mutates the
+  source after snapshot creation, exercises a detached local failure path, and verifies
+  installer refusal while the lease exists.
+- **OpenCode non-interactive guard:** read-only and safe-edit invocations combine the
+  documented `--auto` behavior with an explicit deny-by-default `OPENCODE_PERMISSION`
+  policy. This auto-approves only capabilities Summon explicitly allows and leaves
+  omitted tools and external directories denied. The stream parser recognizes typeless
+  session/part progress envelopes without terminating early, and records a missing
+  `step_finish` as `opencode_stream.completion_evidence=clean_eof_without_step_finish`
+  plus `suspect:true`; callers must not accept that output as a review verdict.
+- **OpenCode unknown-finish guard:** when the JSON stream contains
+  `step_finish.reason=unknown` with all-zero usage and no text, the executor keeps the
+  stable `empty_terminal_result` failure kind but adds bounded
+  `opencode_diagnostic=unknown_finish_zero_tokens` and stream flags. This matches a
+  current OpenCode headless failure shape. The `step_start.modelID` is retained as
+  handshake/target evidence only, so it cannot become `model.served` when the turn did
+  no work; `--auto` only answers non-denied permission requests and is not a
+  provider/model completion mechanism.
+- **Provider-auth diagnostics:** OpenCode missing-cookie and direct API missing-key failures
+  normalize to terminal `authentication_failed` outcomes with explicit login/configuration
+  guidance and no retry or secret capture.
+- **Agent validation diagnostics:** explicit global roots now report legacy flat `*.md`
+  rosters separately, while modern package validation remains strict and failure output
+  includes a safe actionable detail.
+- **OpenCode timeout diagnostics:** zero-output headless timeouts are typed as
+  non-retryable provider timeouts with explicit local-auth guidance, preserving the
+  distinction between a proven auth error and an unproven transport stall.
+- **Timeout-unit documentation:** public examples and the Codex host recipe now carry
+  explicit `ms`, `s`, or `m` suffixes. Bare numeric values remain milliseconds only for
+  backward compatibility; dispatches reject ambiguous bare sub-second budgets while
+  `jobs wait` preserves its short-poll behavior.
+- **Read-only root allowlists:** a review can explicitly add multiple local directories
+  through `--read-root` or `read-roots`. Claude maps them to `--add-dir` and Gemini to
+  `--include-directories`; paths are validated before launch and dry-run exposes the
+  effective list. Backends without an enforceable per-root read-only control fail closed.
+- **Background read-root parity:** repeatable CLI roots are now serialized into detached
+  child argv and the fsynced launch record using their canonical validated paths. A regression
+  compares foreground dry-run policy, child reconstruction, and the durable record so a
+  background job cannot silently fall back to its project cwd alone.
+- **Nous/Hermes credential bridge:** the built-in Nous provider and OpenCode `nous/<model>`
+  route read only `NOUS_API_KEY` from an explicitly named local Hermes profile when the
+  process environment is empty. The key remains child/request scoped and is never serialized.
+- **Nous auth classification:** HTTP 401/403 and equivalent auth-rejection responses from a
+  Hermes-profile key are marked non-retryable and point operators to Hermes Portal auth;
+  provider fallback remains disabled.
+- **OpenAI-compatible transport headers:** the direct API backend sends explicit JSON `Accept`
+  and a stable non-secret client `User-Agent`, which is required by the current Nous edge and
+  remains harmless for other compatible providers.
+- **Hermes OpenRouter credential fallback:** OpenRouter resolution now checks the named WCM
+  target first and then the explicit local Hermes `.env` source, without scanning arbitrary
+  files or serializing the key.
 
 ## [3.2.1] - 2026-08-22
 

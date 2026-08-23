@@ -72,7 +72,8 @@ never proves account eligibility.
 
 OpenCode discovery delegates to `opencode models` and returns provider/model selectors such
 as `openrouter/stealth/ox-alpha` when the local OpenCode configuration and credentials expose
-them. A live list proves only that OpenCode listed the selector; it does not prove that the
+them. Model names and availability can change or disappear without a Summon release. A live
+list proves only that OpenCode listed the selector; it does not prove that the
 account can serve it or that a gateway policy will permit it. Confirm a real dispatch and
 inspect `model.served` plus `served_model_evidence`.
 
@@ -101,8 +102,11 @@ Never assume an alias has caught up to a launch — probe or pin.
 The definitive list is always `--list` (definitions register/edit instantly, so the
 roster may have changed since this table). Models below were verified with the
 strongest backend evidence available at snapshot time: `model.resolved` or
-`model.served` where the backend emits it, and an explicit Kimi stream-model selection
-and response for Kimi:
+`model.served` where the backend emits it, and an explicit Kimi stream target
+selection and response for Kimi. Kimi's prompt JSONL stream currently does not
+emit a terminal served-model or usage receipt, so a completed Kimi turn can
+truthfully retain `model.served: null` and `served_model_evidence: absent`.
+Treat that output as advisory rather than an authoritative named-model review.
 
 | Agents | Backend | Model (verified) | Use for |
 |---|---|---|---|
@@ -117,12 +121,19 @@ and response for Kimi:
 | `terra` / explicit Codex candidate | codex | `gpt-5.6-terra` (declared, unverified) | balanced secondary lane; do not pin until served evidence |
 | `spark` / explicit Codex candidate | codex | `gpt-5.3-spark` (declared, unverified) | fast/quota-isolated candidate; do not pin until served evidence |
 | `coder`, `bug-fixer` | cursor-agent | composer-2.5 | multi-step coding, bug fixing |
-| `kimi-worker` | kimi | `kimi-code/k3` + `effort: max` (pinned target; reverify `model.served`) | maximum-thinking architecture, independent review, broad repository research, ambiguous multi-file work |
-| `kimi-coder` | kimi | `kimi-code/k3` + `effort: max` (pinned target; reverify `model.served`) | maximum-thinking scoped implementation, refactoring, debugging, focused verification |
-| `kimi-k27-coder` | kimi | `kimi-code/kimi-for-coding` (explicit lower-context seat; reverify `model.served`) | deliberate K2.7 implementation/debugging trade-off |
+| `kimi-worker` | kimi | `kimi-code/k3` + `effort: max` (pinned target; provider evidence may be absent) | maximum-thinking architecture, independent review, broad repository research, ambiguous multi-file work |
+| `kimi-coder` | kimi | `kimi-code/k3` + `effort: max` (pinned target; provider evidence may be absent) | maximum-thinking scoped implementation, refactoring, debugging, focused verification |
+| `kimi-k27-coder` | kimi | `kimi-code/kimi-for-coding` (explicit lower-context seat; provider evidence may be absent) | deliberate K2.7 implementation/debugging trade-off |
 | `researcher` | agy | `gemini-3.7-flash-high` (pinned target; refresh and reverify) | primary evidence extraction, repo research, UI review, fast `/council` secondary |
 | `docs-writer`, `frontend`, `antigravity` | agy | Gemini default (pin via `model:`) | docs, frontend, general agy work |
 | explicit ArkCLI Coding Plan seat | arkcli | refreshable plan roster (for example `glm-5-2-260617`) | fast value/coding-plan secondary; verify `model.served` |
+
+Kimi's standard final-report contract is unchanged: `STATUS`, `SUMMARY`,
+`FOLLOW-UP`, and `HANDOFF` are all required. A response containing only
+`STATUS`, `VERDICT`, and `HANDOFF` is preserved and may be useful, but it is
+`report_ok: false` and `suspect: true` because it omitted the required bookends.
+Summon does not manufacture missing model evidence or silently relax that
+contract.
 
 `researcher` is intentionally pinned rather than floating with agy's default. The
 3.7 Flash High route was verified through the local agy roster and a real Summon

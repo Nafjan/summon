@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+from pathlib import Path
 from ctypes import wintypes
 
 
@@ -111,6 +112,50 @@ def read_credential(target: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _read_hermes_env_key(name: str) -> str | None:
+    """Read one named key from the explicit local Hermes env file."""
+    candidates: list[Path] = []
+    for variable in ("SUMMON_HERMES_ENV", "HERMES_ENV"):
+        value = os.environ.get(variable)
+        if value:
+            candidates.append(Path(value).expanduser())
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidates.append(Path(local_app_data) / "hermes" / ".env")
+    home = Path.home()
+    candidates.append(home / "AppData" / "Local" / "hermes" / ".env")
+    candidates.append(home / ".hermes" / ".env")
+    seen: set[str] = set()
+    for path in candidates:
+        normalized = os.path.normcase(os.path.abspath(str(path)))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            if not path.is_file() or path.stat().st_size > 256 * 1024:
+                continue
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key_name, separator, value = line.partition("=")
+            if separator != "=" or key_name.strip() != name:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            if value:
+                return value.strip()
+    return None
+
+
 def resolve_openrouter_api_key() -> tuple[str | None, str | None]:
-    """Read the opt-in local OpenRouter credential target, if available."""
-    return read_credential(_OPENROUTER_TARGET)
+    """Read WCM first, then the explicit local Hermes env fallback."""
+    key, source = read_credential(_OPENROUTER_TARGET)
+    if key:
+        return key, source
+    key = _read_hermes_env_key("OPENROUTER_API_KEY")
+    return (key, "hermes_env") if key else (None, None)

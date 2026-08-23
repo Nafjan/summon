@@ -69,13 +69,15 @@ import _executor  # noqa: E402
 import _receipt  # noqa: E402
 import _telemetry  # noqa: E402
 from _builder import (AgentInvocation, clamp_permission as _clamp,
-                      environment_handoff_context, parse_openrouter_options)  # noqa: E402
+                      environment_handoff_context, normalize_read_roots,
+                      parse_openrouter_options, read_allowlist)  # noqa: E402
 from _executor import ENVELOPE_VERSION as _ENVELOPE_VERSION  # noqa: E402
 from _executor import (agent_def_sha, content_sha,  # noqa: E402
                        envelope_answers_request, execute_agent, finalize_exit_fields,
                        is_terminal_nonretryable, is_terminal_success,
                        request_fingerprint)
-from _loader import bundled_roster_dir, get_agents_dir, list_agents, load_agent  # noqa: E402
+from _loader import (bundled_roster_dir, get_agents_dir, list_agents, load_agent,
+                     parse_read_roots)  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
 # Keep a literal assignment: the release-contract parser uses the dispatcher
@@ -224,9 +226,12 @@ def _request_identity(args) -> dict:
         cli=args.cli, model=args.model, effort=args.effort, json_schema=args.json_schema,
         resume=args.resume, resume_profile=getattr(args, "resume_profile", None),
         worktree=args.worktree, allow_credit=getattr(args, "allow_credit", False),
+        isolated_lane=bool(getattr(args, "isolated_lane", False)),
+        allow_tool_credentials=bool(getattr(args, "allow_tool_credentials", False)),
         gate_with=getattr(args, "gate_with", None),
         max_permission=getattr(args, "max_permission", None),
         artifacts=getattr(args, "artifacts", None),
+        read_roots=getattr(args, "_read_roots_cli", None),
         allow_text_only=bool(getattr(args, "allow_text_only", False)),
         require_tools=bool(getattr(args, "require_tools", False)),
         profile=getattr(args, "profile", None),
@@ -708,14 +713,27 @@ def main() -> None:
         # workspace manifests and emits only the public identity/digest tuple;
         # no roster entry is launched or resolved to an executable here.
         try:
-            from _deliberation_agents import AgentManifestError, discover_agents
+            from _deliberation_agents import (AgentManifestError,
+                                               discover_agents,
+                                               legacy_flat_roster)
             workspace = os.path.abspath(args.cwd or os.getcwd())
-            agents = discover_agents(workspace, args.agents_dir)
+            agents = discover_agents(
+                workspace,
+                args.agents_dir,
+                allow_legacy_flat=bool(args.agents_dir),
+            )
+            legacy_flat = legacy_flat_roster(args.agents_dir)
             report = {
                 "status": "ok",
                 "workspace": os.path.basename(workspace),
                 "count": len(agents),
                 "agents": [agent.as_dict() for agent in agents.values()],
+                "legacy_flat_roster": {
+                    "count": len(legacy_flat),
+                    "files": list(legacy_flat),
+                    "validated": False,
+                    "note": "legacy flat files are reported separately; modern package validation passed",
+                },
                 "provider_calls": 0,
                 "redaction": "public-agent-identity-only",
             }
@@ -723,7 +741,10 @@ def main() -> None:
                              indent=None if args.json else 2))
             sys.exit(0)
         except (AgentManifestError, OSError, ValueError, TypeError) as exc:
-            _print_error(f"custom-agent validation refused ({type(exc).__name__})")
+            detail = str(exc).strip() or "no further detail"
+            _print_error(
+                f"custom-agent validation refused ({type(exc).__name__}): {detail}"
+            )
             sys.exit(1)
 
     # Private role management is deliberately outside dispatch receipts: these commands
@@ -838,12 +859,19 @@ def main() -> None:
         receipt["strict_agents_dir"] = True
 
     def _die(msg: str, exit_code: int = 1, *, error_kind: str | None = None,
-             details: dict | None = None) -> None:
+             details: dict | None = None, extra: dict | None = None) -> None:
         env = {"result": "", "exit_code": exit_code, "status": "error", "error": msg}
         if error_kind:
             env["error_kind"] = error_kind
         if details:
             env["agent_resolution"] = details
+        if extra:
+            # Structured remediation belongs at the envelope top level. Keep
+            # legacy agent_resolution detail intact and never overwrite core
+            # failure fields with helper-provided values.
+            for key, value in extra.items():
+                if key not in env and value is not None:
+                    env[key] = value
         env.update(receipt)
         # --out is the AUTHORITATIVE result path, so a pre-dispatch failure has to land
         # there too. Emitting only to stdout left that path EMPTY after a refused stale
@@ -860,6 +888,24 @@ def main() -> None:
                 pass
         _emit(env, operation=_EMIT_OPERATION)
         sys.exit(exit_code)
+
+    # A detached child is launched from an immutable scripts snapshot. Verify
+    # that the snapshot's digest is the one recorded before Popen, before any
+    # backend work can begin. A mixed or stale tree is fail-closed rather than
+    # borrowing provenance from a later managed install.
+    _expected_scripts_sha = os.environ.get("SUMMON_JOB_SCRIPTS_SHA256")
+    if _resolve_job_file() is not None and _expected_scripts_sha:
+        _actual_scripts_sha = receipt.get("summon", {}).get("scripts_sha256")
+        if _actual_scripts_sha != _expected_scripts_sha:
+            _die("background execution bundle identity did not match its launch record; no provider was contacted",
+                 error_kind="background_bundle_identity_mismatch",
+                 extra={"provider_contacted": False,
+                        "expected_scripts_sha256": _expected_scripts_sha,
+                        "actual_scripts_sha256": _actual_scripts_sha})
+        receipt["summon"]["background_bundle"] = {
+            "kind": "immutable_per_job_snapshot",
+            "scripts_sha256": _actual_scripts_sha,
+        }
 
     if args.resume and args.worktree is not None:
         _die("--resume and --worktree are incompatible: a session lives in the "
@@ -943,6 +989,13 @@ def main() -> None:
 
     # Root-prompt hash joins the receipt HERE, as soon as the prompt is final,
     # so even a missing-agent error downstream carries it.
+    try:
+        # CLI roots are request inputs and must be canonicalized before the identity
+        # is computed. Frontmatter roots are added after the one authoritative agent
+        # snapshot is loaded below; the definition hash covers those values.
+        args._read_roots_cli = normalize_read_roots(getattr(args, "read_root", None))
+    except ValueError as exc:
+        _die(str(exc), error_kind="read_allowlist")
     receipt.update(_receipt.receipt_prompt(args.prompt))
 
     # --out resume behavior: a pre-existing SUCCESS envelope means this job is
@@ -1176,6 +1229,12 @@ def main() -> None:
                 f"Agent definition not found: {getattr(args, '_resolved_agent', args.agent)}")
         run_agent_cli, system_context, _, agent_file, permission, model, extra_args, effort_fm = _loaded
         _agent_fm = _agent_fm or {}
+        try:
+            _fm_read_roots = parse_read_roots(_agent_fm.get("read-roots"))
+            _read_roots = normalize_read_roots(
+                tuple(getattr(args, "_read_roots_cli", ())) + tuple(_fm_read_roots))
+        except ValueError as exc:
+            _die(str(exc), error_kind="read_allowlist")
     except ValueError as e:
         _die(str(e))
     except FileNotFoundError as e:
@@ -1249,6 +1308,13 @@ def main() -> None:
         cli = args.cli or resolve_cli(run_agent_cli)
     except ValueError as e:
         _die(f"agent {args.agent!r}: {e}")
+
+    _effective_permission = _clamp(permission, getattr(args, "max_permission", None))
+    _read_policy = read_allowlist(cli, _effective_permission, args.cwd, _read_roots)
+    # This is intentionally visible before any provider contact. It tells an operator
+    # whether each requested root is actually enforceable instead of implying that a
+    # model saw a file merely because its path appeared in the prompt.
+    receipt["read_allowlist"] = _read_policy
 
     # Resolve a named private profile before backend preflight.  A profile can
     # deliberately pin an executable that is not the one visible on PATH, so
@@ -1441,6 +1507,10 @@ def main() -> None:
         profile_command=((profile_selection or {}).get("command")
                          if profile_selection else None),
         openrouter_options=_openrouter_options,
+        read_roots=_read_roots,
+        worktree=getattr(args, "worktree", None),
+        isolated_lane=bool(getattr(args, "isolated_lane", False)),
+        allow_tool_credentials=bool(getattr(args, "allow_tool_credentials", False)),
     )
 
     if profile_selection:
@@ -1483,6 +1553,18 @@ def main() -> None:
                             artifact_manifest=_artifact_manifest,
                             text_seat_decision=_ts), operation=_EMIT_OPERATION)
         sys.exit(0)
+
+    if _read_policy.get("would_refuse"):
+        _reroute = {
+            key: _read_policy[key]
+            for key in ("recommended_backends", "reroute", "allowed_root",
+                        "requires_packet_refreeze")
+            if _read_policy.get(key) is not None
+        }
+        _reroute["provider_contacted"] = False
+        _die(_read_policy.get("refusal") or "read allowlist cannot be enforced",
+             error_kind=_read_policy.get("error_kind", "read_allowlist_unsupported"),
+             details={"read_allowlist": _read_policy}, extra=_reroute)
 
     if _ts is not None and _ts.get("would_block"):
         _env = _enrich_denial(
@@ -1656,7 +1738,8 @@ def _dry_run_view(invocation, args, agents_dir: str,
                           permission_flags as _pf, _PERMISSION_MAPPING, _agy_wrapper,
                           advisory_warnings, apply_credit_guard, infer_dispatch_billing,
                           credit_spend_allowed, selects_credit_only,
-                          model_backend_compatibility, codex_model_selection)
+                          model_backend_compatibility, codex_model_selection,
+                          read_allowlist, opencode_yolo_isolation_error)
     _guarded, _, _guard_warnings = apply_credit_guard(invocation)
     _codex_selection = (codex_model_selection(
                             invocation.model, invocation.extra_args,
@@ -1683,6 +1766,10 @@ def _dry_run_view(invocation, args, agents_dir: str,
                      "note": "credit-only model authorized"}
     view = {
         "dry_run": True,
+        # A dry-run is a provider-inert resolution proof. Keep this explicit even
+        # when no conflict/refusal path adds its own diagnostics, so callers do not
+        # have to infer non-contact from a missing field.
+        "provider_contacted": False,
         "agent": args.agent,
         "agent_resolved": getattr(args, "_resolved_agent", args.agent),
         "cli": invocation.cli,
@@ -1700,6 +1787,8 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "profile": invocation.profile,
         "billing_predicted": _bill,     # subscription / credit / api / unknown
         "permission": invocation.permission,
+        "read_allowlist": read_allowlist(invocation.cli, invocation.permission,
+                                          invocation.cwd, invocation.read_roots),
         # openai-compat (and any future non-sandbox backend) has no permission
         # mapping — report None instead of raising.
         "permission_flags": (_pf(invocation.cli, invocation.permission)
@@ -1707,6 +1796,8 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "extra_args": list(invocation.extra_args),
         "timeout_ms": args.timeout,
         "worktree": ("would create" if args.worktree is not None else None),
+        "isolated_lane": bool(getattr(args, "isolated_lane", False)),
+        "allow_tool_credentials": bool(getattr(args, "allow_tool_credentials", False)),
         "system_context_chars": len(invocation.system_context),
     }
     if _codex_selection:
@@ -1722,6 +1813,16 @@ def _dry_run_view(invocation, args, agents_dir: str,
             view["refusal"] = _selection_conflict
             view["provider_contacted"] = False
             view["result_usable"] = False
+    if view["read_allowlist"].get("would_refuse"):
+        view["would_refuse"] = True
+        view["error_kind"] = view["read_allowlist"].get(
+            "error_kind", "read_allowlist_unsupported")
+        view["refusal"] = view["read_allowlist"].get(
+            "refusal", "read allowlist cannot be enforced by this backend")
+        for _key in ("recommended_backends", "reroute", "allowed_root",
+                     "requires_packet_refreeze"):
+            if view["read_allowlist"].get(_key) is not None:
+                view[_key] = view["read_allowlist"][_key]
     # Keep dry-run and real dispatch routing decisions identical.  This is a pure namespace
     # check: it does not probe or construct a provider profile.  Codex's configured default
     # is read only when the caller did not pin a model, so the preview can still catch a bad
@@ -1785,6 +1886,10 @@ def _dry_run_view(invocation, args, agents_dir: str,
         # reporting: the dispatch would be refused, AND the preview is partial.
         view["would_refuse"] = True
         view["refusal"] = _ro
+    _oy = opencode_yolo_isolation_error(invocation)
+    if _oy:
+        view["would_refuse"] = True
+        view["refusal"] = _oy
     # Same helper as the real envelope, so preflight shows exactly what the run would
     # warn about -- a short agy clock and a withheld read-only workspace are both things
     # you want to learn BEFORE paying, which is the whole point of --dry-run.
@@ -1856,7 +1961,8 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 view["wrapper"] = _agy_wrapper()
             except ValueError as e:
                 view["error"] = str(e)
-    elif not _selection_conflict:
+    elif (not _selection_conflict
+          and not view["read_allowlist"].get("would_refuse")):
         try:
             cmd, argv, env = build_invocation_args(invocation)
             if invocation.profile_command:

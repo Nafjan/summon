@@ -208,12 +208,23 @@ def read_json(path: str):
 # are omitted so no prompt text or secret is persisted.
 _FLAG_ALLOWLIST = ("agent", "cli", "model", "effort", "timeout", "cwd",
                    "agents_dir", "worktree", "profile", "allow_text_only", "require_tools",
-                   "strict_agents_dir", "enable_roles")
+                   "strict_agents_dir", "enable_roles", "read_root", "isolated_lane",
+                   "allow_tool_credentials")
 
 
 def flags_projection(args) -> dict:
     out: dict = {}
     for key in _FLAG_ALLOWLIST:
+        if key == "read_root":
+            # Keep the launch record auditable without preserving an un-normalized
+            # parser value.  The parent has already rejected missing/reparse roots;
+            # a minimal unit-test Namespace may only expose ``read_root``.
+            val = getattr(args, "_read_roots_cli", None)
+            if val is None:
+                val = getattr(args, "read_root", None)
+            if val:
+                out[key] = list(val)
+            continue
         val = getattr(args, key, None)
         if key == "worktree":
             # worktree is tri-state: None (not requested), "" (bare = auto-named),
@@ -229,7 +240,7 @@ def flags_projection(args) -> dict:
 
 def write_prepared(root: str, job_id: str, *, nonce: str, agent: str,
                    prompt_sha256: str | None, cwd: str, flags: dict,
-                   summon: dict) -> str:
+                   summon: dict, launcher_summon: dict | None = None) -> str:
     """Write the launch record BEFORE spawn. The record path never appears as a
     zero-byte file: the whole content is written to a temp file, fsynced, and
     atomically renamed into place (a reader sees either nothing or a complete
@@ -239,11 +250,16 @@ def write_prepared(root: str, job_id: str, *, nonce: str, agent: str,
     path = record_path(root, job_id)
     if os.path.lexists(path):     # lexists: a symlink here is reuse too, don't follow it
         raise FileExistsError(f"launch record already exists for job {job_id}")
-    _atomic_write_json(path, {
+    record = {
         "job_id": job_id, "nonce": nonce, "agent": agent,
         "prompt_sha256": prompt_sha256, "cwd": cwd, "flags": flags,
         "summon": summon, "prepared_at": time.time(), "pid": None,
-    })
+    }
+    if launcher_summon is not None:
+        # ``summon`` identifies the frozen child bundle. Keep the mutable
+        # parent's identity separately so an install-era race stays visible.
+        record["launcher_summon"] = launcher_summon
+    _atomic_write_json(path, record)
     return path
 
 
@@ -334,6 +350,15 @@ def _classify(rec, rec_state: str, result, res_state: str,
             status = result.get("status")
             if not isinstance(status, str) or not status:
                 return "corrupt", False      # authenticated but malformed envelope
+            expected = rec.get("summon") if isinstance(rec, dict) else None
+            actual = result.get("summon") if isinstance(result, dict) else None
+            # Immutable-bundle records authenticate executable identity in
+            # addition to the result nonce. Legacy records without a digest
+            # retain their historic nonce-only classification.
+            if isinstance(expected, dict) and expected.get("scripts_sha256"):
+                if (not isinstance(actual, dict)
+                        or actual.get("scripts_sha256") != expected.get("scripts_sha256")):
+                    return "identity_mismatch", False
             return status, True
         # a result with no record (legacy --background / record loss) or a nonce
         # that does not match: surface it, but never as trusted.
@@ -417,9 +442,10 @@ def wait_job(root: str, job_id: str, timeout_ms: int, poll_sec: float = 0.5):
     rec, rec_state = _read(record_path(root, job_id))
     rpath = result_path(root, job_id)
     while True:
+        observed_state = None
         result, res_state = _read(rpath)
         if result is not None:
-            _state, trusted = _classify(rec, rec_state, result, res_state)
+            observed_state, trusted = _classify(rec, rec_state, result, res_state)
             if trusted:
                 return result, "done"
             # unverifiable/corrupt/nonce-not-yet-matching: keep waiting for the
@@ -431,9 +457,11 @@ def wait_job(root: str, job_id: str, timeout_ms: int, poll_sec: float = 0.5):
             # so that a verified terminal result wins that unavoidable race.
             result, res_state = _read(rpath)
             if result is not None:
-                _state, trusted = _classify(rec, rec_state, result, res_state)
+                observed_state, trusted = _classify(rec, rec_state, result, res_state)
                 if trusted:
                     return result, "done"
+            if observed_state == "identity_mismatch":
+                return None, "identity_mismatch"
             return None, "stale"
         if time.monotonic() >= deadline:
             return None, "timeout"

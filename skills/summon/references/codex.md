@@ -14,13 +14,25 @@ script keeps running for a few seconds AFTER the child's deadline to kill the pr
 serialize its result envelope. A host timeout equal to or below `--timeout` kills the script
 mid-report, which is the "no output" failure in Common Errors below.
 
-- Script arg: `--timeout 600000` (the child deadline)
+- Script arg: `--timeout 600000ms` (the child deadline; explicit units are recommended)
 - Tool param: `timeout_ms: 660000` (ABOVE it: ~60s of headroom for teardown + reporting)
 - Rule: **tool timeout > `--timeout`**, never equal. Scale the margin with the run: a
   `--council` or `--manifest` fan-out runs many children in sequence, so it needs a much larger
   host ceiling. A `--council` prints its worst-case wall-clock estimate to stderr before
   dispatching; set the host timeout above THAT. A `--manifest` swarm has no aggregate estimator,
   so budget it from its own waves (per-backend concurrency), per-job `timeout`, and `--retries`.
+
+## Read-root routing
+
+Codex read-only mode does not provide an enforceable per-directory read allowlist. A Codex
+review that adds `--read-root` is therefore refused before a model turn with
+`error_kind: read_allowlist_unsupported`; this is expected, not an auth or routing failure.
+
+Preflight the exact request first with `--dry-run`. Its `read_allowlist.would_refuse` field is
+the decision point. When it is true, reselect a **read-only Claude or Gemini agent** and rerun
+the same dry-run with the same roots. Do not move a Codex model pin onto another backend or
+drop the roots to make the lane run. For a native Codex review, keep every permitted review
+artifact under the review `--cwd` instead of requesting additional roots.
 
 ## Sub-Agent Execution
 

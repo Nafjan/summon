@@ -14,11 +14,119 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
+from pathlib import Path
 
 import _jobs
+from _receipt import scripts_sha256
+
+
+_INSTALL_MARKER = ".summon-install.json"
+_EXECUTION_LOCK = "summon.execution.lock"
+
+
+def _managed_host_root(entry_path: str) -> str | None:
+    """Return the host root for a managed dispatcher, else ``None``."""
+    scripts = Path(entry_path).resolve().parent
+    skill = scripts.parent
+    marker = skill / _INSTALL_MARKER
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("installed_by") != "summon":
+        return None
+    return str(skill.parent.parent)
+
+
+def _release_execution_lease(lease: str, token: str) -> None:
+    """Remove only the exact short-lived lease created by this launcher."""
+    try:
+        with open(lease, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and data.get("token") == token:
+            os.unlink(lease)
+    except (OSError, ValueError):
+        pass
+
+
+def _acquire_execution_lease(entry_path: str) -> tuple[str, str] | None:
+    """Interlock an immutable background snapshot with managed install.
+
+    The lease lives beside (not inside) the replaceable skill tree. A launcher
+    refuses to race an active installer; an installer similarly refuses while a
+    launcher is copying and spawning its bundle. Existing leases are never
+    removed here because they may require operator investigation.
+    """
+    host_root = _managed_host_root(entry_path)
+    if host_root is None:
+        return None
+    install_lock = os.path.join(host_root, "summon.install.lock")
+    if os.path.lexists(install_lock):
+        raise ValueError("managed Summon install is in progress; retry the background dispatch shortly")
+    lease = os.path.join(host_root, _EXECUTION_LOCK)
+    token = uuid.uuid4().hex
+    try:
+        fd = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise ValueError("another managed Summon background launch is preparing an immutable bundle; retry shortly") from exc
+    except OSError as exc:
+        raise ValueError(f"cannot create managed Summon execution lease: {exc}") from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"installed_by": "summon", "purpose": "background_snapshot",
+                       "pid": os.getpid(), "token": token}, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError:
+        try:
+            os.unlink(lease)
+        except OSError:
+            pass
+        raise
+    if os.path.lexists(install_lock):
+        _release_execution_lease(lease, token)
+        raise ValueError("managed Summon install started while preparing this dispatch; retry shortly")
+    return lease, token
+
+
+def _freeze_background_bundle(root: str, job_id: str, entry_path: str,
+                              launcher_summon: dict) -> tuple[str, dict]:
+    """Copy dispatcher scripts into a durable per-job execution bundle.
+
+    The child executes this copy, not the mutable managed install. Both the
+    launch record and terminal receipt therefore name the same script digest
+    even if an installer replaces the managed tree while a provider turn runs.
+    The bundle is retained under the job root as provenance evidence.
+    """
+    source_entry = Path(entry_path).resolve()
+    source_scripts = source_entry.parent
+    bundle_root = Path(tempfile.mkdtemp(prefix=f".summon-bundle-{job_id}-", dir=root))
+    bundle_scripts = bundle_root / "scripts"
+    try:
+        shutil.copytree(source_scripts, bundle_scripts,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        child_entry = bundle_scripts / source_entry.name
+        if not child_entry.is_file():
+            raise ValueError("immutable background bundle is missing its dispatcher entry script")
+        digest = scripts_sha256(str(bundle_scripts))
+    except Exception:
+        shutil.rmtree(bundle_root, ignore_errors=True)
+        raise
+    execution = dict(launcher_summon)
+    execution.update({
+        "script": str(child_entry),
+        "scripts_sha256": digest,
+        "background_bundle": {
+            "kind": "immutable_per_job_snapshot",
+            "scripts_sha256": digest,
+        },
+    })
+    return str(child_entry), execution
 
 
 def child_argv(args: argparse.Namespace, result_file: str) -> list:
@@ -41,6 +149,16 @@ def child_argv(args: argparse.Namespace, result_file: str) -> list:
         out += ["--require-tools"]
     if getattr(args, "no_contract_repair", False):
         out += ["--no-contract-repair"]     # honor the opt-out in the detached child
+    # ``--read-root`` is repeatable.  Background argv is rebuilt field by field,
+    # so omitting it silently narrowed the child to only ``--cwd`` even though
+    # the foreground request had already validated and fingerprinted the roots.
+    # Prefer the canonical values computed by the parent; the fallback keeps this
+    # helper compatible with callers/tests that construct a minimal Namespace.
+    _read_roots = getattr(args, "_read_roots_cli", None)
+    if _read_roots is None:
+        _read_roots = getattr(args, "read_root", None)
+    for root in _read_roots or ():
+        out += ["--read-root", root]
     if args.agents_dir:
         out += ["--agents-dir", args.agents_dir]
     if getattr(args, "strict_agents_dir", False):
@@ -73,6 +191,10 @@ def child_argv(args: argparse.Namespace, result_file: str) -> list:
         out += ["--gate-timeout", str(args.gate_timeout)]
     if args.worktree is not None:
         out += [f"--worktree={args.worktree}"]  # =form is unambiguous for the bare case
+    if getattr(args, "isolated_lane", False):
+        out += ["--isolated-lane"]
+    if getattr(args, "allow_tool_credentials", False):
+        out += ["--allow-tool-credentials"]
     for artifact in getattr(args, "artifacts", ()) or ():
         out += ["--artifact", artifact]
     return out + ["--job-file", result_file]
@@ -98,26 +220,37 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict) ->
     nonce = uuid.uuid4().hex
     prompt_sha = (hashlib.sha256(args.prompt.encode("utf-8")).hexdigest()
                   if args.prompt is not None else None)
+    lease = _acquire_execution_lease(entry_path)
     # Launch record BEFORE spawn (fail-closed: a record we cannot write aborts
     # the dispatch rather than launching an untraceable job). Keep the path it
     # returns: every value the handle needs is now computed BEFORE Popen, so
     # nothing fallible runs between a successful spawn and returning the handle.
     try:
+        child_entry, execution_summon = _freeze_background_bundle(
+            root, job_id, entry_path, summon)
         record_file = _jobs.write_prepared(
             root, job_id, nonce=nonce, agent=args.agent,
             prompt_sha256=prompt_sha, cwd=args.cwd,
-            flags=_jobs.flags_projection(args), summon=summon)
-    except OSError as e:
+            flags=_jobs.flags_projection(args), summon=execution_summon,
+            launcher_summon=summon)
+    except (OSError, ValueError) as e:
+        if lease is not None:
+            _release_execution_lease(*lease)
         raise ValueError(f"cannot write the background launch record: {e}") from e
-    cmd = [sys.executable, entry_path, *child_argv(args, result_file)]
-    kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
-                    "stderr": subprocess.DEVNULL}
-    child_env = {**os.environ, "SUMMON_JOB_NONCE": nonce}
-    if prompt_sha:
-        child_env["SUMMON_JOB_PROMPT_SHA"] = prompt_sha   # lets the crash path verify
-    kwargs["env"] = child_env
-    from _spawn import popen_flags
-    proc = subprocess.Popen(cmd, **kwargs, **popen_flags(detached=True))
+    try:
+        cmd = [sys.executable, child_entry, *child_argv(args, result_file)]
+        kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+                        "stderr": subprocess.DEVNULL}
+        child_env = {**os.environ, "SUMMON_JOB_NONCE": nonce,
+                     "SUMMON_JOB_SCRIPTS_SHA256": execution_summon["scripts_sha256"]}
+        if prompt_sha:
+            child_env["SUMMON_JOB_PROMPT_SHA"] = prompt_sha   # lets the crash path verify
+        kwargs["env"] = child_env
+        from _spawn import popen_flags
+        proc = subprocess.Popen(cmd, **kwargs, **popen_flags(detached=True))
+    finally:
+        if lease is not None:
+            _release_execution_lease(*lease)
     # Handle built from ONLY pre-Popen values (no path recompute, no fs call), so
     # it cannot throw here and strand the live child.
     handle = {"status": "background", "job_id": job_id, "pid": proc.pid,
@@ -167,6 +300,10 @@ def run_jobs_query(args, emit_error) -> int:
     if outcome == "stale":
         emit_error(f"background job {args.jobs_wait!r} is stale: its process is no longer "
                    "alive and no verified result was written")
+        return 1
+    if outcome == "identity_mismatch":
+        emit_error(f"background job {args.jobs_wait!r} ended with an execution identity "
+                   "mismatch; its result is not trusted")
         return 1
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result.get("status") == "success" else 1

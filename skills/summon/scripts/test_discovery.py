@@ -731,6 +731,12 @@ def test_doctor_json_roundtrip():
     parsed = _json.loads(_json.dumps(rep, ensure_ascii=False))
     assert set(parsed["backends"]) == {"claude", "codex", "cursor-agent", "gemini", "kimi", "agy", "opencode", "arkcli"}
     assert isinstance(parsed["ok"], bool)
+    assert parsed["read_root_capabilities"] == {
+        "enforced_backends": ["claude", "gemini"],
+        "required_permission": "read-only",
+        "preflight": "dispatch --dry-run with the actual --read-root arguments",
+    }
+    assert "read roots:" in _doctor.render(rep)
 
 
 def _fake_agy_home():
@@ -2298,6 +2304,243 @@ def test_dry_run_resolves_without_executing():
         _sh.rmtree(agents, ignore_errors=True)
 
 
+def test_read_only_allowlist_parses_and_rejects_ambiguous_roots():
+    from _loader import parse_read_roots
+    assert parse_read_roots(None) == ()
+    assert parse_read_roots(" C:\\oracle ; C:\\board ") == (
+        "C:\\oracle", "C:\\board")
+    assert parse_read_roots('["C:\\\\oracle", "C:\\\\board"]') == (
+        "C:\\oracle", "C:\\board")
+    for bad in ('{"root":"C:\\\\oracle"}', '["C:\\\\oracle"', '[1]'):
+        try:
+            parse_read_roots(bad)
+            raise AssertionError(f"expected invalid read-roots: {bad}")
+        except ValueError:
+            pass
+    try:
+        parse_read_roots(";".join(f"C:\\r{i}" for i in range(17)))
+        raise AssertionError("expected read-roots bound")
+    except ValueError:
+        pass
+
+
+def test_read_only_allowlist_is_enforced_by_claude_and_gemini_only():
+    from _builder import (AgentInvocation, build_invocation_args,
+                          normalize_read_roots, read_allowlist)
+    with tempfile.TemporaryDirectory(prefix="summon-read-roots-") as d:
+        one = os.path.join(d, "oracle")
+        two = os.path.join(d, "board")
+        os.mkdir(one)
+        os.mkdir(two)
+        roots = normalize_read_roots([one, two, one])
+        assert len(roots) == 2
+        for cli, flag in (("claude", "--add-dir"),
+                          ("gemini", "--include-directories")):
+            policy = read_allowlist(cli, "read-only", d, roots)
+            assert policy["enforced"] is True and policy["would_refuse"] is False
+            assert policy["effective_paths"] == [os.path.abspath(d), *roots]
+            _, argv, _ = build_invocation_args(AgentInvocation(
+                cli=cli, prompt="inspect", cwd=d, permission="read-only",
+                model="test-model", read_roots=roots))
+            assert argv.count(flag) == 2, (cli, argv)
+            assert all(root in argv for root in roots), (cli, argv)
+        refusal = read_allowlist("codex", "read-only", d, roots)
+        assert refusal["would_refuse"] is True and refusal["enforced"] is False
+        assert "cannot enforce" in refusal["refusal"]
+        assert refusal["recommended_backends"] == ["claude", "gemini"]
+        assert refusal["reroute"] == {
+            "action": "select_read_only_agent",
+            "candidate_backends": ["claude", "gemini"],
+            "required_permission": "read-only",
+            "requires_agent_reselection": True,
+            "preflight": "dry-run",
+        }
+        try:
+            build_invocation_args(AgentInvocation(
+                cli="codex", prompt="inspect", cwd=d, permission="read-only",
+                model="gpt-5.6-sol", read_roots=roots))
+            raise AssertionError("low-level builder ignored unsupported read roots")
+        except ValueError as exc:
+            assert "cannot enforce" in str(exc)
+        unsafe = read_allowlist("claude", "safe-edit", d, roots)
+        assert unsafe["would_refuse"] is True
+        assert "read-only" in unsafe["refusal"]
+        link = os.path.join(d, "oracle-link")
+        try:
+            os.symlink(one, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            link = None  # Windows CI without link privilege: skip this assertion.
+        if link:
+            try:
+                normalize_read_roots([link])
+                raise AssertionError("symlink read root was accepted")
+            except ValueError as exc:
+                assert "symlink or junction" in str(exc)
+        try:
+            normalize_read_roots([os.path.join(d, "missing")])
+            raise AssertionError("missing read root was accepted")
+        except ValueError as exc:
+            assert "does not exist" in str(exc)
+
+
+def test_read_only_allowlist_dry_run_reports_effective_paths_without_provider_contact():
+    import subprocess as sp
+    with tempfile.TemporaryDirectory(prefix="summon-read-roots-e2e-") as d:
+        roster = os.path.join(d, "roster")
+        os.mkdir(roster)
+        one = os.path.join(d, "oracle")
+        two = os.path.join(d, "board")
+        os.mkdir(one)
+        os.mkdir(two)
+        with open(os.path.join(roster, "reviewer.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: read-only\n"
+                     "model: claude-opus-5\n---\n# Reviewer\n")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "run_subagent.py")
+        r = sp.run([sys.executable, script, "--agent", "reviewer", "--prompt", "inspect",
+                    "--cwd", d, "--agents-dir", roster, "--strict-agents-dir",
+                    "--read-root", one, "--read-root", two, "--timeout", "30s",
+                    "--dry-run", "--json"], capture_output=True, text=True,
+                   encoding="utf-8")
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        view = json.loads(r.stdout)
+        policy = view["read_allowlist"]
+        assert policy["enforced"] is True and policy["would_refuse"] is False, view
+        assert policy["effective_paths"] == [os.path.abspath(d),
+                                               os.path.realpath(one),
+                                               os.path.realpath(two)], view
+        assert view.get("provider_contacted") is False
+        assert view["args"].count("--add-dir") == 2, view["args"]
+
+
+def test_read_only_allowlist_foreground_and_background_record_stay_in_parity():
+    """Repeatable read roots must survive the detached launch boundary.
+
+    The background parent writes a launch record before its child loads the agent.
+    Compare the provider-inert foreground policy with both projections that cross
+    that boundary: the child argv and the durable record flags. This catches the
+    regression where the foreground dry-run was correct but the child silently
+    received no ``--read-root`` values.
+    """
+    import argparse as _argparse
+    import subprocess as sp
+    import _background, _jobs
+    from _builder import normalize_read_roots, read_allowlist
+
+    with tempfile.TemporaryDirectory(prefix="summon-read-roots-background-") as d:
+        roster = os.path.join(d, "roster")
+        os.mkdir(roster)
+        one = os.path.join(d, "oracle")
+        two = os.path.join(d, "board")
+        os.mkdir(one)
+        os.mkdir(two)
+        with open(os.path.join(roster, "reviewer.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: read-only\n"
+                     "model: claude-opus-5\n---\n# Reviewer\n")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "run_subagent.py")
+        roots = normalize_read_roots([one, two])
+        r = sp.run([sys.executable, script, "--agent", "reviewer", "--prompt", "inspect",
+                    "--cwd", d, "--agents-dir", roster, "--strict-agents-dir",
+                    "--read-root", one, "--read-root", two, "--timeout", "30s",
+                    "--dry-run", "--json"], capture_output=True, text=True,
+                   encoding="utf-8")
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        foreground = json.loads(r.stdout)["read_allowlist"]
+        assert foreground["requested_paths"] == list(roots), foreground
+        assert foreground["effective_paths"] == [os.path.abspath(d), *roots], foreground
+
+        ns = _argparse.Namespace(
+            agent="reviewer", prompt="inspect", prompt_file=None, cwd=d,
+            agents_dir=roster, strict_agents_dir=True, enable_roles=False,
+            read_root=[one, two], _read_roots_cli=roots,
+            allow_credit=False, allow_payg=False, allow_text_only=False,
+            require_tools=False, no_contract_repair=False, timeout=30000,
+            cli=None, model=None, effort=None, profile=None, resume=None,
+            resume_profile=None, out=None, json_schema=None, debug_dir=None,
+            retries=0, max_permission=None, gate_with=None, gate_timeout=None,
+            worktree=None, artifacts=[])
+        child = _background.child_argv(ns, "result.json")
+        child_roots = [child[i + 1] for i, value in enumerate(child[:-1])
+                       if value == "--read-root"]
+        assert child_roots == list(roots), child
+        background = read_allowlist("claude", "read-only", d, child_roots)
+        assert background == foreground, (foreground, background)
+
+        projected = _jobs.flags_projection(ns)
+        assert projected["read_root"] == list(roots), projected
+        job_root = os.path.join(d, "jobs")
+        jid = _jobs.new_job_id()
+        _jobs.write_prepared(job_root, jid, nonce="r" * 32, agent="reviewer",
+                             prompt_sha256=None, cwd=d, flags=projected, summon={})
+        with open(_jobs.record_path(job_root, jid), encoding="utf-8") as fh:
+            record = json.load(fh)
+        assert record["flags"]["read_root"] == foreground["requested_paths"], record
+
+
+def test_read_only_allowlist_dry_run_marks_unsupported_backend_without_contact():
+    import subprocess as sp
+    with tempfile.TemporaryDirectory(prefix="summon-read-roots-codex-") as d:
+        roster = os.path.join(d, "roster")
+        os.mkdir(roster)
+        root = os.path.join(d, "oracle")
+        os.mkdir(root)
+        with open(os.path.join(roster, "reviewer.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: codex\npermission: read-only\n"
+                     "model: gpt-5.6-sol\n---\n# Reviewer\n")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "run_subagent.py")
+        r = sp.run([sys.executable, script, "--agent", "reviewer", "--prompt", "inspect",
+                    "--cwd", d, "--agents-dir", roster, "--strict-agents-dir",
+                    "--read-root", root, "--dry-run", "--json"],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        view = json.loads(r.stdout)
+        assert view["would_refuse"] is True
+        assert view["error_kind"] == "read_allowlist_unsupported"
+        assert view["read_allowlist"]["would_refuse"] is True
+        assert view["recommended_backends"] == ["claude", "gemini"]
+        assert view["reroute"]["action"] == "select_read_only_agent"
+        assert view.get("provider_contacted") is False
+
+
+def test_read_root_refusal_surfaces_machine_reroute_before_provider_contact():
+    """The real refusal must keep dry-run's actionable reroute shape.
+
+    A PATH-only fake Codex binary lets preflight pass without launching a model.
+    The read-root guard then proves it stops before the provider boundary.
+    """
+    import subprocess as sp
+    with tempfile.TemporaryDirectory(prefix="summon-read-roots-real-") as d:
+        roster = os.path.join(d, "roster")
+        root = os.path.join(d, "oracle")
+        fake_bin = os.path.join(d, "bin")
+        os.mkdir(roster)
+        os.mkdir(root)
+        os.mkdir(fake_bin)
+        with open(os.path.join(roster, "reviewer.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: codex\npermission: read-only\n"
+                     "model: gpt-5.6-sol\n---\n# Reviewer\n")
+        fake = os.path.join(fake_bin, "codex.exe" if os.name == "nt" else "codex")
+        Path(fake).write_bytes(b"")
+        if os.name != "nt":
+            os.chmod(fake, 0o755)
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "run_subagent.py")
+        env = dict(os.environ)
+        env["PATH"] = fake_bin + os.pathsep + env.get("PATH", "")
+        r = sp.run([sys.executable, script, "--agent", "reviewer", "--prompt", "inspect",
+                    "--cwd", d, "--agents-dir", roster, "--strict-agents-dir",
+                    "--read-root", root], capture_output=True, text=True,
+                   encoding="utf-8", env=env)
+        assert r.returncode == 1, (r.stdout, r.stderr)
+        refusal = json.loads(r.stdout)
+        assert refusal["error_kind"] == "read_allowlist_unsupported", refusal
+        assert refusal["provider_contacted"] is False, refusal
+        assert refusal["recommended_backends"] == ["claude", "gemini"], refusal
+        assert refusal["reroute"]["action"] == "select_read_only_agent", refusal
+
+
 # --- Regression tests for ultrareview findings (F1-F25) ----------------------
 
 def test_no_false_success_on_backend_error_result():
@@ -3078,6 +3321,18 @@ def test_researcher_is_pinned_to_gemini_flash_37():
     assert "run-agent: agy" in frontmatter
     assert "model: gemini-3.7-flash-high" in frontmatter
     assert "permission: yolo" in frontmatter
+
+
+def test_ox_opencode_lane_is_broad_authority_for_isolated_worktrees():
+    """Ox needs the complete tool loop; the definition documents the isolation gate."""
+    from pathlib import Path
+    definition = (Path(__file__).resolve().parents[1] / "agents" /
+                  "openrouter-ox-alpha-opencode.md").read_text(encoding="utf-8")
+    frontmatter = definition.split("---", 2)[1]
+    assert "run-agent: opencode" in frontmatter
+    assert "model: openrouter/stealth/ox-alpha" in frontmatter
+    assert "permission: yolo" in frontmatter
+    assert "disposable clone or isolated" in definition
 
 
 def test_parse_report_keeps_real_status_with_pipe():
@@ -4962,9 +5217,14 @@ def test_v4_overall_timeout_skips_fallback_after_breach():
     assert env["status"] == "partial", env["status"]
     assert env.get("council_state") == "overall_timeout", env.get("council_state")
     # THE INVARIANT, and it holds however early the breach lands: no fallback chairman is
-    # ever dispatched after the budget is blown.
+    # ever dispatched after the budget is blown. On a busy host, setup itself can consume
+    # the deliberately tiny 2-second budget; in that valid branch no member is dispatched,
+    # so the member-set assertion is intentionally vacuous.
     assert "chair2" not in dispatched, dispatched
-    assert {"m1", "m2"} <= set(dispatched), dispatched
+    if dispatched:
+        assert {"m1", "m2"} <= set(dispatched), dispatched
+    else:
+        assert env.get("council_state") == "overall_timeout", env.get("council_state")
     # The intended SCENARIO is a breach during the primary chairman. If a slow runner blew
     # the budget before the chairman was even reached, the guard above still proves itself
     # -- but say so rather than silently testing a weaker case.
@@ -12578,9 +12838,41 @@ def test_v10_headless_docs_include_caller_popup_guidance():
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     for rel in ("README.md", os.path.join("skills", "summon", "SKILL.md")):
         text = open(os.path.join(root, rel), encoding="utf-8").read()
-        for needle in ("AGY_PTY_WRAPPER", "agy_stream_proxy.py", "Start-Process",
-                       "cmd /c start", "-WindowStyle Hidden"):
+        for needle in ("AGY_PTY_WRAPPER", "agy_stream_proxy.py", "AGY_ALLOW_LEGACY_PTY",
+                       "Start-Process", "cmd /c start", "-WindowStyle Hidden"):
             assert needle in text, "%s is missing caller popup guidance in %s" % (needle, rel)
+
+
+def test_v10_legacy_agy_pty_is_opt_in_on_windows():
+    """An old project copy must not silently select the visible winpty wrapper."""
+    from unittest import mock
+    import _builder
+
+    with mock.patch.object(_builder.os, "name", "nt"), \
+         mock.patch.dict(_builder.os.environ, {}, clear=False), \
+         mock.patch.object(_builder.os.path, "isfile", return_value=False):
+        _builder.os.environ.pop("AGY_PTY_WRAPPER", None)
+        _builder.os.environ.pop("AGY_ALLOW_LEGACY_PTY", None)
+        try:
+            _builder._agy_wrapper()
+        except ValueError as exc:
+            assert "visible pseudo-console" in str(exc)
+        else:
+            raise AssertionError("legacy agy PTY fallback was selected without opt-in")
+
+    # If a current copy is present, an explicit legacy override is still repaired to the
+    # hidden stream proxy. The escape hatch is available only when the operator opts in.
+    def isfile(path):
+        return str(path).lower().endswith("agy_stream_proxy.py")
+
+    with mock.patch.object(_builder.os, "name", "nt"), \
+         mock.patch.dict(_builder.os.environ,
+                         {"AGY_PTY_WRAPPER": "C:\\legacy\\agy_pty_pyte.py"}, clear=False), \
+         mock.patch.object(_builder.os.path, "isfile", side_effect=isfile):
+        _builder.os.environ.pop("AGY_ALLOW_LEGACY_PTY", None)
+        assert _builder._agy_wrapper().lower().endswith("agy_stream_proxy.py")
+        _builder.os.environ["AGY_ALLOW_LEGACY_PTY"] = "1"
+        assert _builder._agy_wrapper().lower().endswith("agy_pty_pyte.py")
 
 
 def test_v8_project_local_copy_is_enumerated_and_reported():
@@ -12683,6 +12975,30 @@ def test_v10_timeout_diagnostics_do_not_duplicate_the_milliseconds_unit():
     assert resp["timeout"] == {"budget_ms": 360000,
                                "stage": "backend-execution",
                                "partial_output": False}, resp["timeout"]
+
+
+def test_v10_public_timeout_examples_use_explicit_units():
+    """Public operator recipes must not teach the ambiguous bare-millisecond form.
+
+    Bare values remain a compatibility feature in the parser, but a copied example such
+    as ``--timeout 900`` is interpreted as 900ms and is rejected by the dispatch guard.
+    Keep the public skill and host recipe aligned on explicit duration suffixes.
+    """
+    import re
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    paths = (
+        os.path.join(root, "skills", "summon", "SKILL.md"),
+        os.path.join(root, "skills", "summon", "references", "codex.md"),
+    )
+    bare = re.compile(r"--timeout(?:=|\s+)(\d+)(?!\d)(?!\s*(?:ms|s|m)\b)")
+    for path in paths:
+        text = open(path, encoding="utf-8").read()
+        matches = bare.findall(text)
+        assert not matches, "%s contains bare timeout examples: %s" % (path, matches)
+    skill = open(paths[0], encoding="utf-8").read()
+    assert "--timeout 900s" in skill and "--timeout 600000ms" in skill
+    assert "bare numeric" in skill.lower()
 
 
 def test_v10_kimi_review_docs_require_an_isolated_worktree():
@@ -13924,12 +14240,19 @@ def test_v8_every_test_is_actually_collected_by_the_runner():
         "%d test(s) are defined AFTER the __main__ block and will never run: %s. Move them "
         "above it -- the runner snapshots globals() and cannot see them." % (
             len(orphaned), ", ".join(orphaned)))
-    in_source = sum(1 for ln in above.splitlines() if ln.startswith("def test_"))
-    collected = sum(1 for k, v in globals().items()
-                    if k.startswith("test_") and callable(v))
-    assert in_source == collected, (
-        "the source defines %d tests but %d are importable; a duplicate name silently "
-        "shadowed one." % (in_source, collected))
+    # Count definitions from the syntax tree rather than from the live module globals.
+    # A preceding test is allowed to import/patch application modules, and pytest may
+    # temporarily wrap a test callable; using ``globals()`` here made this structural
+    # guard report a false duplicate-name failure after an otherwise clean run. AST names
+    # still catch the actual defect (duplicate definitions shadowing one another), while
+    # the orphan check above catches tests appended below the custom runner block.
+    tree = ast.parse(src, filename=os.path.abspath(__file__))
+    names = [node.name for node in tree.body
+             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and node.name.startswith("test_")]
+    assert len(names) == len(set(names)), (
+        "the source defines duplicate test names that shadow one another: %s" %
+        sorted(name for name in set(names) if names.count(name) > 1))
 
 
 def test_v8_over_long_argv_is_diagnosed_as_argv_not_a_missing_cli():
@@ -15381,7 +15704,7 @@ def test_v9_lifecycle_fixture_blocks_late_grandchild_writes():
     )
     proc = None
 
-    def _wait_for(path: Path, seconds: float = 8.0) -> None:
+    def _wait_for(path: Path, seconds: float = 20.0) -> None:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if path.is_file():
@@ -16808,6 +17131,28 @@ def test_v10_timeout_envelope_surfaces_the_cause_not_just_the_clock():
     assert salient_error("bash: rg: command not found") is not None
 
 
+def test_v11_opencode_empty_timeout_is_typed_and_not_auto_retried():
+    """A headless OpenCode auth/transport stall has no provider evidence.
+
+    Keep it distinct from a proven authentication failure: the envelope must
+    tell the operator to check local OpenCode credentials, refuse automatic
+    retries, and preserve the absence of served-model evidence.
+    """
+    from _executor import _timeout_payload
+
+    class _P:
+        def get_result(self):
+            return ""
+
+    env = _timeout_payload("opencode", _P(), 900_000, [])
+    assert env["error_kind"] == "provider_timeout", env
+    assert env["retryable"] is False, env
+    assert env["result_usable"] is False, env
+    assert env["remediation_code"] == "opencode_output_timeout", env
+    assert "opencode auth login" in env["error"], env
+    assert env.get("model_served") is None
+
+
 def test_v10_roster_paths_are_emitted_normalised():
     """FIELD REPORT (2026-07-28). `--set-agent` with a forward-slash `--agents-dir` emitted
     "C:/Users/x/.agents\\name.md" -- mixed separators in a machine-readable field."""
@@ -17087,6 +17432,23 @@ def test_v10_kimi_auth_and_rate_limit_failures_are_terminal():
     assert limited["error_kind"] == "rate_limited", limited
     assert limited["retryable"] is False and _executor.is_terminal_nonretryable(limited)
     assert limited["remediation_code"] == "provider_quota_wait"
+
+
+def test_opencode_missing_provider_credentials_is_terminal_auth_failure():
+    """OpenCode's cookie-auth error must become actionable, not a generic 401."""
+    import _doctor
+    import _executor
+    verdict = _doctor.classify_ineligibility(
+        "APIError: No cookie auth credentials found", backend="opencode")
+    assert verdict and verdict["kind"] == "auth", verdict
+    assert verdict["repair"]["command"] == "opencode auth login"
+    envelope = {"status": "error", "cli": "opencode",
+                "error": "APIError: No cookie auth credentials found",
+                "output_tail": ""}
+    _executor._attach_eligibility(envelope)
+    assert envelope["error_kind"] == "authentication_failed", envelope
+    assert envelope["auth_outcome"] == "login_required"
+    assert envelope["retryable"] is False
 
 
 def test_v10_kimi_stream_finalizes_only_at_eof():

@@ -531,6 +531,10 @@ def _job_identity(job: dict, args) -> dict:
         effort=job.get("effort"), json_schema=job.get("json_schema"),
         artifacts=job.get("artifacts"), require_tools=_require_tools,
         profile=job.get("profile"),
+        worktree=job.get("worktree", getattr(args, "worktree", None)),
+        isolated_lane=bool(job.get("isolated_lane", getattr(args, "isolated_lane", False))),
+        allow_tool_credentials=bool(job.get(
+            "allow_tool_credentials", getattr(args, "allow_tool_credentials", False))),
         strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)),
         role_provenance=_role_provenance)
 
@@ -543,6 +547,10 @@ def _child_cmd(job: dict, args, out_file: str) -> list:
            "--out", out_file]
     if args.agents_dir:
         cmd += ["--agents-dir", args.agents_dir]
+    if getattr(args, "isolated_lane", False):
+        cmd += ["--isolated-lane"]
+    if getattr(args, "allow_tool_credentials", False):
+        cmd += ["--allow-tool-credentials"]
     if getattr(args, "strict_agents_dir", False):
         cmd += ["--strict-agents-dir"]
     if getattr(args, "enable_roles", False):

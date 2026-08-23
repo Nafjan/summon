@@ -49,6 +49,7 @@ BUILTIN_PROVIDERS = {
     "groq":       {"base_url": "https://api.groq.com/openai/v1", "api_key_env": "GROQ_API_KEY"},
     "together":   {"base_url": "https://api.together.xyz/v1", "api_key_env": "TOGETHER_API_KEY"},
     "deepseek":   {"base_url": "https://api.deepseek.com/v1", "api_key_env": "DEEPSEEK_API_KEY"},
+    "nous":       {"base_url": "https://inference-api.nousresearch.com/v1", "api_key_env": "NOUS_API_KEY"},
     "ollama":     {"base_url": "http://localhost:11434/v1", "api_key_env": ""},   # local, no key
     "lmstudio":   {"base_url": "http://localhost:1234/v1", "api_key_env": ""},    # local, no key
     # BytePlus ModelArk Coding Plan (subscription quota, not per-token API credits).
@@ -514,6 +515,13 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
             api_key, _key_source = resolve_openrouter_api_key()
         except Exception:  # noqa: BLE001 — local store is best-effort
             api_key, _key_source = None, None
+    if (not api_key and inv.api_key_env == "NOUS_API_KEY"
+            and _is_nous_endpoint(inv.base_url)):
+        try:
+            from _nous_credentials import resolve_nous_api_key
+            api_key, _key_source = resolve_nous_api_key()
+        except Exception:  # noqa: BLE001 — local profile is best-effort
+            api_key, _key_source = None, None
     if inv.api_key_env == "BYTEPLUS_CODING_API_KEY" and not api_key:
         try:
             from _arkcli_creds import resolve_byteplus_coding_api_key
@@ -535,6 +543,19 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
     else:
         resp = _do_request(inv.base_url, inv.model, inv.system_context, inv.prompt,
                            api_key, timeout_ms, cli, launch_control=launch_control)
+    if (_key_source == "hermes_profile" and resp.get("status") != "success"
+            and _nous_auth_rejection(resp.get("error"))):
+        # A raw NOUS_API_KEY in an older Hermes profile is not interchangeable
+        # with the short-lived Portal JWT used by current Hermes releases. Keep
+        # the provider error truthful, but make the recovery path explicit and
+        # prevent an orchestrator from interpreting this as a transient retry.
+        resp.setdefault("warnings", []).append(
+            "Nous rejected the credential read from the local Hermes profile; "
+            "check `hermes auth status nous` and authenticate with `hermes auth add nous`. "
+            "Summon did not retry or switch providers.")
+        resp["error_kind"] = "authentication_failed"
+        resp["retryable"] = False
+        resp["remediation_code"] = "nous_portal_auth_required"
     if _key_source == "arkcli_profile" and resp.get("status") == "success":
         resp.setdefault("warnings", []).append(
             "BYTEPLUS_CODING_API_KEY was unset; used the local arkcli profile "
@@ -543,6 +564,14 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
         resp.setdefault("warnings", []).append(
             "OPENROUTER_API_KEY was unset; used the local Windows credential "
             "store for this dispatch (env still wins when set)")
+    if _key_source == "hermes_env" and resp.get("status") == "success":
+        resp.setdefault("warnings", []).append(
+            "OPENROUTER_API_KEY was unset; used the local Hermes env profile "
+            "for this dispatch (env still wins when set)")
+    if _key_source == "hermes_profile" and resp.get("status") == "success":
+        resp.setdefault("warnings", []).append(
+            "NOUS_API_KEY was unset; used the local Hermes Nous profile "
+            "for this dispatch (env still wins when set)")
 
     # --- PAYG consent-gated fallback ---
     if (resp["status"] == "error"
@@ -617,7 +646,16 @@ def _do_request(base_url: str, model: str, system_context: str | None,
         ],
         "stream": False,
     }).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    # Some provider edges (including the Nous inference edge) reject Python's
+    # default ``urllib`` fingerprint with a generic 403/1010 response even when
+    # the bearer is valid. Send an ordinary API client identity and an explicit
+    # JSON accept header; this is transport metadata only and never contains a
+    # credential or user data.
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "summon-openai-compatible/1",
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(base_url + "/chat/completions", data=body,
@@ -705,6 +743,31 @@ def _is_openrouter_endpoint(base_url: str | None) -> bool:
         return False
 
 
+def _is_nous_endpoint(base_url: str | None) -> bool:
+    """Return True only for the configured Nous inference origin."""
+    if not isinstance(base_url, str) or not base_url:
+        return False
+    from urllib.parse import urlsplit
+    try:
+        return (urlsplit(base_url).hostname or "").lower() in {
+            "inference-api.nousresearch.com",
+            "www.inference-api.nousresearch.com",
+        }
+    except ValueError:
+        return False
+
+
+def _nous_auth_rejection(error: object) -> bool:
+    """Recognize provider-auth failures without exposing response bodies."""
+    if not isinstance(error, str):
+        return False
+    lowered = error.lower()
+    return any(marker in lowered for marker in (
+        "http 401", "http 403", "no cookie auth", "unauthorized",
+        "forbidden", "invalid token", "logged out",
+    ))
+
+
 def api_key_available(api_key_env: str | None, base_url: str | None) -> bool:
     """Return whether dispatch can resolve an API credential without exposing it."""
     if not api_key_env:
@@ -715,6 +778,13 @@ def api_key_available(api_key_env: str | None, base_url: str | None) -> bool:
         try:
             from _windows_credentials import resolve_openrouter_api_key
             key, _source = resolve_openrouter_api_key()
+            return bool(key)
+        except Exception:  # noqa: BLE001 — dry-run must remain diagnostic-only
+            return False
+    if api_key_env == "NOUS_API_KEY" and _is_nous_endpoint(base_url):
+        try:
+            from _nous_credentials import resolve_nous_api_key
+            key, _source = resolve_nous_api_key()
             return bool(key)
         except Exception:  # noqa: BLE001 — dry-run must remain diagnostic-only
             return False

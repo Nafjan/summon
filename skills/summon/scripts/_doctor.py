@@ -26,6 +26,15 @@ from pathlib import Path
 _VERSION_TIMEOUT = 45
 _PROBE_TIMEOUT = 25   # opt-in eligibility probe: a minimal real call, short leash
 
+# Doctor cannot validate request-specific roots because it receives no dispatch
+# agent, permission tier, or --read-root list. It can still expose the stable
+# capability boundary and the required provider-inert preflight.
+_READ_ROOT_CAPABILITIES = {
+    "enforced_backends": ["claude", "gemini"],
+    "required_permission": "read-only",
+    "preflight": "dispatch --dry-run with the actual --read-root arguments",
+}
+
 # Known "the binary runs but a real dispatch fails" signatures. A --version probe
 # passes for ALL of these. Each row: (signature, backend-or-None, kind, guidance).
 #   kind "eligibility": authenticated, but the ACCOUNT/CLIENT tier can't dispatch.
@@ -56,6 +65,9 @@ _BACKEND_ISSUE_SIGNS = (
     ("invalid credentials", None, "auth", "refresh the backend login before retrying"),
     ("invalid api key", None, "auth", "check the backend login or API-key configuration"),
     ("api key not valid", None, "auth", "check the backend login or API-key configuration"),
+    ("api key is not set", None, "auth", "set the backend API-key environment variable or complete its provider login"),
+    ("no cookie auth credentials found", "opencode", "auth",
+     "authenticate OpenCode for the selected provider (for OpenRouter, run `opencode auth login` or configure the local OpenRouter credential)"),
     ("401 unauthorized", None, "auth", "refresh the backend login before retrying"),
     ("http 401", None, "auth", "refresh the backend login before retrying"),
     ("status code 401", None, "auth", "refresh the backend login before retrying"),
@@ -165,7 +177,9 @@ _AUTH_REPAIR_PLANS = {
             "interaction": "browser_or_terminal", "supports_autonomous": True},
     "opencode": {"command": "opencode auth login", "argv": ["opencode", "auth", "login"],
                   "interaction": "terminal", "supports_autonomous": False,
-                  "note": "OpenCode auth login may require selecting a provider and entering a key."},
+                  "note": ("OpenCode auth login may require selecting a provider and entering "
+                           "a key; it does not automatically consume Summon's Windows "
+                           "Credential Manager entry.")},
     "arkcli": {"command": "arkcli auth login", "argv": ["arkcli", "auth", "login"],
                "interaction": "browser", "supports_autonomous": True},
 }
@@ -485,6 +499,22 @@ def _check_onboard_prefs() -> dict:
     return {"present": True, "subscriptions": subs}
 
 
+def _opencode_cwd_policy(cwd: str | None) -> dict:
+    """Surface OpenCode's restricted Windows cwd boundary without a provider call."""
+    if not cwd:
+        return {"checked": False}
+    try:
+        from _builder import read_allowlist
+        policy = read_allowlist("opencode", "safe-edit", cwd, ())
+    except Exception as exc:  # noqa: BLE001 - doctor remains advisory and bounded
+        return {"checked": False, "note": f"{type(exc).__name__}: policy unavailable"}
+    out = {"checked": True, "allowed": not bool(policy.get("would_refuse"))}
+    for key in ("error_kind", "allowed_root", "requires_packet_refreeze", "reroute"):
+        if policy.get(key) is not None:
+            out[key] = policy[key]
+    return out
+
+
 def doctor(agents_dir: str | None = None, cwd: str | None = None,
            probe: bool = False, probe_runner=None) -> dict:
     backends = _check_backends()
@@ -505,6 +535,8 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None,
         },
         "byteplus_coding": _check_byteplus_coding(),
         "onboard_prefs": _check_onboard_prefs(),
+        "read_root_capabilities": dict(_READ_ROOT_CAPABILITIES),
+        "opencode_cwd_policy": _opencode_cwd_policy(cwd),
     }
     try:
         from _t3 import t3_status
@@ -617,6 +649,15 @@ def render(report: dict) -> str:
         f"agents   : {'[OK]' if ad['found'] else '[--]'} {ad.get('path')}  "
         f"({ad.get('agent_count', 0)} agent definitions)",
     ]
+    rr = report.get("read_root_capabilities") or {}
+    if rr:
+        lines.append("read roots: only %s enforce extra roots at read-only; %s"
+                     % ("/".join(rr.get("enforced_backends") or []),
+                        rr.get("preflight", "run a dispatch dry-run first")))
+    oc = report.get("opencode_cwd_policy") or {}
+    if oc.get("checked") and not oc.get("allowed"):
+        lines.append("opencode  : [!!] restricted policy denies this cwd; stage a sanitized "
+                     "packet on the recommended local root, re-freeze it, then dry-run")
     bg = report["billing_guard"]
     if bg["openai_api_key_present"]:
         lines.append("billing  : OPENAI_API_KEY is set - "

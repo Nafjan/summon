@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import os
 import re
 from pathlib import Path
@@ -45,7 +46,7 @@ def last_parsed_sha(agent_file: str) -> str | None:
 # ignored, so an agent file can carry its own metadata.
 KNOWN_FRONTMATTER_KEYS = ("run-agent", "permission", "model", "args", "effort",
                           "provider", "base_url", "api_key_env", "capability", "billing",
-                          "profile", "openrouter_options")
+                          "profile", "openrouter_options", "read-roots")
 
 
 def parse_frontmatter(content: str) -> tuple[dict, str]:
@@ -106,6 +107,48 @@ def _unquote(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
         return value[1:-1]
     return value
+
+
+def parse_read_roots(value) -> tuple[str, ...]:
+    """Parse the bounded ``read-roots`` frontmatter value.
+
+    Frontmatter is intentionally flat.  A JSON array is the unambiguous form for
+    Windows paths (for example ``["I:\\\\oracle", "I:\\\\board"]``); a
+    semicolon-separated string is accepted for hand-written definitions.  This
+    function only parses and bounds the list; path existence and backend support
+    are checked by the dispatcher before a child is launched.
+    """
+    if value is None or value == "":
+        return ()
+    if isinstance(value, (list, tuple)):
+        raw = list(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        if text.startswith("["):
+            try:
+                raw = json.loads(text)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "read-roots must be a JSON array or semicolon-separated paths") from exc
+        elif text.startswith("{"):
+            # Do not reinterpret a JSON object as one literal Windows path.  That
+            # typo would otherwise pass parsing and fail much later as a confusing
+            # missing-directory error.
+            raise ValueError("read-roots must be a JSON array or semicolon-separated paths")
+        else:
+            raw = [part.strip() for part in text.split(";") if part.strip()]
+    else:
+        raise ValueError("read-roots must be a JSON array or semicolon-separated paths")
+    if not isinstance(raw, list) or len(raw) > 16:
+        raise ValueError("read-roots must contain at most 16 paths")
+    out = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("read-roots entries must be non-empty strings")
+        out.append(item.strip())
+    return tuple(out)
 
 
 def extract_description(body: str) -> str:

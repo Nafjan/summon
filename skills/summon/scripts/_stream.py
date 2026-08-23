@@ -30,7 +30,8 @@ class StreamProcessor:
     Recognized formats:
     - Claude / Cursor: a single ``{"type": "result", "result": ...}`` line
     - Gemini stream: ``init`` then assistant ``message`` lines, ending with ``result``
-    - Codex stream: ``thread.started`` then ``item.completed`` lines, ending with ``turn.completed``
+    - Codex stream: ``thread.started`` then ``item.completed`` lines, ending with
+      ``turn.completed`` or ``turn.failed``
     """
 
     def __init__(self):
@@ -47,6 +48,16 @@ class StreamProcessor:
         # for an incomplete stream.
         self.is_opencode = False
         self.opencode_parts = []
+        self.opencode_event_count = 0
+        self.opencode_step_finish_seen = False
+        # OpenCode can serialize an otherwise terminal-looking step with an
+        # ``unknown`` finish reason and all-zero usage when its provider/model
+        # produced no usable completion. Keep this diagnostic separate from
+        # ordinary completion evidence; ``step_finish`` alone is not proof that
+        # a response was generated.
+        self.opencode_finish_reason = None
+        self.opencode_zero_output_finish = False
+        self.opencode_zero_token_finish = False
         # Telemetry captured from stream events (None when the CLI doesn't emit it):
         self.session_id = None  # claude session_id / codex thread_id / cursor chat id
         self.usage = None       # token usage dict
@@ -124,6 +135,40 @@ class StreamProcessor:
                 self.codex_messages.append(item["text"])
             return False
 
+        # Codex emits ``turn.failed`` for provider/runtime failures. It is a
+        # terminal event, not an ordinary progress record. Older Summon
+        # versions ignored it, waited for EOF, and then reported only the raw
+        # non-zero exit with no structured terminal result. Preserve bounded
+        # provider detail as an error result so the executor can attach its
+        # normal diagnostics while keeping model service evidence absent.
+        if data.get("type") == "turn.failed":
+            self.is_codex = True
+            self.is_error = True
+            detail = data.get("error")
+            if isinstance(detail, dict):
+                for key in ("message", "detail", "reason", "code"):
+                    value = detail.get(key)
+                    if isinstance(value, str) and value.strip():
+                        detail = value
+                        break
+                else:
+                    detail = None
+            if not isinstance(detail, str) or not detail.strip():
+                for key in ("message", "detail", "reason"):
+                    value = data.get(key)
+                    if isinstance(value, str) and value.strip():
+                        detail = value
+                        break
+            if not isinstance(detail, str) or not detail.strip():
+                detail = "Codex reported that the turn failed"
+            self.result_json = {
+                "type": "result",
+                "result": "",
+                "status": "error",
+                "error": detail[:2000],
+            }
+            return True
+
         # Kimi Code's stream-json protocol is JSONL messages rather than
         # terminal events.  ANY role-bearing record (system/user/tool/meta/
         # assistant) is conversational, never a terminal result -- including a
@@ -153,6 +198,10 @@ class StreamProcessor:
         } and (data.get("sessionID") or data.get("session_id")
                or data.get("part") is not None):
             self.is_opencode = True
+            self.opencode_event_count += 1
+            if data.get("type") == "step_finish":
+                self.opencode_step_finish_seen = True
+                self._capture_opencode_finish(data)
             self._capture_opencode_metadata(data)
             if data.get("type") == "text":
                 part = data.get("part")
@@ -171,6 +220,32 @@ class StreamProcessor:
                 "error": str(detail)[:2000],
             }
             return True
+
+        # A few OpenCode builds have emitted the event envelope without the
+        # top-level ``type`` while retaining the session/part shape.  Do not
+        # send that progress packet through the legacy cursor fallback below:
+        # doing so turns the first text/tool update into a terminal result and
+        # makes the child look as if it completed after one sentence.  The
+        # explicit part-type allowlist keeps cursor's typeless ``result``
+        # objects terminal and avoids treating arbitrary JSON as OpenCode.
+        if ("type" not in data and "event" not in data
+                and (data.get("sessionID") or data.get("session_id"))
+                and isinstance(data.get("part"), dict)
+                and data["part"].get("type") in {
+                    "text", "reasoning", "tool", "step-start", "step-finish",
+                    "snapshot", "patch", "file", "subtask", "agent", "retry",
+                    "compaction",
+                }):
+            self.is_opencode = True
+            self.opencode_event_count += 1
+            part = data["part"]
+            if part.get("type") == "step-finish":
+                self.opencode_step_finish_seen = True
+                self._capture_opencode_finish(data, part)
+            self._capture_opencode_metadata(data)
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                self.opencode_parts.append(part["text"])
+            return False
 
         # Codex: turn.completed signals end (and carries token usage)
         if self.is_codex and data.get("type") == "turn.completed":
@@ -298,14 +373,34 @@ class StreamProcessor:
         part = data.get("part")
         if isinstance(part, dict):
             containers.append(part)
-        for container in containers:
-            for key in ("model", "modelID", "model_id", "served_model", "servedModel"):
-                value = container.get(key)
-                if isinstance(value, str) and value.strip():
-                    self.model = value.strip()
+        part_type = part.get("type") if isinstance(part, dict) else None
+        # OpenCode's step_start carries ``modelID`` for the session/model
+        # selection, not a provider-authored terminal served-model receipt.
+        # Keep it as the handshake target so a zero-output finish cannot be
+        # reported as served merely because the session announced its model.
+        is_handshake = (data.get("type") in {"step_start", "session_created"}
+                        or part_type == "step-start")
+        if is_handshake:
+            for container in containers:
+                for key in ("model", "modelID", "model_id"):
+                    value = container.get(key)
+                    if isinstance(value, str) and value.strip():
+                        self.handshake_model = value.strip()
+                        break
+                if self.handshake_model:
                     break
-            if self.model:
-                break
+        else:
+            for container in containers:
+                # Only explicit terminal/provider model fields count as served
+                # evidence. modelID in an ordinary progress packet remains a
+                # target-style hint and is never promoted on its own.
+                for key in ("model", "served_model", "servedModel"):
+                    value = container.get(key)
+                    if isinstance(value, str) and value.strip():
+                        self.model = value.strip()
+                        break
+                if self.model:
+                    break
         for container in containers:
             tokens = container.get("tokens")
             if isinstance(tokens, dict):
@@ -329,6 +424,43 @@ class StreamProcessor:
             if isinstance(cost, (int, float)) and not isinstance(cost, bool):
                 self.cost_usd = cost
                 break
+
+    def _capture_opencode_finish(self, data: dict, part: dict | None = None) -> None:
+        """Capture safe diagnostics from an OpenCode ``step_finish`` event.
+
+        OpenCode's JSON stream carries the finish reason and usage under the
+        ``part`` object. The values are provider-controlled, so keep only a
+        short reason and boolean zero-output indicators; never copy arbitrary
+        provider payloads into a receipt.
+        """
+        finish = part if isinstance(part, dict) else data.get("part")
+        if not isinstance(finish, dict):
+            finish = data if isinstance(data, dict) else {}
+        reason = finish.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            self.opencode_finish_reason = reason.strip()[:80]
+        self.opencode_zero_output_finish = False
+        self.opencode_zero_token_finish = False
+        tokens = finish.get("tokens")
+        if not isinstance(tokens, dict):
+            return
+
+        def _number(name: str) -> float | None:
+            value = tokens.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+            return None
+
+        output = _number("output")
+        total = _number("total")
+        input_tokens = _number("input")
+        reasoning = _number("reasoning")
+        if output is not None:
+            self.opencode_zero_output_finish = output <= 0
+        if (output is not None and total is not None
+                and input_tokens is not None and reasoning is not None):
+            self.opencode_zero_token_finish = all(
+                value <= 0 for value in (output, total, input_tokens, reasoning))
 
     def get_result(self):
         return self.result_json

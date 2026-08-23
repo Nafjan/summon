@@ -741,6 +741,11 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "argv, so backend argv limits (e.g. agy ~28k chars) apply")
     parser.add_argument("--cwd", help="Working directory (absolute path)")
     parser.add_argument("--agents-dir", help="Directory containing agent definitions")
+    parser.add_argument("--read-root", dest="read_root", action="append", default=None,
+                        metavar="DIR",
+                        help="Additional absolute directory allowed to a read-only Claude "
+                             "or Gemini turn (repeatable; also supports frontmatter "
+                             "read-roots; never broadens other backends)")
     parser.add_argument("--strict-agents-dir", dest="strict_agents_dir", action="store_true",
                         help="Fail closed when an agent is absent from the selected roster; "
                              "do not fall back to bundled or plugin definitions")
@@ -769,6 +774,15 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "ACP routing) when the subprocess transport fails")
     parser.add_argument("--worktree", nargs="?", const="", default=None,
                         help="Run in an isolated git worktree (optional name; auto-named if bare)")
+    parser.add_argument("--isolated-lane", dest="isolated_lane", action="store_true",
+                        help="Acknowledge that this broad-authority turn runs in a disposable "
+                             "copy or separate OS boundary; required for OpenCode yolo "
+                             "without --worktree")
+    parser.add_argument("--allow-tool-credentials", dest="allow_tool_credentials",
+                        action="store_true",
+                        help="Explicitly allow a yolo OpenCode child to receive its provider "
+                             "credential; use only with --isolated-lane/--worktree and a "
+                             "separate account, clone, container, or VM")
     parser.add_argument("--background", action="store_true",
                         help="Dispatch detached; return a job handle immediately")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true",

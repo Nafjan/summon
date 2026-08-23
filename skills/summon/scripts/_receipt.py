@@ -54,11 +54,13 @@ def _read_regular_bounded(path, max_bytes):
 
 
 def scripts_sha256(scripts_dir, max_bytes=None) -> str:
-    """One SHA-256 over EVERY production module in ``scripts_dir`` (all ``*.py``
-    except test_discovery.py, which never executes at dispatch time). Length-prefixed
-    framing (``len(name)|name|len(data)|data``, names sorted) so (name, content)
-    boundaries are unambiguous and drift in ANY sibling (incl. agy_pty_pyte.py), not
-    just the entry file, is detectable.
+    """One SHA-256 over every dispatcher runtime asset in ``scripts_dir``.
+
+    This includes all ``*.py`` files except ``test_discovery.py`` and the Windows
+    ``summon.cmd`` launcher. The launcher is an execution entry point, so omitting
+    it would let a managed install appear converged while its Windows invocation
+    path was missing or stale. Length-prefixed framing
+    (``len(name)|name|len(data)|data``, names sorted) makes boundaries unambiguous.
 
     SINGLE source of truth for install identity: the dispatch receipt and the
     install-drift detector both hash the same way, so a hash difference is always a
@@ -74,7 +76,11 @@ def scripts_sha256(scripts_dir, max_bytes=None) -> str:
     detection still matches the receipt for any genuine copy."""
     here = Path(scripts_dir)
     h = hashlib.sha256()
-    for name in sorted(p.name for p in here.glob("*.py") if p.name != "test_discovery.py"):
+    names = {p.name for p in here.glob("*.py") if p.name != "test_discovery.py"}
+    # Always frame the launcher name, including on an older copy where it is
+    # absent, so missing-versus-present is provenance-visible.
+    names.add("summon.cmd")
+    for name in sorted(names):
         target = here / name
         try:
             if max_bytes is None:

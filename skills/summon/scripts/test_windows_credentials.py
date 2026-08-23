@@ -32,6 +32,16 @@ def test_api_key_available_checks_openrouter_store():
                 "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1") is True
 
 
+def test_openrouter_resolver_uses_explicit_hermes_env_fallback(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("OPENROUTER_API_KEY=unit-test-token\n", encoding="utf-8")
+    with patch.dict(os.environ, {"SUMMON_HERMES_ENV": str(env_file)}, clear=False), \
+         patch("_windows_credentials.read_credential", return_value=(None, None)):
+        key, source = _windows_credentials.resolve_openrouter_api_key()
+    assert key == "unit-test-token"
+    assert source == "hermes_env"
+
+
 def test_openrouter_dispatch_uses_store_without_leaking_secret():
     inv = SimpleNamespace(
         model="stealth/ox-alpha",
