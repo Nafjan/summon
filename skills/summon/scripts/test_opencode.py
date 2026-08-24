@@ -152,6 +152,48 @@ class OpenCodeBuilderTests(unittest.TestCase):
         self.assertEqual(out["result"], "fixture ok")
         self.assertEqual(out["served_model_evidence"], "inferred")
 
+    def test_bare_endorse_with_inferred_model_is_not_authoritative_review(self):
+        """A bare decision word must stay suspect when the report contract is absent.
+
+        This mirrors the observed Ox/OpenCode shape: the child emits a normal
+        step lifecycle and useful text (``ENDORSE``), but no STATUS/SUMMARY/
+        FOLLOW-UP/HANDOFF block and no provider-authored served-model receipt.
+        The result may be advisory, never a machine-verifiable endorsement.
+        """
+        invocation = self._inv(permission="safe-edit")
+        events = [
+            {"type": "step_start", "sessionID": "s",
+             "part": {"modelID": "openrouter/stealth/ox-alpha"}},
+            {"type": "text", "sessionID": "s",
+             "part": {"type": "text", "text": "ENDORSE"}},
+            {"type": "step_finish", "sessionID": "s",
+             "part": {"reason": "stop", "tokens": {
+                 "input": 3, "output": 2, "total": 5, "reasoning": 0},
+                 "cost": 0}},
+        ]
+        code = "import json; " + "; ".join(
+            f"print({json.dumps(json.dumps(event))})" for event in events)
+        with mock.patch.object(_executor, "_resolve_launch",
+                               return_value=(sys.executable,
+                                             ("-c", code))), \
+             mock.patch("_receipt.workspace_snapshot",
+                        return_value={"coverage": "none"}), \
+             mock.patch("_receipt.workspace_evidence", return_value={}):
+            out = _executor.execute_agent(invocation, timeout_ms=5000)
+        self.assertEqual(out["status"], "success")
+        self.assertEqual(out["execution_status"], "success")
+        self.assertEqual(out["result"], "ENDORSE")
+        self.assertIsNone(out["report"])
+        self.assertFalse(out["report_ok"])
+        self.assertTrue(out["suspect"])
+        self.assertIsNone(out["verdict"])
+        self.assertFalse(_executor.is_terminal_success(out))
+        self.assertEqual(out["opencode_stream"]["completion_evidence"],
+                         "step_finish")
+        self.assertEqual(out["served_model_evidence"], "inferred")
+        self.assertEqual(out["model"]["served"],
+                         "openrouter/stealth/ox-alpha")
+
     def test_restricted_windows_external_cwd_refuses_before_dispatch(self):
         with mock.patch.object(_builder.os, "name", "nt"), \
              mock.patch.object(_builder.tempfile, "gettempdir", return_value=r"C:\\Temp"):
@@ -302,6 +344,55 @@ class OpenCodeStreamTests(unittest.TestCase):
         self.assertEqual(p.session_id, "s")
         self.assertIsNone(p.model)
         self.assertEqual(p.handshake_model, "openrouter/stealth/ox-alpha")
+        self.assertEqual(p.usage["output_tokens"], 2)
+
+    def test_dotted_message_part_events_unwrap_properties_and_data(self):
+        """Parse the event envelope persisted by current OpenCode releases.
+
+        The real event stream uses ``message.part.updated.<revision>`` with
+        either a ``properties`` or ``data`` payload.  Its part type has also
+        appeared as both ``step-start`` and ``step_finish``.  ModelID comes
+        from the message metadata and remains a handshake target, never
+        served-model evidence.
+        """
+        lines = [
+            {"type": "message.updated.1", "data": {
+                "sessionID": "s-real-shape",
+                "info": {"role": "assistant", "modelID": "nous/stealth/ox-alpha"},
+            }},
+            {"type": "message.part.updated.1", "properties": {
+                "sessionID": "s-real-shape",
+                "part": {"id": "p1", "messageID": "m1",
+                         "sessionID": "s-real-shape", "type": "step-start"},
+            }},
+            {"type": "message.part.updated.1", "properties": {
+                "sessionID": "s-real-shape",
+                "part": {"id": "p2", "messageID": "m1",
+                         "sessionID": "s-real-shape", "type": "text",
+                         "text": "OK"},
+            }},
+            {"type": "message.part.updated.1", "data": {
+                "sessionID": "s-real-shape",
+                "part": {"id": "p3", "messageID": "m1",
+                         "sessionID": "s-real-shape", "type": "step_finish",
+                         "reason": "stop", "tokens": {
+                             "input": 1, "output": 2, "total": 3,
+                             "reasoning": 0}, "cost": 0},
+            }},
+        ]
+        p = StreamProcessor()
+        for item in lines:
+            self.assertFalse(p.process_line(json.dumps(item)))
+        p.finalize_stream()
+        result = p.get_result()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["result"], "OK")
+        self.assertTrue(p.is_opencode)
+        self.assertEqual(p.opencode_event_count, 4)
+        self.assertTrue(p.opencode_step_finish_seen)
+        self.assertEqual(p.opencode_finish_reason, "stop")
+        self.assertEqual(p.handshake_model, "nous/stealth/ox-alpha")
+        self.assertIsNone(p.model)
         self.assertEqual(p.usage["output_tokens"], 2)
 
     def test_error_event_is_terminal(self):

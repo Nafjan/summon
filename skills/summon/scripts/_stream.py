@@ -5,6 +5,103 @@ from __future__ import annotations
 import json
 
 
+_OPENCODE_DOTTED_EVENTS = {
+    "message.part.updated",
+    "message.updated",
+    "session.created",
+    "session.updated",
+}
+_OPENCODE_PART_TYPES = {
+    "text",
+    "reasoning",
+    "tool",
+    "tool_use",
+    "tool_result",
+    "step_start",
+    "step_finish",
+    "snapshot",
+    "patch",
+    "file",
+    "subtask",
+    "agent",
+    "retry",
+    "compaction",
+}
+
+
+def _opencode_part_type(value) -> str | None:
+    """Return the stable spelling used by the stream parser.
+
+    OpenCode has emitted both ``step_start``/``step_finish`` and
+    ``step-start``/``step-finish`` over its JSON event variants.  Keep the
+    normalization local to the parser; the provider's raw event is never
+    surfaced as public provenance.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip().lower().replace("-", "_")
+    return value if value in _OPENCODE_PART_TYPES else None
+
+
+def _unwrap_opencode_event(data: dict) -> dict:
+    """Normalize OpenCode's dotted event envelopes without making them terminal.
+
+    OpenCode 1.x has used both flattened events (``type: text``) and event
+    envelopes such as ``type: message.part.updated`` whose payload lives under
+    ``properties`` or ``data``.  The latter is also the shape persisted by the
+    local event store.  Only recognized OpenCode event names are unwrapped;
+    all other JSON remains untouched for the other backend parsers.
+    """
+    raw_type = data.get("type")
+    if not isinstance(raw_type, str):
+        return data
+    event_type = raw_type.strip().lower()
+    base_type = event_type
+    suffix = event_type.rsplit(".", 1)
+    if len(suffix) == 2 and suffix[1].isdigit():
+        base_type = suffix[0]
+    if base_type not in _OPENCODE_DOTTED_EVENTS:
+        # Flat events still get the same hyphen/underscore part handling.
+        part = data.get("part")
+        if isinstance(part, dict):
+            canonical = _opencode_part_type(part.get("type"))
+            if canonical and canonical != part.get("type"):
+                normalized = dict(data)
+                normalized["part"] = {**part, "type": canonical}
+                return normalized
+        return data
+
+    normalized = dict(data)
+    # Both OpenCode CLI releases and the persisted event API have used these
+    # payload keys.  Merge rather than replace so sessionID/time fields at the
+    # outer layer remain available to the metadata collector.
+    for key in ("data", "properties"):
+        payload = normalized.get(key)
+        if isinstance(payload, dict):
+            normalized.update(payload)
+    normalized.pop("data", None)
+    normalized.pop("properties", None)
+    normalized["_summon_opencode_event"] = base_type
+
+    if base_type == "message.part.updated":
+        part = normalized.get("part")
+        canonical = _opencode_part_type(part.get("type") if isinstance(part, dict) else None)
+        if isinstance(part, dict) and canonical:
+            normalized["part"] = {**part, "type": canonical}
+            normalized["type"] = canonical
+        else:
+            # Unknown progress parts must remain non-terminal and must not fall
+            # through to Cursor's typeless/result handling.
+            normalized["type"] = "opencode_part"
+    elif base_type == "message.updated":
+        normalized["type"] = "message_updated"
+    elif base_type == "session.created":
+        normalized["type"] = "session_created"
+    else:
+        normalized["type"] = "session_updated"
+    return normalized
+
+
 def _terminal_is_error(data) -> bool:
     """True when a terminal result object reports failure. Claude sets
     ``is_error: true`` and an ``error_*`` subtype on API/turn failures; some
@@ -87,6 +184,12 @@ class StreamProcessor:
         # are not stream events — ignore them rather than crashing on .get().
         if not isinstance(data, dict):
             return False
+
+        # OpenCode 1.x has two JSONL dialects in the wild.  Normalize the
+        # dotted event envelope before any backend-specific terminal checks so
+        # ``message.part.updated`` cannot be mistaken for a generic result (or
+        # silently ignored as an unknown event).
+        data = _unwrap_opencode_event(data)
 
         # Claude stream-json init: {"type":"system","subtype":"init","session_id":...}
         # (distinct from gemini's bare {"type":"init"}). Capture the session id so
@@ -195,8 +298,10 @@ class StreamProcessor:
         if data.get("type") in {
             "step_start", "text", "reasoning", "tool_use", "tool_result",
             "step_finish", "session_created", "message_updated",
+            "session_updated", "opencode_part",
         } and (data.get("sessionID") or data.get("session_id")
-               or data.get("part") is not None):
+               or data.get("part") is not None
+               or data.get("_summon_opencode_event")):
             self.is_opencode = True
             self.opencode_event_count += 1
             if data.get("type") == "step_finish":
@@ -373,13 +478,21 @@ class StreamProcessor:
         part = data.get("part")
         if isinstance(part, dict):
             containers.append(part)
+        info = data.get("info")
+        if isinstance(info, dict):
+            containers.append(info)
         part_type = part.get("type") if isinstance(part, dict) else None
         # OpenCode's step_start carries ``modelID`` for the session/model
         # selection, not a provider-authored terminal served-model receipt.
         # Keep it as the handshake target so a zero-output finish cannot be
         # reported as served merely because the session announced its model.
-        is_handshake = (data.get("type") in {"step_start", "session_created"}
-                        or part_type == "step-start")
+        is_handshake = (
+            data.get("type") in {"step_start", "step-start", "session_created"}
+            or part_type == "step-start"
+            or data.get("_summon_opencode_event") in {
+                "message.updated", "session.created"
+            }
+        )
         if is_handshake:
             for container in containers:
                 for key in ("model", "modelID", "model_id"):
