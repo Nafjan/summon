@@ -558,22 +558,36 @@ class StreamProcessor:
         if not isinstance(tokens, dict):
             return
 
-        def _number(name: str) -> float | None:
-            value = tokens.get(name)
+        def _number_from(container: dict, name: str) -> float | None:
+            value = container.get(name)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 return float(value)
             return None
+
+        def _number(name: str) -> float | None:
+            return _number_from(tokens, name)
 
         output = _number("output")
         total = _number("total")
         input_tokens = _number("input")
         reasoning = _number("reasoning")
+        cache = tokens.get("cache")
+        cache_read = cache_write = None
+        if isinstance(cache, dict):
+            cache_read = _number_from(cache, "read")
+            cache_write = _number_from(cache, "write")
         if output is not None:
             self.opencode_zero_output_finish = output <= 0
-        if (output is not None and total is not None
-                and input_tokens is not None and reasoning is not None):
-            self.opencode_zero_token_finish = all(
-                value <= 0 for value in (output, total, input_tokens, reasoning))
+        # OpenCode does not consistently emit ``total`` (the observed shape
+        # contains input/output/reasoning plus cache counters only).  A missing
+        # aggregate must not turn an otherwise unambiguous all-zero finish into
+        # a false negative.  Require output plus at least one complete token
+        # counter and consider every numeric counter that the provider supplied.
+        available = [value for value in (
+            output, total, input_tokens, reasoning, cache_read, cache_write)
+            if value is not None]
+        if output is not None and len(available) >= 2:
+            self.opencode_zero_token_finish = all(value <= 0 for value in available)
 
     def get_result(self):
         return self.result_json

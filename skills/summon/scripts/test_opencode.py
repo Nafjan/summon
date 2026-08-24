@@ -152,6 +152,31 @@ class OpenCodeBuilderTests(unittest.TestCase):
         self.assertEqual(out["result"], "fixture ok")
         self.assertEqual(out["served_model_evidence"], "inferred")
 
+    def test_zero_token_finish_without_total_is_reported_truthfully(self):
+        """OpenCode's zero-token shape may omit the aggregate ``total`` field."""
+        invocation = self._inv(permission="read-only")
+        events = [
+            {"type": "step_start", "sessionID": "s"},
+            {"type": "step_finish", "sessionID": "s", "part": {
+                "reason": "stop",
+                "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                            "cache": {"read": 0, "write": 0}},
+            }},
+        ]
+        code = "import json; " + "; ".join(
+            f"print({json.dumps(json.dumps(event))})" for event in events)
+        with mock.patch.object(_executor, "_resolve_launch",
+                               return_value=(sys.executable,
+                                             ("-c", code))), \
+             mock.patch("_receipt.workspace_snapshot",
+                        return_value={"coverage": "none"}), \
+             mock.patch("_receipt.workspace_evidence", return_value={}):
+            out = _executor.execute_agent(invocation, timeout_ms=5000)
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["error_kind"], "empty_terminal_result")
+        self.assertTrue(out["opencode_stream"]["zero_output_finish"])
+        self.assertTrue(out["opencode_stream"]["zero_token_finish"])
+
     def test_bare_endorse_with_inferred_model_is_not_authoritative_review(self):
         """A bare decision word must stay suspect when the report contract is absent.
 
