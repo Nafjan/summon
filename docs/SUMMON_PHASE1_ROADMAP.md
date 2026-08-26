@@ -152,6 +152,15 @@ finishes, partial Kimi output, OpenCode step events, background-child death, tim
 cancellation, and terminalization races. No watchdog silently retries or switches a
 provider.
 
+An explicit governed-continuation slice follows the watchdog foundation. It is not an
+automatic retry: one authenticated terminal job, one private provider-reported handle,
+one explicitly claimed steering generation, and one fresh physical attempt form an
+at-most-once chain. Initial activation is provider-specific and opt-in. It requires exact
+workspace and authority continuity, fresh gate/spend consent, and reported exact-model
+evidence; unsupported backends fail before contact. Detached subprocesses do not support
+acknowledged live steering, so `jobs steer` remains `queued_for_resume` until a backend
+exposes and proves a real bidirectional injection API.
+
 ## Workstream D: safe payload efficiency
 
 The compiler has two planes:
@@ -165,9 +174,10 @@ The safe profile may deduplicate byte-identical typed payload blocks, replace an
 artifact body with a content-addressed reference only when the target proves it can
 resolve and hash-check that reference, omit raw tool chatter only when a validated
 report and receipt fully represent it, and bound diagnostic tails while retaining
-typed errors. It never reuses provider sessions. Stateful session reuse and lossy
-semantic summarization are separate, opt-in future profiles and are prohibited for
-final adjudication.
+typed errors. The compiler itself never reuses provider sessions. Governed continuation
+is a separate, explicit operational-recovery path and never becomes an implicit context
+optimization. Lossy semantic summarization remains a future opt-in profile. Resumed
+sessions and lossy summaries are both prohibited for final adjudication.
 
 Dry-run emits a source-to-output mapping, target-resolvability proof, retained
 evidence, lineage digest, and estimated bytes/tokens. Optimization refuses before
@@ -239,6 +249,25 @@ a second coordinator.
   activity, finalization, cancellation, and terminal timeout.
 - Reuse captured Kimi and OpenCode fixtures and virtual time for deterministic tests.
 
+### M2.5 — Governed continuation and queued steering
+
+- Add a private authenticated continuation source bound to the terminal launch, exact
+  reported model, provider handle, effective authority, spend class, gate decision, and
+  actual workspace directory object. Public status exposes only an allowlisted capability
+  projection.
+- Add an atomic, idempotent claim ledger. One steering generation can create at most one
+  successor provider process; ambiguous post-launch failure is indeterminate and never
+  auto-retried.
+- Start with Claude subprocess only after provider-specific continuity evidence. Treat
+  Codex, Cursor, and OpenCode as unverified candidates until separately qualified. Keep
+  AGY, Gemini, Kimi, ACP, and stateless/API routes unsupported until they expose a stable,
+  attestable continuation handle.
+- Re-resolve the agent and current policy, preserve equal authority and read roots, require
+  fresh gate and spend consent, and prove the same workspace object before contact. A
+  successor gets a fresh attempt, frozen bundle, liveness cache, and terminal receipt.
+- Keep live steering false. `jobs steer` authenticates local queued intent; `jobs resume`
+  may claim it for a later turn but never says the running provider received it.
+
 ### M3 — Fleet lanes and orchestration policy
 
 - Implement `summon.fleet/v1` propose, validate, inspect, explain, approve, and
@@ -269,7 +298,9 @@ a second coordinator.
   references, and bounded diagnostic/tool chatter with a target-resolvable map.
 - Provide dry-run mapping, before/after byte and token counts, rollback, and a true
   off switch identical to the frozen legacy path.
-- Do not add provider-session reuse or lossy semantic summarization in Phase 1.
+- Do not let the context compiler initiate provider-session reuse, and do not add lossy
+  semantic summarization in Phase 1. Governed M2.5 continuation remains a separate,
+  explicit operational action and is invalid for final adjudication.
 
 ### M6 — Bounded context freshness
 

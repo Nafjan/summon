@@ -60,6 +60,92 @@ def legacy_heartbeat_auth(nonce: str, job_id: str) -> str:
                     hashlib.sha256).hexdigest()
 
 
+def public_heartbeat(value: dict, integrity: str) -> dict | None:
+    """Return a typed, allowlisted heartbeat projection.
+
+    Authentication proves which worker wrote a heartbeat; it does not make
+    arbitrary nested strings safe to publish. Unknown fields are omitted.
+    """
+    if not isinstance(value, dict) or value.get("schema") not in {
+            "summon.job-heartbeat/v1", "summon.job-heartbeat/v2"}:
+        return None
+    out = {"schema": value["schema"], "integrity": integrity}
+    for key in ("job_id", "attempt_id"):
+        item = value.get(key)
+        if isinstance(item, str) and _jobs.valid_job_id(item):
+            out[key] = item
+    for key in ("attempt_ordinal", "job_elapsed_ms", "auto_extensions", "extension_ms"):
+        item = value.get(key)
+        if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 2 ** 63 - 1:
+            out[key] = item
+    for key in ("job_started_at", "job_hard_deadline_at", "observed_at"):
+        item = value.get(key)
+        if (isinstance(item, (int, float)) and not isinstance(item, bool)
+                and math.isfinite(item) and item >= 0):
+            out[key] = item
+    for key in ("adaptive", "attention_required", "cancel_requested", "control_untrusted"):
+        if isinstance(value.get(key), bool):
+            out[key] = value[key]
+    for key, allowed in {
+        "attempt_kind": {"initial", "transient_retry", "acp_fallback",
+                         "schema_correction", "contract_repair"},
+        "state": {"running", "repairing", "complete", "error", "cancelled"},
+        "control_scope": {"current_attempt_replayed_from_job_origin"},
+    }.items():
+        if value.get(key) in allowed:
+            out[key] = value[key]
+    steering = value.get("steering")
+    if isinstance(steering, dict):
+        queued = steering.get("queued")
+        mode = steering.get("mode")
+        safe_steering = {}
+        if isinstance(queued, int) and not isinstance(queued, bool) and 0 <= queued <= MAX_COMMANDS:
+            safe_steering["queued"] = queued
+        if mode == "queued_for_resume":
+            safe_steering["mode"] = mode
+        if safe_steering:
+            out["steering"] = safe_steering
+    live = value.get("liveness")
+    if isinstance(live, dict):
+        safe_live = {}
+        if live.get("schema") == "summon.liveness/v1":
+            safe_live["schema"] = live["schema"]
+        phase = live.get("phase")
+        if phase in {"startup", "generation", "reconnect", "finalization",
+                     "terminal", "cancelled", "timed_out"}:
+            safe_live["phase"] = phase
+        for key in ("elapsed_ms", "first_trusted_event_ms", "last_meaningful_event_ms"):
+            item = live.get(key)
+            if item is None or (isinstance(item, int) and not isinstance(item, bool)
+                                and 0 <= item <= 2 ** 63 - 1):
+                safe_live[key] = item
+        expired = live.get("expired")
+        if expired is None or expired in {"startup_timeout", "overall_timeout",
+                                          "generation_idle_timeout", "finalization_timeout"}:
+            safe_live["expired"] = expired
+        trusted_kind = live.get("last_trusted_kind")
+        if trusted_kind is None or trusted_kind in {
+                "transport_started", "stream_event", "output_text", "tool_activity",
+                "reconnect", "finalizing", "terminal", "cancelled"}:
+            safe_live["last_trusted_kind"] = trusted_kind
+        activity_kind = live.get("last_activity_kind")
+        if activity_kind is None or activity_kind in {"tool", "generation"}:
+            safe_live["last_activity_kind"] = activity_kind
+        counts = live.get("counts")
+        if isinstance(counts, dict):
+            safe_counts = {}
+            for key in ("trusted", "meaningful", "ignored", "untrusted", "duplicates",
+                        "reordered", "reconnects", "tools"):
+                item = counts.get(key)
+                if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 2 ** 63 - 1:
+                    safe_counts[key] = item
+            if safe_counts:
+                safe_live["counts"] = safe_counts
+        if safe_live:
+            out["liveness"] = safe_live
+    return out
+
+
 def command_auth(nonce: str, job_id: str, command: dict) -> str:
     """Authenticate one append-only v2 control command."""
     return _auth(nonce, f"summon-job-control/v2:{job_id}", command)

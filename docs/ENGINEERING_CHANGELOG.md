@@ -13,6 +13,18 @@ never on added fields.
 
 ## Unreleased
 
+- **Authenticated continuation evidence and capability-safe job status:** completed
+  Claude subprocess jobs can seal a private HMAC-authenticated continuation source bound
+  to the exact launch, attempt, prompt, reported model, session route, approved role or
+  named profile, authority/spend decision, terminal receipt, scripts identity, and
+  workspace directory object. This checkpoint does not expose `jobs resume` and does not
+  claim live steering; other backends remain explicitly candidate or unsupported until
+  provider-specific continuity evidence exists. Concurrent writers are serialized,
+  duplicate/non-finite/oversized JSON fails closed, and public `jobs status` derives an
+  available capability only from the authenticated sidecar bound to the same result
+  snapshot. Status and heartbeat output now use typed allowlists that omit prompts,
+  reports, paths, provider handles, profile/account data, and unknown nested fields.
+
 - **Phase 0 lifecycle and Windows transport hardening:** each physical provider launch now
   carries an opaque `attempt_id`; retries and transport fallbacks get distinct identities while
   structural refusals remain `not_run` with no attempt ID. Detached launch records bind that ID

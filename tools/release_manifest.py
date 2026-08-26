@@ -82,7 +82,7 @@ REQUIRED_COMMANDS = {
     "model_catalog": "python -m unittest skills.summon.scripts.test_model_catalog",
     "model_routing": "python -m unittest skills.summon.scripts.test_model_routing",
     "telemetry_audit": "python -m unittest tests.test_telemetry_audit",
-    "phase0_phase1": "python -m pytest -q skills/summon/scripts/test_phase0_contracts.py skills/summon/scripts/test_install_drift.py skills/summon/scripts/test_kimi_timeout.py skills/summon/scripts/test_phase1_usage.py skills/summon/scripts/test_phase1_compatibility.py skills/summon/scripts/test_evidence_kernel.py skills/summon/scripts/test_job_control.py skills/summon/scripts/test_evidence_guards.py skills/summon/scripts/test_opencode.py skills/summon/scripts/test_background_read_roots.py",
+    "phase0_phase1": "python -m pytest -q skills/summon/scripts/test_phase0_contracts.py skills/summon/scripts/test_install_drift.py skills/summon/scripts/test_kimi_timeout.py skills/summon/scripts/test_phase1_usage.py skills/summon/scripts/test_phase1_compatibility.py skills/summon/scripts/test_evidence_kernel.py skills/summon/scripts/test_job_control.py skills/summon/scripts/test_job_continuation.py skills/summon/scripts/test_resume_capabilities.py skills/summon/scripts/test_evidence_guards.py skills/summon/scripts/test_opencode.py skills/summon/scripts/test_background_read_roots.py",
 }
 # Gate commands are part of the release contract too.  They are intentionally
 # fixed in source rather than accepted from the CLI, so a release evidence file

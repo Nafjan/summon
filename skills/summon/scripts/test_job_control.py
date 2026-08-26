@@ -17,6 +17,7 @@ import _executor
 import _background
 import _cli
 import _job_control
+import _job_continuation
 import _jobs
 from _liveness import LivenessTracker
 from _stream import StreamProcessor
@@ -344,6 +345,183 @@ def test_jobs_status_authenticates_heartbeat_and_redacts_nonce(tmp_path, capsys)
     assert status["heartbeat"]["integrity"] == "payload_authenticated"
 
 
+def test_jobs_status_projects_authenticated_heartbeat_by_typed_schema(tmp_path, capsys):
+    root, job_id = _prepared(tmp_path)
+    sentinel = "rsm_8xqp7v42"
+    heartbeat = {
+        "schema": "summon.job-heartbeat/v2", "job_id": job_id,
+        "attempt_id": job_id, "attempt_kind": "initial", "attempt_ordinal": 1,
+        "state": "running", "opaque": sentinel,
+        "liveness": {"schema": "summon.liveness/v1", "phase": "generation",
+                     "opaque": sentinel, "counts": {"trusted": 1, "opaque": sentinel}},
+        "steering": {"queued": 0, "mode": "queued_for_resume", "opaque": sentinel},
+    }
+    heartbeat["auth"] = _job_control.heartbeat_auth("nonce", heartbeat)
+    _jobs._atomic_write_json(_job_control.heartbeat_path(root, job_id), heartbeat)
+    args = SimpleNamespace(
+        job_dir=root, jobs_extend=None, jobs_cancel=None, jobs_steer=None,
+        jobs_list=False, jobs_status=job_id, jobs_wait=None, json=True)
+    assert _background.run_jobs_query(args, lambda *_args, **_kwargs: None) == 0
+    serialized = capsys.readouterr().out
+    assert sentinel not in serialized
+    status = json.loads(serialized)
+    assert status["heartbeat"]["liveness"]["phase"] == "generation"
+    assert status["heartbeat"]["liveness"]["counts"] == {"trusted": 1}
+    assert status["heartbeat"]["steering"] == {
+        "queued": 0, "mode": "queued_for_resume"}
+
+
+def test_jobs_status_allowlists_record_and_result_without_private_capabilities(
+        tmp_path, capsys):
+    root, job_id = _prepared(tmp_path)
+    record_path = _jobs.record_path(root, job_id)
+    record = _jobs.read_json(record_path)
+    record["flags"].update({
+        "cli": "claude", "model": "claude-opus-5", "cwd": "PRIVATE-CWD",
+        "agents_dir": "PRIVATE-ROSTER", "read_root": ["PRIVATE-READ-ROOT"],
+        "worktree": "PRIVATE-WORKTREE", "max_runtime": 120_000,
+    })
+    record["summon"]["script"] = "PRIVATE-SCRIPT"
+    _jobs._atomic_write_json(record_path, record)
+    _jobs._atomic_write_json(_jobs.result_path(root, job_id), {
+        "status": "success", "execution_status": "success", "job_nonce": "nonce",
+        "summon": {"version": "3.2.1", "scripts_sha256": "c" * 64,
+                   "script": "PRIVATE-RESULT-SCRIPT"},
+        "resume": {"session_id": "PRIVATE-SESSION", "profile": "PRIVATE-PROFILE"},
+        "result": "PRIVATE-REPORT-TEXT", "prompt": "PRIVATE-PROMPT",
+        "agent_def": {"file": "PRIVATE-AGENT-FILE", "agents_dir": "PRIVATE-ROSTER",
+                      "sha256": "d" * 64, "source": "explicit"},
+        "read_allowlist": {"enforced": True,
+                           "requested_paths": ["PRIVATE-READ-ROOT"],
+                           "effective_paths": ["PRIVATE-CWD"]},
+        "model": {"requested": "claude-opus-5", "targeted": "claude-opus-5",
+                  "served": "claude-opus-5"},
+        "served_model_evidence": "reported", "named_model_verified": True,
+        "billing": {"source": "subscription", "account": "PRIVATE-ACCOUNT"},
+    })
+    args = SimpleNamespace(
+        job_dir=root, jobs_extend=None, jobs_cancel=None, jobs_steer=None,
+        jobs_list=False, jobs_status=job_id, jobs_wait=None, json=True)
+    assert _background.run_jobs_query(args, lambda *_args, **_kwargs: None) == 0
+    status = json.loads(capsys.readouterr().out)
+    serialized = json.dumps(status, ensure_ascii=False)
+    for private in (
+            "PRIVATE-CWD", "PRIVATE-ROSTER", "PRIVATE-READ-ROOT",
+            "PRIVATE-WORKTREE", "PRIVATE-SCRIPT", "PRIVATE-RESULT-SCRIPT",
+            "PRIVATE-SESSION", "PRIVATE-PROFILE", "PRIVATE-REPORT-TEXT",
+            "PRIVATE-PROMPT", "PRIVATE-AGENT-FILE", "PRIVATE-ACCOUNT"):
+        assert private not in serialized
+    assert status["record"]["flags"] == {
+        "cli": "claude", "model": "claude-opus-5", "max_runtime": 120_000}
+    assert status["result"]["model"]["served"] == "claude-opus-5"
+    assert status["result"]["agent_def"] == {"sha256": "d" * 64}
+    assert status["result"]["read_allowlist"] == {
+        "enforced": True, "requested_count": 1, "effective_count": 1}
+
+
+def test_jobs_status_rejects_deep_attacker_controlled_public_values(tmp_path, capsys):
+    root, job_id = _prepared(tmp_path)
+    sentinel = "rsm_8xqp7v42"
+    record_path = _jobs.record_path(root, job_id)
+    record = _jobs.read_json(record_path)
+    record["flags"].update({"profile": sentinel, "model": "claude-opus-5",
+                            "cli": "claude"})
+    _jobs._atomic_write_json(record_path, record)
+    _jobs._atomic_write_json(_jobs.result_path(root, job_id), {
+        "status": "success", "execution_status": "success", "job_nonce": "nonce",
+        "summon": record["summon"],
+        "agent": sentinel,
+        "model": {"served": sentinel},
+        "billing": {"source": sentinel},
+        "agent_def": {"sha256": "d" * 64,
+                      "source": sentinel},
+        "read_allowlist": {"enforced": sentinel,
+                           "enforcement": sentinel},
+    })
+    args = SimpleNamespace(
+        job_dir=root, jobs_extend=None, jobs_cancel=None, jobs_steer=None,
+        jobs_list=False, jobs_status=job_id, jobs_wait=None, json=True)
+    assert _background.run_jobs_query(args, lambda *_args, **_kwargs: None) == 0
+    serialized = capsys.readouterr().out
+    assert sentinel not in serialized
+    status = json.loads(serialized)
+    assert "profile" not in status["record"].get("flags", {})
+    assert "model" not in status["result"]
+
+
+def test_jobs_status_preserves_certified_but_ineligible_continuation(tmp_path, capsys):
+    root, job_id = _prepared(tmp_path)
+    record = _jobs.read_json(_jobs.record_path(root, job_id))
+    _jobs._atomic_write_json(_jobs.result_path(root, job_id), {
+        "status": "success", "execution_status": "success", "job_nonce": "nonce",
+        "summon": record["summon"],
+        "continuation": {
+            "schema": "summon.job-continuation/v1", "available": False,
+            "resume_state": "certified",
+            "resume_reason": "reported_exact_model_required",
+            "backend": "claude", "transport": "subprocess",
+            "steering_mode": "queued_for_resume",
+            "live_steering_acknowledged": False,
+        },
+    })
+    args = SimpleNamespace(
+        job_dir=root, jobs_extend=None, jobs_cancel=None, jobs_steer=None,
+        jobs_list=False, jobs_status=job_id, jobs_wait=None, json=True)
+    assert _background.run_jobs_query(args, lambda *_args, **_kwargs: None) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["result"]["continuation"]["available"] is False
+    assert status["result"]["continuation"]["resume_state"] == "certified"
+
+
+@pytest.mark.parametrize("sidecar", [None, b"{}", b'{"job_id":"wrong"}'])
+def test_jobs_status_never_trusts_available_result_without_authenticated_sidecar(
+        tmp_path, capsys, sidecar):
+    root, job_id = _prepared(tmp_path)
+    record = _jobs.read_json(_jobs.record_path(root, job_id))
+    _jobs._atomic_write_json(_jobs.result_path(root, job_id), {
+        "status": "success", "execution_status": "success", "job_nonce": "nonce",
+        "summon": record["summon"],
+        "continuation": {
+            "schema": "summon.job-continuation/v1", "available": True,
+            "resume_state": "certified", "resume_reason": "private_source_authenticated",
+            "backend": "claude", "transport": "subprocess",
+            "steering_mode": "queued_for_resume",
+            "live_steering_acknowledged": False,
+        },
+    })
+    if sidecar is not None:
+        Path(_job_continuation.continuation_path(root, job_id)).write_bytes(sidecar)
+    args = SimpleNamespace(
+        job_dir=root, jobs_extend=None, jobs_cancel=None, jobs_steer=None,
+        jobs_list=False, jobs_status=job_id, jobs_wait=None, json=True)
+    assert _background.run_jobs_query(args, lambda *_args, **_kwargs: None) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert "continuation" not in status["result"]
+
+
+def test_jobs_status_binds_available_source_to_exact_projected_result_snapshot(
+        tmp_path, capsys, monkeypatch):
+    root, job_id = _prepared(tmp_path)
+    record = _jobs.read_json(_jobs.record_path(root, job_id))
+    _jobs._atomic_write_json(_jobs.result_path(root, job_id), {
+        "status": "success", "execution_status": "success", "job_nonce": "nonce",
+        "summon": record["summon"], "attempt_id": job_id,
+        "request_sha256": "d" * 64, "prompt_sha256": record["prompt_sha256"],
+    })
+    monkeypatch.setattr(
+        _job_continuation, "read_private_source",
+        lambda *_args: {
+            "result_binding_sha256": "f" * 64,
+            "backend": {"cli": "claude", "transport": "subprocess"},
+        })
+    args = SimpleNamespace(
+        job_dir=root, jobs_extend=None, jobs_cancel=None, jobs_steer=None,
+        jobs_list=False, jobs_status=job_id, jobs_wait=None, json=True)
+    assert _background.run_jobs_query(args, lambda *_args, **_kwargs: None) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert "continuation" not in status["result"]
+
+
 def test_heartbeat_contains_auth_tag_not_nonce_and_rejects_forgery(tmp_path, capsys):
     root, job_id = _prepared(tmp_path)
     clock = Clock()
@@ -540,7 +718,9 @@ def test_stream_processor_counts_claude_codex_gemini_and_kimi_tool_progress():
 
 
 def test_eof_finalization_timeout_still_reaps_child():
-    program = "import os,time; time.sleep(.4); os.close(1); time.sleep(2)"
+    program = ("import os,time; "
+               "print('{\"type\":\"thread.started\",\"thread_id\":\"fixture\"}', "
+               "flush=True); time.sleep(.1); os.close(1); time.sleep(2)")
     process = subprocess.Popen(
         [sys.executable, "-c", program], stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, encoding="utf-8")
@@ -558,7 +738,9 @@ def test_eof_finalization_keeps_its_grace_after_dispatch_budget(monkeypatch):
     # the EOF finalization deadline extend beyond that original budget. This
     # proves EOF starts a fresh grace period instead of inheriting the dispatch
     # deadline; a shorter grace would not exercise that boundary.
-    program = "import os,time; time.sleep(.1); os.close(1); time.sleep(5)"
+    program = ("import os,time; "
+               "print('{\"type\":\"thread.started\",\"thread_id\":\"fixture\"}', "
+               "flush=True); time.sleep(.1); os.close(1); time.sleep(5)")
     process = subprocess.Popen(
         [sys.executable, "-c", program], stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, encoding="utf-8")
@@ -579,7 +761,10 @@ def test_eof_finalization_keeps_its_grace_after_dispatch_budget(monkeypatch):
     assert response["timeout"]["stage"] == "finalization_timeout"
     assert len(kill_started) == 1
     assert kill_started[0] - started >= 1.20
-    assert elapsed < 4.0
+    # Windows process-tree teardown can add several seconds under a loaded full
+    # suite. The kill-start assertion above proves deadline behavior; this upper
+    # bound only detects an unbounded cleanup hang.
+    assert elapsed < 6.0
     assert process.poll() is not None
 
 

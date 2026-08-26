@@ -322,9 +322,17 @@ def run_jobs_query(args, emit_error) -> int:
             emit_error(str(e)); return 1
         if st is None:
             emit_error(f"no such job {args.jobs_status!r} under {root}"); return 1
+        private_result_binding = None
+        try:
+            from _job_continuation import result_binding_sha256
+            if st.get("trusted") is True and isinstance(st.get("result"), dict):
+                private_result_binding = result_binding_sha256(st["result"])
+        except (TypeError, ValueError):
+            private_result_binding = None
         try:
             from _job_control import (control_summary, heartbeat_auth,
-                                      heartbeat_path, legacy_heartbeat_auth)
+                                      heartbeat_path, legacy_heartbeat_auth,
+                                      public_heartbeat)
             st["control"] = control_summary(root, args.jobs_status)
             heartbeat, _state = _jobs._read(heartbeat_path(root, args.jobs_status))
             record = st.get("record") if isinstance(st.get("record"), dict) else {}
@@ -355,9 +363,8 @@ def run_jobs_query(args, emit_error) -> int:
                     or not auth_ok):
                 st["heartbeat"] = None
             else:
-                st["heartbeat"] = {key: value for key, value in heartbeat.items()
-                                   if key not in {"auth", "nonce"}}
-                st["heartbeat"]["integrity"] = (
+                st["heartbeat"] = public_heartbeat(
+                    heartbeat,
                     "payload_authenticated"
                     if heartbeat.get("schema") == "summon.job-heartbeat/v2"
                     else "legacy_unverified")
@@ -370,6 +377,25 @@ def run_jobs_query(args, emit_error) -> int:
         except (OSError, TypeError, ValueError):
             st["control"] = {"state": "unavailable"}
             st["heartbeat"] = None
+        private_control = st.pop("control", None)
+        private_heartbeat = st.pop("heartbeat", None)
+        st = _jobs.public_job_status(st)
+        # Available continuation is an authenticated capability claim. Never
+        # trust the public-shaped object carried by the terminal result itself;
+        # derive it from the HMAC-bound private sidecar and current capability
+        # registry. Fail closed by omission on any missing/tampered/mismatched
+        # source while retaining the completed job status.
+        try:
+            from _job_continuation import public_projection, read_private_source
+            source = read_private_source(root, args.jobs_status)
+            if (isinstance(st.get("result"), dict)
+                    and private_result_binding is not None
+                    and source.get("result_binding_sha256") == private_result_binding):
+                st["result"]["continuation"] = public_projection(source)
+        except (OSError, TypeError, ValueError):
+            pass
+        st["control"] = private_control
+        st["heartbeat"] = private_heartbeat
         print(json.dumps(st, ensure_ascii=False))
         return 0
     # jobs wait

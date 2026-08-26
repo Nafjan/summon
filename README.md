@@ -366,7 +366,7 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon deliberate open RUN_ID` | open/reuse the local browser ledger (provider-inert) |
 | `summon agent new\|set NAME --set k=v` | scaffold / retune an agent definition |
 | `summon role propose\|approve\|list\|resolve …` | manage private, opt-in role aliases |
-| `summon jobs list\|status [ID]` · `jobs wait ID` | inspect or wait for background jobs (`--json` on list/status) |
+| `summon jobs list\|status [ID]` · `jobs wait ID` | inspect or wait for background jobs (`--json` on list/status). `status` is a redacted, typed projection; `wait` returns the complete private terminal envelope |
 | `summon telemetry enable\|disable\|status\|clear` | manage local opt-in diagnostics; `clear` does not disable |
 | `summon bug-report …` | generate a sanitized report; review it before the separate GitHub submission command |
 | `summon version` · `summon help` | version · usage |

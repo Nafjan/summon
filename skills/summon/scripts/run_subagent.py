@@ -323,7 +323,8 @@ def _stamp_job(env: dict) -> dict:
 
 
 def _emit(obj: dict, *, operation: str | None = None,
-          trusted_executor_result: bool = False) -> None:
+          trusted_executor_result: bool = False,
+          continuation_context=None) -> None:
     """Write the response as JSON — to the job file (background) or stdout."""
     # Primary emission point: guarantee the exit-code-clarity fields on EVERY
     # dispatch-shaped envelope routed here, including the pre-dispatch validation/
@@ -333,6 +334,25 @@ def _emit(obj: dict, *, operation: str | None = None,
     # no-op on query envelopes (list/doctor/version have no exit_code).
     finalize_exit_fields(obj)
     _stamp_job(obj)
+    if trusted_executor_result and continuation_context is not None and _JOB_FILE:
+        try:
+            from _job_continuation import write_private_source
+            _invocation, _args = continuation_context
+            obj["continuation"] = write_private_source(
+                _JOB_FILE, obj, _invocation, _args)
+        except Exception as exc:  # noqa: BLE001 - continuation is optional evidence
+            # Do not erase a completed provider result because continuation
+            # evidence could not be sealed.  Keep the error typed and bounded;
+            # paths, handles, prompts, and exception text remain private.
+            obj["continuation"] = {
+                "schema": "summon.job-continuation/v1",
+                "available": False,
+                "resume_state": "unsupported",
+                "resume_reason": getattr(exc, "kind", "continuation_source_unavailable"),
+                "backend": "unknown", "transport": "unknown",
+                "steering_mode": "queued_for_resume",
+                "live_steering_acknowledged": False,
+            }
     # Diagnostics are strictly opt-in and fail-soft. A malformed local telemetry
     # file must never change dispatch behavior or hide the real envelope.
     try:
@@ -1964,7 +1984,8 @@ def main() -> None:
     if args.out:
         _write_out(args.out, result)
     _emit(result, operation="resume" if args.resume else "dispatch",
-          trusted_executor_result=True)
+          trusted_executor_result=True,
+          continuation_context=(invocation, args))
     sys.exit(0 if result["status"] == "success" else 1)
 
 

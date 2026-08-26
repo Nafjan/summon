@@ -21,6 +21,7 @@ been reused can still look alive.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import stat
@@ -412,6 +413,299 @@ def job_status(root: str, job_id: str) -> dict | None:
         "result_status": (result or {}).get("status"),
         "record": rec, "result": result,
     }
+
+
+_PUBLIC_RECORD_FLAGS = {
+    "cli", "model", "effort", "timeout", "allow_text_only",
+    "require_tools", "strict_agents_dir", "enable_roles", "isolated_lane",
+    "allow_tool_credentials", "adaptive_timeout", "hard_timeout", "max_runtime",
+}
+
+_SAFE_PUBLIC_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+() -]{0,159}$")
+_SAFE_PUBLIC_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_PUBLIC_SECRET_MARKERS = re.compile(
+    r"(?i)(?:secret|token|password|credential|capability|session|handle|private|"
+    r"(?:api|oauth|access|auth)[-_]?key)")
+_PUBLIC_STATES = {
+    "unknown", "corrupt", "unverified", "identity_mismatch", "prepared",
+    "running", "stale", "success", "partial", "blocked", "error", "cancelled",
+    "not_run",
+}
+
+
+def _safe_public_token(value, *, slug: bool = False):
+    if not isinstance(value, str):
+        return None
+    pattern = _SAFE_PUBLIC_SLUG if slug else _SAFE_PUBLIC_TOKEN
+    candidate = value.strip()
+    lowered = candidate.lower()
+    if (pattern.fullmatch(candidate) is None
+            or candidate.startswith(("/", "\\"))
+            or re.match(r"^[A-Za-z]:[\\/]", candidate)
+            or lowered.startswith(("file:", "http:", "https:", "sk-", "ghp_", "akia", "eyj"))
+            or _PUBLIC_SECRET_MARKERS.search(candidate)
+            or any(part in {".", ".."} for part in candidate.split("/"))):
+        return None
+    return candidate
+
+
+def _safe_sha(value):
+    return value if isinstance(value, str) and _SHA256_RE.fullmatch(value) else None
+
+
+def _put_typed(out: dict, key: str, value, kind: str) -> None:
+    if ((kind == "bool" and isinstance(value, bool))
+            or (kind == "int" and isinstance(value, int) and not isinstance(value, bool)
+                and 0 <= value <= 2 ** 63 - 1)
+            or (kind == "signed_int" and isinstance(value, int)
+                and not isinstance(value, bool) and -(2 ** 31) <= value <= 2 ** 31 - 1)
+            or (kind == "number" and isinstance(value, (int, float))
+                and not isinstance(value, bool) and math.isfinite(value) and value >= 0)
+            or (kind == "state" and value in _PUBLIC_STATES)):
+        out[key] = value
+
+_PUBLIC_RESULT_FIELDS = {
+    "status", "execution_status", "attempt_status", "attempts", "attempt_id",
+    "agent", "cli", "backend", "provider", "transport", "model",
+    "served_model_evidence", "model_match", "model_match_state",
+    "named_model_verified", "report_ok", "verdict", "error_kind", "exit_code",
+    "raw_backend_exit_code", "normalized_exit_code", "provider_contacted",
+    "result_usable", "retryable", "resumed", "prompt_sha256", "request_sha256",
+}
+
+
+def _public_summon(value) -> dict | None:
+    """Return executable identity without exposing a local dispatcher path."""
+    if not isinstance(value, dict):
+        return None
+    out = {}
+    version = _safe_public_token(value.get("version"))
+    scripts = _safe_sha(value.get("scripts_sha256"))
+    if version is not None:
+        out["version"] = version
+    if scripts is not None:
+        out["scripts_sha256"] = scripts
+    bundle = value.get("background_bundle")
+    if isinstance(bundle, dict):
+        projected = {}
+        kind = _safe_public_token(bundle.get("kind"), slug=True)
+        digest = _safe_sha(bundle.get("scripts_sha256"))
+        if kind is not None:
+            projected["kind"] = kind
+        if digest is not None:
+            projected["scripts_sha256"] = digest
+        if projected:
+            out["background_bundle"] = projected
+    return out or None
+
+
+def public_job_status(status: dict) -> dict:
+    """Allowlisted local status projection with private capabilities removed.
+
+    Raw job records/results are execution authority: they can contain cwd/read-root
+    paths, provider session handles, an OAuth-bearing AGY profile path, argv-derived
+    values, and the job nonce.  ``jobs status`` is an inspection surface, not a
+    capability-export API, so it exposes bounded evidence only.  Internal resume
+    code must read the authenticated private files directly rather than reconstruct
+    authority from this projection.
+    """
+    projected = {}
+    job_id = status.get("job_id")
+    if valid_job_id(job_id):
+        projected["job_id"] = job_id
+    _put_typed(projected, "state", status.get("state"), "state")
+    _put_typed(projected, "trusted", status.get("trusted"), "bool")
+    attempt_id = status.get("attempt_id")
+    if valid_job_id(attempt_id):
+        projected["attempt_id"] = attempt_id
+    agent = _safe_public_token(status.get("agent"), slug=True)
+    if agent is not None:
+        projected["agent"] = agent
+    _put_typed(projected, "pid", status.get("pid"), "int")
+    _put_typed(projected, "prepared_at", status.get("prepared_at"), "number")
+    _put_typed(projected, "spawned_at", status.get("spawned_at"), "number")
+    liveness = status.get("liveness")
+    if liveness in {None, "alive", "dead", "unknown"}:
+        projected["liveness"] = liveness
+    _put_typed(projected, "result_status", status.get("result_status"), "state")
+    record = status.get("record")
+    if isinstance(record, dict):
+        public_record = {}
+        for key in ("job_id", "attempt_id"):
+            if valid_job_id(record.get(key)):
+                public_record[key] = record[key]
+        agent = _safe_public_token(record.get("agent"), slug=True)
+        if agent is not None:
+            public_record["agent"] = agent
+        prompt_sha = _safe_sha(record.get("prompt_sha256"))
+        if prompt_sha is not None:
+            public_record["prompt_sha256"] = prompt_sha
+        for key, kind in (("prepared_at", "number"), ("spawned_at", "number"),
+                          ("pid", "int")):
+            _put_typed(public_record, key, record.get(key), kind)
+        flags = record.get("flags")
+        if isinstance(flags, dict):
+            public_flags = {}
+            for key in ("cli", "effort"):
+                value = _safe_public_token(flags.get(key), slug=True)
+                if value is not None:
+                    public_flags[key] = value
+            model = _safe_public_token(flags.get("model"))
+            if model is not None:
+                public_flags["model"] = model
+            for key in ("allow_text_only", "require_tools", "strict_agents_dir",
+                        "enable_roles", "isolated_lane", "allow_tool_credentials",
+                        "adaptive_timeout"):
+                _put_typed(public_flags, key, flags.get(key), "bool")
+            for key in ("timeout", "hard_timeout", "max_runtime"):
+                _put_typed(public_flags, key, flags.get(key), "int")
+            if public_flags:
+                public_record["flags"] = public_flags
+        summon = _public_summon(record.get("summon"))
+        if summon:
+            public_record["summon"] = summon
+        launcher = _public_summon(record.get("launcher_summon"))
+        if launcher:
+            public_record["launcher_summon"] = launcher
+        projected["record"] = public_record
+    else:
+        projected["record"] = None
+    result = status.get("result")
+    if isinstance(result, dict):
+        public_result = {}
+        record_flags = record.get("flags") if isinstance(record, dict) else {}
+        if not isinstance(record_flags, dict):
+            record_flags = {}
+        record_agent = _safe_public_token(
+            record.get("agent") if isinstance(record, dict) else None, slug=True)
+        record_cli = _safe_public_token(record_flags.get("cli"), slug=True)
+        record_model = _safe_public_token(record_flags.get("model"))
+        for key in ("status", "execution_status", "attempt_status"):
+            _put_typed(public_result, key, result.get(key), "state")
+        for key in ("attempts",):
+            _put_typed(public_result, key, result.get(key), "int")
+        attempt = result.get("attempt_id")
+        if valid_job_id(attempt):
+            public_result["attempt_id"] = attempt
+        if record_agent is not None and result.get("agent") == record_agent:
+            public_result["agent"] = record_agent
+        for key in ("verdict", "error_kind"):
+            value = _safe_public_token(result.get(key), slug=True)
+            if value is not None:
+                public_result[key] = value
+        for key in ("cli", "backend"):
+            if record_cli is not None and result.get(key) == record_cli:
+                public_result[key] = record_cli
+        transport = result.get("transport")
+        if transport in {"subprocess", "api", "acp"}:
+            public_result["transport"] = transport
+        model = result.get("model")
+        if isinstance(model, dict) and record_model is not None:
+            safe_model = {}
+            for key in ("requested", "targeted"):
+                value = _safe_public_token(model.get(key))
+                if value == record_model:
+                    safe_model[key] = value
+            served = _safe_public_token(model.get("served"))
+            targeted = safe_model.get("targeted") or safe_model.get("requested")
+            if served is not None and served == targeted:
+                safe_model["served"] = served
+            if safe_model:
+                public_result["model"] = safe_model
+        evidence = result.get("served_model_evidence")
+        if evidence in {"reported", "inferred", "absent"}:
+            public_result["served_model_evidence"] = evidence
+        match = result.get("model_match")
+        if match is None or isinstance(match, bool):
+            public_result["model_match"] = match
+        match_state = result.get("model_match_state")
+        if match_state in {"match", "mismatch", "unverified", "not_run"}:
+            public_result["model_match_state"] = match_state
+        for key in ("named_model_verified", "report_ok", "provider_contacted",
+                    "result_usable", "retryable", "resumed"):
+            _put_typed(public_result, key, result.get(key), "bool")
+        for key in ("exit_code", "raw_backend_exit_code", "normalized_exit_code"):
+            _put_typed(public_result, key, result.get(key), "signed_int")
+        for key in ("prompt_sha256", "request_sha256"):
+            digest = _safe_sha(result.get(key))
+            if digest is not None:
+                public_result[key] = digest
+        summon = _public_summon(result.get("summon"))
+        if summon:
+            public_result["summon"] = summon
+        billing = result.get("billing")
+        if isinstance(billing, dict):
+            source = billing.get("source")
+            if source in {"subscription", "credit", "api", "payg", "free", "unknown"}:
+                public_result["billing"] = {"source": source}
+        agent_def = result.get("agent_def")
+        if isinstance(agent_def, dict):
+            safe_agent_def = {}
+            digest = _safe_sha(agent_def.get("sha256"))
+            if digest is not None:
+                safe_agent_def["sha256"] = digest
+            if safe_agent_def:
+                public_result["agent_def"] = safe_agent_def
+        read_policy = result.get("read_allowlist")
+        if isinstance(read_policy, dict):
+            safe_read = {}
+            for key in ("enforced", "would_refuse"):
+                _put_typed(safe_read, key, read_policy.get(key), "bool")
+            enforcement = read_policy.get("enforcement")
+            if enforcement in {"provider_native", "summon_wrapper", "unsupported", "not_run"}:
+                safe_read["enforcement"] = enforcement
+            error_kind = _safe_public_token(read_policy.get("error_kind"), slug=True)
+            if error_kind is not None:
+                safe_read["error_kind"] = error_kind
+            for source, target in (("requested_paths", "requested_count"),
+                                   ("effective_paths", "effective_count")):
+                if isinstance(read_policy.get(source), list):
+                    safe_read[target] = len(read_policy[source])
+            if safe_read:
+                public_result["read_allowlist"] = safe_read
+        continuation = result.get("continuation")
+        continuation_fields = {
+            "schema", "available", "resume_state", "resume_reason", "backend",
+            "transport", "steering_mode", "live_steering_acknowledged",
+        }
+        if (isinstance(continuation, dict)
+                and set(continuation) == continuation_fields
+                and continuation.get("schema") == "summon.job-continuation/v1"
+                and isinstance(continuation.get("available"), bool)
+                and isinstance(continuation.get("live_steering_acknowledged"), bool)
+                and continuation.get("live_steering_acknowledged") is False
+                and all(isinstance(continuation.get(key), str)
+                        and re.fullmatch(r"[a-z0-9_-]{1,128}", continuation[key])
+                        for key in ("resume_state", "resume_reason", "backend",
+                                    "transport", "steering_mode"))):
+            from _resume_capabilities import resume_capability
+            capability = resume_capability(continuation["backend"],
+                                           continuation["transport"])
+            claims_current_capability = (
+                continuation["resume_state"] == capability["resume_state"]
+                and continuation["backend"] == capability["backend"]
+                and continuation["transport"] == capability["transport"]
+                and continuation["steering_mode"] == capability["steering_mode"]
+            )
+            # A certified backend can still have an ineligible individual result
+            # (missing handle/model/contact evidence). Only an available claim
+            # requires certification; unavailable is always a legitimate state.
+            availability_valid = (
+                not continuation["available"]
+                or capability["resume_state"] == "certified"
+            )
+            # ``available:true`` is an authority claim and cannot be trusted from
+            # the result envelope alone. The jobs command adds it only after
+            # authenticating the private sidecar. Unavailable is non-authority
+            # diagnostic state and may be projected directly.
+            if (claims_current_capability and availability_valid
+                    and continuation["available"] is False):
+                public_result["continuation"] = dict(continuation)
+        projected["result"] = public_result
+    else:
+        projected["result"] = None
+    return projected
 
 
 def list_jobs(root: str) -> list[dict]:
