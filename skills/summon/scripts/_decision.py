@@ -9,10 +9,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from _evidence import EvidenceError, digest
+from _evidence import EvidenceError, seal
 
 
-SCHEMA = "summon.decision/v1"
+SCHEMA = "summon.decision/v2"
 ENFORCEMENT = {"enforced", "unenforceable", "unknown"}
 PERMISSION_ORDER = {"read-only": 0, "safe-edit": 1, "yolo": 2}
 MAX_PRIORITY = 1_000_000
@@ -57,7 +57,8 @@ def decide(*, request: dict, candidates: list[dict], constraints: dict,
                           "provider", "source"}, "request")
     _exact_keys(constraints, {"permission_ceiling", "spend_authorized",
                               "enforcement", "unknowns", "corrective_allowed",
-                              "retry_allowed", "fallback_allowed", "require_fresh"},
+                              "retry_allowed", "fallback_allowed", "require_fresh",
+                              "unenforceable_authorized"},
                 "constraints")
     for required in ("corrective_allowed", "retry_allowed", "fallback_allowed"):
         if required not in constraints:
@@ -71,12 +72,23 @@ def decide(*, request: dict, candidates: list[dict], constraints: dict,
     exact_model = _text(request.get("model"), "request.model", nullable=True)
     resolved_agent = _slug_text(
         request.get("resolved_agent"), "request.resolved_agent", nullable=True)
+    if lane and resolved_agent:
+        raise EvidenceError("lane request cannot pre-resolve an agent")
     expected_seat = resolved_agent or agent
     requested_provider = _slug_text(
         request.get("provider"), "request.provider", nullable=True)
-    resolution_source = request.get("source", "explicit_agent")
+    resolution_source = request.get(
+        "source", "explicit_agent" if agent else "approved_lane")
     if resolution_source not in {"explicit_agent", "approved_role", "approved_lane"}:
         raise EvidenceError("request.source is invalid")
+    if lane and resolution_source != "approved_lane":
+        raise EvidenceError("lane request requires approved_lane source")
+    if agent and resolution_source == "approved_lane":
+        raise EvidenceError("agent request cannot use approved_lane source")
+    if (resolution_source == "approved_role"
+            and (not resolved_agent or resolved_agent == agent)):
+        raise EvidenceError(
+            "approved_role source requires a distinct resolved agent")
 
     permission_ceiling = _slug_text(
         constraints.get("permission_ceiling"), "permission_ceiling", nullable=True)
@@ -88,11 +100,25 @@ def decide(*, request: dict, candidates: list[dict], constraints: dict,
     enforcement = constraints.get("enforcement", "unknown")
     if enforcement not in ENFORCEMENT:
         raise EvidenceError("enforcement must be enforced, unenforceable, or unknown")
+    unenforceable_authorized = constraints.get("unenforceable_authorized", False)
+    if not isinstance(unenforceable_authorized, bool):
+        raise EvidenceError("unenforceable_authorized must be boolean")
     unknowns = constraints.get("unknowns") or []
     if (not isinstance(unknowns, list) or len(unknowns) > 128
             or not all(isinstance(item, str) and _RULE.fullmatch(item)
                        for item in unknowns)):
         raise EvidenceError("constraints.unknowns must be bounded strings")
+    corrective_allowed = constraints.get("corrective_allowed")
+    retry_allowed = constraints.get("retry_allowed")
+    fallback_allowed = constraints.get("fallback_allowed")
+    require_fresh = constraints.get("require_fresh", False)
+    for field, value in (
+            ("corrective_allowed", corrective_allowed),
+            ("retry_allowed", retry_allowed),
+            ("fallback_allowed", fallback_allowed),
+            ("require_fresh", require_fresh)):
+        if not isinstance(value, bool):
+            raise EvidenceError(f"constraints.{field} must be boolean")
 
     normalized = []
     for index, candidate in enumerate(candidates):
@@ -119,12 +145,14 @@ def decide(*, request: dict, candidates: list[dict], constraints: dict,
         eligible = candidate.get("eligible", True)
         if not isinstance(eligible, bool):
             raise EvidenceError("candidate.eligible must be boolean")
+        declared_eligible = eligible
         reasons = candidate.get("reasons") or []
         if (not isinstance(reasons, list) or len(reasons) > 64
                 or not all(isinstance(item, str) and _RULE.fullmatch(item)
                            for item in reasons)):
             raise EvidenceError("candidate reasons must be bounded strings")
-        losing = list(reasons)
+        declared_reasons = sorted(set(reasons))
+        losing = list(declared_reasons)
         if not eligible and not losing:
             losing.append("candidate_ineligible")
         if losing:
@@ -140,9 +168,9 @@ def decide(*, request: dict, candidates: list[dict], constraints: dict,
         if exact_model and model != exact_model:
             eligible = False
             losing.append("exact_model_mismatch")
-        requires_spend = candidate.get("requires_spend", False)
+        requires_spend = candidate.get("requires_spend")
         if not isinstance(requires_spend, bool):
-            raise EvidenceError("candidate.requires_spend must be boolean")
+            raise EvidenceError("candidate.requires_spend must be an explicit boolean")
         if requires_spend and not spend_authorized:
             eligible = False
             losing.append("paid_route_not_authorized")
@@ -166,9 +194,6 @@ def decide(*, request: dict, candidates: list[dict], constraints: dict,
             if required and not allowed:
                 eligible = False
                 losing.append(rule)
-        require_fresh = constraints.get("require_fresh", False)
-        if not isinstance(require_fresh, bool):
-            raise EvidenceError("constraints.require_fresh must be boolean")
         freshness = candidate.get("freshness", "unknown")
         if freshness not in {"fresh", "stale", "unknown"}:
             raise EvidenceError("candidate.freshness must be fresh, stale, or unknown")
@@ -182,14 +207,25 @@ def decide(*, request: dict, candidates: list[dict], constraints: dict,
             elif PERMISSION_ORDER[permission] > PERMISSION_ORDER[permission_ceiling]:
                 eligible = False
                 losing.append("permission_ceiling_exceeded")
-            if enforcement != "enforced":
-                eligible = False
-                losing.append(f"permission_{enforcement}")
+        if enforcement != "enforced" and not (
+                enforcement == "unenforceable" and unenforceable_authorized):
+            eligible = False
+            losing.append(f"permission_{enforcement}")
         normalized.append({
             "seat": seat, "backend": backend, "provider": provider, "model": model,
             "permission": permission, "eligible": eligible,
             "losing_rules": sorted(set(losing)),
             "priority": priority,
+            "declared_eligible": declared_eligible,
+            "declared_reasons": declared_reasons,
+            "requires_spend": requires_spend,
+            "gate_allowed": candidate["gate_allowed"],
+            "data_boundary_satisfied": candidate["data_boundary_satisfied"],
+            "requires_corrective": candidate.get("requires_corrective", False),
+            "requires_retry": candidate.get("requires_retry", False),
+            "requires_fallback": candidate.get("requires_fallback", False),
+            "freshness": freshness,
+            "preflight_rules": [],
         })
     eligible = [item for item in normalized if item["eligible"]]
     seats = [item["seat"] for item in normalized]
@@ -216,20 +252,26 @@ def decide(*, request: dict, candidates: list[dict], constraints: dict,
         "resolution": ({
             "seat": winner["seat"], "backend": winner["backend"],
             "provider": winner["provider"], "model_targeted": winner["model"],
-            "winning_rule": winning_rule,
+            "winning_rule": winning_rule, "source": resolution_source,
         } if winner else {"seat": None, "backend": None,
                           "provider": None, "model_targeted": None,
-                          "winning_rule": winning_rule}),
+                          "winning_rule": winning_rule,
+                          "source": resolution_source}),
         "authority": {
             "permission_ceiling": permission_ceiling,
             "spend_authorized": spend_authorized,
             "enforcement": enforcement,
+            "unenforceable_authorized": unenforceable_authorized,
+            "corrective_allowed": corrective_allowed,
+            "retry_allowed": retry_allowed,
+            "fallback_allowed": fallback_allowed,
+            "require_fresh": require_fresh,
         },
         "candidates": normalized,
         "unknowns": sorted(set(unknowns)),
         "digests": _evidence_digests(evidence),
     }
-    return {"schema": SCHEMA, **body, "decision_sha256": digest(SCHEMA, body)}
+    return seal(SCHEMA, body)
 
 
 def _evidence_digests(evidence: dict | None) -> dict:

@@ -75,6 +75,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import _background  # noqa: E402
 import _jobs  # noqa: E402
 import _cli  # noqa: E402
+import _evidence  # noqa: E402
 import _executor  # noqa: E402
 import _receipt  # noqa: E402
 import _telemetry  # noqa: E402
@@ -1997,6 +1998,17 @@ def _dry_run_arg_preview(arg: str) -> str:
     return _executor._redact_output_secrets(preview)
 
 
+def _reseal_effective_decision(view: dict) -> dict:
+    """Apply the canonical common seal after an additive decision projection."""
+    from _evidence import seal
+    body = {key: value for key, value in view.items()
+            if key not in {"schema", "sha256"}}
+    sealed = seal("summon.decision/v2", body)
+    view.clear()
+    view.update(sealed)
+    return view
+
+
 def _effective_decision_view(invocation, args) -> dict:
     """Public, provider-inert explanation of the authority that wins preflight.
 
@@ -2004,7 +2016,8 @@ def _effective_decision_view(invocation, args) -> dict:
     explicitly not consulted here, so this additive receipt cannot alter routing.
     """
     from _apibackend import payg_consent_allowed
-    from _builder import credit_spend_allowed
+    from _builder import (credit_spend_allowed, permission_enforcement,
+                          selects_credit_only, unenforceable_permission_authorized)
 
     role = (getattr(args, "_role_provenance", {}) or {}).get("role")
     source = "approved_role" if isinstance(role, dict) else "explicit_agent"
@@ -2012,6 +2025,11 @@ def _effective_decision_view(invocation, args) -> dict:
     payg_flag = bool(getattr(invocation, "allow_payg", False))
     credit_allowed = bool(credit_flag or credit_spend_allowed())
     payg_allowed = bool(payg_consent_allowed(payg_flag))
+    enforcement = permission_enforcement(invocation.cli, invocation.permission)
+    unenforceable_authorized = bool(
+        enforcement == "unenforceable" and unenforceable_permission_authorized(
+            invocation.cli, invocation.permission,
+            forced=bool(getattr(invocation, "permission_forced", False))))
     usage_view = {"state": "not_consulted", "reason": "exact_pin_preserved"}
     usage_cache = getattr(args, "usage_cache", None)
     if usage_cache:
@@ -2038,9 +2056,21 @@ def _effective_decision_view(invocation, args) -> dict:
                 "reason": "usage_cache_invalid",
                 "observations_considered": 0,
             }
+    from _builder import supports_acp
+    try:
+        _retry_count = max(0, int(getattr(args, "retries", 0) or 0))
+    except (TypeError, ValueError):
+        _retry_count = 0
+    _retry_allowed = bool(
+        _retry_count > 0 or _transient_retries_enabled(args)
+        or invocation.cli == "agy")
+    _fallback_allowed = bool(
+        invocation.transport == "subprocess"
+        and invocation.permission == "yolo"
+        and supports_acp(invocation.cli)
+        and _acp_fallback_enabled(args)
+        and (invocation.cli != "kimi" or _kimi_acp_fallback_allowed(args)))
     from _decision import decide
-    from _evidence import digest
-
     view = decide(
         request={"agent": args.agent, "lane": None, "model": invocation.model,
                  "provider": invocation.cli,
@@ -2059,16 +2089,25 @@ def _effective_decision_view(invocation, args) -> dict:
             "requires_corrective": False,
             "requires_retry": False,
             "requires_fallback": False,
+            # Credit-only classification is a Claude subscription-CLI policy.
+            # An identically named model on openai-compat is already governed by
+            # that route's API/PAYG boundary and must not inherit this refusal.
+            "requires_spend": bool(
+                invocation.cli == "claude" and selects_credit_only(
+                    invocation.model, invocation.extra_args)),
         }],
         constraints={
             "permission_ceiling": getattr(args, "max_permission", None),
             "spend_authorized": bool(credit_allowed or payg_allowed),
-            "enforcement": "enforced",
-            "corrective_allowed": False,
-            "retry_allowed": False,
-            "fallback_allowed": False,
+            "enforcement": enforcement,
+            "unenforceable_authorized": unenforceable_authorized,
+            "corrective_allowed": bool(
+                getattr(args, "json_schema", None)
+                or not getattr(args, "no_contract_repair", False)),
+            "retry_allowed": _retry_allowed,
+            "fallback_allowed": _fallback_allowed,
             "require_fresh": False,
-            "unknowns": ["usage_observation", "roster_digest", "policy_digest"],
+            "unknowns": ["policy_digest", "roster_digest", "usage_observation"],
         },
         evidence={"roster": None, "policy": None},
     )
@@ -2091,11 +2130,8 @@ def _effective_decision_view(invocation, args) -> dict:
         },
     })
     view["usage"] = usage_view
-    view["unknowns"] = ["usage_observation", "roster_digest", "policy_digest"]
-    view.pop("decision_sha256", None)
-    body = {key: value for key, value in view.items() if key != "schema"}
-    view["decision_sha256"] = digest("summon.decision/v1", body)
-    return view
+    view["unknowns"] = ["policy_digest", "roster_digest", "usage_observation"]
+    return _reseal_effective_decision(view)
 
 
 def _sync_effective_decision_refusal(view: dict) -> None:
@@ -2109,6 +2145,10 @@ def _sync_effective_decision_refusal(view: dict) -> None:
     candidates = decision.get("candidates") or []
     for candidate in candidates:
         candidate["eligible"] = False
+        preflight = candidate.setdefault("preflight_rules", [])
+        if rule not in preflight:
+            preflight.append(rule)
+            preflight.sort()
         losing = candidate.setdefault("losing_rules", [])
         if rule not in losing:
             losing.append(rule)
@@ -2117,10 +2157,7 @@ def _sync_effective_decision_refusal(view: dict) -> None:
     resolution.update({"seat": None, "backend": None, "provider": None,
                        "model_targeted": None,
                        "winning_rule": "no_eligible_candidate"})
-    from _evidence import digest
-    decision.pop("decision_sha256", None)
-    body = {key: value for key, value in decision.items() if key != "schema"}
-    decision["decision_sha256"] = digest("summon.decision/v1", body)
+    _reseal_effective_decision(decision)
 
 
 def _dry_run_view(invocation, args, agents_dir: str,
@@ -2200,20 +2237,53 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "allow_tool_credentials": bool(getattr(args, "allow_tool_credentials", False)),
         "system_context_chars": len(invocation.system_context),
     }
-    view["effective_decision"] = _effective_decision_view(invocation, args)
-    if _codex_selection:
+    _decision_projection_invalid = False
+    try:
+        # The decision receipt describes the invocation that can actually cross
+        # the provider boundary.  In particular, a credit guard may replace a
+        # requested model before launch; sealing the pre-guard candidate would
+        # manufacture a refusal for a dispatch that proceeds with the fallback.
+        view["effective_decision"] = _effective_decision_view(_guarded, args)
+    except _evidence.EvidenceError:
+        _decision_projection_invalid = True
+        # The rejected identifier may itself be a path or credential-shaped
+        # value. This is a failure to build the public explanation, not proof
+        # that the real dispatch would refuse. Preserve the ordinary dry-run
+        # shape while redacting every field that can carry the rejected value.
+        for _key in ("agent", "agent_resolved", "cwd", "agents_dir",
+                     "model_requested", "model_effective", "profile"):
+            view[_key] = None
+        view["extra_args"] = []
+        _read = view.get("read_allowlist") or {}
+        view["read_allowlist"] = {
+            "redacted": True,
+            "enforced": _read.get("enforced"),
+            "would_refuse": _read.get("would_refuse"),
+        }
+        view["billing_predicted"] = {
+            "source": "unknown", "note": "redacted with invalid decision projection"}
+        view.update({
+            "decision_projection_available": False,
+            "preview_incomplete": True,
+            "projection_error_kind": "decision_evidence_invalid",
+            "evidence_error": "effective decision evidence could not be validated",
+            "effective_decision": None,
+        })
+    if _codex_selection and not _decision_projection_invalid:
         # This is deliberately additive and safe to share: selectors contain
         # only model ids, never profile paths or config contents.
         view["model_selection_source"] = _codex_selection.get("source")
         view["model_exact_required"] = bool(_codex_selection.get("exact_required"))
         view["model_selectors"] = [item.get("value") for item in
                                     _codex_selection.get("selectors", [])]
-        if _selection_conflict:
-            view["would_refuse"] = True
-            view["error_kind"] = "model_selection_conflict"
-            view["refusal"] = _selection_conflict
-            view["provider_contacted"] = False
-            view["result_usable"] = False
+    if _selection_conflict:
+        view["would_refuse"] = True
+        view["error_kind"] = "model_selection_conflict"
+        view["refusal"] = (
+            "conflicting model selectors make this dispatch ambiguous"
+            if _decision_projection_invalid else _selection_conflict)
+        view["provider_contacted"] = False
+        view["result_usable"] = False
     if view["read_allowlist"].get("would_refuse"):
         view["would_refuse"] = True
         view["error_kind"] = view["read_allowlist"].get(
@@ -2229,7 +2299,8 @@ def _dry_run_view(invocation, args, agents_dir: str,
     # is read only when the caller did not pin a model, so the preview can still catch a bad
     # backend/model pairing before any side effect.
     _compat_model = _eff_model
-    if not _compat_model and invocation.cli == "codex":
+    if (not _decision_projection_invalid and not _compat_model
+            and invocation.cli == "codex"):
         try:
             from _resolver import _codex_default_model
             _compat_model = _codex_default_model()
@@ -2239,12 +2310,15 @@ def _dry_run_view(invocation, args, agents_dir: str,
     if _compat:
         view["would_refuse"] = True
         view["error_kind"] = _compat["error_kind"]
-        view["refusal"] = _compat["message"]
-        view["model_vendor"] = _compat["model_vendor"]
-        view["compatible_backends"] = list(_compat["compatible_backends"])
-        view["recommended_backend"] = _compat["recommended_backend"]
+        view["refusal"] = (
+            "requested model is incompatible with the selected backend"
+            if _decision_projection_invalid else _compat["message"])
+        if not _decision_projection_invalid:
+            view["model_vendor"] = _compat["model_vendor"]
+            view["compatible_backends"] = list(_compat["compatible_backends"])
+            view["recommended_backend"] = _compat["recommended_backend"]
     _role_info = (getattr(args, "_role_provenance", {}) or {}).get("role")
-    if isinstance(_role_info, dict):
+    if isinstance(_role_info, dict) and not _decision_projection_invalid:
         view["role"] = dict(_role_info)
     # Text-seat parity with live: same text_seat shape + would_refuse when blocked.
     if text_seat_decision is None:
@@ -2269,12 +2343,13 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 "--require-tools always refuses")
         if text_seat_decision.get("warning"):
             view.setdefault("warnings", []).append(text_seat_decision["warning"])
-    if artifact_manifest:
+    if artifact_manifest and not _decision_projection_invalid:
         view["artifacts"] = dict(artifact_manifest,
                                  stable_during_dispatch=None,
                                  after_sha256=None)
-    for _w in _guard_warnings:  # credit-only guard actions surfaced in the preview
-        view.setdefault("warnings", []).append(_w)
+    if not _decision_projection_invalid:
+        for _w in _guard_warnings:  # credit-only guard actions surfaced in the preview
+            view.setdefault("warnings", []).append(_w)
     # A dispatch that will be REFUSED must say so in preflight. Surfaced as `would_refuse`
     # plus `error` rather than a warning, because it is not advice: the run does not happen.
     from _builder import readonly_unenforceable_error as _refuse
@@ -2291,6 +2366,12 @@ def _dry_run_view(invocation, args, agents_dir: str,
     if _oy:
         view["would_refuse"] = True
         view["refusal"] = _oy
+    if _decision_projection_invalid:
+        # Continue through all independent, generic refusal checks above, but
+        # stop before rendering commands, warnings, profiles, receipts, or API
+        # details that could echo the rejected identifier.
+        _sync_effective_decision_refusal(view)
+        return view
     # Same helper as the real envelope, so preflight shows exactly what the run would
     # warn about -- a short agy clock and a withheld read-only workspace are both things
     # you want to learn BEFORE paying, which is the whole point of --dry-run.
@@ -2794,7 +2875,12 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
         # receive fresh ids and remain visible in ``attempt_history``.
         attempt_id = (invocation.attempt_id if attempt == 0 and invocation.attempt_id
                       else uuid.uuid4().hex)
-        attempt_invocation = _replace(invocation, attempt_id=attempt_id)
+        attempt_invocation = _replace(
+            invocation, attempt_id=attempt_id,
+            attempt_kind="initial" if attempt == 0 else "transient_retry",
+            attempt_ordinal=attempt + 1,
+            parent_attempt_id=(_attempt_history[-1].get("attempt_id")
+                               if _attempt_history else None))
         result = execute_agent(attempt_invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
                                max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
         attempt += 1
@@ -2899,7 +2985,12 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
         from dataclasses import replace as _replace
         _fallback_attempt_id = uuid.uuid4().hex
         fb = execute_agent(_replace(invocation, transport="acp",
-                                    attempt_id=_fallback_attempt_id),
+                                    attempt_id=_fallback_attempt_id,
+                                    attempt_kind="acp_fallback",
+                                    attempt_ordinal=attempt + 1,
+                                    parent_attempt_id=(
+                                        _attempt_history[-1].get("attempt_id")
+                                        if _attempt_history else None)),
                            timeout_ms=args.timeout, debug_dir=args.debug_dir,
                            max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
         _attempt_history.append(_attempt_projection(fb, _fallback_attempt_id))
@@ -2934,6 +3025,9 @@ def _attempt_projection(envelope: dict, attempt_id: str | None) -> dict:
     model = envelope.get("model") if isinstance(envelope.get("model"), dict) else {}
     return {
         "attempt_id": attempt_id,
+        "attempt_kind": envelope.get("attempt_kind", "initial"),
+        "attempt_ordinal": envelope.get("attempt_ordinal"),
+        "parent_attempt_id": envelope.get("parent_attempt_id"),
         "status": envelope.get("status"),
         "execution_status": envelope.get("execution_status"),
         "provider_contacted": envelope.get("provider_contacted"),
@@ -2943,6 +3037,8 @@ def _attempt_projection(envelope: dict, attempt_id: str | None) -> dict:
         "model_served": model.get("served"),
         "served_model_evidence": envelope.get("served_model_evidence", "absent"),
         "cost_usd": envelope.get("cost_usd"),
+        "liveness": envelope.get("liveness"),
+        "runtime_control": envelope.get("runtime_control"),
     }
 
 
@@ -2957,6 +3053,10 @@ def _blocked_after_attempt(decision: dict, primary: dict, invocation, args,
     denied["attempts"] = attempts
     denied["attempt_status"] = "completed"
     denied["provider_contacted"] = True
+    # ``gate`` is the authority for the envelope's blocked outcome. Preserve
+    # the initial approval only in the prior attempt history; publishing it as
+    # the current gate would contradict this refusal.
+    denied["gate"] = decision
     denied["gate_next_attempt"] = decision
     denied["next_attempt"] = {
         "kind": next_kind,
@@ -2994,7 +3094,10 @@ def _apply_schema(result: dict, schema: dict, invocation, args, agents_dir=None)
         system_context="",  # resume: session already holds the definition
         resume_id=sid or "latest",
         resume_profile=profile or invocation.resume_profile,
-        attempt_id=None,
+        attempt_id=uuid.uuid4().hex,
+        attempt_kind="schema_correction",
+        attempt_ordinal=_attempt_count(result) + 1,
+        parent_attempt_id=result.get("attempt_id"),
     )
     # The schema correction re-dispatches with the ORIGINAL permission (retry_inv does
     # not override it), so under --gate-with it is a SECOND write-capable execution. A
@@ -3014,6 +3117,8 @@ def _apply_schema(result: dict, schema: dict, invocation, args, agents_dir=None)
     except ValueError:
         return result  # resume unsupported on this backend: keep the first verdict
     retry["parse_retry"] = True
+    _schema_history = list(result.get("attempt_history") or [])
+    _schema_history.append(_attempt_projection(retry, retry_inv.attempt_id))
     attach_parsed(retry, schema)
     # Only accept the retry if it STRICTLY improved things: the corrective run
     # both completed successfully AND now satisfies the schema. A retry that
@@ -3025,6 +3130,7 @@ def _apply_schema(result: dict, schema: dict, invocation, args, agents_dir=None)
         # the ORIGINAL call's spend into the returned envelope (the first call was
         # paid for too -- otherwise a schema repair silently under-reports spend).
         retry["attempts"] = _attempt_count(result) + _attempt_count(retry)
+        retry["attempt_history"] = _schema_history
         _aggregate_spend(retry, result)
         # The retry is a DIFFERENT envelope, so gate evidence attached to the original
         # would simply vanish here -- a gated dispatch reporting no gate at all.
@@ -3033,6 +3139,7 @@ def _apply_schema(result: dict, schema: dict, invocation, args, agents_dir=None)
         return retry
     # Rejected: keep the original, but the failed corrective call was still spent.
     result["attempts"] = _attempt_count(result) + _attempt_count(retry)
+    result["attempt_history"] = _schema_history
     _aggregate_spend(result, retry)
     return result
 
@@ -3164,7 +3271,10 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         permission_forced=_forced,
         resume_id=sid or "latest",
         resume_profile=profile or invocation.resume_profile,
-        attempt_id=None,
+        attempt_id=uuid.uuid4().hex,
+        attempt_kind="contract_repair",
+        attempt_ordinal=_attempt_count(result) + 1,
+        parent_attempt_id=result.get("attempt_id"),
         extra_args=(),   # DROP extra_args: a resume keeps the session's model, and a
                          # stray permission-override flag (--dangerously-bypass...,
                          # --permission-mode bypassPermissions) would defeat read-only.
@@ -3193,6 +3303,8 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         return result  # resume unsupported on this backend: keep the first verdict, no call made
     # A corrective call was spent EITHER WAY -> account for attempts + spend honestly.
     result["attempts"] = _attempt_count(result) + _attempt_count(retry)
+    result.setdefault("attempt_history", []).append(
+        _attempt_projection(retry, retry_inv.attempt_id))
     _aggregate_spend(result, retry)
     # Accept a retry that produced a VALID contract and did not error/time out. A
     # truthful DONE **or** PARTIAL/BLOCKED (report_ok true) is better than the

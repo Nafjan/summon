@@ -262,13 +262,13 @@ class LivenessTracker:
             return None
         elapsed = int((now - self.started) * 1000)
         reason = None
-        if elapsed >= self.overall_ms:
+        if self.finalization_started is not None:
+            if int((now - self.finalization_started) * 1000) >= self.finalization_ms:
+                reason = "finalization_timeout"
+        elif elapsed >= self.overall_ms:
             reason = "overall_timeout"
         elif self.first_trusted is None and elapsed >= self.first_event_ms:
             reason = "startup_timeout"
-        elif (self.finalization_started is not None
-              and int((now - self.finalization_started) * 1000) >= self.finalization_ms):
-            reason = "finalization_timeout"
         else:
             baseline = self.last_meaningful or self.first_trusted
             if baseline is not None and int((now - baseline) * 1000) >= self.idle_ms:
@@ -289,14 +289,15 @@ class LivenessTracker:
             return None
         now = self._sample(self._last_now)
         self._last_now = now
+        if self.finalization_started is not None:
+            return max(0, int((self.finalization_started
+                               + self.finalization_ms / 1000 - now) * 1000))
         deadlines = [self.started + self.overall_ms / 1000]
         if self.first_trusted is None:
             deadlines.append(self.started + self.first_event_ms / 1000)
         baseline = self.last_meaningful or self.first_trusted
         if baseline is not None:
             deadlines.append(baseline + self.idle_ms / 1000)
-        if self.finalization_started is not None:
-            deadlines.append(self.finalization_started + self.finalization_ms / 1000)
         return max(0, int((min(deadlines) - now) * 1000))
 
     def meaningful_within(self, interval_ms: int) -> bool:

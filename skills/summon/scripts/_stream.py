@@ -226,15 +226,21 @@ class StreamProcessor:
             return
         if old and self._event_observer is not None:
             try:
-                self._event_observer.reconnect(
+                accepted = self._event_observer.reconnect(
                     old_session_id=old, new_session_id=value,
                     source_event_id=(data.get("event_id") or data.get("id")))
+                if accepted:
+                    self.session_id = value
             except Exception:
                 pass
         else:
             self.session_id = value
             self._liveness("transport_started", data)
-        self.session_id = value
+
+    @staticmethod
+    def _meaningful_chars(value) -> int:
+        """Count visible generation for liveness without altering result text."""
+        return len(value.strip()) if isinstance(value, str) else 0
 
     def process_line(self, line: str) -> bool:
         """Process one line. Returns True when a terminal event is reached."""
@@ -289,7 +295,8 @@ class StreamProcessor:
             # assistant text or monotonically increasing tool steps reset idle.
             content = data.get("response") or data.get("content")
             if isinstance(content, str) and content:
-                self._liveness("output_text", data, output_chars=len(content))
+                self._liveness("output_text", data,
+                               output_chars=self._meaningful_chars(content))
             elif data.get("tool") or data.get("tool_name"):
                 self._tool_progress += 1
                 tool = data.get("tool") or data.get("tool_name")
@@ -323,7 +330,7 @@ class StreamProcessor:
                         continue
                     if block.get("type") == "text" and isinstance(block.get("text"), str):
                         self._liveness("output_text", data,
-                                       output_chars=len(block["text"]))
+                                       output_chars=self._meaningful_chars(block["text"]))
                     elif block.get("type") in {"tool_use", "server_tool_use"}:
                         self._tool_progress += 1
                         self._liveness("tool_activity", data, tool_id="claude_tool",
@@ -346,14 +353,16 @@ class StreamProcessor:
             content = data.get("content", "")
             if isinstance(content, str):
                 self.gemini_parts.append(content)
-                self._liveness("output_text", data, output_chars=len(content))
+                self._liveness("output_text", data,
+                               output_chars=self._meaningful_chars(content))
             return False
 
         if self.is_codex and data.get("type") == "item.completed":
             item = data.get("item", {})
             if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
                 self.codex_messages.append(item["text"])
-                self._liveness("output_text", data, output_chars=len(item["text"]))
+                self._liveness("output_text", data,
+                               output_chars=self._meaningful_chars(item["text"]))
             elif isinstance(item, dict):
                 self._tool_progress += 1
                 self._liveness("tool_activity", data, tool_id="codex_item",
@@ -424,7 +433,8 @@ class StreamProcessor:
                 text = part.get("text") if isinstance(part, dict) else data.get("text")
                 if isinstance(text, str):
                     self.opencode_parts.append(text)
-                    self._liveness("output_text", data, output_chars=len(text))
+                    self._liveness("output_text", data,
+                                   output_chars=self._meaningful_chars(text))
             elif data.get("type") in {"tool_use", "tool_result"}:
                 self._tool_progress += 1
                 part = data.get("part") if isinstance(data.get("part"), dict) else {}
@@ -473,7 +483,8 @@ class StreamProcessor:
             self._capture_opencode_metadata(data)
             if part.get("type") == "text" and isinstance(part.get("text"), str):
                 self.opencode_parts.append(part["text"])
-                self._liveness("output_text", data, output_chars=len(part["text"]))
+                self._liveness("output_text", data,
+                               output_chars=self._meaningful_chars(part["text"]))
             elif part.get("type") in {"tool", "patch", "file", "subtask", "agent"}:
                 self._tool_progress += 1
                 tool_id = part.get("callID") or part.get("id") or part.get("type")
@@ -496,7 +507,7 @@ class StreamProcessor:
             role = str(data.get("role") or "").strip().lower()
             if role == "assistant":
                 content = data.get("content")
-                chars = len(content) if isinstance(content, str) else 0
+                chars = self._meaningful_chars(content)
                 if data.get("tool_calls") or data.get("tool_call"):
                     self._tool_progress += 1
                     self._liveness("tool_activity", data, tool_id="kimi_tool",
@@ -575,6 +586,7 @@ class StreamProcessor:
                 self._capture_telemetry(payload)
                 if payload.get("error"):
                     self.result_json["error"] = payload.get("error")
+                self._liveness("terminal", data)
                 return True
             # A terminal result can itself report failure: claude sets is_error /
             # subtype "error_*"; gemini/cursor may carry status "error"/"failed".

@@ -2876,7 +2876,9 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
                    attempt_id: str | None = None,
                    first_event_ms: int | None = None,
                    idle_ms: int | None = None,
-                   finalization_ms: int | None = None) -> dict:
+                   finalization_ms: int | None = None,
+                   attempt_kind: str = "initial",
+                   attempt_ordinal: int = 1) -> dict:
     """Drive the subprocess and enrich whatever response path it takes.
 
     Single choke point: every return from the read loop (success, timeout,
@@ -2888,7 +2890,9 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
         parse_stream = cli not in ("agy", "arkcli")
     from _liveness import LivenessTracker
     from _job_control import RuntimeControl
-    runtime_control = RuntimeControl.from_environment(timeout_ms)
+    runtime_control = RuntimeControl.from_environment(
+        timeout_ms, attempt_id=attempt_id, attempt_kind=attempt_kind,
+        attempt_ordinal=attempt_ordinal)
     hard_budget_ms = (runtime_control.max_runtime_ms
                       if runtime_control is not None else timeout_ms)
     # In adaptive mode, --timeout is an observation checkpoint. The liveness
@@ -2952,15 +2956,37 @@ def _drive_process_loop(
     accumulated_chars = 0
     line_q = _spawn_reader(process)
     saw_terminal = False
+    terminal_reap_deadline = None
+
+    def _finish_forced_terminal_cleanup(stage: str) -> dict:
+        """Reap a child that outlived a trusted terminal event, preserving it."""
+        _kill_tree(process)
+        _drain_to_eof(line_q)
+        _, stderr = _safe_communicate(process)
+        processor.finalize_stream()
+        response = build_final_response(
+            cli, process.returncode, processor.get_result(), stdout_lines, stderr)
+        response["cleanup"] = {
+            "forced": True,
+            "stage": stage,
+            "reason": "backend_process_outlived_terminal_event",
+        }
+        response.setdefault("warnings", []).append(
+            "Summon preserved the trusted terminal result but force-reaped the "
+            "backend process after its bounded exit grace.")
+        return response
 
     try:
         while True:
+            if (saw_terminal and terminal_reap_deadline is not None
+                    and time.monotonic() >= terminal_reap_deadline):
+                return _finish_forced_terminal_cleanup("terminal_reap_timeout")
             if runtime_control is not None:
                 runtime_control.refresh()
                 runtime_control.checkpoint(
                     active=liveness.meaningful_within(runtime_control.checkpoint_ms))
                 runtime_control.publish(liveness.snapshot())
-                if runtime_control.cancel_requested:
+                if runtime_control.cancel_requested and not saw_terminal:
                     if liveness_emitter is not None:
                         liveness_emitter.emit("cancelled", session_id=processor.session_id)
                     _kill_tree(process)
@@ -2974,7 +3000,7 @@ def _drive_process_loop(
                                       "error_kind": "operator_cancelled",
                                       "retryable": False, "result_usable": False})
                     return _attach_raw(cancelled, stdout_lines)
-                if runtime_control.expired():
+                if not saw_terminal and runtime_control.expired():
                     _kill_tree(process)
                     _drain_to_eof(line_q)
                     _safe_communicate(process)
@@ -2983,7 +3009,7 @@ def _drive_process_loop(
                         "adaptive_attention_timeout" if runtime_control.attention_required
                         else "adaptive_hard_timeout")
                     return timed
-            if liveness is not None:
+            if not saw_terminal and liveness is not None:
                 reason = liveness.expired()
                 if reason is not None:
                     _kill_tree(process)
@@ -2992,7 +3018,11 @@ def _drive_process_loop(
                     timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
                     timed.setdefault("timeout", {})["stage"] = reason
                     return timed
-            if launch_control is not None:
+            # Once a trusted terminal event has been parsed, provider-side
+            # cancellation/deadline state may only influence cleanup.  It must
+            # never replace the terminal result while the backend is being
+            # given its bounded reap grace.
+            if launch_control is not None and not saw_terminal:
                 try:
                     _controlled_cancel = launch_control.is_cancelled()
                 except Exception as exc:
@@ -3047,6 +3077,9 @@ def _drive_process_loop(
                     wait_for = min(wait_for, 0.25,
                                    max(0.001, runtime_control.deadline
                                        - time.monotonic()))
+                if saw_terminal and terminal_reap_deadline is not None:
+                    wait_for = min(wait_for, max(
+                        0.001, terminal_reap_deadline - time.monotonic()))
                 kind, line = line_q.get(timeout=wait_for)
             except queue.Empty:
                 if ((launch_control is not None or liveness is not None)
@@ -3079,6 +3112,11 @@ def _drive_process_loop(
                 # but keep looping so the reader thread can drain stdout to EOF.
                 process.terminate()
                 saw_terminal = True
+                terminal_grace_ms = (
+                    liveness.finalization_ms if liveness is not None else 120_000)
+                terminal_reap_deadline = min(
+                    runtime_control.hard_deadline if runtime_control is not None else deadline,
+                    time.monotonic() + terminal_grace_ms / 1000)
             if (parse_stream and cli == "codex" and expected_model
                     and processor.handshake_model
                     and _model_mismatch(expected_model, processor.handshake_model)):
@@ -3108,11 +3146,23 @@ def _drive_process_loop(
         if liveness_emitter is not None and liveness.snapshot()["phase"] not in {
                 "terminal", "cancelled", "timed_out"}:
             liveness_emitter.emit("finalizing", session_id=processor.session_id)
+        finalization_deadline = time.monotonic() + (
+            liveness.finalization_ms if liveness is not None else 120_000) / 1000
+        if terminal_reap_deadline is not None:
+            post_eof_deadline = terminal_reap_deadline
+        elif runtime_control is not None:
+            # Adaptive jobs still honor their explicit hard cap.  Ordinary jobs
+            # get a real post-EOF finalization grace even when stdout closes at
+            # the original dispatch deadline.
+            post_eof_deadline = min(
+                runtime_control.hard_deadline, finalization_deadline)
+        else:
+            post_eof_deadline = finalization_deadline
         while process.poll() is None:
             if runtime_control is not None:
                 runtime_control.refresh()
                 runtime_control.publish(liveness.snapshot())
-                if runtime_control.cancel_requested:
+                if runtime_control.cancel_requested and not saw_terminal:
                     if liveness_emitter is not None:
                         liveness_emitter.emit("cancelled", session_id=processor.session_id)
                     _kill_tree(process)
@@ -3120,14 +3170,25 @@ def _drive_process_loop(
                     return _attach_raw(_error_response(
                         cli, 130, "background job cancelled during finalization",
                         partial_result=processor.get_result()), stdout_lines)
-            reason = liveness.expired() if liveness is not None else None
+            if time.monotonic() >= post_eof_deadline:
+                if saw_terminal:
+                    return _finish_forced_terminal_cleanup(
+                        "post_eof_terminal_reap_timeout")
+                _kill_tree(process)
+                _safe_communicate(process)
+                timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
+                timed.setdefault("timeout", {})["stage"] = "finalization_timeout"
+                return timed
+            reason = (liveness.expired()
+                      if not saw_terminal and liveness is not None else None)
             if reason is not None:
                 _kill_tree(process)
                 _safe_communicate(process)
                 timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
                 timed.setdefault("timeout", {})["stage"] = reason
                 return timed
-            if launch_control is not None and launch_control.is_cancelled():
+            if (launch_control is not None and not saw_terminal
+                    and launch_control.is_cancelled()):
                 if liveness_emitter is not None:
                     liveness_emitter.emit("cancelled", session_id=processor.session_id)
                 _kill_tree(process)
@@ -3661,6 +3722,25 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             inv.cli, _compat["error_kind"], _compat["message"],
             details=_compat_details), None))
 
+    # Retries and report repairs share the immutable background-job budget.
+    # Enforce it before every API boundary / before_provider_launch / Popen so
+    # an already-expired corrective attempt cannot incur provider contact and
+    # then be killed only after the stream driver reconstructs its clock.
+    if os.environ.get("SUMMON_ADAPTIVE_TIMEOUT") == "1":
+        from _job_control import environment_job_budget
+        _job_budget = environment_job_budget(timeout_ms)
+        if _job_budget["expired"]:
+            _budget_response = _error_response(
+                inv.cli, 124, "background job hard runtime budget exhausted",
+                not_run=True)
+            _budget_response.update({
+                "error_kind": "job_hard_timeout",
+                "retryable": False,
+                "result_usable": False,
+                "timeout": {"stage": "adaptive_job_hard_timeout"},
+            })
+            return _stamp(_enrich(_budget_response, None))
+
     # API-kind backends (e.g. openai-compat): the backend performs the request
     # itself instead of spawning a process. Flows through the same _enrich/_stamp
     # so the envelope shape is identical to a subprocess backend's.
@@ -3804,7 +3884,9 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         from _builder import supports_acp as _supports_acp
         if (_supports_acp(inv.cli)
                 and (launch_control is None or launch_control.allow_secondary)
-                and os.environ.get("SUMMON_ACP_FALLBACK") != "0"):
+                and os.environ.get("SUMMON_ACP_FALLBACK") != "0"
+                and (inv.cli != "kimi"
+                     or os.environ.get("SUMMON_KIMI_ACP_FALLBACK") == "1")):
             from dataclasses import replace as _replace_inv
             _routed = execute_agent(_replace_inv(inv, transport="acp"),
                                     timeout_ms=timeout_ms, debug_dir=debug_dir,
@@ -3932,12 +4014,18 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                                   parse_stream=parse_stream,
                                   launch_control=launch_control,
                                   attempt_id=_attempt_id,
+                                  attempt_kind=getattr(inv, "attempt_kind", "initial"),
+                                  attempt_ordinal=getattr(inv, "attempt_ordinal", 1),
                                   expected_model=(
                                       _requested_model
                                       if inv.cli == "codex"
                                        and _codex_selection.get("exact_required")
                                        else None))
         response.setdefault("provider_contacted", _provider_contacted)
+        response.setdefault("attempt_kind", getattr(inv, "attempt_kind", "initial"))
+        response.setdefault("attempt_ordinal", getattr(inv, "attempt_ordinal", 1))
+        if getattr(inv, "parent_attempt_id", None):
+            response.setdefault("parent_attempt_id", inv.parent_attempt_id)
         if inv.cli == "kimi" and env_override:
             # Kimi 0.38 omits the model from its public stream-json records. Its
             # fresh per-call profile does contain response-accounting records,

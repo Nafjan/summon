@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -250,6 +252,7 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict) ->
                         "stderr": subprocess.DEVNULL}
         child_env = {**os.environ, "SUMMON_JOB_NONCE": nonce,
                      "SUMMON_JOB_ID": job_id,
+                     "SUMMON_JOB_STARTED_AT": str(time.time()),
                      "SUMMON_JOB_SCRIPTS_SHA256": execution_summon["scripts_sha256"]}
         if getattr(args, "adaptive_timeout", False):
             from _job_control import control_path, heartbeat_path
@@ -320,24 +323,51 @@ def run_jobs_query(args, emit_error) -> int:
         if st is None:
             emit_error(f"no such job {args.jobs_status!r} under {root}"); return 1
         try:
-            from _job_control import control_summary, heartbeat_path
+            from _job_control import (control_summary, heartbeat_auth,
+                                      heartbeat_path, legacy_heartbeat_auth)
             st["control"] = control_summary(root, args.jobs_status)
             heartbeat, _state = _jobs._read(heartbeat_path(root, args.jobs_status))
             record = st.get("record") if isinstance(st.get("record"), dict) else {}
+            record_nonce = record.get("nonce")
+            auth_ok = False
+            if isinstance(heartbeat, dict) and isinstance(record_nonce, str) and record_nonce:
+                schema = heartbeat.get("schema")
+                auth_value = str(heartbeat.get("auth") or "").encode("utf-8")
+                if schema == "summon.job-heartbeat/v2":
+                    body = {key: value for key, value in heartbeat.items()
+                            if key != "auth"}
+                    expected_auth = heartbeat_auth(
+                        record_nonce, body).encode("ascii")
+                    auth_ok = hmac.compare_digest(auth_value, expected_auth)
+                elif schema == "summon.job-heartbeat/v1":
+                    expected_auth = legacy_heartbeat_auth(
+                        record_nonce, args.jobs_status).encode("ascii")
+                    auth_ok = hmac.compare_digest(auth_value, expected_auth)
+                # Immutable v1 jobs launched by Summon <=3.2.1 wrote the nonce
+                # directly. Accept that legacy shape only for v1 so a v2
+                # payload can never bypass its full-body MAC.
+                if schema == "summon.job-heartbeat/v1":
+                    auth_ok = auth_ok or hmac.compare_digest(
+                        str(heartbeat.get("nonce") or "").encode("utf-8"),
+                        record_nonce.encode("utf-8"))
             if (not isinstance(heartbeat, dict)
                     or heartbeat.get("job_id") != args.jobs_status
-                    or heartbeat.get("nonce") != record.get("nonce")):
+                    or not auth_ok):
                 st["heartbeat"] = None
             else:
                 st["heartbeat"] = {key: value for key, value in heartbeat.items()
-                                   if key != "nonce"}
+                                   if key not in {"auth", "nonce"}}
+                st["heartbeat"]["integrity"] = (
+                    "payload_authenticated"
+                    if heartbeat.get("schema") == "summon.job-heartbeat/v2"
+                    else "legacy_unverified")
             if isinstance(st.get("record"), dict):
                 st["record"] = {key: value for key, value in st["record"].items()
                                 if key != "nonce"}
             if isinstance(st.get("result"), dict):
                 st["result"] = {key: value for key, value in st["result"].items()
                                 if key != "job_nonce"}
-        except (OSError, ValueError):
+        except (OSError, TypeError, ValueError):
             st["control"] = {"state": "unavailable"}
             st["heartbeat"] = None
         print(json.dumps(st, ensure_ascii=False))

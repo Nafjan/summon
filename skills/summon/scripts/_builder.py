@@ -102,6 +102,11 @@ class AgentInvocation:
     # the executor will mint one before any provider contact. This is an
     # opaque UUID-shaped value, never a prompt or provider identifier.
     attempt_id: str | None = None
+    # Physical-attempt lineage.  Corrective/report retries are separate paid
+    # turns even when they reuse the same provider session.
+    attempt_kind: str = "initial"
+    attempt_ordinal: int = 1
+    parent_attempt_id: str | None = None
 
 
 # Short report-contract nudge appended to RESUME prompts. On resume the session
@@ -246,6 +251,42 @@ _PERMISSION_MAPPING = {
         "yolo": ["--auto"],
     },
 }
+
+# This set is an authority statement, not an argv-spelling shortcut.  New
+# backends therefore fail closed as ``unknown`` until their boundary is reviewed.
+_ENFORCED_PERMISSION_BACKENDS = {
+    "codex", "claude", "gemini", "cursor-agent", "opencode",
+    "arkcli", "openai-compat",
+}
+
+
+def permission_enforcement(cli: str, permission: str) -> str:
+    """Classify the real backend/tier boundary used by decision evidence."""
+    if permission == "yolo":
+        return "enforced"  # no narrower boundary is being promised
+    if cli in {"arkcli", "openai-compat"}:
+        # These are text-only request transports, not local agent loops. They
+        # expose no filesystem, shell, or mutation tools, so read-only and
+        # safe-edit are both bounded by the absence of local tool authority.
+        return "enforced"
+    if cli in {"agy", "kimi"}:
+        return "unenforceable"
+    if cli in _ENFORCED_PERMISSION_BACKENDS:
+        return "enforced"
+    return "unknown"
+
+
+def unenforceable_permission_authorized(cli: str, permission: str, *,
+                                        forced: bool = False) -> bool:
+    """Whether the caller explicitly accepted a known advisory-only tier."""
+    if forced or cli != "agy":
+        return False
+    if permission == "safe-edit":
+        # AGY safe-edit is documented as full-user authority. Declaring it is
+        # the acknowledgement; it must never be produced by a clamp/gate.
+        return True
+    return (permission == "read-only"
+            and os.environ.get(_UNENFORCED_RO_OPT_IN) == "1")
 
 # Only backends whose read-only mode has a native additional-directory control are
 # allowed to receive explicit roots.  Codex's --add-dir is writable, OpenCode's
@@ -772,7 +813,7 @@ def readonly_unenforceable_error(cli: str, permission: str, *,
                     "a trusted, isolated worktree; summon refuses the misleading safe-edit "
                     "label.")
         return None
-    if cli != "agy" or permission != "read-only":
+    if cli != "agy" or permission not in {"read-only", "safe-edit"}:
         return None
     if forced:
         # A tier SUMMON imposed -- a --gate-with adjudicator, a --max-permission clamp, a
@@ -785,12 +826,13 @@ def readonly_unenforceable_error(cli: str, permission: str, *,
         # for one dispatch silently authorized advisory-only gates and clamped members
         # underneath it. A gate that can be waived by the environment it runs in is not a
         # gate.
-        return ("agy cannot enforce read-only, and this dispatch was FORCED to read-only by "
+        return (f"agy cannot enforce {permission}, and this dispatch was FORCED to "
+                f"{permission} by "
                 "summon (a gate, a --max-permission clamp, or a contract-repair resume). "
                 + _UNENFORCED_RO_OPT_IN + " does not apply here: it waives a tier you chose, "
                 "not one summon imposed to reduce privilege. Use a backend that enforces "
-                "read-only for this role.")
-    if os.environ.get(_UNENFORCED_RO_OPT_IN) == "1":
+                f"{permission} for this role.")
+    if unenforceable_permission_authorized(cli, permission, forced=forced):
         return None
     return ("agy cannot enforce the read-only tier, so summon refuses this dispatch rather "
             "than imply a boundary that does not exist. Measured: a declared read-only agy "

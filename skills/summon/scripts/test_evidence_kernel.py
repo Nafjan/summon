@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import math
 from pathlib import Path
@@ -11,6 +12,7 @@ import sys
 
 import pytest
 
+import _builder
 import _decision
 import _evidence
 import _executor
@@ -24,12 +26,15 @@ EMPTY_LIVENESS_COUNTS = {
 
 
 def test_canonical_digest_binds_schema_and_mapping_order():
-    a = _evidence.digest("summon.evidence/v1", {"b": 2, "a": 1})
-    b = _evidence.digest("summon.evidence/v1", {"a": 1, "b": 2})
+    a = _evidence.digest("summon.evidence/v1",
+                         {"kind": "test", "value": {"b": 2, "a": 1}})
+    b = _evidence.digest("summon.evidence/v1",
+                         {"kind": "test", "value": {"a": 1, "b": 2}})
     assert a == b
     liveness = {"phase": "startup", "elapsed_ms": 0,
                 "expired": None, "counts": dict(EMPTY_LIVENESS_COUNTS)}
-    assert (_evidence.digest("summon.evidence/v1", liveness)
+    assert (_evidence.digest("summon.evidence/v1",
+                             {"kind": "test", "value": liveness})
             != _evidence.digest("summon.liveness/v1", liveness))
 
 
@@ -45,21 +50,27 @@ def test_evidence_rejects_unknown_schema_and_unbounded_numbers():
     with pytest.raises(_evidence.EvidenceError):
         _evidence.digest("summon.evidence/v999", {})
     with pytest.raises(_evidence.EvidenceError):
-        _evidence.digest("summon.evidence/v1", {"x": 1 << 64})
+        _evidence.digest("summon.evidence/v1",
+                         {"kind": "test", "value": 1 << 64})
     with pytest.raises(_evidence.EvidenceError):
-        _evidence.digest("summon.evidence/v1", {"x": math.inf})
+        _evidence.digest("summon.evidence/v1",
+                         {"kind": "test", "value": math.inf})
     with pytest.raises(_evidence.EvidenceError, match="binary floats"):
-        _evidence.digest("summon.evidence/v1", {"x": 1.0})
+        _evidence.digest("summon.evidence/v1",
+                         {"kind": "test", "value": 1.0})
     with pytest.raises(_evidence.EvidenceError, match="Unicode"):
-        _evidence.digest("summon.evidence/v1", {"x": "\ud800"})
+        _evidence.digest("summon.evidence/v1",
+                         {"kind": "test", "value": "\ud800"})
 
 
 def test_evidence_seal_verify_and_forgery_rejection():
-    sealed = _evidence.seal("summon.evidence/v1", {"value": 1})
-    assert _evidence.verify(sealed) == {"value": 1}
+    sealed = _evidence.seal("summon.evidence/v1",
+                            {"kind": "test", "value": 1})
+    assert _evidence.verify(sealed) == {"kind": "test", "value": 1}
     with pytest.raises(_evidence.EvidenceError, match="seal fields"):
         _evidence.seal("summon.evidence/v1",
-                       {"schema": "summon.decision/v1", "value": 1})
+                       {"schema": "summon.decision/v2",
+                        "kind": "test", "value": 1})
     forged = dict(sealed, value=2)
     with pytest.raises(_evidence.EvidenceError, match="mismatch"):
         _evidence.verify(forged)
@@ -77,7 +88,8 @@ def test_decision_exact_agent_and_spend_constraints_win():
         candidates=[
             {"seat": "cheap", "backend": "codex", "model": "gpt-5.6-luna",
              "permission": "read-only", "priority": 0,
-             "gate_allowed": True, "data_boundary_satisfied": True},
+             "gate_allowed": True, "data_boundary_satisfied": True,
+             "requires_spend": False},
             {"seat": "sol-review", "backend": "codex", "model": "gpt-5.6-sol",
              "permission": "read-only", "priority": 1, "requires_spend": True,
              "gate_allowed": True, "data_boundary_satisfied": True},
@@ -92,7 +104,8 @@ def test_decision_exact_agent_and_spend_constraints_win():
     reasons = {item["seat"]: item["losing_rules"] for item in result["candidates"]}
     assert reasons["cheap"] == ["agent_mismatch", "exact_model_mismatch"]
     assert reasons["sol-review"] == ["paid_route_not_authorized"]
-    assert len(result["decision_sha256"]) == 64
+    assert len(result["sha256"]) == 64
+    assert _evidence.verify(result)["resolution"]["seat"] is None
     assert result["digests"] == {"roster": None, "policy": None,
                                  "project": None, "approval": None}
 
@@ -102,7 +115,8 @@ def test_decision_exact_agent_permission_and_gate_fail_closed():
         request={"agent": "wanted", "lane": None, "model": "frontier"},
         candidates=[{"seat": "attacker", "backend": "codex", "model": "frontier",
                      "permission": "read-only", "priority": -1,
-                     "gate_allowed": True, "data_boundary_satisfied": True}],
+                     "gate_allowed": True, "data_boundary_satisfied": True,
+                     "requires_spend": False}],
         constraints={"permission_ceiling": "read-only", "spend_authorized": True,
                      "enforcement": "enforced", "corrective_allowed": False,
                      "retry_allowed": False, "fallback_allowed": False},
@@ -113,7 +127,8 @@ def test_decision_exact_agent_permission_and_gate_fail_closed():
         request={"agent": "wanted", "lane": None, "model": "frontier"},
         candidates=[{"seat": "wanted", "backend": "codex", "model": "frontier",
                      "permission": "yolo", "priority": 0,
-                     "gate_allowed": True, "data_boundary_satisfied": True}],
+                     "gate_allowed": True, "data_boundary_satisfied": True,
+                     "requires_spend": False}],
         constraints={"permission_ceiling": "read-only", "spend_authorized": True,
                      "enforcement": "enforced", "corrective_allowed": False,
                      "retry_allowed": False, "fallback_allowed": False},
@@ -124,7 +139,7 @@ def test_decision_exact_agent_permission_and_gate_fail_closed():
         candidates=[{"seat": "wanted", "backend": "codex", "model": "frontier",
                      "permission": "read-only", "priority": 1,
                      "reasons": ["gate_denied"], "gate_allowed": True,
-                     "data_boundary_satisfied": True}],
+                     "data_boundary_satisfied": True, "requires_spend": False}],
         constraints={"permission_ceiling": "read-only", "spend_authorized": True,
                      "enforcement": "enforced", "corrective_allowed": False,
                      "retry_allowed": False, "fallback_allowed": False},
@@ -138,7 +153,8 @@ def test_decision_rejects_mixed_priority_types():
             request={"agent": "wanted", "lane": None, "model": None},
             candidates=[{"seat": "wanted", "backend": "codex", "model": None,
                          "permission": "read-only", "priority": "first",
-                         "gate_allowed": True, "data_boundary_satisfied": True}],
+                         "gate_allowed": True, "data_boundary_satisfied": True,
+                         "requires_spend": False}],
             constraints={"permission_ceiling": "read-only",
                          "spend_authorized": True, "enforcement": "enforced",
                          "corrective_allowed": False, "retry_allowed": False,
@@ -146,11 +162,23 @@ def test_decision_rejects_mixed_priority_types():
         )
 
 
+def test_decision_requires_explicit_spend_classification():
+    with pytest.raises(_evidence.EvidenceError, match="explicit boolean"):
+        _decision.decide(
+            request={"agent": "wanted", "lane": None},
+            candidates=[{"seat": "wanted", "backend": "codex", "model": None,
+                         "permission": "read-only", "priority": 0,
+                         "gate_allowed": True, "data_boundary_satisfied": True}],
+            constraints={"permission_ceiling": None, "spend_authorized": True,
+                         "enforcement": "enforced", "corrective_allowed": False,
+                         "retry_allowed": False, "fallback_allowed": False})
+
+
 def test_decision_rejects_typos_invalid_permissions_and_fail_open_retry():
     base_candidate = {"seat": "wanted", "backend": "codex", "provider": "codex",
                       "model": "frontier", "permission": "read-only", "priority": 0,
                       "gate_allowed": True, "data_boundary_satisfied": True,
-                      "requires_retry": True}
+                      "requires_retry": True, "requires_spend": False}
     base_constraints = {"permission_ceiling": None, "spend_authorized": True,
                         "enforcement": "enforced", "corrective_allowed": False,
                         "retry_allowed": False, "fallback_allowed": False}
@@ -173,7 +201,7 @@ def test_schema_validation_rejects_unknown_and_malformed_nested_fields():
                  "authority": {}, "candidates": ["bad"], "unknowns": [],
                  "digests": {}, "raw_prompt": "private"}
     with pytest.raises(_evidence.EvidenceError):
-        _evidence.digest("summon.decision/v1", malformed)
+        _evidence.digest("summon.decision/v2", malformed)
     with pytest.raises(_evidence.EvidenceError):
         _evidence.digest("summon.liveness/v1",
                          {"phase": [], "elapsed_ms": "0", "expired": {},
@@ -188,15 +216,16 @@ def test_decision_schema_rejects_individual_malformed_request_values(field, requ
         request={"agent": "wanted", "lane": None},
         candidates=[{"seat": "wanted", "backend": "codex", "provider": "codex",
                      "model": "frontier", "permission": "read-only", "priority": 0,
-                     "gate_allowed": True, "data_boundary_satisfied": True}],
+                     "gate_allowed": True, "data_boundary_satisfied": True,
+                     "requires_spend": False}],
         constraints={"permission_ceiling": "read-only", "spend_authorized": True,
                      "enforcement": "enforced", "corrective_allowed": False,
                      "retry_allowed": False, "fallback_allowed": False})
     payload = {key: item for key, item in body.items()
-               if key not in {"schema", "decision_sha256"}}
+               if key not in {"schema", "sha256"}}
     payload["request"][field] = requested_value
     with pytest.raises(_evidence.EvidenceError):
-        _evidence.digest("summon.decision/v1", payload)
+        _evidence.digest("summon.decision/v2", payload)
 
 
 @pytest.mark.parametrize("mutation", [
@@ -229,6 +258,425 @@ def test_decision_kernel_has_no_dispatch_capability_imports():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         and node.func.id in forbidden_calls
     }
+
+
+def test_v2_generic_evidence_schema_is_exact_and_private_text_is_rejected():
+    with pytest.raises(_evidence.EvidenceError, match="exactly"):
+        _evidence.digest("summon.evidence/v2", {"value": 1})
+    with pytest.raises(_evidence.EvidenceError, match="path-like"):
+        _evidence.digest("summon.evidence/v2", {
+            "kind": "test", "value": {"nested": ["C:\\private\\note.txt"]}})
+    for private_text in (
+            "see /home/private/data for details",
+            "url file:///home/private",
+            "cwd=C:\\private\\note.txt",
+            "a,C:/private/note.txt",
+            "model:C:\\private\\model",
+            "[C:/private/note.txt]",
+            "read \\\\server\\private\\data",
+            "read //server/private/data"):
+        with pytest.raises(_evidence.EvidenceError, match="path-like"):
+            _evidence.digest("summon.evidence/v2", {
+                "kind": "test", "value": {"nested": [private_text]}})
+    assert _evidence.digest("summon.evidence/v2", {
+        "kind": "test", "value": {"url": "https://example.com/public"}})
+
+
+def test_evidence_v1_keeps_its_original_generic_canonical_contract():
+    assert _evidence.digest("summon.evidence/v1", {
+        "legacy": ["shape", 1], "no_wrapper_required": True})
+
+
+def test_permission_enforcement_fails_closed_without_a_ceiling():
+    result = _decision.decide(
+        request={"agent": "wanted", "lane": None},
+        candidates=[{"seat": "wanted", "backend": "agy", "model": "frontier",
+                     "permission": "read-only", "priority": 0,
+                     "gate_allowed": True, "data_boundary_satisfied": True,
+                     "requires_spend": False}],
+        constraints={"permission_ceiling": None, "spend_authorized": True,
+                     "enforcement": "unenforceable", "corrective_allowed": False,
+                     "retry_allowed": False, "fallback_allowed": False})
+    assert result["resolution"]["seat"] is None
+    assert result["candidates"][0]["losing_rules"] == [
+        "permission_unenforceable"]
+
+
+def test_argv_permission_mapping_alone_cannot_claim_enforcement(monkeypatch):
+    monkeypatch.setitem(_builder._PERMISSION_MAPPING, "future-backend", {
+        "read-only": ["--plan"], "safe-edit": [], "yolo": []})
+    assert _builder.permission_enforcement(
+        "future-backend", "read-only") == "unknown"
+
+
+@pytest.mark.parametrize("backend", ["openai-compat", "arkcli"])
+def test_text_only_transport_permission_is_enforced_without_local_tools(backend):
+    result = _decision.decide(
+        request={"agent": "text-seat", "lane": None},
+        candidates=[{"seat": "text-seat", "backend": backend,
+                     "model": "frontier", "permission": "read-only",
+                     "priority": 0, "gate_allowed": True,
+                     "data_boundary_satisfied": True,
+                     "requires_spend": False}],
+        constraints={"permission_ceiling": None, "spend_authorized": True,
+                     "enforcement": _builder.permission_enforcement(
+                         backend, "read-only"),
+                     "corrective_allowed": False, "retry_allowed": False,
+                     "fallback_allowed": False})
+    assert result["resolution"]["seat"] == "text-seat"
+    assert result["candidates"][0]["losing_rules"] == []
+
+
+def test_decision_verifier_rejects_forged_nonminimal_lane_winner():
+    decision = _decision.decide(
+        request={"agent": None, "lane": "review"},
+        candidates=[
+            {"seat": "a", "backend": "codex", "model": "frontier",
+             "permission": "read-only", "priority": 0,
+             "gate_allowed": True, "data_boundary_satisfied": True,
+             "requires_spend": False},
+            {"seat": "b", "backend": "claude", "model": "frontier",
+             "permission": "read-only", "priority": 1,
+             "gate_allowed": True, "data_boundary_satisfied": True,
+             "requires_spend": False}],
+        constraints={"permission_ceiling": "read-only", "spend_authorized": True,
+                     "enforcement": "enforced", "corrective_allowed": False,
+                     "retry_allowed": False, "fallback_allowed": False})
+    body = _evidence.verify(decision)
+    body["resolution"] = {
+        "seat": "b", "backend": "claude", "provider": None,
+        "model_targeted": "frontier", "winning_rule": "approved_lane_priority",
+        "source": "approved_lane"}
+    with pytest.raises(_evidence.EvidenceError, match="deterministic winner"):
+        _evidence.verify(_evidence.seal("summon.decision/v2", body))
+
+
+def test_decision_verifier_binds_winning_rule_to_resolution_state():
+    winner = _decision.decide(
+        request={"agent": "a", "lane": None, "source": "explicit_agent"},
+        candidates=[
+            {"seat": "a", "backend": "codex", "model": "frontier",
+             "permission": "read-only", "priority": 0,
+             "gate_allowed": True, "data_boundary_satisfied": True,
+             "requires_spend": False}],
+        constraints={"permission_ceiling": "read-only",
+                     "spend_authorized": True, "enforcement": "enforced",
+                     "corrective_allowed": False, "retry_allowed": False,
+                     "fallback_allowed": False})
+    forged_winner = _evidence.verify(winner)
+    forged_winner["resolution"]["winning_rule"] = "no_eligible_candidate"
+    with pytest.raises(_evidence.EvidenceError, match="winning rule"):
+        _evidence.verify(_evidence.seal("summon.decision/v2", forged_winner))
+
+    no_winner = _decision.decide(
+        request={"agent": "a", "lane": None, "source": "explicit_agent"},
+        candidates=[
+            {"seat": "a", "backend": "agy", "model": "frontier",
+             "permission": "read-only", "priority": 0,
+             "gate_allowed": True, "data_boundary_satisfied": True,
+             "requires_spend": False}],
+        constraints={"permission_ceiling": "read-only",
+                     "spend_authorized": True, "enforcement": "unenforceable",
+                     "corrective_allowed": False, "retry_allowed": False,
+                     "fallback_allowed": False})
+    forged_empty = _evidence.verify(no_winner)
+    forged_empty["resolution"]["winning_rule"] = "exact_agent_preserved"
+    with pytest.raises(_evidence.EvidenceError, match="winning rule"):
+        _evidence.verify(_evidence.seal("summon.decision/v2", forged_empty))
+
+
+def test_decision_source_matches_request_and_rejects_missing_source():
+    role = _decision.decide(
+        request={"agent": "review", "lane": None,
+                 "resolved_agent": "reviewer", "source": "approved_role"},
+        candidates=[
+            {"seat": "reviewer", "backend": "codex", "model": "frontier",
+             "permission": "read-only", "priority": 0,
+             "gate_allowed": True, "data_boundary_satisfied": True,
+             "requires_spend": False}],
+        constraints={"permission_ceiling": "read-only",
+                     "spend_authorized": True, "enforcement": "enforced",
+                     "corrective_allowed": False, "retry_allowed": False,
+                     "fallback_allowed": False})
+    legacy = _evidence.verify(role)
+    legacy["resolution"].pop("source")
+    with pytest.raises(_evidence.EvidenceError, match="source"):
+        _evidence.verify(_evidence.seal("summon.decision/v2", legacy))
+
+    explicit = _decision.decide(
+        request={"agent": "reviewer", "lane": None,
+                 "source": "explicit_agent"},
+        candidates=[
+            {"seat": "reviewer", "backend": "codex", "model": "frontier",
+             "permission": "read-only", "priority": 0,
+             "gate_allowed": True, "data_boundary_satisfied": True,
+             "requires_spend": False}],
+        constraints={"permission_ceiling": "read-only",
+                     "spend_authorized": True, "enforcement": "enforced",
+                     "corrective_allowed": False, "retry_allowed": False,
+                     "fallback_allowed": False})
+    for source, rule in (
+            ("approved_lane", "approved_lane_priority"),
+            ("approved_role", "approved_role_resolved")):
+        forged = copy.deepcopy(_evidence.verify(explicit))
+        forged["resolution"].update({"source": source,
+                                      "winning_rule": rule})
+        with pytest.raises(_evidence.EvidenceError, match="source|role"):
+            _evidence.verify(_evidence.seal("summon.decision/v2", forged))
+
+    with pytest.raises(_evidence.EvidenceError, match="approved_lane"):
+        _decision.decide(
+            request={"agent": "reviewer", "lane": None,
+                     "source": "approved_lane"},
+            candidates=[
+                {"seat": "reviewer", "backend": "codex",
+                 "model": "frontier", "permission": "read-only",
+                 "priority": 0, "gate_allowed": True,
+                 "data_boundary_satisfied": True,
+                 "requires_spend": False}],
+            constraints={"permission_ceiling": "read-only",
+                         "spend_authorized": True,
+                         "enforcement": "enforced",
+                         "corrective_allowed": False,
+                         "retry_allowed": False,
+                         "fallback_allowed": False})
+
+
+def test_decision_verifier_binds_exact_request_fields_to_candidates():
+    explicit = _decision.decide(
+        request={"agent": "a", "lane": None, "model": "m",
+                 "provider": "codex", "source": "explicit_agent"},
+        candidates=[
+            {"seat": "a", "backend": "codex", "provider": "codex",
+             "model": "m", "permission": "read-only", "priority": 0,
+             "gate_allowed": True, "data_boundary_satisfied": True,
+             "requires_spend": False}],
+        constraints={"permission_ceiling": "read-only",
+                     "spend_authorized": True, "enforcement": "enforced",
+                     "corrective_allowed": False, "retry_allowed": False,
+                     "fallback_allowed": False})
+    mutations = (
+        {"agent": "b"},
+        {"resolved_agent": "b"},
+        {"model": "other"},
+        {"provider": "claude"},
+    )
+    for mutation in mutations:
+        forged = copy.deepcopy(_evidence.verify(explicit))
+        forged["request"].update(mutation)
+        with pytest.raises(_evidence.EvidenceError, match="request binding"):
+            _evidence.verify(_evidence.seal("summon.decision/v2", forged))
+
+
+def test_decision_verifier_mirrors_visible_authority_and_canonical_sets():
+    decision = _decision.decide(
+        request={"agent": "a", "lane": None, "source": "explicit_agent"},
+        candidates=[
+            {"seat": "a", "backend": "codex", "model": "m",
+             "permission": "read-only", "priority": 0,
+             "gate_allowed": True, "data_boundary_satisfied": True,
+             "requires_spend": False}],
+        constraints={"permission_ceiling": "read-only",
+                     "spend_authorized": True, "enforcement": "enforced",
+                     "corrective_allowed": False, "retry_allowed": False,
+                     "fallback_allowed": False,
+                     "unknowns": ["roster_digest", "policy_digest"]})
+
+    permission = copy.deepcopy(_evidence.verify(decision))
+    permission["candidates"][0]["permission"] = "yolo"
+    with pytest.raises(_evidence.EvidenceError, match="permission ceiling"):
+        _evidence.verify(_evidence.seal("summon.decision/v2", permission))
+
+    for enforcement in ("unknown", "unenforceable"):
+        forged = copy.deepcopy(_evidence.verify(decision))
+        forged["authority"]["enforcement"] = enforcement
+        with pytest.raises(_evidence.EvidenceError,
+                           match="permission enforcement"):
+            _evidence.verify(_evidence.seal("summon.decision/v2", forged))
+
+    duplicate_rules = copy.deepcopy(_evidence.verify(decision))
+    duplicate_rules["candidates"][0].update({
+        "eligible": False,
+        "losing_rules": ["candidate_ineligible", "candidate_ineligible"],
+    })
+    with pytest.raises(_evidence.EvidenceError, match="not canonical"):
+        _evidence.verify(
+            _evidence.seal("summon.decision/v2", duplicate_rules))
+
+    duplicate_unknowns = copy.deepcopy(_evidence.verify(decision))
+    duplicate_unknowns["unknowns"] = ["roster_digest", "roster_digest"]
+    with pytest.raises(_evidence.EvidenceError, match="not canonical"):
+        _evidence.verify(
+            _evidence.seal("summon.decision/v2", duplicate_unknowns))
+
+    effective = copy.deepcopy(_evidence.verify(decision))
+    effective["authority"]["effective_permission"] = "yolo"
+    with pytest.raises(_evidence.EvidenceError, match="effective permission"):
+        _evidence.verify(_evidence.seal("summon.decision/v2", effective))
+
+    precedence = copy.deepcopy(_evidence.verify(decision))
+    precedence["resolution"]["precedence"] = ["approved_role", "exact_agent"]
+    with pytest.raises(_evidence.EvidenceError, match="precedence"):
+        _evidence.verify(_evidence.seal("summon.decision/v2", precedence))
+
+
+def test_decision_verifier_recomputes_every_visible_constraint_rule():
+    decision = _decision.decide(
+        request={"agent": "a", "lane": None, "source": "explicit_agent"},
+        candidates=[{
+            "seat": "a", "backend": "codex", "model": "m",
+            "permission": "read-only", "priority": 0,
+            "gate_allowed": True, "data_boundary_satisfied": True,
+            "requires_spend": True, "requires_corrective": True,
+            "requires_retry": True, "requires_fallback": True,
+            "freshness": "fresh",
+        }],
+        constraints={
+            "permission_ceiling": "read-only", "spend_authorized": True,
+            "enforcement": "enforced", "corrective_allowed": True,
+            "retry_allowed": True, "fallback_allowed": True,
+            "require_fresh": True,
+        })
+    base = _evidence.verify(decision)
+    mutations = (
+        ("spend_authorized", False),
+        ("corrective_allowed", False),
+        ("retry_allowed", False),
+        ("fallback_allowed", False),
+    )
+    for field, value in mutations:
+        forged = copy.deepcopy(base)
+        forged["authority"][field] = value
+        with pytest.raises(_evidence.EvidenceError,
+                           match="losing rules contradict visible inputs"):
+            _evidence.verify(_evidence.seal("summon.decision/v2", forged))
+
+    stale = copy.deepcopy(base)
+    stale["candidates"][0]["freshness"] = "stale"
+    with pytest.raises(_evidence.EvidenceError,
+                       match="losing rules contradict visible inputs"):
+        _evidence.verify(_evidence.seal("summon.decision/v2", stale))
+
+    gate = copy.deepcopy(base)
+    gate["candidates"][0]["gate_allowed"] = False
+    with pytest.raises(_evidence.EvidenceError,
+                       match="losing rules contradict visible inputs"):
+        _evidence.verify(_evidence.seal("summon.decision/v2", gate))
+
+    boundary = copy.deepcopy(base)
+    boundary["candidates"][0]["data_boundary_satisfied"] = False
+    with pytest.raises(_evidence.EvidenceError,
+                       match="losing rules contradict visible inputs"):
+        _evidence.verify(_evidence.seal("summon.decision/v2", boundary))
+
+
+def test_lane_request_rejects_pre_resolved_agent():
+    with pytest.raises(_evidence.EvidenceError, match="cannot pre-resolve"):
+        _decision.decide(
+            request={"agent": None, "lane": "review",
+                     "resolved_agent": "reviewer", "source": "approved_lane"},
+            candidates=[{
+                "seat": "reviewer", "backend": "codex", "model": "m",
+                "permission": "read-only", "priority": 0,
+                "gate_allowed": True, "data_boundary_satisfied": True,
+                "requires_spend": False,
+            }],
+            constraints={
+                "permission_ceiling": "read-only", "spend_authorized": False,
+                "enforcement": "enforced", "corrective_allowed": False,
+                "retry_allowed": False, "fallback_allowed": False,
+            })
+
+    lane = _decision.decide(
+        request={"agent": None, "lane": "review", "source": "approved_lane"},
+        candidates=[{
+            "seat": "reviewer", "backend": "codex", "model": "m",
+            "permission": "read-only", "priority": 0,
+            "gate_allowed": True, "data_boundary_satisfied": True,
+            "requires_spend": False,
+        }],
+        constraints={
+            "permission_ceiling": "read-only", "spend_authorized": False,
+            "enforcement": "enforced", "corrective_allowed": False,
+            "retry_allowed": False, "fallback_allowed": False,
+        })
+    forged = copy.deepcopy(_evidence.verify(lane))
+    forged["request"]["resolved_agent"] = "reviewer"
+    with pytest.raises(_evidence.EvidenceError, match="cannot pre-resolve"):
+        _evidence.verify(_evidence.seal("summon.decision/v2", forged))
+
+
+def test_decision_verifier_binds_spend_and_usage_projections():
+    decision = _decision.decide(
+        request={"agent": "a", "lane": None, "source": "explicit_agent"},
+        candidates=[
+            {"seat": "a", "backend": "codex", "model": "m",
+             "permission": "read-only", "priority": 0,
+             "gate_allowed": True, "data_boundary_satisfied": True,
+             "requires_spend": False}],
+        constraints={"permission_ceiling": "read-only",
+                     "spend_authorized": False, "enforcement": "enforced",
+                     "corrective_allowed": False, "retry_allowed": False,
+                     "fallback_allowed": False})
+    base = _evidence.verify(decision)
+    base["authority"].update({
+        "effective_permission": "read-only",
+        "credit": {"authorized": False, "source": "none"},
+        "payg": {"authorized": False, "source": "none"},
+    })
+    base["usage"] = {
+        "state": "advisory_only", "reason": "exact_pin_preserved",
+        "observations_considered": 1,
+        "freshness": {"fresh": 1, "stale": 0},
+        "dimensions": ["subscription_allowance"],
+        "comparability": "unverified_semantics",
+    }
+    sealed = _evidence.seal("summon.decision/v2", base)
+    assert _evidence.verify(sealed)["usage"]["observations_considered"] == 1
+
+    mutations = []
+    credit = copy.deepcopy(base)
+    credit["authority"]["credit"] = {
+        "authorized": True, "source": "dispatch_flag"}
+    mutations.append((credit, "spend projection"))
+    source = copy.deepcopy(base)
+    source["authority"]["credit"]["source"] = "arbitrary"
+    mutations.append((source, "credit"))
+    totals = copy.deepcopy(base)
+    totals["usage"]["freshness"] = {"fresh": 7, "stale": 9}
+    mutations.append((totals, "freshness"))
+    dimensions = copy.deepcopy(base)
+    dimensions["usage"]["dimensions"] = [
+        "subscription_allowance", "subscription_allowance"]
+    mutations.append((dimensions, "dimensions"))
+    comparability = copy.deepcopy(base)
+    comparability["usage"]["comparability"] = "arbitrary"
+    mutations.append((comparability, "comparability"))
+    for forged, match in mutations:
+        with pytest.raises(_evidence.EvidenceError, match=match):
+            _evidence.verify(_evidence.seal("summon.decision/v2", forged))
+
+    role = _decision.decide(
+        request={"agent": "review", "lane": None,
+                 "resolved_agent": "a", "source": "approved_role"},
+        candidates=[
+            {"seat": "a", "backend": "codex", "provider": "codex",
+             "model": "m", "permission": "read-only", "priority": 0,
+             "gate_allowed": True, "data_boundary_satisfied": True,
+             "requires_spend": False}],
+        constraints={"permission_ceiling": "read-only",
+                     "spend_authorized": True, "enforcement": "enforced",
+                     "corrective_allowed": False, "retry_allowed": False,
+                     "fallback_allowed": False})
+    for legacy in (False, True):
+        forged = copy.deepcopy(_evidence.verify(role))
+        forged["request"]["resolved_agent"] = "b"
+        if legacy:
+            forged["resolution"].pop("source")
+        with pytest.raises(
+                _evidence.EvidenceError,
+                match="source" if legacy else "request binding"):
+            _evidence.verify(_evidence.seal("summon.decision/v2", forged))
 
 
 class Clock:
@@ -354,8 +802,8 @@ def test_executor_stream_integration_projects_meaningful_liveness():
         [sys.executable, "-c", program], stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, encoding="utf-8")
     response = _executor._drive_process(
-        process, "codex", 2_000, parse_stream=True,
-        attempt_id="a" * 32, first_event_ms=500, idle_ms=500)
+        process, "codex", 5_000, parse_stream=True,
+        attempt_id="a" * 32, first_event_ms=3_000, idle_ms=3_000)
     assert response["liveness"]["phase"] == "terminal"
     assert response["liveness"]["counts"]["meaningful"] == 1
     assert response["liveness"]["counts"]["trusted"] >= 3

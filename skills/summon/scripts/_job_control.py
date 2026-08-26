@@ -8,7 +8,9 @@ provider accepted steering or that a cancellation was instantaneous.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -32,12 +34,55 @@ def heartbeat_path(root: str, job_id: str) -> str:
     return os.path.join(base, f"{job_id}.heartbeat.json")
 
 
+def _auth(nonce: str, domain: str, payload: dict) -> str:
+    """Bind a local control payload to one job secret.
+
+    This detects stale, cross-job, and accidentally/tampered records.  It is not
+    a security boundary against a same-user process that can read the immutable
+    launch record and therefore obtain the nonce.
+    """
+    body = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hmac.new(nonce.encode("utf-8"),
+                    domain.encode("ascii") + b":" + body,
+                    hashlib.sha256).hexdigest()
+
+
+def heartbeat_auth(nonce: str, payload: dict) -> str:
+    """Authenticate the complete v2 heartbeat body (excluding ``auth``)."""
+    return _auth(nonce, "summon-heartbeat/v2", payload)
+
+
+def legacy_heartbeat_auth(nonce: str, job_id: str) -> str:
+    """Read-only compatibility for the unreleased v1 draft."""
+    return hmac.new(nonce.encode("utf-8"),
+                    f"summon-heartbeat:{job_id}".encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def command_auth(nonce: str, job_id: str, command: dict) -> str:
+    """Authenticate one append-only v2 control command."""
+    return _auth(nonce, f"summon-job-control/v2:{job_id}", command)
+
+
+def _valid_command_log(commands: list, generation: int) -> bool:
+    """The v2 log is append-only: generations are exactly 1..N."""
+    return (isinstance(generation, int) and not isinstance(generation, bool)
+            and generation == len(commands)
+            and all(isinstance(item, dict)
+                    and isinstance(item.get("generation"), int)
+                    and not isinstance(item.get("generation"), bool)
+                    and item.get("generation") == index
+                    for index, item in enumerate(commands, 1)))
+
+
 @contextmanager
 def _exclusive_control_lock(path: str):
     """Serialize read-modify-replace command appends across local processes."""
     lock_path = path + ".lock"
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     handle = open(lock_path, "a+b")
+    acquired = False
     try:
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
@@ -53,6 +98,7 @@ def _exclusive_control_lock(path: str):
                 else:
                     import fcntl
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
                 break
             except (OSError, BlockingIOError):
                 if time.monotonic() >= deadline:
@@ -61,13 +107,14 @@ def _exclusive_control_lock(path: str):
         yield
     finally:
         try:
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if acquired:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
 
@@ -113,12 +160,33 @@ def queue_command(root: str, job_id: str, action: str, *,
         if state == _jobs._CORRUPT:
             raise ValueError("job control file is malformed")
         if existing is None:
-            existing = {"schema": "summon.job-control/v1", "job_id": job_id,
-                        "nonce": record["nonce"], "generation": 0, "commands": []}
-        if (existing.get("schema") != "summon.job-control/v1"
+            existing = {"schema": "summon.job-control/v2", "job_id": job_id,
+                        "generation": 0, "commands": []}
+        elif existing.get("schema") == "summon.job-control/v1":
+            # Ownership-safe in-place migration for a launcher from the
+            # immediately preceding draft: authenticate every retained command
+            # and remove the duplicated plaintext nonce.
+            commands = existing.get("commands")
+            generation = existing.get("generation")
+            if (existing.get("job_id") != job_id
+                    or existing.get("nonce") != record["nonce"]
+                    or not isinstance(commands, list)
+                    or not isinstance(generation, int)
+                    or not _valid_command_log(commands, generation)):
+                raise ValueError("job control identity mismatch")
+            migrated = []
+            for item in commands:
+                body = {key: value for key, value in item.items() if key != "auth"}
+                body["auth"] = command_auth(record["nonce"], job_id, body)
+                migrated.append(body)
+            existing = {"schema": "summon.job-control/v2", "job_id": job_id,
+                        "generation": generation, "commands": migrated}
+        if (existing.get("schema") != "summon.job-control/v2"
                 or existing.get("job_id") != job_id
-                or existing.get("nonce") != record["nonce"]
-                or not isinstance(existing.get("commands"), list)):
+                or not isinstance(existing.get("commands"), list)
+                or not isinstance(existing.get("generation"), int)
+                or not _valid_command_log(
+                    existing["commands"], existing["generation"])):
             raise ValueError("job control identity mismatch")
         commands = existing["commands"]
         if len(commands) >= MAX_COMMANDS:
@@ -132,6 +200,7 @@ def queue_command(root: str, job_id: str, action: str, *,
             command["message"] = message
             command["message_sha256"] = hashlib.sha256(
                 message.encode("utf-8")).hexdigest()
+        command["auth"] = command_auth(record["nonce"], job_id, command)
         commands.append(command)
         existing["generation"] = generation
         _jobs._atomic_write_json(path, existing)
@@ -157,12 +226,47 @@ def control_summary(root: str, job_id: str) -> dict | None:
     }
 
 
+def environment_job_budget(timeout_ms: int, *, wall_clock=None) -> dict:
+    """Return the immutable background-job budget without touching providers.
+
+    The job-origin wall clock is shared by initial, retry, and repair attempts.
+    A missing/invalid origin remains non-expired for legacy foreground callers;
+    the child runtime will then anchor itself when it starts.
+    """
+    now_fn = wall_clock or time.time
+    try:
+        maximum = int(os.environ.get("SUMMON_MAX_RUNTIME_MS", timeout_ms))
+    except ValueError:
+        maximum = timeout_ms
+    maximum = max(timeout_ms, min(MAX_EXTENSION_MS, maximum))
+    try:
+        job_started_at = float(os.environ.get("SUMMON_JOB_STARTED_AT", ""))
+    except ValueError:
+        job_started_at = None
+    if (not isinstance(job_started_at, (int, float))
+            or not math.isfinite(job_started_at)):
+        job_started_at = None
+    deadline_at = (job_started_at + maximum / 1000
+                   if job_started_at is not None else None)
+    remaining_ms = (max(0, int((deadline_at - now_fn()) * 1000))
+                    if deadline_at is not None else None)
+    return {
+        "job_started_at": job_started_at,
+        "max_runtime_ms": maximum,
+        "deadline_at": deadline_at,
+        "remaining_ms": remaining_ms,
+        "expired": deadline_at is not None and remaining_ms == 0,
+    }
+
+
 class RuntimeControl:
     """Child-side reader for durable job commands and liveness publication."""
 
     def __init__(self, *, path: str, heartbeat: str, job_id: str, nonce: str,
                  checkpoint_ms: int, max_runtime_ms: int,
-                 clock=time.monotonic):
+                 attempt_id: str | None = None, attempt_kind: str = "initial",
+                 attempt_ordinal: int = 1, job_started_at: float | None = None,
+                 clock=time.monotonic, wall_clock=time.time):
         self.path = path
         self.heartbeat = heartbeat
         self.job_id = job_id
@@ -170,19 +274,32 @@ class RuntimeControl:
         self.checkpoint_ms = checkpoint_ms
         self.max_runtime_ms = max_runtime_ms
         self.clock = clock
-        self.started = clock()
+        self.wall_clock = wall_clock
+        self.job_started_at = (float(job_started_at)
+                               if isinstance(job_started_at, (int, float))
+                               else wall_clock())
+        elapsed = max(0.0, wall_clock() - self.job_started_at)
+        self.started = clock() - elapsed
         self.deadline = self.started + checkpoint_ms / 1000
         self.hard_deadline = self.started + max_runtime_ms / 1000
+        self.attempt_id = attempt_id or job_id
+        self.attempt_kind = attempt_kind
+        self.attempt_ordinal = attempt_ordinal
         self.generation = 0
+        self._command_digests: dict[int, str] = {}
         self.cancel_requested = False
+        self.control_untrusted = False
         self.attention_required = False
         self.auto_extensions = 0
         self.extension_ms = 0
         self.steers: list[dict] = []
         self._last_publish = 0.0
+        self._last_refresh = float("-inf")
 
     @classmethod
-    def from_environment(cls, timeout_ms: int):
+    def from_environment(cls, timeout_ms: int, *, attempt_id: str | None = None,
+                         attempt_kind: str = "initial",
+                         attempt_ordinal: int = 1):
         if os.environ.get("SUMMON_ADAPTIVE_TIMEOUT") != "1":
             return None
         path = os.environ.get("SUMMON_JOB_CONTROL_FILE")
@@ -192,35 +309,73 @@ class RuntimeControl:
         if not all(isinstance(item, str) and item for item in
                    (path, heartbeat, job_id, nonce)):
             return None
-        try:
-            maximum = int(os.environ.get("SUMMON_MAX_RUNTIME_MS", timeout_ms))
-        except ValueError:
-            maximum = timeout_ms
-        maximum = max(timeout_ms, min(MAX_EXTENSION_MS, maximum))
+        budget = environment_job_budget(timeout_ms)
+        maximum = int(budget["max_runtime_ms"])
+        job_started_at = budget["job_started_at"]
         return cls(path=path, heartbeat=heartbeat, job_id=job_id, nonce=nonce,
-                   checkpoint_ms=timeout_ms, max_runtime_ms=maximum)
+                   checkpoint_ms=timeout_ms, max_runtime_ms=maximum,
+                   attempt_id=attempt_id, attempt_kind=attempt_kind,
+                   attempt_ordinal=attempt_ordinal,
+                   job_started_at=job_started_at)
 
-    def refresh(self) -> int:
+    def refresh(self, *, force: bool = False) -> int:
         """Read new commands; return newly authorized extension milliseconds."""
+        now = self.clock()
+        if not force and now - self._last_refresh < 0.25:
+            return 0
+        self._last_refresh = now
         data, state = _jobs._read(self.path)
         if state == _jobs._CORRUPT:
-            self.cancel_requested = True
+            self.control_untrusted = True
             return 0
         if not isinstance(data, dict):
             return 0
-        if data.get("job_id") != self.job_id or data.get("nonce") != self.nonce:
-            self.cancel_requested = True
+        schema = data.get("schema")
+        if data.get("job_id") != self.job_id or schema not in {
+                "summon.job-control/v1", "summon.job-control/v2"}:
+            self.control_untrusted = True
             return 0
         added = 0
         commands = data.get("commands")
         if not isinstance(commands, list) or len(commands) > MAX_COMMANDS:
-            self.cancel_requested = True
+            self.control_untrusted = True
+            return 0
+        declared_generation = data.get("generation")
+        if (not isinstance(declared_generation, int)
+                or isinstance(declared_generation, bool)
+                or declared_generation < self.generation
+                or declared_generation != len(commands)
+                or not _valid_command_log(commands, declared_generation)):
+            # A deleted/recreated or truncated control file must not make a
+            # previously observed cancel/extend/steer disappear.
+            self.control_untrusted = True
+            return 0
+        if schema == "summon.job-control/v1" and data.get("nonce") != self.nonce:
+            self.control_untrusted = True
             return 0
         for command in commands:
             generation = command.get("generation") if isinstance(command, dict) else None
-            if not isinstance(generation, int) or generation <= self.generation:
+            if not isinstance(generation, int) or isinstance(generation, bool):
+                self.control_untrusted = True
+                return 0
+            if schema == "summon.job-control/v2":
+                body = {key: value for key, value in command.items() if key != "auth"}
+                claimed = command.get("auth")
+                if (not isinstance(claimed, str)
+                        or not hmac.compare_digest(
+                            claimed, command_auth(self.nonce, self.job_id, body))):
+                    self.control_untrusted = True
+                    return 0
+            command_digest = hashlib.sha256(json.dumps(
+                command, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")).encode("utf-8")).hexdigest()
+            if generation <= self.generation:
+                if self._command_digests.get(generation) != command_digest:
+                    self.control_untrusted = True
+                    return 0
                 continue
             self.generation = generation
+            self._command_digests[generation] = command_digest
             action = command.get("action")
             if action == "cancel":
                 self.cancel_requested = True
@@ -276,16 +431,28 @@ class RuntimeControl:
             return
         self._last_publish = now
         payload = {
-            "schema": "summon.job-heartbeat/v1", "job_id": self.job_id,
-            "nonce": self.nonce,
+            "schema": "summon.job-heartbeat/v2", "job_id": self.job_id,
+            "attempt_id": self.attempt_id,
+            "attempt_kind": self.attempt_kind,
+            "attempt_ordinal": self.attempt_ordinal,
+            "state": ("repairing" if self.attempt_kind in {
+                "schema_correction", "contract_repair"} else "running"),
+            "job_started_at": self.job_started_at,
+            "job_elapsed_ms": max(
+                0, int((self.wall_clock() - self.job_started_at) * 1000)),
+            "job_hard_deadline_at": (
+                self.job_started_at + self.max_runtime_ms / 1000),
             "observed_at": time.time(), "liveness": liveness,
             "adaptive": True, "attention_required": self.attention_required,
             "auto_extensions": self.auto_extensions,
             "extension_ms": self.extension_ms,
+            "control_scope": "current_attempt_replayed_from_job_origin",
             "cancel_requested": self.cancel_requested,
+            "control_untrusted": self.control_untrusted,
             "steering": {"queued": len(self.steers),
                          "mode": "queued_for_resume"},
         }
+        payload["auth"] = heartbeat_auth(self.nonce, payload)
         _jobs._atomic_write_json(self.heartbeat, payload)
 
     def projection(self) -> dict:
@@ -294,7 +461,9 @@ class RuntimeControl:
                 "extension_ms": self.extension_ms,
                 "hard_runtime_ms": self.max_runtime_ms,
                 "cancel_requested": self.cancel_requested,
+                "control_untrusted": self.control_untrusted,
+                "attempt_id": self.attempt_id,
+                "attempt_kind": self.attempt_kind,
+                "attempt_ordinal": self.attempt_ordinal,
                 "steering": {"queued": len(self.steers),
-                             "mode": "queued_for_resume",
-                             "message_sha256": [item.get("message_sha256")
-                                                for item in self.steers]}}
+                             "mode": "queued_for_resume"}}

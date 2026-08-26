@@ -15,7 +15,8 @@ from typing import Any
 
 KNOWN_SCHEMAS = {
     "summon.evidence/v1",
-    "summon.decision/v1",
+    "summon.evidence/v2",
+    "summon.decision/v2",
     "summon.liveness/v1",
 }
 MAX_DEPTH = 24
@@ -133,13 +134,19 @@ def validate(value: Any, *, depth: int = 0, counter: list[int] | None = None) ->
 def _validate_schema_value(schema: str, value: Any) -> None:
     if not isinstance(value, dict):
         raise EvidenceError(f"{schema} evidence must be an object")
-    if schema == "summon.decision/v1":
+    if schema == "summon.evidence/v2":
+        if set(value) != {"kind", "value"}:
+            raise EvidenceError(
+                "summon.evidence/v2 requires exactly kind and value")
+        _rule(value.get("kind"), "evidence.kind")
+        _reject_private_public_text(value)
+    elif schema == "summon.decision/v2":
         required = {"provider_contacted", "request", "resolution", "authority",
                     "candidates", "unknowns", "digests"}
         missing = sorted(required - set(value))
         if missing:
             raise EvidenceError(
-                "summon.decision/v1 is missing fields: " + ", ".join(missing))
+                "summon.decision/v2 is missing fields: " + ", ".join(missing))
         if value.get("provider_contacted") is not False:
             raise EvidenceError("decision evidence must be provider-inert")
         if not isinstance(value.get("request"), dict) \
@@ -163,15 +170,22 @@ def _validate_schema_value(schema: str, value: Any) -> None:
                     "seat", "backend", "provider", "model_targeted", "winning_rule",
                     "source", "precedence"}):
             raise EvidenceError("decision resolution has malformed fields")
-        if ({"permission_ceiling", "spend_authorized", "enforcement"}
+        if ({"permission_ceiling", "spend_authorized", "enforcement",
+             "unenforceable_authorized", "corrective_allowed", "retry_allowed",
+             "fallback_allowed", "require_fresh"}
                 - set(authority) or set(authority) - {
                     "permission_ceiling", "spend_authorized", "enforcement",
+                    "unenforceable_authorized",
+                    "corrective_allowed", "retry_allowed", "fallback_allowed",
+                    "require_fresh",
                     "effective_permission", "strict_roster", "credit", "payg"}):
             raise EvidenceError("decision authority has malformed fields")
         if set(digests) != {"roster", "policy", "project", "approval"}:
             raise EvidenceError("decision digests have malformed fields")
         if bool(request.get("agent")) == bool(request.get("lane")):
             raise EvidenceError("decision request must name exactly one agent or lane")
+        if request.get("lane") and request.get("resolved_agent"):
+            raise EvidenceError("decision lane request cannot pre-resolve an agent")
         for field in ("agent", "lane", "model", "provider", "resolved_agent"):
             item = request.get(field)
             _public_string(item, f"request.{field}", nullable=True)
@@ -190,12 +204,15 @@ def _validate_schema_value(schema: str, value: Any) -> None:
                 raise EvidenceError("decision resolution source is invalid")
         if "precedence" in resolution:
             precedence = resolution["precedence"]
+            canonical_precedence = [
+                "exact_agent", "approved_role", "approved_lane"]
             if (not isinstance(precedence, list) or not precedence
                     or len(precedence) > 16
                     or not all(isinstance(item, str)
                                and item in {"exact_agent", "approved_role",
                                             "approved_lane"}
-                               for item in precedence)):
+                               for item in precedence)
+                    or precedence != canonical_precedence[:len(precedence)]):
                 raise EvidenceError("decision precedence is invalid")
         if not 1 <= len(value["candidates"]) <= 128:
             raise EvidenceError("decision requires 1..128 candidates")
@@ -203,7 +220,11 @@ def _validate_schema_value(schema: str, value: Any) -> None:
         for candidate in value["candidates"]:
             if not isinstance(candidate, dict) or set(candidate) != {
                     "seat", "backend", "provider", "model", "permission", "eligible",
-                    "losing_rules", "priority"}:
+                    "losing_rules", "priority", "declared_eligible",
+                    "declared_reasons", "requires_spend", "gate_allowed",
+                    "data_boundary_satisfied", "requires_corrective",
+                    "requires_retry", "requires_fallback", "freshness",
+                    "preflight_rules"}:
                 raise EvidenceError("decision candidate has malformed fields")
             _public_string(candidate.get("seat"), "candidate.seat")
             seats.append(candidate["seat"])
@@ -216,10 +237,32 @@ def _validate_schema_value(schema: str, value: Any) -> None:
                     or not isinstance(candidate.get("priority"), int)
                     or isinstance(candidate.get("priority"), bool)
                     or not -1_000_000 <= candidate.get("priority") <= 1_000_000
-                    or not isinstance(candidate.get("losing_rules"), list)
-                    or not all(isinstance(item, str) and _RULE.fullmatch(item)
-                               for item in candidate["losing_rules"])):
+                or not isinstance(candidate.get("losing_rules"), list)
+                or not all(isinstance(item, str) and _RULE.fullmatch(item)
+                           for item in candidate["losing_rules"])
+                or not isinstance(candidate.get("declared_eligible"), bool)
+                or not isinstance(candidate.get("declared_reasons"), list)
+                or not all(isinstance(item, str) and _RULE.fullmatch(item)
+                           for item in candidate["declared_reasons"])
+                or not isinstance(candidate.get("preflight_rules"), list)
+                or not all(isinstance(item, str) and _RULE.fullmatch(item)
+                           for item in candidate["preflight_rules"])
+                or not all(isinstance(candidate.get(field), bool) for field in (
+                    "requires_spend", "gate_allowed", "data_boundary_satisfied",
+                    "requires_corrective", "requires_retry", "requires_fallback"))
+                or candidate.get("freshness") not in {"fresh", "stale", "unknown"}):
                 raise EvidenceError("decision candidate has invalid values")
+            if candidate["losing_rules"] != sorted(set(candidate["losing_rules"])):
+                raise EvidenceError(
+                    "decision candidate losing rules are not canonical")
+            if candidate["declared_reasons"] != sorted(
+                    set(candidate["declared_reasons"])):
+                raise EvidenceError(
+                    "decision candidate declared reasons are not canonical")
+            if candidate["preflight_rules"] != sorted(
+                    set(candidate["preflight_rules"])):
+                raise EvidenceError(
+                    "decision candidate preflight rules are not canonical")
             if candidate["eligible"] == bool(candidate["losing_rules"]):
                 raise EvidenceError("decision candidate eligibility contradicts losing rules")
         if len(seats) != len(set(seats)):
@@ -228,11 +271,17 @@ def _validate_schema_value(schema: str, value: Any) -> None:
                 or not all(isinstance(item, str) and _RULE.fullmatch(item)
                            for item in value["unknowns"])):
             raise EvidenceError("decision unknowns have invalid values")
+        if value["unknowns"] != sorted(set(value["unknowns"])):
+            raise EvidenceError("decision unknowns are not canonical")
         for item in digests.values():
             if item is not None and (not isinstance(item, str)
                                      or not re.fullmatch(r"[0-9a-f]{64}", item)):
                 raise EvidenceError("decision digest reference is invalid")
         if (not isinstance(authority.get("spend_authorized"), bool)
+                or not isinstance(authority.get("unenforceable_authorized"), bool)
+                or not all(isinstance(authority.get(field), bool) for field in (
+                    "corrective_allowed", "retry_allowed", "fallback_allowed",
+                    "require_fresh"))
                 or (authority.get("permission_ceiling") is not None
                     and authority.get("permission_ceiling") not in
                     {"read-only", "safe-edit", "yolo"})
@@ -250,18 +299,144 @@ def _validate_schema_value(schema: str, value: Any) -> None:
             if field not in authority:
                 continue
             item = authority[field]
+            allowed_sources = ({"none", "dispatch_flag", "environment"}
+                               if field == "credit" else
+                               {"none", "dispatch_flag", "operator_configuration"})
             if (not isinstance(item, dict) or set(item) != {"authorized", "source"}
-                    or not isinstance(item.get("authorized"), bool)):
+                    or not isinstance(item.get("authorized"), bool)
+                    or item.get("source") not in allowed_sources
+                    or item["authorized"] != (item["source"] != "none")):
                 raise EvidenceError(f"decision authority.{field} is malformed")
-            _public_string(item.get("source"), f"authority.{field}.source")
+        projected_spend = [authority[field]["authorized"]
+                           for field in ("credit", "payg")
+                           if field in authority]
+        if any(projected_spend) and not authority["spend_authorized"]:
+            raise EvidenceError(
+                "decision spend projection contradicts authorization")
+        if len(projected_spend) == 2 \
+                and authority["spend_authorized"] != any(projected_spend):
+            raise EvidenceError(
+                "decision spend projection contradicts authorization")
         selected = resolution.get("seat")
+        source = resolution.get("source")
+        resolved_agent = request.get("resolved_agent")
+        if source == "approved_lane" and not request.get("lane"):
+            raise EvidenceError(
+                "decision resolution source contradicts request shape")
+        if source in {"explicit_agent", "approved_role"} and not request.get("agent"):
+            raise EvidenceError(
+                "decision resolution source contradicts request shape")
+        if (source == "approved_role"
+                and (not resolved_agent or resolved_agent == request.get("agent"))):
+            raise EvidenceError(
+                "approved role source lacks distinct resolved agent")
+        if source is None:
+            raise EvidenceError("decision resolution source is required")
+        expected_rule = ({
+            "explicit_agent": "exact_agent_preserved",
+            "approved_role": "approved_role_resolved",
+            "approved_lane": "approved_lane_priority",
+        }[source])
+        expected_seat = resolved_agent or request.get("agent")
+        exact_model = request.get("model")
+        exact_provider = request.get("provider")
+        permission_order = {"read-only": 0, "safe-edit": 1, "yolo": 2}
+        permission_ceiling = authority.get("permission_ceiling")
+        enforcement = authority["enforcement"]
+        unenforceable_authorized = authority["unenforceable_authorized"]
+        for candidate in value["candidates"]:
+            losing = candidate["losing_rules"]
+            expected_losing = set(candidate["declared_reasons"])
+            if not candidate["declared_eligible"] and not expected_losing:
+                expected_losing.add("candidate_ineligible")
+            bindings = []
+            if request.get("agent") and expected_seat is not None:
+                bindings.append(("agent_mismatch",
+                                 candidate["seat"] == expected_seat))
+            if exact_model is not None:
+                bindings.append(("exact_model_mismatch",
+                                 candidate["model"] == exact_model))
+            if exact_provider is not None:
+                bindings.append(("exact_provider_mismatch",
+                                 candidate["provider"] == exact_provider))
+            for rule, matches in bindings:
+                if not matches:
+                    expected_losing.add(rule)
+                has_rule = rule in losing
+                if matches and has_rule:
+                    raise EvidenceError(
+                        "decision candidate contradicts exact request binding")
+                if not matches and not has_rule:
+                    raise EvidenceError(
+                        "decision candidate ignores exact request binding")
+            if candidate["requires_spend"] and not authority["spend_authorized"]:
+                expected_losing.add("paid_route_not_authorized")
+            if not candidate["gate_allowed"]:
+                expected_losing.add("gate_denied")
+            if not candidate["data_boundary_satisfied"]:
+                expected_losing.add("data_boundary_unsatisfied")
+            for required_field, allowed_field, rule in (
+                    ("requires_corrective", "corrective_allowed",
+                     "corrective_not_allowed"),
+                    ("requires_retry", "retry_allowed", "retry_not_allowed"),
+                    ("requires_fallback", "fallback_allowed",
+                     "fallback_not_allowed")):
+                if candidate[required_field] and not authority[allowed_field]:
+                    expected_losing.add(rule)
+            if authority["require_fresh"] and candidate["freshness"] != "fresh":
+                expected_losing.add("freshness_required")
+            ceiling_exceeded = (permission_ceiling is not None
+                                and permission_order[candidate["permission"]]
+                                > permission_order[permission_ceiling])
+            if ceiling_exceeded:
+                expected_losing.add("permission_ceiling_exceeded")
+            has_ceiling_rule = "permission_ceiling_exceeded" in losing
+            if ceiling_exceeded != has_ceiling_rule:
+                raise EvidenceError(
+                    "decision candidate contradicts permission ceiling")
+            if ceiling_exceeded and candidate["eligible"]:
+                raise EvidenceError(
+                    "decision candidate ignores permission ceiling")
+            if "permission_order_unknown" in losing:
+                raise EvidenceError(
+                    "decision candidate has impossible permission order")
+            enforcement_rule = (
+                f"permission_{enforcement}"
+                if enforcement != "enforced"
+                and not (enforcement == "unenforceable"
+                         and unenforceable_authorized)
+                else None)
+            if enforcement_rule is not None:
+                expected_losing.add(enforcement_rule)
+            for rule in ("permission_unknown", "permission_unenforceable"):
+                expected = rule == enforcement_rule
+                present = rule in losing
+                if expected != present:
+                    raise EvidenceError(
+                        "decision candidate contradicts permission enforcement")
+            if enforcement_rule is not None and candidate["eligible"]:
+                raise EvidenceError(
+                    "decision candidate ignores permission enforcement")
+            expected_losing.update(candidate["preflight_rules"])
+            if losing != sorted(expected_losing):
+                raise EvidenceError(
+                    "decision candidate losing rules contradict visible inputs")
+            if candidate["eligible"] != (not expected_losing):
+                raise EvidenceError(
+                    "decision candidate eligibility contradicts visible inputs")
         if selected is None:
+            if resolution["winning_rule"] != "no_eligible_candidate":
+                raise EvidenceError(
+                    "empty decision resolution contradicts winning rule")
             if any(resolution.get(field) is not None
                    for field in ("backend", "provider", "model_targeted")):
                 raise EvidenceError("empty decision resolution contains route identity")
             if any(candidate["eligible"] for candidate in value["candidates"]):
                 raise EvidenceError("empty decision resolution ignores eligible candidate")
         else:
+            if resolution["winning_rule"] != expected_rule:
+                raise EvidenceError(
+                    "decision resolution contradicts winning rule")
             winners = [candidate for candidate in value["candidates"]
                        if candidate["seat"] == selected and candidate["eligible"]]
             if len(winners) != 1:
@@ -271,6 +446,17 @@ def _validate_schema_value(schema: str, value: Any) -> None:
                     or resolution.get("provider") != winner["provider"]
                     or resolution.get("model_targeted") != winner["model"]):
                 raise EvidenceError("decision resolution identity contradicts candidate")
+            expected = min(
+                (candidate for candidate in value["candidates"]
+                 if candidate["eligible"]),
+                key=lambda candidate: (candidate["priority"], candidate["seat"]))
+            if selected != expected["seat"]:
+                raise EvidenceError(
+                    "decision resolution does not name the deterministic winner")
+            if ("effective_permission" in authority
+                    and authority["effective_permission"] != winner["permission"]):
+                raise EvidenceError(
+                    "decision effective permission contradicts selected candidate")
         if "usage" in value:
             _validate_decision_usage(value["usage"])
         _reject_private_public_text(value)
@@ -317,12 +503,20 @@ def _validate_schema_value(schema: str, value: Any) -> None:
 def _reject_private_public_text(value: Any) -> None:
     """Reject obvious paths and credentials from public decision evidence."""
     if isinstance(value, str):
-        if (".." in value or re.search(r"(?i)(?:^|\s)[A-Z]:[\\/]", value)
-                or value.startswith(("/", "\\\\"))
+        if (".." in value or re.search(
+                r"(?i)(?:^|[\s('\"=\[,;:])[A-Z]:[\\/]", value)
+                or re.search(
+                    r"(?i)(?:file:\s*(?://)?[/\\]|"
+                    r"(?:^|[\s('\"=\[])(?://[^/\s]|/[^/\s]|\\\\[^\\\s]))",
+                    value)
                 or _PUBLIC_SECRET.search(value)):
             raise EvidenceError("public evidence contains path-like or secret text")
     elif isinstance(value, list):
         for item in value:
+            _reject_private_public_text(item)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _reject_private_public_text(key)
             _reject_private_public_text(item)
 
 
@@ -357,9 +551,18 @@ def _validate_decision_usage(value: Any) -> None:
         dimensions = value.get("dimensions")
         if (not isinstance(dimensions, list) or len(dimensions) > 32
                 or not all(isinstance(item, str) and _RULE.fullmatch(item)
-                           for item in dimensions)):
+                           for item in dimensions)
+                or dimensions != sorted(set(dimensions))):
             raise EvidenceError("decision usage dimensions are invalid")
-        _rule(value.get("comparability"), "usage.comparability")
+        observations = value["observations_considered"]
+        if sum(freshness.values()) != observations:
+            raise EvidenceError(
+                "decision usage freshness contradicts observation count")
+        if len(dimensions) > observations:
+            raise EvidenceError(
+                "decision usage dimensions contradict observation count")
+        if value.get("comparability") != "unverified_semantics":
+            raise EvidenceError("decision usage comparability is invalid")
     elif isinstance(value, dict):
         for item in value.values():
             _reject_private_public_text(item)

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 import _apibackend
+import _builder
 import _cli
 import _usage
 import run_subagent
@@ -129,7 +130,7 @@ def test_effective_decision_preserves_exact_agent_and_authority(monkeypatch):
     )
     decision = run_subagent._effective_decision_view(invocation, args)
 
-    assert decision["schema"] == "summon.decision/v1"
+    assert decision["schema"] == "summon.decision/v2"
     assert decision["provider_contacted"] is False
     assert decision["request"] == {
         "agent": "sol-strategist", "lane": None, "model": "gpt-5.6-sol",
@@ -138,11 +139,220 @@ def test_effective_decision_preserves_exact_agent_and_authority(monkeypatch):
     assert decision["resolution"]["winning_rule"] == "exact_agent_preserved"
     assert decision["authority"]["permission_ceiling"] == "read-only"
     assert decision["authority"]["effective_permission"] == "read-only"
+    assert decision["authority"]["enforcement"] == "enforced"
+    assert decision["authority"]["unenforceable_authorized"] is False
     assert decision["authority"]["payg"] == {"authorized": False, "source": "none"}
     assert decision["usage"] == {
         "state": "not_consulted",
         "reason": "exact_pin_preserved",
     }
+
+
+def test_credit_guard_and_decision_receipt_describe_same_effective_route(
+        monkeypatch):
+    monkeypatch.setattr(_builder, "_CREDIT_ONLY_MODELS", {"credit-model"})
+    monkeypatch.delenv("SUMMON_ALLOW_CREDIT", raising=False)
+    monkeypatch.delenv("SUMMON_ALLOW_FABLE", raising=False)
+    monkeypatch.setattr(_apibackend, "payg_consent_allowed",
+                        lambda flag=False: bool(flag))
+    args = SimpleNamespace(
+        agent="reviewer", _resolved_agent="reviewer", _role_provenance={},
+        max_permission="read-only", allow_credit=False, allow_payg=False,
+        strict_agents_dir=True, usage_cache=None, no_contract_repair=False,
+        json_schema=None)
+    requested = AgentInvocation(
+        cli="claude", prompt="review", cwd="C:/packet",
+        model="credit-model", permission="read-only")
+    guarded, _, _ = _builder.apply_credit_guard(requested)
+    decision = run_subagent._effective_decision_view(guarded, args)
+    assert guarded.model == _builder._OPUS_FALLBACK
+    assert decision["resolution"]["model_targeted"] == _builder._OPUS_FALLBACK
+    assert decision["candidates"][0]["requires_spend"] is False
+    assert decision["resolution"]["seat"] == "reviewer"
+
+    monkeypatch.setenv("SUMMON_ALLOW_CREDIT", "1")
+    authorized, _, _ = _builder.apply_credit_guard(requested)
+    paid = run_subagent._effective_decision_view(authorized, args)
+    assert paid["resolution"]["model_targeted"] == "credit-model"
+    assert paid["candidates"][0]["requires_spend"] is True
+    assert paid["authority"]["spend_authorized"] is True
+
+
+def test_credit_only_name_on_api_transport_does_not_inherit_claude_policy(
+        monkeypatch):
+    monkeypatch.setattr(_builder, "_CREDIT_ONLY_MODELS", {"credit-model"})
+    monkeypatch.setattr(_apibackend, "payg_consent_allowed",
+                        lambda flag=False: bool(flag))
+    invocation = AgentInvocation(
+        cli="openai-compat", prompt="review", cwd="C:/packet",
+        model="credit-model", permission="read-only", allow_payg=False)
+    args = SimpleNamespace(
+        agent="api-reviewer", _resolved_agent="api-reviewer",
+        _role_provenance={}, max_permission="read-only", allow_credit=False,
+        allow_payg=False, strict_agents_dir=True, usage_cache=None,
+        no_contract_repair=False, json_schema=None)
+    decision = run_subagent._effective_decision_view(invocation, args)
+    assert decision["candidates"][0]["requires_spend"] is False
+    assert decision["resolution"]["seat"] == "api-reviewer"
+
+
+def test_dry_run_keeps_invalid_decision_evidence_private_without_false_refusal():
+    invocation = AgentInvocation(
+        cli="codex", prompt="review", cwd="C:/private/packet",
+        model="C:/private/model", permission="read-only",
+        profile="token=abcdefghijklmnop",
+        extra_args=("token=abcdefghijklmnop",))
+    args = SimpleNamespace(
+        agent="C:/private/seat", _resolved_agent="C:/private/seat",
+        _role_provenance={"source": "explicit"}, max_permission="read-only",
+        allow_credit=False, allow_payg=False, strict_agents_dir=True,
+        timeout=1000, worktree=None, isolated_lane=False,
+        allow_tool_credentials=False, read_root=None, usage_cache=None)
+    view = run_subagent._dry_run_view(invocation, args, agents_dir=None)
+    rendered = json.dumps(view)
+    assert "would_refuse" not in view
+    assert view["preview_incomplete"] is True
+    assert view["decision_projection_available"] is False
+    assert view["projection_error_kind"] == "decision_evidence_invalid"
+    assert view["provider_contacted"] is False
+    for private in ("C:/private/model", "C:/private/seat",
+                    "C:/private/packet", "abcdefghijklmnop"):
+        assert private not in rendered
+    for normal_key in ("agent", "cli", "cwd", "permission", "timeout_ms",
+                       "read_allowlist", "effective_decision"):
+        assert normal_key in view
+
+
+def test_invalid_projection_cannot_hide_independent_read_root_refusal():
+    invocation = AgentInvocation(
+        cli="codex", prompt="review", cwd="C:/private/packet",
+        model="C:/private/model", permission="read-only",
+        read_roots=("C:/other-root",))
+    args = SimpleNamespace(
+        agent="C:/private/seat", _resolved_agent="C:/private/seat",
+        _role_provenance={"source": "explicit"}, max_permission="read-only",
+        allow_credit=False, allow_payg=False, strict_agents_dir=True,
+        timeout=1000, worktree=None, isolated_lane=False,
+        allow_tool_credentials=False, read_root=None, usage_cache=None)
+    view = run_subagent._dry_run_view(invocation, args, agents_dir=None)
+    rendered = json.dumps(view)
+    assert view["preview_incomplete"] is True
+    assert view["would_refuse"] is True
+    assert view["error_kind"] == "read_allowlist_unsupported"
+    assert view["read_allowlist"]["would_refuse"] is True
+    for private in ("C:/private/model", "C:/private/seat",
+                    "C:/private/packet", "C:/other-root"):
+        assert private not in rendered
+
+
+def test_invalid_projection_preserves_safe_routing_refusals():
+    common = dict(
+        _role_provenance={"source": "explicit"}, max_permission="read-only",
+        allow_credit=False, allow_payg=False, strict_agents_dir=True,
+        timeout=1000, worktree=None, isolated_lane=False,
+        allow_tool_credentials=False, read_root=None, usage_cache=None)
+    incompatible = AgentInvocation(
+        cli="codex", prompt="review", cwd="C:/packet",
+        model="claude-opus-5/..", permission="read-only")
+    incompatible_args = SimpleNamespace(
+        agent="reviewer", _resolved_agent="reviewer", **common)
+    view = run_subagent._dry_run_view(incompatible, incompatible_args, None)
+    assert view["would_refuse"] is True
+    assert view["error_kind"] == "backend_model_incompatible"
+    assert "claude-opus-5/.." not in json.dumps(view)
+
+    conflict = AgentInvocation(
+        cli="codex", prompt="review", cwd="C:/packet",
+        model="gpt-5.6-sol", permission="read-only",
+        extra_args=("--model", "gpt-5.6-luna"))
+    conflict_args = SimpleNamespace(
+        agent="C:/private/seat", _resolved_agent="C:/private/seat", **common)
+    view = run_subagent._dry_run_view(conflict, conflict_args, None)
+    assert view["would_refuse"] is True
+    assert view["error_kind"] == "model_selection_conflict"
+    assert "C:/private/seat" not in json.dumps(view)
+    assert "gpt-5.6-luna" not in json.dumps(view)
+
+
+def test_decision_receipt_matches_retry_and_fallback_authority(monkeypatch):
+    base = dict(
+        agent="reviewer", _resolved_agent="reviewer", _role_provenance={},
+        max_permission="yolo", allow_credit=False, allow_payg=False,
+        strict_agents_dir=True, usage_cache=None, no_contract_repair=False,
+        json_schema=None, retries=0, transient_retries=False,
+        no_acp_fallback=False, allow_kimi_acp_fallback=False)
+    invocation = AgentInvocation(
+        cli="gemini", prompt="review", cwd="C:/packet",
+        model="gemini-3.7-flash-high", permission="yolo")
+    args = SimpleNamespace(**base)
+    decision = run_subagent._effective_decision_view(invocation, args)
+    assert decision["authority"]["retry_allowed"] is False
+    assert decision["authority"]["fallback_allowed"] is True
+    readonly = AgentInvocation(
+        cli="gemini", prompt="review", cwd="C:/packet",
+        model="gemini-3.7-flash-high", permission="read-only")
+    assert run_subagent._effective_decision_view(
+        readonly, args)["authority"]["fallback_allowed"] is False
+
+    args.retries = 1
+    assert run_subagent._effective_decision_view(
+        invocation, args)["authority"]["retry_allowed"] is True
+    args.retries = 0
+    args.transient_retries = True
+    assert run_subagent._effective_decision_view(
+        invocation, args)["authority"]["retry_allowed"] is True
+    agy = AgentInvocation(
+        cli="agy", prompt="review", cwd="C:/packet",
+        model="gemini-3.7-flash-high", permission="yolo")
+    args.transient_retries = False
+    assert run_subagent._effective_decision_view(
+        agy, args)["authority"]["retry_allowed"] is True
+
+    monkeypatch.setenv("SUMMON_ACP_FALLBACK", "0")
+    assert run_subagent._effective_decision_view(
+        invocation, args)["authority"]["fallback_allowed"] is False
+    monkeypatch.delenv("SUMMON_ACP_FALLBACK")
+    kimi = AgentInvocation(
+        cli="kimi", prompt="review", cwd="C:/packet",
+        model="kimi-code/k3", permission="yolo")
+    assert run_subagent._effective_decision_view(
+        kimi, args)["authority"]["fallback_allowed"] is False
+    args.allow_kimi_acp_fallback = True
+    assert run_subagent._effective_decision_view(
+        kimi, args)["authority"]["fallback_allowed"] is True
+
+
+def test_agy_advisory_opt_in_is_explicit_not_mislabeled(monkeypatch):
+    monkeypatch.setenv("SUMMON_ALLOW_UNENFORCED_READONLY", "1")
+    invocation = AgentInvocation(
+        cli="agy", prompt="review", cwd="C:/packet", model="gemini-3.7-flash-high",
+        permission="read-only", permission_forced=False)
+    args = SimpleNamespace(
+        agent="researcher", _resolved_agent="researcher", _role_provenance={},
+        max_permission=None, allow_credit=False, allow_payg=False,
+        strict_agents_dir=True, usage_cache=None)
+    decision = run_subagent._effective_decision_view(invocation, args)
+    assert decision["resolution"]["seat"] == "researcher"
+    assert decision["authority"]["enforcement"] == "unenforceable"
+    assert decision["authority"]["unenforceable_authorized"] is True
+
+
+def test_agy_explicit_safe_edit_is_typed_full_authority_but_forced_is_refused():
+    explicit = AgentInvocation(
+        cli="agy", prompt="work", cwd="C:/packet", model="gemini-3.7-flash-high",
+        permission="safe-edit", permission_forced=False)
+    args = SimpleNamespace(
+        agent="researcher", _resolved_agent="researcher", _role_provenance={},
+        max_permission=None, allow_credit=False, allow_payg=False,
+        strict_agents_dir=True, usage_cache=None)
+    decision = run_subagent._effective_decision_view(explicit, args)
+    assert decision["resolution"]["seat"] == "researcher"
+    assert decision["authority"]["enforcement"] == "unenforceable"
+    assert decision["authority"]["unenforceable_authorized"] is True
+    assert _builder.readonly_unenforceable_error(
+        "agy", "safe-edit", forced=False) is None
+    assert "FORCED" in _builder.readonly_unenforceable_error(
+        "agy", "safe-edit", forced=True)
 
 
 def test_usage_import_accepts_utf8_bom_and_crlf(tmp_path):
