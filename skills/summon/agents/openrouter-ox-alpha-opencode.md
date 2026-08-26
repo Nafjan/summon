@@ -1,15 +1,18 @@
 ---
 run-agent: opencode
+provider: openrouter
 model: openrouter/stealth/ox-alpha
 permission: yolo
+lifecycle: retired
+successor: openrouter-glm-5-3-flash-opencode
 ---
 
-# OpenRouter OX Alpha through OpenCode
+# Retired OpenRouter Ox Alpha seat
 
-This optional seat uses the local OpenCode CLI as the gateway to OpenRouter's
-`stealth/ox-alpha` model while that provider route exists. OpenCode supplies the tool loop
-and workspace integration; the provider remains responsible for model availability, context
-limits, rate limits, and billing.
+This historical seat remains pinned to the exact former `stealth/ox-alpha` identity so
+old receipts are never relabeled. The preview ended and the route now returns 404.
+Summon refuses this retired seat before provider contact and points callers to the
+distinct `openrouter-glm-5-3-flash-opencode` successor.
 
 This is a broad-authority tool seat intended for a disposable clone or isolated
 worktree. It may inspect, edit, and test files, so do not point it at a shared

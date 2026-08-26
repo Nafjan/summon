@@ -12,11 +12,15 @@ import math
 import re
 from typing import Any
 
+from _backend_policy import CAPABILITIES
+
 
 KNOWN_SCHEMAS = {
     "summon.evidence/v1",
     "summon.evidence/v2",
     "summon.decision/v2",
+    "summon.fleet/v1",
+    "summon.fleet-plan/v1",
     "summon.liveness/v1",
 }
 MAX_DEPTH = 24
@@ -27,6 +31,8 @@ _PUBLIC_SECRET = re.compile(
     r"(?i)(?:sk-(?:or-)?[a-z0-9_-]{12,}|gh[pousr]_[a-z0-9]{20,}|"
     r"AIza[0-9A-Za-z_-]{20,}|(?:api[_-]?key|token|secret)[=:][^\s]{8,})")
 _RULE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
+_FLEET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_LANE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 
 
 def _public_string(value: Any, field: str, *, nullable: bool = False,
@@ -61,6 +67,121 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict:
             raise EvidenceError(f"duplicate JSON field: {key}")
         result[key] = value
     return result
+
+
+def _validate_fleet_lanes(lanes: Any) -> None:
+    """Validate the declarative, deliberately non-routing fleet lane shape."""
+    if not isinstance(lanes, list) or not 1 <= len(lanes) <= 64:
+        raise EvidenceError("fleet requires 1..64 lanes")
+    lane_names = []
+    for lane_index, lane in enumerate(lanes):
+        if not isinstance(lane, dict) or set(lane) != {
+                "name", "candidates", "constraints"}:
+            raise EvidenceError("fleet lane has malformed fields")
+        lane_name = _public_string(lane.get("name"), f"lanes[{lane_index}].name")
+        if not _LANE_ID.fullmatch(lane_name):
+            raise EvidenceError("fleet lane name must be a typed identifier")
+        lane_names.append(lane_name)
+        candidates = lane.get("candidates")
+        if not isinstance(candidates, list) or not 1 <= len(candidates) <= 128:
+            raise EvidenceError("fleet lane requires 1..128 candidates")
+        seats = []
+        canonical_candidates = []
+        for candidate_index, candidate in enumerate(candidates):
+            if not isinstance(candidate, dict) or set(candidate) != {"seat", "priority"}:
+                raise EvidenceError("fleet candidate has malformed fields")
+            seat = _public_string(
+                candidate.get("seat"),
+                f"lanes[{lane_index}].candidates[{candidate_index}].seat")
+            if not _FLEET_ID.fullmatch(seat):
+                raise EvidenceError("fleet candidate seat must be a typed identifier")
+            priority = candidate.get("priority")
+            if (not isinstance(priority, int) or isinstance(priority, bool)
+                    or not -1_000_000 <= priority <= 1_000_000):
+                raise EvidenceError("fleet candidate priority must be a bounded integer")
+            seats.append(seat)
+            canonical_candidates.append((priority, seat))
+        if len(seats) != len(set(seats)) or len(seats) != len({seat.casefold() for seat in seats}):
+            raise EvidenceError("fleet candidate seats must be unique within a lane")
+        if canonical_candidates != sorted(canonical_candidates):
+            raise EvidenceError("fleet candidates must be sorted by priority then seat")
+
+        constraints = lane.get("constraints")
+        if not isinstance(constraints, dict) or set(constraints) != {
+                "provider_allowlist", "model_allowlist", "required_capabilities",
+                "permission_ceiling", "data_boundary", "corrective", "spend"}:
+            raise EvidenceError("fleet constraints have malformed fields")
+        for field in ("provider_allowlist", "model_allowlist", "required_capabilities"):
+            values = constraints.get(field)
+            if not isinstance(values, list) or len(values) > 64:
+                raise EvidenceError(f"fleet {field} must be canonical identifiers")
+            for item in values:
+                _public_string(item, f"fleet {field}")
+                valid = (_RULE.fullmatch(item) if field == "required_capabilities"
+                         else (_FLEET_ID.fullmatch(item)
+                               if field == "provider_allowlist" else True))
+                if field == "required_capabilities" and item not in CAPABILITIES:
+                    valid = False
+                if not valid:
+                    raise EvidenceError(f"fleet {field} must be canonical identifiers")
+            if values != sorted(set(values)):
+                raise EvidenceError(f"fleet {field} must be canonical identifiers")
+        if constraints.get("permission_ceiling") not in {
+                "read-only", "safe-edit", "yolo"}:
+            raise EvidenceError("fleet permission ceiling is invalid")
+        if constraints.get("data_boundary") not in {
+                "unspecified", "public", "local_sanitized", "private_local"}:
+            raise EvidenceError("fleet data boundary is invalid")
+        corrective = constraints.get("corrective")
+        if (not isinstance(corrective, dict) or set(corrective) != {
+                "contract_repair", "retry", "fallback", "continuation"}
+                or not all(isinstance(value, bool) for value in corrective.values())):
+            raise EvidenceError("fleet corrective policy is malformed")
+        spend = constraints.get("spend")
+        if (not isinstance(spend, dict) or set(spend) != {
+                "subscription", "credit", "payg", "max_provider_contacts",
+                "max_billable_attempts", "max_parallel"}
+                or not all(isinstance(spend.get(field), bool)
+                           for field in ("subscription", "credit", "payg"))):
+            raise EvidenceError("fleet spend policy is malformed")
+        contacts = spend.get("max_provider_contacts")
+        billable = spend.get("max_billable_attempts")
+        parallel = spend.get("max_parallel")
+        if (not isinstance(contacts, int) or isinstance(contacts, bool)
+                or not 0 <= contacts <= 128
+                or not isinstance(billable, int) or isinstance(billable, bool)
+                or not 0 <= billable <= contacts
+                or not isinstance(parallel, int) or isinstance(parallel, bool)
+                or not 1 <= parallel <= 32
+                or parallel > max(1, contacts)):
+            raise EvidenceError("fleet spend/contact ceilings are invalid")
+    if lane_names != sorted(lane_names) or len(lane_names) != len(set(lane_names)):
+        raise EvidenceError("fleet lanes must be unique and sorted by name")
+
+
+def _validate_fleet_document(value: dict) -> None:
+    if set(value) != {"draft", "lanes"} or value.get("draft") is not True:
+        raise EvidenceError("summon.fleet/v1 must be an explicit draft")
+    _validate_fleet_lanes(value.get("lanes"))
+    _reject_private_public_text(value)
+
+
+def _validate_fleet_plan(value: dict) -> None:
+    if set(value) != {
+            "provider_contacted", "authorization", "fleet_sha256",
+            "project_sha256", "catalog_sha256", "lanes"}:
+        raise EvidenceError("summon.fleet-plan/v1 has malformed fields")
+    if value.get("provider_contacted") is not False:
+        raise EvidenceError("fleet plan must be provider-inert")
+    if value.get("authorization") != "advisory_only":
+        raise EvidenceError("fleet plan cannot authorize dispatch")
+    for field in ("fleet_sha256", "project_sha256", "catalog_sha256"):
+        digest_value = value.get(field)
+        if (not isinstance(digest_value, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", digest_value)):
+            raise EvidenceError(f"fleet plan {field} must be a SHA-256 digest")
+    _validate_fleet_lanes(value.get("lanes"))
+    _reject_private_public_text(value)
 
 
 def loads(data: str | bytes, *, max_bytes: int = 1 << 20) -> Any:
@@ -140,6 +261,10 @@ def _validate_schema_value(schema: str, value: Any) -> None:
                 "summon.evidence/v2 requires exactly kind and value")
         _rule(value.get("kind"), "evidence.kind")
         _reject_private_public_text(value)
+    elif schema == "summon.fleet/v1":
+        _validate_fleet_document(value)
+    elif schema == "summon.fleet-plan/v1":
+        _validate_fleet_plan(value)
     elif schema == "summon.decision/v2":
         required = {"provider_contacted", "request", "resolution", "authority",
                     "candidates", "unknowns", "digests"}

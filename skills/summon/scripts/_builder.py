@@ -24,6 +24,7 @@ from pathlib import Path
 
 from _loader import DEFAULT_PERMISSION
 from _spawn import run_flags
+from _backend_policy import effective_permission, permission_enforcement
 
 # cursor-agent exposes no machine-readable model list and no floating alias like
 # claude's `opus`/`sonnet`, so its default is pinned here. This is the SINGLE
@@ -252,30 +253,6 @@ _PERMISSION_MAPPING = {
     },
 }
 
-# This set is an authority statement, not an argv-spelling shortcut.  New
-# backends therefore fail closed as ``unknown`` until their boundary is reviewed.
-_ENFORCED_PERMISSION_BACKENDS = {
-    "codex", "claude", "gemini", "cursor-agent", "opencode",
-    "arkcli", "openai-compat",
-}
-
-
-def permission_enforcement(cli: str, permission: str) -> str:
-    """Classify the real backend/tier boundary used by decision evidence."""
-    if permission == "yolo":
-        return "enforced"  # no narrower boundary is being promised
-    if cli in {"arkcli", "openai-compat"}:
-        # These are text-only request transports, not local agent loops. They
-        # expose no filesystem, shell, or mutation tools, so read-only and
-        # safe-edit are both bounded by the absence of local tool authority.
-        return "enforced"
-    if cli in {"agy", "kimi"}:
-        return "unenforceable"
-    if cli in _ENFORCED_PERMISSION_BACKENDS:
-        return "enforced"
-    return "unknown"
-
-
 def unenforceable_permission_authorized(cli: str, permission: str, *,
                                         forced: bool = False) -> bool:
     """Whether the caller explicitly accepted a known advisory-only tier."""
@@ -472,28 +449,6 @@ def permission_flags(cli: str, permission: str) -> list:
         return list(_PERMISSION_MAPPING[cli][permission])
     except KeyError as e:
         raise ValueError(f"No permission mapping for cli={cli!r}, permission={permission!r}") from e
-
-
-def effective_permission(cli: str, permission: str) -> str:
-    """The tier the backend ACTUALLY enforces, which is not always the declared one.
-
-    A security census built from declared `permission:` strings UNDERSTATES real capability
-    on agy, where `safe-edit` maps to the same full bypass as `yolo` -- and a census that
-    undercounts capability is worse than no census, because it is trusted (field report,
-    2026-07-28). Every consumer that summarises capability across a roster must ask this,
-    not the frontmatter.
-    """
-    if cli == "agy":
-        if permission == "safe-edit":
-            return "yolo"          # identical flags; the label is the only difference
-        if permission == "read-only":
-            return "unenforceable"  # refused at dispatch unless explicitly waived
-    if cli == "kimi":
-        if permission == "read-only":
-            return "unenforceable"
-        if permission == "safe-edit":
-            return "yolo"
-    return permission
 
 
 def roster_permission_lint(agents: list) -> list:

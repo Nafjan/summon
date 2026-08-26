@@ -5,6 +5,26 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+- **Provider-inert fleet drafts:** `summon fleet propose`, `validate`, `inspect`,
+  and `explain` now create and examine sealed lane constraints without selecting a
+  winner, approving work, contacting a provider, or authorizing spend. Compiled plans
+  bind the exact sanitized roster catalog and project directory object; substitutions,
+  case-folding collisions, unavailable seats, unsupported capabilities, input clobbering,
+  and private-path write errors fail closed. Inspection remains roster-independent,
+  while explanation reports candidate priority, provenance, declared and effective
+  permission, losing constraints, and unresolved evidence. Provider identity and the
+  dispatch-default permission now come from the same immutable definition snapshot;
+  OpenCode declarations must match the selector it executes, named API registry keys
+  preserve exact case, and inline/undeclared routes stay explicitly unknown. Unknown
+  identity is a losing explanation reason even without an allowlist.
+  Explicit fleet outputs are no-clobber.
+- **Ox Alpha lifecycle correction:** the historical OpenRouter/OpenCode seat is retired
+  and remains pinned to `stealth/ox-alpha`, so existing receipts are never relabeled.
+  A distinct successor targets paid `z-ai/glm-5.3-flash`. Retired seats fail before
+  provider contact and identify their successor in a typed error. The lifecycle gate is
+  shared by ordinary dispatch and the in-process live-deliberation roster boundary, so a
+  retired definition cannot bypass it through another launch surface. Fleet catalogs admit
+  only active seats; deprecated compatibility dispatch remains explicit and warned.
 - **Activity-aware long jobs and governed continuation:** background dispatches now
   treat their timeout as a progress checkpoint by default, publish authenticated
   activity/idle diagnostics, and accept durable extend, cancel, and queued-steering
@@ -70,7 +90,7 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
   (`installs.drift.managed_converged`) from the stricter all-copy `converged` result. Stale
   project and plugin copies remain visible as unmanaged drift instead of being reported as
   repairable by `install.py`; no unmanaged tree is overwritten implicitly.
-- **Explicit credential boundary for broad OpenCode lanes:** Ox/OpenCode `yolo` now requires
+- **Explicit credential boundary for broad OpenCode lanes:** broad OpenCode `yolo` now requires
   `--worktree` or `--isolated-lane`. A private OpenRouter or Nous credential is bridged into
   an unrestricted child only with both the explicit `--isolated-lane` and
   `--allow-tool-credentials` acknowledgements; a worktree alone is not an OS boundary.

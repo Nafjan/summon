@@ -1722,14 +1722,17 @@ def test_roster_set_agent_edits_frontmatter_only():
                capture_output=True, text=True, encoding="utf-8")
         path = os.path.join(d, "probe.md")
         body_before = open(path, encoding="utf-8").read().split("---", 2)[2]
-        # update model + permission, add args
+        # update model + permission, add args and a lifecycle handoff
         r = sp.run([sys.executable, script, "--set-agent", "probe",
                     "--set", "model=claude-sonnet-5", "--set", "permission=yolo",
-                    "--set", 'args=--flag', "--agents-dir", d],
+                    "--set", 'args=--flag', "--set", "lifecycle=retired",
+                    "--set", "successor=probe-v2", "--agents-dir", d],
                    capture_output=True, text=True, encoding="utf-8")
         info = _json.loads(r.stdout)
         assert info["frontmatter"]["model"] == "claude-sonnet-5"
         assert info["frontmatter"]["permission"] == "yolo"
+        assert info["frontmatter"]["lifecycle"] == "retired"
+        assert info["frontmatter"]["successor"] == "probe-v2"
         assert open(path, encoding="utf-8").read().split("---", 2)[2] == body_before
         # empty value removes the key
         r = sp.run([sys.executable, script, "--set-agent", "probe", "--set", "model=",
@@ -1740,6 +1743,14 @@ def test_roster_set_agent_edits_frontmatter_only():
                     "--set", "permission=godmode", "--agents-dir", d],
                    capture_output=True, text=True, encoding="utf-8")
         assert r.returncode == 1 and "permission" in _json.loads(r.stdout)["error"]
+        r = sp.run([sys.executable, script, "--set-agent", "probe",
+                    "--set", "lifecycle=immortal", "--agents-dir", d],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 1 and "lifecycle" in _json.loads(r.stdout)["error"]
+        r = sp.run([sys.executable, script, "--set-agent", "probe",
+                    "--set", "successor=../escape", "--agents-dir", d],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 1 and "agent name" in _json.loads(r.stdout)["error"].lower()
         # unknown key rejected
         r = sp.run([sys.executable, script, "--set-agent", "probe",
                     "--set", "prompt=evil", "--agents-dir", d],
@@ -3475,16 +3486,26 @@ def test_researcher_is_pinned_to_gemini_flash_37():
     assert "permission: yolo" in frontmatter
 
 
-def test_ox_opencode_lane_is_broad_authority_for_isolated_worktrees():
-    """Ox needs the complete tool loop; the definition documents the isolation gate."""
+def test_ox_seat_is_retired_and_glm_successor_keeps_the_isolation_gate():
+    """The historical identity stays exact; the paid successor is a separate seat."""
     from pathlib import Path
     definition = (Path(__file__).resolve().parents[1] / "agents" /
                   "openrouter-ox-alpha-opencode.md").read_text(encoding="utf-8")
     frontmatter = definition.split("---", 2)[1]
     assert "run-agent: opencode" in frontmatter
+    assert "provider: openrouter" in frontmatter
     assert "model: openrouter/stealth/ox-alpha" in frontmatter
     assert "permission: yolo" in frontmatter
-    assert "disposable clone or isolated" in definition
+    assert "lifecycle: retired" in frontmatter
+    assert "successor: openrouter-glm-5-3-flash-opencode" in frontmatter
+
+    successor = (Path(__file__).resolve().parents[1] / "agents" /
+                 "openrouter-glm-5-3-flash-opencode.md").read_text(encoding="utf-8")
+    successor_fm = successor.split("---", 2)[1]
+    assert "provider: openrouter" in successor_fm
+    assert "model: openrouter/z-ai/glm-5.3-flash" in successor_fm
+    assert "permission: yolo" in successor_fm
+    assert "disposable clone or isolated" in successor
 
 
 def test_parse_report_keeps_real_status_with_pipe():
@@ -12779,6 +12800,49 @@ def test_v8_gate_is_forced_read_only_even_if_its_definition_is_yolo():
         "the gate ran with permission %r -- it must be forced read-only regardless "
         "of its own definition" % seen.get("permission"))
     assert dec["approved"] is True
+
+
+def test_retired_gate_refuses_before_in_process_executor():
+    """--gate-with is an in-process launch surface and must honor retirement."""
+    import run_subagent as _rs
+    from _builder import AgentInvocation
+
+    d = tempfile.mkdtemp(prefix="summon-retired-gate-")
+    called = []
+    real_exec = _rs.execute_agent
+    try:
+        with open(os.path.join(d, "old-gate.md"), "w", encoding="utf-8") as fh:
+            fh.write(
+                "---\nrun-agent: definitely-missing-provider\npermission: yolo\n"
+                "lifecycle: retired\nsuccessor: new-gate\n---\n# Old gate\n")
+
+        def should_not_run(*_args, **_kwargs):
+            called.append(True)
+            raise AssertionError("retired gate reached execute_agent")
+
+        _rs.execute_agent = should_not_run
+
+        class A:
+            gate_with = "old-gate"
+            enable_roles = False
+            strict_agents_dir = True
+            agent = "impl"
+            timeout = 60000
+            gate_timeout = None
+            debug_dir = None
+            cli = None
+
+        gated = AgentInvocation(cli="claude", prompt="p", cwd=d,
+                                permission="safe-edit")
+        decision = _rs._run_gate(A(), d, gated)
+    finally:
+        _rs.execute_agent = real_exec
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+    assert called == []
+    assert decision["approved"] is False
+    assert "retired" in decision["reason"]
+    assert "new-gate" in decision["reason"]
 
 
 def test_v8_gate_denial_prevents_the_real_dispatch_entirely():

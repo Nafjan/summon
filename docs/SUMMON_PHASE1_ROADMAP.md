@@ -1,7 +1,9 @@
 # Summon Phase 1 roadmap
 
-Status: executable plan endorsed by native Sol after exact Opus 5, Ox-Alpha,
-Kimi K3 advisory participation, and named-persona adversarial review
+Status: executable plan endorsed by native Sol after exact Opus 5, Kimi K3,
+the temporary Ox-Alpha alias, and named-persona adversarial participation. The
+alias was later identified as GLM-5.3 Flash and is not assumed to remain available
+or free.
 
 Phase 1 makes Summon's existing dispatch, provenance, role-alias, chat, council,
 deliberate, and swarm primitives easier to operate. It borrows useful control-plane
@@ -104,7 +106,10 @@ or raise authority. Context carries no routing authority.
 First expose the current exact-seat resolution as a provider-inert explanation.
 Then specify `summon.fleet/v1` as named lane requirements that resolve through the
 same path. The initial implementation supports only `fleet propose`, `validate`,
-and `explain`; fleet dispatch stays gated.
+`inspect`, and `explain`; it cannot select or approve a route, and fleet dispatch
+stays gated. This first catalog admits active seats only. Deprecated seats remain an
+explicit compatibility-dispatch concept, while retired seats fail in the shared roster
+boundary before every provider-launch surface.
 
 Approval is not a bare content hash. It binds schema version, content digest,
 canonical project identity, selected roster digest, approval generation, and a
@@ -277,7 +282,9 @@ a second coordinator.
 - Bind approval to fleet digest, actor, operation, expiry, provider/model scope,
   permission ceiling, data boundary, corrective behavior, and spend ceiling.
 - Route dispatch, manifest, chat, council, deliberate, and swarm through the same
-  decision receipt. Retain the existing swarm lease coordinator.
+  decision receipt. Reconcile the historical backend-style `provider` label with the new
+  account/endpoint provider identity using additive evidence fields; never reinterpret old
+  receipts. Retain the existing swarm lease coordinator.
 
 ### M4 — Usage, credits, and spend safety
 
@@ -338,11 +345,10 @@ a second coordinator.
 - Obtain unanimous fresh approval from native Sol, exact Opus 5, and two independently
   attested non-OpenAI frontier seats. Kimi K3 remains a required advisory participant
   until its CLI exposes authoritative served-model identity; its child-observed identity
-  cannot count as an exact vote. Prefer exact Ox-Alpha while that transient stealth seat
-  remains available. If Ox-Alpha has
-  been withdrawn or is capacity-blocked at the release checkpoint, replace it with an
-  independent frontier non-OpenAI seat that reports an exact served identity; record the
-  capability-based substitution without lowering quorum or independence.
+  cannot count as an exact vote. Use an independent frontier non-OpenAI seat that reports
+  an exact served identity. A temporary or renamed model alias may participate only when
+  its current identity, availability, billing boundary, and served-model evidence are
+  explicit; never make release quorum depend on it.
 - Obtain a final exact, reported, matched Fable endorsement of the immutable release
   candidate. Publish only after that endorsement, then verify the published artifact
   equals the reviewed artifact and reconverge owned local installs.

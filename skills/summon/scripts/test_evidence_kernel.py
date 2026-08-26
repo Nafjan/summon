@@ -78,7 +78,7 @@ def test_evidence_seal_verify_and_forgery_rejection():
 
 
 def test_unimplemented_evidence_schemas_cannot_be_digested():
-    for schema in ("summon.fleet/v1", "summon.context/v1", "summon.projection/v0"):
+    for schema in ("summon.context/v1", "summon.projection/v0"):
         with pytest.raises(_evidence.EvidenceError, match="unknown"):
             _evidence.digest(schema, {})
 

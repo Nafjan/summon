@@ -1,5 +1,6 @@
 ---
 run-agent: opencode
+provider: openrouter
 model: openrouter/openrouter/fusion
 permission: safe-edit
 openrouter_options: '{"plugins":[{"id":"fusion","preset":"general-budget"}]}'

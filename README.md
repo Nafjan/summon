@@ -368,6 +368,10 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon role propose\|approve\|list\|resolve …` | manage private, opt-in role aliases |
 | `summon jobs list\|status [ID]` · `jobs wait ID` | inspect or wait for background jobs (`--json` on list/status). `status` is a redacted, typed projection; `wait` returns the complete private terminal envelope |
 | `summon telemetry enable\|disable\|status\|clear` | manage local opt-in diagnostics; `clear` does not disable |
+| `summon usage status\|import …` | inspect or import bounded, provider-inert usage evidence; dimensions remain separate and do not reroute an exact request |
+| `summon fleet propose LANE --seats A,B` | create a sealed provider-inert fleet draft; this does not approve, select, dispatch, or authorize spend |
+| `summon fleet validate\|inspect FILE` | validate against the current roster, or inspect every declared constraint without consulting a roster |
+| `summon fleet explain FILE LANE` | compare roster candidates with the sealed constraints; report unknowns but deliberately select no route |
 | `summon bug-report …` | generate a sanitized report; review it before the separate GitHub submission command |
 | `summon version` · `summon help` | version · usage |
 
@@ -381,6 +385,22 @@ providers. The boundary is documented in
 
 `summon` (no args) prints the command list. Everything below is documented in
 [the Summon skill instructions](skills/summon/SKILL.md).
+
+Fleet documents are drafts, not dispatch capabilities. `propose` returns a compiled
+projection bound to the current project directory object and a sanitized roster-catalog
+digest; `--out` persists only the sealed draft and refuses to replace an existing file.
+Fleet catalogs admit only `active` seats. A `deprecated` seat remains available for an
+explicit compatibility dispatch with a warning, while a `retired` seat fails before any
+provider contact and can name a distinct successor.
+`validate` recompiles that relationship against the current roster. `inspect` needs only
+the sealed draft, so it remains useful when a roster has changed or is unavailable and
+shows every candidate's priority. `explain` lists matching and losing constraints,
+provenance, and unresolved evidence; it never chooses a winner. Here, `provider` means
+the account or endpoint authority bound to the executed route: a named API registry key,
+a singleton backend, or an explicit OpenCode declaration verified against its selector.
+Inline endpoints and undeclared gateways remain `unknown`; a model prefix alone never
+becomes provider proof. Approval and fleet dispatch remain gated until their separate
+authority and reservation contracts are implemented and reviewed.
 
 ---
 
@@ -631,7 +651,8 @@ OpenCode instead of using the direct text seat:
 ```markdown
 ---
 run-agent: opencode
-model: openrouter/stealth/ox-alpha
+provider: openrouter
+model: openrouter/z-ai/glm-5.3-flash
 permission: yolo
 ---
 ```
@@ -639,9 +660,10 @@ permission: yolo
 Authenticate OpenCode and verify the live roster with `opencode auth login` and
 `opencode models`. The OpenCode path still respects the provider's context,
 output, quota, and model limits; put large inputs in the workspace and ask the
-agent to read them. The optional Ox seat is intentionally broad-authority while the
-provider exposes it; model availability, naming, and routing can change or disappear
-without a Summon release. Treat the live OpenCode roster as authoritative. Summon
+agent to read them. The old Ox seat is retired and remains pinned to its historical
+identity; the distinct successor targets paid `z-ai/glm-5.3-flash`. Pricing, discounts,
+availability, naming, and routing can change without a Summon release; refresh the live
+OpenCode roster and provider usage evidence before selecting it. Summon
 requires `--worktree` or `--isolated-lane` before it can run: use a
 disposable clone/worktree, inspect `workspace_evidence`, the diff, and tests,
 then keep or discard the result. If Summon must bridge a private provider key
@@ -655,7 +677,7 @@ For a disposable worktree that is itself inside a separately isolated OS boundar
 make both boundaries explicit:
 
 ```powershell
-summon dispatch --agent openrouter-ox-alpha-opencode --worktree ox-review `
+summon dispatch --agent openrouter-glm-5-3-flash-opencode --worktree glm-review `
   --isolated-lane --allow-tool-credentials --cwd <project> `
   --prompt "Inspect and test the change."
 ```

@@ -13,6 +13,31 @@ never on added fields.
 
 ## Unreleased
 
+- **Pure fleet draft compiler and control-plane boundary:** the first M3 slice adds
+  sealed `summon.fleet/v1` and `summon.fleet-plan/v1` evidence, a pure compiler with
+  no provider, process, credential, filesystem, or launch imports, and provider-inert
+  propose, validate, inspect, and explain commands. The plan binds the normalized roster
+  catalog digest and project directory object; explanation rechecks the catalog binding
+  and cannot select a route. A shared backend-policy module prevents the command builder
+  and fleet explanation from disagreeing about effective permission enforcement or
+  singleton account-provider identity. Multi-provider routes use only the provider from
+  the immutable agent-definition snapshot; model namespaces never become provider proof.
+  OpenCode declarations are verified against the executed selector, mixed-case named
+  registry keys preserve dispatch semantics, and inline endpoints remain unknown rather
+  than accepting an unsupported label. Roster listing applies dispatch's default permission from that same snapshot, inspect
+  preserves candidate priority, and explicit fleet outputs atomically refuse clobbering.
+  Regressions cover catalog substitution, portable case folding, unavailable and
+  malformed seats, capability vocabulary, complete constraint projection, bounded
+  reads, output clobbering, symlink targets, redacted I/O errors, and the Windows batch
+  launcher. Approval, reservation, selection, and fleet dispatch remain absent from this
+  slice.
+- **Temporary model lifecycle:** the old Ox/OpenCode seat is retained as a retired,
+  exact historical identity and fails before provider contact. A separate successor targets
+  `openrouter/z-ai/glm-5.3-flash`; no old receipt is reinterpreted as the successor.
+  The former stealth preview is no longer represented as free or permanent. Lifecycle
+  enforcement lives in the shared immutable roster-resolution path used by ordinary dispatch
+  and in-process live deliberation; focused regressions prove the latter never constructs a
+  scheduler or contacts a provider for a retired seat. Fleet catalogs admit active seats only.
 - **Authenticated continuation ledger and crash-safe successor launch:** eligible
   terminal Claude subprocess jobs can reserve one source-scoped successor through a
   private HMAC-authenticated ledger. The claim binds the source receipt and session

@@ -1,5 +1,6 @@
 ---
 run-agent: opencode
+provider: openrouter
 model: openrouter/openrouter/free
 permission: safe-edit
 ---

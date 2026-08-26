@@ -77,6 +77,7 @@ import _jobs  # noqa: E402
 import _cli  # noqa: E402
 import _evidence  # noqa: E402
 import _executor  # noqa: E402
+import _fleet  # noqa: E402
 import _receipt  # noqa: E402
 import _telemetry  # noqa: E402
 import _usage  # noqa: E402
@@ -88,8 +89,8 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
                        envelope_answers_request, execute_agent, finalize_exit_fields,
                        is_terminal_nonretryable, is_terminal_success,
                        request_fingerprint)
-from _loader import (bundled_roster_dir, get_agents_dir, list_agents, load_agent,
-                     parse_read_roots)  # noqa: E402
+from _loader import (AgentLifecycleError, bundled_roster_dir, get_agents_dir, list_agents,
+                     load_agent, parse_read_roots, require_dispatchable_lifecycle)  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
 # Keep a literal assignment: the release-contract parser uses the dispatcher
@@ -901,6 +902,159 @@ def main() -> None:
         _print_error("--usage-cache outside the usage command is valid only with --dry-run")
         sys.exit(1)
 
+    # M3 fleet control plane, slice 1.  Every action here is deliberately
+    # provider-inert: it reads a local roster/fleet draft, compiles declarative
+    # constraints, and may compare them for an explanation. Approval, selection,
+    # reservation and dispatch do not exist on this surface yet.
+    if getattr(args, "fleet_action", None):
+        try:
+            _fleet_explicit = {
+                token.split("=", 1)[0] for token in argv
+                if isinstance(token, str) and token.startswith("--")
+            }
+            _fleet_propose_only = {
+                "--fleet-seats", "--fleet-provider-allowlist",
+                "--fleet-model-allowlist", "--fleet-required-capabilities",
+                "--fleet-permission-ceiling", "--fleet-data-boundary",
+                "--fleet-allow-contract-repair", "--fleet-allow-retry",
+                "--fleet-allow-fallback", "--fleet-allow-continuation",
+                "--fleet-allow-subscription", "--fleet-allow-credit",
+                "--fleet-allow-payg", "--fleet-max-provider-contacts",
+                "--fleet-max-billable-attempts", "--fleet-max-parallel",
+            }
+            _fleet_dispatch_only = {
+                "--agent", "--prompt", "--prompt-file", "--cli", "--model",
+                "--effort", "--max-permission", "--allow-payg", "--resume",
+                "--transport", "--require-exact-model", "--read-root",
+                "--worktree", "--background", "--gate-with",
+                "--isolated-lane", "--allow-tool-credentials",
+            }
+            _dispatch_flags = sorted(
+                _fleet_explicit.intersection(_fleet_dispatch_only))
+            if _dispatch_flags:
+                raise ValueError(
+                    "fleet actions do not accept dispatch-only flags: "
+                    + ", ".join(_dispatch_flags))
+            if args.fleet_action != "propose":
+                _ignored = sorted(_fleet_explicit.intersection(_fleet_propose_only))
+                if _ignored:
+                    raise ValueError(
+                        f"fleet {args.fleet_action} does not accept propose-only flags: "
+                        + ", ".join(_ignored))
+            if (args.out and args.fleet_file
+                    and _fleet.same_output_target(args.out, args.fleet_file)):
+                raise ValueError("fleet --out must not replace its input fleet document")
+
+            if args.fleet_action == "inspect":
+                if _fleet_explicit.intersection({
+                        "--cwd", "--agents-dir", "--strict-agents-dir",
+                        "--fleet-lane"}):
+                    raise ValueError(
+                        "fleet inspect reads only the sealed draft and does not accept "
+                        "roster, cwd, or lane options")
+                if not args.fleet_file:
+                    raise ValueError("fleet inspect requires a fleet file")
+                _fleet_document = _fleet.load_fleet(args.fleet_file)
+                _fleet_result = _fleet.inspect(_fleet_document)
+                if args.out:
+                    _fleet.write_json(args.out, _fleet_result)
+                print(json.dumps(_fleet_result, ensure_ascii=False,
+                                 indent=None if args.json else 2))
+                sys.exit(0)
+
+            _fleet_cwd = args.cwd or os.getcwd()
+            if not os.path.isabs(_fleet_cwd) or not os.path.isdir(_fleet_cwd):
+                raise ValueError("fleet requires an existing absolute --cwd")
+            _fleet_agents_dir = get_agents_dir(args.agents_dir, _fleet_cwd)
+            _fleet_agents = list_agents(_fleet_agents_dir)
+            if getattr(args, "strict_agents_dir", False):
+                _fleet_agents = [item for item in _fleet_agents
+                                 if item.get("source") == "project"]
+            if not _fleet_agents:
+                raise ValueError("fleet roster contains no declarative agent seats")
+
+            if args.fleet_action == "propose":
+                if args.fleet_file:
+                    raise ValueError("fleet propose does not accept a fleet file")
+                if not args.fleet_lane or not args.fleet_seats:
+                    raise ValueError("fleet propose requires a lane and --seats A,B")
+                _fleet_seats = [item.strip() for item in args.fleet_seats.split(",")
+                                if item.strip()]
+                _fleet_report, _fleet_document, _fleet_plan = _fleet.proposal(
+                    lane=args.fleet_lane,
+                    seats=_fleet_seats,
+                    agents=_fleet_agents,
+                    cwd=_fleet_cwd,
+                    permission_ceiling=args.fleet_permission_ceiling,
+                    provider_allowlist=args.fleet_provider_allowlist,
+                    model_allowlist=args.fleet_model_allowlist,
+                    required_capabilities=args.fleet_required_capabilities,
+                    data_boundary=args.fleet_data_boundary,
+                    corrective={
+                        "contract_repair": bool(args.fleet_allow_contract_repair),
+                        "retry": bool(args.fleet_allow_retry),
+                        "fallback": bool(args.fleet_allow_fallback),
+                        "continuation": bool(args.fleet_allow_continuation),
+                    },
+                    spend={
+                        "subscription": bool(args.fleet_allow_subscription),
+                        "credit": bool(args.fleet_allow_credit),
+                        "payg": bool(args.fleet_allow_payg),
+                        "max_provider_contacts": args.fleet_max_provider_contacts,
+                        "max_billable_attempts": args.fleet_max_billable_attempts,
+                        "max_parallel": args.fleet_max_parallel,
+                    },
+                )
+                _fleet_result = dict(
+                    _fleet_report,
+                    fleet_document=_fleet_document,
+                    compiled_plan=_fleet_plan,
+                )
+                if args.out:
+                    _fleet.write_json(args.out, _fleet_document)
+            else:
+                if not args.fleet_file:
+                    raise ValueError(f"fleet {args.fleet_action} requires a fleet file")
+                _fleet_document = _fleet.load_fleet(args.fleet_file)
+                _fleet_plan, _fleet_catalog = _fleet.compile_document(
+                    fleet=_fleet_document, agents=_fleet_agents, cwd=_fleet_cwd)
+                if args.fleet_action == "explain":
+                    if not args.fleet_lane:
+                        raise ValueError("fleet explain requires a lane")
+                    _fleet_result = _fleet.explain(
+                        fleet=_fleet_document, plan=_fleet_plan,
+                        catalog=_fleet_catalog, lane_name=args.fleet_lane)
+                else:
+                    _fleet_result = _fleet.report(
+                        args.fleet_action, _fleet_document, _fleet_plan)
+                    if args.fleet_action == "validate":
+                        _fleet_result["compiled_plan"] = _fleet_plan
+                if args.out:
+                    _fleet.write_json(args.out, _fleet_result)
+            print(json.dumps(_fleet_result, ensure_ascii=False,
+                             indent=None if args.json else 2))
+            sys.exit(0)
+        except (OSError, ValueError, _evidence.EvidenceError) as exc:
+            _fleet_kind = ("fleet_evidence_invalid"
+                           if isinstance(exc, _evidence.EvidenceError)
+                           else "fleet_usage_invalid"
+                           if isinstance(exc, ValueError)
+                           else "fleet_io_failed")
+            _fleet_error = {
+                "status": "error",
+                "result": "",
+                "exit_code": 1,
+                "error": str(exc),
+                "error_kind": _fleet_kind,
+                "retryable": False,
+                "result_usable": False,
+                "provider_contacted": False,
+                "authorization": "advisory_only",
+            }
+            _mark_not_run(_fleet_error)
+            _emit(_fleet_error, operation="fleet")
+            sys.exit(1)
+
     # Local diagnostics are management commands, not dispatches. Keep them
     # ahead of backend/agent validation so a broken roster cannot prevent a
     # user from inspecting or clearing their own evidence.
@@ -1550,6 +1704,20 @@ def main() -> None:
                 f"Agent definition not found: {getattr(args, '_resolved_agent', args.agent)}")
         run_agent_cli, system_context, _, agent_file, permission, model, extra_args, effort_fm = _loaded
         _agent_fm = _agent_fm or {}
+        try:
+            _agent_lifecycle = require_dispatchable_lifecycle(
+                _agent_fm, getattr(args, "_resolved_agent", args.agent))
+        except AgentLifecycleError as exc:
+            _die(
+                str(exc),
+                error_kind="agent_retired",
+                details={"agent": exc.agent, "lifecycle": exc.lifecycle,
+                         "successor": exc.successor},
+            )
+        if _agent_lifecycle == "deprecated":
+            print("warning: selected agent seat is deprecated"
+                  + (f"; prefer {_agent_fm.get('successor')!r}"
+                     if _agent_fm.get("successor") else ""), file=sys.stderr)
         try:
             _fm_read_roots = parse_read_roots(_agent_fm.get("read-roots"))
             _read_roots = normalize_read_roots(
@@ -2630,6 +2798,9 @@ def _run_gate(args, agents_dir, gated_inv, *, launch_control=None) -> dict:
             strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)))
         if tup is None:
             raise FileNotFoundError(f"Agent definition not found: {_gate_name}")
+        # The gate is a direct in-process provider launcher, so it must cross the
+        # same lifecycle boundary as ordinary dispatch and live deliberation.
+        require_dispatchable_lifecycle(gate_fm or {}, _gate_name)
     except Exception as e:  # noqa: BLE001 — an unusable gate must REFUSE, not pass
         return decide(None, _gate_requested) | {
             "reason": f"gate agent {_gate_requested!r} could not be loaded: {e}"}

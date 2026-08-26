@@ -60,7 +60,7 @@ default action), `list`, `agents validate`, `models`, `doctor`, `manifest FILE`,
 `chat`, `swarm`, `deliberate QUESTION`, `deliberate status|replay|recover|cancel|open|resume RUN_ID`,
 `agent
 new|set NAME`, `role propose|approve|list|resolve`, `telemetry enable|disable|status|clear`,
-`usage status|import`, `bug-report`, `version` — e.g. `run_subagent.py
+`usage status|import`, `fleet propose|validate|inspect|explain`, `bug-report`, `version` — e.g. `run_subagent.py
 council --question "…" --cwd DIR`. The
 **legacy flat form still works unchanged** (`run_subagent.py --agent … --prompt …`,
 `--list`, `--manifest FILE`, …), and every flag below is valid in both. Bare
@@ -461,6 +461,16 @@ longer than this child timeout so Summon can clean up and write its result envel
 | `usage status [--cache FILE] [--json]` | - | Read a bounded, normalized local `summon.usage/v1` cache. Provider-inert: no provider query, login, dispatch, or routing change. Missing data remains unknown |
 | `usage import --from FILE [--cache FILE] [--json]` | - | Validate and atomically store an operator-exported, redacted usage snapshot. Unknown fields and provider-attestation claims are rejected; unlike usage dimensions remain incomparable. Observation/retrieval times may lead the local clock by at most 5 minutes; the editable cache is revalidated on every read |
 | `--usage-action` / `--usage-from` / `--usage-cache` | No | Flat equivalents for the two `usage` subcommands. `--usage-cache FILE` may also accompany a dispatch `--dry-run` to add redacted freshness/dimension counts to `effective_decision`; it never changes the exact seat. These paths remain local and provider-inert |
+| `fleet propose LANE --seats A,B [--out FILE]` | - | Create a sealed `summon.fleet/v1` draft and return a provider-inert compiled projection bound to the current project directory object and sanitized roster catalog. `--out` writes only the draft and refuses to replace an existing file. Policy flags declare constraints only; they are never approval or spend consent |
+| `fleet validate FILE [--out FILE]` | - | Recompile the sealed draft against the current roster and project identity. A changed or unavailable seat is reported before any provider contact; output refuses to replace an existing file |
+| `fleet inspect FILE [--out FILE]` | - | Project every declared candidate, priority, and constraint from the sealed draft without consulting a roster or project path. This is intentionally different from validation; output refuses to replace an existing file |
+| `fleet explain FILE LANE [--out FILE]` | - | Compare the plan-bound roster catalog with one lane's constraints and report losing reasons, provenance, and unresolved evidence. It deliberately returns `selection.status:not_authorized`, cannot dispatch, and refuses to replace an existing output file |
+| `--fleet-action` / `--fleet-file` / `--fleet-lane` / `--fleet-seats` | No | Flat equivalents for the fleet action, input draft, lane, and comma-separated seats. Prefer the git-style subcommands above |
+| `--fleet-provider-allowlist` / `--fleet-model-allowlist` / `--fleet-required-capabilities` | No | Repeatable flat proposal constraints for providers, models, and capabilities |
+| `--fleet-permission-ceiling` / `--fleet-data-boundary` | No | Flat proposal authority and data-boundary ceilings |
+| `--fleet-allow-contract-repair` / `--fleet-allow-retry` / `--fleet-allow-fallback` / `--fleet-allow-continuation` | No | Flat proposal declarations for later corrective behavior. They do not perform or approve that behavior |
+| `--fleet-allow-subscription` / `--fleet-allow-credit` / `--fleet-allow-payg` | No | Flat proposal declarations for allowed spend classes. They are constraints, not active spend consent |
+| `--fleet-max-provider-contacts` / `--fleet-max-billable-attempts` / `--fleet-max-parallel` | No | Flat proposal ceilings for contacts, billable attempts, and concurrency |
 | `bug-report` | - | Generate a sanitized local Markdown report from the latest event or `--from FILE`; add `--output FILE` to choose the destination. Review it, then submit that exact file with `bug-report --submit-github --from REVIEWED_REPORT.md` (uses your authenticated `gh` CLI) |
 | `--onboard` | - | Detect installed CLIs / BytePlus key sources; write merge-safe prefs to `~/.agents/summon.json` (never stores API secrets). Subcommand form: `onboard` |
 | `--subscriptions LIST` | No | With `--onboard`: comma list of active plans (e.g. `byteplus-coding,claude`) recorded in prefs |
@@ -468,7 +478,7 @@ longer than this child timeout so Summon can clean up and write its result envel
 | `--no-write` | No | With `--onboard`: detect only; do not write prefs |
 | `--new-agent NAME` | - | Scaffold a new agent definition (house template); customize frontmatter with `--set`. Never overwrites |
 | `--set-agent NAME` | - | Edit an existing agent's frontmatter via `--set KEY=VALUE` (`KEY=` removes); body untouched, values validated |
-| `--set KEY=VALUE` | No | With the two above: `run-agent`, `model`, `model-policy`, `permission`, `args`, `profile` (repeatable) |
+| `--set KEY=VALUE` | No | With the two above: `run-agent`, `model`, `model-policy`, `permission`, `args`, `profile`, `lifecycle`, `successor` (repeatable). Lifecycle is `active`, `deprecated`, or `retired`; a retired seat refuses before provider contact and can name a successor. |
 | `--agent` | Yes* | Agent definition name from --list |
 | `--prompt` | Yes* | Task description to delegate (or `--prompt-file`) |
 | `--prompt-file FILE` | Yes* | Read the prompt from a UTF-8 file (BOM tolerated; strict decoding). Mutually exclusive with `--prompt`. Quoting/encoding ergonomics for long prompts; it does **not** avoid the OS argv limit - backends still receive the prompt on the command line. Windows caps the WHOLE assembled line at 32767 chars (measured: 20k prompt fine, 31k refused; the system context counts toward it), POSIX caps a single argument at 131072, and agy's own limit is ~28k. Over the limit summon refuses before spawning with an argv error - it used to surface as a bogus `CLI not found`, since Windows reports the overflow as a missing file. For material that large, write it to a file under `--cwd` and ask the agent to READ it. A `--background` child re-reads the file |
@@ -830,9 +840,11 @@ Honest edges — plan around these, don't be surprised by them:
   rejected, Summon returns a non-retryable auth diagnostic with `hermes auth status nous` /
   `hermes auth add nous` guidance and never falls back to another provider.
 - **OpenCode is a toolful gateway, not an unlimited transport.** An `opencode` seat can
-  use OpenCode's file and tool loop, including currently available OpenRouter models such as
-  `openrouter/stealth/ox-alpha`; model names and availability can change or disappear
-  without a Summon release. The model context/output limits, provider quotas,
+  use OpenCode's file and tool loop. The former `stealth/ox-alpha` preview was revealed as
+  Z.ai GLM 5.3 Flash. The historical Ox seat is retired without relabeling old receipts;
+  a distinct successor targets the paid `openrouter/z-ai/glm-5.3-flash` route.
+  Model names, prices, discounts, and availability
+  can change without a Summon release. The model context/output limits, provider quotas,
   OpenCode compaction, and OS/CLI transport limits still apply. Put large inputs under
   `--cwd` and ask the seat to read them instead of pasting them into argv. The direct
   `openai-compat` and `arkcli +chat` seats remain text-only by design; use `opencode` when

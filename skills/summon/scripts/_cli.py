@@ -171,6 +171,16 @@ MODE_FLAGS = {
     "telemetry": {"telemetry_enable", "telemetry_disable", "telemetry_status",
                    "telemetry_clear", "json", "job_file"},
     "usage": {"usage_action", "usage_from", "usage_cache", "json", "job_file"},
+    "fleet": {"fleet_action", "fleet_file", "fleet_lane", "fleet_seats",
+               "fleet_provider_allowlist", "fleet_model_allowlist",
+               "fleet_required_capabilities", "fleet_permission_ceiling",
+               "fleet_data_boundary", "fleet_allow_contract_repair",
+               "fleet_allow_retry", "fleet_allow_fallback",
+               "fleet_allow_continuation", "fleet_allow_subscription",
+               "fleet_allow_credit", "fleet_allow_payg",
+               "fleet_max_provider_contacts", "fleet_max_billable_attempts",
+               "fleet_max_parallel", "cwd", "agents_dir", "strict_agents_dir",
+               "out", "json"},
     "bug-report": {"bug_report", "bug_report_from", "bug_report_output",
                      "bug_report_submit", "github_repo", "bug_title",
                      "bug_description", "json", "job_file"},
@@ -226,6 +236,9 @@ MODE_HINTS = {
                   "JSONL evidence and never phones home."),
     "usage": ("usage status/import is provider-inert: it reads or validates a bounded, "
               "redacted local cache and never contacts a provider or changes routing."),
+    "fleet": ("fleet propose/validate/inspect/explain is a provider-inert M3 control "
+              "plane. It compiles candidate constraints and may explain a route, but "
+              "cannot approve, dispatch, or contact a provider."),
     "bug-report": ("bug-report writes a sanitized local report; review it before the "
                     "explicit --submit-github action."),
     "auth": ("auth status is read-only. auth repair never runs unless --allow-auth-repair "
@@ -285,6 +298,8 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "telemetry"
     if getattr(args, "usage_action", None):
         return "usage"
+    if getattr(args, "fleet_action", None):
+        return "fleet"
     if getattr(args, "bug_report", False):
         return "bug-report"
     if getattr(args, "auth_action", None):
@@ -335,7 +350,7 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
                "onboard", "manifest", "council", "deliberate", "agent", "jobs", "version",
                "chat", "swarm", "role", "telemetry", "usage", "bug-report", "auth",
-               "help", "--help", "-h"}
+               "fleet", "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -378,6 +393,9 @@ Commands:
   telemetry enable|disable|status|clear [--json]  manage opt-in local diagnostics
   usage status [--json] | usage import --from FILE [--json]
                                                   inspect/import redacted local usage evidence
+  fleet propose LANE --seats A,B [--out FILE]     draft a provider-inert fleet lane
+  fleet validate|inspect FILE                     validate/inspect a fleet draft
+  fleet explain FILE LANE                         compare constraints without selection
   bug-report [--from FILE] [--output FILE] [--json] create a sanitized report
              [--bug-title TEXT] [--bug-description TEXT]
              --submit-github --from REVIEWED.md [--github-repo OWNER/REPO]
@@ -390,6 +408,37 @@ flat option list, or `summon telemetry --help` / `summon bug-report --help` for 
 
 
 COMMAND_USAGE = {
+    "fleet": """summon fleet propose LANE --seats A,B [--out FILE]
+summon fleet validate FILE [--cwd DIR --agents-dir DIR]
+summon fleet inspect FILE
+summon fleet explain FILE LANE [--cwd DIR --agents-dir DIR]
+
+Build and inspect the provider-inert `summon.fleet/v1` draft and compiled plan.
+This slice cannot approve, dispatch, retry, resume, or contact a provider.  `--out`
+is the only write path; propose writes the sealed fleet document, while the other
+actions write their redacted report.
+
+Propose-only policy flags (repeat allowlists/capabilities as needed):
+  --provider PROVIDER              allowed provider
+  --model MODEL                    allowed model
+  --capability CAPABILITY          required: text, filesystem, tools, or
+                                   read_only_enforced
+  --permission-ceiling TIER        read-only, safe-edit, or yolo
+  --data-boundary BOUNDARY         unspecified, public, local_sanitized,
+                                   or private_local
+  --allow-contract-repair          permit later contract repair
+  --allow-retry                    permit later retry
+  --allow-fallback                 permit later fallback
+  --allow-continuation             permit later continuation
+  --allow-subscription             permit subscription-quota contact
+  --allow-credit                   permit account-credit contact
+  --allow-payg                     permit pay-as-you-go contact
+  --max-provider-contacts N        contact ceiling
+  --max-billable-attempts N        billable-attempt ceiling
+  --max-parallel N                 concurrency ceiling
+
+These flags declare draft constraints only. They are never approval or spend consent.
+""",
     "chat": """summon chat open SESSION_ID [--project-id ID --project-root DIR --participants A,B]
 summon chat post SESSION_ID --message TEXT
 summon chat turn SESSION_ID AGENT --message TEXT [--chat-timeout 10m]
@@ -712,6 +761,50 @@ def rewrite_subcommand(argv: list) -> tuple:
                 translated.append(token)
             index += 1
         return ["--usage-action", action, *translated], None
+    if head == "fleet":
+        if not rest or rest[0] not in ("propose", "validate", "inspect", "explain"):
+            return argv, "error: 'fleet' needs propose/validate/inspect/explain"
+        action = rest[0]
+        if action == "propose":
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, "error: 'fleet propose' needs a lane name"
+            translated = ["--fleet-action", action, "--fleet-lane", rest[1], *rest[2:]]
+        elif action in ("validate", "inspect"):
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, f"error: 'fleet {action}' needs a fleet file"
+            translated = ["--fleet-action", action, "--fleet-file", rest[1], *rest[2:]]
+        else:
+            if (len(rest) < 3 or rest[1].startswith("-")
+                    or rest[2].startswith("-")):
+                return argv, "error: 'fleet explain' needs a fleet file and lane name"
+            translated = ["--fleet-action", action, "--fleet-file", rest[1],
+                          "--fleet-lane", rest[2], *rest[3:]]
+        aliases = {
+            "seats": "fleet-seats",
+            "provider": "fleet-provider-allowlist",
+            "model": "fleet-model-allowlist",
+            "capability": "fleet-required-capabilities",
+            "permission-ceiling": "fleet-permission-ceiling",
+            "data-boundary": "fleet-data-boundary",
+            "allow-contract-repair": "fleet-allow-contract-repair",
+            "allow-retry": "fleet-allow-retry",
+            "allow-fallback": "fleet-allow-fallback",
+            "allow-continuation": "fleet-allow-continuation",
+            "allow-subscription": "fleet-allow-subscription",
+            "allow-credit": "fleet-allow-credit",
+            "allow-payg": "fleet-allow-payg",
+            "max-provider-contacts": "fleet-max-provider-contacts",
+            "max-billable-attempts": "fleet-max-billable-attempts",
+            "max-parallel": "fleet-max-parallel",
+        }
+        rewritten = []
+        for token in translated:
+            if token.startswith("--"):
+                name, separator, value = token[2:].partition("=")
+                name = aliases.get(name, name)
+                token = "--" + name + (separator + value if separator else "")
+            rewritten.append(token)
+        return rewritten, None
     if head == "bug-report":
         return ["--bug-report", *rest], None
     return argv, None
@@ -786,6 +879,64 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--usage-cache", dest="usage_cache", metavar="FILE",
                         help="Private local usage cache override; with dispatch, valid only "
                              "for provider-inert --dry-run explanation")
+    parser.add_argument("--fleet-action",
+                        choices=["propose", "validate", "inspect", "explain"],
+                        help="Provider-inert fleet control-plane action")
+    parser.add_argument("--fleet-file", dest="fleet_file", metavar="FILE",
+                        help="Sealed summon.fleet/v1 draft for validate/inspect/explain")
+    parser.add_argument("--fleet-lane", dest="fleet_lane", metavar="LANE",
+                        help="Fleet lane to propose or explain")
+    parser.add_argument("--fleet-seats", dest="fleet_seats", metavar="A,B",
+                        help="Ordered candidate seats for fleet propose")
+    parser.add_argument("--fleet-provider-allowlist", dest="fleet_provider_allowlist",
+                        action="append", default=None, metavar="PROVIDER",
+                        help="Provider allowed by the proposed lane (repeatable)")
+    parser.add_argument("--fleet-model-allowlist", dest="fleet_model_allowlist",
+                        action="append", default=None, metavar="MODEL",
+                        help="Model allowed by the proposed lane (repeatable)")
+    parser.add_argument("--fleet-required-capabilities",
+                        dest="fleet_required_capabilities", action="append",
+                        default=None, metavar="CAPABILITY",
+                        help="Capability required by the proposed lane (repeatable)")
+    parser.add_argument("--fleet-permission-ceiling",
+                        dest="fleet_permission_ceiling",
+                        choices=["read-only", "safe-edit", "yolo"],
+                        default="read-only",
+                        help="Maximum permission tier in the proposed lane")
+    parser.add_argument("--fleet-data-boundary", dest="fleet_data_boundary",
+                        choices=["unspecified", "public", "local_sanitized",
+                                 "private_local"], default="local_sanitized",
+                        help="Declarative data boundary for the proposed lane")
+    parser.add_argument("--fleet-allow-contract-repair",
+                        dest="fleet_allow_contract_repair", action="store_true",
+                        help="Declare later contract repair as allowed; grants no authority")
+    parser.add_argument("--fleet-allow-retry", dest="fleet_allow_retry",
+                        action="store_true",
+                        help="Declare later retry as allowed; does not retry")
+    parser.add_argument("--fleet-allow-fallback", dest="fleet_allow_fallback",
+                        action="store_true",
+                        help="Declare later fallback as allowed; does not reroute")
+    parser.add_argument("--fleet-allow-continuation", dest="fleet_allow_continuation",
+                        action="store_true",
+                        help="Declare later continuation as allowed; does not resume")
+    parser.add_argument("--fleet-allow-subscription", dest="fleet_allow_subscription",
+                        action="store_true",
+                        help="Allow subscription-backed candidates in the draft only")
+    parser.add_argument("--fleet-allow-credit", dest="fleet_allow_credit",
+                        action="store_true",
+                        help="Allow credit-backed candidates in the draft only")
+    parser.add_argument("--fleet-allow-payg", dest="fleet_allow_payg",
+                        action="store_true",
+                        help="Allow PAYG candidates in the draft; grants no spend consent")
+    parser.add_argument("--fleet-max-provider-contacts",
+                        dest="fleet_max_provider_contacts", type=int, default=1,
+                        help="Declarative provider-contact ceiling for later approval")
+    parser.add_argument("--fleet-max-billable-attempts",
+                        dest="fleet_max_billable_attempts", type=int, default=1,
+                        help="Declarative billable-attempt ceiling for later approval")
+    parser.add_argument("--fleet-max-parallel", dest="fleet_max_parallel",
+                        type=int, default=1,
+                        help="Declarative concurrency ceiling for later approval")
     parser.add_argument("--bug-report", dest="bug_report", action="store_true",
                         help="Create a sanitized local bug report from the latest event or --from")
     parser.add_argument("--from", dest="bug_report_from", metavar="FILE",
@@ -816,7 +967,7 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--set", dest="sets", action="append", default=[],
                         metavar="KEY=VALUE",
                         help="With --new-agent/--set-agent: run-agent, model, model-policy, "
-                             "permission, args, profile")
+                             "permission, args, profile, lifecycle, successor")
     parser.add_argument("--json", action="store_true",
                         help="Emit machine-readable JSON where supported by the selected command")
     parser.add_argument("--probe", action="store_true",
@@ -895,8 +1046,9 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", dest="dry_run", action="store_true",
                         help="Print the fully resolved dispatch (command, model, permission "
                              "flags, cwd) WITHOUT executing anything")
-    parser.add_argument("--out", help="Write the envelope atomically to FILE; if FILE already "
-                                      "holds a valid envelope, skip the run (swarm resume)")
+    parser.add_argument("--out", help="Dispatch: atomically write the envelope and reuse a valid "
+                                      "terminal result. Fleet: write the action-specific output "
+                                      "without replacing an existing file")
     parser.add_argument("--retries", type=int, default=0,
                         help="Re-dispatch up to N times on error/partial, exponential backoff")
     parser.add_argument("--retry-nonretryable", dest="retry_nonretryable", action="store_true",

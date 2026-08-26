@@ -6,7 +6,7 @@ Lets the CALLING agent configure the roster without hand-authoring markdown:
   to miss (the Final-report contract the dispatcher parses, and the
   untrusted-content guard).
 - ``--set-agent NAME --set key=value [...]`` edits frontmatter in place
-  (model, permission, run-agent, args) with validation, leaving the body
+  (model, permission, run-agent, args, lifecycle, successor) with validation, leaving the body
   byte-identical. ``--set key=`` (empty value) REMOVES the key.
 
 Definitions register instantly — no reload; the next --list/dispatch sees them.
@@ -19,12 +19,13 @@ import re
 import tempfile
 
 from _loader import (PERMISSION_VALUES, parse_extra_args, parse_frontmatter,
-                     validate_agent_name)
+                     validate_agent_name, validate_lifecycle)
 from _resolver import _VALID_CLIS
 
 # Frontmatter keys a caller may set. Anything else is a typo or an attempt to
 # smuggle content — reject loudly.
-SETTABLE_KEYS = ("run-agent", "model", "model-policy", "permission", "args", "profile")
+SETTABLE_KEYS = ("run-agent", "model", "model-policy", "permission", "args", "profile",
+                 "lifecycle", "successor")
 
 _TEMPLATE = """---
 {frontmatter}
@@ -109,6 +110,10 @@ def _validate_values(sets: dict, allow_empty: bool) -> None:
         if key == "profile":
             from _profiles import validate_profile_name
             validate_profile_name(value)
+        if key == "lifecycle":
+            validate_lifecycle(value)
+        if key == "successor":
+            validate_agent_name(value)
 
 
 def _atomic_write_bytes(path: str, data: bytes) -> None:

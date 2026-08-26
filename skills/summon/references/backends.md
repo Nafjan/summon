@@ -11,19 +11,21 @@ when its Summon permission tier allows it. The selected model still needs to
 support the tool-calling features that the task requires; OpenRouter maintains
 a [tool-support model filter](https://openrouter.ai/docs/guides/features/tool-calling).
 
-For example, this pins OpenRouter's OX Alpha through OpenCode when that provider
-route is currently available:
+The retired compatibility-named Ox seat remains pinned to its historical selector.
+Its distinct paid successor targets the model that the preview was revealed to be,
+GLM 5.3 Flash, through OpenRouter:
 
 ```markdown
 ---
 run-agent: opencode
-model: openrouter/stealth/ox-alpha
+provider: openrouter
+model: openrouter/z-ai/glm-5.3-flash
 permission: safe-edit
 ---
 ```
 
 The equivalent command is `opencode run --format json --model
-openrouter/stealth/ox-alpha "…"`. Summon supplies the working directory,
+openrouter/z-ai/glm-5.3-flash "…"`. Summon supplies the working directory,
 strips agent arguments that could change the model or directory, and maps its
 permission tiers to OpenCode's `OPENCODE_PERMISSION` policy. Read-only and
 safe-edit also pass `--auto`, but only with an explicit deny-by-default policy;
@@ -87,9 +89,8 @@ Authenticate OpenCode with its provider flow (`opencode auth login` or
 [CLI](https://opencode.ai/docs/cli/), and
 [permissions](https://opencode.ai/docs/permissions/).
 
-This gateway removes the *direct-seat* limitation that caused the optional
-`stealth/ox-alpha` route
-to be labelled text-only. It does not remove model or service limits: the
+This gateway removes the *direct-seat* text-only limitation. It does not remove
+model or service limits: the
 provider's context window and output cap still apply, OpenCode may compact long
 sessions, and operating-system/CLI transport limits still apply to the initial
 prompt. For large inputs, put files under `--cwd` and ask the agent to read
@@ -105,7 +106,7 @@ ID, the selectors shown by `opencode models openrouter` are normally:
 
 | OpenCode selector | OpenRouter behavior | Use it for |
 |---|---|---|
-| `openrouter/stealth/ox-alpha` | A pinned model | Reproducible tool/file work |
+| `openrouter/z-ai/glm-5.3-flash` | A paid pinned model; formerly the Ox Alpha preview | Reproducible tool/file work |
 | `openrouter/openrouter/auto` | Auto Router | Let OpenRouter choose a paid model |
 | `openrouter/openrouter/free` | Free Models Router | Low-volume experiments |
 | `openrouter/openrouter/fusion` | Fusion model alias | Panel-and-judge synthesis |
@@ -153,18 +154,17 @@ does not require this override.
 An upstream HTTP 429 from OpenRouter is a provider-pool availability result, not
 proof that the Summon seat or model selector is broken. The default is fail once;
 `--transient-retries` (or `SUMMON_TRANSIENT_RETRIES=1`) permits one bounded
-exponential-backoff retry. Summon does not silently switch an exact Ox request to
+exponential-backoff retry. Summon does not silently switch an exact GLM 5.3 Flash request to
 another model or provider, and an envelope with no `model.served`/report remains
 non-verdict evidence.
 
 If the OpenRouter pool remains unavailable, an operator can deliberately choose a
-different configured route: an OpenCode Nous provider seat targeting
-`nous/stealth/ox-alpha` (only when `opencode models` lists that route and its local
-auth is valid), or the direct `openai-compat` OpenRouter/Nous seat for text-only
-advisory work. The direct API seat does not provide OpenCode's file/tool loop. The
-Auto, Free, and Fusion aliases are also deliberate model-routing changes, not
-transparent Ox fallbacks; verify their served model before treating the result as
-an Ox review.
+different configured route only when its live roster lists the successor and local
+auth is valid. A historical Nous `stealth/ox-alpha` alias may disappear with the
+preview and must not be assumed equivalent or free. The direct API seat does not
+provide OpenCode's file/tool loop. Auto, Free, and Fusion are deliberate routing
+changes, not transparent GLM fallbacks; verify their served model before treating
+the result as a named-model review.
 
 ## Custom & API backends (`openai-compat`) — direct text seat
 

@@ -73,8 +73,9 @@ catalog candidates are advisory. In every case, the dispatch envelope's exact
 never proves account eligibility.
 
 OpenCode discovery delegates to `opencode models` and returns provider/model selectors such
-as `openrouter/stealth/ox-alpha` when the local OpenCode configuration and credentials expose
-them. Model names and availability can change or disappear without a Summon release. A live
+as `openrouter/z-ai/glm-5.3-flash` when the local OpenCode configuration and credentials expose
+them. The former `stealth/ox-alpha` preview was revealed as this paid model; do not assume the
+old alias or free pricing persists. Model names and availability can change without a Summon release. A live
 list proves only that OpenCode listed the selector; it does not prove that the
 account can serve it or that a gateway policy will permit it. Confirm a real dispatch and
 inspect `model.served` plus `served_model_evidence`.

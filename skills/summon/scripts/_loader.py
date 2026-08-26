@@ -11,8 +11,22 @@ from pathlib import Path
 
 PERMISSION_VALUES = ("read-only", "safe-edit", "yolo")
 DEFAULT_PERMISSION = "safe-edit"
+LIFECYCLE_VALUES = ("active", "deprecated", "retired")
 
 _AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+
+
+class AgentLifecycleError(ValueError):
+    """A resolved roster seat is not allowed to launch a provider turn."""
+
+    def __init__(self, agent: str, lifecycle: str, successor: str | None):
+        self.agent = agent
+        self.lifecycle = lifecycle
+        self.successor = successor
+        message = f"selected agent seat {agent!r} is {lifecycle}"
+        if successor:
+            message += f"; use successor {successor!r}"
+        super().__init__(message)
 
 # sha256 of the bytes the most recent load actually PARSED, keyed by resolved path. The
 # dispatch compares this (not a fresh read) with what the request identity recorded, so an
@@ -46,7 +60,8 @@ def last_parsed_sha(agent_file: str) -> str | None:
 # ignored, so an agent file can carry its own metadata.
 KNOWN_FRONTMATTER_KEYS = ("run-agent", "permission", "model", "model-policy", "args", "effort",
                           "provider", "base_url", "api_key_env", "capability", "billing",
-                          "profile", "openrouter_options", "read-roots")
+                          "profile", "openrouter_options", "read-roots", "lifecycle",
+                          "successor")
 
 
 def parse_frontmatter(content: str) -> tuple[dict, str]:
@@ -183,6 +198,31 @@ def validate_permission(value: str | None) -> str:
     return value
 
 
+def validate_lifecycle(value: str | None) -> str:
+    """Validate an optional roster lifecycle marker."""
+    normalized = (value or "active").strip().lower()
+    if normalized not in LIFECYCLE_VALUES:
+        raise ValueError(
+            f"Invalid lifecycle: {value!r}. Must be one of: {list(LIFECYCLE_VALUES)}")
+    return normalized
+
+
+def require_dispatchable_lifecycle(frontmatter: dict, agent_name: str) -> str:
+    """Return the normalized lifecycle or reject a retired provider route.
+
+    Every surface that can build an invocation must call this after loading the
+    immutable definition snapshot.  Keeping the decision here prevents in-process
+    launchers (for example live deliberation) from drifting from the main dispatcher.
+    """
+    lifecycle = validate_lifecycle(frontmatter.get("lifecycle"))
+    successor = frontmatter.get("successor") or None
+    if successor is not None:
+        validate_agent_name(successor)
+    if lifecycle == "retired":
+        raise AgentLifecycleError(agent_name, lifecycle, successor)
+    return lifecycle
+
+
 def _literal_backslashes(value: str) -> str:
     r"""Windows: make a backslash in `args:` a literal path separator, not a POSIX escape.
 
@@ -312,6 +352,9 @@ def _load_agent_snapshot_from(agents_dir: str, agent_name: str):
             frontmatter, body = parse_frontmatter(content)
             run_agent = frontmatter.get("run-agent")
             permission = validate_permission(frontmatter.get("permission"))
+            frontmatter["lifecycle"] = validate_lifecycle(frontmatter.get("lifecycle"))
+            if frontmatter.get("successor"):
+                validate_agent_name(frontmatter["successor"])
             description = extract_description(body)
             tup = (run_agent, body.strip(), description, str(resolved), permission,
                    frontmatter.get("model") or None,
@@ -445,9 +488,15 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
             seen_names.add(name)
 
             try:
-                content = agent_file.read_text(encoding="utf-8-sig")
-                fm, body = parse_frontmatter(content)
-                description = extract_description(body)
+                # Use the same one-buffer parser as dispatch so provider,
+                # permission, model, effort, description, and definition hash
+                # cannot come from different reads of a changing file.
+                loaded, fm, definition_sha256 = _load_agent_snapshot_from(
+                    agents_dir, name)
+                if loaded is None:
+                    continue
+                (run_agent, _body, description, _path, permission, model,
+                 _extra_args, effort) = loaded
                 # Keep the roster listing useful for humans and provider-safe for
                 # callers: a model pin and reasoning effort are harmless display
                 # metadata, while the actual served model still belongs to the
@@ -455,10 +504,19 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
                 # seat prevents a UI from mistaking the backend default for a
                 # verified model.
                 agents.append({"name": name, "description": description,
-                               "run_agent": (fm or {}).get("run-agent"),
-                               "permission": (fm or {}).get("permission"),
-                               "model": (fm or {}).get("model"),
-                               "effort": (fm or {}).get("effort")})
+                               "run_agent": run_agent,
+                               "permission": permission,
+                               "provider": (fm or {}).get("provider"),
+                               "provider_endpoint_mode": (
+                                   "inline_endpoint" if (fm or {}).get("base_url")
+                                   else "named_provider" if (fm or {}).get("provider")
+                                   else "none"),
+                               "model": model,
+                               "effort": effort,
+                               "lifecycle": validate_lifecycle(
+                                   (fm or {}).get("lifecycle")),
+                               "successor": (fm or {}).get("successor"),
+                               "definition_sha256": definition_sha256})
             except (OSError, UnicodeDecodeError, ValueError):
                 # Unreadable / binary / malformed-frontmatter file: still list it so the
                 # caller sees it exists. ValueError matters since duplicate frontmatter keys
@@ -472,8 +530,9 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
 def list_agents(agents_dir: str) -> list[dict]:
     """List all available agents, sorted by name.
 
-    Returns name/description plus safe declared backend, permission, model, and
-    effort metadata for every agent in ``agents_dir``, plus any from the skill's
+    Returns name/description plus safe declared backend, provider-binding mode,
+    permission, model, effort, lifecycle, successor, and definition digest metadata
+    for every agent in ``agents_dir``, plus any from the skill's
     bundled starter roster that aren't already present (the project dir wins on
     a name collision). Files that fail to parse are still listed with an empty
     description.

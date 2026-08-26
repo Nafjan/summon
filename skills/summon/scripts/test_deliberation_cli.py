@@ -233,6 +233,38 @@ class DeliberationCliTests(unittest.TestCase):
             self.assertNotIn(str(project), output.getvalue())
             self.assertFalse(fake.cancelled)
 
+    def test_fresh_live_lane_refuses_retired_seat_before_scheduler_or_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "project"
+            agents = project / "agents"
+            agents.mkdir(parents=True)
+            (agents / "one.md").write_text(
+                "---\nrun-agent: definitely-missing-provider\npermission: yolo\n"
+                "lifecycle: retired\nsuccessor: one-v2\n---\n",
+                encoding="utf-8")
+            (agents / "two.md").write_text(
+                "---\nrun-agent: claude\npermission: read-only\n---\n",
+                encoding="utf-8")
+            run_root = Path(temp) / "runs"
+            parser = _cli.build_parser("test", 1)
+            args = parser.parse_args([
+                "--deliberate", "--question", "q", "--seats", "one,two",
+                "--options", "yes,no", "--quorum", "all", "--max-attempts", "2",
+                "--deadline", "30s", "--cwd", str(project),
+                "--agents-dir", str(agents), "--run-dir", str(run_root), "--json",
+            ])
+            output = io.StringIO()
+            with mock.patch("_deliberation_live.build_live_scheduler") as scheduler:
+                with contextlib.redirect_stdout(output):
+                    code = store.run_command(args)
+            body = json.loads(output.getvalue())
+            self.assertEqual(code, 1)
+            self.assertEqual(body["status"], "error")
+            self.assertIn("retired", body["error"])
+            self.assertIn("one-v2", body["error"])
+            scheduler.assert_not_called()
+            self.assertFalse(run_root.exists())
+
     def test_fresh_live_lane_rejects_authority_consent_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp) / "project"
