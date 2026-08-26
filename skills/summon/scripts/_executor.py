@@ -2872,7 +2872,11 @@ def _safe_communicate(process: subprocess.Popen, timeout: float = 3.0):
 def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
                    parse_stream: bool | None = None,
                    launch_control: ProviderLaunchControl | None = None,
-                   expected_model: str | None = None) -> dict:
+                   expected_model: str | None = None,
+                   attempt_id: str | None = None,
+                   first_event_ms: int | None = None,
+                   idle_ms: int | None = None,
+                   finalization_ms: int | None = None) -> dict:
     """Drive the subprocess and enrich whatever response path it takes.
 
     Single choke point: every return from the read loop (success, timeout,
@@ -2882,7 +2886,23 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
     if parse_stream is None:
         # arkcli +chat emits plain / pretty JSON, not CLI stream-json events.
         parse_stream = cli not in ("agy", "arkcli")
-    processor = StreamProcessor()
+    from _liveness import LivenessTracker
+    from _job_control import RuntimeControl
+    runtime_control = RuntimeControl.from_environment(timeout_ms)
+    hard_budget_ms = (runtime_control.max_runtime_ms
+                      if runtime_control is not None else timeout_ms)
+    # In adaptive mode, --timeout is an observation checkpoint. The liveness
+    # tracker's hard clocks bind only the separately declared max runtime;
+    # RuntimeControl decides whether activity merits another lease interval.
+    tracker = LivenessTracker(
+        attempt_id=attempt_id or uuid.uuid4().hex,
+        overall_ms=hard_budget_ms,
+        first_event_ms=first_event_ms or hard_budget_ms,
+        idle_ms=idle_ms or hard_budget_ms,
+        finalization_ms=finalization_ms or min(hard_budget_ms, 120_000),
+    )
+    emitter = tracker.emitter()
+    processor = StreamProcessor(event_observer=emitter)
     try:
         from _stream_partials import emit_partial as _emit_partial
         _emit_partial("started", cli=cli, message="subprocess started")
@@ -2891,8 +2911,16 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
     response = _drive_process_loop(process, cli, timeout_ms, processor,
                                    parse_stream=parse_stream,
                                    launch_control=launch_control,
-                                   expected_model=expected_model)
-    return _enrich(response, processor)
+                                   expected_model=expected_model,
+                                   liveness=tracker,
+                                   liveness_emitter=emitter,
+                                   runtime_control=runtime_control)
+    enriched = _enrich(response, processor)
+    enriched["liveness"] = tracker.snapshot()
+    if runtime_control is not None:
+        runtime_control.publish(enriched["liveness"], force=True)
+        enriched["runtime_control"] = runtime_control.projection()
+    return enriched
 
 
 def _drive_process_loop(
@@ -2900,6 +2928,9 @@ def _drive_process_loop(
     parse_stream: bool = True,
     launch_control: ProviderLaunchControl | None = None,
     expected_model: str | None = None,
+    liveness=None,
+    liveness_emitter=None,
+    runtime_control=None,
 ) -> dict:
     """Read process stdout via StreamProcessor, enforce a wall-clock deadline.
 
@@ -2924,6 +2955,43 @@ def _drive_process_loop(
 
     try:
         while True:
+            if runtime_control is not None:
+                runtime_control.refresh()
+                runtime_control.checkpoint(
+                    active=liveness.meaningful_within(runtime_control.checkpoint_ms))
+                runtime_control.publish(liveness.snapshot())
+                if runtime_control.cancel_requested:
+                    if liveness_emitter is not None:
+                        liveness_emitter.emit("cancelled", session_id=processor.session_id)
+                    _kill_tree(process)
+                    _drain_to_eof(line_q)
+                    _safe_communicate(process)
+                    cancelled = _error_response(
+                        cli, 130, "background job cancelled by operator",
+                        partial_result=processor.get_result())
+                    cancelled.update({"status": "blocked", "dispatcher_status": "blocked",
+                                      "execution_status": "cancelled",
+                                      "error_kind": "operator_cancelled",
+                                      "retryable": False, "result_usable": False})
+                    return _attach_raw(cancelled, stdout_lines)
+                if runtime_control.expired():
+                    _kill_tree(process)
+                    _drain_to_eof(line_q)
+                    _safe_communicate(process)
+                    timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
+                    timed.setdefault("timeout", {})["stage"] = (
+                        "adaptive_attention_timeout" if runtime_control.attention_required
+                        else "adaptive_hard_timeout")
+                    return timed
+            if liveness is not None:
+                reason = liveness.expired()
+                if reason is not None:
+                    _kill_tree(process)
+                    _drain_to_eof(line_q)
+                    _safe_communicate(process)
+                    timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
+                    timed.setdefault("timeout", {})["stage"] = reason
+                    return timed
             if launch_control is not None:
                 try:
                     _controlled_cancel = launch_control.is_cancelled()
@@ -2936,6 +3004,8 @@ def _drive_process_loop(
                         f"provider cancellation check failed ({type(exc).__name__})",
                         partial_result=processor.get_result()), stdout_lines)
                 if _controlled_cancel:
+                    if liveness_emitter is not None:
+                        liveness_emitter.emit("cancelled", session_id=processor.session_id)
                     _kill_tree(process)
                     _drain_to_eof(line_q)
                     _safe_communicate(process)
@@ -2957,7 +3027,8 @@ def _drive_process_loop(
                     return _attach_raw(_error_response(
                         cli, 1, f"provider deadline check failed ({type(exc).__name__})",
                         partial_result=processor.get_result()), stdout_lines)
-            remaining = deadline - time.monotonic()
+            remaining = ((runtime_control.hard_deadline if runtime_control is not None
+                          else deadline) - time.monotonic())
             if remaining <= 0:
                 _kill_tree(process)
                 _drain_to_eof(line_q)
@@ -2965,11 +3036,21 @@ def _drive_process_loop(
                 return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
 
             try:
-                kind, line = line_q.get(timeout=(min(remaining, 0.1)
-                                                 if launch_control is not None
-                                                 else remaining))
+                wait_for = remaining
+                if launch_control is not None:
+                    wait_for = min(wait_for, 0.1)
+                if liveness is not None:
+                    next_ms = liveness.next_deadline_ms()
+                    if next_ms is not None:
+                        wait_for = min(wait_for, max(0.001, next_ms / 1000))
+                if runtime_control is not None:
+                    wait_for = min(wait_for, 0.25,
+                                   max(0.001, runtime_control.deadline
+                                       - time.monotonic()))
+                kind, line = line_q.get(timeout=wait_for)
             except queue.Empty:
-                if launch_control is not None and remaining > 0:
+                if ((launch_control is not None or liveness is not None)
+                        and remaining > 0):
                     continue
                 _kill_tree(process)
                 _drain_to_eof(line_q)
@@ -3022,15 +3103,41 @@ def _drive_process_loop(
                 return _attach_raw(blocked, stdout_lines)
 
         # stdout fully drained by reader; communicate() only needs stderr.
-        # Floor at 100ms: even if the deadline expired, give the process a
-        # brief grace window to exit before we escalate to kill().
-        wait_remaining = max(0.1, deadline - time.monotonic())
-        try:
-            _, stderr = process.communicate(timeout=wait_remaining)
-        except subprocess.TimeoutExpired:
-            _kill_tree(process)
-            _, stderr = _safe_communicate(process)
-            return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
+        # EOF is not proof that the child exited: a provider may close stdout
+        # and continue finalizing. Keep cancellation/liveness polling active.
+        if liveness_emitter is not None and liveness.snapshot()["phase"] not in {
+                "terminal", "cancelled", "timed_out"}:
+            liveness_emitter.emit("finalizing", session_id=processor.session_id)
+        while process.poll() is None:
+            if runtime_control is not None:
+                runtime_control.refresh()
+                runtime_control.publish(liveness.snapshot())
+                if runtime_control.cancel_requested:
+                    if liveness_emitter is not None:
+                        liveness_emitter.emit("cancelled", session_id=processor.session_id)
+                    _kill_tree(process)
+                    _safe_communicate(process)
+                    return _attach_raw(_error_response(
+                        cli, 130, "background job cancelled during finalization",
+                        partial_result=processor.get_result()), stdout_lines)
+            reason = liveness.expired() if liveness is not None else None
+            if reason is not None:
+                _kill_tree(process)
+                _safe_communicate(process)
+                timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
+                timed.setdefault("timeout", {})["stage"] = reason
+                return timed
+            if launch_control is not None and launch_control.is_cancelled():
+                if liveness_emitter is not None:
+                    liveness_emitter.emit("cancelled", session_id=processor.session_id)
+                _kill_tree(process)
+                _safe_communicate(process)
+                return _attach_raw(_error_response(
+                    cli, 130, "provider launch cancelled during finalization",
+                    partial_result=processor.get_result()), stdout_lines)
+            time.sleep(0.05)
+
+        _, stderr = _safe_communicate(process)
 
         processor.finalize_stream()
         return build_final_response(
@@ -3040,6 +3147,8 @@ def _drive_process_loop(
         # start_new_session detaches the child from the terminal's signal group,
         # so a Ctrl+C on the parent won't reach it — tree-kill it ourselves so an
         # interrupt doesn't leave an orphaned backend running.
+        if liveness_emitter is not None:
+            liveness_emitter.emit("cancelled", session_id=processor.session_id)
         _kill_tree(process)
         raise
     except (OSError, ValueError) as e:
@@ -3822,6 +3931,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         response = _drive_process(process, inv.cli, timeout_ms,
                                   parse_stream=parse_stream,
                                   launch_control=launch_control,
+                                  attempt_id=_attempt_id,
                                   expected_model=(
                                       _requested_model
                                       if inv.cli == "codex"

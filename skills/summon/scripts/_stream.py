@@ -151,7 +151,9 @@ class StreamProcessor:
       ``turn.completed`` or ``turn.failed``
     """
 
-    def __init__(self):
+    def __init__(self, event_observer=None):
+        self._event_observer = event_observer
+        self._tool_progress = 0
         self.result_json = None
         self.gemini_parts = []
         self.codex_messages = []
@@ -197,6 +199,43 @@ class StreamProcessor:
         self.model_evidence_source = None
         self.is_error = False   # the terminal event itself reported an error (claude is_error / result status)
 
+    def _liveness(self, kind: str, data: dict | None = None, **fields) -> None:
+        """Emit one parser-recognized event through the executor-owned capability."""
+        if self._event_observer is None:
+            return
+        data = data if isinstance(data, dict) else {}
+        session = data.get("session_id") or data.get("sessionID") \
+            or data.get("thread_id") or data.get("conversation_id") or self.session_id
+        source_id = data.get("event_id") or data.get("id")
+        try:
+            self._event_observer.emit(
+                kind, session_id=session if isinstance(session, str) else None,
+                source_event_id=source_id if isinstance(source_id, str) else None,
+                **fields)
+        except Exception:  # liveness evidence must never break stream parsing
+            pass
+
+    def _bind_session(self, value, data: dict) -> None:
+        """Bind or explicitly rotate the parser session for liveness evidence."""
+        if not isinstance(value, str) or not value.strip():
+            self._liveness("transport_started", data)
+            return
+        value = value.strip()
+        old = self.session_id
+        if old == value:
+            return
+        if old and self._event_observer is not None:
+            try:
+                self._event_observer.reconnect(
+                    old_session_id=old, new_session_id=value,
+                    source_event_id=(data.get("event_id") or data.get("id")))
+            except Exception:
+                pass
+        else:
+            self.session_id = value
+            self._liveness("transport_started", data)
+        self.session_id = value
+
     def process_line(self, line: str) -> bool:
         """Process one line. Returns True when a terminal event is reached."""
         line = line.strip()
@@ -230,8 +269,7 @@ class StreamProcessor:
         # (distinct from gemini's bare {"type":"init"}). Capture the session id so
         # the caller can resume this conversation later with --resume.
         if data.get("type") == "system" and data.get("subtype") == "init":
-            if data.get("session_id"):
-                self.session_id = data["session_id"]
+            self._bind_session(data.get("session_id"), data)
             if data.get("model"):
                 self.handshake_model = data["model"]
             return False
@@ -241,22 +279,34 @@ class StreamProcessor:
         # session and model details there so resume can continue later and
         # model provenance stays accurate.
         if data.get("event") == "init":
-            if data.get("conversation_id"):
-                self.session_id = data["conversation_id"]
+            self._bind_session(data.get("conversation_id"), data)
             if data.get("model"):
                 self.handshake_model = data["model"]
             return False
 
+        if data.get("event") == "step_update":
+            # AGY progress packets are trusted transport activity. Only explicit
+            # assistant text or monotonically increasing tool steps reset idle.
+            content = data.get("response") or data.get("content")
+            if isinstance(content, str) and content:
+                self._liveness("output_text", data, output_chars=len(content))
+            elif data.get("tool") or data.get("tool_name"):
+                self._tool_progress += 1
+                tool = data.get("tool") or data.get("tool_name")
+                self._liveness("tool_activity", data, tool_id=str(tool)[:128],
+                               progress=self._tool_progress)
+            else:
+                self._liveness("stream_event", data)
+            return False
+
         if data.get("type") == "init":
             self.is_gemini = True
-            if data.get("session_id"):
-                self.session_id = data["session_id"]
+            self._bind_session(data.get("session_id"), data)
             return False
 
         if data.get("type") == "thread.started":
             self.is_codex = True
-            if data.get("thread_id"):
-                self.session_id = data["thread_id"]
+            self._bind_session(data.get("thread_id"), data)
             if data.get("model"):
                 self.handshake_model = data["model"]
             return False
@@ -265,12 +315,14 @@ class StreamProcessor:
             content = data.get("content", "")
             if isinstance(content, str):
                 self.gemini_parts.append(content)
+                self._liveness("output_text", data, output_chars=len(content))
             return False
 
         if self.is_codex and data.get("type") == "item.completed":
             item = data.get("item", {})
             if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
                 self.codex_messages.append(item["text"])
+                self._liveness("output_text", data, output_chars=len(item["text"]))
             return False
 
         # Codex emits ``turn.failed`` for provider/runtime failures. It is a
@@ -305,6 +357,7 @@ class StreamProcessor:
                 "status": "error",
                 "error": detail[:2000],
             }
+            self._liveness("terminal", data)
             return True
 
         # OpenCode's JSON event protocol (v1.x) uses step_start, text,
@@ -330,6 +383,17 @@ class StreamProcessor:
                 text = part.get("text") if isinstance(part, dict) else data.get("text")
                 if isinstance(text, str):
                     self.opencode_parts.append(text)
+                    self._liveness("output_text", data, output_chars=len(text))
+            elif data.get("type") in {"tool_use", "tool_result"}:
+                self._tool_progress += 1
+                part = data.get("part") if isinstance(data.get("part"), dict) else {}
+                tool_id = part.get("callID") or part.get("id") or data.get("id") or "tool"
+                self._liveness("tool_activity", data, tool_id=str(tool_id)[:128],
+                               progress=self._tool_progress)
+            elif data.get("type") == "step_finish":
+                self._liveness("finalizing", data)
+            else:
+                self._liveness("stream_event", data)
             return False
 
         if data.get("type") in {"error", "session_error", "message_error"}:
@@ -341,6 +405,7 @@ class StreamProcessor:
                 "type": "result", "result": "", "status": "error",
                 "error": str(detail)[:2000],
             }
+            self._liveness("terminal", data)
             return True
 
         # A few OpenCode builds have emitted the event envelope without the
@@ -367,6 +432,16 @@ class StreamProcessor:
             self._capture_opencode_metadata(data)
             if part.get("type") == "text" and isinstance(part.get("text"), str):
                 self.opencode_parts.append(part["text"])
+                self._liveness("output_text", data, output_chars=len(part["text"]))
+            elif part.get("type") in {"tool", "patch", "file", "subtask", "agent"}:
+                self._tool_progress += 1
+                tool_id = part.get("callID") or part.get("id") or part.get("type")
+                self._liveness("tool_activity", data, tool_id=str(tool_id)[:128],
+                               progress=self._tool_progress)
+            elif part.get("type") == "step-finish":
+                self._liveness("finalizing", data)
+            else:
+                self._liveness("stream_event", data)
             return False
 
         # Kimi Code's stream-json protocol is conversational JSONL rather than
@@ -377,6 +452,13 @@ class StreamProcessor:
         # a role is still parsed as OpenCode.
         if isinstance(data.get("role"), str) and not self.is_opencode:
             self._capture_kimi_record(data)
+            role = str(data.get("role") or "").strip().lower()
+            if role == "assistant":
+                content = data.get("content")
+                chars = len(content) if isinstance(content, str) else 0
+                self._liveness("output_text", data, output_chars=chars)
+            else:
+                self._liveness("stream_event", data)
             return False
 
         # Once Kimi has been identified, an untyped object is content, not a
@@ -415,6 +497,7 @@ class StreamProcessor:
                 "result": "\n".join(self.codex_messages),
                 "status": "success",
             }
+            self._liveness("terminal", data)
             return True
 
         # Result type signals completion
@@ -462,6 +545,7 @@ class StreamProcessor:
                     self.result_json["error"] = data["error"]
             else:
                 self.result_json = data
+            self._liveness("terminal", data)
             return True
 
         # Fallback: first valid JSON without a `type` field (some cursor result
@@ -471,6 +555,7 @@ class StreamProcessor:
         if "type" not in data and "event" not in data:
             self._capture_telemetry(data)
             self.result_json = data
+            self._liveness("terminal", data)
             return True
 
         return False
@@ -606,7 +691,7 @@ class StreamProcessor:
         for key in ("sessionID", "session_id"):
             value = data.get(key)
             if isinstance(value, str) and value.strip():
-                self.session_id = value.strip()
+                self._bind_session(value, data)
                 break
         containers = [data]
         part = data.get("part")
@@ -782,3 +867,4 @@ class StreamProcessor:
                 "result": "".join(self.opencode_parts),
                 "status": "error" if self.is_error else "success",
             }
+        self._liveness("terminal", {})

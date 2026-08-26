@@ -55,6 +55,8 @@ jobs:
           skills/summon/scripts/test_kimi_timeout.py
           skills/summon/scripts/test_phase1_usage.py
           skills/summon/scripts/test_phase1_compatibility.py
+          skills/summon/scripts/test_evidence_kernel.py
+          skills/summon/scripts/test_job_control.py
           skills/summon/scripts/test_evidence_guards.py
           skills/summon/scripts/test_opencode.py
           skills/summon/scripts/test_background_read_roots.py

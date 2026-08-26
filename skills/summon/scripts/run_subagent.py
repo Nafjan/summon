@@ -756,6 +756,22 @@ def main() -> None:
     parser = _cli.build_parser(__version__, _ENVELOPE_VERSION)
     args = parser.parse_args(argv)
 
+    if getattr(args, "adaptive_timeout", False) and getattr(args, "hard_timeout", False):
+        parser.error("--adaptive-timeout and --hard-timeout are mutually exclusive")
+    if getattr(args, "background", False) and not getattr(args, "hard_timeout", False):
+        # Detached jobs are observable and controllable, so their first timeout
+        # is an activity checkpoint by default. Foreground dispatch keeps the
+        # historical fixed deadline unless the caller explicitly opts in.
+        args.adaptive_timeout = True
+    if getattr(args, "adaptive_timeout", False):
+        if getattr(args, "max_runtime", None) is None:
+            args.max_runtime = _cli.Milliseconds(
+                max(int(args.timeout), 24 * 60 * 60 * 1000))
+        elif int(args.max_runtime) < int(args.timeout):
+            parser.error("--max-runtime must be greater than or equal to --timeout")
+    elif getattr(args, "max_runtime", None) is not None:
+        parser.error("--max-runtime requires --adaptive-timeout or --background")
+
     # This opt-in must be set before manifest/council fan-out branches so their
     # child dispatches inherit the same explicit choice. Kimi ACP recovery is
     # intentionally off by default because ACP does not provide Summon's host
@@ -989,7 +1005,8 @@ def main() -> None:
 
     # jobs list/status/wait: read-only registry queries; no dispatch. Answer and
     # exit before any agent/prompt/cwd validation.
-    if args.jobs_list or args.jobs_status or args.jobs_wait:
+    if (args.jobs_list or args.jobs_status or args.jobs_wait
+            or args.jobs_extend or args.jobs_cancel or args.jobs_steer):
         sys.exit(_background.run_jobs_query(args, _print_error))
 
     # Conversation rooms are a local context surface. Opening a room or
@@ -2021,38 +2038,89 @@ def _effective_decision_view(invocation, args) -> dict:
                 "reason": "usage_cache_invalid",
                 "observations_considered": 0,
             }
-    return {
-        "schema": "summon.decision/v1",
-        "provider_contacted": False,
-        "request": {"agent": args.agent, "lane": None, "model": invocation.model},
-        "resolution": {
+    from _decision import decide
+    from _evidence import digest
+
+    view = decide(
+        request={"agent": args.agent, "lane": None, "model": invocation.model,
+                 "provider": invocation.cli,
+                 "resolved_agent": getattr(args, "_resolved_agent", args.agent),
+                 "source": source},
+        candidates=[{
             "seat": getattr(args, "_resolved_agent", args.agent),
             "backend": invocation.cli,
-            "model_targeted": invocation.model,
-            "source": source,
-            "precedence": ["exact_agent", "approved_role"],
-            "winning_rule": "exact_agent_preserved" if source == "explicit_agent"
-                            else "approved_role_resolved",
-        },
-        "authority": {
+            "provider": invocation.cli,
+            "model": invocation.model,
+            "permission": invocation.permission,
+            "eligible": True,
+            "priority": 0,
+            "gate_allowed": True,
+            "data_boundary_satisfied": True,
+            "requires_corrective": False,
+            "requires_retry": False,
+            "requires_fallback": False,
+        }],
+        constraints={
             "permission_ceiling": getattr(args, "max_permission", None),
-            "effective_permission": invocation.permission,
-            "strict_roster": bool(getattr(args, "strict_agents_dir", False)),
-            "credit": {
-                "authorized": credit_allowed,
-                "source": "dispatch_flag" if credit_flag else
-                          "environment" if credit_allowed else "none",
-            },
-            "payg": {
-                "authorized": payg_allowed,
-                "source": "dispatch_flag" if payg_flag else
-                          "operator_configuration" if payg_allowed else "none",
-            },
+            "spend_authorized": bool(credit_allowed or payg_allowed),
+            "enforcement": "enforced",
+            "corrective_allowed": False,
+            "retry_allowed": False,
+            "fallback_allowed": False,
+            "require_fresh": False,
+            "unknowns": ["usage_observation", "roster_digest", "policy_digest"],
         },
-        "digests": {"roster": None, "policy": None},
-        "usage": usage_view,
-        "unknowns": ["usage_observation", "roster_digest", "policy_digest"],
-    }
+        evidence={"roster": None, "policy": None},
+    )
+    view["resolution"].update({
+        "source": source,
+        "precedence": ["exact_agent", "approved_role"],
+    })
+    view["authority"].update({
+        "effective_permission": invocation.permission,
+        "strict_roster": bool(getattr(args, "strict_agents_dir", False)),
+        "credit": {
+            "authorized": credit_allowed,
+            "source": "dispatch_flag" if credit_flag else
+                      "environment" if credit_allowed else "none",
+        },
+        "payg": {
+            "authorized": payg_allowed,
+            "source": "dispatch_flag" if payg_flag else
+                      "operator_configuration" if payg_allowed else "none",
+        },
+    })
+    view["usage"] = usage_view
+    view["unknowns"] = ["usage_observation", "roster_digest", "policy_digest"]
+    view.pop("decision_sha256", None)
+    body = {key: value for key, value in view.items() if key != "schema"}
+    view["decision_sha256"] = digest("summon.decision/v1", body)
+    return view
+
+
+def _sync_effective_decision_refusal(view: dict) -> None:
+    """Keep the decision explanation consistent with a later dry-run refusal."""
+    if not view.get("would_refuse"):
+        return
+    decision = view.get("effective_decision")
+    if not isinstance(decision, dict):
+        return
+    rule = view.get("error_kind") or "preflight_refused"
+    candidates = decision.get("candidates") or []
+    for candidate in candidates:
+        candidate["eligible"] = False
+        losing = candidate.setdefault("losing_rules", [])
+        if rule not in losing:
+            losing.append(rule)
+            losing.sort()
+    resolution = decision.setdefault("resolution", {})
+    resolution.update({"seat": None, "backend": None, "provider": None,
+                       "model_targeted": None,
+                       "winning_rule": "no_eligible_candidate"})
+    from _evidence import digest
+    decision.pop("decision_sha256", None)
+    body = {key: value for key, value in decision.items() if key != "schema"}
+    decision["decision_sha256"] = digest("summon.decision/v1", body)
 
 
 def _dry_run_view(invocation, args, agents_dir: str,
@@ -2320,6 +2388,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
         view["native_prefer_hint"] = (
             "openai-compat is a single Chat Completions call — prefer a CLI agent "
             "loop for multi-step coding")
+    _sync_effective_decision_refusal(view)
     return view
 
 

@@ -169,6 +169,10 @@ def child_argv(args: argparse.Namespace, result_file: str) -> list:
         out += ["--enable-roles"]
     if args.timeout:
         out += ["--timeout", str(args.timeout)]
+    if getattr(args, "adaptive_timeout", False):
+        out += ["--adaptive-timeout"]
+    if getattr(args, "max_runtime", None):
+        out += ["--max-runtime", str(args.max_runtime)]
     for flag, val in (("--cli", args.cli), ("--model", args.model), ("--effort", args.effort),
                       ("--profile", getattr(args, "profile", None)),
                       ("--resume", args.resume), ("--resume-profile", args.resume_profile),
@@ -247,6 +251,12 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict) ->
         child_env = {**os.environ, "SUMMON_JOB_NONCE": nonce,
                      "SUMMON_JOB_ID": job_id,
                      "SUMMON_JOB_SCRIPTS_SHA256": execution_summon["scripts_sha256"]}
+        if getattr(args, "adaptive_timeout", False):
+            from _job_control import control_path, heartbeat_path
+            child_env["SUMMON_ADAPTIVE_TIMEOUT"] = "1"
+            child_env["SUMMON_MAX_RUNTIME_MS"] = str(int(args.max_runtime))
+            child_env["SUMMON_JOB_CONTROL_FILE"] = control_path(root, job_id)
+            child_env["SUMMON_JOB_HEARTBEAT_FILE"] = heartbeat_path(root, job_id)
         child_env.pop("SUMMON_CMD_LAUNCHER", None)
         if prompt_sha:
             child_env["SUMMON_JOB_PROMPT_SHA"] = prompt_sha   # lets the crash path verify
@@ -277,6 +287,24 @@ def run_jobs_query(args, emit_error) -> int:
     ``emit_error(message, exit_code=1)`` is the hub's error emitter (injected so
     this module does not import the entry point)."""
     root = _jobs.resolve_jobs_dir(args.job_dir)
+    if args.jobs_extend or args.jobs_cancel or args.jobs_steer:
+        from _job_control import queue_command
+        action = ("extend" if args.jobs_extend else
+                  "cancel" if args.jobs_cancel else "steer")
+        job_id = args.jobs_extend or args.jobs_cancel or args.jobs_steer
+        try:
+            if action == "extend" and args.job_duration is None:
+                raise ValueError("jobs extend requires --duration")
+            if action == "steer" and not args.job_message:
+                raise ValueError("jobs steer requires --message")
+            report = queue_command(
+                root, job_id, action,
+                duration_ms=(int(args.job_duration) if action == "extend" else None),
+                message=(args.job_message if action == "steer" else None))
+        except (OSError, ValueError) as exc:
+            emit_error(str(exc)); return 1
+        print(json.dumps(report, ensure_ascii=False))
+        return 0
     if args.jobs_list:
         rows = _jobs.list_jobs(root)
         if args.json:
@@ -291,6 +319,27 @@ def run_jobs_query(args, emit_error) -> int:
             emit_error(str(e)); return 1
         if st is None:
             emit_error(f"no such job {args.jobs_status!r} under {root}"); return 1
+        try:
+            from _job_control import control_summary, heartbeat_path
+            st["control"] = control_summary(root, args.jobs_status)
+            heartbeat, _state = _jobs._read(heartbeat_path(root, args.jobs_status))
+            record = st.get("record") if isinstance(st.get("record"), dict) else {}
+            if (not isinstance(heartbeat, dict)
+                    or heartbeat.get("job_id") != args.jobs_status
+                    or heartbeat.get("nonce") != record.get("nonce")):
+                st["heartbeat"] = None
+            else:
+                st["heartbeat"] = {key: value for key, value in heartbeat.items()
+                                   if key != "nonce"}
+            if isinstance(st.get("record"), dict):
+                st["record"] = {key: value for key, value in st["record"].items()
+                                if key != "nonce"}
+            if isinstance(st.get("result"), dict):
+                st["result"] = {key: value for key, value in st["result"].items()
+                                if key != "job_nonce"}
+        except (OSError, ValueError):
+            st["control"] = {"state": "unavailable"}
+            st["heartbeat"] = None
         print(json.dumps(st, ensure_ascii=False))
         return 0
     # jobs wait

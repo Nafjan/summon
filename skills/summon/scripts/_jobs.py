@@ -209,7 +209,7 @@ def read_json(path: str):
 _FLAG_ALLOWLIST = ("agent", "cli", "model", "effort", "timeout", "cwd",
                    "agents_dir", "worktree", "profile", "allow_text_only", "require_tools",
                    "strict_agents_dir", "enable_roles", "read_root", "isolated_lane",
-                   "allow_tool_credentials")
+                   "allow_tool_credentials", "adaptive_timeout", "max_runtime")
 
 
 def flags_projection(args) -> dict:

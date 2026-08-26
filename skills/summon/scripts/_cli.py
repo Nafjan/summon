@@ -159,6 +159,9 @@ MODE_FLAGS = {
     "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
     "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
     "jobs-wait": {"jobs_wait", "job_dir", "timeout", "job_file"},
+    "jobs-extend": {"jobs_extend", "job_duration", "job_dir", "json", "job_file"},
+    "jobs-cancel": {"jobs_cancel", "job_dir", "json", "job_file"},
+    "jobs-steer": {"jobs_steer", "job_message", "job_dir", "json", "job_file"},
     # Diagnostics are local management commands. They never dispatch an agent;
     # bug-report submission is an explicit, user-authenticated gh invocation.
     "telemetry": {"telemetry_enable", "telemetry_disable", "telemetry_status",
@@ -206,6 +209,11 @@ MODE_HINTS = {
                     "and --json."),
     "jobs-wait": ("jobs wait is read-only: it takes only the job id, --job-dir, "
                   "and --timeout."),
+    "jobs-extend": ("jobs extend queues a bounded deadline extension; it never "
+                    "contacts a provider."),
+    "jobs-cancel": ("jobs cancel queues cancellation for the active child."),
+    "jobs-steer": ("jobs steer queues a follow-up. Subprocess turns apply it only "
+                   "through an explicit resumed turn; no live injection is claimed."),
     "telemetry": ("telemetry is local-only and opt-in: it writes bounded, sanitized "
                   "JSONL evidence and never phones home."),
     "usage": ("usage status/import is provider-inert: it reads or validates a bounded, "
@@ -236,6 +244,12 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "jobs-status"
     if getattr(args, "jobs_wait", None):
         return "jobs-wait"
+    if getattr(args, "jobs_extend", None):
+        return "jobs-extend"
+    if getattr(args, "jobs_cancel", None):
+        return "jobs-cancel"
+    if getattr(args, "jobs_steer", None):
+        return "jobs-steer"
     if getattr(args, "council_status", None):
         return "council-status"
     if getattr(args, "deliberate_status", None):
@@ -602,12 +616,24 @@ def rewrite_subcommand(argv: list) -> tuple:
             return argv, "help"       # bare `summon jobs` -> usage, not a silent list
         if rest[0] == "list":
             return ["--jobs-list", *rest[1:]], None
-        if rest[0] in ("status", "wait"):
+        if rest[0] in ("status", "wait", "extend", "cancel", "steer"):
             if len(rest) < 2 or rest[1].startswith("-"):
                 return argv, f"error: 'jobs {rest[0]}' needs a job id"
-            flag = "--jobs-status" if rest[0] == "status" else "--jobs-wait"
-            return [flag, rest[1], *rest[2:]], None
-        return argv, f"error: unknown 'jobs' action {rest[0]!r} (use list/status/wait)"
+            flag = {"status": "--jobs-status", "wait": "--jobs-wait",
+                    "extend": "--jobs-extend", "cancel": "--jobs-cancel",
+                    "steer": "--jobs-steer"}[rest[0]]
+            tail = list(rest[2:])
+            if rest[0] == "extend":
+                tail = [("--job-duration" + token[len("--duration"):])
+                         if token == "--duration" or token.startswith("--duration=")
+                         else token for token in tail]
+            elif rest[0] == "steer":
+                tail = [("--job-message" + token[len("--message"):])
+                         if token == "--message" or token.startswith("--message=")
+                         else token for token in tail]
+            return [flag, rest[1], *tail], None
+        return argv, (f"error: unknown 'jobs' action {rest[0]!r} "
+                      "(use list/status/wait/extend/cancel/steer)")
     if head == "version":
         return ["--version", *rest], None
     if head == "manifest":            # first positional is the manifest file
@@ -837,6 +863,14 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "separate account, clone, container, or VM")
     parser.add_argument("--background", action="store_true",
                         help="Dispatch detached; return a job handle immediately")
+    parser.add_argument("--adaptive-timeout", dest="adaptive_timeout", action="store_true",
+                        help="Use activity-aware checkpoints for a background job; active "
+                             "work auto-extends up to --max-runtime")
+    parser.add_argument("--hard-timeout", dest="hard_timeout", action="store_true",
+                        help="Disable the default activity-aware background lease and keep "
+                             "--timeout as a fixed hard deadline")
+    parser.add_argument("--max-runtime", dest="max_runtime", type=parse_timeout,
+                        help="Hard ceiling for an adaptive background job (default: 24h)")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true",
                         help="Print the fully resolved dispatch (command, model, permission "
                              "flags, cwd) WITHOUT executing anything")
@@ -1090,4 +1124,14 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Print one background job's record + result (read-only)")
     parser.add_argument("--jobs-wait", dest="jobs_wait", metavar="JOB_ID",
                         help="Wait for a background job's result (read-only poll; --timeout)")
+    parser.add_argument("--jobs-extend", dest="jobs_extend", metavar="JOB_ID",
+                        help="Queue a bounded extension for an adaptive background job")
+    parser.add_argument("--jobs-cancel", dest="jobs_cancel", metavar="JOB_ID",
+                        help="Queue cancellation for a background job")
+    parser.add_argument("--jobs-steer", dest="jobs_steer", metavar="JOB_ID",
+                        help="Queue a follow-up steering prompt; subprocess turns resume later")
+    parser.add_argument("--job-duration", dest="job_duration", type=parse_timeout,
+                        help="With jobs extend: duration to add")
+    parser.add_argument("--job-message", dest="job_message",
+                        help="With jobs steer: bounded follow-up prompt")
     return parser
