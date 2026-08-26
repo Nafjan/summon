@@ -240,7 +240,8 @@ def flags_projection(args) -> dict:
 
 def write_prepared(root: str, job_id: str, *, nonce: str, agent: str,
                    prompt_sha256: str | None, cwd: str, flags: dict,
-                   summon: dict, launcher_summon: dict | None = None) -> str:
+                   summon: dict, attempt_id: str | None = None,
+                   launcher_summon: dict | None = None) -> str:
     """Write the launch record BEFORE spawn. The record path never appears as a
     zero-byte file: the whole content is written to a temp file, fsynced, and
     atomically renamed into place (a reader sees either nothing or a complete
@@ -250,8 +251,16 @@ def write_prepared(root: str, job_id: str, *, nonce: str, agent: str,
     path = record_path(root, job_id)
     if os.path.lexists(path):     # lexists: a symlink here is reuse too, don't follow it
         raise FileExistsError(f"launch record already exists for job {job_id}")
+    if attempt_id is None:
+        attempt_id = job_id
+    if not valid_job_id(attempt_id):
+        raise ValueError("attempt_id must be a 32-character lowercase hexadecimal token")
     record = {
         "job_id": job_id, "nonce": nonce, "agent": agent,
+        # A background job is one physical attempt.  Keep the identity explicit
+        # even though the current default equals job_id so future orchestration
+        # layers can distinguish logical turns from provider launches.
+        "attempt_id": attempt_id,
         "prompt_sha256": prompt_sha256, "cwd": cwd, "flags": flags,
         "summon": summon, "prepared_at": time.time(), "pid": None,
     }
@@ -387,8 +396,12 @@ def job_status(root: str, job_id: str) -> dict | None:
     if rec is not None and result is None and rec.get("pid") is not None:
         liveness = _pid_liveness(rec.get("pid"))
     state, trusted = _classify(rec, rec_state, result, res_state, liveness)
+    recorded_attempt = (rec or {}).get("attempt_id")
+    if not valid_job_id(recorded_attempt):
+        recorded_attempt = job_id if rec_state == _OK else None
     return {
         "job_id": job_id, "state": state, "trusted": trusted,
+        "attempt_id": recorded_attempt,
         "agent": (rec or {}).get("agent"),
         "pid": (rec or {}).get("pid"),
         "prepared_at": (rec or {}).get("prepared_at"),
@@ -421,7 +434,7 @@ def list_jobs(root: str) -> list[dict]:
     for jid in ids:
         st = job_status(root, jid)
         if st:
-            rows.append({k: st[k] for k in ("job_id", "state", "trusted", "agent",
+            rows.append({k: st[k] for k in ("job_id", "attempt_id", "state", "trusted", "agent",
                                             "pid", "prepared_at", "result_status",
                                             "liveness")})
     rows.sort(key=lambda r: r.get("prepared_at") or 0, reverse=True)

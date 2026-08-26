@@ -34,6 +34,16 @@ Credential Manager entry into this child process for an OpenRouter model. The
 secret is never written to the agent definition, command line, receipt,
 telemetry, or debug file.
 
+OpenCode's assistant `providerID`/`modelID` fields describe the model selected
+before the provider call. They are target evidence, not an authoritative copy of
+the provider response's `model` field. Current OpenCode streams can therefore
+complete a useful Ox turn while an exact-model Summon seat remains
+`served_model_unverified`. Do not promote those fields or retry an exact
+governance seat merely because the session export repeats them. Use a direct
+`openai-compat` OpenRouter/Nous text seat when provider-reported model identity is
+mandatory, or treat the toolful OpenCode result as advisory until OpenCode exposes
+the response model in its event contract.
+
 On Windows, that restricted policy also denies an external working-directory
 volume. Summon detects this in `dispatch --dry-run` and `doctor --cwd` before a
 turn starts. It returns a machine-actionable `allowed_root` on the local
@@ -137,6 +147,24 @@ When `openrouter_options` is present, Summon asks OpenCode to use
 the adapter; if a local release does not, the dispatch fails clearly instead of
 silently dropping the router settings. A normal concrete-model or alias seat
 does not require this override.
+
+### 429s and explicit alternate routes
+
+An upstream HTTP 429 from OpenRouter is a provider-pool availability result, not
+proof that the Summon seat or model selector is broken. The default is fail once;
+`--transient-retries` (or `SUMMON_TRANSIENT_RETRIES=1`) permits one bounded
+exponential-backoff retry. Summon does not silently switch an exact Ox request to
+another model or provider, and an envelope with no `model.served`/report remains
+non-verdict evidence.
+
+If the OpenRouter pool remains unavailable, an operator can deliberately choose a
+different configured route: an OpenCode Nous provider seat targeting
+`nous/stealth/ox-alpha` (only when `opencode models` lists that route and its local
+auth is valid), or the direct `openai-compat` OpenRouter/Nous seat for text-only
+advisory work. The direct API seat does not provide OpenCode's file/tool loop. The
+Auto, Free, and Fusion aliases are also deliberate model-routing changes, not
+transparent Ox fallbacks; verify their served model before treating the result as
+an Ox review.
 
 ## Custom & API backends (`openai-compat`) — direct text seat
 

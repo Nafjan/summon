@@ -7,7 +7,8 @@ provider-specific, and signed-evidence gates remain explicitly separate.
 
 Summon 3.2 has two linked goals:
 
-1. Make an explicit Codex model request trustworthy. A request for Sol must not
+1. Make an explicit named-model request trustworthy across providers. A request for Sol,
+   Opus, Fable, or another governed seat must not
    silently become Luna because a later selector, ambient configuration, resume
    handle, retry path, or provider response changed the route.
 2. Make the local conversation atlas calm and predictable. The browser window
@@ -21,7 +22,7 @@ routing fail closed first, then graduate the chat surface only through rendered
 browser and lifecycle evidence. A model label, a fake receipt, or a unit-test
 pass is not proof of what a provider served.
 
-## 1. Codex model-selection contract
+## 1. Named-model selection and provenance contract
 
 Resolve one immutable selection before profile lookup, workspace setup, or
 provider contact. The record carries:
@@ -44,7 +45,9 @@ selectors block before `Popen` with `model_selection_conflict` and no provider
 contact. The selector is included in dry-run output without private paths or
 configuration contents.
 
-An explicit Codex pin requires an authoritative terminal served-model receipt:
+An exact named-model pin requires an authoritative terminal served-model receipt. Built-in
+governance seats enable this policy automatically; a custom seat opts in with
+`model-policy: exact` or `--require-exact-model`:
 
 - exact match: success and usable result;
 - different handshake: `target_model_mismatch`, blocked, no retry;
@@ -52,7 +55,8 @@ An explicit Codex pin requires an authoritative terminal served-model receipt:
   result unusable;
 - different terminal identity: `served_model_mismatch`, blocked, result unusable.
 
-These outcomes are terminal across ordinary retries, transient retries, ACP or
+Auxiliary provider models remain visible in `model.models_used`, but do not satisfy the exact
+seat when the dominant terminal model differs. These outcomes are terminal across ordinary retries, transient retries, ACP or
 backend fallback, schema/report repair, manifests, council, deliberate, chat,
 and swarm workers. A later operator-directed fresh request is a new request and
 must have a new fingerprint; automatic replay is not allowed.

@@ -24,7 +24,7 @@ from _resolver import _VALID_CLIS
 
 # Frontmatter keys a caller may set. Anything else is a typo or an attempt to
 # smuggle content — reject loudly.
-SETTABLE_KEYS = ("run-agent", "model", "permission", "args", "profile")
+SETTABLE_KEYS = ("run-agent", "model", "model-policy", "permission", "args", "profile")
 
 _TEMPLATE = """---
 {frontmatter}
@@ -102,6 +102,8 @@ def _validate_values(sets: dict, allow_empty: bool) -> None:
             raise ValueError(f"run-agent must be one of {_VALID_CLIS}, got {value!r}")
         if key == "permission" and value not in PERMISSION_VALUES:
             raise ValueError(f"permission must be one of {PERMISSION_VALUES}, got {value!r}")
+        if key == "model-policy" and value.lower() not in {"exact", "required", "strict"}:
+            raise ValueError("model-policy must be exact (or required/strict)")
         if key == "args":
             parse_extra_args(value)  # raises ValueError on unbalanced quoting
         if key == "profile":

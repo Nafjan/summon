@@ -50,6 +50,15 @@ if sys.version_info < (3, 10):
         # imports, so it cannot call finalize_exit_fields, but the contract holds.
         "backend_exit_code": 1,
         "dispatcher_status": "error",
+        "attempts": 0,
+        "attempt_status": "not_run",
+        "execution_status": "not_run",
+        "provider_contacted": False,
+        "model": {"requested": None, "targeted": None, "served": None,
+                  "resolved": None, "models_used": [], "evidence_source": None},
+        "served_model_evidence": "absent",
+        "model_match": None,
+        "named_model_verified": False,
         "normalization_reason": "interpreter older than Python 3.10; summon did not run",
         "error": ("summon needs Python 3.10 or newer, but this interpreter is "
                   + _found + ". Install a newer Python (python.org or your package "
@@ -64,10 +73,12 @@ if sys.version_info < (3, 10):
 sys.path.insert(0, str(Path(__file__).parent))
 
 import _background  # noqa: E402
+import _jobs  # noqa: E402
 import _cli  # noqa: E402
 import _executor  # noqa: E402
 import _receipt  # noqa: E402
 import _telemetry  # noqa: E402
+import _usage  # noqa: E402
 from _builder import (AgentInvocation, clamp_permission as _clamp,
                       environment_handoff_context, normalize_read_roots,
                       parse_openrouter_options, read_allowlist)  # noqa: E402
@@ -236,7 +247,8 @@ def _request_identity(args) -> dict:
         require_tools=bool(getattr(args, "require_tools", False)),
         profile=getattr(args, "profile", None),
         strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)),
-        role_provenance=getattr(args, "_role_provenance", None))
+        role_provenance=getattr(args, "_role_provenance", None),
+        require_exact_model=bool(getattr(args, "require_exact_model", False)))
 
 
 def _complete_artifact_provenance(env: dict, args, before: dict | None) -> dict:
@@ -294,6 +306,12 @@ def _stamp_job(env: dict) -> dict:
     nonce = os.environ.get("SUMMON_JOB_NONCE")
     if nonce:
         env["job_nonce"] = nonce
+    job_id = os.environ.get("SUMMON_JOB_ID")
+    if (not _is_not_run(env) and env.get("attempts") == 1 and isinstance(job_id, str)
+            and re.fullmatch(r"[0-9a-f]{32}", job_id)):
+        # The background job is the physical attempt identity.  Do not copy
+        # arbitrary environment text into a public receipt.
+        env.setdefault("attempt_id", job_id)
     # Fill prompt_sha256 on paths that lack a full receipt (the crash writer);
     # a normal envelope already carries the receipt-computed hash, kept as-is.
     if env.get("prompt_sha256") is None:
@@ -339,17 +357,146 @@ def _emit(obj: dict, *, operation: str | None = None,
         pass
     text = json.dumps(obj, ensure_ascii=False)
     if _JOB_FILE:
-        tmp = _JOB_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, _JOB_FILE)  # rename == atomic done-marker for the poller
+        _write_job_file_text(text, _JOB_FILE)
     else:
         print(text)
 
 
+def _job_file_has_terminal_envelope(job_file: str) -> bool:
+    """Return whether a job path already contains a terminal JSON envelope.
+
+    A valid terminal file is immutable for the lifetime of a physical attempt:
+    crash/SystemExit cleanup must not overwrite a successful receipt, and a
+    duplicate finalizer must be a no-op.  Corrupt JSON is not treated as a
+    terminal value so the owner can replace it with a typed crash envelope.
+    """
+    try:
+        if os.path.islink(job_file):
+            raise OSError("refusing to follow a symlinked background result path")
+        with open(job_file, encoding="utf-8") as fh:
+            value = json.load(fh)
+        return isinstance(value, dict) and isinstance(value.get("status"), str)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+
+
+def _write_job_file_text(text: str, job_file: str) -> None:
+    """Publish one complete background envelope, atomically and idempotently.
+
+    A short exclusive finalizer lock closes the race between the normal emitter
+    and the last-resort SystemExit/crash handler.  The first valid terminal
+    receipt wins; later finalizers discard their temporary file.  The lock is
+    removed only by its owner, so a hard kill leaves an inspectable marker
+    instead of silently allowing a second process to relabel the attempt.
+    ``_jobs`` owns the bounded Windows sharing-violation retry for the final
+    replace.
+    """
+    if _job_file_has_terminal_envelope(job_file):
+        return
+    lock = job_file + ".terminal.lock"
+    token = uuid.uuid4().hex
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"pid": os.getpid(), "token": token,
+                       "created_at": time.time()}, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except FileExistsError:
+        # Another finalizer owns the attempt.  If it has already published a
+        # result, this call is an idempotent no-op.  Give the owner a short,
+        # bounded window to finish its atomic replace; if it does not, preserve
+        # the lock for diagnosis rather than racing an unknown writer.
+        for _ in range(25):
+            if _job_file_has_terminal_envelope(job_file):
+                return
+            time.sleep(0.02)
+        if _job_file_has_terminal_envelope(job_file):
+            return
+        raise
+
+    tmp = f"{job_file}.{token}.tmp"
+    try:
+        # Re-check after taking the lock: a writer that won immediately before
+        # our claim remains authoritative.
+        if _job_file_has_terminal_envelope(job_file):
+            return
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _jobs._replace_with_retry(tmp, job_file)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        try:
+            with open(lock, encoding="utf-8") as fh:
+                owner = json.load(fh)
+            if isinstance(owner, dict) and owner.get("token") == token:
+                os.unlink(lock)
+        except (OSError, ValueError, UnicodeDecodeError):
+            pass
+
+
 def _print_error(error: str, exit_code: int = 1) -> None:
-    _emit({"result": "", "exit_code": exit_code, "status": "error", "error": error},
-          operation=_EMIT_OPERATION)
+    envelope = {"result": "", "exit_code": exit_code,
+                "status": "error", "error": error}
+    _mark_not_run(envelope)
+    _emit(envelope, operation=_EMIT_OPERATION)
+
+
+def _mark_not_run(env: dict) -> dict:
+    """Mark a structural refusal that never reached a provider.
+
+    ``status=error`` is retained for compatibility with generic dispatcher errors, but
+    it must not imply that an agent turn ran.  Keep this as one small seam so every
+    pre-dispatch path uses the same zero-attempt contract.
+    """
+    env["attempts"] = 0
+    env["attempt_status"] = "not_run"
+    env["execution_status"] = "not_run"
+    env["provider_contacted"] = False
+    # Structural refusals are public JSON envelopes too, not only internal
+    # retry state.  Normalize the provenance fields here so a contradictory
+    # compatibility value (for example model_match=true or a stale served id)
+    # can never make a no-provider refusal look like a named-model review.
+    model = env.get("model")
+    model = dict(model) if isinstance(model, dict) else {}
+    model.setdefault("requested", None)
+    model.setdefault("targeted", None)
+    model["served"] = None
+    model["resolved"] = None
+    model["models_used"] = []
+    model["evidence_source"] = None
+    env["model"] = model
+    env["served_model_evidence"] = "absent"
+    env["model_match"] = None
+    env["named_model_verified"] = False
+    return env
+
+
+def _is_not_run(env: dict | None) -> bool:
+    """Whether an envelope is an explicit structural refusal, not a failed turn."""
+    return bool(
+        isinstance(env, dict)
+        and env.get("attempt_status") == "not_run"
+        and env.get("execution_status") == "not_run"
+        and env.get("provider_contacted") is False
+    )
+
+
+def _attempt_count(env: dict | None, default: int = 1) -> int:
+    """Read an attempt count without turning a not-run refusal into one attempt."""
+    if _is_not_run(env):
+        return 0
+    value = env.get("attempts") if isinstance(env, dict) else None
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return default
 
 
 def _preflight_backend(cli: str, command_override: str | None = None) -> dict | None:
@@ -401,6 +548,10 @@ def _preflight_backend(cli: str, command_override: str | None = None) -> dict | 
         "status": "error",
         "result": "",
         "exit_code": 127,   # documented contract: 127 == CLI not found (SKILL.md)
+        "attempts": 0,
+        "attempt_status": "not_run",
+        "execution_status": "not_run",
+        "provider_contacted": False,
         "error": msg,
         "cli": cli,
         "setup": {"backend": cli, "install": hint.get("install"),
@@ -411,6 +562,26 @@ def _preflight_backend(cli: str, command_override: str | None = None) -> dict | 
 
 
 _MEMORY_CAP = 8000  # chars; keeps the injected block well under agy's 28 KB argv guard
+
+# ``cmd.exe`` expands prompt bytes before Python receives ``%*``. The launcher
+# marks that path and the dispatcher rejects every raw prompt; a UTF-8 prompt file
+# is the only transport whose bytes can be verified after batch expansion.
+
+
+def _cmd_prompt_transport_error(prompt: object, prompt_file: object) -> str | None:
+    """Require a prompt file for every raw ``summon.cmd`` dispatch prompt.
+
+    Batch expansion happens before Python receives argv. Inspecting the surviving
+    characters cannot prove that newlines, percent expansions, carets, or metacharacters
+    were preserved, so even apparently simple raw prompt text is untrusted transport.
+    """
+    if os.environ.get("SUMMON_CMD_LAUNCHER") != "1" or prompt_file is not None:
+        return None
+    if not isinstance(prompt, str):
+        return None
+    return ("raw --prompt through summon.cmd cannot be verified after batch expansion; "
+            "use --prompt-file with UTF-8 text so the prompt is transported without "
+            "newline truncation, percent expansion, or cmd metacharacter rewriting")
 
 
 def _apply_gemini_thinking(model: str, effort: str) -> str:
@@ -585,6 +756,13 @@ def main() -> None:
     parser = _cli.build_parser(__version__, _ENVELOPE_VERSION)
     args = parser.parse_args(argv)
 
+    # This opt-in must be set before manifest/council fan-out branches so their
+    # child dispatches inherit the same explicit choice. Kimi ACP recovery is
+    # intentionally off by default because ACP does not provide Summon's host
+    # filesystem/terminal adapter.
+    if getattr(args, "allow_kimi_acp_fallback", False):
+        os.environ["SUMMON_KIMI_ACP_FALLBACK"] = "1"
+
     global _JOB_FILE, _EMIT_OPERATION
     _JOB_FILE = args.job_file
     _EMIT_OPERATION = "resume" if args.resume else "dispatch"
@@ -595,6 +773,40 @@ def main() -> None:
     _bad_mode_flags = _cli.unsupported_mode_flags(argv, args)
     if _bad_mode_flags:
         _print_error(_bad_mode_flags)
+        sys.exit(1)
+
+    # Usage evidence is a local management surface. It stays ahead of all
+    # roster/backend resolution so a missing CLI or broken provider auth cannot
+    # turn a provider-inert status/import command into a dispatch dependency.
+    if getattr(args, "usage_action", None):
+        try:
+            if args.usage_action == "import":
+                if not getattr(args, "usage_from", None):
+                    raise ValueError("usage import requires --from SNAPSHOT.json")
+                _usage_report = _usage.import_snapshot(
+                    args.usage_from, cache_path=getattr(args, "usage_cache", None))
+            else:
+                if getattr(args, "usage_from", None):
+                    raise ValueError("usage status does not accept --from")
+                _usage_report = _usage.status(
+                    cache_path=getattr(args, "usage_cache", None))
+            print(json.dumps(_usage_report, ensure_ascii=False) if args.json
+                  else json.dumps(_usage_report, ensure_ascii=False, indent=2))
+            sys.exit(0)
+        except (OSError, ValueError, FileNotFoundError) as exc:
+            _usage_error = {
+                "status": "error", "result": "", "exit_code": 1,
+                "error": str(exc), "error_kind": "usage_evidence_invalid",
+                "retryable": False, "result_usable": False,
+            }
+            _mark_not_run(_usage_error)
+            _emit(_usage_error, operation="usage")
+            sys.exit(1)
+    if getattr(args, "usage_from", None):
+        _print_error("--usage-from is valid only with usage import")
+        sys.exit(1)
+    if getattr(args, "usage_cache", None) and not getattr(args, "dry_run", False):
+        _print_error("--usage-cache outside the usage command is valid only with --dry-run")
         sys.exit(1)
 
     # Local diagnostics are management commands, not dispatches. Keep them
@@ -861,6 +1073,8 @@ def main() -> None:
     def _die(msg: str, exit_code: int = 1, *, error_kind: str | None = None,
              details: dict | None = None, extra: dict | None = None) -> None:
         env = {"result": "", "exit_code": exit_code, "status": "error", "error": msg}
+        _mark_not_run(env)
+        finalize_exit_fields(env)
         if error_kind:
             env["error_kind"] = error_kind
         if details:
@@ -967,6 +1181,17 @@ def main() -> None:
             _die(f"cannot read --prompt-file {args.prompt_file}: {e}")
         if not args.prompt.strip():
             _die(f"--prompt-file {args.prompt_file} is empty")
+
+    # The batch launcher cannot safely preserve raw CR/LF or cmd metacharacters
+    # inside ``%*``.  Refuse before roster/backend work so the malformed legacy
+    # invocation has an explicit zero-attempt receipt and cannot launch a child;
+    # ``--prompt-file`` is the safe transport for those prompts.
+    _cmd_transport_error = _cmd_prompt_transport_error(args.prompt, args.prompt_file)
+    if _cmd_transport_error:
+        _die(_cmd_transport_error, error_kind="prompt_transport_unsafe",
+             extra={"provider_contacted": False, "retryable": False,
+                    "result_usable": False,
+                    "prompt_transport": {"kind": "summon.cmd", "safe": "prompt-file"}})
 
     # Role aliases are an explicit, opt-in operator feature.  Keep the requested
     # spelling on ``args`` for receipts and child argv, while every loader/identity
@@ -1341,6 +1566,8 @@ def main() -> None:
         setup_error = _preflight_backend(
             cli, (profile_selection or {}).get("command") if profile_selection else None)
         if setup_error is not None:
+            _mark_not_run(setup_error)
+            finalize_exit_fields(setup_error)
             setup_error.update(receipt)   # provenance even on the no-backend path
             # --out is AUTHORITATIVE, and this path bypassed _die() (which writes there), so
             # a preflight failure after a refused stale success was archived left that path
@@ -1468,6 +1695,23 @@ def main() -> None:
         _die(str(e))
 
     _model_source = "cli" if args.model else "frontmatter" if model else None
+    _model_exact_required, _model_exact_source = _executor.model_exact_policy(
+        agent=getattr(args, "_resolved_agent", args.agent),
+        frontmatter=_agent_fm,
+        explicit=bool(getattr(args, "require_exact_model", False)),
+    )
+    if _model_exact_required and not final_model:
+        _die("exact-model policy requires an explicit model pin (use --model or "
+             "add model: to the selected agent)",
+             error_kind="model_exact_pin_missing",
+             extra={"provider_contacted": False, "result_usable": False,
+                    "retryable": False,
+                    "model_policy": {"exact_required": True,
+                                     "source": _model_exact_source}})
+    receipt["model_policy"] = {
+        "exact_required": bool(_model_exact_required),
+        "source": _model_exact_source,
+    }
     invocation = AgentInvocation(
         cli=cli,
         prompt=args.prompt,
@@ -1489,6 +1733,8 @@ def main() -> None:
             and _clamp(permission, args.max_permission) != permission),
         model=final_model,               # incl. agy Gemini thinking-mode suffix
         model_source=_model_source,
+        model_exact_required=bool(_model_exact_required),
+        model_exact_source=_model_exact_source,
         effort=effort,                    # --effort > frontmatter > env > default(high)
         resume_id=args.resume,
         resume_profile=args.resume_profile,
@@ -1511,6 +1757,11 @@ def main() -> None:
         worktree=getattr(args, "worktree", None),
         isolated_lane=bool(getattr(args, "isolated_lane", False)),
         allow_tool_credentials=bool(getattr(args, "allow_tool_credentials", False)),
+        attempt_id=(os.environ.get("SUMMON_JOB_ID")
+                    if _resolve_job_file() is not None
+                    and re.fullmatch(r"[0-9a-f]{32}",
+                                     os.environ.get("SUMMON_JOB_ID", ""))
+                    else None),
     )
 
     if profile_selection:
@@ -1572,6 +1823,7 @@ def main() -> None:
                 agent=args.agent, cli=invocation.cli,
                 text_seat=_ts["text_seat"]),
             receipt, invocation)
+        _mark_not_run(_env)
         if worktree_info:
             _cleanup = _remove_worktree(worktree_info)
             _env["worktree_removed"] = _cleanup["worktree_removed"]
@@ -1601,6 +1853,7 @@ def main() -> None:
             _env = _enrich_denial(
                 blocked_envelope(_gate_decision, agent=args.agent, cli=cli),
                 receipt, invocation)
+            _mark_not_run(_env)
             # A DENIED dispatch must not leave a branch and checkout behind. --worktree runs
             # ~90 lines BEFORE the gate, so a DENY still created `.claude/worktrees/<name>`
             # and `refs/heads/agents/<name>`. The gate exists to authorise side effects, and
@@ -1727,6 +1980,81 @@ def _dry_run_arg_preview(arg: str) -> str:
     return _executor._redact_output_secrets(preview)
 
 
+def _effective_decision_view(invocation, args) -> dict:
+    """Public, provider-inert explanation of the authority that wins preflight.
+
+    Phase 1 starts with exact-agent parity only. Usage and future lane inputs are
+    explicitly not consulted here, so this additive receipt cannot alter routing.
+    """
+    from _apibackend import payg_consent_allowed
+    from _builder import credit_spend_allowed
+
+    role = (getattr(args, "_role_provenance", {}) or {}).get("role")
+    source = "approved_role" if isinstance(role, dict) else "explicit_agent"
+    credit_flag = bool(getattr(args, "allow_credit", False))
+    payg_flag = bool(getattr(invocation, "allow_payg", False))
+    credit_allowed = bool(credit_flag or credit_spend_allowed())
+    payg_allowed = bool(payg_consent_allowed(payg_flag))
+    usage_view = {"state": "not_consulted", "reason": "exact_pin_preserved"}
+    usage_cache = getattr(args, "usage_cache", None)
+    if usage_cache:
+        try:
+            usage_status = _usage.status(cache_path=usage_cache)
+            observations = usage_status["observations"]
+            dimensions = sorted({item["dimension"] for item in observations})
+            usage_view = {
+                "state": "advisory_only",
+                "reason": "exact_pin_preserved",
+                "observations_considered": len(observations),
+                "freshness": {
+                    "fresh": sum(item["freshness"] == "fresh" for item in observations),
+                    "stale": sum(item["freshness"] == "stale" for item in observations),
+                },
+                "dimensions": dimensions,
+                # Operator imports have no adapter seal, so syntactic equality
+                # never becomes semantic comparability in this first slice.
+                "comparability": "unverified_semantics",
+            }
+        except (OSError, ValueError):
+            usage_view = {
+                "state": "invalid",
+                "reason": "usage_cache_invalid",
+                "observations_considered": 0,
+            }
+    return {
+        "schema": "summon.decision/v1",
+        "provider_contacted": False,
+        "request": {"agent": args.agent, "lane": None, "model": invocation.model},
+        "resolution": {
+            "seat": getattr(args, "_resolved_agent", args.agent),
+            "backend": invocation.cli,
+            "model_targeted": invocation.model,
+            "source": source,
+            "precedence": ["exact_agent", "approved_role"],
+            "winning_rule": "exact_agent_preserved" if source == "explicit_agent"
+                            else "approved_role_resolved",
+        },
+        "authority": {
+            "permission_ceiling": getattr(args, "max_permission", None),
+            "effective_permission": invocation.permission,
+            "strict_roster": bool(getattr(args, "strict_agents_dir", False)),
+            "credit": {
+                "authorized": credit_allowed,
+                "source": "dispatch_flag" if credit_flag else
+                          "environment" if credit_allowed else "none",
+            },
+            "payg": {
+                "authorized": payg_allowed,
+                "source": "dispatch_flag" if payg_flag else
+                          "operator_configuration" if payg_allowed else "none",
+            },
+        },
+        "digests": {"roster": None, "policy": None},
+        "usage": usage_view,
+        "unknowns": ["usage_observation", "roster_digest", "policy_digest"],
+    }
+
+
 def _dry_run_view(invocation, args, agents_dir: str,
                   agent_file: str | None = None,
                   artifact_manifest: dict | None = None,
@@ -1779,6 +2107,10 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "model_requested": (_codex_selection.get("requested")
                              if _codex_selection else invocation.model),
         "model_effective": _eff_model,  # after any credit-only-model fallback
+        "model_exact_required": bool(getattr(invocation, "model_exact_required", False)
+                                      or (_codex_selection and
+                                          _codex_selection.get("exact_required"))),
+        "model_exact_source": getattr(invocation, "model_exact_source", None),
         "effort": invocation.effort,
         "effort_transport": (
             "kimi-profile-config" if invocation.cli == "kimi" and invocation.effort
@@ -1800,6 +2132,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "allow_tool_credentials": bool(getattr(args, "allow_tool_credentials", False)),
         "system_context_chars": len(invocation.system_context),
     }
+    view["effective_decision"] = _effective_decision_view(invocation, args)
     if _codex_selection:
         # This is deliberately additive and safe to share: selectors contain
         # only model ids, never profile paths or config contents.
@@ -2080,6 +2413,7 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
         # turn the approval step into the escalation path it exists to prevent.
         # A gate adjudicates a request; it is not a configurable dispatch.
         extra_args=(),
+        attempt_id=None,
     )
     timeout = args.gate_timeout or args.timeout
     if isinstance(timeout, str):
@@ -2278,6 +2612,12 @@ def _acp_fallback_enabled(args) -> bool:
             and not getattr(args, "no_acp_fallback", False))
 
 
+def _kimi_acp_fallback_allowed(args) -> bool:
+    """Kimi ACP recovery is a deliberate opt-in, not a generic timeout retry."""
+    return (getattr(args, "allow_kimi_acp_fallback", False)
+            or os.environ.get("SUMMON_KIMI_ACP_FALLBACK") == "1")
+
+
 def _acp_fallback_worthy(result: dict) -> bool:
     """True only for failure classes a TRANSPORT change can fix (premortem T3).
 
@@ -2349,6 +2689,12 @@ def _is_transient_dispatch_error(result: dict) -> bool:
         "connection reset", "connection refused", "broken pipe",
         "temporarily unavailable", "http 502", "http 503", "http 504",
         " 502 ", " 503 ", " 504 ",
+        # A provider-pool 429 is transient availability, not authentication.
+        # Keep it opt-in and bounded: --transient-retries permits one retry,
+        # while ordinary --retries remains unchanged.
+        "http 429", "status code 429", "429 too many requests",
+        "too many requests", "rate limit exceeded", "rate_limited",
+        "rate_limit_exceeded", "rate-limit-exceeded",
     )):
         return True
     return False
@@ -2362,14 +2708,33 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
     attempts of a side-effecting task on a single approval is materially more than
     what was approved. A refusal mid-retry stops the loop and returns the blocked
     envelope rather than the last failure."""
+    from dataclasses import replace as _replace
+
     attempt = 0
     _auto_scrape_retry = False
     _transient_used = False
     _prev_result: dict = {}
+    _attempt_history: list[dict] = []
     while True:
-        result = execute_agent(invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
+        # Every loop iteration is a distinct physical launch.  Keeping the
+        # identity on the invocation (rather than deriving it from the final
+        # aggregate) lets telemetry distinguish a retry from a duplicate
+        # terminalization of the same attempt.
+        # A background launch record binds its job id to the first physical
+        # attempt. Reuse that precommitted id exactly once; later paid attempts
+        # receive fresh ids and remain visible in ``attempt_history``.
+        attempt_id = (invocation.attempt_id if attempt == 0 and invocation.attempt_id
+                      else uuid.uuid4().hex)
+        attempt_invocation = _replace(invocation, attempt_id=attempt_id)
+        result = execute_agent(attempt_invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
                                max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
         attempt += 1
+        _attempt_history.append(_attempt_projection(result, attempt_id))
+        # Structural preflight/refusal paths never reach a provider. Stop before
+        # retry or ACP logic and preserve their explicit zero-attempt contract.
+        if _is_not_run(result):
+            _mark_not_run(result)
+            return result
         # A scrape-loss on agy gets ONE free retry even at --retries 0. Every other
         # backend fails LOUDLY (a pipe closes, an exit code arrives); a screen-scraped one
         # fails EMPTY, so the operator has to know to opt into retries for the single
@@ -2418,15 +2783,30 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
             break
         refused = _regate_or_none(args, agents_dir, invocation)
         if refused is not None:
-            from _gate import blocked_envelope
-            result = _enrich_denial(
-                blocked_envelope(refused, agent=getattr(args, "agent", None),
-                                 cli=invocation.cli),
-                getattr(args, "_receipt", None), invocation)
-            result["attempts"] = attempt
-            return result
+            return _blocked_after_attempt(
+                refused, result, invocation, args, attempt,
+                next_kind="retry", attempt_history=_attempt_history)
         time.sleep(min(30, 2 ** attempt))
     result["attempts"] = attempt
+    result["attempt_history"] = list(_attempt_history)
+
+    # A Kimi timeout is often a genuinely long-running turn. Its ACP transport
+    # also has no host filesystem/terminal adapter, so automatically spending a
+    # second turn is more likely to duplicate cost and fail on missing tools
+    # than to recover. Preserve the decision in the envelope; an operator can
+    # opt in with --allow-kimi-acp-fallback or SUMMON_KIMI_ACP_FALLBACK=1.
+    if (invocation.cli == "kimi"
+            and result.get("status") in ("error", "partial")
+            and _acp_fallback_worthy(result)
+            and not _kimi_acp_fallback_allowed(args)):
+        result["fallback"] = {
+            "to": "acp",
+            "status": "not_attempted",
+            "reason": "kimi_timeout_requires_explicit_opt_in",
+        }
+        result.setdefault("warnings", []).append(
+            "Kimi ACP fallback is disabled by default for timeout/stream failures; "
+            "use --allow-kimi-acp-fallback only for a deliberate second provider turn")
 
     # ACP fallback: ONE recovery attempt over the Agent Client Protocol when the
     # subprocess path failed in a way a transport change can fix (premortem T3
@@ -2440,28 +2820,26 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
             and invocation.permission == "yolo"  # ACP refuses sub-yolo tiers
             and _supports_acp(invocation.cli)
             and _acp_fallback_enabled(args)
+            and (invocation.cli != "kimi" or _kimi_acp_fallback_allowed(args))
             and _acp_fallback_worthy(result)):
         refused = _regate_or_none(args, agents_dir, invocation)
         if refused is not None:
-            from _gate import blocked_envelope
-            denied = _enrich_denial(
-                blocked_envelope(refused, agent=getattr(args, "agent", None),
-                                 cli=invocation.cli),
-                getattr(args, "_receipt", None), invocation)
-            # The primary attempt's spend happened whether or not the gate
-            # allows the recovery; folding it in keeps accounting honest.
-            _aggregate_spend(denied, result)
-            denied["attempts"] = attempt
-            return denied
+            return _blocked_after_attempt(
+                refused, result, invocation, args, attempt,
+                next_kind="acp_fallback", attempt_history=_attempt_history)
         from dataclasses import replace as _replace
-        fb = execute_agent(_replace(invocation, transport="acp"),
+        _fallback_attempt_id = uuid.uuid4().hex
+        fb = execute_agent(_replace(invocation, transport="acp",
+                                    attempt_id=_fallback_attempt_id),
                            timeout_ms=args.timeout, debug_dir=args.debug_dir,
                            max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
+        _attempt_history.append(_attempt_projection(fb, _fallback_attempt_id))
         if fb.get("status") == "success":
             # Recovered: return the ACP envelope with the primary failure folded
             # in (spend + provenance), never silently.
             _aggregate_spend(fb, result)
             fb["attempts"] = attempt + 1
+            fb["attempt_history"] = list(_attempt_history)
             fb["fallback"] = {
                 "from": "subprocess", "to": "acp",
                 "reason": result.get("error") or result.get("normalization_reason"),
@@ -2476,9 +2854,53 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
         # diagnostics), but the spent fallback attempt is recorded and billed.
         _aggregate_spend(result, fb)
         result["attempts"] = attempt + 1
+        result["attempt_history"] = list(_attempt_history)
         result["fallback"] = {"to": "acp", "status": fb.get("status"),
                               "error": fb.get("error")}
     return result
+
+
+def _attempt_projection(envelope: dict, attempt_id: str | None) -> dict:
+    """Return a compact, prompt-free receipt for one physical provider attempt."""
+    model = envelope.get("model") if isinstance(envelope.get("model"), dict) else {}
+    return {
+        "attempt_id": attempt_id,
+        "status": envelope.get("status"),
+        "execution_status": envelope.get("execution_status"),
+        "provider_contacted": envelope.get("provider_contacted"),
+        "backend_exit_code": envelope.get("backend_exit_code"),
+        "raw_backend_exit_code": envelope.get("raw_backend_exit_code"),
+        "normalized_exit_code": envelope.get("normalized_exit_code"),
+        "model_served": model.get("served"),
+        "served_model_evidence": envelope.get("served_model_evidence", "absent"),
+        "cost_usd": envelope.get("cost_usd"),
+    }
+
+
+def _blocked_after_attempt(decision: dict, primary: dict, invocation, args,
+                           attempts: int, *, next_kind: str,
+                           attempt_history: list[dict]) -> dict:
+    """Represent a denied next attempt without erasing an already-spent one."""
+    denied = dict(primary)
+    denied["status"] = "blocked"
+    denied["dispatcher_status"] = "blocked"
+    denied["result_usable"] = False
+    denied["attempts"] = attempts
+    denied["attempt_status"] = "completed"
+    denied["provider_contacted"] = True
+    denied["gate_next_attempt"] = decision
+    denied["next_attempt"] = {
+        "kind": next_kind,
+        "status": "not_run",
+        "provider_contacted": False,
+        "reason": decision.get("reason"),
+    }
+    denied["blocked_reason"] = (
+        f"approval gate refused the proposed {next_kind}; the prior provider "
+        "attempt remains recorded")
+    denied["attempt_history"] = list(attempt_history)
+    return _enrich_denial(
+        denied, getattr(args, "_receipt", None), invocation)
 
 
 def _apply_schema(result: dict, schema: dict, invocation, args, agents_dir=None) -> dict:
@@ -2503,6 +2925,7 @@ def _apply_schema(result: dict, schema: dict, invocation, args, agents_dir=None)
         system_context="",  # resume: session already holds the definition
         resume_id=sid or "latest",
         resume_profile=profile or invocation.resume_profile,
+        attempt_id=None,
     )
     # The schema correction re-dispatches with the ORIGINAL permission (retry_inv does
     # not override it), so under --gate-with it is a SECOND write-capable execution. A
@@ -2532,7 +2955,7 @@ def _apply_schema(result: dict, schema: dict, invocation, args, agents_dir=None)
         # additional work, not a reset) so cost accounting stays honest, and fold
         # the ORIGINAL call's spend into the returned envelope (the first call was
         # paid for too -- otherwise a schema repair silently under-reports spend).
-        retry["attempts"] = result.get("attempts", 1) + retry.get("attempts", 1)
+        retry["attempts"] = _attempt_count(result) + _attempt_count(retry)
         _aggregate_spend(retry, result)
         # The retry is a DIFFERENT envelope, so gate evidence attached to the original
         # would simply vanish here -- a gated dispatch reporting no gate at all.
@@ -2540,7 +2963,7 @@ def _apply_schema(result: dict, schema: dict, invocation, args, agents_dir=None)
             retry["gate"] = result["gate"]
         return retry
     # Rejected: keep the original, but the failed corrective call was still spent.
-    result["attempts"] = result.get("attempts", 1) + retry.get("attempts", 1)
+    result["attempts"] = _attempt_count(result) + _attempt_count(retry)
     _aggregate_spend(result, retry)
     return result
 
@@ -2578,8 +3001,8 @@ def _aggregate_spend(result: dict, retry: dict) -> None:
         result["usage"] = merged
 
 
-_EXIT_TUPLE = ("exit_code", "backend_exit_code", "dispatcher_status",
-               "normalization_reason")
+_EXIT_TUPLE = ("exit_code", "backend_exit_code", "raw_backend_exit_code",
+               "normalized_exit_code", "dispatcher_status", "normalization_reason")
 
 
 def _push_exit_history(result: dict, retry: dict) -> None:
@@ -2604,7 +3027,8 @@ def _push_exit_history(result: dict, retry: dict) -> None:
     for k in _EXIT_TUPLE:
         result.pop(k, None)
     result["exit_code"] = retry.get("exit_code")
-    for k in ("backend_exit_code", "dispatcher_status", "normalization_reason"):
+    for k in ("backend_exit_code", "raw_backend_exit_code", "normalized_exit_code",
+              "dispatcher_status", "normalization_reason"):
         if retry.get(k) is not None:
             result[k] = retry[k]
     # ADOPT the retry's own reason where it has one; recompute only as a fallback, since a
@@ -2671,6 +3095,7 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         permission_forced=_forced,
         resume_id=sid or "latest",
         resume_profile=profile or invocation.resume_profile,
+        attempt_id=None,
         extra_args=(),   # DROP extra_args: a resume keeps the session's model, and a
                          # stray permission-override flag (--dangerously-bypass...,
                          # --permission-mode bypassPermissions) would defeat read-only.
@@ -2698,7 +3123,7 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
     except ValueError:
         return result  # resume unsupported on this backend: keep the first verdict, no call made
     # A corrective call was spent EITHER WAY -> account for attempts + spend honestly.
-    result["attempts"] = result.get("attempts", 1) + retry.get("attempts", 1)
+    result["attempts"] = _attempt_count(result) + _attempt_count(retry)
     _aggregate_spend(result, retry)
     # Accept a retry that produced a VALID contract and did not error/time out. A
     # truthful DONE **or** PARTIAL/BLOCKED (report_ok true) is better than the
@@ -2796,13 +3221,73 @@ def _crash_envelope(e: BaseException) -> dict:
     return {"result": "", "status": "error", "exit_code": 1,
             "error": f"uncaught {type(e).__name__}: {e}",
             "backend_exit_code": 1, "dispatcher_status": "error",
+            # This handler may run before, during, or after a provider launch.
+            # Claiming zero attempts/no contact manufactures evidence.
+            "attempts": None, "attempt_status": "unknown",
+            "execution_status": "error", "provider_contacted": None,
+            "model": {"requested": None, "targeted": None, "served": None,
+                      "resolved": None, "models_used": [], "evidence_source": None},
+            "served_model_evidence": "absent", "model_match": None,
+            "named_model_verified": False,
             "normalization_reason": f"uncaught {type(e).__name__} before completion"}
+
+
+def _system_exit_envelope(exc: SystemExit) -> dict:
+    """Shape an argparse/early-dispatch exit that bypassed normal emission."""
+    code = exc.code
+    if not isinstance(code, int) or isinstance(code, bool):
+        code = 1
+    return {
+        "result": "",
+        "status": "error",
+        "exit_code": code,
+        "backend_exit_code": code,
+        "dispatcher_status": "error",
+        "error_kind": "dispatcher_exit_before_envelope",
+        "retryable": False,
+        "result_usable": False,
+        "attempts": 0,
+        "attempt_status": "not_run",
+        "execution_status": "not_run",
+        "provider_contacted": False,
+        "model": {"requested": None, "targeted": None, "served": None,
+                  "resolved": None, "models_used": [], "evidence_source": None},
+        "served_model_evidence": "absent",
+        "model_match": None,
+        "named_model_verified": False,
+        "normalization_reason": "dispatcher exited before writing a terminal envelope",
+        "error": f"dispatcher exited before writing a terminal envelope (exit {code})",
+    }
+
+
+def _record_background_system_exit(exc: SystemExit) -> None:
+    """Best-effort terminal receipt for parser/early-exit failures.
+
+    Normal background completion calls ``_emit`` before ``sys.exit`` and already
+    owns a result file. Only write this fallback when a job file was requested
+    but no result exists yet. A failed write remains fail-closed: the child is
+    never reinterpreted as a provider success.
+    """
+    jf = _resolve_job_file()
+    if not jf or os.path.exists(jf):
+        return
+    envelope = _system_exit_envelope(exc)
+    try:
+        _stamp_job(envelope)
+        _telemetry.record(envelope)
+    except Exception:  # noqa: BLE001 - reporting must not alter the exit
+        pass
+    try:
+        _write_job_file_text(json.dumps(envelope, ensure_ascii=False), jf)
+    except BaseException:
+        pass
 
 
 if __name__ == "__main__":
     try:
         main()
-    except SystemExit:
+    except SystemExit as exc:
+        _record_background_system_exit(exc)
         raise  # intentional exits (validation, normal completion) pass through
     except BaseException as e:  # noqa: BLE001 — last-resort net so a bg job never orphans
         err = _crash_envelope(e)
@@ -2814,10 +3299,8 @@ if __name__ == "__main__":
         jf = _resolve_job_file()
         if jf:
             try:
-                with open(jf + ".tmp", "w", encoding="utf-8") as fh:
-                    json.dump(err, fh, ensure_ascii=False)
-                os.replace(jf + ".tmp", jf)
-            except OSError:
+                _write_job_file_text(json.dumps(err, ensure_ascii=False), jf)
+            except BaseException:
                 pass
         else:
             print(json.dumps(err, ensure_ascii=False))

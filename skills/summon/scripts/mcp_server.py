@@ -31,12 +31,14 @@ def _rpc_err(id_, code: int, message: str, data=None):
 
 def _run_summon(args: list[str], timeout_s: float = 120.0) -> dict:
     cmd = [sys.executable, str(RUN), *args]
+    child_env = dict(os.environ)
+    child_env.pop("SUMMON_CMD_LAUNCHER", None)
     from _spawn import run_flags
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=timeout_s, cwd=str(SCRIPTS.parent.parent.parent),
-            **run_flags())
+            env=child_env, **run_flags())
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "timeout", "timeout_s": timeout_s}
     except OSError as e:

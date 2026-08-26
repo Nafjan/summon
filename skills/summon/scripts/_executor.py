@@ -10,9 +10,11 @@ import queue
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping
 
 
@@ -207,11 +209,22 @@ _REPORT_FIELD_RE = re.compile(r"^([A-Z][A-Z0-9_-]{1,}):[ \t]?(.*)$")
 # Markdown-rendered backends (agy above all) bold the contract field names, with
 # the colon landing INSIDE or OUTSIDE the wrapper: `**STATUS:** v` / `**STATUS**: v`.
 _BOLD_FIELD_PREFIX = re.compile(r"^\*\*([A-Z][A-Z0-9_-]{1,})(?::\*\*|\*\*:)")
+# Some providers render a contract field as a Markdown heading.  Accept only a
+# bounded, line-start heading prefix; arbitrary `VERDICT:` prose must remain
+# non-structural.  The required whitespace after `#` is intentional: it keeps
+# shell comments and prompt text from becoming report fields accidentally.
+_HEADING_FIELD_PREFIX = re.compile(r"^\s{0,3}#{1,6}[ \t]+")
 
 
 def _unbold_field_line(line: str) -> str:
-    """Strip a markdown-bold wrapper around a report field key, if present."""
-    return _BOLD_FIELD_PREFIX.sub(lambda m: m.group(1) + ":", line, count=1)
+    """Normalize one structured report line without broadening prose matching.
+
+    A provider may emit `**STATUS:** DONE` or `## VERDICT: BLOCK`.  Both are
+    accepted only at the beginning of a line and only the wrapper is removed;
+    field-name and status validation still happens in :func:`parse_report`.
+    """
+    normalized = _HEADING_FIELD_PREFIX.sub("", line, count=1)
+    return _BOLD_FIELD_PREFIX.sub(lambda m: m.group(1) + ":", normalized, count=1)
 # A line begins a NEW field when its key is either a known field OR a well-formed
 # all-caps identifier (letters/digits/underscore, 2-30 chars) — so a third-party
 # agent's CUSTOM field (SCORE:, RUBRIC:, ...) is captured, not silently folded
@@ -380,11 +393,17 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     # exit tuple aligned even when a backend only reported a protocol-level
     # success (for example ACP end_turn) without a usable result.
     normalize_empty_success(response)
+    finalize_exit_fields(response)
     response["envelope"] = ENVELOPE_VERSION
     # Preserve the executor's outcome BEFORE report semantics reconcile the public
     # status. A successful review can legitimately return VERDICT: BLOCK; a failed
     # execution cannot. Keeping the two signals separate lets callers branch correctly.
-    response["execution_status"] = response.get("status")
+    # Structural refusals are represented as status=error/blocked for compatibility,
+    # but they never entered a provider turn. Preserve their explicit not-run state
+    # while normal executions continue to mirror the terminal dispatcher status.
+    if not (response.get("attempt_status") == "not_run"
+            and response.get("provider_contacted") is False):
+        response["execution_status"] = response.get("status")
     # setdefault (not =) so a non-stream backend (openai-compat) that already
     # populated these from its HTTP response isn't clobbered with None.
     response.setdefault("session_id", processor.session_id if processor else None)
@@ -393,6 +412,25 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     response.setdefault("model_resolved", processor.model if processor else None)
     response.setdefault("model_targeted", processor.handshake_model if processor else None)
     response.setdefault("models_used", processor.models_used if processor else [])
+    response.setdefault(
+        "model_evidence_source",
+        getattr(processor, "model_evidence_source", None) if processor else None,
+    )
+    # Kimi has no terminal-success event. If the dispatcher deadline wins
+    # after assistant text was captured, retain a bounded diagnostic snapshot
+    # in its own namespace. It is deliberately never fed to parse_report,
+    # result promotion, resume, caching, or model provenance.
+    if (processor and processor.is_kimi and response.get("timeout")
+            and not (response.get("result") or "").strip()):
+        partial = processor.kimi_partial_snapshot()
+        if partial:
+            partial["text"] = _redact_output_secrets(partial["text"])
+            response["partial"] = partial
+            response["timeout"]["partial_output"] = True
+            response["partial_output_only"] = True
+            response.setdefault("warnings", []).append(
+                "Kimi emitted assistant text before the deadline but no clean EOF; "
+                "the bounded `partial` snapshot is advisory and is not a completed report")
     if processor and processor.is_opencode:
         # OpenCode's JSON CLI normally emits step_finish before idle/EOF.  Some
         # releases can dispose the non-interactive server while the model is
@@ -498,6 +536,16 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
         warnings = response.setdefault("warnings", [])
         if warning not in warnings:
             warnings.append(warning)
+    # Report reconciliation can change status (for example STATUS: ERROR or a
+    # contract-less approval block), so refresh the explicit normalized code
+    # after all status decisions.  The raw child code never changes here.
+    if response.get("exit_code") is not None and response.get("status"):
+        _raw_exit = response.get("raw_backend_exit_code")
+        if _raw_exit is None:
+            _raw_exit = response.get("backend_exit_code", response.get("exit_code"))
+        response["raw_backend_exit_code"] = _raw_exit
+        response["normalized_exit_code"] = _normalized_exit_code(
+            response.get("status"), _raw_exit)
     # Keep compact structured findings ahead of the potentially long narrative in
     # serialized envelopes. JSON object order is not semantic, but this makes the
     # common human/tool streaming path useful without scanning the transcript first.
@@ -505,6 +553,209 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
         result_text = response.pop("result")
         response["result"] = result_text
     return response
+
+
+_KIMI_WIRE_MAX_BYTES = 16 * 1024 * 1024
+_KIMI_WIRE_CLOCK_SKEW_MS = 10_000
+_KIMI_WIRE_MAX_COUNTER = (1 << 63) - 1
+
+
+def _regular_file_identity(value: os.stat_result) -> tuple[int, int] | None:
+    """Return a stable local-file identity, or fail closed when unavailable."""
+    if not stat.S_ISREG(value.st_mode):
+        return None
+    attrs = getattr(value, "st_file_attributes", 0)
+    if attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+        return None
+    dev = getattr(value, "st_dev", None)
+    ino = getattr(value, "st_ino", None)
+    links = getattr(value, "st_nlink", 1)
+    if (type(dev) is not int or type(ino) is not int or ino <= 0
+            or type(links) is not int or links != 1):
+        return None
+    return dev, ino
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict:
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def _capture_kimi_wire_model(profile: str | None, *, started_wall_ms: int,
+                             ended_wall_ms: int) -> dict | None:
+    """Read bounded post-response model accounting from one isolated Kimi run.
+
+    Kimi 0.38's public ``stream-json`` output omits model identity, but the CLI
+    writes a private ``usage.record`` after each completed LLM response and a
+    terminal ``turn.ended`` record into the fresh per-invocation profile Summon
+    created.  A request record is deliberately insufficient: this helper only
+    accepts positive-output usage records followed by ``turn.ended: completed``.
+
+    The helper returns metadata only.  It never returns journal text, paths,
+    prompts, tool calls, or credentials.  Malformed, oversized, linked, stale,
+    mixed-model, or incomplete journals fail closed as no evidence.
+    """
+    if not isinstance(profile, str) or not profile:
+        return None
+    def _linklike(path: str) -> bool:
+        if os.path.islink(path):
+            return True
+        isjunction = getattr(os.path, "isjunction", None)
+        return bool(callable(isjunction) and isjunction(path))
+
+    root = os.path.realpath(profile)
+    if not os.path.isdir(root) or _linklike(profile):
+        return None
+    # The disposable profile is child-writable. Never recursively walk whatever
+    # tree the child chose to create: that turns one response into an unbounded
+    # filesystem scan. Kimi's contract has one fixed shape, so inspect only
+    # ``sessions/<session>/agents/main/wire.jsonl`` with strict entry caps.
+    candidates: list[str] = []
+    sessions = os.path.join(root, "sessions")
+    try:
+        if not os.path.isdir(sessions) or _linklike(sessions):
+            return None
+        with os.scandir(sessions) as entries:
+            session_entries = []
+            for entry in entries:
+                if len(session_entries) >= 64:
+                    return None
+                if entry.is_dir(follow_symlinks=False) and not _linklike(entry.path):
+                    session_entries.append(entry)
+        for entry in session_entries:
+            path = os.path.join(entry.path, "agents", "main", "wire.jsonl")
+            if os.path.isfile(path) and not _linklike(path):
+                candidates.append(path)
+                if len(candidates) > 8:
+                    return None
+    except OSError:
+        return None
+    if len(candidates) != 1:
+        return None
+
+    path = candidates[0]
+    try:
+        real = os.path.realpath(path)
+        if (os.path.commonpath((root, real)) != root or _linklike(path)
+                or not os.path.isfile(path)):
+            return None
+        before_stat = os.stat(path, follow_symlinks=False)
+        before_identity = _regular_file_identity(before_stat)
+        if before_identity is None:
+            return None
+        size = before_stat.st_size
+        if size <= 0 or size > _KIMI_WIRE_MAX_BYTES:
+            return None
+    except (OSError, ValueError):
+        return None
+
+    models: list[str] = []
+    completed_at: int | None = None
+    completed_index: int | None = None
+    last_usage_at: int | None = None
+    last_usage_index: int | None = None
+    usage_count = 0
+    fd: int | None = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "r", encoding="utf-8", errors="strict") as handle:
+            fd = None  # owned by ``handle`` from here onward
+            opened_stat = os.fstat(handle.fileno())
+            opened_identity = _regular_file_identity(opened_stat)
+            path_open_stat = os.stat(path, follow_symlinks=False)
+            if (opened_identity is None or opened_identity != before_identity
+                    or _regular_file_identity(path_open_stat) != before_identity
+                    or _linklike(path)
+                    or os.path.realpath(path) != real
+                    or opened_stat.st_size != before_stat.st_size
+                    or opened_stat.st_mtime_ns != before_stat.st_mtime_ns):
+                return None
+            for record_index, raw in enumerate(handle):
+                if len(raw) > 1024 * 1024:
+                    return None
+                try:
+                    event = json.loads(
+                        raw,
+                        parse_constant=_reject_json_constant,
+                        object_pairs_hook=_unique_json_object,
+                    )
+                except (json.JSONDecodeError, UnicodeError, ValueError, OverflowError):
+                    return None
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("type")
+                event_time = event.get("time")
+                if event_type not in ("usage.record", "turn.ended"):
+                    continue
+                if (type(event_time) is not int or event_time < 0
+                        or event_time > _KIMI_WIRE_MAX_COUNTER):
+                    return None
+                event_ms = event_time
+                if (event_ms < started_wall_ms - _KIMI_WIRE_CLOCK_SKEW_MS
+                        or event_ms > ended_wall_ms + _KIMI_WIRE_CLOCK_SKEW_MS):
+                    continue
+                if event_type == "usage.record":
+                    if event.get("usageScope") != "turn":
+                        continue
+                    usage = event.get("usage")
+                    output = usage.get("output") if isinstance(usage, dict) else None
+                    model = _safe_model_id(event.get("model"))
+                    if (not model or type(output) is not int or output < 0
+                            or output > _KIMI_WIRE_MAX_COUNTER):
+                        return None
+                    if output > 0:
+                        models.append(model)
+                        usage_count += 1
+                        last_usage_at = event_ms
+                        last_usage_index = record_index
+                elif event.get("reason") == "completed":
+                    completed_at = event_ms
+                    completed_index = record_index
+            after_stat = os.fstat(handle.fileno())
+            path_after_stat = os.stat(path, follow_symlinks=False)
+            if (_regular_file_identity(after_stat) != before_identity
+                    or _regular_file_identity(path_after_stat) != before_identity
+                    or _linklike(path)
+                    or os.path.realpath(path) != real
+                    or after_stat.st_size != opened_stat.st_size
+                    or after_stat.st_mtime_ns != opened_stat.st_mtime_ns
+                    or path_after_stat.st_size != opened_stat.st_size
+                    or path_after_stat.st_mtime_ns != opened_stat.st_mtime_ns):
+                return None
+    except (OSError, UnicodeError, ValueError, OverflowError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    if (not models or completed_at is None or completed_index is None
+            or last_usage_at is None or last_usage_index is None
+            or completed_index <= last_usage_index
+            or completed_at < last_usage_at):
+        return None
+    unique = sorted(set(models))
+    if len(unique) != 1:
+        return None
+    # The completion marker must follow the last response-accounting record.
+    return {
+        "model": unique[0],
+        "models_used": unique,
+        "usage_records": usage_count,
+        "turn_completed": True,
+        "source": "kimi_wire_usage_record",
+    }
 
 
 # Payload elision + startup-noise filtering for the human-facing output_tail.
@@ -615,11 +866,26 @@ def _attach_eligibility(resp: dict) -> dict:
     # echoed the phrase.
     text = (f"{resp.get('error') or ''} {resp.get('output_tail') or ''} "
             f"{resp.get('result') or ''}")
+    # Provider/auth evidence wins over a model-authored missing-tool phrase.
+    # Otherwise a real 401 plus `grep not found` can be relabelled as a local
+    # tool problem and hide the correct login remediation.
     try:
         from _doctor import classify_ineligibility
         verdict = classify_ineligibility(text, backend=resp.get("cli"))
     except Exception:  # noqa: BLE001
         verdict = None
+    tool_failure = missing_executable_details(text) if verdict is None else None
+    if tool_failure is not None:
+        resp["tool_failure"] = tool_failure
+        resp["error_kind"] = "missing_executable"
+        resp["retryable"] = False
+        resp["result_usable"] = False
+        resp["interactive_required"] = False
+        resp["remediation_code"] = "execution_tool_missing"
+        resp.setdefault("warnings", []).append(
+            f"child environment could not run '{tool_failure['executable']}'; "
+            "this is not provider authentication. Use rg, PowerShell, or Python "
+            "and retry explicitly after confirming the required tool path.")
     if verdict is not None:
         resp["eligibility"] = verdict
         if verdict["kind"] == "auth":
@@ -638,7 +904,8 @@ def _attach_eligibility(resp: dict) -> dict:
             }
             resp["retryable"] = False
             resp["result_usable"] = False
-            resp["provider_contacted"] = True
+            if resp.get("attempt_status") != "not_run":
+                resp["provider_contacted"] = True
             # Flat, bounded lifecycle fields are the telemetry contract.  The
             # nested auth plan remains user-facing data and is never projected
             # into the local spool.
@@ -666,7 +933,8 @@ def _attach_eligibility(resp: dict) -> dict:
             resp["error_kind"] = "rate_limited"
             resp["retryable"] = False
             resp["result_usable"] = False
-            resp["provider_contacted"] = True
+            if resp.get("attempt_status") != "not_run":
+                resp["provider_contacted"] = True
             resp["auth_stage"] = "terminal"
             resp["auth_outcome"] = "not_needed"
             resp["interactive_required"] = False
@@ -690,6 +958,9 @@ def _finalize_diagnostics(resp: dict, raw, debug_dir, debug_argv,
     for key in ("result", "error", "error_hint", "output_tail"):
         if isinstance(resp.get(key), str):
             resp[key] = _redact_output_secrets(resp[key])
+    partial = resp.get("partial")
+    if isinstance(partial, dict) and isinstance(partial.get("text"), str):
+        partial["text"] = _redact_output_secrets(partial["text"])
     dbg = _write_debug(debug_dir, debug_argv, raw, resp) if debug_dir else None
     if dbg:
         resp["debug_file"] = dbg
@@ -1320,7 +1591,8 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
                            allow_text_only=False, require_tools=False, profile=None,
                            strict_agents_dir=False, role_provenance=None,
                            read_roots=None, isolated_lane=False,
-                           allow_tool_credentials=False) -> dict:
+                           allow_tool_credentials=False,
+                           require_exact_model=False) -> dict:
     """THE request identity, built in ONE place from RAW inputs.
 
     The dispatcher and the manifest parent each used to build their own dict, so a field
@@ -1386,6 +1658,11 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
             _backend_model = _defn.tup[5]
         except (AttributeError, IndexError, TypeError):
             _backend_model = None
+    _exact_model_required, _exact_model_source = model_exact_policy(
+        agent=agent,
+        frontmatter=(_defn.fm if _defn is not None else None),
+        explicit=bool(require_exact_model),
+    )
     return {
         # not hashed (local facts, not part of the request); carried so the skip can refuse
         # a MALFORMED definition or an identity it could not fully compute, and so dispatch
@@ -1399,6 +1676,10 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         "_profile_error": _profile_error,
         "agent": agent, "prompt": prompt, "cwd": cwd,
         "cli": cli or None, "model": model or None, "effort": effort or None,
+        # Exact-model enforcement is a request control.  Frontmatter policy is
+        # already bound by agent_def_sha256; this boolean also makes a CLI opt-in
+        # distinguishable from a cached best-effort result.
+        "model_exact_required": "1" if _exact_model_required else None,
         # Additional read-only roots are request controls. Keep canonical paths in the
         # fingerprint so a cached answer from a narrower or different allowlist cannot
         # satisfy this dispatch. The envelope reports the effective paths separately.
@@ -1710,6 +1991,7 @@ def is_terminal_nonretryable(env) -> bool:
                     "served_model_unverified",
                     "resume_model_mismatch",
                     "resume_model_unverified",
+                    "missing_executable",
                 })
 
 
@@ -1734,7 +2016,8 @@ _NOISE_MARKERS = (
 # unlucky prompt may have authored.
 _SIGNAL_MARKERS = (
     "error authenticating:", "ineligibletiererror", "authenticationerror",
-    "error: quota", "quota exceeded", "rate limit exceeded", "429 too many requests",
+    "error: quota", "quota exceeded", "rate limit exceeded", "rate_limit_exceeded",
+    "rate-limit-exceeded", "429 too many requests",
     "401 unauthorized", "403 forbidden", "invalid api key", "api key not valid",
     "model not found", "no such model", "econnrefused", "etimedout",
     "permission denied:", "eacces",
@@ -1758,6 +2041,70 @@ _SIGNAL_SUFFIXES = (
     "no such file or directory",
     "command not found",
 )
+
+# A missing shell utility is an execution-environment problem, not provider
+# authentication. Keep these recognizers deliberately structural: a bare word
+# such as ``grep`` in a model's prose must never change the dispatch outcome.
+_MISSING_EXECUTABLE_PATTERNS = (
+    re.compile(
+        r"exec:\s*[\"'](?P<executable>[^\"']+)[\"']:\s*"
+        r"executable file not found in %PATH%",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:^|(?:bash|sh|zsh|fish|busybox)[^:\r\n]*:\s*)"
+        r"(?P<executable>[A-Za-z0-9_.+@-]+):\s*command not found(?:$|[.!\s])",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"the term\s*[\"'](?P<executable>[^\"']+)[\"']\s+is not recognized\s+"
+        r"as\s+(?:a\s+)?(?:name of a cmdlet|the name of a cmdlet)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?P<executable>[A-Za-z0-9_.+@-]+)\s+is not recognized as an internal "
+        r"or external command",
+        re.IGNORECASE,
+    ),
+)
+_SAFE_EXECUTABLE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+@-]{0,95}$")
+
+
+def missing_executable_details(text: str | None) -> dict | None:
+    """Return a bounded, non-secret diagnostic for a structurally missing tool.
+
+    Provider/model output is untrusted, so this only accepts shell error shapes
+    emitted by the child runtime and publishes a basename-like executable name.
+    It intentionally does not try to infer a path, package, or credential state.
+    """
+    if not text:
+        return None
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if not line or len(line) > 400:
+            continue
+        for pattern in _MISSING_EXECUTABLE_PATTERNS:
+            match = pattern.search(line)
+            if not match:
+                continue
+            candidate = str(match.group("executable")).strip().strip("'\"")
+            # A path can appear in the PowerShell form. Publishing only the final
+            # component avoids leaking a local directory while retaining useful
+            # operator guidance.
+            candidate = re.split(r"[\\/]", candidate)[-1]
+            if not _SAFE_EXECUTABLE_NAME.fullmatch(candidate):
+                continue
+            return {
+                "kind": "missing_executable",
+                "executable": candidate,
+                "fatal": True,
+                "recommendations": [
+                    "use rg when available",
+                    "use PowerShell Select-String/Get-ChildItem on Windows",
+                    "use Python's standard library as a cross-platform fallback",
+                ],
+            }
+    return None
 
 
 def salient_error(text: str, prompt: str | None = None) -> str | None:
@@ -1910,15 +2257,28 @@ def _sweep_agy_litter(cwd: str | None, existed_before: bool) -> bool:
 
 
 def finalize_exit_fields(resp: dict) -> dict:
-    """Backfill the exit-code-clarity fields on any dispatch-shaped envelope
-    (has both status and exit_code). Idempotent: a builder that already set the
-    detailed reason keeps it. Used by _stamp AND the pre-dispatch emit paths."""
+    """Backfill explicit raw/normalized exit fields on a dispatch envelope.
+
+    ``exit_code`` remains the legacy field for compatibility and may be the
+    backend's non-zero code even when a complete report made execution a
+    normalized success.  New callers should use ``raw_backend_exit_code`` and
+    ``normalized_exit_code`` instead.  The detailed normalization reason is
+    preserved when a builder already supplied one.
+    """
     if not isinstance(resp, dict) or resp.get("exit_code") is None or not resp.get("status"):
         return resp
-    resp.setdefault("backend_exit_code", resp.get("exit_code"))
+    raw = resp.get("raw_backend_exit_code")
+    if raw is None:
+        raw = resp.get("backend_exit_code")
+    if raw is None:
+        raw = resp.get("exit_code")
+    resp.setdefault("backend_exit_code", raw)
+    resp.setdefault("raw_backend_exit_code", raw)
     resp.setdefault("dispatcher_status", resp.get("status"))
+    resp.setdefault("normalized_exit_code",
+                    _normalized_exit_code(resp.get("status"), raw))
     if "normalization_reason" not in resp:
-        _ec, _st = resp.get("exit_code"), resp.get("status")
+        _ec, _st = raw, resp.get("status")
         if _st == "success" and _ec not in _SUCCESS_EXIT_CODES:
             resp["normalization_reason"] = f"normalized to success (raw backend exit {_ec})"
         elif _st == "success":
@@ -1926,6 +2286,25 @@ def finalize_exit_fields(resp: dict) -> dict:
         else:
             resp["normalization_reason"] = f"status {_st} (backend exit {_ec})"
     return resp
+
+
+def _normalized_exit_code(status: object, raw_backend_exit_code: object) -> int | None:
+    """Return the dispatcher outcome code while preserving the child code separately.
+
+    A complete report can be a successful execution even when a CLI exits non-zero;
+    conversely, an empty result can be an execution error after a zero child exit.
+    ``blocked`` and ``partial`` are terminal outcomes, not process failures, while
+    errors/cancellations with a zero child code receive the conventional code ``1``.
+    """
+    try:
+        raw = int(raw_backend_exit_code)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if status in {"success", "partial", "blocked"}:
+        return 0
+    if status in {"error", "cancelled"} and raw == 0:
+        return 1
+    return raw
 
 
 def _model_mismatch(requested, ran) -> bool:
@@ -1948,6 +2327,62 @@ def _model_mismatch(requested, ran) -> bool:
     if r in _CLAUDE_ALIASES and r in re.split(r"[-_/.:]+", s):
         return False
     return True
+
+
+def model_match_state(requested, targeted, served,
+                      served_model_evidence) -> bool | None:
+    """Return the safe tri-state named-model match for a terminal result.
+
+    ``True`` is reserved for a provider-reported served model with all three
+    identities present and mutually compatible. ``False`` means the provider
+    reported a served model but it disagrees with the requested/targeted model.
+    Missing or inferred evidence is ``None`` and can never certify a named
+    review. The helper never infers identity from status or output tokens.
+    """
+    if served_model_evidence != "reported" or not served:
+        return None
+    if not requested or not targeted:
+        return None
+    # This is a certification bit, not the looser warning/alias comparison
+    # used by ``_model_mismatch``.  A named-model review is verified only when
+    # the provider reported the exact same identifier for requested, targeted,
+    # and served.  Floating aliases may still avoid a warning, but they never
+    # become a named-model proof.
+    return requested.strip() == targeted.strip() == served.strip()
+
+
+# These seats are governance-facing named-model claims rather than ordinary
+# implementation workers.  A provider is allowed to use an auxiliary model in
+# a session (``models_used`` remains an honest list), but the dominant terminal
+# model must still match the requested pin before the result can be consumed as
+# the named review.  Custom seats can opt in with ``model-policy: exact`` or the
+# one-shot ``--require-exact-model`` flag.
+_EXACT_MODEL_SEATS = frozenset({
+    "architect", "planner", "deep-debugger", "security-auditor",
+    "fable", "fable-api", "sol-review", "terra-review", "luna-review",
+    "researcher",
+})
+
+
+def model_exact_policy(agent: str | None = None, frontmatter: dict | None = None,
+                       explicit: bool = False) -> tuple[bool, str | None]:
+    """Resolve the exact-model trust policy without contacting a provider.
+
+    The built-in named review seats are fail-closed by name so an independently
+    copied roster cannot silently lose its governance contract.  User-defined
+    seats remain best-effort unless their frontmatter opts in explicitly.  The
+    caller still supplies the actual model pin; a policy alone never invents a
+    target model.
+    """
+    if explicit:
+        return True, "cli"
+    fm = frontmatter if isinstance(frontmatter, dict) else {}
+    raw = fm.get("model-policy", fm.get("model_policy"))
+    if isinstance(raw, str) and raw.strip().lower() in {"exact", "required", "strict"}:
+        return True, "frontmatter"
+    if agent and str(agent).strip().lower() in _EXACT_MODEL_SEATS:
+        return True, "named-seat"
+    return False, None
 
 
 def trusted_telemetry_model_evidence(response: object):
@@ -2036,9 +2471,10 @@ def _partial_response(cli: str, result: dict | None, exit_code: int, error: str)
 
 
 def _error_response(
-    cli: str, exit_code: int, error: str, partial_result: dict | None = None
+    cli: str, exit_code: int, error: str, partial_result: dict | None = None,
+    *, not_run: bool = False,
 ) -> dict:
-    return {
+    response = {
         "result": partial_result.get("result", "") if partial_result else "",
         "exit_code": exit_code,
         "status": "error",
@@ -2048,13 +2484,26 @@ def _error_response(
         "dispatcher_status": "error",
         "normalization_reason": "execution failed before a usable terminal result",
     }
+    if not_run:
+        response.update({
+            "attempts": 0,
+            "attempt_status": "not_run",
+            "execution_status": "not_run",
+            "provider_contacted": False,
+            "model": {"requested": None, "targeted": None, "served": None,
+                      "resolved": None, "models_used": [], "evidence_source": None},
+            "served_model_evidence": "absent",
+            "model_match": None,
+            "named_model_verified": False,
+        })
+    return response
 
 
 def _blocked_response(
     cli: str, error_kind: str, error: str, *, details: dict | None = None
 ) -> dict:
     """Build a structured, non-contact refusal for deterministic preflight failures."""
-    response = _error_response(cli, 1, error)
+    response = _error_response(cli, 1, error, not_run=True)
     response["status"] = "blocked"
     response["dispatcher_status"] = "blocked"
     response["error_kind"] = error_kind
@@ -2126,6 +2575,25 @@ def build_final_response(
                            f"line, NOT that the agent declined to answer. Retry before "
                            f"rewriting the prompt.")
 
+    # Missing child tools are useful diagnostics, but captured stdout and model
+    # report text are not authority to override a non-zero process or terminal
+    # error. Preserve the report for advisory inspection while the execution
+    # stays failed; a future trusted wrapper event may distinguish post-result
+    # cleanup failure without relying on spoofable text.
+    captured = "".join(stdout_lines)
+    tool_failure = missing_executable_details(captured)
+    terminal_tool_failure = None
+    if isinstance(result, dict):
+        terminal_tool_failure = missing_executable_details(
+            str(result.get("error") or result.get("subtype") or ""))
+    if tool_failure is None:
+        tool_failure = terminal_tool_failure
+    if (tool_failure is not None and exit_code not in _SUCCESS_EXIT_CODES
+            and status == "success"):
+        status = "error"
+        norm_reason = (
+            "captured a complete report, but the backend exited non-zero after a "
+            "fatal missing-executable failure; report retained as advisory")
     response = {
         "result": result.get("result", "") if result else "".join(stdout_lines),
         "exit_code": exit_code,
@@ -2136,9 +2604,13 @@ def build_final_response(
         # success carrying a non-zero backend exit for a process failure (nor
         # ignores a meaningful non-zero backend exit).
         "backend_exit_code": exit_code,
+        "raw_backend_exit_code": exit_code,
         "dispatcher_status": status,
+        "normalized_exit_code": _normalized_exit_code(status, exit_code),
         "normalization_reason": norm_reason,
     }
+    if tool_failure is not None:
+        response["tool_failure"] = tool_failure
     if status == "error":
         if result_errored:
             # str() each part: a backend could put a non-string in result/error,
@@ -2157,7 +2629,7 @@ def build_final_response(
             # Bound the work: failure processing is proportional to captured size, and the
             # cap allows a very large tail. The last 64 KB carries the terminal error in
             # every observed case and keeps this O(small).
-            _captured = "".join(stdout_lines)[-65_536:]
+            _captured = captured[-65_536:]
             _salient = salient_error(_captured)
             if _salient and _salient not in msg:
                 msg = f"{msg}: {_salient}" if not stderr or not stderr.strip() else msg
@@ -2264,12 +2736,12 @@ def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
     # explicitly rather than producing ``360000msms``.
     timeout_budget_ms = int(timeout_ms)
     resp = _partial_response(cli, result, 124, f"Timeout after {timeout_budget_ms}ms")
+    captured = "".join(stdout_lines or [])
     resp["timeout"] = {"budget_ms": timeout_budget_ms,
                        "stage": "backend-execution",
-                       "partial_output": bool(result)}
+                       "partial_output": bool(result) or bool(captured.strip())}
     resp = _attach_raw(resp, stdout_lines)
 
-    captured = "".join(stdout_lines or [])
     # `processor.get_result()` returns the parsed result JSON (a dict) or None -- NOT a
     # string. An earlier draft called .strip() on it, which would have raised
     # AttributeError on every timeout that DID produce a result, i.e. crashed the exact
@@ -2714,6 +3186,14 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     threshold for the human-facing output_tail (None -> the built-in default).
     """
     started = time.monotonic()
+    started_wall_ms = int(time.time() * 1000)
+    # A physical attempt is the unit used for lifecycle accounting.  Keep the
+    # value opaque and bounded; the retry loop supplies a fresh ID for each
+    # provider launch, while direct callers get one lazily here.  Structural
+    # preflight refusals intentionally never publish it.
+    _attempt_id = getattr(inv, "attempt_id", None)
+    if not isinstance(_attempt_id, str) or re.fullmatch(r"[0-9a-f]{32}", _attempt_id) is None:
+        _attempt_id = uuid.uuid4().hex
     # Credit-only model guard: build_invocation_args enforces it in the
     # argv/env (so --dry-run and real dispatch agree); here we keep the ORIGINAL
     # request, the GUARDED effective model (feeds model.targeted), and the guard
@@ -2739,6 +3219,10 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             "source": "invocation" if inv.model else "ambient_config",
         }
     _requested_model = _codex_selection.get("requested")
+    _exact_required = bool(
+        getattr(inv, "model_exact_required", False)
+        or (inv.cli == "codex" and _codex_selection.get("exact_required"))
+    )
     _guarded_inv, _, _guard_warnings = apply_credit_guard(inv)
     debug_argv = [inv.cli]  # what --debug-dir records; each path refines it
     # Defer the initial workspace snapshot until an actual backend spawn is known to fit.
@@ -2756,6 +3240,20 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # Wall-clock per dispatch — orchestrators need this for concurrency
         # tuning and it costs nothing to provide.
         resp["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+        # Provider contact is the boundary between a structural refusal and a
+        # physical attempt.  Only the latter receives an attempt identity and
+        # completed attempt state; this prevents preflight errors from being
+        # counted as spent work while making retries/fallbacks auditable.
+        if resp.get("provider_contacted") is True:
+            resp.setdefault("attempt_id", _attempt_id)
+            _attempts = resp.get("attempts")
+            if (not isinstance(_attempts, int) or isinstance(_attempts, bool)
+                    or _attempts < 1):
+                resp["attempts"] = 1
+            if resp.get("attempt_status") != "not_run":
+                resp["attempt_status"] = "completed"
+        elif resp.get("attempt_status") == "not_run":
+            resp.pop("attempt_id", None)
         # Additive SPI fields (provider.driver / backend_type / served.via).
         try:
             from _drivers import enrich_envelope_from_cli as _enrich_spi
@@ -2836,7 +3334,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         if _terminal_model and not _terminal_model_invalid:
             _served = _terminal_model
         elif (_out_tokens > 0 and _targeted
-              and not (inv.cli == "codex" and _codex_selection.get("exact_required"))):
+              and not _exact_required):
             _served = None if _terminal_model_invalid else _targeted
         else:
             _served = None
@@ -2844,10 +3342,20 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # report is reported evidence; output tokens plus a target are only an
         # inference; neither is absent evidence.  Do not overload suspect/cache
         # semantics for a valid success that lacks provider telemetry.
+        _evidence_source = resp.get("model_evidence_source")
+        # Kimi 0.38 has no authoritative provider identity channel. Any model
+        # id visible through its process is child-observed, regardless of which
+        # parser branch produced it.
+        _client_observed_kimi = inv.cli == "kimi"
         if _terminal_model and not _terminal_model_invalid:
-            resp["served_model_evidence"] = "reported"
+            # Kimi 0.38 exposes model ids only in stdout/profile artifacts that
+            # the child process itself can write. They are useful routing
+            # observations, but not an authoritative provider receipt and must
+            # never certify a named-model vote.
+            resp["served_model_evidence"] = (
+                "inferred" if _client_observed_kimi else "reported")
         elif (_out_tokens > 0 and _targeted and not _terminal_model_invalid
-              and not (inv.cli == "codex" and _codex_selection.get("exact_required"))):
+              and not _exact_required):
             resp["served_model_evidence"] = "inferred"
         else:
             resp["served_model_evidence"] = "absent"
@@ -2874,11 +3382,17 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             except Exception:  # noqa: BLE001 — telemetry best-effort, never fatal
                 pass
         resp["model"] = {"requested": _requested_model, "targeted": _targeted,
-                         "served": _served, "resolved": _legacy, "models_used": _mu}
+                         "served": _served, "resolved": _legacy, "models_used": _mu,
+                         "exact_required": _exact_required,
+                         "exact_source": getattr(inv, "model_exact_source", None),
+                         "evidence_source": resp.get("model_evidence_source")}
+        resp["model_match"] = model_match_state(
+            _requested_model, _targeted, _served, resp.get("served_model_evidence"))
+        resp["named_model_verified"] = resp["model_match"] is True
         if inv.cli == "codex":
             resp["model"].update({
                 "request_source": _codex_selection.get("source"),
-                "exact_required": bool(_codex_selection.get("exact_required")),
+                "exact_required": _exact_required,
             })
         # Model-mismatch warning: if an EXPLICIT request differs from what actually
         # ran (served, else the legacy resolved), surface it prominently -- a pinned
@@ -2892,29 +3406,30 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 f"requested model {_requested_model!r} but the backend ran {_ran!r}; "
                 f"both are kept in the `model` field (a pinned agent model may have "
                 f"been rerouted or fallen back)")
-        # Explicit Codex pins are a trust contract, not a best-effort hint. A
-        # successful response without an exact terminal receipt, or with a
-        # different served model, is useful audit evidence but must not be
-        # consumed as a successful answer or sent through any retry/fallback
-        # path. The provider may already have spent; preserve that fact.
-        if (inv.cli == "codex" and _codex_selection.get("exact_required")
-                and resp.get("status") == "success"):
-            if _handshake and _model_mismatch(_requested_model, _handshake):
+        # Provenance-required named-model pins are a trust contract, not a
+        # best-effort hint. A successful response without an exact terminal
+        # receipt, or with a different served model, is useful audit evidence
+        # but must not be consumed as a successful answer or sent through any
+        # retry/fallback path. The provider may already have spent; preserve
+        # that fact. Codex pins use the same gate as custom/frontmatter seats.
+        if _exact_required and resp.get("status") == "success":
+            if _handshake and _requested_model != _handshake:
                 _trust_kind = "target_model_mismatch"
                 _trust_message = (
-                    f"requested Codex model {_requested_model!r}, but the provider "
+                    f"requested model {_requested_model!r}, but the provider "
                     f"handshake targeted {_handshake!r}; the run is blocked before "
                     "model identity can be trusted")
-            elif _terminal_model_invalid or not _terminal_model:
+            elif (resp.get("served_model_evidence") != "reported"
+                  or _terminal_model_invalid or not _terminal_model):
                 _trust_kind = "served_model_unverified"
                 _trust_message = (
-                    f"explicit Codex model {_requested_model!r} completed without "
+                    f"exact model {_requested_model!r} completed without "
                     "an authoritative terminal served-model receipt; the result "
                     "is blocked and cannot be treated as verified")
-            elif _model_mismatch(_requested_model, _terminal_model):
+            elif _requested_model != _terminal_model:
                 _trust_kind = "served_model_mismatch"
                 _trust_message = (
-                    f"requested Codex model {_requested_model!r}, but the provider "
+                    f"requested model {_requested_model!r}, but the provider "
                     f"reported {_terminal_model!r}; the result is blocked and no "
                     "automatic retry or fallback will be attempted")
             else:
@@ -3052,7 +3567,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             return _stamp(_enrich(_error_response(
                 inv.cli, 1,
                 f"backend {inv.cli!r} has no controlled provider-launch boundary; "
-                "deliberation refused it before contact"), None))
+                "deliberation refused it before contact", not_run=True), None))
         if launch_control is None:
             _backend_resp = BACKENDS[inv.cli]["call"](inv, timeout_ms)
         else:
@@ -3070,7 +3585,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     if _ro_err:
         if workspace_snapshot is not None:
             _workspace_before = workspace_snapshot(inv.cwd)
-        _permission_refusal = _error_response(inv.cli, 1, _ro_err)
+        _permission_refusal = _error_response(inv.cli, 1, _ro_err, not_run=True)
         _permission_refusal.update({
             "error_kind": "permission_unsupported",
             "provider_contacted": False,
@@ -3090,7 +3605,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         from _builder import supports_acp as _supports_acp
         if not _supports_acp(inv.cli):
             return _stamp(_enrich(_error_response(
-                inv.cli, 2, f"backend {inv.cli!r} has no acp transport"), None))
+                inv.cli, 2, f"backend {inv.cli!r} has no acp transport",
+                not_run=True), None))
         if inv.permission != "yolo":
             # Reactive-only enforcement: no permission flags travel to an ACP
             # agent, so containment depends on the agent CHOOSING to send
@@ -3105,7 +3621,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 "the agent choosing to ask (reactive only, unverified on real "
                 "CLIs). summon refuses rather than mislabel the tier. Use yolo "
                 "over ACP, or the subprocess transport, which enforces tiers via "
-                "CLI flags.")
+                "CLI flags.", not_run=True)
             _permission_refusal.update({
                 "error_kind": "permission_unsupported",
                 "provider_contacted": False,
@@ -3133,7 +3649,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     if inv.transport != "subprocess":
         return _stamp(_enrich(_error_response(
             inv.cli, 2, f"unknown transport {inv.transport!r} "
-                        f"(use 'subprocess' or 'acp')"), None))
+                        f"(use 'subprocess' or 'acp')", not_run=True), None))
 
     # timeout_ms is threaded to the builder so agy's wrapper deadline AND its
     # profile-TTL cleanup (which runs during build) both reflect the real request.
@@ -3157,7 +3673,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # deliberation envelope exposes only the exception class.
         _detail = (f"provider preparation refused ({type(_build_err).__name__})"
                    if launch_control is not None else str(_build_err))
-        return _stamp(_enrich(_error_response(inv.cli, 1, _detail), None))
+        return _stamp(_enrich(_error_response(inv.cli, 1, _detail, not_run=True), None))
     command, args = _resolve_launch(command, args)
     # AFTER _resolve_launch: on Windows a .cmd shim is rewritten to `node <path>/cli.js`,
     # which changes the length that actually gets measured by CreateProcess.
@@ -3195,7 +3711,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             return _routed
         # exit 1, not 127: 127 means "CLI not found", and reporting this as a missing
         # binary is precisely the misdiagnosis being fixed.
-        _resp = _error_response(inv.cli, 1, _argv_err)
+        _resp = _error_response(inv.cli, 1, _argv_err, not_run=True)
         # agy builds its per-invocation profile during build_invocation_args, so a rejection
         # HERE leaves a populated profile on disk with no handle to it: the caller could
         # neither resume nor clean it up, and it lingered until a TTL sweep. Hand it back.
@@ -3245,12 +3761,15 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                  f"is reported as a missing file, so this may be argv overflow rather than "
                  f"a missing binary)")
         return _stamp(_enrich(
-            _error_response(inv.cli, 127, f"CLI not found: {command}{_hint}"), None))
+            _error_response(inv.cli, 127, f"CLI not found: {command}{_hint}",
+                            not_run=True), None))
     except OSError as e:
-        return _stamp(_enrich(_error_response(inv.cli, 1, f"{type(e).__name__}: {e}"), None))
+        return _stamp(_enrich(_error_response(
+            inv.cli, 1, f"{type(e).__name__}: {e}", not_run=True), None))
     except ProviderDeadlineError:
         _deadline_response = _error_response(
-            inv.cli, 124, "provider launch deadline exceeded", partial_result=None)
+            inv.cli, 124, "provider launch deadline exceeded", partial_result=None,
+            not_run=True)
         _deadline_response["timeout"] = True
         return _stamp(_enrich(_deadline_response, None))
     except Exception as e:
@@ -3259,7 +3778,12 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # the safe exception class.
         return _stamp(_enrich(_error_response(
             inv.cli, 1,
-            f"provider launch refused by control ({type(e).__name__})"), None))
+            f"provider launch refused by control ({type(e).__name__})", not_run=True), None))
+
+    # Popen returned, so a physical provider attempt exists even if registration
+    # or stream parsing fails immediately. Mark the boundary before any later
+    # finalizer can shape an error envelope.
+    _provider_contacted = True
 
     if launch_control is not None:
         try:
@@ -3273,10 +3797,12 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 launch_control.reaped(process)
             except Exception:
                 pass
-            return _stamp(_enrich(_error_response(
+            _registration_error = _error_response(
                 inv.cli, 1,
                 f"provider process registration failed ({type(e).__name__}); "
-                "child was terminated"), None))
+                "child was terminated")
+            _registration_error["provider_contacted"] = _provider_contacted
+            return _stamp(_enrich(_registration_error, None))
 
     # Windows only: put the child in a kill-on-close Job Object so its whole tree can be
     # terminated even after this leader exits (issue #10) -- taskkill walks parent->child
@@ -3299,8 +3825,43 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                                   expected_model=(
                                       _requested_model
                                       if inv.cli == "codex"
-                                      and _codex_selection.get("exact_required")
-                                      else None))
+                                       and _codex_selection.get("exact_required")
+                                       else None))
+        response.setdefault("provider_contacted", _provider_contacted)
+        if inv.cli == "kimi" and env_override:
+            # Kimi 0.38 omits the model from its public stream-json records. Its
+            # fresh per-call profile does contain response-accounting records,
+            # so capture that evidence before credential sync or controlled
+            # profile cleanup removes the journal. Request-only records never
+            # enter this path and conflicting runtime/stream evidence fails
+            # closed instead of choosing whichever value matches the request.
+            _kimi_evidence = _capture_kimi_wire_model(
+                env_override.get("KIMI_CODE_HOME"),
+                started_wall_ms=started_wall_ms,
+                ended_wall_ms=int(time.time() * 1000),
+            )
+            if _kimi_evidence:
+                _stream_model = _safe_model_id(response.get("model_resolved"))
+                _wire_model = _kimi_evidence["model"]
+                if _stream_model and _stream_model != _wire_model:
+                    response["model_resolved"] = None
+                    response["model_evidence_source"] = "kimi_model_evidence_conflict"
+                    response.setdefault("warnings", []).append(
+                        "Kimi stream and runtime accounting reported different models; "
+                        "served identity was withheld")
+                else:
+                    response["model_resolved"] = _wire_model
+                    response["model_evidence_source"] = (
+                        "kimi_assistant_record+kimi_wire_usage_record"
+                        if _stream_model else "kimi_wire_usage_record")
+                    response["models_used"] = sorted(set(
+                        list(response.get("models_used") or [])
+                        + list(_kimi_evidence["models_used"])))
+                response["kimi_runtime_evidence"] = {
+                    "source": _kimi_evidence["source"],
+                    "usage_records": _kimi_evidence["usage_records"],
+                    "turn_completed": _kimi_evidence["turn_completed"],
+                }
     finally:
         # Kimi receives a disposable isolated home.  Its OAuth refresh token
         # rotation happens in that child home, so persist a validated refresh
@@ -3364,8 +3925,15 @@ def _merge_env(env_override: dict | None) -> dict | None:
     from the child env (used to strip OPENAI_API_KEY so codex bills the ChatGPT
     subscription, never the metered API)."""
     if not env_override:
+        # The Windows launcher marker is a parent-side transport guard, not a
+        # provider setting. Do not leak it into the child or a nested CLI.
+        if os.environ.get("SUMMON_CMD_LAUNCHER") == "1":
+            inherited = {**os.environ}
+            inherited.pop("SUMMON_CMD_LAUNCHER", None)
+            return inherited
         return None
     merged = {**os.environ}
+    merged.pop("SUMMON_CMD_LAUNCHER", None)
     for key, value in env_override.items():
         if value is None:
             merged.pop(key, None)

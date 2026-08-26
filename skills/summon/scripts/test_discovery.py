@@ -922,7 +922,9 @@ def test_envelope_model_and_permission_echo():
     # the guard-effective request; served stays None (no evidence); resolved
     # keeps legacy v1 semantics (None here).
     assert out["model"] == {"requested": "opus", "targeted": "opus", "served": None,
-                            "resolved": None, "models_used": []}
+                            "resolved": None, "models_used": [],
+                            "exact_required": False, "exact_source": None,
+                            "evidence_source": None}
     assert out["permission"] == "read-only"
     assert out["permission_flags"] == ["--permission-mode", "plan"]
     assert "_debug_raw" not in out  # internal key never leaks into the envelope
@@ -1048,6 +1050,27 @@ def test_v1_model_mismatch_detection():
     assert _executor._model_mismatch("x", None) is False
 
 
+def test_v11_named_model_proof_is_tri_state_and_exact():
+    """Only provider-reported exact identity can certify a named-model review."""
+    import _executor
+    exact = _executor.model_match_state(
+        "claude-opus-5", "claude-opus-5", "claude-opus-5", "reported")
+    assert exact is True
+    mismatch = _executor.model_match_state(
+        "claude-opus-5", "claude-opus-5", "claude-haiku-4-5", "reported")
+    assert mismatch is False
+    targeted_mismatch = _executor.model_match_state(
+        "claude-opus-5", "claude-haiku-4-5", "claude-opus-5", "reported")
+    assert targeted_mismatch is False
+    # Inferred and absent evidence remain unknown, rather than false votes.
+    assert _executor.model_match_state(
+        "claude-opus-5", "claude-opus-5", "claude-opus-5", "inferred") is None
+    assert _executor.model_match_state(
+        "claude-opus-5", "claude-opus-5", None, "absent") is None
+    # A floating alias can be warning-compatible but is not exact proof.
+    assert _executor.model_match_state("opus", "opus", "claude-opus-5", "reported") is False
+
+
 def test_v1_normalized_success_exit_fields():
     # rec #8 / regression test 10: a backend that exited non-zero but produced a
     # clean terminal result normalizes to success, with the raw code AND the
@@ -1057,19 +1080,25 @@ def test_v1_normalized_success_exit_fields():
         "codex", 1, {"is_error": False, "result": "done"}, ["done\n"], "")
     assert resp["status"] == "success"
     assert resp["exit_code"] == 1 and resp["backend_exit_code"] == 1
+    assert resp["raw_backend_exit_code"] == 1 and resp["normalized_exit_code"] == 0
     assert resp["dispatcher_status"] == "success"
     assert "normalized to success" in resp["normalization_reason"]
     assert "raw backend exit 1" in resp["normalization_reason"]
     # a plain clean exit (0) states exit and status agree
     ok = _executor.build_final_response("codex", 0, {"is_error": False, "result": "d"}, ["d\n"], "")
     assert ok["backend_exit_code"] == 0 and ok["dispatcher_status"] == "success"
+    assert ok["raw_backend_exit_code"] == 0 and ok["normalized_exit_code"] == 0
     # finalize_exit_fields backfills a bare envelope but never overwrites a reason
     env = _executor.finalize_exit_fields({"status": "error", "exit_code": 127})
     assert env["backend_exit_code"] == 127 and env["dispatcher_status"] == "error"
+    assert env["raw_backend_exit_code"] == 127 and env["normalized_exit_code"] == 127
     assert env["normalization_reason"]
     keep = _executor.finalize_exit_fields(
         {"status": "success", "exit_code": 1, "normalization_reason": "PINNED"})
     assert keep["normalization_reason"] == "PINNED"
+    failed_zero = _executor.finalize_exit_fields({"status": "error", "exit_code": 0})
+    assert failed_zero["raw_backend_exit_code"] == 0
+    assert failed_zero["normalized_exit_code"] == 1
     # query-shaped envelopes (no exit_code) are left untouched
     assert "backend_exit_code" not in _executor.finalize_exit_fields({"agents": []})
 
@@ -1110,6 +1139,52 @@ def test_v1_crash_envelope_carries_exit_fields():
     env = run_subagent._crash_envelope(RuntimeError("boom"))
     assert env["status"] == "error" and env["backend_exit_code"] == 1
     assert env["dispatcher_status"] == "error" and "RuntimeError" in env["normalization_reason"]
+    assert env["attempts"] is None and env["attempt_status"] == "unknown"
+    assert env["execution_status"] == "error"
+    assert env["provider_contacted"] is None
+
+
+def test_v1_background_parser_exit_gets_terminal_envelope():
+    """An argparse/SystemExit before normal dispatch must not orphan a job."""
+    import subprocess
+    root = tempfile.mkdtemp(prefix="summon-bg-parser-exit-")
+    result = os.path.join(root, "job.json")
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "run_subagent.py")
+    try:
+        completed = subprocess.run(
+            [sys.executable, script, "--agent", "missing", "--prompt", "x",
+             "--cwd", root, "--job-file", result, "--bogus"],
+            capture_output=True, text=True, encoding="utf-8")
+        assert completed.returncode == 2, completed.returncode
+        with open(result, encoding="utf-8") as fh:
+            envelope = json.load(fh)
+        assert envelope["error_kind"] == "dispatcher_exit_before_envelope"
+        assert envelope["provider_contacted"] is False
+        assert envelope["result_usable"] is False
+        assert envelope["exit_code"] == 2
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v1_background_envelope_writer_uses_retry_safe_atomic_replace():
+    import run_subagent as rs
+    root = tempfile.mkdtemp(prefix="summon-bg-envelope-write-")
+    result = os.path.join(root, "job.json")
+    calls = []
+    original = rs._jobs._replace_with_retry
+    try:
+        def wrapped(src, dst):
+            calls.append((src, dst))
+            return original(src, dst)
+        rs._jobs._replace_with_retry = wrapped
+        rs._write_job_file_text('{"status":"error"}', result)
+        with open(result, encoding="utf-8") as fh:
+            assert json.load(fh)["status"] == "error"
+        assert calls and calls[0][1] == result
+    finally:
+        rs._jobs._replace_with_retry = original
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_v1_is_terminal_success_shared_gate():
@@ -1840,7 +1915,8 @@ def test_openai_compat_http_roundtrip():
         # API reported the model on the terminal response -> served evidence
         assert env["model"] == {"requested": "test-model", "targeted": "test-model",
                                 "served": "test-model", "resolved": "test-model",
-                                "models_used": []}
+                                "models_used": [], "exact_required": False,
+                                "exact_source": None, "evidence_source": None}
         assert env["usage"]["total_tokens"] == 9 and env["billing"]["source"] == "api"
         assert env["envelope"] == 1
         assert env.get("text_seat", {}).get("allowed") is True
@@ -2537,8 +2613,64 @@ def test_read_root_refusal_surfaces_machine_reroute_before_provider_contact():
         refusal = json.loads(r.stdout)
         assert refusal["error_kind"] == "read_allowlist_unsupported", refusal
         assert refusal["provider_contacted"] is False, refusal
+        assert refusal["attempts"] == 0, refusal
+        assert refusal["attempt_status"] == "not_run", refusal
+        assert refusal["execution_status"] == "not_run", refusal
+        assert refusal["model"]["served"] is None, refusal
+        assert refusal["served_model_evidence"] == "absent", refusal
+        assert refusal["model_match"] is None, refusal
+        assert refusal["named_model_verified"] is False, refusal
         assert refusal["recommended_backends"] == ["claude", "gemini"], refusal
         assert refusal["reroute"]["action"] == "select_read_only_agent", refusal
+
+
+def test_pre_dispatch_refusal_is_not_counted_as_a_retry_attempt():
+    """A structural executor refusal must stop retry/ACP aggregation at zero."""
+    import _builder
+    import run_subagent as rs
+
+    calls = []
+    original = rs.execute_agent
+    try:
+        def fake_execute(*_args, **_kwargs):
+            calls.append(True)
+            return {
+                "status": "error", "result": "", "exit_code": 1,
+                "error_kind": "read_allowlist_unsupported",
+                "attempts": 0, "attempt_status": "not_run",
+                "execution_status": "not_run", "provider_contacted": False,
+            }
+        rs.execute_agent = fake_execute
+        args = types.SimpleNamespace(
+            retries=3, timeout=1000, debug_dir=None,
+            max_tool_output_bytes=None, gate_with=None,
+        )
+        inv = _builder.AgentInvocation(
+            cli="codex", prompt="p", cwd=os.getcwd(),
+            system_context="", permission="read-only",
+        )
+        out = rs._dispatch_with_retries(inv, args)
+    finally:
+        rs.execute_agent = original
+    assert len(calls) == 1, calls
+    assert out["attempts"] == 0, out
+    assert out["attempt_status"] == "not_run", out
+    assert out["execution_status"] == "not_run", out
+    assert out["provider_contacted"] is False, out
+    assert out["model"]["served"] is None, out
+    assert out["served_model_evidence"] == "absent", out
+    assert out["model_match"] is None, out
+    assert out["named_model_verified"] is False, out
+
+
+def test_retry_attempt_counter_distinguishes_not_run_from_missing_legacy_count():
+    import run_subagent as rs
+    assert rs._attempt_count({
+        "attempts": 0, "attempt_status": "not_run",
+        "execution_status": "not_run", "provider_contacted": False,
+    }) == 0
+    # Legacy real envelopes without an attempts field still represent one executed turn.
+    assert rs._attempt_count({"status": "success"}) == 1
 
 
 # --- Regression tests for ultrareview findings (F1-F25) ----------------------
@@ -4049,6 +4181,8 @@ def test_receipt_on_missing_agent_and_preflight():
                    capture_output=True, text=True, encoding="utf-8")
         env = _json.loads(r.stdout)
         assert env["status"] == "error" and "not found" in env["error"], env
+        assert env["attempts"] == 0 and env["attempt_status"] == "not_run", env
+        assert env["execution_status"] == "not_run" and env["provider_contacted"] is False, env
         assert len(env["summon"]["scripts_sha256"]) == 64, env.get("summon")
         assert "git_head_before" in env and "agent_def" not in env, env
         # the ROOT prompt hash is already known and must be present here too
@@ -4064,6 +4198,8 @@ def test_receipt_on_missing_agent_and_preflight():
                     capture_output=True, text=True, encoding="utf-8", env=env_clean)
         env2 = _json.loads(r2.stdout)
         assert env2["status"] == "error" and env2["exit_code"] == 127, env2
+        assert env2["attempts"] == 0 and env2["attempt_status"] == "not_run", env2
+        assert env2["execution_status"] == "not_run" and env2["provider_contacted"] is False, env2
         assert len(env2["summon"]["scripts_sha256"]) == 64, env2.get("summon")
         assert env2["agent_def"]["file"].endswith("gm.md"), env2.get("agent_def")
         assert "prompt_sha256" in env2 and "git_head_before" in env2, env2
@@ -12569,6 +12705,19 @@ def test_v8_gate_uncertain_routes_to_human_not_silent_refusal():
     assert den["requires_human_review"] is False, den
 
 
+def test_v11_gate_refusal_explicitly_records_provider_attempt_not_run():
+    """A gate refusal is a blocked request, not an unaccounted provider attempt."""
+    from _gate import blocked_envelope, decide
+    env = blocked_envelope(
+        decide({"status": "success", "result": "VERDICT: DENY"}, "gate"),
+        agent="worker", cli="claude")
+    assert env["status"] == "blocked"
+    assert env["attempts"] == 0
+    assert env["attempt_status"] == "not_run"
+    assert env["execution_status"] == "not_run"
+    assert env["provider_contacted"] is False
+
+
 def test_v8_gate_is_forced_read_only_even_if_its_definition_is_yolo():
     """A gate whose own definition declares full bypass must still RUN read-only.
     Otherwise --gate-with is itself a privilege-escalation path: name a yolo profile
@@ -17581,6 +17730,29 @@ def test_v10_parse_report_accepts_markdown_bold_fields():
     assert plain and plain["status"] == "DONE"
 
 
+def test_v11_parse_report_accepts_markdown_heading_verdict_and_preserves_block():
+    """Markdown headings are a common renderer shape, but only line-start fields count.
+
+    A complete execution may legitimately produce ``VERDICT: BLOCK``: the
+    execution succeeded and the review finding is a block.  The parser must
+    retain both signals instead of dropping the verdict or turning it into an
+    execution error.
+    """
+    import _executor as ex
+    heading = ("## STATUS: DONE\n## SUMMARY: reviewed\n## VERDICT: BLOCK\n"
+               "## FOLLOW-UP: none\n## HANDOFF: pass the block to the caller")
+    rep = ex.parse_report(heading)
+    assert rep and rep["status"] == "DONE" and rep["verdict"] == "BLOCK", rep
+    out = ex._enrich({"result": heading, "exit_code": 1, "status": "success",
+                      "cli": "claude"}, None)
+    assert out["report_ok"] is True
+    assert out["status"] == "success" and out["execution_status"] == "success"
+    assert out["verdict"] == "block"
+    assert out["raw_backend_exit_code"] == 1 and out["normalized_exit_code"] == 0
+    # A quoted contract template must not become a second report.
+    assert ex.parse_report("## STATUS: DONE | PARTIAL | BLOCKED") is None
+
+
 def test_v10_public_docs_exclude_machine_identity_and_preserve_local_evidence():
     """Public handovers must describe evidence without publishing a maintainer's machine.
 
@@ -17978,6 +18150,15 @@ def test_transient_dispatch_error_classifier():
         {"status": "error", "error": "HTTP 503 from endpoint", "cli": "openai-compat"})
     assert rs._is_transient_dispatch_error(
         {"status": "error", "exit_code": 124, "error": "timed out", "cli": "codex"})
+    assert rs._is_transient_dispatch_error(
+        {"status": "error", "error": "OpenRouter HTTP 429: shared pool busy",
+         "cli": "opencode"})
+    assert rs._is_transient_dispatch_error(
+        {"status": "error", "error": "status code 429 too many requests",
+         "cli": "openai-compat"})
+    assert rs._is_transient_dispatch_error(
+        {"status": "error", "error": "rate_limit_exceeded",
+         "cli": "opencode"})
     assert not rs._is_transient_dispatch_error(
         {"status": "error", "error": "please log in first", "cli": "codex"})
     assert not rs._is_transient_dispatch_error(

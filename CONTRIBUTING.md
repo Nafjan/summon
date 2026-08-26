@@ -9,11 +9,14 @@ dispatcher and no daemon. Keep it that way.
 git clone https://github.com/Nafjan/summon && cd summon
 python skills/summon/scripts/test_discovery.py   # dispatcher tests (mocked backends; no live CLIs)
 python tests/test_install.py                     # installer safety tests (isolated fake HOMEs)
+python -m pip install "pytest>=8,<9"              # test-only; not a Summon runtime dependency
+python -m pytest -q                              # complete provider-inert suite
 python summon.py doctor                          # see which real backends you have
 ```
 
-Both suites are plain-assert, no pytest, and run on Python 3.10–3.13. CI runs them on
-Ubuntu + Windows.
+The two focused scripts remain plain-assert and need no test framework. The complete
+release and Phase 0/1 registry uses pytest. CI runs both forms on Python 3.10–3.13 on
+Ubuntu and Windows.
 
 ## Ground rules
 

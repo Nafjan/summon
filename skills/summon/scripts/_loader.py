@@ -44,7 +44,7 @@ def last_parsed_sha(agent_file: str) -> str | None:
 # Every frontmatter key summon itself reads. Used ONLY for near-miss typo detection in
 # parse_frontmatter -- an unrecognized key that is not a near-miss is still accepted and
 # ignored, so an agent file can carry its own metadata.
-KNOWN_FRONTMATTER_KEYS = ("run-agent", "permission", "model", "args", "effort",
+KNOWN_FRONTMATTER_KEYS = ("run-agent", "permission", "model", "model-policy", "args", "effort",
                           "provider", "base_url", "api_key_env", "capability", "billing",
                           "profile", "openrouter_options", "read-roots")
 

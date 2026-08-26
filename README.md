@@ -109,6 +109,10 @@ not installed or required.
   if it crashes. Good for reviewing, summarizing, or labeling at scale.
 - **Structured extraction:** `--json-schema` validates an agent's final JSON and, on a
   backend that supports resume, spends one corrective retry when it does not match.
+- **Inspect local usage evidence safely:** `summon usage import --from snapshot.json`
+  validates a redacted `summon.usage/v1` export, and `summon usage status --json`
+  reports its freshness without querying a provider or changing model routing. Usage
+  categories remain separate instead of being collapsed into a misleading score.
 - **Governed deliberation:** `summon deliberate` records a receipt-bound, fixed-option
   decision policy and journal. The fresh CLI lane can run one bounded round of
   enforceable read-only subprocess seats after durable receipt/owner fencing; approval,
@@ -209,23 +213,25 @@ expose a complete enumeration command, so its configured default and catalog can
 advisory. Pin a candidate only after a real dispatch proves the exact `model.served` value;
 never infer a new model from a display label or a task name.
 
-The next-release contract makes an explicit Codex pin stricter: Summon emits one canonical
-model selector, refuses conflicting selectors before provider contact, and blocks a pinned run
-when the provider does not return an authoritative terminal served-model receipt. A handshake
-target, output-token estimate, or catalog entry is not proof that Sol (or any other model) was
-served. See [`docs/SUMMON_3.2_PLAN.md`](docs/SUMMON_3.2_PLAN.md) for the routing and chat
-acceptance gates. The fixed-shell chat atlas is still preview-only until its rendered-browser
-and owner-lifecycle gates pass.
+The exact-model contract applies to provenance-required named seats across providers. Summon
+emits one canonical selector where the backend supports it, refuses conflicting selectors
+before provider contact, and blocks an exact seat when the provider does not return an
+authoritative terminal served-model receipt. A handshake target, output-token estimate, or
+catalog entry is not proof that the requested model was served. Claude may report auxiliary
+models in `model.models_used`; that list is retained, but the dominant terminal model must
+still match an exact seat's requested pin. Use `--require-exact-model` or
+`model-policy: exact` for a custom seat. See [`docs/SUMMON_3.2_PLAN.md`](docs/SUMMON_3.2_PLAN.md)
+for the routing and chat acceptance gates. The fixed-shell chat atlas is still preview-only
+until its rendered-browser and owner-lifecycle gates pass.
 
-This does **not** make the Codex backend preview-only. Ordinary Codex dispatch remains a
-supported first-class path. The restriction applies to provenance-required named-model claims
-such as the `sol-review` seat: if Codex completes a turn without an authoritative terminal
-identity, Summon returns `status: "blocked"`, `error_kind: "served_model_unverified"`,
-`model.targeted: "gpt-5.6-sol"`, and `model.served: null`. That means “the requested model
-was not certified,” not “Luna ran instead.” Summon does not infer or silently reroute the
-turn. The certification path is a Codex CLI/adapter receipt that reports the provider-served
-model, a parser fixture for match/mismatch/missing cases, and a fresh live receipt before a
-named Sol seat can be called certified.
+This does **not** make any backend preview-only. Ordinary dispatch remains a supported
+first-class path; only exact named-model claims are fail-closed. For example, if the
+`sol-review` seat completes without an authoritative terminal identity, Summon returns
+`status: "blocked"`, `error_kind: "served_model_unverified"`, and `model.served: null`.
+That means “the requested model was not certified,” not “Luna ran instead.” Summon does not
+infer or silently reroute the turn. The certification path is a provider-authored terminal
+receipt plus parser coverage for match, mismatch, and missing-evidence cases; a fresh live
+receipt is still required before a named seat can be called certified.
 
 For a release or support bundle, generate a provider-inert evidence manifest after
 running the fixed release-test registry:
@@ -515,23 +521,39 @@ vendors.
 
 ```json
 {
-  "status": "success",
-  "result": "…the agent's full answer…",
-  "report": { "status": "DONE", "summary": "Reviewed 4 files; 2 findings",
-              "handoff": "Fix the race in poller.py:88 first",
-              "left_behind": "none" },
-  "environment_handoff": { "declared": true, "left_behind": "none" },
-  "report_ok": true,
-  "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
-               "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
+  "status": "blocked",
+  "execution_status": "not_run",
+  "attempts": 0,
+  "attempt_status": "not_run",
+  "provider_contacted": false,
+  "result": "",
+  "report": null,
+  "environment_handoff": { "declared": false, "left_behind": null },
+  "report_ok": null,
+  "model":   { "requested": "<requested-model-or-null>",
+               "targeted": "<targeted-model-or-null>",
+               "served": null, "resolved": null },
+  "served_model_evidence": "absent",
+  "model_match": null,
+  "named_model_verified": false,
+  "raw_backend_exit_code": null,
+  "normalized_exit_code": null,
+  "exit_code": null,
   "summon":  { "version": "3.2.1", "scripts_sha256": "<sha256>" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
-  "elapsed_ms": 7285,
-  "resume": { "cli": "claude", "session_id": "<session-id>" }
+  "elapsed_ms": 0,
+  "resume": { "cli": "claude", "session_id": null }
 }
 ```
+
+The object above is a safe structural-refusal example, not a success template.
+Successful dispatches must populate these fields from the actual terminal envelope;
+callers must never copy `report_ok`, model proof, attempt counts, or exit codes from
+an example. In particular, `attempts:1` and `model_match:true` are valid only for
+an actually executed, provider-reported exact-model success; they are never valid
+values for a structural `not_run` refusal.
 
 - `report.handoff` → the context to pass to the next call.
 - `environment_handoff` → resources the child created and intentionally left behind. It can
@@ -541,14 +563,32 @@ vendors.
   contract don't get believed.
 - `model.served` → the model that actually did the work (evidence-based; `null` = no
   service evidence observed). `targeted` = what the session was pointed at.
-- For an explicit Codex model pin, `status: "blocked"` with `error_kind` such as
+- `model_match` / `named_model_verified` → exact-model proof, not a guess. The tri-state
+  `model_match` is `true` only for a trusted backend/provider completion record showing
+  equality of requested, targeted, and served IDs; it is `false` for a reported mismatch
+  and `null` for inferred/absent evidence.
+  `named_model_verified` is `true` only when `model_match` is true.
+- For an exact named-model pin, `status: "blocked"` with `error_kind` such as
   `model_selection_conflict`, `target_model_mismatch`, `served_model_mismatch`, or
   `served_model_unverified` is a terminal trust result. It is not automatically retried or
-  rerouted, and `result_usable` is false.
+  rerouted, and `result_usable` is false. The envelope's `model.exact_required` and
+  `model.exact_source` explain why the gate applied.
 - `served_model_evidence` → `reported`, `inferred`, or `absent`: whether the served
-  model came from a terminal provider report, bounded telemetry inference, or no
+  model came from a trusted terminal/runtime completion record, bounded telemetry inference, or no
   service evidence. Missing provenance does not make a usable success retryable;
   an empty terminal result is instead a typed non-retryable error.
+- `model.evidence_source` → the bounded backend/provider record used for a reported
+  identity when one exists. Kimi 0.38 can use positive-output `usage.record` entries
+  plus the completed-turn marker in Summon's fresh isolated per-call profile; request
+  and configuration records never count. Kimi versions that emit neither that runtime
+  accounting nor an assistant model leave `model.served` null and provenance `absent`.
+  Summon never infers K3 from the requested model or local profile configuration.
+- `tool_failure` → a safe, typed missing-executable diagnostic. On Windows, use `rg`,
+  PowerShell, or Python when a child cannot run a POSIX convenience command such as
+  `grep`; a complete report is preserved and the raw backend exit remains visible.
+- `raw_backend_exit_code` and `normalized_exit_code` → explicit child and Summon outcome
+  codes. The legacy `exit_code` remains for compatibility but is ambiguous after report
+  normalization, so automation should use the explicit fields.
 - `timeout` → the timeout budget, whether partial output survived, and the phase Summon can
   prove. ACP names its exact protocol stage; a generic CLI remains `backend-execution` because
   Summon cannot honestly infer whether the vendor was starting, reasoning, or running a tool.
@@ -705,6 +745,8 @@ example, Gemini CLI sessions cannot currently be resumed through Summon's headle
   dispatcher itself. The default **agy** path (a stream-json proxy) is standard library too. Only the
   legacy opt-in agy PTY wrapper needs `pywinpty` and `pyte`
   (tested with `pywinpty 3.0.3` and `pyte 0.8.2`).
+  Contributors running the complete release and Phase 0/1 verification registry also
+  need `pytest>=8,<9`; this is a test-only dependency and is not installed with Summon.
 - **At least one backend:** a vendor CLI installed and logged in (`claude`, `codex`,
   `cursor-agent`, `gemini`, `kimi`, `agy`, or `opencode`), an API key for an `openai-compat` provider, or
   a local Ollama/LM Studio server. `summon doctor` tells you which are installed;
@@ -746,9 +788,11 @@ You bring model access. Summon orchestrates the CLIs and APIs you already use.
   For a review-only Kimi job,
   use `--worktree`, instruct it not to change product files, and inspect the worktree
   before accepting the report or removing it: the review request is not an enforceable read-only boundary.
-  Kimi may report a served model on some CLI/transport versions, but its local profile and
-  requested K3 target are not provider evidence. A successful report with
-  `model.served: null` is useful advisory output, not a certified named-model review.
+  Kimi may expose a served-model observation in child stdout or its isolated runtime journal,
+  but both channels are writable by the child and are therefore labeled `inferred`, never
+  authoritative named-model proof. Its local profile and requested K3 target are not provider
+  evidence. A successful report with absent or inferred identity is useful advisory output,
+  not a certified named-model review.
 - **agy/Antigravity has no enforceable `read-only` tier.** Its `safe-edit` is the same full
   bypass as `yolo`, and declared `read-only` is refused unless explicitly waived. For a
   disposable worktree, use `yolo` deliberately; for a shared or sensitive checkout, use
@@ -786,6 +830,11 @@ You bring model access. Summon orchestrates the CLIs and APIs you already use.
   and refuses with an error that names argv as the cause. `--prompt-file` does **not** avoid
   this -- it is a quoting convenience and the content still travels on the command line. For
   material that large, write it to a file under `--cwd` and ask the agent to read it.
+- **Windows batch transport is fail-closed.** `summon.cmd` marks the batch path and refuses
+  every raw `--prompt` before any roster/backend work. Batch expansion occurs before Python
+  receives argv, so surviving bytes cannot prove that even apparently simple text was not
+  rewritten. Put the prompt in a UTF-8 file and pass `--prompt-file`; the refusal envelope reports
+  `attempts: 0`, `attempt_status: not_run`, and `provider_contacted: false`.
 - **Diagnostics are opt-in and local.** Summon does not collect telemetry by default. When
   enabled, it records bounded, allow-listed metadata locally and omits prompt text, result
   text, raw output, credentials, and absolute paths. It may retain deterministic fingerprints

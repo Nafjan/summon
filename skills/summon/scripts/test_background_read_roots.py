@@ -93,8 +93,10 @@ def test_foreground_and_background_read_allowlists_stay_in_parity():
             gate_timeout=None,
             worktree=None,
             artifacts=[],
+            require_exact_model=True,
         )
         child = _background.child_argv(args, "result.json")
+        assert "--require-exact-model" in child, child
         child_roots = [
             child[index + 1]
             for index, value in enumerate(child[:-1])

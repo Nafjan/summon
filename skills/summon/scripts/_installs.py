@@ -406,16 +406,22 @@ def enumerate_installs(running_scripts_dir: str | None = None,
 
 
 def drift_report(records: list, reference_sha: str | None = None) -> dict:
-    """Classify drift across enumerated records. The reference is the RUNNING copy's hash
-    (the code that actually answered) unless one is passed explicitly.
+    """Classify global, managed, and running-copy convergence independently.
+
+    The global reference is the RUNNING copy's hash (the code that answered) unless one
+    is passed explicitly. The installer-managed set has its own reference so an unmanaged
+    project-vendored runner cannot make internally identical managed installs look stale.
 
     A PRESENT copy is HASHED (comparable), or UNKNOWN when its hash could not be computed
     (a permission error, a foreign non-regular ``*.py``). ``drifted`` = hashed copies whose
     hash differs from the reference. With no reference nothing is called drifted -- we never
-    cry drift we cannot anchor. ``converged`` requires a reference, NO drift, no unknown
-    copy (an uncheckable copy is never reported as 'all match'), AND no host carrying a
-    duplicate 'summon' skill (a stale backup dir loaded beside the canonical copy). Returns
-    {reference_sha, converged, present, hashed, drifted, unknown, duplicates}."""
+    cry drift we cannot anchor. ``converged`` is the strict all-present-copies result, while
+    ``managed_converged`` answers the installer question against the internally selected
+    managed reference and ignores explicitly unmanaged project/plugin copies. Global
+    convergence requires a running reference; managed convergence requires a comparable
+    managed reference. Each also requires no unknown or duplicate copy in its own scope.
+    Returns the legacy fields plus managed/unmanaged partitions and an explicit
+    ``running_matches_managed`` fact."""
     if reference_sha is None:
         run = next((r for r in records if r.get("running") and r.get("sha256")), None)
         reference_sha = run["sha256"] if run else None
@@ -431,8 +437,42 @@ def drift_report(records: list, reference_sha: str | None = None) -> dict:
     duplicates = [{"label": r["label"], "dirs": r["duplicates"]}
                   for r in records if r.get("duplicates")]
     truncated = [r["label"] for r in records if r.get("duplicates_truncated")]
+    managed_present = [r for r in present if r.get("managed")]
+    managed_hashed = [r for r in managed_present if r.get("sha256")]
+    managed_reference_sha = managed_hashed[0]["sha256"] if managed_hashed else None
+    managed_drifted = [r for r in managed_hashed
+                       if managed_reference_sha and r["sha256"] != managed_reference_sha]
+    managed_unknown = [r for r in unknown if r.get("managed")]
+    managed_duplicates = [d for d in duplicates
+                          if any(r.get("label") == d["label"] and r.get("managed")
+                                 for r in records)]
+    managed_truncated = [label for label in truncated
+                         if any(r.get("label") == label and r.get("managed")
+                                for r in records)]
+    unmanaged_drifted = [r for r in drifted if not r.get("managed")]
+    unmanaged_unknown = [r for r in unknown if not r.get("managed")]
+    unmanaged_duplicates = [d for d in duplicates
+                            if not any(r.get("label") == d["label"] and r.get("managed")
+                                       for r in records)]
+    unmanaged_truncated = [label for label in truncated
+                           if not any(r.get("label") == label and r.get("managed")
+                                      for r in records)]
+    managed_converged = (
+        bool(managed_reference_sha) and bool(managed_present) and not managed_drifted
+        and not managed_unknown and not managed_duplicates and not managed_truncated)
     return {"reference_sha": reference_sha,
+            "managed_reference_sha": managed_reference_sha,
+            "running_matches_managed": bool(
+                reference_sha and managed_reference_sha
+                and reference_sha == managed_reference_sha),
             "converged": (bool(reference_sha) and not drifted and not unknown
                           and not duplicates and not truncated),
+            "managed_converged": managed_converged,
             "present": present, "hashed": hashed, "drifted": drifted,
-            "unknown": unknown, "duplicates": duplicates, "scan_truncated": truncated}
+            "unknown": unknown, "duplicates": duplicates, "scan_truncated": truncated,
+            "managed_drifted": managed_drifted, "managed_unknown": managed_unknown,
+            "managed_duplicates": managed_duplicates,
+            "managed_scan_truncated": managed_truncated,
+            "unmanaged_drifted": unmanaged_drifted, "unmanaged_unknown": unmanaged_unknown,
+            "unmanaged_duplicates": unmanaged_duplicates,
+            "unmanaged_scan_truncated": unmanaged_truncated}

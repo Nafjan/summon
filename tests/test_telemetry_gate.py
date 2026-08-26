@@ -155,6 +155,121 @@ class TelemetryGateTests(unittest.TestCase):
         self.assertEqual(trusted["served_model_evidence"], "reported")
         self.assertFalse(trusted["model_mismatch"])
 
+    def test_named_model_projection_is_tri_state_and_ignores_forged_fields(self):
+        def project(model, evidence, mismatch):
+            return MODULE.event_from_envelope({
+                "status": "success", "model": model,
+                # These caller-visible values are intentionally ignored unless
+                # the private executor marker below agrees.
+                "model_match": True, "named_model_verified": True,
+                "served_model_evidence": "reported",
+                "_telemetry_model_evidence": MODULE._trusted_model_evidence(
+                    evidence, mismatch, _capability=MODULE._EVIDENCE_CAPABILITY),
+            })
+
+        exact = project({"requested": "gpt-5.6-sol", "targeted": "gpt-5.6-sol",
+                         "served": "gpt-5.6-sol"}, "reported", False)
+        self.assertTrue(exact["model_match"])
+        self.assertTrue(exact["named_model_verified"])
+        mismatch = project({"requested": "gpt-5.6-sol", "targeted": "gpt-5.6-sol",
+                            "served": "gpt-5.6-luna"}, "reported", True)
+        self.assertFalse(mismatch["model_match"])
+        self.assertFalse(mismatch["named_model_verified"])
+        for evidence in ("inferred", "absent"):
+            unknown = project({"requested": "gpt-5.6-sol", "targeted": "gpt-5.6-sol",
+                               "served": None}, evidence, None)
+            self.assertIsNone(unknown["model_match"])
+            self.assertFalse(unknown["named_model_verified"])
+
+    def test_projection_keeps_raw_and_normalized_exit_codes_distinct(self):
+        normalized = MODULE.event_from_envelope({
+            "status": "success", "exit_code": 1,
+            "raw_backend_exit_code": 1, "normalized_exit_code": 0,
+        })
+        self.assertEqual(normalized["exit_code"], 1)
+        self.assertEqual(normalized["raw_backend_exit_code"], 1)
+        self.assertEqual(normalized["normalized_exit_code"], 0)
+
+    def test_structural_refusal_preserves_explicit_not_run_execution_state(self):
+        event = MODULE.event_from_envelope({
+            "status": "blocked", "execution_status": "not_run",
+            "attempt_status": "not_run", "attempts": 1,
+            "provider_contacted": True,
+            "model": {"requested": "gpt-5.6-sol", "targeted": "gpt-5.6-sol",
+                       "served": "gpt-5.6-sol"},
+            "served_model_evidence": "reported", "model_match": True,
+            "named_model_verified": True,
+        })
+        self.assertEqual(event["status"], "blocked")
+        self.assertEqual(event["execution_status"], "not_run")
+        self.assertEqual(event["attempt_status"], "not_run")
+        self.assertEqual(event["attempts"], 0)
+        self.assertFalse(event["provider_contacted"])
+        self.assertIsNone(event["model_served"])
+        self.assertEqual(event["served_model_evidence"], "absent")
+        self.assertIsNone(event["model_match"])
+        self.assertFalse(event["named_model_verified"])
+
+    def test_public_report_preserves_not_run_contract_and_success_distinction(self):
+        structural = {
+            "status": "blocked", "execution_status": "not_run",
+            "attempt_status": "not_run", "attempts": 7,
+            "provider_contacted": True,
+            "model": {"requested": "gpt-5.6-sol", "targeted": "gpt-5.6-sol",
+                       "served": "gpt-5.6-sol"},
+            "served_model_evidence": "reported", "model_match": True,
+            "named_model_verified": True,
+        }
+        text, meta = MODULE.make_report(structural)
+        event = meta["event"]
+        self.assertEqual(
+            {key: event.get(key) for key in (
+                "attempts", "attempt_status", "execution_status",
+                "provider_contacted", "model_served", "served_model_evidence",
+                "model_match", "named_model_verified")},
+            {"attempts": 0, "attempt_status": "not_run",
+             "execution_status": "not_run", "provider_contacted": False,
+             "model_served": None, "served_model_evidence": "absent",
+             "model_match": None, "named_model_verified": False},
+        )
+        path = self.reports / "not-run.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        self.assertTrue(MODULE.validate_report_file(str(path))["ok"])
+
+        exact = MODULE.event_from_envelope({
+            "status": "success", "execution_status": "success",
+            "attempts": 1, "provider_contacted": True,
+            "model": {"requested": "gpt-5.6-sol", "targeted": "gpt-5.6-sol",
+                       "served": "gpt-5.6-sol"},
+            "_telemetry_model_evidence": MODULE._trusted_model_evidence(
+                "reported", False, _capability=MODULE._EVIDENCE_CAPABILITY),
+        })
+        self.assertEqual(exact["attempts"], 1)
+        self.assertEqual(exact["attempt_status"], "completed")
+        self.assertTrue(exact["model_match"])
+        self.assertTrue(exact["named_model_verified"])
+
+    def test_public_report_cannot_forge_named_model_proof_after_redaction(self):
+        text, meta = MODULE.make_report({
+            "status": "success", "execution_status": "success",
+            "attempts": 1, "provider_contacted": True,
+            "model": {"requested": "gpt-5.6-sol", "targeted": "gpt-5.6-sol",
+                      "served": "gpt-5.6-sol"},
+            "_telemetry_model_evidence": MODULE._trusted_model_evidence(
+                "reported", False, _capability=MODULE._EVIDENCE_CAPABILITY),
+        })
+        event = meta["event"]
+        self.assertIn("Summon diagnostic report", text)
+        self.assertEqual(event["served_model_evidence"], "absent")
+        self.assertIsNone(event["model_match"])
+        self.assertFalse(event["named_model_verified"])
+
+        forged = dict(event, served_model_evidence="reported",
+                      model_match=True, named_model_verified=True)
+        with self.assertRaisesRegex(ValueError, "cannot certify a named model"):
+            MODULE._validate_public_evidence(forged)
+
     def test_auth_lifecycle_requires_the_executor_marker(self):
         direct = MODULE.event_from_envelope({
             "status": "error", "auth_stage": "terminal", "auth_outcome": "recovered",
@@ -264,6 +379,18 @@ class TelemetryGateTests(unittest.TestCase):
                               + "\n```" + after, encoding="utf-8")
             with self.assertRaises(ValueError, msg=key):
                 MODULE.validate_report_file(str(report))
+
+        forged_proof = dict(base)
+        forged_proof.update({
+            "model_match": True,
+            "named_model_verified": True,
+            "served_model_evidence": "absent",
+            "model_served": None,
+        })
+        report.write_text(before + marker + json.dumps(forged_proof, sort_keys=True, indent=2)
+                          + "\n```" + after, encoding="utf-8")
+        with self.assertRaises(ValueError):
+            MODULE.validate_report_file(str(report))
 
         report.write_text(before + marker + '{"source_trust": "unverified"}'
                           + "\n```" + after, encoding="utf-8")

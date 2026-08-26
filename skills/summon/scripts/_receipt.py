@@ -180,8 +180,13 @@ _WORKSPACE_MAX_PATHS = 2048
 # Windows Defender/index locking can make the first status read after a temporary
 # commit exceed the POSIX budget. Keep the probe bounded, but give Windows enough
 # headroom for a real child commit so release repeatability does not depend on luck.
-_WORKSPACE_CALL_TIMEOUT_S = 2.0 if os.name == "nt" else 0.75
-_WORKSPACE_TOTAL_TIMEOUT_S = 6.0 if os.name == "nt" else 2.0
+# Windows process creation and Defender/indexer scans can consume several seconds
+# even for a tiny temporary repository. A two-second per-command budget made the
+# mutation receipt nondeterministically report ``coverage:unavailable`` on an
+# otherwise healthy Git checkout. Keep the bound finite, but leave enough room for
+# the four reads that make up one snapshot.
+_WORKSPACE_CALL_TIMEOUT_S = 5.0 if os.name == "nt" else 0.75
+_WORKSPACE_TOTAL_TIMEOUT_S = 15.0 if os.name == "nt" else 2.0
 _HEAD_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 
 

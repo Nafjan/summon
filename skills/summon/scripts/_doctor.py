@@ -63,6 +63,10 @@ _BACKEND_ISSUE_SIGNS = (
     ("session has expired", None, "auth", "refresh the backend login before retrying"),
     ("session expired", None, "auth", "refresh the backend login before retrying"),
     ("invalid credentials", None, "auth", "refresh the backend login before retrying"),
+    ("provided authorization grant is invalid", "kimi", "auth",
+     "run `kimi login` to refresh Kimi's authorization grant before retrying"),
+    ("authorization grant is invalid", "kimi", "auth",
+     "run `kimi login` to refresh Kimi's authorization grant before retrying"),
     ("invalid api key", None, "auth", "check the backend login or API-key configuration"),
     ("api key not valid", None, "auth", "check the backend login or API-key configuration"),
     ("api key is not set", None, "auth", "set the backend API-key environment variable or complete its provider login"),
@@ -711,6 +715,7 @@ def render(report: dict) -> str:
     if inst and inst.get("records"):
         dr = inst["drift"]
         ref = dr.get("reference_sha")
+        managed_ref = dr.get("managed_reference_sha")
         lines += ["", "installs (this machine):"]
         for r in inst["records"]:
             run = " (running)" if r.get("running") else ""
@@ -720,25 +725,51 @@ def render(report: dict) -> str:
             ver = r.get("version") or "?"
             if not r["sha256"]:   # present but couldn't hash it (perm error / foreign file)
                 mark, sha, note = "[~?]", "unhashable  ", "present but could not be hashed"
-            elif ref and r["sha256"] == ref:
-                mark, sha, note = "[OK]", r["sha256"][:12], "current"
-            elif ref:
-                mark, sha, note = "[~?]", r["sha256"][:12], "DRIFT: stale copy; re-run install.py"
+            elif r.get("managed") and managed_ref and r["sha256"] == managed_ref:
+                mark, sha, note = "[OK]", r["sha256"][:12], "current managed set"
+            elif r.get("managed") and managed_ref:
+                mark, sha, note = (
+                    "[~?]", r["sha256"][:12],
+                    "DRIFT: differs from managed set; re-run install.py")
+            elif not r.get("managed") and ref and r["sha256"] == ref:
+                mark, sha, note = (
+                    "[OK]", r["sha256"][:12], "running/global reference")
+            elif not r.get("managed") and ref:
+                mark, sha, note = (
+                    "[~?]", r["sha256"][:12],
+                    "unmanaged copy differs; installer will not modify it")
             else:
                 mark, sha, note = "[~?]", r["sha256"][:12], "unverified (no running reference)"
             lines.append(f"  {mark} {r['label']:<10} {sha}  v{ver:<7} {note}{run}")
             lines.append(f"       {r['scripts_dir']}")
-        if ref and (dr.get("drifted") or dr.get("unknown")):
+        managed_drift = (dr["managed_drifted"] if "managed_drifted" in dr else [
+            d for d in (dr.get("drifted") or []) if d.get("managed")])
+        managed_unknown = (dr["managed_unknown"] if "managed_unknown" in dr else [
+            u for u in (dr.get("unknown") or []) if u.get("managed")])
+        if ref and (managed_drift or managed_unknown):
             bits = []
-            if dr.get("drifted"):
-                bits.append(f"{len(dr['drifted'])} differ "
-                            f"({', '.join(d['label'] for d in dr['drifted'])})")
-            if dr.get("unknown"):
-                bits.append(f"{len(dr['unknown'])} unhashable "
-                            f"({', '.join(u['label'] for u in dr['unknown'])})")
+            if managed_drift:
+                bits.append(f"{len(managed_drift)} differ "
+                            f"({', '.join(d['label'] for d in managed_drift)})")
+            if managed_unknown:
+                bits.append(f"{len(managed_unknown)} unhashable "
+                            f"({', '.join(u['label'] for u in managed_unknown)})")
             lines.append(f"  drift    : {'; '.join(bits)} - run  python install.py  to converge")
-        elif dr.get("converged") and len(dr.get("present", [])) > 1:
-            lines.append("  drift    : all installed copies match the running install")
+        elif dr.get("managed_converged"):
+            suffix = (" and match the running install"
+                      if dr.get("running_matches_managed")
+                      else "; the running unmanaged copy differs")
+            lines.append("  drift    : all installer-managed copies agree" + suffix)
+        unmanaged_drift = (dr["unmanaged_drifted"] if "unmanaged_drifted" in dr else [
+            d for d in (dr.get("drifted") or []) if not d.get("managed")])
+        unmanaged_unknown = (dr["unmanaged_unknown"] if "unmanaged_unknown" in dr else [
+            u for u in (dr.get("unknown") or []) if not u.get("managed")])
+        if unmanaged_drift or unmanaged_unknown:
+            labels = [d["label"] for d in unmanaged_drift]
+            labels += [u["label"] for u in unmanaged_unknown]
+            lines.append("  unmanaged : " + ", ".join(labels)
+                         + " differ or cannot be hashed; install.py does not modify "
+                           "project/plugin copies (update them only with an explicit owner decision)")
         _dups = dr.get("duplicates") or []
         for d in _dups:
             for path in d["dirs"]:

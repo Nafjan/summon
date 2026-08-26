@@ -44,7 +44,9 @@ describe the behavior and remediation without identifying the machine that expos
 
 **Script Path**: On Windows, use `{SKILL_DIR}\scripts\summon.cmd`; it selects a
 compatible Python through the Windows launcher and must be preferred over invoking
-`run_subagent.py` directly. On macOS/Linux, use `python3 {SKILL_DIR}/scripts/run_subagent.py`.
+`run_subagent.py` directly. The batch launcher requires `--prompt-file` for every dispatch
+prompt because `cmd.exe` expands raw arguments before Python can verify them. On macOS/Linux,
+use `python3 {SKILL_DIR}/scripts/run_subagent.py`.
 The dispatcher requires Python 3.10 or later.
 
 **Install**: This skill ships inside the summon repo at `skills/summon/`. Hosts that support
@@ -58,7 +60,7 @@ default action), `list`, `agents validate`, `models`, `doctor`, `manifest FILE`,
 `chat`, `swarm`, `deliberate QUESTION`, `deliberate status|replay|recover|cancel|open|resume RUN_ID`,
 `agent
 new|set NAME`, `role propose|approve|list|resolve`, `telemetry enable|disable|status|clear`,
-`bug-report`, `version` — e.g. `run_subagent.py
+`usage status|import`, `bug-report`, `version` — e.g. `run_subagent.py
 council --question "…" --cwd DIR`. The
 **legacy flat form still works unchanged** (`run_subagent.py --agent … --prompt …`,
 `--list`, `--manifest FILE`, …), and every flag below is valid in both. Bare
@@ -178,7 +180,10 @@ repair/wait action and do not retry or switch providers silently. Kimi `read-onl
 
 For any significant orchestration, use `doctor --json` and inspect `installs.drift` too.
 It enumerates every known summon copy, identifies the running copy, and reports duplicates
-or stale hashes. Do not trust the version string alone: a field machine had seven current
+or stale hashes. `installs.drift.managed_converged` is the installer gate for the copies
+`install.py` owns; the legacy `converged` field is stricter and also includes explicitly
+unmanaged project/plugin copies. A stale unmanaged copy is reported separately and is not
+changed by `install.py` without an explicit owner decision. Do not trust the version string alone: a field machine had seven current
 0.18.0 installs and one silently vendored 0.14.0 copy. Copies older than 0.18.0 include an
 agy cleanup path that could delete a caller file, so converge drift before running agy.
 
@@ -305,7 +310,9 @@ $env:CLAUDE_CONFIG_DIR = Join-Path $env:USERPROFILE ".claude-fable"
 claude auth login
 claude auth status
 skills\summon\scripts\summon.cmd doctor --json
-skills\summon\scripts\summon.cmd dispatch --agent fable --profile fable --model claude-fable-5 --cwd <project> --prompt "Return the required Final report block."
+$prompt = New-TemporaryFile
+Set-Content -LiteralPath $prompt -Encoding utf8 -Value "Return the required Final report block."
+skills\summon\scripts\summon.cmd dispatch --agent fable --profile fable --model claude-fable-5 --cwd <project> --prompt-file $prompt
 ```
 
 The dispatch envelope is authoritative: check `status`, `model.served`, `profile`, and the
@@ -451,6 +458,9 @@ longer than this child timeout so Summon can clean up and write its result envel
 | `--auth-action` / `--auth-backend` / `--allow-auth-repair` / `--auth-timeout` | No | Flat equivalents for the `auth` subcommands; repair remains blocked without explicit authorization |
 | `--doctor` | - | Check backend CLIs, wrapper deps, agents dir, git, **install drift**, and **T3 Code readiness** (`t3_code` in `--json`; portable labels only); add `--json` for machines. Run this FIRST on a new machine |
 | `telemetry enable\|disable\|status\|clear` | - | Manage opt-in, local-only diagnostics. Every dispatch outcome is represented by bounded, allow-listed metadata; prompt/result text and raw output are omitted, but deterministic prompt/error SHA-256 fingerprints may remain for correlation. No network call is made. Add `--json` for machine-readable output |
+| `usage status [--cache FILE] [--json]` | - | Read a bounded, normalized local `summon.usage/v1` cache. Provider-inert: no provider query, login, dispatch, or routing change. Missing data remains unknown |
+| `usage import --from FILE [--cache FILE] [--json]` | - | Validate and atomically store an operator-exported, redacted usage snapshot. Unknown fields and provider-attestation claims are rejected; unlike usage dimensions remain incomparable. Observation/retrieval times may lead the local clock by at most 5 minutes; the editable cache is revalidated on every read |
+| `--usage-action` / `--usage-from` / `--usage-cache` | No | Flat equivalents for the two `usage` subcommands. `--usage-cache FILE` may also accompany a dispatch `--dry-run` to add redacted freshness/dimension counts to `effective_decision`; it never changes the exact seat. These paths remain local and provider-inert |
 | `bug-report` | - | Generate a sanitized local Markdown report from the latest event or `--from FILE`; add `--output FILE` to choose the destination. Review it, then submit that exact file with `bug-report --submit-github --from REVIEWED_REPORT.md` (uses your authenticated `gh` CLI) |
 | `--onboard` | - | Detect installed CLIs / BytePlus key sources; write merge-safe prefs to `~/.agents/summon.json` (never stores API secrets). Subcommand form: `onboard` |
 | `--subscriptions LIST` | No | With `--onboard`: comma list of active plans (e.g. `byteplus-coding,claude`) recorded in prefs |
@@ -458,7 +468,7 @@ longer than this child timeout so Summon can clean up and write its result envel
 | `--no-write` | No | With `--onboard`: detect only; do not write prefs |
 | `--new-agent NAME` | - | Scaffold a new agent definition (house template); customize frontmatter with `--set`. Never overwrites |
 | `--set-agent NAME` | - | Edit an existing agent's frontmatter via `--set KEY=VALUE` (`KEY=` removes); body untouched, values validated |
-| `--set KEY=VALUE` | No | With the two above: `run-agent`, `model`, `permission`, `args`, `profile` (repeatable) |
+| `--set KEY=VALUE` | No | With the two above: `run-agent`, `model`, `model-policy`, `permission`, `args`, `profile` (repeatable) |
 | `--agent` | Yes* | Agent definition name from --list |
 | `--prompt` | Yes* | Task description to delegate (or `--prompt-file`) |
 | `--prompt-file FILE` | Yes* | Read the prompt from a UTF-8 file (BOM tolerated; strict decoding). Mutually exclusive with `--prompt`. Quoting/encoding ergonomics for long prompts; it does **not** avoid the OS argv limit - backends still receive the prompt on the command line. Windows caps the WHOLE assembled line at 32767 chars (measured: 20k prompt fine, 31k refused; the system context counts toward it), POSIX caps a single argument at 131072, and agy's own limit is ~28k. Over the limit summon refuses before spawning with an argv error - it used to surface as a bogus `CLI not found`, since Windows reports the overflow as a missing file. For material that large, write it to a file under `--cwd` and ask the agent to READ it. A `--background` child re-reads the file |
@@ -470,6 +480,7 @@ longer than this child timeout so Summon can clean up and write its result envel
 | `--enable-roles` | No | Opt into approved user-global role aliases. Exact roster names win; malformed, retargeted, chained, or unapproved aliases fail closed. Children inherit the flag |
 | `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `kimi`, `agy`, `gemini`, `arkcli`, `opencode` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
 | `--model` | No | Override the agent's frontmatter model for this call. Summon performs a side-effect-free backend/model namespace preflight first: a known cross-vendor pairing such as `--cli codex --model claude-opus-5` is returned as `status:blocked`, `error_kind:backend_model_incompatible`, with explicit compatible reroutes; it never builds a profile or spawns a provider. Unknown/future IDs are passed through rather than guessed. `--dry-run` reports the same refusal. |
+| `--require-exact-model` | No | Require provider-authored terminal evidence for the exact requested model. A mismatch or missing receipt becomes `status:blocked` with a non-retryable model-trust error; no fallback, resume, or contract repair is attempted. Built-in governance seats (for example `architect`, `fable`, `sol-review`, and `researcher`) enable this policy automatically; custom seats can declare `model-policy: exact`. |
 | `--profile` | No | Select a named private backend profile from `~/.agents/summon-profiles.json` (currently Claude only). The name is safe metadata; the registry keeps config/auth paths out of agent definitions and receipts. `--profile` overrides frontmatter `profile:` |
 | `--effort` | No | Reasoning / thinking intensity: `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none`/`default`/`off` = leave the backend alone). **Honored by claude + codex** (default **`high`**); **agy Gemini only when set explicitly** (rewrites model to `… (Low\|Medium\|High)`); **Kimi supported models via the isolated `config.toml` profile** (K3 maps `max` directly); **OpenCode maps the tier to its provider `variant`**; ignored for cursor-agent / gemini CLI / openai-compat / arkcli. Precedence: `--effort` > frontmatter `effort:` > `SUMMON_DEFAULT_EFFORT` > built-in `high`. Full matrix: [references/effort.md](references/effort.md) |
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy. Resume for implementation continuity; use a fresh context for final adversarial adjudication so a reviewer is not grading its own prior work. The envelope records `resumed:true|false` |
@@ -477,7 +488,7 @@ longer than this child timeout so Summon can clean up and write its result envel
 | `--worktree` | No | Run in an isolated git worktree (optional name; auto-named if bare). If `--gate-with` denies, summon removes only a pristine checkout whose HEAD still equals its creation commit. Any untracked/modified file, new commit, failed identity check, or cleanup race is preserved and reported in `worktree_cleanup`; no force-removal or force branch deletion is used |
 | `--isolated-lane` | No | Explicitly acknowledge a disposable-copy or separate-OS boundary for a broad-authority OpenCode turn. `--worktree` also satisfies the mutation-isolation requirement, but is not an OS security sandbox |
 | `--allow-tool-credentials` | No | Explicitly allow a yolo OpenCode child to receive a bridged provider credential. Requires `--isolated-lane` and a separate clone/Git directory, account, container, or VM; `--worktree` may add mutation isolation but never substitutes for the OS-boundary acknowledgement. Otherwise Summon scrubs inherited provider variables and fails closed |
-| `--background` | No | Dispatch detached; returns `{status:"background", job_id, result_file, job_dir, record_file}` at once. A launch record is written (fsynced) before the child spawns, so a job that dies before its result is still traceable. Managed installs freeze an immutable per-job scripts bundle before spawn; the record preserves both launcher and execution identities, and an install briefly refuses while that bundle is prepared |
+| `--background` | No | Dispatch detached; returns `{status:"background", job_id, result_file, job_dir, record_file}` at once. A launch record is written (fsynced) before the child spawns, so a job that dies before its result is still traceable. Parser/early-exit failures receive a typed terminal envelope, and result writes use bounded Windows sharing-violation retries; a hard-killed child remains `stale` rather than being treated as a provider result. Managed installs freeze an immutable per-job scripts bundle before spawn; the record preserves both launcher and execution identities, and an install briefly refuses while that bundle is prepared |
 | `--job-dir DIR` | No | Where `--background` writes job records and results (default `{tempdir}/subagents_jobs`; env `SUMMON_JOBS_DIR`). Point it at a durable, private path. Single-user model: summon does not defend the registry against other local users on a shared host |
 | `jobs list` / `jobs status ID` / `jobs wait ID` | - | Read-only registry commands (flat: `--jobs-list` / `--jobs-status ID` / `--jobs-wait ID`; add `--job-dir` and `--json` for `list`/`status`, or `--job-dir` and `--timeout` for `wait`). `list` shows `prepared`, liveness-verified `running`, `stale` (pid gone with no result), `identity_mismatch` (nonce matches but the terminal scripts digest differs from the frozen execution bundle), `unverified` (probe unavailable), or a terminal status. `status` includes `liveness:alive|dead|unknown`; `wait` returns early on stale or identity mismatch instead of burning its timeout. A result is `trusted` only when its `job_nonce` and, for frozen jobs, its scripts digest match the launch record. Liveness proves that a pid exists, not that an old pid was never reused |
 | `--dry-run` | No | Print the fully resolved dispatch (command, model, permission flags) WITHOUT executing — catches wrong models/permissions/dead backends in zero paid runs |
@@ -490,9 +501,10 @@ longer than this child timeout so Summon can clean up and write its result envel
 | `--gate-with AGENT` | No | Require AGENT to APPROVE this dispatch before it runs. The gate is dispatched **forced read-only** (regardless of its own definition, so a gate can never be a privilege-escalation path) and adjudicates the *request*: agent, prompt, permission, cwd. **Fails closed** -- a gate that denies, errors, times out, or emits no parseable `VERDICT:` line blocks the dispatch with `status:blocked`. `VERDICT: UNCERTAIN` additionally sets `requires_human_review:true`, routing the decision to a person. The decision lands in the envelope's `gate` field, including `gate.environment_handoff` if the gate left a resource for the caller. Single dispatch only (rejected for `--manifest`/`--council`). |
 | `--gate-timeout` | No | Timeout for the `--gate-with` dispatch (same grammar as `--timeout`; defaults to it) |
 | `--retries N` | No | Re-dispatch up to N times on `error`/`partial` (exponential backoff; `blocked` is never retried — its cause is structural). Envelope gains `attempts` |
-| `--transient-retries` | No | Also retry a short allowlist of transient transport failures (rate limit / 429 / connection reset) that `--retries` alone would leave alone. Off by default |
+| `--transient-retries` | No | Also retry once for a short allowlist of transient transport failures (rate limit / 429 / connection reset) that `--retries` alone would leave alone. Off by default; it never silently switches providers |
 | `--transport {subprocess,acp}` | No | Force the dispatch transport (default `subprocess`). `acp` runs the turn over the Agent Client Protocol — native support only: `gemini` (`--acp`), `kimi` (`acp`), `cursor-agent` (`acp`). Overrides the agent's `transport:` frontmatter. See "ACP transport" |
 | `--no-acp-fallback` | No | Disable the automatic ACP recovery attempt when a subprocess dispatch fails, and the oversized-prompt ACP routing. Env form: `SUMMON_ACP_FALLBACK=0` |
+| `--allow-kimi-acp-fallback` | No | Explicitly allow one ACP recovery turn after a Kimi subprocess timeout/stream failure. Off by default because Summon's native Kimi ACP adapter has no host filesystem/terminal tool bridge; use only when a deliberate second provider turn is wanted. Env form: `SUMMON_KIMI_ACP_FALLBACK=1` (also inherited by manifest/council children) |
 | `--allow-credit` | No | Authorize spending ACCOUNT CREDIT on an unconditionally credit-only model for this one dispatch (no model meets that definition today; Fable billing is plan-dependent and handled separately, so this currently authorizes nothing and is kept for compatibility); flag form of `SUMMON_ALLOW_CREDIT=1`. Single dispatch only: rejected for `--manifest`/`--council`, where env inheritance would silently authorize every child (set the env var deliberately for fan-out spend) |
 | `--allow-payg` | No | Authorize BytePlus PAYG (`/api/v3`) fallback if the Coding Plan endpoint fails with quota/plan-limit/unsupported-model. Flag form of `SUMMON_ALLOW_BYTEPLUS_PAYG=1`. Requires `BYTEPLUS_CODING_API_KEY` for Coding Plan (`provider: byteplus-coding` / `byteplus-coder`). Single dispatch only: rejected for `--manifest`/`--council` (set the env var or `~/.agents/summon.json` `{"allow_byteplus_payg": true}` for fan-out). The PAYG retry fires once and bills **per-token Platform credits**, not plan quota. See [references/backends.md](references/backends.md#byteplus-modelark-coding-plan--platform-payg) |
 | `--allow-text-only` | No | Authorize a **text-seat** dispatch (`openai-compat` / Summon `arkcli +chat`: no filesystem or tool loop) for this one call. Flag form of `SUMMON_ALLOW_TEXT_ONLY=1`. Agent frontmatter `capability: text-only` also opts in for **single** dispatch (house chat agents); every allowed run still emits a loud TEXT SEAT warning. **Council/manifest auto-reject** text-seat members unless `SUMMON_ALLOW_TEXT_ONLY=1` (capability / this flag alone are not enough for fan-out). On `status:blocked` with `blocked_reason: text_seat_no_tools`, hosts must get fresh consent — **never auto-retry with this flag** |
@@ -585,9 +597,9 @@ stdout entirely.
 
 \*Required for a **dispatch** (running an agent). Not needed for the query/management
 modes — `--list`, `--list-models`, `--doctor`, `--onboard`, `--new-agent`, `--set-agent`, `--version`,
-`telemetry`, `bug-report`, or `--manifest` (which carries its own jobs).
+`telemetry`, `usage`, `bug-report`, or `--manifest` (which carries its own jobs).
 
-**Mode-scoped flags** (ignored/invalid outside their mode): `--json` → `--doctor`/`--onboard`/`council status`/`jobs list`/`jobs status`/`telemetry`/`bug-report` only;
+**Mode-scoped flags** (ignored/invalid outside their mode): `--json` → `--doctor`/`--onboard`/`council status`/`jobs list`/`jobs status`/`telemetry`/`usage`/`bug-report` only;
 `--subscriptions`/`--reset`/`--no-write` → `--onboard` only; `--set` → `--new-agent`/`--set-agent` only; `--concurrency`/`--results-dir` → `--manifest`
 only; `--resume-profile` → agy resume only. Mutually exclusive: `--dry-run` with
 `--background`/`--manifest`; `--background` with `--out` (background reports completion
@@ -640,14 +652,19 @@ Every response carries structured fields for programmatic orchestration:
 | `billing` | `{source, note}` — did this run draw from a vendor **subscription** (CLI login), metered **api** credits, account **credit** (a subscription-CLI model that bills like API), or is the source **unknown**? Pairs with `usage`/`cost_usd` to attribute spend. Advisory (the vendor's billing is truth). |
 | `elapsed_ms` | Wall-clock for the dispatch — on every DISPATCH envelope (success/blocked/partial/error/timeout, incl. spawn failures). Not on the `--background` handle or pre-dispatch validation errors. Use it to tune swarm concurrency. |
 | `timeout` | On a timeout, `{budget_ms, stage, partial_output}` says which bounded budget expired and whether usable text was preserved. ACP names the exact protocol stage (`initialize`, `session/new`, `session/set_model`, or `session/prompt`). A subprocess backend reports `backend-execution`: summon can attest its own deadline but cannot truthfully separate vendor startup, model reasoning, and an agent's tool call without provider telemetry. |
-| `model` | `{requested, targeted, served, resolved, models_used}`, split by EVIDENCE. `requested` = what the caller asked for. `targeted` = what the session was POINTED AT (init handshake, else the post-credit-guard effective model, else the backend's knowable default). `served` = the model that actually did work, set ONLY on service evidence (a terminal-event model report, or output tokens with a known target). `served` is null whenever no service evidence was observed (typical for failed runs) even when `targeted` names a model, and task status is never used as evidence in either direction (a served run can be legitimately downgraded to `blocked`). `resolved` = LEGACY v1 compatibility: handshake-or-terminal, plus the Codex config backfill only for unpinned requests. An explicit Codex pin never inherits the ambient default into `resolved`; that default is not evidence about the turn. Migrate to `targeted`/`served`. `models_used` lists every model id seen (a claude session often also runs a cheap auxiliary model). agy reports none of these beyond `targeted`. Use `served_model_evidence` to distinguish a provider report from an inference. Aliases (`opus`/`sonnet`) can lag a launch; pin the explicit ID for a guaranteed-latest run. |
-| `served_model_evidence` | `reported`, `inferred`, or `absent`. How Summon established `model.served`: `reported` is a non-empty, bounded terminal provider model report; `inferred` is output-token evidence paired with a known target; `absent` means neither was observed. Unsafe or malformed provider values are discarded and never become provenance. This field never invents a model. Missing evidence does not make an otherwise usable success nonterminal; provenance-required workflows must reject `absent` or `inferred` explicitly. A success with an empty or missing result is normalized to `status:"error"` with a consistent exit tuple and `error_kind:"empty_terminal_result"`. |
+| `partial` | Kimi-only timeout diagnostics, when assistant text arrived before clean EOF: `{text, authoritative:false, source:"stream_parts_pre_eof", finalized:false, part_count, captured_chars, bytes_retained, truncated, truncated_chars}`. This bounded, redacted snapshot is advisory only; it is never parsed as `report`, copied into `result`, used for resume/cache reuse, or treated as model evidence. |
+| `model` | `{requested, targeted, served, resolved, models_used, exact_required, exact_source, evidence_source}`, split by EVIDENCE. `requested` = what the caller asked for. `targeted` = what the session was POINTED AT (init handshake, else the post-credit-guard effective model, else the backend's knowable default). `served` = the model that actually did work, set ONLY on service evidence (a trusted terminal/runtime model report, or output tokens with a known target). `served` is null whenever no service evidence was observed (typical for failed runs) even when `targeted` names a model, and task status is never used as evidence in either direction (a served run can be legitimately downgraded to `blocked`). `resolved` = LEGACY v1 compatibility: handshake-or-terminal, plus the Codex config backfill only for unpinned requests. An explicit Codex pin never inherits the ambient default into `resolved`; that default is not evidence about the turn. Migrate to `targeted`/`served`. `models_used` lists every model id seen (a Claude session often also runs a cheap auxiliary model). `exact_required` reports the active fail-closed named-model policy, and `exact_source` identifies `named-seat`, `frontmatter`, or `cli` when present. `evidence_source` identifies the bounded backend/provider record used when available (for example Kimi's `kimi_assistant_record` or `kimi_wire_usage_record`); it is null when the backend exposes no identity. agy reports none of these beyond `targeted`. Use `served_model_evidence` to distinguish a report from an inference. Aliases (`opus`/`sonnet`) can lag a launch; pin the explicit ID for a guaranteed-latest run. |
+| `served_model_evidence` | `reported`, `inferred`, or `absent`. How Summon established `model.served`: `reported` is an authoritative backend/provider terminal identity; `inferred` is client-observed routing evidence; `absent` means neither was observed. Kimi 0.38 stdout and per-call `usage.record` journals are child-writable, so even a positive-output record followed by `turn.ended:completed` is labeled `inferred`, never authoritative named-model proof. Unsafe, malformed, stale, linked, mixed-model, incomplete, or conflicting values are discarded. This field never invents a model. Missing or inferred evidence does not make an ordinary success nonterminal, but provenance-required workflows reject it. A success with an empty or missing result is normalized to `status:"error"` with a consistent exit tuple and `error_kind:"empty_terminal_result"`. |
+| `model_match`, `named_model_verified` | A safe tri-state proof surface. `model_match:true` is emitted only when a trusted backend/provider completion record says the exact `model.requested`, `model.targeted`, and `model.served` identifiers are equal and `served_model_evidence:"reported"`; `false` means reported identity disagrees; `null` means evidence is inferred, absent, malformed, or incomplete. `named_model_verified` is `true` only when `model_match:true` and is otherwise `false`. These fields never trust caller-supplied envelope booleans, and an alias that is warning-compatible is not an exact named-model proof. |
+| `exit_code`, `raw_backend_exit_code`, `normalized_exit_code` | `exit_code` is retained for compatibility and may describe the child process. `raw_backend_exit_code` is the explicit child/transport code; `normalized_exit_code` is Summon's outcome code after report/status normalization (for example, a complete report can normalize a raw `1` to `0`). Use the explicit pair for automation; do not infer execution outcome from the legacy field alone. |
+| `tool_failure` | Present when the child runtime reports a structurally missing executable. Contains only a safe executable basename, `kind:"missing_executable"`, bounded fallback recommendations, and `fatal:true`. A complete report is retained for advisory inspection but cannot override the failed execution. This is an execution-environment diagnostic, not provider authentication; the dispatcher never publishes local paths or secrets. |
 | `opencode_stream` | OpenCode subprocess completion evidence: `{event_count, step_finish_seen, completion_evidence, finish_reason?, zero_output_finish?, zero_token_finish?}`. `completion_evidence:"clean_eof_without_step_finish"` means the child ended before its normal final event; `finish_reason:"unknown"` with `zero_token_finish:true` identifies a no-output completion. Summon marks an empty result as an error and callers must not use it as a review verdict. |
 | `opencode_diagnostic` | Bounded OpenCode failure classification. `unknown_finish_zero_tokens` means the child emitted `step_finish(reason=unknown)` with all-zero usage and no usable text; it is a provider/model no-output symptom, not a permission approval result. |
 | `summon`, `agent_def`, `prompt_sha256`, `git_head_before`, `workspace_evidence`, `artifacts` | Provenance receipt, built progressively on the dispatch path: `summon` identity is on EVERY envelope the path emits (validation errors, missing agent, preflight, results); the other fields join as they become known. `summon` = `{version, script, scripts_sha256}` (one SHA-256, length-prefixed framing, over every production module, so divergent installs become diagnosable from any envelope). `agent_def` = `{file, sha256, agents_dir, source: project\|bundled\|explicit\|env}`, where `agents_dir` is the absolute roster directory the definition was ACTUALLY loaded from. `prompt_sha256` hashes the ROOT prompt. `git_head_before` names tracked repo state. `workspace_evidence` is additive mutation evidence: `{before,after,coverage,child_commit,mutation,read_only_violation,attribution}`. Each snapshot exposes only `head`, `branch`, and bounded repo-relative `staged`, `unstaged`, `renamed`, and `untracked` paths; it never emits cwd, repository root, file contents, or secrets. `coverage` is `complete`, `incomplete`, or `unavailable`; `mutation`, `child_commit`, and `read_only_violation` are `true`/`false` only when the before/after comparison proves them, otherwise `null`. A dirty baseline makes attribution `ambiguous`; a clean baseline makes it `exact`; unavailable coverage is `unavailable`. Git reads use hidden Windows utility flags, per-call/overall deadlines, and a bounded status payload. This evidence does not enforce read-only and does not expose `--verify-no-mutations` yet. Repeatable `--artifact` adds an opt-in loose-file manifest `{files:[{path,sha256,bytes,page_count,page_count_source}],sha256,stable_during_dispatch,after_sha256,changed,after_error?}` and joins its manifest hash to request reuse. `changed` lists proven identity differences and is `null` when the after-read failed; `after_error` explains why stability is unknown. Either case makes a successful result suspect. Hashes and paths only, never content or secrets; paths are local-operator data. |
 | `permission`, `permission_flags` | The permission level and the EXACT CLI flags it mapped to for this run — no more black box. |
 | `effort` | Requested/applied reasoning effort. Claude/Codex pass it to the CLI; supported Kimi models apply it in the isolated profile and add `effort_transport: "kimi-profile-config"`; OpenCode passes it as a provider `variant` and adds `effort_transport: "opencode-variant"`; agy Gemini exposes the tier in `model.requested`. Kimi/OpenCode local configuration is not provider-authored served-model evidence. |
-| `attempts` | How many dispatches this envelope took (`--retries`). |
+| `attempts`, `attempt_status`, `execution_status` | `attempts` is the number of provider turns taken (`--retries`). Every structural pre-dispatch refusal (for example a read-root, backend, model, text-seat, or gate refusal) carries `attempts:0`, `attempt_status:"not_run"`, `execution_status:"not_run"`, and `provider_contacted:false`; it also carries `model.served:null`, `served_model_evidence:"absent"`, `model_match:null`, and `named_model_verified:false`. Its terminal operation `status` remains `error` or `blocked` according to the refusal path. Retry and corrective aggregation never turns that zero into an invented attempt. |
+| `attempt_id` | Opaque UUID-shaped identity for one physical provider launch. Each retry or transport fallback gets a new ID; structural `not_run` refusals omit it. Background jobs bind the same ID to their durable launch record and terminal receipt, so competing finalizers cannot relabel one attempt. |
 | `parsed`, `parse_ok`, `parse_errors` | With `--json-schema`: the agent's final JSON (validated), whether it satisfied the schema, and the specific violations. `parse_retry: true` marks the corrective follow-up. `parse_warnings` lists any schema keywords that were NOT enforced (see below). |
 | `output_tail` | On non-success: the tail of the RAW captured output (stdout+stderr merged) so failures are diagnosable without a re-run. `--debug-dir` captures the full transcript. |
 | `skipped` | `true` when `--out` found a terminal envelope and did not dispatch. A normal failure is re-run; a typed `empty_terminal_result` is preserved as a non-retryable error until the operator explicitly removes its result file or supplies `--retry-nonretryable`. The override permits one deliberate fresh dispatch; if it returns empty again, further retries remain suppressed. |
@@ -716,12 +733,19 @@ For the backends with **native** Agent Client Protocol support — `gemini`, `ki
 `cursor-agent` — summon can run the turn over ACP (JSON-RPC over stdio) instead of a
 one-shot argv spawn. Three ways it engages:
 
-1. **Auto-fallback** (default on): when a subprocess dispatch ends `error`/`partial` in a
-   way a transport change can plausibly fix (timeouts, stream-shape losses), summon makes
-   ONE recovery attempt over ACP, re-gated under `--gate-with`. Structural failures
-   (CLI missing, auth, unenforceable tier, argv-length) never trigger it. The envelope
-   records `fallback: {from, to, reason, primary_status}` and the attempt counts in
-   `attempts`/spend. Disable with `--no-acp-fallback` or `SUMMON_ACP_FALLBACK=0`.
+1. **Auto-fallback** (default on for other native ACP backends): when a subprocess
+   dispatch ends `error`/`partial` in a way a transport change can plausibly fix
+   (timeouts, stream-shape losses), summon makes ONE recovery attempt over ACP,
+   re-gated under `--gate-with`. Structural failures (CLI missing, auth, unenforceable
+   tier, argv-length) never trigger it. Kimi timeout/stream recovery is the exception:
+   it is disabled by default because the ACP adapter has no Summon filesystem/terminal
+   bridge and a second turn can duplicate spend without recovering the task. Opt in for
+   that deliberate second Kimi turn with `--allow-kimi-acp-fallback` or
+   `SUMMON_KIMI_ACP_FALLBACK=1`. The envelope records
+   `fallback: {from, to, reason, primary_status}` (or
+   `{to:"acp", status:"not_attempted", reason:"kimi_timeout_requires_explicit_opt_in"}`)
+   and the attempt counts in `attempts`/spend. Disable all automatic fallback with
+   `--no-acp-fallback` or `SUMMON_ACP_FALLBACK=0`.
 2. **Oversized prompts**: a prompt over the OS argv limit routes to ACP automatically
    (the prompt travels via stdin, no cap) with a warning, instead of erroring.
 3. **Opt-in**: `transport: acp` frontmatter or `--transport acp` makes ACP the primary
@@ -968,6 +992,7 @@ permissions.
 | `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `kimi`, `agy`, `opencode`, `openai-compat` | Which backend executes this agent (`opencode` = OpenCode's toolful CLI gateway; `openai-compat` = any direct OpenAI-compatible API — see "Custom & API backends") |
 | `permission` | `read-only`, `safe-edit` (default), `yolo` | Approval/sandbox level the sub-agent runs with |
 | `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.served` |
+| `model-policy` | `exact` (optional) | Require provider-authored terminal evidence for the pinned model. A mismatch or missing served-model receipt blocks the result without fallback, resume, or contract repair. Built-in governance seats use this policy automatically. |
 | `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning / thinking for this agent. Honored by **claude + codex**; on **agy** + Gemini, counts as *explicit* and rewrites the model suffix; on supported **Kimi** models, writes the isolated profile config; on **OpenCode**, maps to its `variant`. Ignored on other CLIs. `--effort` at dispatch overrides it. See [references/effort.md](references/effort.md) |
 | `openrouter_options` | JSON object (OpenCode only, optional) | Bounded OpenRouter `fusion`/`auto-router` plugin settings. Unknown fields, arbitrary request-body overrides, and mismatched router aliases are rejected. See [references/backends.md](references/backends.md#openrouter-routers-through-opencode) |
 | `args` | shell-style string (optional) | Arbitrary extra backend flags. Codex model-bearing `-m`/`--model`/`-c model=...` selectors are parsed, compared, and collapsed into one canonical selector; other flags remain subject to the permission boundary |
@@ -1045,20 +1070,28 @@ as documentation only. A listed or cataloged model is not proof of account eligi
 successful dispatch envelope with exact `model.served` evidence establishes what ran.
 
 For an explicit Codex pin, Summon emits one canonical `-m` selector and refuses
-conflicting `-m`/`--model`/`-c model=...` values before contacting Codex. The run
-is blocked with a terminal model-trust error when Codex reports a different
-handshake/served model or no authoritative terminal served-model receipt. Summon
-does not retry or silently switch such a request; inspect `model.requested`,
-`model.targeted`, `model.served`, `served_model_evidence`, `error_kind`, and
-`result_usable` together. See [`docs/SUMMON_3.2_PLAN.md`](../../docs/SUMMON_3.2_PLAN.md)
-for the next-release resume and live-evidence contract.
+  conflicting `-m`/`--model`/`-c model=...` values before contacting Codex. The same
+  terminal model-trust gate is used for every backend when a seat is
+  provenance-required: a built-in governance seat (including `architect`, `fable`,
+  `sol-review`, and `researcher`) or a custom seat with `model-policy: exact` must
+  receive provider-authored evidence for the exact requested model. Use
+  `--require-exact-model` to opt a one-off custom dispatch into the same policy.
 
-This gate applies to provenance-required named-model claims, not to Codex as a backend.
-Ordinary Codex dispatch remains supported. A blocked explicit pin means that the provider
-did not prove the requested identity; it is not evidence that another model (for example,
-Luna) served the turn. The Sol seat becomes certifiable only after the Codex CLI or adapter
-emits a provider-authored terminal model receipt and the live match/mismatch/missing-receipt
-matrix passes.
+  The run is blocked with a terminal model-trust error when the provider reports a
+  different dominant terminal model or no authoritative served-model receipt.
+  Auxiliary models may appear in `model.models_used` (Claude sessions commonly use
+  more than one model), but they do not satisfy the named seat when the terminal
+  served model differs. Summon does not retry, resume, contract-repair, or silently
+  switch an exact request. Inspect `model.requested`, `model.targeted`,
+  `model.served`, `model.models_used`, `served_model_evidence`, `error_kind`, and
+  `result_usable` together. See [`docs/SUMMON_3.2_PLAN.md`](../../docs/SUMMON_3.2_PLAN.md)
+  for the live-evidence contract.
+
+  Ordinary best-effort dispatch remains supported for seats without this policy.
+  A blocked exact pin means that the provider did not prove the requested identity;
+  it is not evidence that another model (for example, Luna) served the turn. The Sol
+  seat becomes certifiable only after the CLI or adapter emits a provider-authored
+  terminal model receipt and the live match/mismatch/missing-receipt matrix passes.
 
 **`permission` → exact per-CLI flags** (what the script actually passes — the
 levels are NOT identical across CLIs; when behavior surprises you, check this table):

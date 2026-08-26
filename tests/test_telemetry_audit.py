@@ -161,6 +161,19 @@ class TelemetryAuditTests(unittest.TestCase):
         self.assertNotEqual(MODULE.canonical_terminal_payload(first),
                             MODULE.canonical_terminal_payload(changed))
 
+    def test_not_run_terminal_requires_zero_attempts_and_unknown_model_proof(self):
+        valid = terminal(
+            status="blocked", failure_class="blocked", execution_status="not_run",
+            attempt_status="not_run", attempts=0, provider_contacted=False,
+            served_model_evidence="absent", model_match=None,
+            named_model_verified=False)
+        self.assertEqual(MODULE.reconcile([valid])["counts"]["accepted"], 1)
+        for field, value in (("attempts", 1), ("provider_contacted", True),
+                             ("model_match", True), ("named_model_verified", True),
+                             ("served_model_evidence", "inferred")):
+            forged = dict(valid, **{field: value})
+            self.assertEqual(MODULE.reconcile([forged])["counts"]["invalid"], 1, field)
+
 
 if __name__ == "__main__":
     unittest.main()

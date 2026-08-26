@@ -105,7 +105,7 @@ def parse_quorum(value: str) -> int | str:
 MODE_FLAGS = {
     "manifest": {"manifest", "concurrency", "results_dir", "cwd", "agents_dir",
                  "retries", "retry_nonretryable", "job_file", "strict_agents_dir",
-                 "enable_roles"},
+                 "enable_roles", "allow_kimi_acp_fallback"},
     # Operation-level rows: a fresh council, a resume, and a read-only status
     # each consume a DIFFERENT set (v3.1). Changing members/rounds/question on a
     # resume would be a new run, so they are rejected there; status takes only
@@ -114,14 +114,15 @@ MODE_FLAGS = {
                 "rounds", "cwd", "agents_dir", "timeout", "out", "run_dir", "results_dir",
                 "job_file", "quorum", "chairman_fallback", "member_timeout",
                 "chair_timeout", "overall_timeout", "min_successful", "strict_agents_dir",
-                "enable_roles"},
+                "enable_roles", "allow_kimi_acp_fallback"},
     # A resume may change how the SAME run's stages are gated/timed (quorum,
     # fallback, per-stage timeouts) without changing its identity; question,
     # members, chairman, and rounds still come from the receipt.
     "council-resume": {"council", "resume_run", "cwd", "agents_dir", "timeout",
                        "out", "run_dir", "results_dir", "job_file",
                        "quorum", "chairman_fallback", "member_timeout", "chair_timeout",
-                       "overall_timeout", "min_successful", "strict_agents_dir", "enable_roles"},
+                       "overall_timeout", "min_successful", "strict_agents_dir", "enable_roles",
+                       "allow_kimi_acp_fallback"},
     # Status takes ONLY its id, where to look, and the output format -- it never
     # dispatches, so it has no working directory (use --run-dir to point it).
     "council-status": {"council_status", "run_dir", "json", "job_file"},
@@ -162,6 +163,7 @@ MODE_FLAGS = {
     # bug-report submission is an explicit, user-authenticated gh invocation.
     "telemetry": {"telemetry_enable", "telemetry_disable", "telemetry_status",
                    "telemetry_clear", "json", "job_file"},
+    "usage": {"usage_action", "usage_from", "usage_cache", "json", "job_file"},
     "bug-report": {"bug_report", "bug_report_from", "bug_report_output",
                      "bug_report_submit", "github_repo", "bug_title",
                      "bug_description", "json", "job_file"},
@@ -206,6 +208,8 @@ MODE_HINTS = {
                   "and --timeout."),
     "telemetry": ("telemetry is local-only and opt-in: it writes bounded, sanitized "
                   "JSONL evidence and never phones home."),
+    "usage": ("usage status/import is provider-inert: it reads or validates a bounded, "
+              "redacted local cache and never contacts a provider or changes routing."),
     "bug-report": ("bug-report writes a sanitized local report; review it before the "
                     "explicit --submit-github action."),
     "auth": ("auth status is read-only. auth repair never runs unless --allow-auth-repair "
@@ -255,6 +259,8 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
     if any(getattr(args, name, False) for name in
            ("telemetry_enable", "telemetry_disable", "telemetry_status", "telemetry_clear")):
         return "telemetry"
+    if getattr(args, "usage_action", None):
+        return "usage"
     if getattr(args, "bug_report", False):
         return "bug-report"
     if getattr(args, "auth_action", None):
@@ -304,7 +310,8 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 # discoverable command surface.
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
                "onboard", "manifest", "council", "deliberate", "agent", "jobs", "version",
-               "chat", "swarm", "role", "telemetry", "bug-report", "auth", "help", "--help", "-h"}
+               "chat", "swarm", "role", "telemetry", "usage", "bug-report", "auth",
+               "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -345,6 +352,8 @@ Commands:
   jobs list|status [ID] [--job-dir D] [--json]      inspect background jobs
   jobs wait ID [--job-dir D] [--timeout T]          wait for one background job
   telemetry enable|disable|status|clear [--json]  manage opt-in local diagnostics
+  usage status [--json] | usage import --from FILE [--json]
+                                                  inspect/import redacted local usage evidence
   bug-report [--from FILE] [--output FILE] [--json] create a sanitized report
              [--bug-title TEXT] [--bug-description TEXT]
              --submit-github --from REVIEWED.md [--github-repo OWNER/REPO]
@@ -420,6 +429,13 @@ Manage opt-in local diagnostics. `enable`/`disable` persist the choice; `status`
 the bounded JSONL spool; `clear` removes captured events without disabling collection.
 The `SUMMON_TELEMETRY` environment override is non-persistent and inherited by Summon
 children. No telemetry command dispatches an agent or makes a network call.
+""",
+    "usage": """summon usage status [--json] [--cache FILE]
+summon usage import --from SNAPSHOT.json [--json] [--cache FILE]
+
+Inspect or import normalized, redacted usage evidence. Both actions are provider-inert:
+they never query a provider, repair authentication, dispatch, or change model routing.
+Usage dimensions remain separate; unlike categories are never reduced to one score.
 """,
     "bug-report": """summon bug-report [--from SOURCE] [--output REPORT.md] [--json]
                      [--bug-title TEXT] [--bug-description TEXT]
@@ -629,6 +645,26 @@ def rewrite_subcommand(argv: list) -> tuple:
             return argv, "error: 'telemetry' needs enable/disable/status/clear"
         flag = "--telemetry-" + rest[0]
         return [flag, *rest[1:]], None
+    if head == "usage":
+        if not rest or rest[0] not in ("status", "import"):
+            return argv, "error: 'usage' needs status/import"
+        action = rest[0]
+        translated = []
+        index = 1
+        while index < len(rest):
+            token = rest[index]
+            if token == "--from":
+                translated.append("--usage-from")
+            elif token.startswith("--from="):
+                translated.append("--usage-from=" + token.split("=", 1)[1])
+            elif token == "--cache":
+                translated.append("--usage-cache")
+            elif token.startswith("--cache="):
+                translated.append("--usage-cache=" + token.split("=", 1)[1])
+            else:
+                translated.append(token)
+            index += 1
+        return ["--usage-action", action, *translated], None
     if head == "bug-report":
         return ["--bug-report", *rest], None
     return argv, None
@@ -696,6 +732,13 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                                  action="store_true", help="Show local diagnostics status")
     telemetry_group.add_argument("--telemetry-clear", dest="telemetry_clear",
                                  action="store_true", help="Delete captured local diagnostics")
+    parser.add_argument("--usage-action", choices=["status", "import"],
+                        help="Provider-inert local usage evidence action")
+    parser.add_argument("--usage-from", dest="usage_from", metavar="FILE",
+                        help="With usage import: redacted summon.usage/v1 snapshot")
+    parser.add_argument("--usage-cache", dest="usage_cache", metavar="FILE",
+                        help="Private local usage cache override; with dispatch, valid only "
+                             "for provider-inert --dry-run explanation")
     parser.add_argument("--bug-report", dest="bug_report", action="store_true",
                         help="Create a sanitized local bug report from the latest event or --from")
     parser.add_argument("--from", dest="bug_report_from", metavar="FILE",
@@ -712,7 +755,7 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Short sanitized description for the report")
     parser.add_argument("--transient-retries", dest="transient_retries", action="store_true",
                         help="Enable one conservative retry on transient network/5xx/"
-                             "timeout errors (also SUMMON_TRANSIENT_RETRIES=1). Never retries "
+                             "timeout/rate-limit (429) errors (also SUMMON_TRANSIENT_RETRIES=1). Never retries "
                              "ambiguous billable write failures")
     parser.add_argument("--doctor", action="store_true",
                         help="Check backend CLIs, agy wrapper deps, agents dir, and git; "
@@ -725,7 +768,8 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "(KEY= removes); body untouched")
     parser.add_argument("--set", dest="sets", action="append", default=[],
                         metavar="KEY=VALUE",
-                        help="With --new-agent/--set-agent: run-agent, model, permission, args, profile")
+                        help="With --new-agent/--set-agent: run-agent, model, model-policy, "
+                             "permission, args, profile")
     parser.add_argument("--json", action="store_true",
                         help="Emit machine-readable JSON where supported by the selected command")
     parser.add_argument("--probe", action="store_true",
@@ -755,6 +799,9 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     )
     parser.add_argument("--cli", help="Force specific CLI (claude, cursor-agent, codex, gemini)")
     parser.add_argument("--model", help="Override the agent's frontmatter model for this call")
+    parser.add_argument("--require-exact-model", dest="require_exact_model", action="store_true",
+                        help="Require authoritative terminal evidence for the exact requested model; "
+                             "mismatch or missing evidence blocks the result without retry/fallback")
     parser.add_argument("--profile", help="Select a named private backend profile for this call; "
                         "the name is resolved from ~/.agents/summon-profiles.json and never a path")
     parser.add_argument(
@@ -772,6 +819,11 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--no-acp-fallback", dest="no_acp_fallback", action="store_true",
                         help="Disable the automatic ACP recovery attempt (and oversized-prompt "
                              "ACP routing) when the subprocess transport fails")
+    parser.add_argument("--allow-kimi-acp-fallback", dest="allow_kimi_acp_fallback",
+                        action="store_true",
+                        help="Explicitly allow a Kimi timeout to try one ACP recovery turn; "
+                             "off by default because ACP has no Summon filesystem/terminal "
+                             "adapter (env: SUMMON_KIMI_ACP_FALLBACK=1)")
     parser.add_argument("--worktree", nargs="?", const="", default=None,
                         help="Run in an isolated git worktree (optional name; auto-named if bare)")
     parser.add_argument("--isolated-lane", dest="isolated_lane", action="store_true",

@@ -49,6 +49,12 @@ class AgentInvocation:
     # Where a model pin came from. This is diagnostic provenance only; the
     # canonical selector remains the authority for launch behavior.
     model_source: str | None = None
+    # A provenance-required seat must prove that the provider served the exact
+    # requested model.  This is separate from ``model_source``: most pinned
+    # implementation seats are best-effort, while named review seats can opt
+    # into a fail-closed identity contract.
+    model_exact_required: bool = False
+    model_exact_source: str | None = None
     effort: str | None = None          # reasoning effort: low..max (Kimi uses profile config)
     resume_id: str | None = None       # backend session/thread/chat id to resume
     resume_profile: str | None = None  # agy only: profile dir of the session to resume
@@ -91,6 +97,11 @@ class AgentInvocation:
     # Ordinary dispatches use the report contract. Receipt-bound deliberation
     # turns use a typed ballot contract and must not receive the report nudge.
     output_contract: str = "report"
+    # Stable identity for one physical backend launch. Retries and transport
+    # fallbacks receive a fresh value; direct callers may leave it unset and
+    # the executor will mint one before any provider contact. This is an
+    # opaque UUID-shaped value, never a prompt or provider identifier.
+    attempt_id: str | None = None
 
 
 # Short report-contract nudge appended to RESUME prompts. On resume the session
@@ -114,6 +125,13 @@ Add `LEFT_BEHIND: none` to the Final report if nothing remains. Otherwise, use
 `LEFT_BEHIND:` to name each remaining resource, its location or identifier, its current
 state, why it remains, and the safe stop/removal action. Never include secret values,
 credentials, or tokens in that field.
+
+Use tools that exist in the child environment. On Windows, do not assume POSIX
+`grep`, `sed`, `awk`, or `find` are installed: prefer `rg` when available,
+PowerShell `Select-String`/`Get-ChildItem`, or Python's standard library. If a
+preferred command is missing, continue with one of those fallbacks and mention the
+substitution in the report; do not install tools or retry a completed task solely
+because a convenience command was unavailable.
 """
 
 

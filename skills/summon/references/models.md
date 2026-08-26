@@ -42,9 +42,11 @@ reaches an agent depends only on how that agent names its model:
 > resolved to `claude-sonnet-4-6` while `claude-sonnet-5` was already available. Every
 > dispatch envelope reports `model.served` (the model that actually did the work, on
 > evidence; `model.targeted` is what the session was pointed at, and `resolved` is the
-> legacy field) — check it. For an explicit Codex pin, `resolved` is never filled from
-> the ambient config default when the provider emits no identity; that default is not
-> evidence about the turn. For **guaranteed-latest**, pin the explicit version ID
+> legacy field) — check it. For an exact named-model seat, `resolved` is never treated as
+> a substitute for provider-authored `served` evidence; a missing or mismatching terminal
+> identity blocks the seat. For an explicit Codex pin, `resolved` is never filled from the
+> ambient config default when the provider emits no identity; that default is not evidence
+> about the turn. For **guaranteed-latest**, pin the explicit version ID
 > (`claude-sonnet-5`, `claude-opus-5`) and re-verify when a new model ships; for
 > **auto-float-when-it-works**, use the alias but confirm `model.served` is what you
 > expect. This roster pins EVERY claude agent to a full version id -- both aliases were
@@ -103,10 +105,18 @@ The definitive list is always `--list` (definitions register/edit instantly, so 
 roster may have changed since this table). Models below were verified with the
 strongest backend evidence available at snapshot time: `model.resolved` or
 `model.served` where the backend emits it, and an explicit Kimi stream target
-selection and response for Kimi. Kimi's prompt JSONL stream currently does not
-emit a terminal served-model or usage receipt, so a completed Kimi turn can
-truthfully retain `model.served: null` and `served_model_evidence: absent`.
-Treat that output as advisory rather than an authoritative named-model review.
+selection and response for Kimi. Some Kimi CLI versions include a model
+and usage on an assistant JSONL record; Summon exposes that bounded, child-observed source as
+`model.evidence_source: kimi_assistant_record`. Kimi 0.38 instead writes
+post-response `usage.record` accounting and `turn.ended:completed` into the fresh
+isolated profile for that invocation. Summon accepts a single, positive-output,
+completed, non-conflicting model from that runtime journal as
+`kimi_wire_usage_record`. Both sources are labeled `served_model_evidence: inferred`
+because the child can write them; neither can certify an exact named-model vote.
+Request records, profile configuration, stale or linked
+journals, mixed models, and incomplete turns never mint identity. Versions that
+emit neither form still truthfully retain `model.served: null` and
+`served_model_evidence: absent`.
 
 | Agents | Backend | Model (verified) | Use for |
 |---|---|---|---|

@@ -5,11 +5,53 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+- **Refusal and public-proof invariants:** every structural pre-dispatch refusal
+  (including read-root, backend, model, text-seat, and gate checks) now states
+  `attempts:0`, `attempt_status:"not_run"`, `execution_status:"not_run"`, and
+  `provider_contacted:false`. The public JSON and telemetry/report projections
+  also force `model.served:null`, `served_model_evidence:"absent"`,
+  `model_match:null`, and `named_model_verified:false`; contradictory compatibility
+  fields cannot turn a refusal into a named-model claim. Retry and corrective
+  aggregation preserves zero rather than inventing a paid attempt; the terminal
+  operation status remains `error` or `blocked` according to the refusal path.
+  Public report validation rejects forged `model_match:true` or
+  `named_model_verified:true` values unless the trusted reported-evidence
+  relationship is present.
+- **Evidence-proof and exit clarity:** report parsing now accepts bounded Markdown
+  heading fields such as `## VERDICT: BLOCK`. Envelopes expose tri-state
+  `model_match` plus `named_model_verified`, and distinguish
+  `raw_backend_exit_code` from Summon's `normalized_exit_code`; caller-supplied
+  model-proof flags are never trusted.
+- **Background terminal receipts:** detached children now publish parser/early-exit
+  failures as typed envelopes, and terminal writes reuse the bounded Windows atomic
+  replacement retry used by launch records. A dead child remains `stale` rather than
+  being mistaken for a provider result; no model evidence is synthesized.
+- **OpenRouter 429 handling:** `--transient-retries` now recognizes explicit upstream
+  HTTP 429/rate-limit errors, including the machine-readable `rate_limit_exceeded` token,
+  and permits one bounded exponential-backoff retry. It remains
+  opt-in, does not retry authentication failures, and never silently switches an Ox seat
+  to another provider or model.
+- **Windows tool fallback and Kimi evidence:** a complete report is preserved when a
+  child cannot run a convenience command such as `grep`; the envelope keeps the raw
+  exit code and adds a typed, non-secret `tool_failure` diagnostic with cross-platform
+  alternatives, but the fatal backend outcome remains an unusable error. Kimi assistant
+  and isolated runtime records expose model/usage observations when available; because
+  those records are child-writable, they are labeled inferred and cannot certify an exact
+  named-model review.
+- **Exact named-model provenance:** provenance-required named seats now fail closed when
+  the provider reports a different dominant terminal model or no authoritative served-model
+  receipt. `--require-exact-model` is available for custom seats, and built-in governance
+  seats expose the policy in dry-run/envelopes. Auxiliary models remain visible in
+  `model.models_used` without being silently accepted as the named seat.
 - **Windows AGY popup guard:** Summon now keeps the bundled `agy_stream_proxy.py` as the
   default Windows wrapper and refuses to select the legacy `agy_pty_pyte.py` pseudo-console
   wrapper unless `AGY_ALLOW_LEGACY_PTY=1` is set deliberately. The shared hidden-launch
   flags still apply to the dispatcher, detached jobs, utilities, and nested AGY process;
   custom wrappers remain responsible for hiding any children they create.
+- **Install-drift scope:** `doctor --json` now separates the installer gate
+  (`installs.drift.managed_converged`) from the stricter all-copy `converged` result. Stale
+  project and plugin copies remain visible as unmanaged drift instead of being reported as
+  repairable by `install.py`; no unmanaged tree is overwritten implicitly.
 - **Explicit credential boundary for broad OpenCode lanes:** Ox/OpenCode `yolo` now requires
   `--worktree` or `--isolated-lane`. A private OpenRouter or Nous credential is bridged into
   an unrestricted child only with both the explicit `--isolated-lane` and
@@ -22,6 +64,10 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
   worker/coder seats, but the roster no longer tells callers to expect `model.served` when
   the active CLI does not emit provider-authored evidence. Successful null-provenance Kimi
   output remains advisory and reproducible, not a certified named-model review.
+- **Kimi 0.38 stream parsing:** role records that carry a `type` field are now recognized,
+  and untyped final verifier payloads stay content instead of becoming an unrelated terminal
+  result. Non-zero Kimi exits remain errors; Summon never upgrades a failed child into a
+  certified review. Provider-inert fixtures cover tool-then-report and verifier-only shapes.
 - **Broad-authority isolated lanes:** Kimi, OpenCode/Ox, and agy/Antigravity guidance now
   explicitly supports full-authority code, UI, research, and review work in disposable
   clones or isolated worktrees. The optional Ox seat uses `yolo` so its tool loop is not
@@ -68,6 +114,13 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 - **OpenCode timeout diagnostics:** headless OpenCode timeouts with no usable output are
   now typed as non-retryable provider timeouts with explicit local-auth guidance. Summon
   does not infer an authentication failure or silently spend another provider turn.
+- **Kimi timeout diagnostics and fallback control:** when Kimi emits assistant text before
+  the dispatcher deadline but never reaches clean EOF, the envelope now retains a bounded,
+  redacted `partial` snapshot for diagnosis. It is explicitly advisory: it is not a report,
+  result, resume/cache input, or model evidence, and `report_ok` remains false. Kimi ACP
+  recovery is no longer automatic; use `--allow-kimi-acp-fallback` (or
+  `SUMMON_KIMI_ACP_FALLBACK=1`) when a deliberate second provider turn is worth the
+  duplicate-spend and limited ACP tool surface.
 - **Timeout documentation:** public invocation examples now use explicit `ms`, `s`, or `m`
   units. Bare numeric values remain backward-compatible milliseconds, but dispatches reject
   ambiguous bare sub-second budgets; `jobs wait` keeps its short-poll compatibility.

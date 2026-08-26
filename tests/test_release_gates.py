@@ -75,10 +75,16 @@ class ReleaseGateRunnerTests(unittest.TestCase):
     def test_custom_and_unittest_counts_are_strict(self):
         self.assertEqual(MODULE._parse_count("x", "\n36/36 passed\n"), "36/36")
         self.assertEqual(MODULE._parse_count("x", "Ran 6 tests\n\nOK\n"), "6/6")
+        self.assertEqual(MODULE._parse_count(
+            "x", "================ 61 passed in 3.25s ================\n"), "61/61")
+        self.assertEqual(MODULE._parse_count(
+            "x", "============ 59 passed, 2 skipped in 4.10s ============\n"), "59/61")
         with self.assertRaises(RuntimeError):
             MODULE._parse_count("x", "0/0 passed\n")
         with self.assertRaises(RuntimeError):
             MODULE._parse_count("x", "Ran 0 tests\n\nOK\n")
+        with self.assertRaises(RuntimeError):
+            MODULE._parse_count("x", "2 failed, 59 passed in 4.10s\n")
 
     def test_cli_rejects_in_tree_evidence_output(self):
         output = ROOT / "tools" / ".release-gates-test-output.json"

@@ -26,6 +26,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "summon" / "scripts"
 _CUSTOM_RESULT = re.compile(r"(?m)([0-9]+)/([0-9]+) passed\s*$")
 _UNIT_RESULT = re.compile(r"Ran\s+([0-9]+)\s+tests?", re.IGNORECASE)
+_PYTEST_RESULT = re.compile(
+    r"(?m)^[= ]*([1-9][0-9]*) passed(?P<extras>(?:, [0-9]+ [a-z]+)*) "
+    r"in [0-9.]+s(?: \([^\r\n]+\))?[= ]*$"
+)
 
 
 def _absolute_lexical(value: str | os.PathLike[str]) -> Path:
@@ -149,6 +153,15 @@ def _parse_count(name: str, output: str) -> str:
         if total <= 0:
             raise RuntimeError(f"{name} reported no tests")
         return f"{total}/{total}"
+    matches = list(_PYTEST_RESULT.finditer(output))
+    if matches:
+        passed = int(matches[-1].group(1))
+        extras = matches[-1].group("extras") or ""
+        nonpassing = sum(
+            int(count) for count, kind in re.findall(r", ([0-9]+) ([a-z]+)", extras)
+            if kind in {"skipped", "xfailed", "xpassed", "deselected"}
+        )
+        return f"{passed}/{passed + nonpassing}"
     raise RuntimeError(f"{name} produced no recognized passing test count")
 
 

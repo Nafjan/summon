@@ -13,12 +13,81 @@ never on added fields.
 
 ## Unreleased
 
+- **Phase 0 lifecycle and Windows transport hardening:** each physical provider launch now
+  carries an opaque `attempt_id`; retries and transport fallbacks get distinct identities while
+  structural refusals remain `not_run` with no attempt ID. Detached launch records bind that ID
+  to the job, and terminal receipt publication is first-writer-wins/idempotent under normal and
+  crash-finalizer races. The Windows `summon.cmd` launcher marks raw argv transport and refuses
+  every raw dispatch prompt before roster/backend work; `--prompt-file` is the safe alternative
+  because batch expansion precedes Python validation. Provider-inert regressions cover identity, terminalization, and zero-contact
+  refusal behavior.
+
+- **Fail-closed refusal/proof validation:** every structural pre-dispatch refusal
+  (including read-root, backend, model, text-seat, and gate checks) now carries
+  explicit `attempts:0`, `attempt_status:"not_run"`,
+  `execution_status:"not_run"`, and no provider contact. The public envelope,
+  telemetry event, and reviewed-report projector additionally normalize
+  `model.served:null`, `served_model_evidence:"absent"`, `model_match:null`,
+  and `named_model_verified:false`; contradictory compatibility fields cannot
+  mint named-model proof. Retry/corrective aggregation preserves that zero
+  rather than inventing an attempt.
+  Public report validation enforces the relationship between tri-state model proof,
+  named-model verification, and reported served-model evidence, rejecting forged
+  positive claims even when each field is individually well-typed.
+- **Heading reports and provenance-safe projections:** Markdown heading forms of
+  the structured report contract (including `## VERDICT: BLOCK`) are parsed without
+  confusing a successful execution with a blocking review finding. New
+  `model_match`/`named_model_verified` fields are tri-state/fail-closed and require
+  trusted provider-reported equality of requested, targeted, and served models.
+  `raw_backend_exit_code` and `normalized_exit_code` make report normalization
+  explicit while preserving the legacy `exit_code` field. Provider-inert tests cover
+  heading verdicts, model evidence states, and non-zero child exits normalized by a
+  complete report.
+- **Kimi 0.38 completed-turn model capture:** Kimi's public stream can omit model
+  identity even when its fresh isolated runtime journal records positive-output
+  `usage.record` entries and a completed turn. Summon now captures only that bounded,
+  attempt-local accounting before profile cleanup. Request/config records, stale or
+  linked journals, mixed models, incomplete turns, and stream/journal conflicts remain
+  fail-closed. OpenCode's pre-call assistant `modelID` remains target-only and is not
+  promoted to served-model proof.
+- **Background result publication:** parser/early `SystemExit` paths now leave a
+  typed `dispatcher_exit_before_envelope` receipt when a detached child was given a
+  job file. Normal and crash envelopes use the existing bounded Windows sharing-
+  violation retry, so AV/Search Indexer locks do not silently leave only a `.tmp` file.
+  Hard kills remain honestly classified as stale when no child-authored envelope exists.
+- **Explicit provider-pool backoff:** the transient retry classifier now recognizes
+  structured HTTP 429/rate-limit responses, including OpenRouter/OpenCode's
+  `rate_limit_exceeded` token, while keeping
+  the retry opt-in and bounded to one exponential-backoff attempt. No provider/model
+  fallback is performed and auth/permission failures remain non-retryable.
+- **Windows child-tool resilience and Kimi provenance:** a structurally missing
+  executable such as `grep` no longer downgrades a complete agent report into a
+  generic or authentication failure. Summon preserves the report, retains the raw
+  backend exit, and emits a bounded `tool_failure` diagnostic with `rg`, PowerShell,
+  and Python fallbacks. Kimi assistant JSONL records now contribute provider model
+  and usage metadata when present; the envelope identifies that source and keeps
+  `model.served:null`/`served_model_evidence:"absent"` when the provider omits it.
+  Provider-inert regressions cover both paths.
+- **Fail-closed named-model trust:** exact-model policy now applies across providers for
+  built-in governance seats and custom seats that declare `model-policy: exact` (or use
+  `--require-exact-model`). A provider-reported dominant model mismatch or missing
+  authoritative terminal receipt is normalized to a non-retryable blocked result; no
+  fallback, resume, or contract-repair turn is attempted. Claude auxiliary models remain
+  recorded in `model.models_used` without satisfying the named seat. Provider-inert
+  regression fixtures cover matching, mismatching, and missing-evidence terminal events;
+  no credentials or provider calls are involved.
 - **Windows AGY popup guard:** the default AGY stream proxy now remains on the shared
   `CREATE_NO_WINDOW`/`SW_HIDE` launch path, while the legacy winpty-based
   `agy_pty_pyte.py` wrapper is fail-closed on Windows unless an operator explicitly sets
   `AGY_ALLOW_LEGACY_PTY=1`. This prevents an old/project-local wrapper from silently
   creating a visible pseudo-console. Custom wrappers and vendor-created GUI windows remain
   outside Summon's launch boundary and must hide their own children.
+- **Managed versus unmanaged install drift:** the doctor/install inventory now publishes
+  `managed_converged` plus managed/unmanaged drift partitions. The strict legacy
+  `converged` field still detects any stale or unhashable copy, while the installer gate
+  ignores an explicitly unmanaged project/plugin tree and reports it with an owner-action
+  warning. This prevents a stale Cursor plugin from producing the misleading instruction
+  to rerun an installer that does not own that tree.
 - **Credential/tool boundary for OpenCode yolo:** broad Ox/OpenCode turns now require
   `--worktree` or `--isolated-lane`. Summon refuses to bridge a private OpenRouter/Nous key
   into an unrestricted child unless the caller supplies both `--isolated-lane` and
@@ -29,9 +98,15 @@ never on added fields.
   The optional Ox definition now carries an explicit untrusted-content guard; its
   provider availability is intentionally not a permanent Summon contract.
 - **Kimi roster evidence contract:** K3/max remains the deliberate bundled Kimi target, but
-  roster text now says provider-served evidence may be absent. A successful Kimi envelope with
-  `model.served: null` remains useful advisory output while named-model attestation stays
-  fail-closed; Summon never manufactures evidence.
+  roster text now says provider-served evidence may be absent. When a Kimi assistant record
+  carries a provider model, the envelope exposes that source; otherwise a successful envelope
+  with `model.served: null` remains useful advisory output while named-model attestation stays
+  fail-closed. Summon never manufactures evidence.
+- **Kimi 0.38 stream finalization:** Kimi role records are recognized even when the CLI adds a
+  `type` field, and untyped verifier JSON is retained as Kimi content rather than entering the
+  generic cursor terminal fallback. Clean EOF remains the only Kimi completion boundary, while
+  a non-zero child exit remains an error. Sanitized provider-inert fixtures cover both observed
+  tool-then-report and verifier-only shapes; no private review payload is stored.
 - **Isolated full-authority workflow:** documented and rostered a broad-authority Ox/OpenCode
   lane for disposable clones and isolated worktrees, and clarified that Kimi and
   agy/Antigravity are intentionally useful yolo agents for code, UI, research, and review.
@@ -85,6 +160,17 @@ never on added fields.
 - **OpenCode timeout diagnostics:** zero-output headless timeouts are typed as
   non-retryable provider timeouts with explicit local-auth guidance, preserving the
   distinction between a proven auth error and an unproven transport stall.
+- **Kimi pre-EOF snapshots and ACP gate:** Kimi assistant parts are accumulated in a
+  separate bounded (32 KiB-character) tail while the normal full accumulator remains reserved for
+  clean-EOF success. On deadline, the tail is redacted and emitted under `partial` with
+  `authoritative:false`, `finalized:false`, and truncation counters; it never reaches report
+  parsing, result promotion, resume/cache reuse, or model provenance. Timeout envelopes now
+  set `timeout.partial_output` from captured stream text as well as a parsed result. Kimi
+  subprocess failures no longer auto-spend an ACP recovery turn, because the native ACP
+  adapter has no Summon filesystem/terminal bridge; `--allow-kimi-acp-fallback` or
+  `SUMMON_KIMI_ACP_FALLBACK=1` is an explicit opt-in. Provider-inert tests cover bounded
+  accumulation, secret redaction, non-authoritative status, default-off behavior, and the
+  explicit recovery path.
 - **Timeout-unit documentation:** public examples and the Codex host recipe now carry
   explicit `ms`, `s`, or `m` suffixes. Bare numeric values remain milliseconds only for
   backward compatibility; dispatches reject ambiguous bare sub-second budgets while

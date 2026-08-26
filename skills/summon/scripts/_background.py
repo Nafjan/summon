@@ -147,6 +147,8 @@ def child_argv(args: argparse.Namespace, result_file: str) -> list:
         out += ["--allow-text-only"]
     if getattr(args, "require_tools", False):
         out += ["--require-tools"]
+    if getattr(args, "require_exact_model", False):
+        out += ["--require-exact-model"]
     if getattr(args, "no_contract_repair", False):
         out += ["--no-contract-repair"]     # honor the opt-out in the detached child
     # ``--read-root`` is repeatable.  Background argv is rebuilt field by field,
@@ -232,6 +234,7 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict) ->
             root, job_id, nonce=nonce, agent=args.agent,
             prompt_sha256=prompt_sha, cwd=args.cwd,
             flags=_jobs.flags_projection(args), summon=execution_summon,
+            attempt_id=job_id,
             launcher_summon=summon)
     except (OSError, ValueError) as e:
         if lease is not None:
@@ -242,7 +245,9 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict) ->
         kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
                         "stderr": subprocess.DEVNULL}
         child_env = {**os.environ, "SUMMON_JOB_NONCE": nonce,
+                     "SUMMON_JOB_ID": job_id,
                      "SUMMON_JOB_SCRIPTS_SHA256": execution_summon["scripts_sha256"]}
+        child_env.pop("SUMMON_CMD_LAUNCHER", None)
         if prompt_sha:
             child_env["SUMMON_JOB_PROMPT_SHA"] = prompt_sha   # lets the crash path verify
         kwargs["env"] = child_env

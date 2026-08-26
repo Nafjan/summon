@@ -429,9 +429,12 @@ def _dispatch_child(cmd: list, timeout_sec: float, on_spawn=None, on_reap=None):
     from _executor import _kill_tree, _safe_communicate
     from _spawn import popen_flags
     try:
+        child_env = dict(os.environ)
+        child_env.pop("SUMMON_CMD_LAUNCHER", None)
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 stdin=subprocess.DEVNULL, text=True,
-                                encoding="utf-8", errors="replace", **popen_flags())
+                                encoding="utf-8", errors="replace", env=child_env,
+                                **popen_flags())
     except OSError as e:
         return None, f"{type(e).__name__}: {e}"
     if on_spawn is not None:

@@ -3,6 +3,26 @@
 from __future__ import annotations
 
 import json
+import re
+
+
+_KIMI_PARTIAL_MAX_CHARS = 32 * 1024
+_KIMI_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+() -]{0,159}$")
+
+
+def _safe_kimi_model_id(value) -> str | None:
+    """Accept only a bounded provider model identifier from a Kimi record."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if (not candidate or "://" in candidate or "\\" in candidate
+            or _KIMI_MODEL_ID_RE.fullmatch(candidate) is None):
+        return None
+    low = candidate.lower()
+    if any(marker in low for marker in (
+            "bearer ", "secret", "password", "api-key", "api_key", "token/")):
+        return None
+    return candidate
 
 
 _OPENCODE_DOTTED_EVENTS = {
@@ -139,6 +159,14 @@ class StreamProcessor:
         self.is_codex = False
         self.is_kimi = False
         self.kimi_parts = []
+        # Kimi has no terminal-success record: a clean EOF is the only
+        # completion boundary. Keep the normal accumulator unchanged for
+        # successful runs, but maintain a bounded tail for a timeout snapshot.
+        # The snapshot is diagnostic only and is never used as ``result``.
+        self._kimi_partial_text = ""
+        self._kimi_partial_part_count = 0
+        self._kimi_partial_captured_chars = 0
+        self._kimi_partial_truncated_chars = 0
         # OpenCode's `run --format json` emits step_start/text/step_finish
         # events and defines success at clean EOF rather than a terminal result
         # object.  Keep a separate accumulator so those events are not mistaken
@@ -166,6 +194,7 @@ class StreamProcessor:
         self.handshake_model = None  # from init / thread.started (targeted, not served)
         self.model = None       # from the TERMINAL event only (model field / modelUsage)
         self.models_used = []   # every model id seen in modelUsage (resolved is only the dominant one)
+        self.model_evidence_source = None
         self.is_error = False   # the terminal event itself reported an error (claude is_error / result status)
 
     def process_line(self, line: str) -> bool:
@@ -177,6 +206,12 @@ class StreamProcessor:
         try:
             data = json.loads(line)
         except json.JSONDecodeError:
+            # Kimi can pretty-print a JSON payload over several lines. Once a
+            # Kimi role record has identified the stream, preserve those lines
+            # as assistant output instead of dropping them or letting a later
+            # fragment reach a different backend's terminal fallback.
+            if self.is_kimi:
+                self._record_kimi_assistant(line)
             return False
 
         # A line can be valid JSON but not an object (e.g. a plain-text backend
@@ -272,24 +307,6 @@ class StreamProcessor:
             }
             return True
 
-        # Kimi Code's stream-json protocol is JSONL messages rather than
-        # terminal events.  ANY role-bearing record (system/user/tool/meta/
-        # assistant) is conversational, never a terminal result -- including a
-        # leading system record before the first assistant message, which must
-        # not be mistaken for a cursor-style typeless result and truncate the
-        # run at line one.  Assistant content accumulates until EOF.
-        if "type" not in data and "event" not in data and isinstance(data.get("role"), str):
-            self.is_kimi = True
-            if data["role"] == "assistant":
-                content = data.get("content", "")
-                if isinstance(content, str):
-                    self.kimi_parts.append(content)
-                elif isinstance(content, list):
-                    self.kimi_parts.extend(
-                        part.get("text", "") for part in content
-                        if isinstance(part, dict) and isinstance(part.get("text"), str))
-            return False
-
         # OpenCode's JSON event protocol (v1.x) uses step_start, text,
         # tool_use/tool_result, and step_finish packets.  There is no final
         # result packet; a clean EOF is the terminal signal.  Capture model and
@@ -350,6 +367,25 @@ class StreamProcessor:
             self._capture_opencode_metadata(data)
             if part.get("type") == "text" and isinstance(part.get("text"), str):
                 self.opencode_parts.append(part["text"])
+            return False
+
+        # Kimi Code's stream-json protocol is conversational JSONL rather than
+        # a terminal-event protocol. Newer Kimi releases include ``type`` on
+        # role records (for example ``system.version``), so the old
+        # type-less-only guard missed the stream entirely. This branch comes
+        # after OpenCode's recognized event shapes so an OpenCode part carrying
+        # a role is still parsed as OpenCode.
+        if isinstance(data.get("role"), str) and not self.is_opencode:
+            self._capture_kimi_record(data)
+            return False
+
+        # Once Kimi has been identified, an untyped object is content, not a
+        # cursor-style terminal result. Kimi commonly emits a final verifier
+        # object without ``role``; preserving it lets the normal report parser
+        # inspect the content while clean EOF remains the only Kimi completion
+        # boundary. A non-zero child exit is still handled by the executor.
+        if self.is_kimi:
+            self._record_kimi_payload(data)
             return False
 
         # Codex: turn.completed signals end (and carries token usage)
@@ -464,6 +500,104 @@ class StreamProcessor:
                 return v.get("outputTokens", 0) if isinstance(v, dict) else 0
             self.models_used = sorted(data["modelUsage"])
             self.model = max(data["modelUsage"], key=lambda k: _out(data["modelUsage"][k]))
+
+    def _capture_kimi_metadata(self, data: dict) -> None:
+        """Capture provider-authored identity/usage from Kimi JSONL records.
+
+        Kimi commonly emits only role-bearing records and no terminal result.
+        When an assistant record carries an explicit model field, it is the
+        strongest available served-model evidence. A system/meta record is kept
+        as a handshake target only. If neither appears, the executor leaves
+        ``model.served`` null and marks provenance absent rather than guessing
+        from the requested K3 profile.
+        """
+        if not isinstance(data, dict):
+            return
+        role = str(data.get("role") or "").strip().lower()
+        containers = [data]
+        for key in ("metadata", "meta", "response"):
+            nested = data.get(key)
+            if isinstance(nested, dict):
+                containers.append(nested)
+
+        if role == "assistant":
+            for container in containers:
+                found_model = None
+                for key in (
+                    "served_model", "servedModel", "model", "model_id",
+                    "modelId", "model_name",
+                ):
+                    model = _safe_kimi_model_id(container.get(key))
+                    if model:
+                        found_model = model
+                        break
+                if found_model:
+                    if self.model is None:
+                        self.model = found_model
+                    self.model_evidence_source = "kimi_assistant_record"
+                    if found_model not in self.models_used:
+                        self.models_used.append(found_model)
+        elif role in {"system", "meta", "user"} and not self.handshake_model:
+            # These records can identify the selected session/model but are not
+            # evidence that an assistant completion was served by that model.
+            for container in containers:
+                for key in ("model", "model_id", "modelId", "model_name"):
+                    model = _safe_kimi_model_id(container.get(key))
+                    if model:
+                        self.handshake_model = model
+                        break
+                if self.handshake_model:
+                    break
+
+        # Some Kimi versions attach usage to assistant records. Normalize the
+        # common spellings so the executor can expose inferred provenance only
+        # when output-token evidence is actually present.
+        for container in containers:
+            usage = container.get("usage") or container.get("token_usage")
+            if not isinstance(usage, dict):
+                continue
+            normalized = {}
+            for target, keys in (
+                ("input_tokens", ("input_tokens", "prompt_tokens", "input")),
+                ("output_tokens", ("output_tokens", "completion_tokens", "output")),
+                ("total_tokens", ("total_tokens", "total")),
+                ("reasoning_tokens", ("reasoning_tokens", "reasoning")),
+            ):
+                for key in keys:
+                    value = usage.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        normalized[target] = value
+                        break
+            if normalized:
+                self.usage = normalized
+                break
+        for container in containers:
+            cost = container.get("cost_usd", container.get("cost"))
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                self.cost_usd = cost
+                break
+
+    def _capture_kimi_record(self, data: dict) -> None:
+        """Capture a Kimi role record, including records that carry ``type``."""
+        self.is_kimi = True
+        self._capture_kimi_metadata(data)
+        if str(data.get("role") or "").strip().lower() != "assistant":
+            return
+        content = data.get("content", "")
+        if isinstance(content, str):
+            self._record_kimi_assistant(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    self._record_kimi_assistant(part["text"])
+
+    def _record_kimi_payload(self, data: dict) -> None:
+        """Keep a non-role Kimi JSON payload as bounded, non-terminal content."""
+        try:
+            payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            payload = str(data)
+        self._record_kimi_assistant(payload)
 
     def _capture_opencode_metadata(self, data: dict) -> None:
         """Capture bounded telemetry from an OpenCode JSON event."""
@@ -591,6 +725,48 @@ class StreamProcessor:
 
     def get_result(self):
         return self.result_json
+
+    def _record_kimi_assistant(self, content: str) -> None:
+        """Accumulate Kimi text and a bounded pre-EOF diagnostic tail.
+
+        The full ``kimi_parts`` list remains the clean-EOF success path for
+        compatibility. The separate bounded buffer prevents an unbounded
+        timeout forensic artifact from growing with a long or hostile stream.
+        """
+        self.kimi_parts.append(content)
+        if not content:
+            return
+        self._kimi_partial_part_count += 1
+        self._kimi_partial_captured_chars += len(content)
+        separator = 1 if self._kimi_partial_text else 0
+        if len(content) >= _KIMI_PARTIAL_MAX_CHARS:
+            removed = len(self._kimi_partial_text) + separator
+            removed += len(content) - _KIMI_PARTIAL_MAX_CHARS
+            self._kimi_partial_truncated_chars += max(0, removed)
+            self._kimi_partial_text = content[-_KIMI_PARTIAL_MAX_CHARS:]
+            return
+        combined = self._kimi_partial_text + ("\n" if separator else "") + content
+        if len(combined) > _KIMI_PARTIAL_MAX_CHARS:
+            removed = len(combined) - _KIMI_PARTIAL_MAX_CHARS
+            self._kimi_partial_truncated_chars += removed
+            combined = combined[-_KIMI_PARTIAL_MAX_CHARS:]
+        self._kimi_partial_text = combined
+
+    def kimi_partial_snapshot(self) -> dict | None:
+        """Return bounded, explicitly non-authoritative pre-EOF Kimi text."""
+        if not self.is_kimi or not self._kimi_partial_text:
+            return None
+        return {
+            "text": self._kimi_partial_text,
+            "authoritative": False,
+            "source": "stream_parts_pre_eof",
+            "finalized": False,
+            "part_count": self._kimi_partial_part_count,
+            "captured_chars": self._kimi_partial_captured_chars,
+            "bytes_retained": len(self._kimi_partial_text.encode("utf-8")),
+            "truncated": bool(self._kimi_partial_truncated_chars),
+            "truncated_chars": self._kimi_partial_truncated_chars,
+        }
 
     def finalize_stream(self) -> None:
         """Finish protocols whose success is defined by clean EOF, not an event."""
