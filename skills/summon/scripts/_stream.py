@@ -311,6 +311,37 @@ class StreamProcessor:
                 self.handshake_model = data["model"]
             return False
 
+        # Claude stream-json emits complete assistant messages between init and
+        # result. Text and tool-use blocks are executor-recognized progress;
+        # their contents are never copied into the liveness projection.
+        if data.get("type") == "assistant" and isinstance(data.get("message"), dict):
+            message = data["message"]
+            content = message.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text" and isinstance(block.get("text"), str):
+                        self._liveness("output_text", data,
+                                       output_chars=len(block["text"]))
+                    elif block.get("type") in {"tool_use", "server_tool_use"}:
+                        self._tool_progress += 1
+                        self._liveness("tool_activity", data, tool_id="claude_tool",
+                                       progress=self._tool_progress)
+            return False
+
+        if data.get("type") == "user" and isinstance(data.get("message"), dict):
+            content = data["message"].get("content")
+            if isinstance(content, list) and any(
+                    isinstance(block, dict) and block.get("type") == "tool_result"
+                    for block in content):
+                self._tool_progress += 1
+                self._liveness("tool_activity", data, tool_id="claude_tool_result",
+                               progress=self._tool_progress)
+            else:
+                self._liveness("stream_event", data)
+            return False
+
         if self.is_gemini and data.get("type") == "message" and data.get("role") == "assistant":
             content = data.get("content", "")
             if isinstance(content, str):
@@ -323,6 +354,16 @@ class StreamProcessor:
             if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
                 self.codex_messages.append(item["text"])
                 self._liveness("output_text", data, output_chars=len(item["text"]))
+            elif isinstance(item, dict):
+                self._tool_progress += 1
+                self._liveness("tool_activity", data, tool_id="codex_item",
+                               progress=self._tool_progress)
+            return False
+
+        if self.is_gemini and data.get("type") in {"tool_call", "tool_result"}:
+            self._tool_progress += 1
+            self._liveness("tool_activity", data, tool_id="gemini_tool",
+                           progress=self._tool_progress)
             return False
 
         # Codex emits ``turn.failed`` for provider/runtime failures. It is a
@@ -456,7 +497,14 @@ class StreamProcessor:
             if role == "assistant":
                 content = data.get("content")
                 chars = len(content) if isinstance(content, str) else 0
-                self._liveness("output_text", data, output_chars=chars)
+                if data.get("tool_calls") or data.get("tool_call"):
+                    self._tool_progress += 1
+                    self._liveness("tool_activity", data, tool_id="kimi_tool",
+                                   progress=self._tool_progress)
+                if chars:
+                    self._liveness("output_text", data, output_chars=chars)
+                elif not (data.get("tool_calls") or data.get("tool_call")):
+                    self._liveness("stream_event", data)
             else:
                 self._liveness("stream_event", data)
             return False

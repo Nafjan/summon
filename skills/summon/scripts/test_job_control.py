@@ -146,6 +146,30 @@ def test_stream_processor_reports_authenticated_reconnect_and_agy_progress():
     assert snapshot["counts"]["meaningful"] == 1
 
 
+def test_stream_processor_counts_claude_codex_gemini_and_kimi_tool_progress():
+    fixtures = [
+        ({"type": "system", "subtype": "init", "session_id": "claude"},
+         {"type": "assistant", "session_id": "claude", "message": {"content": [
+             {"type": "tool_use", "id": "private-id", "name": "Read"}]}}),
+        ({"type": "thread.started", "thread_id": "codex"},
+         {"type": "item.completed", "item": {"type": "command_execution"}}),
+        ({"type": "init", "session_id": "gemini"},
+         {"type": "tool_call", "session_id": "gemini", "name": "read_file"}),
+        ({"role": "system", "session_id": "kimi"},
+         {"role": "assistant", "session_id": "kimi", "content": "",
+          "tool_calls": [{"id": "private-id"}]}),
+    ]
+    for index, (start, progress) in enumerate(fixtures):
+        tracker = LivenessTracker(attempt_id=f"attempt-{index}", overall_ms=10_000,
+                                  first_event_ms=1_000, idle_ms=2_000)
+        processor = StreamProcessor(event_observer=tracker.emitter())
+        processor.process_line(json.dumps(start))
+        processor.process_line(json.dumps(progress))
+        snapshot = tracker.snapshot()
+        assert snapshot["counts"]["tools"] == 1
+        assert snapshot["last_activity_kind"] == "tool"
+
+
 def test_eof_finalization_timeout_still_reaps_child():
     program = "import os,time; os.close(1); time.sleep(2)"
     process = subprocess.Popen(
