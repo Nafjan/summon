@@ -332,6 +332,11 @@ def payg_consent_allowed(allow_payg_flag: bool = False) -> bool:
     """
     if allow_payg_flag:
         return True
+    if os.environ.get("SUMMON_FRESH_CONSENT_ONLY") == "1":
+        # A governed continuation is a new physical attempt. Only the
+        # claim-bound --allow-payg flag may authorize it; inherited environment
+        # and standing preferences belong to the completed source job.
+        return False
     if os.environ.get("SUMMON_ALLOW_BYTEPLUS_PAYG") == "1":
         return True
     prefs_path = os.path.join(os.path.expanduser("~"), ".agents", "summon.json")

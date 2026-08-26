@@ -243,7 +243,8 @@ def flags_projection(args) -> dict:
 def write_prepared(root: str, job_id: str, *, nonce: str, agent: str,
                    prompt_sha256: str | None, cwd: str, flags: dict,
                    summon: dict, attempt_id: str | None = None,
-                   launcher_summon: dict | None = None) -> str:
+                   launcher_summon: dict | None = None,
+                   resume_lineage: dict | None = None) -> str:
     """Write the launch record BEFORE spawn. The record path never appears as a
     zero-byte file: the whole content is written to a temp file, fsynced, and
     atomically renamed into place (a reader sees either nothing or a complete
@@ -270,6 +271,15 @@ def write_prepared(root: str, job_id: str, *, nonce: str, agent: str,
         # ``summon`` identifies the frozen child bundle. Keep the mutable
         # parent's identity separately so an install-era race stays visible.
         record["launcher_summon"] = launcher_summon
+    if resume_lineage is not None:
+        expected = {"source_job_id", "request_id", "claim_id", "request_sha256"}
+        if (not isinstance(resume_lineage, dict) or set(resume_lineage) != expected
+                or not all(valid_job_id(resume_lineage.get(key))
+                           for key in ("source_job_id", "request_id", "claim_id"))
+                or not isinstance(resume_lineage.get("request_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", resume_lineage["request_sha256"])):
+            raise ValueError("resume lineage is invalid")
+        record["resume_lineage"] = dict(resume_lineage)
     _atomic_write_json(path, record)
     return path
 

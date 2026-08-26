@@ -800,10 +800,12 @@ class ExecutorPathTests(unittest.TestCase):
     def test_registration_failure_terminates_untracked_child_and_redacts_error(self):
         fake_process = mock.Mock()
         fake_process.pid = 124
+        outcomes = []
         control = ProviderLaunchControl(
             before_launch=lambda evidence: None,
             on_spawn=lambda handle: (_ for _ in ()).throw(
-                RuntimeError("TOP-SECRET-CALLBACK-TEXT")))
+                RuntimeError("TOP-SECRET-CALLBACK-TEXT")),
+            on_indeterminate=lambda error: outcomes.append(type(error).__name__))
         inv = AgentInvocation(cli="claude", prompt="p", cwd=tempfile.gettempdir(),
                               permission="yolo")
         with mock.patch.object(_executor, "build_invocation_args",
@@ -821,6 +823,52 @@ class ExecutorPathTests(unittest.TestCase):
         kill.assert_called_once_with(fake_process)
         self.assertEqual(response["status"], "error")
         self.assertNotIn("TOP-SECRET", json.dumps(response))
+        self.assertEqual(outcomes, ["RuntimeError"])
+
+    def test_subprocess_popen_oserror_records_proven_pre_spawn_failure(self):
+        events = []
+        control = ProviderLaunchControl(
+            before_launch=lambda evidence: events.append("claimed"),
+            on_pre_spawn_failure=lambda error: events.append(type(error).__name__),
+            on_indeterminate=lambda error: events.append("indeterminate"))
+        inv = AgentInvocation(cli="claude", prompt="p", cwd=tempfile.gettempdir(),
+                              permission="yolo")
+        with mock.patch.object(_executor, "build_invocation_args",
+                               return_value=("fake-cli", ["p"], {})), \
+             mock.patch.object(_executor, "_resolve_launch",
+                               return_value=("fake-cli", ["p"])), \
+             mock.patch.object(_executor, "argv_length_error", return_value=None), \
+             mock.patch.object(_executor.subprocess, "Popen",
+                               side_effect=OSError("no process")), \
+             mock.patch("_receipt.workspace_snapshot", return_value={"coverage": "none"}), \
+             mock.patch("_receipt.workspace_evidence", return_value={}):
+            response = _executor.execute_agent(
+                inv, timeout_ms=1000, launch_control=control)
+        self.assertEqual(events, ["claimed", "OSError"])
+        self.assertFalse(response["provider_contacted"])
+
+    def test_subprocess_popen_unexpected_error_records_indeterminate(self):
+        events = []
+        control = ProviderLaunchControl(
+            before_launch=lambda evidence: events.append("claimed"),
+            on_pre_spawn_failure=lambda error: events.append("pre_spawn"),
+            on_indeterminate=lambda error: events.append(type(error).__name__))
+        inv = AgentInvocation(cli="claude", prompt="p", cwd=tempfile.gettempdir(),
+                              permission="yolo")
+        with mock.patch.object(_executor, "build_invocation_args",
+                               return_value=("fake-cli", ["p"], {})), \
+             mock.patch.object(_executor, "_resolve_launch",
+                               return_value=("fake-cli", ["p"])), \
+             mock.patch.object(_executor, "argv_length_error", return_value=None), \
+             mock.patch.object(_executor.subprocess, "Popen",
+                               side_effect=RuntimeError("ambiguous")), \
+             mock.patch("_receipt.workspace_snapshot", return_value={"coverage": "none"}), \
+             mock.patch("_receipt.workspace_evidence", return_value={}):
+            response = _executor.execute_agent(
+                inv, timeout_ms=1000, launch_control=control)
+        self.assertEqual(events, ["claimed", "RuntimeError"])
+        self.assertFalse(response["provider_contacted"])
+        self.assertIn("ambiguously", response["error"])
 
     def test_oversized_subprocess_does_not_route_to_acp(self):
         control = ProviderLaunchControl(before_launch=lambda evidence: None)

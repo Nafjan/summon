@@ -300,30 +300,65 @@ def test_nonfinite_job_origin_is_legacy_unknown_not_an_exception(
 
 
 def test_concurrent_extend_and_cancel_are_both_preserved(tmp_path):
-    root, job_id = _prepared(tmp_path)
-    barrier = threading.Barrier(3)
-    errors = []
+    # Exercise first-use lock creation repeatedly.  The former Windows bug was
+    # intermittent because both callers had to observe a zero-length lock file
+    # before either pre-lock seed write completed.
+    for iteration in range(32):
+        root, job_id = _prepared(tmp_path / str(iteration))
+        barrier = threading.Barrier(3)
+        errors = []
 
-    def worker(action):
-        try:
-            barrier.wait()
-            _job_control.queue_command(
-                root, job_id, action,
-                duration_ms=500 if action == "extend" else None)
-        except Exception as exc:  # surfaced after both writers join
-            errors.append(exc)
+        def worker(action):
+            try:
+                barrier.wait()
+                _job_control.queue_command(
+                    root, job_id, action,
+                    duration_ms=500 if action == "extend" else None)
+            except Exception as exc:  # surfaced after both writers join
+                errors.append(exc)
 
-    threads = [threading.Thread(target=worker, args=(action,))
-               for action in ("extend", "cancel")]
-    for thread in threads:
-        thread.start()
-    barrier.wait()
-    for thread in threads:
-        thread.join()
-    assert not errors
-    raw = _jobs.read_json(_job_control.control_path(root, job_id))
-    assert {item["action"] for item in raw["commands"]} == {"extend", "cancel"}
-    assert raw["generation"] == 2
+        threads = [threading.Thread(target=worker, args=(action,))
+                   for action in ("extend", "cancel")]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+        assert not errors
+        raw = _jobs.read_json(_job_control.control_path(root, job_id))
+        assert {item["action"] for item in raw["commands"]} == {"extend", "cancel"}
+        assert raw["generation"] == 2
+
+
+def test_control_lock_never_seeds_empty_file_before_os_lock(tmp_path, monkeypatch):
+    """First-use serialization must not write outside the acquired OS lock.
+
+    On Windows two callers could previously both observe a new zero-length lock
+    file and race in ``write``/``flush`` before ``msvcrt.locking``.  Refuse any
+    such pre-lock write while exercising the real empty-file locking path.
+    """
+    real_open = open
+    writes = []
+
+    class NoSeedWrite:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        def write(self, data):
+            writes.append(data)
+            raise AssertionError("lock file was seeded before OS lock acquisition")
+
+    def guarded_open(path, mode):
+        return NoSeedWrite(real_open(path, mode))
+
+    monkeypatch.setattr(_job_control, "open", guarded_open, raising=False)
+    control = str(tmp_path / "first-use-control.json")
+    with _job_control._exclusive_control_lock(control):
+        assert Path(control + ".lock").exists()
+    assert writes == []
 
 
 def test_jobs_status_authenticates_heartbeat_and_redacts_nonce(tmp_path, capsys):
@@ -656,6 +691,16 @@ def test_public_control_projection_omits_steering_text_and_digest(tmp_path):
     public = json.dumps(control.projection())
     assert message not in public
     assert "message_sha256" not in public
+
+
+def test_terminal_steer_refusal_points_to_governed_resume(tmp_path):
+    root, job_id = _prepared(tmp_path)
+    _jobs._atomic_write_json(
+        _jobs.result_path(root, job_id),
+        {"status": "success", "job_nonce": "nonce"})
+    with pytest.raises(ValueError, match=r"jobs resume JOB_ID --message TEXT"):
+        _job_control.queue_command(
+            root, job_id, "steer", message="continue with the next check")
 
 
 def test_flags_projection_preserves_explicit_hard_timeout():

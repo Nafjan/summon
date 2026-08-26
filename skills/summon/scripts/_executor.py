@@ -45,6 +45,8 @@ class ProviderLaunchControl:
     def __init__(self, *, before_launch: Callable[[Mapping[str, object]], None],
                  on_spawn: Callable[[object], None] | None = None,
                  on_reap: Callable[[object], None] | None = None,
+                 on_pre_spawn_failure: Callable[[BaseException], None] | None = None,
+                 on_indeterminate: Callable[[BaseException], None] | None = None,
                  on_resource: Callable[[object, str], None] | None = None,
                  cancelled: Callable[[], bool] | None = None,
                  deadline_reached: Callable[[], bool] | None = None,
@@ -54,6 +56,8 @@ class ProviderLaunchControl:
         self._before_launch = before_launch
         self._on_spawn = on_spawn
         self._on_reap = on_reap
+        self._on_pre_spawn_failure = on_pre_spawn_failure
+        self._on_indeterminate = on_indeterminate
         self._on_resource = on_resource
         self._cancelled = cancelled or (lambda: False)
         self._deadline_reached = deadline_reached or (lambda: False)
@@ -96,6 +100,16 @@ class ProviderLaunchControl:
     def reaped(self, handle: object) -> None:
         if self._on_reap is not None:
             self._on_reap(handle)
+
+    def pre_spawn_failed(self, error: BaseException) -> None:
+        """Record a Popen failure that returned no process handle."""
+        if self._on_pre_spawn_failure is not None:
+            self._on_pre_spawn_failure(error)
+
+    def launch_indeterminate(self, error: BaseException) -> None:
+        """Record an ambiguous failure after the durable launch claim."""
+        if self._on_indeterminate is not None:
+            self._on_indeterminate(error)
 
     def register_resource(self, resource: object, kind: str = "provider-resource") -> None:
         """Register a builder-created disposable resource before provider contact.
@@ -3969,14 +3983,32 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # group (a shim's grandchild otherwise survives process.kill() and keeps
     # stdout open, defeating the timeout). Windows walks the tree via taskkill /T.
     from _spawn import popen_flags
-    try:
-        if launch_control is not None:
+    if launch_control is not None:
+        try:
             launch_control.before_provider_launch({
                 "backend": inv.cli,
                 "transport": "subprocess",
                 "command_sha256": hashlib.sha256(
                     str(command).encode("utf-8", errors="replace")).hexdigest(),
             })
+        except ProviderDeadlineError:
+            _deadline_response = _error_response(
+                inv.cli, 124, "provider launch deadline exceeded", partial_result=None,
+                not_run=True)
+            _deadline_response["timeout"] = True
+            return _stamp(_enrich(_deadline_response, None))
+        except Exception as e:
+            try:
+                launch_control.launch_indeterminate(e)
+            except Exception:
+                pass
+            # Callback errors may occur after its durable CAS. Preserve that
+            # ambiguity and never expose callback text, which may contain secrets.
+            return _stamp(_enrich(_error_response(
+                inv.cli, 1,
+                f"provider launch refused by control ({type(e).__name__})",
+                not_run=True), None))
+    try:
         # stdin=DEVNULL: sub-agent CLIs (notably codex) probe stdin for "additional
         # input" and block reading from a TTY inherited from the parent. We never
         # have stdin to give them.
@@ -3993,7 +4025,12 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             env=proc_env,
             **popen_flags(),
         )
-    except FileNotFoundError:
+    except FileNotFoundError as e:
+        if launch_control is not None:
+            try:
+                launch_control.pre_spawn_failed(e)
+            except Exception:
+                pass
         # Windows raises this for an over-long command line too (ERROR_FILE_NOT_FOUND).
         # argv_length_error above catches the known limit; if we still land here with a
         # large argv, say so rather than asserting an install problem we did not verify.
@@ -4006,21 +4043,23 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             _error_response(inv.cli, 127, f"CLI not found: {command}{_hint}",
                             not_run=True), None))
     except OSError as e:
+        if launch_control is not None:
+            try:
+                launch_control.pre_spawn_failed(e)
+            except Exception:
+                pass
         return _stamp(_enrich(_error_response(
             inv.cli, 1, f"{type(e).__name__}: {e}", not_run=True), None))
-    except ProviderDeadlineError:
-        _deadline_response = _error_response(
-            inv.cli, 124, "provider launch deadline exceeded", partial_result=None,
-            not_run=True)
-        _deadline_response["timeout"] = True
-        return _stamp(_enrich(_deadline_response, None))
     except Exception as e:
-        # The callback is orchestrator-owned and may accidentally carry a
-        # secret in its exception text.  Refuse before contact and expose only
-        # the safe exception class.
+        if launch_control is not None:
+            try:
+                launch_control.launch_indeterminate(e)
+            except Exception:
+                pass
         return _stamp(_enrich(_error_response(
             inv.cli, 1,
-            f"provider launch refused by control ({type(e).__name__})", not_run=True), None))
+            f"provider launch failed ambiguously ({type(e).__name__})",
+            not_run=True), None))
 
     # Popen returned, so a physical provider attempt exists even if registration
     # or stream parsing fails immediately. Mark the boundary before any later
@@ -4037,6 +4076,13 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             _safe_communicate(process)
             try:
                 launch_control.reaped(process)
+            except Exception:
+                pass
+            try:
+                # Popen succeeded, so a failed durable on_spawn registration is
+                # never authoritative no-contact evidence. Cleanup is best-effort;
+                # retain an indeterminate marker even after the child is reaped.
+                launch_control.launch_indeterminate(e)
             except Exception:
                 pass
             _registration_error = _error_response(

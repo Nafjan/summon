@@ -12,6 +12,7 @@ import hmac
 import json
 import math
 import os
+import stat
 import time
 from contextlib import contextmanager
 
@@ -22,6 +23,7 @@ MAX_COMMANDS = 128
 MAX_STEER_CHARS = 16_384
 MAX_EXTENSION_MS = 7 * 24 * 60 * 60 * 1000
 LOCK_WAIT_SECONDS = 5.0
+MAX_CONTROL_BYTES = 512 * 1024
 
 
 def control_path(root: str, job_id: str) -> str:
@@ -178,6 +180,44 @@ def _write_control_json(path: str, value: dict) -> None:
     _jobs._atomic_write_json(path, value)
 
 
+def _read_control_json(path: str):
+    """Bounded strict JSON read for authenticated private control inputs."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    if os.name == "nt" and os.path.islink(path):
+        return None, _jobs._CORRUPT
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None, _jobs._MISSING
+    except OSError:
+        return None, _jobs._CORRUPT
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CONTROL_BYTES:
+            return None, _jobs._CORRUPT
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read(MAX_CONTROL_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > MAX_CONTROL_BYTES:
+        return None, _jobs._CORRUPT
+    try:
+        def pairs(items):
+            value = {}
+            for key, item in items:
+                if key in value:
+                    raise ValueError("duplicate JSON key")
+                value[key] = item
+            return value
+        value = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=pairs,
+            parse_constant=lambda _item: (_ for _ in ()).throw(
+                ValueError("non-finite JSON number")))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None, _jobs._CORRUPT
+    return (value, _jobs._OK) if isinstance(value, dict) else (None, _jobs._CORRUPT)
+
+
 def _valid_command_log(commands: list, generation: int) -> bool:
     """The v2 log is append-only: generations are exactly 1..N."""
     return (isinstance(generation, int) and not isinstance(generation, bool)
@@ -293,10 +333,10 @@ def _exclusive_control_lock(path: str):
     handle = open(lock_path, "a+b")
     acquired = False
     try:
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.write(b"\0")
-            handle.flush()
+        # Lock byte zero directly, including on a newly-created empty file.
+        # Seeding the file before acquiring the OS lock creates a Windows race:
+        # concurrent first callers can both observe length zero and one can fail
+        # its write/flush with PermissionError before serialization begins.
         deadline = time.monotonic() + LOCK_WAIT_SECONDS
         while True:
             try:
@@ -339,7 +379,9 @@ def _record(root: str, job_id: str) -> dict:
     if result_state == _jobs._CORRUPT:
         raise ValueError("job result is malformed; control refused")
     if isinstance(result, dict):
-        raise ValueError("job is already terminal; resume it as a new attempt")
+        raise ValueError(
+            "job is already terminal; use 'jobs resume JOB_ID --message TEXT' "
+            "to continue it as a governed new attempt")
     return record
 
 
@@ -444,6 +486,48 @@ def control_summary(root: str, job_id: str) -> dict | None:
                    for action in ("extend", "cancel", "steer")},
         "steering_mode": "queued_for_resume",
     }
+
+
+def authenticated_steering_commands(root: str, job_id: str) -> dict:
+    """Return a private, authenticated snapshot of the complete control log.
+
+    This is an internal continuation input, never a public status projection.
+    The control lock is held while reading so a concurrent append is either
+    wholly before or wholly after the snapshot.  Callers that also own a resume
+    claim ledger must acquire the ledger lock first; no control path acquires a
+    resume-ledger lock, which keeps the lock order acyclic.
+    """
+    record, record_state = _jobs._read(_jobs.record_path(root, job_id))
+    nonce = record.get("nonce") if isinstance(record, dict) else None
+    if record_state != _jobs._OK or not isinstance(nonce, str) or not nonce:
+        raise ValueError("job launch record has no authenticated control identity")
+    path = control_path(root, job_id)
+    with _exclusive_control_lock(path):
+        data, state = _read_control_json(path)
+        if state == _jobs._MISSING:
+            return {"generation": 0,
+                    "control_sha256": hashlib.sha256(b"").hexdigest(),
+                    "steering": []}
+        if state == _jobs._CORRUPT or not isinstance(data, dict):
+            raise ValueError("job control file is malformed")
+        commands, integrity = _validated_commands(data, job_id, nonce)
+        if commands is None or integrity != "authenticated":
+            raise ValueError("job control identity mismatch")
+        try:
+            control_sha = hashlib.sha256(_canonical_json(data)).hexdigest()
+        except (TypeError, ValueError, OverflowError, UnicodeError) as exc:
+            raise ValueError("job control file is malformed") from exc
+        return {"generation": data["generation"],
+                "control_sha256": control_sha,
+                "steering": [
+            {
+                "generation": command["generation"],
+                "message": command["message"],
+                "message_sha256": command["message_sha256"],
+            }
+            for command in commands
+            if command.get("action") == "steer"
+        ]}
 
 
 def environment_job_budget(timeout_ms: int, *, wall_clock=None) -> dict:

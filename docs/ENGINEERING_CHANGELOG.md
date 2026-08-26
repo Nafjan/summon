@@ -13,12 +13,50 @@ never on added fields.
 
 ## Unreleased
 
+- **Authenticated continuation ledger and crash-safe successor launch:** eligible
+  terminal Claude subprocess jobs can reserve one source-scoped successor through a
+  private HMAC-authenticated ledger. The claim binds the source receipt and session
+  handle, exact reported model, named profile/role evidence, workspace object, read
+  roots, permission ceiling, gate, fresh spend consent, queued steering generations,
+  immutable execution bundle, launch record, and canonical terminal result. Durable
+  compare-and-swap phases enforce one child and one provider launch under concurrent
+  callers. Preparation faults remain provider-inert and recover the same request;
+  proven `Popen` failures reuse the same frozen successor, while unexpected launch or
+  post-spawn registration failures become indeterminate and cannot retry. Every
+  governed child envelope—including gate denial and private-claim refusal—receives
+  authenticated public lineage and binds to the canonical on-disk result. A trusted
+  child result closes the result lifecycle after an ambiguous provider launch without
+  certifying contact or no-contact; the authenticated projection stays recovery-required
+  and nonzero. Result-to-claim seal failures are recorded as bounded typed ledger state
+  instead of being swallowed after envelope publication.
+  Governed successors also ignore inherited credit/Fable compatibility switches and
+  standing PAYG preferences; only the claim-bound fresh flags can authorize the new
+  physical attempt. Text-only permission and tool requirements are captured in the
+  authenticated continuation source and private successor claim; the resumed child
+  strips ambient text-seat grants and reconstructs only those source-bound flags.
+  The child's real private-claim authentication-refusal path now includes its frozen
+  Summon identity before terminal sealing; its provider-inert regression drives the
+  dispatcher entry point instead of hand-building a simplified envelope.
+  Raw session handles, steering text, prompts, paths, nonces, and private profile data
+  never enter the public jobs projection. Provider-inert regressions cover tampering,
+  gate/provider ordering, canonical receipt forgery, fault boundaries, Windows argv,
+  and concurrent reservation/recovery races.
+- **Race-free Windows job controls:** the first extend/cancel/steer caller now locks
+  byte zero of an empty lock file directly. The previous pre-lock seed write allowed
+  two simultaneous first callers to race and intermittently raise `PermissionError`.
+  Regressions prohibit any pre-lock write and repeatedly synchronize concurrent first
+  callers on Windows.
+- **Retry-safe explicit result replacement on Windows:** `--out` writes now use the
+  same bounded atomic-replace retry as detached job receipts. A transient antivirus or
+  indexer handle can no longer leave a stale error envelope after the new result was
+  fully written to its temporary file.
 - **Authenticated continuation evidence and capability-safe job status:** completed
   Claude subprocess jobs can seal a private HMAC-authenticated continuation source bound
   to the exact launch, attempt, prompt, reported model, session route, approved role or
   named profile, authority/spend decision, terminal receipt, scripts identity, and
-  workspace directory object. This checkpoint does not expose `jobs resume` and does not
-  claim live steering; other backends remain explicitly candidate or unsupported until
+  workspace directory object. That evidence-sealing checkpoint did not expose `jobs resume`;
+  the authenticated successor entry above now does. It still does not claim live steering,
+  and other backends remain explicitly candidate or unsupported until
   provider-specific continuity evidence exists. Concurrent writers are serialized,
   duplicate/non-finite/oversized JSON fails closed, and public `jobs status` derives an
   available capability only from the authenticated sidecar bound to the same result

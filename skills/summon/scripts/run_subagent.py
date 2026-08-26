@@ -101,6 +101,7 @@ __version__ = "3.2.1"  # summon dispatcher version (see CHANGELOG.md)
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
 _JOB_FILE: str | None = None
 _EMIT_OPERATION = "dispatch"
+_GOVERNED_RESUME_LINEAGE: dict | None = None
 
 
 def _dispatch_agent_snapshot(agents_dir: str, agent_name: str,
@@ -334,6 +335,11 @@ def _emit(obj: dict, *, operation: str | None = None,
     # no-op on query envelopes (list/doctor/version have no exit_code).
     finalize_exit_fields(obj)
     _stamp_job(obj)
+    if _GOVERNED_RESUME_LINEAGE is not None and _JOB_FILE:
+        # Lineage is authenticated from the source ledger + successor launch
+        # record. It applies to every terminal child envelope, including gate
+        # denials and pre-provider validation refusals—not only provider results.
+        obj["lineage"] = dict(_GOVERNED_RESUME_LINEAGE)
     if trusted_executor_result and continuation_context is not None and _JOB_FILE:
         try:
             from _job_continuation import write_private_source
@@ -379,6 +385,18 @@ def _emit(obj: dict, *, operation: str | None = None,
     text = json.dumps(obj, ensure_ascii=False)
     if _JOB_FILE:
         _write_job_file_text(text, _JOB_FILE)
+        if _GOVERNED_RESUME_LINEAGE is not None:
+            try:
+                from _job_resume import mark_terminal_for_job
+                mark_terminal_for_job(_JOB_FILE, obj)
+            except Exception as exc:
+                # Keep the immutable provider receipt, but never hide a failed
+                # result-to-claim seal. Record a bounded typed marker in the
+                # authenticated source ledger so status/resume remains blocked.
+                from _job_resume import record_terminalization_failure
+                record_terminalization_failure(
+                    _JOB_FILE, obj,
+                    getattr(exc, "kind", "resume_terminalization_failed"))
     else:
         print(text)
 
@@ -790,7 +808,8 @@ def main() -> None:
                 max(int(args.timeout), 24 * 60 * 60 * 1000))
         elif int(args.max_runtime) < int(args.timeout):
             parser.error("--max-runtime must be greater than or equal to --timeout")
-    elif getattr(args, "max_runtime", None) is not None:
+    elif (getattr(args, "max_runtime", None) is not None
+          and not getattr(args, "jobs_resume", None)):
         parser.error("--max-runtime requires --adaptive-timeout or --background")
 
     # This opt-in must be set before manifest/council fan-out branches so their
@@ -800,8 +819,44 @@ def main() -> None:
     if getattr(args, "allow_kimi_acp_fallback", False):
         os.environ["SUMMON_KIMI_ACP_FALLBACK"] = "1"
 
-    global _JOB_FILE, _EMIT_OPERATION
+    global _JOB_FILE, _EMIT_OPERATION, _GOVERNED_RESUME_LINEAGE
     _JOB_FILE = args.job_file
+    _GOVERNED_RESUME_LINEAGE = None
+    _governed_resume_context = None
+    if os.environ.get("SUMMON_RESUME_CLAIM_FILE"):
+        try:
+            from _job_resume import authenticated_lineage
+            _GOVERNED_RESUME_LINEAGE = authenticated_lineage(_JOB_FILE)
+        except Exception:
+            _GOVERNED_RESUME_LINEAGE = None
+        try:
+            from _job_resume import load_child_context
+            _governed_resume_context = load_child_context(
+                _JOB_FILE, os.environ.get("SUMMON_RESUME_CLAIM_FILE"))
+            if _governed_resume_context is None:
+                raise ValueError("private resume context is unavailable")
+            # Replace the non-sensitive argv placeholder only after the claim,
+            # source, successor record, workspace, and prompt file authenticate.
+            args.prompt = _governed_resume_context.prompt
+            args.prompt_file = None
+            args.resume = _governed_resume_context.resume_handle
+            args._governed_resume_context = _governed_resume_context
+        except Exception as exc:  # fail before any roster/provider work
+            _resume_error = {
+                "status": "blocked", "result": "", "exit_code": 1,
+                "error": "governed resume child authentication refused",
+                "error_kind": getattr(exc, "kind", "resume_claim_untrusted"),
+                "retryable": False, "result_usable": False,
+                # Bind the refusal to the immutable child bundle before _emit
+                # authenticates and seals it into the source resume ledger.
+                # Without this identity the receipt is correctly classified as
+                # untrusted, but the typed terminalization failure cannot itself
+                # be recorded because it re-authenticates the same receipt.
+                "summon": _receipt_base()["summon"],
+            }
+            _mark_not_run(_resume_error)
+            _emit(_resume_error, operation="resume")
+            sys.exit(1)
     _EMIT_OPERATION = "resume" if args.resume else "dispatch"
 
     # Fan-out modes consume a fixed flag set; anything else present in argv is
@@ -1027,8 +1082,11 @@ def main() -> None:
     # jobs list/status/wait: read-only registry queries; no dispatch. Answer and
     # exit before any agent/prompt/cwd validation.
     if (args.jobs_list or args.jobs_status or args.jobs_wait
-            or args.jobs_extend or args.jobs_cancel or args.jobs_steer):
-        sys.exit(_background.run_jobs_query(args, _print_error))
+            or args.jobs_extend or args.jobs_cancel or args.jobs_steer
+            or args.jobs_resume):
+        sys.exit(_background.run_jobs_query(
+            args, _print_error, entry_path=os.path.abspath(__file__),
+            summon=_receipt_base()["summon"]))
 
     # Conversation rooms are a local context surface. Opening a room or
     # posting human context is authority-inert; the explicit chat turn action
@@ -1814,6 +1872,17 @@ def main() -> None:
             "command_sha256": profile_selection.get("command_sha256"),
         }
 
+    if _governed_resume_context is not None:
+        try:
+            from _job_resume import validate_loaded_invocation
+            validate_loaded_invocation(
+                _governed_resume_context, invocation, args, receipt)
+        except Exception as exc:
+            _die("governed resume child differs from its authenticated claim",
+                 error_kind=getattr(exc, "kind", "resume_child_drift"),
+                 extra={"provider_contacted": False, "retryable": False,
+                        "result_usable": False})
+
     # Frontmatter may *request* PAYG; only operator surfaces grant it.
     if _allow_payg_from_frontmatter(agent_file) and not invocation.allow_payg:
         try:
@@ -1885,7 +1954,33 @@ def main() -> None:
         # A gate authorises ONE execution. --retries would otherwise run the task
         # again (up to N times) on a single approval, which for a side-effecting
         # task is materially more than what was approved. Each attempt re-gates.
-        _gate_decision = _run_gate(args, agents_dir, invocation)
+        _gate_control = None
+        if _governed_resume_context is not None:
+            from _job_resume import provider_launch_control
+            _gate_control = provider_launch_control(
+                _governed_resume_context, gate=True)
+        if _gate_control is None:
+            # Preserve the historical call shape for ordinary dispatches and
+            # downstream wrappers that implement the documented three arguments.
+            _gate_decision = _run_gate(args, agents_dir, invocation)
+        else:
+            _gate_decision = _run_gate(
+                args, agents_dir, invocation, launch_control=_gate_control)
+        if _governed_resume_context is not None:
+            from _job_resume import mark_gate_terminal
+            _gate_digest = hashlib.sha256(json.dumps(
+                _gate_decision, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+            try:
+                mark_gate_terminal(
+                    _governed_resume_context,
+                    approved=bool(_gate_decision.get("approved")),
+                    decision_sha256=_gate_digest)
+            except Exception as exc:
+                _die("governed resume gate state could not be authenticated",
+                     error_kind=getattr(exc, "kind", "resume_gate_state_invalid"),
+                     extra={"provider_contacted": False, "retryable": False,
+                            "result_usable": False})
         if not _gate_decision.get("approved"):
             from _gate import blocked_envelope
             _env = _enrich_denial(
@@ -1921,7 +2016,15 @@ def main() -> None:
     # errors rather than tracebacks. All other CLI-side failures are already
     # shaped into the response by execute_agent.
     try:
-        result = _dispatch_with_retries(invocation, args, agents_dir)
+        if _governed_resume_context is not None:
+            from _job_resume import provider_launch_control
+            result = execute_agent(
+                invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
+                max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None),
+                launch_control=provider_launch_control(
+                    _governed_resume_context, gate=False))
+        else:
+            result = _dispatch_with_retries(invocation, args, agents_dir)
     except ValueError as e:
         _die(str(e))
     # Effort is request-level evidence. Kimi's builder applies it to the
@@ -2494,7 +2597,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
     return view
 
 
-def _run_gate(args, agents_dir, gated_inv) -> dict:
+def _run_gate(args, agents_dir, gated_inv, *, launch_control=None) -> dict:
     """Dispatch the --gate-with agent to adjudicate this request. Returns a gate
     decision dict (see _gate.decide); FAILS CLOSED on every failure path.
 
@@ -2591,7 +2694,8 @@ def _run_gate(args, agents_dir, gated_inv) -> dict:
         from _cli import parse_timeout
         timeout = parse_timeout(timeout)
     try:
-        resp = execute_agent(gate_inv, timeout_ms=timeout, debug_dir=args.debug_dir)
+        resp = execute_agent(gate_inv, timeout_ms=timeout, debug_dir=args.debug_dir,
+                             launch_control=launch_control)
     except Exception as e:  # noqa: BLE001 — a crashed gate REFUSES
         return decide(None, _gate_requested) | {
             "reason": f"gate dispatch failed: {type(e).__name__}: {e}"}
@@ -3396,7 +3500,11 @@ def _write_out(path: str, result: dict) -> None:
         fd, tmp = tempfile.mkstemp(dir=d, prefix=".summon-out-", suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(result, fh, ensure_ascii=False)
-        os.replace(tmp, path)
+        # Reuse the bounded Windows sharing/access retry used by background
+        # receipts. Antivirus and indexer handles can briefly make an otherwise
+        # valid atomic replacement fail with WinError 5/32; leaving the stale
+        # envelope in place is worse than waiting the bounded retry budget.
+        _jobs._replace_with_retry(tmp, path)
     except OSError as e:
         result["out_error"] = f"failed to write --out {path}: {e}"
 

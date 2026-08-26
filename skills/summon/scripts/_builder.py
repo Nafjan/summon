@@ -1275,6 +1275,11 @@ def credit_spend_allowed() -> bool:
     read and honoured so existing scripts keep working; it simply has nothing to
     authorize right now. Keep the machinery ready for the next credit-only model.
     """
+    if os.environ.get("SUMMON_FRESH_CONSENT_ONLY") == "1":
+        # Governed continuation claims require fresh per-attempt consent. Do not
+        # let a durable preference or Fable compatibility switch silently grant
+        # a new paid turn after the original job completed.
+        return os.environ.get("SUMMON_ALLOW_CREDIT") == "1"
     return (os.environ.get("SUMMON_ALLOW_FABLE") == "1"
             or os.environ.get("SUMMON_ALLOW_CREDIT") == "1")
 

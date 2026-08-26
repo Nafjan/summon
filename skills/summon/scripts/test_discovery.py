@@ -1342,6 +1342,26 @@ def test_write_out_unique_tmp():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_write_out_uses_retry_safe_atomic_replace():
+    import run_subagent as rs
+    d = tempfile.mkdtemp(prefix="summon-out-retry-")
+    target = os.path.join(d, "job.json")
+    calls = []
+    original = rs._jobs._replace_with_retry
+    try:
+        def wrapped(src, dst):
+            calls.append((src, dst))
+            return original(src, dst)
+        rs._jobs._replace_with_retry = wrapped
+        rs._write_out(target, {"status": "error", "error": "new"})
+        assert calls and calls[0][1] == target
+        with open(target, encoding="utf-8") as fh:
+            assert json.load(fh)["error"] == "new"
+    finally:
+        rs._jobs._replace_with_retry = original
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_manifest_end_to_end_with_stub_child(tmp=None):
     # Production-path manifest: real run_manifest driving stub jobs whose
     # backend resolves without a live CLI. We stub the child dispatch by
@@ -18001,6 +18021,10 @@ def test_allow_payg_rejected_in_fanout_modes():
     """--allow-payg is not in any fan-out mode's whitelist."""
     from _cli import MODE_FLAGS
     for mode, flags in MODE_FLAGS.items():
+        if mode == "jobs-resume":
+            # A governed continuation is one physical attempt, not fan-out.
+            # Fresh, explicit spend consent is claim-bound for this command.
+            continue
         assert "allow_payg" not in flags, f"allow_payg should NOT be in {mode} whitelist"
 
 

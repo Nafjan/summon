@@ -57,7 +57,8 @@ _AUTHORITY_FIELDS = {
     "permission", "permission_forced", "permission_ceiling", "read_roots",
     "strict_agents_dir", "enable_roles", "isolated_lane",
     "allow_tool_credentials", "model_exact_required", "model_exact_source",
-    "effort", "extra_args", "no_contract_repair",
+    "allow_text_only", "require_tools", "effort", "extra_args",
+    "no_contract_repair",
 }
 _SPEND_FIELDS = {"billing_source", "source_allow_credit", "source_allow_payg"}
 _GATE_FIELDS = {"agent", "decision_sha256"}
@@ -293,7 +294,7 @@ def _valid_source_shape(value: dict) -> bool:
         return False
     for key in ("permission_forced", "strict_agents_dir", "enable_roles",
                 "isolated_lane", "allow_tool_credentials", "model_exact_required",
-                "no_contract_repair"):
+                "allow_text_only", "require_tools", "no_contract_repair"):
         if not isinstance(authority.get(key), bool):
             return False
     spend = value.get("spend")
@@ -417,8 +418,15 @@ def write_private_source(job_file: str, result: dict, invocation, args) -> dict:
         return _unavailable(invocation.cli, invocation.transport,
                             "governed_backend_not_certified")
     if invocation.resume_id:
-        return _unavailable(invocation.cli, invocation.transport,
-                            "ungoverned_resumed_source")
+        try:
+            from _job_resume import governed_source_allowed
+            context = getattr(args, "_governed_resume_context", None)
+            governed = governed_source_allowed(context, invocation, result)
+        except Exception:  # fail closed; raw/private details never enter projection
+            governed = False
+        if not governed:
+            return _unavailable(invocation.cli, invocation.transport,
+                                "ungoverned_resumed_source")
     if result.get("provider_contacted") is not True or result.get("attempts") != 1:
         return _unavailable(invocation.cli, invocation.transport,
                             "single_contact_source_required")
@@ -576,6 +584,8 @@ def write_private_source(job_file: str, result: dict, invocation, args) -> dict:
             "allow_tool_credentials": bool(invocation.allow_tool_credentials),
             "model_exact_required": bool(invocation.model_exact_required),
             "model_exact_source": invocation.model_exact_source,
+            "allow_text_only": bool(getattr(args, "allow_text_only", False)),
+            "require_tools": bool(getattr(args, "require_tools", False)),
             "effort": invocation.effort,
             "extra_args": list(invocation.extra_args),
             "no_contract_repair": bool(getattr(args, "no_contract_repair", False)),

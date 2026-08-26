@@ -162,6 +162,10 @@ MODE_FLAGS = {
     "jobs-extend": {"jobs_extend", "job_duration", "job_dir", "json", "job_file"},
     "jobs-cancel": {"jobs_cancel", "job_dir", "json", "job_file"},
     "jobs-steer": {"jobs_steer", "job_message", "job_dir", "json", "job_file"},
+    "jobs-resume": {"jobs_resume", "job_message", "job_message_file",
+                    "job_request_id", "job_dir", "timeout", "max_runtime",
+                    "max_permission", "gate_with", "gate_timeout",
+                    "allow_credit", "allow_payg", "json", "job_file"},
     # Diagnostics are local management commands. They never dispatch an agent;
     # bug-report submission is an explicit, user-authenticated gh invocation.
     "telemetry": {"telemetry_enable", "telemetry_disable", "telemetry_status",
@@ -214,6 +218,10 @@ MODE_HINTS = {
     "jobs-cancel": ("jobs cancel queues cancellation for the active child."),
     "jobs-steer": ("jobs steer queues a follow-up. Subprocess turns apply it only "
                    "through an explicit resumed turn; no live injection is claimed."),
+    "jobs-resume": ("jobs resume creates one authenticated background successor for "
+                    "an eligible terminal Claude job. It consumes queued steering, "
+                    "uses fresh spend consent, disables retries/fallback/repair, and "
+                    "never places the session handle or message text in child argv."),
     "telemetry": ("telemetry is local-only and opt-in: it writes bounded, sanitized "
                   "JSONL evidence and never phones home."),
     "usage": ("usage status/import is provider-inert: it reads or validates a bounded, "
@@ -250,6 +258,8 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "jobs-cancel"
     if getattr(args, "jobs_steer", None):
         return "jobs-steer"
+    if getattr(args, "jobs_resume", None):
+        return "jobs-resume"
     if getattr(args, "council_status", None):
         return "council-status"
     if getattr(args, "deliberate_status", None):
@@ -616,12 +626,12 @@ def rewrite_subcommand(argv: list) -> tuple:
             return argv, "help"       # bare `summon jobs` -> usage, not a silent list
         if rest[0] == "list":
             return ["--jobs-list", *rest[1:]], None
-        if rest[0] in ("status", "wait", "extend", "cancel", "steer"):
+        if rest[0] in ("status", "wait", "extend", "cancel", "steer", "resume"):
             if len(rest) < 2 or rest[1].startswith("-"):
                 return argv, f"error: 'jobs {rest[0]}' needs a job id"
             flag = {"status": "--jobs-status", "wait": "--jobs-wait",
                     "extend": "--jobs-extend", "cancel": "--jobs-cancel",
-                    "steer": "--jobs-steer"}[rest[0]]
+                    "steer": "--jobs-steer", "resume": "--jobs-resume"}[rest[0]]
             tail = list(rest[2:])
             if rest[0] == "extend":
                 tail = [("--job-duration" + token[len("--duration"):])
@@ -631,9 +641,20 @@ def rewrite_subcommand(argv: list) -> tuple:
                 tail = [("--job-message" + token[len("--message"):])
                          if token == "--message" or token.startswith("--message=")
                          else token for token in tail]
+            elif rest[0] == "resume":
+                translated_tail = []
+                for token in tail:
+                    if token == "--message" or token.startswith("--message="):
+                        token = "--job-message" + token[len("--message"):]
+                    elif token == "--message-file" or token.startswith("--message-file="):
+                        token = "--job-message-file" + token[len("--message-file"):]
+                    elif token == "--request-id" or token.startswith("--request-id="):
+                        token = "--job-request-id" + token[len("--request-id"):]
+                    translated_tail.append(token)
+                tail = translated_tail
             return [flag, rest[1], *tail], None
         return argv, (f"error: unknown 'jobs' action {rest[0]!r} "
-                      "(use list/status/wait/extend/cancel/steer)")
+                      "(use list/status/wait/extend/cancel/steer/resume)")
     if head == "version":
         return ["--version", *rest], None
     if head == "manifest":            # first positional is the manifest file
@@ -1130,8 +1151,14 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Queue cancellation for a background job")
     parser.add_argument("--jobs-steer", dest="jobs_steer", metavar="JOB_ID",
                         help="Queue a follow-up steering prompt; subprocess turns resume later")
+    parser.add_argument("--jobs-resume", dest="jobs_resume", metavar="JOB_ID",
+                        help="Create one governed background continuation successor")
     parser.add_argument("--job-duration", dest="job_duration", type=parse_timeout,
                         help="With jobs extend: duration to add")
     parser.add_argument("--job-message", dest="job_message",
                         help="With jobs steer: bounded follow-up prompt")
+    parser.add_argument("--job-message-file", dest="job_message_file",
+                        help="With jobs resume: UTF-8 follow-up prompt file")
+    parser.add_argument("--job-request-id", dest="job_request_id",
+                        help="With jobs resume: stable 32-hex idempotency key")
     return parser

@@ -5,6 +5,23 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+- **Activity-aware long jobs and governed continuation:** background dispatches now
+  treat their timeout as a progress checkpoint by default, publish authenticated
+  activity/idle diagnostics, and accept durable extend, cancel, and queued-steering
+  commands. Eligible terminal Claude subprocess jobs can create one authenticated,
+  idempotent successor with the same workspace and no greater authority. The successor
+  preserves any gate, requires fresh spend consent, disables retries/fallback/repair,
+  preserves the source's authenticated text-seat/tool requirement while scrubbing
+  ambient text-only grants, and reuses queued steering exactly once. Proven pre-spawn failures are safely
+  recoverable; ambiguous launch or registration failures remain indeterminate and do
+  not relaunch automatically. A canonical child result may close the result lifecycle,
+  but it never rewrites unknown provider contact into a Boolean; the resume projection
+  remains blocked and recovery-required. Detached subprocess steering is explicitly queued for
+  the successor—Summon does not claim the running model received it live.
+- **Reliable concurrent job controls on Windows:** first-use control locking no
+  longer writes a seed byte before acquiring the operating-system lock. Simultaneous
+  extend, cancel, or steer commands are serialized without the intermittent
+  `PermissionError` that could occur while creating a new lock file.
 - **Refusal and public-proof invariants:** every structural pre-dispatch refusal
   (including read-root, backend, model, text-seat, and gate checks) now states
   `attempts:0`, `attempt_status:"not_run"`, `execution_status:"not_run"`, and
@@ -24,7 +41,8 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
   model-proof flags are never trusted.
 - **Background terminal receipts:** detached children now publish parser/early-exit
   failures as typed envelopes, and terminal writes reuse the bounded Windows atomic
-  replacement retry used by launch records. A dead child remains `stale` rather than
+  replacement retry used by launch records. The same retry now protects explicit
+  `--out` result replacement from transient antivirus/indexer sharing locks. A dead child remains `stale` rather than
   being mistaken for a provider result; no model evidence is synthesized.
 - **OpenRouter 429 handling:** `--transient-retries` now recognizes explicit upstream
   HTTP 429/rate-limit errors, including the machine-readable `rate_limit_exceeded` token,
