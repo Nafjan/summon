@@ -17,6 +17,7 @@ import _decision
 import _evidence
 import _executor
 from _liveness import LivenessError, LivenessTracker
+from _stream import StreamProcessor
 
 
 EMPTY_LIVENESS_COUNTS = {
@@ -730,6 +731,113 @@ def test_liveness_tool_activity_counts_and_resets_idle_clock():
     snapshot = tracker.snapshot()
     assert snapshot["counts"]["tools"] == 1
     assert snapshot["counts"]["meaningful"] == 1
+
+
+def test_stream_semantic_replay_dedupe_without_provider_event_ids():
+    """No-id transport replays cannot renew idle, but changed work can."""
+    clock = Clock()
+    tracker = LivenessTracker(attempt_id="semantic-replay", overall_ms=10_000,
+                              first_event_ms=1_000, idle_ms=2_000, clock=clock)
+    processor = StreamProcessor(event_observer=tracker.emitter())
+    processor.process_line(json.dumps(
+        {"type": "system", "subtype": "init", "session_id": "session"}))
+
+    text = {"type": "assistant", "session_id": "session", "message": {
+        "content": [{"type": "text", "text": "private first answer"}]}}
+    processor.process_line(json.dumps(text))
+    clock.advance(1.5)
+    processor.process_line(json.dumps(text))
+    progressed_text = {"type": "assistant", "session_id": "session", "message": {
+        "content": [{"type": "text", "text": "private second answer"}]}}
+    processor.process_line(json.dumps(progressed_text))
+    # A stable outer event id with changed semantic content is incremental
+    # progress; replaying the same id+content is not.
+    stable = {"type": "assistant", "id": "stable-message",
+              "session_id": "session", "message": {"content": [
+                  {"type": "text", "text": "stable first"}]}}
+    processor.process_line(json.dumps(stable))
+    processor.process_line(json.dumps(stable))
+    stable["message"]["content"][0]["text"] = "stable second"
+    processor.process_line(json.dumps(stable))
+
+    tool = {"type": "assistant", "session_id": "session", "message": {
+        "content": [{"type": "tool_use", "name": "Read",
+                     "input": {"path": "private-a.txt"}}]}}
+    processor.process_line(json.dumps(tool))
+    processor.process_line(json.dumps(tool))
+    progressed_tool = {"type": "assistant", "session_id": "session", "message": {
+        "content": [{"type": "tool_use", "name": "Read",
+                     "input": {"path": "private-b.txt"}}]}}
+    processor.process_line(json.dumps(progressed_tool))
+
+    snapshot = tracker.snapshot()
+    assert snapshot["counts"]["meaningful"] == 6
+    assert snapshot["counts"]["tools"] == 2
+    assert all(len(digest) == 64 for digest in processor._liveness_semantic_ids)
+    cached = repr(processor._liveness_semantic_ids)
+    assert "private first answer" not in cached
+    assert "private-a.txt" not in cached
+
+    clock.advance(2.1)
+    assert tracker.expired() == "generation_idle_timeout"
+    assert processor.process_line(json.dumps(
+        {"type": "result", "result": "unchanged parsing", "status": "success"}))
+    assert processor.get_result()["result"] == "unchanged parsing"
+
+
+def test_stream_semantic_dedupe_saturates_instead_of_reaccepting_old_replay():
+    """Churning the bounded cache cannot make event zero meaningful again."""
+    clock = Clock()
+    tracker = LivenessTracker(attempt_id="semantic-saturation", overall_ms=60_000,
+                              first_event_ms=60_000, idle_ms=60_000, clock=clock)
+    processor = StreamProcessor(event_observer=tracker.emitter())
+    processor.process_line(json.dumps(
+        {"type": "system", "subtype": "init", "session_id": "session"}))
+    for index in range(4097):
+        processor.process_line(json.dumps({
+            "type": "assistant", "session_id": "session",
+            "message": {"content": [{"type": "text", "text": f"item-{index}"}]},
+        }))
+    before = tracker.snapshot()["counts"]["meaningful"]
+    assert before == 4096
+    processor.process_line(json.dumps({
+        "type": "assistant", "session_id": "session",
+        "message": {"content": [{"type": "text", "text": "item-0"}]},
+    }))
+    assert tracker.snapshot()["counts"]["meaningful"] == before
+    assert len(processor._liveness_semantic_ids) == 4096
+
+
+def test_replayed_finalizing_event_cannot_slide_finalization_deadline():
+    clock = Clock()
+    tracker = LivenessTracker(attempt_id="finalizing-replay", overall_ms=60_000,
+                              first_event_ms=60_000, idle_ms=60_000,
+                              finalization_ms=2_000, clock=clock)
+    emitter = tracker.emitter()
+    emitter.emit("transport_started", session_id="session")
+    emitter.emit("finalizing", session_id="session")
+    for _ in range(5):
+        clock.advance(0.4)
+        emitter.emit("finalizing", session_id="session")
+    assert tracker.expired() == "finalization_timeout"
+
+
+def test_meaningful_progress_can_leave_then_reenter_finalization_once():
+    clock = Clock()
+    tracker = LivenessTracker(attempt_id="finalizing-progress", overall_ms=60_000,
+                              first_event_ms=60_000, idle_ms=60_000,
+                              finalization_ms=2_000, clock=clock)
+    emitter = tracker.emitter()
+    emitter.emit("transport_started", session_id="session")
+    emitter.emit("finalizing", session_id="session")
+    clock.advance(1.5)
+    emitter.emit("output_text", session_id="session", source_event_id="new-text",
+                 output_chars=5)
+    clock.advance(1.0)
+    assert tracker.expired() is None
+    emitter.emit("finalizing", session_id="session", source_event_id="final-2")
+    clock.advance(2.0)
+    assert tracker.expired() == "finalization_timeout"
 
 
 def test_liveness_virtual_time_startup_terminal_and_clock_regression():

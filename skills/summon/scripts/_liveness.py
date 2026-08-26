@@ -216,6 +216,11 @@ class LivenessTracker:
                 self.counts["tools"] += 1
         if meaningful:
             self.last_meaningful = now
+            # A genuinely new output/tool event means finalization was not the
+            # current phase after all. Permit a later finalizing transition to
+            # start a fresh bounded grace, but never let repeated finalizing
+            # packets slide an existing deadline forward.
+            self.finalization_started = None
             self.last_activity_kind = (
                 "tool" if event.kind == "tool_activity" else "generation")
             self.counts["meaningful"] += 1
@@ -224,7 +229,8 @@ class LivenessTracker:
             self.counts["reconnects"] += 1
             self.phase = "reconnect"
         elif event.kind == "finalizing":
-            self.finalization_started = now
+            if self.finalization_started is None:
+                self.finalization_started = now
             self.phase = "finalization"
         if event.kind in {"terminal", "cancelled"}:
             self.terminal = now

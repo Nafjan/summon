@@ -65,6 +65,33 @@ def command_auth(nonce: str, job_id: str, command: dict) -> str:
     return _auth(nonce, f"summon-job-control/v2:{job_id}", command)
 
 
+def _is_finite_number(value) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _is_sha256(value) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and value == value.lower()
+            and all(char in "0123456789abcdef" for char in value))
+
+
+def _canonical_json(value) -> bytes:
+    """Canonical bytes for authenticated control data; never admits NaN/Inf."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _write_control_json(path: str, value: dict) -> None:
+    """Reject non-JSON numeric values before the shared atomic writer runs."""
+    _canonical_json(value)
+    _jobs._atomic_write_json(path, value)
+
+
 def _valid_command_log(commands: list, generation: int) -> bool:
     """The v2 log is append-only: generations are exactly 1..N."""
     return (isinstance(generation, int) and not isinstance(generation, bool)
@@ -74,6 +101,102 @@ def _valid_command_log(commands: list, generation: int) -> bool:
                     and not isinstance(item.get("generation"), bool)
                     and item.get("generation") == index
                     for index, item in enumerate(commands, 1)))
+
+
+def _valid_command_shape(command: dict, *, authenticated: bool) -> bool:
+    """Validate one exact v1/v2 command shape before it is counted or applied."""
+    if not isinstance(command, dict):
+        return False
+    action = command.get("action")
+    expected = {"generation", "action", "queued_at"}
+    if action == "extend":
+        expected.add("duration_ms")
+    elif action == "steer":
+        expected.update({"message", "message_sha256"})
+    elif action != "cancel":
+        return False
+    if authenticated:
+        expected.add("auth")
+    if set(command) != expected:
+        return False
+    generation = command.get("generation")
+    if (not isinstance(generation, int) or isinstance(generation, bool)
+            or generation < 1 or not _is_finite_number(command.get("queued_at"))):
+        return False
+    if action == "extend":
+        duration = command.get("duration_ms")
+        if (not isinstance(duration, int) or isinstance(duration, bool)
+                or not 1 <= duration <= MAX_EXTENSION_MS):
+            return False
+    elif action == "steer":
+        message = command.get("message")
+        if (not isinstance(message, str) or not message.strip()
+                or len(message) > MAX_STEER_CHARS):
+            return False
+        try:
+            expected_digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        except UnicodeError:
+            return False
+        claimed_digest = command.get("message_sha256")
+        if (not _is_sha256(claimed_digest)
+                or not hmac.compare_digest(claimed_digest, expected_digest)):
+            return False
+    return not authenticated or _is_sha256(command.get("auth"))
+
+
+def _validated_commands(data: dict, job_id: str, nonce: str):
+    """Return ``(commands, integrity)`` or ``(None, 'untrusted')``.
+
+    V2 is accepted only after exact schema, generation, command shape, and HMAC
+    validation. V1 remains readable for the immediately preceding draft, but is
+    explicitly labelled unverified because it authenticated only the whole file
+    with a duplicated nonce rather than each command.
+    """
+    if not isinstance(data, dict) or not isinstance(nonce, str) or not nonce:
+        return None, "untrusted"
+    schema = data.get("schema")
+    if schema == "summon.job-control/v2":
+        if set(data) != {"schema", "job_id", "generation", "commands"}:
+            return None, "untrusted"
+        authenticated = True
+        integrity = "authenticated"
+    elif schema == "summon.job-control/v1":
+        if set(data) != {"schema", "job_id", "nonce", "generation", "commands"}:
+            return None, "untrusted"
+        if data.get("nonce") != nonce:
+            return None, "untrusted"
+        authenticated = False
+        integrity = "legacy_unverified"
+    else:
+        return None, "untrusted"
+    commands = data.get("commands")
+    generation = data.get("generation")
+    if (data.get("job_id") != job_id or not isinstance(commands, list)
+            or len(commands) > MAX_COMMANDS
+            or not _valid_command_log(commands, generation)):
+        return None, "untrusted"
+    for command in commands:
+        if not _valid_command_shape(command, authenticated=authenticated):
+            return None, "untrusted"
+        if authenticated:
+            body = {key: value for key, value in command.items() if key != "auth"}
+            try:
+                expected_auth = command_auth(nonce, job_id, body)
+            except (TypeError, ValueError, OverflowError, UnicodeError):
+                return None, "untrusted"
+            if not hmac.compare_digest(command["auth"], expected_auth):
+                return None, "untrusted"
+    return commands, integrity
+
+
+def _invalid_summary(integrity: str) -> dict:
+    return {
+        "state": integrity,
+        "integrity": integrity,
+        "generation": None,
+        "counts": {action: 0 for action in ("extend", "cancel", "steer")},
+        "steering_mode": "queued_for_resume",
+    }
 
 
 @contextmanager
@@ -163,47 +286,43 @@ def queue_command(root: str, job_id: str, action: str, *,
             existing = {"schema": "summon.job-control/v2", "job_id": job_id,
                         "generation": 0, "commands": []}
         elif existing.get("schema") == "summon.job-control/v1":
-            # Ownership-safe in-place migration for a launcher from the
-            # immediately preceding draft: authenticate every retained command
-            # and remove the duplicated plaintext nonce.
-            commands = existing.get("commands")
-            generation = existing.get("generation")
-            if (existing.get("job_id") != job_id
-                    or existing.get("nonce") != record["nonce"]
-                    or not isinstance(commands, list)
-                    or not isinstance(generation, int)
-                    or not _valid_command_log(commands, generation)):
+            # Never rewrite a live legacy log in place. Older frozen readers
+            # hash the complete command, so adding v2 authentication to an
+            # already-observed command changes its replay identity and can make
+            # the running job distrust all later control. A fresh attempt gets
+            # a v2 log; this legacy job must finish under its original contract.
+            commands, integrity = _validated_commands(
+                existing, job_id, record["nonce"])
+            if commands is None or integrity != "legacy_unverified":
                 raise ValueError("job control identity mismatch")
-            migrated = []
-            for item in commands:
-                body = {key: value for key, value in item.items() if key != "auth"}
-                body["auth"] = command_auth(record["nonce"], job_id, body)
-                migrated.append(body)
-            existing = {"schema": "summon.job-control/v2", "job_id": job_id,
-                        "generation": generation, "commands": migrated}
-        if (existing.get("schema") != "summon.job-control/v2"
-                or existing.get("job_id") != job_id
-                or not isinstance(existing.get("commands"), list)
-                or not isinstance(existing.get("generation"), int)
-                or not _valid_command_log(
-                    existing["commands"], existing["generation"])):
+            raise ValueError(
+                "legacy job control cannot be upgraded while its job is live; "
+                "wait for it to finish or start a fresh attempt")
+        commands, integrity = _validated_commands(
+            existing, job_id, record["nonce"])
+        if commands is None or integrity != "authenticated":
             raise ValueError("job control identity mismatch")
-        commands = existing["commands"]
         if len(commands) >= MAX_COMMANDS:
             raise ValueError("job control command limit reached")
         generation = existing.get("generation", 0) + 1
+        queued_at = time.time()
+        if not _is_finite_number(queued_at):
+            raise ValueError("system clock produced a non-finite control timestamp")
         command = {"generation": generation, "action": action,
-                   "queued_at": time.time()}
+                   "queued_at": queued_at}
         if action == "extend":
             command["duration_ms"] = duration_ms
         if action == "steer":
             command["message"] = message
-            command["message_sha256"] = hashlib.sha256(
-                message.encode("utf-8")).hexdigest()
+            try:
+                command["message_sha256"] = hashlib.sha256(
+                    message.encode("utf-8")).hexdigest()
+            except UnicodeError as exc:
+                raise ValueError("steering message must be valid UTF-8 text") from exc
         command["auth"] = command_auth(record["nonce"], job_id, command)
         commands.append(command)
         existing["generation"] = generation
-        _jobs._atomic_write_json(path, existing)
+        _write_control_json(path, existing)
     return {"status": "queued", "job_id": job_id, "action": action,
             "generation": generation,
             "steering_mode": ("queued_for_resume" if action == "steer" else None),
@@ -213,12 +332,27 @@ def queue_command(root: str, job_id: str, action: str, *,
 def control_summary(root: str, job_id: str) -> dict | None:
     data, state = _jobs._read(control_path(root, job_id))
     if state == _jobs._CORRUPT:
-        return {"state": "corrupt"}
+        return _invalid_summary("corrupt")
     if not isinstance(data, dict):
         return None
-    commands = data.get("commands") if isinstance(data.get("commands"), list) else []
+    record, record_state = _jobs._read(_jobs.record_path(root, job_id))
+    nonce = record.get("nonce") if isinstance(record, dict) else None
+    if record_state != _jobs._OK or not isinstance(nonce, str) or not nonce:
+        return _invalid_summary("untrusted")
+    try:
+        commands, integrity = _validated_commands(data, job_id, nonce)
+    except (TypeError, ValueError, OverflowError, UnicodeError):
+        return _invalid_summary("untrusted")
+    if commands is None:
+        return _invalid_summary("untrusted")
+    if integrity != "authenticated":
+        # V1 remains readable by an in-flight legacy child, but it is never
+        # rewritten in place and status must not promote nonce-bound
+        # observations into an authenticated queued-command claim.
+        return _invalid_summary(integrity)
     return {
         "state": "queued" if commands else "empty",
+        "integrity": integrity,
         "generation": data.get("generation"),
         "counts": {action: sum(item.get("action") == action for item in commands)
                    for action in ("extend", "cancel", "steer")},
@@ -320,6 +454,8 @@ class RuntimeControl:
 
     def refresh(self, *, force: bool = False) -> int:
         """Read new commands; return newly authorized extension milliseconds."""
+        if self.control_untrusted:
+            return 0
         now = self.clock()
         if not force and now - self._last_refresh < 0.25:
             return 0
@@ -330,52 +466,40 @@ class RuntimeControl:
             return 0
         if not isinstance(data, dict):
             return 0
-        schema = data.get("schema")
-        if data.get("job_id") != self.job_id or schema not in {
-                "summon.job-control/v1", "summon.job-control/v2"}:
+        try:
+            commands, _integrity = _validated_commands(data, self.job_id, self.nonce)
+        except (TypeError, ValueError, OverflowError, UnicodeError):
             self.control_untrusted = True
             return 0
-        added = 0
-        commands = data.get("commands")
-        if not isinstance(commands, list) or len(commands) > MAX_COMMANDS:
+        if commands is None:
             self.control_untrusted = True
             return 0
-        declared_generation = data.get("generation")
-        if (not isinstance(declared_generation, int)
-                or isinstance(declared_generation, bool)
-                or declared_generation < self.generation
-                or declared_generation != len(commands)
-                or not _valid_command_log(commands, declared_generation)):
+        declared_generation = data["generation"]
+        if declared_generation < self.generation:
             # A deleted/recreated or truncated control file must not make a
             # previously observed cancel/extend/steer disappear.
             self.control_untrusted = True
             return 0
-        if schema == "summon.job-control/v1" and data.get("nonce") != self.nonce:
-            self.control_untrusted = True
-            return 0
+        pending: list[tuple[dict, str]] = []
         for command in commands:
-            generation = command.get("generation") if isinstance(command, dict) else None
-            if not isinstance(generation, int) or isinstance(generation, bool):
+            generation = command["generation"]
+            try:
+                command_digest = hashlib.sha256(_canonical_json(command)).hexdigest()
+            except (TypeError, ValueError, OverflowError, UnicodeError):
                 self.control_untrusted = True
                 return 0
-            if schema == "summon.job-control/v2":
-                body = {key: value for key, value in command.items() if key != "auth"}
-                claimed = command.get("auth")
-                if (not isinstance(claimed, str)
-                        or not hmac.compare_digest(
-                            claimed, command_auth(self.nonce, self.job_id, body))):
-                    self.control_untrusted = True
-                    return 0
-            command_digest = hashlib.sha256(json.dumps(
-                command, ensure_ascii=False, sort_keys=True,
-                separators=(",", ":")).encode("utf-8")).hexdigest()
             if generation <= self.generation:
                 if self._command_digests.get(generation) != command_digest:
                     self.control_untrusted = True
                     return 0
                 continue
-            self.generation = generation
-            self._command_digests[generation] = command_digest
+            pending.append((command, command_digest))
+
+        # Apply nothing until the complete log has passed validation. An invalid
+        # tail must not make an earlier cancel or extension take effect.
+        added = 0
+        for command, command_digest in pending:
+            generation = command["generation"]
             action = command.get("action")
             if action == "cancel":
                 self.cancel_requested = True
@@ -390,6 +514,8 @@ class RuntimeControl:
                     self.steers.append({"generation": generation,
                                         "message": message,
                                         "message_sha256": command.get("message_sha256")})
+            self.generation = generation
+            self._command_digests[generation] = command_digest
         if added:
             allowed = max(0, int((self.hard_deadline - self.deadline) * 1000))
             applied = min(added, allowed)
@@ -453,7 +579,7 @@ class RuntimeControl:
                          "mode": "queued_for_resume"},
         }
         payload["auth"] = heartbeat_auth(self.nonce, payload)
-        _jobs._atomic_write_json(self.heartbeat, payload)
+        _write_control_json(self.heartbeat, payload)
 
     def projection(self) -> dict:
         return {"enabled": True, "attention_required": self.attention_required,

@@ -8,6 +8,7 @@ import queue
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -49,12 +50,152 @@ def test_control_commands_are_authenticated_bounded_and_prompt_private(tmp_path)
     assert queued["steering_mode"] == "queued_for_resume"
     summary = _job_control.control_summary(root, job_id)
     assert summary["counts"]["steer"] == 1
+    assert summary["integrity"] == "authenticated"
     assert "Focus" not in json.dumps(summary)
     raw = _jobs.read_json(_job_control.control_path(root, job_id))
     assert raw["schema"] == "summon.job-control/v2"
     assert "nonce" not in raw
     assert raw["commands"][0]["message_sha256"]
     assert raw["commands"][0]["auth"]
+
+
+def test_jobs_status_rejects_forged_control_before_counting(tmp_path, capsys):
+    root, job_id = _prepared(tmp_path)
+    _job_control.queue_command(root, job_id, "steer", message="private direction")
+    path = _job_control.control_path(root, job_id)
+    raw = _jobs.read_json(path)
+    raw["commands"][0]["message"] = "forged direction"
+    _jobs._atomic_write_json(path, raw)
+
+    args = SimpleNamespace(
+        job_dir=root, jobs_extend=None, jobs_cancel=None, jobs_steer=None,
+        jobs_list=False, jobs_status=job_id, jobs_wait=None, json=True)
+    assert _background.run_jobs_query(args, lambda *_args, **_kwargs: None) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["control"] == {
+        "state": "untrusted", "integrity": "untrusted", "generation": None,
+        "counts": {"extend": 0, "cancel": 0, "steer": 0},
+        "steering_mode": "queued_for_resume",
+    }
+    assert "private direction" not in json.dumps(status["control"])
+    assert "forged direction" not in json.dumps(status["control"])
+
+
+def test_control_summary_labels_valid_legacy_commands_unverified(tmp_path):
+    root, job_id = _prepared(tmp_path)
+    _jobs._atomic_write_json(_job_control.control_path(root, job_id), {
+        "schema": "summon.job-control/v1", "job_id": job_id, "nonce": "nonce",
+        "generation": 1,
+        "commands": [{"generation": 1, "action": "cancel", "queued_at": 1.0}],
+    })
+    summary = _job_control.control_summary(root, job_id)
+    assert summary["state"] == "legacy_unverified"
+    assert summary["integrity"] == "legacy_unverified"
+    assert summary["counts"] == {"extend": 0, "cancel": 0, "steer": 0}
+
+
+def test_queue_refuses_to_rewrite_live_legacy_log(tmp_path):
+    root, job_id = _prepared(tmp_path)
+    path = _job_control.control_path(root, job_id)
+    legacy = {
+        "schema": "summon.job-control/v1", "job_id": job_id, "nonce": "nonce",
+        "generation": 1,
+        "commands": [{"generation": 1, "action": "extend", "queued_at": 1.0,
+                      "duration_ms": 100}],
+    }
+    _jobs._atomic_write_json(path, legacy)
+    legacy_bytes = Path(path).read_bytes()
+    clock = Clock()
+    control = _job_control.RuntimeControl(
+        path=path, heartbeat=_job_control.heartbeat_path(root, job_id),
+        job_id=job_id, nonce="nonce", checkpoint_ms=1_000,
+        max_runtime_ms=120_000, clock=clock)
+    assert control.refresh(force=True) == 100
+
+    with pytest.raises(ValueError, match="cannot be upgraded while its job is live"):
+        _job_control.queue_command(root, job_id, "extend", duration_ms=500)
+
+    assert Path(path).read_bytes() == legacy_bytes
+    assert _jobs.read_json(path) == legacy
+    assert control.refresh(force=True) == 0
+    assert control.generation == 1
+    assert control.control_untrusted is False
+    assert _job_control.control_summary(root, job_id)["integrity"] == "legacy_unverified"
+
+
+def test_control_summary_distinguishes_corrupt_file(tmp_path):
+    root, job_id = _prepared(tmp_path)
+    Path(_job_control.control_path(root, job_id)).write_text(
+        "{not-json", encoding="utf-8")
+    summary = _job_control.control_summary(root, job_id)
+    assert summary["state"] == "corrupt"
+    assert summary["integrity"] == "corrupt"
+    assert summary["counts"] == {"extend": 0, "cancel": 0, "steer": 0}
+
+
+@pytest.mark.parametrize("bad_timestamp", (
+    float("nan"), float("inf"), float("-inf"), 10 ** 500))
+def test_control_rejects_nonfinite_timestamp_without_stopping_live_work(
+        tmp_path, bad_timestamp):
+    root, job_id = _prepared(tmp_path)
+    path = _job_control.control_path(root, job_id)
+    malformed = {
+        "schema": "summon.job-control/v2", "job_id": job_id, "generation": 2,
+        "commands": [
+            {"generation": 1, "action": "cancel", "queued_at": 1.0},
+            {"generation": 2, "action": "extend", "queued_at": bad_timestamp,
+             "duration_ms": 500},
+        ],
+    }
+    for command in malformed["commands"]:
+        try:
+            command["auth"] = _job_control.command_auth("nonce", job_id, command)
+        except ValueError:
+            command["auth"] = "0" * 64
+    _jobs._atomic_write_json(path, malformed)
+
+    assert _job_control.control_summary(root, job_id)["state"] == "untrusted"
+    clock = Clock()
+    control = _job_control.RuntimeControl(
+        path=path, heartbeat=_job_control.heartbeat_path(root, job_id),
+        job_id=job_id, nonce="nonce", checkpoint_ms=1_000,
+        max_runtime_ms=120_000, clock=clock)
+    assert control.refresh(force=True) == 0
+    assert control.control_untrusted is True
+    assert control.cancel_requested is False
+    assert control.generation == 0
+    clock.advance(1)
+    assert control.checkpoint(active=True) == 1_000
+
+
+def test_runtime_control_rejects_surrogate_canonicalization_without_raising(tmp_path):
+    root, job_id = _prepared(tmp_path)
+    path = _job_control.control_path(root, job_id)
+    malformed = {
+        "schema": "summon.job-control/v2", "job_id": job_id, "generation": 1,
+        "commands": [{"generation": 1, "action": "steer", "queued_at": 1.0,
+                      "message": "\ud800", "message_sha256": "0" * 64,
+                      "auth": "0" * 64}],
+    }
+    # Default ensure_ascii escapes the lone surrogate, modeling hostile JSON
+    # bytes that the ordinary writer correctly refuses to serialize.
+    Path(path).write_text(json.dumps(malformed), encoding="utf-8")
+    control = _job_control.RuntimeControl(
+        path=path, heartbeat=_job_control.heartbeat_path(root, job_id),
+        job_id=job_id, nonce="nonce", checkpoint_ms=1_000,
+        max_runtime_ms=120_000)
+    assert control.refresh(force=True) == 0
+    assert control.control_untrusted is True
+    assert control.cancel_requested is False
+    assert _job_control.control_summary(root, job_id)["integrity"] == "untrusted"
+
+
+def test_queue_rejects_nonfinite_timestamp_before_serialization(tmp_path, monkeypatch):
+    root, job_id = _prepared(tmp_path)
+    monkeypatch.setattr(_job_control.time, "time", lambda: float("inf"))
+    with pytest.raises(ValueError, match="non-finite control timestamp"):
+        _job_control.queue_command(root, job_id, "cancel")
+    assert not os.path.exists(_job_control.control_path(root, job_id))
 
 
 def test_jobs_subcommands_rewrite_public_flags_without_prompt_mangling():
@@ -412,19 +553,33 @@ def test_eof_finalization_timeout_still_reaps_child():
     assert process.poll() is not None
 
 
-def test_eof_finalization_keeps_its_grace_after_dispatch_budget():
-    program = "import os,time; time.sleep(.3); os.close(1); time.sleep(2)"
+def test_eof_finalization_keeps_its_grace_after_dispatch_budget(monkeypatch):
+    # Leave ample scheduler headroom before the overall deadline while making
+    # the EOF finalization deadline extend beyond that original budget. This
+    # proves EOF starts a fresh grace period instead of inheriting the dispatch
+    # deadline; a shorter grace would not exercise that boundary.
+    program = "import os,time; time.sleep(.1); os.close(1); time.sleep(5)"
     process = subprocess.Popen(
         [sys.executable, "-c", program], stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, encoding="utf-8")
     started = __import__("time").monotonic()
+    kill_started = []
+    real_kill_tree = _executor._kill_tree
+
+    def record_kill_tree(target):
+        kill_started.append(__import__("time").monotonic())
+        return real_kill_tree(target)
+
+    monkeypatch.setattr(_executor, "_kill_tree", record_kill_tree)
     response = _executor._drive_process(
-        process, "codex", 500, parse_stream=False,
-        attempt_id="f" * 32, first_event_ms=500, idle_ms=500,
-        finalization_ms=250)
+        process, "codex", 1_000, parse_stream=False,
+        attempt_id="f" * 32, first_event_ms=1_000, idle_ms=1_000,
+        finalization_ms=1_200)
     elapsed = __import__("time").monotonic() - started
     assert response["timeout"]["stage"] == "finalization_timeout"
-    assert elapsed >= 0.50
+    assert len(kill_started) == 1
+    assert kill_started[0] - started >= 1.20
+    assert elapsed < 4.0
     assert process.poll() is not None
 
 

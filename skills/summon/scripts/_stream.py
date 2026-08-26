@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
 
 _KIMI_PARTIAL_MAX_CHARS = 32 * 1024
 _KIMI_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+() -]{0,159}$")
+_MAX_LIVENESS_SEMANTIC_IDENTITIES = 4096
 
 
 def _safe_kimi_model_id(value) -> str | None:
@@ -154,6 +156,11 @@ class StreamProcessor:
     def __init__(self, event_observer=None):
         self._event_observer = event_observer
         self._tool_progress = 0
+        # Some provider stream dialects do not assign an event id to progress
+        # records.  Keep only fixed-size hashes of their semantic payloads, so
+        # a replay cannot manufacture fresh liveness without retaining model
+        # text, tool arguments, or provider identifiers in parser state.
+        self._liveness_semantic_ids: set[str] = set()
         self.result_json = None
         self.gemini_parts = []
         self.codex_messages = []
@@ -199,7 +206,37 @@ class StreamProcessor:
         self.model_evidence_source = None
         self.is_error = False   # the terminal event itself reported an error (claude is_error / result status)
 
-    def _liveness(self, kind: str, data: dict | None = None, **fields) -> None:
+    def _remember_semantic_activity(self, kind: str, identity: object) -> str | None:
+        """Return a new activity digest, or ``None`` for a semantic replay.
+
+        A line without a provider event id has no transport-level replay guard.
+        We conservatively use a canonical, private digest of parser-recognized
+        semantic fields.  The bounded cache stores only the digest.  If a
+        provider cannot distinguish two identical no-id tool invocations, it
+        cannot renew liveness on the second one; accepting that ambiguity would
+        permit replayed packets to hold an adaptive lease open indefinitely.
+        """
+        try:
+            encoded = json.dumps(
+                [kind, identity], ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError):
+            return None
+        digest = hashlib.sha256(encoded).hexdigest()
+        if digest in self._liveness_semantic_ids:
+            return None
+        # Do not evict: rotating a bounded LRU lets an old replay become
+        # "new" again and hold an adaptive lease indefinitely. Once the
+        # conservative semantic budget is saturated, further output/tool
+        # activity cannot renew liveness, even if it carries an outer provider
+        # id. This availability tradeoff is intentionally fail-closed.
+        if len(self._liveness_semantic_ids) >= _MAX_LIVENESS_SEMANTIC_IDENTITIES:
+            return None
+        self._liveness_semantic_ids.add(digest)
+        return digest
+
+    def _liveness(self, kind: str, data: dict | None = None, *,
+                  semantic_identity: object = None, **fields) -> None:
         """Emit one parser-recognized event through the executor-owned capability."""
         if self._event_observer is None:
             return
@@ -207,6 +244,17 @@ class StreamProcessor:
         session = data.get("session_id") or data.get("sessionID") \
             or data.get("thread_id") or data.get("conversation_id") or self.session_id
         source_id = data.get("event_id") or data.get("id")
+        if kind in {"output_text", "tool_activity"}:
+            semantic_digest = self._remember_semantic_activity(kind, semantic_identity)
+            if semantic_digest is None:
+                return
+            # Some incremental protocols reuse a message/part id while its
+            # content grows. Bind that outer id to the semantic delta instead
+            # of treating changed work as an id replay. The observer receives
+            # only a digest, never the provider id or semantic payload.
+            source_id = hashlib.sha256(
+                f"{source_id or ''}:{semantic_digest}".encode("ascii")
+            ).hexdigest()
         try:
             self._event_observer.emit(
                 kind, session_id=session if isinstance(session, str) else None,
@@ -296,12 +344,16 @@ class StreamProcessor:
             content = data.get("response") or data.get("content")
             if isinstance(content, str) and content:
                 self._liveness("output_text", data,
-                               output_chars=self._meaningful_chars(content))
+                               output_chars=self._meaningful_chars(content),
+                               semantic_identity=("agy_text", data.get("conversation_id"),
+                                                  content))
             elif data.get("tool") or data.get("tool_name"):
                 self._tool_progress += 1
                 tool = data.get("tool") or data.get("tool_name")
                 self._liveness("tool_activity", data, tool_id=str(tool)[:128],
-                               progress=self._tool_progress)
+                               progress=self._tool_progress,
+                               semantic_identity=("agy_tool",
+                                                  data.get("conversation_id"), tool))
             else:
                 self._liveness("stream_event", data)
             return False
@@ -325,26 +377,33 @@ class StreamProcessor:
             message = data["message"]
             content = message.get("content")
             if isinstance(content, list):
-                for block in content:
+                for index, block in enumerate(content):
                     if not isinstance(block, dict):
                         continue
                     if block.get("type") == "text" and isinstance(block.get("text"), str):
                         self._liveness("output_text", data,
-                                       output_chars=self._meaningful_chars(block["text"]))
+                                       output_chars=self._meaningful_chars(block["text"]),
+                                       semantic_identity=("claude_text", message.get("id"),
+                                                          index, block["text"]))
                     elif block.get("type") in {"tool_use", "server_tool_use"}:
                         self._tool_progress += 1
                         self._liveness("tool_activity", data, tool_id="claude_tool",
-                                       progress=self._tool_progress)
+                                       progress=self._tool_progress,
+                                       semantic_identity=("claude_tool", message.get("id"),
+                                                          index, block))
             return False
 
         if data.get("type") == "user" and isinstance(data.get("message"), dict):
             content = data["message"].get("content")
-            if isinstance(content, list) and any(
-                    isinstance(block, dict) and block.get("type") == "tool_result"
-                    for block in content):
+            tool_results = [block for block in content if isinstance(block, dict)
+                            and block.get("type") == "tool_result"] \
+                if isinstance(content, list) else []
+            if tool_results:
                 self._tool_progress += 1
                 self._liveness("tool_activity", data, tool_id="claude_tool_result",
-                               progress=self._tool_progress)
+                               progress=self._tool_progress,
+                               semantic_identity=("claude_tool_result",
+                                                  data["message"].get("id"), tool_results))
             else:
                 self._liveness("stream_event", data)
             return False
@@ -354,7 +413,8 @@ class StreamProcessor:
             if isinstance(content, str):
                 self.gemini_parts.append(content)
                 self._liveness("output_text", data,
-                               output_chars=self._meaningful_chars(content))
+                               output_chars=self._meaningful_chars(content),
+                               semantic_identity=("gemini_text", content))
             return False
 
         if self.is_codex and data.get("type") == "item.completed":
@@ -362,17 +422,24 @@ class StreamProcessor:
             if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
                 self.codex_messages.append(item["text"])
                 self._liveness("output_text", data,
-                               output_chars=self._meaningful_chars(item["text"]))
+                               output_chars=self._meaningful_chars(item["text"]),
+                               semantic_identity=("codex_text", item.get("id"),
+                                                  item["text"]))
             elif isinstance(item, dict):
                 self._tool_progress += 1
                 self._liveness("tool_activity", data, tool_id="codex_item",
-                               progress=self._tool_progress)
+                               progress=self._tool_progress,
+                               semantic_identity=("codex_item", item))
             return False
 
         if self.is_gemini and data.get("type") in {"tool_call", "tool_result"}:
             self._tool_progress += 1
             self._liveness("tool_activity", data, tool_id="gemini_tool",
-                           progress=self._tool_progress)
+                           progress=self._tool_progress,
+                           semantic_identity=("gemini_tool", data.get("type"),
+                                              data.get("tool_call_id"),
+                                              data.get("tool_use_id"), data.get("name"),
+                                              data.get("args") or data.get("arguments")))
             return False
 
         # Codex emits ``turn.failed`` for provider/runtime failures. It is a
@@ -434,13 +501,16 @@ class StreamProcessor:
                 if isinstance(text, str):
                     self.opencode_parts.append(text)
                     self._liveness("output_text", data,
-                                   output_chars=self._meaningful_chars(text))
+                                   output_chars=self._meaningful_chars(text),
+                                   semantic_identity=("opencode_text", part.get("id"),
+                                                      text))
             elif data.get("type") in {"tool_use", "tool_result"}:
                 self._tool_progress += 1
                 part = data.get("part") if isinstance(data.get("part"), dict) else {}
                 tool_id = part.get("callID") or part.get("id") or data.get("id") or "tool"
                 self._liveness("tool_activity", data, tool_id=str(tool_id)[:128],
-                               progress=self._tool_progress)
+                               progress=self._tool_progress,
+                               semantic_identity=("opencode_tool", part))
             elif data.get("type") == "step_finish":
                 self._liveness("finalizing", data)
             else:
@@ -484,12 +554,15 @@ class StreamProcessor:
             if part.get("type") == "text" and isinstance(part.get("text"), str):
                 self.opencode_parts.append(part["text"])
                 self._liveness("output_text", data,
-                               output_chars=self._meaningful_chars(part["text"]))
+                               output_chars=self._meaningful_chars(part["text"]),
+                               semantic_identity=("opencode_part_text", part.get("id"),
+                                                  part["text"]))
             elif part.get("type") in {"tool", "patch", "file", "subtask", "agent"}:
                 self._tool_progress += 1
                 tool_id = part.get("callID") or part.get("id") or part.get("type")
                 self._liveness("tool_activity", data, tool_id=str(tool_id)[:128],
-                               progress=self._tool_progress)
+                               progress=self._tool_progress,
+                               semantic_identity=("opencode_part", part))
             elif part.get("type") == "step-finish":
                 self._liveness("finalizing", data)
             else:
@@ -511,9 +584,13 @@ class StreamProcessor:
                 if data.get("tool_calls") or data.get("tool_call"):
                     self._tool_progress += 1
                     self._liveness("tool_activity", data, tool_id="kimi_tool",
-                                   progress=self._tool_progress)
+                                   progress=self._tool_progress,
+                                   semantic_identity=("kimi_tool",
+                                                      data.get("tool_calls")
+                                                      or data.get("tool_call")))
                 if chars:
-                    self._liveness("output_text", data, output_chars=chars)
+                    self._liveness("output_text", data, output_chars=chars,
+                                   semantic_identity=("kimi_text", content))
                 elif not (data.get("tool_calls") or data.get("tool_call")):
                     self._liveness("stream_event", data)
             else:

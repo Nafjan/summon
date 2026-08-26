@@ -2976,6 +2976,31 @@ def _drive_process_loop(
             "backend process after its bounded exit grace.")
         return response
 
+    def _reap_after_driver_failure() -> None:
+        """Best-effort ownership cleanup for an exception leaving the read loop.
+
+        Cleanup must not replace the exception that brought us here.  In
+        particular, ``_drain_to_eof`` is intentionally outside the ordinary
+        success path and may itself encounter a damaged queue during interpreter
+        teardown.  The process/tree kill and bounded communicate still run.
+        """
+        _kill_tree(process)
+        try:
+            _drain_to_eof(line_q)
+        except Exception:  # noqa: BLE001 - preserve the original driver failure
+            pass
+        _safe_communicate(process)
+
+    def _parsed_terminal_available() -> bool:
+        if saw_terminal:
+            return True
+        try:
+            # StreamProcessor.result_json is assigned only by recognized
+            # terminal branches; advisory partial text lives elsewhere.
+            return processor.get_result() is not None
+        except Exception:  # a broken parser accessor cannot mask the driver failure
+            return False
+
     try:
         while True:
             if (saw_terminal and terminal_reap_deadline is not None
@@ -3110,8 +3135,11 @@ def _drive_process_loop(
             if parse_stream and not saw_terminal and processor.process_line(line):
                 # Processor saw a terminal event; ask the CLI to exit cleanly,
                 # but keep looping so the reader thread can drain stdout to EOF.
-                process.terminate()
+                # Bind terminal precedence BEFORE terminate(): CreateProcess/
+                # handle teardown can itself raise after the parser has already
+                # accepted the provider's terminal record.
                 saw_terminal = True
+                process.terminate()
                 terminal_grace_ms = (
                     liveness.finalization_ms if liveness is not None else 120_000)
                 terminal_reap_deadline = min(
@@ -3209,17 +3237,40 @@ def _drive_process_loop(
         # so a Ctrl+C on the parent won't reach it — tree-kill it ourselves so an
         # interrupt doesn't leave an orphaned backend running.
         if liveness_emitter is not None:
-            liveness_emitter.emit("cancelled", session_id=processor.session_id)
-        _kill_tree(process)
+            try:
+                liveness_emitter.emit("cancelled", session_id=processor.session_id)
+            except Exception:  # cancellation telemetry must not mask Ctrl+C
+                pass
+        _reap_after_driver_failure()
         raise
     except (OSError, ValueError) as e:
         # OSError covers I/O failures on the pipe; ValueError covers reading
-        # from a closed file. Anything else propagates so it's not silently
-        # swallowed.
-        _kill_tree(process)
+        # from a closed file. If a trusted terminal event was already parsed,
+        # preserve it: a later driver/pipe failure is cleanup evidence, not a
+        # reason to replace the provider's terminal result.
+        if _parsed_terminal_available():
+            try:
+                return _finish_forced_terminal_cleanup(
+                    "driver_io_exception_after_terminal")
+            except Exception:  # noqa: BLE001 - report the original I/O failure
+                pass
+        _reap_after_driver_failure()
         return _attach_raw(_error_response(
             cli, 1, f"{type(e).__name__}: {e}", partial_result=processor.get_result()
         ), stdout_lines)
+    except BaseException as exc:
+        # An unexpected driver/callback/parser exception must never orphan a paid
+        # provider process. Ordinary Exceptions after a trusted terminal event
+        # preserve that result; process-control BaseExceptions (KeyboardInterrupt,
+        # SystemExit, GeneratorExit) are always re-raised after cleanup.
+        if _parsed_terminal_available() and isinstance(exc, Exception):
+            try:
+                return _finish_forced_terminal_cleanup(
+                    "driver_exception_after_terminal")
+            except Exception:  # noqa: BLE001 - never mask the original exception
+                pass
+        _reap_after_driver_failure()
+        raise
 
 
 def _resolve_launch(command, args):
