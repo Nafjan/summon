@@ -13,6 +13,22 @@ never on added fields.
 
 ## Unreleased
 
+- **Dispatch-integrated safe context and namespace-bound freshness:** M5 now crosses the
+  real provider boundary only after a provider-inert typed-context compile. The input
+  file is a bounded stable regular-file read under the effective local read roots;
+  external references are content-addressed, restricted to non-indirect cwd targets,
+  fail closed when final-handle resolution is unavailable, and are authorized only by
+  an adapter-minted compile-time proof created from the opened file. Receivers must
+  re-hash before use because the target can change across processes. Ordinary
+  context files reject authority-plane blocks. The compiled bytes join prompt/request
+  identity, and a background child consumes the exact prompt frozen beside its immutable
+  scripts rather than reopening mutable source files. Result trust also compares the
+  terminal prompt digest with the launch record. Public evidence contains no paths or
+  bodies, and no context flags retain the M0 serialization goldens. M6 uses v2 stale-
+  acceptance and binding schemas, includes the resolved deliberation-run namespace digest,
+  and rechecks that namespace before scheduler creation and every provider launch.
+  Historical v1 bindings remain authenticated but read-only for status/replay. Both changes remain
+  provider-inert through dry-run and validation.
 - **Bounded live usage adapter and portable evidence:** M4 adds a provider allowlist,
   explicit account-read consent, exact Codex CLI/version and JSON-RPC request-plan checks,
   hidden subprocess launch, bounded stream drains, owned-child timeout cleanup, and honest

@@ -20,6 +20,7 @@ been reused can still look alive.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -380,6 +381,24 @@ def _classify(rec, rec_state: str, result, res_state: str,
                 if (not isinstance(actual, dict)
                         or actual.get("scripts_sha256") != expected.get("scripts_sha256")):
                     return "identity_mismatch", False
+                bundle = expected.get("background_bundle")
+                if isinstance(bundle, dict) and bundle.get("prompt_sha256") is not None:
+                    if (not isinstance(rec.get("prompt_sha256"), str)
+                            or bundle.get("prompt_sha256") != rec.get("prompt_sha256")
+                            or result.get("prompt_sha256") != rec.get("prompt_sha256")):
+                        return "identity_mismatch", False
+                if isinstance(bundle, dict) and bundle.get(
+                        "context_compilation_sha256") is not None:
+                    try:
+                        context_bytes = json.dumps(
+                            result.get("context_compilation"), ensure_ascii=False,
+                            sort_keys=True, separators=(",", ":"),
+                            allow_nan=False).encode("utf-8")
+                    except (TypeError, ValueError, UnicodeEncodeError):
+                        return "identity_mismatch", False
+                    if hashlib.sha256(context_bytes).hexdigest() != bundle.get(
+                            "context_compilation_sha256"):
+                        return "identity_mismatch", False
             return status, True
         # a result with no record (legacy --background / record loss) or a nonce
         # that does not match: surface it, but never as trusted.

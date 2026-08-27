@@ -314,6 +314,7 @@ def build_live_scheduler(*, owner: _rundir.Owner,
                          cancel_command: Callable[[], object] | None = None,
                          durable_context: _context.BoundContext | None = None,
                          context_observer: Callable[[], Mapping[str, object]] | None = None,
+                         context_namespace_observer: Callable[[], str] | None = None,
                          deadline_clock: float | None = None,
                          _executor_for_tests=None) -> DeliberationScheduler:
     """Build one owner-bound scheduler using fresh subprocess adapters.
@@ -329,11 +330,14 @@ def build_live_scheduler(*, owner: _rundir.Owner,
         raise TypeError("cancel_requested must be callable")
     if cancel_command is not None and not callable(cancel_command):
         raise TypeError("cancel_command must be callable")
-    if (durable_context is None) != (context_observer is None):
+    if ((durable_context is None) != (context_observer is None)
+            or (durable_context is None) != (context_namespace_observer is None)):
         raise LiveDeliberationError(
-            "durable context and its source observer must be supplied together")
+            "durable context and its source/namespace observers must be supplied together")
     if context_observer is not None and not callable(context_observer):
         raise TypeError("context_observer must be callable")
+    if context_namespace_observer is not None and not callable(context_namespace_observer):
+        raise TypeError("context_namespace_observer must be callable")
     if not roster.revalidate():
         raise LiveDeliberationError("live roster evidence is stale")
     _validate_live_routes(roster.seats)
@@ -381,6 +385,10 @@ def build_live_scheduler(*, owner: _rundir.Owner,
         if durable_context is None or context_observer is None:
             return
         try:
+            if (context_namespace_observer is None
+                    or context_namespace_observer()
+                    != durable_context.runs_root_sha256):
+                raise ValueError("durable context run namespace changed")
             observed = context_observer()
             _context.revalidate_source(
                 durable_context, observed,

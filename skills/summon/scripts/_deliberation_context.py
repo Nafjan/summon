@@ -19,8 +19,10 @@ from typing import Any
 
 PACKET_SCHEMA = "summon.deliberation-context/v1"
 OBSERVATION_SCHEMA = "summon.context-source-observation/v1"
-ACCEPTANCE_SCHEMA = "summon.accept-stale-intent/v1"
-BINDING_SCHEMA = "summon.deliberation-context-binding/v1"
+ACCEPTANCE_SCHEMA = "summon.accept-stale-intent/v2"
+BINDING_SCHEMA = "summon.deliberation-context-binding/v2"
+LEGACY_ACCEPTANCE_SCHEMA = "summon.accept-stale-intent/v1"
+LEGACY_BINDING_SCHEMA = "summon.deliberation-context-binding/v1"
 PUBLIC_SCHEMA = "summon.deliberation-context-public/v1"
 MAX_INPUT_BYTES = 256 * 1024
 MAX_DEPTH = 64
@@ -211,6 +213,29 @@ class BoundContext:
     binding_sha256: str
     run_id: str
     decision_id: str
+    runs_root_sha256: str | None
+    bound_at_unix_ms: int
+    actual_age_ms: int
+    actual_revision_delta: int
+    mismatch_reasons: tuple[str, ...]
+    routing_authority: bool
+    source: Mapping[str, object]
+    freshness_policy: Mapping[str, int]
+    entries: tuple[Mapping[str, object], ...]
+    observation: Mapping[str, object]
+    acceptance: Mapping[str, object] | None
+
+
+@dataclass(frozen=True)
+class LegacyBoundContext:
+    """Authenticated historical v1 evidence with no execution authority."""
+    schema: str
+    state: str
+    packet_sha256: str
+    source_revision_sha256: str
+    binding_sha256: str
+    run_id: str
+    decision_id: str
     bound_at_unix_ms: int
     actual_age_ms: int
     actual_revision_delta: int
@@ -341,12 +366,13 @@ def _parse_observation(value: object, parsed: ParsedContext) -> dict:
 def _parse_acceptance(value: object) -> dict:
     acceptance = _load(value, "stale acceptance intent")
     _fields(acceptance, {"schema", "packet_sha256", "source_revision_sha256",
+                         "runs_root_sha256",
                          "run_id", "decision_id", "actor", "reason", "scope",
                          "expires_at_unix_ms", "max_age_ms", "max_revision_delta"},
             "stale acceptance intent")
     if acceptance["schema"] != ACCEPTANCE_SCHEMA:
         raise ContextFreshnessError("stale acceptance schema is unsupported")
-    for key in ("packet_sha256", "source_revision_sha256"):
+    for key in ("packet_sha256", "source_revision_sha256", "runs_root_sha256"):
         _text(acceptance[key], key, max_bytes=64, pattern=_HEX64)
     _text(acceptance["run_id"], "acceptance run id", pattern=_RUN_ID)
     _text(acceptance["decision_id"], "acceptance decision id", pattern=_RUN_ID)
@@ -385,10 +411,15 @@ def acceptance_identity(value: object) -> tuple[str, str]:
 
 def bind_context(packet: object, observation: object, *, run_id: str,
                  decision_id: str, unix_now_ms: int,
+                 runs_root_sha256: str | None = None,
                  accept_stale: object | None = None) -> BoundContext:
     parsed = packet if isinstance(packet, ParsedContext) else parse_context_packet(packet)
     run_id = _text(run_id, "run id", pattern=_RUN_ID)
     decision_id = _text(decision_id, "decision id", pattern=_RUN_ID)
+    namespace_sha = None
+    if runs_root_sha256 is not None:
+        namespace_sha = _text(
+            runs_root_sha256, "runs root sha256", max_bytes=64, pattern=_HEX64)
     now = _integer(unix_now_ms, "context clock")
     observed = _parse_observation(observation, parsed)
     observed_at = observed["observed_at_unix_ms"]
@@ -428,6 +459,8 @@ def bind_context(packet: object, observation: object, *, run_id: str,
         valid = (
             acceptance["packet_sha256"] == parsed.packet_sha256
             and acceptance["source_revision_sha256"] == parsed.source_revision_sha256
+            and namespace_sha is not None
+            and acceptance["runs_root_sha256"] == namespace_sha
             and acceptance["run_id"] == run_id
             and acceptance["decision_id"] == decision_id
             and acceptance["expires_at_unix_ms"] > now
@@ -448,6 +481,7 @@ def bind_context(packet: object, observation: object, *, run_id: str,
         "source_revision_sha256": parsed.source_revision_sha256,
         "run_id": run_id,
         "decision_id": decision_id,
+        "runs_root_sha256": namespace_sha,
         "bound_at_unix_ms": now,
         "state": state,
         "actual_age_ms": age,
@@ -464,15 +498,16 @@ def bind_context(packet: object, observation: object, *, run_id: str,
     }
     return BoundContext(
         BINDING_SCHEMA, state, parsed.packet_sha256, parsed.source_revision_sha256,
-        _sha(identity), run_id, decision_id, now, age, delta, tuple(reasons), False,
+        _sha(identity), run_id, decision_id, namespace_sha, now, age, delta,
+        tuple(reasons), False,
         parsed.source, parsed.freshness_policy, parsed.entries, _freeze(observed),
         _freeze(acceptance) if acceptance is not None else None)
 
 
-def public_projection(binding: BoundContext) -> dict:
-    if not isinstance(binding, BoundContext):
+def public_projection(binding: BoundContext | LegacyBoundContext) -> dict:
+    if not isinstance(binding, (BoundContext, LegacyBoundContext)):
         raise ContextFreshnessError("public context projection requires a binding")
-    return {
+    result = {
         "schema": PUBLIC_SCHEMA,
         "state": binding.state,
         "packet_sha256": binding.packet_sha256,
@@ -485,6 +520,9 @@ def public_projection(binding: BoundContext) -> dict:
         "constraint_count": sum(entry["kind"] == "constraint" for entry in binding.entries),
         "routing_authority": False,
     }
+    if isinstance(binding, LegacyBoundContext):
+        result["legacy_read_only"] = True
+    return result
 
 
 def prompt_projection(binding: BoundContext) -> dict:
@@ -516,6 +554,7 @@ def private_projection(binding: BoundContext) -> dict:
         "binding_sha256": binding.binding_sha256,
         "run_id": binding.run_id,
         "decision_id": binding.decision_id,
+        "runs_root_sha256": binding.runs_root_sha256,
         "bound_at_unix_ms": binding.bound_at_unix_ms,
         "actual_age_ms": binding.actual_age_ms,
         "actual_revision_delta": binding.actual_revision_delta,
@@ -534,7 +573,8 @@ def parse_private_projection(value: object) -> BoundContext:
     projection = _load(value, "private context projection")
     expected = {
         "schema", "state", "packet_sha256", "source_revision_sha256",
-        "binding_sha256", "run_id", "decision_id", "bound_at_unix_ms",
+        "binding_sha256", "run_id", "decision_id", "runs_root_sha256",
+        "bound_at_unix_ms",
         "actual_age_ms", "actual_revision_delta", "mismatch_reasons",
         "routing_authority", "source", "freshness_policy", "entries",
         "observation", "acceptance",
@@ -551,10 +591,168 @@ def parse_private_projection(value: object) -> BoundContext:
     reproduced = bind_context(
         packet, projection["observation"], run_id=projection["run_id"],
         decision_id=projection["decision_id"],
+        runs_root_sha256=projection["runs_root_sha256"],
         unix_now_ms=projection["bound_at_unix_ms"],
         accept_stale=projection["acceptance"])
     if private_projection(reproduced) != projection:
         raise ContextFreshnessError("private context projection binding is invalid")
+    return reproduced
+
+
+def _parse_legacy_acceptance(value: object) -> dict:
+    acceptance = _load(value, "legacy stale acceptance intent")
+    _fields(acceptance, {"schema", "packet_sha256", "source_revision_sha256",
+                         "run_id", "decision_id", "actor", "reason", "scope",
+                         "expires_at_unix_ms", "max_age_ms", "max_revision_delta"},
+            "legacy stale acceptance intent")
+    if acceptance["schema"] != LEGACY_ACCEPTANCE_SCHEMA:
+        raise ContextFreshnessError("legacy stale acceptance schema is unsupported")
+    for key in ("packet_sha256", "source_revision_sha256"):
+        _text(acceptance[key], key, max_bytes=64, pattern=_HEX64)
+    _text(acceptance["run_id"], "acceptance run id", pattern=_RUN_ID)
+    _text(acceptance["decision_id"], "acceptance decision id", pattern=_RUN_ID)
+    actor = acceptance["actor"]
+    if not isinstance(actor, dict):
+        raise ContextFreshnessError("acceptance actor must be an object")
+    _fields(actor, {"kind", "id"}, "acceptance actor")
+    if _text(actor["kind"], "acceptance actor kind") not in _ACTOR_KINDS:
+        raise ContextFreshnessError("acceptance actor kind is unsupported")
+    _text(actor["id"], "acceptance actor id")
+    _text(acceptance["reason"], "acceptance reason", max_bytes=MAX_REASON_BYTES)
+    scope = acceptance["scope"]
+    if not isinstance(scope, dict):
+        raise ContextFreshnessError("acceptance scope must be an object")
+    _fields(scope, {"entry_ids", "use"}, "acceptance scope")
+    if scope["use"] != "deliberation_prompt":
+        raise ContextFreshnessError("acceptance scope use is unsupported")
+    ids = scope["entry_ids"]
+    if not isinstance(ids, list) or not ids or len(ids) > MAX_ENTRIES:
+        raise ContextFreshnessError("acceptance entry scope is invalid")
+    normalized = [_text(item, "acceptance entry id", pattern=_ENTRY_ID) for item in ids]
+    if len(set(normalized)) != len(normalized):
+        raise ContextFreshnessError("acceptance entry scope contains duplicates")
+    _integer(acceptance["expires_at_unix_ms"], "acceptance expiry")
+    _integer(acceptance["max_age_ms"], "acceptance maximum age", maximum=2**53 - 1)
+    _integer(acceptance["max_revision_delta"], "acceptance revision delta",
+             maximum=1_000_000)
+    return acceptance
+
+
+def _reproduce_legacy_binding(projection: Mapping[str, object]) -> LegacyBoundContext:
+    packet = {
+        "schema": PACKET_SCHEMA,
+        "source": projection["source"],
+        "freshness_policy": projection["freshness_policy"],
+        "entries": projection["entries"],
+    }
+    parsed = parse_context_packet(packet)
+    run_id = _text(projection["run_id"], "run id", pattern=_RUN_ID)
+    decision_id = _text(projection["decision_id"], "decision id", pattern=_RUN_ID)
+    now = _integer(projection["bound_at_unix_ms"], "context clock")
+    observed = _parse_observation(projection["observation"], parsed)
+    if abs(observed["observed_at_unix_ms"] - now) > MAX_CLOCK_SKEW_MS:
+        raise ContextFreshnessError("source observation clock is outside the allowed skew")
+    if parsed.source["captured_at_unix_ms"] - now > MAX_CLOCK_SKEW_MS:
+        raise ContextFreshnessError("context capture clock is too far in the future")
+    age = max(0, now - parsed.source["captured_at_unix_ms"])
+    delta = observed["revision_delta"]
+    reasons: list[str] = []
+    unbounded = False
+    relation = observed["relation"]
+    if relation == "same":
+        if observed["current_source_digest"] != parsed.source["source_digest"]:
+            reasons.append("same_revision_digest_mismatch")
+            unbounded = True
+    elif relation == "descendant":
+        reasons.append("source_revision_advanced")
+    else:
+        reasons.append("revision_relation_unbounded")
+        unbounded = True
+    if age > parsed.freshness_policy["fresh_max_age_ms"]:
+        reasons.append("age_exceeds_fresh_limit")
+    if age > parsed.freshness_policy["hard_max_age_ms"]:
+        reasons.append("age_exceeds_hard_limit")
+        unbounded = True
+    if delta > parsed.freshness_policy["hard_max_revision_delta"]:
+        reasons.append("revision_delta_exceeds_hard_limit")
+        unbounded = True
+    acceptance = (_parse_legacy_acceptance(projection["acceptance"])
+                  if projection["acceptance"] is not None else None)
+    state = "fresh" if not reasons else "stale_refused"
+    if reasons and acceptance is not None and not unbounded:
+        entry_ids = {entry["id"] for entry in parsed.entries}
+        valid = (
+            acceptance["packet_sha256"] == parsed.packet_sha256
+            and acceptance["source_revision_sha256"] == parsed.source_revision_sha256
+            and acceptance["run_id"] == run_id
+            and acceptance["decision_id"] == decision_id
+            and acceptance["expires_at_unix_ms"] > now
+            and acceptance["max_age_ms"] <= parsed.freshness_policy["hard_max_age_ms"]
+            and acceptance["max_revision_delta"]
+                <= parsed.freshness_policy["hard_max_revision_delta"]
+            and age <= acceptance["max_age_ms"]
+            and delta <= acceptance["max_revision_delta"]
+            and set(acceptance["scope"]["entry_ids"]) == entry_ids)
+        if valid:
+            state = "accepted_stale"
+    identity = {
+        "schema": LEGACY_BINDING_SCHEMA,
+        "packet_sha256": parsed.packet_sha256,
+        "source_revision_sha256": parsed.source_revision_sha256,
+        "run_id": run_id, "decision_id": decision_id,
+        "bound_at_unix_ms": now, "state": state,
+        "actual_age_ms": age, "actual_revision_delta": delta,
+        "mismatch_reasons": reasons,
+        "observation_identity": {key: observed[key] for key in (
+            "kind", "captured_revision", "current_revision", "current_source_digest",
+            "relation", "revision_delta", "verification_method")},
+        "acceptance_sha256": _sha(acceptance) if acceptance is not None else None,
+        "routing_authority": False,
+    }
+    return LegacyBoundContext(
+        LEGACY_BINDING_SCHEMA, state, parsed.packet_sha256,
+        parsed.source_revision_sha256, _sha(identity), run_id, decision_id,
+        now, age, delta, tuple(reasons), False, parsed.source,
+        parsed.freshness_policy, parsed.entries, _freeze(observed),
+        _freeze(acceptance) if acceptance is not None else None)
+
+
+def parse_private_projection_readonly(value: object) -> BoundContext | LegacyBoundContext:
+    """Parse current evidence or authenticated v1 evidence for display/replay only."""
+    projection = _load(value, "private context projection")
+    if projection.get("schema") == BINDING_SCHEMA:
+        return parse_private_projection(projection)
+    expected = {
+        "schema", "state", "packet_sha256", "source_revision_sha256",
+        "binding_sha256", "run_id", "decision_id", "bound_at_unix_ms",
+        "actual_age_ms", "actual_revision_delta", "mismatch_reasons",
+        "routing_authority", "source", "freshness_policy", "entries",
+        "observation", "acceptance",
+    }
+    _fields(projection, expected, "legacy private context projection")
+    if (projection["schema"] != LEGACY_BINDING_SCHEMA
+            or projection["routing_authority"] is not False):
+        raise ContextFreshnessError("private context projection authority is invalid")
+    reproduced = _reproduce_legacy_binding(projection)
+    expected_projection = {
+        "schema": reproduced.schema, "state": reproduced.state,
+        "packet_sha256": reproduced.packet_sha256,
+        "source_revision_sha256": reproduced.source_revision_sha256,
+        "binding_sha256": reproduced.binding_sha256, "run_id": reproduced.run_id,
+        "decision_id": reproduced.decision_id,
+        "bound_at_unix_ms": reproduced.bound_at_unix_ms,
+        "actual_age_ms": reproduced.actual_age_ms,
+        "actual_revision_delta": reproduced.actual_revision_delta,
+        "mismatch_reasons": list(reproduced.mismatch_reasons),
+        "routing_authority": False, "source": _thaw(reproduced.source),
+        "freshness_policy": _thaw(reproduced.freshness_policy),
+        "entries": [_thaw(entry) for entry in reproduced.entries],
+        "observation": _thaw(reproduced.observation),
+        "acceptance": (_thaw(reproduced.acceptance)
+                       if reproduced.acceptance is not None else None),
+    }
+    if expected_projection != projection:
+        raise ContextFreshnessError("legacy private context projection binding is invalid")
     return reproduced
 
 
@@ -578,6 +776,7 @@ def revalidate_source(binding: BoundContext, observation: object, *,
     candidate = bind_context(
         parsed, observed, run_id=binding.run_id,
         decision_id=binding.decision_id, unix_now_ms=unix_now_ms,
+        runs_root_sha256=binding.runs_root_sha256,
         accept_stale=binding.acceptance)
     if candidate.state != binding.state:
         raise ContextFreshnessError(
@@ -588,7 +787,9 @@ def revalidate_source(binding: BoundContext, observation: object, *,
 __all__ = [
     "ACCEPTANCE_SCHEMA", "BINDING_SCHEMA", "BoundContext",
     "ContextFreshnessError", "OBSERVATION_SCHEMA", "PACKET_SCHEMA",
+    "LEGACY_ACCEPTANCE_SCHEMA", "LEGACY_BINDING_SCHEMA", "LegacyBoundContext",
     "ParsedContext", "acceptance_identity", "bind_context", "parse_context_packet",
-    "parse_private_projection", "private_projection", "prompt_projection",
+    "parse_private_projection", "parse_private_projection_readonly",
+    "private_projection", "prompt_projection",
     "public_projection", "revalidate_source",
 ]

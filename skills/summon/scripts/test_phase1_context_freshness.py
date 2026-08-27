@@ -8,6 +8,7 @@ import pathlib
 import sys
 
 import pytest
+import _deliberation_context as context_module
 
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent
@@ -20,6 +21,7 @@ from _deliberation_context import (  # noqa: E402
     bind_context,
     parse_context_packet,
     parse_private_projection,
+    parse_private_projection_readonly,
     private_projection,
     prompt_projection,
     public_projection,
@@ -32,6 +34,7 @@ REVISION = "a" * 40
 NEXT_REVISION = "b" * 40
 SOURCE_DIGEST = "1" * 64
 NEXT_DIGEST = "2" * 64
+RUNS_ROOT_SHA = "3" * 64
 
 
 def packet(*, captured_at: int = NOW - 100, revision: str = REVISION,
@@ -85,9 +88,10 @@ def observation(*, relation: str = "same", revision: str = REVISION,
 def intent(parsed, *, now: int = NOW, max_age: int = 10_000,
            max_delta: int = 2, entry_ids=("constraint-1", "artifact-1")) -> dict:
     return {
-        "schema": "summon.accept-stale-intent/v1",
+        "schema": "summon.accept-stale-intent/v2",
         "packet_sha256": parsed.packet_sha256,
         "source_revision_sha256": parsed.source_revision_sha256,
+        "runs_root_sha256": RUNS_ROOT_SHA,
         "run_id": "run-1",
         "decision_id": "decision-1",
         "actor": {"kind": "human", "id": "operator"},
@@ -102,7 +106,8 @@ def intent(parsed, *, now: int = NOW, max_age: int = 10_000,
 def bind(p=None, o=None, stale=None, *, now=NOW):
     return bind_context(
         p or packet(), o or observation(), run_id="run-1",
-        decision_id="decision-1", unix_now_ms=now, accept_stale=stale)
+        decision_id="decision-1", unix_now_ms=now,
+        runs_root_sha256=RUNS_ROOT_SHA, accept_stale=stale)
 
 
 def test_exact_source_is_fresh_and_has_no_routing_authority():
@@ -137,6 +142,15 @@ def test_age_stale_requires_explicit_acceptance_and_remains_visibly_stale():
     assert "age_exceeds_fresh_limit" in accepted.mismatch_reasons
     assert prompt_projection(accepted)["freshness"]["state"] == "accepted_stale"
     assert public_projection(accepted)["state"] == "accepted_stale"
+
+
+def test_stale_acceptance_cannot_be_replayed_in_a_different_runs_root():
+    p = packet(captured_at=NOW - 5_000)
+    auth = intent(parse_context_packet(p))
+    replay = bind_context(
+        p, observation(), run_id="run-1", decision_id="decision-1",
+        unix_now_ms=NOW, runs_root_sha256="4" * 64, accept_stale=auth)
+    assert replay.state == "stale_refused"
 
 
 def test_forward_revision_delta_can_be_accepted_with_bounded_authority():
@@ -248,6 +262,38 @@ def test_private_projection_round_trips_and_detects_forgery():
         changed[field] = forged
         with pytest.raises(ContextFreshnessError, match="binding"):
             parse_private_projection(changed)
+
+
+def test_authenticated_v1_binding_is_readable_but_cannot_be_prompt_authority():
+    current = private_projection(bind())
+    legacy = copy.deepcopy(current)
+    legacy["schema"] = context_module.LEGACY_BINDING_SCHEMA
+    legacy.pop("runs_root_sha256")
+    identity = {
+        "schema": context_module.LEGACY_BINDING_SCHEMA,
+        "packet_sha256": legacy["packet_sha256"],
+        "source_revision_sha256": legacy["source_revision_sha256"],
+        "run_id": legacy["run_id"], "decision_id": legacy["decision_id"],
+        "bound_at_unix_ms": legacy["bound_at_unix_ms"],
+        "state": legacy["state"], "actual_age_ms": legacy["actual_age_ms"],
+        "actual_revision_delta": legacy["actual_revision_delta"],
+        "mismatch_reasons": legacy["mismatch_reasons"],
+        "observation_identity": {key: legacy["observation"][key] for key in (
+            "kind", "captured_revision", "current_revision", "current_source_digest",
+            "relation", "revision_delta", "verification_method")},
+        "acceptance_sha256": None, "routing_authority": False,
+    }
+    legacy["binding_sha256"] = context_module._sha(identity)
+    restored = parse_private_projection_readonly(legacy)
+    assert public_projection(restored)["legacy_read_only"] is True
+    with pytest.raises(ContextFreshnessError):
+        parse_private_projection(legacy)
+    with pytest.raises(ContextFreshnessError):
+        prompt_projection(restored)
+    forged = copy.deepcopy(legacy)
+    forged["actual_age_ms"] += 1
+    with pytest.raises(ContextFreshnessError, match="binding"):
+        parse_private_projection_readonly(forged)
 
 
 def test_prelaunch_revalidation_rechecks_expiry_and_age_authority():

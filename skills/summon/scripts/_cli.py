@@ -1232,7 +1232,24 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Record loose-file provenance for an input under --cwd "
                              "(repeatable): path, bytes, sha256, and page metadata where "
                              "available; re-check after dispatch and mark changed baselines "
-                             "suspect")
+                              "suspect")
+    parser.add_argument("--context-input-file", dest="context_input_file",
+                        help="Append one typed summon.context-input/v1 packet to this "
+                             "dispatch. Summon reads and compiles it locally before any "
+                             "provider contact; combine with --dry-run for a provider-inert "
+                             "preview")
+    parser.add_argument("--context-profile", dest="context_profile",
+                        choices=("safe", "off"),
+                        help="Context compilation profile (default safe). 'off' preserves the "
+                             "input packet's exact UTF-8 serialization; no context flags keep "
+                             "the legacy dispatch prompt byte-identical")
+    parser.add_argument("--context-reference", dest="context_references",
+                        action="append", default=[], metavar="SHA256_REF=FILE",
+                        help="Hash-read one externalized context target from --cwd "
+                             "(repeatable). The reference must be sha256:<digest>; paths stay "
+                             "out of public receipts")
+    parser.add_argument("--context-compilation-json", dest="context_compilation_json",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--no-contract-repair", dest="no_contract_repair", action="store_true",
                         help="Disable the automatic ONE-shot corrective resume that fixes a "
                              "malformed report contract on a suspect success (status=success but "

@@ -5,6 +5,24 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+- **Opt-in safe context compilation:** ordinary dispatch now accepts a typed
+  `summon.context-input/v1` packet through `--context-input-file`. The default safe
+  profile mechanically compacts only typed payloads; ordinary file input rejects
+  authority-plane blocks because a data file cannot authenticate host authority. It
+  publishes hashes, action counts, lineage, rollback identity, and before/after token
+  estimates in `--dry-run` without contacting a provider. External references require
+  an exact `sha256:<digest>=FILE` binding that Summon hash-reads from `--cwd` with
+  final-handle verification and emits as a cwd-relative locator; caller-authored
+  verification booleans are not trusted. The proof covers compile time, so the receiver
+  must re-hash before use. The
+  `off` profile appends the exact source serialization, while dispatches with no context
+  flags retain the legacy prompt bytes. Background children consume the exact compiled
+  prompt frozen in their immutable per-job bundle, and result trust binds the terminal
+  prompt digest to the launch record. Stale deliberation acceptance is additionally bound to
+  a digest of the resolved run namespace, rechecked before every provider launch, so
+  copying it to another run root cannot replay its one-run authority; the new acceptance
+  and binding contracts use v2 schemas. Authenticated v1 evidence remains readable for
+  historical status/replay but cannot authorize new live work.
 - **Opt-in usage and credit refresh:** `summon usage refresh` now supports one reviewed,
   bounded Codex account-usage adapter. It requires an explicit provider allowlist plus
   `--allow-account-usage-read`, checks the exact supported CLI version and JSON-RPC plan,

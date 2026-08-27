@@ -193,7 +193,9 @@ class LiveIntegrationTests(unittest.TestCase):
             question=self.question, roster=self.roster,
             timeout_ms=self.timeout_ms, clock=lambda: 0.0,
             unix_now_ms=self.unix_now_ms, durable_context=bound,
-            context_observer=observer, _executor_for_tests=executor)
+            context_observer=observer,
+            context_namespace_observer=lambda: bound.runs_root_sha256,
+            _executor_for_tests=executor)
         scheduler.run()
         self.assertEqual(len(packets), 2)
         durable = packets[0]["durable_context"]
@@ -229,10 +231,46 @@ class LiveIntegrationTests(unittest.TestCase):
             question=self.question, roster=self.roster,
             timeout_ms=self.timeout_ms, clock=lambda: 0.0,
             unix_now_ms=self.unix_now_ms, durable_context=bound,
-            context_observer=lambda: drifted, _executor_for_tests=executor)
+            context_observer=lambda: drifted,
+            context_namespace_observer=lambda: bound.runs_root_sha256,
+            _executor_for_tests=executor)
         report = scheduler.run()
         self.assertEqual(contacts, [])
         self.assertNotEqual(report.state, "DECIDED")
+        self.assertEqual(report.error_kind, "context_source_drift")
+
+    def test_context_namespace_is_rechecked_before_every_provider_launch(self):
+        bound, observed, receipt = self.durable()
+        _path, owner = self.init(receipt)
+        namespace = [bound.runs_root_sha256]
+        contacts = []
+
+        def executor(invocation, **kwargs):
+            try:
+                kwargs["launch_control"].before_provider_launch(
+                    {"backend": invocation.cli})
+            except _executor.ProviderLaunchRefusal as exc:
+                return {"status": "blocked", "exit_code": 1, "result": "",
+                        "error_kind": exc.error_kind,
+                        "execution_status": "not_run",
+                        "provider_contacted": False}
+            contacts.append(invocation.cli)
+            namespace[0] = "f" * 64
+            return {"result": json.dumps({
+                "ballot": {"decision": "vote", "option_id": "yes"}}),
+                "exit_code": 0}
+
+        scheduler = live.build_live_scheduler(
+            owner=owner, receipt=receipt, policy=self.policy,
+            question=self.question, roster=self.roster,
+            timeout_ms=self.timeout_ms, clock=lambda: 0.0,
+            unix_now_ms=self.unix_now_ms, durable_context=bound,
+            context_observer=lambda: dict(
+                observed, observed_at_unix_ms=int(time.time() * 1000)),
+            context_namespace_observer=lambda: namespace[0],
+            _executor_for_tests=executor)
+        report = scheduler.run()
+        self.assertEqual(len(contacts), 1)
         self.assertEqual(report.error_kind, "context_source_drift")
 
     def test_deliberation_invocation_uses_ballot_contract_not_report_reminder(self):

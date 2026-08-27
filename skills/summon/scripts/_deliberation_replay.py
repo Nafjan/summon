@@ -234,7 +234,7 @@ def receipt_schedule(receipt: Mapping[str, object]) -> tuple[int, int, str]:
     return rounds, deadline, schedule_digest(rounds, deadline)
 
 
-def _receipt_metadata(receipt: Mapping[str, object]) -> None:
+def _receipt_metadata(receipt: Mapping[str, object], *, allow_legacy_context: bool = False) -> None:
     """Validate immutable question/timestamp metadata before replaying turns."""
     question_sha = receipt.get("question_sha256")
     if not isinstance(question_sha, str) or not _SHA256_RE.fullmatch(question_sha):
@@ -247,8 +247,11 @@ def _receipt_metadata(receipt: Mapping[str, object]) -> None:
             raise ReplayError("receipt created_at is malformed")
     if "durable_context" in receipt:
         try:
-            from _deliberation_context import parse_private_projection
-            binding = parse_private_projection(receipt["durable_context"])
+            from _deliberation_context import (parse_private_projection,
+                                               parse_private_projection_readonly)
+            parser = (parse_private_projection_readonly
+                      if allow_legacy_context else parse_private_projection)
+            binding = parser(receipt["durable_context"])
         except Exception as exc:
             raise ReplayError("receipt durable context binding is invalid") from exc
         if (binding.run_id != receipt.get("run_id")
@@ -424,7 +427,8 @@ def _sealed_command_batch(record: Mapping[str, object],
 
 def replay_checkpoint(receipt: Mapping[str, object],
                       tagged_records: Iterable[tuple[int, Mapping[str, object]]],
-                      current_owner_generation: int) -> ReplayCheckpoint:
+                      current_owner_generation: int, *,
+                      allow_legacy_context: bool = False) -> ReplayCheckpoint:
     """Validate and reconstruct a durable deliberation checkpoint.
 
     ``current_owner_generation`` is the generation being acquired for resume;
@@ -443,7 +447,7 @@ def replay_checkpoint(receipt: Mapping[str, object],
     decision_id = _id(receipt.get("decision_id"), "decision id")
     seat_ids, option_ids, quorum, max_attempts, approval = _receipt_policy(receipt)
     rounds, deadline_unix_ms, schedule_digest_value = receipt_schedule(receipt)
-    _receipt_metadata(receipt)
+    _receipt_metadata(receipt, allow_legacy_context=allow_legacy_context)
     receipt_sha256 = _sha(receipt)
     policy_digest = _policy_digest(decision_id, seat_ids, option_ids, quorum,
                                    max_attempts, approval)

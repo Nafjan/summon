@@ -196,9 +196,16 @@ The compiler has two planes:
 - **typed payload plane:** only explicitly typed immutable artifacts, validated
   reports, and diagnostic tails are eligible for mechanical compaction.
 
+The pure compiler preserves already-authenticated authority for trusted host adapters,
+but the ordinary `--context-input-file` surface is payload-only: a caller-controlled
+file cannot mint system, approval, permission, spend, or report-contract authority.
+
 The safe profile may deduplicate byte-identical typed payload blocks, replace an
-artifact body with a content-addressed reference only when the target proves it can
-resolve and hash-check that reference, omit raw tool chatter only when a validated
+artifact body with a content-addressed reference only after a compile-time final-handle
+readback, and emit the expected digest plus a cwd-relative locator. The receiver must
+re-hash before use because the file is not immutable across processes. The first
+dispatch adapter refuses worktree, additional-root-only, and text-only-backend
+references until a stronger receiver-verifiable locator exists. It may omit raw tool chatter only when a validated
 report and receipt fully represent it, and bound diagnostic tails while retaining
 typed errors. The compiler itself never reuses provider sessions. Governed continuation
 is a separate, explicit operational-recovery path and never becomes an implicit context
@@ -321,12 +328,14 @@ a second coordinator.
 
 ### M5 — Safe context and token optimization
 
-- Compile against the M0 compatibility corpus. Preserve every authority turn byte for
-  byte and in order; transform only explicitly typed payload blocks.
+- Compile against the M0 compatibility corpus. Trusted adapters preserve authority
+  byte-for-byte and in order; the ordinary file surface rejects authority and transforms
+  only explicitly typed payload blocks.
 - Limit the default safe profile to lossless deduplication, validated stable
   references, and bounded diagnostic/tool chatter with a target-resolvable map.
 - Provide dry-run mapping, before/after byte and token counts, rollback, and a true
-  off switch identical to the frozen legacy path.
+  off switch. Omitting context flags is identical to the frozen legacy path; explicit
+  `off` preserves the supplied context packet's exact UTF-8 serialization.
 - Do not let the context compiler initiate provider-session reuse, and do not add lossy
   semantic summarization in Phase 1. Governed M2.5 continuation remains a separate,
   explicit operational action and is invalid for final adjudication.
@@ -335,8 +344,11 @@ a second coordinator.
 
 - Generalize the canonical deliberation packet rather than inventing a second context
   vocabulary.
-- Bind `accepted_stale` to packet and revision digests, actor, reason, scope, expiry,
-  maximum age, and maximum revision delta. Record the actual values.
+- Bind `accepted_stale` to packet and revision digests, the resolved run-namespace
+  digest, actor, reason, scope, expiry, maximum age, and maximum revision delta. Record
+  the actual values, use a v2 acceptance/binding contract, and revalidate the namespace
+  before scheduler creation and every provider launch so replay under another run root
+  or a between-seat namespace swap is refused.
 - Accepted stale evidence remains visibly stale and has no routing authority.
 
 ### M7 — Portable results and native/external adapters

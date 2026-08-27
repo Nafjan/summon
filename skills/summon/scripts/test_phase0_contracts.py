@@ -12,6 +12,9 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+import _background
 import _executor
 import _jobs
 import _manifest
@@ -87,6 +90,73 @@ def test_background_record_binds_attempt_identity():
         record = _jobs.read_json(_jobs.record_path(root, job_id))
         assert record["attempt_id"] == job_id
         assert _jobs.job_status(root, job_id)["attempt_id"] == job_id
+
+
+def test_background_result_prompt_must_match_immutable_launch_record():
+    record = {
+        "nonce": "n" * 32, "prompt_sha256": "a" * 64,
+        "summon": {"scripts_sha256": "b" * 64,
+                   "background_bundle": {"prompt_sha256": "a" * 64}},
+    }
+    result = {
+        "status": "success", "job_nonce": "n" * 32,
+        "prompt_sha256": "c" * 64,
+        "summon": record["summon"],
+    }
+    assert _jobs._classify(record, "ok", result, "ok") == (
+        "identity_mismatch", False)
+    result["prompt_sha256"] = "a" * 64
+    assert _jobs._classify(record, "ok", result, "ok") == ("success", True)
+
+
+def test_background_context_metadata_must_match_immutable_launch_record():
+    metadata = {"schema": "summon.context-dispatch/v1", "provider_contacted": False}
+    digest = __import__("hashlib").sha256(json.dumps(
+        metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False).encode()).hexdigest()
+    record = {
+        "nonce": "n" * 32, "prompt_sha256": "a" * 64,
+        "summon": {"scripts_sha256": "b" * 64, "background_bundle": {
+            "prompt_sha256": "a" * 64,
+            "context_compilation_sha256": digest,
+        }},
+    }
+    result = {
+        "status": "success", "job_nonce": "n" * 32,
+        "prompt_sha256": "a" * 64, "summon": record["summon"],
+        "context_compilation": metadata,
+    }
+    assert _jobs._classify(record, "ok", result, "ok") == ("success", True)
+    result["context_compilation"] = {**metadata, "provider_contacted": True}
+    assert _jobs._classify(record, "ok", result, "ok") == (
+        "identity_mismatch", False)
+
+
+def test_background_child_refuses_changed_frozen_prompt_before_contact(monkeypatch):
+    expected = __import__("hashlib").sha256(b"approved").hexdigest()
+    monkeypatch.setenv("SUMMON_JOB_PROMPT_SHA", expected)
+    args = SimpleNamespace(prompt="changed")
+    with pytest.raises(ValueError, match="launch record"):
+        run_subagent._verify_frozen_background_prompt(args)
+    args.prompt = "approved"
+    run_subagent._verify_frozen_background_prompt(args)
+    assert args._background_prompt_verified is True
+
+
+def test_frozen_prompt_file_mutation_is_refused_before_child_contact(
+        tmp_path, monkeypatch):
+    scripts = tmp_path / "bundle" / "scripts"
+    scripts.mkdir(parents=True)
+    entry = scripts / "run_subagent.py"
+    entry.write_text("# frozen dispatcher", encoding="utf-8")
+    digest = __import__("hashlib").sha256(b"approved").hexdigest()
+    prompt_file = Path(_background._freeze_background_prompt(
+        str(entry), "approved", digest))
+    prompt_file.write_text("changed", encoding="utf-8")
+    monkeypatch.setenv("SUMMON_JOB_PROMPT_SHA", digest)
+    with pytest.raises(ValueError, match="launch record"):
+        run_subagent._verify_frozen_background_prompt(
+            SimpleNamespace(prompt=prompt_file.read_text(encoding="utf-8")))
 
 
 def test_background_first_dispatch_reuses_precommitted_attempt_id(monkeypatch):
@@ -211,6 +281,62 @@ def test_cmd_transport_rejects_unsafe_raw_prompt_without_launch(monkeypatch):
 def test_prompt_file_is_safe_cmd_transport(monkeypatch):
     monkeypatch.setenv("SUMMON_CMD_LAUNCHER", "1")
     assert run_subagent._cmd_prompt_transport_error("one\ntwo & three", "prompt.md") is None
+
+
+def test_context_dry_run_is_provider_inert_and_reports_compilation_without_paths():
+    script = Path(__file__).with_name("run_subagent.py")
+    with tempfile.TemporaryDirectory(prefix="summon-context-dry-") as cwd:
+        agents = Path(cwd, "agents")
+        agents.mkdir()
+        Path(agents, "reviewer.md").write_text(
+            "---\nrun-agent: codex\npermission: read-only\nmodel: gpt-5.6-sol\n---\nReview.",
+            encoding="utf-8")
+        context_path = Path(cwd, "context.json")
+        context_path.write_text(json.dumps({
+            "schema": "summon.context-input/v1",
+            "blocks": [{"id": "note", "plane": "payload", "kind": "note",
+                        "body": "provider-inert fixture"}],
+        }), encoding="utf-8")
+        env = os.environ.copy()
+        env["SUMMON_TELEMETRY"] = "0"
+        completed = subprocess.run(
+            [sys.executable, str(script), "--agent", "reviewer", "--prompt", "review",
+             "--cwd", cwd, "--agents-dir", str(agents), "--strict-agents-dir",
+             "--context-input-file", str(context_path), "--context-profile", "safe",
+             "--dry-run", "--json"],
+            capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        view = json.loads(completed.stdout)
+        projection = view["context_compilation"]
+        assert view["provider_contacted"] is False
+        assert projection["provider_contacted"] is False
+        assert projection["profile"] == "safe"
+        assert projection["block_count"] == 1
+        assert cwd not in json.dumps(projection)
+
+
+def test_context_input_outside_read_allowlist_refuses_before_provider_contact():
+    script = Path(__file__).with_name("run_subagent.py")
+    with tempfile.TemporaryDirectory(prefix="summon-context-cwd-") as cwd, \
+            tempfile.TemporaryDirectory(prefix="summon-context-outside-") as outside:
+        context_path = Path(outside, "context.json")
+        context_path.write_text(json.dumps({
+            "schema": "summon.context-input/v1",
+            "blocks": [{"id": "note", "plane": "payload", "kind": "note",
+                        "body": "outside"}],
+        }), encoding="utf-8")
+        env = os.environ.copy()
+        env["SUMMON_TELEMETRY"] = "0"
+        completed = subprocess.run(
+            [sys.executable, str(script), "--agent", "reviewer", "--prompt", "review",
+             "--cwd", cwd, "--context-input-file", str(context_path),
+             "--dry-run", "--json"],
+            capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
+        assert completed.returncode == 1
+        refusal = json.loads(completed.stdout)
+        assert refusal["error_kind"] == "context_target_outside_allowlist"
+        assert refusal["attempts"] == 0
+        assert refusal["provider_contacted"] is False
 
 
 def test_real_windows_cmd_refuses_all_raw_prompt_bytes_before_dispatch():

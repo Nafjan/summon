@@ -17,6 +17,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import _deliberation_replay as replay
+import _deliberation_context as context
 import _rundir
 
 
@@ -40,6 +41,51 @@ def prepared(run_id="run-1", generation=1, **receipt_kwargs):
     return value, [(generation, event(
         "run_prepared", generation, run_id=run_id,
         receipt_sha256=replay._sha(value)))]
+
+
+def legacy_context_projection():
+    now = 2_000_000
+    packet = {
+        "schema": context.PACKET_SCHEMA,
+        "source": {"kind": "git_commit", "revision": "a" * 40,
+                   "source_digest": "1" * 64,
+                   "captured_at_unix_ms": now - 100},
+        "freshness_policy": {"fresh_max_age_ms": 1_000,
+                             "hard_max_age_ms": 20_000,
+                             "hard_max_revision_delta": 3},
+        "entries": [{"id": "constraint-1", "kind": "constraint",
+                     "body": "Historical constraint.",
+                     "provenance": {"kind": "authored",
+                                    "source_sha256": "3" * 64}}],
+    }
+    observation = {
+        "schema": context.OBSERVATION_SCHEMA, "kind": "git_commit",
+        "captured_revision": "a" * 40, "current_revision": "a" * 40,
+        "current_source_digest": "1" * 64, "relation": "same",
+        "revision_delta": 0, "verification_method": "git-readback",
+        "observed_at_unix_ms": now,
+    }
+    current = context.private_projection(context.bind_context(
+        packet, observation, run_id="run-1", decision_id="decision-1",
+        unix_now_ms=now, runs_root_sha256="4" * 64))
+    current["schema"] = context.LEGACY_BINDING_SCHEMA
+    current.pop("runs_root_sha256")
+    identity = {
+        "schema": context.LEGACY_BINDING_SCHEMA,
+        "packet_sha256": current["packet_sha256"],
+        "source_revision_sha256": current["source_revision_sha256"],
+        "run_id": current["run_id"], "decision_id": current["decision_id"],
+        "bound_at_unix_ms": current["bound_at_unix_ms"], "state": current["state"],
+        "actual_age_ms": current["actual_age_ms"],
+        "actual_revision_delta": current["actual_revision_delta"],
+        "mismatch_reasons": current["mismatch_reasons"],
+        "observation_identity": {key: current["observation"][key] for key in (
+            "kind", "captured_revision", "current_revision", "current_source_digest",
+            "relation", "revision_delta", "verification_method")},
+        "acceptance_sha256": None, "routing_authority": False,
+    }
+    current["binding_sha256"] = context._sha(identity)
+    return current
 
 
 def turn_events(*, seat="a", turn="turn-a-0", ordinal=0, attempt="g1-a0",
@@ -92,6 +138,20 @@ class ReplayTests(unittest.TestCase):
                                  receipt_sha256=replay._sha(bad_timestamp)))]
         with self.assertRaises(replay.ReplayError):
             self.run_replay(records_bad, value=bad_timestamp)
+
+    def test_historical_v1_context_replays_read_only_but_is_not_current_authority(self):
+        value = receipt()
+        value["durable_context"] = legacy_context_projection()
+        records = [(1, event("run_prepared", 1, run_id="run-1",
+                             receipt_sha256=replay._sha(value)))]
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+        checkpoint = replay.replay_checkpoint(
+            value, records, 2, allow_legacy_context=True)
+        self.assertEqual(checkpoint.status, "PREPARED")
+        with self.assertRaises(replay.ReplayError):
+            replay._receipt_metadata(value)
+        replay._receipt_metadata(value, allow_legacy_context=True)
 
     def test_public_audit_fields_are_schema_validated(self):
         value, records = prepared()

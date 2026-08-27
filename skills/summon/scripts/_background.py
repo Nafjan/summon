@@ -133,20 +133,46 @@ def _freeze_background_bundle(root: str, job_id: str, entry_path: str,
     return str(child_entry), execution
 
 
+def _freeze_background_prompt(child_entry: str, prompt: str, prompt_sha256: str) -> str:
+    """Persist the exact parent-approved prompt beside the immutable script tree."""
+    bundle_root = Path(child_entry).resolve().parent.parent
+    prompt_path = bundle_root / "dispatch-prompt.txt"
+    raw = prompt.encode("utf-8")
+    if hashlib.sha256(raw).hexdigest() != prompt_sha256:
+        raise ValueError("background prompt digest changed before it was frozen")
+    fd = os.open(prompt_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            os.unlink(prompt_path)
+        except OSError:
+            pass
+        raise
+    if hashlib.sha256(prompt_path.read_bytes()).hexdigest() != prompt_sha256:
+        raise ValueError("frozen background prompt failed readback verification")
+    return str(prompt_path)
+
+
 def child_argv(args: argparse.Namespace, result_file: str, *, private_resume: bool = False) -> list:
     """Reconstruct the child argv from PARSED args (not by filtering sys.argv,
     which would wrongly drop a token that is another option's *value*). Drops
     --background, adds --job-file."""
-    # A file-sourced prompt is re-passed AS THE FILE (not the loaded text): the
-    # child re-reads it, keeping the detached argv small and mojibake-free.
+    # Fresh background launches use the exact prompt bytes frozen beside their
+    # immutable script bundle. Resume successors use their separate authenticated
+    # private prompt channel.
     if private_resume:
         # The authenticated child replaces this bounded placeholder from its
         # private digest-bound prompt file.  Neither the continuation handle nor
         # operator steering appears in the detached process command line.
         out = ["--agent", args.agent, "--prompt", "governed continuation",
                "--cwd", args.cwd]
-    elif getattr(args, "prompt_file", None):
-        out = ["--agent", args.agent, "--prompt-file", args.prompt_file, "--cwd", args.cwd]
+    elif getattr(args, "_background_frozen_prompt_file", None):
+        out = ["--agent", args.agent, "--prompt-file",
+               args._background_frozen_prompt_file, "--cwd", args.cwd]
     else:
         out = ["--agent", args.agent, "--prompt", args.prompt, "--cwd", args.cwd]
     if getattr(args, "allow_credit", False):
@@ -217,6 +243,10 @@ def child_argv(args: argparse.Namespace, result_file: str, *, private_resume: bo
         out += ["--allow-tool-credentials"]
     for artifact in getattr(args, "artifacts", ()) or ():
         out += ["--artifact", artifact]
+    if isinstance(getattr(args, "_context_compilation", None), dict):
+        out += ["--context-compilation-json", json.dumps(
+            args._context_compilation, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False)]
     return out + ["--job-file", result_file]
 
 
@@ -375,6 +405,17 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
         else:
             child_entry, execution_summon = _freeze_background_bundle(
                 root, job_id, entry_path, summon)
+            frozen_prompt = _freeze_background_prompt(
+                child_entry, args.prompt, prompt_sha)
+            args._background_frozen_prompt_file = frozen_prompt
+            execution_summon["background_bundle"]["prompt_sha256"] = prompt_sha
+            if isinstance(getattr(args, "_context_compilation", None), dict):
+                compilation_bytes = json.dumps(
+                    args._context_compilation, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False).encode("utf-8")
+                execution_summon["background_bundle"][
+                    "context_compilation_sha256"] = hashlib.sha256(
+                        compilation_bytes).hexdigest()
             record_file = _jobs.write_prepared(
                 root, job_id, nonce=nonce, agent=args.agent,
                 prompt_sha256=prompt_sha, cwd=args.cwd,
@@ -440,6 +481,10 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
         child_env.pop("SUMMON_CMD_LAUNCHER", None)
         if prompt_sha:
             child_env["SUMMON_JOB_PROMPT_SHA"] = prompt_sha   # lets the crash path verify
+        context_sha = (execution_summon.get("background_bundle") or {}).get(
+            "context_compilation_sha256")
+        if context_sha:
+            child_env["SUMMON_JOB_CONTEXT_SHA256"] = context_sha
         kwargs["env"] = child_env
         from _spawn import popen_flags
         try:

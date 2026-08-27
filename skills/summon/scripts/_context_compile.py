@@ -27,6 +27,7 @@ LINEAGE_SCHEMA = "summon.context-lineage/v1"
 TOKEN_ESTIMATE_METHOD = "utf8_bytes_div_4_ceiling/v1"
 RECEIPT_PROOF_SCHEMA = "summon.context-receipt-proof/v1"
 RECEIPT_BINDING_SCHEMA = "summon.context-receipt-binding/v1"
+REFERENCE_PROOF_SCHEMA = "summon.context-reference-proof/v1"
 
 MAX_BLOCKS = 256
 MAX_BLOCK_BYTES = 512 * 1024
@@ -52,6 +53,30 @@ class ContextCompileError(ValueError):
     def __init__(self, kind: str, message: str):
         super().__init__(message)
         self.kind = kind
+
+
+class _VerifiedReferenceProof:
+    """Opaque adapter-minted reference proof.
+
+    A plain mapping is caller data, not evidence that a local target was opened
+    and hash-read.  The trusted filesystem adapter is the only production
+    caller of the private minting function below.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: Mapping[str, Any], token: object):
+        if token is not _REFERENCE_PROOF_TOKEN:
+            raise ContextCompileError(
+                "reference_proof_invalid", "reference proof was not minted by the target adapter")
+        self._value = value
+
+
+_REFERENCE_PROOF_TOKEN = object()
+
+
+def _mint_verified_reference_proof(value: Mapping[str, Any]) -> _VerifiedReferenceProof:
+    return _VerifiedReferenceProof(value, _REFERENCE_PROOF_TOKEN)
 
 
 def _canonical(value: Any) -> bytes:
@@ -284,13 +309,16 @@ def _parse_context(value: Mapping[str, Any] | bytes | str) -> dict[str, Any]:
     return {"schema": INPUT_SCHEMA, "blocks": [dict(item) if isinstance(item, Mapping) else item for item in blocks]}
 
 
-def _proofs(value: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
+def _proofs(value: _VerifiedReferenceProof | None) -> dict[str, dict[str, Any]]:
     if value is None:
         return {}
-    top = _snapshot_mapping(value, "reference_proof_invalid")
+    if not isinstance(value, _VerifiedReferenceProof):
+        raise ContextCompileError(
+            "reference_proof_invalid", "reference proof was not minted by the target adapter")
+    top = _snapshot_mapping(value._value, "reference_proof_invalid")
     if set(top) != {"schema", "references"}:
         raise ContextCompileError("reference_proof_invalid", "reference proof is invalid")
-    if top.get("schema") != "summon.context-reference-proof/v1":
+    if top.get("schema") != REFERENCE_PROOF_SCHEMA:
         raise ContextCompileError("reference_proof_invalid", "reference proof schema is unsupported")
     refs = _snapshot_mapping(top.get("references"), "reference_proof_invalid")
     if len(refs) > MAX_BLOCKS:
@@ -301,6 +329,7 @@ def _proofs(value: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
         proof = _snapshot_mapping(raw_proof, "reference_proof_invalid")
         expected_fields = {
             "reference", "sha256", "verified_target", "verification_method",
+            "target_locator",
         }
         if not isinstance(proof, Mapping) or set(proof) != expected_fields:
             raise ContextCompileError("reference_proof_invalid", "reference proof is invalid")
@@ -309,9 +338,19 @@ def _proofs(value: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
         digest = _digest(proof.get("sha256"), "reference sha256")
         if proof.get("verification_method") != "sha256-readback":
             raise ContextCompileError("reference_proof_invalid", "reference hash verification is unsupported")
+        locator = _snapshot_mapping(proof.get("target_locator"), "reference_proof_invalid")
+        if set(locator) != {"root", "path"}:
+            raise ContextCompileError("reference_proof_invalid", "reference target locator is invalid")
+        root = locator.get("root")
+        path = locator.get("path")
+        if (root != "cwd" or not isinstance(path, str) or not path
+                or "\\" in path or path.startswith(("/", "../"))
+                or "/../" in path or re.match(r"^[A-Za-z]:", path)):
+            raise ContextCompileError("reference_proof_invalid", "reference target locator is invalid")
         output[ref] = {
             "reference": ref, "sha256": digest, "verified_target": True,
             "verification_method": "sha256-readback",
+            "target_locator": {"root": root, "path": path},
         }
     return output
 
@@ -557,7 +596,8 @@ def _compile_context(context: Mapping[str, Any] | bytes | str, *, profile: str =
             output = {"id": block["id"], "plane": "payload", "kind": block["kind"],
                       "artifact_ref": block["artifact_ref"], "sha256": body_hash,
                       "target_verified": True,
-                      "verification_method": "sha256-readback"}
+                      "verification_method": "sha256-readback",
+                      "target_locator": dict(proofs[block["artifact_ref"]]["target_locator"])}
             retained.append({**evidence_base, "retention": "stable_reference",
                              "reference": block["artifact_ref"]})
         elif block["kind"] in _IMMUTABLE_KINDS:
@@ -627,7 +667,7 @@ def _compile_context(context: Mapping[str, Any] | bytes | str, *, profile: str =
 
 
 def compile_context(context: Mapping[str, Any] | bytes | str, *, profile: str = "safe",
-                    reference_proof: Mapping[str, Any] | None = None,
+                    reference_proof: _VerifiedReferenceProof | None = None,
                     diagnostic_tail_bytes: int = DEFAULT_DIAGNOSTIC_TAIL_BYTES,
                     legacy_serialized: bytes | str | None = None) -> dict[str, Any]:
     """Typed public entry point; hostile runtime/parser failures never escape raw."""

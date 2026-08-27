@@ -102,6 +102,17 @@ def reconcile_run(root: str, run_id: str, *, lease_sec: float = 600.0) -> dict:
                 or not 0 < float(lease_sec) < 86_400):
             return _result("blocked", run_id, error_kind="invalid_lease")
 
+        # Recovery is an authority-mutating path. Authenticate current receipt
+        # metadata before acquiring an owner or repairing/appending a journal.
+        # Historical v1 context bindings are intentionally readable only by
+        # status/replay and must fail here without changing the run directory.
+        try:
+            preflight_receipt = _store._receipt(path, run_id)
+            _store._replay_policy(preflight_receipt)
+            _replay._receipt_metadata(preflight_receipt)
+        except (_store.DeliberationStoreError, _replay.ReplayError):
+            return _result("blocked", run_id, error_kind="receipt_invalid")
+
         owner = _rundir.acquire_owner(path, float(lease_sec))
         # Repair must precede every journal read in this coordinator.  The
         # existing helper repairs only the newest eligible torn tail and

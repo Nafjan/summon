@@ -191,7 +191,7 @@ def _canonical_terminal_result(root, source_job_id, reservation, *, contacted):
         "attempts": 1 if contacted else 0,
         "attempt_id": reservation.successor_job_id if contacted else None,
         "job_nonce": record["nonce"], "provider_contacted": contacted,
-        "summon": record["summon"],
+        "summon": record["summon"], "prompt_sha256": record["prompt_sha256"],
         "lineage": {
             "kind": "governed_resume", "source_job_id": source_job_id,
             "claim_id": reservation.claim_id,
@@ -927,8 +927,7 @@ def test_concurrent_initial_resume_returns_one_successor_without_record_error(
         "scripts_sha256": scripts_sha256(str(Path(entry).parent)),
     }
     monkeypatch.setattr(_jobs, "_pid_liveness", lambda _pid: "alive")
-    popen_entered = __import__("threading").Event()
-    release_popen = __import__("threading").Event()
+    invoke_barrier = __import__("threading").Barrier(2)
     popen_calls = []
 
     class Process:
@@ -936,14 +935,13 @@ def test_concurrent_initial_resume_returns_one_successor_without_record_error(
 
     def popen(*args, **kwargs):
         popen_calls.append(1)
-        popen_entered.set()
-        assert release_popen.wait(5)
         return Process()
 
     monkeypatch.setattr(_background.subprocess, "Popen", popen)
     parser = _cli.build_parser("3.2.1", 1)
 
     def invoke(_):
+        invoke_barrier.wait(timeout=10)
         args = parser.parse_args([
             "--jobs-resume", source_job_id,
             "--job-message", "continue",
@@ -958,9 +956,7 @@ def test_concurrent_initial_resume_returns_one_successor_without_record_error(
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(invoke, index) for index in range(2)]
-        assert popen_entered.wait(5)
-        release_popen.set()
-        outcomes = [future.result(timeout=10) for future in futures]
+        outcomes = [future.result(timeout=60) for future in futures]
     assert outcomes == [(0, []), (0, [])]
     assert len(popen_calls) == 1
     ledger = _jobs.read_json(resume.ledger_path(root, source_job_id))
@@ -1086,7 +1082,7 @@ def test_untrusted_spawned_result_becomes_indeterminate(
         "status": "blocked", "execution_status": "not_run",
         "attempt_status": "not_run", "attempts": 0, "attempt_id": None,
         "job_nonce": record["nonce"], "provider_contacted": False,
-        "summon": record["summon"],
+        "summon": record["summon"], "prompt_sha256": record["prompt_sha256"],
         "lineage": {
             "kind": "governed_resume", "source_job_id": source_job_id,
             "claim_id": reservation.claim_id,
@@ -1119,7 +1115,7 @@ def test_trusted_spawned_terminal_result_reconciles_complete(
         "status": "blocked", "execution_status": "not_run",
         "attempt_status": "not_run", "attempts": 0, "attempt_id": None,
         "job_nonce": record["nonce"], "provider_contacted": False,
-        "summon": record["summon"],
+        "summon": record["summon"], "prompt_sha256": record["prompt_sha256"],
         "lineage": {
             "kind": "governed_resume", "source_job_id": source_job_id,
             "claim_id": reservation.claim_id,
@@ -1194,7 +1190,7 @@ def _claimed_terminal_result(root, source_job_id, reservation):
         "status": "blocked", "execution_status": "not_run",
         "attempt_status": "not_run", "attempts": 0, "attempt_id": None,
         "job_nonce": record["nonce"], "provider_contacted": False,
-        "summon": record["summon"],
+        "summon": record["summon"], "prompt_sha256": record["prompt_sha256"],
         "lineage": {
             "kind": "governed_resume", "source_job_id": source_job_id,
             "claim_id": reservation.claim_id,

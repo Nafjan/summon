@@ -3884,8 +3884,8 @@ def test_prompt_file_load_conflicts_and_bom():
 
 
 def test_prompt_file_and_allow_credit_in_child_argv():
-    # A --background child re-reads the FILE (small argv, no mojibake) and
-    # keeps the credit authorization.
+    # A --background child reads only the parent's immutable prompt snapshot,
+    # never the caller-owned source file, and keeps the credit authorization.
     import argparse
     import run_subagent as r
     ns = argparse.Namespace(agent="a", prompt="LOADED-TEXT", prompt_file="C:/t/p.md",
@@ -3893,11 +3893,14 @@ def test_prompt_file_and_allow_credit_in_child_argv():
                             timeout=600000, cli=None, model=None, effort=None,
                             resume=None, resume_profile=None, out=None,
                             json_schema=None, debug_dir=None, retries=0, worktree=None)
+    ns._background_frozen_prompt_file = "C:/bundle/dispatch-prompt.txt"
     argv = r._child_argv(ns, "res.json")
-    assert "--prompt-file" in argv and "C:/t/p.md" in argv, argv
+    assert "--prompt-file" in argv and ns._background_frozen_prompt_file in argv, argv
+    assert "C:/t/p.md" not in argv, argv
     assert "LOADED-TEXT" not in argv, argv
     assert "--allow-credit" in argv, argv
     ns.prompt_file, ns.allow_credit = None, False
+    del ns._background_frozen_prompt_file
     argv2 = r._child_argv(ns, "res.json")
     assert "--prompt" in argv2 and "LOADED-TEXT" in argv2 and "--allow-credit" not in argv2
 

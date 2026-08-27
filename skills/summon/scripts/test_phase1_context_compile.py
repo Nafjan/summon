@@ -6,12 +6,15 @@ import ast
 import base64
 import hashlib
 import json
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 import _context_compile as compiler
+import _context_target as target_adapter
 
 
 def sample(*blocks):
@@ -107,15 +110,58 @@ def test_stable_external_reference_requires_target_hash_proof_before_output():
     with pytest.raises(compiler.ContextCompileError) as raised:
         compiler.compile_context(sample(target))
     assert raised.value.kind == "reference_proof_required"
-    proof = {"schema": "summon.context-reference-proof/v1", "references": {
+    forged = {"schema": "summon.context-reference-proof/v1", "references": {
         reference: {"reference": reference, "sha256": digest, "verified_target": True,
-                    "verification_method": "sha256-readback"}}}
-    result = compiler.compile_context(sample(target), reference_proof=proof)
-    block = decoded(result)["blocks"][0]
-    assert block == {"id": "a", "plane": "payload", "kind": "immutable_artifact", "artifact_ref": reference,
-                     "sha256": digest, "target_verified": True,
-                     "verification_method": "sha256-readback"}
-    assert result["source_to_output"][0]["action"] == "referenced"
+                    "verification_method": "sha256-readback",
+                    "target_locator": {"root": "cwd", "path": "fake.txt"}}}}
+    with pytest.raises(compiler.ContextCompileError) as raised:
+        compiler.compile_context(sample(target), reference_proof=forged)
+    assert raised.value.kind == "reference_proof_invalid"
+
+
+def test_trusted_reference_adapter_hash_reads_only_allowed_stable_targets():
+    body = b"frozen body"
+    digest = hashlib.sha256(body).hexdigest()
+    reference = "sha256:" + digest
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+        target = Path(root, "artifact.txt")
+        target.write_bytes(body)
+        proof = target_adapter.make_verified_reference_proof({reference: str(target)}, [root])
+        result = compiler.compile_context(
+            sample(artifact("a", body.decode(), stable=True, externalize=True,
+                            artifact_ref=reference)),
+            reference_proof=proof)
+        assert decoded(result)["blocks"][0]["target_locator"] == {
+            "root": "cwd", "path": "artifact.txt"}
+
+        escaped = Path(outside, "artifact.txt")
+        escaped.write_bytes(body)
+        with pytest.raises(compiler.ContextCompileError) as raised:
+            target_adapter.make_verified_reference_proof({reference: str(escaped)}, [root])
+        assert raised.value.kind == "context_target_outside_allowlist"
+
+
+def test_trusted_reference_adapter_rejects_digest_mismatch():
+    with tempfile.TemporaryDirectory() as root:
+        target = Path(root, "artifact.txt")
+        target.write_text("different", encoding="utf-8")
+        reference = "sha256:" + hashlib.sha256(b"expected").hexdigest()
+        with pytest.raises(compiler.ContextCompileError) as raised:
+            target_adapter.make_verified_reference_proof({reference: str(target)}, [root])
+        assert raised.value.kind == "reference_target_mismatch"
+
+
+def test_reference_adapter_fails_closed_when_final_handle_path_is_unavailable():
+    body = b"frozen body"
+    reference = "sha256:" + hashlib.sha256(body).hexdigest()
+    with tempfile.TemporaryDirectory() as root:
+        target = Path(root, "artifact.txt")
+        target.write_bytes(body)
+        with mock.patch.object(target_adapter, "_final_open_path", return_value=None):
+            with pytest.raises(compiler.ContextCompileError) as raised:
+                target_adapter.make_verified_reference_proof(
+                    {reference: str(target)}, [root])
+        assert raised.value.kind == "context_target_unverifiable"
 
 
 def test_reference_proof_refuses_wrong_hash_and_pathlike_reference():
@@ -125,7 +171,7 @@ def test_reference_proof_refuses_wrong_hash_and_pathlike_reference():
     bad = {"schema": "summon.context-reference-proof/v1", "references": {
         reference: {"reference": reference, "sha256": "0" * 64, "verified_target": True,
                     "verification_method": "sha256-readback"}}}
-    with pytest.raises(compiler.ContextCompileError, match="resolved"):
+    with pytest.raises(compiler.ContextCompileError, match="minted"):
         compiler.compile_context(sample(target), reference_proof=bad)
     with pytest.raises(compiler.ContextCompileError):
         compiler.compile_context(sample(artifact("b", "body", stable=True, externalize=True,
@@ -142,21 +188,12 @@ def test_reference_and_receipt_proofs_are_snapshotted_before_field_validation():
     body = "frozen"
     digest = hashlib.sha256(body.encode()).hexdigest()
     reference = "sha256:" + digest
-    raw_target = NoGetMapping({
-        "reference": reference, "sha256": digest, "verified_target": True,
-        "verification_method": "sha256-readback",
-    })
-    proof = NoGetMapping({
-        "schema": "summon.context-reference-proof/v1",
-        "references": NoGetMapping({reference: raw_target}),
-    })
     raw_receipt = NoGetMapping(receipt_proof())
     result = compiler.compile_context(sample(
-        artifact("a", body, stable=True, externalize=True, artifact_ref=reference),
         report(), diagnostic("d", "verbose", ["tool_missing"], receipt_proof=raw_receipt)),
-        reference_proof=proof, diagnostic_tail_bytes=0)
+        diagnostic_tail_bytes=0)
     assert [item["action"] for item in result["source_to_output"]] == [
-        "referenced", "preserved", "tail_bounded"]
+        "preserved", "tail_bounded"]
     wrong_binding = {"schema": "summon.context-reference-proof/v1", "references": {
         reference: {"reference": "sha256:" + "f" * 64,
                     "sha256": hashlib.sha256(body.encode()).hexdigest(),
@@ -166,6 +203,22 @@ def test_reference_and_receipt_proofs_are_snapshotted_before_field_validation():
             artifact("a", body, stable=True, externalize=True, artifact_ref=reference)),
             reference_proof=wrong_binding)
     assert raised.value.kind == "reference_proof_invalid"
+
+
+def test_reference_adapter_rejects_symlink_or_junction_indirection():
+    body = b"frozen"
+    reference = "sha256:" + hashlib.sha256(body).hexdigest()
+    with tempfile.TemporaryDirectory() as root:
+        real = Path(root, "real.txt")
+        link = Path(root, "link.txt")
+        real.write_bytes(body)
+        try:
+            link.symlink_to(real)
+        except OSError:
+            pytest.skip("symlink creation is unavailable")
+        with pytest.raises(compiler.ContextCompileError) as raised:
+            target_adapter.make_verified_reference_proof({reference: str(link)}, [root])
+        assert raised.value.kind == "context_target_indirect"
 
 
 def test_diagnostic_tail_preserves_typed_errors_full_hash_and_omission_count():

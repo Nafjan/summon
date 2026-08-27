@@ -313,10 +313,15 @@ class DeliberationCliTests(unittest.TestCase):
             parsed = context.parse_context_packet(packet)
             run_id = "deliberation-operator-selected"
             decision_id = "decision-operator-selected"
+            run_root = Path(temp) / "runs"
+            namespace = os.path.normcase(os.path.realpath(
+                os.path.abspath(run_root / "deliberations")))
             intent = {
-                "schema": "summon.accept-stale-intent/v1",
+                "schema": "summon.accept-stale-intent/v2",
                 "packet_sha256": parsed.packet_sha256,
                 "source_revision_sha256": parsed.source_revision_sha256,
+                "runs_root_sha256": hashlib.sha256(
+                    namespace.encode("utf-8")).hexdigest(),
                 "run_id": run_id, "decision_id": decision_id,
                 "actor": {"kind": "human", "id": "operator"},
                 "reason": "Reviewed the bounded age delta.",
@@ -329,7 +334,6 @@ class DeliberationCliTests(unittest.TestCase):
             context_file.write_text(json.dumps(packet), encoding="utf-8")
             acceptance_file = Path(temp) / "acceptance.json"
             acceptance_file.write_text(json.dumps(intent), encoding="utf-8")
-            run_root = Path(temp) / "runs"
             args = _cli.build_parser("test", 1).parse_args([
                 "--deliberate", "--question", "q", "--seats", "one,two",
                 "--options", "yes,no", "--quorum", "all", "--max-attempts", "2",
@@ -350,6 +354,54 @@ class DeliberationCliTests(unittest.TestCase):
             self.assertEqual(body["receipt"]["decision_id"], decision_id)
             self.assertEqual(body["receipt"]["durable_context"]["state"],
                              "accepted_stale")
+
+    def test_live_context_revalidates_run_namespace_before_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            previous_path = _install_fake_claude_on_path(Path(temp))
+            self.addCleanup(_restore_path, previous_path)
+            project = Path(temp) / "project"
+            agents = project / "agents"
+            agents.mkdir(parents=True)
+            for name in ("one", "two"):
+                (agents / f"{name}.md").write_text(
+                    "---\nrun-agent: claude\npermission: read-only\n---\n",
+                    encoding="utf-8")
+            manifest = Path(temp) / "revision-manifest.json"
+            manifest_bytes = b'{"revision":"bounded"}\n'
+            manifest.write_bytes(manifest_bytes)
+            digest = hashlib.sha256(manifest_bytes).hexdigest()
+            packet = {
+                "schema": "summon.deliberation-context/v1",
+                "source": {"kind": "revision_manifest", "revision": "sha256:" + digest,
+                           "source_digest": digest,
+                           "captured_at_unix_ms": int(time.time() * 1000)},
+                "freshness_policy": {"fresh_max_age_ms": 60_000,
+                                     "hard_max_age_ms": 120_000,
+                                     "hard_max_revision_delta": 0},
+                "entries": [{"id": "constraint-1", "kind": "constraint",
+                             "body": "Bounded instruction.",
+                             "provenance": {"kind": "authored",
+                                            "source_sha256": "a" * 64}}],
+            }
+            context_file = Path(temp) / "context.json"
+            context_file.write_text(json.dumps(packet), encoding="utf-8")
+            args = _cli.build_parser("test", 1).parse_args([
+                "--deliberate", "--question", "q", "--seats", "one,two",
+                "--options", "yes,no", "--quorum", "all", "--max-attempts", "2",
+                "--deadline", "30s", "--cwd", str(project),
+                "--agents-dir", str(agents), "--run-dir", str(Path(temp) / "runs"),
+                "--json", "--context-file", str(context_file),
+                "--context-observation-file", str(manifest),
+            ])
+            output = io.StringIO()
+            with mock.patch.object(store, "_runs_root_sha256",
+                                   side_effect=["a" * 64, "b" * 64]), \
+                    mock.patch("_deliberation_live.build_live_scheduler") as scheduler, \
+                    contextlib.redirect_stdout(output):
+                code = store.run_command(args)
+            self.assertEqual(code, 1)
+            self.assertIn("namespace changed", json.loads(output.getvalue())["error"])
+            scheduler.assert_not_called()
 
     def test_fresh_live_lane_refuses_retired_seat_before_scheduler_or_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

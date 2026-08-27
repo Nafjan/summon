@@ -49,6 +49,12 @@ def runs_root(args, cwd: str) -> str:
     return os.path.join(os.path.abspath(base), "deliberations")
 
 
+def _runs_root_sha256(root: str) -> str:
+    """Bind one-run authority to a resolved namespace without recording its path."""
+    canonical = os.path.normcase(os.path.realpath(os.path.abspath(root)))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def run_dir(root: str, run_id: str) -> str:
     return _rundir.run_path(root, run_id)
 
@@ -127,7 +133,7 @@ def _public_receipt(value: Mapping[str, object]) -> dict:
         projected["model_display_by_seat"] = catalog_display
     if "durable_context" in value:
         try:
-            binding = _context.parse_private_projection(value["durable_context"])
+            binding = _context.parse_private_projection_readonly(value["durable_context"])
             projected["durable_context"] = _context.public_projection(binding)
         except _context.ContextFreshnessError as exc:
             raise DeliberationStoreError(
@@ -240,7 +246,8 @@ def _authoritative_checkpoint(path: str, receipt: Mapping[str, object]):
         raise DeliberationStoreError("deliberation journal generation is invalid")
     policy = _replay_policy(receipt)
     try:
-        checkpoint = _replay.replay_checkpoint(receipt, tagged, current)
+        checkpoint = _replay.replay_checkpoint(
+            receipt, tagged, current, allow_legacy_context=True)
     except _replay.ReplayError as exc:
         raise DeliberationStoreError(
             "deliberation journal cannot be reconstructed from its receipt") from exc
@@ -441,6 +448,17 @@ def queue_cancel(root: str, run_id: str, command_id: str | None = None) -> dict:
     This is not an acknowledgement that cancellation happened.  Only the
     scheduler owner may append ``human_command`` and advance durable state.
     """
+    # Cancellation creates new authority-bearing command bytes. Historical v1
+    # durable context is readable by status/replay only, so authenticate current
+    # receipt metadata before even creating the commands directory.
+    try:
+        path = run_dir(root, run_id)
+        receipt = _receipt(path, run_id)
+        _replay_policy(receipt)
+        _replay._receipt_metadata(receipt)
+    except (_replay.ReplayError, DeliberationStoreError, ValueError) as exc:
+        raise DeliberationStoreError(
+            "deliberation receipt cannot authorize a command") from exc
     status = inspect_run(root, run_id)
     if status.get("recovery_required") or not status.get("consistent"):
         raise DeliberationStoreError(
@@ -451,7 +469,6 @@ def queue_cancel(root: str, run_id: str, command_id: str | None = None) -> dict:
     command_id = command_id or ("cmd-" + uuid.uuid4().hex)
     if not _COMMAND_ID_RE.fullmatch(command_id) or ".." in command_id:
         raise DeliberationStoreError("invalid command id")
-    path = run_dir(root, run_id)
     directory = _commands_dir(path)
     if os.path.lexists(directory) and os.path.islink(directory):
         raise DeliberationStoreError("commands inbox is a symbolic link; refusing it")
@@ -833,6 +850,7 @@ def _run_fresh_live(args, root: str, cwd: str) -> int:
         context_binding = _context.bind_context(
             parsed_context, observation, run_id=run_id,
             decision_id=decision_id, unix_now_ms=now_ms,
+            runs_root_sha256=_runs_root_sha256(root),
             accept_stale=stale_intent)
         if context_binding.state == "stale_refused":
             raise DeliberationError(
@@ -918,6 +936,10 @@ def _run_fresh_live(args, root: str, cwd: str) -> int:
     watcher = threading.Thread(target=watch_cancel,
                                name="summon-deliberation-cancel", daemon=True)
     try:
+        if (context_binding is not None
+                and context_binding.runs_root_sha256 != _runs_root_sha256(root)):
+            raise DeliberationStoreError(
+                "durable context run namespace changed before provider launch")
         scheduler = build_live_scheduler(
             owner=owner, receipt=receipt, policy=policy, question=question,
             roster=roster, timeout_ms=timeout_ms,
@@ -929,6 +951,9 @@ def _run_fresh_live(args, root: str, cwd: str) -> int:
                     parsed_context, cwd=cwd,
                     unix_now_ms=int(time.time() * 1000),
                     manifest_path=manifest_path))
+                if parsed_context is not None else None),
+            context_namespace_observer=(
+                (lambda: _runs_root_sha256(root))
                 if parsed_context is not None else None))
         watcher.start()
         report = scheduler.run()

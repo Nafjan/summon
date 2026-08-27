@@ -285,6 +285,54 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual((corrupt["status"], corrupt["error_kind"]),
                          ("blocked", "journal_invalid"))
 
+    def test_legacy_v1_context_recovery_refuses_before_owner_or_journal_mutation(self):
+        from test_deliberation_replay import legacy_context_projection
+
+        value = receipt("run-legacy")
+        value["durable_context"] = legacy_context_projection()
+        path = store.run_dir(self.root, "run-legacy")
+        owner = _rundir.acquire_owner(path, 600)
+        _rundir.atomic_write_json(os.path.join(path, "receipt.json"), value)
+        _rundir.journal_append(path, {
+            "event": "run_prepared", "schema_version": 1,
+            "generation": owner.generation, "run_id": "run-legacy",
+            "receipt_sha256": replay._sha(value),
+        }, owner=owner)
+        self.release(owner)
+        journal = Path(_rundir._journal_path(path, 1))
+        before = journal.read_bytes()
+
+        result = resume.reconcile_run(self.root, "run-legacy")
+
+        self.assertEqual((result["status"], result["error_kind"]),
+                         ("blocked", "receipt_invalid"))
+        self.assertEqual(journal.read_bytes(), before)
+        self.assertFalse(_rundir.read_owner(path))
+
+    def test_legacy_v1_context_cancel_refuses_before_commands_or_journal_mutation(self):
+        from test_deliberation_replay import legacy_context_projection
+
+        value = receipt("run-legacy-cancel")
+        value["durable_context"] = legacy_context_projection()
+        path = store.run_dir(self.root, "run-legacy-cancel")
+        owner = _rundir.acquire_owner(path, 600)
+        _rundir.atomic_write_json(os.path.join(path, "receipt.json"), value)
+        _rundir.journal_append(path, {
+            "event": "run_prepared", "schema_version": 1,
+            "generation": owner.generation, "run_id": "run-legacy-cancel",
+            "receipt_sha256": replay._sha(value),
+        }, owner=owner)
+        self.release(owner)
+        journal = Path(_rundir._journal_path(path, 1))
+        before = journal.read_bytes()
+
+        with self.assertRaises(store.DeliberationStoreError):
+            store.queue_cancel(self.root, "run-legacy-cancel", "operator-1")
+
+        self.assertEqual(journal.read_bytes(), before)
+        self.assertFalse(os.path.exists(os.path.join(path, "commands")))
+        self.assertFalse(_rundir.read_owner(path))
+
     def test_live_owner_unknown_run_and_invalid_id_are_bounded(self):
         _value, _path, owner = self.create()
         held = resume.reconcile_run(self.root, "run-1")
