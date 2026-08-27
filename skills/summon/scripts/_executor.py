@@ -32,6 +32,18 @@ class ProviderDeadlineError(ProviderLaunchError):
     """A controlled provider attempt reached its immutable deadline."""
 
 
+class ProviderLaunchRefusal(ProviderLaunchError):
+    """A typed, provider-free policy fence refused a controlled launch."""
+
+    _KINDS = {"context_source_drift"}
+
+    def __init__(self, error_kind: str) -> None:
+        if error_kind not in self._KINDS:
+            raise ValueError("provider launch refusal kind is unsupported")
+        super().__init__(error_kind)
+        self.error_kind = error_kind
+
+
 class ProviderLaunchControl:
     """Single-use provider boundary used by durable orchestrators.
 
@@ -3997,6 +4009,10 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 not_run=True)
             _deadline_response["timeout"] = True
             return _stamp(_enrich(_deadline_response, None))
+        except ProviderLaunchRefusal as e:
+            return _stamp(_enrich(_blocked_response(
+                inv.cli, e.error_kind,
+                "provider launch refused by a verified local policy fence"), None))
         except Exception as e:
             try:
                 launch_control.launch_indeterminate(e)

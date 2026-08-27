@@ -23,6 +23,8 @@ from typing import Mapping
 
 import _rundir
 import _deliberation_replay as _replay
+import _deliberation_context as _context
+import _deliberation_context_source as _context_source
 import _model_catalog
 from _deliberation import DeliberationError, HumanCommand, TERMINAL_STATES
 
@@ -123,6 +125,13 @@ def _public_receipt(value: Mapping[str, object]) -> dict:
         catalog_display[seat] = display_identity
     if catalog_display:
         projected["model_display_by_seat"] = catalog_display
+    if "durable_context" in value:
+        try:
+            binding = _context.parse_private_projection(value["durable_context"])
+            projected["durable_context"] = _context.public_projection(binding)
+        except _context.ContextFreshnessError as exc:
+            raise DeliberationStoreError(
+                "deliberation durable context projection is invalid") from exc
     return projected
 
 
@@ -637,6 +646,10 @@ def _validate_fresh_args(args) -> None:
         raise ValueError("--max-attempts must be positive")
     if getattr(args, "deadline", None) is None:
         raise ValueError("--deadline is required")
+    if (getattr(args, "context_observation_file", None)
+            or getattr(args, "accept_stale_file", None)) and not getattr(args, "context_file", None):
+        raise ValueError(
+            "--context-observation-file/--accept-stale-file require --context-file")
 
 
 def _fresh_question(args) -> str:
@@ -653,6 +666,32 @@ def _fresh_question(args) -> str:
     if not question:
         raise ValueError("deliberate needs --question or --question-file")
     return question
+
+
+def _read_bounded_context_file(path: str, label: str) -> bytes:
+    """Read one private context input once without following a symlink."""
+    if not isinstance(path, str) or not path:
+        raise ValueError(f"cannot read {label}")
+    if os.name == "nt" and path.replace("/", "\\").startswith("\\\\"):
+        raise ValueError(f"{label} must be a local file")
+    target = Path(path)
+    try:
+        before = target.lstat()
+        if (target.is_symlink() or not target.is_file()
+                or before.st_size > _context.MAX_INPUT_BYTES):
+            raise ValueError(f"{label} is not a bounded regular file")
+        with target.open("rb") as handle:
+            raw = handle.read(_context.MAX_INPUT_BYTES + 1)
+            after = os.fstat(handle.fileno())
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"cannot read {label}") from exc
+    if (len(raw) > _context.MAX_INPUT_BYTES
+            or before.st_dev != after.st_dev or before.st_ino != after.st_ino
+            or before.st_size != after.st_size):
+        raise ValueError(f"{label} changed during readback")
+    return raw
 
 
 def _read_cancel_command(path: str) -> dict | None:
@@ -755,9 +794,24 @@ def _run_fresh_live(args, root: str, cwd: str) -> int:
     if unsupported:
         raise DeliberationError(
             "live read-only lane could not verify its seats: " + "; ".join(unsupported))
-    # The decision id is part of every prompt and plan identity.  Resolve it
+    # A stale-context authority is deliberately one-run. Its fully validated
+    # identity must therefore be selected before plan construction; otherwise
+    # random internal ids would make the public acceptance path unreachable.
+    parsed_context = None
+    stale_intent = None
+    if getattr(args, "context_file", None):
+        parsed_context = _context.parse_context_packet(
+            _read_bounded_context_file(args.context_file, "--context-file"))
+        if getattr(args, "accept_stale_file", None):
+            stale_intent = _read_bounded_context_file(
+                args.accept_stale_file, "--accept-stale-file")
+    if stale_intent is not None:
+        run_id, decision_id = _context.acceptance_identity(stale_intent)
+    else:
+        run_id = "deliberation-" + uuid.uuid4().hex
+        decision_id = "decision-" + uuid.uuid4().hex
+    # The decision id is part of every prompt and plan identity. Resolve it
     # before building the plans so the receipt and invocation agree.
-    decision_id = "decision-" + uuid.uuid4().hex
     plans = build_invocation_plans(
         roster, decision_id=decision_id, cwd=cwd, ballot_only=True)
     policy = DeliberationPolicy(
@@ -770,7 +824,19 @@ def _run_fresh_live(args, root: str, cwd: str) -> int:
         raise DeliberationError(
             "live deliberation per-seat timeout exceeds the supported bound")
     lease_sec = max(600.0, duration_ms / 1000.0 + 30.0)
-    run_id = "deliberation-" + uuid.uuid4().hex
+    context_binding = None
+    manifest_path = getattr(args, "context_observation_file", None)
+    if parsed_context is not None:
+        observation = _context_source.observe_source(
+            parsed_context, cwd=cwd, unix_now_ms=now_ms,
+            manifest_path=manifest_path)
+        context_binding = _context.bind_context(
+            parsed_context, observation, run_id=run_id,
+            decision_id=decision_id, unix_now_ms=now_ms,
+            accept_stale=stale_intent)
+        if context_binding.state == "stale_refused":
+            raise DeliberationError(
+                "durable context is stale and lacks valid one-run acceptance")
     public_roster = roster.as_dict(native=False)
     receipt = {
         "mode": "deliberation", "schema_version": SCHEMA_VERSION,
@@ -802,6 +868,16 @@ def _run_fresh_live(args, root: str, cwd: str) -> int:
                            "role": "participant"} for seat_id in seats],
         "permission_ceilings": permission_ceilings,
     }
+    if context_binding is not None:
+        receipt["durable_context"] = _context.private_projection(context_binding)
+    # Prove the largest non-transcript prompt fits before creating a run or
+    # giving any adapter a chance to contact a provider. Runtime transcript
+    # projection then trims to the exact remaining byte budget.
+    from _deliberation_scheduler import validate_prompt_admission
+    validate_prompt_admission(
+        question=question, policy=policy,
+        seats={seat.seat_id: seat.seat_definition for seat in roster.seats},
+        durable_context=context_binding)
     path, owner = initialize_run(root, receipt, lease_sec=lease_sec)
     scheduler = None
     stop_watch = __import__("threading").Event()
@@ -846,7 +922,14 @@ def _run_fresh_live(args, root: str, cwd: str) -> int:
             owner=owner, receipt=receipt, policy=policy, question=question,
             roster=roster, timeout_ms=timeout_ms,
             clock=time.monotonic, unix_now_ms=now_ms,
-            cancel_command=take_cancel_command)
+            cancel_command=take_cancel_command,
+            durable_context=context_binding,
+            context_observer=(
+                (lambda: _context_source.observe_source(
+                    parsed_context, cwd=cwd,
+                    unix_now_ms=int(time.time() * 1000),
+                    manifest_path=manifest_path))
+                if parsed_context is not None else None))
         watcher.start()
         report = scheduler.run()
         if watcher_error:

@@ -245,6 +245,7 @@ class ExecutionEvidence:
     # live-provider receipt can prove what actually served the turn.
     model_served: str | None = None
     model_targeted: str | None = None
+    error_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -301,6 +302,7 @@ def _field(value: object, name: str, default: object = None) -> object:
 _SAFE_TERMINATION_REASONS = frozenset({
     "started", "deadline", "attempt_budget", "max_rounds", "cancelled",
     "snapshot_drift", "adapter_indeterminate", "adapter_error",
+    "context_source_drift",
     "approval_required", "consensus", "human_cancel", "human_denied",
     "human_approved", "ownership_lost", "max_attempts", "timeout",
 })
@@ -1289,7 +1291,8 @@ class DeliberationEngine:
             self._transition(RunState.TIMED_OUT, "deadline")
             return result
         if not result.evidence.transport_ok:
-            self._transition(RunState.FAILED, "adapter_error")
+            self._transition(
+                RunState.FAILED, result.evidence.error_kind or "adapter_error")
             return result
 
         if ballot is not None and self.ballots.record(ballot, context.turn_ordinal):

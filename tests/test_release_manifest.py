@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -21,6 +22,17 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ReleaseManifestTests(unittest.TestCase):
+    def test_phase0_phase1_release_command_matches_ci_partition(self):
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8")
+        start = ci.index("Unit tests (Phase 0 and Phase 1 provider-inert contracts)")
+        end = ci.index("Unit tests (ACP transport", start)
+        pattern = r"skills/summon/(?:scripts|tests)/test_[A-Za-z0-9_]+\.py"
+        ci_files = set(re.findall(pattern, ci[start:end]))
+        release_files = set(re.findall(
+            pattern, MODULE.REQUIRED_COMMANDS["phase0_phase1"]))
+        self.assertEqual(release_files, ci_files)
+
     def test_source_hash_is_deterministic_and_excludes_python_cache(self):
         first = MODULE.source_tree_sha256(ROOT)
         second = MODULE.source_tree_sha256(ROOT)

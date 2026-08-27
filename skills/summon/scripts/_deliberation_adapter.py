@@ -87,6 +87,7 @@ class FreshDispatchAdapter:
         invocation_for_context: Callable[[TurnContext], AgentInvocation] | None = None,
         cancelled: Callable[[], bool] | None = None,
         deadline_reached: Callable[[], bool] | None = None,
+        prelaunch_revalidate: Callable[[], None] | None = None,
         parse_output: Callable[[str], Mapping[str, object] | None] | None = None,
         executor: Callable[..., dict] = execute_agent,
         debug_dir: str | None = None,
@@ -139,6 +140,9 @@ class FreshDispatchAdapter:
         if deadline_reached is not None and not callable(deadline_reached):
             raise TypeError("deadline_reached must be callable")
         self._deadline_reached = deadline_reached or (lambda: False)
+        if prelaunch_revalidate is not None and not callable(prelaunch_revalidate):
+            raise TypeError("prelaunch_revalidate must be callable")
+        self._prelaunch_revalidate = prelaunch_revalidate or (lambda: None)
         self._parse_output = parse_output or self._parse_json_object
         self._executor = executor
         self._debug_dir = debug_dir
@@ -335,6 +339,7 @@ class FreshDispatchAdapter:
                     or not self.revalidate(spec, current.context)):
                 raise SnapshotDriftError(
                     "owner or participant snapshot changed at provider launch boundary")
+            self._prelaunch_revalidate()
 
         control = ProviderLaunchControl(
             before_launch=_before_launch,
@@ -387,6 +392,9 @@ class FreshDispatchAdapter:
             parser_valid=structured is not None,
             model_served=model_served,
             model_targeted=model_targeted,
+            error_kind=(response.get("error_kind")
+                        if response.get("error_kind") == "context_source_drift"
+                        else None),
         )
         return AdapterResult(evidence=evidence, structured_output=structured,
                              model_prose=prose)

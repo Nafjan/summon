@@ -679,7 +679,12 @@ def _do_request(base_url: str, model: str, system_context: str | None,
                 launch_control.reaped(req)
             except Exception:
                 pass
-            return _err(cli, f"provider launch refused by control ({type(e).__name__})")
+            response = _err(cli, f"provider launch refused by control ({type(e).__name__})")
+            error_kind = getattr(e, "error_kind", None)
+            if error_kind == "context_source_drift":
+                response["error_kind"] = error_kind
+                response["provider_contacted"] = False
+            return response
     try:
         with _opener().open(req, timeout=max(1, timeout_ms / 1000)) as r:
             payload = json.loads(r.read().decode("utf-8", errors="replace"))

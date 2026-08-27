@@ -130,7 +130,9 @@ MODE_FLAGS = {
                      "quorum", "rounds", "max_attempts", "deadline", "cwd",
                      "agents_dir", "run_dir", "results_dir", "strict_agents_dir",
                      "enable_roles", "require_human_approval", "text_only_consent",
-                     "full_authority_consent", "json", "job_file"},
+                     "full_authority_consent", "context_file",
+                     "context_observation_file", "accept_stale_file",
+                     "json", "job_file"},
     "deliberation-resume": {"deliberate_resume", "run_dir", "results_dir", "cwd",
                             "retry_indeterminate", "json", "job_file"},
     "deliberation-open": {"deliberate_open", "run_dir", "results_dir", "cwd",
@@ -1192,6 +1194,12 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="With --council: read the question from a file")
     parser.add_argument("--deliberate", action="store_true",
                         help="Run a bounded headless deliberation (separate from council)")
+    parser.add_argument("--context-file", dest="context_file",
+                        help="With --deliberate: durable context packet JSON")
+    parser.add_argument("--context-observation-file", dest="context_observation_file",
+                        help="With revision-manifest context: exact manifest file to hash-read")
+    parser.add_argument("--accept-stale-file", dest="accept_stale_file",
+                        help="With --deliberate: one-run stale-context authority JSON")
     parser.add_argument("--deliberate-resume", dest="deliberate_resume", metavar="RUN_ID",
                         help="Resume a deliberation run by id")
     parser.add_argument("--deliberate-recover", dest="deliberate_recover", metavar="RUN_ID",

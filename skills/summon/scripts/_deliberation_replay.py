@@ -245,6 +245,17 @@ def _receipt_metadata(receipt: Mapping[str, object]) -> None:
                 not isinstance(created_at, (int, float)) or
                 not math.isfinite(float(created_at)) or created_at < 0):
             raise ReplayError("receipt created_at is malformed")
+    if "durable_context" in receipt:
+        try:
+            from _deliberation_context import parse_private_projection
+            binding = parse_private_projection(receipt["durable_context"])
+        except Exception as exc:
+            raise ReplayError("receipt durable context binding is invalid") from exc
+        if (binding.run_id != receipt.get("run_id")
+                or binding.decision_id != receipt.get("decision_id")
+                or binding.state == "stale_refused"
+                or binding.routing_authority is not False):
+            raise ReplayError("receipt durable context authority is invalid")
 
 
 def _policy_digest(decision_id: str, seat_ids: tuple[str, ...],
@@ -280,6 +291,7 @@ def _quorum_threshold(denominator: int, rule: object) -> int:
 _SAFE_REASONS = frozenset({
     "started", "deadline", "attempt_budget", "max_rounds", "cancelled",
     "snapshot_drift", "adapter_indeterminate", "adapter_error",
+    "context_source_drift",
     "approval_required", "consensus", "human_cancel", "human_denied",
     "human_approved", "ownership_lost", "max_attempts", "timeout",
 })
@@ -548,7 +560,8 @@ def replay_checkpoint(receipt: Mapping[str, object],
                 ("RUNNING", "TIMED_OUT"): {"deadline"},
                 ("RUNNING", "ATTEMPT_BUDGET_EXHAUSTED"): {"attempt_budget"},
                 ("RUNNING", "FAILED"): {"snapshot_drift", "adapter_indeterminate",
-                                          "adapter_error", "ownership_lost"},
+                                          "adapter_error", "context_source_drift",
+                                          "ownership_lost"},
                 ("WAITING_HUMAN", "DECIDED"): {"human_approved"},
                 ("WAITING_HUMAN", "REJECTED"): {"human_denied"},
                 ("WAITING_HUMAN", "CANCELLED"): {"cancelled", "human_cancel"},
