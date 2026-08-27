@@ -180,7 +180,8 @@ MODE_FLAGS = {
                "fleet_allow_credit", "fleet_allow_payg",
                "fleet_max_provider_contacts", "fleet_max_billable_attempts",
                "fleet_max_parallel", "cwd", "agents_dir", "strict_agents_dir",
-               "out", "json"},
+               "fleet_approval_id", "fleet_expires_in",
+               "fleet_expect_generation", "out", "json"},
     "bug-report": {"bug_report", "bug_report_from", "bug_report_output",
                      "bug_report_submit", "github_repo", "bug_title",
                      "bug_description", "json", "job_file"},
@@ -236,9 +237,10 @@ MODE_HINTS = {
                   "JSONL evidence and never phones home."),
     "usage": ("usage status/import is provider-inert: it reads or validates a bounded, "
               "redacted local cache and never contacts a provider or changes routing."),
-    "fleet": ("fleet propose/validate/inspect/explain is a provider-inert M3 control "
-              "plane. It compiles candidate constraints and may explain a route, but "
-              "cannot approve, dispatch, or contact a provider."),
+    "fleet": ("fleet is a provider-inert M3 control plane. Draft actions compile and "
+              "explain constraints; approval actions record authenticated, expiring "
+              "local authority. Nothing on this surface selects, dispatches, or "
+              "contacts a provider."),
     "bug-report": ("bug-report writes a sanitized local report; review it before the "
                     "explicit --submit-github action."),
     "auth": ("auth status is read-only. auth repair never runs unless --allow-auth-repair "
@@ -396,6 +398,9 @@ Commands:
   fleet propose LANE --seats A,B [--out FILE]     draft a provider-inert fleet lane
   fleet validate|inspect FILE                     validate/inspect a fleet draft
   fleet explain FILE LANE                         compare constraints without selection
+  fleet approval status|list                      inspect the private approval store
+  fleet approval approve FILE LANE --expires-in 24h --expect-generation N
+  fleet approval inspect|revoke APPROVAL_ID       inspect or explicitly revoke authority
   bug-report [--from FILE] [--output FILE] [--json] create a sanitized report
              [--bug-title TEXT] [--bug-description TEXT]
              --submit-github --from REVIEWED.md [--github-repo OWNER/REPO]
@@ -412,11 +417,16 @@ COMMAND_USAGE = {
 summon fleet validate FILE [--cwd DIR --agents-dir DIR]
 summon fleet inspect FILE
 summon fleet explain FILE LANE [--cwd DIR --agents-dir DIR]
+summon fleet approval status|list
+summon fleet approval approve FILE LANE --expires-in 24h --expect-generation N
+summon fleet approval inspect APPROVAL_ID
+summon fleet approval revoke APPROVAL_ID --expect-generation N
 
 Build and inspect the provider-inert `summon.fleet/v1` draft and compiled plan.
-This slice cannot approve, dispatch, retry, resume, or contact a provider.  `--out`
-is the only write path; propose writes the sealed fleet document, while the other
-actions write their redacted report.
+Approval commands record authenticated, expiring local authority but cannot select,
+dispatch, retry, resume, or contact a provider. `--expect-generation` is mandatory
+for mutations. `--out` contains only a redacted public receipt; it never contains the
+private store identity, actor identity, MAC, key, or path.
 
 Propose-only policy flags (repeat allowlists/capabilities as needed):
   --provider PROVIDER              allowed provider
@@ -762,8 +772,39 @@ def rewrite_subcommand(argv: list) -> tuple:
             index += 1
         return ["--usage-action", action, *translated], None
     if head == "fleet":
+        if rest and rest[0] == "approval":
+            if len(rest) < 2 or rest[1] not in {
+                    "status", "approve", "list", "inspect", "revoke"}:
+                return argv, "error: 'fleet approval' needs status/approve/list/inspect/revoke"
+            subaction = rest[1]
+            if subaction in {"status", "list"}:
+                translated = ["--fleet-action", "approval-" + subaction, *rest[2:]]
+            elif subaction == "approve":
+                if (len(rest) < 4 or rest[2].startswith("-")
+                        or rest[3].startswith("-")):
+                    return argv, "error: 'fleet approval approve' needs a fleet file and lane"
+                translated = ["--fleet-action", "approval-approve",
+                              "--fleet-file", rest[2], "--fleet-lane", rest[3],
+                              *rest[4:]]
+            else:
+                if len(rest) < 3 or rest[2].startswith("-"):
+                    return argv, f"error: 'fleet approval {subaction}' needs an approval id"
+                translated = ["--fleet-action", "approval-" + subaction,
+                              "--fleet-approval-id", rest[2], *rest[3:]]
+            aliases = {
+                "expires-in": "fleet-expires-in",
+                "expect-generation": "fleet-expect-generation",
+            }
+            rewritten = []
+            for token in translated:
+                if token.startswith("--"):
+                    name, separator, value = token[2:].partition("=")
+                    name = aliases.get(name, name)
+                    token = "--" + name + (separator + value if separator else "")
+                rewritten.append(token)
+            return rewritten, None
         if not rest or rest[0] not in ("propose", "validate", "inspect", "explain"):
-            return argv, "error: 'fleet' needs propose/validate/inspect/explain"
+            return argv, "error: 'fleet' needs propose/validate/inspect/explain/approval"
         action = rest[0]
         if action == "propose":
             if len(rest) < 2 or rest[1].startswith("-"):
@@ -880,7 +921,10 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Private local usage cache override; with dispatch, valid only "
                              "for provider-inert --dry-run explanation")
     parser.add_argument("--fleet-action",
-                        choices=["propose", "validate", "inspect", "explain"],
+                        choices=["propose", "validate", "inspect", "explain",
+                                 "approval-status", "approval-approve",
+                                 "approval-list", "approval-inspect",
+                                 "approval-revoke"],
                         help="Provider-inert fleet control-plane action")
     parser.add_argument("--fleet-file", dest="fleet_file", metavar="FILE",
                         help="Sealed summon.fleet/v1 draft for validate/inspect/explain")
@@ -937,6 +981,15 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--fleet-max-parallel", dest="fleet_max_parallel",
                         type=int, default=1,
                         help="Declarative concurrency ceiling for later approval")
+    parser.add_argument("--fleet-approval-id", dest="fleet_approval_id",
+                        metavar="SHA256",
+                        help="Private-store fleet approval identifier")
+    parser.add_argument("--fleet-expires-in", dest="fleet_expires_in",
+                        metavar="DURATION",
+                        help="Approval lifetime with explicit unit (60s..30d)")
+    parser.add_argument("--fleet-expect-generation", dest="fleet_expect_generation",
+                        type=int, metavar="N",
+                        help="Required compare-and-swap generation for approval mutation")
     parser.add_argument("--bug-report", dest="bug_report", action="store_true",
                         help="Create a sanitized local bug report from the latest event or --from")
     parser.add_argument("--from", dest="bug_report_from", metavar="FILE",

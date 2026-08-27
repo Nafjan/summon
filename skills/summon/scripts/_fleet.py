@@ -204,7 +204,7 @@ def inspect(fleet: dict) -> dict:
         "authorization": "advisory_only",
         "fleet": {"schema": fleet["schema"], "sha256": fleet["sha256"]},
         "lanes": [_lane_projection(lane) for lane in payload["lanes"]],
-        "approval": {"state": "not_available_in_this_slice"},
+        "approval": {"state": "recording_available_not_activated"},
     }
 
 
@@ -220,7 +220,7 @@ def report(action: str, fleet: dict, plan: dict) -> dict:
         "project_sha256": payload["project_sha256"],
         "catalog_sha256": payload["catalog_sha256"],
         "lanes": [_lane_projection(lane) for lane in payload["lanes"]],
-        "approval": {"state": "not_available_in_this_slice"},
+        "approval": {"state": "recording_available_not_activated"},
     }
 
 
@@ -294,13 +294,13 @@ def explain(*, fleet: dict, plan: dict, catalog: list[dict], lane_name: str) -> 
         "selection": {
             "seat": None,
             "status": "not_authorized",
-            "reason": "approval_not_available",
+            "reason": "approval_recorded_not_activated",
         },
         "unknowns": [
-            "approval", "billing_source", "capability_freshness",
+            "approval_consumption", "billing_source", "capability_freshness",
             "data_boundary_evidence", "gate",
         ],
-        "approval": {"state": "not_available_in_this_slice"},
+        "approval": {"state": "recording_available_not_activated"},
     }
 
 
@@ -312,6 +312,23 @@ def same_output_target(left: str, right: str) -> bool:
     except (OSError, TypeError, ValueError) as exc:
         raise _evidence.EvidenceError("fleet output target could not be normalized") from exc
     return left_path == right_path
+
+
+def preflight_json_output(path: str) -> None:
+    """Reject an occupied or unsafe explicit output before durable mutation."""
+    try:
+        destination = Path(path)
+        if destination.is_symlink():
+            raise _evidence.EvidenceError("fleet output refuses a symbolic-link target")
+        if destination.exists():
+            raise _evidence.EvidenceError("fleet output already exists")
+        parent = destination.parent.resolve()
+        if parent.exists() and not parent.is_dir():
+            raise _evidence.EvidenceError("fleet output parent must be a directory")
+    except _evidence.EvidenceError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise _evidence.EvidenceError("fleet output target could not be inspected") from exc
 
 
 def write_json(path: str, value: dict) -> None:

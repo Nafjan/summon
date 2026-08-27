@@ -78,6 +78,7 @@ import _cli  # noqa: E402
 import _evidence  # noqa: E402
 import _executor  # noqa: E402
 import _fleet  # noqa: E402
+import _fleet_approval  # noqa: E402
 import _receipt  # noqa: E402
 import _telemetry  # noqa: E402
 import _usage  # noqa: E402
@@ -902,11 +903,12 @@ def main() -> None:
         _print_error("--usage-cache outside the usage command is valid only with --dry-run")
         sys.exit(1)
 
-    # M3 fleet control plane, slice 1.  Every action here is deliberately
-    # provider-inert: it reads a local roster/fleet draft, compiles declarative
-    # constraints, and may compare them for an explanation. Approval, selection,
-    # reservation and dispatch do not exist on this surface yet.
+    # M3 fleet control plane. Every action is provider-inert. Draft actions
+    # compile/explain constraints; approval actions record authenticated,
+    # expiring local authority. Selection, reservation, and dispatch do not
+    # exist on this surface.
     if getattr(args, "fleet_action", None):
+        _fleet_authority_recorded = False
         try:
             _fleet_explicit = {
                 token.split("=", 1)[0] for token in argv
@@ -929,6 +931,14 @@ def main() -> None:
                 "--worktree", "--background", "--gate-with",
                 "--isolated-lane", "--allow-tool-credentials",
             }
+            _fleet_approval_only = {
+                "--fleet-approval-id", "--fleet-expires-in",
+                "--fleet-expect-generation",
+            }
+            _fleet_approval_actions = {
+                "approval-status", "approval-approve", "approval-list",
+                "approval-inspect", "approval-revoke",
+            }
             _dispatch_flags = sorted(
                 _fleet_explicit.intersection(_fleet_dispatch_only))
             if _dispatch_flags:
@@ -941,9 +951,17 @@ def main() -> None:
                     raise ValueError(
                         f"fleet {args.fleet_action} does not accept propose-only flags: "
                         + ", ".join(_ignored))
+            if args.fleet_action not in _fleet_approval_actions:
+                _ignored = sorted(_fleet_explicit.intersection(_fleet_approval_only))
+                if _ignored:
+                    raise ValueError(
+                        f"fleet {args.fleet_action} does not accept approval-only flags: "
+                        + ", ".join(_ignored))
             if (args.out and args.fleet_file
                     and _fleet.same_output_target(args.out, args.fleet_file)):
                 raise ValueError("fleet --out must not replace its input fleet document")
+            if args.out:
+                _fleet.preflight_json_output(args.out)
 
             if args.fleet_action == "inspect":
                 if _fleet_explicit.intersection({
@@ -956,6 +974,46 @@ def main() -> None:
                     raise ValueError("fleet inspect requires a fleet file")
                 _fleet_document = _fleet.load_fleet(args.fleet_file)
                 _fleet_result = _fleet.inspect(_fleet_document)
+                if args.out:
+                    _fleet.write_json(args.out, _fleet_result)
+                print(json.dumps(_fleet_result, ensure_ascii=False,
+                                 indent=None if args.json else 2))
+                sys.exit(0)
+
+            if args.fleet_action in {
+                    "approval-status", "approval-list", "approval-inspect",
+                    "approval-revoke"}:
+                forbidden = _fleet_explicit.intersection({
+                    "--cwd", "--agents-dir", "--strict-agents-dir",
+                    "--fleet-file", "--fleet-lane", "--fleet-expires-in",
+                })
+                if forbidden:
+                    raise ValueError(
+                        f"fleet {args.fleet_action} does not accept roster, cwd, fleet, "
+                        "lane, or expiry options")
+                if args.fleet_action in {"approval-status", "approval-list"}:
+                    if args.fleet_approval_id or args.fleet_expect_generation is not None:
+                        raise ValueError(
+                            f"fleet {args.fleet_action} accepts no approval id or generation")
+                    _fleet_result = (_fleet_approval.status()
+                                     if args.fleet_action == "approval-status"
+                                     else _fleet_approval.list_approvals())
+                elif args.fleet_action == "approval-inspect":
+                    if not args.fleet_approval_id:
+                        raise ValueError("fleet approval inspect requires an approval id")
+                    if args.fleet_expect_generation is not None:
+                        raise ValueError(
+                            "fleet approval inspect does not accept an expected generation")
+                    _fleet_result = _fleet_approval.inspect(args.fleet_approval_id)
+                else:
+                    if not args.fleet_approval_id:
+                        raise ValueError("fleet approval revoke requires an approval id")
+                    if args.fleet_expect_generation is None:
+                        raise ValueError(
+                            "fleet approval revoke requires --expect-generation N")
+                    _fleet_result = _fleet_approval.revoke(
+                        args.fleet_approval_id,
+                        expected_generation=args.fleet_expect_generation)
                 if args.out:
                     _fleet.write_json(args.out, _fleet_result)
                 print(json.dumps(_fleet_result, ensure_ascii=False,
@@ -1018,7 +1076,26 @@ def main() -> None:
                 _fleet_document = _fleet.load_fleet(args.fleet_file)
                 _fleet_plan, _fleet_catalog = _fleet.compile_document(
                     fleet=_fleet_document, agents=_fleet_agents, cwd=_fleet_cwd)
-                if args.fleet_action == "explain":
+                if args.fleet_action == "approval-approve":
+                    if not args.fleet_lane:
+                        raise ValueError("fleet approval approve requires a lane")
+                    if args.fleet_approval_id:
+                        raise ValueError(
+                            "fleet approval approve does not accept an approval id")
+                    if not args.fleet_expires_in:
+                        raise ValueError(
+                            "fleet approval approve requires --expires-in DURATION")
+                    if args.fleet_expect_generation is None:
+                        raise ValueError(
+                            "fleet approval approve requires --expect-generation N")
+                    _fleet_result = _fleet_approval.approve(
+                        fleet=_fleet_document, plan=_fleet_plan,
+                        lane_name=args.fleet_lane,
+                        expires_in_seconds=_fleet_approval.parse_expiry(
+                            args.fleet_expires_in),
+                        expected_generation=args.fleet_expect_generation)
+                    _fleet_authority_recorded = True
+                elif args.fleet_action == "explain":
                     if not args.fleet_lane:
                         raise ValueError("fleet explain requires a lane")
                     _fleet_result = _fleet.explain(
@@ -1035,7 +1112,9 @@ def main() -> None:
                              indent=None if args.json else 2))
             sys.exit(0)
         except (OSError, ValueError, _evidence.EvidenceError) as exc:
-            _fleet_kind = ("fleet_evidence_invalid"
+            _fleet_kind = ("fleet_busy"
+                           if isinstance(exc, _fleet_approval.ApprovalBusyError)
+                           else "fleet_evidence_invalid"
                            if isinstance(exc, _evidence.EvidenceError)
                            else "fleet_usage_invalid"
                            if isinstance(exc, ValueError)
@@ -1046,10 +1125,17 @@ def main() -> None:
                 "exit_code": 1,
                 "error": str(exc),
                 "error_kind": _fleet_kind,
-                "retryable": False,
+                "retryable": isinstance(exc, _fleet_approval.ApprovalBusyError),
                 "result_usable": False,
                 "provider_contacted": False,
-                "authorization": "advisory_only",
+                "selection": None,
+                "dispatch_available": False,
+                "authorization": (
+                    "recorded_receipt_undelivered"
+                    if _fleet_authority_recorded else
+                    "not_recorded"
+                    if str(getattr(args, "fleet_action", "")).startswith(
+                        "approval-") else "advisory_only"),
             }
             _mark_not_run(_fleet_error)
             _emit(_fleet_error, operation="fleet")

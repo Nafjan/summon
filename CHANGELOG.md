@@ -5,6 +5,25 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+- **Authenticated fleet approval recording:** `summon fleet approval` can now inspect,
+  record, list, and revoke authenticated, expiring local authority for one exact compiled
+  fleet lane. Approval binds the sealed fleet and plan, project and roster catalog,
+  lane digest, operation, authority ceilings, and generation; copied, forged, stale,
+  expired, or revoked records fail closed. Mutations use mandatory generation
+  compare-and-swap; idempotency includes the requested lifetime, so a shorter request
+  cannot silently reuse longer authority. Windows private paths are reset to and verified
+  against an owner-only ACL through native security-descriptor and current-process-token
+  APIs, including pre-existing explicit grants and without executable lookup. Expired and
+  revoked entries are compacted on the next mutation; relative
+  path overrides and nonempty unsafe directories are refused, and new approvals reserve
+  byte and generation headroom for revocation. Store-size failures and lock failures are rejected before corrupting
+  state and expose no private path. Approval projections distinguish issuance generation
+  from the current store generation. Store reads and writes share a collection-sized
+  bounded parse contract, and explicit receipt targets are checked before authority is
+  recorded. Public receipts
+  redact private identities, paths, and authentication
+  material and explicitly report `recorded_not_activated`: this slice cannot select,
+  reserve, retry, resume, dispatch, or contact a provider.
 - **Provider-inert fleet drafts:** `summon fleet propose`, `validate`, `inspect`,
   and `explain` now create and examine sealed lane constraints without selecting a
   winner, approving work, contacting a provider, or authorizing spend. Compiled plans

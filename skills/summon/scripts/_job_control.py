@@ -26,6 +26,10 @@ LOCK_WAIT_SECONDS = 5.0
 MAX_CONTROL_BYTES = 512 * 1024
 
 
+class ControlBusyError(ValueError):
+    """The local control-file lock is held by another live operation."""
+
+
 def control_path(root: str, job_id: str) -> str:
     base = os.path.dirname(_jobs.record_path(root, job_id))
     return os.path.join(base, f"{job_id}.control.json")
@@ -351,7 +355,7 @@ def _exclusive_control_lock(path: str):
                 break
             except (OSError, BlockingIOError):
                 if time.monotonic() >= deadline:
-                    raise ValueError("job control is busy; retry the command")
+                    raise ControlBusyError("job control is busy; retry the command")
                 time.sleep(0.025)
         yield
     finally:

@@ -60,7 +60,8 @@ default action), `list`, `agents validate`, `models`, `doctor`, `manifest FILE`,
 `chat`, `swarm`, `deliberate QUESTION`, `deliberate status|replay|recover|cancel|open|resume RUN_ID`,
 `agent
 new|set NAME`, `role propose|approve|list|resolve`, `telemetry enable|disable|status|clear`,
-`usage status|import`, `fleet propose|validate|inspect|explain`, `bug-report`, `version` — e.g. `run_subagent.py
+`usage status|import`, `fleet propose|validate|inspect|explain`,
+`fleet approval status|approve|list|inspect|revoke`, `bug-report`, `version` — e.g. `run_subagent.py
 council --question "…" --cwd DIR`. The
 **legacy flat form still works unchanged** (`run_subagent.py --agent … --prompt …`,
 `--list`, `--manifest FILE`, …), and every flag below is valid in both. Bare
@@ -465,12 +466,37 @@ longer than this child timeout so Summon can clean up and write its result envel
 | `fleet validate FILE [--out FILE]` | - | Recompile the sealed draft against the current roster and project identity. A changed or unavailable seat is reported before any provider contact; output refuses to replace an existing file |
 | `fleet inspect FILE [--out FILE]` | - | Project every declared candidate, priority, and constraint from the sealed draft without consulting a roster or project path. This is intentionally different from validation; output refuses to replace an existing file |
 | `fleet explain FILE LANE [--out FILE]` | - | Compare the plan-bound roster catalog with one lane's constraints and report losing reasons, provenance, and unresolved evidence. It deliberately returns `selection.status:not_authorized`, cannot dispatch, and refuses to replace an existing output file |
-| `--fleet-action` / `--fleet-file` / `--fleet-lane` / `--fleet-seats` | No | Flat equivalents for the fleet action, input draft, lane, and comma-separated seats. Prefer the git-style subcommands above |
+| `fleet approval status\|list` | - | Read the authenticated private approval store through a bounded redacted projection. No provider or routing action occurs |
+| `fleet approval approve FILE LANE --expires-in DURATION --expect-generation N [--out FILE]` | - | Recompile the sealed fleet against the current project and roster, then record authenticated, expiring local authority for that exact lane. Expiry must be 60 seconds through 30 days with an explicit unit. The public receipt says `recorded_not_activated`; it cannot select or dispatch |
+| `fleet approval inspect APPROVAL_ID` | - | Inspect one recorded approval without exposing the private store identity, actor identity, MAC, key, or path |
+| `fleet approval revoke APPROVAL_ID --expect-generation N` | - | Revoke one approval with a mandatory store-generation compare-and-swap. Revocation is idempotent after it lands |
+| `--fleet-action` / `--fleet-file` / `--fleet-lane` / `--fleet-seats` / `--fleet-approval-id` | No | Flat equivalents for the fleet action, input draft, lane, comma-separated seats, and approval id. Prefer the git-style subcommands above |
+| `--fleet-expires-in` / `--fleet-expect-generation` | No | Flat approval mutation fields. Expiry requires an explicit unit; expected generation is mandatory. They never activate dispatch authority |
+| `SUMMON_FLEET_APPROVAL_STORE` / `SUMMON_FLEET_APPROVAL_KEY` | No | Optional operator-owned absolute locations for the private authenticated store and its separate key file. The default store is `~/.agents/summon/fleet-approvals.json`; the default key is its sibling `.key` file. Both must be owner-only, non-linked local paths (POSIX `0700`/`0600`, or a protected owner-only Windows ACL). Never commit, share, or place them under a project directory |
 | `--fleet-provider-allowlist` / `--fleet-model-allowlist` / `--fleet-required-capabilities` | No | Repeatable flat proposal constraints for providers, models, and capabilities |
 | `--fleet-permission-ceiling` / `--fleet-data-boundary` | No | Flat proposal authority and data-boundary ceilings |
 | `--fleet-allow-contract-repair` / `--fleet-allow-retry` / `--fleet-allow-fallback` / `--fleet-allow-continuation` | No | Flat proposal declarations for later corrective behavior. They do not perform or approve that behavior |
 | `--fleet-allow-subscription` / `--fleet-allow-credit` / `--fleet-allow-payg` | No | Flat proposal declarations for allowed spend classes. They are constraints, not active spend consent |
 | `--fleet-max-provider-contacts` / `--fleet-max-billable-attempts` / `--fleet-max-parallel` | No | Flat proposal ceilings for contacts, billable attempts, and concurrency |
+
+Approval replay is idempotent only while the exact scope and requested lifetime remain
+active; a changed lifetime creates a new issuance under the current generation. Because
+an exact replay is not a mutation, it returns the existing receipt—even near expiry—and
+does not extend its lifetime; this remains true when the supplied expected generation is
+stale. Expired and revoked entries are compacted on the next approval mutation. The store
+does not renew an exact replay and reports the current `store_generation` separately from
+the approval's issuance `generation`. It is bounded to 4 MiB and 4,096 active records and reserves byte and generation capacity to
+revoke every active approval.
+Summon checks an explicit approval-receipt `--out` target before recording authority.
+An occupied or unsafe target records nothing. If a later publication race loses after
+the authenticated write, the error reports `recorded_receipt_undelivered`; recover the
+redacted receipt with `fleet approval list` or `fleet approval inspect APPROVAL_ID`.
+Summon hardens a pre-existing directory only when it is empty; filenames alone never prove
+that a nonempty directory is Summon-owned. Create a dedicated owner-only directory instead.
+If a mutation reports a
+generation conflict, read `fleet approval status` and retry deliberately with the reported
+generation. If clock rollback is reported, correct the system clock before retrying; do
+not bypass or rewrite the authenticated store.
 | `bug-report` | - | Generate a sanitized local Markdown report from the latest event or `--from FILE`; add `--output FILE` to choose the destination. Review it, then submit that exact file with `bug-report --submit-github --from REVIEWED_REPORT.md` (uses your authenticated `gh` CLI) |
 | `--onboard` | - | Detect installed CLIs / BytePlus key sources; write merge-safe prefs to `~/.agents/summon.json` (never stores API secrets). Subcommand form: `onboard` |
 | `--subscriptions LIST` | No | With `--onboard`: comma list of active plans (e.g. `byteplus-coding,claude`) recorded in prefs |

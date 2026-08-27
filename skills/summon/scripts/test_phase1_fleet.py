@@ -107,7 +107,7 @@ def test_propose_validate_inspect_explain_are_deterministic_and_no_contact(tmp_p
     assert fleet == repeated_fleet
     assert plan == repeated_plan
     assert report["provider_contacted"] is False
-    assert report["approval"] == {"state": "not_available_in_this_slice"}
+    assert report["approval"] == {"state": "recording_available_not_activated"}
 
     catalog, _, unavailable = _fleet.catalog_snapshot(_agents())
     assert unavailable == []
@@ -118,7 +118,7 @@ def test_propose_validate_inspect_explain_are_deterministic_and_no_contact(tmp_p
     assert explained["selection"] == {
         "seat": None,
         "status": "not_authorized",
-        "reason": "approval_not_available",
+        "reason": "approval_recorded_not_activated",
     }
     assert explained["authorization"] == "advisory_only"
     assert "approved dispatch authority" in explained["summary"]

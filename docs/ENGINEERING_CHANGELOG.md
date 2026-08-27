@@ -13,6 +13,30 @@ never on added fields.
 
 ## Unreleased
 
+- **Authenticated, provider-inert fleet approval store:** M3b1 adds a private
+  `summon.fleet-approval-store/v1` ledger and individually authenticated
+  `summon.fleet-approval/v1` records. Each record binds the sealed fleet, compiled plan,
+  canonical project, roster catalog, lane and lane digest, local actor, operation,
+  authority ceilings, issuance, expiry, and generation. The store uses a separate local
+  key, authenticated contents, atomic replacement, strict bounded parsing, private-file
+  protections, mandatory generation compare-and-swap, idempotent concurrent recording,
+  expiry-sensitive issuance identity, explicit revocation, pre-write size enforcement,
+  typed transient lock contention, bounded terminal-record compaction, absolute override
+  paths, per-active-approval revocation headroom, refusal to claim nonempty unsafe directories, and
+  clock-rollback checks. Windows hardening uses native security-descriptor APIs
+  to reset pre-existing ACLs, derives a process-cached current-user SID from the native
+  process token without executable lookup or account-name rewriting, and verifies an exact
+  owner-only postcondition for the private directory, key,
+  store, and lock without launching PowerShell. Store parsing uses a dedicated item
+  budget sized for the bounded record collections,
+  reparse the exact serialized bytes before replacement, and preflight public receipt
+  targets before durable approval mutation. Public projections and lock failures omit
+  store paths; approval projections expose separate issuance and current-store
+  generations so idempotent replay remains operationally explicit. Public projections omit store
+  and actor identities, MACs, keys, and paths. The module imports no selector, executor,
+  background, resolver, or provider code and exposes no dispatch function; every receipt
+  says `recorded_not_activated`. Approval consumption, reservation, and fleet dispatch
+  remain a later, separately reviewed slice.
 - **Pure fleet draft compiler and control-plane boundary:** the first M3 slice adds
   sealed `summon.fleet/v1` and `summon.fleet-plan/v1` evidence, a pure compiler with
   no provider, process, credential, filesystem, or launch imports, and provider-inert

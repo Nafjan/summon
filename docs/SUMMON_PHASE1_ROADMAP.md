@@ -105,8 +105,10 @@ or raise authority. Context carries no routing authority.
 
 First expose the current exact-seat resolution as a provider-inert explanation.
 Then specify `summon.fleet/v1` as named lane requirements that resolve through the
-same path. The initial implementation supports only `fleet propose`, `validate`,
-`inspect`, and `explain`; it cannot select or approve a route, and fleet dispatch
+same path. The first slice supports `fleet propose`, `validate`, `inspect`, and
+`explain`; it cannot select or approve a route. The next provider-inert slice records
+authenticated, expiring approval for an exact compiled lane but deliberately cannot
+consume that authority, select a route, reserve an attempt, or dispatch. Fleet dispatch
 stays gated. This first catalog admits active seats only. Deprecated seats remain an
 explicit compatibility-dispatch concept, while retired seats fail in the shared roster
 boundary before every provider-launch surface.
@@ -114,8 +116,21 @@ boundary before every provider-launch surface.
 Approval is not a bare content hash. It binds schema version, content digest,
 canonical project identity, selected roster digest, approval generation, and a
 private local approval-store identity. Copying or retargeting the same bytes requires
-new scoped approval. Exact agent names retain precedence, and lane selection requires
-the explicit `--lane` namespace. Collision and legacy-flat-form tests are mandatory.
+new scoped approval. The private store and each approval are authenticated separately;
+mutations require compare-and-swap against the current generation, expiry is mandatory,
+and public receipts redact the store identity, local actor identity, MAC, key, and path.
+Idempotency includes the requested lifetime: a different lifetime creates a distinct
+issuance, while an exact active replay returns the existing issuance without mutation.
+Expired and revoked entries remain inspectable until the next approval mutation, which
+compacts them before recording new authority. New authority also reserves enough bounded
+store bytes and generation capacity to revoke every active approval. Private path overrides must be absolute, and Summon
+never claims a nonempty unsafe directory based on expected filenames; the documented
+recovery path for a generation conflict is status then deliberate retry, while clock
+rollback requires correcting the system clock.
+Recorded approval remains `recorded_not_activated` until a separately reviewed
+one-time reservation and dispatch-consumption slice exists. Exact agent names retain
+precedence, and lane selection requires the explicit `--lane` namespace. Collision and
+legacy-flat-form tests are mandatory.
 
 ## Workstream B: usage and credit awareness
 
@@ -275,8 +290,9 @@ a second coordinator.
 
 ### M3 — Fleet lanes and orchestration policy
 
-- Implement `summon.fleet/v1` propose, validate, inspect, explain, approve, and
-  explicitly approved dispatch.
+- Implement `summon.fleet/v1` propose, validate, inspect, explain, and approval recording;
+  add approval consumption and explicitly approved dispatch only in a separate reviewed
+  slice.
 - Keep policy as a typed constraint compiler that is structurally unable to route or
   dispatch. Feed its output to the M1 kernel.
 - Bind approval to fleet digest, actor, operation, expiry, provider/model scope,

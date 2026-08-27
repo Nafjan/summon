@@ -184,8 +184,12 @@ def _validate_fleet_plan(value: dict) -> None:
     _reject_private_public_text(value)
 
 
-def loads(data: str | bytes, *, max_bytes: int = 1 << 20) -> Any:
+def loads(data: str | bytes, *, max_bytes: int = 1 << 20,
+          max_items: int = MAX_ITEMS) -> Any:
     """Parse bounded UTF-8 JSON with duplicate/non-finite rejection."""
+    if (not isinstance(max_items, int) or isinstance(max_items, bool)
+            or max_items < 1):
+        raise EvidenceError("evidence item limit must be a positive integer")
     if isinstance(data, bytes):
         raw = data
         try:
@@ -207,17 +211,18 @@ def loads(data: str | bytes, *, max_bytes: int = 1 << 20) -> Any:
                            parse_constant=_reject_constant)
     except (json.JSONDecodeError, UnicodeError) as exc:
         raise EvidenceError("evidence must be valid JSON") from exc
-    validate(value)
+    validate(value, max_items=max_items)
     return value
 
 
-def validate(value: Any, *, depth: int = 0, counter: list[int] | None = None) -> None:
+def validate(value: Any, *, depth: int = 0, counter: list[int] | None = None,
+             max_items: int = MAX_ITEMS) -> None:
     """Validate a JSON-compatible value against global resource bounds."""
     if counter is None:
         counter = [0]
     counter[0] += 1
-    if counter[0] > MAX_ITEMS:
-        raise EvidenceError(f"evidence exceeds {MAX_ITEMS} values")
+    if counter[0] > max_items:
+        raise EvidenceError(f"evidence exceeds {max_items} values")
     if depth > MAX_DEPTH:
         raise EvidenceError(f"evidence exceeds depth {MAX_DEPTH}")
     if value is None or isinstance(value, bool):
@@ -240,14 +245,17 @@ def validate(value: Any, *, depth: int = 0, counter: list[int] | None = None) ->
         return
     if isinstance(value, list):
         for item in value:
-            validate(item, depth=depth + 1, counter=counter)
+            validate(item, depth=depth + 1, counter=counter,
+                     max_items=max_items)
         return
     if isinstance(value, dict):
         for key, item in value.items():
             if not isinstance(key, str):
                 raise EvidenceError("object keys must be strings")
-            validate(key, depth=depth + 1, counter=counter)
-            validate(item, depth=depth + 1, counter=counter)
+            validate(key, depth=depth + 1, counter=counter,
+                     max_items=max_items)
+            validate(item, depth=depth + 1, counter=counter,
+                     max_items=max_items)
         return
     raise EvidenceError(f"unsupported evidence type: {type(value).__name__}")
 

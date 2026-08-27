@@ -372,6 +372,10 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon fleet propose LANE --seats A,B` | create a sealed provider-inert fleet draft; this does not approve, select, dispatch, or authorize spend |
 | `summon fleet validate\|inspect FILE` | validate against the current roster, or inspect every declared constraint without consulting a roster |
 | `summon fleet explain FILE LANE` | compare roster candidates with the sealed constraints; report unknowns but deliberately select no route |
+| `summon fleet approval status\|list` | inspect the private approval store through a redacted, provider-inert projection |
+| `summon fleet approval approve FILE LANE --expires-in 24h --expect-generation N` | record authenticated, expiring local authority for the exact compiled lane; this still cannot select or dispatch |
+| `summon fleet approval inspect APPROVAL_ID` | inspect one recorded approval without mutation |
+| `summon fleet approval revoke APPROVAL_ID --expect-generation N` | explicitly revoke recorded authority with a generation-bound mutation |
 | `summon bug-report …` | generate a sanitized report; review it before the separate GitHub submission command |
 | `summon version` · `summon help` | version · usage |
 
@@ -399,8 +403,35 @@ provenance, and unresolved evidence; it never chooses a winner. Here, `provider`
 the account or endpoint authority bound to the executed route: a named API registry key,
 a singleton backend, or an explicit OpenCode declaration verified against its selector.
 Inline endpoints and undeclared gateways remain `unknown`; a model prefix alone never
-becomes provider proof. Approval and fleet dispatch remain gated until their separate
-authority and reservation contracts are implemented and reviewed.
+becomes provider proof. The approval surface records authenticated, expiring local
+authority bound to the sealed fleet, compiled plan, project, catalog, lane, operation,
+and authority ceilings. Mutations require the current store generation. Public receipts
+omit private store and actor identities, authentication material, and paths, and say
+`recorded_not_activated`: they cannot select, reserve, retry, resume, dispatch, or contact
+a provider. Repeating an active approval with the same scope and requested lifetime is
+idempotent; changing the requested lifetime creates a distinct issuance under the current
+generation. Because an exact replay does not mutate the store, it returns the existing
+receipt—even near expiry—and does not extend its lifetime; this remains true when its
+supplied expected generation is stale. Each approval projection reports both its issuance
+`generation` and the current `store_generation`, so the latter can be used for the next
+explicit compare-and-swap. Expired and revoked records remain visible until
+the next approval mutation, which compacts them before writing new authority. The store
+is bounded to 4 MiB and 4,096 active records and reserves byte and generation capacity to
+revoke every active approval.
+Summon checks an explicit approval-receipt `--out` target before recording authority.
+An occupied or unsafe target records nothing. If a later publication race loses after
+the authenticated write, the error reports `recorded_receipt_undelivered`; recover the
+redacted receipt with `fleet approval list` or `fleet approval inspect`.
+The default private store is
+`~/.agents/summon/fleet-approvals.json`; its sibling `.key` file is separate. Summon
+requires owner-only paths (POSIX `0700`/`0600`, or a protected owner-only Windows ACL),
+and path overrides must be absolute. Summon hardens a pre-existing directory only when it
+is empty; filenames alone never prove that a nonempty directory is Summon-owned. Create
+a dedicated owner-only directory instead. On a generation conflict, run `fleet approval status`
+and deliberately retry with its current generation. If clock rollback is detected, correct
+the system clock before retrying; no approval is consumed. Approval consumption and fleet
+dispatch remain separately gated until their
+reservation and one-time launch contracts are implemented and reviewed.
 
 ---
 
