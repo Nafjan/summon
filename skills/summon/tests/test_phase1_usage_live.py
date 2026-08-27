@@ -186,6 +186,17 @@ def test_unreviewed_codex_cli_version_fails_closed_without_persisting(tmp_path):
     assert not path.exists()
 
 
+def test_missing_binary_failure_is_not_mislabeled_as_schema_mismatch(tmp_path):
+    result = live.refresh_codex(
+        allow_account_usage_read=True,
+        runner=runner_for(
+            "", exit_code=1, provider_contacted=False, cli_version=None),
+        store_file=str(tmp_path / "usage.json"), now=NOW)
+    assert result["error_kind"] == "backend_execution_failed"
+    assert result["provider_contacted"] is False
+    assert result["attempts"] == 1
+
+
 @pytest.mark.parametrize("escaped_key", ["e\\u006dail", "access\\u0054oken"])
 def test_escaped_sensitive_json_keys_fail_before_parse(tmp_path, escaped_key):
     payload = (
@@ -378,6 +389,31 @@ def test_total_timeout_is_not_retried(tmp_path):
         store_file=str(tmp_path / "usage.json"), now=NOW)
     assert result["error_kind"] == "usage_refresh_timeout"
     assert len(calls) == 1 and result["attempts"] == 1
+
+
+def test_command_timeout_survives_refresh_projection_with_honest_contact(tmp_path):
+    calls = []
+
+    def stalled(_plan):
+        calls.append(True)
+        return {
+            "stdout": b'{"jsonrpc":"2.0","id":1,"result":{}}\n',
+            "stderr": b"private provider diagnostics must not escape",
+            "exit_code": 124,
+            "elapsed_ms": live.COMMAND_TIMEOUT_MS,
+            "provider_contacted": None,
+            "cli_version": live.CODEX_SCHEMA_CLI_VERSION,
+            "error_kind": "usage_refresh_command_timeout",
+        }
+
+    result = live.refresh_codex(
+        allow_account_usage_read=True, runner=stalled,
+        store_file=str(tmp_path / "usage.json"), now=NOW)
+    assert result["error_kind"] == "usage_refresh_command_timeout"
+    assert result["attempts"] == 1
+    assert result["provider_contacted"] is None
+    assert len(calls) == 1
+    assert "private provider diagnostics" not in json.dumps(result)
 
 
 def test_runner_exception_is_unknown_contact_not_auth_and_is_not_retried(tmp_path):

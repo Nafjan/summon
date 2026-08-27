@@ -5,6 +5,21 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+- **Opt-in usage and credit refresh:** `summon usage refresh` now supports one reviewed,
+  bounded Codex account-usage adapter. It requires an explicit provider allowlist plus
+  `--allow-account-usage-read`, checks the exact supported CLI version and JSON-RPC plan,
+  launches headlessly, keeps raw account responses private and transient, and never logs
+  in, repairs authentication, dispatches, retries, or changes routing. Mixed or unsupported
+  provider sets fail before contact. `usage export` produces a portable redacted snapshot,
+  while `usage example` creates deterministic synthetic evidence for integrations. Usage
+  dimensions remain separate and advisory; exact pins and spend boundaries still win.
+  AGY and ArkCLI expose promising usage commands, but remain schema-unverified until
+  version-pinned response fixtures and privacy mappings are reviewed.
+- **Approved fleet launch:** an explicit `dispatch --lane` can now consume one exact,
+  authenticated fleet approval for one single-candidate foreground subprocess attempt.
+  The provider boundary revalidates the sealed fleet, roster, project, prompt/data proof,
+  permission and spend ceilings, and an atomic launch claim. Retry, fallback, repair,
+  resume, background, worktree, and authority expansion remain unavailable in this slice.
 - **Authenticated fleet approval recording:** `summon fleet approval` can now inspect,
   record, list, and revoke authenticated, expiring local authority for one exact compiled
   fleet lane. Approval binds the sealed fleet and plan, project and roster catalog,

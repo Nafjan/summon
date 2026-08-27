@@ -172,7 +172,9 @@ MODE_FLAGS = {
     # bug-report submission is an explicit, user-authenticated gh invocation.
     "telemetry": {"telemetry_enable", "telemetry_disable", "telemetry_status",
                    "telemetry_clear", "json", "job_file"},
-    "usage": {"usage_action", "usage_from", "usage_cache", "json", "job_file"},
+    "usage": {"usage_action", "usage_from", "usage_cache", "usage_live_store",
+              "usage_providers", "allow_account_usage_read", "dry_run", "out",
+              "json", "job_file"},
     "fleet": {"fleet_action", "fleet_file", "fleet_lane", "fleet_seats",
                "fleet_provider_allowlist", "fleet_model_allowlist",
                "fleet_required_capabilities", "fleet_permission_ceiling",
@@ -240,8 +242,9 @@ MODE_HINTS = {
                     "never places the session handle or message text in child argv."),
     "telemetry": ("telemetry is local-only and opt-in: it writes bounded, sanitized "
                   "JSONL evidence and never phones home."),
-    "usage": ("usage status/import is provider-inert: it reads or validates a bounded, "
-              "redacted local cache and never contacts a provider or changes routing."),
+    "usage": ("usage status/import/export/example are provider-inert. usage refresh "
+              "requires an explicit provider allowlist and account-usage-read consent; "
+              "it never logs in, repairs auth, dispatches, or changes routing."),
     "fleet": ("fleet is a provider-inert M3 control plane. Draft actions compile and "
               "explain constraints; approval actions record authenticated, expiring "
               "local authority. Nothing on this surface selects, dispatches, or "
@@ -414,7 +417,8 @@ Commands:
   jobs wait ID [--job-dir D] [--timeout T]          wait for one background job
   telemetry enable|disable|status|clear [--json]  manage opt-in local diagnostics
   usage status [--json] | usage import --from FILE [--json]
-                                                  inspect/import redacted local usage evidence
+  usage refresh --providers NAME --allow-account-usage-read [--dry-run]
+  usage export|example --out FILE [--json]        inspect/refresh/export redacted usage evidence
   fleet propose LANE --seats A,B [--out FILE]     draft a provider-inert fleet lane
   fleet validate|inspect FILE                     validate/inspect a fleet draft
   fleet explain FILE LANE                         compare constraints without selection
@@ -533,11 +537,16 @@ the bounded JSONL spool; `clear` removes captured events without disabling colle
 The `SUMMON_TELEMETRY` environment override is non-persistent and inherited by Summon
 children. No telemetry command dispatches an agent or makes a network call.
 """,
-    "usage": """summon usage status [--json] [--cache FILE]
+    "usage": """summon usage status [--json] [--cache FILE] [--live-store FILE]
 summon usage import --from SNAPSHOT.json [--json] [--cache FILE]
+summon usage refresh --providers codex --allow-account-usage-read
+                     [--dry-run] [--live-store FILE] [--json]
+summon usage export --out SNAPSHOT.json [--cache FILE] [--live-store FILE] [--json]
+summon usage example --out SNAPSHOT.json [--json]
 
-Inspect or import normalized, redacted usage evidence. Both actions are provider-inert:
-they never query a provider, repair authentication, dispatch, or change model routing.
+Inspect, import, or export normalized redacted usage evidence. Refresh is the only action
+that may query account usage; it requires explicit provider and consent flags, makes one
+bounded attempt, and never logs in, repairs auth, dispatches, retries, or changes routing.
 Usage dimensions remain separate; unlike categories are never reduced to one score.
 """,
     "bug-report": """summon bug-report [--from SOURCE] [--output REPORT.md] [--json]
@@ -789,8 +798,8 @@ def rewrite_subcommand(argv: list) -> tuple:
         flag = "--telemetry-" + rest[0]
         return [flag, *rest[1:]], None
     if head == "usage":
-        if not rest or rest[0] not in ("status", "import"):
-            return argv, "error: 'usage' needs status/import"
+        if not rest or rest[0] not in ("status", "import", "refresh", "export", "example"):
+            return argv, "error: 'usage' needs status/import/refresh/export/example"
         action = rest[0]
         translated = []
         index = 1
@@ -804,6 +813,14 @@ def rewrite_subcommand(argv: list) -> tuple:
                 translated.append("--usage-cache")
             elif token.startswith("--cache="):
                 translated.append("--usage-cache=" + token.split("=", 1)[1])
+            elif token == "--live-store":
+                translated.append("--usage-live-store")
+            elif token.startswith("--live-store="):
+                translated.append("--usage-live-store=" + token.split("=", 1)[1])
+            elif token == "--providers":
+                translated.append("--usage-providers")
+            elif token.startswith("--providers="):
+                translated.append("--usage-providers=" + token.split("=", 1)[1])
             else:
                 translated.append(token)
             index += 1
@@ -950,13 +967,22 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                                  action="store_true", help="Show local diagnostics status")
     telemetry_group.add_argument("--telemetry-clear", dest="telemetry_clear",
                                  action="store_true", help="Delete captured local diagnostics")
-    parser.add_argument("--usage-action", choices=["status", "import"],
-                        help="Provider-inert local usage evidence action")
+    parser.add_argument("--usage-action",
+                        choices=["status", "import", "refresh", "export", "example"],
+                        help="Local usage evidence action; refresh alone may query an account")
     parser.add_argument("--usage-from", dest="usage_from", metavar="FILE",
                         help="With usage import: redacted summon.usage/v1 snapshot")
     parser.add_argument("--usage-cache", dest="usage_cache", metavar="FILE",
                         help="Private local usage cache override; with dispatch, valid only "
                              "for provider-inert --dry-run explanation")
+    parser.add_argument("--usage-live-store", dest="usage_live_store", metavar="FILE",
+                        help="Authenticated private live-usage store override")
+    parser.add_argument("--usage-providers", dest="usage_providers", action="append",
+                        metavar="NAME[,NAME]",
+                        help="With usage refresh: explicit provider allowlist (repeatable)")
+    parser.add_argument("--allow-account-usage-read", dest="allow_account_usage_read",
+                        action="store_true",
+                        help="Authorize one bounded account-usage read; no login or dispatch")
     parser.add_argument("--fleet-action",
                         choices=["propose", "validate", "inspect", "explain",
                                  "approval-status", "approval-approve",

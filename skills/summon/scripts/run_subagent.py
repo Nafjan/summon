@@ -899,25 +899,113 @@ def main() -> None:
                 + ", ".join(_lane_early_modes))
             sys.exit(1)
 
-    # Usage evidence is a local management surface. It stays ahead of all
-    # roster/backend resolution so a missing CLI or broken provider auth cannot
-    # turn a provider-inert status/import command into a dispatch dependency.
+    # Usage evidence stays ahead of roster/backend resolution. Only the explicit
+    # refresh action may cross an account-usage boundary; it cannot dispatch a
+    # model, log in, repair auth, retry, or change routing.
     if getattr(args, "usage_action", None):
         try:
+            import _usage_live
+
+            _usage_providers = []
+            for _group in (getattr(args, "usage_providers", None) or []):
+                for _provider in str(_group).split(","):
+                    _provider = _provider.strip().lower()
+                    if _provider and _provider not in _usage_providers:
+                        _usage_providers.append(_provider)
+            _usage_live_store = getattr(args, "usage_live_store", None)
+            _usage_consent = bool(getattr(args, "allow_account_usage_read", False))
+            _usage_out = getattr(args, "out", None)
+            _usage_dry = bool(getattr(args, "dry_run", False))
+
             if args.usage_action == "import":
                 if not getattr(args, "usage_from", None):
                     raise ValueError("usage import requires --from SNAPSHOT.json")
+                if (_usage_providers or _usage_live_store or _usage_consent
+                        or _usage_out or _usage_dry):
+                    raise ValueError("usage import accepts only --from, --cache, and --json")
                 _usage_report = _usage.import_snapshot(
                     args.usage_from, cache_path=getattr(args, "usage_cache", None))
-            else:
+            elif args.usage_action == "status":
                 if getattr(args, "usage_from", None):
                     raise ValueError("usage status does not accept --from")
-                _usage_report = _usage.status(
+                if _usage_providers or _usage_consent or _usage_out or _usage_dry:
+                    raise ValueError(
+                        "usage status accepts only --cache, --live-store, and --json")
+                _imported = _usage.status(
                     cache_path=getattr(args, "usage_cache", None))
+                if _usage_live_store:
+                    _usage_report = {
+                        "schema": "summon.usage-status/v1", "status": "success",
+                        "provider_contacted": False, "advisory_only": True,
+                        "imported": _imported,
+                        "live": _usage_live.status(store_file=_usage_live_store),
+                    }
+                else:
+                    _usage_report = _imported
+            elif args.usage_action == "refresh":
+                if (getattr(args, "usage_from", None)
+                        or getattr(args, "usage_cache", None) or _usage_out):
+                    raise ValueError(
+                        "usage refresh accepts --providers, --allow-account-usage-read, "
+                        "--dry-run, --live-store, and --json")
+                if not _usage_providers:
+                    raise ValueError("usage refresh requires --providers NAME")
+                _checks = [
+                    _usage_live.preflight(
+                        name, allow_account_usage_read=_usage_consent,
+                        dry_run=_usage_dry)
+                    for name in _usage_providers
+                ]
+                _blocked = [item for item in _checks if item.get("status") != "success"]
+                if _blocked:
+                    _usage_report = {
+                        "schema": _usage_live.PUBLIC_SCHEMA, "status": "blocked",
+                        "execution_status": "not_run", "attempts": 0,
+                        "attempt_status": "not_run", "provider_contacted": False,
+                        "result_usable": False, "routing_changed": False,
+                        "error_kind": "usage_refresh_preflight_failed",
+                        "providers": _checks,
+                    }
+                elif len(_usage_providers) != 1 or _usage_providers[0] != "codex":
+                    # Every requested provider passed preflight, but this release still
+                    # enables one adapter per command so contact accounting is exact.
+                    _usage_report = {
+                        "schema": _usage_live.PUBLIC_SCHEMA, "status": "blocked",
+                        "execution_status": "not_run", "attempts": 0,
+                        "attempt_status": "not_run", "provider_contacted": False,
+                        "result_usable": False, "routing_changed": False,
+                        "error_kind": "usage_refresh_provider_set_unsupported",
+                        "providers": _checks,
+                    }
+                else:
+                    from _usage_runner import run_plan
+                    _usage_report = _usage_live.refresh_codex(
+                        allow_account_usage_read=_usage_consent,
+                        dry_run=_usage_dry, runner=run_plan,
+                        store_file=_usage_live_store)
+            elif args.usage_action == "export":
+                if (getattr(args, "usage_from", None) or _usage_providers
+                        or _usage_consent or _usage_dry or not _usage_out):
+                    raise ValueError(
+                        "usage export requires --out and accepts only --cache, "
+                        "--live-store, and --json")
+                _live = (_usage_live.status(store_file=_usage_live_store)
+                         if _usage_live_store else None)
+                _usage_report = _usage.export_snapshot(
+                    _usage_out, cache_path=getattr(args, "usage_cache", None),
+                    live_status=_live)
+            else:
+                if (getattr(args, "usage_from", None)
+                        or getattr(args, "usage_cache", None)
+                        or _usage_live_store or _usage_providers
+                        or _usage_consent or _usage_dry or not _usage_out):
+                    raise ValueError("usage example requires only --out FILE and --json")
+                _usage_report = _usage.write_synthetic_snapshot(_usage_out)
             print(json.dumps(_usage_report, ensure_ascii=False) if args.json
                   else json.dumps(_usage_report, ensure_ascii=False, indent=2))
-            sys.exit(0)
-        except (OSError, ValueError, FileNotFoundError) as exc:
+            sys.exit(0 if _usage_report.get("status") == "success" else 1)
+        except (OSError, ValueError, FileNotFoundError,
+                _evidence.EvidenceError) as exc:
             _usage_error = {
                 "status": "error", "result": "", "exit_code": 1,
                 "error": str(exc), "error_kind": "usage_evidence_invalid",
@@ -928,6 +1016,17 @@ def main() -> None:
             sys.exit(1)
     if getattr(args, "usage_from", None):
         _print_error("--usage-from is valid only with usage import")
+        sys.exit(1)
+    if (getattr(args, "usage_live_store", None)
+            and not getattr(args, "dry_run", False)):
+        _print_error(
+            "--usage-live-store outside usage is valid only with provider-inert --dry-run")
+        sys.exit(1)
+    if getattr(args, "usage_providers", None):
+        _print_error("--usage-providers is valid only with usage refresh")
+        sys.exit(1)
+    if getattr(args, "allow_account_usage_read", False):
+        _print_error("--allow-account-usage-read is valid only with usage refresh")
         sys.exit(1)
     if getattr(args, "usage_cache", None) and not getattr(args, "dry_run", False):
         _print_error("--usage-cache outside the usage command is valid only with --dry-run")
@@ -2627,25 +2726,18 @@ def _effective_decision_view(invocation, args) -> dict:
             forced=bool(getattr(invocation, "permission_forced", False))))
     usage_view = {"state": "not_consulted", "reason": "exact_pin_preserved"}
     usage_cache = getattr(args, "usage_cache", None)
-    if usage_cache:
+    usage_live_store = getattr(args, "usage_live_store", None)
+    if usage_cache or usage_live_store:
         try:
-            usage_status = _usage.status(cache_path=usage_cache)
-            observations = usage_status["observations"]
-            dimensions = sorted({item["dimension"] for item in observations})
-            usage_view = {
-                "state": "advisory_only",
-                "reason": "exact_pin_preserved",
-                "observations_considered": len(observations),
-                "freshness": {
-                    "fresh": sum(item["freshness"] == "fresh" for item in observations),
-                    "stale": sum(item["freshness"] == "stale" for item in observations),
-                },
-                "dimensions": dimensions,
-                # Operator imports have no adapter seal, so syntactic equality
-                # never becomes semantic comparability in this first slice.
-                "comparability": "unverified_semantics",
-            }
-        except (OSError, ValueError):
+            from _usage_advisory import project as _usage_advisory
+            imported = (_usage.status(cache_path=usage_cache) if usage_cache else None)
+            if usage_live_store:
+                import _usage_live
+                live = _usage_live.status(store_file=usage_live_store)
+            else:
+                live = None
+            usage_view = _usage_advisory(imported=imported, live=live)
+        except (OSError, ValueError, _evidence.EvidenceError):
             usage_view = {
                 "state": "invalid",
                 "reason": "usage_cache_invalid",

@@ -335,7 +335,7 @@ def status(*, cache_path: str | None = None, now: str | None = None) -> dict:
             "provider_contacted": False,
             "cache_state": "missing",
             "observations": [],
-            "capabilities": list(CAPABILITIES.values()),
+            "capabilities": _capabilities(),
             "selection_advice": _selection_advice([]),
         }
     checked_at = _now(now)
@@ -363,8 +363,142 @@ def status(*, cache_path: str | None = None, now: str | None = None) -> dict:
         "provider_contacted": False,
         "cache_state": cache_state,
         "observations": observations,
-        "capabilities": list(CAPABILITIES.values()),
+        "capabilities": _capabilities(),
         "selection_advice": _selection_advice(observations),
+    }
+
+
+def _portable_observation(value: dict) -> dict:
+    """Drop local-only fields and downgrade evidence for portable export.
+
+    A copied snapshot cannot carry the authenticated private store or provider
+    attestation with it.  Export therefore becomes an explicit operator export;
+    consumers must not promote it back to live/provider-reported evidence.
+    """
+    allowed = {
+        "provider", "dimension", "support", "retrieved_at", "remaining", "reset_at",
+    }
+    item = {key: value[key] for key in allowed if key in value}
+    retrieved = item.get("retrieved_at")
+    if not isinstance(retrieved, str):
+        raise ValueError("usage export observation is missing retrieved_at")
+    expires = value.get("expires_at")
+    ttl = DEFAULT_EXPORT_TTL_SECONDS
+    if isinstance(expires, str):
+        seconds = int((_parse_time(expires, "expires_at")
+                       - _parse_time(retrieved, "retrieved_at")).total_seconds())
+        if 1 <= seconds <= MAX_TTL_SECONDS:
+            ttl = seconds
+    item.update({
+        "source": "operator_export",
+        "observed_at": retrieved,
+        "ttl_seconds": ttl,
+        "latency_ms": 0,
+    })
+    return _validate_observation(item)
+
+
+DEFAULT_EXPORT_TTL_SECONDS = 300
+
+
+def _capabilities() -> list[dict]:
+    """Merge the provider-inert import registry with reviewed live adapters."""
+    import _usage_live
+
+    live = {item["provider"]: item for item in _usage_live.capabilities()}
+    result = []
+    for provider in sorted(PROVIDERS):
+        item = dict(CAPABILITIES[provider])
+        adapter = live.get(provider)
+        if adapter is not None:
+            state = adapter["state"]
+            item.update(adapter)
+            item["live_refresh"] = state
+            item["support"] = (
+                "supported" if state == "fixture_supported"
+                else "unsupported" if state == "unsupported" else "unknown")
+            item["provider_contacted"] = False
+        result.append(item)
+    return result
+
+
+def _write_new(path: Path, value: dict) -> None:
+    """Write a portable artifact once; never replace an existing or linked target."""
+    if path.exists() or path.is_symlink():
+        raise ValueError("usage output already exists")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ValueError("usage output directory could not be prepared") from exc
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")) + "\n"
+    raw = payload.encode("utf-8")
+    if len(raw) > MAX_BYTES:
+        raise ValueError(f"usage output exceeds {MAX_BYTES} bytes")
+    try:
+        with path.open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError as exc:
+        raise ValueError("usage output already exists") from exc
+    except OSError as exc:
+        raise ValueError("usage output could not be written") from exc
+
+
+def export_snapshot(output_path: str, *, cache_path: str | None = None,
+                    live_status: dict | None = None, now: str | None = None) -> dict:
+    """Write a redacted, de-attested portable snapshot without provider contact."""
+    observations = []
+    imported = status(cache_path=cache_path, now=now)
+    observations.extend(_portable_observation(item)
+                        for item in imported.get("observations", []))
+    if live_status is not None:
+        if (not isinstance(live_status, dict)
+                or live_status.get("status") != "success"
+                or not isinstance(live_status.get("observations"), list)):
+            raise ValueError("live usage status is invalid")
+        observations.extend(_portable_observation(item)
+                            for item in live_status["observations"])
+    normalized = _validate_snapshot({"schema": SCHEMA, "observations": observations})
+    _write_new(Path(output_path), normalized)
+    return {
+        "schema": SCHEMA, "status": "success", "provider_contacted": False,
+        "exported": len(observations), "portable_attestation": "operator_export",
+    }
+
+
+def synthetic_snapshot() -> dict:
+    """Deterministic, non-account example spanning every advisory dimension/state."""
+    base = "2026-01-01T00:00:00Z"
+    values = [
+        ("codex", "subscription_allowance", "supported", {"value": 75.0, "unit": "percent"}),
+        ("openrouter", "api_balance", "supported", {"value": 12.5, "unit": "usd"}),
+        ("arkcli", "account_credit", "supported", {"value": 1000.0, "unit": "credit_units"}),
+        ("agy", "rate_limit", "supported", {"value": 50.0, "unit": "percent"}),
+        ("claude", "unknown", "unsupported", None),
+        ("kimi", "unknown", "unknown", None),
+    ]
+    observations = []
+    for provider, dimension, support, remaining in values:
+        item = {
+            "provider": provider, "dimension": dimension, "support": support,
+            "source": "operator_export", "observed_at": base,
+            "retrieved_at": base, "ttl_seconds": DEFAULT_EXPORT_TTL_SECONDS,
+            "latency_ms": 0,
+        }
+        if remaining is not None:
+            item["remaining"] = remaining
+        observations.append(_validate_observation(item))
+    return {"schema": SCHEMA, "observations": observations}
+
+
+def write_synthetic_snapshot(output_path: str) -> dict:
+    value = synthetic_snapshot()
+    _write_new(Path(output_path), value)
+    return {
+        "schema": SCHEMA, "status": "success", "provider_contacted": False,
+        "example": True, "observations": len(value["observations"]),
     }
 
 

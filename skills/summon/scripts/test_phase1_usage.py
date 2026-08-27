@@ -14,6 +14,8 @@ import _apibackend
 import _builder
 import _cli
 import _usage
+import _usage_advisory
+import _usage_live
 import run_subagent
 from _builder import AgentInvocation
 
@@ -42,6 +44,131 @@ def test_usage_subcommands_are_provider_inert_modes():
         ["usage", "import", "--from", "snapshot.json", "--cache", "cache.json"]
     ) == (["--usage-action", "import", "--usage-from", "snapshot.json",
            "--usage-cache", "cache.json"], None)
+    assert _cli.rewrite_subcommand(
+        ["usage", "refresh", "--providers", "codex", "--live-store", "live.json"]
+    ) == (["--usage-action", "refresh", "--usage-providers", "codex",
+           "--usage-live-store", "live.json"], None)
+    assert _cli.rewrite_subcommand(["usage", "export", "--out", "portable.json"])[0] == [
+        "--usage-action", "export", "--out", "portable.json"]
+
+
+def test_usage_example_and_export_are_deterministic_redacted_and_no_overwrite(tmp_path):
+    example = tmp_path / "example.json"
+    report = _usage.write_synthetic_snapshot(str(example))
+    assert report["provider_contacted"] is False
+    first = example.read_bytes()
+    assert first == (json.dumps(
+        _usage.synthetic_snapshot(), ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")) + "\n").encode("utf-8")
+    with pytest.raises(ValueError, match="already exists"):
+        _usage.write_synthetic_snapshot(str(example))
+
+    portable = tmp_path / "portable.json"
+    live = {
+        "status": "success", "observations": [{
+            "provider": "codex", "dimension": "rate_limit",
+            "support": "supported", "retrieved_at": "2026-08-26T09:00:00Z",
+            "expires_at": "2026-08-26T09:05:00Z",
+            "remaining": {"value": 75.0, "unit": "percent"},
+            "account_scope_hmac": "a" * 64,
+            "local_path": "C:/private/account",
+        }],
+    }
+    exported = _usage.export_snapshot(
+        str(portable), cache_path=str(tmp_path / "missing.json"), live_status=live,
+        now="2026-08-26T09:00:00Z")
+    rendered = portable.read_text(encoding="utf-8")
+    assert exported["portable_attestation"] == "operator_export"
+    assert "account_scope_hmac" not in rendered
+    assert "private/account" not in rendered
+    assert '"source":"operator_export"' in rendered
+
+
+def test_usage_status_reports_live_capability_truthfully(tmp_path):
+    capabilities = {
+        item["provider"]: item
+        for item in _usage.status(cache_path=str(tmp_path / "missing.json"))["capabilities"]
+    }
+    assert capabilities["codex"]["live_refresh"] == "fixture_supported"
+    assert capabilities["codex"]["support"] == "supported"
+    assert capabilities["agy"]["live_refresh"] == "schema_unverified"
+    assert capabilities["arkcli"]["live_refresh"] == "schema_unverified"
+    assert all(item["provider_contacted"] is False for item in capabilities.values())
+
+
+def test_usage_output_directory_error_never_discloses_path(monkeypatch, tmp_path):
+    sentinel = "C:/private/operator/account-name"
+
+    def refused(*_args, **_kwargs):
+        raise OSError(f"cannot create {sentinel}")
+
+    monkeypatch.setattr(Path, "mkdir", refused)
+    with pytest.raises(ValueError) as raised:
+        _usage.write_synthetic_snapshot(str(tmp_path / "nested" / "example.json"))
+    assert str(raised.value) == "usage output directory could not be prepared"
+    assert sentinel not in str(raised.value)
+
+
+def test_usage_export_refuses_symlink_target(tmp_path):
+    target = tmp_path / "target.json"
+    target.write_text("preserve", encoding="utf-8")
+    link = tmp_path / "link.json"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    with pytest.raises(ValueError, match="already exists"):
+        _usage.export_snapshot(str(link), cache_path=str(tmp_path / "missing.json"))
+    assert target.read_text(encoding="utf-8") == "preserve"
+
+
+def test_usage_refresh_mixed_allowlist_blocks_before_runner(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(_usage_live, "refresh_codex",
+                        lambda **_kwargs: calls.append(True) or {})
+    monkeypatch.setattr(os.sys, "argv", [
+        str(Path(run_subagent.__file__)), "usage", "refresh", "--providers",
+        "codex,agy", "--allow-account-usage-read", "--json"])
+    with pytest.raises(SystemExit) as completed:
+        run_subagent.main()
+    assert completed.value.code == 1
+    assert calls == []
+    result = json.loads(capsys.readouterr().out.strip())
+    assert result["provider_contacted"] is False
+    assert result["attempts"] == 0
+    assert result["providers"][1]["error_kind"] == "schema_unverified"
+
+
+def test_usage_refresh_unknown_provider_is_structured_and_provider_inert(
+        monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(_usage_live, "refresh_codex",
+                        lambda **_kwargs: calls.append(True) or {})
+    monkeypatch.setattr(os.sys, "argv", [
+        str(Path(run_subagent.__file__)), "usage", "refresh", "--providers",
+        "unknown-provider", "--allow-account-usage-read", "--json"])
+    with pytest.raises(SystemExit) as completed:
+        run_subagent.main()
+    assert completed.value.code == 1
+    result = json.loads(capsys.readouterr().out.strip())
+    assert calls == []
+    assert result["attempts"] == 0
+    assert result["provider_contacted"] is False
+    assert result["providers"][0]["provider"] is None
+    assert result["providers"][0]["error_kind"] == "provider_unsupported"
+
+
+def test_usage_refresh_dry_run_never_calls_runner(monkeypatch, capsys):
+    monkeypatch.setattr(os.sys, "argv", [
+        str(Path(run_subagent.__file__)), "usage", "refresh", "--providers", "codex",
+        "--allow-account-usage-read", "--dry-run", "--json"])
+    with pytest.raises(SystemExit) as completed:
+        run_subagent.main()
+    assert completed.value.code == 0
+    result = json.loads(capsys.readouterr().out.strip())
+    assert result["provider_contacted"] is False
+    assert result["attempts"] == 0
+    assert result["dry_run"] is True
 
 
 def test_usage_import_status_round_trip_is_redacted_and_cache_only(tmp_path):
@@ -617,14 +744,29 @@ def test_effective_decision_explains_explicit_usage_cache_without_rerouting(
     )
     decision = run_subagent._effective_decision_view(invocation, args)
     assert decision["resolution"]["winning_rule"] == "exact_agent_preserved"
-    assert decision["usage"] == {
-        "state": "advisory_only",
-        "reason": "exact_pin_preserved",
-        "observations_considered": 1,
-        "freshness": {"fresh": 1, "stale": 0},
-        "dimensions": ["subscription_allowance"],
-        "comparability": "unverified_semantics",
-    }
+    assert decision["usage"]["state"] == "advisory_only"
+    assert decision["usage"]["reason"] == "exact_pin_preserved"
+    assert decision["usage"]["observations_considered"] == 1
+    assert decision["usage"]["freshness"] == {"fresh": 1, "stale": 0}
+    assert decision["usage"]["dimensions"] == ["subscription_allowance"]
+    assert decision["usage"]["comparability"] == "unverified_semantics"
+
+
+def test_usage_advisory_omits_values_account_identity_and_paths():
+    result = _usage_advisory.project(live={
+        "observations": [{
+            "provider": "codex", "dimension": "rate_limit",
+            "support": "supported", "freshness": "fresh",
+            "remaining": {"value": 25, "unit": "percent"},
+            "account_scope_hmac": "a" * 64,
+            "path": "C:/private/account",
+        }],
+    })
+    rendered = json.dumps(result)
+    assert result["observations_considered"] == 1
+    assert "remaining" not in rendered
+    assert "account_scope" not in rendered
+    assert "private/account" not in rendered
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows launcher contract")

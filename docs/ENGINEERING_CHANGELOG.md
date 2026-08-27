@@ -13,6 +13,25 @@ never on added fields.
 
 ## Unreleased
 
+- **Bounded live usage adapter and portable evidence:** M4 adds a provider allowlist,
+  explicit account-read consent, exact Codex CLI/version and JSON-RPC request-plan checks,
+  hidden subprocess launch, bounded stream drains, owned-child timeout cleanup, and honest
+  provider-contact accounting. Raw account responses and account identifiers never enter
+  the portable snapshot or effective-decision advisory. Export de-attests observations as
+  operator evidence; synthetic examples cover allowance, API balance, account credit,
+  rate limit, unsupported, and unknown dimensions. Usage cannot route, dispatch, retry,
+  authorize spend, log in, or repair authentication. AGY and ArkCLI adapters remain
+  disabled until their machine-readable schemas are captured and reviewed version by
+  version. The JSONL drain uses incremental bounded pipe reads, only successful account
+  responses can prove provider contact, and the owned app-server is reaped once the exact
+  reviewed response set is complete. Authenticated status reads may advance their local
+  anti-rollback checkpoint but cannot alter observations or contact a provider.
+- **One-time fleet activation:** the reviewed M3 activation path now recompiles and binds
+  the exact fleet, roster, project, approval, data proof, prompt, permission, billing
+  class, and launch before consuming one atomic contact slot. Only one foreground
+  subprocess candidate and one physical attempt are allowed; ambiguity is terminal and
+  retry, fallback, repair, resume, background, worktree, and authority escalation are
+  structurally absent.
 - **Authenticated, provider-inert fleet approval store:** M3b1 adds a private
   `summon.fleet-approval-store/v1` ledger and individually authenticated
   `summon.fleet-approval/v1` records. Each record binds the sealed fleet, compiled plan,
@@ -35,8 +54,8 @@ never on added fields.
   generations so idempotent replay remains operationally explicit. Public projections omit store
   and actor identities, MACs, keys, and paths. The module imports no selector, executor,
   background, resolver, or provider code and exposes no dispatch function; every receipt
-  says `recorded_not_activated`. Approval consumption, reservation, and fleet dispatch
-  remain a later, separately reviewed slice.
+  says `recorded_not_activated`. Recording remains inert; activation is implemented only
+  by the separate, narrowly reviewed one-time launch contract described above.
 - **Pure fleet draft compiler and control-plane boundary:** the first M3 slice adds
   sealed `summon.fleet/v1` and `summon.fleet-plan/v1` evidence, a pure compiler with
   no provider, process, credential, filesystem, or launch imports, and provider-inert
@@ -53,8 +72,8 @@ never on added fields.
   Regressions cover catalog substitution, portable case folding, unavailable and
   malformed seats, capability vocabulary, complete constraint projection, bounded
   reads, output clobbering, symlink targets, redacted I/O errors, and the Windows batch
-  launcher. Approval, reservation, selection, and fleet dispatch remain absent from this
-  slice.
+  launcher. Approval, reservation, selection, and dispatch remain absent from the pure
+  draft/compiler module and enter only through the separate activation boundary.
 - **Temporary model lifecycle:** all ended direct and OpenCode `stealth/ox-alpha`
   selectors are retained as retired, exact historical identities and fail before provider
   contact, including stale custom roster definitions without lifecycle metadata. A separate successor targets

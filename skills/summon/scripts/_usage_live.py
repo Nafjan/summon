@@ -129,7 +129,16 @@ def _base_projection(provider: str) -> dict:
 def preflight(provider: str, *, allow_account_usage_read: bool = False,
               dry_run: bool = False) -> dict:
     """Provider-inert consent and capability preflight."""
-    provider = _provider(provider)
+    try:
+        provider = _provider(provider)
+    except UsageLiveError:
+        return {
+            "schema": PUBLIC_SCHEMA, "provider": None,
+            "status": "blocked", "execution_status": "not_run",
+            "attempts": 0, "provider_contacted": False,
+            "advisory_only": True, "routing_changed": False,
+            "error_kind": "provider_unsupported",
+        }
     result = _base_projection(provider)
     state = CAPABILITIES[provider]["state"]
     if state == "schema_unverified":
@@ -791,10 +800,7 @@ def _normalize_runner_result(
         value: Any) -> tuple[bytes | str, bytes | str, int, int, bool | None]:
     if not isinstance(value, dict):
         raise UsageLiveError("runner_contract_invalid", "runner result must be an object")
-    if value.get("cli_version") != CODEX_SCHEMA_CLI_VERSION:
-        raise UsageLiveError(
-            "schema_version_mismatch",
-            "Codex CLI version differs from the reviewed usage schema fixture")
+    cli_version = value.get("cli_version")
     stdout = value.get("stdout", b"")
     stderr = value.get("stderr", b"")
     if not isinstance(stdout, (bytes, str)) or not isinstance(stderr, (bytes, str)):
@@ -819,9 +825,17 @@ def _normalize_runner_result(
         reported = value.get("error_kind")
         kind = reported if reported in {
             "authentication_failed", "usage_refresh_timeout",
+            "usage_refresh_command_timeout",
             "backend_execution_failed",
         } else "backend_execution_failed"
+        if (kind == "backend_execution_failed" and isinstance(cli_version, str)
+                and cli_version != CODEX_SCHEMA_CLI_VERSION):
+            kind = "schema_version_mismatch"
         raise UsageLiveError(kind, "Codex usage refresh failed")
+    if cli_version != CODEX_SCHEMA_CLI_VERSION:
+        raise UsageLiveError(
+            "schema_version_mismatch",
+            "Codex CLI version differs from the reviewed usage schema fixture")
     return stdout, stderr, exit_code, elapsed_ms, _provider_contacted(value)
 
 

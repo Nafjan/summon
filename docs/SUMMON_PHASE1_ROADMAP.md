@@ -108,8 +108,10 @@ Then specify `summon.fleet/v1` as named lane requirements that resolve through t
 same path. The first slice supports `fleet propose`, `validate`, `inspect`, and
 `explain`; it cannot select or approve a route. The next provider-inert slice records
 authenticated, expiring approval for an exact compiled lane but deliberately cannot
-consume that authority, select a route, reserve an attempt, or dispatch. Fleet dispatch
-stays gated. This first catalog admits active seats only. Deprecated seats remain an
+consume that authority by itself. A separately reviewed activation boundary can consume
+one exact approval for one single-candidate foreground subprocess attempt after complete
+revalidation; it has no retry, fallback, repair, resume, background, worktree, or authority
+expansion. This first catalog admits active seats only. Deprecated seats remain an
 explicit compatibility-dispatch concept, while retired seats fail in the shared roster
 boundary before every provider-launch surface.
 
@@ -127,10 +129,10 @@ store bytes and generation capacity to revoke every active approval. Private pat
 never claims a nonempty unsafe directory based on expected filenames; the documented
 recovery path for a generation conflict is status then deliberate retry, while clock
 rollback requires correcting the system clock.
-Recorded approval remains `recorded_not_activated` until a separately reviewed
-one-time reservation and dispatch-consumption slice exists. Exact agent names retain
-precedence, and lane selection requires the explicit `--lane` namespace. Collision and
-legacy-flat-form tests are mandatory.
+Recorded approval remains `recorded_not_activated`; only the separate one-time reservation
+and dispatch-consumption boundary can activate it. Exact agent names retain precedence,
+and lane selection requires the explicit `--lane` namespace. Collision and legacy-flat-
+form tests are mandatory.
 
 ## Workstream B: usage and credit awareness
 
@@ -150,9 +152,13 @@ remaining fraction exists. Explanations use plain reasons such as `stale`,
 
 `summon usage status` is provider-inert and reads a bounded local cache. A
 provider-inert, schema-validating `usage import --from FILE` supplies a complete
-first workflow for operator-exported redacted observations. A later explicit
-`usage refresh --providers ...` may run documented read-only provider commands; it
-never logs in, repairs auth, prints identifiers, dispatches, or alters routing.
+workflow for operator-exported redacted observations. `usage export` writes a portable,
+de-attested snapshot, and `usage example` creates deterministic synthetic evidence.
+The first explicit live adapter supports a bounded Codex account read only when both an
+allowlisted provider and `--allow-account-usage-read` are present. It validates the exact
+CLI/version and request plan and never logs in, repairs auth, prints identifiers,
+dispatches, retries, or alters routing. AGY and ArkCLI remain schema-unverified until
+version-pinned fixtures and redaction mappings are reviewed.
 
 Usage is advisory. The effective decision receipt records the exact request,
 permission ceiling, spend boundary, authorization source, comparability result, and

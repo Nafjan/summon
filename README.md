@@ -109,10 +109,13 @@ not installed or required.
   if it crashes. Good for reviewing, summarizing, or labeling at scale.
 - **Structured extraction:** `--json-schema` validates an agent's final JSON and, on a
   backend that supports resume, spends one corrective retry when it does not match.
-- **Inspect local usage evidence safely:** `summon usage import --from snapshot.json`
-  validates a redacted `summon.usage/v1` export, and `summon usage status --json`
-  reports its freshness without querying a provider or changing model routing. Usage
-  categories remain separate instead of being collapsed into a misleading score.
+- **Inspect usage and credit evidence safely:** `summon usage import --from snapshot.json`
+  validates an operator export, `usage example --out FILE` creates a synthetic fixture,
+  and `usage export --out FILE` writes a portable redacted snapshot. The first live
+  adapter can read Codex account usage only with an explicit provider allowlist and
+  `--allow-account-usage-read`; it does not log in, repair authentication, dispatch a
+  model, retry, or change routing. Allowance, API balance, account credit, and rate
+  limits remain separate instead of being collapsed into a misleading score.
 - **Governed deliberation:** `summon deliberate` records a receipt-bound, fixed-option
   decision policy and journal. The fresh CLI lane can run one bounded round of
   enforceable read-only subprocess seats after durable receipt/owner fencing; approval,
@@ -370,7 +373,7 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon jobs extend ID --duration 30m` · `jobs cancel ID` | extend an observable job within its hard runtime budget, or request process-tree cancellation |
 | `summon jobs steer ID --message "…"` · `jobs resume ID --message "…"` | queue authenticated guidance for a later eligible continuation, then explicitly create one governed successor; this is not claimed as live mid-turn injection |
 | `summon telemetry enable\|disable\|status\|clear` | manage local opt-in diagnostics; `clear` does not disable |
-| `summon usage status\|import …` | inspect or import bounded, provider-inert usage evidence; dimensions remain separate and do not reroute an exact request |
+| `summon usage status\|import\|refresh\|export\|example …` | inspect, refresh, or exchange bounded usage evidence. Live refresh requires an explicit provider allowlist and account-read consent; usage remains advisory and cannot reroute an exact request |
 | `summon fleet propose LANE --seats A,B` | create a sealed provider-inert fleet draft; this does not approve, select, dispatch, or authorize spend |
 | `summon fleet validate\|inspect FILE` | validate against the current roster, or inspect every declared constraint without consulting a roster |
 | `summon fleet explain FILE LANE` | compare roster candidates with the sealed constraints; report unknowns but deliberately select no route |
@@ -378,6 +381,7 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon fleet approval approve FILE LANE --expires-in 24h --expect-generation N` | record authenticated, expiring local authority for the exact compiled lane; this still cannot select or dispatch |
 | `summon fleet approval inspect APPROVAL_ID` | inspect one recorded approval without mutation |
 | `summon fleet approval revoke APPROVAL_ID --expect-generation N [--out FILE]` | explicitly revoke recorded authority with a generation-bound mutation |
+| `summon dispatch --lane LANE --fleet-file FILE --fleet-approval-id ID --fleet-data-proof PROOF …` | consume one exact approval for one foreground, single-seat, single-attempt launch; no retry, fallback, repair, resume, background, worktree, or authority expansion |
 | `summon bug-report …` | generate a sanitized report; review it before the separate GitHub submission command |
 | `summon version` · `summon help` | version · usage |
 
@@ -392,7 +396,7 @@ providers. The boundary is documented in
 `summon` (no args) prints the command list. Everything below is documented in
 [the Summon skill instructions](skills/summon/SKILL.md).
 
-Fleet documents are drafts, not dispatch capabilities. `propose` returns a compiled
+Fleet documents are drafts, not dispatch capabilities by themselves. `propose` returns a compiled
 projection bound to the current project directory object and a sanitized roster-catalog
 digest; `--out` persists only the sealed draft and refuses to replace an existing file.
 Fleet catalogs admit only `active` seats. A `deprecated` seat remains available for an
@@ -409,8 +413,12 @@ becomes provider proof. The approval surface records authenticated, expiring loc
 authority bound to the sealed fleet, compiled plan, project, catalog, lane, operation,
 and authority ceilings. Mutations require the current store generation. Public receipts
 omit private store and actor identities, authentication material, and paths, and say
-`recorded_not_activated`: they cannot select, reserve, retry, resume, dispatch, or contact
-a provider. Repeating an active approval with the same scope and requested lifetime is
+`recorded_not_activated`: recording alone cannot select, reserve, retry, resume, dispatch,
+or contact a provider. A separate `dispatch --lane` command may consume that exact
+approval for one single-candidate foreground subprocess attempt after revalidating the
+fleet, roster, project, prompt/data proof, authority ceiling, spend boundary, and launch.
+It has no retry, fallback, repair, resume, background, or worktree path. Repeating an
+active approval with the same scope and requested lifetime is
 idempotent; changing the requested lifetime creates a distinct issuance under the current
 generation. Because an exact replay does not mutate the store, it returns the existing
 receipt—even near expiry—and does not extend its lifetime; this remains true when its
@@ -431,9 +439,8 @@ and path overrides must be absolute. Summon hardens a pre-existing directory onl
 is empty; filenames alone never prove that a nonempty directory is Summon-owned. Create
 a dedicated owner-only directory instead. On a generation conflict, run `fleet approval status`
 and deliberately retry with its current generation. If clock rollback is detected, correct
-the system clock before retrying; no approval is consumed. Approval consumption and fleet
-dispatch remain separately gated until their
-reservation and one-time launch contracts are implemented and reviewed.
+the system clock before retrying; no approval is consumed. The one-time launch contract is
+implemented, separately reviewed, and remains intentionally narrower than ordinary dispatch.
 
 ---
 
