@@ -24,6 +24,45 @@ _SENSITIVE_ARG_KEYS = {
 }
 
 
+def _canonical_sha256(value: object) -> str:
+    """Hash a JSON value with one stable, non-lossy encoding."""
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _subprocess_launch_evidence(command: object, args: list[object], cwd: str,
+                                proc_env: Mapping[str, object] | None,
+                                *, backend: str) -> dict[str, object]:
+    """Return private, content-bound evidence for the exact Popen boundary.
+
+    Only digests and bounded identifiers cross into the durable controller. In
+    particular, argv values, paths, prompts, and environment values are never
+    exposed by this object.
+    """
+    effective_env = proc_env if proc_env is not None else os.environ
+    normalized_cwd = os.path.normcase(os.path.realpath(cwd))
+    resolved_command = str(command)
+    resolved_argv = [resolved_command, *(str(arg) for arg in args)]
+    env_names = sorted(str(name) for name in effective_env)
+    env_projection = {
+        str(name): str(effective_env[name]) for name in sorted(effective_env)
+    }
+    return {
+        "schema": "summon.fleet-launch-evidence/v1",
+        "backend": str(backend),
+        "transport": "subprocess",
+        "command_sha256": hashlib.sha256(
+            resolved_command.encode("utf-8", errors="replace")).hexdigest(),
+        "argv_sha256": _canonical_sha256(resolved_argv),
+        "cwd_sha256": _canonical_sha256(normalized_cwd),
+        "env_names_sha256": _canonical_sha256(env_names),
+        "env_sha256": _canonical_sha256(env_projection),
+    }
+
+
 class ProviderLaunchError(RuntimeError):
     """A controlled provider launch was refused before provider contact."""
 
@@ -3949,6 +3988,13 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                           and (_agy_litter_path(inv.cwd) or "")
                           and os.path.isfile(_agy_litter_path(inv.cwd)))
     proc_env = _merge_env(env_override)
+    if launch_control is not None and proc_env is None:
+        # Evidence and Popen must see the same immutable environment snapshot.
+        # Passing env=None would let a concurrent os.environ mutation change the
+        # child after the durable claim. Values remain private; only their
+        # aggregate digest enters the launch evidence.
+        proc_env = {**os.environ}
+        proc_env.pop("SUMMON_CMD_LAUNCHER", None)
     # AFTER _merge_env: the POSIX total counts the environment, and the environment that
     # matters is the one Popen receives -- overrides included, stripped keys excluded.
     _argv_err = argv_length_error(inv.cli, command, args, proc_env)
@@ -3997,12 +4043,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     from _spawn import popen_flags
     if launch_control is not None:
         try:
-            launch_control.before_provider_launch({
-                "backend": inv.cli,
-                "transport": "subprocess",
-                "command_sha256": hashlib.sha256(
-                    str(command).encode("utf-8", errors="replace")).hexdigest(),
-            })
+            launch_control.before_provider_launch(_subprocess_launch_evidence(
+                command, args, inv.cwd, proc_env, backend=inv.cli))
         except ProviderDeadlineError:
             _deadline_response = _error_response(
                 inv.cli, 124, "provider launch deadline exceeded", partial_result=None,

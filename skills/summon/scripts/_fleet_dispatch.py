@@ -79,7 +79,7 @@ _SECRET = re.compile(
 
 _LAUNCH_EVIDENCE_FIELDS = frozenset({
     "schema", "backend", "transport", "command_sha256", "argv_sha256",
-    "cwd_sha256", "env_names_sha256",
+    "cwd_sha256", "env_names_sha256", "env_sha256",
 })
 
 
@@ -1350,7 +1350,8 @@ def _validate_launch_evidence(value: Any, *, invocation: Any,
             "fleet_activation_launch_evidence_invalid",
             "final launch evidence differs from the resolved backend or transport")
     for field in (
-            "command_sha256", "argv_sha256", "cwd_sha256", "env_names_sha256"):
+            "command_sha256", "argv_sha256", "cwd_sha256", "env_names_sha256",
+            "env_sha256"):
         try:
             _sha(value.get(field), f"launch_evidence.{field}")
         except FleetDispatchError as exc:

@@ -870,6 +870,35 @@ def main() -> None:
         _print_error(_bad_mode_flags)
         sys.exit(1)
 
+    # A live lane is a single-dispatch authority surface.  Query and local
+    # management handlers also branch before the ordinary lane guard, so reject
+    # those combinations here instead of letting them silently win. Fan-out
+    # modes are rejected by the whitelist above because the private rewritten
+    # lane token maps to `fleet_dispatch_lane`.
+    if getattr(args, "fleet_dispatch_lane", None):
+        _lane_early_modes = [
+            label for label, active in (
+                ("list", bool(args.list)),
+                ("models", bool(args.list_models)),
+                ("doctor", bool(args.doctor)),
+                ("onboard", bool(getattr(args, "onboard", False))),
+                ("agents validate", bool(getattr(args, "validate_agents", False))),
+                ("telemetry", any(getattr(args, name, False) for name in (
+                    "telemetry_enable", "telemetry_disable",
+                    "telemetry_status", "telemetry_clear"))),
+                ("role", any((getattr(args, "role_propose", None),
+                              getattr(args, "role_approve", None),
+                              getattr(args, "role_list", False),
+                              getattr(args, "role_resolve", None)))),
+                ("agent management", bool(args.new_agent or args.set_agent)),
+            ) if active
+        ]
+        if _lane_early_modes:
+            _print_error(
+                "dispatch --lane cannot be combined with another command mode: "
+                + ", ".join(_lane_early_modes))
+            sys.exit(1)
+
     # Usage evidence is a local management surface. It stays ahead of all
     # roster/backend resolution so a missing CLI or broken provider auth cannot
     # turn a provider-inert status/import command into a dispatch dependency.
@@ -1531,6 +1560,102 @@ def main() -> None:
                     "result_usable": False,
                     "prompt_transport": {"kind": "summon.cmd", "safe": "prompt-file"}})
 
+    # M3 live fleet slice: turn one approved, single-candidate lane into the
+    # exact roster seat before request identity and agent snapshotting. This
+    # first executable slice is intentionally narrow: one foreground subprocess
+    # attempt, no overrides, retries, fallback, gate, worktree, resume, repair,
+    # or alternate output path. Existing exact-agent dispatch is unchanged.
+    _fleet_live_context = None
+    _fleet_live_lane = getattr(args, "fleet_dispatch_lane", None)
+    _fleet_live_option_used = bool(
+        _fleet_live_lane or getattr(args, "fleet_file", None)
+        or getattr(args, "fleet_approval_id", None)
+        or getattr(args, "fleet_data_proof", None))
+    if _fleet_live_lane:
+        if args.agent:
+            _die("give --agent or --lane, not both",
+                 error_kind="fleet_activation_usage_invalid")
+        if args.prompt_file is None:
+            _die("approved lane dispatch requires --prompt-file",
+                 error_kind="fleet_activation_usage_invalid")
+        if not args.fleet_file or not args.fleet_approval_id or not args.fleet_data_proof:
+            _die("approved lane dispatch requires --fleet-file, --fleet-approval-id, "
+                 "and --fleet-data-proof",
+                 error_kind="fleet_activation_usage_invalid")
+        if not args.cwd or not os.path.isabs(args.cwd) or not os.path.isdir(args.cwd):
+            _die("approved lane dispatch requires an existing absolute --cwd",
+                 error_kind="fleet_activation_usage_invalid")
+        _incompatible = []
+        for _name, _used in (
+                ("--cli", bool(args.cli)), ("--model", bool(args.model)),
+                ("--profile", bool(args.profile)), ("--effort", bool(args.effort)),
+                ("--max-permission", bool(args.max_permission)),
+                ("--allow-credit", bool(args.allow_credit)),
+                ("--allow-payg", bool(args.allow_payg)),
+                ("--allow-text-only", bool(args.allow_text_only)),
+                ("--require-tools", bool(args.require_tools)),
+                ("--require-exact-model", bool(args.require_exact_model)),
+                ("--resume", bool(args.resume)),
+                ("--resume-profile", bool(args.resume_profile)),
+                ("--transport", bool(args.transport)),
+                ("--read-root", bool(args.read_root)),
+                ("--worktree", args.worktree is not None),
+                ("--background", bool(args.background)),
+                ("--job-file", bool(args.job_file)),
+                ("--adaptive-timeout", bool(args.adaptive_timeout)),
+                ("--hard-timeout", bool(args.hard_timeout)),
+                ("--max-runtime", args.max_runtime is not None),
+                ("--out", bool(args.out)), ("--gate-with", bool(args.gate_with)),
+                ("--isolated-lane", bool(args.isolated_lane)),
+                ("--allow-tool-credentials", bool(args.allow_tool_credentials)),
+                ("--retries", bool(args.retries)),
+                ("--retry-nonretryable", bool(args.retry_nonretryable)),
+                ("--transient-retries", bool(args.transient_retries)),
+                ("--json-schema", bool(args.json_schema)),
+                ("--artifact", bool(args.artifacts)),
+                ("--enable-roles", bool(args.enable_roles))):
+            if _used:
+                _incompatible.append(_name)
+        if _incompatible:
+            _die("approved lane dispatch does not accept: "
+                 + ", ".join(_incompatible),
+                 error_kind="fleet_activation_usage_invalid")
+        try:
+            _fleet_document = _fleet.load_fleet(args.fleet_file)
+            _fleet_agents_dir = get_agents_dir(args.agents_dir, args.cwd)
+            _fleet_agents = list_agents(_fleet_agents_dir)
+            if getattr(args, "strict_agents_dir", False):
+                _fleet_agents = [item for item in _fleet_agents
+                                 if item.get("source") == "project"]
+            _fleet_plan, _fleet_catalog = _fleet.compile_document(
+                fleet=_fleet_document, agents=_fleet_agents, cwd=args.cwd)
+            _fleet_payload = _evidence.verify(_fleet_plan)
+            _fleet_lanes = [item for item in _fleet_payload["lanes"]
+                            if item["name"] == _fleet_live_lane]
+            if len(_fleet_lanes) != 1 or len(_fleet_lanes[0]["candidates"]) != 1:
+                raise ValueError(
+                    "live fleet dispatch requires one existing single-candidate lane")
+            args.agent = _fleet_lanes[0]["candidates"][0]["seat"]
+            # Disable every corrective path even when ambient environment opts
+            # into one; the runtime calls execute_agent exactly once below.
+            args.no_contract_repair = True
+            _fleet_live_context = {
+                "fleet": _fleet_document, "plan": _fleet_plan,
+                "catalog": _fleet_catalog, "lane": _fleet_live_lane,
+                "approval_id": args.fleet_approval_id,
+                "data_proof": args.fleet_data_proof,
+                "fleet_path": args.fleet_file,
+                "agents_dir": _fleet_agents_dir,
+                "strict_agents_dir": bool(getattr(
+                    args, "strict_agents_dir", False)),
+            }
+        except (OSError, ValueError, _evidence.EvidenceError) as exc:
+            _die(str(exc), error_kind=getattr(
+                exc, "kind", "fleet_activation_evidence_invalid"))
+    elif _fleet_live_option_used:
+        _die("--fleet-file, --fleet-approval-id, and --fleet-data-proof require --lane "
+             "for a dispatch", error_kind="fleet_activation_usage_invalid")
+
     # Role aliases are an explicit, opt-in operator feature.  Keep the requested
     # spelling on ``args`` for receipts and child argv, while every loader/identity
     # path below uses the resolved target.  Exact agent definitions win inside the
@@ -1583,6 +1708,13 @@ def main() -> None:
     _identity = _request_identity(args)
     request_sha = request_fingerprint(**_identity)
     receipt["request_sha256"] = request_sha
+    if _fleet_live_context is not None:
+        receipt["fleet_request"] = {
+            "lane": _fleet_live_context["lane"],
+            "approval_id": _fleet_live_context["approval_id"],
+            "source": "approved_lane",
+            "attempt_policy": "single_foreground_subprocess",
+        }
     _role_info = (getattr(args, "_role_provenance", {}) or {}).get("role")
     if isinstance(_role_info, dict):
         # Role provenance is intentionally digest/name-only.  The registry path and
@@ -1792,6 +1924,11 @@ def main() -> None:
                 f"Agent definition not found: {getattr(args, '_resolved_agent', args.agent)}")
         run_agent_cli, system_context, _, agent_file, permission, model, extra_args, effort_fm = _loaded
         _agent_fm = _agent_fm or {}
+        if _fleet_live_context is not None and extra_args:
+            _die(
+                "approved lane dispatch does not permit agent frontmatter args in "
+                "this first executable slice",
+                error_kind="fleet_activation_agent_args_unsupported")
         try:
             _agent_lifecycle = require_dispatchable_lifecycle(
                 _agent_fm, getattr(args, "_resolved_agent", args.agent))
@@ -2173,9 +2310,28 @@ def main() -> None:
     )
 
     if args.dry_run:
-        _emit(_dry_run_view(invocation, args, agents_dir, agent_file,
-                            artifact_manifest=_artifact_manifest,
-                            text_seat_decision=_ts), operation=_EMIT_OPERATION)
+        _dry_view = _dry_run_view(
+            invocation, args, agents_dir, agent_file,
+            artifact_manifest=_artifact_manifest,
+            text_seat_decision=_ts)
+        if _fleet_live_context is not None:
+            try:
+                import _fleet_runtime
+                _dry_view["fleet_dispatch"] = _fleet_runtime.preview(
+                    approval_id=_fleet_live_context["approval_id"],
+                    fleet_path=_fleet_live_context["fleet_path"],
+                    agents_dir=_fleet_live_context["agents_dir"],
+                    strict_agents_dir=_fleet_live_context["strict_agents_dir"],
+                    lane_name=_fleet_live_context["lane"],
+                    cwd=args.cwd,
+                    data_proof=_fleet_live_context["data_proof"],
+                    invocation=invocation,
+                    agent_definition_sha256=_def_actual,
+                    request_identity_sha256=request_sha)
+            except (OSError, ValueError, _evidence.EvidenceError) as exc:
+                _die(str(exc), error_kind=getattr(
+                    exc, "kind", "fleet_activation_evidence_invalid"))
+        _emit(_dry_view, operation=_EMIT_OPERATION)
         sys.exit(0)
 
     if _read_policy.get("would_refuse"):
@@ -2281,7 +2437,21 @@ def main() -> None:
     # escaping so unknown --cli values or unsafe agent paths surface as JSON
     # errors rather than tracebacks. All other CLI-side failures are already
     # shaped into the response by execute_agent.
+    _fleet_runtime_state = None
     try:
+        if _fleet_live_context is not None:
+            import _fleet_runtime
+            _fleet_runtime_state = _fleet_runtime.prepare(
+                approval_id=_fleet_live_context["approval_id"],
+                fleet_path=_fleet_live_context["fleet_path"],
+                agents_dir=_fleet_live_context["agents_dir"],
+                strict_agents_dir=_fleet_live_context["strict_agents_dir"],
+                lane_name=_fleet_live_context["lane"],
+                cwd=args.cwd,
+                data_proof=_fleet_live_context["data_proof"],
+                invocation=invocation,
+                agent_definition_sha256=_def_actual,
+                request_identity_sha256=request_sha)
         if _governed_resume_context is not None:
             from _job_resume import provider_launch_control
             result = execute_agent(
@@ -2289,10 +2459,44 @@ def main() -> None:
                 max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None),
                 launch_control=provider_launch_control(
                     _governed_resume_context, gate=False))
+        elif _fleet_runtime_state is not None:
+            result = execute_agent(
+                invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
+                max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None),
+                launch_control=_fleet_runtime_state.control())
+            result = _fleet_runtime_state.finalize(result)
         else:
             result = _dispatch_with_retries(invocation, args, agents_dir)
-    except ValueError as e:
-        _die(str(e))
+    except (OSError, ValueError, _evidence.EvidenceError) as e:
+        if _fleet_runtime_state is not None:
+            try:
+                _fleet_failure = _fleet_runtime_state.failure(e)
+                finalize_exit_fields(_fleet_failure)
+                _fleet_failure.update(receipt)
+                _emit(_fleet_failure, operation="dispatch")
+                sys.exit(1)
+            except SystemExit:
+                raise
+            except Exception as reconciliation_error:  # defensive last resort
+                _fleet_failure = {
+                    "status": "error", "execution_status": "error",
+                    "result": "", "provider_contacted": None,
+                    "attempts": 1, "attempt_status": "indeterminate",
+                    "raw_backend_exit_code": None, "normalized_exit_code": 1,
+                    "exit_code": 1, "retryable": False, "result_usable": False,
+                    "served_model_evidence": "absent", "model_match": None,
+                    "named_model_verified": False,
+                    "error": str(e),
+                    "error_kind": "fleet_dispatch_reconciliation_failed",
+                    "reconciliation_error_kind": getattr(
+                        reconciliation_error, "kind",
+                        type(reconciliation_error).__name__),
+                }
+                finalize_exit_fields(_fleet_failure)
+                _fleet_failure.update(receipt)
+                _emit(_fleet_failure, operation="dispatch")
+                sys.exit(1)
+        _die(str(e), error_kind=getattr(e, "kind", None))
     # Effort is request-level evidence. Kimi's builder applies it to the
     # disposable profile config; the provider may still omit a served-effort
     # receipt, so keep the transport explicit instead of implying provider proof.
@@ -2354,7 +2558,8 @@ def main() -> None:
         _write_out(args.out, result)
     _emit(result, operation="resume" if args.resume else "dispatch",
           trusted_executor_result=True,
-          continuation_context=(invocation, args))
+          continuation_context=(
+              None if _fleet_runtime_state is not None else (invocation, args)))
     sys.exit(0 if result["status"] == "success" else 1)
 
 

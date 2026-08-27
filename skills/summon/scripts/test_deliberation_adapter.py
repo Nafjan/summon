@@ -796,6 +796,13 @@ class ExecutorPathTests(unittest.TestCase):
         popen.assert_called_once()
         self.assertEqual([event[0] for event in events], ["before", "spawn", "reap"])
         self.assertNotIn("secret", json.dumps(events[0][1]))
+        child_env = popen.call_args.kwargs["env"]
+        self.assertIsInstance(child_env, dict)
+        self.assertEqual(
+            events[0][1]["env_sha256"],
+            _executor._canonical_sha256({
+                str(name): str(child_env[name]) for name in sorted(child_env)
+            }))
 
     def test_registration_failure_terminates_untracked_child_and_redacts_error(self):
         fake_process = mock.Mock()

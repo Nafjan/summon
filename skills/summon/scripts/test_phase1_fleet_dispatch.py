@@ -154,6 +154,7 @@ def _launch_evidence(invocation, **changes):
         "cwd_sha256": _fleet_dispatch._digest(os.path.normcase(os.path.realpath(
             invocation.cwd))),
         "env_names_sha256": _sha("CLAUDE_CONFIG_DIR"),
+        "env_sha256": _sha("CLAUDE_CONFIG_DIR=private"),
     }
     values.update(changes)
     return values

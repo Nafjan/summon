@@ -221,6 +221,9 @@ MODE_HINTS = {
              "event and resumes its provider session only when identity evidence matches; "
              "drift creates a visible fork. It never changes a ballot. `chat open "
              "--chat-browser auto|builtin|ide|system|link` starts or reuses the atlas."),
+    "swarm": ("swarm is a provider-neutral local coordinator. It journals claims, "
+              "leases, cancellation, and artifacts but never owns an ordinary fleet "
+              "dispatch or silently consumes dispatch flags."),
     "jobs-list": ("jobs list is read-only: it takes only --job-dir and --json."),
     "jobs-status": ("jobs status is read-only: it takes only the job id, --job-dir, "
                     "and --json."),
@@ -249,8 +252,17 @@ MODE_HINTS = {
              "is explicit; a successful login still requires an explicit retry of the "
              "original dispatch."),
 }
-FLAG_NAMES = {"sets": "--set"}  # dests whose flag spelling isn't dest.replace('_','-')
+FLAG_NAMES = {
+    "sets": "--set",
+    # Never expose the private parser destination in user-facing whitelist
+    # errors. It is only the rewritten representation of `dispatch --lane`.
+    "fleet_dispatch_lane": "--lane",
+}  # dests whose public spelling isn't dest.replace('_','-')
 TOKEN_DESTS = {"set": "sets", "from": "bug_report_from",
+               # private parser spelling produced only by `dispatch --lane`;
+               # mapping it here makes every fan-out whitelist reject a lane
+               # before entering its handler.
+               "fleet-dispatch-lane-internal": "fleet_dispatch_lane",
                # ergonomic names used only by the `chat` subcommand
                "project-id": "chat_project_id", "project-root": "chat_project_root",
                "initiator-host": "chat_initiator_host", "initiator-agent": "chat_initiator_agent",
@@ -293,6 +305,8 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "deliberation-open"
     if getattr(args, "chat_action", None):
         return "chat"
+    if getattr(args, "swarm_action", None):
+        return "swarm"
     if getattr(args, "deliberate", False):
         return "deliberation"
     if args.council:
@@ -361,7 +375,11 @@ USAGE = """summon — cross-vendor sub-agents for any AI CLI
 Usage: summon <command> [options]
 
 Commands:
-  dispatch  --agent NAME --prompt "…" --cwd DIR   run an agent (the default action)
+  dispatch  --agent NAME (--prompt TEXT | --prompt-file FILE) --cwd DIR
+                                                    run an exact agent
+  dispatch  --lane NAME --fleet-file FILE --fleet-approval-id SHA256
+            --fleet-data-proof PROOF --prompt-file FILE --cwd DIR
+                                                    run one approved fleet lane
   list                                            list available agents
   agents validate [--cwd DIR] [--agents-dir D]   validate custom agent manifests
   models    [--cli BACKEND]                       what each backend can run now
@@ -551,6 +569,13 @@ def rewrite_subcommand(argv: list) -> tuple:
     ``(argv, mode)`` where mode is 'help' (print usage, exit 0), a string
     'error: …' (print error, exit 2), or None. Legacy flat invocations (argv
     starts with '-') pass through untouched."""
+    if any(
+            item == "--fleet-dispatch-lane-internal"
+            or item.startswith("--fleet-dispatch-lane-internal=")
+            for item in argv):
+        return argv, (
+            "error: --fleet-dispatch-lane-internal is private; use "
+            "`summon dispatch --lane NAME ...`")
     if not argv:
         return argv, "help"
     head = argv[0]
@@ -564,6 +589,16 @@ def rewrite_subcommand(argv: list) -> tuple:
     if any(a in ("--help", "-h") for a in rest):
         return argv, f"help:{head}" if head in COMMAND_USAGE else "help"
     if head in ("dispatch", "run"):
+        if head == "dispatch":
+            # Live fleet authority is intentionally available only through the
+            # explicit dispatch subcommand. Keep legacy flat invocations and
+            # the historical `run` alias from silently acquiring this surface.
+            rest = [
+                ("--fleet-dispatch-lane-internal=" + item.split("=", 1)[1])
+                if item.startswith("--lane=") else
+                "--fleet-dispatch-lane-internal" if item == "--lane" else item
+                for item in rest
+            ]
         return rest, None
     if head == "agents" and rest and rest[0] == "validate":
         return ["--validate-agents", *rest[1:]], None
@@ -986,6 +1021,9 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--fleet-approval-id", dest="fleet_approval_id",
                         metavar="SHA256",
                         help="Private-store fleet approval identifier")
+    parser.add_argument("--fleet-data-proof", dest="fleet_data_proof",
+                        choices=["operator_attested", "public_prompt_verified"],
+                        help="Prompt-bound data proof for one approved live lane dispatch")
     parser.add_argument("--fleet-expires-in", dest="fleet_expires_in",
                         metavar="DURATION",
                         help="Approval lifetime with explicit unit (60s..30d)")
@@ -1029,7 +1067,10 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="With --doctor: run a minimal LIVE call per backend to verify "
                              "account/client eligibility (catches e.g. Gemini IneligibleTierError "
                              "that a --version check misses). Costs a tiny dispatch per backend")
-    parser.add_argument("--agent", help="Agent definition name")
+    parser.add_argument("--agent", help="Exact agent definition name")
+    parser.add_argument("--fleet-dispatch-lane-internal",
+                        dest="fleet_dispatch_lane", metavar="LANE",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--prompt", help="Task prompt")
     parser.add_argument("--prompt-file", dest="prompt_file",
                         help="Read the task prompt from FILE (UTF-8; BOM tolerated). "
