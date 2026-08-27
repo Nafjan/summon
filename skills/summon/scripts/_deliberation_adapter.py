@@ -23,7 +23,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 
-from _builder import AgentInvocation
+from _builder import AgentInvocation, _agy_release_profile_lease
 from _deliberation import (AdapterResult, CleanupReceipt, DeliberationError,
                            DuplicateAttemptError, ExecutionEvidence,
                            LaunchSpec, LaunchToken, SnapshotDriftError,
@@ -367,9 +367,18 @@ class FreshDispatchAdapter:
         # durable response to status=success.  Treat that explicit normalized
         # status as transport success; raw non-zero without it remains a
         # transport failure and cannot reach ballot acceptance.
-        normalized_success = response.get("status") == "success"
-        transport_ok = (not timed_out and
-                        (exit_code in (0, 143, -15) or normalized_success))
+        response_status = response.get("status")
+        explicit_status = (response_status if response_status in {
+            "success", "partial", "blocked", "error"
+        } else None)
+        normalized_success = explicit_status == "success"
+        # An explicit executor status is authoritative in both directions.
+        # In particular, a provider-authored cancelled/incomplete terminal can
+        # carry raw exit 0 (or a wrapper SIGTERM spelling) without becoming an
+        # acceptable deliberation transport.
+        transport_ok = (not timed_out and (
+            normalized_success if explicit_status is not None
+            else exit_code in (0, 143, -15)))
         prose = response.get("result") if isinstance(response.get("result"), str) else ""
         structured = self._parse_output(prose)
         model_served = None
@@ -393,8 +402,10 @@ class FreshDispatchAdapter:
             model_served=model_served,
             model_targeted=model_targeted,
             error_kind=(response.get("error_kind")
-                        if response.get("error_kind") == "context_source_drift"
-                        else None),
+                        if response.get("error_kind") in {
+                            "context_source_drift", "provider_cancelled",
+                            "provider_incomplete",
+                        } else None),
         )
         return AdapterResult(evidence=evidence, structured_output=structured,
                              model_prose=prose)
@@ -444,10 +455,14 @@ class FreshDispatchAdapter:
                 retained.append(f"{resource.kind}:cleanup-unverified")
                 continue
             try:
+                lease_clean = (resource.kind != "agy-profile"
+                               or _agy_release_profile_lease(real))
                 if os.path.exists(real):
                     shutil.rmtree(real)
                 if os.path.lexists(real):
                     raise OSError("profile remains")
+                if not lease_clean:
+                    raise OSError("profile lease remains")
             except Exception:  # noqa: BLE001 - receipt must remain honest
                 retained.append(f"{resource.kind}:cleanup-unverified")
             else:

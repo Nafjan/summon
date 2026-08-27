@@ -175,6 +175,8 @@ MODE_FLAGS = {
     "usage": {"usage_action", "usage_from", "usage_cache", "usage_live_store",
               "usage_providers", "allow_account_usage_read", "dry_run", "out",
               "json", "job_file"},
+    "result": {"result_action", "result_kind", "result_from",
+               "result_repo_root", "result_adapter", "out", "json", "job_file"},
     "fleet": {"fleet_action", "fleet_file", "fleet_lane", "fleet_seats",
                "fleet_provider_allowlist", "fleet_model_allowlist",
                "fleet_required_capabilities", "fleet_permission_ceiling",
@@ -245,6 +247,9 @@ MODE_HINTS = {
     "usage": ("usage status/import/export/example are provider-inert. usage refresh "
               "requires an explicit provider allowlist and account-usage-read consent; "
               "it never logs in, repairs auth, dispatches, or changes routing."),
+    "result": ("result project/validate/consume are provider-inert. They derive or "
+               "inspect an experimental redacted compatibility receipt and never "
+               "dispatch, resume, authorize, or contact a provider."),
     "fleet": ("fleet is a provider-inert M3 control plane. Draft actions compile and "
               "explain constraints; approval actions record authenticated, expiring "
               "local authority. Nothing on this surface selects, dispatches, or "
@@ -319,6 +324,8 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "telemetry"
     if getattr(args, "usage_action", None):
         return "usage"
+    if getattr(args, "result_action", None):
+        return "result"
     if getattr(args, "fleet_action", None):
         return "fleet"
     if getattr(args, "bug_report", False):
@@ -371,7 +378,7 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
                "onboard", "manifest", "council", "deliberate", "agent", "jobs", "version",
                "chat", "swarm", "role", "telemetry", "usage", "bug-report", "auth",
-               "fleet", "help", "--help", "-h"}
+               "fleet", "result", "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -419,6 +426,9 @@ Commands:
   usage status [--json] | usage import --from FILE [--json]
   usage refresh --providers NAME --allow-account-usage-read [--dry-run]
   usage export|example --out FILE [--json]        inspect/refresh/export redacted usage evidence
+  result project --kind KIND --from FILE --repo-root DIR [--out FILE] [--json]
+  result validate FILE [--json] | result consume FILE --adapter reference [--json]
+                                                  portable experimental receipts
   fleet propose LANE --seats A,B [--out FILE]     draft a provider-inert fleet lane
   fleet validate|inspect FILE                     validate/inspect a fleet draft
   fleet explain FILE LANE                         compare constraints without selection
@@ -548,6 +558,18 @@ Inspect, import, or export normalized redacted usage evidence. Refresh is the on
 that may query account usage; it requires explicit provider and consent flags, makes one
 bounded attempt, and never logs in, repairs auth, dispatches, retries, or changes routing.
 Usage dimensions remain separate; unlike categories are never reduced to one score.
+""",
+    "result": """summon result project --kind dispatch --from PRIVATE.json
+                      --repo-root DIR [--out PORTABLE.json] [--json]
+summon result validate PORTABLE.json [--json]
+summon result consume PORTABLE.json --adapter reference [--json]
+
+Derive, validate, or inspect an experimental redacted compatibility receipt. These
+commands are provider-inert and grant no dispatch, routing, resume, filesystem, spend,
+native-host, or adjudication authority. `project` reads one authoritative private
+receipt locally; its output excludes prompts, results, transcripts, sessions, account
+facts, raw errors, and local paths. The schema remains experimental until an external
+consumer validates every supported source surface.
 """,
     "bug-report": """summon bug-report [--from SOURCE] [--output REPORT.md] [--json]
                      [--bug-title TEXT] [--bug-description TEXT]
@@ -825,6 +847,29 @@ def rewrite_subcommand(argv: list) -> tuple:
                 translated.append(token)
             index += 1
         return ["--usage-action", action, *translated], None
+    if head == "result":
+        if not rest or rest[0] not in ("project", "validate", "consume"):
+            return argv, "error: 'result' needs project/validate/consume"
+        action = rest[0]
+        if action == "project":
+            translated = ["--result-action", "project"]
+            tail = rest[1:]
+        else:
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, f"error: 'result {action}' needs a JSON file"
+            translated = ["--result-action", action, "--result-from", rest[1]]
+            tail = rest[2:]
+        for token in tail:
+            if token == "--kind" or token.startswith("--kind="):
+                token = "--result-kind" + token[len("--kind"):]
+            elif token == "--from" or token.startswith("--from="):
+                token = "--result-from" + token[len("--from"):]
+            elif token == "--repo-root" or token.startswith("--repo-root="):
+                token = "--result-repo-root" + token[len("--repo-root"):]
+            elif token == "--adapter" or token.startswith("--adapter="):
+                token = "--result-adapter" + token[len("--adapter"):]
+            translated.append(token)
+        return translated, None
     if head == "fleet":
         if rest and rest[0] == "approval":
             if len(rest) < 2 or rest[1] not in {
@@ -983,6 +1028,20 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--allow-account-usage-read", dest="allow_account_usage_read",
                         action="store_true",
                         help="Authorize one bounded account-usage read; no login or dispatch")
+    parser.add_argument("--result-action",
+                        choices=("project", "validate", "consume"),
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--result-kind", dest="result_kind",
+                        choices=("dispatch", "job", "chat", "council",
+                                 "deliberate", "swarm"),
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--result-from", dest="result_from", metavar="FILE",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--result-repo-root", dest="result_repo_root", metavar="DIR",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--result-adapter", dest="result_adapter",
+                        choices=("reference",),
+                        help=argparse.SUPPRESS)
     parser.add_argument("--fleet-action",
                         choices=["propose", "validate", "inspect", "explain",
                                  "approval-status", "approval-approve",

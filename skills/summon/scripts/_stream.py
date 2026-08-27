@@ -143,6 +143,33 @@ def _terminal_is_error(data) -> bool:
     return status in ("error", "failed")
 
 
+_AGY_TERMINAL_OUTCOMES = {
+    "SUCCESS": "success",
+    "ERROR": "error",
+    "INVALID": "error",
+    "CANCELED": "blocked",
+    "CANCELLED": "blocked",
+    "INTERRUPTED": "blocked",
+    "WAITING": "partial",
+    "RUNNING": "partial",
+}
+
+
+def _agy_terminal_outcome(raw_status) -> tuple[str, str]:
+    """Return one bounded Summon outcome for an AGY terminal state.
+
+    AGY 1.1.22 emits an enum-like status in its result envelope.  Unknown,
+    blank, and malformed values fail closed instead of inheriting the generic
+    "a result object exists" success rule.
+    """
+    if isinstance(raw_status, str):
+        state = raw_status.strip().upper()
+        outcome = _AGY_TERMINAL_OUTCOMES.get(state)
+        if outcome is not None:
+            return state, outcome
+    return "UNKNOWN", "error"
+
+
 class StreamProcessor:
     """Process streaming JSON output from various CLIs.
 
@@ -153,8 +180,9 @@ class StreamProcessor:
       ``turn.completed`` or ``turn.failed``
     """
 
-    def __init__(self, event_observer=None):
+    def __init__(self, event_observer=None, cli: str | None = None):
         self._event_observer = event_observer
+        self._declared_cli = cli
         self._tool_progress = 0
         # Some provider stream dialects do not assign an event id to progress
         # records.  Keep only fixed-size hashes of their semantic payloads, so
@@ -167,6 +195,7 @@ class StreamProcessor:
         self.is_gemini = False
         self.is_codex = False
         self.is_kimi = False
+        self.is_agy = cli == "agy"
         self.kimi_parts = []
         # Kimi has no terminal-success record: a clean EOF is the only
         # completion boundary. Keep the normal accumulator unchanged for
@@ -318,12 +347,14 @@ class StreamProcessor:
         # dotted event envelope before any backend-specific terminal checks so
         # ``message.part.updated`` cannot be mistaken for a generic result (or
         # silently ignored as an unknown event).
-        data = _unwrap_opencode_event(data)
+        if self._declared_cli in (None, "opencode"):
+            data = _unwrap_opencode_event(data)
 
         # Claude stream-json init: {"type":"system","subtype":"init","session_id":...}
         # (distinct from gemini's bare {"type":"init"}). Capture the session id so
         # the caller can resume this conversation later with --resume.
-        if data.get("type") == "system" and data.get("subtype") == "init":
+        if (data.get("type") == "system" and data.get("subtype") == "init"
+                and self._declared_cli in (None, "claude")):
             self._bind_session(data.get("session_id"), data)
             if data.get("model"):
                 self.handshake_model = data["model"]
@@ -334,7 +365,10 @@ class StreamProcessor:
         # payload and step details under `step_update`; older releases also put
         # selected fields at the top level.  Read both shapes without flattening
         # arbitrary payload keys into the generic parser namespace.
-        if data.get("event") == "init":
+        if (data.get("event") == "init"
+                and self._declared_cli in (None, "agy")):
+            if self._declared_cli is None:
+                self.is_agy = True
             init = data.get("init") if isinstance(data.get("init"), dict) else {}
             self._bind_session(data.get("conversation_id") or init.get("conversation_id"),
                                data)
@@ -345,7 +379,10 @@ class StreamProcessor:
                 self.handshake_model = model
             return False
 
-        if data.get("event") == "step_update":
+        if (data.get("event") == "step_update"
+                and self._declared_cli in (None, "agy")):
+            if self._declared_cli is None:
+                self.is_agy = True
             # AGY progress packets are trusted transport activity. Only explicit
             # assistant text or monotonically increasing tool steps reset idle.
             step = (data.get("step_update")
@@ -390,12 +427,14 @@ class StreamProcessor:
                 self._liveness("stream_event", data)
             return False
 
-        if data.get("type") == "init":
+        if (data.get("type") == "init"
+                and self._declared_cli in (None, "gemini")):
             self.is_gemini = True
             self._bind_session(data.get("session_id"), data)
             return False
 
-        if data.get("type") == "thread.started":
+        if (data.get("type") == "thread.started"
+                and self._declared_cli in (None, "codex")):
             self.is_codex = True
             self._bind_session(data.get("thread_id"), data)
             if data.get("model"):
@@ -405,7 +444,9 @@ class StreamProcessor:
         # Claude stream-json emits complete assistant messages between init and
         # result. Text and tool-use blocks are executor-recognized progress;
         # their contents are never copied into the liveness projection.
-        if data.get("type") == "assistant" and isinstance(data.get("message"), dict):
+        if (data.get("type") == "assistant"
+                and isinstance(data.get("message"), dict)
+                and self._declared_cli in (None, "claude")):
             message = data["message"]
             content = message.get("content")
             if isinstance(content, list):
@@ -425,7 +466,9 @@ class StreamProcessor:
                                                           index, block))
             return False
 
-        if data.get("type") == "user" and isinstance(data.get("message"), dict):
+        if (data.get("type") == "user"
+                and isinstance(data.get("message"), dict)
+                and self._declared_cli in (None, "claude")):
             content = data["message"].get("content")
             tool_results = [block for block in content if isinstance(block, dict)
                             and block.get("type") == "tool_result"] \
@@ -480,7 +523,8 @@ class StreamProcessor:
         # non-zero exit with no structured terminal result. Preserve bounded
         # provider detail as an error result so the executor can attach its
         # normal diagnostics while keeping model service evidence absent.
-        if data.get("type") == "turn.failed":
+        if (data.get("type") == "turn.failed"
+                and self._declared_cli in (None, "codex")):
             self.is_codex = True
             self.is_error = True
             detail = data.get("error")
@@ -514,13 +558,13 @@ class StreamProcessor:
         # result packet; a clean EOF is the terminal signal.  Capture model and
         # usage telemetry wherever a provider/part exposes it, without turning
         # the handshake into served-model evidence.
-        if data.get("type") in {
+        if (self._declared_cli in (None, "opencode") and data.get("type") in {
             "step_start", "text", "reasoning", "tool_use", "tool_result",
             "step_finish", "session_created", "message_updated",
             "session_updated", "opencode_part",
         } and (data.get("sessionID") or data.get("session_id")
                or data.get("part") is not None
-               or data.get("_summon_opencode_event")):
+               or data.get("_summon_opencode_event"))):
             self.is_opencode = True
             self.opencode_event_count += 1
             if data.get("type") == "step_finish":
@@ -549,7 +593,8 @@ class StreamProcessor:
                 self._liveness("stream_event", data)
             return False
 
-        if data.get("type") in {"error", "session_error", "message_error"}:
+        if (self._declared_cli in (None, "opencode")
+                and data.get("type") in {"error", "session_error", "message_error"}):
             self.is_opencode = True
             self.is_error = True
             self._capture_opencode_metadata(data)
@@ -568,7 +613,8 @@ class StreamProcessor:
         # makes the child look as if it completed after one sentence.  The
         # explicit part-type allowlist keeps cursor's typeless ``result``
         # objects terminal and avoids treating arbitrary JSON as OpenCode.
-        if ("type" not in data and "event" not in data
+        if (self._declared_cli in (None, "opencode")
+                and "type" not in data and "event" not in data
                 and (data.get("sessionID") or data.get("session_id"))
                 and isinstance(data.get("part"), dict)
                 and data["part"].get("type") in {
@@ -607,7 +653,8 @@ class StreamProcessor:
         # type-less-only guard missed the stream entirely. This branch comes
         # after OpenCode's recognized event shapes so an OpenCode part carrying
         # a role is still parsed as OpenCode.
-        if isinstance(data.get("role"), str) and not self.is_opencode:
+        if (self._declared_cli in (None, "kimi")
+                and isinstance(data.get("role"), str) and not self.is_opencode):
             self._capture_kimi_record(data)
             role = str(data.get("role") or "").strip().lower()
             if role == "assistant":
@@ -669,32 +716,47 @@ class StreamProcessor:
             return True
 
         # Result type signals completion
-        if data.get("type") == "result" or data.get("event") == "result":
+        if ((data.get("type") == "result"
+             and self._declared_cli in (None, "claude", "gemini", "cursor-agent"))
+                or (data.get("event") == "result"
+                    and self._declared_cli in (None, "agy"))):
             self._capture_telemetry(data)
             # agy's `result` event wraps terminal output under a `result`
             # object. The payload is intentionally similar to a terminal event:
             # `status` + `response` + `usage`, but keyed differently from
             # Claude/Gemini.
             payload = data.get("result")
-            if isinstance(payload, dict) and "response" in payload:
-                raw_status = payload.get("status")
-                if raw_status is None or (isinstance(raw_status, str) and not raw_status.strip()):
-                    status = "success"
-                elif isinstance(raw_status, str):
-                    status = raw_status.lower()
+            if (self._declared_cli is None and data.get("event") == "result"
+                    and isinstance(payload, dict)
+                    and ("status" in payload or "response" in payload)):
+                self.is_agy = True
+            if self.is_agy:
+                if isinstance(payload, dict) and (
+                        "status" in payload or "response" in payload):
+                    raw_status = payload.get("status")
+                    terminal_state, status = _agy_terminal_outcome(raw_status)
+                    response = payload.get("response")
+                    self._capture_telemetry(payload)
+                    error = payload.get("error")
                 else:
-                    status = str(raw_status).lower()
-                self.is_error = _terminal_is_error(payload)
+                    # Never pass an AGY-shaped provider object into the generic
+                    # result path: provider-authored `_summon_*` keys must not
+                    # impersonate parser integrity markers, and malformed
+                    # payloads must not inherit result-present success.
+                    terminal_state, status, response = "UNKNOWN", "error", ""
+                    error = payload.get("error") if isinstance(payload, dict) else None
+                self.is_error = status == "error"
                 self.result_json = {
                     "type": "result",
-                    "result": payload.get("response", ""),
-                    "status": "error" if self.is_error else status,
+                    "result": response if isinstance(response, str) else "",
+                    "status": status,
+                    # These keys exist only on this parser-authored object; raw
+                    # provider data never reaches this mapping unchanged.
+                    "_summon_provider_terminal_state": terminal_state,
+                    "_summon_terminal_outcome": status,
                 }
-                if raw_status is None or (isinstance(raw_status, str) and not raw_status.strip()):
-                    self.result_json["blank_status_fallback"] = True
-                self._capture_telemetry(payload)
-                if payload.get("error"):
-                    self.result_json["error"] = payload.get("error")
+                if error:
+                    self.result_json["error"] = error
                 self._liveness("terminal", data)
                 return True
             # A terminal result can itself report failure: claude sets is_error /
@@ -723,7 +785,18 @@ class StreamProcessor:
         # must not treat any event-bearing packet as completion.
         if "type" not in data and "event" not in data:
             self._capture_telemetry(data)
-            self.result_json = data
+            if self.is_agy:
+                # Type-less objects are not an AGY terminal protocol shape.
+                # Fail closed and mint integrity markers here rather than
+                # accepting provider-authored `_summon_*` keys verbatim.
+                self.is_error = True
+                self.result_json = {
+                    "type": "result", "result": "", "status": "error",
+                    "_summon_provider_terminal_state": "UNKNOWN",
+                    "_summon_terminal_outcome": "error",
+                }
+            else:
+                self.result_json = data
             self._liveness("terminal", data)
             return True
 
@@ -1024,6 +1097,13 @@ class StreamProcessor:
 
     def finalize_stream(self) -> None:
         """Finish protocols whose success is defined by clean EOF, not an event."""
+        if self.result_json is None and self.is_agy:
+            self.is_error = True
+            self.result_json = {
+                "type": "result", "result": "", "status": "error",
+                "_summon_provider_terminal_state": "UNKNOWN",
+                "_summon_terminal_outcome": "error",
+            }
         if self.result_json is None and self.is_kimi:
             self.result_json = {
                 "type": "result",

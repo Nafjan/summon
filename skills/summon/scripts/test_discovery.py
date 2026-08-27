@@ -2747,7 +2747,11 @@ def test_stream_parses_agy_stream_json_result_payload():
     sp.process_line('{"event":"result","result":{"conversation_id":"123","status":"SUCCESS",'
                    '"response":"hello\\n","usage":{"input_tokens":1,"output_tokens":2}}}')
     out = sp.get_result()
-    assert out == {"type": "result", "result": "hello\n", "status": "success"}, out
+    assert out == {
+        "type": "result", "result": "hello\n", "status": "success",
+        "_summon_provider_terminal_state": "SUCCESS",
+        "_summon_terminal_outcome": "success",
+    }, out
     assert sp.usage == {"input_tokens": 1, "output_tokens": 2}
 
 

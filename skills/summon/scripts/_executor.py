@@ -244,7 +244,7 @@ from _builder import (AgentInvocation, BACKENDS, advisory_warnings,
                       model_backend_compatibility,
                       credit_spend_allowed, infer_dispatch_billing, permission_flags,
                       selects_credit_only)
-from _stream import StreamProcessor, _terminal_is_error
+from _stream import StreamProcessor, _agy_terminal_outcome, _terminal_is_error
 
 # SIGTERM, as Popen reports it (-15) and as a shell wrapper reports it (128+15).
 _SIGTERM_EXIT_CODES = (143, -15)
@@ -2583,6 +2583,8 @@ def build_final_response(
     result: dict | None,
     stdout_lines: list,
     stderr: str,
+    *,
+    allow_plain_output: bool = True,
 ) -> dict:
     """Assemble the response dict from process exit state and parsed result.
 
@@ -2597,8 +2599,28 @@ def build_final_response(
     # failure would be mislabelled success).
     if cli == "kimi" and exit_code != 0:
         result = None
-    result_errored = bool(result) and _terminal_is_error(result)
-    if result and not result_errored:
+    agy_terminal = None
+    if cli == "agy" and isinstance(result, dict):
+        if ("_summon_provider_terminal_state" in result
+                or "_summon_terminal_outcome" in result):
+            provider_state, expected_outcome = _agy_terminal_outcome(
+                result.get("_summon_provider_terminal_state"))
+            if result.get("_summon_terminal_outcome") != expected_outcome:
+                provider_state, expected_outcome = "UNKNOWN", "error"
+        else:
+            # Defense in depth: an AGY parsed result without the parser-authored
+            # integrity pair is never a generic clean terminal event.
+            provider_state, expected_outcome = "UNKNOWN", "error"
+        agy_terminal = (provider_state, expected_outcome)
+    result_errored = (bool(result) and _terminal_is_error(result)) or (
+        agy_terminal is not None and agy_terminal[1] == "error")
+    if agy_terminal is not None:
+        provider_state, status = agy_terminal
+        norm_reason = (
+            f"AGY terminal event reported {provider_state}; normalized to {status} "
+            f"(raw backend exit {exit_code})"
+        )
+    elif result and not result_errored:
         # Terminal event parsed AND it did not self-report an error -> task
         # completed. A non-zero exit (e.g. from terminate() of a Windows .cmd
         # shim after we got the result) is not a failure.
@@ -2613,11 +2635,13 @@ def build_final_response(
         # otherwise a model/API error would leak through as a false success.
         status = "error"
         norm_reason = "backend terminal event self-reported an error"
-    elif exit_code == 0 and "".join(stdout_lines).strip():
+    elif (allow_plain_output and exit_code == 0
+          and "".join(stdout_lines).strip()):
         # Plain-text backend that exited cleanly WITH output (no parsed terminal event).
         status = "success"
         norm_reason = "clean exit with output, no terminal event to parse"
-    elif exit_code in _SIGTERM_EXIT_CODES and "".join(stdout_lines).strip():
+    elif (allow_plain_output and exit_code in _SIGTERM_EXIT_CODES
+          and "".join(stdout_lines).strip()):
         # SIGTERM but NO terminal event, so this is not our own post-result terminate() (that
         # path lands on the first branch, which has a result). Something OUTSIDE killed the run
         # -- a host-tool timeout, a CI cancel, docker stop -- and the output is whatever the
@@ -2674,6 +2698,13 @@ def build_final_response(
         "normalized_exit_code": _normalized_exit_code(status, exit_code),
         "normalization_reason": norm_reason,
     }
+    if agy_terminal is not None:
+        response["provider_terminal_state"] = agy_terminal[0]
+        response["provider_terminal_outcome"] = agy_terminal[1]
+        if status == "blocked":
+            response["error_kind"] = "provider_cancelled"
+        elif status == "partial":
+            response["error_kind"] = "provider_incomplete"
     if tool_failure is not None:
         response["tool_failure"] = tool_failure
     if status == "error":
@@ -2971,7 +3002,7 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
         finalization_ms=finalization_ms or min(hard_budget_ms, 120_000),
     )
     emitter = tracker.emitter()
-    processor = StreamProcessor(event_observer=emitter)
+    processor = StreamProcessor(event_observer=emitter, cli=cli)
     try:
         from _stream_partials import emit_partial as _emit_partial
         _emit_partial("started", cli=cli, message="subprocess started")
@@ -3028,9 +3059,11 @@ def _drive_process_loop(
         _kill_tree(process)
         _drain_to_eof(line_q)
         _, stderr = _safe_communicate(process)
-        processor.finalize_stream()
+        if parse_stream:
+            processor.finalize_stream()
         response = build_final_response(
-            cli, process.returncode, processor.get_result(), stdout_lines, stderr)
+            cli, process.returncode, processor.get_result(), stdout_lines, stderr,
+            allow_plain_output=not parse_stream)
         response["cleanup"] = {
             "forced": True,
             "stage": stage,
@@ -3293,9 +3326,15 @@ def _drive_process_loop(
 
         _, stderr = _safe_communicate(process)
 
-        processor.finalize_stream()
+        # Legacy/custom AGY wrappers return a plain terminal scrape. They never
+        # emit Summon's authenticated stream dialect, so finalizing an empty
+        # StreamProcessor here would manufacture UNKNOWN/error and discard a
+        # perfectly valid clean plain-text result.
+        if parse_stream:
+            processor.finalize_stream()
         return build_final_response(
-            cli, process.returncode, processor.get_result(), stdout_lines, stderr
+            cli, process.returncode, processor.get_result(), stdout_lines, stderr,
+            allow_plain_output=not parse_stream,
         )
     except KeyboardInterrupt:
         # start_new_session detaches the child from the terminal's signal group,

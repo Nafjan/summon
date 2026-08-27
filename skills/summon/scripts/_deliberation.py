@@ -1267,7 +1267,8 @@ class DeliberationEngine:
         # over a model ballot that has not yet been durably accepted.
         cancel_before_finish = self._cancel_requested_safely()
         ballot = None
-        if (not cancel_before_finish and result.evidence.parser_valid and
+        if (not cancel_before_finish and result.evidence.transport_ok
+                and not result.evidence.timed_out and result.evidence.parser_valid and
                 isinstance(result.structured_output, Mapping)):
             ballot = validate_ballot(result.structured_output.get("ballot"), binding, self.policy)
         try:

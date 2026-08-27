@@ -292,10 +292,20 @@ class LiveIntegrationTests(unittest.TestCase):
         import _executor
 
         def fake_build(_invocation, _timeout_ms=None, *, resource_register=None):
+            ballot = json.dumps({
+                "ballot": {"decision": "vote", "option_id": "yes"},
+            })
+            terminal = json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": ballot,
+                "session_id": "fixture-session",
+            })
             script = (
                 "from pathlib import Path; "
                 f"Path({str(marker)!r}).open('a', encoding='ascii').write('child\\n'); "
-                "print('STATUS: DONE\\nSUMMARY: fake\\nFOLLOW-UP: none\\nHANDOFF: none')"
+                f"print({terminal!r})"
             )
             return sys.executable, ["-c", script], None
 

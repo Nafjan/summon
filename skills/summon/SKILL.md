@@ -463,6 +463,9 @@ longer than this child timeout so Summon can clean up and write its result envel
 | `usage import --from FILE [--cache FILE] [--json]` | - | Validate and atomically store an operator-exported, redacted usage snapshot. Unknown fields and provider-attestation claims are rejected; unlike usage dimensions remain incomparable. Observation/retrieval times may lead the local clock by at most 5 minutes; the editable cache is revalidated on every read |
 | `usage refresh --providers codex --allow-account-usage-read [--dry-run] [--live-store FILE] [--json]` | - | Run one explicit bounded account-usage read through the fixture-pinned Codex adapter. The complete provider set is preflighted before contact. It never logs in, repairs auth, dispatches a model, retries, falls back, or changes routing. AGY and ArkCLI remain visible as `schema_unverified` until version-pinned structured fixtures are reviewed |
 | `usage export --out FILE [--cache FILE] [--live-store FILE]` / `usage example --out FILE` | - | Write a new, redacted portable `summon.usage/v1` snapshot or deterministic synthetic example. Existing/symlinked targets are refused. Export drops local account-scope evidence and deliberately downgrades provenance to `operator_export` |
+| `result project --kind dispatch\|job --from PRIVATE.json --repo-root DIR [--out FILE] [--json]` | - | Derive an experimental redacted compatibility receipt without provider contact. Dispatch binds the exact private bytes. Job additionally requires a trusted terminal result authenticated by its private launch record. Output omits prompts, response prose, transcripts, sessions, account facts, raw errors, and local paths; existing outputs are never replaced |
+| `result validate PORTABLE.json [--json]` | - | Strictly validate schema, digest, no-contact, model-proof, artifact-digest/path-absence, and privacy invariants. Validation grants no execution or routing authority |
+| `result consume PORTABLE.json --adapter reference [--json]` | - | Exercise the bundled authority-free reference consumer. Chat, council, deliberate, and swarm currently return typed provider-inert refusals because their records cannot truthfully be flattened into one dispatch/model receipt |
 | `--usage-action` / `--usage-from` / `--usage-cache` / `--usage-live-store` / `--usage-providers` | No | Flat equivalents for usage subcommands. `--usage-cache FILE` and `--usage-live-store FILE` may accompany a dispatch `--dry-run` to add only redacted freshness/dimension counts to `effective_decision`; they never change the exact seat. A live-store read may advance its authenticated local anti-rollback checkpoint as described above |
 | `--allow-account-usage-read` | No | Explicit consent for one `usage refresh` account-status query. Invalid anywhere else; it authorizes no model call, login, retry, credit use, PAYG, or route change |
 | `fleet propose LANE --seats A,B [--out FILE]` | - | Create a sealed `summon.fleet/v1` draft and return a provider-inert compiled projection bound to the current project directory object and sanitized roster catalog. `--out` writes only the draft and refuses to replace an existing file. Policy flags declare constraints only; they are never approval or spend consent |
@@ -1193,6 +1196,10 @@ Caveats worth knowing:
   and nested AGY process uses `CREATE_NO_WINDOW` plus `STARTUPINFO(SW_HIDE)`. A vendor CLI
   or custom wrapper that explicitly creates its own GUI window is outside this launch
   boundary; the built-in AGY stream proxy stays on the hidden subprocess path.
+- **AGY seats require AGY 1.1.22 or newer.** Before profile creation or provider contact,
+  Summon performs a bounded `agy --help` capability check for `--print-timeout`; it fails
+  with an upgrade instruction when the installed CLI cannot share Summon's adaptive hard
+  budget.
 - **Caller checklist when a popup persists:** have the calling agent invoke Summon directly,
   not through `Start-Process`, `cmd /c start`, or a custom PTY/window launcher. Leave
   `AGY_PTY_WRAPPER` unset so the bundled `agy_stream_proxy.py` is selected; if a custom

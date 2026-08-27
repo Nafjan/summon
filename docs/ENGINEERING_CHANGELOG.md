@@ -13,6 +13,29 @@ never on added fields.
 
 ## Unreleased
 
+- **M7 portable dispatch/job projection:** an experimental, provider-inert result kernel
+  projects only allowlisted execution, contact, model-proof, artifact, and digest facts
+  from exact private receipt bytes. Dispatch inputs require an exact byte digest; job inputs
+  additionally authenticate the private launch record and terminal nonce/scripts binding.
+  Artifact entries are digest-addressed and omit mutable local path locators; verified nested
+  locators remain deferred until platform-specific handle-relative traversal can close
+  ancestor-substitution races. The no-clobber writer retains file descriptors, verifies
+  content and inode identity, and refuses unsafe cleanup after a link-stage race. A strict reference
+  consumer grants no authority. Surfaces without one equivalent authenticated terminal
+  source remain typed refusals rather than being flattened into false provider/model facts.
+- **AGY 1.1.22 terminal/budget normalization:** the stream parser and executor now carry
+  a bounded provider terminal state through normalization, including response-less terminal
+  errors. The builder makes Summon's remaining hard runtime the sole AGY print timeout and
+  both builder and proxy strip double- and single-dash caller overrides before the prompt.
+  Provider-inert tests cover 10-minute, adaptive-extension, malformed-state, cancellation,
+  partial-state, response-less, Windows-proxy, and prompt-boundary cases. Parser integrity
+  markers are never accepted from raw provider data. Owner-only AGY credential profiles
+  retain the adaptive hard deadline for live work while a dead owner's orphan lifetime is
+  capped and reaped through an OS-held host lease on the next cleanup pass;
+  child-writable profile markers and reusable PIDs cannot extend that cap or forge a
+  live-owner exemption because the lease also binds the owner's OS process-birth identity.
+  A taken-over lease cannot exceed its independent hard cap, while a proven live owner can
+  outlast the orphan cap without shortening an explicitly longer adaptive runtime.
 - **Dispatch-integrated safe context and namespace-bound freshness:** M5 now crosses the
   real provider boundary only after a provider-inert typed-context compile. The input
   file is a bounded stable regular-file read under the effective local read roots;

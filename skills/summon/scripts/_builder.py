@@ -19,6 +19,8 @@ import tempfile
 import time
 import threading
 import hashlib
+import math
+import secrets
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -534,7 +536,10 @@ _BOUNDARY_FLAGS = {
               "--full-auto", "--yolo"),
     "cursor-agent": ("--mode", "--trust", "-f", "--force"),
     "gemini": ("--approval-mode", "-y", "--yolo", "--include-directories"),
-    "agy": ("--add-dir", "--mode", "--sandbox", "--dangerously-skip-permissions", "--yolo"),
+    "agy": ("--add-dir", "--mode", "--sandbox", "--dangerously-skip-permissions", "--yolo",
+            "--print-timeout", "--agent", "--project", "--log-file", "--output-file",
+            "--conversation", "--continue-id", "--resume", "--continue", "--new-project",
+            "--output-format", "--output", "--of"),
     "kimi": ("--auto", "--yolo", "--plan", "--session", "-S", "--continue", "-c",
              "--agent", "--agent-file", "--add-dir", "--skills-dir"),
     # OpenCode can change model, session, working directory, agent, output
@@ -547,7 +552,10 @@ _BOUNDARY_FLAGS = {
 # too, or the bare value becomes a stray positional argument.
 _BOUNDARY_TAKES_VALUE = {"--permission-mode", "-s", "--sandbox", "--mode", "--approval-mode",
                          "--add-dir", "--include-directories", "--session", "-S", "--agent", "--agent-file", "--skills-dir",
-                         "--model", "-m", "--dir", "--format", "--variant"}
+                         "--model", "-m", "--dir", "--format", "--variant",
+                         "--print-timeout", "--agent", "--project", "--log-file",
+                         "--output-file", "--conversation", "--continue-id",
+                         "--output-format", "--output", "--of"}
 # codex configures approval policy through `-c key=value`, so the KEY decides, not the flag.
 _CODEX_CONFIG_KEYS = ("approval_policy", "sandbox_mode", "sandbox_permissions")
 
@@ -1929,6 +1937,306 @@ def _reject_oversized_agy_prompt(prompt: str) -> None:
             "agent definition or task prompt, or write the material to a file under --cwd "
             "and ask the agent to READ it.")
 _AGY_RUN_TTL_SEC = 900   # don't clean run dirs younger than this (may be in use)
+_AGY_ORPHAN_RETENTION_SEC = 24 * 60 * 60
+_AGY_OWNER_PID_FILE = ".summon_owner_pid"
+_AGY_PRINT_TIMEOUT_CAPABILITY: dict[tuple[str, int | None], bool] = {}
+_AGY_PROFILE_LEASES: dict[str, tuple[object, str]] = {}
+_AGY_LEASE_LOCK_OFFSET = 4096
+_AGY_LEASE_SCHEMA = "summon.agy-profile-lease/v2"
+
+
+def _agy_profile_retention_sec(deadline_sec: float) -> float:
+    """Bound a dead owner's credential-copy retention without limiting runtime."""
+    return min(_AGY_ORPHAN_RETENTION_SEC,
+               max(_AGY_RUN_TTL_SEC, deadline_sec * 2 + 300))
+
+
+def _agy_lease_token_from_run_name(name: str) -> str | None:
+    """Read the host-created lease token from a current run name."""
+    if not name.startswith("run-"):
+        return None
+    parts = name.split("-", 3)
+    if (len(parts) != 4 or not parts[1].isascii() or not parts[1].isdecimal()
+            or int(parts[1]) <= 0 or len(parts[2]) != 32
+            or any(char not in "0123456789abcdef" for char in parts[2])):
+        return None
+    return parts[2]
+
+
+def _agy_lock_lease(handle, *, blocking: bool) -> None:
+    # Keep the Windows byte-range lock outside the bounded metadata region so
+    # an independent cleanup process can authenticate the live owner while the
+    # lease is held. POSIX flock ignores the current file offset.
+    handle.seek(_AGY_LEASE_LOCK_OFFSET)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(
+            handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(
+            handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+
+
+def _agy_unlock_lease(handle) -> None:
+    handle.seek(_AGY_LEASE_LOCK_OFFSET)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _agy_lease_state(path: str) -> str:
+    """Return held, free, missing, or unknown for a host-side run lease."""
+    try:
+        handle = open(path, "r+b")
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unknown"
+    try:
+        try:
+            _agy_lock_lease(handle, blocking=False)
+        except (BlockingIOError, OSError):
+            return "held"
+        try:
+            _agy_unlock_lease(handle)
+        except OSError:
+            return "unknown"
+        return "free"
+    finally:
+        handle.close()
+
+
+def _agy_lease_token(metadata: dict) -> str:
+    canonical = json.dumps(
+        metadata, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("ascii")
+    return hashlib.sha256(b"summon-agy-profile-lease-v2\0" + canonical).hexdigest()[:32]
+
+
+def _agy_private_lease_path(path: str) -> str:
+    """Return the unpublished hard-link name used while acquiring a lease."""
+    token = os.path.splitext(os.path.basename(path))[0]
+    return os.path.join(os.path.dirname(path), f".{token}.publishing")
+
+
+def _agy_unlink_lease_names(path: str) -> bool:
+    """Remove both names for a released lease; report whether both are gone."""
+    private_path = _agy_private_lease_path(path)
+    for candidate in (path, private_path):
+        try:
+            os.unlink(candidate)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            continue
+    return not os.path.lexists(path) and not os.path.lexists(private_path)
+
+
+def _agy_create_profile_lease(
+        runs_dir: str, expires_at: float) -> tuple[object, str, str]:
+    lease_dir = os.path.join(runs_dir, ".summon-leases")
+    os.makedirs(lease_dir, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(lease_dir, 0o700)
+    if not math.isfinite(expires_at):
+        raise ValueError("agy lease expiry is invalid")
+    metadata = {
+        "schema": _AGY_LEASE_SCHEMA,
+        "expires_at": expires_at,
+        "owner_pid": os.getpid(),
+        "owner_birth": _agy_process_birth_token(os.getpid()),
+        "nonce": secrets.token_hex(32),
+    }
+    token = _agy_lease_token(metadata)
+    path = os.path.join(lease_dir, f"{token}.lock")
+    private_path = _agy_private_lease_path(path)
+    # Acquire and populate a private inode first. The public .lock pathname is
+    # created only by a same-directory hard link after the OS lock is held, so
+    # an orphan scan can never observe the published lease as free.
+    handle = open(private_path, "x+b")
+    try:
+        _agy_lock_lease(handle, blocking=False)
+        handle.seek(0)
+        handle.write((json.dumps(
+            metadata, sort_keys=True, separators=(",", ":"),
+            allow_nan=False) + "\n").encode("ascii"))
+        handle.flush()
+        os.fsync(handle.fileno())
+        os.link(private_path, path)
+        return handle, path, token
+    except Exception:
+        try:
+            _agy_unlock_lease(handle)
+        except OSError:
+            pass
+        handle.close()
+        _agy_unlink_lease_names(path)
+        raise
+
+
+def _agy_posix_process_birth_token(pid: int) -> str | None:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = raw.rsplit(")", 1)[1].strip().split()
+        if len(fields) > 19:
+            return f"proc:{fields[19]}"
+    except (OSError, UnicodeError, IndexError):
+        pass
+    # macOS/BSD have no /proc start-time field. Their native ps exposes a
+    # stable process start record; hash its bounded C-locale text so lease
+    # metadata remains compact and contains no host-specific display text.
+    ps_path = next((candidate for candidate in ("/bin/ps", "/usr/bin/ps")
+                    if os.path.isfile(candidate)), None)
+    if ps_path is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [ps_path, "-o", "lstart=", "-p", str(pid)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+            errors="replace", timeout=2.0, check=False,
+            env={**os.environ, "LC_ALL": "C"}, **run_flags())
+        started = completed.stdout.strip()
+        if completed.returncode == 0 and 1 <= len(started) <= 128 \
+                and "\n" not in started and "\r" not in started:
+            return "ps:" + hashlib.sha256(started.encode("utf-8")).hexdigest()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _agy_process_birth_token(pid: int) -> str | None:
+    """Return an OS process-birth identity; a PID alone is not liveness proof."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return None
+            class _FileTime(ctypes.Structure):
+                _fields_ = [("low", ctypes.c_ulong), ("high", ctypes.c_ulong)]
+            created, exited, kernel, user = (_FileTime() for _ in range(4))
+            try:
+                if not kernel32.GetProcessTimes(
+                        handle, ctypes.byref(created), ctypes.byref(exited),
+                        ctypes.byref(kernel), ctypes.byref(user)):
+                    return None
+                return f"win:{(int(created.high) << 32) | int(created.low)}"
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 - unavailable identity fails closed
+            return None
+    return _agy_posix_process_birth_token(pid)
+
+
+def _agy_lease_metadata(path: str) -> dict | None:
+    try:
+        # Use an unbuffered bounded read on Windows: a buffered reader may
+        # prefetch through the independently locked byte and fail the entire
+        # metadata read even though the metadata range itself is unlocked.
+        with open(path, "rb", buffering=0) as handle:
+            raw = handle.read(1025).partition(b"\n")[0]
+        if len(raw) > 1024:
+            return None
+        value = json.loads(raw.decode("ascii"))
+        if (not isinstance(value, dict)
+                or set(value) != {
+                    "schema", "expires_at", "owner_pid", "owner_birth", "nonce"}
+                or value.get("schema") != _AGY_LEASE_SCHEMA):
+            return None
+        expires = float(value.get("expires_at"))
+        pid = value.get("owner_pid")
+        birth = value.get("owner_birth")
+        nonce = value.get("nonce")
+        if (not math.isfinite(expires) or isinstance(pid, bool)
+                or not isinstance(pid, int) or pid <= 0
+                or birth is not None and not isinstance(birth, str)
+                or not isinstance(nonce, str) or len(nonce) != 64
+                or any(char not in "0123456789abcdef" for char in nonce)):
+            return None
+        expected_token = os.path.splitext(os.path.basename(path))[0]
+        if (len(expected_token) != 32
+                or not secrets.compare_digest(
+                    expected_token, _agy_lease_token(value))):
+            return None
+        return {"expires_at": min(
+                    expires, os.path.getctime(path) + _AGY_ORPHAN_RETENTION_SEC),
+                "owner_pid": pid, "owner_birth": birth}
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _agy_lease_expiry_cap(path: str) -> float | None:
+    metadata = _agy_lease_metadata(path)
+    return metadata["expires_at"] if metadata is not None else None
+
+
+def _agy_lease_owner_live(path: str) -> bool:
+    metadata = _agy_lease_metadata(path)
+    if metadata is None or not metadata.get("owner_birth"):
+        return False
+    return (_agy_process_birth_token(metadata["owner_pid"])
+            == metadata["owner_birth"])
+
+
+def _agy_release_profile_lease(profile: str) -> bool:
+    lease = _AGY_PROFILE_LEASES.pop(os.path.realpath(profile), None)
+    if lease is None:
+        return True
+    handle, path = lease
+    try:
+        _agy_unlock_lease(handle)
+    except OSError:
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
+    return _agy_unlink_lease_names(path)
+
+
+def _require_agy_print_timeout_support() -> None:
+    """Fail before profile creation when AGY lacks the bounded-print contract."""
+    path = shutil.which("agy")
+    if not path and os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        fallback = (os.path.join(local_app_data, "agy", "bin", "agy.exe")
+                    if local_app_data else None)
+        if fallback and os.path.isfile(fallback):
+            path = fallback
+    if not path:
+        raise ValueError("agy executable not found; install AGY 1.1.22 or newer")
+    try:
+        identity = (os.path.realpath(path), os.stat(path).st_mtime_ns)
+    except OSError:
+        identity = (os.path.realpath(path), None)
+    supported = _AGY_PRINT_TIMEOUT_CAPABILITY.get(identity)
+    if supported is None:
+        command = [path, "--help"]
+        if os.name == "nt" and path.lower().endswith((".cmd", ".bat")):
+            command = ["cmd", "/d", "/c", path, "--help"]
+        try:
+            from _spawn import run_flags
+            completed = subprocess.run(
+                command, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=20, stdin=subprocess.DEVNULL,
+                **run_flags())
+            help_text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+            supported = completed.returncode == 0 and "--print-timeout" in help_text
+        except (OSError, ValueError, subprocess.SubprocessError):
+            supported = False
+        _AGY_PRINT_TIMEOUT_CAPABILITY[identity] = supported
+    if not supported:
+        raise ValueError(
+            "agy does not expose --print-timeout; install AGY 1.1.22 or newer "
+            "before dispatch so Summon can enforce the adaptive hard budget")
 
 
 def _has_pty_modules(python: str) -> bool:
@@ -2025,12 +2333,11 @@ def _agy_wrapper() -> str:
 def _agy_cleanup_old_runs(runs_dir: str, deadline_sec: float | None = None) -> None:
     """Best-effort removal of prior per-invocation profiles.
 
-    Each profile carries a ``.summon_expiry`` timestamp (its OWN deadline +
-    sidecar margin); a dir is reaped only once past its own expiry, so a SHORT
-    call's cleanup can't delete a concurrent LONG call's still-valid profile.
-    Dirs without a marker (legacy/partial) fall back to mtime + a TTL sized by
-    this call's deadline. Correctness never depends on this — every run uses a
-    brand-new dir regardless of whether old ones were cleaned.
+    Each current profile has a bounded orphan-expiry timestamp plus an OS-held
+    lease outside provider HOME. A held lease preserves a concurrent long call
+    until its independently recorded hard cap; lease takeover cannot retain an
+    orphan forever. An unlocked owner becomes eligible after the earlier expiry.
+    Legacy/partial dirs fall back to the same bounded TTL. Every run is fresh.
     """
     try:
         names = os.listdir(runs_dir)
@@ -2041,25 +2348,80 @@ def _agy_cleanup_old_runs(runs_dir: str, deadline_sec: float | None = None) -> N
             deadline_sec = float(os.environ.get("AGY_PTY_DEADLINE", "300"))
         except ValueError:
             deadline_sec = 300.0
-    ttl = max(_AGY_RUN_TTL_SEC, deadline_sec * 2 + 300)
+    ttl = _agy_profile_retention_sec(deadline_sec)
     now = time.time()
-    cutoff = now - ttl
+    profile_tokens = {
+        token for token in (_agy_lease_token_from_run_name(name) for name in names)
+        if token is not None
+    }
     for name in names:
         p = os.path.join(runs_dir, name)
         try:
+            if name == ".summon-leases":
+                continue
             if not os.path.isdir(p):
                 continue
-            # Honor the dir's OWN expiry marker if present (concurrency-safe).
+            # A live owner may legitimately outlast the bounded orphan TTL. An
+            # OS lock outside provider HOME is the authority; neither a
+            # child-writable marker nor a recycled PID can grant the exemption.
+            token = _agy_lease_token_from_run_name(name)
+            lease_path = (os.path.join(runs_dir, ".summon-leases", f"{token}.lock")
+                          if token is not None else None)
+            lease_state = _agy_lease_state(lease_path) if lease_path else "missing"
+            expiry_cap = (_agy_lease_expiry_cap(lease_path)
+                          if lease_path is not None else None)
+            if expiry_cap is None:
+                expiry_cap = os.path.getctime(p) + _AGY_ORPHAN_RETENTION_SEC
+            if lease_state == "held" and (
+                    _agy_lease_owner_live(lease_path) or now < expiry_cap):
+                continue
+
+            # The child-writable expiry may request earlier cleanup but can
+            # never extend retention past the host-side lease cap.
             try:
                 with open(os.path.join(p, ".summon_expiry"), encoding="utf-8") as _fh:
-                    if now < float(_fh.read().strip()):
-                        continue  # still within its own validity window
+                    raw_expiry = _fh.read(129)
+                if len(raw_expiry) > 128:
+                    raise ValueError("oversized expiry marker")
+                expires = float(raw_expiry.strip())
+                if not math.isfinite(expires):
+                    expires = expiry_cap
             except (OSError, ValueError):
-                pass
-            if os.path.getmtime(p) < cutoff:
-                shutil.rmtree(p, ignore_errors=True)
+                expires = min(expiry_cap, os.path.getmtime(p) + ttl)
+            if now < min(expires, expiry_cap):
+                continue
+            shutil.rmtree(p, ignore_errors=True)
+            if lease_path and lease_state == "free":
+                _agy_unlink_lease_names(lease_path)
         except OSError:
             pass
+    # A normal controlled-resource cleanup can remove the profile before this
+    # dispatcher exits. Reap only unlocked orphan leases; a creation race keeps
+    # its lease held before the profile directory is published.
+    lease_dir = os.path.join(runs_dir, ".summon-leases")
+    try:
+        lease_names = os.listdir(lease_dir)
+    except OSError:
+        lease_names = []
+    for lease_name in lease_names:
+        if lease_name.startswith(".") and lease_name.endswith(".publishing"):
+            token = lease_name[1:-len(".publishing")]
+            if (len(token) == 32
+                    and not any(char not in "0123456789abcdef" for char in token)):
+                private_path = os.path.join(lease_dir, lease_name)
+                if _agy_lease_state(private_path) == "free":
+                    _agy_unlink_lease_names(
+                        os.path.join(lease_dir, f"{token}.lock"))
+            continue
+        token, suffix = os.path.splitext(lease_name)
+        if (suffix != ".lock" or len(token) != 32
+                or any(char not in "0123456789abcdef" for char in token)):
+            continue
+        if token in profile_tokens:
+            continue
+        lease_path = os.path.join(lease_dir, lease_name)
+        if _agy_lease_state(lease_path) == "free":
+            _agy_unlink_lease_names(lease_path)
 
 
 def _agy_lock_down(prof: str) -> None:
@@ -2198,18 +2560,36 @@ def _ensure_agy_profile(cwd: str, deadline_sec: float = 300.0) -> str:
     os.makedirs(runs, exist_ok=True)
     _agy_cleanup_old_runs(runs, deadline_sec)
 
-    # mkdtemp gives an ATOMICALLY-unique dir (no <pid>-<ms> collision when two
-    # same-process calls land in the same millisecond).
-    prof = tempfile.mkdtemp(prefix="run-", dir=runs)
-    # Self-describe when THIS profile becomes safe to reap (own deadline + sidecar
-    # margin). A concurrent SHORT call's cleanup reads this and leaves a long
-    # call's still-valid profile alone — the reaping no longer depends on the
-    # cleaner's own deadline.
+    # The lease is outside provider HOME and stays locked by this dispatcher.
+    # OS lock release, not a child-writable PID file, proves owner death.
+    lease_handle = None
+    lease_path = None
+    try:
+        lease_handle, lease_path, token = _agy_create_profile_lease(
+            runs, time.time() + _agy_profile_retention_sec(deadline_sec))
+        prof = tempfile.mkdtemp(prefix=f"run-{os.getpid()}-{token}-", dir=runs)
+        _AGY_PROFILE_LEASES[os.path.realpath(prof)] = (lease_handle, lease_path)
+    except (OSError, ValueError) as exc:
+        if lease_handle is not None:
+            try:
+                _agy_unlock_lease(lease_handle)
+            except OSError:
+                pass
+            lease_handle.close()
+        if lease_path:
+            _agy_unlink_lease_names(lease_path)
+        raise ValueError("agy profile: failed to create host lifecycle lease") from exc
+    # The bounded timestamp controls dead-owner retention only. A held lease
+    # preserves a legitimate adaptive job even when it outlives that timestamp.
     try:
         with open(os.path.join(prof, ".summon_expiry"), "w", encoding="utf-8") as _fh:
-            _fh.write(repr(time.time() + deadline_sec * 2 + 300))
-    except OSError:
-        pass
+            _fh.write(repr(time.time() + _agy_profile_retention_sec(deadline_sec)))
+        with open(os.path.join(prof, _AGY_OWNER_PID_FILE), "w", encoding="utf-8") as _fh:
+            _fh.write(str(os.getpid()))
+    except OSError as exc:
+        _agy_release_profile_lease(prof)
+        shutil.rmtree(prof, ignore_errors=True)
+        raise ValueError("agy profile: failed to record bounded owner lifecycle") from exc
     try:
         g = os.path.join(prof, ".gemini")
         acli = os.path.join(g, "antigravity-cli")
@@ -2247,11 +2627,13 @@ def _ensure_agy_profile(cwd: str, deadline_sec: float = 300.0) -> str:
             os.chmod(os.path.join(g, "settings.json"), 0o600)
             os.chmod(os.path.join(acli, "settings.json"), 0o600)
     except ValueError:
+        _agy_release_profile_lease(prof)
         shutil.rmtree(prof, ignore_errors=True)  # never leave a partial profile
         raise
     except OSError as e:
         # Convert raw FS/icacls errors to ValueError so the broker returns a
         # clean JSON error instead of crashing (run_subagent catches ValueError).
+        _agy_release_profile_lease(prof)
         shutil.rmtree(prof, ignore_errors=True)
         raise ValueError(f"agy profile: build failed: {type(e).__name__}: {e}") from e
     return prof
@@ -2665,12 +3047,23 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
     # floor to int — keep sub-second precision), else the env/default. Used both
     # for the wrapper (AGY_PTY_DEADLINE) and for sizing the profile-TTL cleanup.
     if timeout_ms:
-        deadline_sec = max(1.0, timeout_ms / 1000)
+        requested_timeout_ms = max(1, int(timeout_ms))
     else:
         try:
-            deadline_sec = float(os.environ.get("AGY_PTY_DEADLINE", "300"))
+            requested_timeout_ms = max(
+                1, int(float(os.environ.get("AGY_PTY_DEADLINE", "300")) * 1000))
         except ValueError:
-            deadline_sec = 300.0
+            requested_timeout_ms = 300_000
+    internal_timeout_ms = requested_timeout_ms
+    if os.environ.get("SUMMON_ADAPTIVE_TIMEOUT") == "1":
+        from _job_control import environment_job_budget
+        budget = environment_job_budget(requested_timeout_ms)
+        internal_timeout_ms = (budget["remaining_ms"]
+                               if budget["remaining_ms"] is not None
+                               else budget["max_runtime_ms"])
+        internal_timeout_ms = max(1, int(internal_timeout_ms))
+    deadline_sec = internal_timeout_ms / 1000
+    _require_agy_print_timeout_support()
     wrapper = _agy_wrapper()  # FIRST: fails fast on POSIX before any profile is built
     perm = permission_flags(inv.cli, inv.permission)  # --dangerously-skip-permissions
     # Optional model pin from agent frontmatter (`model:`). agy accepts display
@@ -2711,6 +3104,7 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
             try:
                 resource_register(profile, "agy-profile")
             except Exception as exc:  # noqa: BLE001 - never orphan copied credentials
+                _agy_release_profile_lease(profile)
                 shutil.rmtree(profile, ignore_errors=True)
                 raise ValueError("agy profile: controlled cleanup registration failed") from exc
         _attest_agy_profile(profile, getattr(inv, "agy_account_sha256", None),
@@ -2742,7 +3136,13 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
     # permission mapping advisory against the roster. Drop only the flags that move the
     # boundary, so ordinary passthrough args keep working.
     extra = _strip_agy_boundary_flags(inv.extra_args)
-    args = [wrapper, *perm, *add_dir, *extra, *cont, *model_flag, "--print", prompt]
+    # AGY's own headless default is shorter than many Summon jobs.  Bind its
+    # print timeout to the same remaining hard budget Summon enforces, using an
+    # explicit seconds suffix accepted by AGY 1.1.22.  ceil avoids truncating a
+    # fractional final second while Summon remains the authoritative hard stop.
+    print_timeout = f"{max(1, (internal_timeout_ms + 999) // 1000)}s"
+    args = [wrapper, *perm, *add_dir, *extra, *cont, *model_flag,
+            "--print-timeout", print_timeout, "--print", prompt]
     env = {
         "USERPROFILE": profile,
         "HOME": profile,

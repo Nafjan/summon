@@ -374,6 +374,8 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon jobs steer ID --message "…"` · `jobs resume ID --message "…"` | queue authenticated guidance for a later eligible continuation, then explicitly create one governed successor; this is not claimed as live mid-turn injection |
 | `summon telemetry enable\|disable\|status\|clear` | manage local opt-in diagnostics; `clear` does not disable |
 | `summon usage status\|import\|refresh\|export\|example …` | inspect, refresh, or exchange bounded usage evidence. Live refresh requires an explicit provider allowlist and account-read consent; usage remains advisory and cannot reroute an exact request |
+| `summon result project --kind dispatch\|job --from PRIVATE.json --repo-root DIR` | derive an experimental redacted compatibility receipt without contacting a provider; only authenticated terminal job records are accepted for `job` |
+| `summon result validate PORTABLE.json` · `result consume PORTABLE.json --adapter reference` | strictly validate or authority-freely consume a portable receipt; chat, council, deliberate, and swarm projection currently refuse rather than inventing common semantics |
 | `summon fleet propose LANE --seats A,B` | create a sealed provider-inert fleet draft; this does not approve, select, dispatch, or authorize spend |
 | `summon fleet validate\|inspect FILE` | validate against the current roster, or inspect every declared constraint without consulting a roster |
 | `summon fleet explain FILE LANE` | compare roster candidates with the sealed constraints; report unknowns but deliberately select no route |
@@ -395,6 +397,13 @@ providers. The boundary is documented in
 
 `summon` (no args) prints the command list. Everything below is documented in
 [the Summon skill instructions](skills/summon/SKILL.md).
+
+Portable result receipts are compatibility views, not replacements for private execution
+envelopes and not dispatch capabilities. They omit prompts, response text, transcripts,
+sessions, local paths, account facts, and raw diagnostics. A reported exact model identity
+is verified only when requested, targeted, and served values agree; inferred or absent
+evidence stays unverified. The schema remains experimental while consumers validate the
+supported dispatch and authenticated-job surfaces.
 
 Fleet documents are drafts, not dispatch capabilities by themselves. `propose` returns a compiled
 projection bound to the current project directory object and a sanitized roster-catalog
@@ -815,6 +824,10 @@ example, Gemini CLI sessions cannot currently be resumed through Summon's headle
   `cursor-agent`, `gemini`, `kimi`, `agy`, or `opencode`), an API key for an `openai-compat` provider, or
   a local Ollama/LM Studio server. `summon doctor` tells you which are installed;
   `doctor --probe` spends a small live call per backend to confirm sign-in and eligibility.
+- **AGY 1.1.22 or newer for AGY seats:** Summon preflights the provider-inert
+  `--print-timeout` capability before copying credentials or launching a turn, then binds
+  that timeout to the remaining adaptive hard budget. Older AGY builds fail with an
+  upgrade instruction instead of an unknown-flag backend error.
 - **`git`** if you use `--worktree`.
 - **A host that can run a shell command:** a coding CLI, an AI IDE, a desktop agent app, or
   a plain terminal. Anything that can invoke `python` and read the skill can drive it.

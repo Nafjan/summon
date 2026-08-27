@@ -381,6 +381,30 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertNotIn(root, repr(receipt))
             self.assertIsNotNone(adapter_module._profile_runs_root("agy-profile"))
 
+    def test_disposable_agy_profile_cleanup_releases_host_lease(self):
+        import _builder
+        with tempfile.TemporaryDirectory() as root:
+            runs = os.path.join(root, "runs")
+            os.makedirs(runs)
+            handle, lease_path, token = _builder._agy_create_profile_lease(
+                runs, _builder.time.time() + 3600)
+            profile = tempfile.mkdtemp(
+                prefix=f"run-{os.getpid()}-{token}-", dir=runs)
+            profile_key = os.path.realpath(profile)
+            _builder._AGY_PROFILE_LEASES[profile_key] = (handle, lease_path)
+            with mock.patch.dict(os.environ, {"AGY_HEADLESS_PROFILE": root}, clear=False):
+                adapter = FreshDispatchAdapter(
+                    self.invocation(), snapshot_digest=SNAPSHOT,
+                    current_snapshot_digest=lambda: SNAPSHOT,
+                    owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+                    executor=lambda *args, **kwargs: {})
+                adapter._on_resource(profile, "agy-profile")
+                receipt = adapter.cleanup()
+            self.assertTrue(receipt.clean)
+            self.assertFalse(os.path.exists(profile))
+            self.assertFalse(os.path.lexists(lease_path))
+            self.assertNotIn(profile_key, _builder._AGY_PROFILE_LEASES)
+
     def test_resource_registration_rejects_named_or_outside_profile(self):
         with tempfile.TemporaryDirectory() as root:
             outside = os.path.join(root, "named-profile")
@@ -475,15 +499,26 @@ class AdapterBoundaryTests(unittest.TestCase):
                     fh.write("PRIVATE-CREDENTIAL")
                 created.append(profile)
                 resource_register(profile, "agy-profile")
+                report = ("STATUS: DONE\nSUMMARY: fake\nFOLLOW-UP: none\n"
+                          "HANDOFF: none")
+                terminal = json.dumps({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": report,
+                    "session_id": "fixture-session",
+                })
                 return sys.executable, [
                     "-c",
-                    "print('STATUS: DONE\\nSUMMARY: fake\\nFOLLOW-UP: none\\n"
-                    "HANDOFF: none')",
+                    f"print({terminal!r})",
                 ], None
 
             inv = replace(self.invocation(cli="claude", prompt="provider smoke"),
                           cwd=os.getcwd())
-            with mock.patch.dict(os.environ, {"AGY_HEADLESS_PROFILE": root}, clear=False), \
+            clean_env = {key: value for key, value in os.environ.items()
+                         if not key.startswith("SUMMON_")}
+            clean_env["AGY_HEADLESS_PROFILE"] = root
+            with mock.patch.dict(os.environ, clean_env, clear=True), \
                     mock.patch.object(executor_module, "build_invocation_args",
                                       side_effect=fake_build):
                 adapter = FreshDispatchAdapter(
@@ -496,8 +531,8 @@ class AdapterBoundaryTests(unittest.TestCase):
                 result = adapter.launch(
                     spec, token_for_context(spec, context, "attempt-provider"))
                 receipt = adapter.cleanup()
-            self.assertEqual(result.evidence.exit_code, 0)
             self.assertTrue(result.evidence.transport_ok)
+            self.assertFalse(result.evidence.timed_out)
             self.assertEqual(len(created), 1)
             self.assertFalse(os.path.exists(created[0]))
             self.assertTrue(receipt.clean)
@@ -525,6 +560,35 @@ class AdapterBoundaryTests(unittest.TestCase):
         self.assertTrue(result.evidence.transport_ok)
         self.assertFalse(result.evidence.parser_valid is False and
                          result.evidence.timed_out)
+
+    def test_explicit_cancelled_or_incomplete_status_is_not_transport_ok(self):
+        for status, error_kind, raw_exit in (
+                ("blocked", "provider_cancelled", 0),
+                ("blocked", "provider_cancelled", 143),
+                ("partial", "provider_incomplete", -15)):
+            with self.subTest(status=status, raw_exit=raw_exit):
+                adapter = FreshDispatchAdapter(
+                    self.invocation(cli="agy", prompt=f"{status} result"),
+                    snapshot_digest=SNAPSHOT,
+                    current_snapshot_digest=lambda: SNAPSHOT,
+                    owner_is_current=lambda: True,
+                    timeout_ms=5000,
+                    generation=1,
+                    executor=lambda *args, _status=status, _kind=error_kind,
+                    _exit=raw_exit, **kwargs: {
+                        "result": "{}", "exit_code": _exit, "status": _status,
+                        "error_kind": _kind,
+                    })
+                context = turn_with_prompt(
+                    f"{status} result", turn_id=f"turn-{status}-{raw_exit}",
+                    ordinal=0)
+                spec = adapter.prepare(context)
+                result = adapter.launch(
+                    spec, token_for_context(
+                        spec, context, f"attempt-{status}-{raw_exit}"))
+                self.assertFalse(result.evidence.transport_ok)
+                self.assertTrue(result.evidence.parser_valid)
+                self.assertEqual(result.evidence.error_kind, error_kind)
 
     def test_served_model_identity_is_captured_as_bounded_attempt_evidence(self):
         adapter = FreshDispatchAdapter(

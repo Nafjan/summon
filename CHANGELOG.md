@@ -5,6 +5,24 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+- **Experimental portable result receipts:** `summon result project` now derives a
+  compact, provider-inert compatibility receipt from an exact private dispatch envelope
+  or an authenticated terminal background job. The private envelope remains authoritative.
+  Portable output excludes prompts, model prose, transcripts, sessions, account facts,
+  raw errors, and local paths; it recomputes exact-model proof, preserves unknown attempt
+  evidence, and publishes content digests plus bounded metadata instead of mutable artifact
+  path locators. `result validate` and the authority-free `reference` consumer reject unknown
+  fields, forged cross-field claims, duplicate JSON keys, unsafe paths, and modified
+  digests. Chat, council, deliberate, and swarm currently fail before provider contact
+  because none exposes one authenticated terminal receipt with equivalent semantics.
+- **AGY terminal and timeout correctness:** Summon now passes AGY an explicit
+  `--print-timeout` derived from the same foreground or adaptive hard budget, strips caller
+  attempts to override that boundary, and preserves the prompt boundary. AGY terminal
+  states are typed instead of treating every result-shaped event as success: error and
+  invalid fail, cancelled/interrupted block, waiting/running remain partial, and unknown
+  states fail closed—even when the terminal event contains no response text. Isolated AGY
+  credential profiles now bind cleanup to the live owner and cap dead-owner retention
+  without shortening an active adaptive job.
 - **Opt-in safe context compilation:** ordinary dispatch now accepts a typed
   `summon.context-input/v1` packet through `--context-input-file`. The default safe
   profile mechanically compacts only typed payloads; ordinary file input rejects

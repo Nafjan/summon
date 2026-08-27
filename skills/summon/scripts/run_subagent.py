@@ -79,6 +79,7 @@ import _evidence  # noqa: E402
 import _executor  # noqa: E402
 import _fleet  # noqa: E402
 import _fleet_approval  # noqa: E402
+import _portable_result  # noqa: E402
 import _receipt  # noqa: E402
 import _telemetry  # noqa: E402
 import _usage  # noqa: E402
@@ -1220,6 +1221,113 @@ def main() -> None:
         sys.exit(1)
     if getattr(args, "usage_cache", None) and not getattr(args, "dry_run", False):
         _print_error("--usage-cache outside the usage command is valid only with --dry-run")
+        sys.exit(1)
+
+    # Experimental portable-result projection.  This branch is deliberately
+    # ahead of roster/backend resolution: project/validate/consume are local,
+    # provider-inert transformations and grant no dispatch authority.
+    if getattr(args, "result_action", None):
+        _result_error_kind = "portable_result_invalid"
+        try:
+            _result_action = args.result_action
+            _result_from = getattr(args, "result_from", None)
+            _result_kind = getattr(args, "result_kind", None)
+            _result_root = getattr(args, "result_repo_root", None)
+            _result_adapter = getattr(args, "result_adapter", None)
+            _result_out = getattr(args, "out", None)
+            if not _result_from:
+                raise _portable_result.PortableResultError(
+                    f"result {_result_action} requires an input JSON file")
+            _result_bytes = _portable_result.read_regular_file_bytes(_result_from)
+            if _result_action == "project":
+                if not _result_kind or not _result_root:
+                    raise _portable_result.PortableResultError(
+                        "result project requires --kind and --repo-root")
+                if _result_adapter:
+                    raise _portable_result.PortableResultError(
+                        "result project does not accept --adapter")
+                if _result_kind not in {"dispatch", "job"}:
+                    _result_error_kind = f"portable_{_result_kind}_source_unavailable"
+                    raise _portable_result.PortableResultError(
+                        f"portable source surface {_result_kind!r} has no single authenticated terminal receipt")
+                _private = _portable_result.load_private_envelope_bytes(_result_bytes)
+                _source_sha = hashlib.sha256(_result_bytes).hexdigest()
+                if _result_kind == "job":
+                    _source_path = Path(_result_from).absolute()
+                    _job_id = _source_path.stem
+                    if not _jobs.valid_job_id(_job_id):
+                        raise _portable_result.PortableResultError(
+                            "job projection input filename must be an exact job id")
+                    _job_root = str(_source_path.parent)
+                    _expected_result = Path(_jobs.result_path(_job_root, _job_id)).absolute()
+                    if (os.path.normcase(str(_source_path))
+                            != os.path.normcase(str(_expected_result))):
+                        raise _portable_result.PortableResultError(
+                            "job projection requires a trusted terminal result and matching private record")
+                    _record_path = _jobs.record_path(_job_root, _job_id)
+                    _record_bytes = _portable_result.read_regular_file_bytes(_record_path)
+                    _record_private = _portable_result.load_private_envelope_bytes(_record_bytes)
+                    _job_state, _job_trusted = _jobs._classify(
+                        _record_private, _jobs._OK, _private, _jobs._OK)
+                    if (not _job_trusted or _job_state not in {
+                            "success", "partial", "blocked", "error"}):
+                        raise _portable_result.PortableResultError(
+                            "job projection requires a trusted terminal result and matching private record")
+                    _portable_result.require_current_job_binding(
+                        _record_private, _private)
+                    if (_portable_result.read_regular_file_bytes(_record_path) != _record_bytes
+                            or _portable_result.read_regular_file_bytes(_source_path)
+                            != _result_bytes):
+                        raise _portable_result.PortableResultError(
+                            "job record or result changed during authentication")
+                    _result_report = _portable_result.project_dispatch(
+                        _private, _result_root, source_sha256=_source_sha,
+                        source_surface="job",
+                        source_binding_sha256=hashlib.sha256(_record_bytes).hexdigest())
+                else:
+                    _result_report = _portable_result.project_dispatch(
+                        _private, _result_root, source_sha256=_source_sha)
+                if _result_out:
+                    _portable_result.write_projection_file(_result_out, _result_report)
+            elif _result_action == "validate":
+                if any((_result_kind, _result_root, _result_adapter, _result_out)):
+                    raise _portable_result.PortableResultError(
+                        "result validate accepts only its JSON file and --json")
+                _projection = _portable_result.load_projection_bytes(_result_bytes)
+                _result_report = {
+                    "schema": "summon.portable-validation/experimental-1",
+                    "status": "success", "provider_contacted": False,
+                    "authority_granted": False,
+                    "projection_sha256": _projection["integrity"]["projection_sha256"],
+                }
+            else:
+                if any((_result_kind, _result_root, _result_out)):
+                    raise _portable_result.PortableResultError(
+                        "result consume accepts only its JSON file, --adapter, and --json")
+                if _result_adapter != "reference":
+                    raise _portable_result.PortableResultError(
+                        "result consume requires --adapter reference")
+                _projection = _portable_result.load_projection_bytes(_result_bytes)
+                _result_report = _portable_result.consume_reference(_projection)
+            print(json.dumps(_result_report, ensure_ascii=False)
+                  if args.json else json.dumps(_result_report, ensure_ascii=False, indent=2))
+            sys.exit(0)
+        except (OSError, ValueError, _portable_result.PortableResultError) as exc:
+            _result_error = {
+                "schema": "summon.portable-command/experimental-1",
+                "status": "error", "execution_status": "not_run",
+                "attempts": 0, "attempt_status": "not_run",
+                "provider_contacted": False, "authority_granted": False,
+                "error_kind": _result_error_kind,
+                "error": _portable_result.public_error_message(exc),
+            }
+            print(json.dumps(_result_error, ensure_ascii=False)
+                  if args.json else json.dumps(_result_error, ensure_ascii=False, indent=2))
+            sys.exit(1)
+
+    if any((getattr(args, "result_kind", None), getattr(args, "result_from", None),
+            getattr(args, "result_repo_root", None), getattr(args, "result_adapter", None))):
+        _print_error("portable result flags are valid only with the result command")
         sys.exit(1)
 
     # M3 fleet control plane. Every action is provider-inert. Draft actions

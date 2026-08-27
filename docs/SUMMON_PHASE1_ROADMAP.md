@@ -234,9 +234,11 @@ promotion is explicit, bounded, and reviewable.
 ## Workstream F: portable result projection and native adapters
 
 The rich private envelope stays authoritative. A compact projection is not frozen as
-v1 until one real external consumer validates it. Touched files are repository-
-relative validated paths only, or hashes when relativity cannot be proven. Drive,
-UNC, device, absolute, traversal, malformed, and symlink-escape paths are rejected.
+v1 until one real external consumer validates it. The experimental-1 slice publishes
+content hashes and bounded metadata only; mutable path locators are omitted. A later
+locator schema requires handle-relative traversal on both POSIX and Windows before it
+may expose repository-relative paths. Drive, UNC, device, absolute, traversal,
+malformed, and symlink-escape input paths never reach the portable receipt.
 
 Native Codex/Claude/IDE adapters remain explicit host integrations. External CLI
 agents are not called native subagents unless the host exposes and attests that
@@ -354,8 +356,8 @@ a second coordinator.
 ### M7 — Portable results and native/external adapters
 
 - Derive a redacted compatibility projection from the authoritative private envelope.
-- Reject absolute, traversal, drive, UNC, device, malformed, and symlink-escape paths;
-  expose only validated repository-relative paths or safe hashes.
+- Omit mutable artifact path locators and expose only safe content hashes plus bounded
+  metadata; defer locators until POSIX and Windows handle-relative traversal is proven.
 - Require explicit native-adapter attestation. External CLI agents are not described
   as native subagents unless the host proves that relationship.
 - Exercise dispatch, chat, council, deliberate, and swarm through the projection, and
