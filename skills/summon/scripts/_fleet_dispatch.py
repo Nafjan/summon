@@ -44,6 +44,7 @@ ANCHOR_SCHEMA = "summon.fleet-dispatch-anchor/v1"
 CLAIM_SCHEMA = "summon.fleet-dispatch-claim/v1"
 PUBLIC_SCHEMA = "summon.fleet-dispatch/v1"
 ACTIVATION_BINDING_SCHEMA = "summon.fleet-activation-binding/v1"
+LAUNCH_EVIDENCE_SCHEMA = "summon.fleet-launch-evidence/v1"
 INITIALIZATION_SCHEMA = "summon.fleet-dispatch-initialization/v1"
 MAX_LEDGER_BYTES = 4 * 1024 * 1024
 MAX_ANCHOR_BYTES = 4096
@@ -75,6 +76,11 @@ _PUBLIC_TEXT = re.compile(r"^[^\x00-\x1f\x7f]{1,256}$")
 _SECRET = re.compile(
     r"(?i)(?:sk-(?:or-)?[a-z0-9_-]{12,}|gh[pousr]_[a-z0-9]{20,}|"
     r"AIza[0-9A-Za-z_-]{20,}|(?:api[_-]?key|token|secret)[=:][^\s]{8,})")
+
+_LAUNCH_EVIDENCE_FIELDS = frozenset({
+    "schema", "backend", "transport", "command_sha256", "argv_sha256",
+    "cwd_sha256", "env_names_sha256",
+})
 
 
 class FleetDispatchError(_evidence.EvidenceError):
@@ -522,11 +528,19 @@ def _validate_claim(claim: Any, ledger: dict) -> None:
             "request_identity_sha256", "private_binding_hmac", "billing_class",
             "attempt_policy",
         }
-        if (not isinstance(activation, dict) or set(activation) != activation_fields
+        final_launch_sha256 = activation.get("final_launch_sha256") if isinstance(
+            activation, dict) else None
+        activation_field_sets = {
+            frozenset(activation_fields),
+            frozenset(activation_fields | {"final_launch_sha256"}),
+        }
+        if (not isinstance(activation, dict) or set(activation) not in activation_field_sets
                 or activation.get("schema") != ACTIVATION_BINDING_SCHEMA
                 or not all(_SHA256.fullmatch(str(activation.get(field, "")))
                            for field in ("contract_sha256", "agent_definition_sha256",
                                          "request_identity_sha256", "private_binding_hmac"))
+                or ("final_launch_sha256" in activation
+                    and not _SHA256.fullmatch(str(final_launch_sha256)))
                 or activation.get("billing_class") not in BILLING_CLASSES
                 or activation.get("attempt_policy") != {
                     "foreground_subprocess_only": True, "max_attempts": 1,
@@ -605,6 +619,15 @@ def _validate_claim(claim: Any, ledger: dict) -> None:
             or claim["terminal_sha256"] is None):
         raise FleetDispatchError(
             "fleet_dispatch_ledger_untrusted", "terminal claim is incoherent")
+    if activation is not None:
+        launch_committed = "final_launch_sha256" in activation
+        if ((phase in {"reserved", "cancelled_pre_spawn"} and launch_committed)
+                or (phase in {
+                    "provider_launch_claimed", "spawn_failed", "spawned", "reaped",
+                    "indeterminate", "terminal"} and not launch_committed)):
+            raise FleetDispatchError(
+                "fleet_dispatch_ledger_untrusted",
+                "activation final-launch binding contradicts its claim phase")
 
 
 def _validate_ledger(value: Any, key: bytes, approval_id: str) -> dict:
@@ -1301,6 +1324,48 @@ def _activation_attempt_policy() -> dict:
     }
 
 
+def _validate_launch_evidence(value: Any, *, invocation: Any,
+                              route: dict) -> dict:
+    """Validate the private, final builder projection for one launch CAS.
+
+    The executor computes these digests from the concrete command, argv, cwd, and
+    environment-name set immediately before it asks for a launch claim.  The ledger
+    records only the digest of this compact projection: no command, path, argv, or
+    environment value can reach a public receipt.
+    """
+    if (not isinstance(value, dict) or set(value) != _LAUNCH_EVIDENCE_FIELDS
+            or value.get("schema") != LAUNCH_EVIDENCE_SCHEMA):
+        raise FleetDispatchError(
+            "fleet_activation_launch_evidence_invalid",
+            "final launch evidence has an invalid schema")
+    backend = value.get("backend")
+    transport = value.get("transport")
+    if (not isinstance(backend, str) or not _PUBLIC_ID.fullmatch(backend)
+            or not isinstance(transport, str) or not _PUBLIC_ID.fullmatch(transport)
+            or backend != getattr(invocation, "cli", None)
+            or backend != route.get("backend")
+            or transport != "subprocess"
+            or transport != getattr(invocation, "transport", None)):
+        raise FleetDispatchError(
+            "fleet_activation_launch_evidence_invalid",
+            "final launch evidence differs from the resolved backend or transport")
+    for field in (
+            "command_sha256", "argv_sha256", "cwd_sha256", "env_names_sha256"):
+        try:
+            _sha(value.get(field), f"launch_evidence.{field}")
+        except FleetDispatchError as exc:
+            raise FleetDispatchError(
+                "fleet_activation_launch_evidence_invalid",
+                "final launch evidence has an invalid digest") from exc
+    expected_cwd_sha256 = _digest(os.path.normcase(os.path.realpath(
+        str(getattr(invocation, "cwd", "")))))
+    if not hmac.compare_digest(value["cwd_sha256"], expected_cwd_sha256):
+        raise FleetDispatchError(
+            "fleet_activation_launch_evidence_invalid",
+            "final launch evidence differs from the frozen working directory")
+    return {field: value[field] for field in sorted(_LAUNCH_EVIDENCE_FIELDS)}
+
+
 def _activation_request(*, bindings: dict, authority: dict, decision: dict,
                         prompt_sha256: str, billing: dict[str, str],
                         data_boundary: dict, route: dict,
@@ -1695,6 +1760,110 @@ def claim_provider_launch(reservation: Reservation, *, fleet: dict, plan: dict,
         live_context=(fleet, plan, catalog, lane_name, cwd))
 
 
+def claim_activation_provider_launch(
+        reservation: Reservation, *, fleet: dict, plan: dict,
+        catalog: list[dict], lane_name: str, cwd: str, data_boundary: dict,
+        invocation: Any, activation_candidate: dict,
+        agent_definition_sha256: str,
+        current_request_identity_sha256: str,
+        launch_evidence: dict) -> dict:
+    """Atomically bind a final launch projection and consume one activation slot.
+
+    This intentionally contains no process-launch capability.  A future executor must
+    construct ``launch_evidence`` from its concrete command, argv, cwd, and child
+    environment immediately before this call, then launch only that exact plan after
+    the durable ``provider_launch_claimed`` result.  A provider has not been contacted
+    when this function returns.
+    """
+    if not isinstance(reservation, Reservation):
+        raise FleetDispatchError(
+            "fleet_dispatch_claim_invalid", "dispatch reservation is invalid")
+    path = ledger_path(reservation.approval_id)
+    with _fleet_approval._store_lock():
+        key = _fleet_approval._load_key(create=False)
+        if key is None:
+            raise FleetDispatchError(
+                "fleet_dispatch_approval_unavailable", "fleet approval key is unavailable")
+        store, approval = _active_approval(
+            reservation.approval_id, key, _fleet_approval._now())
+        ledger = _read_ledger(
+            path, key, reservation.approval_id, store, missing_ok=False)
+        claim = ledger["claims"].get(reservation.claim_id)
+        if (claim is None or claim["request_id"] != reservation.request_id
+                or claim["request_sha256"] != reservation.request_sha256
+                or claim["decision"] != reservation.decision
+                or claim["route"] != reservation.route
+                or claim.get("activation") is None):
+            raise FleetDispatchError(
+                "fleet_dispatch_claim_untrusted", "activation reservation differs from its ledger")
+        if claim["phase"] != "reserved":
+            raise FleetDispatchError(
+                "fleet_dispatch_cas_conflict", "activation reservation is no longer reserved")
+
+        candidate, bindings, authority, decision, route, request = _activation_inputs(
+            approval_id=reservation.approval_id, fleet=fleet, plan=plan,
+            catalog=catalog, lane_name=lane_name, cwd=cwd,
+            data_boundary=data_boundary, invocation=invocation,
+            activation_candidate=activation_candidate,
+            agent_definition_sha256=agent_definition_sha256,
+            current_request_identity_sha256=current_request_identity_sha256,
+            approval=approval)
+        expected_hmac = _fleet_activation.private_binding_hmac(
+            invocation, master_key=key, approval_id=reservation.approval_id,
+            claim_id=reservation.claim_id, contract_sha256=candidate["sha256"],
+            agent_definition_sha256=agent_definition_sha256,
+            current_request_identity_sha256=current_request_identity_sha256)
+        activation = claim["activation"]
+        if (ledger["bindings"] != bindings or ledger["authority"] != authority
+                or claim["decision"] != decision or claim["route"] != route
+                or claim["request"] != request
+                or activation.get("contract_sha256") != candidate["sha256"]
+                or activation.get("agent_definition_sha256") != agent_definition_sha256
+                or activation.get("request_identity_sha256")
+                != current_request_identity_sha256
+                or activation.get("billing_class") != candidate["billing"]["class"]
+                or activation.get("billing_class") != route["billing_class"]
+                or "final_launch_sha256" in activation
+                or not hmac.compare_digest(
+                    str(activation.get("private_binding_hmac", "")), expected_hmac)):
+            raise FleetDispatchError(
+                "fleet_activation_context_changed",
+                "current activation inputs differ from the private reservation")
+        final_launch = _validate_launch_evidence(
+            launch_evidence, invocation=invocation, route=route)
+
+        if ledger["generation"] >= MAX_GENERATION or claim["claim_generation"] >= MAX_GENERATION:
+            raise FleetDispatchError(
+                "fleet_dispatch_ledger_full", "dispatch generation limit reached")
+        spend = ledger["authority"]["spend"]
+        billable = claim["route"]["billing_class"] in {"credit", "payg"}
+        if ledger["totals"]["provider_contact_slots_consumed"] >= spend["max_provider_contacts"]:
+            raise FleetDispatchError(
+                "fleet_dispatch_contact_ceiling", "provider-contact ceiling changed or is exhausted")
+        if (billable and ledger["totals"]["billable_slots_consumed"]
+                >= spend["max_billable_attempts"]):
+            raise FleetDispatchError(
+                "fleet_dispatch_billable_ceiling", "billable-attempt ceiling changed or is exhausted")
+
+        claim["activation"] = {
+            **activation,
+            "final_launch_sha256": _digest(final_launch),
+        }
+        claim["contact_slot_reserved"] = False
+        claim["billable_slot_reserved"] = False
+        claim["contact_slot_consumed"] = True
+        claim["billable_slot_consumed"] = billable
+        claim["provider_contacted"] = None
+        claim["phase"] = "provider_launch_claimed"
+        claim["claim_generation"] += 1
+        claim["updated_at"] = _now_text()
+        ledger["totals"]["provider_contact_slots_consumed"] += 1
+        ledger["totals"]["billable_slots_consumed"] += int(billable)
+        ledger["generation"] += 1
+        authenticated = _write_ledger(path, ledger, key, store)
+        return json.loads(json.dumps(authenticated["claims"][reservation.claim_id]))
+
+
 def mark_spawn_failed(reservation: Reservation) -> dict:
     return _mutate(
         reservation, expected="provider_launch_claimed", target="spawn_failed",
@@ -1972,10 +2141,12 @@ def verify_public_receipt(value: Any) -> dict:
 
 
 __all__ = [
-    "LEDGER_SCHEMA", "CLAIM_SCHEMA", "PUBLIC_SCHEMA", "FleetDispatchError",
+    "LEDGER_SCHEMA", "CLAIM_SCHEMA", "PUBLIC_SCHEMA", "LAUNCH_EVIDENCE_SCHEMA",
+    "FleetDispatchError",
     "Reservation", "reserve_dispatch", "reserve_activation_dispatch",
     "preflight_activation_dispatch", "cancel_pre_spawn",
-    "claim_provider_launch", "mark_spawn_failed", "mark_spawned",
+    "claim_provider_launch", "claim_activation_provider_launch",
+    "mark_spawn_failed", "mark_spawned",
     "mark_reaped", "mark_indeterminate", "mark_terminal", "get_claim",
     "public_receipt", "verify_public_receipt", "ledger_path",
 ]

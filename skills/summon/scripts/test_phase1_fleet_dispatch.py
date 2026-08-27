@@ -144,6 +144,40 @@ def _reserve_activation(context, **changes):
         **values)
 
 
+def _launch_evidence(invocation, **changes):
+    values = {
+        "schema": _fleet_dispatch.LAUNCH_EVIDENCE_SCHEMA,
+        "backend": invocation.cli,
+        "transport": invocation.transport,
+        "command_sha256": _sha("claude"),
+        "argv_sha256": _sha("frozen argv"),
+        "cwd_sha256": _fleet_dispatch._digest(os.path.normcase(os.path.realpath(
+            invocation.cwd))),
+        "env_names_sha256": _sha("CLAUDE_CONFIG_DIR"),
+    }
+    values.update(changes)
+    return values
+
+
+def _claim_activation(context, reservation, **changes):
+    invocation, candidate, definition_sha, request_sha = _activation_material(context)
+    values = {
+        "invocation": invocation,
+        "activation_candidate": candidate,
+        "agent_definition_sha256": definition_sha,
+        "current_request_identity_sha256": request_sha,
+    }
+    values.update(changes)
+    return _fleet_dispatch.claim_activation_provider_launch(
+        reservation, fleet=context["fleet"], plan=context["plan"],
+        catalog=context["catalog"], lane_name="review", cwd=context["cwd"],
+        data_boundary={
+            "boundary": "local_sanitized", "proof": "operator_attested",
+            "evidence_sha256": _fleet_activation._sha(values["invocation"].prompt)},
+        launch_evidence=values.pop("launch_evidence", _launch_evidence(values["invocation"])),
+        **values)
+
+
 def test_activation_reservation_is_private_provider_inert_and_revalidated(
         approved, monkeypatch):
     for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
@@ -177,6 +211,106 @@ def test_activation_reservation_is_private_provider_inert_and_revalidated(
     assert "credential-one" not in public
     assert definition_sha not in public
     assert request_sha not in public
+
+
+def test_activation_launch_claim_is_atomic_private_and_consumes_once(approved):
+    reservation = _reserve_activation(approved)
+    claimed = _claim_activation(approved, reservation)
+    assert claimed["phase"] == "provider_launch_claimed"
+    assert claimed["provider_contacted"] is None
+    assert claimed["contact_slot_consumed"] is True
+    assert claimed["activation"]["final_launch_sha256"] == _fleet_dispatch._digest(
+        _launch_evidence(_activation_material(approved)[0]))
+    with pytest.raises(_fleet_dispatch.FleetDispatchError) as duplicate:
+        _claim_activation(approved, reservation)
+    assert duplicate.value.kind == "fleet_dispatch_cas_conflict"
+    public = json.dumps(_fleet_dispatch.public_receipt(reservation), sort_keys=True)
+    for private_value in (
+            "final_launch_sha256", "frozen argv", "CLAUDE_CONFIG_DIR",
+            _sha("frozen argv"), _sha("CLAUDE_CONFIG_DIR")):
+        assert private_value not in public
+
+
+@pytest.mark.parametrize("field,value", [
+    ("schema", "wrong.schema/v1"),
+    ("backend", "codex"),
+    ("transport", "acp"),
+    ("argv_sha256", "not-a-digest"),
+    ("cwd_sha256", _sha("different-cwd")),
+])
+def test_activation_launch_evidence_drift_refuses_before_capacity_consumption(
+        approved, field, value):
+    reservation = _reserve_activation(approved)
+    invocation = _activation_material(approved)[0]
+    evidence = _launch_evidence(invocation, **{field: value})
+    with pytest.raises(_fleet_dispatch.FleetDispatchError) as refused:
+        _claim_activation(approved, reservation, launch_evidence=evidence)
+    assert refused.value.kind == "fleet_activation_launch_evidence_invalid"
+    claim = _fleet_dispatch.get_claim(reservation)
+    assert claim["phase"] == "reserved"
+    assert claim["contact_slot_consumed"] is False
+    assert claim["activation"].get("final_launch_sha256") is None
+
+
+def test_activation_launch_claim_revalidates_private_hmac_and_route_before_cas(
+        approved, monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
+                 "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_PRIVATE_TEST", "credential-one")
+    reservation = _reserve_activation(approved)
+    monkeypatch.setenv("ANTHROPIC_PRIVATE_TEST", "credential-two")
+    with pytest.raises(_fleet_dispatch.FleetDispatchError) as changed:
+        _claim_activation(approved, reservation)
+    assert changed.value.kind == "fleet_activation_context_changed"
+    claim = _fleet_dispatch.get_claim(reservation)
+    assert claim["phase"] == "reserved"
+    assert claim["contact_slot_consumed"] is False
+
+
+def test_activation_launch_claim_revalidates_route_and_billing_before_cas(
+        approved, monkeypatch):
+    reservation = _reserve_activation(approved)
+    changed_catalog = json.loads(json.dumps(approved["catalog"]))
+    changed_catalog[0]["model"] = "different-model"
+    with pytest.raises(_fleet_dispatch.FleetDispatchError) as route_changed:
+        _fleet_dispatch.claim_activation_provider_launch(
+            reservation, fleet=approved["fleet"], plan=approved["plan"],
+            catalog=changed_catalog, lane_name="review", cwd=approved["cwd"],
+            data_boundary={
+                "boundary": "local_sanitized", "proof": "operator_attested",
+                "evidence_sha256": _fleet_activation._sha("review this")},
+            invocation=_activation_material(approved)[0],
+            activation_candidate=_activation_material(approved)[1],
+            agent_definition_sha256=_activation_material(approved)[2],
+            current_request_identity_sha256=_activation_material(approved)[3],
+            launch_evidence=_launch_evidence(_activation_material(approved)[0]))
+    assert route_changed.value.kind == "fleet_dispatch_catalog_mismatch"
+    assert _fleet_dispatch.get_claim(reservation)["phase"] == "reserved"
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-credential")
+    with pytest.raises(_fleet_dispatch.FleetDispatchError) as billing_changed:
+        _claim_activation(approved, reservation)
+    assert billing_changed.value.kind == "fleet_dispatch_no_eligible_route"
+    assert _fleet_dispatch.get_claim(reservation)["contact_slot_consumed"] is False
+
+
+def test_concurrent_activation_launch_claim_has_one_capacity_consumer(approved):
+    reservation = _reserve_activation(approved)
+
+    def claim(_index):
+        try:
+            return _claim_activation(approved, reservation)["phase"]
+        except _fleet_dispatch.FleetDispatchError as exc:
+            return exc.kind
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        outcomes = list(pool.map(claim, range(8)))
+    assert outcomes.count("provider_launch_claimed") == 1
+    assert outcomes.count("fleet_dispatch_cas_conflict") == 7
+    claim_state = _fleet_dispatch.get_claim(reservation)
+    assert claim_state["contact_slot_consumed"] is True
+    assert claim_state["activation"]["final_launch_sha256"]
 
 
 def test_activation_same_class_credential_rotation_fails_preflight(approved, monkeypatch):
