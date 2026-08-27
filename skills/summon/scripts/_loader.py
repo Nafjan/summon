@@ -13,6 +13,20 @@ PERMISSION_VALUES = ("read-only", "safe-edit", "yolo")
 DEFAULT_PERMISSION = "safe-edit"
 LIFECYCLE_VALUES = ("active", "deprecated", "retired")
 
+# Provider aliases can disappear while a user-owned roster definition remains
+# unchanged.  Keep exact historical selectors as tombstones instead of silently
+# retargeting them to the model later revealed behind a preview alias.  This gate
+# is intentionally selector-based so an old project/global seat also fails before
+# provider contact even when it predates the ``lifecycle`` frontmatter field.
+_RETIRED_MODEL_SUCCESSORS = {
+    ("openai-compat", "stealth/ox-alpha"):
+        "openrouter-glm-5-3-flash-opencode",
+    ("opencode", "openrouter/stealth/ox-alpha"):
+        "openrouter-glm-5-3-flash-opencode",
+    ("opencode", "nous/stealth/ox-alpha"):
+        "openrouter-glm-5-3-flash-opencode",
+}
+
 _AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 
 
@@ -207,6 +221,41 @@ def validate_lifecycle(value: str | None) -> str:
     return normalized
 
 
+def effective_lifecycle(frontmatter: dict) -> tuple[str, str | None]:
+    """Return the route-aware lifecycle and an optional successor seat.
+
+    Explicit retirement remains authoritative.  A known ended provider selector
+    is also retired even when a stale custom definition still says ``active`` or
+    omits lifecycle metadata.  The successor is a distinct seat; callers must
+    select it explicitly, so historical identities and receipts are never relabeled.
+    """
+    lifecycle = validate_lifecycle(frontmatter.get("lifecycle"))
+    successor = frontmatter.get("successor") or None
+    if successor is not None:
+        validate_agent_name(successor)
+    route_successor = retired_route_successor(
+        frontmatter.get("run-agent"), frontmatter.get("model"))
+    if route_successor:
+        return "retired", route_successor
+    return lifecycle, successor
+
+
+def retired_route_successor(backend: object, model: object) -> str | None:
+    """Return the explicit successor for one exact ended effective route."""
+    if not isinstance(backend, str) or not isinstance(model, str):
+        return None
+    return _RETIRED_MODEL_SUCCESSORS.get(
+        (backend.strip().lower(), model.strip().lower()))
+
+
+def require_dispatchable_route(backend: object, model: object,
+                               agent_name: str) -> None:
+    """Reject an ended effective route after CLI/model overrides are applied."""
+    successor = retired_route_successor(backend, model)
+    if successor:
+        raise AgentLifecycleError(agent_name, "retired", successor)
+
+
 def require_dispatchable_lifecycle(frontmatter: dict, agent_name: str) -> str:
     """Return the normalized lifecycle or reject a retired provider route.
 
@@ -214,10 +263,7 @@ def require_dispatchable_lifecycle(frontmatter: dict, agent_name: str) -> str:
     immutable definition snapshot.  Keeping the decision here prevents in-process
     launchers (for example live deliberation) from drifting from the main dispatcher.
     """
-    lifecycle = validate_lifecycle(frontmatter.get("lifecycle"))
-    successor = frontmatter.get("successor") or None
-    if successor is not None:
-        validate_agent_name(successor)
+    lifecycle, successor = effective_lifecycle(frontmatter)
     if lifecycle == "retired":
         raise AgentLifecycleError(agent_name, lifecycle, successor)
     return lifecycle
@@ -352,9 +398,10 @@ def _load_agent_snapshot_from(agents_dir: str, agent_name: str):
             frontmatter, body = parse_frontmatter(content)
             run_agent = frontmatter.get("run-agent")
             permission = validate_permission(frontmatter.get("permission"))
-            frontmatter["lifecycle"] = validate_lifecycle(frontmatter.get("lifecycle"))
-            if frontmatter.get("successor"):
-                validate_agent_name(frontmatter["successor"])
+            lifecycle, successor = effective_lifecycle(frontmatter)
+            frontmatter["lifecycle"] = lifecycle
+            if successor:
+                frontmatter["successor"] = successor
             description = extract_description(body)
             tup = (run_agent, body.strip(), description, str(resolved), permission,
                    frontmatter.get("model") or None,
@@ -497,6 +544,7 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
                     continue
                 (run_agent, _body, description, _path, permission, model,
                  _extra_args, effort) = loaded
+                lifecycle, successor = effective_lifecycle(fm or {})
                 # Keep the roster listing useful for humans and provider-safe for
                 # callers: a model pin and reasoning effort are harmless display
                 # metadata, while the actual served model still belongs to the
@@ -513,9 +561,8 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
                                    else "none"),
                                "model": model,
                                "effort": effort,
-                               "lifecycle": validate_lifecycle(
-                                   (fm or {}).get("lifecycle")),
-                               "successor": (fm or {}).get("successor"),
+                               "lifecycle": lifecycle,
+                               "successor": successor,
                                "definition_sha256": definition_sha256})
             except (OSError, UnicodeDecodeError, ValueError):
                 # Unreadable / binary / malformed-frontmatter file: still list it so the

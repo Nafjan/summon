@@ -7,6 +7,8 @@ import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import _apibackend
 import _nous_credentials
 from _builder import opencode_env_override
@@ -109,11 +111,22 @@ def test_opencode_nous_bridge_is_child_only_and_configured():
          patch.dict(os.environ, {}, clear=False):
         os.environ.pop("NOUS_API_KEY", None)
         os.environ.pop("OPENCODE_CONFIG_CONTENT", None)
-        env = opencode_env_override("nous/stealth/ox-alpha")
+        env = opencode_env_override("nous/current-model")
     assert env["NOUS_API_KEY"] == "profile-secret"
     config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
     provider = config["provider"]["nous"]
     assert provider["options"]["baseURL"] == "https://inference-api.nousresearch.com/v1"
     assert provider["options"]["apiKey"] == "{env:NOUS_API_KEY}"
-    assert provider["models"]["stealth/ox-alpha"]["name"] == "Ox Alpha"
+    assert provider["models"]["current-model"]["name"] == "current-model"
     assert os.environ.get("NOUS_API_KEY") != "profile-secret"
+
+
+def test_opencode_nous_bridge_rejects_malformed_dynamic_model():
+    with pytest.raises(ValueError, match="empty or malformed"):
+        opencode_env_override("nous/")
+    with pytest.raises(ValueError, match="empty or malformed"):
+        opencode_env_override("nous/bad\nmodel")
+    with pytest.raises(ValueError, match="empty or malformed"):
+        opencode_env_override("nous/bad model")
+    with pytest.raises(ValueError, match="empty or malformed"):
+        opencode_env_override("nous/bad\x7fmodel")

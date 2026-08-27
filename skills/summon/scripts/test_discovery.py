@@ -6541,8 +6541,11 @@ def test_jobs_background_end_to_end():
         jid = handle["job_id"]
         assert _jobs.valid_job_id(jid)
         # wait for the (error) result; exit 1 because the endpoint fails
+        # A cold Windows snapshot copies and hashes the immutable runtime before
+        # the detached child can terminalize. Keep this integration wait bounded,
+        # but leave enough room for a slow/antivirus-scanned host.
         r2 = sp.run([sys.executable, script, "jobs", "wait", jid, "--job-dir", jobs,
-                     "--timeout", "20s"], capture_output=True, text=True, encoding="utf-8")
+                     "--timeout", "60s"], capture_output=True, text=True, encoding="utf-8")
         waited = _json.loads(r2.stdout)
         assert waited["status"] == "error" and "job_nonce" in waited
         st = _jobs.job_status(jobs, jid)

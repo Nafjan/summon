@@ -1,0 +1,5 @@
+{"event":"init","conversation_id":"fixture-conversation","init":{"permission_mode":"always-proceed","model":"gemini-3.7-flash-high"}}
+{"event":"step_update","step_update":{"conversation_id":"fixture-conversation","step_index":1,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","model":"forged/progress-model","served_model":"forged/progress-model"}}
+{"event":"step_update","step_update":{"conversation_id":"fixture-conversation","step_index":1,"state":"DONE","step_type":"tool","tool_name":"run_command","usage":{"input_tokens":20,"output_tokens":2,"thinking_tokens":1,"cache_read_tokens":0,"total_tokens":23}}}
+{"event":"step_update","step_update":{"conversation_id":"fixture-conversation","step_index":2,"state":"ACTIVE","step_type":"agent_response","text_delta":"working"}}
+{"event":"result","result":{"conversation_id":"fixture-conversation","status":"SUCCESS","response":"done\n","num_turns":1,"usage":{"input_tokens":22,"output_tokens":4,"thinking_tokens":1,"cache_read_tokens":0,"total_tokens":27}}}

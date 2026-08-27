@@ -91,7 +91,8 @@ from _executor import (agent_def_sha, content_sha,  # noqa: E402
                        is_terminal_nonretryable, is_terminal_success,
                        request_fingerprint)
 from _loader import (AgentLifecycleError, bundled_roster_dir, get_agents_dir, list_agents,
-                     load_agent, parse_read_roots, require_dispatchable_lifecycle)  # noqa: E402
+                     load_agent, parse_read_roots, require_dispatchable_lifecycle,
+                     require_dispatchable_route)  # noqa: E402
 from _resolver import discover_models, resolve_cli  # noqa: E402
 
 # Keep a literal assignment: the release-contract parser uses the dispatcher
@@ -1898,6 +1899,16 @@ def main() -> None:
     # operator selected.  The model guard is evaluated against the dispatch
     # override/frontmatter before any side effect (worktree or profile build).
     final_model = args.model or model
+    try:
+        require_dispatchable_route(
+            cli, final_model, getattr(args, "_resolved_agent", args.agent))
+    except AgentLifecycleError as exc:
+        _die(
+            str(exc),
+            error_kind="agent_retired",
+            details={"agent": exc.agent, "lifecycle": exc.lifecycle,
+                     "successor": exc.successor},
+        )
     profile_name = getattr(args, "profile", None) or _agent_fm.get("profile")
     profile_selection = None
     if profile_name:

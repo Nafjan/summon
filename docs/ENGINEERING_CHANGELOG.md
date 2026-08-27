@@ -55,13 +55,21 @@ never on added fields.
   reads, output clobbering, symlink targets, redacted I/O errors, and the Windows batch
   launcher. Approval, reservation, selection, and fleet dispatch remain absent from this
   slice.
-- **Temporary model lifecycle:** the old Ox/OpenCode seat is retained as a retired,
-  exact historical identity and fails before provider contact. A separate successor targets
+- **Temporary model lifecycle:** all ended direct and OpenCode `stealth/ox-alpha`
+  selectors are retained as retired, exact historical identities and fail before provider
+  contact, including stale custom roster definitions without lifecycle metadata. A separate successor targets
   `openrouter/z-ai/glm-5.3-flash`; no old receipt is reinterpreted as the successor.
   The former stealth preview is no longer represented as free or permanent. Lifecycle
   enforcement lives in the shared immutable roster-resolution path used by ordinary dispatch
   and in-process live deliberation; focused regressions prove the latter never constructs a
   scheduler or contacts a provider for a retired seat. Fleet catalogs admit active seats only.
+- **AGY 1.1.22 machine contracts:** the resolver prefers the documented JSON models
+  envelope, strictly bounds and validates model identifiers, and performs at most one
+  explicitly labeled legacy-text fallback. The stream parser accepts nested init and
+  step-update payloads, records target/session/usage and trusted tool or generation
+  activity, deduplicates replayed progress, and never promotes progress model metadata to
+  served-model evidence. Provider-inert fixtures cover the nested event shape and hidden
+  Windows native/shim launch paths.
 - **Authenticated continuation ledger and crash-safe successor launch:** eligible
   terminal Claude subprocess jobs can reserve one source-scoped successor through a
   private HMAC-authenticated ledger. The claim binds the source receipt and session

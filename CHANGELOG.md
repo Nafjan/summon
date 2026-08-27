@@ -37,13 +37,21 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
   preserve exact case, and inline/undeclared routes stay explicitly unknown. Unknown
   identity is a losing explanation reason even without an allowlist.
   Explicit fleet outputs are no-clobber.
-- **Ox Alpha lifecycle correction:** the historical OpenRouter/OpenCode seat is retired
-  and remains pinned to `stealth/ox-alpha`, so existing receipts are never relabeled.
+- **Ox Alpha lifecycle correction:** every historical direct and tool-enabled
+  `stealth/ox-alpha` route is retired and remains pinned to that selector, so existing
+  receipts are never relabeled. Route-level tombstones also stop stale custom roster
+  definitions before provider contact.
   A distinct successor targets paid `z-ai/glm-5.3-flash`. Retired seats fail before
   provider contact and identify their successor in a typed error. The lifecycle gate is
   shared by ordinary dispatch and the in-process live-deliberation roster boundary, so a
   retired definition cannot bypass it through another launch surface. Fleet catalogs admit
   only active seats; deprecated compatibility dispatch remains explicit and warned.
+- **AGY 1.1.22 headless integration:** model discovery now prefers the documented
+  JSON command envelope and retains one bounded legacy-text fallback. Nested init and
+  step events now publish trusted session, target-model, tool, generation, and usage
+  activity to the adaptive watchdog without turning progress metadata into served-model
+  proof. Duplicate progress cannot renew liveness, and Windows shim discovery remains
+  headless.
 - **Activity-aware long jobs and governed continuation:** background dispatches now
   treat their timeout as a progress checkpoint by default, publish authenticated
   activity/idle diagnostics, and accept durable extend, cancel, and queued-steering

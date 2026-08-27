@@ -298,7 +298,7 @@ def test_catalog_uses_single_snapshot_provider_and_dispatch_default_permission(t
     agents_dir = tmp_path / "agents"
     agents_dir.mkdir()
     definitions = {
-        "nous": ("openai-compat", "nous", "stealth/ox-alpha", None),
+        "nous": ("openai-compat", "nous", "nous/current-model", None),
         "openrouter": ("opencode", "openrouter", "openrouter/z-ai/glm-5.3-flash", "yolo"),
         "byteplus": ("openai-compat", "byteplus-coding", "glm-5.2", "read-only"),
         "defaulted": ("openai-compat", "anthropic", "claude-fable-5", None),
@@ -420,6 +420,123 @@ def test_retired_agent_refuses_before_provider_and_names_successor(tmp_path):
     assert envelope["provider_contacted"] is False
     assert envelope["attempts"] == 0
     assert envelope["agent_resolution"]["successor"] == "new-seat"
+
+
+@pytest.mark.parametrize(("backend", "model"), [
+    ("openai-compat", "stealth/ox-alpha"),
+    ("opencode", "openrouter/stealth/ox-alpha"),
+    ("opencode", "nous/stealth/ox-alpha"),
+])
+def test_ended_ox_alias_is_route_retired_even_in_stale_custom_roster(
+        tmp_path, backend, model):
+    """An old user definition cannot bypass the provider-alias tombstone."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    (agents_dir / "old-ox.md").write_text(
+        "---\n"
+        f"run-agent: {backend}\n"
+        f"model: {model}\n"
+        "permission: read-only\n"
+        "lifecycle: active\n"
+        "---\n# Historical preview\nEnded.\n",
+        encoding="utf-8")
+    listed = {item["name"]: item for item in _loader.list_agents(str(agents_dir))}
+    assert listed["old-ox"]["lifecycle"] == "retired"
+    assert listed["old-ox"]["successor"] == "openrouter-glm-5-3-flash-opencode"
+    active = {
+        "name": "active-seat", "run_agent": "claude",
+        "permission": "read-only", "model": "claude-opus-5",
+        "lifecycle": "active", "source": "project",
+    }
+    catalog, _, unavailable = _fleet.catalog_snapshot([listed["old-ox"], active])
+    assert [item["seat"] for item in catalog] == ["active-seat"]
+    assert unavailable == ["old-ox"]
+
+    script = Path(__file__).with_name("run_subagent.py")
+    completed = subprocess.run(
+        [sys.executable, str(script), "--agent", "old-ox", "--prompt", "test",
+         "--cwd", str(tmp_path), "--agents-dir", str(agents_dir),
+         "--strict-agents-dir", "--json"],
+        capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert completed.returncode == 1
+    envelope = json.loads(completed.stdout)
+    assert envelope["error_kind"] == "agent_retired"
+    assert envelope["provider_contacted"] is False
+    assert envelope["attempts"] == 0
+    assert envelope["model"]["served"] is None
+    assert envelope["agent_resolution"]["successor"] == \
+        "openrouter-glm-5-3-flash-opencode"
+
+
+@pytest.mark.parametrize(("declared_backend", "declared_model", "overrides"), [
+    ("opencode", "openrouter/current-model",
+     ["--model", "openrouter/stealth/ox-alpha"]),
+    ("codex", "nous/stealth/ox-alpha", ["--cli", "opencode"]),
+    ("codex", "current-model",
+     ["--cli", "opencode", "--model", "nous/stealth/ox-alpha"]),
+    ("openai-compat", "current-model", ["--model", "stealth/ox-alpha"]),
+])
+def test_effective_cli_and_model_overrides_cannot_bypass_ended_route_tombstone(
+        tmp_path, declared_backend, declared_model, overrides):
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    (agents_dir / "active-seat.md").write_text(
+        "---\n"
+        f"run-agent: {declared_backend}\n"
+        f"model: {declared_model}\n"
+        "permission: read-only\n"
+        "lifecycle: active\n"
+        "---\n# Active declaration\nTest override.\n",
+        encoding="utf-8")
+    script = Path(__file__).with_name("run_subagent.py")
+    completed = subprocess.run(
+        [sys.executable, str(script), "--agent", "active-seat", "--prompt", "test",
+         "--cwd", str(tmp_path), "--agents-dir", str(agents_dir),
+         "--strict-agents-dir", "--dry-run", "--json", *overrides],
+        capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert completed.returncode == 1
+    envelope = json.loads(completed.stdout)
+    assert envelope["error_kind"] == "agent_retired"
+    assert envelope["provider_contacted"] is False
+    assert envelope["attempts"] == 0
+    assert envelope["attempt_status"] == "not_run"
+    assert envelope["execution_status"] == "not_run"
+    assert envelope["model"]["served"] is None
+    assert envelope["served_model_evidence"] == "absent"
+    assert envelope["agent_resolution"]["successor"] == \
+        "openrouter-glm-5-3-flash-opencode"
+
+
+def test_real_dispatch_override_hits_route_tombstone_before_backend_preflight(tmp_path):
+    """The effective-route gate is shared by dry-run and real dispatch."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    (agents_dir / "active-seat.md").write_text(
+        "---\n"
+        "run-agent: codex\n"
+        "model: current-model\n"
+        "permission: read-only\n"
+        "lifecycle: active\n"
+        "---\n# Active declaration\nTest override.\n",
+        encoding="utf-8")
+    script = Path(__file__).with_name("run_subagent.py")
+    completed = subprocess.run(
+        [sys.executable, str(script), "--agent", "active-seat", "--prompt", "test",
+         "--cwd", str(tmp_path), "--agents-dir", str(agents_dir),
+         "--strict-agents-dir", "--cli", "opencode", "--model",
+         "nous/stealth/ox-alpha", "--json"],
+        capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert completed.returncode == 1
+    envelope = json.loads(completed.stdout)
+    assert envelope["error_kind"] == "agent_retired"
+    assert envelope["provider_contacted"] is False
+    assert envelope["attempts"] == 0
+    assert envelope["attempt_status"] == "not_run"
+    assert envelope["execution_status"] == "not_run"
+    assert envelope["model"]["served"] is None
+    assert envelope["served_model_evidence"] == "absent"
+    assert envelope["agent_resolution"]["successor"] == \
+        "openrouter-glm-5-3-flash-opencode"
 
 
 def test_bounded_read_unknown_capability_and_unrunnable_seat_are_actionable(tmp_path):

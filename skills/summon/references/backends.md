@@ -160,8 +160,9 @@ non-verdict evidence.
 
 If the OpenRouter pool remains unavailable, an operator can deliberately choose a
 different configured route only when its live roster lists the successor and local
-auth is valid. A historical Nous `stealth/ox-alpha` alias may disappear with the
-preview and must not be assumed equivalent or free. The direct API seat does not
+auth is valid. The historical Nous `stealth/ox-alpha` preview has ended, and Summon
+retires that selector before provider contact; it is not assumed equivalent or free.
+The direct API seat does not
 provide OpenCode's file/tool loop. Auto, Free, and Fusion are deliberate routing
 changes, not transparent GLM fallbacks; verify their served model before treating
 the result as a named-model review.

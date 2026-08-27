@@ -367,6 +367,8 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon agent new\|set NAME --set k=v` | scaffold / retune an agent definition |
 | `summon role propose\|approve\|list\|resolve …` | manage private, opt-in role aliases |
 | `summon jobs list\|status [ID]` · `jobs wait ID` | inspect or wait for background jobs (`--json` on list/status). `status` is a redacted, typed projection; `wait` returns the complete private terminal envelope |
+| `summon jobs extend ID --duration 30m` · `jobs cancel ID` | extend an observable job within its hard runtime budget, or request process-tree cancellation |
+| `summon jobs steer ID --message "…"` · `jobs resume ID --message "…"` | queue authenticated guidance for a later eligible continuation, then explicitly create one governed successor; this is not claimed as live mid-turn injection |
 | `summon telemetry enable\|disable\|status\|clear` | manage local opt-in diagnostics; `clear` does not disable |
 | `summon usage status\|import …` | inspect or import bounded, provider-inert usage evidence; dimensions remain separate and do not reroute an exact request |
 | `summon fleet propose LANE --seats A,B` | create a sealed provider-inert fleet draft; this does not approve, select, dispatch, or authorize spend |
@@ -505,8 +507,10 @@ dispatch it with the **summon** skill instead of doing everything yourself:
   diverse so that independent reviewers can expose different failure modes.
 - **Use Gemini Flash 3.7 as a fast independent evidence lane.** The bundled
   `researcher` seat is pinned to `gemini-3.7-flash-high` through agy and is the recommended
-  secondary voice for a cross-vendor council. Verify `model.served` in the envelope; agy
-  cannot enforce read-only, so keep this seat in research/review roles.
+  secondary voice for a cross-vendor council. AGY 1.1.22 reports the targeted model,
+  session, activity, and terminal usage, but not authoritative `model.served`; treat the
+  named-model vote as advisory. AGY cannot enforce read-only, so keep this seat in a
+  disposable research/review lane when a hard filesystem boundary matters.
 - **Use Grok 4.6 as a near-frontier candidate, not a blind default.** Probe it
   with `--cli cursor-agent --model grok-4.6`, require the envelope's `model.served` to match,
   and keep Gemini pinned until a local smoke proves eligibility, evidence quality, and the

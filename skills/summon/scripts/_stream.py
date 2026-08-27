@@ -195,6 +195,7 @@ class StreamProcessor:
         # Telemetry captured from stream events (None when the CLI doesn't emit it):
         self.session_id = None  # claude session_id / codex thread_id / cursor chat id
         self.usage = None       # token usage dict
+        self.progress_usage = None  # advisory partial usage; never model-service evidence
         self.cost_usd = None    # claude total_cost_usd
         # Two model slots, split by EVIDENCE: the init handshake announces what
         # the session is POINTED AT before any inference happens, so it must
@@ -328,32 +329,63 @@ class StreamProcessor:
                 self.handshake_model = data["model"]
             return False
 
-        # Agy stream-json emits session events under `event` instead of `type`
-        # for the legacy one-shot stream (init/step_update/result). Capture the
-        # session and model details there so resume can continue later and
-        # model provenance stays accurate.
+        # Agy stream-json emits session events under `event` instead of `type`.
+        # Current releases put run configuration under the matching `init`
+        # payload and step details under `step_update`; older releases also put
+        # selected fields at the top level.  Read both shapes without flattening
+        # arbitrary payload keys into the generic parser namespace.
         if data.get("event") == "init":
-            self._bind_session(data.get("conversation_id"), data)
-            if data.get("model"):
-                self.handshake_model = data["model"]
+            init = data.get("init") if isinstance(data.get("init"), dict) else {}
+            self._bind_session(data.get("conversation_id") or init.get("conversation_id"),
+                               data)
+            model = init.get("model") or data.get("model")
+            if isinstance(model, str) and model:
+                # The init packet describes the selected/targeted model.  It is
+                # not a provider-reported served-model receipt.
+                self.handshake_model = model
             return False
 
         if data.get("event") == "step_update":
             # AGY progress packets are trusted transport activity. Only explicit
             # assistant text or monotonically increasing tool steps reset idle.
-            content = data.get("response") or data.get("content")
+            step = (data.get("step_update")
+                    if isinstance(data.get("step_update"), dict) else data)
+            self._bind_session(step.get("conversation_id") or data.get("conversation_id"),
+                               data)
+            # Step usage is provider telemetry, but a model-looking field on a
+            # progress packet is never served-model evidence.  Avoid the generic
+            # terminal telemetry helper here so progress cannot mint identity.
+            if isinstance(step.get("usage"), dict):
+                # Keep partial progress accounting separate from terminal usage.
+                # The executor may use terminal output-token usage as weak,
+                # explicitly inferred service evidence; a progress packet must
+                # never activate even that weaker path.
+                self.progress_usage = step["usage"]
+            content = (step.get("text_delta") or step.get("response")
+                       or step.get("content"))
             if isinstance(content, str) and content:
                 self._liveness("output_text", data,
                                output_chars=self._meaningful_chars(content),
-                               semantic_identity=("agy_text", data.get("conversation_id"),
-                                                  content))
-            elif data.get("tool") or data.get("tool_name"):
-                self._tool_progress += 1
-                tool = data.get("tool") or data.get("tool_name")
+                               semantic_identity=("agy_text", self.session_id,
+                                                  step.get("step_index"),
+                                                  step.get("state"), content))
+            elif (step.get("step_type") == "tool"
+                  or step.get("tool") or step.get("tool_name")):
+                tool = step.get("tool") or step.get("tool_name") or "agy_tool"
+                step_index = step.get("step_index")
+                if isinstance(step_index, int) and not isinstance(step_index, bool) \
+                        and 0 <= step_index <= (1 << 62) - 1:
+                    # ACTIVE then DONE for one step must be monotonic, while an
+                    # exact replay of either packet remains a duplicate.
+                    progress = step_index * 2 + (1 if step.get("state") == "DONE" else 0)
+                else:
+                    self._tool_progress += 1
+                    progress = self._tool_progress
                 self._liveness("tool_activity", data, tool_id=str(tool)[:128],
-                               progress=self._tool_progress,
+                               progress=progress,
                                semantic_identity=("agy_tool",
-                                                  data.get("conversation_id"), tool))
+                                                  self.session_id, step.get("step_index"),
+                                                  step.get("state"), tool))
             else:
                 self._liveness("stream_event", data)
             return False

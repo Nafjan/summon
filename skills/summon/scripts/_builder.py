@@ -1576,6 +1576,11 @@ def opencode_env_override(model: str | None, *, permission: str = "safe-edit",
     if not isinstance(model, str):
         return scrub
     if normalized.startswith("nous/"):
+        provider_model = model.strip()[len("nous/"):]
+        if (not provider_model or len(provider_model) > 256
+                or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f
+                       for ch in provider_model)):
+            raise ValueError("Nous OpenCode model selector is empty or malformed")
         try:
             from _nous_credentials import resolve_nous_api_key
             key, _source = resolve_nous_api_key()
@@ -1591,7 +1596,7 @@ def opencode_env_override(model: str | None, *, permission: str = "safe-edit",
                         "apiKey": "{env:NOUS_API_KEY}",
                     },
                     "models": {
-                        "stealth/ox-alpha": {"name": "Ox Alpha"},
+                        provider_model: {"name": provider_model},
                     },
                 }
             }

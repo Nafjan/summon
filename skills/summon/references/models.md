@@ -59,7 +59,8 @@ reaches an agent depends only on how that agent names its model:
 exposes it. Add `--refresh` in the subcommand form (`summon models --refresh`) or
 `--refresh-models` in the flat form when a provider roster may have changed. Each entry is
 tagged with a `source` so you know how much to trust it:
-- `live` — queried just now (`agy models`, `opencode models`, or an explicit ArkCLI refresh)
+- `live` — queried just now (`agy --output-format json models`, `opencode models`, or an
+  explicit ArkCLI refresh; older AGY versions use one labeled legacy-text fallback)
 - `cache` — read from a provider roster cache; refresh explicitly when it is stale
 - `config` — read from the CLI's own default config (`codex` → config.toml)
 - `static` — documented aliases/defaults to pass via `--model` (CLI has no list)
@@ -74,8 +75,10 @@ never proves account eligibility.
 
 OpenCode discovery delegates to `opencode models` and returns provider/model selectors such
 as `openrouter/z-ai/glm-5.3-flash` when the local OpenCode configuration and credentials expose
-them. The former `stealth/ox-alpha` preview was revealed as this paid model; do not assume the
-old alias or free pricing persists. Model names and availability can change without a Summon release. A live
+them. The former `stealth/ox-alpha` preview was revealed as this paid model. Its direct
+and tool-enabled aliases are retired and stale custom definitions are refused before
+provider contact; do not assume the old alias or free pricing persists. Model names and
+availability can change without a Summon release. A live
 list proves only that OpenCode listed the selector; it does not prove that the
 account can serve it or that a gateway policy will permit it. Confirm a real dispatch and
 inspect `model.served` plus `served_model_evidence`.
