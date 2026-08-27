@@ -10,9 +10,12 @@ from __future__ import annotations
 
 from dataclasses import fields, is_dataclass
 import hashlib
+import hmac
 import json
 import os
+from pathlib import Path
 import re
+import stat
 import tomllib
 from typing import Any
 
@@ -22,6 +25,7 @@ MAX_CANONICAL_BYTES = 256 * 1024
 MAX_ITEMS = 4096
 MAX_DEPTH = 16
 MAX_TEXT = 32 * 1024
+MAX_PRIVATE_FILE_BYTES = 256 * 1024
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CLAIM_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -58,9 +62,26 @@ _INVOCATION_FIELDS = frozenset({
 })
 
 _BINDING_HASHES = frozenset({
-    "approval_id", "fleet_sha256", "lane_sha256", "catalog_sha256",
+    "approval_id", "fleet_sha256", "plan_sha256", "lane_sha256", "catalog_sha256",
     "project_sha256", "prompt_sha256", "request_identity_sha256",
 })
+
+_SENSITIVE_ENV_EXACT = frozenset({
+    "CLI_API_KEY", "CODEX_HOME", "CODEX_MODEL_PROVIDER",
+    "SUBAGENTS_ALLOW_OPENAI_KEY", "SUMMON_ALLOW_CREDIT", "SUMMON_ALLOW_PAYG",
+    "SUMMON_FRESH_CONSENT_ONLY",
+})
+_SENSITIVE_ENV_PREFIXES = (
+    "ANTHROPIC_", "OPENAI_", "CURSOR_", "CLAUDE_CODE_", "GOOGLE_",
+    "GEMINI_", "AWS_", "KIMI_", "AGY_", "ARK_", "OPENROUTER_", "NOUS_",
+)
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,255}$")
+
+_CLAUDE_PRIVATE_FILES = (
+    ".credentials.json", "account.json", "auth.json", "credentials.json",
+    "settings.json", "settings.local.json",
+)
+_CODEX_PRIVATE_FILES = ("auth.json", "config.json", "config.toml")
 
 
 class FleetActivationError(ValueError):
@@ -148,9 +169,34 @@ def invocation_structural_sha256(invocation: Any) -> str:
     return _sha(_invocation_projection(invocation))
 
 
-def _codex_custom_provider_configured() -> bool | None:
+def _profile_environment(invocation: Any) -> dict[str, str]:
+    """Project the environment the pure backend builder actually gives its child."""
+    effective = dict(os.environ)
+    profile_env = getattr(invocation, "profile_env", None)
+    # Of the currently eligible builders only Claude forwards profile_env.  Do
+    # not pretend unused values affect Codex or Cursor execution.
+    if getattr(invocation, "cli", None) == "claude" and profile_env is not None:
+        if (not isinstance(profile_env, dict)
+                or not all(isinstance(key, str) and _ENV_NAME.fullmatch(key)
+                           and (value is None or isinstance(value, str))
+                           for key, value in profile_env.items())):
+            raise FleetActivationError(
+                "fleet_activation_invocation_invalid",
+                "profile environment must contain bounded environment names and text")
+        for key, value in profile_env.items():
+            if value is None:
+                effective.pop(key, None)
+            else:
+                effective[key] = value
+    return effective
+
+
+def _codex_custom_provider_configured(environment: dict[str, str]) -> bool | None:
     """Return True for a selected custom provider, None when config is unreadable."""
-    path = os.path.join(os.path.expanduser("~"), ".codex", "config.toml")
+    configured_root = environment.get("CODEX_HOME")
+    root = (os.path.expandvars(os.path.expanduser(configured_root))
+            if configured_root else os.path.join(os.path.expanduser("~"), ".codex"))
+    path = os.path.join(root, "config.toml")
     if not os.path.exists(path):
         return False
     try:
@@ -176,14 +222,15 @@ def derive_billing_class(invocation: Any) -> dict:
     cli = getattr(invocation, "cli", None)
     model = getattr(invocation, "model", None)
     extra_args = tuple(getattr(invocation, "extra_args", ()) or ())
+    environment = _profile_environment(invocation)
     if cli == "codex":
-        configured = _codex_custom_provider_configured()
+        configured = _codex_custom_provider_configured(environment)
         custom = bool(
             configured is not False
-            or os.environ.get("CODEX_HOME")
-            or os.environ.get("CODEX_MODEL_PROVIDER")
-            or os.environ.get("OPENAI_BASE_URL")
-            or os.environ.get("OPENAI_API_BASE")
+            or environment.get("CODEX_HOME")
+            or environment.get("CODEX_MODEL_PROVIDER")
+            or environment.get("OPENAI_BASE_URL")
+            or environment.get("OPENAI_API_BASE")
             # A named Codex profile has its own config-precedence chain and can
             # select a custom provider even when the base config is ordinary.
             # Slice A does not resolve/profile-bind those private bytes, so any
@@ -199,43 +246,54 @@ def derive_billing_class(invocation: Any) -> dict:
         if custom:
             billing, source = "unknown", "custom_provider_configuration"
         else:
-            metered = bool(os.environ.get("OPENAI_API_KEY")
-                           and os.environ.get("SUBAGENTS_ALLOW_OPENAI_KEY") == "1")
+            metered = bool(environment.get("OPENAI_API_KEY")
+                           and environment.get("SUBAGENTS_ALLOW_OPENAI_KEY") == "1")
             billing = "payg" if metered else "subscription"
             source = "codex_key_policy"
     elif cli == "claude":
+        settings_environment = _claude_settings_environment(invocation, environment)
+        if settings_environment is None:
+            return {
+                "class": "unknown", "source": "custom_provider_configuration",
+                "evidence": "derived_local_policy", "candidate_eligible": False,
+                "credential_binding_required": False, "final_recheck_required": True,
+            }
+        effective = {**environment, **settings_environment}
         custom = bool(
-            os.environ.get("CLAUDE_CODE_USE_BEDROCK")
-            or os.environ.get("CLAUDE_CODE_USE_VERTEX")
-            or os.environ.get("ANTHROPIC_BEDROCK_BASE_URL")
-            or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
-            or os.environ.get("ANTHROPIC_BASE_URL"))
+            effective.get("CLAUDE_CODE_USE_BEDROCK")
+            or effective.get("CLAUDE_CODE_USE_VERTEX")
+            or effective.get("ANTHROPIC_BEDROCK_BASE_URL")
+            or effective.get("ANTHROPIC_VERTEX_PROJECT_ID")
+            or effective.get("ANTHROPIC_BASE_URL"))
         if custom:
             billing, source = "unknown", "custom_provider_configuration"
-        elif os.environ.get("ANTHROPIC_API_KEY"):
+        elif effective.get("ANTHROPIC_API_KEY"):
             billing, source = "payg", "anthropic_key_present"
         elif model == "claude-fable-5":
             billing, source = "unknown", "plan_dependent_model"
         else:
             billing, source = "subscription", "anthropic_key_absent"
     elif cli == "cursor-agent":
-        custom = bool(os.environ.get("CURSOR_API_BASE_URL"))
+        custom = bool(environment.get("CURSOR_API_BASE_URL"))
         if custom:
             billing, source = "unknown", "custom_provider_configuration"
         else:
-            billing = ("payg" if (os.environ.get("CLI_API_KEY")
-                                   or os.environ.get("CURSOR_API_KEY"))
-                       else "subscription")
+            # A key is bindable. Cursor's signed-in subscription account is not
+            # yet exposed through a provider-inert, content-addressable identity,
+            # so absence of a key must not certify an account or subscription.
+            billing = ("payg" if (environment.get("CLI_API_KEY")
+                                   or environment.get("CURSOR_API_KEY"))
+                       else "unknown")
             source = "cursor_key_policy"
     elif cli == "gemini":
         vertex = bool(
-            os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-            or os.environ.get("GOOGLE_CLOUD_PROJECT")
-            or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI"))
+            environment.get("GOOGLE_APPLICATION_CREDENTIALS")
+            or environment.get("GOOGLE_CLOUD_PROJECT")
+            or environment.get("GOOGLE_GENAI_USE_VERTEXAI"))
         if vertex:
             billing, source = "unknown", "vertex_or_adc_configuration"
         else:
-            billing = "payg" if os.environ.get("GEMINI_API_KEY") else "unknown"
+            billing = "payg" if environment.get("GEMINI_API_KEY") else "unknown"
             source = "gemini_key_policy"
     else:
         billing, source = "unknown", "unsupported_backend_policy"
@@ -442,9 +500,283 @@ def matches_activation_candidate(contract: dict, *, agent_definition_sha256: str
     return bool(structural_match and normalized["invocation"]["private_binding"] == "verified")
 
 
+def validate_private_binding_inputs(
+        contract: dict, *, agent_definition_sha256: str,
+        current_request_identity_sha256: str, invocation: Any) -> dict:
+    """Validate all non-secret Slice A evidence before a private ledger binding."""
+    normalized = validate_activation_contract(contract)
+    _validate_attempt_policy(invocation)
+    if (not isinstance(agent_definition_sha256, str)
+            or not _SHA256.fullmatch(agent_definition_sha256)
+            or not isinstance(current_request_identity_sha256, str)
+            or not _SHA256.fullmatch(current_request_identity_sha256)):
+        raise FleetActivationError(
+            "fleet_activation_binding_invalid", "current identity digest is malformed")
+    if normalized["candidate_eligible"] is not True:
+        raise FleetActivationError(
+            "fleet_activation_billing_unknown",
+            "unknown billing cannot become an authoritative activation candidate")
+    if (normalized["agent"]["definition_sha256"] != agent_definition_sha256
+            or normalized["bindings"]["request_identity_sha256"]
+            != current_request_identity_sha256
+            or normalized["invocation"]["structural_sha256"]
+            != invocation_structural_sha256(invocation)
+            or normalized["billing"] != derive_billing_class(invocation)
+            or normalized["bindings"]["prompt_sha256"]
+            != _sha(getattr(invocation, "prompt", ""))):
+        raise FleetActivationError(
+            "fleet_activation_binding_changed",
+            "definition, request, invocation, prompt, or billing evidence changed")
+    return normalized
+
+
+def _sensitive_environment_projection(
+        invocation: Any, environment: dict[str, str]) -> dict:
+    selected = {}
+    for key, value in environment.items():
+        if key in _SENSITIVE_ENV_EXACT or key.startswith(_SENSITIVE_ENV_PREFIXES):
+            if (not isinstance(key, str) or len(key) > 256
+                    or not isinstance(value, str) or len(value) > MAX_TEXT):
+                raise FleetActivationError(
+                    "fleet_activation_private_binding_invalid",
+                    "sensitive environment exceeds private binding bounds")
+            selected[key] = value
+    api_key_env = getattr(invocation, "api_key_env", None)
+    if api_key_env is not None:
+        if not isinstance(api_key_env, str) or not _ENV_NAME.fullmatch(api_key_env):
+            raise FleetActivationError(
+                "fleet_activation_private_binding_invalid",
+                "API-key environment name is malformed")
+        if api_key_env in environment:
+            value = environment[api_key_env]
+            if len(value) > MAX_TEXT:
+                raise FleetActivationError(
+                    "fleet_activation_private_binding_invalid",
+                    "API-key environment value exceeds private binding bounds")
+            selected[api_key_env] = value
+    if len(selected) > 256:
+        raise FleetActivationError(
+            "fleet_activation_private_binding_invalid",
+            "too many sensitive environment values for private binding")
+    return {key: selected[key] for key in sorted(selected)}
+
+
+def _reject_private_link(path: str, field: str, *, directory: bool) -> os.stat_result:
+    try:
+        value = os.lstat(path)
+    except OSError as exc:
+        raise FleetActivationError(
+            "fleet_activation_private_binding_invalid",
+            f"{field} cannot be inspected for private binding") from exc
+    attrs = getattr(value, "st_file_attributes", 0)
+    if stat.S_ISLNK(value.st_mode) or bool(
+            attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+        raise FleetActivationError(
+            "fleet_activation_private_binding_invalid",
+            f"{field} refuses links and reparse points")
+    expected = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected(value.st_mode) or (not directory and getattr(value, "st_nlink", 1) != 1):
+        raise FleetActivationError(
+            "fleet_activation_private_binding_invalid",
+            f"{field} must be a private {'directory' if directory else 'single-link regular file'}")
+    return value
+
+
+def _reject_private_ancestors(path: str, field: str) -> None:
+    current = Path(os.path.abspath(path))
+    for component in reversed([current, *current.parents]):
+        if not os.path.lexists(component):
+            continue
+        value = os.lstat(component)
+        attrs = getattr(value, "st_file_attributes", 0)
+        if stat.S_ISLNK(value.st_mode) or bool(
+                attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+            raise FleetActivationError(
+                "fleet_activation_private_binding_invalid",
+                f"{field} refuses a linked or reparse-point ancestor")
+
+
+def _private_file_bytes(path: str, field: str) -> bytes | None:
+    if not os.path.lexists(path):
+        return None
+    _reject_private_ancestors(os.path.dirname(path), field)
+    identity = _reject_private_link(path, field, directory=False)
+    if identity.st_size > MAX_PRIVATE_FILE_BYTES:
+        raise FleetActivationError(
+            "fleet_activation_private_binding_invalid",
+            f"{field} exceeds private binding bounds")
+    try:
+        with open(path, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            raw = handle.read(MAX_PRIVATE_FILE_BYTES + 1)
+            closed = os.fstat(handle.fileno())
+    except OSError as exc:
+        raise FleetActivationError(
+            "fleet_activation_private_binding_invalid",
+            f"{field} cannot be read for private binding") from exc
+    if (len(raw) > MAX_PRIVATE_FILE_BYTES
+            or (identity.st_dev, identity.st_ino, identity.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+            or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+            != (closed.st_dev, closed.st_ino, closed.st_size, closed.st_mtime_ns)):
+        raise FleetActivationError(
+            "fleet_activation_private_binding_invalid",
+            f"{field} changed while it was privately bound")
+    return raw
+
+
+def _private_file_sha256(path: str, field: str) -> str | None:
+    raw = _private_file_bytes(path, field)
+    return None if raw is None else hashlib.sha256(raw).hexdigest()
+
+
+def _private_directory_projection(
+        root: str, names: tuple[str, ...], field: str) -> dict | None:
+    expanded = os.path.abspath(os.path.expandvars(os.path.expanduser(root)))
+    if not os.path.lexists(expanded):
+        return None
+    _reject_private_ancestors(os.path.dirname(expanded), field)
+    _reject_private_link(expanded, field, directory=True)
+    return {
+        name: _private_file_sha256(os.path.join(expanded, name), f"{field}/{name}")
+        for name in names
+    }
+
+
+def _profile_private_projection(
+        invocation: Any, environment: dict[str, str]) -> dict:
+    cli = getattr(invocation, "cli", None)
+    if cli == "claude":
+        root = environment.get("CLAUDE_CONFIG_DIR") or os.path.join(
+            os.path.expanduser("~"), ".claude")
+        project_root = os.path.join(
+            os.path.abspath(getattr(invocation, "cwd", "")), ".claude")
+        return {
+            "backend": "claude",
+            "profile": _private_directory_projection(
+                root, _CLAUDE_PRIVATE_FILES, "Claude profile"),
+            # Named Claude profiles retain Claude's project/local settings
+            # sources. Bind those bytes as well as the named user profile so a
+            # project cannot change credentials or endpoint selection between
+            # reservation and the final launch recheck.
+            "project": _private_directory_projection(
+                project_root, ("settings.json", "settings.local.json"),
+                "Claude project settings"),
+            "account": _private_file_sha256(
+                os.path.join(os.path.expanduser("~"), ".claude.json"),
+                "Claude account configuration"),
+        }
+    if cli == "codex":
+        configured_root = environment.get("CODEX_HOME")
+        root = (os.path.expandvars(os.path.expanduser(configured_root))
+                if configured_root else os.path.join(os.path.expanduser("~"), ".codex"))
+        return {
+            "backend": "codex",
+            "profile": _private_directory_projection(
+                root, _CODEX_PRIVATE_FILES, "Codex profile"),
+            "account": None,
+        }
+    return {"backend": cli, "profile": None, "account": None}
+
+
+def _claude_settings_environment(
+        invocation: Any, environment: dict[str, str]) -> dict[str, str] | None:
+    """Return enabled named-profile/project settings env, or fail closed.
+
+    Default Claude seats disable ambient setting sources in ``_builder``. Named
+    profiles deliberately keep them, so activation must apply and later bind the
+    user, project, and local project files that can alter credentials or routing.
+    """
+    if (getattr(invocation, "cli", None) != "claude"
+            or getattr(invocation, "profile_env", None) is None):
+        return {}
+    root = environment.get("CLAUDE_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude")
+    expanded = os.path.abspath(os.path.expandvars(os.path.expanduser(root)))
+    project = os.path.join(
+        os.path.abspath(getattr(invocation, "cwd", "")), ".claude")
+    result: dict[str, str] = {}
+    sources = (
+        (expanded, "settings.json", "Claude profile/settings.json"),
+        (expanded, "settings.local.json", "Claude profile/settings.local.json"),
+        (project, "settings.json", "Claude project settings/settings.json"),
+        (project, "settings.local.json",
+         "Claude project settings/settings.local.json"),
+    )
+    for directory, name, field in sources:
+        raw = _private_file_bytes(
+            os.path.join(directory, name), field)
+        if raw is None:
+            continue
+        try:
+            value = _bounded(json.loads(raw.decode("utf-8")))
+        except (UnicodeDecodeError, json.JSONDecodeError, FleetActivationError):
+            return None
+        if not isinstance(value, dict):
+            return None
+        # Executable credential helpers or cloud refresh hooks can change the
+        # effective account dynamically and cannot be certified provider-inertly.
+        if any(value.get(key) is not None for key in (
+                "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport")):
+            return None
+        configured = value.get("env", {})
+        if (not isinstance(configured, dict)
+                or not all(_ENV_NAME.fullmatch(str(key))
+                           and (item is None or isinstance(item, str))
+                           for key, item in configured.items())):
+            return None
+        for key, item in configured.items():
+            if item is None:
+                result.pop(key, None)
+            else:
+                result[key] = item
+    return result
+
+
+def private_binding_hmac(
+        invocation: Any, *, master_key: bytes, approval_id: str, claim_id: str,
+        contract_sha256: str, agent_definition_sha256: str,
+        current_request_identity_sha256: str) -> str:
+    """HMAC every private invocation/account/environment input; expose no values."""
+    if not isinstance(master_key, bytes) or len(master_key) < 32:
+        raise FleetActivationError(
+            "fleet_activation_private_binding_invalid", "private approval key is invalid")
+    for value, pattern in (
+            (approval_id, _SHA256), (claim_id, _CLAIM_ID),
+            (contract_sha256, _SHA256), (agent_definition_sha256, _SHA256),
+            (current_request_identity_sha256, _SHA256)):
+        if not isinstance(value, str) or not pattern.fullmatch(value):
+            raise FleetActivationError(
+                "fleet_activation_private_binding_invalid",
+                "private activation identity is malformed")
+    environment = _profile_environment(invocation)
+    projection = {
+        "contract_sha256": contract_sha256,
+        "agent_definition_sha256": agent_definition_sha256,
+        "request_identity_sha256": current_request_identity_sha256,
+        "invocation": {
+            name: _bounded(getattr(invocation, name))
+            for name in sorted(_INVOCATION_FIELDS)
+        },
+        "sensitive_environment": _sensitive_environment_projection(
+            invocation, environment),
+        "profile_private": _profile_private_projection(invocation, environment),
+    }
+    raw = _canonical(projection)
+    if len(raw) > MAX_CANONICAL_BYTES:
+        raise FleetActivationError(
+            "fleet_activation_private_binding_invalid",
+            "private activation binding exceeds bounds")
+    domain = (b"summon.fleet-activation-private/v1\0"
+              + approval_id.encode("ascii") + b"\0" + claim_id.encode("ascii"))
+    derived = hmac.new(master_key, domain, hashlib.sha256).digest()
+    return hmac.new(derived, raw, hashlib.sha256).hexdigest()
+
+
 __all__ = [
     "SCHEMA", "FleetActivationError", "PURE_SUBPROCESS_BACKENDS",
     "derive_billing_class", "invocation_structural_sha256",
     "freeze_activation_candidate", "validate_activation_contract",
-    "matches_activation_candidate",
+    "matches_activation_candidate", "validate_private_binding_inputs",
+    "private_binding_hmac",
 ]

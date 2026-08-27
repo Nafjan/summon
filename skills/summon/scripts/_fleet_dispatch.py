@@ -1,12 +1,17 @@
 """Authenticated, provider-inert fleet dispatch reservations.
 
 This module owns no process, provider, network, or credential-launch capability.  It
-turns one active M3b1 fleet approval into bounded, durable, single-use launch claims.
-The caller must still connect the claim transitions to ``ProviderLaunchControl``.
+turns one active M3b1 fleet approval into bounded, locally durable, single-use launch
+claims. The caller must still connect the claim transitions to
+``ProviderLaunchControl``.
 
 Public receipts are evidence only. Authority comes from reopening the private
-approval store, dispatch ledger, and separate monotonic anchor sidecar under the
-shared store lock.
+approval store, dispatch ledger, separate monotonic anchor, and authenticated
+initialization marker under the shared store lock. Partial deletion and torn writes
+fail closed while at least one dispatch-history artifact survives. As in
+``_fleet_approval``, the local OS account is the trust boundary: this does not defend
+against that owner deliberately deleting every authenticated dispatch-history
+artifact, or rolling back or deleting its key or approval state.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from typing import Any
 import _decision
 import _evidence
 import _fleet
+import _fleet_activation
 import _fleet_approval
 import _fleet_compile
 import _jobs
@@ -37,9 +43,12 @@ LEDGER_SCHEMA = "summon.fleet-dispatch-ledger/v1"
 ANCHOR_SCHEMA = "summon.fleet-dispatch-anchor/v1"
 CLAIM_SCHEMA = "summon.fleet-dispatch-claim/v1"
 PUBLIC_SCHEMA = "summon.fleet-dispatch/v1"
+ACTIVATION_BINDING_SCHEMA = "summon.fleet-activation-binding/v1"
+INITIALIZATION_SCHEMA = "summon.fleet-dispatch-initialization/v1"
 MAX_LEDGER_BYTES = 4 * 1024 * 1024
 MAX_ANCHOR_BYTES = 4096
 MAX_ANCHOR_PARSE_ITEMS = 64
+MAX_INITIALIZATION_BYTES = 2048
 MAX_PUBLIC_RECEIPT_BYTES = 64 * 1024
 MAX_CLAIMS = 4096
 MAX_PARSE_ITEMS = 180_000
@@ -120,6 +129,14 @@ def _anchor_key(master: bytes, store_id: str, approval_id: str) -> bytes:
     return hmac.new(master, domain, hashlib.sha256).digest()
 
 
+def _initialization_key(master: bytes, store_id: str, approval_id: str) -> bytes:
+    domain = (
+        b"summon.fleet-dispatch-initialization/v1\0"
+        + store_id.encode("ascii") + b"\0" + approval_id.encode("ascii")
+    )
+    return hmac.new(master, domain, hashlib.sha256).digest()
+
+
 def _mac(key: bytes, value: dict) -> str:
     return hmac.new(key, _canonical(value), hashlib.sha256).hexdigest()
 
@@ -152,6 +169,21 @@ def anchor_path(approval_id: str) -> str:
         raise FleetDispatchError(
             "fleet_dispatch_approval_invalid", "fleet dispatch approval id is malformed")
     return os.path.join(anchor_root(), approval_id + ".json")
+
+
+def initialization_root() -> str:
+    """Approval-store companion root, independent of both dispatch roots."""
+    return os.path.join(
+        os.path.dirname(os.path.abspath(_fleet_approval.store_path())),
+        "fleet-dispatch-initialized",
+    )
+
+
+def initialization_path(approval_id: str) -> str:
+    if not _SHA256.fullmatch(str(approval_id or "")):
+        raise FleetDispatchError(
+            "fleet_dispatch_approval_invalid", "fleet dispatch approval id is malformed")
+    return os.path.join(initialization_root(), approval_id + ".json")
 
 
 def _public_identifier(value: Any, field: str, *, nullable: bool = False) -> str | None:
@@ -443,7 +475,7 @@ def _validate_claim(claim: Any, ledger: dict) -> None:
         "contact_slot_consumed", "billable_slot_consumed",
         "provider_contacted", "terminal_sha256", "created_at", "updated_at",
     }
-    if (not isinstance(claim, dict) or set(claim) != fields
+    if (not isinstance(claim, dict) or set(claim) not in {frozenset(fields), frozenset(fields | {"activation"})}
             or claim.get("schema") != CLAIM_SCHEMA
             or not isinstance(claim.get("ordinal"), int)
             or isinstance(claim.get("ordinal"), bool)
@@ -466,10 +498,15 @@ def _validate_claim(claim: Any, ledger: dict) -> None:
     _timestamp(claim.get("created_at"), "created_at")
     _timestamp(claim.get("updated_at"), "updated_at")
     request = claim.get("request")
-    if (not isinstance(request, dict) or set(request) != {
+    request_fields = {
             "operation", "bindings", "authority", "decision_sha256",
             "prompt_sha256", "billing", "data_boundary", "route"}
-            or request.get("operation") != "fleet_dispatch"
+    activation = claim.get("activation")
+    if activation is not None:
+        request_fields.add("activation_sha256")
+    if (not isinstance(request, dict) or set(request) != request_fields
+            or request.get("operation") not in {"fleet_dispatch", "fleet_activation_dispatch"}
+            or (activation is None) != (request.get("operation") == "fleet_dispatch")
             or request.get("bindings") != ledger["bindings"]
             or request.get("authority") != ledger["authority"]
             or not _SHA256.fullmatch(str(request.get("decision_sha256", "")))
@@ -479,6 +516,26 @@ def _validate_claim(claim: Any, ledger: dict) -> None:
             or claim["request_sha256"] != _digest(request)):
         raise FleetDispatchError(
             "fleet_dispatch_ledger_untrusted", "dispatch request binding is invalid")
+    if activation is not None:
+        activation_fields = {
+            "schema", "contract_sha256", "agent_definition_sha256",
+            "request_identity_sha256", "private_binding_hmac", "billing_class",
+            "attempt_policy",
+        }
+        if (not isinstance(activation, dict) or set(activation) != activation_fields
+                or activation.get("schema") != ACTIVATION_BINDING_SCHEMA
+                or not all(_SHA256.fullmatch(str(activation.get(field, "")))
+                           for field in ("contract_sha256", "agent_definition_sha256",
+                                         "request_identity_sha256", "private_binding_hmac"))
+                or activation.get("billing_class") not in BILLING_CLASSES
+                or activation.get("attempt_policy") != {
+                    "foreground_subprocess_only": True, "max_attempts": 1,
+                    "retry": False, "fallback": False,
+                    "continuation": False, "background": False,
+                }
+                or request.get("activation_sha256") != activation["contract_sha256"]):
+            raise FleetDispatchError(
+                "fleet_dispatch_ledger_untrusted", "activation binding is malformed")
     data_boundary = request.get("data_boundary")
     _normalize_data_boundary(
         data_boundary, declared=ledger["authority"]["data_boundary"],
@@ -889,6 +946,74 @@ def _recover_prepared_ledger(path: str, key: bytes,
             "staged dispatch ledger could not be promoted") from exc
 
 
+def _read_initialization_marker(
+        key: bytes, store: dict, approval_id: str) -> bool:
+    path = initialization_path(approval_id)
+    root = os.path.dirname(path)
+    if not os.path.lexists(path):
+        return False
+    _fleet_approval._reject_reparse_ancestors(root)
+    _fleet_approval._verify_private(root, directory=True)
+    identity = _fleet_approval._regular_single_link(
+        path, "dispatch initialization marker")
+    _fleet_approval._verify_private(path, directory=False)
+    if identity.st_size > MAX_INITIALIZATION_BYTES:
+        raise _evidence.EvidenceError("fleet dispatch initialization marker is oversized")
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise _evidence.EvidenceError(
+            "fleet dispatch initialization marker could not be read") from exc
+    value = _evidence.loads(
+        raw, max_bytes=MAX_INITIALIZATION_BYTES, max_items=32)
+    approval = store.get("approvals", {}).get(approval_id)
+    fields = {"schema", "store_id", "approval_id", "approval_generation", "mac"}
+    if (approval is None or not isinstance(value, dict) or set(value) != fields
+            or value.get("schema") != INITIALIZATION_SCHEMA
+            or value.get("store_id") != store.get("store_id")
+            or value.get("approval_id") != approval_id
+            or value.get("approval_generation") != approval.get("generation")):
+        raise _evidence.EvidenceError(
+            "fleet dispatch initialization marker is malformed")
+    expected = _mac(
+        _initialization_key(key, value["store_id"], approval_id), _unsigned(value))
+    if not hmac.compare_digest(str(value.get("mac", "")), expected):
+        raise _evidence.EvidenceError(
+            "fleet dispatch initialization marker authentication failed")
+    return True
+
+
+def _write_initialization_marker(
+        key: bytes, store: dict, approval_id: str) -> None:
+    if _read_initialization_marker(key, store, approval_id):
+        return
+    approval = store.get("approvals", {}).get(approval_id)
+    if approval is None:
+        raise _evidence.EvidenceError(
+            "fleet approval is unavailable for dispatch initialization")
+    body = {
+        "schema": INITIALIZATION_SCHEMA, "store_id": store["store_id"],
+        "approval_id": approval_id,
+        "approval_generation": approval["generation"],
+    }
+    authenticated = {
+        **body,
+        "mac": _mac(_initialization_key(
+            key, store["store_id"], approval_id), body),
+    }
+    serialized = json.dumps(
+        authenticated, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if len(serialized) > MAX_INITIALIZATION_BYTES:
+        raise _evidence.EvidenceError(
+            "fleet dispatch initialization marker is oversized")
+    _fleet_approval._secure_private_root(initialization_root())
+    _write_bytes_atomic(initialization_path(approval_id), serialized)
+    if not _read_initialization_marker(key, store, approval_id):
+        raise _evidence.EvidenceError(
+            "fleet dispatch initialization marker could not be verified")
+
+
 def _read_ledger(path: str, key: bytes, approval_id: str, store: dict, *,
                  missing_ok: bool) -> dict | None:
     try:
@@ -896,13 +1021,46 @@ def _read_ledger(path: str, key: bytes, approval_id: str, store: dict, *,
     except _evidence.EvidenceError as exc:
         raise FleetDispatchError(
             "fleet_dispatch_ledger_replay", str(exc)) from exc
-    if not os.path.lexists(path):
+    ledger_exists = os.path.lexists(path)
+    anchor_exists = os.path.lexists(anchor_path(approval_id))
+    try:
+        initialized = _read_initialization_marker(key, store, approval_id)
+    except _evidence.EvidenceError as exc:
+        raise FleetDispatchError(
+            "fleet_dispatch_ledger_replay", str(exc)) from exc
+    if not ledger_exists:
+        if initialized and not anchor_exists:
+            raise FleetDispatchError(
+                "fleet_dispatch_ledger_replay",
+                "authenticated dispatch history exists but both dispatch roots are missing")
+        if not initialized and not anchor_exists:
+            if not missing_ok:
+                raise FleetDispatchError(
+                    "fleet_dispatch_claim_missing", "dispatch ledger does not exist")
+            try:
+                # Commit the durable marker first. A crash before anchor creation
+                # deliberately becomes ambiguous history and fails closed later.
+                _write_initialization_marker(key, store, approval_id)
+            except _evidence.EvidenceError as exc:
+                raise FleetDispatchError(
+                    "fleet_dispatch_anchor_failed",
+                    "dispatch first-use marker could not be recorded") from exc
         try:
             _reconcile_dispatch_anchor(
                 store, key, approval_id, None, ledger_retired=False)
         except _evidence.EvidenceError as exc:
             raise FleetDispatchError(
                 "fleet_dispatch_ledger_replay", str(exc)) from exc
+        if not initialized and anchor_exists:
+            try:
+                # Upgrade a legacy clean genesis anchor only after its exact
+                # empty state reconciles. Commit the durable marker before any
+                # caller can create a new ledger from that legacy state.
+                _write_initialization_marker(key, store, approval_id)
+            except _evidence.EvidenceError as exc:
+                raise FleetDispatchError(
+                    "fleet_dispatch_anchor_failed",
+                    "legacy dispatch genesis could not be durably marked") from exc
         if missing_ok:
             return None
         raise FleetDispatchError(
@@ -920,6 +1078,15 @@ def _read_ledger(path: str, key: bytes, approval_id: str, store: dict, *,
         except _evidence.EvidenceError as exc:
             raise FleetDispatchError(
                 "fleet_dispatch_ledger_replay", str(exc)) from exc
+        if not initialized:
+            try:
+                # Safely adopt a legacy authenticated ledger only after its
+                # independent anchor has reconciled the exact bytes.
+                _write_initialization_marker(key, store, approval_id)
+            except _evidence.EvidenceError as exc:
+                raise FleetDispatchError(
+                    "fleet_dispatch_anchor_failed",
+                    "legacy dispatch history could not be durably marked") from exc
         return value
     except FleetDispatchError:
         raise
@@ -1126,6 +1293,194 @@ def reserve_dispatch(*, approval_id: str, fleet: dict, plan: dict,
         return _reservation(claim)
 
 
+def _activation_attempt_policy() -> dict:
+    return {
+        "foreground_subprocess_only": True, "max_attempts": 1,
+        "retry": False, "fallback": False,
+        "continuation": False, "background": False,
+    }
+
+
+def _activation_request(*, bindings: dict, authority: dict, decision: dict,
+                        prompt_sha256: str, billing: dict[str, str],
+                        data_boundary: dict, route: dict,
+                        activation_sha256: str) -> dict:
+    request = _semantic_request(
+        bindings=bindings, authority=authority, decision=decision,
+        prompt_sha256=prompt_sha256, billing=billing,
+        data_boundary=data_boundary, route=route)
+    request["operation"] = "fleet_activation_dispatch"
+    request["activation_sha256"] = activation_sha256
+    return request
+
+
+def _activation_inputs(*, approval_id: str, fleet: dict, plan: dict,
+                       catalog: list[dict], lane_name: str, cwd: str,
+                       data_boundary: dict, invocation: Any,
+                       activation_candidate: dict,
+                       agent_definition_sha256: str,
+                       current_request_identity_sha256: str,
+                       approval: dict) -> tuple[dict, dict, dict, dict, dict, dict]:
+    try:
+        candidate = _fleet_activation.validate_private_binding_inputs(
+            activation_candidate,
+            agent_definition_sha256=agent_definition_sha256,
+            current_request_identity_sha256=current_request_identity_sha256,
+            invocation=invocation)
+    except _fleet_activation.FleetActivationError as exc:
+        raise FleetDispatchError(exc.kind, str(exc)) from exc
+    bindings, authority, normalized_catalog = _approved_context(
+        fleet=fleet, plan=plan, catalog=catalog,
+        lane_name=lane_name, cwd=cwd, approval=approval)
+    _payload, lane = _fleet_approval._lane(plan, lane_name)
+    if len(lane["candidates"]) != 1:
+        raise FleetDispatchError(
+            "fleet_activation_lane_ambiguous",
+            "authoritative activation currently requires a single-candidate lane")
+    seat = lane["candidates"][0]["seat"]
+    expected_bindings = {**{key: value for key, value in bindings.items() if key != "lane"},
+                         "approval_id": approval_id,
+                         "prompt_sha256": _fleet_activation._sha(invocation.prompt),
+                         "request_identity_sha256": current_request_identity_sha256}
+    if (candidate["bindings"] != {**expected_bindings,
+                                  "claim_id": candidate["bindings"]["claim_id"]}
+            or candidate["agent"]["seat"] != seat):
+        raise FleetDispatchError(
+            "fleet_activation_context_changed",
+            "activation candidate differs from the approved lane or bindings")
+    billing_class = candidate["billing"]["class"]
+    billing = {seat: billing_class}
+    boundary = _normalize_data_boundary(
+        data_boundary, declared=authority["data_boundary"],
+        prompt_sha256=expected_bindings["prompt_sha256"])
+    decision, route = _decision_and_route(
+        approval_id=approval_id, bindings=bindings, authority=authority,
+        lane=lane, catalog=normalized_catalog, billing=billing,
+        data_boundary=boundary)
+    if (route["seat"] != seat or route["backend"] != invocation.cli
+            or route["model"] != invocation.model
+            or route["permission"] != invocation.permission):
+        raise FleetDispatchError(
+            "fleet_activation_route_changed",
+            "resolved lane route differs from the frozen invocation")
+    request = _activation_request(
+        bindings=bindings, authority=authority, decision=decision,
+        prompt_sha256=expected_bindings["prompt_sha256"], billing=billing,
+        data_boundary=boundary, route=route,
+        activation_sha256=candidate["sha256"])
+    return candidate, bindings, authority, decision, route, request
+
+
+def reserve_activation_dispatch(*, approval_id: str, fleet: dict, plan: dict,
+                                catalog: list[dict], lane_name: str, cwd: str,
+                                data_boundary: dict, invocation: Any,
+                                activation_candidate: dict,
+                                agent_definition_sha256: str,
+                                current_request_identity_sha256: str,
+                                request_id: str | None = None) -> Reservation:
+    """Privately bind one frozen Slice A candidate; never launch or consume it."""
+    if request_id is not None and not _ID.fullmatch(str(request_id)):
+        raise FleetDispatchError(
+            "fleet_dispatch_request_invalid", "request id must be 32 lowercase hex characters")
+    path = ledger_path(approval_id)
+    now = _fleet_approval._now()
+    with _fleet_approval._store_lock():
+        key = _fleet_approval._load_key(create=False)
+        store, approval = _active_approval(approval_id, key, now)
+        candidate, bindings, authority, decision, route, request = _activation_inputs(
+            approval_id=approval_id, fleet=fleet, plan=plan, catalog=catalog,
+            lane_name=lane_name, cwd=cwd, data_boundary=data_boundary,
+            invocation=invocation, activation_candidate=activation_candidate,
+            agent_definition_sha256=agent_definition_sha256,
+            current_request_identity_sha256=current_request_identity_sha256,
+            approval=approval)
+        claim_id = candidate["bindings"]["claim_id"]
+        request_sha256 = _digest(request)
+        stable_id = request_id or claim_id
+        activation = {
+            "schema": ACTIVATION_BINDING_SCHEMA,
+            "contract_sha256": candidate["sha256"],
+            "agent_definition_sha256": agent_definition_sha256,
+            "request_identity_sha256": current_request_identity_sha256,
+            "private_binding_hmac": _fleet_activation.private_binding_hmac(
+                invocation, master_key=key, approval_id=approval_id,
+                claim_id=claim_id, contract_sha256=candidate["sha256"],
+                agent_definition_sha256=agent_definition_sha256,
+                current_request_identity_sha256=current_request_identity_sha256),
+            "billing_class": candidate["billing"]["class"],
+            "attempt_policy": _activation_attempt_policy(),
+        }
+        root = os.path.dirname(path)
+        _fleet_approval._secure_private_root(root)
+        ledger = _read_ledger(path, key, approval_id, store, missing_ok=True)
+        approval_sha = _digest(approval)
+        if ledger is None:
+            ledger = {
+                "schema": LEDGER_SCHEMA, "store_id": store["store_id"],
+                "approval_id": approval_id,
+                "approval_generation": approval["generation"],
+                "approval_sha256": approval_sha, "bindings": bindings,
+                "authority": authority, "generation": 0, "next_ordinal": 0,
+                "totals": {"provider_contact_slots_consumed": 0,
+                           "billable_slots_consumed": 0},
+                "claims": {}, "mac": "",
+            }
+        elif (ledger["store_id"] != store["store_id"]
+              or ledger["approval_generation"] != approval["generation"]
+              or ledger["approval_sha256"] != approval_sha
+              or ledger["bindings"] != bindings or ledger["authority"] != authority):
+            raise FleetDispatchError(
+                "fleet_dispatch_approval_mismatch",
+                "dispatch ledger belongs to different approval authority")
+        for existing in ledger["claims"].values():
+            if existing["request_id"] == stable_id or existing["request_sha256"] == request_sha256:
+                if (existing["request_sha256"] != request_sha256
+                        or existing.get("activation") != activation):
+                    raise FleetDispatchError(
+                        "fleet_dispatch_request_conflict",
+                        "activation request is already bound to different private inputs")
+                return _reservation(existing)
+        if claim_id in ledger["claims"]:
+            raise FleetDispatchError(
+                "fleet_dispatch_request_conflict", "activation claim id is already occupied")
+        if len(ledger["claims"]) >= MAX_CLAIMS:
+            raise FleetDispatchError("fleet_dispatch_ledger_full", "dispatch claim limit reached")
+        spend = authority["spend"]
+        contacts = ledger["totals"]["provider_contact_slots_consumed"] + sum(
+            int(item["contact_slot_reserved"]) for item in ledger["claims"].values())
+        bills = ledger["totals"]["billable_slots_consumed"] + sum(
+            int(item["billable_slot_reserved"]) for item in ledger["claims"].values())
+        active = sum(int(item["phase"] in ACTIVE_PHASES)
+                     for item in ledger["claims"].values())
+        route_billable = route["billing_class"] in {"credit", "payg"}
+        if contacts >= spend["max_provider_contacts"]:
+            raise FleetDispatchError("fleet_dispatch_contact_ceiling", "approved provider-contact ceiling is exhausted")
+        if route_billable and bills >= spend["max_billable_attempts"]:
+            raise FleetDispatchError("fleet_dispatch_billable_ceiling", "approved billable-attempt ceiling is exhausted")
+        if active >= spend["max_parallel"]:
+            raise FleetDispatchError("fleet_dispatch_parallel_ceiling", "approved parallel ceiling is exhausted")
+        if ledger["generation"] >= MAX_GENERATION or ledger["next_ordinal"] >= MAX_CLAIMS:
+            raise FleetDispatchError("fleet_dispatch_ledger_full", "dispatch generation limit reached")
+        created = _now_text()
+        claim = {
+            "schema": CLAIM_SCHEMA, "ordinal": ledger["next_ordinal"] + 1,
+            "claim_generation": 1, "claim_id": claim_id,
+            "request_id": stable_id, "request_sha256": request_sha256,
+            "request": request, "decision": decision, "route": route,
+            "activation": activation, "phase": "reserved",
+            "contact_slot_reserved": True,
+            "billable_slot_reserved": route_billable,
+            "contact_slot_consumed": False, "billable_slot_consumed": False,
+            "provider_contacted": False, "terminal_sha256": None,
+            "created_at": created, "updated_at": created,
+        }
+        ledger["claims"][claim_id] = claim
+        ledger["next_ordinal"] += 1
+        ledger["generation"] += 1
+        _write_ledger(path, ledger, key, store)
+        return _reservation(claim)
+
+
 def _revalidate_launch_context(*, ledger: dict, claim: dict, approval: dict,
                                store: dict, fleet: dict, plan: dict,
                                catalog: list[dict], lane_name: str, cwd: str) -> None:
@@ -1156,6 +1511,72 @@ def _revalidate_launch_context(*, ledger: dict, claim: dict, approval: dict,
         raise FleetDispatchError(
             "fleet_dispatch_context_changed",
             "current lane decision differs from the reserved dispatch")
+
+
+def preflight_activation_dispatch(
+        reservation: Reservation, *, fleet: dict, plan: dict,
+        catalog: list[dict], lane_name: str, cwd: str, data_boundary: dict,
+        invocation: Any, activation_candidate: dict,
+        agent_definition_sha256: str,
+        current_request_identity_sha256: str) -> dict:
+    """Revalidate a private activation reservation without consuming any slot.
+
+    This is evidence only. A future launcher must repeat this validation while
+    holding the same lock that consumes the slot and freezes final argv/env;
+    returning ``ready`` here is never a transferable launch capability.
+    """
+    if not isinstance(reservation, Reservation):
+        raise FleetDispatchError(
+            "fleet_dispatch_claim_invalid", "dispatch reservation is invalid")
+    with _fleet_approval._store_lock():
+        key = _fleet_approval._load_key(create=False)
+        store, approval = _active_approval(
+            reservation.approval_id, key, _fleet_approval._now())
+        ledger = _read_ledger(
+            ledger_path(reservation.approval_id), key,
+            reservation.approval_id, store, missing_ok=False)
+        claim = ledger["claims"].get(reservation.claim_id)
+        if (claim is None or claim["request_id"] != reservation.request_id
+                or claim["request_sha256"] != reservation.request_sha256
+                or claim["decision"] != reservation.decision
+                or claim["route"] != reservation.route
+                or claim.get("activation") is None):
+            raise FleetDispatchError(
+                "fleet_dispatch_claim_untrusted", "activation reservation differs from its ledger")
+        if claim["phase"] != "reserved":
+            raise FleetDispatchError(
+                "fleet_dispatch_cas_conflict", "activation reservation is no longer reserved")
+        candidate, bindings, authority, decision, route, request = _activation_inputs(
+            approval_id=reservation.approval_id, fleet=fleet, plan=plan,
+            catalog=catalog, lane_name=lane_name, cwd=cwd,
+            data_boundary=data_boundary, invocation=invocation,
+            activation_candidate=activation_candidate,
+            agent_definition_sha256=agent_definition_sha256,
+            current_request_identity_sha256=current_request_identity_sha256,
+            approval=approval)
+        expected_hmac = _fleet_activation.private_binding_hmac(
+            invocation, master_key=key, approval_id=reservation.approval_id,
+            claim_id=reservation.claim_id, contract_sha256=candidate["sha256"],
+            agent_definition_sha256=agent_definition_sha256,
+            current_request_identity_sha256=current_request_identity_sha256)
+        activation = claim["activation"]
+        if (ledger["bindings"] != bindings or ledger["authority"] != authority
+                or claim["decision"] != decision or claim["route"] != route
+                or claim["request"] != request
+                or activation["contract_sha256"] != candidate["sha256"]
+                or activation["agent_definition_sha256"] != agent_definition_sha256
+                or activation["request_identity_sha256"] != current_request_identity_sha256
+                or not hmac.compare_digest(
+                    activation["private_binding_hmac"], expected_hmac)):
+            raise FleetDispatchError(
+                "fleet_activation_context_changed",
+                "current activation inputs differ from the private reservation")
+        return {
+            "ready": True, "provider_contacted": False,
+            "contract_sha256": activation["contract_sha256"],
+            "billing_class": activation["billing_class"],
+            "attempt_policy": dict(activation["attempt_policy"]),
+        }
 
 
 def _mutate(reservation: Reservation, *, expected: str, target: str,
@@ -1354,7 +1775,7 @@ def get_claim(reservation: Reservation) -> dict:
 
 def _public_payload(ledger: dict, claim: dict) -> dict:
     route = claim["route"]
-    return {
+    payload = {
         "status": "success",
         "action": "fleet_dispatch_claim",
         "authorization": "evidence_only",
@@ -1385,6 +1806,14 @@ def _public_payload(ledger: dict, claim: dict) -> dict:
             "provider_contacted": claim["provider_contacted"],
         },
     }
+    if claim.get("activation") is not None:
+        activation = claim["activation"]
+        payload["activation"] = {
+            "contract_sha256": activation["contract_sha256"],
+            "billing_class": activation["billing_class"],
+            "attempt_policy": dict(activation["attempt_policy"]),
+        }
+    return payload
 
 
 def _validate_public_payload_before_hash(payload: dict) -> None:
@@ -1434,7 +1863,9 @@ def public_receipt(reservation: Reservation) -> dict:
 def verify_public_receipt(value: Any) -> dict:
     fields = {"schema", "sha256", "status", "action", "authorization",
               "approval", "bindings", "decision", "resolution", "claim"}
-    if not isinstance(value, dict) or set(value) != fields or value.get("schema") != PUBLIC_SCHEMA:
+    if (not isinstance(value, dict)
+            or set(value) not in {frozenset(fields), frozenset(fields | {"activation"})}
+            or value.get("schema") != PUBLIC_SCHEMA):
         raise FleetDispatchError(
             "fleet_dispatch_receipt_invalid", "public dispatch receipt is malformed")
     payload = {key: item for key, item in value.items() if key not in {"schema", "sha256"}}
@@ -1448,6 +1879,7 @@ def verify_public_receipt(value: Any) -> dict:
     bindings = payload.get("bindings")
     resolution = payload.get("resolution")
     claim = payload.get("claim")
+    activation = payload.get("activation")
     if (payload.get("status") != "success"
             or payload.get("action") != "fleet_dispatch_claim"
             or payload.get("authorization") != "evidence_only"
@@ -1480,6 +1912,15 @@ def verify_public_receipt(value: Any) -> dict:
                 "billable_slot_consumed", "provider_contacted"}):
         raise FleetDispatchError(
             "fleet_dispatch_receipt_invalid", "public dispatch receipt fields are invalid")
+    if activation is not None and (
+            not isinstance(activation, dict)
+            or set(activation) != {"contract_sha256", "billing_class", "attempt_policy"}
+            or not _SHA256.fullmatch(str(activation.get("contract_sha256", "")))
+            or activation.get("billing_class") not in BILLING_CLASSES
+            or activation.get("attempt_policy") != _activation_attempt_policy()
+            or activation.get("billing_class") != resolution.get("billing_class")):
+        raise FleetDispatchError(
+            "fleet_dispatch_receipt_invalid", "public activation projection is invalid")
     for field in ("seat", "backend", "provider"):
         _public_identifier(resolution.get(field), f"resolution.{field}")
     _public_text(resolution.get("model"), "resolution.model", nullable=True)
@@ -1532,7 +1973,8 @@ def verify_public_receipt(value: Any) -> dict:
 
 __all__ = [
     "LEDGER_SCHEMA", "CLAIM_SCHEMA", "PUBLIC_SCHEMA", "FleetDispatchError",
-    "Reservation", "reserve_dispatch", "cancel_pre_spawn",
+    "Reservation", "reserve_dispatch", "reserve_activation_dispatch",
+    "preflight_activation_dispatch", "cancel_pre_spawn",
     "claim_provider_launch", "mark_spawn_failed", "mark_spawned",
     "mark_reaped", "mark_indeterminate", "mark_terminal", "get_claim",
     "public_receipt", "verify_public_receipt", "ledger_path",

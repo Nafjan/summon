@@ -22,6 +22,7 @@ def _bindings(prompt: str = "review this") -> dict:
     return {
         "approval_id": _digest("approval"),
         "fleet_sha256": _digest("fleet"),
+        "plan_sha256": _digest("plan"),
         "lane_sha256": _digest("lane"),
         "catalog_sha256": _digest("catalog"),
         "project_sha256": _digest("project"),
@@ -151,6 +152,15 @@ def test_cursor_api_keys_never_project_subscription(monkeypatch, name):
     assert result["credential_binding_required"] is True
 
 
+def test_cursor_subscription_account_is_ineligible_until_privately_attested(monkeypatch):
+    for name in ("CLI_API_KEY", "CURSOR_API_KEY", "CURSOR_API_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    result = _fleet_activation.derive_billing_class(
+        _invocation(cli="cursor-agent"))
+    assert result["class"] == "unknown"
+    assert result["candidate_eligible"] is False
+
+
 @pytest.mark.parametrize("name", [
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
     "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_PROJECT_ID",
@@ -160,6 +170,81 @@ def test_claude_custom_provider_routes_are_unknown(monkeypatch, name):
     monkeypatch.setenv(name, "configured")
     assert _fleet_activation.derive_billing_class(
         _invocation(cli="claude"))["class"] == "unknown"
+
+
+def test_claude_profile_environment_controls_effective_billing(tmp_path, monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    payg = _invocation(
+        cli="claude", profile_env={
+            "CLAUDE_CONFIG_DIR": str(tmp_path),
+            "ANTHROPIC_API_KEY": "synthetic-test-key"})
+    custom = _invocation(
+        cli="claude", profile_env={
+            "CLAUDE_CONFIG_DIR": str(tmp_path),
+            "ANTHROPIC_BASE_URL": "https://example.invalid"})
+    assert _fleet_activation.derive_billing_class(payg)["class"] == "payg"
+    assert _fleet_activation.derive_billing_class(custom)["class"] == "unknown"
+
+
+def test_claude_profile_settings_control_effective_billing(tmp_path, monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    profile = tmp_path / "claude-profile"
+    profile.mkdir()
+    invocation = _invocation(
+        cli="claude", profile_env={"CLAUDE_CONFIG_DIR": str(profile)})
+    (profile / "settings.json").write_text(
+        '{"env":{"ANTHROPIC_API_KEY":"synthetic-test-key"}}', encoding="utf-8")
+    assert _fleet_activation.derive_billing_class(invocation)["class"] == "payg"
+    (profile / "settings.json").write_text(
+        '{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid"}}', encoding="utf-8")
+    assert _fleet_activation.derive_billing_class(invocation)["class"] == "unknown"
+
+
+def test_named_claude_profile_binds_project_settings_billing_and_bytes(
+        tmp_path, monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    profile = tmp_path / "claude-profile"
+    project = tmp_path / "project"
+    (project / ".claude").mkdir(parents=True)
+    profile.mkdir()
+    invocation = _invocation(
+        cli="claude", cwd=str(project),
+        profile_env={"CLAUDE_CONFIG_DIR": str(profile)})
+    settings = project / ".claude" / "settings.json"
+    settings.write_text(
+        '{"env":{"ANTHROPIC_API_KEY":"synthetic-project-key"}}',
+        encoding="utf-8")
+    assert _fleet_activation.derive_billing_class(invocation)["class"] == "payg"
+    kwargs = {
+        "master_key": b"k" * 32, "approval_id": "a" * 64,
+        "claim_id": "b" * 32, "contract_sha256": "c" * 64,
+        "agent_definition_sha256": "d" * 64,
+        "current_request_identity_sha256": "e" * 64,
+    }
+    first = _fleet_activation.private_binding_hmac(invocation, **kwargs)
+    settings.write_text(
+        '{"env":{"ANTHROPIC_API_KEY":"rotated-project-key"}}',
+        encoding="utf-8")
+    second = _fleet_activation.private_binding_hmac(invocation, **kwargs)
+    assert first != second
+
+
+def test_arbitrary_api_key_environment_value_is_keyed(monkeypatch):
+    invocation = _invocation(api_key_env="PRIVATE_VENDOR_KEY")
+    kwargs = {
+        "master_key": b"k" * 32, "approval_id": "a" * 64,
+        "claim_id": "b" * 32, "contract_sha256": "c" * 64,
+        "agent_definition_sha256": "d" * 64,
+        "current_request_identity_sha256": "e" * 64,
+    }
+    monkeypatch.setenv("PRIVATE_VENDOR_KEY", "first-low-entropy-value")
+    first = _fleet_activation.private_binding_hmac(invocation, **kwargs)
+    monkeypatch.setenv("PRIVATE_VENDOR_KEY", "second-low-entropy-value")
+    second = _fleet_activation.private_binding_hmac(invocation, **kwargs)
+    assert first != second
 
 
 @pytest.mark.parametrize("name", [

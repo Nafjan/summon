@@ -14,8 +14,10 @@ import subprocess
 
 import pytest
 
+from _builder import AgentInvocation
 import _evidence
 import _fleet
+import _fleet_activation
 import _fleet_approval
 import _fleet_compile
 import _fleet_dispatch
@@ -96,6 +98,157 @@ def _claim(context, reservation):
     return _fleet_dispatch.claim_provider_launch(
         reservation, fleet=context["fleet"], plan=context["plan"],
         catalog=context["catalog"], lane_name="review", cwd=context["cwd"])
+
+
+def _activation_material(context, *, claim_id="a" * 32, prompt="review this"):
+    profile = Path(context["cwd"]) / ".claude-activation-profile"
+    profile.mkdir(exist_ok=True)
+    invocation = AgentInvocation(
+        cli="claude", prompt=prompt, cwd=context["cwd"],
+        permission="read-only", transport="subprocess", model="frontier-alpha",
+        model_source="agent", model_exact_required=True,
+        model_exact_source="agent", output_contract="report",
+        profile_env={"CLAUDE_CONFIG_DIR": str(profile)})
+    definition_sha = _sha("definition")
+    request_sha = _sha("fresh request")
+    payload = _evidence.verify(context["plan"])
+    lane = next(item for item in payload["lanes"] if item["name"] == "review")
+    approved_bindings = _fleet_approval._bindings(
+        context["fleet"], context["plan"], lane)
+    bindings = {
+        "approval_id": context["approval_id"],
+        **{key: value for key, value in approved_bindings.items() if key != "lane"},
+        "prompt_sha256": _fleet_activation._sha(prompt),
+        "request_identity_sha256": request_sha,
+    }
+    candidate = _fleet_activation.freeze_activation_candidate(
+        bindings=bindings, claim_id=claim_id, seat="alpha",
+        agent_definition_sha256=definition_sha, invocation=invocation)
+    return invocation, candidate, definition_sha, request_sha
+
+
+def _reserve_activation(context, **changes):
+    invocation, candidate, definition_sha, request_sha = _activation_material(context)
+    values = {
+        "invocation": invocation, "activation_candidate": candidate,
+        "agent_definition_sha256": definition_sha,
+        "current_request_identity_sha256": request_sha,
+    }
+    values.update(changes)
+    return _fleet_dispatch.reserve_activation_dispatch(
+        approval_id=context["approval_id"], fleet=context["fleet"],
+        plan=context["plan"], catalog=context["catalog"], lane_name="review",
+        cwd=context["cwd"], data_boundary={
+            "boundary": "local_sanitized", "proof": "operator_attested",
+            "evidence_sha256": _fleet_activation._sha(values["invocation"].prompt)},
+        **values)
+
+
+def test_activation_reservation_is_private_provider_inert_and_revalidated(
+        approved, monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
+                 "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_PRIVATE_TEST", "credential-one")
+    reservation = _reserve_activation(approved)
+    claim = _fleet_dispatch.get_claim(reservation)
+    assert claim["activation"]["private_binding_hmac"]
+    assert claim["phase"] == "reserved"
+    invocation, candidate, definition_sha, request_sha = _activation_material(approved)
+    preflight = _fleet_dispatch.preflight_activation_dispatch(
+        reservation, fleet=approved["fleet"], plan=approved["plan"],
+        catalog=approved["catalog"], lane_name="review", cwd=approved["cwd"],
+        data_boundary={"boundary": "local_sanitized", "proof": "operator_attested",
+                       "evidence_sha256": _fleet_activation._sha(invocation.prompt)},
+        invocation=invocation, activation_candidate=candidate,
+        agent_definition_sha256=definition_sha,
+        current_request_identity_sha256=request_sha)
+    assert preflight["ready"] is True
+    assert preflight["provider_contacted"] is False
+    receipt = _fleet_dispatch.public_receipt(reservation)
+    payload = _fleet_dispatch.verify_public_receipt(receipt)
+    assert payload["activation"] == {
+        "contract_sha256": candidate["sha256"],
+        "billing_class": "subscription",
+        "attempt_policy": _fleet_dispatch._activation_attempt_policy(),
+    }
+    public = json.dumps(receipt, sort_keys=True)
+    assert "private_binding_hmac" not in public
+    assert "credential-one" not in public
+    assert definition_sha not in public
+    assert request_sha not in public
+
+
+def test_activation_same_class_credential_rotation_fails_preflight(approved, monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
+                 "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_PRIVATE_TEST", "credential-one")
+    reservation = _reserve_activation(approved)
+    invocation, candidate, definition_sha, request_sha = _activation_material(approved)
+    monkeypatch.setenv("ANTHROPIC_PRIVATE_TEST", "credential-two")
+    with pytest.raises(_fleet_dispatch.FleetDispatchError, match="private reservation"):
+        _fleet_dispatch.preflight_activation_dispatch(
+            reservation, fleet=approved["fleet"], plan=approved["plan"],
+            catalog=approved["catalog"], lane_name="review", cwd=approved["cwd"],
+            data_boundary={"boundary": "local_sanitized", "proof": "operator_attested",
+                           "evidence_sha256": _fleet_activation._sha(invocation.prompt)},
+            invocation=invocation, activation_candidate=candidate,
+            agent_definition_sha256=definition_sha,
+            current_request_identity_sha256=request_sha)
+
+
+def test_activation_profile_content_rotation_fails_preflight(approved, monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
+                 "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    profile = Path(approved["cwd"]) / ".claude-activation-profile"
+    profile.mkdir(exist_ok=True)
+    settings = profile / "settings.json"
+    settings.write_text('{"account":"first"}', encoding="utf-8")
+    reservation = _reserve_activation(approved)
+    invocation, candidate, definition_sha, request_sha = _activation_material(approved)
+    settings.write_text('{"account":"second"}', encoding="utf-8")
+    with pytest.raises(_fleet_dispatch.FleetDispatchError, match="private reservation"):
+        _fleet_dispatch.preflight_activation_dispatch(
+            reservation, fleet=approved["fleet"], plan=approved["plan"],
+            catalog=approved["catalog"], lane_name="review", cwd=approved["cwd"],
+            data_boundary={"boundary": "local_sanitized", "proof": "operator_attested",
+                           "evidence_sha256": _fleet_activation._sha(invocation.prompt)},
+            invocation=invocation, activation_candidate=candidate,
+            agent_definition_sha256=definition_sha,
+            current_request_identity_sha256=request_sha)
+
+
+def test_activation_unknown_billing_and_stale_identity_refuse(approved, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://example.invalid")
+    with pytest.raises(_fleet_dispatch.FleetDispatchError) as unknown:
+        _reserve_activation(approved)
+    assert unknown.value.kind == "fleet_activation_billing_unknown"
+    monkeypatch.delenv("ANTHROPIC_BASE_URL")
+    invocation, candidate, definition_sha, request_sha = _activation_material(approved)
+    with pytest.raises(_fleet_dispatch.FleetDispatchError) as stale:
+        _reserve_activation(
+            approved, invocation=invocation, activation_candidate=candidate,
+            agent_definition_sha256=_sha("changed"),
+            current_request_identity_sha256=request_sha)
+    assert stale.value.kind == "fleet_activation_binding_changed"
+
+
+def test_activation_duplicate_is_idempotent_and_private_change_conflicts(
+        approved, monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
+                 "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_PRIVATE_TEST", "same")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        reservations = list(pool.map(lambda _item: _reserve_activation(approved), range(8)))
+    first = reservations[0]
+    assert all(item == first for item in reservations)
+    monkeypatch.setenv("ANTHROPIC_PRIVATE_TEST", "changed")
+    with pytest.raises(_fleet_dispatch.FleetDispatchError) as conflict:
+        _reserve_activation(approved)
+    assert conflict.value.kind == "fleet_dispatch_request_conflict"
 
 
 def test_module_is_provider_inert_and_has_no_launch_imports():
@@ -495,6 +648,54 @@ def test_separate_anchor_detects_whole_ledger_directory_deletion(approved):
     with pytest.raises(_fleet_dispatch.FleetDispatchError) as deleted:
         _fleet_dispatch.get_claim(reservation)
     assert deleted.value.kind == "fleet_dispatch_ledger_replay"
+
+
+def test_durable_initialization_marker_detects_both_dispatch_roots_deleted(approved):
+    reservation = _reserve_activation(approved)
+    marker = Path(_fleet_dispatch.initialization_path(approved["approval_id"]))
+    assert marker.exists()
+    assert marker.parent not in {
+        Path(_fleet_dispatch.ledger_root()), Path(_fleet_dispatch.anchor_root())}
+    shutil.rmtree(_fleet_dispatch.ledger_root())
+    shutil.rmtree(_fleet_dispatch.anchor_root())
+    assert marker.exists()
+    with pytest.raises(_fleet_dispatch.FleetDispatchError) as deleted:
+        _fleet_dispatch.get_claim(reservation)
+    assert deleted.value.kind == "fleet_dispatch_ledger_replay"
+    with pytest.raises(_fleet_dispatch.FleetDispatchError) as reset:
+        _reserve_activation(approved)
+    assert reset.value.kind == "fleet_dispatch_ledger_replay"
+
+
+def test_legacy_empty_anchor_is_marked_before_first_ledger_and_cannot_reset(approved):
+    approval_id = approved["approval_id"]
+    with _fleet_approval._store_lock():
+        key = _fleet_approval._load_key(create=False)
+        store = _fleet_approval._read_store(key, _fleet_approval._now())
+        _fleet_dispatch._reconcile_dispatch_anchor(
+            store, key, approval_id, None, ledger_retired=False)
+    marker = Path(_fleet_dispatch.initialization_path(approval_id))
+    assert Path(_fleet_dispatch.anchor_path(approval_id)).exists()
+    assert not marker.exists()
+
+    _reserve_activation(approved)
+    assert marker.exists()
+    shutil.rmtree(_fleet_dispatch.ledger_root())
+    shutil.rmtree(_fleet_dispatch.anchor_root())
+    with pytest.raises(_fleet_dispatch.FleetDispatchError) as reset:
+        _reserve_activation(approved)
+    assert reset.value.kind == "fleet_dispatch_ledger_replay"
+
+
+def test_initialization_marker_is_authenticated(approved):
+    reservation = _reserve(approved)
+    path = Path(_fleet_dispatch.initialization_path(approved["approval_id"]))
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["approval_generation"] += 1
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(_fleet_dispatch.FleetDispatchError) as tampered:
+        _fleet_dispatch.get_claim(reservation)
+    assert tampered.value.kind == "fleet_dispatch_ledger_replay"
 
 
 def test_anchor_recovers_crash_after_ledger_replace(approved, monkeypatch):
