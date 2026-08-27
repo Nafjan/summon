@@ -737,6 +737,46 @@ def test_cli_occupied_receipt_refuses_before_recording_authority(
     assert not Path(_fleet_approval.key_path()).exists()
 
 
+def test_cli_revoke_receipt_failure_reports_durable_mutation(
+        tmp_path, private_store):
+    fleet, plan = _plan(tmp_path)
+    approved = _fleet_approval.approve(
+        fleet=fleet, plan=plan, lane_name="review",
+        expires_in_seconds=3600, expected_generation=0)
+    approval_id = approved["approval"]["approval_id"]
+    output = tmp_path / "revocation.json"
+    wrapper = tmp_path / "revoke_with_failed_receipt.py"
+    script_dir = Path(__file__).parent
+    argv = [
+        "run_subagent.py", "fleet", "approval", "revoke", approval_id,
+        "--expect-generation", "1", "--out", str(output), "--json",
+    ]
+    wrapper.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(script_dir)!r})\n"
+        "import _evidence, _fleet\n"
+        "def refuse_receipt(path, value):\n"
+        "    if value.get('action') == 'fleet_approval_revoked':\n"
+        "        raise _evidence.EvidenceError('simulated receipt publication race')\n"
+        "    raise AssertionError('unexpected fleet output')\n"
+        "_fleet.write_json = refuse_receipt\n"
+        "import run_subagent\n"
+        f"sys.argv = {argv!r}\n"
+        "run_subagent.main()\n",
+        encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, str(wrapper)], capture_output=True, text=True,
+        encoding="utf-8", timeout=30)
+
+    assert completed.returncode == 1
+    error = json.loads(completed.stdout)
+    assert error["authorization"] == "recorded_receipt_undelivered"
+    assert error["provider_contacted"] is False
+    assert not output.exists()
+    assert _fleet_approval.inspect(approval_id)["approval"]["state"] == "revoked"
+    assert _fleet_approval.status()["generation"] == 2
+
+
 def test_store_parser_reads_more_than_shared_evidence_item_limit(
         tmp_path, private_store):
     fleet, plan = _plan(tmp_path)

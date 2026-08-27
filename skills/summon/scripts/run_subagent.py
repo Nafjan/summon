@@ -1014,6 +1014,7 @@ def main() -> None:
                     _fleet_result = _fleet_approval.revoke(
                         args.fleet_approval_id,
                         expected_generation=args.fleet_expect_generation)
+                    _fleet_authority_recorded = True
                 if args.out:
                     _fleet.write_json(args.out, _fleet_result)
                 print(json.dumps(_fleet_result, ensure_ascii=False,

@@ -219,6 +219,9 @@ def validate(value: Any, *, depth: int = 0, counter: list[int] | None = None,
              max_items: int = MAX_ITEMS) -> None:
     """Validate a JSON-compatible value against global resource bounds."""
     if counter is None:
+        if (not isinstance(max_items, int) or isinstance(max_items, bool)
+                or max_items < 1):
+            raise EvidenceError("evidence item limit must be a positive integer")
         counter = [0]
     counter[0] += 1
     if counter[0] > max_items:

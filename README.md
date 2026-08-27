@@ -375,7 +375,7 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon fleet approval status\|list` | inspect the private approval store through a redacted, provider-inert projection |
 | `summon fleet approval approve FILE LANE --expires-in 24h --expect-generation N` | record authenticated, expiring local authority for the exact compiled lane; this still cannot select or dispatch |
 | `summon fleet approval inspect APPROVAL_ID` | inspect one recorded approval without mutation |
-| `summon fleet approval revoke APPROVAL_ID --expect-generation N` | explicitly revoke recorded authority with a generation-bound mutation |
+| `summon fleet approval revoke APPROVAL_ID --expect-generation N [--out FILE]` | explicitly revoke recorded authority with a generation-bound mutation |
 | `summon bug-report …` | generate a sanitized report; review it before the separate GitHub submission command |
 | `summon version` · `summon help` | version · usage |
 
