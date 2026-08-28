@@ -26,6 +26,37 @@ def _content_reference(value: object) -> str:
     return value
 
 
+def _windows_path_has_reparse_component(path: str) -> bool:
+    """Inspect components without confusing an 8.3 alias for a reparse point.
+
+    ``realpath`` expands Windows short names (for example ``RUNNER~1``) even
+    when no symlink or junction exists. Comparing lexical and resolved spellings
+    therefore rejects ordinary files on some Windows installations. The reparse
+    attribute is the authoritative signal for indirection there.
+    """
+    current = os.path.abspath(path)
+    while True:
+        try:
+            value = os.lstat(current)
+        except OSError as exc:
+            raise ContextCompileError(
+                "context_target_invalid", "context target is invalid") from exc
+        attributes = getattr(value, "st_file_attributes", 0)
+        if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+
+
+def _path_is_indirect(lexical_path: str, resolved_path: str) -> bool:
+    """Distinguish actual indirection from Windows spelling normalization."""
+    if os.name == "nt":
+        return _windows_path_has_reparse_component(lexical_path)
+    return os.path.normcase(lexical_path) != os.path.normcase(resolved_path)
+
+
 def _resolve_allowed_file(path: str, allowed_roots: list[str] | tuple[str, ...]) -> tuple[str, int, str]:
     """Resolve a target to one explicit root and a safe slash-relative locator."""
     if not isinstance(path, str) or not path or not allowed_roots:
@@ -33,7 +64,8 @@ def _resolve_allowed_file(path: str, allowed_roots: list[str] | tuple[str, ...])
     try:
         lexical_target = os.path.abspath(path)
         target = os.path.realpath(lexical_target)
-        roots = [os.path.realpath(os.path.abspath(root)) for root in allowed_roots]
+        lexical_roots = [os.path.abspath(root) for root in allowed_roots]
+        roots = [os.path.realpath(root) for root in lexical_roots]
         matches = [
             (index, root) for index, root in enumerate(roots)
             if os.path.isdir(root)
@@ -48,10 +80,11 @@ def _resolve_allowed_file(path: str, allowed_roots: list[str] | tuple[str, ...])
     # File references are reopened by a delegated agent using a cwd-relative
     # locator. Reject symlink/junction/reparse indirection instead of attempting
     # to reason about a path-swap race across process boundaries.
-    if os.path.normcase(lexical_target) != os.path.normcase(target):
+    index, root = matches[0]
+    if (_path_is_indirect(lexical_target, target)
+            or _path_is_indirect(lexical_roots[index], root)):
         raise ContextCompileError(
             "context_target_indirect", "context target uses an indirect filesystem path")
-    index, root = matches[0]
     relative = os.path.relpath(target, root).replace("\\", "/")
     if relative in {"", "."} or relative.startswith("../") or relative.startswith("/"):
         raise ContextCompileError("context_target_invalid", "context target locator is invalid")

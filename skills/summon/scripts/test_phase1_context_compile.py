@@ -6,6 +6,8 @@ import ast
 import base64
 import hashlib
 import json
+import os
+import subprocess
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -219,6 +221,83 @@ def test_reference_adapter_rejects_symlink_or_junction_indirection():
         with pytest.raises(compiler.ContextCompileError) as raised:
             target_adapter.make_verified_reference_proof({reference: str(link)}, [root])
         assert raised.value.kind == "context_target_indirect"
+
+
+def test_reference_adapter_rejects_indirect_allowed_root():
+    body = b"frozen"
+    reference = "sha256:" + hashlib.sha256(body).hexdigest()
+    with tempfile.TemporaryDirectory() as parent:
+        real = Path(parent, "real")
+        indirect = Path(parent, "indirect")
+        real.mkdir()
+        target = real / "artifact.txt"
+        target.write_bytes(body)
+        try:
+            indirect.symlink_to(real, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlink creation is unavailable")
+        with pytest.raises(compiler.ContextCompileError) as raised:
+            target_adapter.make_verified_reference_proof(
+                {reference: str(target)}, [str(indirect)])
+        assert raised.value.kind == "context_target_indirect"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_reference_adapter_rejects_windows_junction_indirection():
+    body = b"frozen"
+    reference = "sha256:" + hashlib.sha256(body).hexdigest()
+    with tempfile.TemporaryDirectory() as root:
+        real = Path(root, "real")
+        junction = Path(root, "junction")
+        real.mkdir()
+        target = real / "artifact.txt"
+        target.write_bytes(body)
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(real)],
+            capture_output=True, text=True, encoding="utf-8")
+        if created.returncode != 0:
+            pytest.skip("junction creation is unavailable")
+        with pytest.raises(compiler.ContextCompileError) as raised:
+            target_adapter.make_verified_reference_proof(
+                {reference: str(junction / "artifact.txt")}, [root])
+        assert raised.value.kind == "context_target_indirect"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_reference_adapter_rejects_windows_junction_allowed_root():
+    body = b"frozen"
+    reference = "sha256:" + hashlib.sha256(body).hexdigest()
+    with tempfile.TemporaryDirectory() as root:
+        real = Path(root, "real")
+        junction = Path(root, "junction")
+        real.mkdir()
+        target = real / "artifact.txt"
+        target.write_bytes(body)
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(real)],
+            capture_output=True, text=True, encoding="utf-8")
+        if created.returncode != 0:
+            pytest.skip("junction creation is unavailable")
+        with pytest.raises(compiler.ContextCompileError) as raised:
+            target_adapter.make_verified_reference_proof(
+                {reference: str(target)}, [str(junction)])
+        assert raised.value.kind == "context_target_indirect"
+
+
+def test_windows_short_name_expansion_is_not_treated_as_indirection(monkeypatch):
+    short = r"C:\Users\RUNNER~1\AppData\Local\Temp\artifact.txt"
+    canonical = r"C:\Users\runneradmin\AppData\Local\Temp\artifact.txt"
+    monkeypatch.setattr(target_adapter.os, "name", "nt")
+    inspected = []
+
+    def no_reparse(path):
+        inspected.append(path)
+        return False
+
+    monkeypatch.setattr(
+        target_adapter, "_windows_path_has_reparse_component", no_reparse)
+    assert target_adapter._path_is_indirect(short, canonical) is False
+    assert inspected == [short]
 
 
 def test_diagnostic_tail_preserves_typed_errors_full_hash_and_omission_count():
