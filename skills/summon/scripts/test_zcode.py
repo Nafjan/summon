@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePath
 from types import SimpleNamespace
 from unittest import mock
 
@@ -139,7 +139,8 @@ class ZCodeBuilderTests(unittest.TestCase):
         with mock.patch.object(_zcode.os, "name", "nt"), \
              mock.patch("_zcode._well_known_bundle_candidates",
                         return_value=[("well-known", "windows_bundle")]), \
-             mock.patch("_zcode._registry_install_locations", return_value=["registry-root"]):
+             mock.patch("_zcode._registry_install_locations", return_value=["registry-root"]), \
+             mock.patch("_zcode.Path", PurePath):
             candidates = _zcode._bundle_candidates()
         self.assertEqual(candidates[0], ("well-known", "windows_bundle"))
         self.assertEqual(candidates[1][1], "windows_registry")
@@ -274,7 +275,8 @@ class ZCodeBuilderTests(unittest.TestCase):
     def test_windows_attachment_acl_uses_effective_token_principal(self):
         proc = SimpleNamespace(returncode=0, stdout="DOMAIN\\worker\n")
         with mock.patch.object(_builder.os, "name", "nt"), \
-             mock.patch("_builder.subprocess.run", return_value=proc) as command:
+             mock.patch("_builder.subprocess.run", return_value=proc) as command, \
+             mock.patch("_spawn.run_flags", return_value={}):
             self.assertEqual(_builder._windows_current_principal(), "DOMAIN\\worker")
         self.assertEqual(command.call_args.args[0], ["whoami"])
 
