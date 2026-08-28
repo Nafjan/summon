@@ -2346,6 +2346,12 @@ def main() -> None:
                 f"Agent definition not found: {getattr(args, '_resolved_agent', args.agent)}")
         run_agent_cli, system_context, _, agent_file, permission, model, extra_args, effort_fm = _loaded
         _agent_fm = _agent_fm or {}
+        # Safe declarative provider metadata for decision evidence. The backend
+        # remains transport; route_provider validates multi-provider bindings.
+        args._declared_provider = _agent_fm.get("provider")
+        args._provider_endpoint_mode = (
+            "inline_endpoint" if _agent_fm.get("base_url")
+            else "named_provider" if _agent_fm.get("provider") else "none")
         if _fleet_live_context is not None and extra_args:
             _die(
                 "approved lane dispatch does not permit agent frontmatter args in "
@@ -2765,6 +2771,17 @@ def main() -> None:
         _emit(_dry_view, operation=_EMIT_OPERATION)
         sys.exit(0)
 
+    # The same pure native-ZCode authority preflight drives dry-run and live.
+    # Refuse before a work loop, attachment, or provider attempt can begin.
+    from _builder import zcode_invocation_preflight
+    _zcode_refusal = zcode_invocation_preflight(invocation)
+    if _zcode_refusal:
+        _die(_zcode_refusal["message"],
+             error_kind=_zcode_refusal["error_kind"],
+             extra={"provider_contacted": False, "attempts": 0,
+                    "attempt_status": "not_run", "execution_status": "not_run",
+                    "result_usable": False, "retryable": False})
+
     if _read_policy.get("would_refuse"):
         _reroute = {
             key: _read_policy[key]
@@ -3044,6 +3061,7 @@ def _effective_decision_view(invocation, args) -> dict:
     from _apibackend import payg_consent_allowed
     from _builder import (credit_spend_allowed, permission_enforcement,
                           selects_credit_only, unenforceable_permission_authorized)
+    from _backend_policy import route_provider
 
     role = (getattr(args, "_role_provenance", {}) or {}).get("role")
     source = "approved_role" if isinstance(role, dict) else "explicit_agent"
@@ -3089,16 +3107,25 @@ def _effective_decision_view(invocation, args) -> dict:
         and supports_acp(invocation.cli)
         and _acp_fallback_enabled(args)
         and (invocation.cli != "kimi" or _kimi_acp_fallback_allowed(args)))
+    _declared_provider = getattr(args, "_declared_provider", None)
+    _provider, _provider_evidence = route_provider(
+        invocation.cli, _declared_provider, invocation.model,
+        getattr(args, "_provider_endpoint_mode", "none"))
+    _decision_provider = None if _provider == "unknown" else _provider
+    _public_declared_provider = (
+        _declared_provider if isinstance(_declared_provider, str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+@-]{0,127}", _declared_provider)
+        else None)
     from _decision import decide
     view = decide(
         request={"agent": args.agent, "lane": None, "model": invocation.model,
-                 "provider": invocation.cli,
+                 "provider": _decision_provider,
                  "resolved_agent": getattr(args, "_resolved_agent", args.agent),
                  "source": source},
         candidates=[{
             "seat": getattr(args, "_resolved_agent", args.agent),
             "backend": invocation.cli,
-            "provider": invocation.cli,
+            "provider": _decision_provider,
             "model": invocation.model,
             "permission": invocation.permission,
             "eligible": True,
@@ -3133,6 +3160,9 @@ def _effective_decision_view(invocation, args) -> dict:
     view["resolution"].update({
         "source": source,
         "precedence": ["exact_agent", "approved_role"],
+        "provider_declared": _public_declared_provider,
+        "provider_evidence": _provider_evidence,
+        "transport": invocation.cli,
     })
     view["authority"].update({
         "effective_permission": invocation.permission,
@@ -3394,6 +3424,14 @@ def _dry_run_view(invocation, args, agents_dir: str,
     if _oy:
         view["would_refuse"] = True
         view["refusal"] = _oy
+    from _builder import zcode_invocation_preflight
+    _zcode_refusal = zcode_invocation_preflight(invocation)
+    if _zcode_refusal:
+        view["would_refuse"] = True
+        view["error_kind"] = _zcode_refusal["error_kind"]
+        view["refusal"] = _zcode_refusal["message"]
+        view["provider_contacted"] = False
+        view["result_usable"] = False
     if _decision_projection_invalid:
         # Continue through all independent, generic refusal checks above, but
         # stop before rendering commands, warnings, profiles, receipts, or API
@@ -3568,6 +3606,21 @@ def _run_gate(args, agents_dir, gated_inv, *, launch_control=None) -> dict:
             return decide(None, _gate_requested) | {
                 "reason": f"gate profile {gate_profile!r} could not be resolved: {e}"}
 
+    gate_base_url = gate_api_key_env = gate_api_key_fingerprint = None
+    if gate_cli == "openai-compat":
+        try:
+            from _apibackend import (credential_fingerprint, resolve_api_credential,
+                                     resolve_endpoint)
+            gate_base_url, gate_api_key_env = resolve_endpoint(
+                gate_fm or {}, agents_dir)
+            _gate_key, _gate_key_source = resolve_api_credential(
+                gate_api_key_env, gate_base_url)
+            gate_api_key_fingerprint = credential_fingerprint(
+                gate_api_key_env, _gate_key)
+        except (OSError, ValueError) as e:
+            return decide(None, _gate_requested) | {
+                "reason": f"gate API endpoint could not be resolved: {e}"}
+
     # EVERY field comes from the invocation actually being gated, not from args. Taking
     # prompt/cwd from args meant a re-gate (retry, schema correction, contract repair)
     # adjudicated the ORIGINAL task while a DIFFERENT request was dispatched -- the gate
@@ -3587,6 +3640,8 @@ def _run_gate(args, agents_dir, gated_inv, *, launch_control=None) -> dict:
         permission="read-only",   # FORCED: never inherit the gate definition's tier
         permission_forced=True,   # so the opt-in cannot turn the adjudicator advisory
         model=gate_model, effort=gate_effort,
+        base_url=gate_base_url, api_key_env=gate_api_key_env,
+        api_key_fingerprint=gate_api_key_fingerprint,
         profile=gate_profile,
         profile_env=((gate_profile_selection or {}).get("env")
                      if gate_profile_selection else None),

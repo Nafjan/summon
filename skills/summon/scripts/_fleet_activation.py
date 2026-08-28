@@ -52,6 +52,7 @@ _BILLING_SOURCES = frozenset({
 _PRIVATE_INVOCATION_FIELDS = frozenset({
     "prompt", "cwd", "system_context", "agent_file", "resume_id",
     "resume_profile", "extra_args", "base_url", "api_key_env",
+    "api_key_fingerprint",
     "agy_account_sha256", "profile", "profile_env", "profile_command",
     "openrouter_options", "worktree", "read_roots", "attempt_id",
     "parent_attempt_id",
@@ -61,7 +62,7 @@ _INVOCATION_FIELDS = frozenset({
     "cli", "prompt", "cwd", "system_context", "agent_file", "permission",
     "transport", "model", "model_source", "model_exact_required",
     "model_exact_source", "effort", "resume_id", "resume_profile", "extra_args",
-    "base_url", "api_key_env", "allow_payg", "agy_account_sha256",
+    "base_url", "api_key_env", "api_key_fingerprint", "allow_payg", "agy_account_sha256",
     "agy_account_checked", "permission_forced", "profile", "profile_env",
     "profile_command", "openrouter_options", "worktree", "isolated_lane",
     "allow_tool_credentials", "read_roots", "output_contract", "attempt_id",

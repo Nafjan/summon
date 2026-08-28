@@ -533,18 +533,27 @@ def test_doctor_rejects_nonzero_version_probe():
     # A CLI that errors on --version must not be verified/usable.
     import types
     import _doctor
+    import _zcode
     orig_run, orig_which = _doctor.subprocess.run, _doctor.shutil.which
+    orig_zcode = _zcode.resolve_zcode_cli
     _doctor.shutil.which = lambda name: "/fake/" + name
+    # ZCode has reviewed bundle/registry discovery rather than a plain PATH
+    # probe; keep this test's fake-all-backends contract deterministic.
+    _zcode.resolve_zcode_cli = lambda: None
     _doctor.subprocess.run = lambda *a, **k: types.SimpleNamespace(
         returncode=7, stdout="FATAL BROKEN INSTALL", stderr="")
     try:
         rep = _doctor.doctor()
     finally:
         _doctor.subprocess.run, _doctor.shutil.which = orig_run, orig_which
+        _zcode.resolve_zcode_cli = orig_zcode
     assert rep["usable_backends"] == [], rep["usable_backends"]
     assert rep["ok"] is False
-    for b in rep["backends"].values():
-        assert b["found"] is True and b["verified"] is False
+    for name, backend in rep["backends"].items():
+        if name == "zcode":
+            assert backend["found"] is False and not backend.get("verified", False)
+        else:
+            assert backend["found"] is True and backend["verified"] is False
 
 
 def test_alias_ownership_is_frontmatter_not_body_substring():

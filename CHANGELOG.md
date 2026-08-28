@@ -10,15 +10,21 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
   owner-restricted prompt attachments, banner-tolerant terminal JSON parsing,
   session/usage capture, and explicit terminal-only liveness. Native ZCode
   refuses model pins and safe-edit because neither per-call model selection nor
-  a safe-edit boundary is proven. Experimental native yolo now requires both a
+  a safe-edit boundary is proven. The truthful generic seat is `zcode-native`;
+  the misleading `zcode-coding-plan` name is retired with that successor.
+  Experimental native yolo now requires both a
   disposable boundary and an explicit credential-access acknowledgement, which
-  does not claim a sandbox. Added distinct direct and OpenCode Z.AI
+  does not claim a sandbox, and every native tier scrubs inherited provider
+  credential variables. Added distinct direct and OpenCode Z.AI
   Coding Plan GLM-5.3 Flash seats alongside the existing OpenRouter successor;
   retired Ox aliases and historical receipts remain unchanged. The direct seat
   is text-only, pins the coding endpoint, supports an explicit environment key
   and a bounded helper-config fallback, and never runs helper scripts or emits
   credentials/configuration locations. Z.AI usage remains diagnostic-only and
-  schema-unverified pending a reviewed provider contract.
+  schema-unverified pending a reviewed provider contract. Direct API request
+  identity binds environment, Windows Credential Manager, Hermes/Nous,
+  ArkCLI, and Z.AI-helper credential fallbacks by a private one-way identity;
+  unavailable evidence stays unarmed rather than causing a false mismatch.
 
 ## [3.3.0] - 2026-08-28
 

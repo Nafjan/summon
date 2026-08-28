@@ -40,13 +40,47 @@ def _redact(text: str, secret: str | None) -> str:
     return text
 
 
-def credential_fingerprint(api_key_env: str | None, api_key: str | None) -> str:
-    """Return a one-way credential identity without retaining the credential."""
+def credential_fingerprint(api_key_env: str | None, api_key: str | None) -> str | None:
+    """Return a one-way credential identity, or None when none was resolved."""
     if not api_key:
-        return ""
+        return None
     return hashlib.sha256(
         b"summon-credential-v1\0" + (api_key_env or "").encode("utf-8") + b"\0"
         + api_key.encode("utf-8")).hexdigest()[:32]
+
+
+def resolve_api_credential(api_key_env: str | None, base_url: str | None,
+                           *, environ: dict[str, str] | None = None
+                           ) -> tuple[str | None, str | None]:
+    """Resolve the credential used by a reviewed direct API route.
+
+    Environment variables win. Bounded local fallbacks mirror the call path so
+    request identity can bind the same account without serializing a secret.
+    Resolver failures are deliberately indistinguishable from absence here.
+    """
+    env = os.environ if environ is None else environ
+    api_key = env.get(api_key_env) if api_key_env else None
+    source = "env" if api_key else None
+    try:
+        if (not api_key and api_key_env == "OPENROUTER_API_KEY"
+                and _is_openrouter_endpoint(base_url)):
+            from _windows_credentials import resolve_openrouter_api_key
+            api_key, source = resolve_openrouter_api_key()
+        if (not api_key and api_key_env == "NOUS_API_KEY"
+                and _is_nous_endpoint(base_url)):
+            from _nous_credentials import resolve_nous_api_key
+            api_key, source = resolve_nous_api_key()
+        if (not api_key and api_key_env == "BYTEPLUS_CODING_API_KEY"
+                and _is_byteplus_coding_plan_endpoint(base_url)):
+            from _arkcli_creds import resolve_byteplus_coding_api_key
+            api_key, source = resolve_byteplus_coding_api_key()
+        if (not api_key and api_key_env == "ZAI_CODING_API_KEY"
+                and is_zai_coding_plan_endpoint(base_url)):
+            from _zai_coding_plan import resolve_zai_coding_api_key
+            api_key, source = resolve_zai_coding_api_key(environ=env)
+    except Exception:  # noqa: BLE001 - local stores are best-effort
+        return None, None
+    return api_key, source
 
 # Sensible defaults so common providers work with just `provider:` + `model:`.
 BUILTIN_PROVIDERS = {
@@ -553,39 +587,8 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
     if _cp_model:
         return _err(cli, _cp_model)
 
-    api_key = os.environ.get(inv.api_key_env) if inv.api_key_env else None
-    _key_source = "env" if api_key else None
-    # OpenRouter is the one built-in API provider with a private local
-    # Credential Manager convention.  Environment variables still win; the
-    # store fallback is Windows-only, opt-in by the presence of the target,
-    # and never copies the secret into a child environment or an envelope.
-    if (not api_key and inv.api_key_env == "OPENROUTER_API_KEY"
-            and _is_openrouter_endpoint(inv.base_url)):
-        try:
-            from _windows_credentials import resolve_openrouter_api_key
-            api_key, _key_source = resolve_openrouter_api_key()
-        except Exception:  # noqa: BLE001 — local store is best-effort
-            api_key, _key_source = None, None
-    if (not api_key and inv.api_key_env == "NOUS_API_KEY"
-            and _is_nous_endpoint(inv.base_url)):
-        try:
-            from _nous_credentials import resolve_nous_api_key
-            api_key, _key_source = resolve_nous_api_key()
-        except Exception:  # noqa: BLE001 — local profile is best-effort
-            api_key, _key_source = None, None
-    if inv.api_key_env == "BYTEPLUS_CODING_API_KEY" and not api_key:
-        try:
-            from _arkcli_creds import resolve_byteplus_coding_api_key
-            api_key, _key_source = resolve_byteplus_coding_api_key()
-        except Exception:  # noqa: BLE001 — credential resolve is best-effort
-            api_key, _key_source = None, None
-    if (not api_key and inv.api_key_env == "ZAI_CODING_API_KEY"
-            and is_zai_coding_plan_endpoint(inv.base_url)):
-        try:
-            from _zai_coding_plan import resolve_zai_coding_api_key
-            api_key, _key_source = resolve_zai_coding_api_key()
-        except Exception:  # noqa: BLE001 — credential resolve is best-effort
-            api_key, _key_source = None, None
+    api_key, _key_source = resolve_api_credential(
+        inv.api_key_env, inv.base_url)
     if inv.api_key_env and not api_key:
         msg = f"openai-compat: ${inv.api_key_env} is not set"
         if inv.api_key_env == "BYTEPLUS_CODING_API_KEY":

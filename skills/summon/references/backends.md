@@ -108,7 +108,7 @@ historical Ox receipts. The distinct active GLM-5.3 Flash routes are optional:
 | OpenRouter through OpenCode | `openrouter/z-ai/glm-5.3-flash` | Yes, in an isolated lane | OpenCode selection is advisory unless a provider response reports the model |
 | Z.AI Coding Plan through OpenCode | `zai-coding-plan/glm-5.3-flash` | Yes, in an isolated lane | Same OpenCode provenance limitation |
 | Direct Z.AI Coding Plan | `glm-5.3-flash` | No: one text request | Provider response model can support exact-model verification |
-| Native ZCode | no Summon model selector | Native tool loop | Preview only: no reviewed per-call selector or provider-authored served-model receipt |
+| Native ZCode (`zcode-native`) | no Summon model selector | Native tool loop | Preview only: no reviewed per-call selector or provider-authored served-model receipt |
 
 The direct Z.AI seat uses only the coding endpoint, not a general API endpoint.
 It is an `openai-compat` text seat and therefore needs self-contained context
@@ -134,7 +134,10 @@ read-only requires the existing explicit unenforced-read-only opt-in, while
 experimental `yolo` requires a worktree or isolated lane **and**
 `--allow-tool-credentials`. That acknowledgement does not create a sandbox:
 it records acceptance that ZCode may use its own local provider configuration,
-while Summon only scrubs conventional inherited provider environment variables.
+while Summon scrubs conventional inherited provider environment variables in
+every native ZCode tier. The older `zcode-coding-plan` name is retired because
+native ZCode does not prove a Coding Plan provider or model; it points to the
+truthful `zcode-native` successor.
 This keeps broad native authority usable in disposable boundaries without
 inventing a model or a sandbox claim.
 

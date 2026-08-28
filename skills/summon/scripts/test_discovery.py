@@ -10767,7 +10767,7 @@ def test_v7_dispatch_uses_the_endpoint_that_was_fingerprinted():
         with open(reg, "w", encoding="utf-8") as fh:
             _json.dump({"tenant": {"base_url": "https://a.example/v1"}}, fh)
         ident = build_request_identity(agent="t", prompt="p", cwd=d, agents_dir=d)
-        assert ident["_endpoint"] == ("https://a.example/v1", ""), ident["_endpoint"]
+        assert ident["_endpoint"] == ("https://a.example/v1", "", None), ident["_endpoint"]
 
         # the snapshot is what dispatch will use, even after the registry moves underneath
         with open(reg, "w", encoding="utf-8") as fh:
@@ -10791,7 +10791,7 @@ def test_v7_dispatch_uses_the_endpoint_that_was_fingerprinted():
         # the registry MOVED underneath: the snapshot must still win.
         from run_subagent import _endpoint_for_dispatch
         agent_file = os.path.join(d, "t.md")
-        assert _endpoint_for_dispatch(ident, agent_file, d) == ident["_endpoint"], \
+        assert _endpoint_for_dispatch(ident, agent_file, d) == ident["_endpoint"][:2], \
             "the dispatch re-resolved instead of using the snapshot it fingerprinted"
         assert _endpoint_for_dispatch(ident, agent_file, d)[0] == "https://a.example/v1"
         # a fresh identity carries the NEW endpoint, and the chooser follows it

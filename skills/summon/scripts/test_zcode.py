@@ -20,6 +20,7 @@ import _apibackend
 import _stream
 import _zcode
 import run_subagent
+from _loader import list_agents
 from _builder import AgentInvocation, build_invocation_args, model_backend_compatibility
 from _zai_coding_plan import resolve_zai_coding_api_key
 from _zcode import ZCodeTarget, parse_zcode_json_output, zcode_result_fields
@@ -52,6 +53,18 @@ class ZCodeParserTests(unittest.TestCase):
             processor.finalize_stream()
         self.assertEqual(processor.result_json["status"], "error")
         self.assertIn("exceeded", processor.result_json["error"])
+        self.assertEqual(processor.result_json["result"], "")
+        self.assertLessEqual(processor._zcode_output_bytes, 8)
+
+    def test_stream_byte_cap_counts_inserted_line_boundaries(self):
+        processor = StreamProcessor(cli="zcode")
+        with mock.patch.object(_stream, "_ZCODE_OUTPUT_MAX_BYTES", 4):
+            processor.process_line("ab")
+            processor.process_line("cd")
+            processor.finalize_stream()
+        self.assertTrue(processor.zcode_output_truncated)
+        self.assertEqual(processor._zcode_output_bytes, 4)
+        self.assertEqual(processor.result_json["result"], "")
 
 
 class ZCodeBuilderTests(unittest.TestCase):
@@ -74,7 +87,7 @@ class ZCodeBuilderTests(unittest.TestCase):
     def test_dry_run_refuses_native_model_pin_without_contact_or_keyerror(self):
         invocation = self._inv(model="glm-5.3-flash")
         args = SimpleNamespace(
-            agent="zcode-coding-plan", _resolved_agent="zcode-coding-plan",
+            agent="zcode-native", _resolved_agent="zcode-native",
             strict_agents_dir=False, timeout=1000, worktree=None,
             _role_provenance={}, agents_dir=None, gate_with=None,
             allow_text_only=False, require_tools=False,
@@ -86,6 +99,19 @@ class ZCodeBuilderTests(unittest.TestCase):
         self.assertEqual(view["attempt_status"], "not_run")
         self.assertEqual(view["execution_status"], "not_run")
         self.assertFalse(view["provider_contacted"])
+
+    def test_native_yolo_preflight_matches_live_authority_refusals(self):
+        no_lane = AgentInvocation(
+            cli="zcode", prompt="p", cwd=tempfile.gettempdir(), permission="yolo",
+            allow_tool_credentials=True)
+        no_ack = self._inv(allow_tool_credentials=False)
+        for invocation, kind in (
+                (no_lane, "zcode_isolation_required"),
+                (no_ack, "zcode_tool_credentials_consent_required")):
+            refusal = _builder.zcode_invocation_preflight(invocation)
+            self.assertEqual(refusal["error_kind"], kind)
+            with self.assertRaisesRegex(ValueError, refusal["message"].split(";")[0]):
+                build_invocation_args(invocation)
 
     def test_preflight_accepts_a_discovered_bundle_without_path_shim(self):
         with mock.patch.object(run_subagent.shutil, "which", return_value=None), \
@@ -170,6 +196,36 @@ class ZCodeBuilderTests(unittest.TestCase):
         self.assertIsNone(env["ZAI_CODING_API_KEY"])
         self.assertIsNone(env["GLM_TOKEN"])
 
+    def test_advisory_plan_also_scrubs_provider_environment(self):
+        invocation = self._inv(permission="read-only")
+        with mock.patch.dict(os.environ, {
+                "SUMMON_ALLOW_UNENFORCED_READONLY": "1",
+                "ZAI_CODING_API_KEY": "fixture",
+                "OPENROUTER_API_KEY": "fixture"}, clear=False), \
+             mock.patch("_zcode.resolve_zcode_cli", return_value=self._target()), \
+             mock.patch("_builder._lock_zcode_attachment"):
+            _command, args, env = build_invocation_args(invocation)
+        _builder.cleanup_zcode_attachment(args)
+        self.assertIsNone(env["ZAI_CODING_API_KEY"])
+        self.assertIsNone(env["OPENROUTER_API_KEY"])
+
+    def test_agent_args_cannot_restore_a_native_model_selector(self):
+        with mock.patch("_zcode.resolve_zcode_cli", return_value=self._target()), \
+             mock.patch("_builder._lock_zcode_attachment"):
+            _command, args, _env = build_invocation_args(self._inv(
+                extra_args=("--model", "other", "-m", "other-2", "--model=third")))
+        _builder.cleanup_zcode_attachment(args)
+        self.assertNotIn("--model", args)
+        self.assertNotIn("-m", args)
+        self.assertNotIn("--model=third", args)
+
+    def test_native_seat_name_is_truthful_and_old_alias_is_retired(self):
+        roster = Path(__file__).resolve().parent.parent / "agents"
+        by_name = {item["name"]: item for item in list_agents(str(roster))}
+        self.assertEqual(by_name["zcode-native"]["lifecycle"], "active")
+        self.assertEqual(by_name["zcode-coding-plan"]["lifecycle"], "retired")
+        self.assertEqual(by_name["zcode-coding-plan"]["successor"], "zcode-native")
+
     def test_effective_permission_never_upgrades_refused_safe_edit_to_yolo(self):
         from _backend_policy import effective_permission, permission_enforcement
         self.assertEqual(effective_permission("zcode", "safe-edit"), "unenforceable")
@@ -218,6 +274,30 @@ class ZCodeBuilderTests(unittest.TestCase):
         self.assertEqual(out["zcode_stream"]["streaming_progress"], "unavailable")
         self.assertIsNone(out["model"]["served"])
         self.assertFalse(Path(captured["attachment"]).exists())
+
+    def test_decision_names_validated_provider_separately_from_transport(self):
+        common = dict(
+            agent="seat", _resolved_agent="seat", _role_provenance={},
+            allow_credit=False, allow_text_only=True, require_tools=False,
+            strict_agents_dir=False, retries=0, transient_retries=False,
+            no_contract_repair=False, json_schema=None, max_permission=None)
+        cases = (
+            (AgentInvocation(cli="openai-compat", prompt="p", cwd=".",
+                             model="glm-5.3-flash", permission="read-only"),
+             "zai-coding-plan", "named_provider", "zai-coding-plan", "named_registry"),
+            (AgentInvocation(cli="opencode", prompt="p", cwd=".", permission="yolo",
+                             model="zai-coding-plan/glm-5.3-flash"),
+             "zai-coding-plan", "named_provider", "zai-coding-plan",
+             "model_selector_verified"),
+            (self._inv(), None, "none", None, "unknown"),
+        )
+        for invocation, declared, mode, provider, evidence in cases:
+            args = SimpleNamespace(**common, _declared_provider=declared,
+                                   _provider_endpoint_mode=mode)
+            view = run_subagent._effective_decision_view(invocation, args)
+            self.assertEqual(view["resolution"]["provider"], provider)
+            self.assertEqual(view["resolution"]["provider_evidence"], evidence)
+            self.assertEqual(view["resolution"]["transport"], invocation.cli)
 
 
 class ZaiCodingPlanCredentialTests(unittest.TestCase):
@@ -346,6 +426,44 @@ class ZaiCodingPlanCredentialTests(unittest.TestCase):
         self.assertEqual(response["status"], "error")
         self.assertIn("credential changed", response["error"])
         self.assertEqual(request.call_count, 0)
+
+    def test_missing_fingerprint_does_not_false_mismatch_a_fallback(self):
+        invocation = AgentInvocation(
+            cli="openai-compat", prompt="p", cwd=tempfile.gettempdir(),
+            permission="read-only", model="fixture",
+            base_url="https://openrouter.ai/api/v1",
+            api_key_env="OPENROUTER_API_KEY", api_key_fingerprint=None)
+        success = {"status": "success", "exit_code": 0, "cli": "openai-compat",
+                   "result": "ok", "model_resolved": "fixture"}
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("_windows_credentials.resolve_openrouter_api_key",
+                        return_value=("fixture-key", "windows_credential")), \
+             mock.patch("_apibackend._do_request", return_value=success) as request:
+            response = _apibackend.call(invocation, 1000)
+        self.assertEqual(response["status"], "success")
+        self.assertEqual(request.call_count, 1)
+
+    def test_reviewed_fallback_credentials_bind_only_one_way_identity(self):
+        cases = (
+            ("openrouter", "_windows_credentials.resolve_openrouter_api_key",
+             "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1"),
+            ("nous", "_nous_credentials.resolve_nous_api_key",
+             "NOUS_API_KEY", "https://inference-api.nousresearch.com/v1"),
+            ("byteplus-coding", "_arkcli_creds.resolve_byteplus_coding_api_key",
+             "BYTEPLUS_CODING_API_KEY",
+             "https://ark.ap-southeast.bytepluses.com/api/coding/v3"),
+        )
+        for provider, target, key_env, endpoint in cases:
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch(target, return_value=("fixture-private-key", "fixture")):
+                state = _executor._endpoint_state(
+                    directory, directory, "seat",
+                    SimpleNamespace(fm={"provider": provider}))
+            self.assertEqual(state[2][0], endpoint)
+            self.assertEqual(state[2][1], key_env)
+            self.assertRegex(state[2][2], r"^[0-9a-f]{32}$")
+            self.assertNotIn("fixture-private-key", repr(state))
 
 
 if __name__ == "__main__":

@@ -91,6 +91,17 @@ def test_contract_is_unbound_non_authority_and_private_values_are_only_digests()
         assert private not in serialized
 
 
+def test_api_credential_fingerprint_is_private_structure_not_exported_value():
+    fingerprint = "a" * 32
+    contract = _freeze(_invocation(api_key_fingerprint=fingerprint))
+    serialized = json.dumps(contract, sort_keys=True)
+    assert fingerprint not in serialized
+    projected = _fleet_activation._invocation_projection(
+        _invocation(api_key_fingerprint=fingerprint))
+    assert projected["api_key_fingerprint"] == {
+        "present": True, "kind": "scalar", "items": 1}
+
+
 @pytest.mark.parametrize("change", [
     {"permission": "safe-edit"},
     {"model": "gpt-other"},

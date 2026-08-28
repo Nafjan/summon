@@ -569,6 +569,7 @@ _BOUNDARY_FLAGS = {
     "opencode": ("--auto", "--model", "-m", "--session", "-s", "--continue",
                  "--agent", "--dir", "--format", "--variant"),
     "zcode": ("--cwd", "--json", "--no-color", "--mode", "--permission-mode",
+              "--model", "-m",
               "--allowed-tools", "--disallowed-tools", "--resume", "--continue",
               "--attach", "--prompt", "--settings", "--target", "--target-replace"),
 }
@@ -1967,13 +1968,13 @@ def _windows_current_principal() -> str:
     return value
 
 
-def _zcode_yolo_env_scrub() -> dict[str, None]:
-    """Remove conventional provider credentials from an unrestricted ZCode child.
+def _zcode_provider_env_scrub() -> dict[str, None]:
+    """Remove conventional provider credentials from every native ZCode child.
 
-    This does not sandbox ZCode's own local credential store.  The caller must
-    explicitly acknowledge that remaining local authority with
-    ``--allow-tool-credentials``; scrubbing only avoids an avoidable ambient
-    environment leak.
+    ZCode's plan/read-only behavior is advisory and therefore is not a safe
+    reason to forward ambient provider keys. This does not sandbox ZCode's own
+    local credential store. A yolo caller must separately acknowledge that
+    remaining local authority with ``--allow-tool-credentials``.
     """
     return {key: None for key in _opencode_credential_env_keys()}
 
@@ -2054,6 +2055,61 @@ def cleanup_zcode_attachment(args: list | tuple | None) -> None:
         pass
 
 
+def zcode_invocation_preflight(inv: AgentInvocation) -> dict | None:
+    """Return a pure, typed refusal shared by preview and live dispatch.
+
+    This intentionally performs no discovery, attachment write, or provider
+    work. Keeping authority checks here prevents a dry-run from promising that
+    a native ZCode request will launch when the live builder must refuse it.
+    """
+    if inv.cli != "zcode":
+        return None
+    if inv.model:
+        return {
+            "error_kind": "zcode_model_selector_unsupported",
+            "message": (
+                "zcode has no reviewed headless --model selector; select the model "
+                "in ZCode itself and leave the Summon model field unset"),
+        }
+    if inv.permission == "safe-edit":
+        return {
+            "error_kind": "zcode_safe_edit_unsupported",
+            "message": (
+                "ZCode has no reliable headless safe-edit mode; use permission: yolo "
+                "only in a disposable lane, or an advisory plan/read-only dispatch"),
+        }
+    if inv.permission == "read-only" and not unenforceable_permission_authorized(
+            inv.cli, inv.permission, forced=inv.permission_forced):
+        return {
+            "error_kind": "permission_unsupported",
+            "message": (
+                "ZCode plan mode is advisory rather than a proven filesystem boundary. "
+                "Use an enforcing review backend, or set " + _UNENFORCED_RO_OPT_IN +
+                "=1 to run a clearly labeled advisory plan turn."),
+        }
+    if inv.permission == "yolo" and inv.worktree is None and not inv.isolated_lane:
+        return {
+            "error_kind": "zcode_isolation_required",
+            "message": (
+                "ZCode yolo requires --worktree or --isolated-lane; broad authority is "
+                "available for disposable copies, not active shared checkouts"),
+        }
+    if inv.permission == "yolo" and not inv.allow_tool_credentials:
+        return {
+            "error_kind": "zcode_tool_credentials_consent_required",
+            "message": (
+                "ZCode yolo can access its local provider configuration and requires "
+                "--allow-tool-credentials in addition to --worktree or --isolated-lane; "
+                "the acknowledgement does not create a sandbox"),
+        }
+    if inv.resume_id and not _ZCODE_RESUME_RE.fullmatch(inv.resume_id):
+        return {
+            "error_kind": "zcode_resume_id_invalid",
+            "message": "ZCode resume id must be a sess_ identifier",
+        }
+    return None
+
+
 def _build_zcode_args(inv: AgentInvocation, *, resource_register=None
                       ) -> tuple[str, list, dict | None]:
     """Build one headless ZCode invocation without reading local ZCode config.
@@ -2066,31 +2122,9 @@ def _build_zcode_args(inv: AgentInvocation, *, resource_register=None
     returning exit zero; broad, disposable work uses its explicit ``yolo``
     mode instead.
     """
-    if inv.model:
-        raise ValueError(
-            "zcode has no reviewed headless --model selector; select the model in "
-            "ZCode itself and leave the Summon model field unset")
-    if inv.permission == "safe-edit":
-        raise ValueError(
-            "ZCode has no reliable headless safe-edit mode; use permission: yolo "
-            "only in a disposable lane, or an advisory plan/read-only dispatch")
-    if inv.permission == "read-only" and not unenforceable_permission_authorized(
-            inv.cli, inv.permission, forced=inv.permission_forced):
-        raise ValueError(
-            "ZCode plan mode is advisory rather than a proven filesystem boundary. "
-            "Use an enforcing review backend, or set " + _UNENFORCED_RO_OPT_IN +
-            "=1 to run a clearly labeled advisory plan turn.")
-    if inv.permission == "yolo" and inv.worktree is None and not inv.isolated_lane:
-        raise ValueError(
-            "ZCode yolo requires --worktree or --isolated-lane; broad authority is "
-            "available for disposable copies, not active shared checkouts")
-    if inv.permission == "yolo" and not inv.allow_tool_credentials:
-        raise ValueError(
-            "ZCode yolo can access its local provider configuration and requires "
-            "--allow-tool-credentials in addition to --worktree or --isolated-lane; "
-            "the acknowledgement does not create a sandbox")
-    if inv.resume_id and not _ZCODE_RESUME_RE.fullmatch(inv.resume_id):
-        raise ValueError("ZCode resume id must be a sess_ identifier")
+    refusal = zcode_invocation_preflight(inv)
+    if refusal:
+        raise ValueError(refusal["message"])
     try:
         from _zcode import resolve_zcode_cli
         target = resolve_zcode_cli()
@@ -2121,7 +2155,7 @@ def _build_zcode_args(inv: AgentInvocation, *, resource_register=None
         args += ["--attach", attachment, "--prompt", _ZCODE_FIXED_PROMPT]
         return target.command, args, {
             "SUMMON_ZCODE_DISCOVERY_SOURCE": target.source,
-            **(_zcode_yolo_env_scrub() if inv.permission == "yolo" else {}),
+            **_zcode_provider_env_scrub(),
         }
     except Exception:
         try:

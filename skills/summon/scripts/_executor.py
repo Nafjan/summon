@@ -1656,25 +1656,23 @@ def _endpoint_state(agents_dir, cwd, agent, defn=None) -> tuple:
     # practical attack. summon's rule that secrets stay in the environment and out of
     # artifacts is about the SECRET; a one-way digest is not the secret, and the alternative
     # was a wrong answer.
-    _cred = os.environ.get(api_key_env) if api_key_env else None
-    # Z.AI Coding Plan can resolve a key through the deliberately bounded
-    # helper reader. Include that same key's one-way identity before deciding
-    # whether an existing result is reusable; otherwise rotating the helper
-    # key would cross-account reuse an old answer.
+    _cred = None
+    # Bind environment keys and every reviewed local fallback through the same
+    # resolver the API call uses. Missing/unavailable evidence remains None;
+    # it must not arm a comparison against an empty-string pseudo-credential.
     try:
-        from _apibackend import credential_fingerprint, is_zai_coding_plan_endpoint
-        if (not _cred and api_key_env == "ZAI_CODING_API_KEY"
-                and is_zai_coding_plan_endpoint(base_url)):
-            from _zai_coding_plan import resolve_zai_coding_api_key
-            _cred, _source = resolve_zai_coding_api_key()
+        from _apibackend import credential_fingerprint, resolve_api_credential
+        _cred, _source = resolve_api_credential(api_key_env, base_url)
         cred_id = credential_fingerprint(api_key_env, _cred)
     except Exception:  # noqa: BLE001 - an unreadable helper cannot prove reuse
-        cred_id = "unresolved"
+        cred_id = None
     # The resolved endpoint/env pair and credential fingerprint travel together so dispatch
     # can use the endpoint snapshot and reject a changed helper/env credential. Resolving twice meant a providers.json edit between
     # the two reads sent the request to B while stamping it as A -- and restoring A then let
     # B's answer resume as A's. The identity and the call now describe the same endpoint.
-    return (hashlib.sha256(f"{base_url}|{api_key_env}|{cred_id}".encode("utf-8")).hexdigest(),
+    _credential_state = cred_id if cred_id is not None else "unavailable"
+    return (hashlib.sha256(
+                f"{base_url}|{api_key_env}|{_credential_state}".encode("utf-8")).hexdigest(),
             "ok", (base_url, api_key_env, cred_id))
 
 

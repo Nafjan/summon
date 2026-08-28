@@ -304,8 +304,13 @@ def _validate_schema_value(schema: str, value: Any) -> None:
         if ({"seat", "backend", "provider", "model_targeted", "winning_rule"}
                 - set(resolution) or set(resolution) - {
                     "seat", "backend", "provider", "model_targeted", "winning_rule",
-                    "source", "precedence"}):
+                    "source", "precedence", "provider_declared",
+                    "provider_evidence", "transport"}):
             raise EvidenceError("decision resolution has malformed fields")
+        if "provider_evidence" in resolution and resolution["provider_evidence"] not in {
+                "backend_static", "named_registry", "model_selector_verified",
+                "unknown", "mismatch"}:
+            raise EvidenceError("decision resolution provider evidence is invalid")
         if ({"permission_ceiling", "spend_authorized", "enforcement",
              "unenforceable_authorized", "corrective_allowed", "retry_allowed",
              "fallback_allowed", "require_fresh"}

@@ -26,6 +26,9 @@ never on added fields.
   fail before contact, safe-edit is refused, advisory read-only is opt-in, and
   experimental yolo needs an isolated/worktree boundary plus an explicit
   credential-access acknowledgement; that acknowledgement is not a sandbox.
+  The active generic seat is named `zcode-native`; the misleading historical
+  `zcode-coding-plan` alias is retired. Every native tier scrubs inherited
+  provider credential variables because plan mode is advisory, not a sandbox.
   Terminal JSON means liveness and
   usage are terminal-only, and no model provenance is manufactured.
 - **Direct Z.AI Coding Plan text seat:** registered the coding-only endpoint as
@@ -38,6 +41,12 @@ never on added fields.
   prompt attachment cleanup, and terminal-only metadata. The helper remains an
   auth/usage diagnostic, not an inference backend; usage reads are unsupported
   until a version-pinned schema and privacy mapping are reviewed.
+- **Credential and decision evidence:** direct API request identity now binds
+  reviewed environment and local fallback credential sources with a private
+  one-way digest, while unavailable identity remains `None` and cannot trigger
+  a false empty-string mismatch. Z.AI helper rotation still refuses before
+  provider contact. Provider-inert decision evidence records backend transport,
+  declared provider, and the route-provider validation class separately.
 
 ## 3.3.0 - 2026-08-28
 

@@ -344,12 +344,17 @@ class StreamProcessor:
             # unavailable until that terminal document and is kept honest as
             # such rather than fabricating stream events.
             encoded = line.encode("utf-8", errors="replace")
+            separator = b"\n" if self._zcode_output_parts else b""
             if self._zcode_output_bytes < _ZCODE_OUTPUT_MAX_BYTES:
                 remaining = _ZCODE_OUTPUT_MAX_BYTES - self._zcode_output_bytes
-                item = encoded[:remaining].decode("utf-8", errors="ignore")
+                combined = separator + encoded
+                kept = combined[:remaining]
+                item = kept.decode("utf-8", errors="ignore")
+                # Store the already-accounted newline with the next part so
+                # final concatenation cannot exceed the byte cap.
                 self._zcode_output_parts.append(item)
                 self._zcode_output_bytes += len(item.encode("utf-8"))
-                if len(encoded) > remaining:
+                if len(combined) > remaining:
                     self.zcode_output_truncated = True
             else:
                 self.zcode_output_truncated = True
@@ -1149,7 +1154,7 @@ class StreamProcessor:
             # Preserve newline boundaries because ZCode may pretty-print its
             # document. A leading stdout banner is tolerated by the dedicated
             # parser; arbitrary prose is never upgraded into structured data.
-            raw = "\n".join(self._zcode_output_parts)
+            raw = "".join(self._zcode_output_parts)
             try:
                 from _zcode import parse_zcode_json_output, zcode_result_fields
                 fields = (zcode_result_fields(parse_zcode_json_output(raw))
@@ -1166,7 +1171,10 @@ class StreamProcessor:
                 self.usage = fields["usage"]
             self.result_json = {
                 "type": "result",
-                "result": fields.get("response") or raw,
+                # Never surface a retained prefix of oversized stdout. It can
+                # contain prompt/tool material and is not a terminal result.
+                "result": (fields.get("response") or raw)
+                          if not self.zcode_output_truncated else "",
                 "status": "success" if fields.get("parse_ok") else "error",
                 **({"error": ("ZCode terminal JSON exceeded the bounded output limit"
                                 if self.zcode_output_truncated else
