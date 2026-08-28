@@ -144,6 +144,13 @@ class ZCodeBuilderTests(unittest.TestCase):
         self.assertEqual(candidates[0], ("well-known", "windows_bundle"))
         self.assertEqual(candidates[1][1], "windows_registry")
 
+    def test_windows_registry_name_accepts_versioned_app_but_not_helpers(self):
+        pattern = _zcode._WINDOWS_DISPLAY_NAME_RE
+        self.assertIsNotNone(pattern.fullmatch("ZCode"))
+        self.assertIsNotNone(pattern.fullmatch("ZCode 3.10.1"))
+        self.assertIsNone(pattern.fullmatch("ZCode Helper"))
+        self.assertIsNone(pattern.fullmatch("Unofficial ZCode 3.10.1"))
+
     def test_path_shim_does_not_block_direct_executable_discovery(self):
         target = self._target()
         def which(name):

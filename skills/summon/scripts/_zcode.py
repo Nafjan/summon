@@ -20,6 +20,8 @@ from pathlib import Path
 _BUNDLE_RELATIVE = ("resources", "glm", "zcode.cjs")
 _MAX_JSON_OUTPUT = 1_048_576
 _SESSION_RE = re.compile(r"^sess_[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_WINDOWS_DISPLAY_NAME_RE = re.compile(
+    r"^ZCode(?:\s+\d+(?:\.\d+){1,3})?$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -85,10 +87,11 @@ def _registry_install_locations() -> list[str]:
                         with winreg.OpenKey(root, name) as item:
                             display, _ = winreg.QueryValueEx(item, "DisplayName")
                             # A substring would trust unrelated uninstall records
-                            # such as "ZCode Helper". Only the app's exact display
-                            # name is an installation authority.
+                            # such as "ZCode Helper". The current Windows installer
+                            # uses either "ZCode" or a version-suffixed name such as
+                            # "ZCode 3.10.1"; accept only those bounded forms.
                             if (not isinstance(display, str)
-                                    or display.strip().casefold() != "zcode"):
+                                    or not _WINDOWS_DISPLAY_NAME_RE.fullmatch(display.strip())):
                                 continue
                             try:
                                 location, _ = winreg.QueryValueEx(item, "InstallLocation")
