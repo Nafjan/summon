@@ -16,8 +16,15 @@ import os
 from pathlib import Path
 import re
 import stat
-import tomllib
 from typing import Any
+
+try:  # Python 3.11+ standard library; optional compatibility package on 3.10.
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - selected by the interpreter version
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
 
 
 SCHEMA = "summon.fleet-activation/v1"
@@ -199,12 +206,17 @@ def _codex_custom_provider_configured(environment: dict[str, str]) -> bool | Non
     path = os.path.join(root, "config.toml")
     if not os.path.exists(path):
         return False
+    # A Python 3.10 standalone install may not have the optional ``tomli``
+    # compatibility package.  Do not guess that an unreadable config is safe:
+    # unknown makes the candidate ineligible without crashing the dispatcher.
+    if tomllib is None:
+        return None
     try:
         if os.path.getsize(path) > MAX_CANONICAL_BYTES:
             return None
         with open(path, "rb") as handle:
             value = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, ValueError, TypeError):
         return None
     if not isinstance(value, dict):
         return None

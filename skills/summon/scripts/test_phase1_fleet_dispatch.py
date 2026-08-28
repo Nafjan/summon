@@ -995,7 +995,7 @@ def test_ledger_hardlink_and_private_mode_fail_closed(approved):
         link.unlink()
     if os.name != "nt":
         path.chmod(0o644)
-        with pytest.raises(_evidence.EvidenceError, match="permissions"):
+        with pytest.raises(_evidence.EvidenceError, match="owner-only"):
             _fleet_dispatch.get_claim(reservation)
 
 

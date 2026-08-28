@@ -261,6 +261,7 @@ class OpenCodeBuilderTests(unittest.TestCase):
                         return_value=("test-secret", "windows_credential")):
             self.assertEqual(opencode_env_override("coding-plan/deepseek-v4-pro"), {})
 
+    @unittest.skipUnless(os.name == "nt", "Windows launcher regression")
     def test_windows_launch_prefers_npm_bundled_cli_over_desktop_launcher(self):
         desktop_launcher = r"C:\OpenCode\opencode.exe"
         npm_shim = r"C:\npm\opencode.cmd"

@@ -284,6 +284,26 @@ def test_codex_model_provider_config_is_unknown(tmp_path, monkeypatch):
     assert _fleet_activation.derive_billing_class(_invocation())["class"] == "unknown"
 
 
+def test_codex_standard_config_uses_available_toml_parser(tmp_path, monkeypatch):
+    config = tmp_path / ".codex" / "config.toml"
+    config.parent.mkdir()
+    config.write_text('model = "gpt-5.6-sol"\n', encoding="utf-8")
+    monkeypatch.setattr(_fleet_activation.os.path, "expanduser", lambda value: str(tmp_path))
+    assert _fleet_activation.tomllib is not None
+    assert _fleet_activation._codex_custom_provider_configured({}) is False
+
+
+def test_codex_missing_toml_parser_fails_closed(tmp_path, monkeypatch):
+    config = tmp_path / ".codex" / "config.toml"
+    config.parent.mkdir()
+    config.write_text('model = "gpt-5.6-sol"\n', encoding="utf-8")
+    monkeypatch.setattr(_fleet_activation.os.path, "expanduser", lambda value: str(tmp_path))
+    monkeypatch.setattr(_fleet_activation, "tomllib", None)
+    billing = _fleet_activation.derive_billing_class(_invocation())
+    assert billing["class"] == "unknown"
+    assert billing["candidate_eligible"] is False
+
+
 def test_fresh_request_identity_is_required_and_slice_a_never_certifies():
     contract = _freeze()
     assert not _fleet_activation.matches_activation_candidate(

@@ -399,8 +399,18 @@ def test_workspace_recreation_is_not_continuity(tmp_path):
     continuation.write_private_source(job_file, result, invocation, args)
     _publish_result(job_file, result)
     workspace = Path(invocation.cwd)
+    before = continuation.capture_workspace(str(workspace))
     workspace.rmdir()
+    # Some POSIX filesystems immediately recycle the just-freed inode.  Keep a
+    # decoy directory alive so the recreated workspace gets a distinct
+    # directory-object identity and the test exercises the continuity check,
+    # not an allocator coincidence.
+    decoy = workspace.with_name("workspace-identity-decoy")
+    decoy.mkdir()
     workspace.mkdir()
+    after = continuation.capture_workspace(str(workspace))
+    if (after["device"], after["inode"]) == (before["device"], before["inode"]):
+        pytest.skip("filesystem reused a live directory identity")
     with pytest.raises(continuation.ContinuationError,
                        match="workspace continuity") as error:
         continuation.read_private_source(root, job_id)

@@ -429,9 +429,15 @@ def _apply_windows_acl(path: str, *, directory: bool) -> None:
                 acl_pointer, 2, inheritance, 0x001F01FF, sid_pointer):
             raise _evidence.EvidenceError(
                 "fleet approval could not secure a private ACL")
+        # The verifier promises both an owner-only DACL and current-user
+        # ownership.  A freshly-created directory can inherit an Administrators
+        # or service-account owner on hosted Windows runners, so applying only
+        # the DACL leaves the postcondition false even though the ACE is right.
+        # Set the owner and protected DACL atomically to the same SID.
         code = advapi.SetNamedSecurityInfoW(
-            os.path.abspath(path), 1, 0x00000004 | 0x80000000,
-            None, None, acl_pointer, None)
+            os.path.abspath(path), 1,
+            0x00000001 | 0x00000004 | 0x80000000,
+            sid_pointer, None, acl_pointer, None)
         if code != 0:
             raise _evidence.EvidenceError(
                 "fleet approval could not secure a private ACL")
