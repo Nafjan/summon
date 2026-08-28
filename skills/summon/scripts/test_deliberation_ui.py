@@ -11,6 +11,7 @@ import sys
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -221,6 +222,8 @@ class DeliberationUITests(unittest.TestCase):
             replay = request("/api/v1/runs/run-1/replay")
             self.assertEqual(replay["status"], "success")
             self.assertEqual(replay["records"][0]["event"], "run_prepared")
+            self.assertEqual(
+                replay["receipt"]["model_display_by_seat"]["a"]["name"], "Sol")
 
             # SSE is not JSON; read the stream body directly.
             stream_request = Request(
@@ -232,6 +235,7 @@ class DeliberationUITests(unittest.TestCase):
                 stream_response = urlopen(stream_request, timeout=3)
                 stream_body = stream_response.read()
             self.assertIn(b"event: snapshot", stream_body)
+            self.assertIn(b'"receipt"', stream_body)
 
             origin = f"http://127.0.0.1:{surface.address[1]}"
             queued = request(
@@ -286,7 +290,7 @@ class DeliberationUITests(unittest.TestCase):
         self.assertNotIn("prompt", json.dumps(projected))
         self.assertNotIn("private", json.dumps(projected))
 
-    def test_catalog_display_wins_and_served_evidence_is_hash_bound(self):
+    def test_catalog_display_uses_only_replay_validated_model_evidence(self):
         receipt = {
             "decision_id": "decision", "seat_ids": ["a"],
             "option_ids": ["yes", "no"], "quorum_rule": "all",
@@ -300,6 +304,8 @@ class DeliberationUITests(unittest.TestCase):
                 "a": {"role": "secret", "name": "Forged", "version": "0",
                       "label": "frontier", "served_exact": True},
             },
+            # A receipt-authored served hash is not runtime evidence. The
+            # immutable receipt exists before any provider turn.
             "model_served_sha256_by_seat": {
                 "a": hashlib.sha256(b"some-other-model").hexdigest(),
             },
@@ -308,9 +314,79 @@ class DeliberationUITests(unittest.TestCase):
         display = projected["model_display_by_seat"]["a"]
         self.assertEqual(display["name"], "Sol")
         self.assertEqual(display["version"], "5.6")
-        self.assertEqual(display["availability"], "served_mismatch")
+        self.assertEqual(display["availability"], "catalog_listed")
+        self.assertEqual(display["served_model_evidence"], "absent")
         self.assertFalse(display["served_exact"])
         self.assertNotIn("Forged", json.dumps(projected))
+
+        def checkpoint(evidence, served, phase="finished", targeted="gpt-5.6-sol"):
+            return SimpleNamespace(
+                attempts=(SimpleNamespace(
+                    attempt_id="attempt-1", seat_id="a", phase=phase),),
+                transcript_events=({
+                    "event": "attempt_model_identity",
+                    "attempt_id": "attempt-1",
+                    "model_served": served,
+                    "model_targeted": targeted,
+                    "served_model_evidence": evidence,
+                },),
+            )
+
+        exact = store._public_receipt(
+            receipt, checkpoint("reported", "gpt-5.6-sol"))
+        self.assertEqual(
+            exact["model_display_by_seat"]["a"]["availability"],
+            "served_exact")
+        self.assertTrue(exact["model_display_by_seat"]["a"]["served_exact"])
+
+        mismatch = store._public_receipt(
+            receipt, checkpoint("reported", "gpt-5.6-luna"))
+        self.assertEqual(
+            mismatch["model_display_by_seat"]["a"]["availability"],
+            "served_mismatch")
+        self.assertFalse(mismatch["model_display_by_seat"]["a"]["served_exact"])
+
+        inferred = store._public_receipt(
+            receipt, checkpoint("inferred", "gpt-5.6-sol"))
+        inferred_display = inferred["model_display_by_seat"]["a"]
+        self.assertEqual(inferred_display["availability"], "served_inferred")
+        self.assertEqual(inferred_display["served_model_evidence"], "inferred")
+        self.assertFalse(inferred_display["served_exact"])
+
+        indeterminate = store._public_receipt(
+            receipt, checkpoint("reported", "gpt-5.6-sol", "indeterminate"))
+        indeterminate_display = indeterminate["model_display_by_seat"]["a"]
+        self.assertEqual(
+            indeterminate_display["availability"], "served_unverified")
+        self.assertEqual(
+            indeterminate_display["served_model_evidence"], "absent")
+        self.assertFalse(indeterminate_display["served_exact"])
+
+        target_mismatch = store._public_receipt(
+            receipt, checkpoint("reported", "gpt-5.6-sol",
+                                targeted="gpt-5.6-luna"))
+        target_mismatch_display = target_mismatch["model_display_by_seat"]["a"]
+        self.assertEqual(
+            target_mismatch_display["availability"], "served_mismatch")
+        self.assertFalse(target_mismatch_display["served_exact"])
+
+        mixed = SimpleNamespace(
+            attempts=(
+                SimpleNamespace(attempt_id="attempt-1", seat_id="a",
+                                phase="finished"),
+                SimpleNamespace(attempt_id="attempt-2", seat_id="a",
+                                phase="indeterminate"),
+            ),
+            transcript_events=checkpoint(
+                "reported", "gpt-5.6-sol").transcript_events,
+        )
+        mixed_display = store._public_receipt(
+            receipt, mixed)["model_display_by_seat"]["a"]
+        self.assertEqual(mixed_display["availability"], "served_unverified")
+        self.assertEqual(mixed_display["served_model_evidence"], "absent")
+        self.assertFalse(mixed_display["served_exact"])
+        for private_model in ("gpt-5.6-sol", "gpt-5.6-luna"):
+            self.assertNotIn(private_model, json.dumps(inferred))
 
 
 if __name__ == "__main__":

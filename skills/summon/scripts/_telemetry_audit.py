@@ -20,6 +20,8 @@ _OPERATIONS = {
     "resume", "swarm", "doctor", "onboarding",
 }
 _STATUSES = {"success", "error", "blocked", "partial", "cancelled", "unknown"}
+_EXECUTION_STATUSES = _STATUSES | {"not_run"}
+_ATTEMPT_STATUSES = {"not_run", "completed", "unknown"}
 _FAILURE_CLASSES = {
     "success", "blocked", "timeout", "cancelled", "authentication", "quota",
     "permission", "transport", "missing_cli", "invalid_input", "report_contract",
@@ -58,7 +60,9 @@ CANONICAL_TERMINAL_FIELDS = (
     "report_ok", "report_error_code", "result_usable", "model_requested_class",
     "model_served_class", "served_model_evidence", "model_mismatch",
     "auth_stage", "auth_outcome", "interactive_required", "remediation_code",
-    "auth_lifecycle_evidence", "timeout_stage", "exit_code",
+    "auth_lifecycle_evidence", "timeout_stage", "exit_code", "attempt_status",
+    "model_match", "named_model_verified", "raw_backend_exit_code",
+    "normalized_exit_code",
 )
 
 
@@ -173,7 +177,10 @@ def _valid_event(event: Mapping[str, object]) -> bool:
             is_start and event.get("failure_class") is None):
         return False
     execution_status = event.get("execution_status")
-    if execution_status is not None and not _enum(execution_status, _STATUSES):
+    if execution_status is not None and not _enum(execution_status, _EXECUTION_STATUSES):
+        return False
+    attempt_status = event.get("attempt_status")
+    if attempt_status is not None and not _enum(attempt_status, _ATTEMPT_STATUSES):
         return False
     for key in ("result_usable", "provider_contacted"):
         value = event.get(key)
@@ -194,6 +201,19 @@ def _valid_event(event: Mapping[str, object]) -> bool:
         return False
     if event.get("model_mismatch") is not None and not isinstance(event.get("model_mismatch"), bool):
         return False
+    for key in ("model_match", "named_model_verified"):
+        value = event.get(key)
+        if value is not None and not isinstance(value, bool):
+            return False
+    if (execution_status == "not_run" or attempt_status == "not_run"):
+        if (event.get("attempts") != 0
+                or attempt_status != "not_run"
+                or execution_status != "not_run"
+                or event.get("provider_contacted") is not False
+                or event.get("served_model_evidence") != "absent"
+                or event.get("model_match") is not None
+                or event.get("named_model_verified") is not False):
+            return False
     if event.get("auth_stage") is not None and not _enum(event.get("auth_stage"), _AUTH_STAGES):
         return False
     if event.get("auth_outcome") is not None and not _enum(event.get("auth_outcome"), _AUTH_OUTCOMES):

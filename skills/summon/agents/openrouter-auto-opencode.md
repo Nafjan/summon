@@ -1,5 +1,6 @@
 ---
 run-agent: opencode
+provider: openrouter
 model: openrouter/openrouter/auto
 permission: safe-edit
 openrouter_options: '{"plugins":[{"id":"auto-router","cost_tier":"max"}]}'

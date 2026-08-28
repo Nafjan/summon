@@ -381,6 +381,30 @@ class AdapterBoundaryTests(unittest.TestCase):
             self.assertNotIn(root, repr(receipt))
             self.assertIsNotNone(adapter_module._profile_runs_root("agy-profile"))
 
+    def test_disposable_agy_profile_cleanup_releases_host_lease(self):
+        import _builder
+        with tempfile.TemporaryDirectory() as root:
+            runs = os.path.join(root, "runs")
+            os.makedirs(runs)
+            handle, lease_path, token = _builder._agy_create_profile_lease(
+                runs, _builder.time.time() + 3600)
+            profile = tempfile.mkdtemp(
+                prefix=f"run-{os.getpid()}-{token}-", dir=runs)
+            profile_key = os.path.realpath(profile)
+            _builder._AGY_PROFILE_LEASES[profile_key] = (handle, lease_path)
+            with mock.patch.dict(os.environ, {"AGY_HEADLESS_PROFILE": root}, clear=False):
+                adapter = FreshDispatchAdapter(
+                    self.invocation(), snapshot_digest=SNAPSHOT,
+                    current_snapshot_digest=lambda: SNAPSHOT,
+                    owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+                    executor=lambda *args, **kwargs: {})
+                adapter._on_resource(profile, "agy-profile")
+                receipt = adapter.cleanup()
+            self.assertTrue(receipt.clean)
+            self.assertFalse(os.path.exists(profile))
+            self.assertFalse(os.path.lexists(lease_path))
+            self.assertNotIn(profile_key, _builder._AGY_PROFILE_LEASES)
+
     def test_resource_registration_rejects_named_or_outside_profile(self):
         with tempfile.TemporaryDirectory() as root:
             outside = os.path.join(root, "named-profile")
@@ -475,15 +499,26 @@ class AdapterBoundaryTests(unittest.TestCase):
                     fh.write("PRIVATE-CREDENTIAL")
                 created.append(profile)
                 resource_register(profile, "agy-profile")
+                report = ("STATUS: DONE\nSUMMARY: fake\nFOLLOW-UP: none\n"
+                          "HANDOFF: none")
+                terminal = json.dumps({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": report,
+                    "session_id": "fixture-session",
+                })
                 return sys.executable, [
                     "-c",
-                    "print('STATUS: DONE\\nSUMMARY: fake\\nFOLLOW-UP: none\\n"
-                    "HANDOFF: none')",
+                    f"print({terminal!r})",
                 ], None
 
             inv = replace(self.invocation(cli="claude", prompt="provider smoke"),
                           cwd=os.getcwd())
-            with mock.patch.dict(os.environ, {"AGY_HEADLESS_PROFILE": root}, clear=False), \
+            clean_env = {key: value for key, value in os.environ.items()
+                         if not key.startswith("SUMMON_")}
+            clean_env["AGY_HEADLESS_PROFILE"] = root
+            with mock.patch.dict(os.environ, clean_env, clear=True), \
                     mock.patch.object(executor_module, "build_invocation_args",
                                       side_effect=fake_build):
                 adapter = FreshDispatchAdapter(
@@ -496,8 +531,8 @@ class AdapterBoundaryTests(unittest.TestCase):
                 result = adapter.launch(
                     spec, token_for_context(spec, context, "attempt-provider"))
                 receipt = adapter.cleanup()
-            self.assertEqual(result.evidence.exit_code, 0)
             self.assertTrue(result.evidence.transport_ok)
+            self.assertFalse(result.evidence.timed_out)
             self.assertEqual(len(created), 1)
             self.assertFalse(os.path.exists(created[0]))
             self.assertTrue(receipt.clean)
@@ -526,6 +561,35 @@ class AdapterBoundaryTests(unittest.TestCase):
         self.assertFalse(result.evidence.parser_valid is False and
                          result.evidence.timed_out)
 
+    def test_explicit_cancelled_or_incomplete_status_is_not_transport_ok(self):
+        for status, error_kind, raw_exit in (
+                ("blocked", "provider_cancelled", 0),
+                ("blocked", "provider_cancelled", 143),
+                ("partial", "provider_incomplete", -15)):
+            with self.subTest(status=status, raw_exit=raw_exit):
+                adapter = FreshDispatchAdapter(
+                    self.invocation(cli="agy", prompt=f"{status} result"),
+                    snapshot_digest=SNAPSHOT,
+                    current_snapshot_digest=lambda: SNAPSHOT,
+                    owner_is_current=lambda: True,
+                    timeout_ms=5000,
+                    generation=1,
+                    executor=lambda *args, _status=status, _kind=error_kind,
+                    _exit=raw_exit, **kwargs: {
+                        "result": "{}", "exit_code": _exit, "status": _status,
+                        "error_kind": _kind,
+                    })
+                context = turn_with_prompt(
+                    f"{status} result", turn_id=f"turn-{status}-{raw_exit}",
+                    ordinal=0)
+                spec = adapter.prepare(context)
+                result = adapter.launch(
+                    spec, token_for_context(
+                        spec, context, f"attempt-{status}-{raw_exit}"))
+                self.assertFalse(result.evidence.transport_ok)
+                self.assertTrue(result.evidence.parser_valid)
+                self.assertEqual(result.evidence.error_kind, error_kind)
+
     def test_served_model_identity_is_captured_as_bounded_attempt_evidence(self):
         adapter = FreshDispatchAdapter(
             self.invocation(cli="claude", prompt="model evidence"),
@@ -536,6 +600,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             generation=1,
             executor=lambda *args, **kwargs: {
                 "result": "{}", "exit_code": 0,
+                "served_model_evidence": "reported",
                 "model": {"targeted": "claude-opus-4-7",
                            "served": "claude-opus-4-7"},
             })
@@ -546,6 +611,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             spec, token_for_context(spec, context, "attempt-model"))
         self.assertEqual(result.evidence.model_targeted, "claude-opus-4-7")
         self.assertEqual(result.evidence.model_served, "claude-opus-4-7")
+        self.assertEqual(result.evidence.served_model_evidence, "reported")
 
         invalid = FreshDispatchAdapter(
             self.invocation(cli="claude", prompt="invalid model evidence"),
@@ -556,6 +622,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             generation=1,
             executor=lambda *args, **kwargs: {
                 "result": "{}", "exit_code": 0,
+                "served_model_evidence": "reported",
                 "model": {"served": r"C:\\private\\credential"},
             })
         invalid_context = turn_with_prompt("invalid model evidence",
@@ -566,6 +633,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             invalid_spec,
             token_for_context(invalid_spec, invalid_context, "attempt-invalid-model"))
         self.assertIsNone(invalid_result.evidence.model_served)
+        self.assertEqual(invalid_result.evidence.served_model_evidence, "absent")
         self.assertNotIn("private", repr(invalid_result.evidence))
 
     def test_owner_refusal_after_profile_build_still_cleans_profile(self):
@@ -796,14 +864,23 @@ class ExecutorPathTests(unittest.TestCase):
         popen.assert_called_once()
         self.assertEqual([event[0] for event in events], ["before", "spawn", "reap"])
         self.assertNotIn("secret", json.dumps(events[0][1]))
+        child_env = popen.call_args.kwargs["env"]
+        self.assertIsInstance(child_env, dict)
+        self.assertEqual(
+            events[0][1]["env_sha256"],
+            _executor._canonical_sha256({
+                str(name): str(child_env[name]) for name in sorted(child_env)
+            }))
 
     def test_registration_failure_terminates_untracked_child_and_redacts_error(self):
         fake_process = mock.Mock()
         fake_process.pid = 124
+        outcomes = []
         control = ProviderLaunchControl(
             before_launch=lambda evidence: None,
             on_spawn=lambda handle: (_ for _ in ()).throw(
-                RuntimeError("TOP-SECRET-CALLBACK-TEXT")))
+                RuntimeError("TOP-SECRET-CALLBACK-TEXT")),
+            on_indeterminate=lambda error: outcomes.append(type(error).__name__))
         inv = AgentInvocation(cli="claude", prompt="p", cwd=tempfile.gettempdir(),
                               permission="yolo")
         with mock.patch.object(_executor, "build_invocation_args",
@@ -821,6 +898,52 @@ class ExecutorPathTests(unittest.TestCase):
         kill.assert_called_once_with(fake_process)
         self.assertEqual(response["status"], "error")
         self.assertNotIn("TOP-SECRET", json.dumps(response))
+        self.assertEqual(outcomes, ["RuntimeError"])
+
+    def test_subprocess_popen_oserror_records_proven_pre_spawn_failure(self):
+        events = []
+        control = ProviderLaunchControl(
+            before_launch=lambda evidence: events.append("claimed"),
+            on_pre_spawn_failure=lambda error: events.append(type(error).__name__),
+            on_indeterminate=lambda error: events.append("indeterminate"))
+        inv = AgentInvocation(cli="claude", prompt="p", cwd=tempfile.gettempdir(),
+                              permission="yolo")
+        with mock.patch.object(_executor, "build_invocation_args",
+                               return_value=("fake-cli", ["p"], {})), \
+             mock.patch.object(_executor, "_resolve_launch",
+                               return_value=("fake-cli", ["p"])), \
+             mock.patch.object(_executor, "argv_length_error", return_value=None), \
+             mock.patch.object(_executor.subprocess, "Popen",
+                               side_effect=OSError("no process")), \
+             mock.patch("_receipt.workspace_snapshot", return_value={"coverage": "none"}), \
+             mock.patch("_receipt.workspace_evidence", return_value={}):
+            response = _executor.execute_agent(
+                inv, timeout_ms=1000, launch_control=control)
+        self.assertEqual(events, ["claimed", "OSError"])
+        self.assertFalse(response["provider_contacted"])
+
+    def test_subprocess_popen_unexpected_error_records_indeterminate(self):
+        events = []
+        control = ProviderLaunchControl(
+            before_launch=lambda evidence: events.append("claimed"),
+            on_pre_spawn_failure=lambda error: events.append("pre_spawn"),
+            on_indeterminate=lambda error: events.append(type(error).__name__))
+        inv = AgentInvocation(cli="claude", prompt="p", cwd=tempfile.gettempdir(),
+                              permission="yolo")
+        with mock.patch.object(_executor, "build_invocation_args",
+                               return_value=("fake-cli", ["p"], {})), \
+             mock.patch.object(_executor, "_resolve_launch",
+                               return_value=("fake-cli", ["p"])), \
+             mock.patch.object(_executor, "argv_length_error", return_value=None), \
+             mock.patch.object(_executor.subprocess, "Popen",
+                               side_effect=RuntimeError("ambiguous")), \
+             mock.patch("_receipt.workspace_snapshot", return_value={"coverage": "none"}), \
+             mock.patch("_receipt.workspace_evidence", return_value={}):
+            response = _executor.execute_agent(
+                inv, timeout_ms=1000, launch_control=control)
+        self.assertEqual(events, ["claimed", "RuntimeError"])
+        self.assertFalse(response["provider_contacted"])
+        self.assertIn("ambiguously", response["error"])
 
     def test_oversized_subprocess_does_not_route_to_acp(self):
         control = ProviderLaunchControl(before_launch=lambda evidence: None)

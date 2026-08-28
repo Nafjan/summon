@@ -78,6 +78,8 @@ result path yourself:
 
 - `summon jobs list [--job-dir D] [--json]`: every job's state: `prepared` (launched,
   spawn unconfirmed), `running` (pid known, not asserted alive), a terminal status,
+  `identity_mismatch` (the result nonce matches but its scripts digest differs from the
+  frozen execution bundle),
   `unverified` (a result whose `job_nonce` does not match its record, or a legacy
   result with no record), or `corrupt` (a record/result present but unreadable, or an
   authenticated result with a malformed envelope). A corrupt job still lists (it does
@@ -87,8 +89,9 @@ result path yourself:
   at the path is skipped until the real child writes, then the envelope is printed.
 
 The child stamps a `job_nonce` into its result envelope so a result at a job's path can
-be authenticated against the record that launched it; `status`/`wait` never trust an
-unverifiable result. This is a single-user, single-machine registry (summon does not
+be authenticated against the record that launched it. Managed installs also run each
+background child from an immutable per-job scripts snapshot, and the terminal digest
+must match that snapshot. `status`/`wait` never trust an unverifiable result. This is a single-user, single-machine registry (summon does not
 defend it against other local users on a shared host). Liveness verification, cancel,
 and reaping are a later addition.
 

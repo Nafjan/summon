@@ -39,6 +39,49 @@ def _redact(text: str, secret: str | None) -> str:
         return text.replace(secret, "***REDACTED***")
     return text
 
+
+def credential_fingerprint(api_key_env: str | None, api_key: str | None) -> str | None:
+    """Return a one-way credential identity, or None when none was resolved."""
+    if not api_key:
+        return None
+    return hashlib.sha256(
+        b"summon-credential-v1\0" + (api_key_env or "").encode("utf-8") + b"\0"
+        + api_key.encode("utf-8")).hexdigest()[:32]
+
+
+def resolve_api_credential(api_key_env: str | None, base_url: str | None,
+                           *, environ: dict[str, str] | None = None
+                           ) -> tuple[str | None, str | None]:
+    """Resolve the credential used by a reviewed direct API route.
+
+    Environment variables win. Bounded local fallbacks mirror the call path so
+    request identity can bind the same account without serializing a secret.
+    Resolver failures are deliberately indistinguishable from absence here.
+    """
+    env = os.environ if environ is None else environ
+    api_key = env.get(api_key_env) if api_key_env else None
+    source = "env" if api_key else None
+    try:
+        if (not api_key and api_key_env == "OPENROUTER_API_KEY"
+                and _is_openrouter_endpoint(base_url)):
+            from _windows_credentials import resolve_openrouter_api_key
+            api_key, source = resolve_openrouter_api_key()
+        if (not api_key and api_key_env == "NOUS_API_KEY"
+                and _is_nous_endpoint(base_url)):
+            from _nous_credentials import resolve_nous_api_key
+            api_key, source = resolve_nous_api_key()
+        if (not api_key and api_key_env == "BYTEPLUS_CODING_API_KEY"
+                and _is_byteplus_coding_plan_endpoint(base_url)):
+            from _arkcli_creds import resolve_byteplus_coding_api_key
+            api_key, source = resolve_byteplus_coding_api_key()
+        if (not api_key and api_key_env == "ZAI_CODING_API_KEY"
+                and is_zai_coding_plan_endpoint(base_url)):
+            from _zai_coding_plan import resolve_zai_coding_api_key
+            api_key, source = resolve_zai_coding_api_key(environ=env)
+    except Exception:  # noqa: BLE001 - local stores are best-effort
+        return None, None
+    return api_key, source
+
 # Sensible defaults so common providers work with just `provider:` + `model:`.
 BUILTIN_PROVIDERS = {
     "openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY"},
@@ -49,6 +92,7 @@ BUILTIN_PROVIDERS = {
     "groq":       {"base_url": "https://api.groq.com/openai/v1", "api_key_env": "GROQ_API_KEY"},
     "together":   {"base_url": "https://api.together.xyz/v1", "api_key_env": "TOGETHER_API_KEY"},
     "deepseek":   {"base_url": "https://api.deepseek.com/v1", "api_key_env": "DEEPSEEK_API_KEY"},
+    "nous":       {"base_url": "https://inference-api.nousresearch.com/v1", "api_key_env": "NOUS_API_KEY"},
     "ollama":     {"base_url": "http://localhost:11434/v1", "api_key_env": ""},   # local, no key
     "lmstudio":   {"base_url": "http://localhost:1234/v1", "api_key_env": ""},    # local, no key
     # BytePlus ModelArk Coding Plan (subscription quota, not per-token API credits).
@@ -59,11 +103,15 @@ BUILTIN_PROVIDERS = {
         "base_url": "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
         "api_key_env": "BYTEPLUS_CODING_API_KEY",
     },
+    "zai-coding-plan": {
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+        "api_key_env": "ZAI_CODING_API_KEY",
+    },
 }
 
 # Providers whose base_url MUST contain /api/coding (subscription path).
 # A wrong URL silently bills PAYG — refuse rather than warn-and-continue.
-_CODING_PLAN_PROVIDERS = frozenset({"byteplus-coding"})
+_CODING_PLAN_PROVIDERS = frozenset({"byteplus-coding", "zai-coding-plan"})
 
 # Curated, non-exhaustive recommendations. The plan roster is dynamic and can
 # contain legacy or temporarily broken entries, so do not present it as a list
@@ -114,24 +162,22 @@ def refresh_coding_plan_roster(plan: str = "coding-plan",
     import subprocess
     import time
     from _spawn import run_flags
-    cmd = ["arkcli", "plans", "model-list", "--plan", plan, "--format", "json"]
-    # On Windows, prefer arkcli.cmd when PATH resolution is via npm shim.
+    from _arkcli_backend import _arkcli_cmd
+    try:
+        cmd = [*_arkcli_cmd(), "plans", "model-list", "--plan", plan,
+               "--format", "json"]
+    except RuntimeError as first_error:
+        raise RuntimeError(
+            "arkcli package entry point is unavailable; reinstall "
+            "@byteplus/ark-cli to refresh the Coding Plan roster") from first_error
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=timeout_s, shell=False, **run_flags())
-    except FileNotFoundError:
-        # npm global shim
-        cmd0 = cmd[:]
-        cmd0[0] = "arkcli.cmd" if os.name == "nt" else "arkcli"
-        try:
-            proc = subprocess.run(
-                cmd0, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=timeout_s, shell=True, **run_flags())
-        except FileNotFoundError as e:
-            raise RuntimeError(
-                "arkcli not found on PATH; install @byteplus/ark-cli to refresh "
-                "the Coding Plan roster") from e
+    except FileNotFoundError as first_error:
+        raise RuntimeError(
+            "arkcli not found on PATH; install @byteplus/ark-cli to refresh "
+            "the Coding Plan roster") from first_error
     if proc.returncode != 0:
         raise RuntimeError(
             f"arkcli plans model-list failed (exit {proc.returncode}): "
@@ -243,9 +289,33 @@ def is_coding_plan_endpoint(base_url: str | None) -> bool:
     return "/api/coding" in path
 
 
+def is_zai_coding_plan_endpoint(base_url: str | None) -> bool:
+    """True only for the published Z.AI Coding Plan OpenAI-compatible endpoint."""
+    if not isinstance(base_url, str) or not base_url:
+        return False
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(base_url)
+        return (parts.scheme.casefold() == "https"
+                and (parts.hostname or "").casefold() == "api.z.ai"
+                and (parts.path or "").rstrip("/").casefold() == "/api/coding/paas/v4"
+                and not parts.query and not parts.fragment)
+    except ValueError:
+        return False
+
+
+def _is_byteplus_coding_plan_endpoint(base_url: str | None) -> bool:
+    return is_coding_plan_endpoint(base_url) and not is_zai_coding_plan_endpoint(base_url)
+
+
 def coding_plan_billing(base_url: str | None) -> dict | None:
     """Honest billing for Coding Plan URLs: subscription quota, not API credits."""
-    if not is_coding_plan_endpoint(base_url):
+    if is_zai_coding_plan_endpoint(base_url):
+        return {
+            "source": "subscription",
+            "note": "Z.AI Coding Plan coding endpoint - provider plan/quota semantics apply",
+        }
+    if not _is_byteplus_coding_plan_endpoint(base_url):
         return None
     return {
         "source": "subscription",
@@ -260,7 +330,7 @@ def coding_plan_model_error(base_url: str | None, model: str | None) -> str | No
     ``auto`` is an arkcli routing alias, not a ModelArk Chat Completions model —
     the upstream error falsely says the model 'does not support the coding plan'.
     """
-    if not is_coding_plan_endpoint(base_url):
+    if not _is_byteplus_coding_plan_endpoint(base_url):
         return None
     mid = (model or "").strip()
     if mid.lower() == "auto":
@@ -277,6 +347,12 @@ def _validate_coding_plan_url(provider: str, base_url: str) -> None:
     """Refuse Coding Plan providers pointed at the PAYG /api/v3 path."""
     if provider not in _CODING_PLAN_PROVIDERS:
         return
+    if provider == "zai-coding-plan":
+        if is_zai_coding_plan_endpoint(base_url):
+            return
+        raise ValueError(
+            "provider 'zai-coding-plan' must use the Z.AI Coding Plan endpoint "
+            "https://api.z.ai/api/coding/paas/v4")
     if is_coding_plan_endpoint(base_url):
         return
     raise ValueError(
@@ -290,7 +366,7 @@ def _validate_coding_plan_url(provider: str, base_url: str) -> None:
 
 def _rewrite_coding_plan_http_error(base_url: str, model: str, code: int, detail: str) -> str | None:
     """Make BytePlus UnsupportedModel errors actionable for Coding Plan users."""
-    if not is_coding_plan_endpoint(base_url):
+    if not _is_byteplus_coding_plan_endpoint(base_url):
         return None
     low = (detail or "").lower()
     if "unsupportedmodel" not in low and "does not support the coding plan" not in low:
@@ -331,6 +407,11 @@ def payg_consent_allowed(allow_payg_flag: bool = False) -> bool:
     """
     if allow_payg_flag:
         return True
+    if os.environ.get("SUMMON_FRESH_CONSENT_ONLY") == "1":
+        # A governed continuation is a new physical attempt. Only the
+        # claim-bound --allow-payg flag may authorize it; inherited environment
+        # and standing preferences belong to the completed source job.
+        return False
     if os.environ.get("SUMMON_ALLOW_BYTEPLUS_PAYG") == "1":
         return True
     prefs_path = os.path.join(os.path.expanduser("~"), ".agents", "summon.json")
@@ -352,6 +433,11 @@ def coding_to_payg_base_url(coding_url: str) -> str:
     retry against the chat-completions PAYG path.
     Raises ValueError if input is not a Coding Plan URL.
     """
+    # Z.AI's coding endpoint is a separate subscription product.  It has no
+    # reviewed automatic PAYG companion, so this generic BytePlus helper must
+    # not manufacture one if a future caller reaches it directly.
+    if is_zai_coding_plan_endpoint(coding_url):
+        raise ValueError("Z.AI Coding Plan has no reviewed automatic PAYG fallback")
     if not is_coding_plan_endpoint(coding_url):
         raise ValueError(
             f"cannot rewrite non-Coding-Plan URL to PAYG: {coding_url!r}")
@@ -501,32 +587,26 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
     if _cp_model:
         return _err(cli, _cp_model)
 
-    api_key = os.environ.get(inv.api_key_env) if inv.api_key_env else None
-    _key_source = "env" if api_key else None
-    # OpenRouter is the one built-in API provider with a private local
-    # Credential Manager convention.  Environment variables still win; the
-    # store fallback is Windows-only, opt-in by the presence of the target,
-    # and never copies the secret into a child environment or an envelope.
-    if (not api_key and inv.api_key_env == "OPENROUTER_API_KEY"
-            and _is_openrouter_endpoint(inv.base_url)):
-        try:
-            from _windows_credentials import resolve_openrouter_api_key
-            api_key, _key_source = resolve_openrouter_api_key()
-        except Exception:  # noqa: BLE001 — local store is best-effort
-            api_key, _key_source = None, None
-    if inv.api_key_env == "BYTEPLUS_CODING_API_KEY" and not api_key:
-        try:
-            from _arkcli_creds import resolve_byteplus_coding_api_key
-            api_key, _key_source = resolve_byteplus_coding_api_key()
-        except Exception:  # noqa: BLE001 — credential resolve is best-effort
-            api_key, _key_source = None, None
+    api_key, _key_source = resolve_api_credential(
+        inv.api_key_env, inv.base_url)
     if inv.api_key_env and not api_key:
         msg = f"openai-compat: ${inv.api_key_env} is not set"
         if inv.api_key_env == "BYTEPLUS_CODING_API_KEY":
             msg += (" - set it to your Coding Plan profile API key "
                     "(from `arkcli auth status` / `arkcli auth apikey`), "
                     "not a short-lived SSO token")
+        if inv.api_key_env == "ZAI_CODING_API_KEY":
+            msg += " - set it for the Z.AI Coding Plan endpoint"
         return _err(cli, msg)
+    expected_credential = getattr(inv, "api_key_fingerprint", None)
+    if (expected_credential is not None
+            and credential_fingerprint(inv.api_key_env, api_key) != expected_credential):
+        # The identity was built with another helper/env credential. Do not let
+        # a result-file reuse or a mid-dispatch helper edit cross accounts.
+        return _err(
+            cli,
+            "openai-compat credential changed after request identity was prepared; "
+            "recompute the request identity before dispatch")
 
     wall_deadline = time.monotonic() + max(1.0, timeout_ms / 1000.0)
     if launch_control is None:
@@ -535,18 +615,43 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
     else:
         resp = _do_request(inv.base_url, inv.model, inv.system_context, inv.prompt,
                            api_key, timeout_ms, cli, launch_control=launch_control)
+    if (_key_source == "hermes_profile" and resp.get("status") != "success"
+            and _nous_auth_rejection(resp.get("error"))):
+        # A raw NOUS_API_KEY in an older Hermes profile is not interchangeable
+        # with the short-lived Portal JWT used by current Hermes releases. Keep
+        # the provider error truthful, but make the recovery path explicit and
+        # prevent an orchestrator from interpreting this as a transient retry.
+        resp.setdefault("warnings", []).append(
+            "Nous rejected the credential read from the local Hermes profile; "
+            "check `hermes auth status nous` and authenticate with `hermes auth add nous`. "
+            "Summon did not retry or switch providers.")
+        resp["error_kind"] = "authentication_failed"
+        resp["retryable"] = False
+        resp["remediation_code"] = "nous_portal_auth_required"
     if _key_source == "arkcli_profile" and resp.get("status") == "success":
         resp.setdefault("warnings", []).append(
             "BYTEPLUS_CODING_API_KEY was unset; used the local arkcli profile "
             "API key for this dispatch (env still wins when set)")
+    if _key_source == "coding_helper_config" and resp.get("status") == "success":
+        resp.setdefault("warnings", []).append(
+            "ZAI_CODING_API_KEY was unset; used the local Coding Plan helper configuration "
+            "for this dispatch (env still wins when set)")
     if _key_source == "windows_credential" and resp.get("status") == "success":
         resp.setdefault("warnings", []).append(
             "OPENROUTER_API_KEY was unset; used the local Windows credential "
             "store for this dispatch (env still wins when set)")
+    if _key_source == "hermes_env" and resp.get("status") == "success":
+        resp.setdefault("warnings", []).append(
+            "OPENROUTER_API_KEY was unset; used the local Hermes env profile "
+            "for this dispatch (env still wins when set)")
+    if _key_source == "hermes_profile" and resp.get("status") == "success":
+        resp.setdefault("warnings", []).append(
+            "NOUS_API_KEY was unset; used the local Hermes Nous profile "
+            "for this dispatch (env still wins when set)")
 
     # --- PAYG consent-gated fallback ---
     if (resp["status"] == "error"
-            and is_coding_plan_endpoint(inv.base_url)
+            and _is_byteplus_coding_plan_endpoint(inv.base_url)
             and resp.get("_payg_fallback_worthy")
             and (launch_control is None or launch_control.allow_secondary)):
         allow_payg = getattr(inv, "allow_payg", False)
@@ -617,7 +722,16 @@ def _do_request(base_url: str, model: str, system_context: str | None,
         ],
         "stream": False,
     }).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    # Some provider edges (including the Nous inference edge) reject Python's
+    # default ``urllib`` fingerprint with a generic 403/1010 response even when
+    # the bearer is valid. Send an ordinary API client identity and an explicit
+    # JSON accept header; this is transport metadata only and never contains a
+    # credential or user data.
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "summon-openai-compatible/1",
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(base_url + "/chat/completions", data=body,
@@ -636,7 +750,12 @@ def _do_request(base_url: str, model: str, system_context: str | None,
                 launch_control.reaped(req)
             except Exception:
                 pass
-            return _err(cli, f"provider launch refused by control ({type(e).__name__})")
+            response = _err(cli, f"provider launch refused by control ({type(e).__name__})")
+            error_kind = getattr(e, "error_kind", None)
+            if error_kind == "context_source_drift":
+                response["error_kind"] = error_kind
+                response["provider_contacted"] = False
+            return response
     try:
         with _opener().open(req, timeout=max(1, timeout_ms / 1000)) as r:
             payload = json.loads(r.read().decode("utf-8", errors="replace"))
@@ -646,7 +765,8 @@ def _do_request(base_url: str, model: str, system_context: str | None,
             detail = e.read().decode("utf-8", errors="replace")[:500]
         except Exception:  # noqa: BLE001
             pass
-        fallback_worthy = is_payg_fallback_worthy(e.code, detail or e.reason)
+        fallback_worthy = (_is_byteplus_coding_plan_endpoint(base_url)
+                            and is_payg_fallback_worthy(e.code, detail or e.reason))
         rewritten = _rewrite_coding_plan_http_error(base_url, model, e.code, detail or e.reason)
         err_msg = rewritten or f"HTTP {e.code} from {base_url}: {detail or e.reason}"
         resp = _err(cli, _redact(err_msg, api_key))
@@ -705,6 +825,31 @@ def _is_openrouter_endpoint(base_url: str | None) -> bool:
         return False
 
 
+def _is_nous_endpoint(base_url: str | None) -> bool:
+    """Return True only for the configured Nous inference origin."""
+    if not isinstance(base_url, str) or not base_url:
+        return False
+    from urllib.parse import urlsplit
+    try:
+        return (urlsplit(base_url).hostname or "").lower() in {
+            "inference-api.nousresearch.com",
+            "www.inference-api.nousresearch.com",
+        }
+    except ValueError:
+        return False
+
+
+def _nous_auth_rejection(error: object) -> bool:
+    """Recognize provider-auth failures without exposing response bodies."""
+    if not isinstance(error, str):
+        return False
+    lowered = error.lower()
+    return any(marker in lowered for marker in (
+        "http 401", "http 403", "no cookie auth", "unauthorized",
+        "forbidden", "invalid token", "logged out",
+    ))
+
+
 def api_key_available(api_key_env: str | None, base_url: str | None) -> bool:
     """Return whether dispatch can resolve an API credential without exposing it."""
     if not api_key_env:
@@ -718,10 +863,24 @@ def api_key_available(api_key_env: str | None, base_url: str | None) -> bool:
             return bool(key)
         except Exception:  # noqa: BLE001 — dry-run must remain diagnostic-only
             return False
+    if api_key_env == "NOUS_API_KEY" and _is_nous_endpoint(base_url):
+        try:
+            from _nous_credentials import resolve_nous_api_key
+            key, _source = resolve_nous_api_key()
+            return bool(key)
+        except Exception:  # noqa: BLE001 — dry-run must remain diagnostic-only
+            return False
     if api_key_env == "BYTEPLUS_CODING_API_KEY":
         try:
             from _arkcli_creds import resolve_byteplus_coding_api_key
             key, _source = resolve_byteplus_coding_api_key()
+            return bool(key)
+        except Exception:  # noqa: BLE001 — dry-run must remain diagnostic-only
+            return False
+    if api_key_env == "ZAI_CODING_API_KEY" and is_zai_coding_plan_endpoint(base_url):
+        try:
+            from _zai_coding_plan import resolve_zai_coding_api_key
+            key, _source = resolve_zai_coding_api_key()
             return bool(key)
         except Exception:  # noqa: BLE001 — dry-run must remain diagnostic-only
             return False

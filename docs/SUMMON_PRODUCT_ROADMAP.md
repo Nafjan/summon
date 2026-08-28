@@ -1,13 +1,15 @@
 # Summon product roadmap
 
-Last reviewed: 2026-08-22
-Current release: `3.2.1`
+Last reviewed: 2026-08-28
+Current release: `3.3.0`
 Product status: dispatch and council are public. The local chat atlas and swarm coordinator
 are public preview surfaces. Deliberation and provider lanes use independent evidence gates.
 
 The immutable `v3.1.0` tag remains the prior source-bound GA release. The published `v3.2.0`
-release established the routing, roster, and chat baseline; `v3.2.1` is the non-destructive
-security and OpenCode gateway patch on that line. The older `v3.0.0-ga` tag remains the historical provider-inert preview
+release established the routing, roster, and chat baseline; `v3.2.1` was the non-destructive
+security and OpenCode gateway patch on that line. `v3.3.0` completes the reviewed Phase 1
+operator workflow: approved fleet activation, advisory usage evidence, safe context
+compilation, adaptive job supervision, and portable results. The older `v3.0.0-ga` tag remains the historical provider-inert preview
 baseline. The certified source passed all 17 fixed
 suites and all eight release gates, with clean source and converged managed installs. The
 reviewed Claude matrix covered a normal decided run, durable cancellation after provider
@@ -45,7 +47,7 @@ not inferred from this release.
 | Live provider composition | Receipt/plan/owner/deadline fences plus reviewed Claude normal/cancel/deadline matrix; deadline remains conservatively indeterminate with uncertain spend | Claude gate passes; provider expansion remains separately gated |
 | Browser conversation surface | Authenticated loopback, stale-record fencing, bounded requests, redaction, accessibility, visual evidence, and explicit cancellable roster-agent turns; richer multi-run lifecycle remains preview | Unreleased post-GA preview |
 | Local swarm coordinator | `_rundir`-backed owner/lease/claim journal, idempotent worker messages, claim-bound artifacts, cancellation, and explicit uncertain-spend recovery; no implicit provider or IDE attachment | Provider-neutral preview |
-| Managed local installs | The installer detects nine host profiles (eight managed records); 3.2.1 convergence is verified by the clean release registry | Unmanaged local copies are reported locally without publishing their identity or hashes |
+| Managed local installs | The installer detects nine host profiles (eight managed records); 3.3.0 convergence is verified by the clean release registry | Unmanaged local copies are reported locally without publishing their identity or hashes |
 
 Telemetry is opt-in and local-only. “On” means bounded, allow-listed JSONL diagnostics; it does not transmit data. See [local diagnostics and telemetry](TELEMETRY.md) for the privacy boundary. GitHub issue submission remains a separate explicit action. Release documents do not record any workstation's telemetry state.
 

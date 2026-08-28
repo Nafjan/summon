@@ -19,6 +19,7 @@ from typing import Callable, Mapping
 import _rundir
 import _deliberation_replay as _replay
 import _executor
+import _deliberation_context as _context
 from _deliberation import (DeliberationError, DeliberationPolicy,
                            _receipt_binding)
 from _deliberation_adapter import FreshDispatchAdapter, SeatMultiplexAdapter
@@ -237,7 +238,8 @@ def bind_live_receipt(*, owner: _rundir.Owner, receipt: Mapping[str, object],
                       policy: DeliberationPolicy, question: str,
                       roster: FrozenRoster, plans: Mapping[str, object],
                       timeout_ms: int, clock_now: float,
-                      unix_now_ms: int) -> LiveBinding:
+                      unix_now_ms: int,
+                      durable_context: _context.BoundContext | None = None) -> LiveBinding:
     """Validate the owner receipt, roster identity, policy and schedule once."""
     snapshot, receipt_sha = _owner_receipt(owner, receipt)
     if (not isinstance(question, str) or not question.strip()
@@ -258,6 +260,21 @@ def bind_live_receipt(*, owner: _rundir.Owner, receipt: Mapping[str, object],
         raise LiveDeliberationError("live question differs from the receipt")
     if snapshot.get("roster_digest") != roster.roster_digest:
         raise LiveDeliberationError("live roster differs from the receipt")
+    receipt_context = snapshot.get("durable_context")
+    if (receipt_context is None) != (durable_context is None):
+        raise LiveDeliberationError("live durable context differs from the receipt")
+    if durable_context is not None:
+        try:
+            restored = _context.parse_private_projection(receipt_context)
+        except _context.ContextFreshnessError as exc:
+            raise LiveDeliberationError(
+                "live durable context receipt is invalid") from exc
+        if (restored != durable_context
+                or restored.run_id != snapshot.get("run_id")
+                or restored.decision_id != policy.decision_id
+                or restored.state == "stale_refused"):
+            raise LiveDeliberationError(
+                "live durable context binding is invalid")
     if tuple(snapshot.get("seat_ids", ())) != tuple(seat.seat_id for seat in roster.seats):
         raise LiveDeliberationError("live seat order differs from the receipt")
     _validate_provider_contract(snapshot, roster=roster, plans=plans,
@@ -273,6 +290,20 @@ def bind_live_receipt(*, owner: _rundir.Owner, receipt: Mapping[str, object],
                        schedule.deadline_unix_ms, schedule.deadline_clock)
 
 
+def _validate_live_routes(seats) -> None:
+    if any(seat.transport != "subprocess" for seat in seats):
+        raise LiveDeliberationError(
+            "live deliberation permits subprocess transports only")
+    unsupported_backends = sorted({
+        seat.cli for seat in seats
+        if seat.cli in {"kimi", "openai-compat", "arkcli"}
+    })
+    if unsupported_backends:
+        raise LiveDeliberationError(
+            "live deliberation backend is integration-pending: "
+            + ", ".join(unsupported_backends))
+
+
 def build_live_scheduler(*, owner: _rundir.Owner,
                          receipt: Mapping[str, object],
                          policy: DeliberationPolicy, question: str,
@@ -281,6 +312,9 @@ def build_live_scheduler(*, owner: _rundir.Owner,
                          worktree_proofs: Mapping[str, WorktreeProof] | None = None,
                          cancel_requested: Callable[[], bool] | None = None,
                          cancel_command: Callable[[], object] | None = None,
+                         durable_context: _context.BoundContext | None = None,
+                         context_observer: Callable[[], Mapping[str, object]] | None = None,
+                         context_namespace_observer: Callable[[], str] | None = None,
                          deadline_clock: float | None = None,
                          _executor_for_tests=None) -> DeliberationScheduler:
     """Build one owner-bound scheduler using fresh subprocess adapters.
@@ -296,8 +330,17 @@ def build_live_scheduler(*, owner: _rundir.Owner,
         raise TypeError("cancel_requested must be callable")
     if cancel_command is not None and not callable(cancel_command):
         raise TypeError("cancel_command must be callable")
+    if ((durable_context is None) != (context_observer is None)
+            or (durable_context is None) != (context_namespace_observer is None)):
+        raise LiveDeliberationError(
+            "durable context and its source/namespace observers must be supplied together")
+    if context_observer is not None and not callable(context_observer):
+        raise TypeError("context_observer must be callable")
+    if context_namespace_observer is not None and not callable(context_namespace_observer):
+        raise TypeError("context_namespace_observer must be callable")
     if not roster.revalidate():
         raise LiveDeliberationError("live roster evidence is stale")
+    _validate_live_routes(roster.seats)
     cwd = roster.root_cwd
     if not isinstance(cwd, str) or not os.path.isdir(cwd):
         raise LiveDeliberationError("live roster has no valid execution scope")
@@ -310,7 +353,8 @@ def build_live_scheduler(*, owner: _rundir.Owner,
     binding = bind_live_receipt(
         owner=owner, receipt=receipt, policy=policy, question=question,
         roster=roster, plans=plans, timeout_ms=timeout_ms,
-        clock_now=clock(), unix_now_ms=unix_now_ms)
+        clock_now=clock(), unix_now_ms=unix_now_ms,
+        durable_context=durable_context)
     _validate_time_authority(owner, binding, timeout_ms=timeout_ms,
                              physical_attempts=len(policy.seat_ids),
                              unix_now_ms=unix_now_ms)
@@ -319,10 +363,6 @@ def build_live_scheduler(*, owner: _rundir.Owner,
     if binding.rounds != 1 or policy.max_attempts != len(policy.seat_ids):
         raise LiveDeliberationError(
             "phase-b permits exactly one physical attempt per seat")
-    if any(seat.cli == "kimi" for seat in roster.seats):
-        raise LiveDeliberationError(
-            "kimi live deliberation is disabled until source credentials are receipt-bound")
-
     external_cancel = cancel_requested or (lambda: False)
     owner_current = lambda: _owner_current_with_lease(owner)
     chosen_executor = (_executor.execute_agent if _executor_for_tests is None
@@ -340,6 +380,21 @@ def build_live_scheduler(*, owner: _rundir.Owner,
                      or response.get("exit_code") == 124)):
             raise LiveDeliberationError("controlled provider attempt timed out")
         return response
+
+    def revalidate_context_source() -> None:
+        if durable_context is None or context_observer is None:
+            return
+        try:
+            if (context_namespace_observer is None
+                    or context_namespace_observer()
+                    != durable_context.runs_root_sha256):
+                raise ValueError("durable context run namespace changed")
+            observed = context_observer()
+            _context.revalidate_source(
+                durable_context, observed,
+                unix_now_ms=int(time.time() * 1000))
+        except Exception as exc:
+            raise _executor.ProviderLaunchRefusal("context_source_drift") from exc
 
     holder: dict[str, DeliberationScheduler] = {}
     deadline_latched = [False]
@@ -401,6 +456,7 @@ def build_live_scheduler(*, owner: _rundir.Owner,
             timeout_ms=timeout_ms, generation=owner.generation,
             invocation_for_context=invocation_for_context,
             cancelled=shared_cancel, deadline_reached=wall_deadline_reached,
+            prelaunch_revalidate=revalidate_context_source,
             executor=controlled_execute)
 
     adapter = SeatMultiplexAdapter(children)
@@ -414,6 +470,7 @@ def build_live_scheduler(*, owner: _rundir.Owner,
         deadline=binding.deadline_clock,
         clock=authoritative_clock, rounds=binding.rounds,
         cancel_requested=shared_cancel, cancel_command=cancel_command,
+        durable_context=durable_context,
         live_provider=False)
     activation = (os.path.realpath(owner.run_dir), owner.nonce)
     with _ACTIVATION_LOCK:

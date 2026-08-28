@@ -17,6 +17,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import _deliberation_replay as replay
+import _deliberation_context as context
 import _rundir
 
 
@@ -40,6 +41,51 @@ def prepared(run_id="run-1", generation=1, **receipt_kwargs):
     return value, [(generation, event(
         "run_prepared", generation, run_id=run_id,
         receipt_sha256=replay._sha(value)))]
+
+
+def legacy_context_projection():
+    now = 2_000_000
+    packet = {
+        "schema": context.PACKET_SCHEMA,
+        "source": {"kind": "git_commit", "revision": "a" * 40,
+                   "source_digest": "1" * 64,
+                   "captured_at_unix_ms": now - 100},
+        "freshness_policy": {"fresh_max_age_ms": 1_000,
+                             "hard_max_age_ms": 20_000,
+                             "hard_max_revision_delta": 3},
+        "entries": [{"id": "constraint-1", "kind": "constraint",
+                     "body": "Historical constraint.",
+                     "provenance": {"kind": "authored",
+                                    "source_sha256": "3" * 64}}],
+    }
+    observation = {
+        "schema": context.OBSERVATION_SCHEMA, "kind": "git_commit",
+        "captured_revision": "a" * 40, "current_revision": "a" * 40,
+        "current_source_digest": "1" * 64, "relation": "same",
+        "revision_delta": 0, "verification_method": "git-readback",
+        "observed_at_unix_ms": now,
+    }
+    current = context.private_projection(context.bind_context(
+        packet, observation, run_id="run-1", decision_id="decision-1",
+        unix_now_ms=now, runs_root_sha256="4" * 64))
+    current["schema"] = context.LEGACY_BINDING_SCHEMA
+    current.pop("runs_root_sha256")
+    identity = {
+        "schema": context.LEGACY_BINDING_SCHEMA,
+        "packet_sha256": current["packet_sha256"],
+        "source_revision_sha256": current["source_revision_sha256"],
+        "run_id": current["run_id"], "decision_id": current["decision_id"],
+        "bound_at_unix_ms": current["bound_at_unix_ms"], "state": current["state"],
+        "actual_age_ms": current["actual_age_ms"],
+        "actual_revision_delta": current["actual_revision_delta"],
+        "mismatch_reasons": current["mismatch_reasons"],
+        "observation_identity": {key: current["observation"][key] for key in (
+            "kind", "captured_revision", "current_revision", "current_source_digest",
+            "relation", "revision_delta", "verification_method")},
+        "acceptance_sha256": None, "routing_authority": False,
+    }
+    current["binding_sha256"] = context._sha(identity)
+    return current
 
 
 def turn_events(*, seat="a", turn="turn-a-0", ordinal=0, attempt="g1-a0",
@@ -93,6 +139,20 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaises(replay.ReplayError):
             self.run_replay(records_bad, value=bad_timestamp)
 
+    def test_historical_v1_context_replays_read_only_but_is_not_current_authority(self):
+        value = receipt()
+        value["durable_context"] = legacy_context_projection()
+        records = [(1, event("run_prepared", 1, run_id="run-1",
+                             receipt_sha256=replay._sha(value)))]
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(records, value=value)
+        checkpoint = replay.replay_checkpoint(
+            value, records, 2, allow_legacy_context=True)
+        self.assertEqual(checkpoint.status, "PREPARED")
+        with self.assertRaises(replay.ReplayError):
+            replay._receipt_metadata(value)
+        replay._receipt_metadata(value, allow_legacy_context=True)
+
     def test_public_audit_fields_are_schema_validated(self):
         value, records = prepared()
         records.append((1, event("state_transition", 1, **{
@@ -121,11 +181,18 @@ class ReplayTests(unittest.TestCase):
         attempts = turn_events()
         attempts.insert(-1, (1, event(
             "attempt_model_identity", 1, attempt_id="g1-a0",
-            model_served="claude-opus-4-7", model_targeted="claude-opus-4-7")))
+            model_served="claude-opus-4-7", model_targeted="claude-opus-4-7",
+            served_model_evidence="reported")))
         records.extend(attempts)
         checkpoint = self.run_replay(records, value=value)
-        self.assertTrue(any(item.get("event") == "attempt_model_identity"
-                            for item in checkpoint.transcript_events))
+        public_identity = next(
+            item for item in checkpoint.transcript_events
+            if item.get("event") == "attempt_model_identity")
+        self.assertNotIn("model_served", public_identity)
+        self.assertNotIn("model_targeted", public_identity)
+        self.assertEqual(
+            public_identity["model_served_sha256"],
+            hashlib.sha256(b"claude-opus-4-7").hexdigest())
 
         bad = list(records)
         bad[-2] = (1, event(
@@ -133,6 +200,46 @@ class ReplayTests(unittest.TestCase):
             model_served=r"C:\\private\\secret", model_targeted=None))
         with self.assertRaises(replay.ReplayError):
             self.run_replay(bad, value=value)
+
+        bad_evidence = list(records)
+        bad_evidence[-2] = (1, event(
+            "attempt_model_identity", 1, attempt_id="g1-a0",
+            model_served="claude-opus-4-7", model_targeted="claude-opus-4-7",
+            served_model_evidence="caller_claimed"))
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(bad_evidence, value=value)
+
+    def test_attempt_model_identity_requires_finished_order_generation_and_uniqueness(self):
+        value, records = prepared()
+        records.append((1, event("state_transition", 1, **{
+            "from": "PREPARED", "to": "RUNNING", "reason": "started"})))
+        base = turn_events()
+        identity = (1, event(
+            "attempt_model_identity", 1, attempt_id="g1-a0",
+            model_served="claude-opus-4-7", model_targeted="claude-opus-4-7",
+            served_model_evidence="reported"))
+
+        before_finish = records + base[:2] + [identity] + base[2:]
+        with self.assertRaisesRegex(
+                replay.ReplayError, "matching finished attempt"):
+            self.run_replay(before_finish, value=value)
+
+        after_ballot = records + base + [identity]
+        with self.assertRaisesRegex(replay.ReplayError, "after its ballot"):
+            self.run_replay(after_ballot, value=value)
+
+        duplicate = records + base[:3] + [identity, identity] + base[3:]
+        with self.assertRaisesRegex(replay.ReplayError, "duplicate model identity"):
+            self.run_replay(duplicate, value=value)
+
+        wrong_generation = records + base[:3] + [(2, event(
+            "attempt_model_identity", 2, attempt_id="g1-a0",
+            model_served="claude-opus-4-7",
+            model_targeted="claude-opus-4-7",
+            served_model_evidence="reported"))]
+        with self.assertRaisesRegex(
+                replay.ReplayError, "matching finished attempt"):
+            self.run_replay(wrong_generation, value=value, owner_generation=3)
 
     def test_journal_repair_is_first_record_of_its_segment(self):
         value, records = prepared()

@@ -42,9 +42,11 @@ reaches an agent depends only on how that agent names its model:
 > resolved to `claude-sonnet-4-6` while `claude-sonnet-5` was already available. Every
 > dispatch envelope reports `model.served` (the model that actually did the work, on
 > evidence; `model.targeted` is what the session was pointed at, and `resolved` is the
-> legacy field) — check it. For an explicit Codex pin, `resolved` is never filled from
-> the ambient config default when the provider emits no identity; that default is not
-> evidence about the turn. For **guaranteed-latest**, pin the explicit version ID
+> legacy field) — check it. For an exact named-model seat, `resolved` is never treated as
+> a substitute for provider-authored `served` evidence; a missing or mismatching terminal
+> identity blocks the seat. For an explicit Codex pin, `resolved` is never filled from the
+> ambient config default when the provider emits no identity; that default is not evidence
+> about the turn. For **guaranteed-latest**, pin the explicit version ID
 > (`claude-sonnet-5`, `claude-opus-5`) and re-verify when a new model ships; for
 > **auto-float-when-it-works**, use the alias but confirm `model.served` is what you
 > expect. This roster pins EVERY claude agent to a full version id -- both aliases were
@@ -57,7 +59,8 @@ reaches an agent depends only on how that agent names its model:
 exposes it. Add `--refresh` in the subcommand form (`summon models --refresh`) or
 `--refresh-models` in the flat form when a provider roster may have changed. Each entry is
 tagged with a `source` so you know how much to trust it:
-- `live` — queried just now (`agy models`, `opencode models`, or an explicit ArkCLI refresh)
+- `live` — queried just now (`agy --output-format json models`, `opencode models`, or an
+  explicit ArkCLI refresh; older AGY versions use one labeled legacy-text fallback)
 - `cache` — read from a provider roster cache; refresh explicitly when it is stale
 - `config` — read from the CLI's own default config (`codex` → config.toml)
 - `static` — documented aliases/defaults to pass via `--model` (CLI has no list)
@@ -71,8 +74,12 @@ catalog candidates are advisory. In every case, the dispatch envelope's exact
 never proves account eligibility.
 
 OpenCode discovery delegates to `opencode models` and returns provider/model selectors such
-as `openrouter/stealth/ox-alpha` when the local OpenCode configuration and credentials expose
-them. A live list proves only that OpenCode listed the selector; it does not prove that the
+as `openrouter/z-ai/glm-5.3-flash` when the local OpenCode configuration and credentials expose
+them. The former `stealth/ox-alpha` preview was revealed as this paid model. Its direct
+and tool-enabled aliases are retired and stale custom definitions are refused before
+provider contact; do not assume the old alias or free pricing persists. Model names and
+availability can change without a Summon release. A live
+list proves only that OpenCode listed the selector; it does not prove that the
 account can serve it or that a gateway policy will permit it. Confirm a real dispatch and
 inspect `model.served` plus `served_model_evidence`.
 
@@ -101,8 +108,19 @@ Never assume an alias has caught up to a launch — probe or pin.
 The definitive list is always `--list` (definitions register/edit instantly, so the
 roster may have changed since this table). Models below were verified with the
 strongest backend evidence available at snapshot time: `model.resolved` or
-`model.served` where the backend emits it, and an explicit Kimi stream-model selection
-and response for Kimi:
+`model.served` where the backend emits it, and an explicit Kimi stream target
+selection and response for Kimi. Some Kimi CLI versions include a model
+and usage on an assistant JSONL record; Summon exposes that bounded, child-observed source as
+`model.evidence_source: kimi_assistant_record`. Kimi 0.38 instead writes
+post-response `usage.record` accounting and `turn.ended:completed` into the fresh
+isolated profile for that invocation. Summon accepts a single, positive-output,
+completed, non-conflicting model from that runtime journal as
+`kimi_wire_usage_record`. Both sources are labeled `served_model_evidence: inferred`
+because the child can write them; neither can certify an exact named-model vote.
+Request records, profile configuration, stale or linked
+journals, mixed models, and incomplete turns never mint identity. Versions that
+emit neither form still truthfully retain `model.served: null` and
+`served_model_evidence: absent`.
 
 | Agents | Backend | Model (verified) | Use for |
 |---|---|---|---|
@@ -117,12 +135,19 @@ and response for Kimi:
 | `terra` / explicit Codex candidate | codex | `gpt-5.6-terra` (declared, unverified) | balanced secondary lane; do not pin until served evidence |
 | `spark` / explicit Codex candidate | codex | `gpt-5.3-spark` (declared, unverified) | fast/quota-isolated candidate; do not pin until served evidence |
 | `coder`, `bug-fixer` | cursor-agent | composer-2.5 | multi-step coding, bug fixing |
-| `kimi-worker` | kimi | `kimi-code/k3` + `effort: max` (pinned target; reverify `model.served`) | maximum-thinking architecture, independent review, broad repository research, ambiguous multi-file work |
-| `kimi-coder` | kimi | `kimi-code/k3` + `effort: max` (pinned target; reverify `model.served`) | maximum-thinking scoped implementation, refactoring, debugging, focused verification |
-| `kimi-k27-coder` | kimi | `kimi-code/kimi-for-coding` (explicit lower-context seat; reverify `model.served`) | deliberate K2.7 implementation/debugging trade-off |
+| `kimi-worker` | kimi | `kimi-code/k3` + `effort: max` (pinned target; provider evidence may be absent) | maximum-thinking architecture, independent review, broad repository research, ambiguous multi-file work |
+| `kimi-coder` | kimi | `kimi-code/k3` + `effort: max` (pinned target; provider evidence may be absent) | maximum-thinking scoped implementation, refactoring, debugging, focused verification |
+| `kimi-k27-coder` | kimi | `kimi-code/kimi-for-coding` (explicit lower-context seat; provider evidence may be absent) | deliberate K2.7 implementation/debugging trade-off |
 | `researcher` | agy | `gemini-3.7-flash-high` (pinned target; refresh and reverify) | primary evidence extraction, repo research, UI review, fast `/council` secondary |
 | `docs-writer`, `frontend`, `antigravity` | agy | Gemini default (pin via `model:`) | docs, frontend, general agy work |
 | explicit ArkCLI Coding Plan seat | arkcli | refreshable plan roster (for example `glm-5-2-260617`) | fast value/coding-plan secondary; verify `model.served` |
+
+Kimi's standard final-report contract is unchanged: `STATUS`, `SUMMARY`,
+`FOLLOW-UP`, and `HANDOFF` are all required. A response containing only
+`STATUS`, `VERDICT`, and `HANDOFF` is preserved and may be useful, but it is
+`report_ok: false` and `suspect: true` because it omitted the required bookends.
+Summon does not manufacture missing model evidence or silently relax that
+contract.
 
 `researcher` is intentionally pinned rather than floating with agy's default. The
 3.7 Flash High route was verified through the local agy roster and a real Summon

@@ -32,6 +32,15 @@ def _command_for(backend: str, plan: dict[str, Any]) -> list[str]:
     argv = [str(value) for value in plan.get("argv") or []]
     if not argv:
         raise ValueError(f"no auth command is registered for {backend!r}")
+    if backend == "zcode" and argv[0] == "zcode":
+        # ZCode commonly ships only as a desktop-bundled Node CLI, so PATH can
+        # be empty even though doctor and dispatch can use it. Reuse the same
+        # direct-target resolver; never route a registry value through a shell.
+        from _zcode import resolve_zcode_cli
+        target = resolve_zcode_cli()
+        if target is None:
+            raise FileNotFoundError("zcode is not installed or discoverable")
+        return [target.command, *target.prefix_args, *argv[1:]]
     executable = _portable_executable(argv[0])
     if not executable:
         raise FileNotFoundError(f"{backend} is not installed or not on PATH")

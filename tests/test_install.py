@@ -200,12 +200,18 @@ def test_shipped_examples_are_installed_and_owned():
         r = _run(home, "--hosts", "claude", "--no-agents")
         assert r.returncode == 0, r.stdout + r.stderr
         dest = _dest(home)
-        expected = os.path.join("examples", "document-audit.manifest.json")
-        assert os.path.isfile(os.path.join(dest, expected))
+        expected = {
+            os.path.join("examples", "document-audit.manifest.json"),
+            os.path.join("examples", "phase1", "consume_portable_result.py"),
+            os.path.join("examples", "phase1", "portable-result.sample.json"),
+            os.path.join("examples", "phase1", "portable-consumer.expected.json"),
+        }
+        for relative in expected:
+            assert os.path.isfile(os.path.join(dest, relative))
         with open(os.path.join(dest, ".summon-install.json"), encoding="utf-8") as fh:
             manifest = json.load(fh)
         normalized = {Path(name).as_posix() for name in manifest["files"]}
-        assert Path(expected).as_posix() in normalized
+        assert {Path(relative).as_posix() for relative in expected} <= normalized
     finally:
         shutil.rmtree(home, ignore_errors=True)
 
@@ -304,6 +310,18 @@ def test_lock_blocks_concurrent_install():
         open(os.path.join(home, ".claude", "summon.install.lock"), "w").write("12345")
         r = _run(home, "--hosts", "claude", "--no-agents")
         assert r.returncode == 2 and "lock" in r.stdout.lower(), (r.returncode, r.stdout)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_install_refuses_background_snapshot_lease():
+    home = _fake_home()
+    try:
+        os.makedirs(os.path.join(home, ".claude", "skills"))
+        with open(os.path.join(home, ".claude", "summon.execution.lock"), "w", encoding="utf-8") as fh:
+            json.dump({"installed_by": "summon", "purpose": "background_snapshot"}, fh)
+        r = _run(home, "--hosts", "claude", "--no-agents")
+        assert r.returncode == 2 and "background dispatch" in r.stdout.lower(), (r.returncode, r.stdout)
     finally:
         shutil.rmtree(home, ignore_errors=True)
 
@@ -449,6 +467,7 @@ def test_alias_off_by_default_and_optional():
         r = _run(home, "--hosts", "claude", "--no-agents", "--with-alias")
         md = os.path.join(alias, "SKILL.md")
         assert os.path.isfile(md) and "Legacy alias" in open(md, encoding="utf-8").read()
+        assert os.path.isfile(os.path.join(_dest(home), "scripts", "summon.cmd"))
         # points at the sibling summon scripts (no duplication)
         assert "/../summon/scripts/run_subagent.py" in open(md, encoding="utf-8").read()
     finally:
@@ -514,18 +533,27 @@ def test_doctor_rejects_nonzero_version_probe():
     # A CLI that errors on --version must not be verified/usable.
     import types
     import _doctor
+    import _zcode
     orig_run, orig_which = _doctor.subprocess.run, _doctor.shutil.which
+    orig_zcode = _zcode.resolve_zcode_cli
     _doctor.shutil.which = lambda name: "/fake/" + name
+    # ZCode has reviewed bundle/registry discovery rather than a plain PATH
+    # probe; keep this test's fake-all-backends contract deterministic.
+    _zcode.resolve_zcode_cli = lambda: None
     _doctor.subprocess.run = lambda *a, **k: types.SimpleNamespace(
         returncode=7, stdout="FATAL BROKEN INSTALL", stderr="")
     try:
         rep = _doctor.doctor()
     finally:
         _doctor.subprocess.run, _doctor.shutil.which = orig_run, orig_which
+        _zcode.resolve_zcode_cli = orig_zcode
     assert rep["usable_backends"] == [], rep["usable_backends"]
     assert rep["ok"] is False
-    for b in rep["backends"].values():
-        assert b["found"] is True and b["verified"] is False
+    for name, backend in rep["backends"].items():
+        if name == "zcode":
+            assert backend["found"] is False and not backend.get("verified", False)
+        else:
+            assert backend["found"] is True and backend["verified"] is False
 
 
 def test_alias_ownership_is_frontmatter_not_body_substring():

@@ -23,6 +23,8 @@ from typing import Mapping
 
 import _rundir
 import _deliberation_replay as _replay
+import _deliberation_context as _context
+import _deliberation_context_source as _context_source
 import _model_catalog
 from _deliberation import DeliberationError, HumanCommand, TERMINAL_STATES
 
@@ -47,6 +49,12 @@ def runs_root(args, cwd: str) -> str:
     return os.path.join(os.path.abspath(base), "deliberations")
 
 
+def _runs_root_sha256(root: str) -> str:
+    """Bind one-run authority to a resolved namespace without recording its path."""
+    canonical = os.path.normcase(os.path.realpath(os.path.abspath(root)))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def run_dir(root: str, run_id: str) -> str:
     return _rundir.run_path(root, run_id)
 
@@ -61,7 +69,64 @@ def _receipt(path: str, run_id: str) -> dict:
     return value
 
 
-def _public_receipt(value: Mapping[str, object]) -> dict:
+def _runtime_model_evidence(checkpoint: object | None) -> dict[str, dict[str, object]]:
+    """Derive per-seat model proof only from the validated durable replay."""
+    if checkpoint is None:
+        return {}
+    attempts: dict[str, tuple[str, str]] = {}
+    collected: dict[str, dict[str, object]] = {}
+    for attempt in tuple(getattr(checkpoint, "attempts", ()) or ()):
+        attempt_id = getattr(attempt, "attempt_id", None)
+        seat = getattr(attempt, "seat_id", None)
+        phase = getattr(attempt, "phase", None)
+        if not isinstance(attempt_id, str) or not isinstance(seat, str):
+            continue
+        attempts[attempt_id] = (seat, phase)
+        entry = collected.setdefault(seat, {
+            "finished_ids": set(), "identity_ids": set(),
+            "reported_pairs": [], "inferred": False,
+            "absent": False, "unfinished": False,
+        })
+        if phase == "finished":
+            entry["finished_ids"].add(attempt_id)
+        else:
+            entry["unfinished"] = True
+    for record in tuple(getattr(checkpoint, "transcript_events", ()) or ()):
+        if not isinstance(record, Mapping) or record.get("event") != "attempt_model_identity":
+            continue
+        attempt_id = record.get("attempt_id")
+        attempt = attempts.get(attempt_id)
+        if attempt is None or attempt[1] != "finished":
+            continue
+        seat = attempt[0]
+        evidence = record.get("served_model_evidence", "absent")
+        served_hash = record.get("model_served_sha256")
+        targeted_hash = record.get("model_targeted_sha256")
+        # Compatibility for synthetic/in-process checkpoints created before
+        # replay began exporting hashes. These values never cross the UI.
+        if not isinstance(served_hash, str) and isinstance(record.get("model_served"), str):
+            served_hash = hashlib.sha256(
+                record["model_served"].encode("utf-8")).hexdigest()
+        if (not isinstance(targeted_hash, str)
+                and isinstance(record.get("model_targeted"), str)):
+            targeted_hash = hashlib.sha256(
+                record["model_targeted"].encode("utf-8")).hexdigest()
+        entry = collected[seat]
+        entry["identity_ids"].add(attempt_id)
+        if evidence == "reported" and isinstance(served_hash, str):
+            entry["reported_pairs"].append((targeted_hash, served_hash))
+        elif evidence == "inferred":
+            entry["inferred"] = True
+        else:
+            entry["absent"] = True
+    for entry in collected.values():
+        if entry["finished_ids"] - entry["identity_ids"]:
+            entry["absent"] = True
+    return collected
+
+
+def _public_receipt(value: Mapping[str, object],
+                    checkpoint: object | None = None) -> dict:
     """Project only bounded receipt facts needed by the local observer.
 
     The browser needs policy labels and agent transport labels to explain a
@@ -95,34 +160,57 @@ def _public_receipt(value: Mapping[str, object]) -> dict:
                 catalog_display[seat] = display_identity
         if safe_plans:
             projected["plan_identity_by_seat"] = safe_plans
-    # Model identity is derived only from the exact redacted plan hash and the
-    # checked-in catalog.  Never trust a receipt-provided display row: otherwise
-    # a forged receipt could make the browser claim that an arbitrary model was
-    # frontier or served.  Service evidence is a separate hash-only field;
-    # absence means "not verified", equality means exact, and a different hash
-    # means mismatch.  The raw requested/served model strings never cross this
-    # projection boundary.
-    served_by_seat = value.get("model_served_sha256_by_seat")
-    if not isinstance(served_by_seat, Mapping):
-        served_by_seat = {}
+    # Model identity is derived only from the exact redacted plan hash, the
+    # checked-in catalog, and replay-validated executor evidence. Never trust a
+    # receipt-provided display row or served hash: the immutable receipt exists
+    # before provider service. Raw model strings never cross this boundary.
+    runtime_evidence = _runtime_model_evidence(checkpoint)
     for seat, display_identity in list(catalog_display.items()):
         plan = plans.get(seat) if isinstance(plans, Mapping) else None
         requested_hash = plan.get("model_sha256") if isinstance(plan, Mapping) else None
-        served_hash = served_by_seat.get(seat)
+        evidence = runtime_evidence.get(seat, {})
+        reported_pairs = evidence.get("reported_pairs", [])
         display_identity = dict(display_identity)
-        if isinstance(served_hash, str) and _SHA256_RE.fullmatch(served_hash):
-            if served_hash == requested_hash:
-                display_identity["availability"] = "served_exact"
-                display_identity["served_exact"] = True
-            else:
-                display_identity["availability"] = "served_mismatch"
-                display_identity["served_exact"] = False
+        reported_mismatch = any(
+            served_hash != requested_hash
+            or (targeted_hash is not None and targeted_hash != requested_hash)
+            for targeted_hash, served_hash in reported_pairs
+        )
+        reported_unverified = any(
+            targeted_hash is None for targeted_hash, _served_hash in reported_pairs)
+        incomplete = bool(
+            evidence.get("unfinished") or evidence.get("absent")
+            or reported_unverified)
+        if reported_mismatch:
+            display_identity["served_model_evidence"] = "reported"
+            display_identity["availability"] = "served_mismatch"
+            display_identity["served_exact"] = False
+        elif incomplete:
+            display_identity["availability"] = "served_unverified"
+            display_identity["served_model_evidence"] = "absent"
+            display_identity["served_exact"] = False
+        elif evidence.get("inferred") is True:
+            display_identity["availability"] = "served_inferred"
+            display_identity["served_model_evidence"] = "inferred"
+            display_identity["served_exact"] = False
+        elif reported_pairs:
+            display_identity["served_model_evidence"] = "reported"
+            display_identity["availability"] = "served_exact"
+            display_identity["served_exact"] = True
         else:
             display_identity["availability"] = "catalog_listed"
+            display_identity["served_model_evidence"] = "absent"
             display_identity["served_exact"] = False
         catalog_display[seat] = display_identity
     if catalog_display:
         projected["model_display_by_seat"] = catalog_display
+    if "durable_context" in value:
+        try:
+            binding = _context.parse_private_projection_readonly(value["durable_context"])
+            projected["durable_context"] = _context.public_projection(binding)
+        except _context.ContextFreshnessError as exc:
+            raise DeliberationStoreError(
+                "deliberation durable context projection is invalid") from exc
     return projected
 
 
@@ -231,7 +319,8 @@ def _authoritative_checkpoint(path: str, receipt: Mapping[str, object]):
         raise DeliberationStoreError("deliberation journal generation is invalid")
     policy = _replay_policy(receipt)
     try:
-        checkpoint = _replay.replay_checkpoint(receipt, tagged, current)
+        checkpoint = _replay.replay_checkpoint(
+            receipt, tagged, current, allow_legacy_context=True)
     except _replay.ReplayError as exc:
         raise DeliberationStoreError(
             "deliberation journal cannot be reconstructed from its receipt") from exc
@@ -349,7 +438,7 @@ def inspect_run(root: str, run_id: str) -> dict:
                 "pid": after.get("pid"), "generation": after.get("generation"),
                 "lease_expires": after.get("lease_expires"),
             },
-            "receipt": _public_receipt(receipt),
+            "receipt": _public_receipt(receipt, checkpoint),
             "projection": _project_checkpoint(checkpoint, records),
             "journal_records": len(records),
             "journal_torn_tail": torn,
@@ -406,6 +495,7 @@ def replay_run(root: str, run_id: str) -> dict:
            ({"error_kind": "unstable_read"} if not consistent else {})),
         "projection": _project_checkpoint(checkpoint, records),
         "records": _public_transcript(checkpoint, records),
+        "receipt": _public_receipt(receipt, checkpoint),
         "checkpoint_digest": checkpoint.digest,
     }
 
@@ -432,6 +522,17 @@ def queue_cancel(root: str, run_id: str, command_id: str | None = None) -> dict:
     This is not an acknowledgement that cancellation happened.  Only the
     scheduler owner may append ``human_command`` and advance durable state.
     """
+    # Cancellation creates new authority-bearing command bytes. Historical v1
+    # durable context is readable by status/replay only, so authenticate current
+    # receipt metadata before even creating the commands directory.
+    try:
+        path = run_dir(root, run_id)
+        receipt = _receipt(path, run_id)
+        _replay_policy(receipt)
+        _replay._receipt_metadata(receipt)
+    except (_replay.ReplayError, DeliberationStoreError, ValueError) as exc:
+        raise DeliberationStoreError(
+            "deliberation receipt cannot authorize a command") from exc
     status = inspect_run(root, run_id)
     if status.get("recovery_required") or not status.get("consistent"):
         raise DeliberationStoreError(
@@ -442,7 +543,6 @@ def queue_cancel(root: str, run_id: str, command_id: str | None = None) -> dict:
     command_id = command_id or ("cmd-" + uuid.uuid4().hex)
     if not _COMMAND_ID_RE.fullmatch(command_id) or ".." in command_id:
         raise DeliberationStoreError("invalid command id")
-    path = run_dir(root, run_id)
     directory = _commands_dir(path)
     if os.path.lexists(directory) and os.path.islink(directory):
         raise DeliberationStoreError("commands inbox is a symbolic link; refusing it")
@@ -637,6 +737,10 @@ def _validate_fresh_args(args) -> None:
         raise ValueError("--max-attempts must be positive")
     if getattr(args, "deadline", None) is None:
         raise ValueError("--deadline is required")
+    if (getattr(args, "context_observation_file", None)
+            or getattr(args, "accept_stale_file", None)) and not getattr(args, "context_file", None):
+        raise ValueError(
+            "--context-observation-file/--accept-stale-file require --context-file")
 
 
 def _fresh_question(args) -> str:
@@ -653,6 +757,32 @@ def _fresh_question(args) -> str:
     if not question:
         raise ValueError("deliberate needs --question or --question-file")
     return question
+
+
+def _read_bounded_context_file(path: str, label: str) -> bytes:
+    """Read one private context input once without following a symlink."""
+    if not isinstance(path, str) or not path:
+        raise ValueError(f"cannot read {label}")
+    if os.name == "nt" and path.replace("/", "\\").startswith("\\\\"):
+        raise ValueError(f"{label} must be a local file")
+    target = Path(path)
+    try:
+        before = target.lstat()
+        if (target.is_symlink() or not target.is_file()
+                or before.st_size > _context.MAX_INPUT_BYTES):
+            raise ValueError(f"{label} is not a bounded regular file")
+        with target.open("rb") as handle:
+            raw = handle.read(_context.MAX_INPUT_BYTES + 1)
+            after = os.fstat(handle.fileno())
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"cannot read {label}") from exc
+    if (len(raw) > _context.MAX_INPUT_BYTES
+            or before.st_dev != after.st_dev or before.st_ino != after.st_ino
+            or before.st_size != after.st_size):
+        raise ValueError(f"{label} changed during readback")
+    return raw
 
 
 def _read_cancel_command(path: str) -> dict | None:
@@ -755,9 +885,24 @@ def _run_fresh_live(args, root: str, cwd: str) -> int:
     if unsupported:
         raise DeliberationError(
             "live read-only lane could not verify its seats: " + "; ".join(unsupported))
-    # The decision id is part of every prompt and plan identity.  Resolve it
+    # A stale-context authority is deliberately one-run. Its fully validated
+    # identity must therefore be selected before plan construction; otherwise
+    # random internal ids would make the public acceptance path unreachable.
+    parsed_context = None
+    stale_intent = None
+    if getattr(args, "context_file", None):
+        parsed_context = _context.parse_context_packet(
+            _read_bounded_context_file(args.context_file, "--context-file"))
+        if getattr(args, "accept_stale_file", None):
+            stale_intent = _read_bounded_context_file(
+                args.accept_stale_file, "--accept-stale-file")
+    if stale_intent is not None:
+        run_id, decision_id = _context.acceptance_identity(stale_intent)
+    else:
+        run_id = "deliberation-" + uuid.uuid4().hex
+        decision_id = "decision-" + uuid.uuid4().hex
+    # The decision id is part of every prompt and plan identity. Resolve it
     # before building the plans so the receipt and invocation agree.
-    decision_id = "decision-" + uuid.uuid4().hex
     plans = build_invocation_plans(
         roster, decision_id=decision_id, cwd=cwd, ballot_only=True)
     policy = DeliberationPolicy(
@@ -770,7 +915,20 @@ def _run_fresh_live(args, root: str, cwd: str) -> int:
         raise DeliberationError(
             "live deliberation per-seat timeout exceeds the supported bound")
     lease_sec = max(600.0, duration_ms / 1000.0 + 30.0)
-    run_id = "deliberation-" + uuid.uuid4().hex
+    context_binding = None
+    manifest_path = getattr(args, "context_observation_file", None)
+    if parsed_context is not None:
+        observation = _context_source.observe_source(
+            parsed_context, cwd=cwd, unix_now_ms=now_ms,
+            manifest_path=manifest_path)
+        context_binding = _context.bind_context(
+            parsed_context, observation, run_id=run_id,
+            decision_id=decision_id, unix_now_ms=now_ms,
+            runs_root_sha256=_runs_root_sha256(root),
+            accept_stale=stale_intent)
+        if context_binding.state == "stale_refused":
+            raise DeliberationError(
+                "durable context is stale and lacks valid one-run acceptance")
     public_roster = roster.as_dict(native=False)
     receipt = {
         "mode": "deliberation", "schema_version": SCHEMA_VERSION,
@@ -802,6 +960,16 @@ def _run_fresh_live(args, root: str, cwd: str) -> int:
                            "role": "participant"} for seat_id in seats],
         "permission_ceilings": permission_ceilings,
     }
+    if context_binding is not None:
+        receipt["durable_context"] = _context.private_projection(context_binding)
+    # Prove the largest non-transcript prompt fits before creating a run or
+    # giving any adapter a chance to contact a provider. Runtime transcript
+    # projection then trims to the exact remaining byte budget.
+    from _deliberation_scheduler import validate_prompt_admission
+    validate_prompt_admission(
+        question=question, policy=policy,
+        seats={seat.seat_id: seat.seat_definition for seat in roster.seats},
+        durable_context=context_binding)
     path, owner = initialize_run(root, receipt, lease_sec=lease_sec)
     scheduler = None
     stop_watch = __import__("threading").Event()
@@ -842,17 +1010,36 @@ def _run_fresh_live(args, root: str, cwd: str) -> int:
     watcher = threading.Thread(target=watch_cancel,
                                name="summon-deliberation-cancel", daemon=True)
     try:
+        if (context_binding is not None
+                and context_binding.runs_root_sha256 != _runs_root_sha256(root)):
+            raise DeliberationStoreError(
+                "durable context run namespace changed before provider launch")
         scheduler = build_live_scheduler(
             owner=owner, receipt=receipt, policy=policy, question=question,
             roster=roster, timeout_ms=timeout_ms,
             clock=time.monotonic, unix_now_ms=now_ms,
-            cancel_command=take_cancel_command)
+            cancel_command=take_cancel_command,
+            durable_context=context_binding,
+            context_observer=(
+                (lambda: _context_source.observe_source(
+                    parsed_context, cwd=cwd,
+                    unix_now_ms=int(time.time() * 1000),
+                    manifest_path=manifest_path))
+                if parsed_context is not None else None),
+            context_namespace_observer=(
+                (lambda: _runs_root_sha256(root))
+                if parsed_context is not None else None))
         watcher.start()
         report = scheduler.run()
         if watcher_error:
             raise DeliberationStoreError("live cancel channel failed closed")
         result = report.as_dict()
-        result.update({"run_id": run_id, "receipt": _public_receipt(receipt),
+        _tagged, torn, checkpoint, _policy = _authoritative_checkpoint(path, receipt)
+        if torn:
+            raise DeliberationStoreError(
+                "live deliberation journal has an incomplete terminal tail")
+        result.update({"run_id": run_id,
+                       "receipt": _public_receipt(receipt, checkpoint),
                        "cancel": ("applied" if consumed_command
                                   and result.get("state") == "CANCELLED" else "none")})
         if consumed_command and result.get("state") == "CANCELLED":

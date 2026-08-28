@@ -11,28 +11,71 @@ when its Summon permission tier allows it. The selected model still needs to
 support the tool-calling features that the task requires; OpenRouter maintains
 a [tool-support model filter](https://openrouter.ai/docs/guides/features/tool-calling).
 
-For example, this pins OpenRouter's OX Alpha through OpenCode:
+The retired compatibility-named Ox seat remains pinned to its historical selector.
+Its distinct paid successor targets the model that the preview was revealed to be,
+GLM 5.3 Flash, through OpenRouter:
 
 ```markdown
 ---
 run-agent: opencode
-model: openrouter/stealth/ox-alpha
+provider: openrouter
+model: openrouter/z-ai/glm-5.3-flash
 permission: safe-edit
 ---
 ```
 
 The equivalent command is `opencode run --format json --model
-openrouter/stealth/ox-alpha "…"`. Summon supplies the working directory,
+openrouter/z-ai/glm-5.3-flash "…"`. Summon supplies the working directory,
 strips agent arguments that could change the model or directory, and maps its
-permission tiers to OpenCode's `OPENCODE_PERMISSION` policy. `yolo` is the only
-tier that passes OpenCode's `--auto` flag. A local `OPENROUTER_API_KEY` takes
+permission tiers to OpenCode's `OPENCODE_PERMISSION` policy. Read-only and
+safe-edit also pass `--auto`, but only with an explicit deny-by-default policy;
+OpenCode's explicit denies still win, so this does not broaden the tier. A local
+`OPENROUTER_API_KEY` takes
 precedence; on Windows, Summon may bridge the private `summonOpenRouter`
 Credential Manager entry into this child process for an OpenRouter model. The
 secret is never written to the agent definition, command line, receipt,
 telemetry, or debug file.
 
+OpenCode's assistant `providerID`/`modelID` fields describe the model selected
+before the provider call. They are target evidence, not an authoritative copy of
+the provider response's `model` field. Current OpenCode streams can therefore
+complete a useful Ox turn while an exact-model Summon seat remains
+`served_model_unverified`. Do not promote those fields or retry an exact
+governance seat merely because the session export repeats them. Use a direct
+`openai-compat` OpenRouter/Nous text seat when provider-reported model identity is
+mandatory, or treat the toolful OpenCode result as advisory until OpenCode exposes
+the response model in its event contract.
+
+On Windows, that restricted policy also denies an external working-directory
+volume. Summon detects this in `dispatch --dry-run` and `doctor --cwd` before a
+turn starts. It returns a machine-actionable `allowed_root` on the local
+temporary volume plus `copy_sanitized_packet_and_refreeze`. Copy only the
+review packet there, re-freeze any packet hashes after the copy, and dry-run
+again. Do not switch a restricted seat to `yolo` merely to bypass this boundary on
+a shared, sensitive, or live checkout. If the task is in a disposable clone/worktree,
+`yolo` is the intended broad-authority OpenCode/Ox mode: it enables the complete tool
+loop, but the caller must inspect `workspace_evidence`, the diff, tests, and cleanup
+before integrating anything. A Git worktree is not an OS security boundary; use a
+separate clone/Git directory, account, container, or VM when the child must not reach
+shared Git metadata, credentials, private data, or live resources.
+
+OpenCode `yolo` is therefore an explicit isolated lane: Summon requires
+`--worktree` or `--isolated-lane` before it will launch broad authority. If a private
+OpenRouter or Nous key must be bridged into that unrestricted child, also pass
+`--isolated-lane` and `--allow-tool-credentials` and use a separate clone/Git directory,
+account, container, or VM. A `--worktree` may add mutation isolation but never replaces
+the explicit OS-boundary acknowledgement. Without both explicit consents, Summon scrubs
+inherited provider variables and fails closed instead of handing a key to arbitrary shell
+tools. A worktree is mutation isolation, not credential or OS containment.
+
+If a headless turn emits `step_finish` with `reason: unknown`, zero tokens, and no
+text, Summon rejects the empty completion and records
+`opencode_diagnostic=unknown_finish_zero_tokens`. This is a provider/model
+no-output symptom; `--auto` only answers non-denied permission requests and is not
+the source of model output.
+
 Summon also starts the child with OpenCode's project-discovery and external-code
-guards: `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `OPENCODE_PURE=1`,
+guards: the documented `--pure` flag plus `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `OPENCODE_PURE=1`,
 `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`, and `OPENCODE_DISABLE_CLAUDE_CODE=1`.
 This prevents a repository's `opencode.json`, `.opencode` plugins, or external
 skill files from changing the provider or observing a bridged credential before
@@ -46,14 +89,65 @@ Authenticate OpenCode with its provider flow (`opencode auth login` or
 [CLI](https://opencode.ai/docs/cli/), and
 [permissions](https://opencode.ai/docs/permissions/).
 
-This gateway removes the *direct-seat* limitation that caused `stealth/ox-alpha`
-to be labelled text-only. It does not remove model or service limits: the
+This gateway removes the *direct-seat* text-only limitation. It does not remove
+model or service limits: the
 provider's context window and output cap still apply, OpenCode may compact long
 sessions, and operating-system/CLI transport limits still apply to the initial
 prompt. For large inputs, put files under `--cwd` and ask the agent to read
 them; do not paste an unbounded document into the prompt. Check
 `model.served` in the Summon envelope; a requested model or OpenCode roster
 entry is not provider-authored proof.
+
+### GLM-5.3 Flash routes and native ZCode
+
+Summon keeps the ended Ox Alpha preview identity retired. It does not relabel
+historical Ox receipts. The distinct active GLM-5.3 Flash routes are optional:
+
+| Route | Selector | Tools/files | Exact-model evidence |
+|---|---|---|---|
+| OpenRouter through OpenCode | `openrouter/z-ai/glm-5.3-flash` | Yes, in an isolated lane | OpenCode selection is advisory unless a provider response reports the model |
+| Z.AI Coding Plan through OpenCode | `zai-coding-plan/glm-5.3-flash` | Yes, in an isolated lane | Same OpenCode provenance limitation |
+| Direct Z.AI Coding Plan | `glm-5.3-flash` | No: one text request | Provider response model can support exact-model verification |
+| Native ZCode (`zcode-native`) | no Summon model selector | Native tool loop | Preview only: no reviewed per-call selector or provider-authored served-model receipt |
+
+The direct Z.AI seat uses only the coding endpoint, not a general API endpoint.
+It is an `openai-compat` text seat and therefore needs self-contained context
+plus the normal text-seat consent. An explicit `ZAI_CODING_API_KEY` wins. If
+that is absent, Summon can read only the plan-kind and API-key scalar from an
+already-configured official Coding Plan helper profile; it never invokes the
+helper, imports arbitrary YAML, copies the key to a child process, or includes
+the key/configuration location in telemetry or receipts. `summon doctor` shows
+only whether this route is resolvable. `summon usage refresh` remains
+schema-unverified for this provider until a version-pinned, privacy-reviewed
+usage response contract is available.
+
+Native ZCode discovery checks `ZCODE_CLI`, PATH, Windows uninstall metadata,
+and common application bundles without executing a registry command or reading
+the app configuration. It launches hidden and headlessly, puts the complete
+task in an owner-restricted UTF-8 attachment, removes that attachment after the
+child exits, and performs bounded next-launch cleanup for stale attachments
+from an ordinary hard kill. It tolerates a leading banner before the one
+terminal JSON object.
+The native CLI has its own login and model configuration; installing the
+desktop app or configuring Z.AI inside OpenCode does not configure that native
+CLI. `summon auth repair zcode --allow-auth-repair` can start the discovered
+bundle's login flow, though browser approval can still be required.
+Because ZCode provides terminal JSON rather than a reviewed progress stream,
+its liveness is terminal-only. It refuses `model:` and `safe-edit`; advisory
+read-only requires the existing explicit unenforced-read-only opt-in, while
+experimental `yolo` requires a worktree or isolated lane **and**
+`--allow-tool-credentials`. That acknowledgement does not create a sandbox:
+it records acceptance that ZCode may use its own local provider configuration,
+while Summon scrubs conventional inherited provider environment variables in
+every native ZCode tier. The older `zcode-coding-plan` name is retired because
+native ZCode does not prove a Coding Plan provider or model; it points to the
+truthful `zcode-native` successor.
+This keeps broad native authority usable in disposable boundaries without
+inventing a model or a sandbox claim.
+
+The ZCode bundle-discovery and attached-brief approach was informed by the
+[MIT-licensed delegate-skills project](https://github.com/amElnagdy/delegate-skills).
+Summon's implementation and provenance contract are independent.
 
 ### OpenRouter routers through OpenCode
 
@@ -63,7 +157,7 @@ ID, the selectors shown by `opencode models openrouter` are normally:
 
 | OpenCode selector | OpenRouter behavior | Use it for |
 |---|---|---|
-| `openrouter/stealth/ox-alpha` | A pinned model | Reproducible tool/file work |
+| `openrouter/z-ai/glm-5.3-flash` | A paid pinned model; formerly the Ox Alpha preview | Reproducible tool/file work |
 | `openrouter/openrouter/auto` | Auto Router | Let OpenRouter choose a paid model |
 | `openrouter/openrouter/free` | Free Models Router | Low-volume experiments |
 | `openrouter/openrouter/fusion` | Fusion model alias | Panel-and-judge synthesis |
@@ -106,6 +200,24 @@ the adapter; if a local release does not, the dispatch fails clearly instead of
 silently dropping the router settings. A normal concrete-model or alias seat
 does not require this override.
 
+### 429s and explicit alternate routes
+
+An upstream HTTP 429 from OpenRouter is a provider-pool availability result, not
+proof that the Summon seat or model selector is broken. The default is fail once;
+`--transient-retries` (or `SUMMON_TRANSIENT_RETRIES=1`) permits one bounded
+exponential-backoff retry. Summon does not silently switch an exact GLM 5.3 Flash request to
+another model or provider, and an envelope with no `model.served`/report remains
+non-verdict evidence.
+
+If the OpenRouter pool remains unavailable, an operator can deliberately choose a
+different configured route only when its live roster lists the successor and local
+auth is valid. The historical Nous `stealth/ox-alpha` preview has ended, and Summon
+retires that selector before provider contact; it is not assumed equivalent or free.
+The direct API seat does not
+provide OpenCode's file/tool loop. Auto, Free, and Fusion are deliberate routing
+changes, not transparent GLM fallbacks; verify their served model before treating
+the result as a named-model review.
+
 ## Custom & API backends (`openai-compat`) — direct text seat
 
 The direct API backend can run against **any OpenAI-compatible
@@ -146,8 +258,10 @@ For the built-in OpenRouter provider, `OPENROUTER_API_KEY` still takes precedenc
 On Windows, when that variable is unset, Summon may read a local Credential Manager
 entry named `summonOpenRouter`. For the direct API seat, the credential is used only
 for the current HTTP request. For an OpenCode OpenRouter seat, it is bridged only into
-that child process because OpenCode is the provider gateway. In both cases it is never
-placed in an agent definition, receipt, telemetry record, command line, or debug file.
+that child process because OpenCode is the provider gateway; a yolo bridge additionally
+requires the explicit isolated-lane and tool-credential flags above. In all cases the
+secret is never placed in an agent definition, receipt, telemetry record, command line,
+or debug file.
 Other providers continue to use their configured environment variable or local
 credential mechanism.
 
@@ -189,7 +303,7 @@ model: deepseek-v4-pro
 ---
 ```
 
-Or the bundled agent: `python scripts/run_subagent.py --agent byteplus-coder --prompt "..."`.
+On Windows use the bundled launcher: `scripts\summon.cmd --agent byteplus-coder --prompt "..."`.
 
 Set `BYTEPLUS_CODING_API_KEY` to the **profile API key** from `arkcli auth status`
 (not the short-lived SSO `id_token`). List profiles with `arkcli auth status`;
@@ -351,12 +465,12 @@ Agent frontmatter `allow_payg: true` is **not** a consent grant (agent authors a
 Examples:
 
 ```powershell
-python scripts/run_subagent.py --agent byteplus-coder --prompt "..." --allow-payg
+scripts\summon.cmd --agent byteplus-coder --prompt "..." --allow-payg
 ```
 
 ```powershell
 $env:SUMMON_ALLOW_BYTEPLUS_PAYG = "1"
-python scripts/run_subagent.py --agent byteplus-coder --prompt "..."
+scripts\summon.cmd --agent byteplus-coder --prompt "..."
 ```
 Without consent, the error message tells you how to enable it. The retry is
 **never** attempted for auth failures (401/403), network errors, timeouts, or

@@ -95,6 +95,27 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.state.status, RunState.ATTEMPT_BUDGET_EXHAUSTED)
         self.assertEqual(engine.next_action(), NextAction.DONE)
 
+    def test_cancelled_transport_cannot_mark_a_valid_looking_ballot_valid(self):
+        payload = result("s1", "t1", "a1", "blue")
+        cancelled = AdapterResult(
+            ExecutionEvidence(
+                False, 0, timed_out=False, parser_valid=True,
+                error_kind="provider_cancelled"),
+            payload.structured_output,
+            model_prose=payload.model_prose)
+        engine, adapter, events = self.make_engine(
+            [cancelled], attempts=1, quorum=1)
+
+        engine.run_turn(context("s1", "t1", 0), "a1")
+
+        self.assertEqual(adapter.spawn_count, 1)
+        self.assertEqual(engine.state.status, RunState.FAILED)
+        finished = next(event for event in events
+                        if event["event"] == "attempt_finished")
+        self.assertFalse(finished["transport_ok"])
+        self.assertFalse(finished["ballot_valid"])
+        self.assertFalse(any(event["event"] == "ballot_accepted" for event in events))
+
     def test_approval_gate_precedes_attempt_limit_and_cancel_wins_same_sequence(self):
         engine, adapter, events = self.make_engine([
             result("s1", "t1", "a1", "green")], attempts=1, quorum=1, approval=True)

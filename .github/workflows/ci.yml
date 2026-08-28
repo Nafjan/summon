@@ -19,8 +19,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      - name: Install test dependency
+        run: python -m pip install "pytest>=8,<9"
+
       - name: Compile all modules
-        run: python -m py_compile skills/summon/scripts/run_subagent.py skills/summon/scripts/_loader.py skills/summon/scripts/_resolver.py skills/summon/scripts/_builder.py skills/summon/scripts/_executor.py skills/summon/scripts/_stream.py skills/summon/scripts/_doctor.py skills/summon/scripts/_auth.py skills/summon/scripts/_rundir.py skills/summon/scripts/_council.py skills/summon/scripts/_manifest.py skills/summon/scripts/_jobs.py skills/summon/scripts/_receipt.py skills/summon/scripts/_installs.py skills/summon/scripts/_cli.py skills/summon/scripts/_background.py skills/summon/scripts/_telemetry.py skills/summon/scripts/_telemetry_audit.py skills/summon/scripts/_deliberation.py skills/summon/scripts/_deliberation_agents.py skills/summon/scripts/_deliberation_store.py skills/summon/scripts/_deliberation_browser.py skills/summon/scripts/_deliberation_scheduler.py skills/summon/scripts/_deliberation_roster.py skills/summon/scripts/_deliberation_invocation.py skills/summon/scripts/_deliberation_replay.py skills/summon/scripts/_deliberation_recovery.py skills/summon/scripts/_deliberation_resume.py skills/summon/scripts/_deliberation_adapter.py skills/summon/scripts/_deliberation_phase_a.py skills/summon/scripts/_deliberation_live.py skills/summon/scripts/_deliberation_ui.py skills/summon/scripts/_conversation.py skills/summon/scripts/_conversation_page.py skills/summon/scripts/_conversation_runtime.py skills/summon/scripts/_swarm_protocol.py skills/summon/scripts/_swarm_coordinator.py skills/summon/scripts/_conversation_browser.py skills/summon/scripts/_conversation_ui.py skills/summon/scripts/_model_catalog.py tools/release_manifest.py tools/release_gates.py tools/release_contract.py summon.py install.py
+        run: python -m py_compile skills/summon/scripts/run_subagent.py skills/summon/scripts/_loader.py skills/summon/scripts/_resolver.py skills/summon/scripts/_builder.py skills/summon/scripts/_executor.py skills/summon/scripts/_spawn.py skills/summon/scripts/_stream.py skills/summon/scripts/_doctor.py skills/summon/scripts/_auth.py skills/summon/scripts/_rundir.py skills/summon/scripts/_council.py skills/summon/scripts/_manifest.py skills/summon/scripts/_jobs.py skills/summon/scripts/_receipt.py skills/summon/scripts/_installs.py skills/summon/scripts/_cli.py skills/summon/scripts/_background.py skills/summon/scripts/_telemetry.py skills/summon/scripts/_telemetry_audit.py skills/summon/scripts/_usage.py skills/summon/scripts/_usage_live.py skills/summon/scripts/_usage_runner.py skills/summon/scripts/_usage_advisory.py skills/summon/scripts/_context_compile.py skills/summon/scripts/_portable_result.py skills/summon/scripts/_apibackend.py skills/summon/scripts/_arkcli_backend.py skills/summon/scripts/_acpbackend.py skills/summon/scripts/_zcode.py skills/summon/scripts/_zai_coding_plan.py skills/summon/scripts/agy_stream_proxy.py skills/summon/scripts/_deliberation_context.py skills/summon/scripts/_deliberation_context_source.py skills/summon/scripts/_fleet.py skills/summon/scripts/_fleet_approval.py skills/summon/scripts/_fleet_dispatch.py skills/summon/scripts/_fleet_activation.py skills/summon/scripts/_fleet_runtime.py skills/summon/scripts/_deliberation.py skills/summon/scripts/_deliberation_agents.py skills/summon/scripts/_deliberation_store.py skills/summon/scripts/_deliberation_browser.py skills/summon/scripts/_deliberation_scheduler.py skills/summon/scripts/_deliberation_roster.py skills/summon/scripts/_deliberation_invocation.py skills/summon/scripts/_deliberation_replay.py skills/summon/scripts/_deliberation_recovery.py skills/summon/scripts/_deliberation_resume.py skills/summon/scripts/_deliberation_adapter.py skills/summon/scripts/_deliberation_phase_a.py skills/summon/scripts/_deliberation_live.py skills/summon/scripts/_deliberation_ui.py skills/summon/scripts/_conversation.py skills/summon/scripts/_conversation_page.py skills/summon/scripts/_conversation_runtime.py skills/summon/scripts/_swarm_protocol.py skills/summon/scripts/_swarm_coordinator.py skills/summon/scripts/_conversation_browser.py skills/summon/scripts/_conversation_ui.py skills/summon/scripts/_model_catalog.py tools/release_manifest.py tools/release_gates.py tools/release_contract.py summon.py install.py
 
       - name: Unit tests (dispatcher)
         run: python skills/summon/scripts/test_discovery.py
@@ -43,6 +46,41 @@ jobs:
 
       - name: Unit tests (release evidence runner)
         run: python -m unittest tests.test_release_gates
+
+      - name: Unit tests (Phase 0 and Phase 1 provider-inert contracts)
+        run: >-
+          python -m pytest -q
+          skills/summon/scripts/test_phase0_contracts.py
+          skills/summon/scripts/test_install_drift.py
+          skills/summon/scripts/test_kimi_timeout.py
+          skills/summon/scripts/test_phase1_usage.py
+          skills/summon/tests/test_phase1_usage_live.py
+          skills/summon/scripts/test_phase1_usage_runner.py
+          skills/summon/scripts/test_phase1_context_compile.py
+          skills/summon/scripts/test_phase1_context_freshness.py
+          skills/summon/scripts/test_phase1_context_source.py
+          skills/summon/scripts/test_portable_result.py
+          skills/summon/scripts/test_agy_1_1_22.py
+          skills/summon/scripts/test_phase1_compatibility.py
+          skills/summon/scripts/test_phase1_operator_workflow.py
+          skills/summon/scripts/test_phase1_fleet_dispatch.py
+          skills/summon/scripts/test_phase1_fleet_activation.py
+          skills/summon/scripts/test_phase1_fleet.py
+          skills/summon/scripts/test_phase1_fleet_approval.py
+          skills/summon/scripts/test_phase1_fleet_runtime.py
+          skills/summon/scripts/test_evidence_kernel.py
+          skills/summon/scripts/test_job_control.py
+          skills/summon/scripts/test_job_continuation.py
+          skills/summon/scripts/test_job_resume.py
+          skills/summon/scripts/test_resume_capabilities.py
+          skills/summon/scripts/test_evidence_guards.py
+          skills/summon/scripts/test_opencode.py
+          skills/summon/scripts/test_zcode.py
+          skills/summon/scripts/test_background_read_roots.py
+          skills/summon/scripts/test_codex_stream.py
+          skills/summon/scripts/test_executor_ownership.py
+          skills/summon/scripts/test_nous_credentials.py
+          skills/summon/scripts/test_windows_credentials.py
 
       - name: Unit tests (ACP transport, fake subprocess only)
         run: python tests/test_acpbackend.py
@@ -105,7 +143,7 @@ jobs:
         shell: bash
         run: |
           python summon.py --list-models > models.json
-          python -c "import json; m=json.load(open('models.json'))['models']; assert set(m) == {'claude','codex','agy','cursor-agent','gemini','kimi','opencode','arkcli'}; print({k: v['source'] for k, v in m.items()})"
+          python -c "import json; m=json.load(open('models.json'))['models']; assert set(m) == {'claude','codex','agy','cursor-agent','gemini','kimi','opencode','arkcli','zcode'}; print({k: v['source'] for k, v in m.items()})"
 
       - name: Dry-run resolves without executing (no backend needed)
         shell: bash
@@ -187,6 +225,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
+      - name: Install test dependency
+        run: python -m pip install "pytest>=8,<9"
       - name: Generate and bind machine release evidence
         shell: bash
         run: |
@@ -207,6 +247,7 @@ jobs:
               "conversation", "conversation_runtime", "conversation_ui", "model_routing", "release_contract",
               "swarm_protocol", "swarm_coordinator", "account_evidence", "release_gates", "live_provider_gate",
               "telemetry_audit",
+              "phase0_phase1",
           }
           assert manifest["evidence"]["source_tree_sha256"] == evidence["source_tree_sha256"]
           assert manifest["version_contract"]["ready"]

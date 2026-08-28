@@ -179,6 +179,18 @@ def blocked_envelope(decision: dict, *, agent: str, cli: str) -> dict:
         "result": "",
         "status": "blocked",
         "exit_code": 0,
+        # The gate ran, but the requested provider turn did not.  Keep the
+        # numeric compatibility field and add an explicit state so callers do
+        # not confuse a structural refusal with a missing attempt receipt.
+        "attempts": 0,
+        "attempt_status": "not_run",
+        "execution_status": "not_run",
+        "provider_contacted": False,
+        "model": {"requested": None, "targeted": None, "served": None,
+                  "resolved": None, "models_used": [], "evidence_source": None},
+        "served_model_evidence": "absent",
+        "model_match": None,
+        "named_model_verified": False,
         "cli": cli,
         "agent": agent,
         "error": None,

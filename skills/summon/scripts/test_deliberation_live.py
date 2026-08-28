@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -18,8 +19,11 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import _deliberation_live as live
+import _deliberation_context as context
 import _deliberation_roster as roster
 import _deliberation_store as store
+import _executor
+import _apibackend
 import _rundir
 from _deliberation import DeliberationPolicy
 from _deliberation_invocation import build_invocation_plans
@@ -98,6 +102,63 @@ class LiveIntegrationTests(unittest.TestCase):
             return {"result": "not-a-ballot", "exit_code": 0}
         return run
 
+    def durable(self):
+        digest = "7" * 64
+        packet = {
+            "schema": context.PACKET_SCHEMA,
+            "source": {"kind": "revision_manifest",
+                       "revision": "sha256:" + digest,
+                       "source_digest": digest,
+                       "captured_at_unix_ms": self.unix_now_ms - 100},
+            "freshness_policy": {"fresh_max_age_ms": 60_000,
+                                 "hard_max_age_ms": 120_000,
+                                 "hard_max_revision_delta": 0},
+            "entries": [{"id": "constraint-1", "kind": "constraint",
+                         "body": "Historical openrouter/stealth/ox-alpha stays retired.",
+                         "provenance": {"kind": "authored",
+                                        "source_sha256": "8" * 64}}],
+        }
+        observed = {"schema": context.OBSERVATION_SCHEMA,
+                    "kind": "revision_manifest",
+                    "captured_revision": "sha256:" + digest,
+                    "current_revision": "sha256:" + digest,
+                    "current_source_digest": digest, "relation": "same",
+                    "revision_delta": 0, "verification_method": "sha256-readback",
+                    "observed_at_unix_ms": self.unix_now_ms}
+        bound = context.bind_context(
+            packet, observed, run_id="live-1", decision_id="decision",
+            unix_now_ms=self.unix_now_ms)
+        receipt = dict(self.receipt, durable_context=context.private_projection(bound))
+        return bound, observed, receipt
+
+    def test_live_route_guard_rejects_non_subprocess_and_api_backends(self):
+        with self.assertRaisesRegex(live.LiveDeliberationError, "subprocess"):
+            live._validate_live_routes((
+                SimpleNamespace(cli="claude", transport="acp"),))
+        for backend in ("kimi", "openai-compat", "arkcli"):
+            with self.subTest(backend=backend):
+                with self.assertRaisesRegex(live.LiveDeliberationError,
+                                            "integration-pending"):
+                    live._validate_live_routes((
+                        SimpleNamespace(cli=backend, transport="subprocess"),))
+
+    def test_api_launch_control_preserves_typed_provider_free_refusal(self):
+        class Control:
+            def before_provider_launch(self, _evidence):
+                raise _executor.ProviderLaunchRefusal("context_source_drift")
+
+            def spawned(self, _resource):
+                raise AssertionError("provider resource must not be marked spawned")
+
+            def reaped(self, _resource):
+                return None
+
+        response = _apibackend._do_request(
+            "https://invalid.example/v1", "test-model", None, "prompt", None,
+            1000, "openai-compat", launch_control=Control())
+        self.assertEqual(response.get("error_kind"), "context_source_drift")
+        self.assertIs(response.get("provider_contacted"), False)
+
     def test_live_scheduler_is_receipt_bound_and_contacts_fake_once_per_turn(self):
         _path, owner = self.init()
         calls = []
@@ -110,6 +171,107 @@ class LiveIntegrationTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(report.turns_started, 2)
         self.assertEqual(report.state, "ATTEMPT_BUDGET_EXHAUSTED")
+
+    def test_durable_context_is_prompt_bound_and_publicly_redacted(self):
+        bound, observed, receipt = self.durable()
+        _path, owner = self.init(receipt)
+        packets = []
+
+        def executor(invocation, **kwargs):
+            kwargs["launch_control"].before_provider_launch({"backend": invocation.cli})
+            packets.append(json.loads(invocation.prompt.split(
+                "DELIBERATION_PACKET:\n", 1)[1]))
+            return {"result": json.dumps({
+                "ballot": {"decision": "vote", "option_id": "yes"}}),
+                "exit_code": 0}
+
+        def observer():
+            return dict(observed, observed_at_unix_ms=int(time.time() * 1000))
+
+        scheduler = live.build_live_scheduler(
+            owner=owner, receipt=receipt, policy=self.policy,
+            question=self.question, roster=self.roster,
+            timeout_ms=self.timeout_ms, clock=lambda: 0.0,
+            unix_now_ms=self.unix_now_ms, durable_context=bound,
+            context_observer=observer,
+            context_namespace_observer=lambda: bound.runs_root_sha256,
+            _executor_for_tests=executor)
+        scheduler.run()
+        self.assertEqual(len(packets), 2)
+        durable = packets[0]["durable_context"]
+        self.assertEqual(durable["freshness"]["state"], "fresh")
+        rendered = json.dumps(durable)
+        self.assertIn("openrouter/stealth/ox-alpha", rendered)
+        self.assertNotIn("z-ai/glm-5.3-flash", rendered)
+        public = json.dumps(store._public_receipt(receipt))
+        self.assertNotIn("openrouter/stealth/ox-alpha", public)
+        self.assertNotIn("sha256:" + "7" * 64, public)
+
+    def test_context_source_drift_refuses_before_provider_contact(self):
+        bound, observed, receipt = self.durable()
+        _path, owner = self.init(receipt)
+        contacts = []
+
+        def executor(invocation, **kwargs):
+            try:
+                kwargs["launch_control"].before_provider_launch(
+                    {"backend": invocation.cli})
+            except _executor.ProviderLaunchRefusal as exc:
+                return {"status": "blocked", "exit_code": 1, "result": "",
+                        "error_kind": exc.error_kind,
+                        "execution_status": "not_run",
+                        "provider_contacted": False}
+            contacts.append(True)
+            return {"result": "{}", "exit_code": 0}
+
+        drifted = dict(observed, current_source_digest="9" * 64,
+                       observed_at_unix_ms=int(time.time() * 1000))
+        scheduler = live.build_live_scheduler(
+            owner=owner, receipt=receipt, policy=self.policy,
+            question=self.question, roster=self.roster,
+            timeout_ms=self.timeout_ms, clock=lambda: 0.0,
+            unix_now_ms=self.unix_now_ms, durable_context=bound,
+            context_observer=lambda: drifted,
+            context_namespace_observer=lambda: bound.runs_root_sha256,
+            _executor_for_tests=executor)
+        report = scheduler.run()
+        self.assertEqual(contacts, [])
+        self.assertNotEqual(report.state, "DECIDED")
+        self.assertEqual(report.error_kind, "context_source_drift")
+
+    def test_context_namespace_is_rechecked_before_every_provider_launch(self):
+        bound, observed, receipt = self.durable()
+        _path, owner = self.init(receipt)
+        namespace = [bound.runs_root_sha256]
+        contacts = []
+
+        def executor(invocation, **kwargs):
+            try:
+                kwargs["launch_control"].before_provider_launch(
+                    {"backend": invocation.cli})
+            except _executor.ProviderLaunchRefusal as exc:
+                return {"status": "blocked", "exit_code": 1, "result": "",
+                        "error_kind": exc.error_kind,
+                        "execution_status": "not_run",
+                        "provider_contacted": False}
+            contacts.append(invocation.cli)
+            namespace[0] = "f" * 64
+            return {"result": json.dumps({
+                "ballot": {"decision": "vote", "option_id": "yes"}}),
+                "exit_code": 0}
+
+        scheduler = live.build_live_scheduler(
+            owner=owner, receipt=receipt, policy=self.policy,
+            question=self.question, roster=self.roster,
+            timeout_ms=self.timeout_ms, clock=lambda: 0.0,
+            unix_now_ms=self.unix_now_ms, durable_context=bound,
+            context_observer=lambda: dict(
+                observed, observed_at_unix_ms=int(time.time() * 1000)),
+            context_namespace_observer=lambda: namespace[0],
+            _executor_for_tests=executor)
+        report = scheduler.run()
+        self.assertEqual(len(contacts), 1)
+        self.assertEqual(report.error_kind, "context_source_drift")
 
     def test_deliberation_invocation_uses_ballot_contract_not_report_reminder(self):
         import _builder
@@ -130,10 +292,20 @@ class LiveIntegrationTests(unittest.TestCase):
         import _executor
 
         def fake_build(_invocation, _timeout_ms=None, *, resource_register=None):
+            ballot = json.dumps({
+                "ballot": {"decision": "vote", "option_id": "yes"},
+            })
+            terminal = json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": ballot,
+                "session_id": "fixture-session",
+            })
             script = (
                 "from pathlib import Path; "
                 f"Path({str(marker)!r}).open('a', encoding='ascii').write('child\\n'); "
-                "print('STATUS: DONE\\nSUMMARY: fake\\nFOLLOW-UP: none\\nHANDOFF: none')"
+                f"print({terminal!r})"
             )
             return sys.executable, ["-c", script], None
 

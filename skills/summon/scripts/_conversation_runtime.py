@@ -895,10 +895,12 @@ class ConversationRuntime:
             if (current_start is None or current_finish is not None
                     or current_start.get("payload", {}).get("turn_id") != job.turn_id):
                 raise ConversationRuntimeError("chat turn boundary changed before provider launch")
+            child_env = dict(os.environ)
+            child_env.pop("SUMMON_CMD_LAUNCHER", None)
             process = subprocess.Popen(
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                **popen_flags())
+                env=child_env, **popen_flags())
             job.process = process
             # The shared helper owns the typed Win32 Job Object implementation.
             # It attaches immediately after Popen. POSIX has its process-group

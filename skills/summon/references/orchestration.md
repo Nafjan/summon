@@ -9,7 +9,7 @@ Project-agnostic and host-agnostic. Adopt the parts you need; every section is
 written so a single orchestrator (human or agent) can act on it without a
 house style guide.
 
-Semantics below were verified against summon **3.2.1**. Model ids and alias
+Semantics below were verified against summon **3.3.0**. Model ids and alias
 behaviour are volatile: re-check with `doctor`, `list`, `models`, and
 `--dry-run` before a run you care about.
 
@@ -188,10 +188,21 @@ Confirm the real flags with `--dry-run` before trusting any permission label.
 
 Defaults that hold up:
 
-- Reviewers, councils, planners: **read-only**.
-- Exactly **one** implementer per change set gets write access.
-- Full bypass is not a routine tier. If a run needs it, isolate it, keep
-  credentials and sensitive data out of it, and record why.
+- Reviewers, councils, and planners that truly must not mutate a shared checkout:
+  **read-only** on a backend that actually enforces it, or an isolated disposable
+  worktree with a full-authority agent when the review needs tools.
+- Exactly **one** implementer per change set gets write access to a given isolated
+  worktree; parallel implementers get separate worktrees.
+- Full authority is a productive, supported tier for Kimi, OpenCode/Ox, agy/Antigravity,
+  and similar toolful agents when the checkout is disposable. Inspect mutation evidence,
+  tests, and the diff before integrating. OpenCode `yolo` requires `--worktree` or
+  `--isolated-lane`; a private provider-key bridge additionally requires both
+  `--isolated-lane` and `--allow-tool-credentials`. `--worktree` is mutation isolation, not an OS
+  security boundary: it can share Git metadata, the operator account, environment, and
+  other reachable resources. It is not permission to touch credentials, private/client
+  data, provider spend, databases/migrations, deployments, shared Git, protected artifacts,
+  or running stacks; use a separate clone/Git directory, account, container, or VM when
+  those resources must be protected.
 
 ### `--max-permission`: clamp down, never up
 
@@ -225,7 +236,10 @@ For repository deliberation (read-only council over a codebase):
 - never point concurrent members at a dirty active workspace.
 
 Never reset, stash, or discard someone else's dirty worktree. Isolate new work
-and report what you found.
+and report what you found. If a capable reviewer needs to run tools that plan mode
+would block, give it a disposable worktree and `yolo`, instruct it to keep product
+changes out of the result unless requested, and inspect the diff before accepting the
+review. This is a deliberate isolation trade-off, not a read-only claim.
 
 ### Backends that do not stand in `--cwd`
 
@@ -331,7 +345,8 @@ Most orchestration waste is re-running work that already succeeded.
   council from scratch. `council status <run-id>` inspects state read-only.
 - **`--background`** returns a job handle immediately; poll with
   `jobs list` / `jobs status ID` / `jobs wait ID`. A result is trusted only when
-  its nonce matches the launch record.
+  its nonce matches the launch record and, for a managed frozen job, its scripts
+  digest matches the launch record's immutable execution bundle.
 - **`--retries N`** retries `error`/`partial` with backoff. `blocked` is never
   retried, because its cause is structural.
 - **`--json-schema FILE`** validates the agent's final JSON against a contract

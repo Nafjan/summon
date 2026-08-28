@@ -22,6 +22,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import _cli
+import _deliberation_context as context
 import _deliberation_store as store
 import _rundir
 
@@ -71,6 +72,14 @@ def _receipt(run_id: str) -> dict:
 
 
 class DeliberationCliTests(unittest.TestCase):
+    def test_windows_unc_context_input_is_refused_before_path_touch(self) -> None:
+        with mock.patch.object(store.os, "name", "nt"), \
+                mock.patch.object(store.Path, "lstat") as lstat:
+            with self.assertRaisesRegex(ValueError, "local file"):
+                store._read_bounded_context_file(
+                    r"\\server\share\context.json", "--context-file")
+        lstat.assert_not_called()
+
     def test_git_style_rewrites_are_explicit(self) -> None:
         self.assertEqual(
             _cli.rewrite_subcommand(["deliberate", "--question", "q"]),
@@ -210,13 +219,37 @@ class DeliberationCliTests(unittest.TestCase):
                     "---\nrun-agent: claude\npermission: read-only\n---\n",
                     encoding="utf-8")
             run_root = Path(temp) / "runs"
+            manifest = Path(temp) / "revision-manifest.json"
+            manifest_bytes = b'{"revision":"bounded"}\n'
+            manifest.write_bytes(manifest_bytes)
+            manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+            context_file = Path(temp) / "durable-context.json"
+            context_file.write_text(json.dumps({
+                "schema": "summon.deliberation-context/v1",
+                "source": {"kind": "revision_manifest",
+                           "revision": "sha256:" + manifest_sha,
+                           "source_digest": manifest_sha,
+                           "captured_at_unix_ms": int(time.time() * 1000)},
+                "freshness_policy": {"fresh_max_age_ms": 60_000,
+                                     "hard_max_age_ms": 120_000,
+                                     "hard_max_revision_delta": 0},
+                "entries": [{"id": "constraint-1", "kind": "constraint",
+                             "body": "PRIVATE DURABLE CONTEXT",
+                             "provenance": {"kind": "authored",
+                                            "source_sha256": "a" * 64}}],
+            }), encoding="utf-8")
             parser = _cli.build_parser("test", 1)
             args = parser.parse_args([
                 "--deliberate", "--question", "q", "--seats", "one,two",
                 "--options", "yes,no", "--quorum", "all", "--max-attempts", "2",
                 "--deadline", "30s", "--cwd", str(project),
                 "--agents-dir", str(agents), "--run-dir", str(run_root), "--json",
+                "--context-file", str(context_file),
+                "--context-observation-file", str(manifest),
             ])
+            self.assertIsNone(_cli.unsupported_mode_flags([
+                "--deliberate", "--context-file", str(context_file),
+                "--context-observation-file", str(manifest)], args))
             fake = FakeScheduler()
             with mock.patch("_deliberation_live.build_live_scheduler",
                             return_value=fake):
@@ -230,8 +263,177 @@ class DeliberationCliTests(unittest.TestCase):
             self.assertEqual(body["receipt"]["quorum_rule"], "all")
             self.assertEqual(body["receipt"]["plan_identity_by_seat"]["one"][
                 "effective_permission"], "read-only")
+            self.assertEqual(body["receipt"]["durable_context"]["state"], "fresh")
+            self.assertNotIn("PRIVATE DURABLE CONTEXT", output.getvalue())
             self.assertNotIn(str(project), output.getvalue())
             self.assertFalse(fake.cancelled)
+
+    def test_stale_acceptance_identity_is_reachable_from_fresh_cli(self) -> None:
+        class FakeReport:
+            def as_dict(self):
+                return {"mode": "deliberation-run", "status": "success",
+                        "state": "UNRESOLVED", "uncertain_spend": False}
+
+        class FakeScheduler:
+            def cancel(self):
+                pass
+
+            def run(self):
+                return FakeReport()
+
+        with tempfile.TemporaryDirectory() as temp:
+            previous_path = _install_fake_claude_on_path(Path(temp))
+            self.addCleanup(_restore_path, previous_path)
+            project = Path(temp) / "project"
+            agents = project / "agents"
+            agents.mkdir(parents=True)
+            for name in ("one", "two"):
+                (agents / f"{name}.md").write_text(
+                    "---\nrun-agent: claude\npermission: read-only\n---\n",
+                    encoding="utf-8")
+            manifest = Path(temp) / "revision-manifest.json"
+            manifest_bytes = b'{"revision":"bounded"}\n'
+            manifest.write_bytes(manifest_bytes)
+            manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+            now_ms = int(time.time() * 1000)
+            packet = {
+                "schema": "summon.deliberation-context/v1",
+                "source": {"kind": "revision_manifest",
+                           "revision": "sha256:" + manifest_sha,
+                           "source_digest": manifest_sha,
+                           "captured_at_unix_ms": now_ms - 5_000},
+                "freshness_policy": {"fresh_max_age_ms": 1_000,
+                                     "hard_max_age_ms": 120_000,
+                                     "hard_max_revision_delta": 0},
+                "entries": [{"id": "constraint-1", "kind": "constraint",
+                             "body": "Bounded stale instruction.",
+                             "provenance": {"kind": "authored",
+                                            "source_sha256": "a" * 64}}],
+            }
+            parsed = context.parse_context_packet(packet)
+            run_id = "deliberation-operator-selected"
+            decision_id = "decision-operator-selected"
+            run_root = Path(temp) / "runs"
+            namespace = os.path.normcase(os.path.realpath(
+                os.path.abspath(run_root / "deliberations")))
+            intent = {
+                "schema": "summon.accept-stale-intent/v2",
+                "packet_sha256": parsed.packet_sha256,
+                "source_revision_sha256": parsed.source_revision_sha256,
+                "runs_root_sha256": hashlib.sha256(
+                    namespace.encode("utf-8")).hexdigest(),
+                "run_id": run_id, "decision_id": decision_id,
+                "actor": {"kind": "human", "id": "operator"},
+                "reason": "Reviewed the bounded age delta.",
+                "scope": {"entry_ids": ["constraint-1"],
+                          "use": "deliberation_prompt"},
+                "expires_at_unix_ms": now_ms + 60_000,
+                "max_age_ms": 30_000, "max_revision_delta": 0,
+            }
+            context_file = Path(temp) / "context.json"
+            context_file.write_text(json.dumps(packet), encoding="utf-8")
+            acceptance_file = Path(temp) / "acceptance.json"
+            acceptance_file.write_text(json.dumps(intent), encoding="utf-8")
+            args = _cli.build_parser("test", 1).parse_args([
+                "--deliberate", "--question", "q", "--seats", "one,two",
+                "--options", "yes,no", "--quorum", "all", "--max-attempts", "2",
+                "--deadline", "30s", "--cwd", str(project),
+                "--agents-dir", str(agents), "--run-dir", str(run_root), "--json",
+                "--context-file", str(context_file),
+                "--context-observation-file", str(manifest),
+                "--accept-stale-file", str(acceptance_file),
+            ])
+            with mock.patch("_deliberation_live.build_live_scheduler",
+                            return_value=FakeScheduler()):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    code = store.run_command(args)
+            body = json.loads(output.getvalue())
+            self.assertEqual(code, 0)
+            self.assertEqual(body["run_id"], run_id)
+            self.assertEqual(body["receipt"]["decision_id"], decision_id)
+            self.assertEqual(body["receipt"]["durable_context"]["state"],
+                             "accepted_stale")
+
+    def test_live_context_revalidates_run_namespace_before_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            previous_path = _install_fake_claude_on_path(Path(temp))
+            self.addCleanup(_restore_path, previous_path)
+            project = Path(temp) / "project"
+            agents = project / "agents"
+            agents.mkdir(parents=True)
+            for name in ("one", "two"):
+                (agents / f"{name}.md").write_text(
+                    "---\nrun-agent: claude\npermission: read-only\n---\n",
+                    encoding="utf-8")
+            manifest = Path(temp) / "revision-manifest.json"
+            manifest_bytes = b'{"revision":"bounded"}\n'
+            manifest.write_bytes(manifest_bytes)
+            digest = hashlib.sha256(manifest_bytes).hexdigest()
+            packet = {
+                "schema": "summon.deliberation-context/v1",
+                "source": {"kind": "revision_manifest", "revision": "sha256:" + digest,
+                           "source_digest": digest,
+                           "captured_at_unix_ms": int(time.time() * 1000)},
+                "freshness_policy": {"fresh_max_age_ms": 60_000,
+                                     "hard_max_age_ms": 120_000,
+                                     "hard_max_revision_delta": 0},
+                "entries": [{"id": "constraint-1", "kind": "constraint",
+                             "body": "Bounded instruction.",
+                             "provenance": {"kind": "authored",
+                                            "source_sha256": "a" * 64}}],
+            }
+            context_file = Path(temp) / "context.json"
+            context_file.write_text(json.dumps(packet), encoding="utf-8")
+            args = _cli.build_parser("test", 1).parse_args([
+                "--deliberate", "--question", "q", "--seats", "one,two",
+                "--options", "yes,no", "--quorum", "all", "--max-attempts", "2",
+                "--deadline", "30s", "--cwd", str(project),
+                "--agents-dir", str(agents), "--run-dir", str(Path(temp) / "runs"),
+                "--json", "--context-file", str(context_file),
+                "--context-observation-file", str(manifest),
+            ])
+            output = io.StringIO()
+            with mock.patch.object(store, "_runs_root_sha256",
+                                   side_effect=["a" * 64, "b" * 64]), \
+                    mock.patch("_deliberation_live.build_live_scheduler") as scheduler, \
+                    contextlib.redirect_stdout(output):
+                code = store.run_command(args)
+            self.assertEqual(code, 1)
+            self.assertIn("namespace changed", json.loads(output.getvalue())["error"])
+            scheduler.assert_not_called()
+
+    def test_fresh_live_lane_refuses_retired_seat_before_scheduler_or_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "project"
+            agents = project / "agents"
+            agents.mkdir(parents=True)
+            (agents / "one.md").write_text(
+                "---\nrun-agent: definitely-missing-provider\npermission: yolo\n"
+                "lifecycle: retired\nsuccessor: one-v2\n---\n",
+                encoding="utf-8")
+            (agents / "two.md").write_text(
+                "---\nrun-agent: claude\npermission: read-only\n---\n",
+                encoding="utf-8")
+            run_root = Path(temp) / "runs"
+            parser = _cli.build_parser("test", 1)
+            args = parser.parse_args([
+                "--deliberate", "--question", "q", "--seats", "one,two",
+                "--options", "yes,no", "--quorum", "all", "--max-attempts", "2",
+                "--deadline", "30s", "--cwd", str(project),
+                "--agents-dir", str(agents), "--run-dir", str(run_root), "--json",
+            ])
+            output = io.StringIO()
+            with mock.patch("_deliberation_live.build_live_scheduler") as scheduler:
+                with contextlib.redirect_stdout(output):
+                    code = store.run_command(args)
+            body = json.loads(output.getvalue())
+            self.assertEqual(code, 1)
+            self.assertEqual(body["status"], "error")
+            self.assertIn("retired", body["error"])
+            self.assertIn("one-v2", body["error"])
+            scheduler.assert_not_called()
+            self.assertFalse(run_root.exists())
 
     def test_fresh_live_lane_rejects_authority_consent_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -275,7 +477,11 @@ class DeliberationCliTests(unittest.TestCase):
                 "option_id": "yes", "confidence": "high", "evidence_refs": [],
             }
             return {"status": "success", "exit_code": 0,
-                    "result": json.dumps({"ballot": ballot})}
+                    "result": json.dumps({"ballot": ballot}),
+                    "model": {"requested": "claude-opus-5",
+                              "targeted": "claude-opus-5",
+                              "served": "claude-opus-5"},
+                    "served_model_evidence": "reported"}
 
         with tempfile.TemporaryDirectory() as temp:
             previous_path = _install_fake_claude_on_path(Path(temp))
@@ -285,7 +491,8 @@ class DeliberationCliTests(unittest.TestCase):
             agents.mkdir(parents=True)
             for name in ("one", "two"):
                 (agents / f"{name}.md").write_text(
-                    "---\nrun-agent: claude\npermission: read-only\n---\n",
+                    "---\nrun-agent: claude\nmodel: claude-opus-5\n"
+                    "permission: read-only\n---\n",
                     encoding="utf-8")
             run_root = Path(temp) / "runs"
             parser = _cli.build_parser("test", 1)
@@ -305,6 +512,9 @@ class DeliberationCliTests(unittest.TestCase):
             self.assertEqual(body["state"], "DECIDED")
             self.assertEqual(body["decision_option"], "yes")
             self.assertEqual(body["turns_started"], 2)
+            self.assertTrue(body["receipt"]["model_display_by_seat"]["one"][
+                "served_exact"])
+            self.assertNotIn("claude-opus-5", output.getvalue())
             status = store.inspect_run(str(run_root / "deliberations"), body["run_id"])
             self.assertEqual(status["projection"]["state"], "decided")
             self.assertEqual(status["projection"]["physical_attempts"]["started"], 2)

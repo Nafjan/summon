@@ -4,14 +4,43 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import os
 import re
 from pathlib import Path
 
 PERMISSION_VALUES = ("read-only", "safe-edit", "yolo")
 DEFAULT_PERMISSION = "safe-edit"
+LIFECYCLE_VALUES = ("active", "deprecated", "retired")
+
+# Provider aliases can disappear while a user-owned roster definition remains
+# unchanged.  Keep exact historical selectors as tombstones instead of silently
+# retargeting them to the model later revealed behind a preview alias.  This gate
+# is intentionally selector-based so an old project/global seat also fails before
+# provider contact even when it predates the ``lifecycle`` frontmatter field.
+_RETIRED_MODEL_SUCCESSORS = {
+    ("openai-compat", "stealth/ox-alpha"):
+        "openrouter-glm-5-3-flash-opencode",
+    ("opencode", "openrouter/stealth/ox-alpha"):
+        "openrouter-glm-5-3-flash-opencode",
+    ("opencode", "nous/stealth/ox-alpha"):
+        "openrouter-glm-5-3-flash-opencode",
+}
 
 _AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+
+
+class AgentLifecycleError(ValueError):
+    """A resolved roster seat is not allowed to launch a provider turn."""
+
+    def __init__(self, agent: str, lifecycle: str, successor: str | None):
+        self.agent = agent
+        self.lifecycle = lifecycle
+        self.successor = successor
+        message = f"selected agent seat {agent!r} is {lifecycle}"
+        if successor:
+            message += f"; use successor {successor!r}"
+        super().__init__(message)
 
 # sha256 of the bytes the most recent load actually PARSED, keyed by resolved path. The
 # dispatch compares this (not a fresh read) with what the request identity recorded, so an
@@ -43,9 +72,10 @@ def last_parsed_sha(agent_file: str) -> str | None:
 # Every frontmatter key summon itself reads. Used ONLY for near-miss typo detection in
 # parse_frontmatter -- an unrecognized key that is not a near-miss is still accepted and
 # ignored, so an agent file can carry its own metadata.
-KNOWN_FRONTMATTER_KEYS = ("run-agent", "permission", "model", "args", "effort",
+KNOWN_FRONTMATTER_KEYS = ("run-agent", "permission", "model", "model-policy", "args", "effort",
                           "provider", "base_url", "api_key_env", "capability", "billing",
-                          "profile", "openrouter_options")
+                          "profile", "openrouter_options", "read-roots", "lifecycle",
+                          "successor")
 
 
 def parse_frontmatter(content: str) -> tuple[dict, str]:
@@ -108,6 +138,48 @@ def _unquote(value: str) -> str:
     return value
 
 
+def parse_read_roots(value) -> tuple[str, ...]:
+    """Parse the bounded ``read-roots`` frontmatter value.
+
+    Frontmatter is intentionally flat.  A JSON array is the unambiguous form for
+    Windows paths (for example ``["I:\\\\oracle", "I:\\\\board"]``); a
+    semicolon-separated string is accepted for hand-written definitions.  This
+    function only parses and bounds the list; path existence and backend support
+    are checked by the dispatcher before a child is launched.
+    """
+    if value is None or value == "":
+        return ()
+    if isinstance(value, (list, tuple)):
+        raw = list(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        if text.startswith("["):
+            try:
+                raw = json.loads(text)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "read-roots must be a JSON array or semicolon-separated paths") from exc
+        elif text.startswith("{"):
+            # Do not reinterpret a JSON object as one literal Windows path.  That
+            # typo would otherwise pass parsing and fail much later as a confusing
+            # missing-directory error.
+            raise ValueError("read-roots must be a JSON array or semicolon-separated paths")
+        else:
+            raw = [part.strip() for part in text.split(";") if part.strip()]
+    else:
+        raise ValueError("read-roots must be a JSON array or semicolon-separated paths")
+    if not isinstance(raw, list) or len(raw) > 16:
+        raise ValueError("read-roots must contain at most 16 paths")
+    out = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("read-roots entries must be non-empty strings")
+        out.append(item.strip())
+    return tuple(out)
+
+
 def extract_description(body: str) -> str:
     """First non-heading line of the body, capped at 240 chars with an explicit
     ellipsis — on a word boundary when the line has spaces; a single unbroken
@@ -138,6 +210,63 @@ def validate_permission(value: str | None) -> str:
             f"Invalid permission: {value!r}. Must be one of: {list(PERMISSION_VALUES)}"
         )
     return value
+
+
+def validate_lifecycle(value: str | None) -> str:
+    """Validate an optional roster lifecycle marker."""
+    normalized = (value or "active").strip().lower()
+    if normalized not in LIFECYCLE_VALUES:
+        raise ValueError(
+            f"Invalid lifecycle: {value!r}. Must be one of: {list(LIFECYCLE_VALUES)}")
+    return normalized
+
+
+def effective_lifecycle(frontmatter: dict) -> tuple[str, str | None]:
+    """Return the route-aware lifecycle and an optional successor seat.
+
+    Explicit retirement remains authoritative.  A known ended provider selector
+    is also retired even when a stale custom definition still says ``active`` or
+    omits lifecycle metadata.  The successor is a distinct seat; callers must
+    select it explicitly, so historical identities and receipts are never relabeled.
+    """
+    lifecycle = validate_lifecycle(frontmatter.get("lifecycle"))
+    successor = frontmatter.get("successor") or None
+    if successor is not None:
+        validate_agent_name(successor)
+    route_successor = retired_route_successor(
+        frontmatter.get("run-agent"), frontmatter.get("model"))
+    if route_successor:
+        return "retired", route_successor
+    return lifecycle, successor
+
+
+def retired_route_successor(backend: object, model: object) -> str | None:
+    """Return the explicit successor for one exact ended effective route."""
+    if not isinstance(backend, str) or not isinstance(model, str):
+        return None
+    return _RETIRED_MODEL_SUCCESSORS.get(
+        (backend.strip().lower(), model.strip().lower()))
+
+
+def require_dispatchable_route(backend: object, model: object,
+                               agent_name: str) -> None:
+    """Reject an ended effective route after CLI/model overrides are applied."""
+    successor = retired_route_successor(backend, model)
+    if successor:
+        raise AgentLifecycleError(agent_name, "retired", successor)
+
+
+def require_dispatchable_lifecycle(frontmatter: dict, agent_name: str) -> str:
+    """Return the normalized lifecycle or reject a retired provider route.
+
+    Every surface that can build an invocation must call this after loading the
+    immutable definition snapshot.  Keeping the decision here prevents in-process
+    launchers (for example live deliberation) from drifting from the main dispatcher.
+    """
+    lifecycle, successor = effective_lifecycle(frontmatter)
+    if lifecycle == "retired":
+        raise AgentLifecycleError(agent_name, lifecycle, successor)
+    return lifecycle
 
 
 def _literal_backslashes(value: str) -> str:
@@ -269,6 +398,10 @@ def _load_agent_snapshot_from(agents_dir: str, agent_name: str):
             frontmatter, body = parse_frontmatter(content)
             run_agent = frontmatter.get("run-agent")
             permission = validate_permission(frontmatter.get("permission"))
+            lifecycle, successor = effective_lifecycle(frontmatter)
+            frontmatter["lifecycle"] = lifecycle
+            if successor:
+                frontmatter["successor"] = successor
             description = extract_description(body)
             tup = (run_agent, body.strip(), description, str(resolved), permission,
                    frontmatter.get("model") or None,
@@ -402,9 +535,16 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
             seen_names.add(name)
 
             try:
-                content = agent_file.read_text(encoding="utf-8-sig")
-                fm, body = parse_frontmatter(content)
-                description = extract_description(body)
+                # Use the same one-buffer parser as dispatch so provider,
+                # permission, model, effort, description, and definition hash
+                # cannot come from different reads of a changing file.
+                loaded, fm, definition_sha256 = _load_agent_snapshot_from(
+                    agents_dir, name)
+                if loaded is None:
+                    continue
+                (run_agent, _body, description, _path, permission, model,
+                 _extra_args, effort) = loaded
+                lifecycle, successor = effective_lifecycle(fm or {})
                 # Keep the roster listing useful for humans and provider-safe for
                 # callers: a model pin and reasoning effort are harmless display
                 # metadata, while the actual served model still belongs to the
@@ -412,10 +552,18 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
                 # seat prevents a UI from mistaking the backend default for a
                 # verified model.
                 agents.append({"name": name, "description": description,
-                               "run_agent": (fm or {}).get("run-agent"),
-                               "permission": (fm or {}).get("permission"),
-                               "model": (fm or {}).get("model"),
-                               "effort": (fm or {}).get("effort")})
+                               "run_agent": run_agent,
+                               "permission": permission,
+                               "provider": (fm or {}).get("provider"),
+                               "provider_endpoint_mode": (
+                                   "inline_endpoint" if (fm or {}).get("base_url")
+                                   else "named_provider" if (fm or {}).get("provider")
+                                   else "none"),
+                               "model": model,
+                               "effort": effort,
+                               "lifecycle": lifecycle,
+                               "successor": successor,
+                               "definition_sha256": definition_sha256})
             except (OSError, UnicodeDecodeError, ValueError):
                 # Unreadable / binary / malformed-frontmatter file: still list it so the
                 # caller sees it exists. ValueError matters since duplicate frontmatter keys
@@ -429,8 +577,9 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
 def list_agents(agents_dir: str) -> list[dict]:
     """List all available agents, sorted by name.
 
-    Returns name/description plus safe declared backend, permission, model, and
-    effort metadata for every agent in ``agents_dir``, plus any from the skill's
+    Returns name/description plus safe declared backend, provider-binding mode,
+    permission, model, effort, lifecycle, successor, and definition digest metadata
+    for every agent in ``agents_dir``, plus any from the skill's
     bundled starter roster that aren't already present (the project dir wins on
     a name collision). Files that fail to parse are still listed with an empty
     description.

@@ -23,7 +23,8 @@ from _builder import BACKEND_CLIS, clamp_permission, effective_permission
 from _deliberation_agents import AgentManifestError, FrozenAgent, resolve_agent as resolve_custom_agent
 from _model_catalog import display_for as _model_display_for
 from _deliberation_scheduler import SeatDefinition
-from _loader import PERMISSION_VALUES, get_agents_dir, load_agent_snapshot
+from _loader import (AgentLifecycleError, PERMISSION_VALUES, get_agents_dir,
+                     load_agent_snapshot, require_dispatchable_lifecycle)
 from _resolver import resolve_cli
 from _roles import resolve_for_dispatch
 
@@ -730,6 +731,10 @@ def freeze_roster(
             roster_dir, resolved_agent, strict_agents_dir=strict_agents_dir)
         if not loaded or not frontmatter or not definition_sha:
             raise RosterResolutionError(f"agent {resolved_agent!r} did not resolve")
+        try:
+            require_dispatchable_lifecycle(frontmatter, resolved_agent)
+        except AgentLifecycleError as exc:
+            raise RosterResolutionError(str(exc)) from exc
         role_detail = role_info.get("role")
         if isinstance(role_detail, Mapping):
             target_sha = role_detail.get("target_sha256")

@@ -11,7 +11,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/core-stdlib_only-brightgreen.svg" alt="core: stdlib only">
-  <img src="https://img.shields.io/badge/backends-7-brightgreen.svg" alt="7 backends">
+  <img src="https://img.shields.io/badge/backends-10-brightgreen.svg" alt="10 backends">
   <img src="https://img.shields.io/badge/install-npx_skills_add-8B5CF6.svg" alt="npx skills add">
 </p>
 
@@ -45,8 +45,9 @@ Anthropic, Google, and local models (Ollama, LM Studio) work as agents too.
                                                    ├──► agy            (Antigravity)
                                                     ├──► arkcli         (BytePlus Coding Plan)
                                                     ├──► opencode       (OpenCode gateway)
+                                                    ├──► zcode          (native ZCode preview)
                                                     └──► openai-compat  (ModelArk / OpenRouter /
-                                                         OpenAI / Anthropic / Google / Ollama / …)
+                                                         Z.AI Coding Plan / OpenAI / Anthropic / …)
 ```
 
 Most multi-agent tools assume one specific CLI is the orchestrator. Summon inverts that:
@@ -109,6 +110,13 @@ not installed or required.
   if it crashes. Good for reviewing, summarizing, or labeling at scale.
 - **Structured extraction:** `--json-schema` validates an agent's final JSON and, on a
   backend that supports resume, spends one corrective retry when it does not match.
+- **Inspect usage and credit evidence safely:** `summon usage import --from snapshot.json`
+  validates an operator export, `usage example --out FILE` creates a synthetic fixture,
+  and `usage export --out FILE` writes a portable redacted snapshot. The first live
+  adapter can read Codex account usage only with an explicit provider allowlist and
+  `--allow-account-usage-read`; it does not log in, repair authentication, dispatch a
+  model, retry, or change routing. Allowance, API balance, account credit, and rate
+  limits remain separate instead of being collapsed into a misleading score.
 - **Governed deliberation:** `summon deliberate` records a receipt-bound, fixed-option
   decision policy and journal. The fresh CLI lane can run one bounded round of
   enforceable read-only subprocess seats after durable receipt/owner fencing; approval,
@@ -154,10 +162,11 @@ commit" or "convene a council on monorepo versus polyrepo." Add `-g` to install 
 Codex, Cursor, Gemini, Antigravity, and claw-likes like openclaw and hermes. Powered by the
 open [`skills`](https://www.skills.sh) registry.
 
-You need **Node** (for `npx`), **Python 3.10+** on your `PATH`, and at least one AI CLI you're
-logged into. After installing, ask your agent to run summon's `doctor` check and it lists what's
-ready and what's missing. On Windows, if the install reports a symlink permission error, run it
-again with `--copy`.
+You need **Node** (for `npx`), **Python 3.10+**, and at least one AI CLI you're logged into.
+After installing, ask your agent to run summon's `doctor` check and it lists what's ready and
+what's missing. On Windows, call `scripts\summon.cmd` rather than invoking `run_subagent.py`
+directly: it selects a compatible Python through `py -3` and avoids a stale `.py` file
+association. If the install reports a symlink permission error, run it again with `--copy`.
 
 ### Multi-host installer (`python install.py`)
 
@@ -208,23 +217,25 @@ expose a complete enumeration command, so its configured default and catalog can
 advisory. Pin a candidate only after a real dispatch proves the exact `model.served` value;
 never infer a new model from a display label or a task name.
 
-The next-release contract makes an explicit Codex pin stricter: Summon emits one canonical
-model selector, refuses conflicting selectors before provider contact, and blocks a pinned run
-when the provider does not return an authoritative terminal served-model receipt. A handshake
-target, output-token estimate, or catalog entry is not proof that Sol (or any other model) was
-served. See [`docs/SUMMON_3.2_PLAN.md`](docs/SUMMON_3.2_PLAN.md) for the routing and chat
-acceptance gates. The fixed-shell chat atlas is still preview-only until its rendered-browser
-and owner-lifecycle gates pass.
+The exact-model contract applies to provenance-required named seats across providers. Summon
+emits one canonical selector where the backend supports it, refuses conflicting selectors
+before provider contact, and blocks an exact seat when the provider does not return an
+authoritative terminal served-model receipt. A handshake target, output-token estimate, or
+catalog entry is not proof that the requested model was served. Claude may report auxiliary
+models in `model.models_used`; that list is retained, but the dominant terminal model must
+still match an exact seat's requested pin. Use `--require-exact-model` or
+`model-policy: exact` for a custom seat. See [`docs/SUMMON_3.2_PLAN.md`](docs/SUMMON_3.2_PLAN.md)
+for the routing and chat acceptance gates. The fixed-shell chat atlas is still preview-only
+until its rendered-browser and owner-lifecycle gates pass.
 
-This does **not** make the Codex backend preview-only. Ordinary Codex dispatch remains a
-supported first-class path. The restriction applies to provenance-required named-model claims
-such as the `sol-review` seat: if Codex completes a turn without an authoritative terminal
-identity, Summon returns `status: "blocked"`, `error_kind: "served_model_unverified"`,
-`model.targeted: "gpt-5.6-sol"`, and `model.served: null`. That means “the requested model
-was not certified,” not “Luna ran instead.” Summon does not infer or silently reroute the
-turn. The certification path is a Codex CLI/adapter receipt that reports the provider-served
-model, a parser fixture for match/mismatch/missing cases, and a fresh live receipt before a
-named Sol seat can be called certified.
+This does **not** make any backend preview-only. Ordinary dispatch remains a supported
+first-class path; only exact named-model claims are fail-closed. For example, if the
+`sol-review` seat completes without an authoritative terminal identity, Summon returns
+`status: "blocked"`, `error_kind: "served_model_unverified"`, and `model.served: null`.
+That means “the requested model was not certified,” not “Luna ran instead.” Summon does not
+infer or silently reroute the turn. The certification path is a provider-authored terminal
+receipt plus parser coverage for match, mismatch, and missing-evidence cases; a fresh live
+receipt is still required before a named seat can be called certified.
 
 For a release or support bundle, generate a provider-inert evidence manifest after
 running the fixed release-test registry:
@@ -234,7 +245,7 @@ python tools/release_gates.py --require-clean --output "${RUNNER_TEMP:-${TMPDIR:
 python tools/release_manifest.py \
   --evidence-file "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json" \
   --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" \
-  --expected-version 3.2.1 --check
+  --expected-version 3.3.0 --check
 ```
 
 The runner executes the fixed suites, records output digests, strips backend credentials and
@@ -248,7 +259,9 @@ evidence and must not be presented as certification.
 The installer preserves unmanaged host copies and reports local drift through `doctor`; it does
 not overwrite those copies automatically. The version, migration, compatibility, and rollback
 contract is documented in
-[`docs/VERSIONING_AND_3.0.md`](docs/VERSIONING_AND_3.0.md).
+[`docs/PHASE1_MIGRATION_ROLLBACK.md`](docs/PHASE1_MIGRATION_ROLLBACK.md). The older
+[`docs/VERSIONING_AND_3.0.md`](docs/VERSIONING_AND_3.0.md) is retained as historical
+3.0/3.1 release evidence.
 
 `install.py` stages atomically, never touches an agent file you already have, and uninstalls
 cleanly (`python install.py --uninstall`). Migrating from the old name? `--with-alias` adds a
@@ -359,8 +372,21 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon deliberate open RUN_ID` | open/reuse the local browser ledger (provider-inert) |
 | `summon agent new\|set NAME --set k=v` | scaffold / retune an agent definition |
 | `summon role propose\|approve\|list\|resolve …` | manage private, opt-in role aliases |
-| `summon jobs list\|status [ID]` · `jobs wait ID` | inspect or wait for background jobs (`--json` on list/status) |
+| `summon jobs list\|status [ID]` · `jobs wait ID` | inspect or wait for background jobs (`--json` on list/status). `status` is a redacted, typed projection; `wait` returns the complete private terminal envelope |
+| `summon jobs extend ID --duration 30m` · `jobs cancel ID` | extend an active adaptive job's soft and hard deadlines (bounded to seven days from job start), or request process-tree cancellation |
+| `summon jobs steer ID --message "…"` · `jobs resume ID --message "…"` | queue authenticated guidance for a later eligible continuation, then explicitly create one governed successor; this is not claimed as live mid-turn injection |
 | `summon telemetry enable\|disable\|status\|clear` | manage local opt-in diagnostics; `clear` does not disable |
+| `summon usage status\|import\|refresh\|export\|example …` | inspect, refresh, or exchange bounded usage evidence. Live refresh requires an explicit provider allowlist and account-read consent; usage remains advisory and cannot reroute an exact request |
+| `summon result project --kind dispatch\|job --from PRIVATE.json --repo-root DIR` | derive an experimental redacted compatibility receipt without contacting a provider; only authenticated terminal job records are accepted for `job` |
+| `summon result validate PORTABLE.json` · `result consume PORTABLE.json --adapter reference` | strictly validate or authority-freely consume a portable receipt; chat, council, deliberate, and swarm projection currently refuse rather than inventing common semantics |
+| `summon fleet propose LANE --seats A,B` | create a sealed provider-inert fleet draft; this does not approve, select, dispatch, or authorize spend |
+| `summon fleet validate\|inspect FILE` | validate against the current roster, or inspect every declared constraint without consulting a roster |
+| `summon fleet explain FILE LANE` | compare roster candidates with the sealed constraints; report unknowns but deliberately select no route |
+| `summon fleet approval status\|list` | inspect the private approval store through a redacted, provider-inert projection |
+| `summon fleet approval approve FILE LANE --expires-in 24h --expect-generation N` | record authenticated, expiring local authority for the exact compiled lane; this still cannot select or dispatch |
+| `summon fleet approval inspect APPROVAL_ID` | inspect one recorded approval without mutation |
+| `summon fleet approval revoke APPROVAL_ID --expect-generation N [--out FILE]` | explicitly revoke recorded authority with a generation-bound mutation |
+| `summon dispatch --lane LANE --fleet-file FILE --fleet-approval-id ID --fleet-data-proof PROOF …` | consume one exact approval for one foreground, single-seat, single-attempt launch; no retry, fallback, repair, resume, background, worktree, or authority expansion |
 | `summon bug-report …` | generate a sanitized report; review it before the separate GitHub submission command |
 | `summon version` · `summon help` | version · usage |
 
@@ -374,6 +400,66 @@ providers. The boundary is documented in
 
 `summon` (no args) prints the command list. Everything below is documented in
 [the Summon skill instructions](skills/summon/SKILL.md).
+
+For a copy-paste path through fleet approval, usage evidence, context compilation,
+adaptive jobs, and portable results, use the
+[Phase 1 operator workflow](docs/PHASE1_OPERATOR_GUIDE.md). Upgrade and rollback state is
+covered by the [Phase 1 migration contract](docs/PHASE1_MIGRATION_ROLLBACK.md).
+
+Portable result receipts are compatibility views, not replacements for private execution
+envelopes and not dispatch capabilities. They omit prompts, response text, transcripts,
+sessions, local paths, account facts, and raw diagnostics. A reported exact model identity
+is verified only when requested, targeted, and served values agree; inferred or absent
+evidence stays unverified. The schema remains experimental while consumers validate the
+supported dispatch and authenticated-job surfaces. The shipped
+`examples/phase1/consume_portable_result.py` golden imports no Summon modules; it
+demonstrates interoperability but is not a claim of independent adoption.
+
+Fleet documents are drafts, not dispatch capabilities by themselves. `propose` returns a compiled
+projection bound to the current project directory object and a sanitized roster-catalog
+digest; `--out` persists only the sealed draft and refuses to replace an existing file.
+Fleet catalogs admit only `active` seats. A `deprecated` seat remains available for an
+explicit compatibility dispatch with a warning, while a `retired` seat fails before any
+provider contact and can name a distinct successor.
+`validate` recompiles that relationship against the current roster. `inspect` needs only
+the sealed draft, so it remains useful when a roster has changed or is unavailable and
+shows every candidate's priority. `explain` lists matching and losing constraints,
+provenance, and unresolved evidence; it never chooses a winner. Here, `provider` means
+the account or endpoint authority bound to the executed route: a named API registry key,
+a singleton backend, or an explicit OpenCode declaration verified against its selector.
+Inline endpoints and undeclared gateways remain `unknown`; a model prefix alone never
+becomes provider proof. The approval surface records authenticated, expiring local
+authority bound to the sealed fleet, compiled plan, project, catalog, lane, operation,
+and authority ceilings. Mutations require the current store generation. Public receipts
+omit private store and actor identities, authentication material, and paths, and say
+`recorded_not_activated`: recording alone cannot select, reserve, retry, resume, dispatch,
+or contact a provider. A separate `dispatch --lane` command may consume that exact
+approval for one single-candidate foreground subprocess attempt after revalidating the
+fleet, roster, project, prompt/data proof, authority ceiling, spend boundary, and launch.
+It has no retry, fallback, repair, resume, background, or worktree path. Repeating an
+active approval with the same scope and requested lifetime is
+idempotent; changing the requested lifetime creates a distinct issuance under the current
+generation. Because an exact replay does not mutate the store, it returns the existing
+receipt—even near expiry—and does not extend its lifetime; this remains true when its
+supplied expected generation is stale. Each approval projection reports both its issuance
+`generation` and the current `store_generation`, so the latter can be used for the next
+explicit compare-and-swap. Expired and revoked records remain visible until
+the next approval mutation, which compacts them before writing new authority. The store
+is bounded to 4 MiB and 4,096 active records and reserves byte and generation capacity to
+revoke every active approval.
+Summon checks an explicit approval-receipt `--out` target before recording authority.
+An occupied or unsafe target records nothing. If a later publication race loses after
+the authenticated write, the error reports `recorded_receipt_undelivered`; recover the
+redacted receipt with `fleet approval list` or `fleet approval inspect`.
+The default private store is
+`~/.agents/summon/fleet-approvals.json`; its sibling `.key` file is separate. Summon
+requires owner-only paths (POSIX `0700`/`0600`, or a protected owner-only Windows ACL),
+and path overrides must be absolute. Summon hardens a pre-existing directory only when it
+is empty; filenames alone never prove that a nonempty directory is Summon-owned. Create
+a dedicated owner-only directory instead. On a generation conflict, run `fleet approval status`
+and deliberately retry with its current generation. If clock rollback is detected, correct
+the system clock before retrying; no approval is consumed. The one-time launch contract is
+implemented, separately reviewed, and remains intentionally narrower than ordinary dispatch.
 
 ---
 
@@ -447,8 +533,10 @@ dispatch it with the **summon** skill instead of doing everything yourself:
   diverse so that independent reviewers can expose different failure modes.
 - **Use Gemini Flash 3.7 as a fast independent evidence lane.** The bundled
   `researcher` seat is pinned to `gemini-3.7-flash-high` through agy and is the recommended
-  secondary voice for a cross-vendor council. Verify `model.served` in the envelope; agy
-  cannot enforce read-only, so keep this seat in research/review roles.
+  secondary voice for a cross-vendor council. AGY 1.1.22 reports the targeted model,
+  session, activity, and terminal usage, but not authoritative `model.served`; treat the
+  named-model vote as advisory. AGY cannot enforce read-only, so keep this seat in a
+  disposable research/review lane when a hard filesystem boundary matters.
 - **Use Grok 4.6 as a near-frontier candidate, not a blind default.** Probe it
   with `--cli cursor-agent --model grok-4.6`, require the envelope's `model.served` to match,
   and keep Gemini pinned until a local smoke proves eligibility, evidence quality, and the
@@ -514,23 +602,39 @@ vendors.
 
 ```json
 {
-  "status": "success",
-  "result": "…the agent's full answer…",
-  "report": { "status": "DONE", "summary": "Reviewed 4 files; 2 findings",
-              "handoff": "Fix the race in poller.py:88 first",
-              "left_behind": "none" },
-  "environment_handoff": { "declared": true, "left_behind": "none" },
-  "report_ok": true,
-  "model":   { "requested": "sonnet", "targeted": "claude-sonnet-5",
-               "served": "claude-sonnet-5", "resolved": "claude-sonnet-5" },
-  "summon":  { "version": "3.2.1", "scripts_sha256": "<sha256>" },
+  "status": "blocked",
+  "execution_status": "not_run",
+  "attempts": 0,
+  "attempt_status": "not_run",
+  "provider_contacted": false,
+  "result": "",
+  "report": null,
+  "environment_handoff": { "declared": false, "left_behind": null },
+  "report_ok": null,
+  "model":   { "requested": "<requested-model-or-null>",
+               "targeted": "<targeted-model-or-null>",
+               "served": null, "resolved": null },
+  "served_model_evidence": "absent",
+  "model_match": null,
+  "named_model_verified": false,
+  "raw_backend_exit_code": null,
+  "normalized_exit_code": null,
+  "exit_code": null,
+  "summon":  { "version": "3.3.0", "scripts_sha256": "<sha256>" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
-  "elapsed_ms": 7285,
-  "resume": { "cli": "claude", "session_id": "<session-id>" }
+  "elapsed_ms": 0,
+  "resume": { "cli": "claude", "session_id": null }
 }
 ```
+
+The object above is a safe structural-refusal example, not a success template.
+Successful dispatches must populate these fields from the actual terminal envelope;
+callers must never copy `report_ok`, model proof, attempt counts, or exit codes from
+an example. In particular, `attempts:1` and `model_match:true` are valid only for
+an actually executed, provider-reported exact-model success; they are never valid
+values for a structural `not_run` refusal.
 
 - `report.handoff` → the context to pass to the next call.
 - `environment_handoff` → resources the child created and intentionally left behind. It can
@@ -540,14 +644,32 @@ vendors.
   contract don't get believed.
 - `model.served` → the model that actually did the work (evidence-based; `null` = no
   service evidence observed). `targeted` = what the session was pointed at.
-- For an explicit Codex model pin, `status: "blocked"` with `error_kind` such as
+- `model_match` / `named_model_verified` → exact-model proof, not a guess. The tri-state
+  `model_match` is `true` only for a trusted backend/provider completion record showing
+  equality of requested, targeted, and served IDs; it is `false` for a reported mismatch
+  and `null` for inferred/absent evidence.
+  `named_model_verified` is `true` only when `model_match` is true.
+- For an exact named-model pin, `status: "blocked"` with `error_kind` such as
   `model_selection_conflict`, `target_model_mismatch`, `served_model_mismatch`, or
   `served_model_unverified` is a terminal trust result. It is not automatically retried or
-  rerouted, and `result_usable` is false.
+  rerouted, and `result_usable` is false. The envelope's `model.exact_required` and
+  `model.exact_source` explain why the gate applied.
 - `served_model_evidence` → `reported`, `inferred`, or `absent`: whether the served
-  model came from a terminal provider report, bounded telemetry inference, or no
+  model came from a trusted terminal/runtime completion record, bounded telemetry inference, or no
   service evidence. Missing provenance does not make a usable success retryable;
   an empty terminal result is instead a typed non-retryable error.
+- `model.evidence_source` → the bounded backend/provider record used for a reported
+  identity when one exists. Kimi 0.38 can use positive-output `usage.record` entries
+  plus the completed-turn marker in Summon's fresh isolated per-call profile; request
+  and configuration records never count. Kimi versions that emit neither that runtime
+  accounting nor an assistant model leave `model.served` null and provenance `absent`.
+  Summon never infers K3 from the requested model or local profile configuration.
+- `tool_failure` → a safe, typed missing-executable diagnostic. On Windows, use `rg`,
+  PowerShell, or Python when a child cannot run a POSIX convenience command such as
+  `grep`; a complete report is preserved and the raw backend exit remains visible.
+- `raw_backend_exit_code` and `normalized_exit_code` → explicit child and Summon outcome
+  codes. The legacy `exit_code` remains for compatibility but is ambiguous after report
+  normalization, so automation should use the explicit fields.
 - `timeout` → the timeout budget, whether partial output survived, and the phase Summon can
   prove. ACP names its exact protocol stage; a generic CLI remains `backend-execution` because
   Summon cannot honestly infer whether the vendor was starting, reasoning, or running a tool.
@@ -590,15 +712,41 @@ OpenCode instead of using the direct text seat:
 ```markdown
 ---
 run-agent: opencode
-model: openrouter/stealth/ox-alpha
-permission: safe-edit
+provider: openrouter
+model: openrouter/z-ai/glm-5.3-flash
+permission: yolo
 ---
 ```
 
 Authenticate OpenCode and verify the live roster with `opencode auth login` and
 `opencode models`. The OpenCode path still respects the provider's context,
 output, quota, and model limits; put large inputs in the workspace and ask the
-agent to read them. See the [OpenCode backend reference](skills/summon/references/backends.md#opencode-cli-gateway--toolful-access-to-compatible-providers).
+agent to read them. The old Ox seat is retired and remains pinned to its historical
+identity; the distinct successor targets paid `z-ai/glm-5.3-flash`. Pricing, discounts,
+availability, naming, and routing can change without a Summon release; refresh the live
+OpenCode roster and provider usage evidence before selecting it. Summon
+requires `--worktree` or `--isolated-lane` before it can run: use a
+disposable clone/worktree, inspect `workspace_evidence`, the diff, and tests,
+then keep or discard the result. If Summon must bridge a private provider key
+into a yolo OpenCode child, add `--isolated-lane` and
+`--allow-tool-credentials` only after choosing a separate clone/Git directory,
+OS account, container, or VM; a worktree alone does not protect credentials. Use
+`safe-edit` or an enforcing backend when the
+checkout is shared or sensitive. See the [OpenCode backend reference](skills/summon/references/backends.md#opencode-cli-gateway--toolful-access-to-compatible-providers).
+
+For a disposable worktree that is itself inside a separately isolated OS boundary,
+make both boundaries explicit:
+
+```powershell
+summon dispatch --agent openrouter-glm-5-3-flash-opencode --worktree glm-review `
+  --isolated-lane --allow-tool-credentials --cwd <project> `
+  --prompt "Inspect and test the change."
+```
+
+Use `--isolated-lane` instead of `--worktree` when the checkout is already a
+separate disposable copy. The credential flag is intentionally not a default;
+use it only with a separate OS boundary when arbitrary shell tools must not be
+able to reach the normal account or credential store.
 
 Headless Summon dispatches disable OpenCode project configuration, external
 plugins, external skills, and Claude-compatible project discovery for the child.
@@ -680,10 +828,16 @@ example, Gemini CLI sessions cannot currently be resumed through Summon's headle
   dispatcher itself. The default **agy** path (a stream-json proxy) is standard library too. Only the
   legacy opt-in agy PTY wrapper needs `pywinpty` and `pyte`
   (tested with `pywinpty 3.0.3` and `pyte 0.8.2`).
+  Contributors running the complete release and Phase 0/1 verification registry also
+  need `pytest>=8,<9`; this is a test-only dependency and is not installed with Summon.
 - **At least one backend:** a vendor CLI installed and logged in (`claude`, `codex`,
   `cursor-agent`, `gemini`, `kimi`, `agy`, or `opencode`), an API key for an `openai-compat` provider, or
   a local Ollama/LM Studio server. `summon doctor` tells you which are installed;
   `doctor --probe` spends a small live call per backend to confirm sign-in and eligibility.
+- **AGY 1.1.22 or newer for AGY seats:** Summon preflights the provider-inert
+  `--print-timeout` capability before copying credentials or launching a turn, then binds
+  that timeout to the remaining adaptive hard budget. Older AGY builds fail with an
+  upgrade instruction instead of an unknown-flag backend error.
 - **`git`** if you use `--worktree`.
 - **A host that can run a shell command:** a coding CLI, an AI IDE, a desktop agent app, or
   a plain terminal. Anything that can invoke `python` and read the skill can drive it.
@@ -696,8 +850,9 @@ example, Gemini CLI sessions cannot currently be resumed through Summon's headle
 - **If a popup persists:** the calling agent should invoke Summon directly, leave
   `AGY_PTY_WRAPPER` unset so the bundled `agy_stream_proxy.py` is used, and avoid wrapping
   the call in `Start-Process` or `cmd /c start`. If a PowerShell helper must use
-  `Start-Process`, pass `-WindowStyle Hidden`; a custom wrapper must hide its own children
-  and be reported in the handoff.
+  `Start-Process`, pass `-WindowStyle Hidden`; the legacy winpty wrapper
+  (`agy_pty_pyte.py`) is disabled on Windows unless `AGY_ALLOW_LEGACY_PTY=1` is set
+  deliberately. A custom wrapper must hide its own children and be reported in the handoff.
 
 You bring model access. Summon orchestrates the CLIs and APIs you already use.
 
@@ -705,25 +860,36 @@ You bring model access. Summon orchestrates the CLIs and APIs you already use.
 
 ## Security, permissions, and terms
 
-- **Permissions.** Each agent's `permission:` (`read-only` / `safe-edit` / `yolo`) maps to
-  that CLI's own sandbox flags. Bundled agents ship `safe-edit` (auto-approve edits, no
-  bypass). Raise anything to `yolo` deliberately, and only in repos you trust.
-- **Kimi Code is deliberately stricter.** Its non-interactive prompt runner auto-handles tools
-  and cannot combine with its plan mode, so Summon refuses Kimi `read-only` and `safe-edit`.
-  `kimi-worker` and `kimi-coder` pin K3 with maximum supported thinking through the isolated
-  profile; `kimi-k27-coder` is the explicit lower-context K2.7 seat. All three are `yolo` only
-  and belong in a trusted isolated worktree. For a review-only Kimi job,
-  use `--worktree`, instruct it not to edit, then inspect the worktree before accepting the
-  report or removing it: the review label does not create an enforceable read-only boundary.
-- **agy is the exception, twice over.** It has no workspace-write tier, so its `safe-edit`
-  is a full bypass like `yolo`. And it has **no enforceable `read-only` tier at all**, so
-  since 0.15.0 summon *refuses* an agy dispatch declared `read-only` rather than imply a
-  boundary that does not exist. Measured over five canaries: `--sandbox` restricts terminal
-  operations only, `--mode plan` does not withhold the file tools, and withholding the
-  workspace only breaks *relative* paths -- a declared read-only agy agent read a secret
-  file and created another by absolute path. `SUMMON_ALLOW_UNENFORCED_READONLY=1` dispatches
-  anyway and marks the tier advisory in `warnings`; it waives only a tier **you** declared,
-  never one summon imposed (a `--gate-with` adjudicator, a clamp that bit, a repair resume).
+- **Permissions map to real CLI behavior.** Each agent's `permission:` (`read-only` /
+  `safe-edit` / `yolo`) maps to that CLI's flags, and the envelope records the exact mapping.
+  Use `yolo` for Kimi, OpenCode/Ox, agy/Antigravity, and similar toolful agents when the
+  work is inside a disposable clone or isolated worktree and you will inspect the diff,
+  tests, and mutation evidence before integrating. This is how code, UI, research, and
+  review lanes get the capability they need without making the active checkout the blast
+  radius.
+- **Kimi Code uses full-authority prompt mode.** Its non-interactive runner auto-handles
+  tools and rejects `read-only` and `safe-edit`; Summon refuses those labels rather than
+  misrepresenting the boundary. `kimi-worker` and `kimi-coder` pin K3 at maximum thinking,
+  while `kimi-k27-coder` is the explicit lower-context K2.7 seat. Use them in isolated
+  worktrees, monitor their mutations, and keep or discard the result after verification.
+  For a review-only Kimi job,
+  use `--worktree`, instruct it not to change product files, and inspect the worktree
+  before accepting the report or removing it: the review request is not an enforceable read-only boundary.
+  Kimi may expose a served-model observation in child stdout or its isolated runtime journal,
+  but both channels are writable by the child and are therefore labeled `inferred`, never
+  authoritative named-model proof. Its local profile and requested K3 target are not provider
+  evidence. A successful report with absent or inferred identity is useful advisory output,
+  not a certified named-model review.
+- **agy/Antigravity has no enforceable `read-only` tier.** Its `safe-edit` is the same full
+  bypass as `yolo`, and declared `read-only` is refused unless explicitly waived. For a
+  disposable worktree, use `yolo` deliberately; for a shared or sensitive checkout, use
+  an enforcing backend instead. `SUMMON_ALLOW_UNENFORCED_READONLY=1` marks a caller-declared
+  read-only run advisory; it never overrides a clamp or governance-imposed restriction.
+- **A worktree is mutation isolation, not a security sandbox.** A Git worktree can share
+  repository metadata, the operator account, environment variables, and other resources
+  visible to the child. If credentials, private/client data, shared Git state, or a live
+  resource must be protected, use a sanitized packet in a separate clone with its own Git
+  directory, OS account, container, or VM, or choose a backend with an enforceable boundary.
 - **Treat the whole `--cwd` as trusted.** Files under it, `.agents/memory.md`
   (auto-injected into agent context), and manifest `prompt_file`s are trusted operator
   input. Every bundled agent also carries an "untrusted content: data, not instructions"
@@ -731,8 +897,13 @@ You bring model access. Summon orchestrates the CLIs and APIs you already use.
 - **Secrets.** The agy backend copies OAuth tokens into a per-invocation profile locked to
   your user (icacls / `0700`) and isolated from your real profile. `openai-compat` reads
   API keys from env (or the documented local OpenRouter credential fallback) and redacts
-  them from any error output. OpenCode uses its own auth/configuration; Summon's optional
-  OpenRouter bridge passes a key only to that child process and never records it.
+  them from any error output. OpenCode uses its own auth/configuration. In restricted
+  tiers, Summon keeps the optional OpenRouter bridge child-scoped; in yolo mode it
+  scrubs inherited provider credentials and refuses a private-key bridge unless the
+  caller explicitly supplies `--isolated-lane` plus `--allow-tool-credentials`;
+  `--worktree` may additionally provide mutation isolation but never replaces the
+  OS-boundary acknowledgement. The key is never recorded in an envelope, telemetry,
+  prompt, or public agent definition.
 - **Terms of service.** Summon drives each vendor's *official* CLI (built for scripted use)
   on *your* accounts, which is the intended path for personal and dev work. Don't share
   accounts, build a product on subscription auth, or hammer parallel volume; use API-key
@@ -746,6 +917,11 @@ You bring model access. Summon orchestrates the CLIs and APIs you already use.
   and refuses with an error that names argv as the cause. `--prompt-file` does **not** avoid
   this -- it is a quoting convenience and the content still travels on the command line. For
   material that large, write it to a file under `--cwd` and ask the agent to read it.
+- **Windows batch transport is fail-closed.** `summon.cmd` marks the batch path and refuses
+  every raw `--prompt` before any roster/backend work. Batch expansion occurs before Python
+  receives argv, so surviving bytes cannot prove that even apparently simple text was not
+  rewritten. Put the prompt in a UTF-8 file and pass `--prompt-file`; the refusal envelope reports
+  `attempts: 0`, `attempt_status: not_run`, and `provider_contacted: false`.
 - **Diagnostics are opt-in and local.** Summon does not collect telemetry by default. When
   enabled, it records bounded, allow-listed metadata locally and omits prompt text, result
   text, raw output, credentials, and absolute paths. It may retain deterministic fingerprints

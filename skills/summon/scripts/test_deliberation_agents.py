@@ -96,6 +96,26 @@ class CustomAgentTests(unittest.TestCase):
         with self.assertRaises(agents.AgentManifestError):
             agents.discover_agents(self.workspace, global_root)
 
+    def test_explicit_global_legacy_flat_roster_is_reported_separately(self):
+        global_root = self.root / "legacy-global"
+        global_root.mkdir()
+        (global_root / "architect.md").write_text(
+            "---\nrun-agent: claude\nmodel: claude-opus-5\npermission: read-only\n---\n\n# Architect\n",
+            encoding="utf-8",
+        )
+        found = agents.discover_agents(
+            self.workspace, global_root, allow_legacy_flat=True
+        )
+        self.assertEqual(found, {})
+        self.assertEqual(agents.legacy_flat_roster(global_root), ("architect.md",))
+
+    def test_default_discovery_still_rejects_flat_files(self):
+        global_root = self.root / "legacy-global"
+        global_root.mkdir()
+        (global_root / "architect.md").write_text("legacy", encoding="utf-8")
+        with self.assertRaises(agents.AgentManifestError):
+            agents.discover_agents(self.workspace, global_root)
+
     def test_missing_unknown_duplicate_and_malformed_fields_fail_closed(self):
         cases = {
             "missing": manifest().replace("role: reviewer\n", ""),

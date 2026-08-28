@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to your agents dir as providers.json (or ~/.agents/providers.json) to add OpenAI-compatible endpoints. Built-ins already include openrouter, openai, anthropic, google, groq, together, deepseek, ollama, lmstudio, byteplus-coding — you only need entries here for custom/self-hosted endpoints or to override a built-in.",
+  "_comment": "Copy to your agents dir as providers.json (or ~/.agents/providers.json) to add OpenAI-compatible endpoints. Built-ins already include openrouter, openai, anthropic, google, groq, together, deepseek, ollama, lmstudio, byteplus-coding, zai-coding-plan — you only need entries here for custom/self-hosted endpoints or to override a built-in.",
 
   "local-vllm": {
     "base_url": "http://127.0.0.1:8000/v1",
@@ -13,6 +13,8 @@
     "base_url": "http://localhost:11434/v1",
     "api_key_env": ""
   },
+
+  "_zai_coding_plan_comment": "zai-coding-plan is built in and fixed to its published coding-only endpoint. Use ZAI_CODING_API_KEY, or an existing official Coding Plan helper configuration; do not override it here with a general Z.AI API endpoint.",
 
   "_byteplus_comment": "Override the built-in byteplus-coding for a different region. The URL MUST contain /api/coding/ — Summon refuses /api/v3 (PAYG) for this provider. For always-PAYG Platform API, add a separate entry with .../api/v3 and your platform key env (e.g. BYTEPLUS_API_KEY) — do not reuse the byteplus-coding name.",
   "byteplus-coding": {

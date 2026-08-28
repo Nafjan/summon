@@ -13,7 +13,424 @@ never on added fields.
 
 ## Unreleased
 
-No unreleased changes.
+## 3.3.0 - 2026-08-29
+
+- **Native ZCode / Z.AI Coding Plan integration:** introduced a tenth backend
+  through original, provider-inert code. ZCode discovery accepts an explicit
+  executable/bundle path, direct PATH target, Windows uninstall metadata
+  (including safe DisplayIcon/UninstallString parent hints), and common bundles;
+  it never shells a registry value. The executor launches direct binaries or
+  Node bundles headlessly, confines the task to a strict UTF-8 owner-restricted
+  attachment, registers it with controlled launch cleanup, and parses only a
+  bounded terminal JSON document with a nonempty response plus `sess_` session
+  identifier. Leading banners are tolerated; arbitrary/incomplete JSON fails
+  closed. Native ZCode is deliberately multi-provider/ambient: model overrides
+  fail before contact, safe-edit is refused, advisory read-only is opt-in, and
+  experimental yolo needs an isolated/worktree boundary plus an explicit
+  credential-access acknowledgement; that acknowledgement is not a sandbox.
+  The active generic seat is named `zcode-native`; the misleading historical
+  `zcode-coding-plan` alias is retired. Every native tier scrubs inherited
+  provider credential variables because plan mode is advisory, not a sandbox.
+  Terminal JSON means liveness and
+  usage are terminal-only, and no model provenance is manufactured.
+- **Direct Z.AI Coding Plan text seat:** registered the coding-only endpoint as
+  a distinct OpenAI-compatible provider, with no BytePlus PAYG retry behavior.
+  Credential precedence is explicit environment first, then a bounded,
+  non-symlink top-level-scalar reader for an existing official helper profile;
+  no helper process/config mutation occurs and neither key nor path reaches a
+  response, diagnostic, or receipt. Provider-inert fixtures cover endpoint
+  pinning, credential precedence, non-Coding-Plan rejection, ZCode parsing,
+  prompt attachment cleanup, and terminal-only metadata. The helper remains an
+  auth/usage diagnostic, not an inference backend; usage reads are unsupported
+  until a version-pinned schema and privacy mapping are reviewed.
+- **Credential and decision evidence:** direct API request identity now binds
+  reviewed environment and local fallback credential sources with a private
+  one-way digest, while unavailable identity remains `None` and cannot trigger
+  a false empty-string mismatch. Z.AI helper rotation still refuses before
+  provider contact. Provider-inert decision evidence records backend transport,
+  declared provider, and the route-provider validation class separately.
+- Fixed live adaptive job extensions so an authenticated operator command advances both
+  the active checkpoint and hard liveness deadline without waiting for provider output.
+  The executor polls the durable control log at its bounded control cadence, publishes the
+  applied generation and updated deadline in the authenticated heartbeat, caps total job
+  runtime at seven days, and refuses extensions queued after the then-current hard deadline.
+
+- **Final dispatch-boundary and deliberation evidence closure:** every provider launch now
+  receives one explicit environment snapshot filtered by the shared internal-capability
+  denylist; the former foreground shortcut cannot bypass newly added capability names.
+  Windows ArkCLI and OpenCode launch planning refuses unsafe batch shims before contact and
+  preserves the zero-attempt contract, while the ArkCLI roster refresh resolves the safe
+  Node entry point before its first child process. The POSIX AGY proxy joins its supervised
+  parent group, with a behavioral regression proving timeout teardown reaches a real
+  descendant. Deliberation replay binds model identity to a finished attempt and generation,
+  aggregates every finished attempt conservatively, hashes raw model identifiers in public
+  output, and derives immediate, replay, and server-sent event receipts from the authenticated
+  checkpoint. CI and the fixed release registry include the affected executor, backend,
+  ownership, credential, and stream regressions.
+- **M8 integrated operator and compatibility closure:** added one end-to-end,
+  provider-inert operator test covering sealed fleet proposal/validation/explanation,
+  authenticated approval and dry-run activation, usage import/status/export/refresh
+  planning, safe/off context compilation, bounded stale-context labeling, trusted
+  liveness, the public status/extend/steer/cancel job-control surfaces, private-envelope
+  projection, and portable consumption. Resume remains covered by its dedicated authenticated
+  continuation suite because a successful resume needs terminal provider-session evidence.
+  The Windows wrapper
+  golden checks nonempty doctor JSON, typed refusal of unsafe raw multiline prompt
+  transport, and lossless prompt-file dispatch. A separate standard-library consumer
+  imports no Summon code, validates a checked-in portable receipt and digest, rejects a
+  forged named-model claim, and emits an authority-free golden. The release contract now
+  requires a canonical-version marker in the active Phase 1 migration document instead
+  of accepting the historical 3.0/3.1 document, and the migration gate proves private
+  durable state survives managed refresh and uninstall. CI, the fixed release registry,
+  installer ownership assertions, public docs, and migration guidance carry the same
+  artifacts.
+- **M7 portable dispatch/job projection:** an experimental, provider-inert result kernel
+  projects only allowlisted execution, contact, model-proof, artifact, and digest facts
+  from exact private receipt bytes. Dispatch inputs require an exact byte digest; job inputs
+  additionally authenticate the private launch record and terminal nonce/scripts binding.
+  Artifact entries are digest-addressed and omit mutable local path locators; verified nested
+  locators remain deferred until platform-specific handle-relative traversal can close
+  ancestor-substitution races. The no-clobber writer retains file descriptors, verifies
+  content and inode identity, and refuses unsafe cleanup after a link-stage race. A strict reference
+  consumer grants no authority. Surfaces without one equivalent authenticated terminal
+  source remain typed refusals rather than being flattened into false provider/model facts.
+- **AGY 1.1.22 terminal/budget normalization:** the stream parser and executor now carry
+  a bounded provider terminal state through normalization, including response-less terminal
+  errors. The builder makes Summon's remaining hard runtime the sole AGY print timeout and
+  both builder and proxy strip double- and single-dash caller overrides before the prompt.
+  Provider-inert tests cover 10-minute, adaptive-extension, malformed-state, cancellation,
+  partial-state, response-less, Windows-proxy, and prompt-boundary cases. Parser integrity
+  markers are never accepted from raw provider data. Owner-only AGY credential profiles
+  retain the adaptive hard deadline for live work while a dead owner's orphan lifetime is
+  capped and reaped through an OS-held host lease on the next cleanup pass;
+  child-writable profile markers and reusable PIDs cannot extend that cap or forge a
+  live-owner exemption because the lease also binds the owner's OS process-birth identity.
+  A taken-over lease cannot exceed its independent hard cap, while a proven live owner can
+  outlast the orphan cap without shortening an explicitly longer adaptive runtime.
+- **Dispatch-integrated safe context and namespace-bound freshness:** M5 now crosses the
+  real provider boundary only after a provider-inert typed-context compile. The input
+  file is a bounded stable regular-file read under the effective local read roots;
+  external references are content-addressed, restricted to non-indirect cwd targets,
+  fail closed when final-handle resolution is unavailable, and are authorized only by
+  an adapter-minted compile-time proof created from the opened file. Receivers must
+  re-hash before use because the target can change across processes. Ordinary
+  context files reject authority-plane blocks. The compiled bytes join prompt/request
+  identity, and a background child consumes the exact prompt frozen beside its immutable
+  scripts rather than reopening mutable source files. Result trust also compares the
+  terminal prompt digest with the launch record. Public evidence contains no paths or
+  bodies, and no context flags retain the M0 serialization goldens. M6 uses v2 stale-
+  acceptance and binding schemas, includes the resolved deliberation-run namespace digest,
+  and rechecks that namespace before scheduler creation and every provider launch.
+  Historical v1 bindings remain authenticated but read-only for status/replay. Both changes remain
+  provider-inert through dry-run and validation.
+- **Bounded live usage adapter and portable evidence:** M4 adds a provider allowlist,
+  explicit account-read consent, exact Codex CLI/version and JSON-RPC request-plan checks,
+  hidden subprocess launch, bounded stream drains, owned-child timeout cleanup, and honest
+  provider-contact accounting. Raw account responses and account identifiers never enter
+  the portable snapshot or effective-decision advisory. Export de-attests observations as
+  operator evidence; synthetic examples cover allowance, API balance, account credit,
+  rate limit, unsupported, and unknown dimensions. Usage cannot route, dispatch, retry,
+  authorize spend, log in, or repair authentication. AGY and ArkCLI adapters remain
+  disabled until their machine-readable schemas are captured and reviewed version by
+  version. The JSONL drain uses incremental bounded pipe reads, only successful account
+  responses can prove provider contact, and the owned app-server is reaped once the exact
+  reviewed response set is complete. Authenticated status reads may advance their local
+  anti-rollback checkpoint but cannot alter observations or contact a provider.
+- **One-time fleet activation:** the reviewed M3 activation path now recompiles and binds
+  the exact fleet, roster, project, approval, data proof, prompt, permission, billing
+  class, and launch before consuming one atomic contact slot. Only one foreground
+  subprocess candidate and one physical attempt are allowed; ambiguity is terminal and
+  retry, fallback, repair, resume, background, worktree, and authority escalation are
+  structurally absent.
+- **Authenticated, provider-inert fleet approval store:** M3b1 adds a private
+  `summon.fleet-approval-store/v1` ledger and individually authenticated
+  `summon.fleet-approval/v1` records. Each record binds the sealed fleet, compiled plan,
+  canonical project, roster catalog, lane and lane digest, local actor, operation,
+  authority ceilings, issuance, expiry, and generation. The store uses a separate local
+  key, authenticated contents, atomic replacement, strict bounded parsing, private-file
+  protections, mandatory generation compare-and-swap, idempotent concurrent recording,
+  expiry-sensitive issuance identity, explicit revocation, pre-write size enforcement,
+  typed transient lock contention, bounded terminal-record compaction, absolute override
+  paths, per-active-approval revocation headroom, refusal to claim nonempty unsafe directories, and
+  clock-rollback checks. Windows hardening uses native security-descriptor APIs
+  to reset pre-existing ACLs, derives a process-cached current-user SID from the native
+  process token without executable lookup or account-name rewriting, and verifies an exact
+  owner-only postcondition for the private directory, key,
+  store, and lock without launching PowerShell. Store parsing uses a dedicated item
+  budget sized for the bounded record collections,
+  reparse the exact serialized bytes before replacement, and preflight public receipt
+  targets before durable approval mutation. Public projections and lock failures omit
+  store paths; approval projections expose separate issuance and current-store
+  generations so idempotent replay remains operationally explicit. Public projections omit store
+  and actor identities, MACs, keys, and paths. The module imports no selector, executor,
+  background, resolver, or provider code and exposes no dispatch function; every receipt
+  says `recorded_not_activated`. Recording remains inert; activation is implemented only
+  by the separate, narrowly reviewed one-time launch contract described above.
+- **Pure fleet draft compiler and control-plane boundary:** the first M3 slice adds
+  sealed `summon.fleet/v1` and `summon.fleet-plan/v1` evidence, a pure compiler with
+  no provider, process, credential, filesystem, or launch imports, and provider-inert
+  propose, validate, inspect, and explain commands. The plan binds the normalized roster
+  catalog digest and project directory object; explanation rechecks the catalog binding
+  and cannot select a route. A shared backend-policy module prevents the command builder
+  and fleet explanation from disagreeing about effective permission enforcement or
+  singleton account-provider identity. Multi-provider routes use only the provider from
+  the immutable agent-definition snapshot; model namespaces never become provider proof.
+  OpenCode declarations are verified against the executed selector, mixed-case named
+  registry keys preserve dispatch semantics, and inline endpoints remain unknown rather
+  than accepting an unsupported label. Roster listing applies dispatch's default permission from that same snapshot, inspect
+  preserves candidate priority, and explicit fleet outputs atomically refuse clobbering.
+  Regressions cover catalog substitution, portable case folding, unavailable and
+  malformed seats, capability vocabulary, complete constraint projection, bounded
+  reads, output clobbering, symlink targets, redacted I/O errors, and the Windows batch
+  launcher. Approval, reservation, selection, and dispatch remain absent from the pure
+  draft/compiler module and enter only through the separate activation boundary.
+- **Temporary model lifecycle:** all ended direct and OpenCode `stealth/ox-alpha`
+  selectors are retained as retired, exact historical identities and fail before provider
+  contact, including stale custom roster definitions without lifecycle metadata. A separate successor targets
+  `openrouter/z-ai/glm-5.3-flash`; no old receipt is reinterpreted as the successor.
+  The former stealth preview is no longer represented as free or permanent. Lifecycle
+  enforcement lives in the shared immutable roster-resolution path used by ordinary dispatch
+  and in-process live deliberation; focused regressions prove the latter never constructs a
+  scheduler or contacts a provider for a retired seat. Fleet catalogs admit active seats only.
+- **AGY 1.1.22 machine contracts:** the resolver prefers the documented JSON models
+  envelope, strictly bounds and validates model identifiers, and performs at most one
+  explicitly labeled legacy-text fallback. The stream parser accepts nested init and
+  step-update payloads, records target/session/usage and trusted tool or generation
+  activity, deduplicates replayed progress, and never promotes progress model metadata to
+  served-model evidence. Provider-inert fixtures cover the nested event shape and hidden
+  Windows native/shim launch paths.
+- **Authenticated continuation ledger and crash-safe successor launch:** eligible
+  terminal Claude subprocess jobs can reserve one source-scoped successor through a
+  private HMAC-authenticated ledger. The claim binds the source receipt and session
+  handle, exact reported model, named profile/role evidence, workspace object, read
+  roots, permission ceiling, gate, fresh spend consent, queued steering generations,
+  immutable execution bundle, launch record, and canonical terminal result. Durable
+  compare-and-swap phases enforce one child and one provider launch under concurrent
+  callers. Preparation faults remain provider-inert and recover the same request;
+  proven `Popen` failures reuse the same frozen successor, while unexpected launch or
+  post-spawn registration failures become indeterminate and cannot retry. Every
+  governed child envelope—including gate denial and private-claim refusal—receives
+  authenticated public lineage and binds to the canonical on-disk result. A trusted
+  child result closes the result lifecycle after an ambiguous provider launch without
+  certifying contact or no-contact; the authenticated projection stays recovery-required
+  and nonzero. Result-to-claim seal failures are recorded as bounded typed ledger state
+  instead of being swallowed after envelope publication.
+  Governed successors also ignore inherited credit/Fable compatibility switches and
+  standing PAYG preferences; only the claim-bound fresh flags can authorize the new
+  physical attempt. Text-only permission and tool requirements are captured in the
+  authenticated continuation source and private successor claim; the resumed child
+  strips ambient text-seat grants and reconstructs only those source-bound flags.
+  The child's real private-claim authentication-refusal path now includes its frozen
+  Summon identity before terminal sealing; its provider-inert regression drives the
+  dispatcher entry point instead of hand-building a simplified envelope.
+  Raw session handles, steering text, prompts, paths, nonces, and private profile data
+  never enter the public jobs projection. Provider-inert regressions cover tampering,
+  gate/provider ordering, canonical receipt forgery, fault boundaries, Windows argv,
+  and concurrent reservation/recovery races.
+- **Race-free Windows job controls:** the first extend/cancel/steer caller now locks
+  byte zero of an empty lock file directly. The previous pre-lock seed write allowed
+  two simultaneous first callers to race and intermittently raise `PermissionError`.
+  Regressions prohibit any pre-lock write and repeatedly synchronize concurrent first
+  callers on Windows.
+- **Retry-safe explicit result replacement on Windows:** `--out` writes now use the
+  same bounded atomic-replace retry as detached job receipts. A transient antivirus or
+  indexer handle can no longer leave a stale error envelope after the new result was
+  fully written to its temporary file.
+- **Authenticated continuation evidence and capability-safe job status:** completed
+  Claude subprocess jobs can seal a private HMAC-authenticated continuation source bound
+  to the exact launch, attempt, prompt, reported model, session route, approved role or
+  named profile, authority/spend decision, terminal receipt, scripts identity, and
+  workspace directory object. That evidence-sealing checkpoint did not expose `jobs resume`;
+  the authenticated successor entry above now does. It still does not claim live steering,
+  and other backends remain explicitly candidate or unsupported until
+  provider-specific continuity evidence exists. Concurrent writers are serialized,
+  duplicate/non-finite/oversized JSON fails closed, and public `jobs status` derives an
+  available capability only from the authenticated sidecar bound to the same result
+  snapshot. Status and heartbeat output now use typed allowlists that omit prompts,
+  reports, paths, provider handles, profile/account data, and unknown nested fields.
+
+- **Phase 0 lifecycle and Windows transport hardening:** each physical provider launch now
+  carries an opaque `attempt_id`; retries and transport fallbacks get distinct identities while
+  structural refusals remain `not_run` with no attempt ID. Detached launch records bind that ID
+  to the job, and terminal receipt publication is first-writer-wins/idempotent under normal and
+  crash-finalizer races. The Windows `summon.cmd` launcher marks raw argv transport and refuses
+  every raw dispatch prompt before roster/backend work; `--prompt-file` is the safe alternative
+  because batch expansion precedes Python validation. Provider-inert regressions cover identity, terminalization, and zero-contact
+  refusal behavior.
+
+- **Fail-closed refusal/proof validation:** every structural pre-dispatch refusal
+  (including read-root, backend, model, text-seat, and gate checks) now carries
+  explicit `attempts:0`, `attempt_status:"not_run"`,
+  `execution_status:"not_run"`, and no provider contact. The public envelope,
+  telemetry event, and reviewed-report projector additionally normalize
+  `model.served:null`, `served_model_evidence:"absent"`, `model_match:null`,
+  and `named_model_verified:false`; contradictory compatibility fields cannot
+  mint named-model proof. Retry/corrective aggregation preserves that zero
+  rather than inventing an attempt.
+  Public report validation enforces the relationship between tri-state model proof,
+  named-model verification, and reported served-model evidence, rejecting forged
+  positive claims even when each field is individually well-typed.
+- **Heading reports and provenance-safe projections:** Markdown heading forms of
+  the structured report contract (including `## VERDICT: BLOCK`) are parsed without
+  confusing a successful execution with a blocking review finding. New
+  `model_match`/`named_model_verified` fields are tri-state/fail-closed and require
+  trusted provider-reported equality of requested, targeted, and served models.
+  `raw_backend_exit_code` and `normalized_exit_code` make report normalization
+  explicit while preserving the legacy `exit_code` field. Provider-inert tests cover
+  heading verdicts, model evidence states, and non-zero child exits normalized by a
+  complete report.
+- **Kimi 0.38 completed-turn model capture:** Kimi's public stream can omit model
+  identity even when its fresh isolated runtime journal records positive-output
+  `usage.record` entries and a completed turn. Summon now captures only that bounded,
+  attempt-local accounting before profile cleanup. Request/config records, stale or
+  linked journals, mixed models, incomplete turns, and stream/journal conflicts remain
+  fail-closed. OpenCode's pre-call assistant `modelID` remains target-only and is not
+  promoted to served-model proof.
+- **Background result publication:** parser/early `SystemExit` paths now leave a
+  typed `dispatcher_exit_before_envelope` receipt when a detached child was given a
+  job file. Normal and crash envelopes use the existing bounded Windows sharing-
+  violation retry, so AV/Search Indexer locks do not silently leave only a `.tmp` file.
+  Hard kills remain honestly classified as stale when no child-authored envelope exists.
+- **Explicit provider-pool backoff:** the transient retry classifier now recognizes
+  structured HTTP 429/rate-limit responses, including OpenRouter/OpenCode's
+  `rate_limit_exceeded` token, while keeping
+  the retry opt-in and bounded to one exponential-backoff attempt. No provider/model
+  fallback is performed and auth/permission failures remain non-retryable.
+- **Windows child-tool resilience and Kimi provenance:** a structurally missing
+  executable such as `grep` no longer downgrades a complete agent report into a
+  generic or authentication failure. Summon preserves the report, retains the raw
+  backend exit, and emits a bounded `tool_failure` diagnostic with `rg`, PowerShell,
+  and Python fallbacks. Kimi assistant JSONL records now contribute provider model
+  and usage metadata when present; the envelope identifies that source and keeps
+  `model.served:null`/`served_model_evidence:"absent"` when the provider omits it.
+  Provider-inert regressions cover both paths.
+- **Fail-closed named-model trust:** exact-model policy now applies across providers for
+  built-in governance seats and custom seats that declare `model-policy: exact` (or use
+  `--require-exact-model`). A provider-reported dominant model mismatch or missing
+  authoritative terminal receipt is normalized to a non-retryable blocked result; no
+  fallback, resume, or contract-repair turn is attempted. Claude auxiliary models remain
+  recorded in `model.models_used` without satisfying the named seat. Provider-inert
+  regression fixtures cover matching, mismatching, and missing-evidence terminal events;
+  no credentials or provider calls are involved.
+- **Windows AGY popup guard:** the default AGY stream proxy now remains on the shared
+  `CREATE_NO_WINDOW`/`SW_HIDE` launch path, while the legacy winpty-based
+  `agy_pty_pyte.py` wrapper is fail-closed on Windows unless an operator explicitly sets
+  `AGY_ALLOW_LEGACY_PTY=1`. This prevents an old/project-local wrapper from silently
+  creating a visible pseudo-console. Custom wrappers and vendor-created GUI windows remain
+  outside Summon's launch boundary and must hide their own children.
+- **Managed versus unmanaged install drift:** the doctor/install inventory now publishes
+  `managed_converged` plus managed/unmanaged drift partitions. The strict legacy
+  `converged` field still detects any stale or unhashable copy, while the installer gate
+  ignores an explicitly unmanaged project/plugin tree and reports it with an owner-action
+  warning. This prevents a stale Cursor plugin from producing the misleading instruction
+  to rerun an installer that does not own that tree.
+- **Credential/tool boundary for OpenCode yolo:** broad Ox/OpenCode turns now require
+  `--worktree` or `--isolated-lane`. Summon refuses to bridge a private OpenRouter/Nous key
+  into an unrestricted child unless the caller supplies both `--isolated-lane` and
+  `--allow-tool-credentials`; a worktree alone is mutation isolation, not an OS boundary.
+  Inherited provider variables are scrubbed otherwise. The public contract requires a
+  separate clone/Git directory, account, container, or VM when credentials or shared state
+  must be protected, because a Git worktree is mutation isolation rather than an OS sandbox.
+  The optional Ox definition now carries an explicit untrusted-content guard; its
+  provider availability is intentionally not a permanent Summon contract.
+- **Kimi roster evidence contract:** K3/max remains the deliberate bundled Kimi target, but
+  roster text now says provider-served evidence may be absent. When a Kimi assistant record
+  carries a provider model, the envelope exposes that source; otherwise a successful envelope
+  with `model.served: null` remains useful advisory output while named-model attestation stays
+  fail-closed. Summon never manufactures evidence.
+- **Kimi 0.38 stream finalization:** Kimi role records are recognized even when the CLI adds a
+  `type` field, and untyped verifier JSON is retained as Kimi content rather than entering the
+  generic cursor terminal fallback. Clean EOF remains the only Kimi completion boundary, while
+  a non-zero child exit remains an error. Sanitized provider-inert fixtures cover both observed
+  tool-then-report and verifier-only shapes; no private review payload is stored.
+- **Isolated full-authority workflow:** documented and rostered a broad-authority Ox/OpenCode
+  lane for disposable clones and isolated worktrees, and clarified that Kimi and
+  agy/Antigravity are intentionally useful yolo agents for code, UI, research, and review.
+  The integration gate remains local: inspect `workspace_evidence`, diffs, tests, artifact
+  stability, and report contracts before accepting changes. A Git worktree is explicitly
+  documented as mutation isolation rather than an OS security boundary; use a separate
+  clone/Git directory, account, container, or VM for protected resources. OpenCode's
+  `--auto` behavior remains conditional on a versioned provider-inert acceptance, and
+  Kimi served-model nulls remain advisory rather than fabricated provenance. Credentials,
+  private/client data, provider spend, databases/migrations, deployments, shared Git,
+  protected artifacts, and running stacks remain outside this lane.
+- **Terminal and isolation hardening:** Codex `turn.failed` is now parsed as a bounded
+  structured terminal error, preserving fail-closed model evidence and actionable provider
+  diagnostics. OpenCode dispatches now pass its documented `--pure` flag, and external-drive
+  cwd preflight remains enforced when extra roots are present.
+- **Windows interpreter selection:** added a `scripts\\summon.cmd` dispatcher launcher.
+  It verifies Python 3.10+ through the Windows launcher before running the dispatcher and is
+  now the documented Windows invocation path. This prevents an arbitrary `.py` association
+  from selecting a legacy interpreter that cannot parse the installed scripts.
+- **Background execution provenance:** a managed `--background` launcher now takes a
+  durable immutable copy of its scripts before spawning the child. The parent launch
+  identity and the child's execution-bundle identity are recorded separately; registry
+  trust requires both the nonce and scripts digest to match. `jobs` surfaces a terminal
+  `identity_mismatch` instead of accepting a mismatched result, and `jobs wait` returns
+  that condition rather than reporting it as a generic stale job. A host-root execution
+  lease serializes the short snapshot/spawn phase with the atomic installer; neither side
+  replaces or deletes the other's marker. Provider-inert regression coverage mutates the
+  source after snapshot creation, exercises a detached local failure path, and verifies
+  installer refusal while the lease exists.
+- **OpenCode non-interactive guard:** read-only and safe-edit invocations combine the
+  documented `--auto` behavior with an explicit deny-by-default `OPENCODE_PERMISSION`
+  policy. This auto-approves only capabilities Summon explicitly allows and leaves
+  omitted tools and external directories denied. The stream parser recognizes typeless
+  session/part progress envelopes without terminating early, and records a missing
+  `step_finish` as `opencode_stream.completion_evidence=clean_eof_without_step_finish`
+  plus `suspect:true`; callers must not accept that output as a review verdict.
+- **OpenCode unknown-finish guard:** when the JSON stream contains
+  `step_finish.reason=unknown` with all-zero usage and no text, the executor keeps the
+  stable `empty_terminal_result` failure kind but adds bounded
+  `opencode_diagnostic=unknown_finish_zero_tokens` and stream flags. This matches a
+  current OpenCode headless failure shape. The `step_start.modelID` is retained as
+  handshake/target evidence only, so it cannot become `model.served` when the turn did
+  no work; `--auto` only answers non-denied permission requests and is not a
+  provider/model completion mechanism.
+- **Provider-auth diagnostics:** OpenCode missing-cookie and direct API missing-key failures
+  normalize to terminal `authentication_failed` outcomes with explicit login/configuration
+  guidance and no retry or secret capture.
+- **Agent validation diagnostics:** explicit global roots now report legacy flat `*.md`
+  rosters separately, while modern package validation remains strict and failure output
+  includes a safe actionable detail.
+- **OpenCode timeout diagnostics:** zero-output headless timeouts are typed as
+  non-retryable provider timeouts with explicit local-auth guidance, preserving the
+  distinction between a proven auth error and an unproven transport stall.
+- **Kimi pre-EOF snapshots and ACP gate:** Kimi assistant parts are accumulated in a
+  separate bounded (32 KiB-character) tail while the normal full accumulator remains reserved for
+  clean-EOF success. On deadline, the tail is redacted and emitted under `partial` with
+  `authoritative:false`, `finalized:false`, and truncation counters; it never reaches report
+  parsing, result promotion, resume/cache reuse, or model provenance. Timeout envelopes now
+  set `timeout.partial_output` from captured stream text as well as a parsed result. Kimi
+  subprocess failures no longer auto-spend an ACP recovery turn, because the native ACP
+  adapter has no Summon filesystem/terminal bridge; `--allow-kimi-acp-fallback` or
+  `SUMMON_KIMI_ACP_FALLBACK=1` is an explicit opt-in. Provider-inert tests cover bounded
+  accumulation, secret redaction, non-authoritative status, default-off behavior, and the
+  explicit recovery path.
+- **Timeout-unit documentation:** public examples and the Codex host recipe now carry
+  explicit `ms`, `s`, or `m` suffixes. Bare numeric values remain milliseconds only for
+  backward compatibility; dispatches reject ambiguous bare sub-second budgets while
+  `jobs wait` preserves its short-poll behavior.
+- **Read-only root allowlists:** a review can explicitly add multiple local directories
+  through `--read-root` or `read-roots`. Claude maps them to `--add-dir` and Gemini to
+  `--include-directories`; paths are validated before launch and dry-run exposes the
+  effective list. Backends without an enforceable per-root read-only control fail closed.
+- **Background read-root parity:** repeatable CLI roots are now serialized into detached
+  child argv and the fsynced launch record using their canonical validated paths. A regression
+  compares foreground dry-run policy, child reconstruction, and the durable record so a
+  background job cannot silently fall back to its project cwd alone.
+- **Nous/Hermes credential bridge:** the built-in Nous provider and OpenCode `nous/<model>`
+  route read only `NOUS_API_KEY` from an explicitly named local Hermes profile when the
+  process environment is empty. The key remains child/request scoped and is never serialized.
+- **Nous auth classification:** HTTP 401/403 and equivalent auth-rejection responses from a
+  Hermes-profile key are marked non-retryable and point operators to Hermes Portal auth;
+  provider fallback remains disabled.
+- **OpenAI-compatible transport headers:** the direct API backend sends explicit JSON `Accept`
+  and a stable non-secret client `User-Agent`, which is required by the current Nous edge and
+  remains harmless for other compatible providers.
+- **Hermes OpenRouter credential fallback:** OpenRouter resolution now checks the named WCM
+  target first and then the explicit local Hermes `.env` source, without scanning arbitrary
+  files or serializing the key.
 
 ## [3.2.1] - 2026-08-22
 

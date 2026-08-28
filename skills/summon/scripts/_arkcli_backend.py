@@ -16,22 +16,34 @@ import subprocess
 from typing import Any
 
 
+def _is_windows() -> bool:
+    """Return whether the active runtime uses Windows launch semantics.
+
+    Keeping this behind a tiny seam lets provider-inert tests exercise the
+    Windows shim policy on POSIX without mutating the process-wide ``os.name``
+    value (which also changes how ``pathlib.Path`` behaves).
+    """
+    return os.name == "nt"
+
+
 def _arkcli_cmd() -> list[str]:
     """Resolve an invocable arkcli argv prefix.
 
     On Windows, prefer ``node <pkg>/scripts/run.js`` over ``cmd /c arkcli.cmd``
     so user prompts are NOT re-parsed by cmd.exe (metacharacters in prompts
-    must not become shell injection). Falls back to the .cmd shim only when
-    the npm package layout cannot be found.
+    must not become shell injection). A shim without its package entry point
+    is refused instead of falling back to a command shell.
     """
-    if os.name == "nt":
+    if _is_windows():
         path = shutil.which("arkcli.cmd") or shutil.which("arkcli")
         if path and str(path).lower().endswith((".cmd", ".bat")):
             node_js = _arkcli_node_entry(path)
             if node_js:
                 node = shutil.which("node") or "node"
                 return [node, node_js]
-            return ["cmd", "/c", path]
+            raise RuntimeError(
+                "arkcli package entry point is unavailable; reinstall "
+                "@byteplus/ark-cli so prompts are not routed through cmd.exe")
         if path:
             return [path]
     path = shutil.which("arkcli")
@@ -58,16 +70,20 @@ def _arkcli_node_entry(shim_path: str) -> str | None:
 
 def call(inv, timeout_ms: int) -> dict:
     cli = "arkcli"
-    if not shutil.which("arkcli") and not (os.name == "nt" and shutil.which("arkcli.cmd")):
+    if not shutil.which("arkcli") and not (_is_windows() and shutil.which("arkcli.cmd")):
         return _err(cli, "arkcli not found on PATH — install @byteplus/ark-cli "
-                         "and run arkcli auth login")
+                         "and run arkcli auth login", not_run=True)
     model = getattr(inv, "model", None) or ""
     if not model or str(model).strip().lower() in ("auto", "ark-code-latest"):
         return _err(cli, "arkcli backend needs a concrete model id "
-                         "(not auto / ark-code-latest)")
+                         "(not auto / ark-code-latest)", not_run=True)
     prompt = getattr(inv, "prompt", "") or ""
     system = getattr(inv, "system_context", "") or ""
-    cmd = [*_arkcli_cmd(), "+chat", "--no-progress", "--model", str(model)]
+    try:
+        cmd = [*_arkcli_cmd(), "+chat", "--no-progress", "--model", str(model)]
+    except RuntimeError as e:
+        return _err(cli, str(e), not_run=True,
+                    error_kind="unsafe_windows_launcher")
     if system:
         cmd.extend(["--instructions", system])
     resume = getattr(inv, "resume_id", None)
@@ -76,12 +92,13 @@ def call(inv, timeout_ms: int) -> dict:
     # End-of-options so a prompt starting with "-" cannot be parsed as flags.
     cmd.append("--")
     cmd.append(prompt)
-    from _spawn import run_flags
+    from _spawn import run_flags, scrub_provider_env
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=max(1, int(timeout_ms) / 1000.0),
-            stdin=subprocess.DEVNULL, **run_flags())
+            stdin=subprocess.DEVNULL, env=scrub_provider_env(dict(os.environ)),
+            **run_flags())
     except subprocess.TimeoutExpired:
         return _err(cli, f"arkcli +chat timed out after {timeout_ms}ms")
     except OSError as e:
@@ -127,7 +144,20 @@ def call(inv, timeout_ms: int) -> dict:
     return resp
 
 
-def _err(cli: str, msg: str) -> dict:
-    return {"result": "", "status": "error", "exit_code": 1, "cli": cli,
-            "error": msg, "backend_type": "arkcli_chat",
-            "served_via": "arkcli_chat", "provider": {"driver": "arkcli"}}
+def _err(cli: str, msg: str, *, not_run: bool = False,
+         error_kind: str | None = None) -> dict:
+    value = {"result": "", "status": "error", "exit_code": 1, "cli": cli,
+             "error": msg, "backend_type": "arkcli_chat",
+             "served_via": "arkcli_chat", "provider": {"driver": "arkcli"}}
+    if not_run:
+        value.update({
+            "attempts": 0,
+            "attempt_status": "not_run",
+            "execution_status": "not_run",
+            "provider_contacted": False,
+            "result_usable": False,
+            "retryable": False,
+        })
+    if error_kind:
+        value["error_kind"] = error_kind
+    return value

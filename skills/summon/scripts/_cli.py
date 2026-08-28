@@ -43,7 +43,7 @@ class Milliseconds(int):
 
 def parse_timeout(value: str) -> int:
     """--timeout accepts bare milliseconds (backward compatible) or a human
-    suffix: '90s', '10m', '600000ms'. Returns whole milliseconds (>= 1;
+    suffix: '90s', '10m', '4h', '600000ms'. Returns whole milliseconds (>= 1;
     fractional input rounds). Zero, negative, and non-finite durations are
     rejected here so they fail as argparse errors, not as instantly-killed
     agents or an OverflowError from the executor."""
@@ -55,11 +55,14 @@ def parse_timeout(value: str) -> int:
             ms = float(s[:-1]) * 1000
         elif s.endswith("m"):
             ms = float(s[:-1]) * 60_000
+        elif s.endswith("h"):
+            ms = float(s[:-1]) * 3_600_000
         else:
             ms = float(s)
     except ValueError:
         raise argparse.ArgumentTypeError(
-            f"invalid --timeout {value!r}: use milliseconds or a suffix, e.g. 600000, 600s, 10m")
+            f"invalid --timeout {value!r}: use milliseconds or a suffix, "
+            "e.g. 600000, 600s, 10m, 4h")
     if not math.isfinite(ms) or ms <= 0:
         raise argparse.ArgumentTypeError(
             f"invalid --timeout {value!r}: must be a positive finite duration")
@@ -68,7 +71,7 @@ def parse_timeout(value: str) -> int:
     # kill the dispatch instantly -- which is exactly what it did to a four-member council
     # in the field (2026-07-27): every seat killed after ~1s, no work performed. An explicit
     # `300ms` is still accepted, because someone writing the unit means it.
-    _bare_sub_second = (not s.endswith(("ms", "s", "m"))) and ms < 1000
+    _bare_sub_second = (not s.endswith(("ms", "s", "m", "h"))) and ms < 1000
     # A finite but absurd value ('1e308') survived the checks above and then blew up far
     # downstream as an OverflowError inside threading.Event().wait() -- a traceback instead of a
     # dispatch. Nothing legitimate waits on a sub-agent for over a week, so cap it here where the
@@ -105,7 +108,7 @@ def parse_quorum(value: str) -> int | str:
 MODE_FLAGS = {
     "manifest": {"manifest", "concurrency", "results_dir", "cwd", "agents_dir",
                  "retries", "retry_nonretryable", "job_file", "strict_agents_dir",
-                 "enable_roles"},
+                 "enable_roles", "allow_kimi_acp_fallback"},
     # Operation-level rows: a fresh council, a resume, and a read-only status
     # each consume a DIFFERENT set (v3.1). Changing members/rounds/question on a
     # resume would be a new run, so they are rejected there; status takes only
@@ -114,14 +117,15 @@ MODE_FLAGS = {
                 "rounds", "cwd", "agents_dir", "timeout", "out", "run_dir", "results_dir",
                 "job_file", "quorum", "chairman_fallback", "member_timeout",
                 "chair_timeout", "overall_timeout", "min_successful", "strict_agents_dir",
-                "enable_roles"},
+                "enable_roles", "allow_kimi_acp_fallback"},
     # A resume may change how the SAME run's stages are gated/timed (quorum,
     # fallback, per-stage timeouts) without changing its identity; question,
     # members, chairman, and rounds still come from the receipt.
     "council-resume": {"council", "resume_run", "cwd", "agents_dir", "timeout",
                        "out", "run_dir", "results_dir", "job_file",
                        "quorum", "chairman_fallback", "member_timeout", "chair_timeout",
-                       "overall_timeout", "min_successful", "strict_agents_dir", "enable_roles"},
+                       "overall_timeout", "min_successful", "strict_agents_dir", "enable_roles",
+                       "allow_kimi_acp_fallback"},
     # Status takes ONLY its id, where to look, and the output format -- it never
     # dispatches, so it has no working directory (use --run-dir to point it).
     "council-status": {"council_status", "run_dir", "json", "job_file"},
@@ -129,7 +133,9 @@ MODE_FLAGS = {
                      "quorum", "rounds", "max_attempts", "deadline", "cwd",
                      "agents_dir", "run_dir", "results_dir", "strict_agents_dir",
                      "enable_roles", "require_human_approval", "text_only_consent",
-                     "full_authority_consent", "json", "job_file"},
+                     "full_authority_consent", "context_file",
+                     "context_observation_file", "accept_stale_file",
+                     "json", "job_file"},
     "deliberation-resume": {"deliberate_resume", "run_dir", "results_dir", "cwd",
                             "retry_indeterminate", "json", "job_file"},
     "deliberation-open": {"deliberate_open", "run_dir", "results_dir", "cwd",
@@ -158,10 +164,33 @@ MODE_FLAGS = {
     "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
     "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
     "jobs-wait": {"jobs_wait", "job_dir", "timeout", "job_file"},
+    "jobs-extend": {"jobs_extend", "job_duration", "job_dir", "json", "job_file"},
+    "jobs-cancel": {"jobs_cancel", "job_dir", "json", "job_file"},
+    "jobs-steer": {"jobs_steer", "job_message", "job_dir", "json", "job_file"},
+    "jobs-resume": {"jobs_resume", "job_message", "job_message_file",
+                    "job_request_id", "job_dir", "timeout", "max_runtime",
+                    "max_permission", "gate_with", "gate_timeout",
+                    "allow_credit", "allow_payg", "json", "job_file"},
     # Diagnostics are local management commands. They never dispatch an agent;
     # bug-report submission is an explicit, user-authenticated gh invocation.
     "telemetry": {"telemetry_enable", "telemetry_disable", "telemetry_status",
                    "telemetry_clear", "json", "job_file"},
+    "usage": {"usage_action", "usage_from", "usage_cache", "usage_live_store",
+              "usage_providers", "allow_account_usage_read", "dry_run", "out",
+              "json", "job_file"},
+    "result": {"result_action", "result_kind", "result_from",
+               "result_repo_root", "result_adapter", "out", "json", "job_file"},
+    "fleet": {"fleet_action", "fleet_file", "fleet_lane", "fleet_seats",
+               "fleet_provider_allowlist", "fleet_model_allowlist",
+               "fleet_required_capabilities", "fleet_permission_ceiling",
+               "fleet_data_boundary", "fleet_allow_contract_repair",
+               "fleet_allow_retry", "fleet_allow_fallback",
+               "fleet_allow_continuation", "fleet_allow_subscription",
+               "fleet_allow_credit", "fleet_allow_payg",
+               "fleet_max_provider_contacts", "fleet_max_billable_attempts",
+               "fleet_max_parallel", "cwd", "agents_dir", "strict_agents_dir",
+               "fleet_approval_id", "fleet_expires_in",
+               "fleet_expect_generation", "out", "json"},
     "bug-report": {"bug_report", "bug_report_from", "bug_report_output",
                      "bug_report_submit", "github_repo", "bug_title",
                      "bug_description", "json", "job_file"},
@@ -199,21 +228,52 @@ MODE_HINTS = {
              "event and resumes its provider session only when identity evidence matches; "
              "drift creates a visible fork. It never changes a ballot. `chat open "
              "--chat-browser auto|builtin|ide|system|link` starts or reuses the atlas."),
+    "swarm": ("swarm is a provider-neutral local coordinator. It journals claims, "
+              "leases, cancellation, and artifacts but never owns an ordinary fleet "
+              "dispatch or silently consumes dispatch flags."),
     "jobs-list": ("jobs list is read-only: it takes only --job-dir and --json."),
     "jobs-status": ("jobs status is read-only: it takes only the job id, --job-dir, "
                     "and --json."),
     "jobs-wait": ("jobs wait is read-only: it takes only the job id, --job-dir, "
                   "and --timeout."),
+    "jobs-extend": ("jobs extend queues a bounded deadline extension; it never "
+                    "contacts a provider."),
+    "jobs-cancel": ("jobs cancel queues cancellation for the active child."),
+    "jobs-steer": ("jobs steer queues a follow-up. Subprocess turns apply it only "
+                   "through an explicit resumed turn; no live injection is claimed."),
+    "jobs-resume": ("jobs resume creates one authenticated background successor for "
+                    "an eligible terminal Claude job. It consumes queued steering, "
+                    "uses fresh spend consent, disables retries/fallback/repair, and "
+                    "never places the session handle or message text in child argv."),
     "telemetry": ("telemetry is local-only and opt-in: it writes bounded, sanitized "
                   "JSONL evidence and never phones home."),
+    "usage": ("usage status/import/export/example are provider-inert. usage refresh "
+              "requires an explicit provider allowlist and account-usage-read consent; "
+              "it never logs in, repairs auth, dispatches, or changes routing."),
+    "result": ("result project/validate/consume are provider-inert. They derive or "
+               "inspect an experimental redacted compatibility receipt and never "
+               "dispatch, resume, authorize, or contact a provider."),
+    "fleet": ("fleet is a provider-inert M3 control plane. Draft actions compile and "
+              "explain constraints; approval actions record authenticated, expiring "
+              "local authority. Nothing on this surface selects, dispatches, or "
+              "contacts a provider."),
     "bug-report": ("bug-report writes a sanitized local report; review it before the "
                     "explicit --submit-github action."),
     "auth": ("auth status is read-only. auth repair never runs unless --allow-auth-repair "
              "is explicit; a successful login still requires an explicit retry of the "
              "original dispatch."),
 }
-FLAG_NAMES = {"sets": "--set"}  # dests whose flag spelling isn't dest.replace('_','-')
+FLAG_NAMES = {
+    "sets": "--set",
+    # Never expose the private parser destination in user-facing whitelist
+    # errors. It is only the rewritten representation of `dispatch --lane`.
+    "fleet_dispatch_lane": "--lane",
+}  # dests whose public spelling isn't dest.replace('_','-')
 TOKEN_DESTS = {"set": "sets", "from": "bug_report_from",
+               # private parser spelling produced only by `dispatch --lane`;
+               # mapping it here makes every fan-out whitelist reject a lane
+               # before entering its handler.
+               "fleet-dispatch-lane-internal": "fleet_dispatch_lane",
                # ergonomic names used only by the `chat` subcommand
                "project-id": "chat_project_id", "project-root": "chat_project_root",
                "initiator-host": "chat_initiator_host", "initiator-agent": "chat_initiator_agent",
@@ -232,6 +292,14 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "jobs-status"
     if getattr(args, "jobs_wait", None):
         return "jobs-wait"
+    if getattr(args, "jobs_extend", None):
+        return "jobs-extend"
+    if getattr(args, "jobs_cancel", None):
+        return "jobs-cancel"
+    if getattr(args, "jobs_steer", None):
+        return "jobs-steer"
+    if getattr(args, "jobs_resume", None):
+        return "jobs-resume"
     if getattr(args, "council_status", None):
         return "council-status"
     if getattr(args, "deliberate_status", None):
@@ -248,6 +316,8 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "deliberation-open"
     if getattr(args, "chat_action", None):
         return "chat"
+    if getattr(args, "swarm_action", None):
+        return "swarm"
     if getattr(args, "deliberate", False):
         return "deliberation"
     if args.council:
@@ -255,6 +325,12 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
     if any(getattr(args, name, False) for name in
            ("telemetry_enable", "telemetry_disable", "telemetry_status", "telemetry_clear")):
         return "telemetry"
+    if getattr(args, "usage_action", None):
+        return "usage"
+    if getattr(args, "result_action", None):
+        return "result"
+    if getattr(args, "fleet_action", None):
+        return "fleet"
     if getattr(args, "bug_report", False):
         return "bug-report"
     if getattr(args, "auth_action", None):
@@ -304,14 +380,19 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 # discoverable command surface.
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
                "onboard", "manifest", "council", "deliberate", "agent", "jobs", "version",
-               "chat", "swarm", "role", "telemetry", "bug-report", "auth", "help", "--help", "-h"}
+               "chat", "swarm", "role", "telemetry", "usage", "bug-report", "auth",
+               "fleet", "result", "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
 Usage: summon <command> [options]
 
 Commands:
-  dispatch  --agent NAME --prompt "…" --cwd DIR   run an agent (the default action)
+  dispatch  --agent NAME (--prompt TEXT | --prompt-file FILE) --cwd DIR
+                                                    run an exact agent
+  dispatch  --lane NAME --fleet-file FILE --fleet-approval-id SHA256
+            --fleet-data-proof PROOF --prompt-file FILE --cwd DIR
+                                                    run one approved fleet lane
   list                                            list available agents
   agents validate [--cwd DIR] [--agents-dir D]   validate custom agent manifests
   models    [--cli BACKEND]                       what each backend can run now
@@ -345,6 +426,18 @@ Commands:
   jobs list|status [ID] [--job-dir D] [--json]      inspect background jobs
   jobs wait ID [--job-dir D] [--timeout T]          wait for one background job
   telemetry enable|disable|status|clear [--json]  manage opt-in local diagnostics
+  usage status [--json] | usage import --from FILE [--json]
+  usage refresh --providers NAME --allow-account-usage-read [--dry-run]
+  usage export|example --out FILE [--json]        inspect/refresh/export redacted usage evidence
+  result project --kind KIND --from FILE --repo-root DIR [--out FILE] [--json]
+  result validate FILE [--json] | result consume FILE --adapter reference [--json]
+                                                  portable experimental receipts
+  fleet propose LANE --seats A,B [--out FILE]     draft a provider-inert fleet lane
+  fleet validate|inspect FILE                     validate/inspect a fleet draft
+  fleet explain FILE LANE                         compare constraints without selection
+  fleet approval status|list                      inspect the private approval store
+  fleet approval approve FILE LANE --expires-in 24h --expect-generation N
+  fleet approval inspect|revoke APPROVAL_ID       inspect or explicitly revoke authority
   bug-report [--from FILE] [--output FILE] [--json] create a sanitized report
              [--bug-title TEXT] [--bug-description TEXT]
              --submit-github --from REVIEWED.md [--github-repo OWNER/REPO]
@@ -357,6 +450,42 @@ flat option list, or `summon telemetry --help` / `summon bug-report --help` for 
 
 
 COMMAND_USAGE = {
+    "fleet": """summon fleet propose LANE --seats A,B [--out FILE]
+summon fleet validate FILE [--cwd DIR --agents-dir DIR]
+summon fleet inspect FILE
+summon fleet explain FILE LANE [--cwd DIR --agents-dir DIR]
+summon fleet approval status|list
+summon fleet approval approve FILE LANE --expires-in 24h --expect-generation N
+summon fleet approval inspect APPROVAL_ID
+summon fleet approval revoke APPROVAL_ID --expect-generation N
+
+Build and inspect the provider-inert `summon.fleet/v1` draft and compiled plan.
+Approval commands record authenticated, expiring local authority but cannot select,
+dispatch, retry, resume, or contact a provider. `--expect-generation` is mandatory
+for mutations. `--out` contains only a redacted public receipt; it never contains the
+private store identity, actor identity, MAC, key, or path.
+
+Propose-only policy flags (repeat allowlists/capabilities as needed):
+  --provider PROVIDER              allowed provider
+  --model MODEL                    allowed model
+  --capability CAPABILITY          required: text, filesystem, tools, or
+                                   read_only_enforced
+  --permission-ceiling TIER        read-only, safe-edit, or yolo
+  --data-boundary BOUNDARY         unspecified, public, local_sanitized,
+                                   or private_local
+  --allow-contract-repair          permit later contract repair
+  --allow-retry                    permit later retry
+  --allow-fallback                 permit later fallback
+  --allow-continuation             permit later continuation
+  --allow-subscription             permit subscription-quota contact
+  --allow-credit                   permit account-credit contact
+  --allow-payg                     permit pay-as-you-go contact
+  --max-provider-contacts N        contact ceiling
+  --max-billable-attempts N        billable-attempt ceiling
+  --max-parallel N                 concurrency ceiling
+
+These flags declare draft constraints only. They are never approval or spend consent.
+""",
     "chat": """summon chat open SESSION_ID [--project-id ID --project-root DIR --participants A,B]
 summon chat post SESSION_ID --message TEXT
 summon chat turn SESSION_ID AGENT --message TEXT [--chat-timeout 10m]
@@ -421,6 +550,30 @@ the bounded JSONL spool; `clear` removes captured events without disabling colle
 The `SUMMON_TELEMETRY` environment override is non-persistent and inherited by Summon
 children. No telemetry command dispatches an agent or makes a network call.
 """,
+    "usage": """summon usage status [--json] [--cache FILE] [--live-store FILE]
+summon usage import --from SNAPSHOT.json [--json] [--cache FILE]
+summon usage refresh --providers codex --allow-account-usage-read
+                     [--dry-run] [--live-store FILE] [--json]
+summon usage export --out SNAPSHOT.json [--cache FILE] [--live-store FILE] [--json]
+summon usage example --out SNAPSHOT.json [--json]
+
+Inspect, import, or export normalized redacted usage evidence. Refresh is the only action
+that may query account usage; it requires explicit provider and consent flags, makes one
+bounded attempt, and never logs in, repairs auth, dispatches, retries, or changes routing.
+Usage dimensions remain separate; unlike categories are never reduced to one score.
+""",
+    "result": """summon result project --kind dispatch --from PRIVATE.json
+                      --repo-root DIR [--out PORTABLE.json] [--json]
+summon result validate PORTABLE.json [--json]
+summon result consume PORTABLE.json --adapter reference [--json]
+
+Derive, validate, or inspect an experimental redacted compatibility receipt. These
+commands are provider-inert and grant no dispatch, routing, resume, filesystem, spend,
+native-host, or adjudication authority. `project` reads one authoritative private
+receipt locally; its output excludes prompts, results, transcripts, sessions, account
+facts, raw errors, and local paths. The schema remains experimental until an external
+consumer validates every supported source surface.
+""",
     "bug-report": """summon bug-report [--from SOURCE] [--output REPORT.md] [--json]
                      [--bug-title TEXT] [--bug-description TEXT]
 summon bug-report --submit-github --from REVIEWED.md
@@ -450,6 +603,13 @@ def rewrite_subcommand(argv: list) -> tuple:
     ``(argv, mode)`` where mode is 'help' (print usage, exit 0), a string
     'error: …' (print error, exit 2), or None. Legacy flat invocations (argv
     starts with '-') pass through untouched."""
+    if any(
+            item == "--fleet-dispatch-lane-internal"
+            or item.startswith("--fleet-dispatch-lane-internal=")
+            for item in argv):
+        return argv, (
+            "error: --fleet-dispatch-lane-internal is private; use "
+            "`summon dispatch --lane NAME ...`")
     if not argv:
         return argv, "help"
     head = argv[0]
@@ -463,6 +623,16 @@ def rewrite_subcommand(argv: list) -> tuple:
     if any(a in ("--help", "-h") for a in rest):
         return argv, f"help:{head}" if head in COMMAND_USAGE else "help"
     if head in ("dispatch", "run"):
+        if head == "dispatch":
+            # Live fleet authority is intentionally available only through the
+            # explicit dispatch subcommand. Keep legacy flat invocations and
+            # the historical `run` alias from silently acquiring this surface.
+            rest = [
+                ("--fleet-dispatch-lane-internal=" + item.split("=", 1)[1])
+                if item.startswith("--lane=") else
+                "--fleet-dispatch-lane-internal" if item == "--lane" else item
+                for item in rest
+            ]
         return rest, None
     if head == "agents" and rest and rest[0] == "validate":
         return ["--validate-agents", *rest[1:]], None
@@ -586,12 +756,35 @@ def rewrite_subcommand(argv: list) -> tuple:
             return argv, "help"       # bare `summon jobs` -> usage, not a silent list
         if rest[0] == "list":
             return ["--jobs-list", *rest[1:]], None
-        if rest[0] in ("status", "wait"):
+        if rest[0] in ("status", "wait", "extend", "cancel", "steer", "resume"):
             if len(rest) < 2 or rest[1].startswith("-"):
                 return argv, f"error: 'jobs {rest[0]}' needs a job id"
-            flag = "--jobs-status" if rest[0] == "status" else "--jobs-wait"
-            return [flag, rest[1], *rest[2:]], None
-        return argv, f"error: unknown 'jobs' action {rest[0]!r} (use list/status/wait)"
+            flag = {"status": "--jobs-status", "wait": "--jobs-wait",
+                    "extend": "--jobs-extend", "cancel": "--jobs-cancel",
+                    "steer": "--jobs-steer", "resume": "--jobs-resume"}[rest[0]]
+            tail = list(rest[2:])
+            if rest[0] == "extend":
+                tail = [("--job-duration" + token[len("--duration"):])
+                         if token == "--duration" or token.startswith("--duration=")
+                         else token for token in tail]
+            elif rest[0] == "steer":
+                tail = [("--job-message" + token[len("--message"):])
+                         if token == "--message" or token.startswith("--message=")
+                         else token for token in tail]
+            elif rest[0] == "resume":
+                translated_tail = []
+                for token in tail:
+                    if token == "--message" or token.startswith("--message="):
+                        token = "--job-message" + token[len("--message"):]
+                    elif token == "--message-file" or token.startswith("--message-file="):
+                        token = "--job-message-file" + token[len("--message-file"):]
+                    elif token == "--request-id" or token.startswith("--request-id="):
+                        token = "--job-request-id" + token[len("--request-id"):]
+                    translated_tail.append(token)
+                tail = translated_tail
+            return [flag, rest[1], *tail], None
+        return argv, (f"error: unknown 'jobs' action {rest[0]!r} "
+                      "(use list/status/wait/extend/cancel/steer/resume)")
     if head == "version":
         return ["--version", *rest], None
     if head == "manifest":            # first positional is the manifest file
@@ -629,6 +822,132 @@ def rewrite_subcommand(argv: list) -> tuple:
             return argv, "error: 'telemetry' needs enable/disable/status/clear"
         flag = "--telemetry-" + rest[0]
         return [flag, *rest[1:]], None
+    if head == "usage":
+        if not rest or rest[0] not in ("status", "import", "refresh", "export", "example"):
+            return argv, "error: 'usage' needs status/import/refresh/export/example"
+        action = rest[0]
+        translated = []
+        index = 1
+        while index < len(rest):
+            token = rest[index]
+            if token == "--from":
+                translated.append("--usage-from")
+            elif token.startswith("--from="):
+                translated.append("--usage-from=" + token.split("=", 1)[1])
+            elif token == "--cache":
+                translated.append("--usage-cache")
+            elif token.startswith("--cache="):
+                translated.append("--usage-cache=" + token.split("=", 1)[1])
+            elif token == "--live-store":
+                translated.append("--usage-live-store")
+            elif token.startswith("--live-store="):
+                translated.append("--usage-live-store=" + token.split("=", 1)[1])
+            elif token == "--providers":
+                translated.append("--usage-providers")
+            elif token.startswith("--providers="):
+                translated.append("--usage-providers=" + token.split("=", 1)[1])
+            else:
+                translated.append(token)
+            index += 1
+        return ["--usage-action", action, *translated], None
+    if head == "result":
+        if not rest or rest[0] not in ("project", "validate", "consume"):
+            return argv, "error: 'result' needs project/validate/consume"
+        action = rest[0]
+        if action == "project":
+            translated = ["--result-action", "project"]
+            tail = rest[1:]
+        else:
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, f"error: 'result {action}' needs a JSON file"
+            translated = ["--result-action", action, "--result-from", rest[1]]
+            tail = rest[2:]
+        for token in tail:
+            if token == "--kind" or token.startswith("--kind="):
+                token = "--result-kind" + token[len("--kind"):]
+            elif token == "--from" or token.startswith("--from="):
+                token = "--result-from" + token[len("--from"):]
+            elif token == "--repo-root" or token.startswith("--repo-root="):
+                token = "--result-repo-root" + token[len("--repo-root"):]
+            elif token == "--adapter" or token.startswith("--adapter="):
+                token = "--result-adapter" + token[len("--adapter"):]
+            translated.append(token)
+        return translated, None
+    if head == "fleet":
+        if rest and rest[0] == "approval":
+            if len(rest) < 2 or rest[1] not in {
+                    "status", "approve", "list", "inspect", "revoke"}:
+                return argv, "error: 'fleet approval' needs status/approve/list/inspect/revoke"
+            subaction = rest[1]
+            if subaction in {"status", "list"}:
+                translated = ["--fleet-action", "approval-" + subaction, *rest[2:]]
+            elif subaction == "approve":
+                if (len(rest) < 4 or rest[2].startswith("-")
+                        or rest[3].startswith("-")):
+                    return argv, "error: 'fleet approval approve' needs a fleet file and lane"
+                translated = ["--fleet-action", "approval-approve",
+                              "--fleet-file", rest[2], "--fleet-lane", rest[3],
+                              *rest[4:]]
+            else:
+                if len(rest) < 3 or rest[2].startswith("-"):
+                    return argv, f"error: 'fleet approval {subaction}' needs an approval id"
+                translated = ["--fleet-action", "approval-" + subaction,
+                              "--fleet-approval-id", rest[2], *rest[3:]]
+            aliases = {
+                "expires-in": "fleet-expires-in",
+                "expect-generation": "fleet-expect-generation",
+            }
+            rewritten = []
+            for token in translated:
+                if token.startswith("--"):
+                    name, separator, value = token[2:].partition("=")
+                    name = aliases.get(name, name)
+                    token = "--" + name + (separator + value if separator else "")
+                rewritten.append(token)
+            return rewritten, None
+        if not rest or rest[0] not in ("propose", "validate", "inspect", "explain"):
+            return argv, "error: 'fleet' needs propose/validate/inspect/explain/approval"
+        action = rest[0]
+        if action == "propose":
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, "error: 'fleet propose' needs a lane name"
+            translated = ["--fleet-action", action, "--fleet-lane", rest[1], *rest[2:]]
+        elif action in ("validate", "inspect"):
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, f"error: 'fleet {action}' needs a fleet file"
+            translated = ["--fleet-action", action, "--fleet-file", rest[1], *rest[2:]]
+        else:
+            if (len(rest) < 3 or rest[1].startswith("-")
+                    or rest[2].startswith("-")):
+                return argv, "error: 'fleet explain' needs a fleet file and lane name"
+            translated = ["--fleet-action", action, "--fleet-file", rest[1],
+                          "--fleet-lane", rest[2], *rest[3:]]
+        aliases = {
+            "seats": "fleet-seats",
+            "provider": "fleet-provider-allowlist",
+            "model": "fleet-model-allowlist",
+            "capability": "fleet-required-capabilities",
+            "permission-ceiling": "fleet-permission-ceiling",
+            "data-boundary": "fleet-data-boundary",
+            "allow-contract-repair": "fleet-allow-contract-repair",
+            "allow-retry": "fleet-allow-retry",
+            "allow-fallback": "fleet-allow-fallback",
+            "allow-continuation": "fleet-allow-continuation",
+            "allow-subscription": "fleet-allow-subscription",
+            "allow-credit": "fleet-allow-credit",
+            "allow-payg": "fleet-allow-payg",
+            "max-provider-contacts": "fleet-max-provider-contacts",
+            "max-billable-attempts": "fleet-max-billable-attempts",
+            "max-parallel": "fleet-max-parallel",
+        }
+        rewritten = []
+        for token in translated:
+            if token.startswith("--"):
+                name, separator, value = token[2:].partition("=")
+                name = aliases.get(name, name)
+                token = "--" + name + (separator + value if separator else "")
+            rewritten.append(token)
+        return rewritten, None
     if head == "bug-report":
         return ["--bug-report", *rest], None
     return argv, None
@@ -696,6 +1015,109 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                                  action="store_true", help="Show local diagnostics status")
     telemetry_group.add_argument("--telemetry-clear", dest="telemetry_clear",
                                  action="store_true", help="Delete captured local diagnostics")
+    parser.add_argument("--usage-action",
+                        choices=["status", "import", "refresh", "export", "example"],
+                        help="Local usage evidence action; refresh alone may query an account")
+    parser.add_argument("--usage-from", dest="usage_from", metavar="FILE",
+                        help="With usage import: redacted summon.usage/v1 snapshot")
+    parser.add_argument("--usage-cache", dest="usage_cache", metavar="FILE",
+                        help="Private local usage cache override; with dispatch, valid only "
+                             "for provider-inert --dry-run explanation")
+    parser.add_argument("--usage-live-store", dest="usage_live_store", metavar="FILE",
+                        help="Authenticated private live-usage store override")
+    parser.add_argument("--usage-providers", dest="usage_providers", action="append",
+                        metavar="NAME[,NAME]",
+                        help="With usage refresh: explicit provider allowlist (repeatable)")
+    parser.add_argument("--allow-account-usage-read", dest="allow_account_usage_read",
+                        action="store_true",
+                        help="Authorize one bounded account-usage read; no login or dispatch")
+    parser.add_argument("--result-action",
+                        choices=("project", "validate", "consume"),
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--result-kind", dest="result_kind",
+                        choices=("dispatch", "job", "chat", "council",
+                                 "deliberate", "swarm"),
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--result-from", dest="result_from", metavar="FILE",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--result-repo-root", dest="result_repo_root", metavar="DIR",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--result-adapter", dest="result_adapter",
+                        choices=("reference",),
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--fleet-action",
+                        choices=["propose", "validate", "inspect", "explain",
+                                 "approval-status", "approval-approve",
+                                 "approval-list", "approval-inspect",
+                                 "approval-revoke"],
+                        help="Provider-inert fleet control-plane action")
+    parser.add_argument("--fleet-file", dest="fleet_file", metavar="FILE",
+                        help="Sealed summon.fleet/v1 draft for validate/inspect/explain")
+    parser.add_argument("--fleet-lane", dest="fleet_lane", metavar="LANE",
+                        help="Fleet lane to propose or explain")
+    parser.add_argument("--fleet-seats", dest="fleet_seats", metavar="A,B",
+                        help="Ordered candidate seats for fleet propose")
+    parser.add_argument("--fleet-provider-allowlist", dest="fleet_provider_allowlist",
+                        action="append", default=None, metavar="PROVIDER",
+                        help="Provider allowed by the proposed lane (repeatable)")
+    parser.add_argument("--fleet-model-allowlist", dest="fleet_model_allowlist",
+                        action="append", default=None, metavar="MODEL",
+                        help="Model allowed by the proposed lane (repeatable)")
+    parser.add_argument("--fleet-required-capabilities",
+                        dest="fleet_required_capabilities", action="append",
+                        default=None, metavar="CAPABILITY",
+                        help="Capability required by the proposed lane (repeatable)")
+    parser.add_argument("--fleet-permission-ceiling",
+                        dest="fleet_permission_ceiling",
+                        choices=["read-only", "safe-edit", "yolo"],
+                        default="read-only",
+                        help="Maximum permission tier in the proposed lane")
+    parser.add_argument("--fleet-data-boundary", dest="fleet_data_boundary",
+                        choices=["unspecified", "public", "local_sanitized",
+                                 "private_local"], default="local_sanitized",
+                        help="Declarative data boundary for the proposed lane")
+    parser.add_argument("--fleet-allow-contract-repair",
+                        dest="fleet_allow_contract_repair", action="store_true",
+                        help="Declare later contract repair as allowed; grants no authority")
+    parser.add_argument("--fleet-allow-retry", dest="fleet_allow_retry",
+                        action="store_true",
+                        help="Declare later retry as allowed; does not retry")
+    parser.add_argument("--fleet-allow-fallback", dest="fleet_allow_fallback",
+                        action="store_true",
+                        help="Declare later fallback as allowed; does not reroute")
+    parser.add_argument("--fleet-allow-continuation", dest="fleet_allow_continuation",
+                        action="store_true",
+                        help="Declare later continuation as allowed; does not resume")
+    parser.add_argument("--fleet-allow-subscription", dest="fleet_allow_subscription",
+                        action="store_true",
+                        help="Allow subscription-backed candidates in the draft only")
+    parser.add_argument("--fleet-allow-credit", dest="fleet_allow_credit",
+                        action="store_true",
+                        help="Allow credit-backed candidates in the draft only")
+    parser.add_argument("--fleet-allow-payg", dest="fleet_allow_payg",
+                        action="store_true",
+                        help="Allow PAYG candidates in the draft; grants no spend consent")
+    parser.add_argument("--fleet-max-provider-contacts",
+                        dest="fleet_max_provider_contacts", type=int, default=1,
+                        help="Declarative provider-contact ceiling for later approval")
+    parser.add_argument("--fleet-max-billable-attempts",
+                        dest="fleet_max_billable_attempts", type=int, default=1,
+                        help="Declarative billable-attempt ceiling for later approval")
+    parser.add_argument("--fleet-max-parallel", dest="fleet_max_parallel",
+                        type=int, default=1,
+                        help="Declarative concurrency ceiling for later approval")
+    parser.add_argument("--fleet-approval-id", dest="fleet_approval_id",
+                        metavar="SHA256",
+                        help="Private-store fleet approval identifier")
+    parser.add_argument("--fleet-data-proof", dest="fleet_data_proof",
+                        choices=["operator_attested", "public_prompt_verified"],
+                        help="Prompt-bound data proof for one approved live lane dispatch")
+    parser.add_argument("--fleet-expires-in", dest="fleet_expires_in",
+                        metavar="DURATION",
+                        help="Approval lifetime with explicit unit (60s..30d)")
+    parser.add_argument("--fleet-expect-generation", dest="fleet_expect_generation",
+                        type=int, metavar="N",
+                        help="Required compare-and-swap generation for approval mutation")
     parser.add_argument("--bug-report", dest="bug_report", action="store_true",
                         help="Create a sanitized local bug report from the latest event or --from")
     parser.add_argument("--from", dest="bug_report_from", metavar="FILE",
@@ -712,7 +1134,7 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Short sanitized description for the report")
     parser.add_argument("--transient-retries", dest="transient_retries", action="store_true",
                         help="Enable one conservative retry on transient network/5xx/"
-                             "timeout errors (also SUMMON_TRANSIENT_RETRIES=1). Never retries "
+                             "timeout/rate-limit (429) errors (also SUMMON_TRANSIENT_RETRIES=1). Never retries "
                              "ambiguous billable write failures")
     parser.add_argument("--doctor", action="store_true",
                         help="Check backend CLIs, agy wrapper deps, agents dir, and git; "
@@ -725,14 +1147,18 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "(KEY= removes); body untouched")
     parser.add_argument("--set", dest="sets", action="append", default=[],
                         metavar="KEY=VALUE",
-                        help="With --new-agent/--set-agent: run-agent, model, permission, args, profile")
+                        help="With --new-agent/--set-agent: run-agent, model, model-policy, "
+                             "permission, args, profile, lifecycle, successor")
     parser.add_argument("--json", action="store_true",
                         help="Emit machine-readable JSON where supported by the selected command")
     parser.add_argument("--probe", action="store_true",
                         help="With --doctor: run a minimal LIVE call per backend to verify "
                              "account/client eligibility (catches e.g. Gemini IneligibleTierError "
                              "that a --version check misses). Costs a tiny dispatch per backend")
-    parser.add_argument("--agent", help="Agent definition name")
+    parser.add_argument("--agent", help="Exact agent definition name")
+    parser.add_argument("--fleet-dispatch-lane-internal",
+                        dest="fleet_dispatch_lane", metavar="LANE",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--prompt", help="Task prompt")
     parser.add_argument("--prompt-file", dest="prompt_file",
                         help="Read the task prompt from FILE (UTF-8; BOM tolerated). "
@@ -741,15 +1167,24 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "argv, so backend argv limits (e.g. agy ~28k chars) apply")
     parser.add_argument("--cwd", help="Working directory (absolute path)")
     parser.add_argument("--agents-dir", help="Directory containing agent definitions")
+    parser.add_argument("--read-root", dest="read_root", action="append", default=None,
+                        metavar="DIR",
+                        help="Additional absolute directory allowed to a read-only Claude "
+                             "or Gemini turn (repeatable; also supports frontmatter "
+                             "read-roots; never broadens other backends)")
     parser.add_argument("--strict-agents-dir", dest="strict_agents_dir", action="store_true",
                         help="Fail closed when an agent is absent from the selected roster; "
                              "do not fall back to bundled or plugin definitions")
     parser.add_argument(
         "--timeout", type=parse_timeout, default=600000,
-        help="Timeout: bare ms, or with suffix — 600s, 10m (default: 600000 ms = 10m)"
+        help="Timeout: bare ms, or with suffix — 600s, 10m, 4h "
+             "(default: 600000 ms = 10m)"
     )
     parser.add_argument("--cli", help="Force specific CLI (claude, cursor-agent, codex, gemini)")
     parser.add_argument("--model", help="Override the agent's frontmatter model for this call")
+    parser.add_argument("--require-exact-model", dest="require_exact_model", action="store_true",
+                        help="Require authoritative terminal evidence for the exact requested model; "
+                             "mismatch or missing evidence blocks the result without retry/fallback")
     parser.add_argument("--profile", help="Select a named private backend profile for this call; "
                         "the name is resolved from ~/.agents/summon-profiles.json and never a path")
     parser.add_argument(
@@ -767,15 +1202,38 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--no-acp-fallback", dest="no_acp_fallback", action="store_true",
                         help="Disable the automatic ACP recovery attempt (and oversized-prompt "
                              "ACP routing) when the subprocess transport fails")
+    parser.add_argument("--allow-kimi-acp-fallback", dest="allow_kimi_acp_fallback",
+                        action="store_true",
+                        help="Explicitly allow a Kimi timeout to try one ACP recovery turn; "
+                             "off by default because ACP has no Summon filesystem/terminal "
+                             "adapter (env: SUMMON_KIMI_ACP_FALLBACK=1)")
     parser.add_argument("--worktree", nargs="?", const="", default=None,
                         help="Run in an isolated git worktree (optional name; auto-named if bare)")
+    parser.add_argument("--isolated-lane", dest="isolated_lane", action="store_true",
+                        help="Acknowledge that this broad-authority turn runs in a disposable "
+                             "copy or separate OS boundary; required for OpenCode yolo "
+                             "without --worktree")
+    parser.add_argument("--allow-tool-credentials", dest="allow_tool_credentials",
+                        action="store_true",
+                        help="Explicitly allow a yolo OpenCode child to receive its provider "
+                             "credential; use only with --isolated-lane/--worktree and a "
+                             "separate account, clone, container, or VM")
     parser.add_argument("--background", action="store_true",
                         help="Dispatch detached; return a job handle immediately")
+    parser.add_argument("--adaptive-timeout", dest="adaptive_timeout", action="store_true",
+                        help="Use activity-aware checkpoints for a background job; active "
+                             "work auto-extends up to --max-runtime")
+    parser.add_argument("--hard-timeout", dest="hard_timeout", action="store_true",
+                        help="Disable the default activity-aware background lease and keep "
+                             "--timeout as a fixed hard deadline")
+    parser.add_argument("--max-runtime", dest="max_runtime", type=parse_timeout,
+                        help="Hard ceiling for an adaptive background job (default: 24h)")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true",
                         help="Print the fully resolved dispatch (command, model, permission "
                              "flags, cwd) WITHOUT executing anything")
-    parser.add_argument("--out", help="Write the envelope atomically to FILE; if FILE already "
-                                      "holds a valid envelope, skip the run (swarm resume)")
+    parser.add_argument("--out", help="Dispatch: atomically write the envelope and reuse a valid "
+                                      "terminal result. Fleet: write the action-specific output "
+                                      "without replacing an existing file")
     parser.add_argument("--retries", type=int, default=0,
                         help="Re-dispatch up to N times on error/partial, exponential backoff")
     parser.add_argument("--retry-nonretryable", dest="retry_nonretryable", action="store_true",
@@ -837,7 +1295,24 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Record loose-file provenance for an input under --cwd "
                              "(repeatable): path, bytes, sha256, and page metadata where "
                              "available; re-check after dispatch and mark changed baselines "
-                             "suspect")
+                              "suspect")
+    parser.add_argument("--context-input-file", dest="context_input_file",
+                        help="Append one typed summon.context-input/v1 packet to this "
+                             "dispatch. Summon reads and compiles it locally before any "
+                             "provider contact; combine with --dry-run for a provider-inert "
+                             "preview")
+    parser.add_argument("--context-profile", dest="context_profile",
+                        choices=("safe", "off"),
+                        help="Context compilation profile (default safe). 'off' preserves the "
+                             "input packet's exact UTF-8 serialization; no context flags keep "
+                             "the legacy dispatch prompt byte-identical")
+    parser.add_argument("--context-reference", dest="context_references",
+                        action="append", default=[], metavar="SHA256_REF=FILE",
+                        help="Hash-read one externalized context target from --cwd "
+                             "(repeatable). The reference must be sha256:<digest>; paths stay "
+                             "out of public receipts")
+    parser.add_argument("--context-compilation-json", dest="context_compilation_json",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--no-contract-repair", dest="no_contract_repair", action="store_true",
                         help="Disable the automatic ONE-shot corrective resume that fixes a "
                              "malformed report contract on a suspect success (status=success but "
@@ -866,6 +1341,12 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="With --council: read the question from a file")
     parser.add_argument("--deliberate", action="store_true",
                         help="Run a bounded headless deliberation (separate from council)")
+    parser.add_argument("--context-file", dest="context_file",
+                        help="With --deliberate: durable context packet JSON")
+    parser.add_argument("--context-observation-file", dest="context_observation_file",
+                        help="With revision-manifest context: exact manifest file to hash-read")
+    parser.add_argument("--accept-stale-file", dest="accept_stale_file",
+                        help="With --deliberate: one-run stale-context authority JSON")
     parser.add_argument("--deliberate-resume", dest="deliberate_resume", metavar="RUN_ID",
                         help="Resume a deliberation run by id")
     parser.add_argument("--deliberate-recover", dest="deliberate_recover", metavar="RUN_ID",
@@ -1024,4 +1505,20 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Print one background job's record + result (read-only)")
     parser.add_argument("--jobs-wait", dest="jobs_wait", metavar="JOB_ID",
                         help="Wait for a background job's result (read-only poll; --timeout)")
+    parser.add_argument("--jobs-extend", dest="jobs_extend", metavar="JOB_ID",
+                        help="Queue a bounded extension for an adaptive background job")
+    parser.add_argument("--jobs-cancel", dest="jobs_cancel", metavar="JOB_ID",
+                        help="Queue cancellation for a background job")
+    parser.add_argument("--jobs-steer", dest="jobs_steer", metavar="JOB_ID",
+                        help="Queue a follow-up steering prompt; subprocess turns resume later")
+    parser.add_argument("--jobs-resume", dest="jobs_resume", metavar="JOB_ID",
+                        help="Create one governed background continuation successor")
+    parser.add_argument("--job-duration", dest="job_duration", type=parse_timeout,
+                        help="With jobs extend: duration to add")
+    parser.add_argument("--job-message", dest="job_message",
+                        help="With jobs steer: bounded follow-up prompt")
+    parser.add_argument("--job-message-file", dest="job_message_file",
+                        help="With jobs resume: UTF-8 follow-up prompt file")
+    parser.add_argument("--job-request-id", dest="job_request_id",
+                        help="With jobs resume: stable 32-hex idempotency key")
     return parser

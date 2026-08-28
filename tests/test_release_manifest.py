@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -21,6 +22,54 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ReleaseManifestTests(unittest.TestCase):
+    def test_managed_skill_fingerprint_matches_installer_payload(self):
+        install_spec = importlib.util.spec_from_file_location(
+            "summon_install_for_manifest_test", ROOT / "install.py"
+        )
+        install = importlib.util.module_from_spec(install_spec)
+        assert install_spec and install_spec.loader
+        install_spec.loader.exec_module(install)
+        self.assertEqual(MODULE._MANAGED_SKILL_PAYLOAD, frozenset(install.SKILL_PAYLOAD))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill = Path(temp_dir) / "summon"
+            (skill / "scripts").mkdir(parents=True)
+            (skill / "tests").mkdir()
+            (skill / "SKILL.md").write_text("skill\n", encoding="utf-8")
+            (skill / "scripts" / "runner.py").write_text("pass\n", encoding="utf-8")
+            (skill / "tests" / "release_only.py").write_text("ignored\n", encoding="utf-8")
+            first_hash, first_files, first_error = MODULE._tree_fingerprint(
+                skill, include_top_level=MODULE._MANAGED_SKILL_PAYLOAD
+            )
+            self.assertIsNone(first_error)
+            self.assertEqual(first_files, {"SKILL.md", "scripts/runner.py"})
+
+            (skill / "tests" / "release_only.py").write_text("changed\n", encoding="utf-8")
+            second_hash, second_files, second_error = MODULE._tree_fingerprint(
+                skill, include_top_level=MODULE._MANAGED_SKILL_PAYLOAD
+            )
+            self.assertIsNone(second_error)
+            self.assertEqual(first_hash, second_hash)
+            self.assertEqual(first_files, second_files)
+
+            (skill / "scripts" / "runner.py").write_text("changed\n", encoding="utf-8")
+            third_hash, _, third_error = MODULE._tree_fingerprint(
+                skill, include_top_level=MODULE._MANAGED_SKILL_PAYLOAD
+            )
+            self.assertIsNone(third_error)
+            self.assertNotEqual(first_hash, third_hash)
+
+    def test_phase0_phase1_release_command_matches_ci_partition(self):
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8")
+        start = ci.index("Unit tests (Phase 0 and Phase 1 provider-inert contracts)")
+        end = ci.index("Unit tests (ACP transport", start)
+        pattern = r"skills/summon/(?:scripts|tests)/test_[A-Za-z0-9_]+\.py"
+        ci_files = set(re.findall(pattern, ci[start:end]))
+        release_files = set(re.findall(
+            pattern, MODULE.REQUIRED_COMMANDS["phase0_phase1"]))
+        self.assertEqual(release_files, ci_files)
+
     def test_source_hash_is_deterministic_and_excludes_python_cache(self):
         first = MODULE.source_tree_sha256(ROOT)
         second = MODULE.source_tree_sha256(ROOT)
@@ -59,6 +108,11 @@ class ReleaseManifestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MODULE._pairs(["deliberation=0/0"], "test",
                            allowed=MODULE.REQUIRED_TESTS)
+        self.assertEqual(
+            MODULE._pairs(["deliberation=835/836"], "test",
+                          allowed=MODULE.REQUIRED_TESTS),
+            {"deliberation": "835/836"},
+        )
         with self.assertRaises(ValueError):
             MODULE._pairs(["live_provider=maybe"], "gate",
                            allowed=MODULE.REQUIRED_GATES)

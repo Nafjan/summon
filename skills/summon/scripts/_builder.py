@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import getpass
+import ntpath
 import re
 import os
 import shutil
@@ -18,10 +19,14 @@ import tempfile
 import time
 import threading
 import hashlib
+import math
+import secrets
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from _loader import DEFAULT_PERMISSION
 from _spawn import run_flags
+from _backend_policy import effective_permission, permission_enforcement
 
 # cursor-agent exposes no machine-readable model list and no floating alias like
 # claude's `opus`/`sonnet`, so its default is pinned here. This is the SINGLE
@@ -47,12 +52,22 @@ class AgentInvocation:
     # Where a model pin came from. This is diagnostic provenance only; the
     # canonical selector remains the authority for launch behavior.
     model_source: str | None = None
+    # A provenance-required seat must prove that the provider served the exact
+    # requested model.  This is separate from ``model_source``: most pinned
+    # implementation seats are best-effort, while named review seats can opt
+    # into a fail-closed identity contract.
+    model_exact_required: bool = False
+    model_exact_source: str | None = None
     effort: str | None = None          # reasoning effort: low..max (Kimi uses profile config)
     resume_id: str | None = None       # backend session/thread/chat id to resume
     resume_profile: str | None = None  # agy only: profile dir of the session to resume
     extra_args: tuple = ()             # arbitrary backend flags (agent `args:` frontmatter)
     base_url: str | None = None        # openai-compat only: resolved API base url
     api_key_env: str | None = None     # openai-compat only: env var holding the API key
+    # One-way identity recorded before dispatch for endpoint credentials that
+    # may be resolved from a bounded local helper. Never serialized or sent to
+    # the provider; the API backend compares it before contacting the network.
+    api_key_fingerprint: str | None = None
     allow_payg: bool = False           # byteplus-coding: per-run consent for PAYG fallback
     # agy only: the account digest the REQUEST IDENTITY recorded, checked against the bytes
     # actually copied into the isolated profile so a swap in between cannot produce a result
@@ -76,9 +91,29 @@ class AgentInvocation:
     # Only router/plugin fields are accepted; arbitrary OpenCode config is never
     # copied from an agent definition into the child process.
     openrouter_options: dict | None = None
+    # Broad-authority OpenCode turns are deliberately explicit.  ``worktree`` is
+    # the dispatcher-created mutation boundary; ``isolated_lane`` is the operator's
+    # acknowledgement that a disposable clone/OS boundary is being used.  Neither
+    # is a claim that a Git worktree is a security sandbox.
+    worktree: str | None = None
+    isolated_lane: bool = False
+    allow_tool_credentials: bool = False
+    # Explicit additional directories the read-only seat may inspect.  These are
+    # normalized absolute paths, never arbitrary backend flags.
+    read_roots: tuple = ()
     # Ordinary dispatches use the report contract. Receipt-bound deliberation
     # turns use a typed ballot contract and must not receive the report nudge.
     output_contract: str = "report"
+    # Stable identity for one physical backend launch. Retries and transport
+    # fallbacks receive a fresh value; direct callers may leave it unset and
+    # the executor will mint one before any provider contact. This is an
+    # opaque UUID-shaped value, never a prompt or provider identifier.
+    attempt_id: str | None = None
+    # Physical-attempt lineage.  Corrective/report retries are separate paid
+    # turns even when they reuse the same provider session.
+    attempt_kind: str = "initial"
+    attempt_ordinal: int = 1
+    parent_attempt_id: str | None = None
 
 
 # Short report-contract nudge appended to RESUME prompts. On resume the session
@@ -102,6 +137,13 @@ Add `LEFT_BEHIND: none` to the Final report if nothing remains. Otherwise, use
 `LEFT_BEHIND:` to name each remaining resource, its location or identifier, its current
 state, why it remains, and the safe stop/removal action. Never include secret values,
 credentials, or tokens in that field.
+
+Use tools that exist in the child environment. On Windows, do not assume POSIX
+`grep`, `sed`, `awk`, or `find` are installed: prefer `rg` when available,
+PowerShell `Select-String`/`Get-ChildItem`, or Python's standard library. If a
+preferred command is missing, continue with one of those fallbacks and mention the
+substitution in the report; do not install tools or retry a completed task solely
+because a convenience command was unavailable.
 """
 
 
@@ -157,6 +199,12 @@ def build_command(cli: str, prompt: str) -> tuple[str, list]:
         # _build_opencode_args so this helper stays a pure command template.
         return "opencode", ["run", "--format", "json", prompt]
 
+    if cli == "zcode":
+        # ZCode's prompt transport is an attached file, constructed by
+        # _build_zcode_args.  Keeping this placeholder minimal prevents a
+        # caller from accidentally routing the full task through argv.
+        return "zcode", []
+
     raise ValueError(f"Unknown CLI: {cli}")
 
 
@@ -206,13 +254,195 @@ _PERMISSION_MAPPING = {
     "opencode": {
         # OpenCode's permission boundary is supplied through the documented
         # OPENCODE_PERMISSION JSON environment variable (see
-        # _build_opencode_args).  `--auto` is reserved for an explicit yolo
-        # dispatch; read-only and safe-edit never rely on auto-approval.
-        "read-only": [],
-        "safe-edit": [],
+        # _build_opencode_args).  `--auto` is safe here because the policy is
+        # deny-by-default and explicit denies remain enforced by OpenCode; it
+        # prevents an allowed read/list/edit tool from waiting for a human that
+        # cannot answer a headless one-shot turn.  It does not grant bash,
+        # external-directory, or any other tool omitted from the policy.
+        "read-only": ["--auto"],
+        "safe-edit": ["--auto"],
         "yolo": ["--auto"],
     },
+    "zcode": {
+        # ZCode calls this a "mode", not a sandbox.  Only yolo is a reliable
+        # headless write mode.  The builder rejects safe-edit and requires an
+        # explicit advisory opt-in for plan/read-only (see below).
+        "read-only": ["--mode", "plan"],
+        "safe-edit": [],
+        "yolo": ["--mode", "yolo"],
+    },
 }
+
+def unenforceable_permission_authorized(cli: str, permission: str, *,
+                                        forced: bool = False) -> bool:
+    """Whether the caller explicitly accepted a known advisory-only tier."""
+    if forced or cli not in {"agy", "zcode"}:
+        return False
+    if cli == "zcode":
+        return (permission == "read-only"
+                and os.environ.get(_UNENFORCED_RO_OPT_IN) == "1")
+    if permission == "safe-edit":
+        # AGY safe-edit is documented as full-user authority. Declaring it is
+        # the acknowledgement; it must never be produced by a clamp/gate.
+        return True
+    return (permission == "read-only"
+            and os.environ.get(_UNENFORCED_RO_OPT_IN) == "1")
+
+# Only backends whose read-only mode has a native additional-directory control are
+# allowed to receive explicit roots.  Codex's --add-dir is writable, OpenCode's
+# external-directory policy is not a per-root read allowlist, and agy/Kimi do not
+# enforce a read-only boundary; silently ignoring a requested root would be worse
+# than refusing the dispatch.
+_READ_ROOT_FLAGS = {
+    "claude": "--add-dir",
+    "gemini": "--include-directories",
+}
+_READ_ROOT_BACKENDS = tuple(_READ_ROOT_FLAGS)
+_MAX_READ_ROOTS = 16
+_WINDOWS_REPARSE_POINT = 0x400
+
+
+def _read_root_is_reparse(path: Path) -> bool:
+    """Reject symlink/junction roots so an allowlist cannot expand unexpectedly."""
+    try:
+        if path.is_symlink():
+            return True
+        attrs = getattr(path.lstat(), "st_file_attributes", 0)
+        return bool(attrs & _WINDOWS_REPARSE_POINT)
+    except FileNotFoundError:
+        # A missing path is handled by the strict resolve below so the caller
+        # gets the useful "does not exist" diagnostic, not a false reparse-point
+        # accusation.
+        return False
+    except OSError:
+        return True
+
+
+def normalize_read_roots(values) -> tuple[str, ...]:
+    """Validate and canonicalize explicit additional read-only directories."""
+    if values is None:
+        return ()
+    if isinstance(values, (str, os.PathLike)):
+        values = (values,)
+    values = tuple(values)
+    if len(values) > _MAX_READ_ROOTS:
+        raise ValueError(f"read-roots accepts at most {_MAX_READ_ROOTS} paths")
+    out = []
+    seen = set()
+    for raw in values:
+        text = os.fspath(raw) if isinstance(raw, os.PathLike) else raw
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("read-root paths must be non-empty strings")
+        text = text.strip()
+        if not os.path.isabs(text):
+            raise ValueError(f"read-root must be an absolute path: {text!r}")
+        path = Path(text)
+        # Inspect the lexical path BEFORE resolve(strict=True).  Resolving first
+        # would turn a symlink/junction into its target and accidentally make the
+        # escape look like an ordinary directory.
+        if _read_root_is_reparse(path):
+            raise ValueError(f"read-root may not be a symlink or junction: {text!r}")
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"read-root does not exist or is unreadable: {text!r}") from exc
+        if not resolved.is_dir():
+            raise ValueError(
+                f"read-root must be an existing directory (use its parent for a file): {text!r}")
+        if _read_root_is_reparse(resolved):
+            raise ValueError(f"read-root may not be a symlink or junction: {text!r}")
+        key = os.path.normcase(os.path.normpath(str(resolved)))
+        if key not in seen:
+            seen.add(key)
+            out.append(str(resolved))
+    return tuple(out)
+
+
+def _opencode_restricted_cwd_policy(cli: str, permission: str, cwd: str | None,
+                                    roots: tuple) -> dict | None:
+    """Return a pre-dispatch refusal for an OpenCode external Windows cwd.
+
+    Summon's restricted OpenCode policies deny ``external_directory``.  OpenCode
+    applies that rule to a working directory on a non-local Windows volume, so
+    describing the cwd as enforceable in a dry-run would be a runtime mismatch.
+    Keep the deny: ask the operator to stage a *sanitized* packet under the
+    local temporary volume and freeze its evidence again instead of silently
+    broadening authority.
+    """
+    if cli != "opencode" or permission == "yolo" or os.name != "nt" or not cwd:
+        return None
+    cwd_drive = ntpath.splitdrive(ntpath.abspath(cwd))[0].casefold()
+    local_temp = ntpath.abspath(tempfile.gettempdir())
+    local_drive = ntpath.splitdrive(local_temp)[0].casefold()
+    if not cwd_drive or not local_drive or cwd_drive == local_drive:
+        return None
+    allowed_root = ntpath.join(local_temp, "opencode")
+    return {
+        "error_kind": "opencode_external_cwd_denied",
+        "refusal": (
+            "OpenCode's restricted permission policy denies external_directory for this "
+            "Windows working directory; stage a sanitized packet on the local OpenCode "
+            "volume, re-freeze its hashes, then re-run dry-run"),
+        "allowed_root": allowed_root,
+        "requires_packet_refreeze": True,
+        "reroute": {
+            "action": "copy_sanitized_packet_and_refreeze",
+            "allowed_root": allowed_root,
+            "requires_packet_refreeze": True,
+            "preflight": "dry-run",
+        },
+    }
+
+
+def read_allowlist(cli: str, permission: str, cwd: str,
+                   read_roots=()) -> dict:
+    """Describe the effective readable roots and whether the backend can enforce them."""
+    roots = tuple(read_roots or ())
+    base = os.path.abspath(cwd) if cwd else None
+    effective = []
+    if base:
+        effective.append(base)
+    for root in roots:
+        if root not in effective:
+            effective.append(root)
+    mechanism = _READ_ROOT_FLAGS.get(cli)
+    opencode_cwd_policy = _opencode_restricted_cwd_policy(cli, permission, cwd, roots)
+    supported = (not roots or (mechanism is not None and permission == "read-only")) \
+        and opencode_cwd_policy is None
+    reason = None
+    if roots and mechanism is None:
+        reason = (f"{cli} cannot enforce explicit read-only roots; use Claude or Gemini "
+                  "read-only mode for this request")
+    elif roots and permission != "read-only":
+        reason = "read-roots is only valid with permission: read-only"
+    elif opencode_cwd_policy is not None:
+        reason = opencode_cwd_policy["refusal"]
+    policy = {
+        "requested_paths": list(roots),
+        "effective_paths": effective,
+        "backend": cli,
+        "permission": permission,
+        "mechanism": mechanism,
+        "enforced": bool(supported),
+        "would_refuse": not supported,
+        **({"refusal": reason} if reason else {}),
+    }
+    if opencode_cwd_policy is not None:
+        policy.update(opencode_cwd_policy)
+    elif not supported:
+        # This is deliberately a backend/agent re-selection, not a model
+        # fallback. A Codex pin cannot be run by Claude or Gemini, and saying
+        # otherwise would conceal a fidelity change. Callers select a compatible
+        # read-only review seat, then dry-run it with the same roots.
+        policy["recommended_backends"] = list(_READ_ROOT_BACKENDS)
+        policy["reroute"] = {
+            "action": "select_read_only_agent",
+            "candidate_backends": list(_READ_ROOT_BACKENDS),
+            "required_permission": "read-only",
+            "requires_agent_reselection": cli not in _READ_ROOT_BACKENDS,
+            "preflight": "dry-run",
+        }
+    return policy
 
 
 # Authority ORDER, lowest first. Used only to clamp downward; nothing raises a tier.
@@ -242,28 +472,6 @@ def permission_flags(cli: str, permission: str) -> list:
         return list(_PERMISSION_MAPPING[cli][permission])
     except KeyError as e:
         raise ValueError(f"No permission mapping for cli={cli!r}, permission={permission!r}") from e
-
-
-def effective_permission(cli: str, permission: str) -> str:
-    """The tier the backend ACTUALLY enforces, which is not always the declared one.
-
-    A security census built from declared `permission:` strings UNDERSTATES real capability
-    on agy, where `safe-edit` maps to the same full bypass as `yolo` -- and a census that
-    undercounts capability is worse than no census, because it is trusted (field report,
-    2026-07-28). Every consumer that summarises capability across a roster must ask this,
-    not the frontmatter.
-    """
-    if cli == "agy":
-        if permission == "safe-edit":
-            return "yolo"          # identical flags; the label is the only difference
-        if permission == "read-only":
-            return "unenforceable"  # refused at dispatch unless explicitly waived
-    if cli == "kimi":
-        if permission == "read-only":
-            return "unenforceable"
-        if permission == "safe-edit":
-            return "yolo"
-    return permission
 
 
 def roster_permission_lint(agents: list) -> list:
@@ -344,12 +552,15 @@ _AGY_MIN_ADVISED_TIMEOUT_MS = 420_000
 # `--gate-with` already drop extra_args wholesale for exactly this reason; a DIRECTLY
 # declared tier did not, which left the permission mapping advisory against the roster.
 _BOUNDARY_FLAGS = {
-    "claude": ("--permission-mode", "--dangerously-skip-permissions"),
+    "claude": ("--permission-mode", "--dangerously-skip-permissions", "--add-dir"),
     "codex": ("-s", "--sandbox", "--dangerously-bypass-approvals-and-sandbox",
               "--full-auto", "--yolo"),
     "cursor-agent": ("--mode", "--trust", "-f", "--force"),
-    "gemini": ("--approval-mode", "-y", "--yolo"),
-    "agy": ("--add-dir", "--mode", "--sandbox", "--dangerously-skip-permissions", "--yolo"),
+    "gemini": ("--approval-mode", "-y", "--yolo", "--include-directories"),
+    "agy": ("--add-dir", "--mode", "--sandbox", "--dangerously-skip-permissions", "--yolo",
+            "--print-timeout", "--agent", "--project", "--log-file", "--output-file",
+            "--conversation", "--continue-id", "--resume", "--continue", "--new-project",
+            "--output-format", "--output", "--of"),
     "kimi": ("--auto", "--yolo", "--plan", "--session", "-S", "--continue", "-c",
              "--agent", "--agent-file", "--add-dir", "--skills-dir"),
     # OpenCode can change model, session, working directory, agent, output
@@ -357,12 +568,22 @@ _BOUNDARY_FLAGS = {
     # agent-defined passthrough so the frozen Summon identity remains truthful.
     "opencode": ("--auto", "--model", "-m", "--session", "-s", "--continue",
                  "--agent", "--dir", "--format", "--variant"),
+    "zcode": ("--cwd", "--json", "--no-color", "--mode", "--permission-mode",
+              "--model", "-m",
+              "--allowed-tools", "--disallowed-tools", "--resume", "--continue",
+              "--attach", "--prompt", "--settings", "--target", "--target-replace"),
 }
 # Flags that consume the NEXT token as their value; dropping the flag must drop the value
 # too, or the bare value becomes a stray positional argument.
 _BOUNDARY_TAKES_VALUE = {"--permission-mode", "-s", "--sandbox", "--mode", "--approval-mode",
-                         "--add-dir", "--session", "-S", "--agent", "--agent-file", "--skills-dir",
-                         "--model", "-m", "--dir", "--format", "--variant"}
+                         "--add-dir", "--include-directories", "--session", "-S", "--agent", "--agent-file", "--skills-dir",
+                         "--model", "-m", "--dir", "--format", "--variant",
+                         "--print-timeout", "--agent", "--project", "--log-file",
+                         "--output-file", "--conversation", "--continue-id",
+                         "--output-format", "--output", "--of", "--cwd",
+                         "--permission-mode", "--allowed-tools", "--disallowed-tools",
+                         "--resume", "--attach", "--prompt", "--settings", "--target",
+                         "--target-replace"}
 # codex configures approval policy through `-c key=value`, so the KEY decides, not the flag.
 _CODEX_CONFIG_KEYS = ("approval_policy", "sandbox_mode", "sandbox_permissions")
 
@@ -583,7 +804,24 @@ def readonly_unenforceable_error(cli: str, permission: str, *,
                     "a trusted, isolated worktree; summon refuses the misleading safe-edit "
                     "label.")
         return None
-    if cli != "agy" or permission != "read-only":
+    if cli == "zcode":
+        if permission == "safe-edit":
+            return (
+                "ZCode's headless build/edit modes do not provide a reliable workspace-write "
+                "boundary. Summon refuses the misleading safe-edit label; use a deliberately "
+                "declared yolo turn only in a disposable worktree or isolated lane.")
+        if permission == "read-only":
+            if forced:
+                return (
+                    "ZCode plan mode is not a proven read-only filesystem boundary, and this "
+                    "dispatch was forced to read-only by Summon. Use an enforcing review backend.")
+            if not unenforceable_permission_authorized(cli, permission, forced=forced):
+                return (
+                    "ZCode plan mode is advisory rather than a proven read-only filesystem "
+                    "boundary. Use an enforcing review backend, or set "
+                    + _UNENFORCED_RO_OPT_IN + "=1 to dispatch a clearly labeled advisory plan turn.")
+        return None
+    if cli != "agy" or permission not in {"read-only", "safe-edit"}:
         return None
     if forced:
         # A tier SUMMON imposed -- a --gate-with adjudicator, a --max-permission clamp, a
@@ -596,12 +834,13 @@ def readonly_unenforceable_error(cli: str, permission: str, *,
         # for one dispatch silently authorized advisory-only gates and clamped members
         # underneath it. A gate that can be waived by the environment it runs in is not a
         # gate.
-        return ("agy cannot enforce read-only, and this dispatch was FORCED to read-only by "
+        return (f"agy cannot enforce {permission}, and this dispatch was FORCED to "
+                f"{permission} by "
                 "summon (a gate, a --max-permission clamp, or a contract-repair resume). "
                 + _UNENFORCED_RO_OPT_IN + " does not apply here: it waives a tier you chose, "
                 "not one summon imposed to reduce privilege. Use a backend that enforces "
-                "read-only for this role.")
-    if os.environ.get(_UNENFORCED_RO_OPT_IN) == "1":
+                f"{permission} for this role.")
+    if unenforceable_permission_authorized(cli, permission, forced=forced):
         return None
     return ("agy cannot enforce the read-only tier, so summon refuses this dispatch rather "
             "than imply a boundary that does not exist. Measured: a declared read-only agy "
@@ -631,6 +870,16 @@ def agy_readonly_workspace_warning(cli: str, permission: str) -> str | None:
             "any path your user account can, whatever this tier says. You set "
             + _UNENFORCED_RO_OPT_IN + "=1, so summon dispatched anyway. Treat the result as "
             "having had full filesystem access.")
+
+
+def zcode_readonly_warning(cli: str, permission: str) -> str | None:
+    """Keep the explicit ZCode plan-mode opt-in visible in every envelope."""
+    if (cli == "zcode" and permission == "read-only"
+            and os.environ.get(_UNENFORCED_RO_OPT_IN) == "1"):
+        return (
+            "ZCode plan mode is ADVISORY: Summon adds a mode and write/shell deny list, "
+            "but does not claim a proven filesystem sandbox. Inspect workspace evidence.")
+    return None
 
 
 def agy_timeout_warning(cli: str, timeout_ms: int | None) -> str | None:
@@ -800,6 +1049,7 @@ def advisory_warnings(cli: str, permission: str, timeout_ms: int | None,
                         cursor_premium_agreement_warning(cli, notice_model),
                         agy_permission_warning(cli, permission),
                         agy_readonly_workspace_warning(cli, permission),
+                        zcode_readonly_warning(cli, permission),
                         agy_timeout_warning(cli, timeout_ms)) if w]
 
 
@@ -824,6 +1074,7 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     perm = permission_flags(inv.cli, inv.permission)
     model_flag = ["--model", inv.model] if inv.model else []
     effort_flag = ["--effort", inv.effort] if inv.effort else []
+    root_flags = [item for root in inv.read_roots for item in ("--add-dir", root)]
     # Claude Code loads user/project settings by default. Those settings may
     # contain an unrelated ANTHROPIC_BASE_URL / ANTHROPIC_MODEL override (for
     # example a BytePlus coding profile), which silently routes a default
@@ -833,6 +1084,7 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     setting_sources = [] if inv.profile_env is not None else ["--setting-sources", ""]
     common = (perm + model_flag + effort_flag
               + strip_boundary_flags(inv.cli, inv.extra_args)
+              + root_flags
               + setting_sources)
 
     if inv.resume_id:
@@ -848,6 +1100,12 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
                 inv.profile_env)
 
     system_prompt = f"cwd: {inv.cwd}\n\n{inv.system_context}"
+    if inv.read_roots:
+        system_prompt += (
+            "\n\nExplicit additional read-only directories authorized for this turn:\n"
+            + "\n".join(f"- {root}" for root in inv.read_roots)
+            + "\nDo not access other directories."
+        )
     if inv.output_contract != "deliberation":
         system_prompt += (
             "\n\nReminder before responding: your final message MUST end with the exact "
@@ -871,14 +1129,18 @@ def _build_gemini_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         raise ValueError("resume is not supported for the gemini backend")
     perm = permission_flags(inv.cli, inv.permission)
     model_flag = ["--model", inv.model] if inv.model else []
+    root_flags = [item for root in inv.read_roots
+                  for item in ("--include-directories", root)]
     if inv.agent_file:
         command, base_args = build_command(inv.cli, inv.prompt)
         return (command,
                 perm + model_flag + strip_boundary_flags(inv.cli, inv.extra_args)
+                + root_flags
                 + base_args,
                 {"GEMINI_SYSTEM_MD": inv.agent_file})
     return _concatenated_args(
-        inv, perm + model_flag + strip_boundary_flags(inv.cli, inv.extra_args), env=None)
+        inv, perm + model_flag + strip_boundary_flags(inv.cli, inv.extra_args)
+        + root_flags, env=None)
 
 
 def _build_kimi_args(inv: AgentInvocation, *, resource_register=None
@@ -1032,6 +1294,11 @@ def credit_spend_allowed() -> bool:
     read and honoured so existing scripts keep working; it simply has nothing to
     authorize right now. Keep the machinery ready for the next credit-only model.
     """
+    if os.environ.get("SUMMON_FRESH_CONSENT_ONLY") == "1":
+        # Governed continuation claims require fresh per-attempt consent. Do not
+        # let a durable preference or Fable compatibility switch silently grant
+        # a new paid turn after the original job completed.
+        return os.environ.get("SUMMON_ALLOW_CREDIT") == "1"
     return (os.environ.get("SUMMON_ALLOW_FABLE") == "1"
             or os.environ.get("SUMMON_ALLOW_CREDIT") == "1")
 
@@ -1270,15 +1537,21 @@ def _build_cursor_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
 def _opencode_permission_env(permission: str) -> str:
     """Return a strict OpenCode permission policy for a Summon tier.
 
-    OpenCode defaults most tools to ``allow``.  Passing ``--auto`` alone would
-    therefore make a supposedly bounded run full-authority, and merely omitting
-    it would leave a user/project config in charge.  The CLI documents
-    ``OPENCODE_PERMISSION`` as an inline JSON override, so use it to make the
-    three Summon tiers explicit for every invocation.
+    OpenCode defaults most tools to ``allow``.  The CLI documents ``--auto`` as
+    approving requests that are not explicitly denied, so the builder combines
+    that flag with an inline, deny-by-default JSON policy.  This lets allowed
+    read/list/edit tools run headlessly while preserving a hard deny for every
+    omitted capability and for external directories.
     """
     if permission == "yolo":
         return json.dumps({"*": "allow"}, separators=(",", ":"))
+    # OpenCode evaluates matching object rules in order, with the last match
+    # winning.  Put the catch-all deny first and the explicitly allowed tools
+    # after it; placing ``*`` last would silently deny the tools we intended to
+    # make usable in a headless read-only turn.
     allowed = {
+        "*": "deny",
+        "external_directory": "deny",
         "read": "allow",
         "glob": "allow",
         "grep": "allow",
@@ -1287,16 +1560,48 @@ def _opencode_permission_env(permission: str) -> str:
     }
     if permission == "safe-edit":
         allowed["edit"] = "allow"
-    # A deny-by-default policy is the important part.  Explicitly deny tools
-    # that can escape the requested read/edit boundary even if a future
-    # OpenCode release changes a default from ask to allow.
-    allowed["*"] = "deny"
-    allowed["external_directory"] = "deny"
     return json.dumps(allowed, separators=(",", ":"))
 
 
-def opencode_env_override(model: str | None) -> dict[str, str]:
-    """Return private credential material OpenCode needs for an OpenRouter model.
+def opencode_yolo_isolation_error(inv: AgentInvocation) -> str | None:
+    """Explain why a broad OpenCode turn cannot run on an unqualified checkout."""
+    if inv.cli == "opencode" and inv.permission == "yolo":
+        if inv.worktree is None and not inv.isolated_lane:
+            return (
+                "OpenCode yolo requires --worktree or --isolated-lane; broad authority is "
+                "available for disposable copies, not active shared checkouts")
+    return None
+
+
+def _opencode_credential_env_keys() -> tuple[str, ...]:
+    """Return inherited credential-looking variables that must not reach yolo tools.
+
+    This is intentionally a bounded deny list of provider/auth namespaces rather than a
+    blanket ``*_TOKEN`` scrub: PATH, locale, and ordinary application settings are needed
+    to launch OpenCode.  The child-only provider key is added back only after the caller
+    explicitly acknowledges an isolated lane and credential-bearing tools.
+    """
+    keys: list[str] = []
+    prefixes = (
+        "OPENAI_", "ANTHROPIC_", "OPENROUTER_", "GEMINI_", "GOOGLE_", "CURSOR_",
+        "KIMI_", "DEEPSEEK_", "NOUS_", "BYTEPLUS_", "AWS_", "AZURE_", "GITHUB_",
+        "ZAI_", "ZHIPU_", "GLM_",
+    )
+    # OpenCode's inline config can contain provider keys even when no conventional
+    # *_API_KEY variable is present. Treat it as credential-bearing configuration in
+    # unrestricted turns; a yolo child receives only a bounded overlay built below.
+    exact = {"GH_TOKEN", "GITLAB_TOKEN", "HUGGINGFACE_TOKEN", "HF_TOKEN",
+             "OPENCODE_CONFIG_CONTENT"}
+    for key in os.environ:
+        if key in exact or key.startswith(prefixes):
+            keys.append(key)
+    return tuple(sorted(set(keys)))
+
+
+def opencode_env_override(model: str | None, *, permission: str = "safe-edit",
+                          isolated_lane: bool = False,
+                          allow_tool_credentials: bool = False) -> dict[str, str | None]:
+    """Return child-only credential/config material for private model routes.
 
     OpenCode normally stores provider credentials in its own auth store.  Summon
     also supports the local ``summonOpenRouter`` Windows credential convention
@@ -1304,16 +1609,96 @@ def opencode_env_override(model: str | None) -> dict[str, str]:
     child process, and only for an ``openrouter/`` model; it never enters an
     agent definition, argv, receipt, telemetry, or debug file.
     """
-    if not isinstance(model, str) or not model.strip().lower().startswith("openrouter/"):
-        return {}
+    normalized = model.strip().lower() if isinstance(model, str) else ""
+    # A yolo OpenCode child can run arbitrary shell commands.  Do not silently
+    # hand that shell the parent process's provider credentials: a worktree only
+    # isolates mutations, not the operator account, environment, or credential
+    # store.  Explicit flags are required before a private key is bridged.
+    if permission == "yolo":
+        scrub = {key: None for key in _opencode_credential_env_keys()}
+        if not (isolated_lane and allow_tool_credentials):
+            if normalized.startswith(("openrouter/", "nous/")):
+                try:
+                    from _windows_credentials import resolve_openrouter_api_key
+                    from _nous_credentials import resolve_nous_api_key
+                    key = (resolve_openrouter_api_key()[0]
+                           if normalized.startswith("openrouter/")
+                           else resolve_nous_api_key()[0])
+                except Exception:  # noqa: BLE001 — preflight must stay deterministic
+                    key = None
+                if key or any(name in os.environ for name in ("OPENROUTER_API_KEY",
+                                                               "NOUS_API_KEY")):
+                    raise ValueError(
+                        "OpenCode yolo with a private provider credential requires "
+                        "--isolated-lane and --allow-tool-credentials; use a separate "
+                        "clone/Git directory, account, container, or VM when the child "
+                        "must not be able to inspect credentials")
+            # No Summon-managed key is available.  Still scrub inherited provider
+            # credentials before launching an unrestricted tool loop.
+            return scrub
+    else:
+        scrub = {}
+    if not isinstance(model, str):
+        return scrub
+    if normalized.startswith("nous/"):
+        provider_model = model.strip()[len("nous/"):]
+        if (not provider_model or len(provider_model) > 256
+                or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f
+                       for ch in provider_model)):
+            raise ValueError("Nous OpenCode model selector is empty or malformed")
+        try:
+            from _nous_credentials import resolve_nous_api_key
+            key, _source = resolve_nous_api_key()
+        except Exception:  # noqa: BLE001 - local profile lookup is best-effort
+            key = None
+        overlay = {
+            "provider": {
+                "nous": {
+                    "name": "Nous Research",
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": {
+                        "baseURL": "https://inference-api.nousresearch.com/v1",
+                        "apiKey": "{env:NOUS_API_KEY}",
+                    },
+                    "models": {
+                        provider_model: {"name": provider_model},
+                    },
+                }
+            }
+        }
+        # A yolo child may run arbitrary shell tools. Never merge ambient inline config,
+        # which can contain an unrelated provider key or startup/plugin setting. The
+        # caller's explicit settings are rebuilt from the validated overlay.
+        existing = (None if permission == "yolo"
+                    else os.environ.get("OPENCODE_CONFIG_CONTENT"))
+        if existing:
+            try:
+                parsed = json.loads(existing)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "OPENCODE_CONFIG_CONTENT is not valid JSON; cannot safely add "
+                    "the local Nous provider") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("OPENCODE_CONFIG_CONTENT must be a JSON object")
+            overlay = _deep_merge_opencode_config(parsed, overlay)
+        env = {**scrub, "OPENCODE_CONFIG_CONTENT": json.dumps(overlay, separators=(",", ":"))}
+        if key:
+            env["NOUS_API_KEY"] = key
+        return env
+    if not normalized.startswith("openrouter/"):
+        return scrub
     if os.environ.get("OPENROUTER_API_KEY"):
-        return {}
+        # The existing environment is already the provider source.  In yolo mode
+        # it was removed above unless the caller explicitly opted into exposure;
+        # in restricted modes preserve the historical child inheritance.
+        return ({**scrub, "OPENROUTER_API_KEY": os.environ["OPENROUTER_API_KEY"]}
+                if permission == "yolo" else {})
     try:
         from _windows_credentials import resolve_openrouter_api_key
         key, _source = resolve_openrouter_api_key()
     except Exception:  # noqa: BLE001 - local credential store is best-effort
         key = None
-    return {"OPENROUTER_API_KEY": key} if key else {}
+    return {**scrub, "OPENROUTER_API_KEY": key} if key else scrub
 
 
 _OPENROUTER_ROUTER_PLUGIN_FIELDS = {
@@ -1468,7 +1853,11 @@ def opencode_router_env_override(inv: AgentInvocation) -> dict[str, str]:
             }
         }
     }
-    existing = os.environ.get("OPENCODE_CONFIG_CONTENT")
+    # A yolo child may run arbitrary shell tools. Never merge ambient inline config,
+    # which can contain an unrelated provider key or startup/plugin setting. The
+    # caller's explicit router settings are rebuilt from the validated overlay.
+    existing = (None if getattr(inv, "permission", "safe-edit") == "yolo"
+                else os.environ.get("OPENCODE_CONFIG_CONTENT"))
     if existing:
         try:
             parsed = json.loads(existing)
@@ -1491,6 +1880,9 @@ def _build_opencode_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     session/usage telemetry where OpenCode emits it.
     """
     perm = permission_flags(inv.cli, inv.permission)
+    _isolation_error = opencode_yolo_isolation_error(inv)
+    if _isolation_error:
+        raise ValueError(_isolation_error)
     if inv.resume_id:
         prompt = _resume_prompt(inv)
     else:
@@ -1502,7 +1894,7 @@ def _build_opencode_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     # `--dir` keeps OpenCode's project root aligned with Summon's cwd even when
     # the parent process was launched from another directory.  Permission JSON
     # is process-local and never writes the user's OpenCode config.
-    args = (["run", "--format", "json"] + perm + model_flag
+    args = (["run", "--format", "json", "--pure"] + perm + model_flag
             + variant_flag + session_flag + ["--dir", inv.cwd]
             + strip_boundary_flags(inv.cli, inv.extra_args) + [prompt])
     # OpenCode discovers repository-local config, rules, agents, skills, and
@@ -1518,18 +1910,267 @@ def _build_opencode_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
         "OPENCODE_DISABLE_CLAUDE_CODE": "1",
     }
+    env.update(opencode_env_override(
+        inv.model, permission=inv.permission, isolated_lane=bool(
+            inv.isolated_lane),
+        allow_tool_credentials=inv.allow_tool_credentials))
+    # Apply validated router settings after the yolo scrub. The router helper ignores
+    # ambient inline config for yolo turns, so this remains a bounded child-only overlay.
     env.update(opencode_router_env_override(inv))
-    env.update(opencode_env_override(inv.model))
     return inv.profile_command or command, args, env
 
 
+# --- Z.AI ZCode ---------------------------------------------------------------
+
+_ZCODE_RESUME_RE = re.compile(r"^sess_[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_ZCODE_FIXED_PROMPT = "Follow the attached task exactly and finish with the required report."
+_ZCODE_STALE_ATTACHMENT_TTL_SECONDS = 60 * 60
+_ZCODE_STALE_ATTACHMENT_SCAN_LIMIT = 32
+
+
+def _lock_zcode_attachment(path: str) -> None:
+    """Apply owner-only prompt material permissions or fail before launch."""
+    os.chmod(path, 0o600)
+    if os.name != "nt":
+        return
+    user = _windows_current_principal()
+    if not user:
+        raise OSError("current Windows principal is unavailable")
+    try:
+        from _spawn import run_flags
+        locked = subprocess.run(
+            ["icacls", path, "/inheritance:r", "/grant:r", f"{user}:F"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10, **run_flags())
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise OSError("unable to secure ZCode prompt attachment") from exc
+    if locked.returncode != 0:
+        raise OSError("unable to secure ZCode prompt attachment")
+
+
+def _windows_current_principal() -> str:
+    """Return the effective Windows token principal without trusting USERNAME."""
+    if os.name != "nt":
+        return ""
+    try:
+        from _spawn import run_flags
+        result = subprocess.run(
+            ["whoami"], capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=5, **run_flags())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    principal = (result.stdout or "").strip().splitlines()
+    value = principal[0].strip() if principal else ""
+    if (not value or any(ch in value for ch in (";", "<", ">", "|", "&", "^", "\x00", '"'))):
+        return ""
+    return value
+
+
+def _zcode_provider_env_scrub() -> dict[str, None]:
+    """Remove conventional provider credentials from every native ZCode child.
+
+    ZCode's plan/read-only behavior is advisory and therefore is not a safe
+    reason to forward ambient provider keys. This does not sandbox ZCode's own
+    local credential store. A yolo caller must separately acknowledge that
+    remaining local authority with ``--allow-tool-credentials``.
+    """
+    return {key: None for key in _opencode_credential_env_keys()}
+
+
+def _reap_stale_zcode_attachments() -> None:
+    """Bounded next-launch cleanup for attachments left by an ordinary hard kill."""
+    try:
+        root = tempfile.gettempdir()
+        cutoff = time.time() - _ZCODE_STALE_ATTACHMENT_TTL_SECONDS
+        candidates = 0
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if candidates >= _ZCODE_STALE_ATTACHMENT_SCAN_LIMIT:
+                    break
+                if (not entry.name.startswith("summon-zcode-")
+                        or not entry.name.endswith(".md")
+                        or entry.is_symlink()
+                        or not entry.is_file(follow_symlinks=False)):
+                    continue
+                candidates += 1
+                try:
+                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                        os.remove(entry.path)
+                except OSError:
+                    continue
+    except OSError:
+        return
+
+
+def _write_zcode_attachment(text: str) -> str:
+    """Write one private task attachment outside the repository.
+
+    ZCode's documented headless CLI accepts an attached file but not a safe
+    stdin prompt.  The file keeps a potentially long/multiline task off the
+    Windows command line.  The executor removes it after the owned child is
+    reaped; this helper does not retain the task in any Summon receipt.
+    """
+    _reap_stale_zcode_attachments()
+    fd, path = tempfile.mkstemp(prefix="summon-zcode-", suffix=".md")
+    try:
+        # mkstemp creates a private descriptor; lock its ACL before any task
+        # bytes are written. Strict UTF-8 refuses an unencodable task rather
+        # than silently rewriting it.
+        _lock_zcode_attachment(path)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
+def cleanup_zcode_attachment(args: list | tuple | None) -> None:
+    """Best-effort removal of the per-turn private ZCode attachment."""
+    if not isinstance(args, (list, tuple)):
+        return
+    try:
+        index = list(args).index("--attach")
+        path = args[index + 1]
+    except (ValueError, IndexError):
+        return
+    if not isinstance(path, str) or not path:
+        return
+    try:
+        candidate = os.path.realpath(path)
+        temp_root = os.path.realpath(tempfile.gettempdir())
+        if (os.path.dirname(candidate) == temp_root
+                and os.path.basename(candidate).startswith("summon-zcode-")):
+            os.remove(candidate)
+    except OSError:
+        pass
+
+
+def zcode_invocation_preflight(inv: AgentInvocation) -> dict | None:
+    """Return a pure, typed refusal shared by preview and live dispatch.
+
+    This intentionally performs no discovery, attachment write, or provider
+    work. Keeping authority checks here prevents a dry-run from promising that
+    a native ZCode request will launch when the live builder must refuse it.
+    """
+    if inv.cli != "zcode":
+        return None
+    if inv.model:
+        return {
+            "error_kind": "zcode_model_selector_unsupported",
+            "message": (
+                "zcode has no reviewed headless --model selector; select the model "
+                "in ZCode itself and leave the Summon model field unset"),
+        }
+    if inv.permission == "safe-edit":
+        return {
+            "error_kind": "zcode_safe_edit_unsupported",
+            "message": (
+                "ZCode has no reliable headless safe-edit mode; use permission: yolo "
+                "only in a disposable lane, or an advisory plan/read-only dispatch"),
+        }
+    if inv.permission == "read-only" and not unenforceable_permission_authorized(
+            inv.cli, inv.permission, forced=inv.permission_forced):
+        return {
+            "error_kind": "permission_unsupported",
+            "message": (
+                "ZCode plan mode is advisory rather than a proven filesystem boundary. "
+                "Use an enforcing review backend, or set " + _UNENFORCED_RO_OPT_IN +
+                "=1 to run a clearly labeled advisory plan turn."),
+        }
+    if inv.permission == "yolo" and inv.worktree is None and not inv.isolated_lane:
+        return {
+            "error_kind": "zcode_isolation_required",
+            "message": (
+                "ZCode yolo requires --worktree or --isolated-lane; broad authority is "
+                "available for disposable copies, not active shared checkouts"),
+        }
+    if inv.permission == "yolo" and not inv.allow_tool_credentials:
+        return {
+            "error_kind": "zcode_tool_credentials_consent_required",
+            "message": (
+                "ZCode yolo can access its local provider configuration and requires "
+                "--allow-tool-credentials in addition to --worktree or --isolated-lane; "
+                "the acknowledgement does not create a sandbox"),
+        }
+    if inv.resume_id and not _ZCODE_RESUME_RE.fullmatch(inv.resume_id):
+        return {
+            "error_kind": "zcode_resume_id_invalid",
+            "message": "ZCode resume id must be a sess_ identifier",
+        }
+    return None
+
+
+def _build_zcode_args(inv: AgentInvocation, *, resource_register=None
+                      ) -> tuple[str, list, dict | None]:
+    """Build one headless ZCode invocation without reading local ZCode config.
+
+    ZCode does not expose an argv model selector.  Consequently this backend
+    never accepts an explicit Summon model pin: its configured provider/model
+    remains an unverified local selection until a future provider-authored
+    terminal receipt proves it.  ``build`` and ``edit`` modes are deliberately
+    rejected because ZCode's headless permission client can block writes while
+    returning exit zero; broad, disposable work uses its explicit ``yolo``
+    mode instead.
+    """
+    refusal = zcode_invocation_preflight(inv)
+    if refusal:
+        raise ValueError(refusal["message"])
+    try:
+        from _zcode import resolve_zcode_cli
+        target = resolve_zcode_cli()
+    except Exception as exc:  # noqa: BLE001 - discovery must not expose internals
+        raise ValueError("ZCode CLI discovery failed") from exc
+    if target is None:
+        raise ValueError(
+            "ZCode CLI was not found; set ZCODE_CLI to its local executable/bundle "
+            "or install the ZCode desktop app")
+    text = _resume_prompt(inv) if inv.resume_id else _concatenated_prompt(inv)
+    attachment = _write_zcode_attachment(text)
+    try:
+        if resource_register is not None:
+            try:
+                resource_register(attachment, "zcode-prompt-attachment")
+            except Exception as exc:  # noqa: BLE001 - do not orphan prompt material
+                raise ValueError(
+                    "zcode prompt attachment: controlled cleanup registration failed") from exc
+        args = [*target.prefix_args, "--cwd", inv.cwd, "--json", "--no-color"]
+        args += permission_flags("zcode", inv.permission)
+        # plan turns subtract write/shell tools as defence in depth. This is a
+        # deny list, not a claim that ZCode supplies an allowlist sandbox.
+        if inv.permission == "read-only":
+            args += ["--disallowed-tools", "Write,Edit,Bash,Shell"]
+        if inv.resume_id:
+            args += ["--resume", inv.resume_id]
+        args += strip_boundary_flags("zcode", inv.extra_args)
+        args += ["--attach", attachment, "--prompt", _ZCODE_FIXED_PROMPT]
+        return target.command, args, {
+            "SUMMON_ZCODE_DISCOVERY_SOURCE": target.source,
+            **_zcode_provider_env_scrub(),
+        }
+    except Exception:
+        try:
+            os.remove(attachment)
+        except OSError:
+            pass
+        raise
+
+
 # --- Antigravity (agy) headless one-shot support -------------------------------
-# agy has no working non-interactive pipe mode: --print renders only to a TTY,
-# so a piped stdout captures nothing. We launch it under a ConPTY+pyte wrapper
-# (captures the TTY-only "drip" output as clean text) inside a FRESH, token-locked,
-# PER-INVOCATION profile (no MCP servers, no inherited memory) so agy behaves as a
-# deterministic one-shot instead of a roaming, memory-carrying interactive agent.
-# See agy_pty_pyte.py.
+# agy has no working non-interactive pipe mode on older releases: --print renders
+# only to a TTY, so a pipe captures nothing. Current releases expose stream-json and
+# use the bundled hidden `agy_stream_proxy.py`; the legacy ConPTY/pyte scraper remains
+# an explicit opt-in only. Both paths use a FRESH, token-locked, PER-INVOCATION profile
+# (no MCP servers, no inherited memory) so agy behaves as a deterministic one-shot.
 #
 # Each call gets its OWN throwaway profile dir, so (a) no prior-session state can
 # leak in (isolation holds) and (b) concurrent agy sub-agents never collide on
@@ -1598,6 +2239,306 @@ def _reject_oversized_agy_prompt(prompt: str) -> None:
             "agent definition or task prompt, or write the material to a file under --cwd "
             "and ask the agent to READ it.")
 _AGY_RUN_TTL_SEC = 900   # don't clean run dirs younger than this (may be in use)
+_AGY_ORPHAN_RETENTION_SEC = 24 * 60 * 60
+_AGY_OWNER_PID_FILE = ".summon_owner_pid"
+_AGY_PRINT_TIMEOUT_CAPABILITY: dict[tuple[str, int | None], bool] = {}
+_AGY_PROFILE_LEASES: dict[str, tuple[object, str]] = {}
+_AGY_LEASE_LOCK_OFFSET = 4096
+_AGY_LEASE_SCHEMA = "summon.agy-profile-lease/v2"
+
+
+def _agy_profile_retention_sec(deadline_sec: float) -> float:
+    """Bound a dead owner's credential-copy retention without limiting runtime."""
+    return min(_AGY_ORPHAN_RETENTION_SEC,
+               max(_AGY_RUN_TTL_SEC, deadline_sec * 2 + 300))
+
+
+def _agy_lease_token_from_run_name(name: str) -> str | None:
+    """Read the host-created lease token from a current run name."""
+    if not name.startswith("run-"):
+        return None
+    parts = name.split("-", 3)
+    if (len(parts) != 4 or not parts[1].isascii() or not parts[1].isdecimal()
+            or int(parts[1]) <= 0 or len(parts[2]) != 32
+            or any(char not in "0123456789abcdef" for char in parts[2])):
+        return None
+    return parts[2]
+
+
+def _agy_lock_lease(handle, *, blocking: bool) -> None:
+    # Keep the Windows byte-range lock outside the bounded metadata region so
+    # an independent cleanup process can authenticate the live owner while the
+    # lease is held. POSIX flock ignores the current file offset.
+    handle.seek(_AGY_LEASE_LOCK_OFFSET)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(
+            handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(
+            handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+
+
+def _agy_unlock_lease(handle) -> None:
+    handle.seek(_AGY_LEASE_LOCK_OFFSET)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _agy_lease_state(path: str) -> str:
+    """Return held, free, missing, or unknown for a host-side run lease."""
+    try:
+        handle = open(path, "r+b")
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unknown"
+    try:
+        try:
+            _agy_lock_lease(handle, blocking=False)
+        except (BlockingIOError, OSError):
+            return "held"
+        try:
+            _agy_unlock_lease(handle)
+        except OSError:
+            return "unknown"
+        return "free"
+    finally:
+        handle.close()
+
+
+def _agy_lease_token(metadata: dict) -> str:
+    canonical = json.dumps(
+        metadata, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("ascii")
+    return hashlib.sha256(b"summon-agy-profile-lease-v2\0" + canonical).hexdigest()[:32]
+
+
+def _agy_private_lease_path(path: str) -> str:
+    """Return the unpublished hard-link name used while acquiring a lease."""
+    token = os.path.splitext(os.path.basename(path))[0]
+    return os.path.join(os.path.dirname(path), f".{token}.publishing")
+
+
+def _agy_unlink_lease_names(path: str) -> bool:
+    """Remove both names for a released lease; report whether both are gone."""
+    private_path = _agy_private_lease_path(path)
+    for candidate in (path, private_path):
+        try:
+            os.unlink(candidate)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            continue
+    return not os.path.lexists(path) and not os.path.lexists(private_path)
+
+
+def _agy_create_profile_lease(
+        runs_dir: str, expires_at: float) -> tuple[object, str, str]:
+    lease_dir = os.path.join(runs_dir, ".summon-leases")
+    os.makedirs(lease_dir, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(lease_dir, 0o700)
+    if not math.isfinite(expires_at):
+        raise ValueError("agy lease expiry is invalid")
+    metadata = {
+        "schema": _AGY_LEASE_SCHEMA,
+        "expires_at": expires_at,
+        "owner_pid": os.getpid(),
+        "owner_birth": _agy_process_birth_token(os.getpid()),
+        "nonce": secrets.token_hex(32),
+    }
+    token = _agy_lease_token(metadata)
+    path = os.path.join(lease_dir, f"{token}.lock")
+    private_path = _agy_private_lease_path(path)
+    # Acquire and populate a private inode first. The public .lock pathname is
+    # created only by a same-directory hard link after the OS lock is held, so
+    # an orphan scan can never observe the published lease as free.
+    handle = open(private_path, "x+b")
+    try:
+        _agy_lock_lease(handle, blocking=False)
+        handle.seek(0)
+        handle.write((json.dumps(
+            metadata, sort_keys=True, separators=(",", ":"),
+            allow_nan=False) + "\n").encode("ascii"))
+        handle.flush()
+        os.fsync(handle.fileno())
+        os.link(private_path, path)
+        return handle, path, token
+    except Exception:
+        try:
+            _agy_unlock_lease(handle)
+        except OSError:
+            pass
+        handle.close()
+        _agy_unlink_lease_names(path)
+        raise
+
+
+def _agy_posix_process_birth_token(pid: int) -> str | None:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = raw.rsplit(")", 1)[1].strip().split()
+        if len(fields) > 19:
+            return f"proc:{fields[19]}"
+    except (OSError, UnicodeError, IndexError):
+        pass
+    # macOS/BSD have no /proc start-time field. Their native ps exposes a
+    # stable process start record; hash its bounded C-locale text so lease
+    # metadata remains compact and contains no host-specific display text.
+    ps_path = next((candidate for candidate in ("/bin/ps", "/usr/bin/ps")
+                    if os.path.isfile(candidate)), None)
+    if ps_path is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [ps_path, "-o", "lstart=", "-p", str(pid)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+            errors="replace", timeout=2.0, check=False,
+            env={**os.environ, "LC_ALL": "C"}, **run_flags())
+        started = completed.stdout.strip()
+        if completed.returncode == 0 and 1 <= len(started) <= 128 \
+                and "\n" not in started and "\r" not in started:
+            return "ps:" + hashlib.sha256(started.encode("utf-8")).hexdigest()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _agy_process_birth_token(pid: int) -> str | None:
+    """Return an OS process-birth identity; a PID alone is not liveness proof."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return None
+            class _FileTime(ctypes.Structure):
+                _fields_ = [("low", ctypes.c_ulong), ("high", ctypes.c_ulong)]
+            created, exited, kernel, user = (_FileTime() for _ in range(4))
+            try:
+                if not kernel32.GetProcessTimes(
+                        handle, ctypes.byref(created), ctypes.byref(exited),
+                        ctypes.byref(kernel), ctypes.byref(user)):
+                    return None
+                return f"win:{(int(created.high) << 32) | int(created.low)}"
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 - unavailable identity fails closed
+            return None
+    return _agy_posix_process_birth_token(pid)
+
+
+def _agy_lease_metadata(path: str) -> dict | None:
+    try:
+        # Use an unbuffered bounded read on Windows: a buffered reader may
+        # prefetch through the independently locked byte and fail the entire
+        # metadata read even though the metadata range itself is unlocked.
+        with open(path, "rb", buffering=0) as handle:
+            raw = handle.read(1025).partition(b"\n")[0]
+        if len(raw) > 1024:
+            return None
+        value = json.loads(raw.decode("ascii"))
+        if (not isinstance(value, dict)
+                or set(value) != {
+                    "schema", "expires_at", "owner_pid", "owner_birth", "nonce"}
+                or value.get("schema") != _AGY_LEASE_SCHEMA):
+            return None
+        expires = float(value.get("expires_at"))
+        pid = value.get("owner_pid")
+        birth = value.get("owner_birth")
+        nonce = value.get("nonce")
+        if (not math.isfinite(expires) or isinstance(pid, bool)
+                or not isinstance(pid, int) or pid <= 0
+                or birth is not None and not isinstance(birth, str)
+                or not isinstance(nonce, str) or len(nonce) != 64
+                or any(char not in "0123456789abcdef" for char in nonce)):
+            return None
+        expected_token = os.path.splitext(os.path.basename(path))[0]
+        if (len(expected_token) != 32
+                or not secrets.compare_digest(
+                    expected_token, _agy_lease_token(value))):
+            return None
+        return {"expires_at": min(
+                    expires, os.path.getctime(path) + _AGY_ORPHAN_RETENTION_SEC),
+                "owner_pid": pid, "owner_birth": birth}
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _agy_lease_expiry_cap(path: str) -> float | None:
+    metadata = _agy_lease_metadata(path)
+    return metadata["expires_at"] if metadata is not None else None
+
+
+def _agy_lease_owner_live(path: str) -> bool:
+    metadata = _agy_lease_metadata(path)
+    if metadata is None or not metadata.get("owner_birth"):
+        return False
+    return (_agy_process_birth_token(metadata["owner_pid"])
+            == metadata["owner_birth"])
+
+
+def _agy_release_profile_lease(profile: str) -> bool:
+    lease = _AGY_PROFILE_LEASES.pop(os.path.realpath(profile), None)
+    if lease is None:
+        return True
+    handle, path = lease
+    try:
+        _agy_unlock_lease(handle)
+    except OSError:
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
+    return _agy_unlink_lease_names(path)
+
+
+def _require_agy_print_timeout_support() -> None:
+    """Fail before profile creation when AGY lacks the bounded-print contract."""
+    path = shutil.which("agy")
+    if not path and os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        fallback = (os.path.join(local_app_data, "agy", "bin", "agy.exe")
+                    if local_app_data else None)
+        if fallback and os.path.isfile(fallback):
+            path = fallback
+    if not path:
+        raise ValueError("agy executable not found; install AGY 1.1.22 or newer")
+    try:
+        identity = (os.path.realpath(path), os.stat(path).st_mtime_ns)
+    except OSError:
+        identity = (os.path.realpath(path), None)
+    supported = _AGY_PRINT_TIMEOUT_CAPABILITY.get(identity)
+    if supported is None:
+        command = [path, "--help"]
+        if os.name == "nt" and path.lower().endswith((".cmd", ".bat")):
+            command = ["cmd", "/d", "/c", path, "--help"]
+        try:
+            from _spawn import run_flags
+            completed = subprocess.run(
+                command, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=20, stdin=subprocess.DEVNULL,
+                **run_flags())
+            help_text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+            supported = completed.returncode == 0 and "--print-timeout" in help_text
+        except (OSError, ValueError, subprocess.SubprocessError):
+            supported = False
+        _AGY_PRINT_TIMEOUT_CAPABILITY[identity] = supported
+    if not supported:
+        raise ValueError(
+            "agy does not expose --print-timeout; install AGY 1.1.22 or newer "
+            "before dispatch so Summon can enforce the adaptive hard budget")
 
 
 def _has_pty_modules(python: str) -> bool:
@@ -1612,19 +2553,21 @@ def _has_pty_modules(python: str) -> bool:
 
 
 def _agy_python() -> str:
-    """An interpreter that can run the agy PTY wrapper.
+    """An interpreter that can run the selected agy wrapper.
 
     $AGY_PTY_PYTHON always wins. With a CUSTOM wrapper ($AGY_PTY_WRAPPER) we
     trust the caller's environment and use the current interpreter. For the
-    bundled ConPTY wrapper, PROBE candidates for pywinpty+pyte (current
-    interpreter first, then well-known installs, then PATH) instead of assuming
-    a hardcoded path. If none has the modules, fall back to the current
-    interpreter — the wrapper then exits 127 with a clear install message that
-    the executor surfaces as a CLI error.
+    explicitly selected legacy ConPTY wrapper, PROBE candidates for pywinpty+pyte
+    (current interpreter first, then well-known installs, then PATH) instead of
+    assuming a hardcoded path. The stream proxy uses only the standard library and
+    stays on the current interpreter.
     """
     env = os.environ.get("AGY_PTY_PYTHON")
     if env and os.path.isfile(env):
         return env
+    wrapper = _agy_wrapper()
+    if _agy_wrapper_is_stream(wrapper):
+        return sys.executable
     if os.environ.get("AGY_PTY_WRAPPER"):
         return sys.executable
     candidates = [sys.executable, r"C:\python313\python.exe", r"C:\python312\python.exe",
@@ -1651,28 +2594,52 @@ def _agy_wrapper() -> str:
     The error is raised here — before any profile work — so dispatch failures are
     reported before credentials are copied.
     """
-    override = os.environ.get("AGY_PTY_WRAPPER")
-    if override:
-        return override
     here = os.path.dirname(os.path.abspath(__file__))
     here_wrapper = os.path.join(here, "agy_stream_proxy.py")
+    override = os.environ.get("AGY_PTY_WRAPPER")
+    if override:
+        # The legacy pywinpty scraper creates a pseudo-console and can flash a
+        # visible window even when Summon's outer Popen is hidden. Keep it an
+        # explicit escape hatch; silently selecting it from an old install is
+        # exactly the intermittent popup failure this wrapper was introduced to
+        # prevent. A current bundled stream proxy wins unless the operator opts
+        # into the legacy route deliberately.
+        if (os.name == "nt"
+                and os.path.basename(override).lower() == "agy_pty_pyte.py"
+                and os.environ.get("AGY_ALLOW_LEGACY_PTY") != "1"):
+            if os.path.isfile(here_wrapper):
+                return here_wrapper
+            raise ValueError(
+                "the legacy agy_pty_pyte wrapper can open a visible pseudo-console; "
+                "use the bundled agy_stream_proxy.py or set AGY_ALLOW_LEGACY_PTY=1 "
+                "only when a visible legacy PTY is intentional")
+        return override
     if os.path.isfile(here_wrapper):  # bundled beside the scripts (public installs)
         return here_wrapper
     legacy = os.path.join(here, "agy_pty_pyte.py")
     if os.path.isfile(legacy):
+        if os.name == "nt" and os.environ.get("AGY_ALLOW_LEGACY_PTY") != "1":
+            raise ValueError(
+                "the legacy agy_pty_pyte wrapper is disabled on Windows because it can "
+                "open a visible pseudo-console; install the current stream proxy or "
+                "set AGY_ALLOW_LEGACY_PTY=1 deliberately")
         return legacy
-    return os.path.join(os.path.expanduser("~"), ".agents", "scripts", "agy_pty_pyte.py")
+    fallback = os.path.join(os.path.expanduser("~"), ".agents", "scripts", "agy_pty_pyte.py")
+    if os.name == "nt" and os.environ.get("AGY_ALLOW_LEGACY_PTY") != "1":
+        raise ValueError(
+            "no hidden agy stream proxy is installed; the legacy fallback is disabled on "
+            "Windows because it can open a visible pseudo-console")
+    return fallback
 
 
 def _agy_cleanup_old_runs(runs_dir: str, deadline_sec: float | None = None) -> None:
     """Best-effort removal of prior per-invocation profiles.
 
-    Each profile carries a ``.summon_expiry`` timestamp (its OWN deadline +
-    sidecar margin); a dir is reaped only once past its own expiry, so a SHORT
-    call's cleanup can't delete a concurrent LONG call's still-valid profile.
-    Dirs without a marker (legacy/partial) fall back to mtime + a TTL sized by
-    this call's deadline. Correctness never depends on this — every run uses a
-    brand-new dir regardless of whether old ones were cleaned.
+    Each current profile has a bounded orphan-expiry timestamp plus an OS-held
+    lease outside provider HOME. A held lease preserves a concurrent long call
+    until its independently recorded hard cap; lease takeover cannot retain an
+    orphan forever. An unlocked owner becomes eligible after the earlier expiry.
+    Legacy/partial dirs fall back to the same bounded TTL. Every run is fresh.
     """
     try:
         names = os.listdir(runs_dir)
@@ -1683,25 +2650,80 @@ def _agy_cleanup_old_runs(runs_dir: str, deadline_sec: float | None = None) -> N
             deadline_sec = float(os.environ.get("AGY_PTY_DEADLINE", "300"))
         except ValueError:
             deadline_sec = 300.0
-    ttl = max(_AGY_RUN_TTL_SEC, deadline_sec * 2 + 300)
+    ttl = _agy_profile_retention_sec(deadline_sec)
     now = time.time()
-    cutoff = now - ttl
+    profile_tokens = {
+        token for token in (_agy_lease_token_from_run_name(name) for name in names)
+        if token is not None
+    }
     for name in names:
         p = os.path.join(runs_dir, name)
         try:
+            if name == ".summon-leases":
+                continue
             if not os.path.isdir(p):
                 continue
-            # Honor the dir's OWN expiry marker if present (concurrency-safe).
+            # A live owner may legitimately outlast the bounded orphan TTL. An
+            # OS lock outside provider HOME is the authority; neither a
+            # child-writable marker nor a recycled PID can grant the exemption.
+            token = _agy_lease_token_from_run_name(name)
+            lease_path = (os.path.join(runs_dir, ".summon-leases", f"{token}.lock")
+                          if token is not None else None)
+            lease_state = _agy_lease_state(lease_path) if lease_path else "missing"
+            expiry_cap = (_agy_lease_expiry_cap(lease_path)
+                          if lease_path is not None else None)
+            if expiry_cap is None:
+                expiry_cap = os.path.getctime(p) + _AGY_ORPHAN_RETENTION_SEC
+            if lease_state == "held" and (
+                    _agy_lease_owner_live(lease_path) or now < expiry_cap):
+                continue
+
+            # The child-writable expiry may request earlier cleanup but can
+            # never extend retention past the host-side lease cap.
             try:
                 with open(os.path.join(p, ".summon_expiry"), encoding="utf-8") as _fh:
-                    if now < float(_fh.read().strip()):
-                        continue  # still within its own validity window
+                    raw_expiry = _fh.read(129)
+                if len(raw_expiry) > 128:
+                    raise ValueError("oversized expiry marker")
+                expires = float(raw_expiry.strip())
+                if not math.isfinite(expires):
+                    expires = expiry_cap
             except (OSError, ValueError):
-                pass
-            if os.path.getmtime(p) < cutoff:
-                shutil.rmtree(p, ignore_errors=True)
+                expires = min(expiry_cap, os.path.getmtime(p) + ttl)
+            if now < min(expires, expiry_cap):
+                continue
+            shutil.rmtree(p, ignore_errors=True)
+            if lease_path and lease_state == "free":
+                _agy_unlink_lease_names(lease_path)
         except OSError:
             pass
+    # A normal controlled-resource cleanup can remove the profile before this
+    # dispatcher exits. Reap only unlocked orphan leases; a creation race keeps
+    # its lease held before the profile directory is published.
+    lease_dir = os.path.join(runs_dir, ".summon-leases")
+    try:
+        lease_names = os.listdir(lease_dir)
+    except OSError:
+        lease_names = []
+    for lease_name in lease_names:
+        if lease_name.startswith(".") and lease_name.endswith(".publishing"):
+            token = lease_name[1:-len(".publishing")]
+            if (len(token) == 32
+                    and not any(char not in "0123456789abcdef" for char in token)):
+                private_path = os.path.join(lease_dir, lease_name)
+                if _agy_lease_state(private_path) == "free":
+                    _agy_unlink_lease_names(
+                        os.path.join(lease_dir, f"{token}.lock"))
+            continue
+        token, suffix = os.path.splitext(lease_name)
+        if (suffix != ".lock" or len(token) != 32
+                or any(char not in "0123456789abcdef" for char in token)):
+            continue
+        if token in profile_tokens:
+            continue
+        lease_path = os.path.join(lease_dir, lease_name)
+        if _agy_lease_state(lease_path) == "free":
+            _agy_unlink_lease_names(lease_path)
 
 
 def _agy_lock_down(prof: str) -> None:
@@ -1840,18 +2862,36 @@ def _ensure_agy_profile(cwd: str, deadline_sec: float = 300.0) -> str:
     os.makedirs(runs, exist_ok=True)
     _agy_cleanup_old_runs(runs, deadline_sec)
 
-    # mkdtemp gives an ATOMICALLY-unique dir (no <pid>-<ms> collision when two
-    # same-process calls land in the same millisecond).
-    prof = tempfile.mkdtemp(prefix="run-", dir=runs)
-    # Self-describe when THIS profile becomes safe to reap (own deadline + sidecar
-    # margin). A concurrent SHORT call's cleanup reads this and leaves a long
-    # call's still-valid profile alone — the reaping no longer depends on the
-    # cleaner's own deadline.
+    # The lease is outside provider HOME and stays locked by this dispatcher.
+    # OS lock release, not a child-writable PID file, proves owner death.
+    lease_handle = None
+    lease_path = None
+    try:
+        lease_handle, lease_path, token = _agy_create_profile_lease(
+            runs, time.time() + _agy_profile_retention_sec(deadline_sec))
+        prof = tempfile.mkdtemp(prefix=f"run-{os.getpid()}-{token}-", dir=runs)
+        _AGY_PROFILE_LEASES[os.path.realpath(prof)] = (lease_handle, lease_path)
+    except (OSError, ValueError) as exc:
+        if lease_handle is not None:
+            try:
+                _agy_unlock_lease(lease_handle)
+            except OSError:
+                pass
+            lease_handle.close()
+        if lease_path:
+            _agy_unlink_lease_names(lease_path)
+        raise ValueError("agy profile: failed to create host lifecycle lease") from exc
+    # The bounded timestamp controls dead-owner retention only. A held lease
+    # preserves a legitimate adaptive job even when it outlives that timestamp.
     try:
         with open(os.path.join(prof, ".summon_expiry"), "w", encoding="utf-8") as _fh:
-            _fh.write(repr(time.time() + deadline_sec * 2 + 300))
-    except OSError:
-        pass
+            _fh.write(repr(time.time() + _agy_profile_retention_sec(deadline_sec)))
+        with open(os.path.join(prof, _AGY_OWNER_PID_FILE), "w", encoding="utf-8") as _fh:
+            _fh.write(str(os.getpid()))
+    except OSError as exc:
+        _agy_release_profile_lease(prof)
+        shutil.rmtree(prof, ignore_errors=True)
+        raise ValueError("agy profile: failed to record bounded owner lifecycle") from exc
     try:
         g = os.path.join(prof, ".gemini")
         acli = os.path.join(g, "antigravity-cli")
@@ -1889,11 +2929,13 @@ def _ensure_agy_profile(cwd: str, deadline_sec: float = 300.0) -> str:
             os.chmod(os.path.join(g, "settings.json"), 0o600)
             os.chmod(os.path.join(acli, "settings.json"), 0o600)
     except ValueError:
+        _agy_release_profile_lease(prof)
         shutil.rmtree(prof, ignore_errors=True)  # never leave a partial profile
         raise
     except OSError as e:
         # Convert raw FS/icacls errors to ValueError so the broker returns a
         # clean JSON error instead of crashing (run_subagent catches ValueError).
+        _agy_release_profile_lease(prof)
         shutil.rmtree(prof, ignore_errors=True)
         raise ValueError(f"agy profile: build failed: {type(e).__name__}: {e}") from e
     return prof
@@ -2307,12 +3349,23 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
     # floor to int — keep sub-second precision), else the env/default. Used both
     # for the wrapper (AGY_PTY_DEADLINE) and for sizing the profile-TTL cleanup.
     if timeout_ms:
-        deadline_sec = max(1.0, timeout_ms / 1000)
+        requested_timeout_ms = max(1, int(timeout_ms))
     else:
         try:
-            deadline_sec = float(os.environ.get("AGY_PTY_DEADLINE", "300"))
+            requested_timeout_ms = max(
+                1, int(float(os.environ.get("AGY_PTY_DEADLINE", "300")) * 1000))
         except ValueError:
-            deadline_sec = 300.0
+            requested_timeout_ms = 300_000
+    internal_timeout_ms = requested_timeout_ms
+    if os.environ.get("SUMMON_ADAPTIVE_TIMEOUT") == "1":
+        from _job_control import environment_job_budget
+        budget = environment_job_budget(requested_timeout_ms)
+        internal_timeout_ms = (budget["remaining_ms"]
+                               if budget["remaining_ms"] is not None
+                               else budget["max_runtime_ms"])
+        internal_timeout_ms = max(1, int(internal_timeout_ms))
+    deadline_sec = internal_timeout_ms / 1000
+    _require_agy_print_timeout_support()
     wrapper = _agy_wrapper()  # FIRST: fails fast on POSIX before any profile is built
     perm = permission_flags(inv.cli, inv.permission)  # --dangerously-skip-permissions
     # Optional model pin from agent frontmatter (`model:`). agy accepts display
@@ -2353,6 +3406,7 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
             try:
                 resource_register(profile, "agy-profile")
             except Exception as exc:  # noqa: BLE001 - never orphan copied credentials
+                _agy_release_profile_lease(profile)
                 shutil.rmtree(profile, ignore_errors=True)
                 raise ValueError("agy profile: controlled cleanup registration failed") from exc
         _attest_agy_profile(profile, getattr(inv, "agy_account_sha256", None),
@@ -2384,7 +3438,13 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
     # permission mapping advisory against the roster. Drop only the flags that move the
     # boundary, so ordinary passthrough args keep working.
     extra = _strip_agy_boundary_flags(inv.extra_args)
-    args = [wrapper, *perm, *add_dir, *extra, *cont, *model_flag, "--print", prompt]
+    # AGY's own headless default is shorter than many Summon jobs.  Bind its
+    # print timeout to the same remaining hard budget Summon enforces, using an
+    # explicit seconds suffix accepted by AGY 1.1.22.  ceil avoids truncating a
+    # fractional final second while Summon remains the authoritative hard stop.
+    print_timeout = f"{max(1, (internal_timeout_ms + 999) // 1000)}s"
+    args = [wrapper, *perm, *add_dir, *extra, *cont, *model_flag,
+            "--print-timeout", print_timeout, "--print", prompt]
     env = {
         "USERPROFILE": profile,
         "HOME": profile,
@@ -2449,6 +3509,8 @@ BACKENDS: dict = {
                      "acp": {"call": _acp_call}},
     "opencode":     {"kind": "subprocess", "build": _build_opencode_args,
                      "side_effects": True},
+    "zcode":        {"kind": "subprocess", "build": _build_zcode_args,
+                     "side_effects": True},
     "agy":          {"kind": "subprocess", "build": _build_agy_args, "side_effects": True},
     "arkcli":       {"kind": "api", "call": _arkcli_call},
     "openai-compat": {"kind": "api", "call": _api_call},
@@ -2509,6 +3571,19 @@ def model_backend_compatibility(cli: str, model: str | None) -> dict | None:
     """
     if not isinstance(cli, str) or not isinstance(model, str) or not model.strip():
         return None
+    if cli == "zcode":
+        return {
+            "error_kind": "zcode_model_selector_unsupported",
+            "backend": cli,
+            "model_requested": model,
+            "compatible_backends": ["openai-compat", "opencode"],
+            "recommended_backend": "opencode",
+            "message": (
+                "ZCode has no reviewed headless per-call model selector or terminal "
+                "provider-authored served-model receipt; remove `model:` for the "
+                "generic native preview seat, or use an explicit OpenCode/direct "
+                "Coding Plan model seat"),
+        }
     normalized = model.strip().lower()
     vendor = None
     for candidate, prefixes in _MODEL_VENDOR_PREFIXES.items():
@@ -2550,6 +3625,16 @@ def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None, *
         raise ValueError(f"Unknown backend: {inv.cli}")
     if b["kind"] != "subprocess":
         raise ValueError(f"backend {inv.cli!r} is {b['kind']}-kind; no argv to build")
+    # Keep the low-level builder fail-closed too.  The normal dispatcher performs
+    # this check before side effects, but callers that use the executor/builder
+    # directly must not be able to smuggle roots to a backend that cannot enforce
+    # the declared read-only boundary.
+    _roots = normalize_read_roots(inv.read_roots)
+    _policy = read_allowlist(inv.cli, inv.permission, inv.cwd, _roots)
+    if _policy.get("would_refuse"):
+        raise ValueError(_policy.get("refusal") or "read allowlist cannot be enforced")
+    if _roots != inv.read_roots:
+        inv = replace(inv, read_roots=_roots)
     # Credit-only guard (Fable): substitute the model, scrub credit-only model
     # flags from `args:`, and strip ANTHROPIC_* alias remaps HERE so real dispatch
     # and --dry-run enforce it identically. The executor surfaces the notes/billing.
@@ -2560,6 +3645,8 @@ def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None, *
     elif inv.cli == "kimi" and resource_register is not None:
         cmd, args, env = _build_kimi_args(
             inv, resource_register=resource_register)
+    elif inv.cli == "zcode":
+        cmd, args, env = _build_zcode_args(inv, resource_register=resource_register)
     else:
         cmd, args, env = b["build"](inv)
     if credit_env:

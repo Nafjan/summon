@@ -40,7 +40,7 @@ EVENT_SCHEMA_VERSION = 2
 # Keep the telemetry contract tied to the dispatcher release without importing
 # ``run_subagent`` (which would introduce a module cycle).  Release bumps must
 # update this alongside the dispatcher ``__version__``.
-SUMMON_VERSION = "3.2.1"
+SUMMON_VERSION = "3.3.0"
 # Backward-compatible name for callers that used the old event constant.  It
 # refers to event records, never the persisted opt-in configuration.
 SCHEMA_VERSION = EVENT_SCHEMA_VERSION
@@ -75,6 +75,10 @@ _OPERATIONS = {
 }
 _COHORTS = {"test", "review", "preflight", "orchestration", "legacy_unknown"}
 _STATUSES = {"success", "error", "blocked", "partial", "cancelled", "unknown"}
+# A structural refusal did not execute a provider turn.  Keep this state on
+# ``execution_status`` only; the terminal operation status remains ``blocked``.
+_EXECUTION_STATUSES = _STATUSES | {"not_run"}
+_ATTEMPT_STATUSES = {"not_run", "completed", "unknown"}
 _SERVED_MODEL_EVIDENCE = {"reported", "inferred", "absent", "unknown"}
 _MODEL_SOURCES = {
     "cli", "frontmatter", "invocation", "ambient_config", "legacy_args",
@@ -87,14 +91,17 @@ _PUBLIC_REPORT_KEYS = {
     "backend", "transport", "permission", "model_requested", "model_targeted",
     "model_resolved", "model_served", "model_requested_class", "model_served_class",
     "model_source", "model_selector_source", "served_model_evidence", "model_mismatch",
+    "model_match", "named_model_verified",
     "report_expected", "report_ok", "report_error_code", "result_usable",
     "provider_contacted", "auth_stage", "auth_outcome", "interactive_required",
     "remediation_code", "auth_lifecycle_evidence", "exit_code", "elapsed_ms", "attempts",
+    "attempt_status",
     "timeout_stage", "billing_source", "summon_version", "warning_count", "artifacts",
     "event_id", "operation_id", "parent_operation_id", "attempt_id", "provider_turn_id",
     "event_sequence", "cohort_provenance_digest", "provider_adapter_revision",
     "evidence_registry_revision", "error_sha256", "prompt_sha256", "scripts_sha256",
-    "platform", "workspace", "recorded_at",
+    "platform", "workspace", "recorded_at", "raw_backend_exit_code",
+    "normalized_exit_code",
 }
 # Reports are generated from the complete public projection.  Requiring that
 # shape prevents a hand-written file containing only ``source_trust`` (or a
@@ -140,9 +147,9 @@ _REQUIRED_EVENT_FIELDS = {
     "parent_operation_id", "attempt_id", "provider_turn_id", "event_sequence",
     "validation_outcome", "cohort_provenance_digest", "provider_adapter_revision",
     "evidence_registry_revision", "status", "failure_class",
-    "served_model_evidence", "model_mismatch",
+    "served_model_evidence", "model_mismatch", "model_match", "named_model_verified",
     "report_expected", "report_ok", "report_error_code", "summon_version",
-    "auth_lifecycle_evidence",
+    "auth_lifecycle_evidence", "attempt_status",
 }
 _VALIDATION_OUTCOMES = {
     "valid", "invalid_status", "invalid_cohort", "invalid_model_evidence",
@@ -722,18 +729,60 @@ def event_from_envelope(envelope: dict, *, source: str = "dispatch",
     summon = envelope.get("summon") if isinstance(envelope.get("summon"), dict) else {}
     timeout = envelope.get("timeout") if isinstance(envelope.get("timeout"), dict) else {}
     billing = envelope.get("billing") if isinstance(envelope.get("billing"), dict) else {}
+    raw_execution_status = _bounded(envelope.get("execution_status"), _EXECUTION_STATUSES)
+    raw_attempt_status = _bounded(envelope.get("attempt_status"), _ATTEMPT_STATUSES)
+    structural_not_run = (
+        raw_execution_status == "not_run" or raw_attempt_status == "not_run")
+    if structural_not_run:
+        # ``execution_status:not_run`` is an explicit proof that the provider
+        # turn never started.  Re-project the complete public contract from
+        # that fact instead of trusting contradictory compatibility fields
+        # such as attempts=1, provider_contacted=true, or model_match=true.
+        execution_status = "not_run"
+        attempt_status = "not_run"
+        attempts = 0
+        provider_contacted = False
+    else:
+        execution_status = raw_execution_status
+        attempts = _int(envelope.get("attempts"), 0, 100)
+        provider_contacted = _bool_or_none(envelope.get("provider_contacted"))
+        attempt_status = raw_attempt_status
+        if attempt_status is None and (
+                (attempts is not None and attempts > 0)
+                or provider_contacted is True):
+            # The executor has not historically stamped a success-only
+            # attempt status.  ``completed`` means the attempt terminalized;
+            # it does not imply a successful report or trusted model proof.
+            attempt_status = "completed"
     requested_model = _safe_model_id(model.get("requested"))
-    served_model = _safe_model_id(model.get("served"))
     targeted_model = _safe_model_id(model.get("targeted"))
     resolved_model = _safe_model_id(model.get("resolved"))
     evidence = envelope.get("_telemetry_model_evidence")
-    if isinstance(evidence, _TrustedModelEvidence):
+    if structural_not_run:
+        served_model = None
+        served_evidence, mismatch = "absent", None
+    elif isinstance(evidence, _TrustedModelEvidence):
+        served_model = _safe_model_id(model.get("served"))
         served_evidence = evidence.served_model_evidence
         mismatch = evidence.model_mismatch
     else:
+        served_model = _safe_model_id(model.get("served"))
         served_evidence, mismatch = "absent", None
     if served_evidence == "reported" and served_model is None:
         served_evidence, mismatch = "absent", None
+    # A public projection must not manufacture a named-model claim from the
+    # caller's envelope fields.  Only the executor-created trusted marker can
+    # assert provider-reported identity, and even then all three identities
+    # must be present and exactly equal.  Inferred/absent evidence is explicitly
+    # unknown (null), never a false named-model vote.
+    if (served_evidence == "reported" and mismatch is not None
+            and requested_model and targeted_model and served_model):
+        model_match = (
+            requested_model == targeted_model == served_model
+            and mismatch is False)
+    else:
+        model_match = None
+    named_model_verified = model_match is True
     auth_marker = envelope.get("_telemetry_auth_lifecycle")
     if isinstance(auth_marker, _TrustedAuthLifecycle):
         auth_stage = auth_marker.auth_stage
@@ -801,7 +850,10 @@ def event_from_envelope(envelope: dict, *, source: str = "dispatch",
         "cohort": _cohort(cohort if cohort is not None else operation_context.cohort),
         "operation_id": _safe_opaque_id(operation_context.operation_id) or uuid.uuid4().hex,
         "parent_operation_id": _safe_opaque_id(operation_context.parent_operation_id),
-        "attempt_id": None,
+        # The executor mints a UUID-shaped physical-attempt identity.  Preserve
+        # only that bounded opaque value; a caller-supplied arbitrary string is
+        # not allowed to enter the local event contract.
+        "attempt_id": _safe_opaque_id(envelope.get("attempt_id")),
         "provider_turn_id": None,
         "event_sequence": operation_context.next_sequence(),
         "validation_outcome": validation_outcome,
@@ -811,7 +863,7 @@ def event_from_envelope(envelope: dict, *, source: str = "dispatch",
         "provider_adapter_revision": None,
         "evidence_registry_revision": None,
         "status": status,
-        "execution_status": _bounded(envelope.get("execution_status"), _STATUSES),
+        "execution_status": execution_status,
         "failure_class": failure,
         "error_sha256": _digest(envelope.get("error")),
         "backend": _bounded(envelope.get("cli"), {
@@ -831,20 +883,28 @@ def event_from_envelope(envelope: dict, *, source: str = "dispatch",
         "model_selector_source": _bounded(model.get("selector_source"), _MODEL_SOURCES),
         "served_model_evidence": served_evidence,
         "model_mismatch": mismatch,
+        "model_match": model_match,
+        "named_model_verified": named_model_verified,
         "permission": _bounded(envelope.get("permission"), {"read-only", "safe-edit", "yolo"}),
         "report_expected": None,
         "report_ok": None,
         "report_error_code": None,
         "result_usable": _bool_or_none(envelope.get("result_usable")),
-        "provider_contacted": _bool_or_none(envelope.get("provider_contacted")),
+        "provider_contacted": provider_contacted,
         "auth_stage": auth_stage,
         "auth_outcome": auth_outcome,
         "interactive_required": interactive_required,
         "remediation_code": remediation_code,
         "auth_lifecycle_evidence": auth_lifecycle_evidence,
         "exit_code": _int(envelope.get("exit_code"), -255, 255),
+        "raw_backend_exit_code": _int(
+            envelope.get("raw_backend_exit_code",
+                         envelope.get("backend_exit_code", envelope.get("exit_code"))),
+            -255, 255),
+        "normalized_exit_code": _int(envelope.get("normalized_exit_code"), -255, 255),
         "elapsed_ms": _int(envelope.get("elapsed_ms"), 0, 7 * 24 * 60 * 60 * 1000),
-        "attempts": _int(envelope.get("attempts"), 0, 100),
+        "attempts": attempts,
+        "attempt_status": attempt_status,
         "timeout_stage": _timeout_stage(timeout.get("stage")),
         "billing_source": _bounded(billing.get("source"), {
             "api", "credit", "subscription", "unknown"}),
@@ -919,6 +979,16 @@ def _valid_public_schema2_event(item: dict) -> bool:
         return False
     if not isinstance(item.get("status"), str) or item.get("status") not in _STATUSES:
         return False
+    execution_status = item.get("execution_status")
+    if (execution_status is not None
+            and (not isinstance(execution_status, str)
+                 or execution_status not in _EXECUTION_STATUSES)):
+        return False
+    attempt_status = item.get("attempt_status")
+    if (attempt_status is not None
+            and (not isinstance(attempt_status, str)
+                 or attempt_status not in _ATTEMPT_STATUSES)):
+        return False
     if item.get("summon_version") != SUMMON_VERSION:
         return False
     validation_outcome = item.get("validation_outcome")
@@ -977,8 +1047,13 @@ def _sanitize_event(item: dict, *, source: str = "bug-report") -> dict | None:
         # Auth lifecycle labels are also untrusted when reloaded from a
         # user-editable spool.  The report boundary does not mint recovery
         # claims or expose provider login state.
-        "exit_code": item.get("exit_code"), "elapsed_ms": item.get("elapsed_ms"),
-        "attempts": item.get("attempts"), "timeout": {"stage": item.get("timeout_stage")},
+        "exit_code": item.get("exit_code"),
+        "raw_backend_exit_code": item.get("raw_backend_exit_code"),
+        "normalized_exit_code": item.get("normalized_exit_code"),
+        "elapsed_ms": item.get("elapsed_ms"),
+        "attempts": item.get("attempts"),
+        "attempt_status": item.get("attempt_status"),
+        "timeout": {"stage": item.get("timeout_stage")},
         "billing": {"source": item.get("billing_source")},
         "summon": {"version": item.get("summon_version"),
                    "scripts_sha256": item.get("scripts_sha256")},
@@ -1007,6 +1082,13 @@ def _sanitize_event(item: dict, *, source: str = "bug-report") -> dict | None:
     for key in ("model_requested", "model_targeted", "model_resolved", "model_served",
                 "model_source", "model_selector_source"):
         event[key] = None
+    # Public bug reports intentionally redact every model identifier and carry no
+    # signed evidence-registry binding. They therefore cannot certify a named model,
+    # even when the private local event did. Keep the private spool authoritative.
+    event["served_model_evidence"] = "absent"
+    event["model_mismatch"] = None
+    event["model_match"] = None
+    event["named_model_verified"] = False
     for key, allowed in {
         "backend": {"claude", "codex", "cursor-agent", "gemini", "agy", "kimi",
                      "arkcli", "openai-compat", "summon"},
@@ -1041,6 +1123,8 @@ def _sanitize_event(item: dict, *, source: str = "bug-report") -> dict | None:
             "model_requested_class": None, "model_served_class": None,
             "model_source": None, "model_selector_source": None,
             "served_model_evidence": None, "model_mismatch": None,
+            "model_match": None, "named_model_verified": False,
+            "attempt_status": None,
             "auth_stage": None, "auth_outcome": None,
             "interactive_required": None, "remediation_code": None,
             "auth_lifecycle_evidence": None,
@@ -1359,7 +1443,7 @@ def _validate_public_evidence(evidence: object) -> None:
         raise ValueError("reviewed report contains an unsupported schema")
 
     _enum_or_none("status", _STATUSES)
-    _enum_or_none("execution_status", _STATUSES)
+    _enum_or_none("execution_status", _EXECUTION_STATUSES)
     _enum_or_none("failure_class", _FAILURE_CLASSES)
     _enum_or_none("backend", {"claude", "codex", "cursor-agent", "gemini", "agy", "kimi",
                                "arkcli", "openai-compat", "summon"})
@@ -1395,9 +1479,40 @@ def _validate_public_evidence(evidence: object) -> None:
     _bool_or_none_public("result_usable")
     _bool_or_none_public("provider_contacted")
     _bool_or_none_public("model_mismatch")
+    _bool_or_none_public("model_match")
+    if not isinstance(evidence.get("named_model_verified"), bool):
+        raise ValueError("reviewed report contains an invalid named-model proof")
+    # The public report is user-editable, so shape validation must also enforce
+    # the relationship between these fields. A forged ``true`` bit with null
+    # served identity/evidence must never pass merely because each JSON value is
+    # individually well-typed. ``false`` is meaningful only for a reported
+    # mismatch; absent/inferred evidence is represented by ``null``.
+    model_match = evidence.get("model_match")
+    named_verified = evidence.get("named_model_verified")
+    served_evidence = evidence.get("served_model_evidence")
+    expected_public_evidence = (
+        "absent" if schema == EVENT_SCHEMA_VERSION else None)
+    if (served_evidence != expected_public_evidence
+            or evidence.get("model_mismatch") is not None
+            or model_match is not None or named_verified is not False):
+        raise ValueError(
+            "public reports redact model identity and cannot certify a named model")
     _int_or_none("exit_code", -255, 255)
+    _int_or_none("raw_backend_exit_code", -255, 255)
+    _int_or_none("normalized_exit_code", -255, 255)
     _int_or_none("elapsed_ms", 0, 7 * 24 * 60 * 60 * 1000)
     _int_or_none("attempts", 0, 100)
+    _enum_or_none("attempt_status", _ATTEMPT_STATUSES)
+    if (evidence.get("execution_status") == "not_run"
+            or evidence.get("attempt_status") == "not_run"):
+        if (evidence.get("attempts") != 0
+                or evidence.get("attempt_status") != "not_run"
+                or evidence.get("execution_status") != "not_run"
+                or evidence.get("provider_contacted") is not False
+                or evidence.get("served_model_evidence") != "absent"
+                or evidence.get("model_match") is not None
+                or evidence.get("named_model_verified") is not False):
+            raise ValueError("not-run reports must prove zero attempts and no provider contact")
     if "warning_count" in evidence:
         _int_or_none("warning_count", 0, _MAX_WARNINGS)
 

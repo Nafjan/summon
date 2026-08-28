@@ -45,6 +45,14 @@ _PAYLOAD_ROOTS = (
     "tests", ".github/workflows",
 )
 
+# Must mirror install.py's SKILL_PAYLOAD.  The source skill also contains
+# provider-inert tests used by the release evidence runner; those tests are
+# source-bound by _PAYLOAD_ROOTS above but are intentionally not copied into
+# host skill installations.
+_MANAGED_SKILL_PAYLOAD = frozenset({
+    "SKILL.md", "scripts", "references", "agents", "examples",
+})
+
 # These names are the release contract, not caller-provided labels. A
 # manifest may still be generated for an intermediate preview with partial
 # facts, but --check must contain every entry so missing evidence cannot be
@@ -56,7 +64,7 @@ REQUIRED_TESTS = frozenset({
     "swarm_coordinator",
     "model_routing", "release_contract",
     "account_evidence", "live_provider_gate",
-    "release_gates", "telemetry_audit",
+    "release_gates", "telemetry_audit", "phase0_phase1",
 })
 REQUIRED_GATES = frozenset({
     "fake_lifecycle", "browser_security", "model_identity",
@@ -82,6 +90,7 @@ REQUIRED_COMMANDS = {
     "model_catalog": "python -m unittest skills.summon.scripts.test_model_catalog",
     "model_routing": "python -m unittest skills.summon.scripts.test_model_routing",
     "telemetry_audit": "python -m unittest tests.test_telemetry_audit",
+    "phase0_phase1": "python -m pytest -q skills/summon/scripts/test_phase0_contracts.py skills/summon/scripts/test_install_drift.py skills/summon/scripts/test_kimi_timeout.py skills/summon/scripts/test_phase1_usage.py skills/summon/tests/test_phase1_usage_live.py skills/summon/scripts/test_phase1_usage_runner.py skills/summon/scripts/test_phase1_context_compile.py skills/summon/scripts/test_phase1_context_freshness.py skills/summon/scripts/test_phase1_context_source.py skills/summon/scripts/test_portable_result.py skills/summon/scripts/test_agy_1_1_22.py skills/summon/scripts/test_phase1_compatibility.py skills/summon/scripts/test_phase1_operator_workflow.py skills/summon/scripts/test_phase1_fleet_dispatch.py skills/summon/scripts/test_phase1_fleet_activation.py skills/summon/scripts/test_phase1_fleet.py skills/summon/scripts/test_phase1_fleet_approval.py skills/summon/scripts/test_phase1_fleet_runtime.py skills/summon/scripts/test_evidence_kernel.py skills/summon/scripts/test_job_control.py skills/summon/scripts/test_job_continuation.py skills/summon/scripts/test_job_resume.py skills/summon/scripts/test_resume_capabilities.py skills/summon/scripts/test_evidence_guards.py skills/summon/scripts/test_opencode.py skills/summon/scripts/test_zcode.py skills/summon/scripts/test_background_read_roots.py skills/summon/scripts/test_codex_stream.py skills/summon/scripts/test_executor_ownership.py skills/summon/scripts/test_nous_credentials.py skills/summon/scripts/test_windows_credentials.py",
 }
 # Gate commands are part of the release contract too.  They are intentionally
 # fixed in source rather than accepted from the CLI, so a release evidence file
@@ -109,7 +118,7 @@ def _version_contract(root: Path) -> dict[str, object]:
             "schema": 1,
             "version": {"canonical": None, "versions": {}, "converged": False,
                          "errors": ["release version contract is missing"]},
-            "migration": {"path": "docs/VERSIONING_AND_3.0.md", "present": False,
+            "migration": {"path": "docs/PHASE1_MIGRATION_ROLLBACK.md", "present": False,
                            "complete": False, "missing": ["release contract"]},
             "ready": False,
         }
@@ -121,7 +130,7 @@ def _version_contract(root: Path) -> dict[str, object]:
             "schema": 1,
             "version": {"canonical": None, "versions": {}, "converged": False,
                          "errors": ["release version contract cannot be loaded"]},
-            "migration": {"path": "docs/VERSIONING_AND_3.0.md", "present": False,
+            "migration": {"path": "docs/PHASE1_MIGRATION_ROLLBACK.md", "present": False,
                            "complete": False, "missing": ["release contract"]},
             "ready": False,
         }
@@ -137,7 +146,10 @@ def _passing_count(value: object) -> tuple[int, int] | None:
     if not match:
         return None
     passed, total = int(match.group(1)), int(match.group(2))
-    if total <= 0 or passed != total:
+    # Machine-produced pytest evidence can include platform-specific skips.
+    # A nonzero command exit is rejected by release_gates before this compact
+    # count is emitted, so 0 < passed <= total means all executed tests passed.
+    if total <= 0 or passed <= 0 or passed > total:
         return None
     return passed, total
 
@@ -224,7 +236,12 @@ def _assert_external_path(root: Path, path: Path, label: str) -> None:
     raise ValueError(f"{label} must be outside the release source tree")
 
 
-def _tree_fingerprint(root: Path, *, exclude: frozenset[str] = frozenset()) -> tuple[str | None, set[str], str | None]:
+def _tree_fingerprint(
+    root: Path,
+    *,
+    exclude: frozenset[str] = frozenset(),
+    include_top_level: frozenset[str] | None = None,
+) -> tuple[str | None, set[str], str | None]:
     """Hash a bounded regular-file tree and return ``(digest, files, error)``.
 
     Install convergence must cover the complete skill, not merely production
@@ -239,6 +256,9 @@ def _tree_fingerprint(root: Path, *, exclude: frozenset[str] = frozenset()) -> t
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames.sort()
             filenames.sort()
+            relative_dir = Path(dirpath).relative_to(root)
+            if include_top_level is not None and not relative_dir.parts:
+                dirnames[:] = [name for name in dirnames if name in include_top_level]
             for dirname in list(dirnames):
                 item = Path(dirpath) / dirname
                 if _link_like(item):
@@ -250,6 +270,9 @@ def _tree_fingerprint(root: Path, *, exclude: frozenset[str] = frozenset()) -> t
                 if item.is_symlink() or not item.is_file():
                     return None, files, f"non-regular file: {filename}"
                 relative = item.relative_to(root).as_posix()
+                if (include_top_level is not None
+                        and Path(relative).parts[0] not in include_top_level):
+                    continue
                 if relative.endswith(".pyc") or "__pycache__" in Path(relative).parts:
                     continue
                 data = _canonical_bytes(item)
@@ -422,7 +445,9 @@ def _install_facts(root: Path) -> dict[str, object]:
 
     reference = report.get("reference_sha")
     source_skill_hash, source_skill_files, source_skill_error = _tree_fingerprint(
-        root / "skills" / "summon", exclude=frozenset({".summon-install.json"})
+        root / "skills" / "summon",
+        exclude=frozenset({".summon-install.json"}),
+        include_top_level=_MANAGED_SKILL_PAYLOAD,
     )
     source_companions = {}
     for companion in ("council", "deliberate"):

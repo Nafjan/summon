@@ -1,0 +1,53 @@
+{
+  "schema": "summon.usage-live-codex-schema-fixture/v1",
+  "generator": {
+    "command": "codex app-server generate-json-schema --out DIR",
+    "cli_version": "codex-cli 0.147.0",
+    "protocol": "app-server-v2"
+  },
+  "source_sha256": {
+    "ClientRequest.json": "6ba8920b1eb51583d43829d73a353bb069a888d08ed763a44272440c14efc88f",
+    "ClientNotification.json": "706cf248d75027c84a3c63348d0ed507182e8eba40069dd17541793de029145a",
+    "v2/GetAccountParams.json": "30b545275f60975b55bd6fbaafd70f15505801d14168ee82d3931b6e93c78aab",
+    "v2/GetAccountResponse.json": "dc770d8377dfe9b93b67e857e22ba7f99726265c8ca5cae63c5ad06e78b70b9d",
+    "v2/GetAccountRateLimitsResponse.json": "c67762e486f5a9b081ec42650fce657781669e6b1261c09c47bc8085d8cf2fc1"
+  },
+  "request_contract": [
+    {
+      "method": "initialize",
+      "params_required": true,
+      "required_params": ["clientInfo"],
+      "optional_params": ["capabilities"]
+    },
+    {
+      "method": "initialized",
+      "notification": true
+    },
+    {
+      "method": "account/read",
+      "params_required": true,
+      "refreshToken_type": "boolean",
+      "summon_value": false
+    },
+    {
+      "method": "account/rateLimits/read",
+      "params_required": false
+    }
+  ],
+  "response_contract": {
+    "GetAccountResponse": {
+      "required": ["requiresOpenaiAuth"],
+      "properties": ["account", "requiresOpenaiAuth"]
+    },
+    "GetAccountRateLimitsResponse": {
+      "required": ["rateLimits"],
+      "properties": ["rateLimitResetCredits", "rateLimits", "rateLimitsByLimitId"]
+    }
+  },
+  "privacy": {
+    "contains_account_data": false,
+    "contains_credentials": false,
+    "contains_local_paths": false,
+    "contains_provider_output": false
+  }
+}

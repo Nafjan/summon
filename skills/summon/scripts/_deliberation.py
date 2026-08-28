@@ -245,6 +245,16 @@ class ExecutionEvidence:
     # live-provider receipt can prove what actually served the turn.
     model_served: str | None = None
     model_targeted: str | None = None
+    error_kind: str | None = None
+    served_model_evidence: str = "absent"
+
+    def __post_init__(self) -> None:
+        if self.served_model_evidence not in {"reported", "inferred", "absent"}:
+            raise ValueError("served model evidence class is invalid")
+        if (self.served_model_evidence in {"reported", "inferred"}
+                and self.model_served is None):
+            raise ValueError(
+                "reported or inferred model evidence requires a served identity")
 
 
 @dataclass(frozen=True)
@@ -301,6 +311,7 @@ def _field(value: object, name: str, default: object = None) -> object:
 _SAFE_TERMINATION_REASONS = frozenset({
     "started", "deadline", "attempt_budget", "max_rounds", "cancelled",
     "snapshot_drift", "adapter_indeterminate", "adapter_error",
+    "context_source_drift",
     "approval_required", "consensus", "human_cancel", "human_denied",
     "human_approved", "ownership_lost", "max_attempts", "timeout",
 })
@@ -616,7 +627,8 @@ class AttemptLedger:
                 "parser_valid": evidence.parser_valid,
                 "ballot_valid": ballot_valid,
             })
-            if evidence.model_served is not None:
+            if (evidence.model_served is not None
+                    or evidence.model_targeted is not None):
                 self._append({
                     "event": "attempt_model_identity",
                     "schema_version": SCHEMA_VERSION,
@@ -624,6 +636,7 @@ class AttemptLedger:
                     "attempt_id": attempt_id,
                     "model_served": evidence.model_served,
                     "model_targeted": evidence.model_targeted,
+                    "served_model_evidence": evidence.served_model_evidence,
                 })
             entry.phase = "finished"
 
@@ -1265,7 +1278,8 @@ class DeliberationEngine:
         # over a model ballot that has not yet been durably accepted.
         cancel_before_finish = self._cancel_requested_safely()
         ballot = None
-        if (not cancel_before_finish and result.evidence.parser_valid and
+        if (not cancel_before_finish and result.evidence.transport_ok
+                and not result.evidence.timed_out and result.evidence.parser_valid and
                 isinstance(result.structured_output, Mapping)):
             ballot = validate_ballot(result.structured_output.get("ballot"), binding, self.policy)
         try:
@@ -1289,7 +1303,8 @@ class DeliberationEngine:
             self._transition(RunState.TIMED_OUT, "deadline")
             return result
         if not result.evidence.transport_ok:
-            self._transition(RunState.FAILED, "adapter_error")
+            self._transition(
+                RunState.FAILED, result.evidence.error_kind or "adapter_error")
             return result
 
         if ballot is not None and self.ballots.record(ballot, context.turn_ordinal):

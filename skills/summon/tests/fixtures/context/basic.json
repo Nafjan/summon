@@ -1,0 +1,11 @@
+{
+  "schema": "summon.context-input/v1",
+  "blocks": [
+    {
+      "id": "fixture-note",
+      "plane": "payload",
+      "kind": "note",
+      "body": "Provider-inert context fixture."
+    }
+  ]
+}

@@ -38,7 +38,8 @@ class FrozenRosterTests(unittest.TestCase):
 
     def add_agent(self, name: str, *, cli: str = "claude", permission: str = "read-only",
                   extra: str = "", transport: str | None = None,
-                  model: str | None = None, capability: str | None = None) -> Path:
+                  model: str | None = None, capability: str | None = None,
+                  lifecycle: str | None = None, successor: str | None = None) -> Path:
         lines = ["---", f"run-agent: {cli}", f"permission: {permission}"]
         if transport:
             lines.append(f"transport: {transport}")
@@ -46,6 +47,10 @@ class FrozenRosterTests(unittest.TestCase):
             lines.append(f"model: {model}")
         if capability:
             lines.append(f"capability: {capability}")
+        if lifecycle:
+            lines.append(f"lifecycle: {lifecycle}")
+        if successor:
+            lines.append(f"successor: {successor}")
         if extra:
             lines.append(f"args: {extra}")
         lines += ["---", "# Test seat", "A deterministic test definition.", ""]
@@ -106,6 +111,20 @@ class FrozenRosterTests(unittest.TestCase):
                          hashlib.sha256(path.read_bytes()).hexdigest())
         self.assertEqual(seat.authority_class, "enforceable")
         self.assertTrue(snap.revalidate())
+
+    def test_retired_seat_is_refused_at_shared_live_roster_boundary(self):
+        self.add_agent("worker", cli="definitely-missing-provider", lifecycle="Retired",
+                       successor="worker-v2")
+        with self.assertRaisesRegex(
+                roster.RosterResolutionError,
+                "retired.*successor 'worker-v2'"):
+            self.freeze()
+
+        # Deprecated remains dispatchable for compatibility, but a live caller
+        # receives the same normalized snapshot and can surface its warning.
+        self.add_agent("worker", lifecycle="deprecated", successor="worker-v2")
+        snap = self.freeze()
+        self.assertEqual(snap.seat("one").resolved_agent, "worker")
 
     def test_public_roster_exposes_catalog_display_identity_without_private_model_bytes(self):
         self.add_agent("worker", model="claude-fable-5")

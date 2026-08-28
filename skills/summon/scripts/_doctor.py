@@ -26,6 +26,15 @@ from pathlib import Path
 _VERSION_TIMEOUT = 45
 _PROBE_TIMEOUT = 25   # opt-in eligibility probe: a minimal real call, short leash
 
+# Doctor cannot validate request-specific roots because it receives no dispatch
+# agent, permission tier, or --read-root list. It can still expose the stable
+# capability boundary and the required provider-inert preflight.
+_READ_ROOT_CAPABILITIES = {
+    "enforced_backends": ["claude", "gemini"],
+    "required_permission": "read-only",
+    "preflight": "dispatch --dry-run with the actual --read-root arguments",
+}
+
 # Known "the binary runs but a real dispatch fails" signatures. A --version probe
 # passes for ALL of these. Each row: (signature, backend-or-None, kind, guidance).
 #   kind "eligibility": authenticated, but the ACCOUNT/CLIENT tier can't dispatch.
@@ -54,8 +63,15 @@ _BACKEND_ISSUE_SIGNS = (
     ("session has expired", None, "auth", "refresh the backend login before retrying"),
     ("session expired", None, "auth", "refresh the backend login before retrying"),
     ("invalid credentials", None, "auth", "refresh the backend login before retrying"),
+    ("provided authorization grant is invalid", "kimi", "auth",
+     "run `kimi login` to refresh Kimi's authorization grant before retrying"),
+    ("authorization grant is invalid", "kimi", "auth",
+     "run `kimi login` to refresh Kimi's authorization grant before retrying"),
     ("invalid api key", None, "auth", "check the backend login or API-key configuration"),
     ("api key not valid", None, "auth", "check the backend login or API-key configuration"),
+    ("api key is not set", None, "auth", "set the backend API-key environment variable or complete its provider login"),
+    ("no cookie auth credentials found", "opencode", "auth",
+     "authenticate OpenCode for the selected provider (for OpenRouter, run `opencode auth login` or configure the local OpenRouter credential)"),
     ("401 unauthorized", None, "auth", "refresh the backend login before retrying"),
     ("http 401", None, "auth", "refresh the backend login before retrying"),
     ("status code 401", None, "auth", "refresh the backend login before retrying"),
@@ -135,6 +151,10 @@ _BACKENDS = {
         "install": "npm install -g opencode-ai",
         "auth": "opencode auth login  (or `opencode providers login`)",
     },
+    "zcode": {
+        "install": "Z.AI ZCode desktop app (bundled CLI) or set ZCODE_CLI",
+        "auth": "open ZCode and complete its provider sign-in; use `zcode login` when supported by the installed CLI",
+    },
     "arkcli": {
         "install": "npm install -g @byteplus/ark-cli",
         "auth": "arkcli auth login",
@@ -165,7 +185,16 @@ _AUTH_REPAIR_PLANS = {
             "interaction": "browser_or_terminal", "supports_autonomous": True},
     "opencode": {"command": "opencode auth login", "argv": ["opencode", "auth", "login"],
                   "interaction": "terminal", "supports_autonomous": False,
-                  "note": "OpenCode auth login may require selecting a provider and entering a key."},
+                  "note": ("OpenCode auth login may require selecting a provider and entering "
+                           "a key; it does not automatically consume Summon's Windows "
+                           "Credential Manager entry.")},
+    "zcode": {"command": "zcode login",
+              "argv": ["zcode", "login"],
+              "interaction": "browser_or_terminal", "supports_autonomous": True,
+              "note": ("Summon can start the discovered desktop-bundled ZCode login flow; "
+                       "browser approval may still be required. Native ZCode keeps its own "
+                       "CLI model configuration, separate from OpenCode and the Coding Plan "
+                       "helper.")},
     "arkcli": {"command": "arkcli auth login", "argv": ["arkcli", "auth", "login"],
                "interaction": "browser", "supports_autonomous": True},
 }
@@ -218,24 +247,40 @@ def _check_backends() -> dict:
     --version probe is reported found-but-unverified and NOT counted usable —
     a random binary shadowing a backend name must not read as ready."""
     names = list(_BACKENDS)
-    paths = {n: shutil.which(n) for n in names}
+    zcode_targets = {}
+    try:
+        from _zcode import resolve_zcode_cli, zcode_version
+        zcode_targets["zcode"] = resolve_zcode_cli()
+    except Exception:  # noqa: BLE001 - doctor remains usable if optional discovery fails
+        zcode_targets["zcode"] = None
+        zcode_version = None
+    paths = {n: (None if n == "zcode" else shutil.which(n)) for n in names}
     with ThreadPoolExecutor(max_workers=len(names)) as pool:
         versions = dict(zip(names, pool.map(
-            lambda n: _probe_version(paths[n]) if paths[n] else None, names)))
+            lambda n: (zcode_version(zcode_targets[n]) if n == "zcode"
+                       and zcode_targets.get(n) is not None and zcode_version is not None
+                       else _probe_version(paths[n]) if paths[n] else None), names)))
     out: dict = {}
     for name in names:
         path = paths[name]
+        zcode_target = zcode_targets.get(name) if name == "zcode" else None
         # Tiered eligibility (the field feedback): binary_ok is knowable cheaply;
         # auth_ok / account_eligible / model_access_verified are NOT (a passing
         # --version is not eligibility), so they stay None ("unverified") until the
         # opt-in live probe fills them. Being honest here is the whole point -- the
         # incident was a --version-OK Gemini that failed the first real dispatch.
-        entry: dict = {"found": bool(path), "path": path, "binary_ok": bool(path),
+        entry: dict = {"found": bool(path or zcode_target), "path": path,
+                       "binary_ok": bool(path or zcode_target),
                        "auth_ok": None, "account_eligible": None,
                        "model_access_verified": None}
-        if path:
+        if path or zcode_target:
             entry["version"] = versions[name]
             entry["verified"] = versions[name] is not None
+            if zcode_target is not None:
+                entry["discovery_source"] = zcode_target.source
+                # Do not emit a local install path: it does not help another
+                # operator and can leak a machine layout in copied diagnostics.
+                entry["path"] = None
         else:
             entry["install"] = _BACKENDS[name]["install"]
         entry["auth_hint"] = _BACKENDS[name]["auth"]
@@ -469,6 +514,16 @@ def _check_byteplus_coding() -> dict:
     return entry
 
 
+def _check_zai_coding_plan() -> dict:
+    """Z.AI Coding Plan credential readiness only; never reads a provider."""
+    try:
+        from _zai_coding_plan import zai_coding_plan_status
+        return zai_coding_plan_status()
+    except Exception:  # noqa: BLE001 - doctor must remain provider-inert
+        return {"env_set": False, "resolvable": False, "source": None,
+                "hint": "Z.AI Coding Plan diagnostics are unavailable"}
+
+
 def _check_onboard_prefs() -> dict:
     """Onboard prefs summary (subscriptions only; no secrets)."""
     try:
@@ -483,6 +538,22 @@ def _check_onboard_prefs() -> dict:
     if not isinstance(subs, list):
         subs = []
     return {"present": True, "subscriptions": subs}
+
+
+def _opencode_cwd_policy(cwd: str | None) -> dict:
+    """Surface OpenCode's restricted Windows cwd boundary without a provider call."""
+    if not cwd:
+        return {"checked": False}
+    try:
+        from _builder import read_allowlist
+        policy = read_allowlist("opencode", "safe-edit", cwd, ())
+    except Exception as exc:  # noqa: BLE001 - doctor remains advisory and bounded
+        return {"checked": False, "note": f"{type(exc).__name__}: policy unavailable"}
+    out = {"checked": True, "allowed": not bool(policy.get("would_refuse"))}
+    for key in ("error_kind", "allowed_root", "requires_packet_refreeze", "reroute"):
+        if policy.get(key) is not None:
+            out[key] = policy[key]
+    return out
 
 
 def doctor(agents_dir: str | None = None, cwd: str | None = None,
@@ -504,7 +575,10 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None,
                     "unless SUBAGENTS_ALLOW_OPENAI_KEY=1",
         },
         "byteplus_coding": _check_byteplus_coding(),
+        "zai_coding_plan": _check_zai_coding_plan(),
         "onboard_prefs": _check_onboard_prefs(),
+        "read_root_capabilities": dict(_READ_ROOT_CAPABILITIES),
+        "opencode_cwd_policy": _opencode_cwd_policy(cwd),
     }
     try:
         from _t3 import t3_status
@@ -617,6 +691,15 @@ def render(report: dict) -> str:
         f"agents   : {'[OK]' if ad['found'] else '[--]'} {ad.get('path')}  "
         f"({ad.get('agent_count', 0)} agent definitions)",
     ]
+    rr = report.get("read_root_capabilities") or {}
+    if rr:
+        lines.append("read roots: only %s enforce extra roots at read-only; %s"
+                     % ("/".join(rr.get("enforced_backends") or []),
+                        rr.get("preflight", "run a dispatch dry-run first")))
+    oc = report.get("opencode_cwd_policy") or {}
+    if oc.get("checked") and not oc.get("allowed"):
+        lines.append("opencode  : [!!] restricted policy denies this cwd; stage a sanitized "
+                     "packet on the recommended local root, re-freeze it, then dry-run")
     bg = report["billing_guard"]
     if bg["openai_api_key_present"]:
         lines.append("billing  : OPENAI_API_KEY is set - "
@@ -644,6 +727,13 @@ def render(report: dict) -> str:
             lines.append(f"  [~?] roster cache present  ({rc.get('path')})")
     else:
         lines.append("  [--] no roster cache at ~/.agents/byteplus-coding-roster.json")
+    zai = report.get("zai_coding_plan") or {}
+    lines += ["", "z.ai coding plan:"]
+    if zai.get("resolvable"):
+        lines.append(f"  [OK] direct text-seat credential resolvable (source: {zai.get('source') or '?'})")
+    else:
+        lines.append("  [--] direct text-seat credential not resolvable; "
+                     "set ZAI_CODING_API_KEY or configure the official helper")
     op = report.get("onboard_prefs") or {}
     lines += ["", "onboard prefs:"]
     if op.get("present"):
@@ -670,6 +760,7 @@ def render(report: dict) -> str:
     if inst and inst.get("records"):
         dr = inst["drift"]
         ref = dr.get("reference_sha")
+        managed_ref = dr.get("managed_reference_sha")
         lines += ["", "installs (this machine):"]
         for r in inst["records"]:
             run = " (running)" if r.get("running") else ""
@@ -679,25 +770,51 @@ def render(report: dict) -> str:
             ver = r.get("version") or "?"
             if not r["sha256"]:   # present but couldn't hash it (perm error / foreign file)
                 mark, sha, note = "[~?]", "unhashable  ", "present but could not be hashed"
-            elif ref and r["sha256"] == ref:
-                mark, sha, note = "[OK]", r["sha256"][:12], "current"
-            elif ref:
-                mark, sha, note = "[~?]", r["sha256"][:12], "DRIFT: stale copy; re-run install.py"
+            elif r.get("managed") and managed_ref and r["sha256"] == managed_ref:
+                mark, sha, note = "[OK]", r["sha256"][:12], "current managed set"
+            elif r.get("managed") and managed_ref:
+                mark, sha, note = (
+                    "[~?]", r["sha256"][:12],
+                    "DRIFT: differs from managed set; re-run install.py")
+            elif not r.get("managed") and ref and r["sha256"] == ref:
+                mark, sha, note = (
+                    "[OK]", r["sha256"][:12], "running/global reference")
+            elif not r.get("managed") and ref:
+                mark, sha, note = (
+                    "[~?]", r["sha256"][:12],
+                    "unmanaged copy differs; installer will not modify it")
             else:
                 mark, sha, note = "[~?]", r["sha256"][:12], "unverified (no running reference)"
             lines.append(f"  {mark} {r['label']:<10} {sha}  v{ver:<7} {note}{run}")
             lines.append(f"       {r['scripts_dir']}")
-        if ref and (dr.get("drifted") or dr.get("unknown")):
+        managed_drift = (dr["managed_drifted"] if "managed_drifted" in dr else [
+            d for d in (dr.get("drifted") or []) if d.get("managed")])
+        managed_unknown = (dr["managed_unknown"] if "managed_unknown" in dr else [
+            u for u in (dr.get("unknown") or []) if u.get("managed")])
+        if ref and (managed_drift or managed_unknown):
             bits = []
-            if dr.get("drifted"):
-                bits.append(f"{len(dr['drifted'])} differ "
-                            f"({', '.join(d['label'] for d in dr['drifted'])})")
-            if dr.get("unknown"):
-                bits.append(f"{len(dr['unknown'])} unhashable "
-                            f"({', '.join(u['label'] for u in dr['unknown'])})")
+            if managed_drift:
+                bits.append(f"{len(managed_drift)} differ "
+                            f"({', '.join(d['label'] for d in managed_drift)})")
+            if managed_unknown:
+                bits.append(f"{len(managed_unknown)} unhashable "
+                            f"({', '.join(u['label'] for u in managed_unknown)})")
             lines.append(f"  drift    : {'; '.join(bits)} - run  python install.py  to converge")
-        elif dr.get("converged") and len(dr.get("present", [])) > 1:
-            lines.append("  drift    : all installed copies match the running install")
+        elif dr.get("managed_converged"):
+            suffix = (" and match the running install"
+                      if dr.get("running_matches_managed")
+                      else "; the running unmanaged copy differs")
+            lines.append("  drift    : all installer-managed copies agree" + suffix)
+        unmanaged_drift = (dr["unmanaged_drifted"] if "unmanaged_drifted" in dr else [
+            d for d in (dr.get("drifted") or []) if not d.get("managed")])
+        unmanaged_unknown = (dr["unmanaged_unknown"] if "unmanaged_unknown" in dr else [
+            u for u in (dr.get("unknown") or []) if not u.get("managed")])
+        if unmanaged_drift or unmanaged_unknown:
+            labels = [d["label"] for d in unmanaged_drift]
+            labels += [u["label"] for u in unmanaged_unknown]
+            lines.append("  unmanaged : " + ", ".join(labels)
+                         + " differ or cannot be hashed; install.py does not modify "
+                           "project/plugin copies (update them only with an explicit owner decision)")
         _dups = dr.get("duplicates") or []
         for d in _dups:
             for path in d["dirs"]:

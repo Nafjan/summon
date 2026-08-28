@@ -234,7 +234,7 @@ def receipt_schedule(receipt: Mapping[str, object]) -> tuple[int, int, str]:
     return rounds, deadline, schedule_digest(rounds, deadline)
 
 
-def _receipt_metadata(receipt: Mapping[str, object]) -> None:
+def _receipt_metadata(receipt: Mapping[str, object], *, allow_legacy_context: bool = False) -> None:
     """Validate immutable question/timestamp metadata before replaying turns."""
     question_sha = receipt.get("question_sha256")
     if not isinstance(question_sha, str) or not _SHA256_RE.fullmatch(question_sha):
@@ -245,6 +245,20 @@ def _receipt_metadata(receipt: Mapping[str, object]) -> None:
                 not isinstance(created_at, (int, float)) or
                 not math.isfinite(float(created_at)) or created_at < 0):
             raise ReplayError("receipt created_at is malformed")
+    if "durable_context" in receipt:
+        try:
+            from _deliberation_context import (parse_private_projection,
+                                               parse_private_projection_readonly)
+            parser = (parse_private_projection_readonly
+                      if allow_legacy_context else parse_private_projection)
+            binding = parser(receipt["durable_context"])
+        except Exception as exc:
+            raise ReplayError("receipt durable context binding is invalid") from exc
+        if (binding.run_id != receipt.get("run_id")
+                or binding.decision_id != receipt.get("decision_id")
+                or binding.state == "stale_refused"
+                or binding.routing_authority is not False):
+            raise ReplayError("receipt durable context authority is invalid")
 
 
 def _policy_digest(decision_id: str, seat_ids: tuple[str, ...],
@@ -280,6 +294,7 @@ def _quorum_threshold(denominator: int, rule: object) -> int:
 _SAFE_REASONS = frozenset({
     "started", "deadline", "attempt_budget", "max_rounds", "cancelled",
     "snapshot_drift", "adapter_indeterminate", "adapter_error",
+    "context_source_drift",
     "approval_required", "consensus", "human_cancel", "human_denied",
     "human_approved", "ownership_lost", "max_attempts", "timeout",
 })
@@ -321,7 +336,7 @@ _TRANSCRIPT_FIELDS = {
                           "launch_spec_sha256", "transport_ok", "exit_code",
                           "timed_out", "parser_valid", "ballot_valid"),
     "attempt_model_identity": ("event", "schema_version", "generation",
-                                "attempt_id", "model_served", "model_targeted"),
+                                "attempt_id", "served_model_evidence"),
     "ballot_accepted": ("event", "schema_version", "generation", "attempt_id",
                          "seat_id", "turn_id", "turn_ordinal", "decision",
                          "option_id"),
@@ -345,7 +360,17 @@ def _public_event(record: Mapping[str, object]) -> dict:
     fields = _TRANSCRIPT_FIELDS.get(event)
     if fields is None:
         raise ReplayError("cannot export unknown replay event")
-    return {key: record[key] for key in fields if key in record}
+    projected = {key: record[key] for key in fields if key in record}
+    if event == "attempt_model_identity":
+        # Custom/private model aliases can reveal account or project metadata.
+        # The observer only needs equality evidence, so export content hashes
+        # rather than raw provider model strings.
+        for key in ("model_served", "model_targeted"):
+            value = record.get(key)
+            if isinstance(value, str):
+                projected[key + "_sha256"] = hashlib.sha256(
+                    value.encode("utf-8")).hexdigest()
+    return projected
 
 
 def command_batch_sha256(commands: Iterable[ReplayCommand]) -> str:
@@ -412,7 +437,8 @@ def _sealed_command_batch(record: Mapping[str, object],
 
 def replay_checkpoint(receipt: Mapping[str, object],
                       tagged_records: Iterable[tuple[int, Mapping[str, object]]],
-                      current_owner_generation: int) -> ReplayCheckpoint:
+                      current_owner_generation: int, *,
+                      allow_legacy_context: bool = False) -> ReplayCheckpoint:
     """Validate and reconstruct a durable deliberation checkpoint.
 
     ``current_owner_generation`` is the generation being acquired for resume;
@@ -431,7 +457,7 @@ def replay_checkpoint(receipt: Mapping[str, object],
     decision_id = _id(receipt.get("decision_id"), "decision id")
     seat_ids, option_ids, quorum, max_attempts, approval = _receipt_policy(receipt)
     rounds, deadline_unix_ms, schedule_digest_value = receipt_schedule(receipt)
-    _receipt_metadata(receipt)
+    _receipt_metadata(receipt, allow_legacy_context=allow_legacy_context)
     receipt_sha256 = _sha(receipt)
     policy_digest = _policy_digest(decision_id, seat_ids, option_ids, quorum,
                                    max_attempts, approval)
@@ -491,6 +517,8 @@ def replay_checkpoint(receipt: Mapping[str, object],
     finished: set[str] = set()
     accepted: list[ReplayBallot] = []
     ballot_keys: set[str] = set()
+    balloted_attempts: set[str] = set()
+    identity_attempts: set[str] = set()
     latest_ballot_ordinal: dict[str, int] = {}
     latest_ballot: dict[str, ReplayBallot] = {}
     expected_turn_ordinal = 0
@@ -548,7 +576,8 @@ def replay_checkpoint(receipt: Mapping[str, object],
                 ("RUNNING", "TIMED_OUT"): {"deadline"},
                 ("RUNNING", "ATTEMPT_BUDGET_EXHAUSTED"): {"attempt_budget"},
                 ("RUNNING", "FAILED"): {"snapshot_drift", "adapter_indeterminate",
-                                          "adapter_error", "ownership_lost"},
+                                          "adapter_error", "context_source_drift",
+                                          "ownership_lost"},
                 ("WAITING_HUMAN", "DECIDED"): {"human_approved"},
                 ("WAITING_HUMAN", "REJECTED"): {"human_denied"},
                 ("WAITING_HUMAN", "CANCELLED"): {"cancelled", "human_cancel"},
@@ -733,13 +762,26 @@ def replay_checkpoint(receipt: Mapping[str, object],
             continue
         if event == "attempt_model_identity":
             attempt_id = _id(record.get("attempt_id"), "model identity attempt id")
-            if attempt_id not in attempts:
-                raise ReplayError("model identity lacks a matching attempt")
+            prior = attempts.get(attempt_id)
+            if (prior is None or prior.phase != "finished"
+                    or prior.generation != generation):
+                raise ReplayError(
+                    "model identity lacks a matching finished attempt")
+            if attempt_id in identity_attempts:
+                raise ReplayError("attempt has duplicate model identity evidence")
+            if attempt_id in balloted_attempts:
+                raise ReplayError("model identity appeared after its ballot")
             for key in ("model_served", "model_targeted"):
                 value = record.get(key)
                 if value is not None and (not isinstance(value, str)
                                           or _MODEL_RE.fullmatch(value) is None):
                     raise ReplayError("attempt model identity is malformed")
+            evidence = record.get("served_model_evidence", "absent")
+            if evidence not in {"reported", "inferred", "absent"}:
+                raise ReplayError("attempt model evidence class is malformed")
+            if evidence in {"reported", "inferred"} and record.get("model_served") is None:
+                raise ReplayError("attempt model evidence lacks a served identity")
+            identity_attempts.add(attempt_id)
             transcript.append(_public_event(record))
             continue
         if event == "ballot_accepted":
@@ -772,6 +814,7 @@ def replay_checkpoint(receipt: Mapping[str, object],
                 raise ReplayError("duplicate or regressed ballot")
             latest_ballot_ordinal[prior.seat_id] = prior.turn_ordinal
             ballot_keys.add(key)
+            balloted_attempts.add(attempt_id)
             ballot = ReplayBallot(decision_id, prior.seat_id, prior.turn_id,
                                   attempt_id, prior.turn_ordinal, decision, option)
             accepted.append(ballot)

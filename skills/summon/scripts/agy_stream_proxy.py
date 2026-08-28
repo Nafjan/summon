@@ -52,6 +52,7 @@ def _has_output_format_flag(args: list[str]) -> bool:
 _BOUNDARY_VALUE_FLAGS = {
     "--add-dir", "--mode", "--sandbox", "--conversation",
     "--agent", "--project", "--log-file", "--output-file", "--continue-id",
+    "--print-timeout",
 }
 # Boolean flags: stripped alone, no value token follows.
 _BOUNDARY_FLAG_ONLY = {
@@ -78,14 +79,20 @@ def _strip_boundary_flags(args: list[str]) -> list[str]:
             result.append(a)
             result.extend(args[i + 1:])
             break
-        if a in _BOUNDARY_VALUE_FLAGS:
+        name, sep, _ = a.partition("=")
+        # Go-style single-dash long options are accepted by AGY.  Normalize
+        # them for boundary comparison without changing the emitted argv.
+        boundary_name = name
+        if (boundary_name.startswith("-") and not boundary_name.startswith("--")
+                and len(boundary_name) > 2):
+            boundary_name = "-" + boundary_name
+        if not sep and boundary_name in _BOUNDARY_VALUE_FLAGS:
             i += 2 if i + 1 < len(args) else 1
             continue
-        if a in _BOUNDARY_FLAG_ONLY:
+        if not sep and boundary_name in _BOUNDARY_FLAG_ONLY:
             i += 1
             continue
-        name, sep, _ = a.partition("=")
-        if sep and name in _BOUNDARY_VALUE_FLAGS | _BOUNDARY_FLAG_ONLY:
+        if sep and boundary_name in _BOUNDARY_VALUE_FLAGS | _BOUNDARY_FLAG_ONLY:
             i += 1
             continue
         result.append(a)
@@ -151,7 +158,10 @@ def main() -> int:
             text=True,
             encoding="utf-8",
             errors="replace",
-            **popen_flags(),
+            # The executor already launches this proxy as a POSIX session/group
+            # leader. Keep AGY in that group so timeout/cancel killpg reaches
+            # both processes. Windows still receives the shared hidden flags.
+            **popen_flags(join_parent_group=True),
             env=env,
         )
     except Exception as e:  # noqa: BLE001

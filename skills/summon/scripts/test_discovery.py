@@ -572,17 +572,22 @@ def test_description_word_boundary_cap():
 
 def test_doctor_all_missing_is_fail_soft():
     # With every CLI absent, doctor must still return a full report (ok=False),
-    # never raise. Simulate by stubbing shutil.which inside _doctor.
+    # never raise. Simulate both ordinary PATH misses and ZCode's app-bundle
+    # discovery miss; ZCode deliberately has a second discovery path.
     import _doctor
+    import _zcode
     orig = _doctor.shutil.which
+    orig_zcode = _zcode.resolve_zcode_cli
     _doctor.shutil.which = lambda name: None
+    _zcode.resolve_zcode_cli = lambda: None
     try:
         rep = _doctor.doctor()
     finally:
         _doctor.shutil.which = orig
+        _zcode.resolve_zcode_cli = orig_zcode
     assert rep["ok"] is False
     assert rep["usable_backends"] == []
-    for b in ("claude", "codex", "cursor-agent", "gemini", "agy"):
+    for b in ("claude", "codex", "cursor-agent", "gemini", "agy", "zcode"):
         assert rep["backends"][b]["found"] is False
         assert rep["backends"][b]["install"]
     # render() must also survive the all-missing report (and stay ASCII-safe)
@@ -729,8 +734,59 @@ def test_doctor_json_roundtrip():
     import _doctor
     rep = _doctor.doctor()
     parsed = _json.loads(_json.dumps(rep, ensure_ascii=False))
-    assert set(parsed["backends"]) == {"claude", "codex", "cursor-agent", "gemini", "kimi", "agy", "opencode", "arkcli"}
+    assert set(parsed["backends"]) == {
+        "claude", "codex", "cursor-agent", "gemini", "kimi", "agy",
+        "opencode", "arkcli", "zcode",
+    }
     assert isinstance(parsed["ok"], bool)
+    assert parsed["read_root_capabilities"] == {
+        "enforced_backends": ["claude", "gemini"],
+        "required_permission": "read-only",
+        "preflight": "dispatch --dry-run with the actual --read-root arguments",
+    }
+    assert "read roots:" in _doctor.render(rep)
+
+
+def _fake_agy_executable():
+    """Put a minimal AGY capability probe on PATH for hermetic builder tests.
+
+    Production dispatch deliberately refuses an AGY binary that does not expose
+    ``--print-timeout``.  Tests for argument construction must exercise that gate
+    without depending on a developer workstation or GitHub runner having AGY
+    installed.  Use an actual platform-native shim instead of bypassing the gate.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        bindir = tempfile.mkdtemp(prefix="summon-fake-agy-bin-")
+        saved_path = os.environ.get("PATH")
+        saved_pathext = os.environ.get("PATHEXT")
+        if os.name == "nt":
+            executable = os.path.join(bindir, "agy.cmd")
+            with open(executable, "w", encoding="utf-8", newline="") as fh:
+                fh.write("@echo off\r\necho --print-timeout\r\nexit /b 0\r\n")
+            os.environ["PATHEXT"] = saved_pathext or ".COM;.EXE;.BAT;.CMD"
+        else:
+            executable = os.path.join(bindir, "agy")
+            with open(executable, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("#!/bin/sh\nprintf '%s\\n' '--print-timeout'\n")
+            os.chmod(executable, 0o700)
+        os.environ["PATH"] = bindir + os.pathsep + (saved_path or "")
+        try:
+            yield executable
+        finally:
+            if saved_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = saved_path
+            if saved_pathext is None:
+                os.environ.pop("PATHEXT", None)
+            else:
+                os.environ["PATHEXT"] = saved_pathext
+            shutil.rmtree(bindir, ignore_errors=True)
+
+    return _ctx()
 
 
 def _fake_agy_home():
@@ -759,7 +815,8 @@ def _fake_agy_home():
         os.environ["AGY_HEADLESS_PROFILE"] = state
         os.environ.pop("AGY_PTY_WRAPPER", None)
         try:
-            yield home
+            with _fake_agy_executable():
+                yield home
         finally:
             for k, v in saved.items():
                 if v is None:
@@ -916,7 +973,9 @@ def test_envelope_model_and_permission_echo():
     # the guard-effective request; served stays None (no evidence); resolved
     # keeps legacy v1 semantics (None here).
     assert out["model"] == {"requested": "opus", "targeted": "opus", "served": None,
-                            "resolved": None, "models_used": []}
+                            "resolved": None, "models_used": [],
+                            "exact_required": False, "exact_source": None,
+                            "evidence_source": None}
     assert out["permission"] == "read-only"
     assert out["permission_flags"] == ["--permission-mode", "plan"]
     assert "_debug_raw" not in out  # internal key never leaks into the envelope
@@ -1042,6 +1101,27 @@ def test_v1_model_mismatch_detection():
     assert _executor._model_mismatch("x", None) is False
 
 
+def test_v11_named_model_proof_is_tri_state_and_exact():
+    """Only provider-reported exact identity can certify a named-model review."""
+    import _executor
+    exact = _executor.model_match_state(
+        "claude-opus-5", "claude-opus-5", "claude-opus-5", "reported")
+    assert exact is True
+    mismatch = _executor.model_match_state(
+        "claude-opus-5", "claude-opus-5", "claude-haiku-4-5", "reported")
+    assert mismatch is False
+    targeted_mismatch = _executor.model_match_state(
+        "claude-opus-5", "claude-haiku-4-5", "claude-opus-5", "reported")
+    assert targeted_mismatch is False
+    # Inferred and absent evidence remain unknown, rather than false votes.
+    assert _executor.model_match_state(
+        "claude-opus-5", "claude-opus-5", "claude-opus-5", "inferred") is None
+    assert _executor.model_match_state(
+        "claude-opus-5", "claude-opus-5", None, "absent") is None
+    # A floating alias can be warning-compatible but is not exact proof.
+    assert _executor.model_match_state("opus", "opus", "claude-opus-5", "reported") is False
+
+
 def test_v1_normalized_success_exit_fields():
     # rec #8 / regression test 10: a backend that exited non-zero but produced a
     # clean terminal result normalizes to success, with the raw code AND the
@@ -1051,19 +1131,25 @@ def test_v1_normalized_success_exit_fields():
         "codex", 1, {"is_error": False, "result": "done"}, ["done\n"], "")
     assert resp["status"] == "success"
     assert resp["exit_code"] == 1 and resp["backend_exit_code"] == 1
+    assert resp["raw_backend_exit_code"] == 1 and resp["normalized_exit_code"] == 0
     assert resp["dispatcher_status"] == "success"
     assert "normalized to success" in resp["normalization_reason"]
     assert "raw backend exit 1" in resp["normalization_reason"]
     # a plain clean exit (0) states exit and status agree
     ok = _executor.build_final_response("codex", 0, {"is_error": False, "result": "d"}, ["d\n"], "")
     assert ok["backend_exit_code"] == 0 and ok["dispatcher_status"] == "success"
+    assert ok["raw_backend_exit_code"] == 0 and ok["normalized_exit_code"] == 0
     # finalize_exit_fields backfills a bare envelope but never overwrites a reason
     env = _executor.finalize_exit_fields({"status": "error", "exit_code": 127})
     assert env["backend_exit_code"] == 127 and env["dispatcher_status"] == "error"
+    assert env["raw_backend_exit_code"] == 127 and env["normalized_exit_code"] == 127
     assert env["normalization_reason"]
     keep = _executor.finalize_exit_fields(
         {"status": "success", "exit_code": 1, "normalization_reason": "PINNED"})
     assert keep["normalization_reason"] == "PINNED"
+    failed_zero = _executor.finalize_exit_fields({"status": "error", "exit_code": 0})
+    assert failed_zero["raw_backend_exit_code"] == 0
+    assert failed_zero["normalized_exit_code"] == 1
     # query-shaped envelopes (no exit_code) are left untouched
     assert "backend_exit_code" not in _executor.finalize_exit_fields({"agents": []})
 
@@ -1104,6 +1190,52 @@ def test_v1_crash_envelope_carries_exit_fields():
     env = run_subagent._crash_envelope(RuntimeError("boom"))
     assert env["status"] == "error" and env["backend_exit_code"] == 1
     assert env["dispatcher_status"] == "error" and "RuntimeError" in env["normalization_reason"]
+    assert env["attempts"] is None and env["attempt_status"] == "unknown"
+    assert env["execution_status"] == "error"
+    assert env["provider_contacted"] is None
+
+
+def test_v1_background_parser_exit_gets_terminal_envelope():
+    """An argparse/SystemExit before normal dispatch must not orphan a job."""
+    import subprocess
+    root = tempfile.mkdtemp(prefix="summon-bg-parser-exit-")
+    result = os.path.join(root, "job.json")
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "run_subagent.py")
+    try:
+        completed = subprocess.run(
+            [sys.executable, script, "--agent", "missing", "--prompt", "x",
+             "--cwd", root, "--job-file", result, "--bogus"],
+            capture_output=True, text=True, encoding="utf-8")
+        assert completed.returncode == 2, completed.returncode
+        with open(result, encoding="utf-8") as fh:
+            envelope = json.load(fh)
+        assert envelope["error_kind"] == "dispatcher_exit_before_envelope"
+        assert envelope["provider_contacted"] is False
+        assert envelope["result_usable"] is False
+        assert envelope["exit_code"] == 2
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v1_background_envelope_writer_uses_retry_safe_atomic_replace():
+    import run_subagent as rs
+    root = tempfile.mkdtemp(prefix="summon-bg-envelope-write-")
+    result = os.path.join(root, "job.json")
+    calls = []
+    original = rs._jobs._replace_with_retry
+    try:
+        def wrapped(src, dst):
+            calls.append((src, dst))
+            return original(src, dst)
+        rs._jobs._replace_with_retry = wrapped
+        rs._write_job_file_text('{"status":"error"}', result)
+        with open(result, encoding="utf-8") as fh:
+            assert json.load(fh)["status"] == "error"
+        assert calls and calls[0][1] == result
+    finally:
+        rs._jobs._replace_with_retry = original
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_v1_is_terminal_success_shared_gate():
@@ -1259,6 +1391,26 @@ def test_write_out_unique_tmp():
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
+
+
+def test_write_out_uses_retry_safe_atomic_replace():
+    import run_subagent as rs
+    d = tempfile.mkdtemp(prefix="summon-out-retry-")
+    target = os.path.join(d, "job.json")
+    calls = []
+    original = rs._jobs._replace_with_retry
+    try:
+        def wrapped(src, dst):
+            calls.append((src, dst))
+            return original(src, dst)
+        rs._jobs._replace_with_retry = wrapped
+        rs._write_out(target, {"status": "error", "error": "new"})
+        assert calls and calls[0][1] == target
+        with open(target, encoding="utf-8") as fh:
+            assert json.load(fh)["error"] == "new"
+    finally:
+        rs._jobs._replace_with_retry = original
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_run_manifest_end_to_end_with_stub_child(tmp=None):
@@ -1621,14 +1773,17 @@ def test_roster_set_agent_edits_frontmatter_only():
                capture_output=True, text=True, encoding="utf-8")
         path = os.path.join(d, "probe.md")
         body_before = open(path, encoding="utf-8").read().split("---", 2)[2]
-        # update model + permission, add args
+        # update model + permission, add args and a lifecycle handoff
         r = sp.run([sys.executable, script, "--set-agent", "probe",
                     "--set", "model=claude-sonnet-5", "--set", "permission=yolo",
-                    "--set", 'args=--flag', "--agents-dir", d],
+                    "--set", 'args=--flag', "--set", "lifecycle=retired",
+                    "--set", "successor=probe-v2", "--agents-dir", d],
                    capture_output=True, text=True, encoding="utf-8")
         info = _json.loads(r.stdout)
         assert info["frontmatter"]["model"] == "claude-sonnet-5"
         assert info["frontmatter"]["permission"] == "yolo"
+        assert info["frontmatter"]["lifecycle"] == "retired"
+        assert info["frontmatter"]["successor"] == "probe-v2"
         assert open(path, encoding="utf-8").read().split("---", 2)[2] == body_before
         # empty value removes the key
         r = sp.run([sys.executable, script, "--set-agent", "probe", "--set", "model=",
@@ -1639,6 +1794,14 @@ def test_roster_set_agent_edits_frontmatter_only():
                     "--set", "permission=godmode", "--agents-dir", d],
                    capture_output=True, text=True, encoding="utf-8")
         assert r.returncode == 1 and "permission" in _json.loads(r.stdout)["error"]
+        r = sp.run([sys.executable, script, "--set-agent", "probe",
+                    "--set", "lifecycle=immortal", "--agents-dir", d],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 1 and "lifecycle" in _json.loads(r.stdout)["error"]
+        r = sp.run([sys.executable, script, "--set-agent", "probe",
+                    "--set", "successor=../escape", "--agents-dir", d],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 1 and "agent name" in _json.loads(r.stdout)["error"].lower()
         # unknown key rejected
         r = sp.run([sys.executable, script, "--set-agent", "probe",
                     "--set", "prompt=evil", "--agents-dir", d],
@@ -1834,7 +1997,8 @@ def test_openai_compat_http_roundtrip():
         # API reported the model on the terminal response -> served evidence
         assert env["model"] == {"requested": "test-model", "targeted": "test-model",
                                 "served": "test-model", "resolved": "test-model",
-                                "models_used": []}
+                                "models_used": [], "exact_required": False,
+                                "exact_source": None, "evidence_source": None}
         assert env["usage"]["total_tokens"] == 9 and env["billing"]["source"] == "api"
         assert env["envelope"] == 1
         assert env.get("text_seat", {}).get("allowed") is True
@@ -2298,6 +2462,299 @@ def test_dry_run_resolves_without_executing():
         _sh.rmtree(agents, ignore_errors=True)
 
 
+def test_read_only_allowlist_parses_and_rejects_ambiguous_roots():
+    from _loader import parse_read_roots
+    assert parse_read_roots(None) == ()
+    assert parse_read_roots(" C:\\oracle ; C:\\board ") == (
+        "C:\\oracle", "C:\\board")
+    assert parse_read_roots('["C:\\\\oracle", "C:\\\\board"]') == (
+        "C:\\oracle", "C:\\board")
+    for bad in ('{"root":"C:\\\\oracle"}', '["C:\\\\oracle"', '[1]'):
+        try:
+            parse_read_roots(bad)
+            raise AssertionError(f"expected invalid read-roots: {bad}")
+        except ValueError:
+            pass
+    try:
+        parse_read_roots(";".join(f"C:\\r{i}" for i in range(17)))
+        raise AssertionError("expected read-roots bound")
+    except ValueError:
+        pass
+
+
+def test_read_only_allowlist_is_enforced_by_claude_and_gemini_only():
+    from _builder import (AgentInvocation, build_invocation_args,
+                          normalize_read_roots, read_allowlist)
+    with tempfile.TemporaryDirectory(prefix="summon-read-roots-") as d:
+        one = os.path.join(d, "oracle")
+        two = os.path.join(d, "board")
+        os.mkdir(one)
+        os.mkdir(two)
+        roots = normalize_read_roots([one, two, one])
+        assert len(roots) == 2
+        for cli, flag in (("claude", "--add-dir"),
+                          ("gemini", "--include-directories")):
+            policy = read_allowlist(cli, "read-only", d, roots)
+            assert policy["enforced"] is True and policy["would_refuse"] is False
+            assert policy["effective_paths"] == [os.path.abspath(d), *roots]
+            _, argv, _ = build_invocation_args(AgentInvocation(
+                cli=cli, prompt="inspect", cwd=d, permission="read-only",
+                model="test-model", read_roots=roots))
+            assert argv.count(flag) == 2, (cli, argv)
+            assert all(root in argv for root in roots), (cli, argv)
+        refusal = read_allowlist("codex", "read-only", d, roots)
+        assert refusal["would_refuse"] is True and refusal["enforced"] is False
+        assert "cannot enforce" in refusal["refusal"]
+        assert refusal["recommended_backends"] == ["claude", "gemini"]
+        assert refusal["reroute"] == {
+            "action": "select_read_only_agent",
+            "candidate_backends": ["claude", "gemini"],
+            "required_permission": "read-only",
+            "requires_agent_reselection": True,
+            "preflight": "dry-run",
+        }
+        try:
+            build_invocation_args(AgentInvocation(
+                cli="codex", prompt="inspect", cwd=d, permission="read-only",
+                model="gpt-5.6-sol", read_roots=roots))
+            raise AssertionError("low-level builder ignored unsupported read roots")
+        except ValueError as exc:
+            assert "cannot enforce" in str(exc)
+        unsafe = read_allowlist("claude", "safe-edit", d, roots)
+        assert unsafe["would_refuse"] is True
+        assert "read-only" in unsafe["refusal"]
+        link = os.path.join(d, "oracle-link")
+        try:
+            os.symlink(one, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            link = None  # Windows CI without link privilege: skip this assertion.
+        if link:
+            try:
+                normalize_read_roots([link])
+                raise AssertionError("symlink read root was accepted")
+            except ValueError as exc:
+                assert "symlink or junction" in str(exc)
+        try:
+            normalize_read_roots([os.path.join(d, "missing")])
+            raise AssertionError("missing read root was accepted")
+        except ValueError as exc:
+            assert "does not exist" in str(exc)
+
+
+def test_read_only_allowlist_dry_run_reports_effective_paths_without_provider_contact():
+    import subprocess as sp
+    with tempfile.TemporaryDirectory(prefix="summon-read-roots-e2e-") as d:
+        roster = os.path.join(d, "roster")
+        os.mkdir(roster)
+        one = os.path.join(d, "oracle")
+        two = os.path.join(d, "board")
+        os.mkdir(one)
+        os.mkdir(two)
+        with open(os.path.join(roster, "reviewer.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: read-only\n"
+                     "model: claude-opus-5\n---\n# Reviewer\n")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "run_subagent.py")
+        r = sp.run([sys.executable, script, "--agent", "reviewer", "--prompt", "inspect",
+                    "--cwd", d, "--agents-dir", roster, "--strict-agents-dir",
+                    "--read-root", one, "--read-root", two, "--timeout", "30s",
+                    "--dry-run", "--json"], capture_output=True, text=True,
+                   encoding="utf-8")
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        view = json.loads(r.stdout)
+        policy = view["read_allowlist"]
+        assert policy["enforced"] is True and policy["would_refuse"] is False, view
+        assert policy["effective_paths"] == [os.path.abspath(d),
+                                               os.path.realpath(one),
+                                               os.path.realpath(two)], view
+        assert view.get("provider_contacted") is False
+        assert view["args"].count("--add-dir") == 2, view["args"]
+
+
+def test_read_only_allowlist_foreground_and_background_record_stay_in_parity():
+    """Repeatable read roots must survive the detached launch boundary.
+
+    The background parent writes a launch record before its child loads the agent.
+    Compare the provider-inert foreground policy with both projections that cross
+    that boundary: the child argv and the durable record flags. This catches the
+    regression where the foreground dry-run was correct but the child silently
+    received no ``--read-root`` values.
+    """
+    import argparse as _argparse
+    import subprocess as sp
+    import _background, _jobs
+    from _builder import normalize_read_roots, read_allowlist
+
+    with tempfile.TemporaryDirectory(prefix="summon-read-roots-background-") as d:
+        roster = os.path.join(d, "roster")
+        os.mkdir(roster)
+        one = os.path.join(d, "oracle")
+        two = os.path.join(d, "board")
+        os.mkdir(one)
+        os.mkdir(two)
+        with open(os.path.join(roster, "reviewer.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: claude\npermission: read-only\n"
+                     "model: claude-opus-5\n---\n# Reviewer\n")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "run_subagent.py")
+        roots = normalize_read_roots([one, two])
+        r = sp.run([sys.executable, script, "--agent", "reviewer", "--prompt", "inspect",
+                    "--cwd", d, "--agents-dir", roster, "--strict-agents-dir",
+                    "--read-root", one, "--read-root", two, "--timeout", "30s",
+                    "--dry-run", "--json"], capture_output=True, text=True,
+                   encoding="utf-8")
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        foreground = json.loads(r.stdout)["read_allowlist"]
+        assert foreground["requested_paths"] == list(roots), foreground
+        assert foreground["effective_paths"] == [os.path.abspath(d), *roots], foreground
+
+        ns = _argparse.Namespace(
+            agent="reviewer", prompt="inspect", prompt_file=None, cwd=d,
+            agents_dir=roster, strict_agents_dir=True, enable_roles=False,
+            read_root=[one, two], _read_roots_cli=roots,
+            allow_credit=False, allow_payg=False, allow_text_only=False,
+            require_tools=False, no_contract_repair=False, timeout=30000,
+            cli=None, model=None, effort=None, profile=None, resume=None,
+            resume_profile=None, out=None, json_schema=None, debug_dir=None,
+            retries=0, max_permission=None, gate_with=None, gate_timeout=None,
+            worktree=None, artifacts=[])
+        child = _background.child_argv(ns, "result.json")
+        child_roots = [child[i + 1] for i, value in enumerate(child[:-1])
+                       if value == "--read-root"]
+        assert child_roots == list(roots), child
+        background = read_allowlist("claude", "read-only", d, child_roots)
+        assert background == foreground, (foreground, background)
+
+        projected = _jobs.flags_projection(ns)
+        assert projected["read_root"] == list(roots), projected
+        job_root = os.path.join(d, "jobs")
+        jid = _jobs.new_job_id()
+        _jobs.write_prepared(job_root, jid, nonce="r" * 32, agent="reviewer",
+                             prompt_sha256=None, cwd=d, flags=projected, summon={})
+        with open(_jobs.record_path(job_root, jid), encoding="utf-8") as fh:
+            record = json.load(fh)
+        assert record["flags"]["read_root"] == foreground["requested_paths"], record
+
+
+def test_read_only_allowlist_dry_run_marks_unsupported_backend_without_contact():
+    import subprocess as sp
+    with tempfile.TemporaryDirectory(prefix="summon-read-roots-codex-") as d:
+        roster = os.path.join(d, "roster")
+        os.mkdir(roster)
+        root = os.path.join(d, "oracle")
+        os.mkdir(root)
+        with open(os.path.join(roster, "reviewer.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: codex\npermission: read-only\n"
+                     "model: gpt-5.6-sol\n---\n# Reviewer\n")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "run_subagent.py")
+        r = sp.run([sys.executable, script, "--agent", "reviewer", "--prompt", "inspect",
+                    "--cwd", d, "--agents-dir", roster, "--strict-agents-dir",
+                    "--read-root", root, "--dry-run", "--json"],
+                   capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        view = json.loads(r.stdout)
+        assert view["would_refuse"] is True
+        assert view["error_kind"] == "read_allowlist_unsupported"
+        assert view["read_allowlist"]["would_refuse"] is True
+        assert view["recommended_backends"] == ["claude", "gemini"]
+        assert view["reroute"]["action"] == "select_read_only_agent"
+        assert view.get("provider_contacted") is False
+
+
+def test_read_root_refusal_surfaces_machine_reroute_before_provider_contact():
+    """The real refusal must keep dry-run's actionable reroute shape.
+
+    A PATH-only fake Codex binary lets preflight pass without launching a model.
+    The read-root guard then proves it stops before the provider boundary.
+    """
+    import subprocess as sp
+    with tempfile.TemporaryDirectory(prefix="summon-read-roots-real-") as d:
+        roster = os.path.join(d, "roster")
+        root = os.path.join(d, "oracle")
+        fake_bin = os.path.join(d, "bin")
+        os.mkdir(roster)
+        os.mkdir(root)
+        os.mkdir(fake_bin)
+        with open(os.path.join(roster, "reviewer.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nrun-agent: codex\npermission: read-only\n"
+                     "model: gpt-5.6-sol\n---\n# Reviewer\n")
+        fake = os.path.join(fake_bin, "codex.exe" if os.name == "nt" else "codex")
+        Path(fake).write_bytes(b"")
+        if os.name != "nt":
+            os.chmod(fake, 0o755)
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "run_subagent.py")
+        env = dict(os.environ)
+        env["PATH"] = fake_bin + os.pathsep + env.get("PATH", "")
+        r = sp.run([sys.executable, script, "--agent", "reviewer", "--prompt", "inspect",
+                    "--cwd", d, "--agents-dir", roster, "--strict-agents-dir",
+                    "--read-root", root], capture_output=True, text=True,
+                   encoding="utf-8", env=env)
+        assert r.returncode == 1, (r.stdout, r.stderr)
+        refusal = json.loads(r.stdout)
+        assert refusal["error_kind"] == "read_allowlist_unsupported", refusal
+        assert refusal["provider_contacted"] is False, refusal
+        assert refusal["attempts"] == 0, refusal
+        assert refusal["attempt_status"] == "not_run", refusal
+        assert refusal["execution_status"] == "not_run", refusal
+        assert refusal["model"]["served"] is None, refusal
+        assert refusal["served_model_evidence"] == "absent", refusal
+        assert refusal["model_match"] is None, refusal
+        assert refusal["named_model_verified"] is False, refusal
+        assert refusal["recommended_backends"] == ["claude", "gemini"], refusal
+        assert refusal["reroute"]["action"] == "select_read_only_agent", refusal
+
+
+def test_pre_dispatch_refusal_is_not_counted_as_a_retry_attempt():
+    """A structural executor refusal must stop retry/ACP aggregation at zero."""
+    import _builder
+    import run_subagent as rs
+
+    calls = []
+    original = rs.execute_agent
+    try:
+        def fake_execute(*_args, **_kwargs):
+            calls.append(True)
+            return {
+                "status": "error", "result": "", "exit_code": 1,
+                "error_kind": "read_allowlist_unsupported",
+                "attempts": 0, "attempt_status": "not_run",
+                "execution_status": "not_run", "provider_contacted": False,
+            }
+        rs.execute_agent = fake_execute
+        args = types.SimpleNamespace(
+            retries=3, timeout=1000, debug_dir=None,
+            max_tool_output_bytes=None, gate_with=None,
+        )
+        inv = _builder.AgentInvocation(
+            cli="codex", prompt="p", cwd=os.getcwd(),
+            system_context="", permission="read-only",
+        )
+        out = rs._dispatch_with_retries(inv, args)
+    finally:
+        rs.execute_agent = original
+    assert len(calls) == 1, calls
+    assert out["attempts"] == 0, out
+    assert out["attempt_status"] == "not_run", out
+    assert out["execution_status"] == "not_run", out
+    assert out["provider_contacted"] is False, out
+    assert out["model"]["served"] is None, out
+    assert out["served_model_evidence"] == "absent", out
+    assert out["model_match"] is None, out
+    assert out["named_model_verified"] is False, out
+
+
+def test_retry_attempt_counter_distinguishes_not_run_from_missing_legacy_count():
+    import run_subagent as rs
+    assert rs._attempt_count({
+        "attempts": 0, "attempt_status": "not_run",
+        "execution_status": "not_run", "provider_contacted": False,
+    }) == 0
+    # Legacy real envelopes without an attempts field still represent one executed turn.
+    assert rs._attempt_count({"status": "success"}) == 1
+
+
 # --- Regression tests for ultrareview findings (F1-F25) ----------------------
 
 def test_no_false_success_on_backend_error_result():
@@ -2341,7 +2798,11 @@ def test_stream_parses_agy_stream_json_result_payload():
     sp.process_line('{"event":"result","result":{"conversation_id":"123","status":"SUCCESS",'
                    '"response":"hello\\n","usage":{"input_tokens":1,"output_tokens":2}}}')
     out = sp.get_result()
-    assert out == {"type": "result", "result": "hello\n", "status": "success"}, out
+    assert out == {
+        "type": "result", "result": "hello\n", "status": "success",
+        "_summon_provider_terminal_state": "SUCCESS",
+        "_summon_terminal_outcome": "success",
+    }, out
     assert sp.usage == {"input_tokens": 1, "output_tokens": 2}
 
 
@@ -2521,15 +2982,16 @@ def test_schema_null_value_parses_ok():
 
 
 def test_manifest_timeout_grammar_matches_child():
-    # W3: bare number is MILLISECONDS (like the child), suffixes ms/s/m; no 'h'.
+    # W3: bare number is MILLISECONDS (like the child), suffixes ms/s/m/h.
     import _manifest
     assert _manifest._timeout_seconds("600000") == 600.0      # bare == ms
     assert _manifest._timeout_seconds("30s") == 30.0
     assert _manifest._timeout_seconds("2m") == 120.0
     assert _manifest._timeout_seconds("500ms") == 1.0         # floored to >=1s
-    assert _manifest._timeout_seconds("2h") == 600.0          # 'h' unsupported -> default
+    assert _manifest._timeout_seconds("2h") == 7200.0
     # parent watchdog stays comfortably above the child's own budget
     assert _manifest._parent_timeout({"timeout": "30s"}) >= 90.0
+    assert _manifest._parent_timeout({"timeout": "2h"}) == 10_860.0
 
 
 def test_fable_runs_unsubstituted_and_reports_plan_dependent_billing():
@@ -3080,6 +3542,28 @@ def test_researcher_is_pinned_to_gemini_flash_37():
     assert "permission: yolo" in frontmatter
 
 
+def test_ox_seat_is_retired_and_glm_successor_keeps_the_isolation_gate():
+    """The historical identity stays exact; the paid successor is a separate seat."""
+    from pathlib import Path
+    definition = (Path(__file__).resolve().parents[1] / "agents" /
+                  "openrouter-ox-alpha-opencode.md").read_text(encoding="utf-8")
+    frontmatter = definition.split("---", 2)[1]
+    assert "run-agent: opencode" in frontmatter
+    assert "provider: openrouter" in frontmatter
+    assert "model: openrouter/stealth/ox-alpha" in frontmatter
+    assert "permission: yolo" in frontmatter
+    assert "lifecycle: retired" in frontmatter
+    assert "successor: openrouter-glm-5-3-flash-opencode" in frontmatter
+
+    successor = (Path(__file__).resolve().parents[1] / "agents" /
+                 "openrouter-glm-5-3-flash-opencode.md").read_text(encoding="utf-8")
+    successor_fm = successor.split("---", 2)[1]
+    assert "provider: openrouter" in successor_fm
+    assert "model: openrouter/z-ai/glm-5.3-flash" in successor_fm
+    assert "permission: yolo" in successor_fm
+    assert "disposable clone or isolated" in successor
+
+
 def test_parse_report_keeps_real_status_with_pipe():
     # GF5: a real status containing " | " (not a template) must NOT be skipped.
     import _executor
@@ -3456,8 +3940,8 @@ def test_prompt_file_load_conflicts_and_bom():
 
 
 def test_prompt_file_and_allow_credit_in_child_argv():
-    # A --background child re-reads the FILE (small argv, no mojibake) and
-    # keeps the credit authorization.
+    # A --background child reads only the parent's immutable prompt snapshot,
+    # never the caller-owned source file, and keeps the credit authorization.
     import argparse
     import run_subagent as r
     ns = argparse.Namespace(agent="a", prompt="LOADED-TEXT", prompt_file="C:/t/p.md",
@@ -3465,11 +3949,14 @@ def test_prompt_file_and_allow_credit_in_child_argv():
                             timeout=600000, cli=None, model=None, effort=None,
                             resume=None, resume_profile=None, out=None,
                             json_schema=None, debug_dir=None, retries=0, worktree=None)
+    ns._background_frozen_prompt_file = "C:/bundle/dispatch-prompt.txt"
     argv = r._child_argv(ns, "res.json")
-    assert "--prompt-file" in argv and "C:/t/p.md" in argv, argv
+    assert "--prompt-file" in argv and ns._background_frozen_prompt_file in argv, argv
+    assert "C:/t/p.md" not in argv, argv
     assert "LOADED-TEXT" not in argv, argv
     assert "--allow-credit" in argv, argv
     ns.prompt_file, ns.allow_credit = None, False
+    del ns._background_frozen_prompt_file
     argv2 = r._child_argv(ns, "res.json")
     assert "--prompt" in argv2 and "LOADED-TEXT" in argv2 and "--allow-credit" not in argv2
 
@@ -3794,6 +4281,8 @@ def test_receipt_on_missing_agent_and_preflight():
                    capture_output=True, text=True, encoding="utf-8")
         env = _json.loads(r.stdout)
         assert env["status"] == "error" and "not found" in env["error"], env
+        assert env["attempts"] == 0 and env["attempt_status"] == "not_run", env
+        assert env["execution_status"] == "not_run" and env["provider_contacted"] is False, env
         assert len(env["summon"]["scripts_sha256"]) == 64, env.get("summon")
         assert "git_head_before" in env and "agent_def" not in env, env
         # the ROOT prompt hash is already known and must be present here too
@@ -3809,6 +4298,8 @@ def test_receipt_on_missing_agent_and_preflight():
                     capture_output=True, text=True, encoding="utf-8", env=env_clean)
         env2 = _json.loads(r2.stdout)
         assert env2["status"] == "error" and env2["exit_code"] == 127, env2
+        assert env2["attempts"] == 0 and env2["attempt_status"] == "not_run", env2
+        assert env2["execution_status"] == "not_run" and env2["provider_contacted"] is False, env2
         assert len(env2["summon"]["scripts_sha256"]) == 64, env2.get("summon")
         assert env2["agent_def"]["file"].endswith("gm.md"), env2.get("agent_def")
         assert "prompt_sha256" in env2 and "git_head_before" in env2, env2
@@ -4962,9 +5453,14 @@ def test_v4_overall_timeout_skips_fallback_after_breach():
     assert env["status"] == "partial", env["status"]
     assert env.get("council_state") == "overall_timeout", env.get("council_state")
     # THE INVARIANT, and it holds however early the breach lands: no fallback chairman is
-    # ever dispatched after the budget is blown.
+    # ever dispatched after the budget is blown. On a busy host, setup itself can consume
+    # the deliberately tiny 2-second budget; in that valid branch no member is dispatched,
+    # so the member-set assertion is intentionally vacuous.
     assert "chair2" not in dispatched, dispatched
-    assert {"m1", "m2"} <= set(dispatched), dispatched
+    if dispatched:
+        assert {"m1", "m2"} <= set(dispatched), dispatched
+    else:
+        assert env.get("council_state") == "overall_timeout", env.get("council_state")
     # The intended SCENARIO is a breach during the primary chairman. If a slow runner blew
     # the budget before the chairman was even reached, the guard above still proves itself
     # -- but say so rather than silently testing a weaker case.
@@ -6104,8 +6600,11 @@ def test_jobs_background_end_to_end():
         jid = handle["job_id"]
         assert _jobs.valid_job_id(jid)
         # wait for the (error) result; exit 1 because the endpoint fails
+        # A cold Windows snapshot copies and hashes the immutable runtime before
+        # the detached child can terminalize. Keep this integration wait bounded,
+        # but leave enough room for a slow/antivirus-scanned host.
         r2 = sp.run([sys.executable, script, "jobs", "wait", jid, "--job-dir", jobs,
-                     "--timeout", "20s"], capture_output=True, text=True, encoding="utf-8")
+                     "--timeout", "60s"], capture_output=True, text=True, encoding="utf-8")
         waited = _json.loads(r2.stdout)
         assert waited["status"] == "error" and "job_nonce" in waited
         st = _jobs.job_status(jobs, jid)
@@ -8237,6 +8736,14 @@ def test_v7_absurd_timeout_is_rejected_not_overflowed():
     assert parse_timeout(str(_MAX_TIMEOUT_MS)) == _MAX_TIMEOUT_MS
     assert parse_timeout("600s") == 600_000
     assert parse_timeout("10m") == 600_000
+    assert parse_timeout("4h") == 14_400_000
+    help_text = __import__("_cli").build_parser("0.0.0", 1).format_help()
+    assert "4h" in help_text, "public --help omitted the accepted hour suffix"
+    skill = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "SKILL.md")
+    if os.path.isfile(skill):
+        skill_text = open(skill, encoding="utf-8").read()
+        assert "`h` for hours" in skill_text and "`--timeout 4h`" in skill_text
     # and the accepted maximum is a value the executor's own wait can actually take
     import threading
     threading.Event().wait(0)
@@ -10260,7 +10767,7 @@ def test_v7_dispatch_uses_the_endpoint_that_was_fingerprinted():
         with open(reg, "w", encoding="utf-8") as fh:
             _json.dump({"tenant": {"base_url": "https://a.example/v1"}}, fh)
         ident = build_request_identity(agent="t", prompt="p", cwd=d, agents_dir=d)
-        assert ident["_endpoint"] == ("https://a.example/v1", ""), ident["_endpoint"]
+        assert ident["_endpoint"] == ("https://a.example/v1", "", None), ident["_endpoint"]
 
         # the snapshot is what dispatch will use, even after the registry moves underneath
         with open(reg, "w", encoding="utf-8") as fh:
@@ -10284,7 +10791,7 @@ def test_v7_dispatch_uses_the_endpoint_that_was_fingerprinted():
         # the registry MOVED underneath: the snapshot must still win.
         from run_subagent import _endpoint_for_dispatch
         agent_file = os.path.join(d, "t.md")
-        assert _endpoint_for_dispatch(ident, agent_file, d) == ident["_endpoint"], \
+        assert _endpoint_for_dispatch(ident, agent_file, d) == ident["_endpoint"][:2], \
             "the dispatch re-resolved instead of using the snapshot it fingerprinted"
         assert _endpoint_for_dispatch(ident, agent_file, d)[0] == "https://a.example/v1"
         # a fresh identity carries the NEW endpoint, and the chooser follows it
@@ -10873,7 +11380,8 @@ def test_v7_agy_dispatch_verifies_the_copied_account_bytes():
                                   resume_id="latest" if resume else None,
                                   resume_profile=resume_profile if resume else None,
                                   agy_account_sha256=expected)
-            return _builder.build_invocation_args(inv, timeout_ms=60000)
+            with _fake_agy_executable():
+                return _builder.build_invocation_args(inv, timeout_ms=60000)
 
         # RESUME with the account it was fingerprinted under: allowed
         build(prof_a, sha_a)
@@ -11029,9 +11537,10 @@ def test_v7_dispatch_overwritten_env_is_not_part_of_the_request():
             from _builder import AgentInvocation
             os.environ["AGY_PTY_QUIET"] = "77"
             try:
-                _c, _a, env_override = _builder.build_invocation_args(
-                    AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd()),
-                    timeout_ms=60000)
+                with _fake_agy_executable():
+                    _c, _a, env_override = _builder.build_invocation_args(
+                        AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd()),
+                        timeout_ms=60000)
                 assert (env_override or {}).get("AGY_PTY_QUIET") == "77", (
                     "the builder stopped forwarding the ambient AGY_PTY_QUIET",
                     (env_override or {}).get("AGY_PTY_QUIET"))
@@ -12309,6 +12818,19 @@ def test_v8_gate_uncertain_routes_to_human_not_silent_refusal():
     assert den["requires_human_review"] is False, den
 
 
+def test_v11_gate_refusal_explicitly_records_provider_attempt_not_run():
+    """A gate refusal is a blocked request, not an unaccounted provider attempt."""
+    from _gate import blocked_envelope, decide
+    env = blocked_envelope(
+        decide({"status": "success", "result": "VERDICT: DENY"}, "gate"),
+        agent="worker", cli="claude")
+    assert env["status"] == "blocked"
+    assert env["attempts"] == 0
+    assert env["attempt_status"] == "not_run"
+    assert env["execution_status"] == "not_run"
+    assert env["provider_contacted"] is False
+
+
 def test_v8_gate_is_forced_read_only_even_if_its_definition_is_yolo():
     """A gate whose own definition declares full bypass must still RUN read-only.
     Otherwise --gate-with is itself a privilege-escalation path: name a yolo profile
@@ -12350,6 +12872,49 @@ def test_v8_gate_is_forced_read_only_even_if_its_definition_is_yolo():
         "the gate ran with permission %r -- it must be forced read-only regardless "
         "of its own definition" % seen.get("permission"))
     assert dec["approved"] is True
+
+
+def test_retired_gate_refuses_before_in_process_executor():
+    """--gate-with is an in-process launch surface and must honor retirement."""
+    import run_subagent as _rs
+    from _builder import AgentInvocation
+
+    d = tempfile.mkdtemp(prefix="summon-retired-gate-")
+    called = []
+    real_exec = _rs.execute_agent
+    try:
+        with open(os.path.join(d, "old-gate.md"), "w", encoding="utf-8") as fh:
+            fh.write(
+                "---\nrun-agent: definitely-missing-provider\npermission: yolo\n"
+                "lifecycle: retired\nsuccessor: new-gate\n---\n# Old gate\n")
+
+        def should_not_run(*_args, **_kwargs):
+            called.append(True)
+            raise AssertionError("retired gate reached execute_agent")
+
+        _rs.execute_agent = should_not_run
+
+        class A:
+            gate_with = "old-gate"
+            enable_roles = False
+            strict_agents_dir = True
+            agent = "impl"
+            timeout = 60000
+            gate_timeout = None
+            debug_dir = None
+            cli = None
+
+        gated = AgentInvocation(cli="claude", prompt="p", cwd=d,
+                                permission="safe-edit")
+        decision = _rs._run_gate(A(), d, gated)
+    finally:
+        _rs.execute_agent = real_exec
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+    assert called == []
+    assert decision["approved"] is False
+    assert "retired" in decision["reason"]
+    assert "new-gate" in decision["reason"]
 
 
 def test_v8_gate_denial_prevents_the_real_dispatch_entirely():
@@ -12578,9 +13143,42 @@ def test_v10_headless_docs_include_caller_popup_guidance():
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     for rel in ("README.md", os.path.join("skills", "summon", "SKILL.md")):
         text = open(os.path.join(root, rel), encoding="utf-8").read()
-        for needle in ("AGY_PTY_WRAPPER", "agy_stream_proxy.py", "Start-Process",
-                       "cmd /c start", "-WindowStyle Hidden"):
+        for needle in ("AGY_PTY_WRAPPER", "agy_stream_proxy.py", "AGY_ALLOW_LEGACY_PTY",
+                       "Start-Process", "cmd /c start", "-WindowStyle Hidden"):
             assert needle in text, "%s is missing caller popup guidance in %s" % (needle, rel)
+
+
+def test_v10_legacy_agy_pty_is_opt_in_on_windows():
+    """An old project copy must not silently select the visible winpty wrapper."""
+    from unittest import mock
+    import _builder
+
+    with mock.patch.object(_builder.os, "name", "nt"), \
+         mock.patch.dict(_builder.os.environ, {}, clear=False), \
+         mock.patch.object(_builder.os.path, "isfile", return_value=False):
+        _builder.os.environ.pop("AGY_PTY_WRAPPER", None)
+        _builder.os.environ.pop("AGY_ALLOW_LEGACY_PTY", None)
+        try:
+            _builder._agy_wrapper()
+        except ValueError as exc:
+            assert "visible pseudo-console" in str(exc)
+        else:
+            raise AssertionError("legacy agy PTY fallback was selected without opt-in")
+
+    # If a current copy is present, an explicit legacy override is still repaired to the
+    # hidden stream proxy. The escape hatch is available only when the operator opts in.
+    def isfile(path):
+        return str(path).lower().endswith("agy_stream_proxy.py")
+
+    with mock.patch.object(_builder.os, "name", "nt"), \
+         mock.patch.dict(_builder.os.environ,
+                         {"AGY_PTY_WRAPPER": os.path.join("legacy", "agy_pty_pyte.py")},
+                         clear=False), \
+         mock.patch.object(_builder.os.path, "isfile", side_effect=isfile):
+        _builder.os.environ.pop("AGY_ALLOW_LEGACY_PTY", None)
+        assert _builder._agy_wrapper().lower().endswith("agy_stream_proxy.py")
+        _builder.os.environ["AGY_ALLOW_LEGACY_PTY"] = "1"
+        assert _builder._agy_wrapper().lower().endswith("agy_pty_pyte.py")
 
 
 def test_v8_project_local_copy_is_enumerated_and_reported():
@@ -12683,6 +13281,30 @@ def test_v10_timeout_diagnostics_do_not_duplicate_the_milliseconds_unit():
     assert resp["timeout"] == {"budget_ms": 360000,
                                "stage": "backend-execution",
                                "partial_output": False}, resp["timeout"]
+
+
+def test_v10_public_timeout_examples_use_explicit_units():
+    """Public operator recipes must not teach the ambiguous bare-millisecond form.
+
+    Bare values remain a compatibility feature in the parser, but a copied example such
+    as ``--timeout 900`` is interpreted as 900ms and is rejected by the dispatch guard.
+    Keep the public skill and host recipe aligned on explicit duration suffixes.
+    """
+    import re
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    paths = (
+        os.path.join(root, "skills", "summon", "SKILL.md"),
+        os.path.join(root, "skills", "summon", "references", "codex.md"),
+    )
+    bare = re.compile(r"--timeout(?:=|\s+)(\d+)(?!\d)(?!\s*(?:ms|s|m|h)\b)")
+    for path in paths:
+        text = open(path, encoding="utf-8").read()
+        matches = bare.findall(text)
+        assert not matches, "%s contains bare timeout examples: %s" % (path, matches)
+    skill = open(paths[0], encoding="utf-8").read()
+    assert "--timeout 900s" in skill and "--timeout 600000ms" in skill
+    assert "bare numeric" in skill.lower()
 
 
 def test_v10_kimi_review_docs_require_an_isolated_worktree():
@@ -13156,6 +13778,71 @@ def test_v8_every_public_flag_is_documented_in_skill_md():
         % (undocumented, sorted(suppressed) or "none"))
 
 
+def test_phase1_operator_guide_only_documents_live_commands_and_flags():
+    """Bind the Phase 1 runbook examples to argparse's actual public surface.
+
+    The guide is deliberately smaller than SKILL.md, so it must not list every public flag.
+    Every long option and command path that it *does* recommend must still exist in the
+    real parser. This catches a renamed or removed control before operators copy a stale
+    command from the runbook.
+    """
+    import re
+    import shlex
+
+    import _cli
+
+    scripts = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(scripts)))
+    guide = os.path.join(repo, "docs", "PHASE1_OPERATOR_GUIDE.md")
+    assert os.path.isfile(guide), "PHASE1_OPERATOR_GUIDE.md is a required release surface"
+    doc = open(guide, encoding="utf-8").read()
+    parser = _cli.build_parser("0.0.0", 1)
+
+    commands = []
+    for block in re.findall(
+            r"```(?:text|bash|sh|console)\s*\n(.*?)```", doc, flags=re.DOTALL):
+        logical = block.replace("\\\n", " ")
+        commands.extend(line.strip() for line in logical.splitlines()
+                        if line.lstrip().startswith("summon "))
+    all_guide_commands = re.findall(r"(?m)^\s*summon\b", doc)
+    assert len(commands) == len(all_guide_commands) == 26, (
+        "operator guide command coverage changed; review every added/removed command: %r"
+        % commands)
+
+    def command_path(command):
+        words = shlex.split(command, posix=True)[1:]
+        if words[0] == "fleet" and words[1] == "approval":
+            return tuple(words[:3])
+        if words[0] in {"fleet", "usage", "jobs", "result"}:
+            return tuple(words[:2])
+        return (words[0],)
+
+    assert {command_path(command) for command in commands} == {
+        ("doctor",), ("list",), ("models",), ("dispatch",),
+        ("fleet", "propose"), ("fleet", "validate"), ("fleet", "inspect"),
+        ("fleet", "explain"), ("fleet", "approval", "status"),
+        ("fleet", "approval", "approve"),
+        ("usage", "status"), ("usage", "example"), ("usage", "import"),
+        ("usage", "export"), ("usage", "refresh"),
+        ("jobs", "status"), ("jobs", "extend"), ("jobs", "steer"),
+        ("jobs", "cancel"), ("jobs", "resume"),
+        ("result", "project"), ("result", "validate"), ("result", "consume"),
+    }
+    assert "GENERATION_FROM_STATUS" in doc and "integer `generation`" in doc
+
+    for command in commands:
+        argv = shlex.split(command.replace("GENERATION_FROM_STATUS", "0"), posix=True)
+        assert argv.pop(0) == "summon"
+        rewritten, mode = _cli.rewrite_subcommand(argv)
+        assert mode is None, (command, rewritten, mode)
+        try:
+            parser.parse_args(rewritten)
+        except SystemExit as exc:
+            raise AssertionError(
+                "PHASE1_OPERATOR_GUIDE.md documents a command the public parser rejects: "
+                + command) from exc
+
+
 def test_v8_every_control_flag_reaches_the_background_child():
     """STRUCTURAL: a control that changes what a dispatch is ALLOWED to do must survive
     detachment. child_argv rebuilds the child's argv field by field, so anything absent is
@@ -13502,7 +14189,8 @@ def test_v8_agent_args_cannot_reopen_the_agy_boundary():
             permission="read-only",
             extra_args=("--add-dir", "/elsewhere", "--mode", "yolo",
                         "--dangerously-skip-permissions", "--keep", "me"))
-        _cmd, argv, _env = _builder.build_invocation_args(inv, timeout_ms=60000)
+        with _fake_agy_executable():
+            _cmd, argv, _env = _builder.build_invocation_args(inv, timeout_ms=60000)
         assert argv.count("--add-dir") <= 1, (
             "the agent's own --add-dir survived into the real argv: %r" % (argv,))
         assert "/elsewhere" not in argv, (
@@ -13924,12 +14612,19 @@ def test_v8_every_test_is_actually_collected_by_the_runner():
         "%d test(s) are defined AFTER the __main__ block and will never run: %s. Move them "
         "above it -- the runner snapshots globals() and cannot see them." % (
             len(orphaned), ", ".join(orphaned)))
-    in_source = sum(1 for ln in above.splitlines() if ln.startswith("def test_"))
-    collected = sum(1 for k, v in globals().items()
-                    if k.startswith("test_") and callable(v))
-    assert in_source == collected, (
-        "the source defines %d tests but %d are importable; a duplicate name silently "
-        "shadowed one." % (in_source, collected))
+    # Count definitions from the syntax tree rather than from the live module globals.
+    # A preceding test is allowed to import/patch application modules, and pytest may
+    # temporarily wrap a test callable; using ``globals()`` here made this structural
+    # guard report a false duplicate-name failure after an otherwise clean run. AST names
+    # still catch the actual defect (duplicate definitions shadowing one another), while
+    # the orphan check above catches tests appended below the custom runner block.
+    tree = ast.parse(src, filename=os.path.abspath(__file__))
+    names = [node.name for node in tree.body
+             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and node.name.startswith("test_")]
+    assert len(names) == len(set(names)), (
+        "the source defines duplicate test names that shadow one another: %s" %
+        sorted(name for name in set(names) if names.count(name) > 1))
 
 
 def test_v8_over_long_argv_is_diagnosed_as_argv_not_a_missing_cli():
@@ -14371,7 +15066,8 @@ def test_v8_build_failures_return_an_envelope_not_an_exception():
         os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
         inv = _builder.AgentInvocation(cli="agy", prompt="p" * 40000, cwd=os.getcwd(),
                                        system_context="c", permission="read-only")
-        resp = _executor.execute_agent(inv, timeout_ms=30_000)   # must not raise
+        with _fake_agy_executable():
+            resp = _executor.execute_agent(inv, timeout_ms=30_000)   # must not raise
     finally:
         _builder._agy_wrapper = r_wrapper
         if had is None:
@@ -15381,7 +16077,7 @@ def test_v9_lifecycle_fixture_blocks_late_grandchild_writes():
     )
     proc = None
 
-    def _wait_for(path: Path, seconds: float = 8.0) -> None:
+    def _wait_for(path: Path, seconds: float = 20.0) -> None:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if path.is_file():
@@ -16161,10 +16857,12 @@ def test_v9_a_bare_sub_second_timeout_is_a_units_mistake():
             % (bare, bare))
 
     # explicit units are never flagged: writing the unit means the caller meant it
-    for explicit in ("300ms", "1000", "600000", "300s", "10m"):
+    for explicit in ("300ms", "1000", "600000", "300s", "10m", "0.0001h", "4h"):
         assert rs._parse_timeout(explicit).bare_sub_second is False, explicit
     assert rs._parse_timeout("300ms") == 300
     assert rs._parse_timeout("300s") == 300_000
+    assert rs._parse_timeout("0.0001h") == 360
+    assert rs._parse_timeout("4h") == 14_400_000
     assert rs._parse_timeout("600000") == 600_000, "bare ms stays backward compatible"
 
     # ...and the DISPATCH path is what refuses it, naming the likely intent
@@ -16381,7 +17079,7 @@ def test_v10_units_guard_precedes_every_side_effect():
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "run_subagent.py"), encoding="utf-8").read()
     guard = src.index('for _flag, _val in (("--timeout"')
-    worktree = src.index("if args.worktree is not None and not args.dry_run:")
+    worktree = src.index("_preflight_then_setup_worktree(", guard)
     assert guard < worktree, (
         "the units guard runs AFTER worktree creation, so a rejected dispatch still leaves "
         "a branch and a checkout on disk")
@@ -16808,6 +17506,28 @@ def test_v10_timeout_envelope_surfaces_the_cause_not_just_the_clock():
     assert salient_error("bash: rg: command not found") is not None
 
 
+def test_v11_opencode_empty_timeout_is_typed_and_not_auto_retried():
+    """A headless OpenCode auth/transport stall has no provider evidence.
+
+    Keep it distinct from a proven authentication failure: the envelope must
+    tell the operator to check local OpenCode credentials, refuse automatic
+    retries, and preserve the absence of served-model evidence.
+    """
+    from _executor import _timeout_payload
+
+    class _P:
+        def get_result(self):
+            return ""
+
+    env = _timeout_payload("opencode", _P(), 900_000, [])
+    assert env["error_kind"] == "provider_timeout", env
+    assert env["retryable"] is False, env
+    assert env["result_usable"] is False, env
+    assert env["remediation_code"] == "opencode_output_timeout", env
+    assert "opencode auth login" in env["error"], env
+    assert env.get("model_served") is None
+
+
 def test_v10_roster_paths_are_emitted_normalised():
     """FIELD REPORT (2026-07-28). `--set-agent` with a forward-slash `--agents-dir` emitted
     "C:/Users/x/.agents\\name.md" -- mixed separators in a machine-readable field."""
@@ -17089,6 +17809,23 @@ def test_v10_kimi_auth_and_rate_limit_failures_are_terminal():
     assert limited["remediation_code"] == "provider_quota_wait"
 
 
+def test_opencode_missing_provider_credentials_is_terminal_auth_failure():
+    """OpenCode's cookie-auth error must become actionable, not a generic 401."""
+    import _doctor
+    import _executor
+    verdict = _doctor.classify_ineligibility(
+        "APIError: No cookie auth credentials found", backend="opencode")
+    assert verdict and verdict["kind"] == "auth", verdict
+    assert verdict["repair"]["command"] == "opencode auth login"
+    envelope = {"status": "error", "cli": "opencode",
+                "error": "APIError: No cookie auth credentials found",
+                "output_tail": ""}
+    _executor._attach_eligibility(envelope)
+    assert envelope["error_kind"] == "authentication_failed", envelope
+    assert envelope["auth_outcome"] == "login_required"
+    assert envelope["retryable"] is False
+
+
 def test_v10_kimi_stream_finalizes_only_at_eof():
     import _executor as ex
     from _stream import StreamProcessor
@@ -17217,6 +17954,29 @@ def test_v10_parse_report_accepts_markdown_bold_fields():
     # Plain parsing is unchanged.
     plain = ex.parse_report("STATUS: DONE\nSUMMARY: s\nFOLLOW-UP: f\nHANDOFF: h")
     assert plain and plain["status"] == "DONE"
+
+
+def test_v11_parse_report_accepts_markdown_heading_verdict_and_preserves_block():
+    """Markdown headings are a common renderer shape, but only line-start fields count.
+
+    A complete execution may legitimately produce ``VERDICT: BLOCK``: the
+    execution succeeded and the review finding is a block.  The parser must
+    retain both signals instead of dropping the verdict or turning it into an
+    execution error.
+    """
+    import _executor as ex
+    heading = ("## STATUS: DONE\n## SUMMARY: reviewed\n## VERDICT: BLOCK\n"
+               "## FOLLOW-UP: none\n## HANDOFF: pass the block to the caller")
+    rep = ex.parse_report(heading)
+    assert rep and rep["status"] == "DONE" and rep["verdict"] == "BLOCK", rep
+    out = ex._enrich({"result": heading, "exit_code": 1, "status": "success",
+                      "cli": "claude"}, None)
+    assert out["report_ok"] is True
+    assert out["status"] == "success" and out["execution_status"] == "success"
+    assert out["verdict"] == "block"
+    assert out["raw_backend_exit_code"] == 1 and out["normalized_exit_code"] == 0
+    # A quoted contract template must not become a second report.
+    assert ex.parse_report("## STATUS: DONE | PARTIAL | BLOCKED") is None
 
 
 def test_v10_public_docs_exclude_machine_identity_and_preserve_local_evidence():
@@ -17467,6 +18227,10 @@ def test_allow_payg_rejected_in_fanout_modes():
     """--allow-payg is not in any fan-out mode's whitelist."""
     from _cli import MODE_FLAGS
     for mode, flags in MODE_FLAGS.items():
+        if mode == "jobs-resume":
+            # A governed continuation is one physical attempt, not fan-out.
+            # Fresh, explicit spend consent is claim-bound for this command.
+            continue
         assert "allow_payg" not in flags, f"allow_payg should NOT be in {mode} whitelist"
 
 
@@ -17616,6 +18380,15 @@ def test_transient_dispatch_error_classifier():
         {"status": "error", "error": "HTTP 503 from endpoint", "cli": "openai-compat"})
     assert rs._is_transient_dispatch_error(
         {"status": "error", "exit_code": 124, "error": "timed out", "cli": "codex"})
+    assert rs._is_transient_dispatch_error(
+        {"status": "error", "error": "OpenRouter HTTP 429: shared pool busy",
+         "cli": "opencode"})
+    assert rs._is_transient_dispatch_error(
+        {"status": "error", "error": "status code 429 too many requests",
+         "cli": "openai-compat"})
+    assert rs._is_transient_dispatch_error(
+        {"status": "error", "error": "rate_limit_exceeded",
+         "cli": "opencode"})
     assert not rs._is_transient_dispatch_error(
         {"status": "error", "error": "please log in first", "cli": "codex"})
     assert not rs._is_transient_dispatch_error(

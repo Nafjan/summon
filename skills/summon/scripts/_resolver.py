@@ -7,6 +7,7 @@ so an orchestrator never has to rely on a stale hardcoded model list.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -21,7 +22,7 @@ def _valid_clis() -> tuple:
         return BACKEND_CLIS
     except ImportError:
         return ("claude", "cursor-agent", "codex", "gemini", "kimi", "agy",
-                "opencode", "arkcli", "openai-compat")
+                "opencode", "zcode", "arkcli", "openai-compat")
 
 
 _VALID_CLIS = _valid_clis()
@@ -100,6 +101,73 @@ def resolve_cli(frontmatter_cli: str | None, default: str = "codex") -> str:
 
 _CLAUDE_ALIASES = ("opus", "sonnet", "haiku")  # float to the latest release
 _AGY_MODELS_TIMEOUT = 25
+_AGY_MAX_MODELS = 10_000
+_AGY_MAX_MODEL_ID = 256
+
+
+def _agy_command(exe: str, *args: str, _platform: str | None = None) -> list[str]:
+    """Build a shell-free AGY command, using cmd only for Windows shims."""
+    platform = os.name if _platform is None else _platform
+    if platform == "nt" and exe.lower().endswith((".cmd", ".bat")):
+        return ["cmd", "/d", "/c", exe, *args]
+    return [exe, *args]
+
+
+def _valid_agy_model_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if (not value or len(value) > _AGY_MAX_MODEL_ID
+            or any(ord(char) < 0x20 or ord(char) == 0x7f for char in value)):
+        return None
+    return value
+
+
+def _parse_agy_json_models(stdout: str) -> list[str] | None:
+    """Parse the documented `agy --output-format json models` envelope.
+
+    ``None`` means the JSON contract was unavailable or malformed and permits
+    the legacy text fallback.  An empty list is a valid machine response.
+    """
+    try:
+        payload = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or str(payload.get("status", "")).upper() != "SUCCESS":
+        return None
+    command = payload.get("command")
+    data = command.get("data") if isinstance(command, dict) else None
+    values = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(command, dict) or command.get("name") != "models" \
+            or not isinstance(values, list) or len(values) > _AGY_MAX_MODELS:
+        return None
+    models: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        model_id = _valid_agy_model_id(item.get("id") if isinstance(item, dict) else None)
+        if model_id is None:
+            return None
+        if model_id not in seen:
+            seen.add(model_id)
+            models.append(model_id)
+    return models
+
+
+def _parse_agy_plain_models(stdout: str) -> list[str]:
+    """Parse the pre-1.1.12 text list as a compatibility fallback."""
+    models: list[str] = []
+    seen: set[str] = set()
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        model_id = _valid_agy_model_id(stripped.split("\t", 1)[0].split(None, 1)[0])
+        if model_id is not None and model_id not in seen:
+            seen.add(model_id)
+            models.append(model_id)
+        if len(models) >= _AGY_MAX_MODELS:
+            break
+    return models
 
 
 def _codex_default_model() -> str | None:
@@ -158,25 +226,44 @@ def _codex_default_model_scan(cfg: str) -> str | None:
 
 
 def _agy_live_models() -> tuple[str, list, str | None]:
-    """(source, models, note). Live `agy models` exposes a machine-readable list.
-    Fails soft: a missing/slow/erroring agy yields
-    ("unavailable", [], reason) rather than raising."""
+    """Discover AGY models through JSON, with a legacy text fallback.
+
+    Fails soft: a missing/slow/erroring AGY yields ``unavailable`` rather than
+    raising.  Discovery is advisory and never becomes served-model evidence.
+    """
     exe = shutil.which("agy")
     if not exe:
         return "unavailable", [], "agy not on PATH"
+    from _spawn import run_flags
     try:
-        from _spawn import run_flags
-        r = subprocess.run([exe, "models"], capture_output=True, text=True,
+        r = subprocess.run(_agy_command(exe, "--output-format", "json", "models"),
+                           capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
                            timeout=_AGY_MODELS_TIMEOUT, stdin=subprocess.DEVNULL, **run_flags())
     except (OSError, ValueError, subprocess.SubprocessError) as e:
-        # errors="replace" prevents UnicodeDecodeError, but keep ValueError +
-        # the broad SubprocessError base so NOTHING escapes the fail-soft contract.
         return "unavailable", [], f"{type(e).__name__}: {e}"
-    if r.returncode != 0:
-        return "unavailable", [], ((r.stderr or r.stdout or "").strip()[:200] or "non-zero exit")
-    models = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
-    return "live", models, None
+    if r.returncode == 0:
+        models = _parse_agy_json_models(r.stdout or "")
+        if models is not None:
+            return "live", models, None
+
+    # Older AGY releases do not accept --output-format on the models command.
+    # This is one bounded local discovery fallback, not a model dispatch, retry,
+    # or served-identity claim.
+    try:
+        legacy = subprocess.run(_agy_command(exe, "models"), capture_output=True, text=True,
+                                encoding="utf-8", errors="replace",
+                                timeout=_AGY_MODELS_TIMEOUT, stdin=subprocess.DEVNULL,
+                                **run_flags())
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return "unavailable", [], f"{type(e).__name__}: {e}"
+    if legacy.returncode != 0:
+        detail = (legacy.stderr or legacy.stdout or r.stderr or r.stdout or "").strip()[:200]
+        return "unavailable", [], detail or "non-zero exit"
+    models = _parse_agy_plain_models(legacy.stdout or "")
+    if not models:
+        return "unavailable", [], "agy models returned no valid model ids"
+    return "live", models, "Legacy text fallback from `agy models`; upgrade AGY for JSON discovery."
 
 
 def _opencode_live_models() -> tuple[str, list, str | None]:
@@ -347,6 +434,25 @@ def discover_models(cli: str | None = None, *, refresh: bool = False) -> dict:
             "models": models,
             "note": note or "Live from `opencode models`; listed is not proof of account access.",
         }, "opencode")
+
+    if want("zcode"):
+        try:
+            from _zcode import resolve_zcode_cli, zcode_version
+            target = resolve_zcode_cli()
+            version = zcode_version(target) if target else None
+        except Exception:  # noqa: BLE001 - provider-free discovery stays fail-soft
+            target, version = None, None
+        info["zcode"] = stamp({
+            "source": "local" if target else "unavailable",
+            "version": version,
+            "discovery_source": target.source if target else None,
+            "models": [],
+            "note": (
+                "ZCode has no reviewed headless model selector. Its configured native "
+                "provider/model is intentionally not read from private configuration and cannot be "
+                "treated as model.served evidence. Use an explicit OpenCode Z.AI Coding Plan "
+                "seat for a target-model selector."),
+        }, "zcode")
 
     # ArkCLI/ModelArk exposes a Coding Plan roster. Keep the normal query
     # offline by reading the existing bounded cache; `--refresh` explicitly

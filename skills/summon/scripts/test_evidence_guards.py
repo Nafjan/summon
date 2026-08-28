@@ -17,11 +17,34 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import _executor  # noqa: E402
 import _schema  # noqa: E402
+from _loader import parse_frontmatter  # noqa: E402
 from _builder import AgentInvocation  # noqa: E402
 
 
 class EvidenceGuardTests(unittest.TestCase):
     _REPORT = "STATUS: DONE\nSUMMARY: usable\nFOLLOW-UP: none\nHANDOFF: none"
+
+    def test_exact_model_policy_is_opt_in_or_reserved_named_seat(self):
+        self.assertEqual(
+            _executor.model_exact_policy("architect", {"model": "claude-opus-5"}),
+            (True, "named-seat"),
+        )
+        self.assertEqual(
+            _executor.model_exact_policy("custom-review", {"model-policy": "exact"}),
+            (True, "frontmatter"),
+        )
+        self.assertEqual(
+            _executor.model_exact_policy("worker", {"model": "kimi-code/k3"}, True),
+            (True, "cli"),
+        )
+        self.assertEqual(
+            _executor.model_exact_policy("worker", {"model": "kimi-code/k3"}),
+            (False, None),
+        )
+        frontmatter, _ = parse_frontmatter(
+            "---\nmodel: claude-opus-5\nmodel-policy: exact\n---\nReview\n"
+        )
+        self.assertEqual(frontmatter["model-policy"], "exact")
 
     def _execute_acp(self, response: dict) -> dict:
         """Drive execute_agent through the registered ACP callable.
@@ -71,6 +94,55 @@ class EvidenceGuardTests(unittest.TestCase):
             result = _executor.execute_agent(invocation, timeout_ms=5000)
         return result
 
+    def _execute_claude_stream(self, *, served_model="claude-opus-5",
+                               requested_model="claude-opus-5",
+                               handshake_model="claude-opus-5",
+                               exact_required=True, include_model_usage=True) -> dict:
+        """Drive the Claude JSONL result path with deterministic modelUsage."""
+        import subprocess
+        usage = {
+            "claude-opus-5": {"inputTokens": 2, "outputTokens": 1},
+            "claude-haiku-4-5-20251001": {"inputTokens": 2, "outputTokens": 5},
+        }
+        terminal = {
+            "type": "result", "subtype": "success", "result": self._REPORT,
+            "modelUsage": usage, "usage": {"output_tokens": 6},
+            "total_cost_usd": 0,
+        }
+        if served_model == "claude-opus-5":
+            terminal["modelUsage"] = {
+                "claude-opus-5": {"inputTokens": 2, "outputTokens": 6},
+                "claude-haiku-4-5-20251001": {"inputTokens": 2, "outputTokens": 1},
+            }
+        elif served_model == "claude-haiku-4-5-20251001":
+            terminal["modelUsage"] = {
+                "claude-opus-5": {"inputTokens": 2, "outputTokens": 1},
+                "claude-haiku-4-5-20251001": {"inputTokens": 2, "outputTokens": 6},
+            }
+        elif served_model is not None:
+            terminal["modelUsage"] = {
+                served_model: {"inputTokens": 2, "outputTokens": 6},
+            }
+        if not include_model_usage:
+            terminal.pop("modelUsage", None)
+        lines = [
+            {"type": "system", "subtype": "init", "session_id": "session-test",
+             "model": handshake_model},
+            terminal,
+        ]
+        code = "import json; " + "; ".join(
+            f"print({json.dumps(json.dumps(line))})" for line in lines)
+        invocation = AgentInvocation(
+            cli="claude", model=requested_model, prompt="review",
+            cwd=tempfile.gettempdir(), permission="read-only",
+            model_exact_required=exact_required, model_exact_source="test")
+        with mock.patch.object(_executor, "build_invocation_args",
+                               return_value=(sys.executable, ("-c", code), None)), \
+             mock.patch("_receipt.workspace_snapshot",
+                        return_value={"coverage": "none"}), \
+             mock.patch("_receipt.workspace_evidence", return_value={}):
+            return _executor.execute_agent(invocation, timeout_ms=5000)
+
     def test_acp_empty_success_is_normalized_as_one_consistent_error_tuple(self):
         result = self._execute_acp({
             "result": "", "exit_code": 0, "status": "success", "cli": "kimi",
@@ -99,6 +171,78 @@ class EvidenceGuardTests(unittest.TestCase):
         self.assertNotIn("suspect", result)
         self.assertTrue(any("provenance is not confirmed" in w
                             for w in result.get("warnings", [])))
+
+    def test_complete_report_with_missing_child_tool_stays_advisory_error(self):
+        """A report is retained, but model text cannot override a failed process."""
+        raw = self._REPORT + '\nexec: "grep": executable file not found in %PATH%\n'
+        base = _executor.build_final_response("agy", 1, None, [raw], "")
+        result = _executor._enrich(base, None)
+        _executor._attach_eligibility(result)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["backend_exit_code"], 1)
+        self.assertTrue(result["report_ok"])
+        self.assertEqual(result["tool_failure"]["kind"], "missing_executable")
+        self.assertEqual(result["tool_failure"]["executable"], "grep")
+        self.assertTrue(result["tool_failure"]["fatal"])
+        self.assertFalse(result["result_usable"])
+        self.assertNotEqual(result.get("error_kind"), "authentication_failed")
+
+    def test_incomplete_report_missing_child_tool_is_typed_not_auth(self):
+        raw = 'STATUS: PARTIAL\nSUMMARY: stopped\nexec: "grep": executable file not found in %PATH%\n'
+        base = _executor.build_final_response("agy", 1, None, [raw], "")
+        result = _executor._enrich(base, None)
+        _executor._attach_eligibility(result)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_kind"], "missing_executable")
+        self.assertFalse(result["result_usable"])
+        self.assertFalse(result.get("interactive_required", True))
+        self.assertNotIn("auth", result)
+
+    def test_terminal_error_missing_child_tool_cannot_be_promoted_by_report(self):
+        terminal = {
+            "type": "result",
+            "status": "error",
+            "error": 'exec: "grep": executable file not found in %PATH%',
+            "result": self._REPORT,
+        }
+        base = _executor.build_final_response(
+            "gemini", 1, terminal, [json.dumps(terminal)], "")
+        result = _executor._enrich(base, None)
+        self.assertEqual(result["status"], "error")
+        self.assertTrue(result["report_ok"])
+        self.assertEqual(result["tool_failure"]["executable"], "grep")
+
+    def test_clean_terminal_plus_fatal_missing_tool_stays_unusable_error(self):
+        terminal = {"type": "result", "status": "success", "result": self._REPORT}
+        raw = self._REPORT + '\nexec: "grep": executable file not found in %PATH%\n'
+        result = _executor._enrich(
+            _executor.build_final_response("gemini", 1, terminal, [raw], ""), None)
+        _executor._attach_eligibility(result)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["execution_status"], "error")
+        self.assertEqual(result["backend_exit_code"], 1)
+        self.assertEqual(result["normalized_exit_code"], 1)
+        self.assertTrue(result["report_ok"])
+        self.assertTrue(result["tool_failure"]["fatal"])
+        self.assertFalse(result["result_usable"])
+
+    def test_missing_tool_text_cannot_mask_an_auth_failure(self):
+        raw = (self._REPORT + '\nexec: "grep": executable file not found in %PATH%\n'
+               + "HTTP 401 Unauthorized\n")
+        result = _executor._enrich(
+            _executor.build_final_response("agy", 1, None, [raw], ""), None)
+        _executor._attach_eligibility(result)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["backend_exit_code"], 1)
+        self.assertTrue(result["report_ok"])
+        self.assertFalse(result["result_usable"])
+
+    def test_missing_tool_diagnostic_does_not_publish_a_local_path(self):
+        details = _executor.missing_executable_details(
+            "The term 'C:\\private\\bin\\grep.exe' is not recognized "
+            "as the name of a cmdlet")
+        self.assertEqual(details["executable"], "grep.exe")
+        self.assertNotIn("Users", repr(details))
 
     def test_explicit_codex_model_without_terminal_receipt_is_blocked(self):
         result = self._execute_codex_stream()
@@ -140,6 +284,51 @@ class EvidenceGuardTests(unittest.TestCase):
         self.assertFalse(result["result_usable"])
         self.assertEqual(result["model"]["targeted"], "gpt-5.6-luna")
 
+    def test_exact_claude_seat_blocks_auxiliary_model_as_dominant_served(self):
+        result = self._execute_claude_stream(served_model="claude-haiku-4-5-20251001")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error_kind"], "served_model_mismatch")
+        self.assertFalse(result["retryable"])
+        self.assertFalse(result["result_usable"])
+        self.assertEqual(result["model"]["requested"], "claude-opus-5")
+        self.assertEqual(result["model"]["served"], "claude-haiku-4-5-20251001")
+        self.assertEqual(
+            result["model"]["models_used"],
+            ["claude-haiku-4-5-20251001", "claude-opus-5"],
+        )
+
+    def test_exact_claude_seat_accepts_matching_terminal_model(self):
+        result = self._execute_claude_stream(served_model="claude-opus-5")
+        self.assertEqual(result["status"], "success")
+        self.assertNotEqual(result.get("result_usable"), False)
+        self.assertEqual(result["model"]["served"], "claude-opus-5")
+        self.assertEqual(result["served_model_evidence"], "reported")
+
+    def test_exact_claude_floating_alias_is_not_certified_as_exact(self):
+        result = self._execute_claude_stream(
+            requested_model="opus", handshake_model="claude-opus-5",
+            served_model="claude-opus-5")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error_kind"], "target_model_mismatch")
+        self.assertIs(result["model_match"], False)
+        self.assertFalse(result["named_model_verified"])
+
+    def test_exact_claude_seat_blocks_missing_terminal_model_evidence(self):
+        result = self._execute_claude_stream(include_model_usage=False)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error_kind"], "served_model_unverified")
+        self.assertFalse(result["retryable"])
+        self.assertFalse(result["result_usable"])
+        self.assertIsNone(result["model"]["served"])
+        self.assertEqual(result["served_model_evidence"], "absent")
+
+    def test_best_effort_claude_pin_keeps_mismatch_advisory(self):
+        result = self._execute_claude_stream(
+            served_model="claude-haiku-4-5-20251001", exact_required=False)
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(any("requested model" in warning
+                            for warning in result.get("warnings", [])))
+
     def test_codex_model_mismatch_never_retries(self):
         import run_subagent
         result = self._execute_codex_stream(served_model="gpt-5.6-luna")
@@ -163,7 +352,8 @@ class EvidenceGuardTests(unittest.TestCase):
             "model_resolved": "kimi-code/k3",
         })
         self.assertEqual(result["status"], "success")
-        self.assertEqual(result["served_model_evidence"], "reported")
+        self.assertEqual(result["served_model_evidence"], "inferred")
+        self.assertFalse(result["named_model_verified"])
         self.assertEqual(result["model"]["served"], "kimi-code/k3")
 
     def test_malformed_terminal_model_never_becomes_public_provenance(self):

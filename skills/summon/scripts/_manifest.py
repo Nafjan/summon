@@ -361,9 +361,9 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
 
 def _timeout_seconds(spec, default: float = 600.0) -> float:
     """Parse a job timeout the SAME way the child ``--timeout`` does — a bare
-    number is MILLISECONDS, suffixes are ms/s/m — and return seconds. (The old
-    version read a bare number as seconds and accepted 'h', disagreeing with the
-    child and sizing the watchdog 1000x too large.) Only sizes the parent
+    number is MILLISECONDS, suffixes are ms/s/m/h — and return seconds. (The old
+    version read a bare number as seconds, disagreeing with the child and sizing
+    the watchdog 1000x too large.) Only sizes the parent
     watchdog; the child enforces the real deadline, so odd input falls back to
     the default rather than raising."""
     if spec is None:
@@ -376,6 +376,8 @@ def _timeout_seconds(spec, default: float = 600.0) -> float:
             ms = float(s[:-1]) * 1000
         elif s.endswith("m"):
             ms = float(s[:-1]) * 60_000
+        elif s.endswith("h"):
+            ms = float(s[:-1]) * 3_600_000
         else:
             ms = float(s)  # bare number == milliseconds, matching the child
     except ValueError:
@@ -429,9 +431,12 @@ def _dispatch_child(cmd: list, timeout_sec: float, on_spawn=None, on_reap=None):
     from _executor import _kill_tree, _safe_communicate
     from _spawn import popen_flags
     try:
+        child_env = dict(os.environ)
+        child_env.pop("SUMMON_CMD_LAUNCHER", None)
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 stdin=subprocess.DEVNULL, text=True,
-                                encoding="utf-8", errors="replace", **popen_flags())
+                                encoding="utf-8", errors="replace", env=child_env,
+                                **popen_flags())
     except OSError as e:
         return None, f"{type(e).__name__}: {e}"
     if on_spawn is not None:
@@ -531,6 +536,10 @@ def _job_identity(job: dict, args) -> dict:
         effort=job.get("effort"), json_schema=job.get("json_schema"),
         artifacts=job.get("artifacts"), require_tools=_require_tools,
         profile=job.get("profile"),
+        worktree=job.get("worktree", getattr(args, "worktree", None)),
+        isolated_lane=bool(job.get("isolated_lane", getattr(args, "isolated_lane", False))),
+        allow_tool_credentials=bool(job.get(
+            "allow_tool_credentials", getattr(args, "allow_tool_credentials", False))),
         strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)),
         role_provenance=_role_provenance)
 
@@ -543,6 +552,10 @@ def _child_cmd(job: dict, args, out_file: str) -> list:
            "--out", out_file]
     if args.agents_dir:
         cmd += ["--agents-dir", args.agents_dir]
+    if getattr(args, "isolated_lane", False):
+        cmd += ["--isolated-lane"]
+    if getattr(args, "allow_tool_credentials", False):
+        cmd += ["--allow-tool-credentials"]
     if getattr(args, "strict_agents_dir", False):
         cmd += ["--strict-agents-dir"]
     if getattr(args, "enable_roles", False):

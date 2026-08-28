@@ -121,9 +121,10 @@ which carries the full, current documentation.
 
 This alias runs the same dispatcher, which lives in the sibling `summon` skill:
 
-**Script Path**: `{SKILL_DIR}/../summon/scripts/run_subagent.py` (where `{SKILL_DIR}` is
-the directory containing this SKILL.md). All parameters, agents, and behavior are
-identical to `/summon` — see that skill for the complete reference.
+**Script Path**: On Windows use `{SKILL_DIR}\\../summon/scripts/summon.cmd`; elsewhere use
+`python3 {SKILL_DIR}/../summon/scripts/run_subagent.py` (where `{SKILL_DIR}` is the directory
+containing this SKILL.md). All parameters, agents, and behavior are identical to `/summon` — see
+that skill for the complete reference.
 """
 
 _DELIBERATE_MARKER = "summon-managed: deliberate-companion"
@@ -293,6 +294,16 @@ def _release_lock(lock: str, token: str) -> None:
         pass
 
 
+def _execution_lease_held(host_root: str) -> bool:
+    """Whether a background launcher is freezing an immutable scripts bundle.
+
+    The lease is deliberately outside the replaceable skill tree. Refusing an
+    install is safer than swapping that tree mid-launch. We never remove a
+    lease here because it is not owned by the install-lock protocol.
+    """
+    return os.path.lexists(os.path.join(host_root, "summon.execution.lock"))
+
+
 def _build_tree(dst: str) -> list:
     """Copy the payload into dst; return the manifest file list."""
     files = []
@@ -356,6 +367,10 @@ def install_skill(host: str, dry: bool) -> tuple:
 
     staging = None
     try:
+        if _execution_lease_held(HOSTS[host]):
+            return (f"[!!]  {host}: a background dispatch is preparing an immutable "
+                    f"scripts bundle (lock: {os.path.join(HOSTS[host], 'summon.execution.lock')}); "
+                    "retry shortly", False)
         # Crash recovery (under the lock): a previous run may have moved the
         # good tree aside and died before the swap. Put it back first.
         if not os.path.isdir(dest) and os.path.isdir(backup) and _owned(backup):

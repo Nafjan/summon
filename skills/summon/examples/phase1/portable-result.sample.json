@@ -1,0 +1,58 @@
+{
+  "artifacts": {
+    "artifact_stability": "unknown",
+    "bytes": null,
+    "files": [
+      {
+        "bytes": 7,
+        "media_type": "text/plain",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    ],
+    "workspace_mutation": "unknown"
+  },
+  "attestation": {
+    "agent": "reviewer",
+    "backend": "claude",
+    "provider": "anthropic",
+    "transport": "subprocess"
+  },
+  "contact": {
+    "provider_contacted": true,
+    "retry_or_fallback": "none"
+  },
+  "integrity": {
+    "projection_sha256": "21d7cde60e2e5537888023cdb8dbf2ce3c6ba176910778c60981ee4bd2f7404f",
+    "scripts_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "summon_version": "3.2.1"
+  },
+  "model": {
+    "model_match": true,
+    "named_model_verified": true,
+    "requested": "frontier-alpha",
+    "served": "frontier-alpha",
+    "served_model_evidence": "reported",
+    "targeted": "frontier-alpha"
+  },
+  "outcome": {
+    "attempt_status": "completed",
+    "attempts": 1,
+    "error_kind": null,
+    "execution_status": "success",
+    "normalized_exit_code": 0,
+    "raw_backend_exit_code": 0,
+    "report_ok": true,
+    "result_usable": true,
+    "status": "success",
+    "verdict": "pass"
+  },
+  "schema": "summon.portable-result/experimental-1",
+  "source": {
+    "binding_sha256": null,
+    "native_adapter_attested": false,
+    "receipt_sha256": "09a723b6343fae1615d919fd09c24f2979b373b5bb9b5509364f93e0a6401035",
+    "relationship": "external",
+    "source_schema": "summon.dispatch-envelope/unknown",
+    "surface": "dispatch"
+  }
+}
