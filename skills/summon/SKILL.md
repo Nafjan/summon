@@ -1,6 +1,6 @@
 ---
 name: summon
-description: Summon another AI CLI — Claude, Codex, Cursor, Gemini, Kimi, Antigravity, ArkCLI, OpenCode, or native ZCode — as a sub-agent to run a task, in parallel when useful. Use whenever the user names an agent or sub-agent to run, asks to delegate work to another AI or a specific model, wants a second opinion or a cross-vendor code review, wants to fan several models out over a task, or references an agent definition. One dispatcher over supported CLI and API backends returns a structured JSON result and supports isolated git worktrees, background and manifest-driven swarms, JSON-schema-validated output, model discovery, and per-agent model/permission config. Formerly named "sub-agents".
+description: Summon another AI CLI — Claude, Codex, Cursor, Gemini, Kimi, Antigravity, ArkCLI, OpenCode, or the experimental native ZCode preview — as a sub-agent to run a task, in parallel when useful. Use whenever the user names an agent or sub-agent to run, asks to delegate work to another AI or a specific model, wants a second opinion or a cross-vendor code review, wants to fan several models out over a task, or references an agent definition. One dispatcher over supported CLI and API backends returns a structured JSON result and supports isolated git worktrees, background and manifest-driven swarms, JSON-schema-validated output, model discovery, and per-agent model/permission config. Formerly named "sub-agents".
 allowed-tools: Bash Read
 ---
 

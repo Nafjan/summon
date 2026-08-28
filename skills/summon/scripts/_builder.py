@@ -64,6 +64,10 @@ class AgentInvocation:
     extra_args: tuple = ()             # arbitrary backend flags (agent `args:` frontmatter)
     base_url: str | None = None        # openai-compat only: resolved API base url
     api_key_env: str | None = None     # openai-compat only: env var holding the API key
+    # One-way identity recorded before dispatch for endpoint credentials that
+    # may be resolved from a bounded local helper. Never serialized or sent to
+    # the provider; the API backend compares it before contacting the network.
+    api_key_fingerprint: str | None = None
     allow_payg: bool = False           # byteplus-coding: per-run consent for PAYG fallback
     # agy only: the account digest the REQUEST IDENTITY recorded, checked against the bytes
     # actually copied into the isolated profile so a swap in between cannot produce a result
@@ -1580,6 +1584,7 @@ def _opencode_credential_env_keys() -> tuple[str, ...]:
     prefixes = (
         "OPENAI_", "ANTHROPIC_", "OPENROUTER_", "GEMINI_", "GOOGLE_", "CURSOR_",
         "KIMI_", "DEEPSEEK_", "NOUS_", "BYTEPLUS_", "AWS_", "AZURE_", "GITHUB_",
+        "ZAI_", "ZHIPU_", "GLM_",
     )
     # OpenCode's inline config can contain provider keys even when no conventional
     # *_API_KEY variable is present. Treat it as credential-bearing configuration in
@@ -1918,6 +1923,8 @@ def _build_opencode_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
 
 _ZCODE_RESUME_RE = re.compile(r"^sess_[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _ZCODE_FIXED_PROMPT = "Follow the attached task exactly and finish with the required report."
+_ZCODE_STALE_ATTACHMENT_TTL_SECONDS = 60 * 60
+_ZCODE_STALE_ATTACHMENT_SCAN_LIMIT = 32
 
 
 def _lock_zcode_attachment(path: str) -> None:
@@ -1925,7 +1932,7 @@ def _lock_zcode_attachment(path: str) -> None:
     os.chmod(path, 0o600)
     if os.name != "nt":
         return
-    user = (os.environ.get("USERNAME") or "").strip()
+    user = _windows_current_principal()
     if not user:
         raise OSError("current Windows principal is unavailable")
     try:
@@ -1940,6 +1947,62 @@ def _lock_zcode_attachment(path: str) -> None:
         raise OSError("unable to secure ZCode prompt attachment")
 
 
+def _windows_current_principal() -> str:
+    """Return the effective Windows token principal without trusting USERNAME."""
+    if os.name != "nt":
+        return ""
+    try:
+        from _spawn import run_flags
+        result = subprocess.run(
+            ["whoami"], capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=5, **run_flags())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    principal = (result.stdout or "").strip().splitlines()
+    value = principal[0].strip() if principal else ""
+    if (not value or any(ch in value for ch in (";", "<", ">", "|", "&", "^", "\x00", '"'))):
+        return ""
+    return value
+
+
+def _zcode_yolo_env_scrub() -> dict[str, None]:
+    """Remove conventional provider credentials from an unrestricted ZCode child.
+
+    This does not sandbox ZCode's own local credential store.  The caller must
+    explicitly acknowledge that remaining local authority with
+    ``--allow-tool-credentials``; scrubbing only avoids an avoidable ambient
+    environment leak.
+    """
+    return {key: None for key in _opencode_credential_env_keys()}
+
+
+def _reap_stale_zcode_attachments() -> None:
+    """Bounded next-launch cleanup for attachments left by an ordinary hard kill."""
+    try:
+        root = tempfile.gettempdir()
+        cutoff = time.time() - _ZCODE_STALE_ATTACHMENT_TTL_SECONDS
+        candidates = 0
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if candidates >= _ZCODE_STALE_ATTACHMENT_SCAN_LIMIT:
+                    break
+                if (not entry.name.startswith("summon-zcode-")
+                        or not entry.name.endswith(".md")
+                        or entry.is_symlink()
+                        or not entry.is_file(follow_symlinks=False)):
+                    continue
+                candidates += 1
+                try:
+                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                        os.remove(entry.path)
+                except OSError:
+                    continue
+    except OSError:
+        return
+
+
 def _write_zcode_attachment(text: str) -> str:
     """Write one private task attachment outside the repository.
 
@@ -1948,6 +2011,7 @@ def _write_zcode_attachment(text: str) -> str:
     Windows command line.  The executor removes it after the owned child is
     reaped; this helper does not retain the task in any Summon receipt.
     """
+    _reap_stale_zcode_attachments()
     fd, path = tempfile.mkstemp(prefix="summon-zcode-", suffix=".md")
     try:
         # mkstemp creates a private descriptor; lock its ACL before any task
@@ -2020,6 +2084,11 @@ def _build_zcode_args(inv: AgentInvocation, *, resource_register=None
         raise ValueError(
             "ZCode yolo requires --worktree or --isolated-lane; broad authority is "
             "available for disposable copies, not active shared checkouts")
+    if inv.permission == "yolo" and not inv.allow_tool_credentials:
+        raise ValueError(
+            "ZCode yolo can access its local provider configuration and requires "
+            "--allow-tool-credentials in addition to --worktree or --isolated-lane; "
+            "the acknowledgement does not create a sandbox")
     if inv.resume_id and not _ZCODE_RESUME_RE.fullmatch(inv.resume_id):
         raise ValueError("ZCode resume id must be a sess_ identifier")
     try:
@@ -2050,7 +2119,10 @@ def _build_zcode_args(inv: AgentInvocation, *, resource_register=None
             args += ["--resume", inv.resume_id]
         args += strip_boundary_flags("zcode", inv.extra_args)
         args += ["--attach", attachment, "--prompt", _ZCODE_FIXED_PROMPT]
-        return target.command, args, {"SUMMON_ZCODE_DISCOVERY_SOURCE": target.source}
+        return target.command, args, {
+            "SUMMON_ZCODE_DISCOVERY_SOURCE": target.source,
+            **(_zcode_yolo_env_scrub() if inv.permission == "yolo" else {}),
+        }
     except Exception:
         try:
             os.remove(attachment)

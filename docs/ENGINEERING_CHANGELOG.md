@@ -24,7 +24,9 @@ never on added fields.
   identifier. Leading banners are tolerated; arbitrary/incomplete JSON fails
   closed. Native ZCode is deliberately multi-provider/ambient: model overrides
   fail before contact, safe-edit is refused, advisory read-only is opt-in, and
-  yolo needs an isolated/worktree boundary. Terminal JSON means liveness and
+  experimental yolo needs an isolated/worktree boundary plus an explicit
+  credential-access acknowledgement; that acknowledgement is not a sandbox.
+  Terminal JSON means liveness and
   usage are terminal-only, and no model provenance is manufactured.
 - **Direct Z.AI Coding Plan text seat:** registered the coding-only endpoint as
   a distinct OpenAI-compatible provider, with no BytePlus PAYG retry behavior.

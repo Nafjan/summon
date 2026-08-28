@@ -125,12 +125,18 @@ Native ZCode discovery checks `ZCODE_CLI`, PATH, Windows uninstall metadata,
 and common application bundles without executing a registry command or reading
 the app configuration. It launches hidden and headlessly, puts the complete
 task in an owner-restricted UTF-8 attachment, removes that attachment after the
-child exits, and tolerates a leading banner before the one terminal JSON object.
+child exits, and performs bounded next-launch cleanup for stale attachments
+from an ordinary hard kill. It tolerates a leading banner before the one
+terminal JSON object.
 Because ZCode provides terminal JSON rather than a reviewed progress stream,
 its liveness is terminal-only. It refuses `model:` and `safe-edit`; advisory
 read-only requires the existing explicit unenforced-read-only opt-in, while
-`yolo` requires a worktree or isolated lane. This keeps broad native authority
-usable in disposable boundaries without inventing a model or a sandbox claim.
+experimental `yolo` requires a worktree or isolated lane **and**
+`--allow-tool-credentials`. That acknowledgement does not create a sandbox:
+it records acceptance that ZCode may use its own local provider configuration,
+while Summon only scrubs conventional inherited provider environment variables.
+This keeps broad native authority usable in disposable boundaries without
+inventing a model or a sandbox claim.
 
 The ZCode bundle-discovery and attached-brief approach was informed by the
 [MIT-licensed delegate-skills project](https://github.com/amElnagdy/delegate-skills).

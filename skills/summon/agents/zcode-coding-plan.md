@@ -12,9 +12,12 @@ not claim a provider, a model pin, or GLM-5.3 Flash. Use the explicit direct
 or OpenCode Z.AI Coding Plan seats when an exact target-model selector is
 required.
 
-This is a broad-authority `yolo` mode for disposable clones, isolated worktrees,
-or similarly reversible boundaries. Launch with `--worktree` or
-`--isolated-lane`. Do not use it in a shared checkout or near credentials,
+This experimental broad-authority `yolo` mode is only for disposable clones,
+isolated worktrees, or similarly reversible boundaries. Launch with
+`--worktree` or `--isolated-lane` **and** `--allow-tool-credentials`. The
+acknowledgement does not create a sandbox: ZCode can still use its own local
+provider configuration, while Summon scrubs conventional inherited provider
+environment variables. Do not use it in a shared checkout or near credentials,
 client/private data, deployments, databases, protected artifacts, or a running
 stack. ZCode returns its session, usage, and result only at terminal JSON
 completion; live progress and provider-reported served-model identity may be

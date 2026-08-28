@@ -10,6 +10,7 @@ import re
 _KIMI_PARTIAL_MAX_CHARS = 32 * 1024
 _KIMI_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+() -]{0,159}$")
 _MAX_LIVENESS_SEMANTIC_IDENTITIES = 4096
+_ZCODE_OUTPUT_MAX_BYTES = 1_048_576
 
 
 def _safe_kimi_model_id(value) -> str | None:
@@ -228,7 +229,8 @@ class StreamProcessor:
         # retaining an unbounded document.
         self.is_zcode = cli == "zcode"
         self._zcode_output_parts: list[str] = []
-        self._zcode_output_chars = 0
+        self._zcode_output_bytes = 0
+        self.zcode_output_truncated = False
         self.zcode_context_window = None
         self.zcode_json_parsed = False
         # Telemetry captured from stream events (None when the CLI doesn't emit it):
@@ -341,11 +343,16 @@ class StreamProcessor:
             # document, possibly preceded by a banner. Progress/session data is
             # unavailable until that terminal document and is kept honest as
             # such rather than fabricating stream events.
-            if self._zcode_output_chars < 1_048_576:
-                remaining = 1_048_576 - self._zcode_output_chars
-                item = line[:remaining]
+            encoded = line.encode("utf-8", errors="replace")
+            if self._zcode_output_bytes < _ZCODE_OUTPUT_MAX_BYTES:
+                remaining = _ZCODE_OUTPUT_MAX_BYTES - self._zcode_output_bytes
+                item = encoded[:remaining].decode("utf-8", errors="ignore")
                 self._zcode_output_parts.append(item)
-                self._zcode_output_chars += len(item)
+                self._zcode_output_bytes += len(item.encode("utf-8"))
+                if len(encoded) > remaining:
+                    self.zcode_output_truncated = True
+            else:
+                self.zcode_output_truncated = True
             return False
 
         try:
@@ -1145,7 +1152,10 @@ class StreamProcessor:
             raw = "\n".join(self._zcode_output_parts)
             try:
                 from _zcode import parse_zcode_json_output, zcode_result_fields
-                fields = zcode_result_fields(parse_zcode_json_output(raw))
+                fields = (zcode_result_fields(parse_zcode_json_output(raw))
+                          if not self.zcode_output_truncated else
+                          {"response": "", "session_id": None, "usage": None,
+                           "context_window": None, "parse_ok": False})
             except Exception:  # noqa: BLE001 - a malformed terminal is not success
                 fields = {"response": "", "session_id": None, "usage": None,
                           "context_window": None, "parse_ok": False}
@@ -1158,7 +1168,9 @@ class StreamProcessor:
                 "type": "result",
                 "result": fields.get("response") or raw,
                 "status": "success" if fields.get("parse_ok") else "error",
-                **({"error": "ZCode did not emit a parseable terminal JSON result"}
+                **({"error": ("ZCode terminal JSON exceeded the bounded output limit"
+                                if self.zcode_output_truncated else
+                                "ZCode did not emit a parseable terminal JSON result")}
                    if not fields.get("parse_ok") else {}),
             }
         self._liveness("terminal", {})

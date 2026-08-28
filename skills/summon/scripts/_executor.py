@@ -1657,15 +1657,25 @@ def _endpoint_state(agents_dir, cwd, agent, defn=None) -> tuple:
     # artifacts is about the SECRET; a one-way digest is not the secret, and the alternative
     # was a wrong answer.
     _cred = os.environ.get(api_key_env) if api_key_env else None
-    cred_id = hashlib.sha256(
-        b"summon-credential-v1\0" + (api_key_env or "").encode("utf-8") + b"\0"
-        + _cred.encode("utf-8")).hexdigest()[:32] if _cred else ""
-    # The RESOLVED PAIR is returned alongside the digest so the dispatch can use the very
-    # snapshot that was fingerprinted. Resolving twice meant a providers.json edit between
+    # Z.AI Coding Plan can resolve a key through the deliberately bounded
+    # helper reader. Include that same key's one-way identity before deciding
+    # whether an existing result is reusable; otherwise rotating the helper
+    # key would cross-account reuse an old answer.
+    try:
+        from _apibackend import credential_fingerprint, is_zai_coding_plan_endpoint
+        if (not _cred and api_key_env == "ZAI_CODING_API_KEY"
+                and is_zai_coding_plan_endpoint(base_url)):
+            from _zai_coding_plan import resolve_zai_coding_api_key
+            _cred, _source = resolve_zai_coding_api_key()
+        cred_id = credential_fingerprint(api_key_env, _cred)
+    except Exception:  # noqa: BLE001 - an unreadable helper cannot prove reuse
+        cred_id = "unresolved"
+    # The resolved endpoint/env pair and credential fingerprint travel together so dispatch
+    # can use the endpoint snapshot and reject a changed helper/env credential. Resolving twice meant a providers.json edit between
     # the two reads sent the request to B while stamping it as A -- and restoring A then let
     # B's answer resume as A's. The identity and the call now describe the same endpoint.
     return (hashlib.sha256(f"{base_url}|{api_key_env}|{cred_id}".encode("utf-8")).hexdigest(),
-            "ok", (base_url, api_key_env))
+            "ok", (base_url, api_key_env, cred_id))
 
 
 # Keys an identity dict carries for the SKIP's benefit that are NOT part of the request
@@ -1840,9 +1850,9 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # OpenCode yolo is an explicit isolated-lane operation.  These controls
         # are part of the identity so a cached unrestricted result cannot satisfy
         # a later request with a different credential/tool boundary.
-        "isolated_lane": ("1" if isolated_lane else None) if _rcli == "opencode" else None,
+        "isolated_lane": ("1" if isolated_lane else None) if _rcli in {"opencode", "zcode"} else None,
         "allow_tool_credentials": (
-            "1" if allow_tool_credentials else None) if _rcli == "opencode" else None,
+            "1" if allow_tool_credentials else None) if _rcli in {"opencode", "zcode"} else None,
         # The CONTROLS are part of the request. Without them a stored --out success
         # from an UNGATED, UNCLAMPED run satisfied a later gated+clamped request for
         # the "same" task: the skip handed back a result produced under authority the

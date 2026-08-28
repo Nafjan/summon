@@ -38,6 +38,11 @@ _CAPABILITIES = {
         RESUME_CANDIDATE, "provider_receipt_required"),
     ("opencode", "subprocess"): (
         RESUME_CANDIDATE, "provider_receipt_required"),
+    # ZCode emits a syntactically validated sess_ handle in terminal JSON and
+    # accepts it through its headless resume seam, but an installed end-to-end
+    # smoke has not yet certified continuity across versions.
+    ("zcode", "subprocess"): (
+        RESUME_CANDIDATE, "installed_resume_smoke_required"),
     ("agy", "subprocess"): (
         RESUME_UNSUPPORTED, "agy_profile_continuity_unreliable"),
     ("gemini", "subprocess"): (

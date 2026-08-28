@@ -15,7 +15,9 @@ from pathlib import Path
 
 
 _MAX_CONFIG_BYTES = 64 * 1024
-_SCALAR = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*(?:#.*)?$")
+# A comment starts only after whitespace.  API keys may legally contain '#',
+# so treating every hash as a comment silently truncates credentials.
+_SCALAR = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)(?:\s+#.*)?\s*$")
 _KEY_NAMES = frozenset({"api_key"})
 _PLAN_NAMES = frozenset({"plan"})
 
@@ -43,10 +45,10 @@ def _safe_regular_file(path: Path) -> bool:
             if current.is_symlink():
                 return False
             current = current.parent
-        stat = path.stat()
+        file_stat = path.stat()
     except OSError:
         return False
-    return path.is_file() and 0 < stat.st_size <= _MAX_CONFIG_BYTES
+    return path.is_file() and 0 < file_stat.st_size <= _MAX_CONFIG_BYTES
 
 
 def _unquote_scalar(value: str) -> str | None:
@@ -72,11 +74,19 @@ def _read_helper_scalars(path: Path) -> dict[str, str] | None:
         # a final-path symlink. fstat validates the opened descriptor instead
         # of trusting the earlier pathname metadata.
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        before = path.stat()
         descriptor = os.open(path, flags)
         with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
             info = os.fstat(handle.fileno())
             if (not stat.S_ISREG(info.st_mode)
                     or info.st_size <= 0 or info.st_size > _MAX_CONFIG_BYTES):
+                return None
+            # Refuse a rename/replacement or size change between pathname
+            # inspection and descriptor read. This is not a general file lock;
+            # it is a bounded fail-closed guard for a credential source.
+            if (before.st_size != info.st_size
+                    or before.st_dev != info.st_dev
+                    or before.st_ino != info.st_ino):
                 return None
             text = handle.read(_MAX_CONFIG_BYTES + 1)
             if len(text.encode("utf-8", errors="replace")) > _MAX_CONFIG_BYTES:
@@ -127,7 +137,9 @@ def resolve_zai_coding_api_key(*, environ: dict[str, str] | None = None) -> tupl
         return None, None
     plan = next((values[name] for name in _PLAN_NAMES if name in values), "")
     normalized_plan = plan.casefold().replace("-", "_")
-    if normalized_plan not in {"coding", "coding_plan", "glm_coding_plan_global"}:
+    # The global coding endpoint is reviewed only for this explicit helper
+    # plan. Generic or regional profiles must not be silently repurposed.
+    if normalized_plan != "glm_coding_plan_global":
         return None, "helper_not_coding_plan"
     key = next((values[name] for name in _KEY_NAMES if name in values), "")
     return (key or None), ("coding_helper_config" if key else "helper_key_missing")

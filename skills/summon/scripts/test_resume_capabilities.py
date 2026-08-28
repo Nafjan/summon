@@ -15,6 +15,7 @@ import _resume_capabilities as capabilities
     ("codex", "subprocess", "candidate", "provider_receipt_required"),
     ("cursor-agent", "subprocess", "candidate", "provider_receipt_required"),
     ("opencode", "subprocess", "candidate", "provider_receipt_required"),
+    ("zcode", "subprocess", "candidate", "installed_resume_smoke_required"),
     ("agy", "subprocess", "unsupported", "agy_profile_continuity_unreliable"),
     ("gemini", "subprocess", "unsupported", "stable_session_resume_unavailable"),
     ("kimi", "subprocess", "unsupported", "stable_session_id_unavailable"),

@@ -75,6 +75,7 @@ jobs:
           skills/summon/scripts/test_resume_capabilities.py
           skills/summon/scripts/test_evidence_guards.py
           skills/summon/scripts/test_opencode.py
+          skills/summon/scripts/test_zcode.py
           skills/summon/scripts/test_background_read_roots.py
           skills/summon/scripts/test_codex_stream.py
           skills/summon/scripts/test_executor_ownership.py

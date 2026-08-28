@@ -10,7 +10,9 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
   owner-restricted prompt attachments, banner-tolerant terminal JSON parsing,
   session/usage capture, and explicit terminal-only liveness. Native ZCode
   refuses model pins and safe-edit because neither per-call model selection nor
-  a safe-edit boundary is proven. Added distinct direct and OpenCode Z.AI
+  a safe-edit boundary is proven. Experimental native yolo now requires both a
+  disposable boundary and an explicit credential-access acknowledgement, which
+  does not claim a sandbox. Added distinct direct and OpenCode Z.AI
   Coding Plan GLM-5.3 Flash seats alongside the existing OpenRouter successor;
   retired Ox aliases and historical receipts remain unchanged. The direct seat
   is text-only, pins the coding endpoint, supports an explicit environment key

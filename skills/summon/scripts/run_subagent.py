@@ -136,7 +136,7 @@ def _endpoint_for_dispatch(identity: dict, agent_file: str, agents_dir: str) -> 
     """
     snap = (identity or {}).get("_endpoint")
     if snap:
-        return tuple(snap)
+        return tuple(snap[:2])
     return _compat_endpoint(agent_file, agents_dir)
 
 
@@ -750,15 +750,18 @@ def _preflight_backend(cli: str, command_override: str | None = None) -> dict | 
     # command has already been validated by the profile resolver, so it is a
     # legitimate preflight success even when the bare backend name is absent
     # from PATH.
-    if cli == "openai-compat" or command_override or shutil.which(cli):
+    if cli == "openai-compat" or command_override:
         return None
     if cli == "zcode":
         try:
-            from _zcode import resolve_zcode_cli
+            from _zcode import rejected_zcode_path_shim, resolve_zcode_cli
             if resolve_zcode_cli() is not None:
                 return None
+            _zcode_rejected_shim = rejected_zcode_path_shim()
         except Exception:  # noqa: BLE001 - fall through to safe setup guidance
-            pass
+            _zcode_rejected_shim = False
+    elif shutil.which(cli):
+        return None
     # Enrichment is best-effort: an incomplete install missing _doctor.py must
     # still yield a setup message, never an uncaught ImportError from this guard.
     try:
@@ -779,6 +782,8 @@ def _preflight_backend(cli: str, command_override: str | None = None) -> dict | 
     msg = (f"The '{cli}' CLI isn't installed or isn't on your PATH, so this agent "
            f"can't run. Install it: {hint.get('install', 'see the vendor docs')}. "
            f"Then sign in: {hint.get('auth', 'log in to the CLI')}.")
+    if cli == "zcode" and locals().get("_zcode_rejected_shim"):
+        msg += " A PATH command-wrapper was found but is not a safe native ZCode target; install or point ZCODE_CLI at the direct executable/bundle."
     if usable:
         msg += (f" Backends ready right now: {', '.join(usable)} - or pick an agent on "
                 "one of those (run the `list` command).")
@@ -2670,6 +2675,8 @@ def main() -> None:
         agy_account_sha256=_identity.get("agy_account_sha256"),
         agy_account_checked=bool(_identity.get("_agy_account_checked")),
         api_key_env=api_key_env,
+        api_key_fingerprint=((_identity.get("_endpoint") or (None, None, None))[2]
+                             if cli == "openai-compat" else None),
         allow_payg=getattr(args, "allow_payg", False),
         profile=profile_name,
         profile_env=(profile_selection or {}).get("env") if profile_selection else None,
@@ -3215,6 +3222,9 @@ def _dry_run_view(invocation, args, agents_dir: str,
         # when no conflict/refusal path adds its own diagnostics, so callers do not
         # have to infer non-contact from a missing field.
         "provider_contacted": False,
+        "attempts": 0,
+        "attempt_status": "not_run",
+        "execution_status": "not_run",
         "agent": args.agent,
         "agent_resolved": getattr(args, "_resolved_agent", args.agent),
         "cli": invocation.cli,
@@ -3328,7 +3338,11 @@ def _dry_run_view(invocation, args, agents_dir: str,
             "requested model is incompatible with the selected backend"
             if _decision_projection_invalid else _compat["message"])
         if not _decision_projection_invalid:
-            view["model_vendor"] = _compat["model_vendor"]
+            # A backend-specific refusal (native ZCode has no reviewed model
+            # selector) does not invent a model vendor.  Generic namespace
+            # incompatibilities do carry one.
+            if _compat.get("model_vendor") is not None:
+                view["model_vendor"] = _compat["model_vendor"]
             view["compatible_backends"] = list(_compat["compatible_backends"])
             view["recommended_backend"] = _compat["recommended_backend"]
     _role_info = (getattr(args, "_role_provenance", {}) or {}).get("role")

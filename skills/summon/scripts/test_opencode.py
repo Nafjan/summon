@@ -126,6 +126,14 @@ class OpenCodeBuilderTests(unittest.TestCase):
         self.assertEqual(env["OPENROUTER_API_KEY"], "test-secret")
         self.assertIsNone(env["ANTHROPIC_API_KEY"])
 
+    def test_zai_coding_plan_yolo_does_not_inherit_direct_api_key(self):
+        """The OpenCode Z.AI seat authenticates through OpenCode's own store."""
+        with mock.patch.dict(os.environ, {"ZAI_CODING_API_KEY": "fixture-key"}, clear=False):
+            env = opencode_env_override(
+                "zai-coding-plan/glm-5.3-flash", permission="yolo",
+                isolated_lane=True, allow_tool_credentials=True)
+        self.assertIsNone(env["ZAI_CODING_API_KEY"])
+
     def test_provider_inert_child_fixture_receives_policy_and_auto(self):
         """Exercise the real executor boundary without contacting OpenCode/provider."""
         invocation = self._inv(permission="safe-edit")

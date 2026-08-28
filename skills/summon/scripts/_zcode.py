@@ -84,7 +84,11 @@ def _registry_install_locations() -> list[str]:
                         name = winreg.EnumKey(root, index)
                         with winreg.OpenKey(root, name) as item:
                             display, _ = winreg.QueryValueEx(item, "DisplayName")
-                            if not isinstance(display, str) or "zcode" not in display.casefold():
+                            # A substring would trust unrelated uninstall records
+                            # such as "ZCode Helper". Only the app's exact display
+                            # name is an installation authority.
+                            if (not isinstance(display, str)
+                                    or display.strip().casefold() != "zcode"):
                                 continue
                             try:
                                 location, _ = winreg.QueryValueEx(item, "InstallLocation")
@@ -123,12 +127,10 @@ def _registry_install_locations() -> list[str]:
     return locations
 
 
-def _bundle_candidates() -> list[tuple[str, str]]:
-    """Return reviewed app-bundle locations, with no private-config lookup."""
+def _well_known_bundle_candidates() -> list[tuple[str, str]]:
+    """Return trusted app-bundle locations, with no private-config lookup."""
     candidates: list[tuple[str, str]] = []
     if os.name == "nt":
-        for root in _registry_install_locations():
-            candidates.append((str(Path(root).joinpath(*_BUNDLE_RELATIVE)), "windows_registry"))
         local = os.environ.get("LOCALAPPDATA")
         if local:
             candidates.append((str(Path(local, "Programs", "ZCode").joinpath(*_BUNDLE_RELATIVE)),
@@ -148,9 +150,24 @@ def _bundle_candidates() -> list[tuple[str, str]]:
     return candidates
 
 
+def _bundle_candidates() -> list[tuple[str, str]]:
+    """Prefer well-known bundles before bounded registry fallback hints."""
+    candidates = _well_known_bundle_candidates()
+    if os.name == "nt":
+        for root in _registry_install_locations():
+            candidates.append((str(Path(root).joinpath(*_BUNDLE_RELATIVE)), "windows_registry"))
+    return candidates
+
+
+def rejected_zcode_path_shim(*, which=shutil.which) -> bool:
+    """Whether PATH resolves only a command wrapper that this backend rejects."""
+    first = which("zcode")
+    return isinstance(first, str) and Path(first).suffix.casefold() in {".cmd", ".bat", ".ps1"}
+
+
 def resolve_zcode_cli(*, environ: dict[str, str] | None = None,
                       which=shutil.which) -> ZCodeTarget | None:
-    """Resolve ZCode: explicit ``ZCODE_CLI``, PATH, registry, then bundles.
+    """Resolve ZCode: explicit ``ZCODE_CLI``, PATH, well-known bundles, registry.
 
     An explicit environment override is useful for portable/CI installations.
     It is interpreted as a local file path only; no shell command parsing is
@@ -160,10 +177,13 @@ def resolve_zcode_cli(*, environ: dict[str, str] | None = None,
     override = env.get("ZCODE_CLI")
     if isinstance(override, str) and override.strip():
         return _target(os.path.expandvars(os.path.expanduser(override.strip())), "env", which=which)
-    path_hit = which("zcode") or (which("zcode.exe") if os.name == "nt" else None)
-    target = _target(path_hit, "path", which=which) if path_hit else None
-    if target is not None:
-        return target
+    # A PATH shim is not a terminal miss: Windows often has zcode.cmd before
+    # zcode.exe, and .cmd reparses arguments. Keep searching direct targets.
+    for name in (("zcode", "zcode.exe") if os.name == "nt" else ("zcode",)):
+        path_hit = which(name)
+        target = _target(path_hit, "path", which=which) if path_hit else None
+        if target is not None:
+            return target
     for candidate, source in _bundle_candidates():
         target = _target(candidate, source, which=which)
         if target is not None:

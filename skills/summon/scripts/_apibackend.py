@@ -39,6 +39,15 @@ def _redact(text: str, secret: str | None) -> str:
         return text.replace(secret, "***REDACTED***")
     return text
 
+
+def credential_fingerprint(api_key_env: str | None, api_key: str | None) -> str:
+    """Return a one-way credential identity without retaining the credential."""
+    if not api_key:
+        return ""
+    return hashlib.sha256(
+        b"summon-credential-v1\0" + (api_key_env or "").encode("utf-8") + b"\0"
+        + api_key.encode("utf-8")).hexdigest()[:32]
+
 # Sensible defaults so common providers work with just `provider:` + `model:`.
 BUILTIN_PROVIDERS = {
     "openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY"},
@@ -586,6 +595,15 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
         if inv.api_key_env == "ZAI_CODING_API_KEY":
             msg += " - set it for the Z.AI Coding Plan endpoint"
         return _err(cli, msg)
+    expected_credential = getattr(inv, "api_key_fingerprint", None)
+    if (expected_credential is not None
+            and credential_fingerprint(inv.api_key_env, api_key) != expected_credential):
+        # The identity was built with another helper/env credential. Do not let
+        # a result-file reuse or a mid-dispatch helper edit cross accounts.
+        return _err(
+            cli,
+            "openai-compat credential changed after request identity was prepared; "
+            "recompute the request identity before dispatch")
 
     wall_deadline = time.monotonic() + max(1.0, timeout_ms / 1000.0)
     if launch_control is None:

@@ -64,8 +64,11 @@ def effective_permission(cli: str, permission: str) -> str:
         if permission == "safe-edit":
             return "yolo"
     if cli == "zcode":
+        # ZCode's native build/edit modes are deliberately refused by the
+        # command builder.  Do not describe that rejected tier as a yolo
+        # route in fleet/deliberation evidence.
         if permission == "safe-edit":
-            return "yolo"
+            return "unenforceable"
         if permission == "read-only":
             return "unenforceable"
     return permission
