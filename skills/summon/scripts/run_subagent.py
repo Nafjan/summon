@@ -925,6 +925,18 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
             "base_head": base_head}
 
 
+def _preflight_then_setup_worktree(invocation, cwd: str, name_arg: str | None,
+                                   agent: str, *, dry_run: bool = False):
+    """Run pure authority checks before creating any persistent Git state."""
+    from _builder import zcode_invocation_preflight
+    refusal = zcode_invocation_preflight(invocation)
+    if refusal is not None:
+        return None, refusal
+    if name_arg is None or dry_run:
+        return None, None
+    return _setup_worktree(cwd, name_arg, agent), None
+
+
 # --- Background dispatch + jobs queries (moved to _background.py) ---------------
 # child_argv/spawn_background/run_jobs_query/render_jobs live in _background.py.
 # _child_argv is a CALL re-export (a test calls it); spawn_background uses the
@@ -2533,13 +2545,6 @@ def main() -> None:
                  f"Bare values are milliseconds for backward compatibility (600000 == 10m); "
                  f"write {_n}ms explicitly if you really want it.")
 
-    if args.worktree is not None and not args.dry_run:
-        try:
-            worktree_info = _setup_worktree(args.cwd, args.worktree, args.agent)
-        except ValueError as e:
-            _die(str(e))
-        args.cwd = worktree_info["cwd"]
-
     # Reasoning-effort precedence: --effort > agent `effort:` frontmatter >
     # SUMMON_DEFAULT_EFFORT env > the built-in default (high — summon delegates the
     # hard problems, so it defaults to deep reasoning). `none`/`default`/`off` = the
@@ -2772,15 +2777,23 @@ def main() -> None:
         sys.exit(0)
 
     # The same pure native-ZCode authority preflight drives dry-run and live.
-    # Refuse before a work loop, attachment, or provider attempt can begin.
-    from _builder import zcode_invocation_preflight
-    _zcode_refusal = zcode_invocation_preflight(invocation)
+    # It runs before optional worktree creation so a not-run refusal cannot
+    # leave a branch or checkout behind.
+    try:
+        worktree_info, _zcode_refusal = _preflight_then_setup_worktree(
+            invocation, args.cwd, args.worktree, args.agent,
+            dry_run=bool(args.dry_run))
+    except ValueError as e:
+        _die(str(e))
     if _zcode_refusal:
         _die(_zcode_refusal["message"],
              error_kind=_zcode_refusal["error_kind"],
              extra={"provider_contacted": False, "attempts": 0,
                     "attempt_status": "not_run", "execution_status": "not_run",
                     "result_usable": False, "retryable": False})
+    if worktree_info is not None:
+        args.cwd = worktree_info["cwd"]
+        invocation.cwd = worktree_info["cwd"]
 
     if _read_policy.get("would_refuse"):
         _reroute = {

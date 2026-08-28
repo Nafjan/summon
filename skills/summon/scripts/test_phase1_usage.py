@@ -261,7 +261,7 @@ def test_effective_decision_preserves_exact_agent_and_authority(monkeypatch):
     assert decision["provider_contacted"] is False
     assert decision["request"] == {
         "agent": "sol-strategist", "lane": None, "model": "gpt-5.6-sol",
-        "provider": "codex"}
+        "provider": "openai"}
     assert decision["resolution"]["seat"] == "sol-strategist"
     assert decision["resolution"]["winning_rule"] == "exact_agent_preserved"
     assert decision["authority"]["permission_ceiling"] == "read-only"

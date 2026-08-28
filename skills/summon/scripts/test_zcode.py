@@ -113,6 +113,23 @@ class ZCodeBuilderTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, refusal["message"].split(";")[0]):
                 build_invocation_args(invocation)
 
+    def test_refused_native_zcode_preflight_never_creates_worktree(self):
+        refused = (
+            self._inv(model="glm-5.3-flash"),
+            self._inv(allow_tool_credentials=False),
+            AgentInvocation(cli="zcode", prompt="p", cwd=tempfile.gettempdir(),
+                            permission="yolo", allow_tool_credentials=True),
+            self._inv(permission="safe-edit"),
+            self._inv(permission="read-only"),
+        )
+        with mock.patch.object(run_subagent, "_setup_worktree") as setup:
+            for invocation in refused:
+                info, refusal = run_subagent._preflight_then_setup_worktree(
+                    invocation, invocation.cwd, "fixture", "zcode-native")
+                self.assertIsNone(info)
+                self.assertIsNotNone(refusal)
+        setup.assert_not_called()
+
     def test_preflight_accepts_a_discovered_bundle_without_path_shim(self):
         with mock.patch.object(run_subagent.shutil, "which", return_value=None), \
              mock.patch("_zcode.resolve_zcode_cli", return_value=self._target()):
