@@ -45,6 +45,14 @@ _PAYLOAD_ROOTS = (
     "tests", ".github/workflows",
 )
 
+# Must mirror install.py's SKILL_PAYLOAD.  The source skill also contains
+# provider-inert tests used by the release evidence runner; those tests are
+# source-bound by _PAYLOAD_ROOTS above but are intentionally not copied into
+# host skill installations.
+_MANAGED_SKILL_PAYLOAD = frozenset({
+    "SKILL.md", "scripts", "references", "agents", "examples",
+})
+
 # These names are the release contract, not caller-provided labels. A
 # manifest may still be generated for an intermediate preview with partial
 # facts, but --check must contain every entry so missing evidence cannot be
@@ -228,7 +236,12 @@ def _assert_external_path(root: Path, path: Path, label: str) -> None:
     raise ValueError(f"{label} must be outside the release source tree")
 
 
-def _tree_fingerprint(root: Path, *, exclude: frozenset[str] = frozenset()) -> tuple[str | None, set[str], str | None]:
+def _tree_fingerprint(
+    root: Path,
+    *,
+    exclude: frozenset[str] = frozenset(),
+    include_top_level: frozenset[str] | None = None,
+) -> tuple[str | None, set[str], str | None]:
     """Hash a bounded regular-file tree and return ``(digest, files, error)``.
 
     Install convergence must cover the complete skill, not merely production
@@ -243,6 +256,9 @@ def _tree_fingerprint(root: Path, *, exclude: frozenset[str] = frozenset()) -> t
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames.sort()
             filenames.sort()
+            relative_dir = Path(dirpath).relative_to(root)
+            if include_top_level is not None and not relative_dir.parts:
+                dirnames[:] = [name for name in dirnames if name in include_top_level]
             for dirname in list(dirnames):
                 item = Path(dirpath) / dirname
                 if _link_like(item):
@@ -254,6 +270,9 @@ def _tree_fingerprint(root: Path, *, exclude: frozenset[str] = frozenset()) -> t
                 if item.is_symlink() or not item.is_file():
                     return None, files, f"non-regular file: {filename}"
                 relative = item.relative_to(root).as_posix()
+                if (include_top_level is not None
+                        and Path(relative).parts[0] not in include_top_level):
+                    continue
                 if relative.endswith(".pyc") or "__pycache__" in Path(relative).parts:
                     continue
                 data = _canonical_bytes(item)
@@ -426,7 +445,9 @@ def _install_facts(root: Path) -> dict[str, object]:
 
     reference = report.get("reference_sha")
     source_skill_hash, source_skill_files, source_skill_error = _tree_fingerprint(
-        root / "skills" / "summon", exclude=frozenset({".summon-install.json"})
+        root / "skills" / "summon",
+        exclude=frozenset({".summon-install.json"}),
+        include_top_level=_MANAGED_SKILL_PAYLOAD,
     )
     source_companions = {}
     for companion in ("council", "deliberate"):

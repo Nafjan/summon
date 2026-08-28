@@ -84,6 +84,7 @@ class ReleaseGateRunnerTests(unittest.TestCase):
             mock.patch.object(MODULE, "GATE_COMMANDS", {}),
             mock.patch.object(MODULE, "_source_hash", side_effect=["b" * 64, "b" * 64]),
             mock.patch.object(MODULE, "_git_head", side_effect=["c" * 40, "c" * 40]),
+            mock.patch.object(MODULE.platform, "platform", return_value="Windows-test"),
             mock.patch.object(MODULE.subprocess, "run", side_effect=[status, status]) as run,
         ):
             MODULE.build_evidence(1.0)

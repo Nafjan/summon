@@ -22,6 +22,43 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ReleaseManifestTests(unittest.TestCase):
+    def test_managed_skill_fingerprint_matches_installer_payload(self):
+        install_spec = importlib.util.spec_from_file_location(
+            "summon_install_for_manifest_test", ROOT / "install.py"
+        )
+        install = importlib.util.module_from_spec(install_spec)
+        assert install_spec and install_spec.loader
+        install_spec.loader.exec_module(install)
+        self.assertEqual(MODULE._MANAGED_SKILL_PAYLOAD, frozenset(install.SKILL_PAYLOAD))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill = Path(temp_dir) / "summon"
+            (skill / "scripts").mkdir(parents=True)
+            (skill / "tests").mkdir()
+            (skill / "SKILL.md").write_text("skill\n", encoding="utf-8")
+            (skill / "scripts" / "runner.py").write_text("pass\n", encoding="utf-8")
+            (skill / "tests" / "release_only.py").write_text("ignored\n", encoding="utf-8")
+            first_hash, first_files, first_error = MODULE._tree_fingerprint(
+                skill, include_top_level=MODULE._MANAGED_SKILL_PAYLOAD
+            )
+            self.assertIsNone(first_error)
+            self.assertEqual(first_files, {"SKILL.md", "scripts/runner.py"})
+
+            (skill / "tests" / "release_only.py").write_text("changed\n", encoding="utf-8")
+            second_hash, second_files, second_error = MODULE._tree_fingerprint(
+                skill, include_top_level=MODULE._MANAGED_SKILL_PAYLOAD
+            )
+            self.assertIsNone(second_error)
+            self.assertEqual(first_hash, second_hash)
+            self.assertEqual(first_files, second_files)
+
+            (skill / "scripts" / "runner.py").write_text("changed\n", encoding="utf-8")
+            third_hash, _, third_error = MODULE._tree_fingerprint(
+                skill, include_top_level=MODULE._MANAGED_SKILL_PAYLOAD
+            )
+            self.assertIsNone(third_error)
+            self.assertNotEqual(first_hash, third_hash)
+
     def test_phase0_phase1_release_command_matches_ci_partition(self):
         ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8")
