@@ -151,6 +151,10 @@ _BACKENDS = {
         "install": "npm install -g opencode-ai",
         "auth": "opencode auth login  (or `opencode providers login`)",
     },
+    "zcode": {
+        "install": "Z.AI ZCode desktop app (bundled CLI) or set ZCODE_CLI",
+        "auth": "open ZCode and complete its provider sign-in; use `zcode login` when supported by the installed CLI",
+    },
     "arkcli": {
         "install": "npm install -g @byteplus/ark-cli",
         "auth": "arkcli auth login",
@@ -184,6 +188,12 @@ _AUTH_REPAIR_PLANS = {
                   "note": ("OpenCode auth login may require selecting a provider and entering "
                            "a key; it does not automatically consume Summon's Windows "
                            "Credential Manager entry.")},
+    "zcode": {"command": "zcode login",
+              "argv": ["zcode", "login"],
+              "interaction": "browser_or_terminal", "supports_autonomous": False,
+              "note": ("Some desktop-bundled ZCode CLIs do not expose a stable login command; "
+                       "complete sign-in in the ZCode app when this command is unavailable. "
+                       "The Coding Plan helper is diagnostics-only, not login or inference.")},
     "arkcli": {"command": "arkcli auth login", "argv": ["arkcli", "auth", "login"],
                "interaction": "browser", "supports_autonomous": True},
 }
@@ -236,24 +246,40 @@ def _check_backends() -> dict:
     --version probe is reported found-but-unverified and NOT counted usable —
     a random binary shadowing a backend name must not read as ready."""
     names = list(_BACKENDS)
-    paths = {n: shutil.which(n) for n in names}
+    zcode_targets = {}
+    try:
+        from _zcode import resolve_zcode_cli, zcode_version
+        zcode_targets["zcode"] = resolve_zcode_cli()
+    except Exception:  # noqa: BLE001 - doctor remains usable if optional discovery fails
+        zcode_targets["zcode"] = None
+        zcode_version = None
+    paths = {n: (None if n == "zcode" else shutil.which(n)) for n in names}
     with ThreadPoolExecutor(max_workers=len(names)) as pool:
         versions = dict(zip(names, pool.map(
-            lambda n: _probe_version(paths[n]) if paths[n] else None, names)))
+            lambda n: (zcode_version(zcode_targets[n]) if n == "zcode"
+                       and zcode_targets.get(n) is not None and zcode_version is not None
+                       else _probe_version(paths[n]) if paths[n] else None), names)))
     out: dict = {}
     for name in names:
         path = paths[name]
+        zcode_target = zcode_targets.get(name) if name == "zcode" else None
         # Tiered eligibility (the field feedback): binary_ok is knowable cheaply;
         # auth_ok / account_eligible / model_access_verified are NOT (a passing
         # --version is not eligibility), so they stay None ("unverified") until the
         # opt-in live probe fills them. Being honest here is the whole point -- the
         # incident was a --version-OK Gemini that failed the first real dispatch.
-        entry: dict = {"found": bool(path), "path": path, "binary_ok": bool(path),
+        entry: dict = {"found": bool(path or zcode_target), "path": path,
+                       "binary_ok": bool(path or zcode_target),
                        "auth_ok": None, "account_eligible": None,
                        "model_access_verified": None}
-        if path:
+        if path or zcode_target:
             entry["version"] = versions[name]
             entry["verified"] = versions[name] is not None
+            if zcode_target is not None:
+                entry["discovery_source"] = zcode_target.source
+                # Do not emit a local install path: it does not help another
+                # operator and can leak a machine layout in copied diagnostics.
+                entry["path"] = None
         else:
             entry["install"] = _BACKENDS[name]["install"]
         entry["auth_hint"] = _BACKENDS[name]["auth"]
@@ -487,6 +513,16 @@ def _check_byteplus_coding() -> dict:
     return entry
 
 
+def _check_zai_coding_plan() -> dict:
+    """Z.AI Coding Plan credential readiness only; never reads a provider."""
+    try:
+        from _zai_coding_plan import zai_coding_plan_status
+        return zai_coding_plan_status()
+    except Exception:  # noqa: BLE001 - doctor must remain provider-inert
+        return {"env_set": False, "resolvable": False, "source": None,
+                "hint": "Z.AI Coding Plan diagnostics are unavailable"}
+
+
 def _check_onboard_prefs() -> dict:
     """Onboard prefs summary (subscriptions only; no secrets)."""
     try:
@@ -538,6 +574,7 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None,
                     "unless SUBAGENTS_ALLOW_OPENAI_KEY=1",
         },
         "byteplus_coding": _check_byteplus_coding(),
+        "zai_coding_plan": _check_zai_coding_plan(),
         "onboard_prefs": _check_onboard_prefs(),
         "read_root_capabilities": dict(_READ_ROOT_CAPABILITIES),
         "opencode_cwd_policy": _opencode_cwd_policy(cwd),
@@ -689,6 +726,13 @@ def render(report: dict) -> str:
             lines.append(f"  [~?] roster cache present  ({rc.get('path')})")
     else:
         lines.append("  [--] no roster cache at ~/.agents/byteplus-coding-roster.json")
+    zai = report.get("zai_coding_plan") or {}
+    lines += ["", "z.ai coding plan:"]
+    if zai.get("resolvable"):
+        lines.append(f"  [OK] direct text-seat credential resolvable (source: {zai.get('source') or '?'})")
+    else:
+        lines.append("  [--] direct text-seat credential not resolvable; "
+                     "set ZAI_CODING_API_KEY or configure the official helper")
     op = report.get("onboard_prefs") or {}
     lines += ["", "onboard prefs:"]
     if op.get("present"):

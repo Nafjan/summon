@@ -11,10 +11,11 @@ from __future__ import annotations
 PERMISSION_ORDER = {"read-only": 0, "safe-edit": 1, "yolo": 2}
 KNOWN_BACKENDS = frozenset({
     "agy", "arkcli", "claude", "codex", "cursor-agent", "gemini", "kimi",
-    "openai-compat", "opencode",
+    "openai-compat", "opencode", "zcode",
 })
 TOOLFUL_BACKENDS = frozenset({
     "agy", "claude", "codex", "cursor-agent", "gemini", "kimi", "opencode",
+    "zcode",
 })
 TEXT_ONLY_BACKENDS = frozenset({"arkcli", "openai-compat"})
 CAPABILITIES = frozenset({"filesystem", "read_only_enforced", "text", "tools"})
@@ -33,7 +34,7 @@ _PROVIDER_BY_BACKEND = {
     "gemini": "google",
     "kimi": "moonshot",
 }
-MULTI_PROVIDER_BACKENDS = frozenset({"openai-compat", "opencode"})
+MULTI_PROVIDER_BACKENDS = frozenset({"openai-compat", "opencode", "zcode"})
 
 
 def permission_enforcement(cli: str, permission: str) -> str:
@@ -45,7 +46,7 @@ def permission_enforcement(cli: str, permission: str) -> str:
     if cli in TEXT_ONLY_BACKENDS:
         # These request transports expose no local filesystem or shell tools.
         return "enforced"
-    if cli in {"agy", "kimi"}:
+    if cli in {"agy", "kimi", "zcode"}:
         return "unenforceable"
     return "enforced"
 
@@ -62,6 +63,11 @@ def effective_permission(cli: str, permission: str) -> str:
             return "unenforceable"
         if permission == "safe-edit":
             return "yolo"
+    if cli == "zcode":
+        if permission == "safe-edit":
+            return "yolo"
+        if permission == "read-only":
+            return "unenforceable"
     return permission
 
 

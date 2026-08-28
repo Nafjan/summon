@@ -1,12 +1,12 @@
 ---
 name: summon
-description: Summon another AI CLI — Claude, Codex, Cursor, Gemini, Kimi, Antigravity, ArkCLI, or OpenCode — as a sub-agent to run a task, in parallel when useful. Use whenever the user names an agent or sub-agent to run, asks to delegate work to another AI or a specific model, wants a second opinion or a cross-vendor code review, wants to fan several models out over a task, or references an agent definition. One dispatcher over eight CLI backends returns a structured JSON result and supports isolated git worktrees, background and manifest-driven swarms, JSON-schema-validated output, model discovery, and per-agent model/permission config. Formerly named "sub-agents".
+description: Summon another AI CLI — Claude, Codex, Cursor, Gemini, Kimi, Antigravity, ArkCLI, OpenCode, or native ZCode — as a sub-agent to run a task, in parallel when useful. Use whenever the user names an agent or sub-agent to run, asks to delegate work to another AI or a specific model, wants a second opinion or a cross-vendor code review, wants to fan several models out over a task, or references an agent definition. One dispatcher over supported CLI and API backends returns a structured JSON result and supports isolated git worktrees, background and manifest-driven swarms, JSON-schema-validated output, model discovery, and per-agent model/permission config. Formerly named "sub-agents".
 allowed-tools: Bash Read
 ---
 
 # Summon — Cross-Vendor Sub-Agents for Any AI CLI
 
-Spawns external CLI AIs (claude, cursor-agent, codex, gemini, kimi, agy, arkcli, and opencode) as isolated sub-agents with dedicated
+Spawns external CLI AIs (claude, cursor-agent, codex, gemini, kimi, agy, arkcli, opencode, and zcode) as isolated sub-agents with dedicated
 context. Supports session resume, per-call model/effort overrides, isolated git worktrees, background
 dispatch, structured report parsing, loose-file provenance, and provider cost/usage telemetry -- see
 Parameters and the response-field table. Optional local diagnostics are separate: they are disabled by

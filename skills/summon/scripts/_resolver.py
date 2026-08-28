@@ -22,7 +22,7 @@ def _valid_clis() -> tuple:
         return BACKEND_CLIS
     except ImportError:
         return ("claude", "cursor-agent", "codex", "gemini", "kimi", "agy",
-                "opencode", "arkcli", "openai-compat")
+                "opencode", "zcode", "arkcli", "openai-compat")
 
 
 _VALID_CLIS = _valid_clis()
@@ -434,6 +434,25 @@ def discover_models(cli: str | None = None, *, refresh: bool = False) -> dict:
             "models": models,
             "note": note or "Live from `opencode models`; listed is not proof of account access.",
         }, "opencode")
+
+    if want("zcode"):
+        try:
+            from _zcode import resolve_zcode_cli, zcode_version
+            target = resolve_zcode_cli()
+            version = zcode_version(target) if target else None
+        except Exception:  # noqa: BLE001 - provider-free discovery stays fail-soft
+            target, version = None, None
+        info["zcode"] = stamp({
+            "source": "local" if target else "unavailable",
+            "version": version,
+            "discovery_source": target.source if target else None,
+            "models": [],
+            "note": (
+                "ZCode has no reviewed headless model selector. Its configured native "
+                "provider/model is intentionally not read from private configuration and cannot be "
+                "treated as model.served evidence. Use an explicit OpenCode Z.AI Coding Plan "
+                "seat for a target-model selector."),
+        }, "zcode")
 
     # ArkCLI/ModelArk exposes a Coding Plan roster. Keep the normal query
     # offline by reading the existing bounded cache; `--refresh` explicitly

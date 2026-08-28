@@ -13,6 +13,30 @@ never on added fields.
 
 ## Unreleased
 
+- **Native ZCode / Z.AI Coding Plan integration:** introduced a tenth backend
+  through original, provider-inert code. ZCode discovery accepts an explicit
+  executable/bundle path, direct PATH target, Windows uninstall metadata
+  (including safe DisplayIcon/UninstallString parent hints), and common bundles;
+  it never shells a registry value. The executor launches direct binaries or
+  Node bundles headlessly, confines the task to a strict UTF-8 owner-restricted
+  attachment, registers it with controlled launch cleanup, and parses only a
+  bounded terminal JSON document with a nonempty response plus `sess_` session
+  identifier. Leading banners are tolerated; arbitrary/incomplete JSON fails
+  closed. Native ZCode is deliberately multi-provider/ambient: model overrides
+  fail before contact, safe-edit is refused, advisory read-only is opt-in, and
+  yolo needs an isolated/worktree boundary. Terminal JSON means liveness and
+  usage are terminal-only, and no model provenance is manufactured.
+- **Direct Z.AI Coding Plan text seat:** registered the coding-only endpoint as
+  a distinct OpenAI-compatible provider, with no BytePlus PAYG retry behavior.
+  Credential precedence is explicit environment first, then a bounded,
+  non-symlink top-level-scalar reader for an existing official helper profile;
+  no helper process/config mutation occurs and neither key nor path reaches a
+  response, diagnostic, or receipt. Provider-inert fixtures cover endpoint
+  pinning, credential precedence, non-Coding-Plan rejection, ZCode parsing,
+  prompt attachment cleanup, and terminal-only metadata. The helper remains an
+  auth/usage diagnostic, not an inference backend; usage reads are unsupported
+  until a version-pinned schema and privacy mapping are reviewed.
+
 ## 3.3.0 - 2026-08-28
 
 - **Final dispatch-boundary and deliberation evidence closure:** every provider launch now

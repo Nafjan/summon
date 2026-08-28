@@ -195,6 +195,12 @@ def build_command(cli: str, prompt: str) -> tuple[str, list]:
         # _build_opencode_args so this helper stays a pure command template.
         return "opencode", ["run", "--format", "json", prompt]
 
+    if cli == "zcode":
+        # ZCode's prompt transport is an attached file, constructed by
+        # _build_zcode_args.  Keeping this placeholder minimal prevents a
+        # caller from accidentally routing the full task through argv.
+        return "zcode", []
+
     raise ValueError(f"Unknown CLI: {cli}")
 
 
@@ -253,13 +259,24 @@ _PERMISSION_MAPPING = {
         "safe-edit": ["--auto"],
         "yolo": ["--auto"],
     },
+    "zcode": {
+        # ZCode calls this a "mode", not a sandbox.  Only yolo is a reliable
+        # headless write mode.  The builder rejects safe-edit and requires an
+        # explicit advisory opt-in for plan/read-only (see below).
+        "read-only": ["--mode", "plan"],
+        "safe-edit": [],
+        "yolo": ["--mode", "yolo"],
+    },
 }
 
 def unenforceable_permission_authorized(cli: str, permission: str, *,
                                         forced: bool = False) -> bool:
     """Whether the caller explicitly accepted a known advisory-only tier."""
-    if forced or cli != "agy":
+    if forced or cli not in {"agy", "zcode"}:
         return False
+    if cli == "zcode":
+        return (permission == "read-only"
+                and os.environ.get(_UNENFORCED_RO_OPT_IN) == "1")
     if permission == "safe-edit":
         # AGY safe-edit is documented as full-user authority. Declaring it is
         # the acknowledgement; it must never be produced by a clamp/gate.
@@ -547,6 +564,9 @@ _BOUNDARY_FLAGS = {
     # agent-defined passthrough so the frozen Summon identity remains truthful.
     "opencode": ("--auto", "--model", "-m", "--session", "-s", "--continue",
                  "--agent", "--dir", "--format", "--variant"),
+    "zcode": ("--cwd", "--json", "--no-color", "--mode", "--permission-mode",
+              "--allowed-tools", "--disallowed-tools", "--resume", "--continue",
+              "--attach", "--prompt", "--settings", "--target", "--target-replace"),
 }
 # Flags that consume the NEXT token as their value; dropping the flag must drop the value
 # too, or the bare value becomes a stray positional argument.
@@ -555,7 +575,10 @@ _BOUNDARY_TAKES_VALUE = {"--permission-mode", "-s", "--sandbox", "--mode", "--ap
                          "--model", "-m", "--dir", "--format", "--variant",
                          "--print-timeout", "--agent", "--project", "--log-file",
                          "--output-file", "--conversation", "--continue-id",
-                         "--output-format", "--output", "--of"}
+                         "--output-format", "--output", "--of", "--cwd",
+                         "--permission-mode", "--allowed-tools", "--disallowed-tools",
+                         "--resume", "--attach", "--prompt", "--settings", "--target",
+                         "--target-replace"}
 # codex configures approval policy through `-c key=value`, so the KEY decides, not the flag.
 _CODEX_CONFIG_KEYS = ("approval_policy", "sandbox_mode", "sandbox_permissions")
 
@@ -776,6 +799,23 @@ def readonly_unenforceable_error(cli: str, permission: str, *,
                     "a trusted, isolated worktree; summon refuses the misleading safe-edit "
                     "label.")
         return None
+    if cli == "zcode":
+        if permission == "safe-edit":
+            return (
+                "ZCode's headless build/edit modes do not provide a reliable workspace-write "
+                "boundary. Summon refuses the misleading safe-edit label; use a deliberately "
+                "declared yolo turn only in a disposable worktree or isolated lane.")
+        if permission == "read-only":
+            if forced:
+                return (
+                    "ZCode plan mode is not a proven read-only filesystem boundary, and this "
+                    "dispatch was forced to read-only by Summon. Use an enforcing review backend.")
+            if not unenforceable_permission_authorized(cli, permission, forced=forced):
+                return (
+                    "ZCode plan mode is advisory rather than a proven read-only filesystem "
+                    "boundary. Use an enforcing review backend, or set "
+                    + _UNENFORCED_RO_OPT_IN + "=1 to dispatch a clearly labeled advisory plan turn.")
+        return None
     if cli != "agy" or permission not in {"read-only", "safe-edit"}:
         return None
     if forced:
@@ -825,6 +865,16 @@ def agy_readonly_workspace_warning(cli: str, permission: str) -> str | None:
             "any path your user account can, whatever this tier says. You set "
             + _UNENFORCED_RO_OPT_IN + "=1, so summon dispatched anyway. Treat the result as "
             "having had full filesystem access.")
+
+
+def zcode_readonly_warning(cli: str, permission: str) -> str | None:
+    """Keep the explicit ZCode plan-mode opt-in visible in every envelope."""
+    if (cli == "zcode" and permission == "read-only"
+            and os.environ.get(_UNENFORCED_RO_OPT_IN) == "1"):
+        return (
+            "ZCode plan mode is ADVISORY: Summon adds a mode and write/shell deny list, "
+            "but does not claim a proven filesystem sandbox. Inspect workspace evidence.")
+    return None
 
 
 def agy_timeout_warning(cli: str, timeout_ms: int | None) -> str | None:
@@ -994,6 +1044,7 @@ def advisory_warnings(cli: str, permission: str, timeout_ms: int | None,
                         cursor_premium_agreement_warning(cli, notice_model),
                         agy_permission_warning(cli, permission),
                         agy_readonly_workspace_warning(cli, permission),
+                        zcode_readonly_warning(cli, permission),
                         agy_timeout_warning(cli, timeout_ms)) if w]
 
 
@@ -1861,6 +1912,151 @@ def _build_opencode_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     # ambient inline config for yolo turns, so this remains a bounded child-only overlay.
     env.update(opencode_router_env_override(inv))
     return inv.profile_command or command, args, env
+
+
+# --- Z.AI ZCode ---------------------------------------------------------------
+
+_ZCODE_RESUME_RE = re.compile(r"^sess_[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_ZCODE_FIXED_PROMPT = "Follow the attached task exactly and finish with the required report."
+
+
+def _lock_zcode_attachment(path: str) -> None:
+    """Apply owner-only prompt material permissions or fail before launch."""
+    os.chmod(path, 0o600)
+    if os.name != "nt":
+        return
+    user = (os.environ.get("USERNAME") or "").strip()
+    if not user:
+        raise OSError("current Windows principal is unavailable")
+    try:
+        from _spawn import run_flags
+        locked = subprocess.run(
+            ["icacls", path, "/inheritance:r", "/grant:r", f"{user}:F"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10, **run_flags())
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise OSError("unable to secure ZCode prompt attachment") from exc
+    if locked.returncode != 0:
+        raise OSError("unable to secure ZCode prompt attachment")
+
+
+def _write_zcode_attachment(text: str) -> str:
+    """Write one private task attachment outside the repository.
+
+    ZCode's documented headless CLI accepts an attached file but not a safe
+    stdin prompt.  The file keeps a potentially long/multiline task off the
+    Windows command line.  The executor removes it after the owned child is
+    reaped; this helper does not retain the task in any Summon receipt.
+    """
+    fd, path = tempfile.mkstemp(prefix="summon-zcode-", suffix=".md")
+    try:
+        # mkstemp creates a private descriptor; lock its ACL before any task
+        # bytes are written. Strict UTF-8 refuses an unencodable task rather
+        # than silently rewriting it.
+        _lock_zcode_attachment(path)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
+def cleanup_zcode_attachment(args: list | tuple | None) -> None:
+    """Best-effort removal of the per-turn private ZCode attachment."""
+    if not isinstance(args, (list, tuple)):
+        return
+    try:
+        index = list(args).index("--attach")
+        path = args[index + 1]
+    except (ValueError, IndexError):
+        return
+    if not isinstance(path, str) or not path:
+        return
+    try:
+        candidate = os.path.realpath(path)
+        temp_root = os.path.realpath(tempfile.gettempdir())
+        if (os.path.dirname(candidate) == temp_root
+                and os.path.basename(candidate).startswith("summon-zcode-")):
+            os.remove(candidate)
+    except OSError:
+        pass
+
+
+def _build_zcode_args(inv: AgentInvocation, *, resource_register=None
+                      ) -> tuple[str, list, dict | None]:
+    """Build one headless ZCode invocation without reading local ZCode config.
+
+    ZCode does not expose an argv model selector.  Consequently this backend
+    never accepts an explicit Summon model pin: its configured provider/model
+    remains an unverified local selection until a future provider-authored
+    terminal receipt proves it.  ``build`` and ``edit`` modes are deliberately
+    rejected because ZCode's headless permission client can block writes while
+    returning exit zero; broad, disposable work uses its explicit ``yolo``
+    mode instead.
+    """
+    if inv.model:
+        raise ValueError(
+            "zcode has no reviewed headless --model selector; select the model in "
+            "ZCode itself and leave the Summon model field unset")
+    if inv.permission == "safe-edit":
+        raise ValueError(
+            "ZCode has no reliable headless safe-edit mode; use permission: yolo "
+            "only in a disposable lane, or an advisory plan/read-only dispatch")
+    if inv.permission == "read-only" and not unenforceable_permission_authorized(
+            inv.cli, inv.permission, forced=inv.permission_forced):
+        raise ValueError(
+            "ZCode plan mode is advisory rather than a proven filesystem boundary. "
+            "Use an enforcing review backend, or set " + _UNENFORCED_RO_OPT_IN +
+            "=1 to run a clearly labeled advisory plan turn.")
+    if inv.permission == "yolo" and inv.worktree is None and not inv.isolated_lane:
+        raise ValueError(
+            "ZCode yolo requires --worktree or --isolated-lane; broad authority is "
+            "available for disposable copies, not active shared checkouts")
+    if inv.resume_id and not _ZCODE_RESUME_RE.fullmatch(inv.resume_id):
+        raise ValueError("ZCode resume id must be a sess_ identifier")
+    try:
+        from _zcode import resolve_zcode_cli
+        target = resolve_zcode_cli()
+    except Exception as exc:  # noqa: BLE001 - discovery must not expose internals
+        raise ValueError("ZCode CLI discovery failed") from exc
+    if target is None:
+        raise ValueError(
+            "ZCode CLI was not found; set ZCODE_CLI to its local executable/bundle "
+            "or install the ZCode desktop app")
+    text = _resume_prompt(inv) if inv.resume_id else _concatenated_prompt(inv)
+    attachment = _write_zcode_attachment(text)
+    try:
+        if resource_register is not None:
+            try:
+                resource_register(attachment, "zcode-prompt-attachment")
+            except Exception as exc:  # noqa: BLE001 - do not orphan prompt material
+                raise ValueError(
+                    "zcode prompt attachment: controlled cleanup registration failed") from exc
+        args = [*target.prefix_args, "--cwd", inv.cwd, "--json", "--no-color"]
+        args += permission_flags("zcode", inv.permission)
+        # plan turns subtract write/shell tools as defence in depth. This is a
+        # deny list, not a claim that ZCode supplies an allowlist sandbox.
+        if inv.permission == "read-only":
+            args += ["--disallowed-tools", "Write,Edit,Bash,Shell"]
+        if inv.resume_id:
+            args += ["--resume", inv.resume_id]
+        args += strip_boundary_flags("zcode", inv.extra_args)
+        args += ["--attach", attachment, "--prompt", _ZCODE_FIXED_PROMPT]
+        return target.command, args, {"SUMMON_ZCODE_DISCOVERY_SOURCE": target.source}
+    except Exception:
+        try:
+            os.remove(attachment)
+        except OSError:
+            pass
+        raise
 
 
 # --- Antigravity (agy) headless one-shot support -------------------------------
@@ -3207,6 +3403,8 @@ BACKENDS: dict = {
                      "acp": {"call": _acp_call}},
     "opencode":     {"kind": "subprocess", "build": _build_opencode_args,
                      "side_effects": True},
+    "zcode":        {"kind": "subprocess", "build": _build_zcode_args,
+                     "side_effects": True},
     "agy":          {"kind": "subprocess", "build": _build_agy_args, "side_effects": True},
     "arkcli":       {"kind": "api", "call": _arkcli_call},
     "openai-compat": {"kind": "api", "call": _api_call},
@@ -3267,6 +3465,19 @@ def model_backend_compatibility(cli: str, model: str | None) -> dict | None:
     """
     if not isinstance(cli, str) or not isinstance(model, str) or not model.strip():
         return None
+    if cli == "zcode":
+        return {
+            "error_kind": "zcode_model_selector_unsupported",
+            "backend": cli,
+            "model_requested": model,
+            "compatible_backends": ["openai-compat", "opencode"],
+            "recommended_backend": "opencode",
+            "message": (
+                "ZCode has no reviewed headless per-call model selector or terminal "
+                "provider-authored served-model receipt; remove `model:` for the "
+                "generic native preview seat, or use an explicit OpenCode/direct "
+                "Coding Plan model seat"),
+        }
     normalized = model.strip().lower()
     vendor = None
     for candidate, prefixes in _MODEL_VENDOR_PREFIXES.items():
@@ -3328,6 +3539,8 @@ def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None, *
     elif inv.cli == "kimi" and resource_register is not None:
         cmd, args, env = _build_kimi_args(
             inv, resource_register=resource_register)
+    elif inv.cli == "zcode":
+        cmd, args, env = _build_zcode_args(inv, resource_register=resource_register)
     else:
         cmd, args, env = b["build"](inv)
     if credit_env:

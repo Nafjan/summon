@@ -11,7 +11,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/core-stdlib_only-brightgreen.svg" alt="core: stdlib only">
-  <img src="https://img.shields.io/badge/backends-7-brightgreen.svg" alt="7 backends">
+  <img src="https://img.shields.io/badge/backends-10-brightgreen.svg" alt="10 backends">
   <img src="https://img.shields.io/badge/install-npx_skills_add-8B5CF6.svg" alt="npx skills add">
 </p>
 
@@ -45,8 +45,9 @@ Anthropic, Google, and local models (Ollama, LM Studio) work as agents too.
                                                    ├──► agy            (Antigravity)
                                                     ├──► arkcli         (BytePlus Coding Plan)
                                                     ├──► opencode       (OpenCode gateway)
+                                                    ├──► zcode          (native ZCode preview)
                                                     └──► openai-compat  (ModelArk / OpenRouter /
-                                                         OpenAI / Anthropic / Google / Ollama / …)
+                                                         Z.AI Coding Plan / OpenAI / Anthropic / …)
 ```
 
 Most multi-agent tools assume one specific CLI is the orchestrator. Summon inverts that:

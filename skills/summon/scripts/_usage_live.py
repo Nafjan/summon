@@ -76,6 +76,14 @@ CAPABILITIES = {
         "provider": "agy", "state": "schema_unverified",
         "mechanism": None, "live_enabled": False,
     },
+    "zai-coding-plan": {
+        # The installed Z.AI Coding Plan helper can diagnose local auth and
+        # documents usage endpoints, but Summon has not frozen a versioned,
+        # redacted response fixture or a credential boundary for it. Keep this
+        # explicit instead of invoking the helper or scraping private config.
+        "provider": "zai-coding-plan", "state": "schema_unverified",
+        "mechanism": "coding_helper_diagnostic", "live_enabled": False,
+    },
 }
 
 _REDACTED_KEYS = (

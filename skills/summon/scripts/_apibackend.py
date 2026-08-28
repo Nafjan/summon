@@ -60,11 +60,15 @@ BUILTIN_PROVIDERS = {
         "base_url": "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
         "api_key_env": "BYTEPLUS_CODING_API_KEY",
     },
+    "zai-coding-plan": {
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+        "api_key_env": "ZAI_CODING_API_KEY",
+    },
 }
 
 # Providers whose base_url MUST contain /api/coding (subscription path).
 # A wrong URL silently bills PAYG — refuse rather than warn-and-continue.
-_CODING_PLAN_PROVIDERS = frozenset({"byteplus-coding"})
+_CODING_PLAN_PROVIDERS = frozenset({"byteplus-coding", "zai-coding-plan"})
 
 # Curated, non-exhaustive recommendations. The plan roster is dynamic and can
 # contain legacy or temporarily broken entries, so do not present it as a list
@@ -242,9 +246,33 @@ def is_coding_plan_endpoint(base_url: str | None) -> bool:
     return "/api/coding" in path
 
 
+def is_zai_coding_plan_endpoint(base_url: str | None) -> bool:
+    """True only for the published Z.AI Coding Plan OpenAI-compatible endpoint."""
+    if not isinstance(base_url, str) or not base_url:
+        return False
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(base_url)
+        return (parts.scheme.casefold() == "https"
+                and (parts.hostname or "").casefold() == "api.z.ai"
+                and (parts.path or "").rstrip("/").casefold() == "/api/coding/paas/v4"
+                and not parts.query and not parts.fragment)
+    except ValueError:
+        return False
+
+
+def _is_byteplus_coding_plan_endpoint(base_url: str | None) -> bool:
+    return is_coding_plan_endpoint(base_url) and not is_zai_coding_plan_endpoint(base_url)
+
+
 def coding_plan_billing(base_url: str | None) -> dict | None:
     """Honest billing for Coding Plan URLs: subscription quota, not API credits."""
-    if not is_coding_plan_endpoint(base_url):
+    if is_zai_coding_plan_endpoint(base_url):
+        return {
+            "source": "subscription",
+            "note": "Z.AI Coding Plan coding endpoint - provider plan/quota semantics apply",
+        }
+    if not _is_byteplus_coding_plan_endpoint(base_url):
         return None
     return {
         "source": "subscription",
@@ -259,7 +287,7 @@ def coding_plan_model_error(base_url: str | None, model: str | None) -> str | No
     ``auto`` is an arkcli routing alias, not a ModelArk Chat Completions model —
     the upstream error falsely says the model 'does not support the coding plan'.
     """
-    if not is_coding_plan_endpoint(base_url):
+    if not _is_byteplus_coding_plan_endpoint(base_url):
         return None
     mid = (model or "").strip()
     if mid.lower() == "auto":
@@ -276,6 +304,12 @@ def _validate_coding_plan_url(provider: str, base_url: str) -> None:
     """Refuse Coding Plan providers pointed at the PAYG /api/v3 path."""
     if provider not in _CODING_PLAN_PROVIDERS:
         return
+    if provider == "zai-coding-plan":
+        if is_zai_coding_plan_endpoint(base_url):
+            return
+        raise ValueError(
+            "provider 'zai-coding-plan' must use the Z.AI Coding Plan endpoint "
+            "https://api.z.ai/api/coding/paas/v4")
     if is_coding_plan_endpoint(base_url):
         return
     raise ValueError(
@@ -289,7 +323,7 @@ def _validate_coding_plan_url(provider: str, base_url: str) -> None:
 
 def _rewrite_coding_plan_http_error(base_url: str, model: str, code: int, detail: str) -> str | None:
     """Make BytePlus UnsupportedModel errors actionable for Coding Plan users."""
-    if not is_coding_plan_endpoint(base_url):
+    if not _is_byteplus_coding_plan_endpoint(base_url):
         return None
     low = (detail or "").lower()
     if "unsupportedmodel" not in low and "does not support the coding plan" not in low:
@@ -356,6 +390,11 @@ def coding_to_payg_base_url(coding_url: str) -> str:
     retry against the chat-completions PAYG path.
     Raises ValueError if input is not a Coding Plan URL.
     """
+    # Z.AI's coding endpoint is a separate subscription product.  It has no
+    # reviewed automatic PAYG companion, so this generic BytePlus helper must
+    # not manufacture one if a future caller reaches it directly.
+    if is_zai_coding_plan_endpoint(coding_url):
+        raise ValueError("Z.AI Coding Plan has no reviewed automatic PAYG fallback")
     if not is_coding_plan_endpoint(coding_url):
         raise ValueError(
             f"cannot rewrite non-Coding-Plan URL to PAYG: {coding_url!r}")
@@ -531,12 +570,21 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
             api_key, _key_source = resolve_byteplus_coding_api_key()
         except Exception:  # noqa: BLE001 — credential resolve is best-effort
             api_key, _key_source = None, None
+    if (not api_key and inv.api_key_env == "ZAI_CODING_API_KEY"
+            and is_zai_coding_plan_endpoint(inv.base_url)):
+        try:
+            from _zai_coding_plan import resolve_zai_coding_api_key
+            api_key, _key_source = resolve_zai_coding_api_key()
+        except Exception:  # noqa: BLE001 — credential resolve is best-effort
+            api_key, _key_source = None, None
     if inv.api_key_env and not api_key:
         msg = f"openai-compat: ${inv.api_key_env} is not set"
         if inv.api_key_env == "BYTEPLUS_CODING_API_KEY":
             msg += (" - set it to your Coding Plan profile API key "
                     "(from `arkcli auth status` / `arkcli auth apikey`), "
                     "not a short-lived SSO token")
+        if inv.api_key_env == "ZAI_CODING_API_KEY":
+            msg += " - set it for the Z.AI Coding Plan endpoint"
         return _err(cli, msg)
 
     wall_deadline = time.monotonic() + max(1.0, timeout_ms / 1000.0)
@@ -563,6 +611,10 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
         resp.setdefault("warnings", []).append(
             "BYTEPLUS_CODING_API_KEY was unset; used the local arkcli profile "
             "API key for this dispatch (env still wins when set)")
+    if _key_source == "coding_helper_config" and resp.get("status") == "success":
+        resp.setdefault("warnings", []).append(
+            "ZAI_CODING_API_KEY was unset; used the local Coding Plan helper configuration "
+            "for this dispatch (env still wins when set)")
     if _key_source == "windows_credential" and resp.get("status") == "success":
         resp.setdefault("warnings", []).append(
             "OPENROUTER_API_KEY was unset; used the local Windows credential "
@@ -578,7 +630,7 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
 
     # --- PAYG consent-gated fallback ---
     if (resp["status"] == "error"
-            and is_coding_plan_endpoint(inv.base_url)
+            and _is_byteplus_coding_plan_endpoint(inv.base_url)
             and resp.get("_payg_fallback_worthy")
             and (launch_control is None or launch_control.allow_secondary)):
         allow_payg = getattr(inv, "allow_payg", False)
@@ -692,7 +744,8 @@ def _do_request(base_url: str, model: str, system_context: str | None,
             detail = e.read().decode("utf-8", errors="replace")[:500]
         except Exception:  # noqa: BLE001
             pass
-        fallback_worthy = is_payg_fallback_worthy(e.code, detail or e.reason)
+        fallback_worthy = (_is_byteplus_coding_plan_endpoint(base_url)
+                            and is_payg_fallback_worthy(e.code, detail or e.reason))
         rewritten = _rewrite_coding_plan_http_error(base_url, model, e.code, detail or e.reason)
         err_msg = rewritten or f"HTTP {e.code} from {base_url}: {detail or e.reason}"
         resp = _err(cli, _redact(err_msg, api_key))
@@ -800,6 +853,13 @@ def api_key_available(api_key_env: str | None, base_url: str | None) -> bool:
         try:
             from _arkcli_creds import resolve_byteplus_coding_api_key
             key, _source = resolve_byteplus_coding_api_key()
+            return bool(key)
+        except Exception:  # noqa: BLE001 — dry-run must remain diagnostic-only
+            return False
+    if api_key_env == "ZAI_CODING_API_KEY" and is_zai_coding_plan_endpoint(base_url):
+        try:
+            from _zai_coding_plan import resolve_zai_coding_api_key
+            key, _source = resolve_zai_coding_api_key()
             return bool(key)
         except Exception:  # noqa: BLE001 — dry-run must remain diagnostic-only
             return False

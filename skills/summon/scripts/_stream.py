@@ -221,6 +221,16 @@ class StreamProcessor:
         self.opencode_finish_reason = None
         self.opencode_zero_output_finish = False
         self.opencode_zero_token_finish = False
+        # ZCode's --json output is a SINGLE document emitted at clean EOF. A
+        # dependency may print a banner before it, so buffer bounded line input
+        # and parse only in finalize_stream. The executor separately caps total
+        # stdout; this local cap prevents direct StreamProcessor users from
+        # retaining an unbounded document.
+        self.is_zcode = cli == "zcode"
+        self._zcode_output_parts: list[str] = []
+        self._zcode_output_chars = 0
+        self.zcode_context_window = None
+        self.zcode_json_parsed = False
         # Telemetry captured from stream events (None when the CLI doesn't emit it):
         self.session_id = None  # claude session_id / codex thread_id / cursor chat id
         self.usage = None       # token usage dict
@@ -324,6 +334,18 @@ class StreamProcessor:
         """Process one line. Returns True when a terminal event is reached."""
         line = line.strip()
         if not line or self.result_json is not None:
+            return False
+
+        if self._declared_cli == "zcode":
+            # Do not attempt JSONL parsing: ZCode documents one final JSON
+            # document, possibly preceded by a banner. Progress/session data is
+            # unavailable until that terminal document and is kept honest as
+            # such rather than fabricating stream events.
+            if self._zcode_output_chars < 1_048_576:
+                remaining = 1_048_576 - self._zcode_output_chars
+                item = line[:remaining]
+                self._zcode_output_parts.append(item)
+                self._zcode_output_chars += len(item)
             return False
 
         try:
@@ -1115,5 +1137,28 @@ class StreamProcessor:
                 "type": "result",
                 "result": "".join(self.opencode_parts),
                 "status": "error" if self.is_error else "success",
+            }
+        if self.result_json is None and self.is_zcode:
+            # Preserve newline boundaries because ZCode may pretty-print its
+            # document. A leading stdout banner is tolerated by the dedicated
+            # parser; arbitrary prose is never upgraded into structured data.
+            raw = "\n".join(self._zcode_output_parts)
+            try:
+                from _zcode import parse_zcode_json_output, zcode_result_fields
+                fields = zcode_result_fields(parse_zcode_json_output(raw))
+            except Exception:  # noqa: BLE001 - a malformed terminal is not success
+                fields = {"response": "", "session_id": None, "usage": None,
+                          "context_window": None, "parse_ok": False}
+            self.zcode_json_parsed = bool(fields.get("parse_ok"))
+            self.zcode_context_window = fields.get("context_window")
+            self._bind_session(fields.get("session_id"), {})
+            if isinstance(fields.get("usage"), dict):
+                self.usage = fields["usage"]
+            self.result_json = {
+                "type": "result",
+                "result": fields.get("response") or raw,
+                "status": "success" if fields.get("parse_ok") else "error",
+                **({"error": "ZCode did not emit a parseable terminal JSON result"}
+                   if not fields.get("parse_ok") else {}),
             }
         self._liveness("terminal", {})

@@ -24,6 +24,18 @@ _SENSITIVE_ARG_KEYS = {
 }
 
 
+def _cleanup_launch_artifacts(cli: str, env_override: dict | None,
+                              args: list | tuple | None = None) -> None:
+    """Remove private, per-launch material when a child will not retain it."""
+    if cli != "zcode":
+        return
+    try:
+        from _builder import cleanup_zcode_attachment
+        cleanup_zcode_attachment(args)
+    except Exception:  # noqa: BLE001 - cleanup must not replace an envelope
+        pass
+
+
 def _canonical_sha256(value: object) -> str:
     """Hash a JSON value with one stable, non-lossy encoding."""
     payload = json.dumps(
@@ -533,6 +545,19 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
             response["normalization_reason"] = (
                 "OpenCode emitted step_finish(reason=unknown) with zero tokens; "
                 "Summon rejected the empty completion")
+    if processor and getattr(processor, "is_zcode", False):
+        # ZCode emits one final JSON document rather than a progress stream.
+        # Its configured model is not a provider-authored served-model receipt,
+        # so only session, usage, parse completeness, and context-window data
+        # are surfaced here.
+        response["zcode_stream"] = {
+            "completion_evidence": (
+                "terminal_json" if processor.zcode_json_parsed
+                else "unparseable_terminal_output"),
+            "streaming_progress": "unavailable",
+        }
+        if processor.zcode_context_window is not None:
+            response["zcode_stream"]["context_window"] = processor.zcode_context_window
     # Baseline resume handle on EVERY path (incl. spawn-failure) so orchestrators
     # can read response["resume"] unconditionally. execute_agent enriches it with
     # the agy profile on the normal path.
@@ -4027,6 +4052,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     try:
         command, args = _resolve_launch(command, args)
     except ValueError as _launch_err:
+        _cleanup_launch_artifacts(inv.cli, env_override, args)
         _resp = _error_response(inv.cli, 1, str(_launch_err), not_run=True)
         _resp.update({
             "error_kind": "unsafe_windows_launcher",
@@ -4076,6 +4102,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             _routed["fallback"] = {"from": "subprocess", "to": "acp",
                                    "reason": "argv-length",
                                    "primary_status": "not_dispatched"}
+            _cleanup_launch_artifacts(inv.cli, env_override, args)
             return _routed
         # exit 1, not 127: 127 means "CLI not found", and reporting this as a missing
         # binary is precisely the misdiagnosis being fixed.
@@ -4086,6 +4113,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         if inv.cli == "agy" and env_override:
             _resp["resume"] = {"cli": inv.cli, "session_id": None,
                                "profile": env_override.get("USERPROFILE")}
+        _cleanup_launch_artifacts(inv.cli, env_override, args)
         return _stamp(_enrich(_resp, None))
     if workspace_snapshot is not None and _workspace_before is None:
         _workspace_before = workspace_snapshot(inv.cwd)
@@ -4104,8 +4132,10 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 inv.cli, 124, "provider launch deadline exceeded", partial_result=None,
                 not_run=True)
             _deadline_response["timeout"] = True
+            _cleanup_launch_artifacts(inv.cli, env_override, args)
             return _stamp(_enrich(_deadline_response, None))
         except ProviderLaunchRefusal as e:
+            _cleanup_launch_artifacts(inv.cli, env_override, args)
             return _stamp(_enrich(_blocked_response(
                 inv.cli, e.error_kind,
                 "provider launch refused by a verified local policy fence"), None))
@@ -4116,6 +4146,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 pass
             # Callback errors may occur after its durable CAS. Preserve that
             # ambiguity and never expose callback text, which may contain secrets.
+            _cleanup_launch_artifacts(inv.cli, env_override, args)
             return _stamp(_enrich(_error_response(
                 inv.cli, 1,
                 f"provider launch refused by control ({type(e).__name__})",
@@ -4151,6 +4182,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                  f" (the command line is {_n} chars; on Windows an over-long command line "
                  f"is reported as a missing file, so this may be argv overflow rather than "
                  f"a missing binary)")
+        _cleanup_launch_artifacts(inv.cli, env_override, args)
         return _stamp(_enrich(
             _error_response(inv.cli, 127, f"CLI not found: {command}{_hint}",
                             not_run=True), None))
@@ -4160,6 +4192,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 launch_control.pre_spawn_failed(e)
             except Exception:
                 pass
+        _cleanup_launch_artifacts(inv.cli, env_override, args)
         return _stamp(_enrich(_error_response(
             inv.cli, 1, f"{type(e).__name__}: {e}", not_run=True), None))
     except Exception as e:
@@ -4168,6 +4201,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 launch_control.launch_indeterminate(e)
             except Exception:
                 pass
+        _cleanup_launch_artifacts(inv.cli, env_override, args)
         return _stamp(_enrich(_error_response(
             inv.cli, 1,
             f"provider launch failed ambiguously ({type(e).__name__})",
@@ -4202,6 +4236,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 f"provider process registration failed ({type(e).__name__}); "
                 "child was terminated")
             _registration_error["provider_contacted"] = _provider_contacted
+            _cleanup_launch_artifacts(inv.cli, env_override, args)
             return _stamp(_enrich(_registration_error, None))
 
     # Windows only: put the child in a kill-on-close Job Object so its whole tree can be
@@ -4294,6 +4329,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 _sweep_agy_litter(inv.cwd, _litter_before)
             except Exception:  # noqa: BLE001
                 pass
+        _cleanup_launch_artifacts(inv.cli, env_override, args)
         if launch_control is not None:
             try:
                 launch_control.reaped(process)

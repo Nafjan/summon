@@ -5,6 +5,19 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+- **ZCode and Z.AI Coding Plan routes:** added a native ZCode preview backend
+  with provider-inert Windows/PATH/bundle discovery, hidden headless launch,
+  owner-restricted prompt attachments, banner-tolerant terminal JSON parsing,
+  session/usage capture, and explicit terminal-only liveness. Native ZCode
+  refuses model pins and safe-edit because neither per-call model selection nor
+  a safe-edit boundary is proven. Added distinct direct and OpenCode Z.AI
+  Coding Plan GLM-5.3 Flash seats alongside the existing OpenRouter successor;
+  retired Ox aliases and historical receipts remain unchanged. The direct seat
+  is text-only, pins the coding endpoint, supports an explicit environment key
+  and a bounded helper-config fallback, and never runs helper scripts or emits
+  credentials/configuration locations. Z.AI usage remains diagnostic-only and
+  schema-unverified pending a reviewed provider contract.
+
 ## [3.3.0] - 2026-08-28
 
 - **Release-candidate boundary hardening:** provider subprocesses now receive an explicit,

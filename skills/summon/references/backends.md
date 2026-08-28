@@ -98,6 +98,44 @@ them; do not paste an unbounded document into the prompt. Check
 `model.served` in the Summon envelope; a requested model or OpenCode roster
 entry is not provider-authored proof.
 
+### GLM-5.3 Flash routes and native ZCode
+
+Summon keeps the ended Ox Alpha preview identity retired. It does not relabel
+historical Ox receipts. The distinct active GLM-5.3 Flash routes are optional:
+
+| Route | Selector | Tools/files | Exact-model evidence |
+|---|---|---|---|
+| OpenRouter through OpenCode | `openrouter/z-ai/glm-5.3-flash` | Yes, in an isolated lane | OpenCode selection is advisory unless a provider response reports the model |
+| Z.AI Coding Plan through OpenCode | `zai-coding-plan/glm-5.3-flash` | Yes, in an isolated lane | Same OpenCode provenance limitation |
+| Direct Z.AI Coding Plan | `glm-5.3-flash` | No: one text request | Provider response model can support exact-model verification |
+| Native ZCode | no Summon model selector | Native tool loop | Preview only: no reviewed per-call selector or provider-authored served-model receipt |
+
+The direct Z.AI seat uses only the coding endpoint, not a general API endpoint.
+It is an `openai-compat` text seat and therefore needs self-contained context
+plus the normal text-seat consent. An explicit `ZAI_CODING_API_KEY` wins. If
+that is absent, Summon can read only the plan-kind and API-key scalar from an
+already-configured official Coding Plan helper profile; it never invokes the
+helper, imports arbitrary YAML, copies the key to a child process, or includes
+the key/configuration location in telemetry or receipts. `summon doctor` shows
+only whether this route is resolvable. `summon usage refresh` remains
+schema-unverified for this provider until a version-pinned, privacy-reviewed
+usage response contract is available.
+
+Native ZCode discovery checks `ZCODE_CLI`, PATH, Windows uninstall metadata,
+and common application bundles without executing a registry command or reading
+the app configuration. It launches hidden and headlessly, puts the complete
+task in an owner-restricted UTF-8 attachment, removes that attachment after the
+child exits, and tolerates a leading banner before the one terminal JSON object.
+Because ZCode provides terminal JSON rather than a reviewed progress stream,
+its liveness is terminal-only. It refuses `model:` and `safe-edit`; advisory
+read-only requires the existing explicit unenforced-read-only opt-in, while
+`yolo` requires a worktree or isolated lane. This keeps broad native authority
+usable in disposable boundaries without inventing a model or a sandbox claim.
+
+The ZCode bundle-discovery and attached-brief approach was informed by the
+[MIT-licensed delegate-skills project](https://github.com/amElnagdy/delegate-skills).
+Summon's implementation and provenance contract are independent.
+
 ### OpenRouter routers through OpenCode
 
 OpenCode can use OpenRouter's concrete models and router aliases as model

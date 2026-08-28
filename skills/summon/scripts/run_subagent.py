@@ -752,6 +752,13 @@ def _preflight_backend(cli: str, command_override: str | None = None) -> dict | 
     # from PATH.
     if cli == "openai-compat" or command_override or shutil.which(cli):
         return None
+    if cli == "zcode":
+        try:
+            from _zcode import resolve_zcode_cli
+            if resolve_zcode_cli() is not None:
+                return None
+        except Exception:  # noqa: BLE001 - fall through to safe setup guidance
+            pass
     # Enrichment is best-effort: an incomplete install missing _doctor.py must
     # still yield a setup message, never an uncaught ImportError from this guard.
     try:
@@ -3424,7 +3431,8 @@ def _dry_run_view(invocation, args, agents_dir: str,
         # Coding Plan: honest quota note + refuse known-bad model ids in preflight.
         try:
             from _apibackend import coding_plan_billing, coding_plan_model_error, \
-                payg_consent_allowed, is_coding_plan_endpoint
+                payg_consent_allowed, is_coding_plan_endpoint, \
+                is_zai_coding_plan_endpoint
             _cpb = coding_plan_billing(invocation.base_url)
             if _cpb:
                 view["billing"] = dict(_cpb)
@@ -3433,7 +3441,11 @@ def _dry_run_view(invocation, args, agents_dir: str,
             if _cpm:
                 view["would_refuse"] = True
                 view["refusal"] = _cpm
-            if is_coding_plan_endpoint(invocation.base_url):
+            # Z.AI Coding Plan has its own subscription endpoint.  It is not
+            # a BytePlus PAYG-fallback route, so never advertise consent for
+            # a different provider's billing path in its dry-run evidence.
+            if (is_coding_plan_endpoint(invocation.base_url)
+                    and not is_zai_coding_plan_endpoint(invocation.base_url)):
                 _payg_flag = getattr(invocation, "allow_payg", False)
                 view["payg_consent"] = payg_consent_allowed(_payg_flag)
                 view["payg_fallback_eligible"] = True
