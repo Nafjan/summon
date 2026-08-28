@@ -79,6 +79,9 @@ class ReleaseGateRunnerTests(unittest.TestCase):
             "x", "================ 61 passed in 3.25s ================\n"), "61/61")
         self.assertEqual(MODULE._parse_count(
             "x", "============ 59 passed, 2 skipped in 4.10s ============\n"), "59/61")
+        self.assertEqual(MODULE._parse_count(
+            "x", "831 passed, 1 skipped, 26 subtests passed in 100.33s\n"),
+            "831/832")
         with self.assertRaises(RuntimeError):
             MODULE._parse_count("x", "0/0 passed\n")
         with self.assertRaises(RuntimeError):

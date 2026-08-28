@@ -402,6 +402,7 @@ def test_invalid_projection_preserves_safe_routing_refusals():
 
 
 def test_decision_receipt_matches_retry_and_fallback_authority(monkeypatch):
+    monkeypatch.delenv("SUMMON_ACP_FALLBACK", raising=False)
     base = dict(
         agent="reviewer", _resolved_agent="reviewer", _role_provenance={},
         max_permission="yolo", allow_credit=False, allow_payg=False,

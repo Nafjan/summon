@@ -23,6 +23,16 @@ RUNNER = HERE / "run_subagent.py"
 PHASE1_EXAMPLES = HERE.parent / "examples" / "phase1"
 
 
+def _windows_system_directory() -> Path:
+    """Return System32 without requiring COMSPEC in a scrubbed CI environment."""
+    comspec = os.environ.get("COMSPEC")
+    if comspec:
+        return Path(comspec).parent
+    windows_root = os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR")
+    assert windows_root, "Windows tests require COMSPEC, SYSTEMROOT, or WINDIR"
+    return Path(windows_root) / "System32"
+
+
 def _run(args: list[str], *, env: dict[str, str], expected: int = 0) -> dict:
     completed = subprocess.run(
         [sys.executable, str(RUNNER), *args], capture_output=True, text=True,
@@ -160,7 +170,7 @@ def test_phase1_operator_workflow_is_coherent_provider_inert_and_private(
     env.update({"HOME": str(profile), "USERPROFILE": str(profile)})
     path_parts = [str(bin_dir), str(Path(sys.executable).parent)]
     if os.name == "nt":
-        path_parts.append(str(Path(os.environ["COMSPEC"]).parent))
+        path_parts.append(str(_windows_system_directory()))
     else:
         path_parts.extend(["/usr/bin", "/bin"])
     env["PATH"] = os.pathsep.join(dict.fromkeys(path_parts))
@@ -381,7 +391,7 @@ def test_windows_wrapper_emits_doctor_json_and_preserves_multiline_prompt(tmp_pa
     assert py_launcher is not None
     env["PATH"] = os.pathsep.join((
         str(bin_dir), str(Path(py_launcher).parent),
-        str(Path(os.environ["COMSPEC"]).parent),
+        str(_windows_system_directory()),
     ))
     wrapper = HERE / "summon.cmd"
     base = ["cmd.exe", "/d", "/s", "/c", "call", str(wrapper)]

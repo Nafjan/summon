@@ -357,6 +357,10 @@ def test_foreign_terminal_packet_cannot_become_plain_text_success_at_eof(
         [sys.executable, "-c",
          f"import sys; sys.stdout.write({line!r}); sys.stdout.flush()"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+    # This is an EOF-normalization test, not a process-startup timing test.
+    # Reap the tiny producer first so a loaded Windows host cannot turn a
+    # scheduler delay into a first-event timeout result.
+    process.wait(timeout=10)
     response = _executor._drive_process(
         process, declared_cli, 5_000, parse_stream=True,
         attempt_id="b" * 32, first_event_ms=1_000, idle_ms=1_000,

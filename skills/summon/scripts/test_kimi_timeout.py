@@ -459,6 +459,9 @@ def test_kimi_038_nonzero_exit_remains_fail_closed_for_both_shapes():
 
 
 def test_kimi_timeout_does_not_auto_spend_an_acp_fallback(monkeypatch):
+    # Prove the Kimi-specific opt-in guard, not the release runner's global
+    # fallback kill switch, is what prevents the second provider attempt.
+    monkeypatch.delenv("SUMMON_ACP_FALLBACK", raising=False)
     invocation = AgentInvocation(
         cli="kimi", prompt="test", cwd=os.getcwd(), permission="yolo")
     primary = {
@@ -490,6 +493,7 @@ def test_kimi_timeout_does_not_auto_spend_an_acp_fallback(monkeypatch):
 
 
 def test_kimi_acp_fallback_requires_explicit_opt_in(monkeypatch):
+    monkeypatch.delenv("SUMMON_ACP_FALLBACK", raising=False)
     invocation = AgentInvocation(
         cli="kimi", prompt="test", cwd=os.getcwd(), permission="yolo")
     primary = {

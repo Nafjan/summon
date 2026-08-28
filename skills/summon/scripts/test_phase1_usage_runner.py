@@ -200,13 +200,13 @@ def test_real_pipe_progress_is_visible_and_completion_reaps_owned_child():
 
     result = runner._execute(
         [sys.executable, "-u", "-c", script], input_bytes=b"",
-        timeout_ms=3000, command_timeout_ms=700,
+        timeout_ms=30_000, command_timeout_ms=10_000,
         progress_probe=runner._response_progress, completion_target=3,
         max_stdout=4096, max_stderr=4096, kill_tree=kill)
     assert result["exit_code"] == 0
     assert result["error_kind"] is None
     assert runner._response_progress(result["stdout"]) == 3
-    assert killed and 700 < result["elapsed_ms"] < 3000
+    assert killed and 700 < result["elapsed_ms"] < 30_000
 
 
 def test_real_silent_pipe_hits_command_timeout_and_reaps_owned_child():

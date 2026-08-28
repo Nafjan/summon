@@ -27,7 +27,8 @@ SCRIPTS = ROOT / "skills" / "summon" / "scripts"
 _CUSTOM_RESULT = re.compile(r"(?m)([0-9]+)/([0-9]+) passed\s*$")
 _UNIT_RESULT = re.compile(r"Ran\s+([0-9]+)\s+tests?", re.IGNORECASE)
 _PYTEST_RESULT = re.compile(
-    r"(?m)^[= ]*([1-9][0-9]*) passed(?P<extras>(?:, [0-9]+ [a-z]+)*) "
+    r"(?m)^[= ]*([1-9][0-9]*) passed"
+    r"(?P<extras>(?:, [0-9]+ [a-z]+(?: passed)?)*) "
     r"in [0-9.]+s(?: \([^\r\n]+\))?[= ]*$"
 )
 
