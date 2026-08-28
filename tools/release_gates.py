@@ -158,11 +158,15 @@ def _parse_count(name: str, output: str) -> str:
     if matches:
         passed = int(matches[-1].group(1))
         extras = matches[-1].group("extras") or ""
-        nonpassing = sum(
-            int(count) for count, kind in re.findall(r", ([0-9]+) ([a-z]+)", extras)
-            if kind in {"skipped", "xfailed", "xpassed", "deselected"}
-        )
-        return f"{passed}/{passed + nonpassing}"
+        counts = [(int(count), kind) for count, kind in re.findall(
+            r", ([0-9]+) ([a-z]+)", extras)]
+        unsupported = [(count, kind) for count, kind in counts
+                       if kind in {"xfailed", "xpassed", "deselected"} and count]
+        if unsupported:
+            raise RuntimeError(
+                f"{name} reported unsupported incomplete pytest outcomes")
+        skipped = sum(count for count, kind in counts if kind == "skipped")
+        return f"{passed}/{passed + skipped}"
     raise RuntimeError(f"{name} produced no recognized passing test count")
 
 

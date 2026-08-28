@@ -83,6 +83,8 @@ class ReleaseGateRunnerTests(unittest.TestCase):
             "x", "831 passed, 1 skipped, 26 subtests passed in 100.33s\n"),
             "831/832")
         with self.assertRaises(RuntimeError):
+            MODULE._parse_count("x", "10 passed, 1 xfailed in 1.00s\n")
+        with self.assertRaises(RuntimeError):
             MODULE._parse_count("x", "0/0 passed\n")
         with self.assertRaises(RuntimeError):
             MODULE._parse_count("x", "Ran 0 tests\n\nOK\n")

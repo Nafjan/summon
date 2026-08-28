@@ -71,6 +71,11 @@ class ReleaseManifestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MODULE._pairs(["deliberation=0/0"], "test",
                            allowed=MODULE.REQUIRED_TESTS)
+        self.assertEqual(
+            MODULE._pairs(["deliberation=835/836"], "test",
+                          allowed=MODULE.REQUIRED_TESTS),
+            {"deliberation": "835/836"},
+        )
         with self.assertRaises(ValueError):
             MODULE._pairs(["live_provider=maybe"], "gate",
                            allowed=MODULE.REQUIRED_GATES)

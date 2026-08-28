@@ -138,7 +138,10 @@ def _passing_count(value: object) -> tuple[int, int] | None:
     if not match:
         return None
     passed, total = int(match.group(1)), int(match.group(2))
-    if total <= 0 or passed != total:
+    # Machine-produced pytest evidence can include platform-specific skips.
+    # A nonzero command exit is rejected by release_gates before this compact
+    # count is emitted, so 0 < passed <= total means all executed tests passed.
+    if total <= 0 or passed <= 0 or passed > total:
         return None
     return passed, total
 

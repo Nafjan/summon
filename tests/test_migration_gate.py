@@ -91,6 +91,9 @@ def _materialize_durable_state(home: str) -> tuple[Path, set[str]]:
             agents_root / "summon-usage-live-checkpoints"),
         "SUMMON_TELEMETRY_CONFIG": str(agents_root / "summon-telemetry.json"),
         "SUMMON_TELEMETRY_FILE": str(agents_root / "summon-telemetry.jsonl"),
+        # The release runner disables ambient telemetry. This fixture tests
+        # durable opt-in state, so make its consent explicit and local.
+        "SUMMON_TELEMETRY": "1",
     }
     with patch.dict(os.environ, env, clear=False):
         agents = [{
@@ -157,6 +160,7 @@ def _assert_durable_state_readable(home: str) -> None:
             agents_root / "summon-usage-live-checkpoints"),
         "SUMMON_TELEMETRY_CONFIG": str(agents_root / "summon-telemetry.json"),
         "SUMMON_TELEMETRY_FILE": str(agents_root / "summon-telemetry.jsonl"),
+        "SUMMON_TELEMETRY": "1",
     }
     with patch.dict(os.environ, env, clear=False):
         job = _jobs.job_status(str(root / "jobs"), "a" * 32)
