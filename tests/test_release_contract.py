@@ -17,7 +17,7 @@ class ReleaseContractTests(unittest.TestCase):
     def test_current_companions_are_version_converged(self):
         facts = contract.version_facts(ROOT)
         self.assertTrue(facts["converged"], facts)
-        self.assertEqual(facts["canonical"], "3.2.1")
+        self.assertEqual(facts["canonical"], "3.3.0")
         self.assertEqual(set(facts["versions"]),
                          {"dispatcher", "mcp_server", "plugin", "telemetry"})
 
@@ -33,23 +33,23 @@ class ReleaseContractTests(unittest.TestCase):
             (root / "skills/summon/scripts").mkdir(parents=True)
             (root / "docs").mkdir()
             (root / "plugin.json").write_text(
-                json.dumps({"version": "3.2.1"}), encoding="utf-8")
+                json.dumps({"version": "3.3.0"}), encoding="utf-8")
             for name, assignment in (
                 ("run_subagent.py", "__version__"),
                 ("_telemetry.py", "SUMMON_VERSION"),
                 ("mcp_server.py", "SERVER_VERSION"),
             ):
                 (root / "skills/summon/scripts" / name).write_text(
-                    f'{assignment} = "3.2.1"\n', encoding="utf-8")
+                    f'{assignment} = "3.3.0"\n', encoding="utf-8")
             current = (ROOT / "docs/PHASE1_MIGRATION_ROLLBACK.md").read_text(
                 encoding="utf-8")
             (root / "docs/PHASE1_MIGRATION_ROLLBACK.md").write_text(
-                current.replace("Current product version: 3.2.1",
+                current.replace("Current product version: 3.3.0",
                                 "Current product version: 3.1.0"),
                 encoding="utf-8")
             result = contract.release_contract(root)
             self.assertFalse(result["ready"])
-            self.assertIn("unique current product version marker: 3.2.1",
+            self.assertIn("unique current product version marker: 3.3.0",
                           result["migration"]["missing"])
 
     def test_stale_marker_cannot_be_hidden_by_a_correct_example(self):
@@ -57,14 +57,14 @@ class ReleaseContractTests(unittest.TestCase):
             root = self._complete_release_root(Path(raw))
             path = root / "docs/PHASE1_MIGRATION_ROLLBACK.md"
             text = path.read_text(encoding="utf-8").replace(
-                "Current product version: 3.2.1",
-                "Current product version: 3.1.0\n\nExample: Current product version: 3.2.1",
+                "Current product version: 3.3.0",
+                "Current product version: 3.1.0\n\nExample: Current product version: 3.3.0",
                 1,
             )
             path.write_text(text, encoding="utf-8")
             result = contract.release_contract(root)
             self.assertFalse(result["ready"])
-            self.assertIn("unique current product version marker: 3.2.1",
+            self.assertIn("unique current product version marker: 3.3.0",
                           result["migration"]["missing"])
 
     def test_duplicate_version_markers_fail_closed(self):
@@ -73,7 +73,7 @@ class ReleaseContractTests(unittest.TestCase):
             path = root / "docs/PHASE1_MIGRATION_ROLLBACK.md"
             text = path.read_text(encoding="utf-8")
             path.write_text(
-                text + "\nCurrent product version: 3.2.1\n", encoding="utf-8")
+                text + "\nCurrent product version: 3.3.0\n", encoding="utf-8")
             result = contract.release_contract(root)
             self.assertFalse(result["ready"])
 
@@ -82,14 +82,14 @@ class ReleaseContractTests(unittest.TestCase):
         (root / "skills/summon/scripts").mkdir(parents=True)
         (root / "docs").mkdir()
         (root / "plugin.json").write_text(
-            json.dumps({"version": "3.2.1"}), encoding="utf-8")
+            json.dumps({"version": "3.3.0"}), encoding="utf-8")
         for name, assignment in (
             ("run_subagent.py", "__version__"),
             ("_telemetry.py", "SUMMON_VERSION"),
             ("mcp_server.py", "SERVER_VERSION"),
         ):
             (root / "skills/summon/scripts" / name).write_text(
-                f'{assignment} = "3.2.1"\n', encoding="utf-8")
+                f'{assignment} = "3.3.0"\n', encoding="utf-8")
         shutil.copyfile(
             ROOT / "docs/PHASE1_MIGRATION_ROLLBACK.md",
             root / "docs/PHASE1_MIGRATION_ROLLBACK.md")

@@ -13,6 +13,8 @@ never on added fields.
 
 ## Unreleased
 
+## 3.3.0 - 2026-08-28
+
 - **M8 integrated operator and compatibility closure:** added one end-to-end,
   provider-inert operator test covering sealed fleet proposal/validation/explanation,
   authenticated approval and dry-run activation, usage import/status/export/refresh

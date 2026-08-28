@@ -2,7 +2,7 @@
 
 Status: **historical; criteria met and 1.0.0 publication authorized on 2026-07-29.**
 This document predates the current 3.0.0 public-preview baseline; it is not a 3.0 GA
-certification. Current line is 3.2.x; see `docs/VERSIONING_AND_3.0.md` for the
+certification. Current line is 3.3.x; see `docs/VERSIONING_AND_3.0.md` for the
 historical 3.0 boundary and `docs/PHASE1_MIGRATION_ROLLBACK.md` for the active release
 contract.
 

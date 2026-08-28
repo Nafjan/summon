@@ -5,6 +5,8 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-08-28
+
 - **Integrated Phase 1 operator and migration contract:** the shipped operator guide now
   joins fleet explanation and approval, advisory usage evidence, safe/off context
   compilation, adaptive job supervision, and portable-result consumption into one

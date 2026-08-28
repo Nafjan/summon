@@ -99,7 +99,7 @@ from _resolver import discover_models, resolve_cli  # noqa: E402
 # Keep a literal assignment: the release-contract parser uses the dispatcher
 # source as a machine-checkable companion.  `_telemetry.SUMMON_VERSION` must be
 # updated in the same release; the release contract checks both literals.
-__version__ = "3.2.1"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "3.3.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
