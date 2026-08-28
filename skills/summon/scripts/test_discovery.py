@@ -572,17 +572,22 @@ def test_description_word_boundary_cap():
 
 def test_doctor_all_missing_is_fail_soft():
     # With every CLI absent, doctor must still return a full report (ok=False),
-    # never raise. Simulate by stubbing shutil.which inside _doctor.
+    # never raise. Simulate both ordinary PATH misses and ZCode's app-bundle
+    # discovery miss; ZCode deliberately has a second discovery path.
     import _doctor
+    import _zcode
     orig = _doctor.shutil.which
+    orig_zcode = _zcode.resolve_zcode_cli
     _doctor.shutil.which = lambda name: None
+    _zcode.resolve_zcode_cli = lambda: None
     try:
         rep = _doctor.doctor()
     finally:
         _doctor.shutil.which = orig
+        _zcode.resolve_zcode_cli = orig_zcode
     assert rep["ok"] is False
     assert rep["usable_backends"] == []
-    for b in ("claude", "codex", "cursor-agent", "gemini", "agy"):
+    for b in ("claude", "codex", "cursor-agent", "gemini", "agy", "zcode"):
         assert rep["backends"][b]["found"] is False
         assert rep["backends"][b]["install"]
     # render() must also survive the all-missing report (and stay ASCII-safe)
@@ -729,7 +734,10 @@ def test_doctor_json_roundtrip():
     import _doctor
     rep = _doctor.doctor()
     parsed = _json.loads(_json.dumps(rep, ensure_ascii=False))
-    assert set(parsed["backends"]) == {"claude", "codex", "cursor-agent", "gemini", "kimi", "agy", "opencode", "arkcli"}
+    assert set(parsed["backends"]) == {
+        "claude", "codex", "cursor-agent", "gemini", "kimi", "agy",
+        "opencode", "arkcli", "zcode",
+    }
     assert isinstance(parsed["ok"], bool)
     assert parsed["read_root_capabilities"] == {
         "enforced_backends": ["claude", "gemini"],
