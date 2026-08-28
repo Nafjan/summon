@@ -234,6 +234,134 @@ def test_adaptive_control_auto_extends_active_and_flags_idle(tmp_path):
     assert control.cancel_requested is True
 
 
+def test_operator_extend_advances_live_hard_deadline_and_acknowledges_generation(
+        tmp_path, monkeypatch):
+    root, job_id = _prepared(tmp_path)
+    monotonic = Clock()
+    wall = Clock()
+    wall.value = 100.0
+    control = _job_control.RuntimeControl(
+        path=_job_control.control_path(root, job_id),
+        heartbeat=_job_control.heartbeat_path(root, job_id),
+        job_id=job_id, nonce="nonce", checkpoint_ms=1_000,
+        max_runtime_ms=2_000, job_started_at=100.0,
+        clock=monotonic, wall_clock=wall)
+    original_hard = control.hard_deadline
+
+    monotonic.value = 1.9
+    wall.value = 101.9
+    monkeypatch.setattr(_job_control.time, "time", wall)
+    _job_control.queue_command(root, job_id, "extend", duration_ms=3_000)
+
+    assert control.refresh(force=True) == 3_000
+    assert control.hard_deadline == original_hard + 3.0
+    assert control.max_runtime_ms == 5_000
+    assert control.operator_extensions == 1
+    assert control.generation == 1
+    monotonic.value = 2.1
+    wall.value = 102.1
+    assert control.expired() is False
+
+    control.publish({"phase": "generation"}, force=True)
+    heartbeat = _jobs.read_json(_job_control.heartbeat_path(root, job_id))
+    assert heartbeat["job_hard_deadline_at"] == 105.0
+    assert heartbeat["control_generation"] == 1
+    assert heartbeat["operator_extensions"] == 1
+    public = _job_control.public_heartbeat(heartbeat, "payload_authenticated")
+    assert public["job_hard_deadline_at"] == 105.0
+    assert public["control_generation"] == 1
+
+
+def test_operator_extend_queued_after_hard_deadline_cannot_revive_job(
+        tmp_path, monkeypatch):
+    root, job_id = _prepared(tmp_path)
+    monotonic = Clock()
+    wall = Clock()
+    wall.value = 103.0
+    control = _job_control.RuntimeControl(
+        path=_job_control.control_path(root, job_id),
+        heartbeat=_job_control.heartbeat_path(root, job_id),
+        job_id=job_id, nonce="nonce", checkpoint_ms=1_000,
+        max_runtime_ms=2_000, job_started_at=100.0,
+        clock=monotonic, wall_clock=wall)
+    original_hard = control.hard_deadline
+    monkeypatch.setattr(_job_control.time, "time", wall)
+
+    _job_control.queue_command(root, job_id, "extend", duration_ms=3_000)
+
+    assert control.refresh(force=True) == 0
+    assert control.generation == 1
+    assert control.hard_deadline == original_hard
+    assert control.max_runtime_ms == 2_000
+    assert control.operator_extensions == 0
+
+
+def test_driver_consumes_extend_while_subprocess_stream_is_silent(
+        tmp_path, monkeypatch):
+    """A live extension is polled and applied without waiting for stdout."""
+    root, job_id = _prepared(tmp_path)
+    monotonic = Clock()
+    wall = Clock()
+    wall.value = 100.0
+    control = _job_control.RuntimeControl(
+        path=_job_control.control_path(root, job_id),
+        heartbeat=_job_control.heartbeat_path(root, job_id),
+        job_id=job_id, nonce="nonce", checkpoint_ms=100,
+        max_runtime_ms=200, job_started_at=100.0,
+        clock=monotonic, wall_clock=wall)
+    tracker = LivenessTracker(
+        attempt_id="live-extension", overall_ms=200,
+        first_event_ms=200, idle_ms=1_000, finalization_ms=100,
+        clock=monotonic)
+    emitter = tracker.emitter()
+    emitter.emit("transport_started", session_id="session")
+    emitter.emit("output_text", session_id="session", output_chars=1)
+
+    class SilentQueue:
+        calls = 0
+
+        def get(self, timeout):
+            self.calls += 1
+            if self.calls == 1:
+                monotonic.advance(timeout)
+                wall.advance(timeout)
+                _job_control.queue_command(
+                    root, job_id, "extend", duration_ms=200)
+                raise queue.Empty
+            if self.calls == 2:
+                monotonic.advance(timeout)
+                wall.advance(timeout)
+                raise queue.Empty
+            return (_executor._EOF, None)
+
+    class Finished:
+        returncode = 0
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return 0
+
+    killed = []
+    monkeypatch.setattr(_job_control.time, "time", wall)
+    monkeypatch.setattr(_executor.time, "monotonic", monotonic)
+    monkeypatch.setattr(_executor, "_spawn_reader", lambda _process: SilentQueue())
+    monkeypatch.setattr(_executor, "_kill_tree", lambda _process: killed.append(True))
+    monkeypatch.setattr(_executor, "_safe_communicate",
+                        lambda _process, timeout=3.0: (None, ""))
+
+    response = _executor._drive_process_loop(
+        Finished(), "agy", 200, StreamProcessor(cli="agy"),
+        parse_stream=False, liveness=tracker, liveness_emitter=emitter,
+        runtime_control=control)
+
+    assert killed == [], response
+    assert response.get("timeout") is None
+    assert control.generation == 1
+    assert control.hard_deadline == pytest.approx(0.4)
+    assert tracker.overall_ms == 400
+
+
 def test_retry_control_preserves_job_origin_and_exposes_attempt_identity(tmp_path):
     root, job_id = _prepared(tmp_path)
     monotonic = Clock()
@@ -888,7 +1016,7 @@ def test_adaptive_expiry_cannot_replace_a_trusted_terminal_result(monkeypatch):
         def __init__(self):
             self.terminal_seen = False
 
-        def refresh(self):
+        def refresh(self, *, force=False):
             return 0
 
         def checkpoint(self, *, active):

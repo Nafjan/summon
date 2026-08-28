@@ -373,7 +373,7 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon agent new\|set NAME --set k=v` | scaffold / retune an agent definition |
 | `summon role propose\|approve\|list\|resolve …` | manage private, opt-in role aliases |
 | `summon jobs list\|status [ID]` · `jobs wait ID` | inspect or wait for background jobs (`--json` on list/status). `status` is a redacted, typed projection; `wait` returns the complete private terminal envelope |
-| `summon jobs extend ID --duration 30m` · `jobs cancel ID` | extend an observable job within its hard runtime budget, or request process-tree cancellation |
+| `summon jobs extend ID --duration 30m` · `jobs cancel ID` | extend an active adaptive job's soft and hard deadlines (bounded to seven days from job start), or request process-tree cancellation |
 | `summon jobs steer ID --message "…"` · `jobs resume ID --message "…"` | queue authenticated guidance for a later eligible continuation, then explicitly create one governed successor; this is not claimed as live mid-turn injection |
 | `summon telemetry enable\|disable\|status\|clear` | manage local opt-in diagnostics; `clear` does not disable |
 | `summon usage status\|import\|refresh\|export\|example …` | inspect, refresh, or exchange bounded usage evidence. Live refresh requires an explicit provider allowlist and account-read consent; usage remains advisory and cannot reroute an exact request |

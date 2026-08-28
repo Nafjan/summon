@@ -3138,7 +3138,12 @@ def _drive_process_loop(
                     and time.monotonic() >= terminal_reap_deadline):
                 return _finish_forced_terminal_cleanup("terminal_reap_timeout")
             if runtime_control is not None:
-                runtime_control.refresh()
+                # The read loop itself is already bounded to a 250 ms control
+                # poll. Force this read so RuntimeControl's defensive caller
+                # throttle cannot defer a command beyond a nearby deadline.
+                operator_extension = runtime_control.refresh(force=True)
+                if operator_extension and not saw_terminal:
+                    liveness.extend_overall(operator_extension)
                 runtime_control.checkpoint(
                     active=liveness.meaningful_within(runtime_control.checkpoint_ms))
                 runtime_control.publish(liveness.snapshot())
@@ -3319,7 +3324,13 @@ def _drive_process_loop(
             post_eof_deadline = finalization_deadline
         while process.poll() is None:
             if runtime_control is not None:
-                runtime_control.refresh()
+                operator_extension = runtime_control.refresh(force=True)
+                if operator_extension and not saw_terminal:
+                    liveness.extend_overall(operator_extension)
+                    if terminal_reap_deadline is None:
+                        post_eof_deadline = min(
+                            runtime_control.hard_deadline,
+                            finalization_deadline)
                 runtime_control.publish(liveness.snapshot())
                 if runtime_control.cancel_requested and not saw_terminal:
                     if liveness_emitter is not None:

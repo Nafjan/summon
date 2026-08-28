@@ -47,6 +47,11 @@ never on added fields.
   a false empty-string mismatch. Z.AI helper rotation still refuses before
   provider contact. Provider-inert decision evidence records backend transport,
   declared provider, and the route-provider validation class separately.
+- Fixed live adaptive job extensions so an authenticated operator command advances both
+  the active checkpoint and hard liveness deadline without waiting for provider output.
+  The executor polls the durable control log at its bounded control cadence, publishes the
+  applied generation and updated deadline in the authenticated heartbeat, caps total job
+  runtime at seven days, and refuses extensions queued after the then-current hard deadline.
 
 ## 3.3.0 - 2026-08-28
 

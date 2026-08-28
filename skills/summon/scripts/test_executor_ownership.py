@@ -89,7 +89,7 @@ def test_unexpected_exception_after_terminal_preserves_result_and_reaps_child():
         hard_deadline = time.monotonic() + 60
         cancel_requested = False
 
-        def refresh(self):
+        def refresh(self, *, force=False):
             # Bind the fault to the parser's actual terminal state rather than
             # scheduler timing; under a loaded full suite the reader thread may
             # not publish its first line before several refresh polls.

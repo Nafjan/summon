@@ -80,7 +80,8 @@ def public_heartbeat(value: dict, integrity: str) -> dict | None:
         item = value.get(key)
         if isinstance(item, str) and _jobs.valid_job_id(item):
             out[key] = item
-    for key in ("attempt_ordinal", "job_elapsed_ms", "auto_extensions", "extension_ms"):
+    for key in ("attempt_ordinal", "job_elapsed_ms", "auto_extensions",
+                "operator_extensions", "extension_ms", "control_generation"):
         item = value.get(key)
         if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 2 ** 63 - 1:
             out[key] = item
@@ -599,6 +600,7 @@ class RuntimeControl:
         self.control_untrusted = False
         self.attention_required = False
         self.auto_extensions = 0
+        self.operator_extensions = 0
         self.extension_ms = 0
         self.steers: list[dict] = []
         self._last_publish = 0.0
@@ -681,7 +683,24 @@ class RuntimeControl:
                 duration = command.get("duration_ms")
                 if isinstance(duration, int) and not isinstance(duration, bool) \
                         and 1 <= duration <= MAX_EXTENSION_MS:
-                    added += duration
+                    # Process the authenticated append-only log in generation
+                    # order. An extension is live only when it was queued by the
+                    # operator before the then-current hard deadline. An earlier
+                    # valid extension may therefore make a later command
+                    # eligible, but a late command cannot resurrect an expired
+                    # job.
+                    hard_deadline_at = (
+                        self.job_started_at + self.max_runtime_ms / 1000)
+                    if command["queued_at"] <= hard_deadline_at:
+                        remaining_capacity = max(
+                            0, MAX_EXTENSION_MS - self.max_runtime_ms)
+                        applied = min(duration, remaining_capacity)
+                        if applied:
+                            added += applied
+                            self.max_runtime_ms += applied
+                            self.hard_deadline += applied / 1000
+                            self.deadline += applied / 1000
+                            self.operator_extensions += 1
             elif action == "steer" and isinstance(command.get("message"), str):
                 message = command["message"]
                 if 0 < len(message) <= MAX_STEER_CHARS:
@@ -691,13 +710,9 @@ class RuntimeControl:
             self.generation = generation
             self._command_digests[generation] = command_digest
         if added:
-            allowed = max(0, int((self.hard_deadline - self.deadline) * 1000))
-            applied = min(added, allowed)
-            self.deadline += applied / 1000
-            self.extension_ms += applied
-            if applied:
-                self.attention_required = False
-            return applied
+            self.extension_ms += added
+            self.attention_required = False
+            return added
         return 0
 
     def checkpoint(self, *, active: bool) -> int:
@@ -745,7 +760,9 @@ class RuntimeControl:
             "observed_at": time.time(), "liveness": liveness,
             "adaptive": True, "attention_required": self.attention_required,
             "auto_extensions": self.auto_extensions,
+            "operator_extensions": self.operator_extensions,
             "extension_ms": self.extension_ms,
+            "control_generation": self.generation,
             "control_scope": "current_attempt_replayed_from_job_origin",
             "cancel_requested": self.cancel_requested,
             "control_untrusted": self.control_untrusted,
@@ -758,8 +775,10 @@ class RuntimeControl:
     def projection(self) -> dict:
         return {"enabled": True, "attention_required": self.attention_required,
                 "auto_extensions": self.auto_extensions,
+                "operator_extensions": self.operator_extensions,
                 "extension_ms": self.extension_ms,
                 "hard_runtime_ms": self.max_runtime_ms,
+                "control_generation": self.generation,
                 "cancel_requested": self.cancel_requested,
                 "control_untrusted": self.control_untrusted,
                 "attempt_id": self.attempt_id,

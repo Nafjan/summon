@@ -116,7 +116,10 @@ summon jobs cancel JOB_ID --json
 ```
 
 The adaptive timeout is a progress checkpoint, not permission to run forever. Only
-trusted provider events renew liveness. `steer` queues authenticated guidance for an
+trusted provider events renew liveness. An authenticated `extend` command queued before
+the current hard deadline advances both the live attempt's checkpoint and hard deadline,
+up to the seven-day job cap; `jobs status` exposes the applied control generation in the
+authenticated heartbeat. `steer` queues authenticated guidance for an
 eligible successor; it is not claimed as live mid-turn injection. After a terminal
 eligible Claude subprocess job, create one explicit successor with:
 

@@ -22,6 +22,7 @@ TRUSTED_KINDS = {
 FINAL_PHASES = {"terminal", "cancelled", "timed_out"}
 MAX_PROGRESS = (1 << 63) - 1
 MAX_DEDUPE_IDS = 4096
+MAX_LIVENESS_MS = 7 * 24 * 60 * 60 * 1000
 
 
 class LivenessError(ValueError):
@@ -98,7 +99,7 @@ class LivenessTracker:
                             ("idle_ms", idle_ms),
                             ("finalization_ms", finalization_ms)):
             if (not isinstance(value, int) or isinstance(value, bool)
-                    or not 1 <= value <= 604800000):
+                    or not 1 <= value <= MAX_LIVENESS_MS):
                 raise LivenessError(f"{name} must be a bounded positive integer")
         self.attempt_id = attempt_id
         self.session_id = session_id
@@ -288,6 +289,22 @@ class LivenessTracker:
         now = self._sample(self._last_now)
         self._last_now = now
         return self._expire_at(now)
+
+    def extend_overall(self, duration_ms: int) -> None:
+        """Advance the hard liveness clock after a bounded operator extension.
+
+        RuntimeControl authenticates and bounds the command. The tracker keeps
+        an independent overall clock, so it must advance in the same executor
+        iteration or the original liveness deadline can still kill healthy
+        work.
+        """
+        if (not isinstance(duration_ms, int) or isinstance(duration_ms, bool)
+                or duration_ms <= 0
+                or self.overall_ms + duration_ms > MAX_LIVENESS_MS):
+            raise LivenessError("overall extension exceeds the bounded job runtime")
+        if self.phase in FINAL_PHASES or self.timeout_reason is not None:
+            raise LivenessError("a terminal liveness clock cannot be extended")
+        self.overall_ms += duration_ms
 
     def next_deadline_ms(self) -> int | None:
         """Milliseconds until the next active deadline, for a bounded pipe poll."""

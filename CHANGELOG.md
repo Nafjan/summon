@@ -25,6 +25,11 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
   identity binds environment, Windows Credential Manager, Hermes/Nous,
   ArkCLI, and Z.AI-helper credential fallbacks by a private one-way identity;
   unavailable evidence stays unarmed rather than causing a false mismatch.
+- **Reliable live job extension:** `summon jobs extend` now advances both the adaptive
+  checkpoint and the active attempt's hard deadline while the provider subprocess is
+  running, without waiting for another stream event. Authenticated heartbeats expose the
+  applied control generation and updated deadline; late commands cannot revive an expired
+  job, and total runtime remains capped at seven days from job start.
 
 ## [3.3.0] - 2026-08-28
 
