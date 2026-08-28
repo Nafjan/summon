@@ -739,6 +739,48 @@ def test_doctor_json_roundtrip():
     assert "read roots:" in _doctor.render(rep)
 
 
+def _fake_agy_executable():
+    """Put a minimal AGY capability probe on PATH for hermetic builder tests.
+
+    Production dispatch deliberately refuses an AGY binary that does not expose
+    ``--print-timeout``.  Tests for argument construction must exercise that gate
+    without depending on a developer workstation or GitHub runner having AGY
+    installed.  Use an actual platform-native shim instead of bypassing the gate.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        bindir = tempfile.mkdtemp(prefix="summon-fake-agy-bin-")
+        saved_path = os.environ.get("PATH")
+        saved_pathext = os.environ.get("PATHEXT")
+        if os.name == "nt":
+            executable = os.path.join(bindir, "agy.cmd")
+            with open(executable, "w", encoding="utf-8", newline="") as fh:
+                fh.write("@echo off\r\necho --print-timeout\r\nexit /b 0\r\n")
+            os.environ["PATHEXT"] = saved_pathext or ".COM;.EXE;.BAT;.CMD"
+        else:
+            executable = os.path.join(bindir, "agy")
+            with open(executable, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("#!/bin/sh\nprintf '%s\\n' '--print-timeout'\n")
+            os.chmod(executable, 0o700)
+        os.environ["PATH"] = bindir + os.pathsep + (saved_path or "")
+        try:
+            yield executable
+        finally:
+            if saved_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = saved_path
+            if saved_pathext is None:
+                os.environ.pop("PATHEXT", None)
+            else:
+                os.environ["PATHEXT"] = saved_pathext
+            shutil.rmtree(bindir, ignore_errors=True)
+
+    return _ctx()
+
+
 def _fake_agy_home():
     """Redirect the agy profile builder at a throwaway credential fixture.
 
@@ -765,7 +807,8 @@ def _fake_agy_home():
         os.environ["AGY_HEADLESS_PROFILE"] = state
         os.environ.pop("AGY_PTY_WRAPPER", None)
         try:
-            yield home
+            with _fake_agy_executable():
+                yield home
         finally:
             for k, v in saved.items():
                 if v is None:
@@ -11329,7 +11372,8 @@ def test_v7_agy_dispatch_verifies_the_copied_account_bytes():
                                   resume_id="latest" if resume else None,
                                   resume_profile=resume_profile if resume else None,
                                   agy_account_sha256=expected)
-            return _builder.build_invocation_args(inv, timeout_ms=60000)
+            with _fake_agy_executable():
+                return _builder.build_invocation_args(inv, timeout_ms=60000)
 
         # RESUME with the account it was fingerprinted under: allowed
         build(prof_a, sha_a)
@@ -11485,9 +11529,10 @@ def test_v7_dispatch_overwritten_env_is_not_part_of_the_request():
             from _builder import AgentInvocation
             os.environ["AGY_PTY_QUIET"] = "77"
             try:
-                _c, _a, env_override = _builder.build_invocation_args(
-                    AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd()),
-                    timeout_ms=60000)
+                with _fake_agy_executable():
+                    _c, _a, env_override = _builder.build_invocation_args(
+                        AgentInvocation(cli="agy", prompt="p", cwd=os.getcwd()),
+                        timeout_ms=60000)
                 assert (env_override or {}).get("AGY_PTY_QUIET") == "77", (
                     "the builder stopped forwarding the ambient AGY_PTY_QUIET",
                     (env_override or {}).get("AGY_PTY_QUIET"))
@@ -13119,7 +13164,8 @@ def test_v10_legacy_agy_pty_is_opt_in_on_windows():
 
     with mock.patch.object(_builder.os, "name", "nt"), \
          mock.patch.dict(_builder.os.environ,
-                         {"AGY_PTY_WRAPPER": "C:\\legacy\\agy_pty_pyte.py"}, clear=False), \
+                         {"AGY_PTY_WRAPPER": os.path.join("legacy", "agy_pty_pyte.py")},
+                         clear=False), \
          mock.patch.object(_builder.os.path, "isfile", side_effect=isfile):
         _builder.os.environ.pop("AGY_ALLOW_LEGACY_PTY", None)
         assert _builder._agy_wrapper().lower().endswith("agy_stream_proxy.py")
@@ -14135,7 +14181,8 @@ def test_v8_agent_args_cannot_reopen_the_agy_boundary():
             permission="read-only",
             extra_args=("--add-dir", "/elsewhere", "--mode", "yolo",
                         "--dangerously-skip-permissions", "--keep", "me"))
-        _cmd, argv, _env = _builder.build_invocation_args(inv, timeout_ms=60000)
+        with _fake_agy_executable():
+            _cmd, argv, _env = _builder.build_invocation_args(inv, timeout_ms=60000)
         assert argv.count("--add-dir") <= 1, (
             "the agent's own --add-dir survived into the real argv: %r" % (argv,))
         assert "/elsewhere" not in argv, (
@@ -15011,7 +15058,8 @@ def test_v8_build_failures_return_an_envelope_not_an_exception():
         os.environ["SUMMON_ALLOW_UNENFORCED_READONLY"] = "1"
         inv = _builder.AgentInvocation(cli="agy", prompt="p" * 40000, cwd=os.getcwd(),
                                        system_context="c", permission="read-only")
-        resp = _executor.execute_agent(inv, timeout_ms=30_000)   # must not raise
+        with _fake_agy_executable():
+            resp = _executor.execute_agent(inv, timeout_ms=30_000)   # must not raise
     finally:
         _builder._agy_wrapper = r_wrapper
         if had is None:
