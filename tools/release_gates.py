@@ -89,6 +89,12 @@ REQUIRED_TESTS = frozenset(COMMANDS)
 GATE_COMMANDS = dict(_MANIFEST.REQUIRED_GATE_COMMANDS)
 REQUIRED_GATES = frozenset(_MANIFEST.REQUIRED_GATES)
 
+# Git metadata reads can briefly exceed ten seconds on Windows when antivirus,
+# filesystem indexing, or another test process is walking the same checkout.
+# Keep this bounded, but do not let a healthy clean-tree check invalidate an
+# otherwise complete release run because of a transient storage stall.
+GIT_METADATA_TIMEOUT_SECONDS = 60.0
+
 
 def _canonical_bytes(path: Path) -> bytes:
     data = path.read_bytes()
@@ -108,7 +114,7 @@ def _git_head() -> str:
          "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
          "rev-parse", "--show-toplevel"],
         cwd=str(ROOT), env=env, capture_output=True, text=True,
-        encoding="utf-8", timeout=10, check=True,
+        encoding="utf-8", timeout=GIT_METADATA_TIMEOUT_SECONDS, check=True,
     ).stdout.strip()
     if Path(top).resolve() != ROOT.resolve():
         raise RuntimeError("Git repository top-level does not match release root")
@@ -116,7 +122,7 @@ def _git_head() -> str:
         ["git", "-c", f"safe.directory={ROOT.resolve()}",
          "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
          "rev-parse", "HEAD"], cwd=str(ROOT), env=env, capture_output=True,
-        text=True, encoding="utf-8", timeout=10, check=True,
+        text=True, encoding="utf-8", timeout=GIT_METADATA_TIMEOUT_SECONDS, check=True,
     )
     return result.stdout.strip()
 
@@ -326,7 +332,7 @@ def build_evidence(timeout: float, *, require_clean: bool = False,
          "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
          "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"],
         cwd=str(ROOT), env=_MANIFEST._git_env(), capture_output=True,
-        text=True, encoding="utf-8", timeout=10, check=True,
+        text=True, encoding="utf-8", timeout=GIT_METADATA_TIMEOUT_SECONDS, check=True,
     ).stdout
     if require_clean and status_before.strip():
         raise RuntimeError("--require-clean refuses a dirty source tree")
@@ -346,7 +352,7 @@ def build_evidence(timeout: float, *, require_clean: bool = False,
          "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
          "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"],
         cwd=str(ROOT), env=_MANIFEST._git_env(), capture_output=True,
-        text=True, encoding="utf-8", timeout=10, check=True,
+        text=True, encoding="utf-8", timeout=GIT_METADATA_TIMEOUT_SECONDS, check=True,
     ).stdout
     after_head = _git_head()
     if before_hash != after_hash or head != after_head or status_before != status_after:

@@ -6,8 +6,11 @@ import hashlib
 import io
 import json
 import contextlib
+import subprocess
+import tempfile
 from unittest import mock
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 
@@ -57,6 +60,55 @@ class ReleaseGateRunnerTests(unittest.TestCase):
     def test_machine_result_digest_shape(self):
         digest = "a" * 64
         self.assertTrue(MODULE.re.fullmatch(r"[0-9a-f]{64}", digest))
+
+    def test_git_metadata_timeout_is_bounded_but_windows_tolerant(self):
+        self.assertGreaterEqual(MODULE.GIT_METADATA_TIMEOUT_SECONDS, 30.0)
+        self.assertLessEqual(MODULE.GIT_METADATA_TIMEOUT_SECONDS, 120.0)
+
+    def test_git_metadata_calls_use_the_bounded_timeout(self):
+        completed = [
+            SimpleNamespace(stdout=str(ROOT)),
+            SimpleNamespace(stdout="a" * 40),
+        ]
+        with mock.patch.object(MODULE.subprocess, "run", side_effect=completed) as run:
+            self.assertEqual(MODULE._git_head(), "a" * 40)
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(all(
+            call.kwargs["timeout"] == MODULE.GIT_METADATA_TIMEOUT_SECONDS
+            for call in run.call_args_list
+        ))
+
+        status = SimpleNamespace(stdout="")
+        with (
+            mock.patch.object(MODULE, "COMMANDS", {}),
+            mock.patch.object(MODULE, "GATE_COMMANDS", {}),
+            mock.patch.object(MODULE, "_source_hash", side_effect=["b" * 64, "b" * 64]),
+            mock.patch.object(MODULE, "_git_head", side_effect=["c" * 40, "c" * 40]),
+            mock.patch.object(MODULE.subprocess, "run", side_effect=[status, status]) as run,
+        ):
+            MODULE.build_evidence(1.0)
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(all(
+            call.kwargs["timeout"] == MODULE.GIT_METADATA_TIMEOUT_SECONDS
+            for call in run.call_args_list
+        ))
+
+    def test_git_timeout_fails_closed_without_evidence(self):
+        errors = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "evidence.json"
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "build_evidence",
+                    side_effect=subprocess.TimeoutExpired(["git", "status"], 60),
+                ),
+                contextlib.redirect_stderr(errors),
+            ):
+                result = MODULE.main(["--output", str(output)])
+            self.assertEqual(result, 2)
+            self.assertFalse(output.exists())
+        self.assertIn("timed out", errors.getvalue())
 
     def test_outer_artifact_hash_is_recomputable_with_gate_marker_hash(self):
         artifact = MODULE._artifact(
