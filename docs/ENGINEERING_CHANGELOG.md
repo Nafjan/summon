@@ -13,6 +13,8 @@ never on added fields.
 
 ## Unreleased
 
+## 3.3.0 - 2026-08-29
+
 - **Native ZCode / Z.AI Coding Plan integration:** introduced a tenth backend
   through original, provider-inert code. ZCode discovery accepts an explicit
   executable/bundle path, direct PATH target, Windows uninstall metadata
@@ -52,8 +54,6 @@ never on added fields.
   The executor polls the durable control log at its bounded control cadence, publishes the
   applied generation and updated deadline in the authenticated heartbeat, caps total job
   runtime at seven days, and refuses extensions queued after the then-current hard deadline.
-
-## 3.3.0 - 2026-08-28
 
 - **Final dispatch-boundary and deliberation evidence closure:** every provider launch now
   receives one explicit environment snapshot filtered by the shared internal-capability

@@ -5,6 +5,8 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-08-29
+
 - **ZCode and Z.AI Coding Plan routes:** added a native ZCode preview backend
   with provider-inert Windows/PATH/bundle discovery, hidden headless launch,
   owner-restricted prompt attachments, banner-tolerant terminal JSON parsing,
@@ -30,8 +32,6 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
   running, without waiting for another stream event. Authenticated heartbeats expose the
   applied control generation and updated deadline; late commands cannot revive an expired
   job, and total runtime remains capped at seven days from job start.
-
-## [3.3.0] - 2026-08-28
 
 - **Release-candidate boundary hardening:** provider subprocesses now receive an explicit,
   scrubbed environment snapshot on every dispatch path, including ordinary foreground
