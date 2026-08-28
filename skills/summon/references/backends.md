@@ -128,6 +128,10 @@ task in an owner-restricted UTF-8 attachment, removes that attachment after the
 child exits, and performs bounded next-launch cleanup for stale attachments
 from an ordinary hard kill. It tolerates a leading banner before the one
 terminal JSON object.
+The native CLI has its own login and model configuration; installing the
+desktop app or configuring Z.AI inside OpenCode does not configure that native
+CLI. `summon auth repair zcode --allow-auth-repair` can start the discovered
+bundle's login flow, though browser approval can still be required.
 Because ZCode provides terminal JSON rather than a reviewed progress stream,
 its liveness is terminal-only. It refuses `model:` and `safe-edit`; advisory
 read-only requires the existing explicit unenforced-read-only opt-in, while

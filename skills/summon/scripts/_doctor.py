@@ -190,10 +190,11 @@ _AUTH_REPAIR_PLANS = {
                            "Credential Manager entry.")},
     "zcode": {"command": "zcode login",
               "argv": ["zcode", "login"],
-              "interaction": "browser_or_terminal", "supports_autonomous": False,
-              "note": ("Some desktop-bundled ZCode CLIs do not expose a stable login command; "
-                       "complete sign-in in the ZCode app when this command is unavailable. "
-                       "The Coding Plan helper is diagnostics-only, not login or inference.")},
+              "interaction": "browser_or_terminal", "supports_autonomous": True,
+              "note": ("Summon can start the discovered desktop-bundled ZCode login flow; "
+                       "browser approval may still be required. Native ZCode keeps its own "
+                       "CLI model configuration, separate from OpenCode and the Coding Plan "
+                       "helper.")},
     "arkcli": {"command": "arkcli auth login", "argv": ["arkcli", "auth", "login"],
                "interaction": "browser", "supports_autonomous": True},
 }

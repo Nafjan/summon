@@ -151,6 +151,22 @@ class ZCodeBuilderTests(unittest.TestCase):
         self.assertIsNone(pattern.fullmatch("ZCode Helper"))
         self.assertIsNone(pattern.fullmatch("Unofficial ZCode 3.10.1"))
 
+    def test_auth_repair_reuses_desktop_bundle_discovery(self):
+        import _auth
+        target = ZCodeTarget(
+            command="node-direct", prefix_args=("bundle/zcode.cjs",),
+            source="windows_registry")
+        with mock.patch("_zcode.resolve_zcode_cli", return_value=target):
+            command = _auth._command_for(
+                "zcode", {"argv": ["zcode", "login"]})
+        self.assertEqual(command, ["node-direct", "bundle/zcode.cjs", "login"])
+
+    def test_zcode_auth_plan_can_start_bundled_login(self):
+        from _doctor import auth_repair_plan
+        plan = auth_repair_plan("zcode")
+        self.assertTrue(plan["supports_autonomous"])
+        self.assertEqual(plan["command"], "zcode login")
+
     def test_path_shim_does_not_block_direct_executable_discovery(self):
         target = self._target()
         def which(name):
