@@ -425,9 +425,18 @@ def _reset_probe_cache() -> None:
 
 # -- main entry point -----------------------------------------------------------
 
-def _err(cli: str, code: int, msg: str, diag: list | None = None) -> dict:
+def _err(cli: str, code: int, msg: str, diag: list | None = None, *,
+         not_run: bool = False, error_kind: str | None = None) -> dict:
     resp = {"result": "", "exit_code": code, "status": "error", "cli": cli,
             "error": msg}
+    if not_run:
+        resp.update({
+            "attempts": 0, "attempt_status": "not_run",
+            "execution_status": "not_run", "provider_contacted": False,
+            "result_usable": False, "retryable": False,
+        })
+    if error_kind:
+        resp["error_kind"] = error_kind
     if diag:
         resp["_debug_raw"] = "\n".join(diag)
     return resp
@@ -458,7 +467,12 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
         if probe_err:
             return _err(cli, 2, probe_err)
 
-    command, args = _resolve_launch(cli, list(acp_args))
+    try:
+        command, args = _resolve_launch(cli, list(acp_args))
+    except ValueError as exc:
+        return _err(
+            cli, 2, str(exc), not_run=True,
+            error_kind="unsafe_windows_launcher")
     # The subprocess builders install the per-backend identity (kimi's isolated
     # credential profile above all). Running ACP without that env would
     # authenticate as the AMBIENT account with the full real profile (MCP
@@ -482,10 +496,12 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
             return _err(cli, 2,
                         f"provider preparation refused ({type(e).__name__})")
         return _err(cli, 2, str(e))
+    from _spawn import scrub_provider_env
     child_env = dict(os.environ)
     for key, value in (env_override or {}).items():
         if key != "GEMINI_SYSTEM_MD":
             child_env[key] = value
+    child_env = scrub_provider_env(child_env)
     try:
         if launch_control is not None:
             launch_control.before_provider_launch({

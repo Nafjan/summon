@@ -41,11 +41,16 @@ def _hidden_startupinfo():
     return info
 
 
-def popen_flags(*, detached: bool = False) -> dict:
+def popen_flags(*, detached: bool = False,
+                join_parent_group: bool = False) -> dict:
     """Platform ``Popen`` kwargs for a spawned child.
 
     ``detached=False`` (the default, for every worker summon waits on): no console
     on Windows, own session on POSIX.
+
+    ``join_parent_group=True`` is for a supervised POSIX shim child that must stay
+    in the caller's process group so the outer timeout can terminate the complete
+    tree. It has no effect on Windows, where job ownership is handled separately.
 
     ``detached=True`` (only the ``--background`` launcher): the child outlives this
     process, so it needs its own process GROUP as well. ``DETACHED_PROCESS`` already
@@ -54,6 +59,8 @@ def popen_flags(*, detached: bool = False) -> dict:
     stacked on for symmetry.
     """
     if os.name != "nt":
+        if join_parent_group:
+            return {}
         return {"start_new_session": True}
     hidden = {"startupinfo": _hidden_startupinfo()}
     if detached:
@@ -62,6 +69,32 @@ def popen_flags(*, detached: bool = False) -> dict:
         return hidden
     hidden["creationflags"] = subprocess.CREATE_NO_WINDOW
     return hidden
+
+
+_INTERNAL_PROVIDER_ENV_NAMES = frozenset({
+    "SUMMON_ADAPTIVE_TIMEOUT",
+    "SUMMON_MAX_RUNTIME_MS",
+    "SUMMON_RESUME_CLAIM_FILE",
+    "SUMMON_FRESH_CONSENT_ONLY",
+    "SUMMON_CMD_LAUNCHER",
+    "SUMMON_FLEET_APPROVAL_KEY",
+    "SUMMON_FLEET_APPROVAL_STORE",
+})
+
+
+def scrub_provider_env(values: dict[str, str]) -> dict[str, str]:
+    """Remove dispatcher control capabilities from a provider child.
+
+    A detached background dispatcher needs these values itself, but the vendor
+    CLI it launches must not inherit the outer job's authenticated control,
+    heartbeat, provenance, or continuation channel. Ordinary provider settings
+    remain byte-for-byte unchanged.
+    """
+    return {
+        key: value for key, value in values.items()
+        if key not in _INTERNAL_PROVIDER_ENV_NAMES
+        and not key.startswith("SUMMON_JOB_")
+    }
 
 
 def run_flags() -> dict:

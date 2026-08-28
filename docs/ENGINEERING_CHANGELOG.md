@@ -15,6 +15,18 @@ never on added fields.
 
 ## 3.3.0 - 2026-08-28
 
+- **Final dispatch-boundary and deliberation evidence closure:** every provider launch now
+  receives one explicit environment snapshot filtered by the shared internal-capability
+  denylist; the former foreground shortcut cannot bypass newly added capability names.
+  Windows ArkCLI and OpenCode launch planning refuses unsafe batch shims before contact and
+  preserves the zero-attempt contract, while the ArkCLI roster refresh resolves the safe
+  Node entry point before its first child process. The POSIX AGY proxy joins its supervised
+  parent group, with a behavioral regression proving timeout teardown reaches a real
+  descendant. Deliberation replay binds model identity to a finished attempt and generation,
+  aggregates every finished attempt conservatively, hashes raw model identifiers in public
+  output, and derives immediate, replay, and server-sent event receipts from the authenticated
+  checkpoint. CI and the fixed release registry include the affected executor, backend,
+  ownership, credential, and stream regressions.
 - **M8 integrated operator and compatibility closure:** added one end-to-end,
   provider-inert operator test covering sealed fleet proposal/validation/explanation,
   authenticated approval and dry-run activation, usage import/status/export/refresh

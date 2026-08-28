@@ -477,7 +477,11 @@ class DeliberationCliTests(unittest.TestCase):
                 "option_id": "yes", "confidence": "high", "evidence_refs": [],
             }
             return {"status": "success", "exit_code": 0,
-                    "result": json.dumps({"ballot": ballot})}
+                    "result": json.dumps({"ballot": ballot}),
+                    "model": {"requested": "claude-opus-5",
+                              "targeted": "claude-opus-5",
+                              "served": "claude-opus-5"},
+                    "served_model_evidence": "reported"}
 
         with tempfile.TemporaryDirectory() as temp:
             previous_path = _install_fake_claude_on_path(Path(temp))
@@ -487,7 +491,8 @@ class DeliberationCliTests(unittest.TestCase):
             agents.mkdir(parents=True)
             for name in ("one", "two"):
                 (agents / f"{name}.md").write_text(
-                    "---\nrun-agent: claude\npermission: read-only\n---\n",
+                    "---\nrun-agent: claude\nmodel: claude-opus-5\n"
+                    "permission: read-only\n---\n",
                     encoding="utf-8")
             run_root = Path(temp) / "runs"
             parser = _cli.build_parser("test", 1)
@@ -507,6 +512,9 @@ class DeliberationCliTests(unittest.TestCase):
             self.assertEqual(body["state"], "DECIDED")
             self.assertEqual(body["decision_option"], "yes")
             self.assertEqual(body["turns_started"], 2)
+            self.assertTrue(body["receipt"]["model_display_by_seat"]["one"][
+                "served_exact"])
+            self.assertNotIn("claude-opus-5", output.getvalue())
             status = store.inspect_run(str(run_root / "deliberations"), body["run_id"])
             self.assertEqual(status["projection"]["state"], "decided")
             self.assertEqual(status["projection"]["physical_attempts"]["started"], 2)

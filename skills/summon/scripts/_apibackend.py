@@ -115,24 +115,22 @@ def refresh_coding_plan_roster(plan: str = "coding-plan",
     import subprocess
     import time
     from _spawn import run_flags
-    cmd = ["arkcli", "plans", "model-list", "--plan", plan, "--format", "json"]
-    # On Windows, prefer arkcli.cmd when PATH resolution is via npm shim.
+    from _arkcli_backend import _arkcli_cmd
+    try:
+        cmd = [*_arkcli_cmd(), "plans", "model-list", "--plan", plan,
+               "--format", "json"]
+    except RuntimeError as first_error:
+        raise RuntimeError(
+            "arkcli package entry point is unavailable; reinstall "
+            "@byteplus/ark-cli to refresh the Coding Plan roster") from first_error
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=timeout_s, shell=False, **run_flags())
-    except FileNotFoundError:
-        # npm global shim
-        cmd0 = cmd[:]
-        cmd0[0] = "arkcli.cmd" if os.name == "nt" else "arkcli"
-        try:
-            proc = subprocess.run(
-                cmd0, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=timeout_s, shell=True, **run_flags())
-        except FileNotFoundError as e:
-            raise RuntimeError(
-                "arkcli not found on PATH; install @byteplus/ark-cli to refresh "
-                "the Coding Plan roster") from e
+    except FileNotFoundError as first_error:
+        raise RuntimeError(
+            "arkcli not found on PATH; install @byteplus/ark-cli to refresh "
+            "the Coding Plan roster") from first_error
     if proc.returncode != 0:
         raise RuntimeError(
             f"arkcli plans model-list failed (exit {proc.returncode}): "

@@ -251,6 +251,10 @@ def test_acp_child_env_comes_from_builder_minus_superseded_channels():
     profile -- minus the env channel ACP supersedes (GEMINI_SYSTEM_MD, which is
     prepended to the prompt on this transport instead)."""
     import _builder
+    old_job = os.environ.get("SUMMON_JOB_ID")
+    old_fleet = os.environ.get("SUMMON_FLEET_APPROVAL_STORE")
+    os.environ["SUMMON_JOB_ID"] = "outer-job"
+    os.environ["SUMMON_FLEET_APPROVAL_STORE"] = "private-store-path"
     orig_build = _builder.build_invocation_args
     orig_popen = _acpbackend.subprocess.Popen
     captured = {}
@@ -269,9 +273,33 @@ def test_acp_child_env_comes_from_builder_minus_superseded_channels():
         _builder.build_invocation_args = orig_build
         _acpbackend.subprocess.Popen = orig_popen
         _restore(patched)
+        if old_job is None:
+            os.environ.pop("SUMMON_JOB_ID", None)
+        else:
+            os.environ["SUMMON_JOB_ID"] = old_job
+        if old_fleet is None:
+            os.environ.pop("SUMMON_FLEET_APPROVAL_STORE", None)
+        else:
+            os.environ["SUMMON_FLEET_APPROVAL_STORE"] = old_fleet
     assert resp["status"] == "success", resp.get("error")
     assert captured["env"]["KIMI_CODE_HOME"] == "/iso"
     assert "GEMINI_SYSTEM_MD" not in captured["env"]
+    assert "SUMMON_JOB_ID" not in captured["env"]
+    assert "SUMMON_FLEET_APPROVAL_STORE" not in captured["env"]
+
+
+def test_acp_unsafe_launcher_refusal_is_explicitly_not_run(monkeypatch):
+    monkeypatch.setattr(_acpbackend, "_probe_acp", lambda _cli: None)
+    monkeypatch.setattr(
+        _executor, "_resolve_launch",
+        lambda _command, _args: (_ for _ in ()).throw(
+            ValueError("unsafe command shim")))
+    response = _acpbackend.call(_inv(), 1000)
+    assert response["error_kind"] == "unsafe_windows_launcher"
+    assert response["attempts"] == 0
+    assert response["attempt_status"] == "not_run"
+    assert response["execution_status"] == "not_run"
+    assert response["provider_contacted"] is False
 
 
 def test_acp_refuses_sub_yolo_tiers():

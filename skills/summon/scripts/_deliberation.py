@@ -246,6 +246,15 @@ class ExecutionEvidence:
     model_served: str | None = None
     model_targeted: str | None = None
     error_kind: str | None = None
+    served_model_evidence: str = "absent"
+
+    def __post_init__(self) -> None:
+        if self.served_model_evidence not in {"reported", "inferred", "absent"}:
+            raise ValueError("served model evidence class is invalid")
+        if (self.served_model_evidence in {"reported", "inferred"}
+                and self.model_served is None):
+            raise ValueError(
+                "reported or inferred model evidence requires a served identity")
 
 
 @dataclass(frozen=True)
@@ -618,7 +627,8 @@ class AttemptLedger:
                 "parser_valid": evidence.parser_valid,
                 "ballot_valid": ballot_valid,
             })
-            if evidence.model_served is not None:
+            if (evidence.model_served is not None
+                    or evidence.model_targeted is not None):
                 self._append({
                     "event": "attempt_model_identity",
                     "schema_version": SCHEMA_VERSION,
@@ -626,6 +636,7 @@ class AttemptLedger:
                     "attempt_id": attempt_id,
                     "model_served": evidence.model_served,
                     "model_targeted": evidence.model_targeted,
+                    "served_model_evidence": evidence.served_model_evidence,
                 })
             entry.phase = "finished"
 

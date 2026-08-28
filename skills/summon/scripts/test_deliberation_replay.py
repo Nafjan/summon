@@ -181,11 +181,18 @@ class ReplayTests(unittest.TestCase):
         attempts = turn_events()
         attempts.insert(-1, (1, event(
             "attempt_model_identity", 1, attempt_id="g1-a0",
-            model_served="claude-opus-4-7", model_targeted="claude-opus-4-7")))
+            model_served="claude-opus-4-7", model_targeted="claude-opus-4-7",
+            served_model_evidence="reported")))
         records.extend(attempts)
         checkpoint = self.run_replay(records, value=value)
-        self.assertTrue(any(item.get("event") == "attempt_model_identity"
-                            for item in checkpoint.transcript_events))
+        public_identity = next(
+            item for item in checkpoint.transcript_events
+            if item.get("event") == "attempt_model_identity")
+        self.assertNotIn("model_served", public_identity)
+        self.assertNotIn("model_targeted", public_identity)
+        self.assertEqual(
+            public_identity["model_served_sha256"],
+            hashlib.sha256(b"claude-opus-4-7").hexdigest())
 
         bad = list(records)
         bad[-2] = (1, event(
@@ -193,6 +200,46 @@ class ReplayTests(unittest.TestCase):
             model_served=r"C:\\private\\secret", model_targeted=None))
         with self.assertRaises(replay.ReplayError):
             self.run_replay(bad, value=value)
+
+        bad_evidence = list(records)
+        bad_evidence[-2] = (1, event(
+            "attempt_model_identity", 1, attempt_id="g1-a0",
+            model_served="claude-opus-4-7", model_targeted="claude-opus-4-7",
+            served_model_evidence="caller_claimed"))
+        with self.assertRaises(replay.ReplayError):
+            self.run_replay(bad_evidence, value=value)
+
+    def test_attempt_model_identity_requires_finished_order_generation_and_uniqueness(self):
+        value, records = prepared()
+        records.append((1, event("state_transition", 1, **{
+            "from": "PREPARED", "to": "RUNNING", "reason": "started"})))
+        base = turn_events()
+        identity = (1, event(
+            "attempt_model_identity", 1, attempt_id="g1-a0",
+            model_served="claude-opus-4-7", model_targeted="claude-opus-4-7",
+            served_model_evidence="reported"))
+
+        before_finish = records + base[:2] + [identity] + base[2:]
+        with self.assertRaisesRegex(
+                replay.ReplayError, "matching finished attempt"):
+            self.run_replay(before_finish, value=value)
+
+        after_ballot = records + base + [identity]
+        with self.assertRaisesRegex(replay.ReplayError, "after its ballot"):
+            self.run_replay(after_ballot, value=value)
+
+        duplicate = records + base[:3] + [identity, identity] + base[3:]
+        with self.assertRaisesRegex(replay.ReplayError, "duplicate model identity"):
+            self.run_replay(duplicate, value=value)
+
+        wrong_generation = records + base[:3] + [(2, event(
+            "attempt_model_identity", 2, attempt_id="g1-a0",
+            model_served="claude-opus-4-7",
+            model_targeted="claude-opus-4-7",
+            served_model_evidence="reported"))]
+        with self.assertRaisesRegex(
+                replay.ReplayError, "matching finished attempt"):
+            self.run_replay(wrong_generation, value=value, owner_generation=3)
 
     def test_journal_repair_is_first_record_of_its_segment(self):
         value, records = prepared()

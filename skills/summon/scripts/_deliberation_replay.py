@@ -336,7 +336,7 @@ _TRANSCRIPT_FIELDS = {
                           "launch_spec_sha256", "transport_ok", "exit_code",
                           "timed_out", "parser_valid", "ballot_valid"),
     "attempt_model_identity": ("event", "schema_version", "generation",
-                                "attempt_id", "model_served", "model_targeted"),
+                                "attempt_id", "served_model_evidence"),
     "ballot_accepted": ("event", "schema_version", "generation", "attempt_id",
                          "seat_id", "turn_id", "turn_ordinal", "decision",
                          "option_id"),
@@ -360,7 +360,17 @@ def _public_event(record: Mapping[str, object]) -> dict:
     fields = _TRANSCRIPT_FIELDS.get(event)
     if fields is None:
         raise ReplayError("cannot export unknown replay event")
-    return {key: record[key] for key in fields if key in record}
+    projected = {key: record[key] for key in fields if key in record}
+    if event == "attempt_model_identity":
+        # Custom/private model aliases can reveal account or project metadata.
+        # The observer only needs equality evidence, so export content hashes
+        # rather than raw provider model strings.
+        for key in ("model_served", "model_targeted"):
+            value = record.get(key)
+            if isinstance(value, str):
+                projected[key + "_sha256"] = hashlib.sha256(
+                    value.encode("utf-8")).hexdigest()
+    return projected
 
 
 def command_batch_sha256(commands: Iterable[ReplayCommand]) -> str:
@@ -507,6 +517,8 @@ def replay_checkpoint(receipt: Mapping[str, object],
     finished: set[str] = set()
     accepted: list[ReplayBallot] = []
     ballot_keys: set[str] = set()
+    balloted_attempts: set[str] = set()
+    identity_attempts: set[str] = set()
     latest_ballot_ordinal: dict[str, int] = {}
     latest_ballot: dict[str, ReplayBallot] = {}
     expected_turn_ordinal = 0
@@ -750,13 +762,26 @@ def replay_checkpoint(receipt: Mapping[str, object],
             continue
         if event == "attempt_model_identity":
             attempt_id = _id(record.get("attempt_id"), "model identity attempt id")
-            if attempt_id not in attempts:
-                raise ReplayError("model identity lacks a matching attempt")
+            prior = attempts.get(attempt_id)
+            if (prior is None or prior.phase != "finished"
+                    or prior.generation != generation):
+                raise ReplayError(
+                    "model identity lacks a matching finished attempt")
+            if attempt_id in identity_attempts:
+                raise ReplayError("attempt has duplicate model identity evidence")
+            if attempt_id in balloted_attempts:
+                raise ReplayError("model identity appeared after its ballot")
             for key in ("model_served", "model_targeted"):
                 value = record.get(key)
                 if value is not None and (not isinstance(value, str)
                                           or _MODEL_RE.fullmatch(value) is None):
                     raise ReplayError("attempt model identity is malformed")
+            evidence = record.get("served_model_evidence", "absent")
+            if evidence not in {"reported", "inferred", "absent"}:
+                raise ReplayError("attempt model evidence class is malformed")
+            if evidence in {"reported", "inferred"} and record.get("model_served") is None:
+                raise ReplayError("attempt model evidence lacks a served identity")
+            identity_attempts.add(attempt_id)
             transcript.append(_public_event(record))
             continue
         if event == "ballot_accepted":
@@ -789,6 +814,7 @@ def replay_checkpoint(receipt: Mapping[str, object],
                 raise ReplayError("duplicate or regressed ballot")
             latest_ballot_ordinal[prior.seat_id] = prior.turn_ordinal
             ballot_keys.add(key)
+            balloted_attempts.add(attempt_id)
             ballot = ReplayBallot(decision_id, prior.seat_id, prior.turn_id,
                                   attempt_id, prior.turn_ordinal, decision, option)
             accepted.append(ballot)

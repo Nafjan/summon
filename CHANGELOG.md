@@ -7,6 +7,18 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [3.3.0] - 2026-08-28
 
+- **Release-candidate boundary hardening:** provider subprocesses now receive an explicit,
+  scrubbed environment snapshot on every dispatch path, including ordinary foreground
+  turns. Summon refuses unsafe Windows batch-shim fallbacks before provider contact, uses
+  the safe ArkCLI Node entry point when available, and reports zero attempts for these
+  structural refusals. On POSIX, the AGY proxy stays in the supervised process group so a
+  timeout can terminate its descendants as well as the proxy.
+- **Deliberation evidence consistency:** live, server-sent event, and replay views now
+  derive receipts from the authenticated checkpoint. Replay accepts model identity only
+  after the matching finished attempt in the same generation, and a seat is exact-model
+  verified only when, for every finished attempt, the requested and targeted identities
+  match the provider-reported served identity. Public replay data hashes raw model
+  identifiers.
 - **Integrated Phase 1 operator and migration contract:** the shipped operator guide now
   joins fleet explanation and approval, advisory usage evidence, safe/off context
   compilation, adaptive job supervision, and portable-result consumption into one

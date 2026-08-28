@@ -277,6 +277,38 @@ class OpenCodeBuilderTests(unittest.TestCase):
         self.assertEqual(command, npm_cli)
         self.assertEqual(args[:2], ["run", "--format"])
 
+    def test_windows_launch_refuses_unresolved_command_shim(self):
+        npm_shim = r"C:\npm\opencode.cmd"
+        with mock.patch.object(_executor.os, "name", "nt"), \
+             mock.patch.object(_executor.shutil, "which",
+                               side_effect=lambda name: npm_shim
+                               if name.lower() in {"opencode", "opencode.cmd"}
+                               else None), \
+             mock.patch.object(_executor.os.path, "isfile", return_value=False):
+            with self.assertRaisesRegex(ValueError, "native executable"):
+                _executor._resolve_launch(
+                    "opencode", ["run", "prompt & must remain data"])
+
+    def test_windows_launcher_refusal_is_zero_contact_envelope(self):
+        npm_shim = r"C:\npm\opencode.cmd"
+        invocation = AgentInvocation(
+            cli="opencode", prompt="provider-inert", cwd=tempfile.gettempdir(),
+            model="custom-model", permission="yolo")
+        with mock.patch.object(_executor, "build_invocation_args",
+                               return_value=("opencode", ["run"], None)), \
+             mock.patch.object(_executor.os, "name", "nt"), \
+             mock.patch.object(_executor.shutil, "which",
+                               side_effect=lambda name: npm_shim
+                               if name.lower() in {"opencode", "opencode.cmd"}
+                               else None), \
+             mock.patch.object(_executor.os.path, "isfile", return_value=False):
+            response = _executor.execute_agent(invocation, timeout_ms=1000)
+        self.assertEqual(response["error_kind"], "unsafe_windows_launcher")
+        self.assertEqual(response["attempts"], 0)
+        self.assertEqual(response["attempt_status"], "not_run")
+        self.assertEqual(response["execution_status"], "not_run")
+        self.assertFalse(response["provider_contacted"])
+
     def test_fusion_plugin_is_forwarded_through_child_config(self):
         inv = self._inv(
             model="openrouter/openrouter/fusion",

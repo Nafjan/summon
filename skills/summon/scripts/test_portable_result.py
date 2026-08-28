@@ -285,6 +285,11 @@ def test_strict_loader_rejects_duplicate_nonfinite_and_oversized_json(tmp_path):
         portable.load_projection_bytes(b'{"value":NaN}')
     with pytest.raises(portable.PortableResultError):
         portable.load_projection_bytes(encoded, max_bytes=8)
+    deeply_nested = ("[" * 1200 + "0" + "]" * 1200).encode("utf-8")
+    with pytest.raises(portable.PortableResultError):
+        portable.load_projection_bytes(deeply_nested)
+    with pytest.raises(portable.PortableResultError):
+        portable.load_private_envelope_bytes(deeply_nested)
 
 
 def test_private_loader_is_bounded_strict_and_keeps_exact_bytes_for_caller_hash():

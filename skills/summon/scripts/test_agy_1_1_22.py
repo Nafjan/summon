@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -14,6 +15,7 @@ import pytest
 import _builder
 import _executor
 import _resolver
+import _spawn
 import agy_stream_proxy
 from _liveness import LivenessTracker
 from _stream import StreamProcessor
@@ -781,6 +783,71 @@ def test_proxy_strips_go_style_single_dash_timeout_spellings():
         "-print-timeout", "1s", "-print-timeout=2s",
         "--print", "quote -print-timeout=3s",
     ]) == ["--print", "quote -print-timeout=3s"]
+
+
+def test_proxy_child_joins_outer_posix_process_group(monkeypatch):
+    monkeypatch.setattr(_spawn.os, "name", "posix")
+    assert _spawn.popen_flags() == {"start_new_session": True}
+    assert _spawn.popen_flags(join_parent_group=True) == {}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group regression")
+def test_proxy_timeout_kills_real_descendant_process_group(tmp_path):
+    pid_file = tmp_path / "pids.json"
+    fake_agy = tmp_path / "agy"
+    fake_agy.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(30)'])\n"
+        "with open(os.environ['FAKE_AGY_PIDS'], 'w', encoding='utf-8') as fh:\n"
+        "    json.dump({'agy': os.getpid(), 'child': child.pid}, fh)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    fake_agy.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = str(tmp_path) + os.pathsep + env.get("PATH", "")
+    env["FAKE_AGY_PIDS"] = str(pid_file)
+    proxy = subprocess.Popen(
+        [sys.executable, str(Path(agy_stream_proxy.__file__)), "--print", "x"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+        **_spawn.popen_flags(),
+    )
+    try:
+        for _ in range(100):
+            if pid_file.is_file():
+                break
+            import time
+            time.sleep(0.05)
+        assert pid_file.is_file(), "fake AGY did not start"
+        pids = json.loads(pid_file.read_text(encoding="utf-8"))
+        assert os.getpgid(pids["agy"]) == proxy.pid
+        assert os.getpgid(pids["child"]) == proxy.pid
+        _executor._kill_tree(proxy)
+        proxy.wait(timeout=5)
+
+        def alive_non_zombie(pid):
+            try:
+                os.kill(pid, 0)
+                stat = Path(f"/proc/{pid}/stat")
+                return not stat.is_file() or stat.read_text().split()[2] != "Z"
+            except (OSError, IndexError):
+                return False
+
+        for _ in range(100):
+            if not any(alive_non_zombie(pid) for pid in pids.values()):
+                break
+            import time
+            time.sleep(0.05)
+        assert not any(alive_non_zombie(pid) for pid in pids.values())
+    finally:
+        if proxy.poll() is None:
+            try:
+                os.killpg(proxy.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proxy.wait(timeout=5)
 
 
 def test_builder_strips_every_proxy_boundary_flag_from_agent_args():

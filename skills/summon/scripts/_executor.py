@@ -3424,7 +3424,10 @@ def _resolve_launch(command, args):
                 _js = None
             if _js:
                 return (shutil.which("node") or "node"), [_js, *args]
-            return "cmd.exe", ["/c", _ark, *args]
+            raise ValueError(
+                "arkcli is available only through a Windows command shim whose "
+                "package entry point could not be resolved; reinstall arkcli so "
+                "Summon can pass prompt argv without cmd.exe reparsing")
         return _ark, args
     # OpenCode's npm install exposes an .cmd/.ps1 shim that launches the
     # bundled native binary.  CreateProcess cannot execute the shim directly;
@@ -3448,7 +3451,10 @@ def _resolve_launch(command, args):
         if str(_oc).lower().endswith(".exe") and os.path.isfile(_oc):
             return _oc, args
         if str(_oc).lower().endswith((".cmd", ".bat")):
-            return "cmd.exe", ["/c", _oc, *args]
+            raise ValueError(
+                "opencode is available only through a Windows command shim whose "
+                "native executable could not be resolved; reinstall OpenCode so "
+                "Summon can pass prompt argv without cmd.exe reparsing")
         return _oc, args
     resolved = shutil.which(command) or command
     if os.name != "nt" or not resolved.lower().endswith((".cmd", ".bat")):
@@ -4018,7 +4024,16 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         _detail = (f"provider preparation refused ({type(_build_err).__name__})"
                    if launch_control is not None else str(_build_err))
         return _stamp(_enrich(_error_response(inv.cli, 1, _detail, not_run=True), None))
-    command, args = _resolve_launch(command, args)
+    try:
+        command, args = _resolve_launch(command, args)
+    except ValueError as _launch_err:
+        _resp = _error_response(inv.cli, 1, str(_launch_err), not_run=True)
+        _resp.update({
+            "error_kind": "unsafe_windows_launcher",
+            "retryable": False,
+            "result_usable": False,
+        })
+        return _stamp(_enrich(_resp, None))
     # AFTER _resolve_launch: on Windows a .cmd shim is rewritten to `node <path>/cli.js`,
     # which changes the length that actually gets measured by CreateProcess.
     # agy litters the dispatch cwd with a language-server log; note whether one is already
@@ -4032,8 +4047,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # Passing env=None would let a concurrent os.environ mutation change the
         # child after the durable claim. Values remain private; only their
         # aggregate digest enters the launch evidence.
-        proc_env = {**os.environ}
-        proc_env.pop("SUMMON_CMD_LAUNCHER", None)
+        from _spawn import scrub_provider_env
+        proc_env = scrub_provider_env(dict(os.environ))
     # AFTER _merge_env: the POSIX total counts the environment, and the environment that
     # matters is the one Popen receives -- overrides included, stripped keys excluded.
     _argv_err = argv_length_error(inv.cli, command, args, proc_env)
@@ -4316,19 +4331,18 @@ def _merge_env(env_override: dict | None) -> dict | None:
     """Merge env_override onto os.environ. A value of None means REMOVE that key
     from the child env (used to strip OPENAI_API_KEY so codex bills the ChatGPT
     subscription, never the metered API)."""
+    from _spawn import scrub_provider_env
     if not env_override:
-        # The Windows launcher marker is a parent-side transport guard, not a
-        # provider setting. Do not leak it into the child or a nested CLI.
-        if os.environ.get("SUMMON_CMD_LAUNCHER") == "1":
-            inherited = {**os.environ}
-            inherited.pop("SUMMON_CMD_LAUNCHER", None)
-            return inherited
-        return None
+        # Always cross the provider boundary with an explicit scrubbed snapshot.
+        # A trigger predicate duplicated the scrub list and repeatedly drifted as
+        # new dispatcher capabilities were added, allowing the omitted variables
+        # through the plain foreground path.  The scrub list is the sole source
+        # of truth; materializing os.environ is negligible beside a provider turn.
+        return scrub_provider_env(dict(os.environ))
     merged = {**os.environ}
-    merged.pop("SUMMON_CMD_LAUNCHER", None)
     for key, value in env_override.items():
         if value is None:
             merged.pop(key, None)
         else:
             merged[key] = value
-    return merged
+    return scrub_provider_env(merged)

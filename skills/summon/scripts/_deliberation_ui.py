@@ -226,11 +226,13 @@ h1 {{ margin:7px 0 0; max-width:100%; font-size:1.45rem; font-weight:650; letter
       label: typeof item.label === 'string' ? item.label : 'unclassified',
       lane: typeof item.lane === 'string' ? item.lane : 'unassigned',
       availability: typeof item.availability === 'string' ? item.availability : 'unverified',
+      servedEvidence: typeof item.served_model_evidence === 'string' ? item.served_model_evidence : 'absent',
       servedExact: item.served_exact === true }};
   }}
   function modelTooltip(identity) {{
     return ['Role: '+identity.role, 'Model: '+identity.name, 'Version: '+identity.version,
       'Lane: '+identity.lane, 'Label: '+identity.label, 'Availability: '+identity.availability,
+      'Served evidence: '+identity.servedEvidence,
       'Served exact: '+(identity.servedExact ? 'yes' : 'not verified')].join('\\n');
   }}
   function ownerAvailable(owner) {{

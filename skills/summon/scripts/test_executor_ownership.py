@@ -14,7 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import _executor
 from _liveness import LivenessTracker
-from _spawn import popen_flags
+from _deliberation_adapter import ProviderLaunchControl
+from _spawn import popen_flags, scrub_provider_env
 from _stream import StreamProcessor
 
 
@@ -134,3 +135,103 @@ def test_terminate_error_after_parsed_terminal_preserves_result_and_reaps_child(
     assert response["result"] == "STATUS: DONE"
     assert response["cleanup"]["stage"] == "driver_io_exception_after_terminal"
     assert process.poll() is not None
+
+
+def test_provider_env_scrubs_outer_job_control_capabilities(monkeypatch):
+    monkeypatch.setenv("SUMMON_ADAPTIVE_TIMEOUT", "1")
+    monkeypatch.setenv("SUMMON_MAX_RUNTIME_MS", "999999")
+    monkeypatch.setenv("SUMMON_JOB_ID", "a" * 32)
+    monkeypatch.setenv("SUMMON_JOB_NONCE", "b" * 32)
+    monkeypatch.setenv("SUMMON_JOB_CONTROL_FILE", "outer-control.json")
+    monkeypatch.setenv("SUMMON_JOB_HEARTBEAT_FILE", "outer-heartbeat.json")
+    monkeypatch.setenv("SUMMON_RESUME_CLAIM_FILE", "outer-claim.json")
+    monkeypatch.setenv("SUMMON_FRESH_CONSENT_ONLY", "1")
+    monkeypatch.setenv("SUMMON_FLEET_APPROVAL_KEY", "approval-key-path")
+    monkeypatch.setenv("SUMMON_FLEET_APPROVAL_STORE", "approval-store-path")
+    monkeypatch.setenv("SUMMON_KEEP_ME", "ordinary-setting")
+
+    merged = _executor._merge_env({
+        "SUMMON_JOB_ID": "attempted-reintroduction",
+        "PROVIDER_SETTING": "kept",
+    })
+
+    assert merged is not None
+    assert merged["SUMMON_KEEP_ME"] == "ordinary-setting"
+    assert merged["PROVIDER_SETTING"] == "kept"
+    assert not any(key.startswith("SUMMON_JOB_") for key in merged)
+    for key in (
+        "SUMMON_ADAPTIVE_TIMEOUT", "SUMMON_MAX_RUNTIME_MS",
+        "SUMMON_RESUME_CLAIM_FILE", "SUMMON_FRESH_CONSENT_ONLY",
+        "SUMMON_FLEET_APPROVAL_KEY", "SUMMON_FLEET_APPROVAL_STORE",
+    ):
+        assert key not in merged
+
+
+def test_plain_foreground_provider_env_is_always_scrubbed(monkeypatch):
+    monkeypatch.delenv("SUMMON_ADAPTIVE_TIMEOUT", raising=False)
+    monkeypatch.delenv("SUMMON_CMD_LAUNCHER", raising=False)
+    for key in tuple(os.environ):
+        if key.startswith("SUMMON_JOB_"):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("SUMMON_FLEET_APPROVAL_KEY", "private-key-path")
+    monkeypatch.setenv("SUMMON_FLEET_APPROVAL_STORE", "private-store-path")
+    monkeypatch.setenv("SUMMON_KEEP_ME", "ordinary-setting")
+
+    merged = _executor._merge_env(None)
+
+    assert merged is not None
+    assert merged["SUMMON_KEEP_ME"] == "ordinary-setting"
+    assert "SUMMON_FLEET_APPROVAL_KEY" not in merged
+    assert "SUMMON_FLEET_APPROVAL_STORE" not in merged
+
+
+def test_controlled_subprocess_snapshot_scrubs_internal_capabilities(monkeypatch):
+    import _receipt
+
+    monkeypatch.setenv("SUMMON_ADAPTIVE_TIMEOUT", "0")
+    monkeypatch.setenv("SUMMON_FLEET_APPROVAL_KEY", "private-key-path")
+    captured = {}
+
+    def refused_popen(*_args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        raise OSError("provider-inert fixture")
+
+    control = ProviderLaunchControl(before_launch=lambda _evidence: None)
+    invocation = _executor.AgentInvocation(
+        cli="claude", prompt="provider-inert", cwd=os.getcwd(),
+        permission="yolo")
+    monkeypatch.setattr(
+        _executor, "build_invocation_args",
+        lambda _inv, _timeout, **_kwargs: ("fake-provider", [], None))
+    monkeypatch.setattr(
+        _executor, "_resolve_launch", lambda command, args: (command, args))
+    monkeypatch.setattr(_executor, "argv_length_error", lambda *_args: None)
+    monkeypatch.setattr(_executor.subprocess, "Popen", refused_popen)
+    monkeypatch.setattr(
+        _receipt, "workspace_snapshot", lambda _cwd: {"coverage": "none"})
+    monkeypatch.setattr(
+        _receipt, "workspace_evidence", lambda *_args, **_kwargs: {})
+
+    result = _executor.execute_agent(
+        invocation, timeout_ms=1000, launch_control=control)
+
+    assert result["provider_contacted"] is False
+    assert captured["env"] is not None
+    assert "SUMMON_ADAPTIVE_TIMEOUT" not in captured["env"]
+    assert "SUMMON_FLEET_APPROVAL_KEY" not in captured["env"]
+
+
+def test_scrub_provider_env_leaves_unrelated_summon_preferences_unchanged():
+    original = {
+        "SUMMON_JOB_ID": "private-control",
+        "SUMMON_TELEMETRY": "1",
+        "SUMMON_DEFAULT_EFFORT": "high",
+        "PATH": "fixture-path",
+    }
+    scrubbed = scrub_provider_env(original)
+    assert scrubbed == {
+        "SUMMON_TELEMETRY": "1",
+        "SUMMON_DEFAULT_EFFORT": "high",
+        "PATH": "fixture-path",
+    }
+    assert original["SUMMON_JOB_ID"] == "private-control"

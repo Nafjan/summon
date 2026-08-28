@@ -394,6 +394,10 @@ class FreshDispatchAdapter:
             model_served = None
         if not isinstance(model_targeted, str) or safe_model.fullmatch(model_targeted) is None:
             model_targeted = None
+        served_model_evidence = response.get("served_model_evidence")
+        if (served_model_evidence not in {"reported", "inferred", "absent"}
+                or model_served is None):
+            served_model_evidence = "absent"
         evidence = ExecutionEvidence(
             transport_ok=transport_ok,
             exit_code=exit_code,
@@ -406,6 +410,7 @@ class FreshDispatchAdapter:
                             "context_source_drift", "provider_cancelled",
                             "provider_incomplete",
                         } else None),
+            served_model_evidence=served_model_evidence,
         )
         return AdapterResult(evidence=evidence, structured_output=structured,
                              model_prose=prose)

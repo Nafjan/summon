@@ -424,7 +424,7 @@ def load_projection_bytes(data: bytes, *, max_bytes: int = _JSON_MAX_BYTES) -> d
             parse_constant=lambda _constant: (_ for _ in ()).throw(
                 PortableResultError("non-finite JSON constant")),
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise PortableResultError("invalid projection JSON") from exc
     validate_projection(value)
     return value
@@ -448,7 +448,7 @@ def load_private_envelope_bytes(
             parse_constant=lambda _constant: (_ for _ in ()).throw(
                 PortableResultError("non-finite JSON constant")),
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise PortableResultError("invalid private envelope JSON") from exc
     if not isinstance(value, dict):
         raise PortableResultError("private envelope must be an object")

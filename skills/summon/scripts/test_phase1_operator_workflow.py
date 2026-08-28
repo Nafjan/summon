@@ -21,6 +21,14 @@ import _jobs
 HERE = Path(__file__).resolve().parent
 RUNNER = HERE / "run_subagent.py"
 PHASE1_EXAMPLES = HERE.parent / "examples" / "phase1"
+PHASE1_GUIDE = HERE.parents[2] / "docs" / "PHASE1_OPERATOR_GUIDE.md"
+
+
+def test_operator_guide_never_presents_relative_execution_roots():
+    guide = PHASE1_GUIDE.read_text(encoding="utf-8")
+    assert "--cwd ." not in guide
+    assert "--repo-root ." not in guide
+    assert guide.count("<ABSOLUTE_PROJECT_DIR>") >= 10
 
 
 def _windows_system_directory() -> Path:

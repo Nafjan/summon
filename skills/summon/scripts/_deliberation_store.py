@@ -69,7 +69,64 @@ def _receipt(path: str, run_id: str) -> dict:
     return value
 
 
-def _public_receipt(value: Mapping[str, object]) -> dict:
+def _runtime_model_evidence(checkpoint: object | None) -> dict[str, dict[str, object]]:
+    """Derive per-seat model proof only from the validated durable replay."""
+    if checkpoint is None:
+        return {}
+    attempts: dict[str, tuple[str, str]] = {}
+    collected: dict[str, dict[str, object]] = {}
+    for attempt in tuple(getattr(checkpoint, "attempts", ()) or ()):
+        attempt_id = getattr(attempt, "attempt_id", None)
+        seat = getattr(attempt, "seat_id", None)
+        phase = getattr(attempt, "phase", None)
+        if not isinstance(attempt_id, str) or not isinstance(seat, str):
+            continue
+        attempts[attempt_id] = (seat, phase)
+        entry = collected.setdefault(seat, {
+            "finished_ids": set(), "identity_ids": set(),
+            "reported_pairs": [], "inferred": False,
+            "absent": False, "unfinished": False,
+        })
+        if phase == "finished":
+            entry["finished_ids"].add(attempt_id)
+        else:
+            entry["unfinished"] = True
+    for record in tuple(getattr(checkpoint, "transcript_events", ()) or ()):
+        if not isinstance(record, Mapping) or record.get("event") != "attempt_model_identity":
+            continue
+        attempt_id = record.get("attempt_id")
+        attempt = attempts.get(attempt_id)
+        if attempt is None or attempt[1] != "finished":
+            continue
+        seat = attempt[0]
+        evidence = record.get("served_model_evidence", "absent")
+        served_hash = record.get("model_served_sha256")
+        targeted_hash = record.get("model_targeted_sha256")
+        # Compatibility for synthetic/in-process checkpoints created before
+        # replay began exporting hashes. These values never cross the UI.
+        if not isinstance(served_hash, str) and isinstance(record.get("model_served"), str):
+            served_hash = hashlib.sha256(
+                record["model_served"].encode("utf-8")).hexdigest()
+        if (not isinstance(targeted_hash, str)
+                and isinstance(record.get("model_targeted"), str)):
+            targeted_hash = hashlib.sha256(
+                record["model_targeted"].encode("utf-8")).hexdigest()
+        entry = collected[seat]
+        entry["identity_ids"].add(attempt_id)
+        if evidence == "reported" and isinstance(served_hash, str):
+            entry["reported_pairs"].append((targeted_hash, served_hash))
+        elif evidence == "inferred":
+            entry["inferred"] = True
+        else:
+            entry["absent"] = True
+    for entry in collected.values():
+        if entry["finished_ids"] - entry["identity_ids"]:
+            entry["absent"] = True
+    return collected
+
+
+def _public_receipt(value: Mapping[str, object],
+                    checkpoint: object | None = None) -> dict:
     """Project only bounded receipt facts needed by the local observer.
 
     The browser needs policy labels and agent transport labels to explain a
@@ -103,30 +160,46 @@ def _public_receipt(value: Mapping[str, object]) -> dict:
                 catalog_display[seat] = display_identity
         if safe_plans:
             projected["plan_identity_by_seat"] = safe_plans
-    # Model identity is derived only from the exact redacted plan hash and the
-    # checked-in catalog.  Never trust a receipt-provided display row: otherwise
-    # a forged receipt could make the browser claim that an arbitrary model was
-    # frontier or served.  Service evidence is a separate hash-only field;
-    # absence means "not verified", equality means exact, and a different hash
-    # means mismatch.  The raw requested/served model strings never cross this
-    # projection boundary.
-    served_by_seat = value.get("model_served_sha256_by_seat")
-    if not isinstance(served_by_seat, Mapping):
-        served_by_seat = {}
+    # Model identity is derived only from the exact redacted plan hash, the
+    # checked-in catalog, and replay-validated executor evidence. Never trust a
+    # receipt-provided display row or served hash: the immutable receipt exists
+    # before provider service. Raw model strings never cross this boundary.
+    runtime_evidence = _runtime_model_evidence(checkpoint)
     for seat, display_identity in list(catalog_display.items()):
         plan = plans.get(seat) if isinstance(plans, Mapping) else None
         requested_hash = plan.get("model_sha256") if isinstance(plan, Mapping) else None
-        served_hash = served_by_seat.get(seat)
+        evidence = runtime_evidence.get(seat, {})
+        reported_pairs = evidence.get("reported_pairs", [])
         display_identity = dict(display_identity)
-        if isinstance(served_hash, str) and _SHA256_RE.fullmatch(served_hash):
-            if served_hash == requested_hash:
-                display_identity["availability"] = "served_exact"
-                display_identity["served_exact"] = True
-            else:
-                display_identity["availability"] = "served_mismatch"
-                display_identity["served_exact"] = False
+        reported_mismatch = any(
+            served_hash != requested_hash
+            or (targeted_hash is not None and targeted_hash != requested_hash)
+            for targeted_hash, served_hash in reported_pairs
+        )
+        reported_unverified = any(
+            targeted_hash is None for targeted_hash, _served_hash in reported_pairs)
+        incomplete = bool(
+            evidence.get("unfinished") or evidence.get("absent")
+            or reported_unverified)
+        if reported_mismatch:
+            display_identity["served_model_evidence"] = "reported"
+            display_identity["availability"] = "served_mismatch"
+            display_identity["served_exact"] = False
+        elif incomplete:
+            display_identity["availability"] = "served_unverified"
+            display_identity["served_model_evidence"] = "absent"
+            display_identity["served_exact"] = False
+        elif evidence.get("inferred") is True:
+            display_identity["availability"] = "served_inferred"
+            display_identity["served_model_evidence"] = "inferred"
+            display_identity["served_exact"] = False
+        elif reported_pairs:
+            display_identity["served_model_evidence"] = "reported"
+            display_identity["availability"] = "served_exact"
+            display_identity["served_exact"] = True
         else:
             display_identity["availability"] = "catalog_listed"
+            display_identity["served_model_evidence"] = "absent"
             display_identity["served_exact"] = False
         catalog_display[seat] = display_identity
     if catalog_display:
@@ -365,7 +438,7 @@ def inspect_run(root: str, run_id: str) -> dict:
                 "pid": after.get("pid"), "generation": after.get("generation"),
                 "lease_expires": after.get("lease_expires"),
             },
-            "receipt": _public_receipt(receipt),
+            "receipt": _public_receipt(receipt, checkpoint),
             "projection": _project_checkpoint(checkpoint, records),
             "journal_records": len(records),
             "journal_torn_tail": torn,
@@ -422,6 +495,7 @@ def replay_run(root: str, run_id: str) -> dict:
            ({"error_kind": "unstable_read"} if not consistent else {})),
         "projection": _project_checkpoint(checkpoint, records),
         "records": _public_transcript(checkpoint, records),
+        "receipt": _public_receipt(receipt, checkpoint),
         "checkpoint_digest": checkpoint.digest,
     }
 
@@ -960,7 +1034,12 @@ def _run_fresh_live(args, root: str, cwd: str) -> int:
         if watcher_error:
             raise DeliberationStoreError("live cancel channel failed closed")
         result = report.as_dict()
-        result.update({"run_id": run_id, "receipt": _public_receipt(receipt),
+        _tagged, torn, checkpoint, _policy = _authoritative_checkpoint(path, receipt)
+        if torn:
+            raise DeliberationStoreError(
+                "live deliberation journal has an incomplete terminal tail")
+        result.update({"run_id": run_id,
+                       "receipt": _public_receipt(receipt, checkpoint),
                        "cancel": ("applied" if consumed_command
                                   and result.get("state") == "CANCELLED" else "none")})
         if consumed_command and result.get("state") == "CANCELLED":

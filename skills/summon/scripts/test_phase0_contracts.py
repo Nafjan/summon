@@ -18,8 +18,101 @@ import _background
 import _executor
 import _jobs
 import _manifest
+import _spawn
 import _telemetry
 import run_subagent
+
+
+def test_posix_arkcli_roster_refresh_fails_cleanly_without_shell_fallback(
+        monkeypatch, tmp_path):
+    import _apibackend as api
+    import _arkcli_backend as ark
+
+    calls = []
+
+    def missing(argv, **kwargs):
+        calls.append((argv, kwargs))
+        raise FileNotFoundError("fixture missing")
+
+    monkeypatch.setattr(api.os, "name", "posix")
+    monkeypatch.setattr(ark.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(subprocess, "run", missing)
+    monkeypatch.setattr(api, "_roster_cache_path", lambda: str(tmp_path / "cache.json"))
+    with pytest.raises(RuntimeError, match="arkcli not found on PATH"):
+        api.refresh_coding_plan_roster()
+    assert len(calls) == 1
+    assert calls[0][0][:3] == ["arkcli", "plans", "model-list"]
+    assert calls[0][1].get("shell") is False
+
+
+def test_windows_arkcli_roster_refresh_uses_node_entry_without_shell(
+        monkeypatch, tmp_path):
+    import _apibackend as api
+    import _arkcli_backend as ark
+
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"plan": "coding-plan", "models": []}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(api.os, "name", "nt")
+    monkeypatch.setattr(_spawn, "run_flags", dict)
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(ark.shutil, "which", lambda name: {
+        "arkcli.cmd": r"C:\\npm\\arkcli.cmd",
+        "node": r"C:\\node\\node.exe",
+    }.get(name))
+    monkeypatch.setattr(ark, "_arkcli_node_entry",
+                        lambda _shim: r"C:\\npm\\node_modules\\arkcli\\run.js")
+    monkeypatch.setattr(api, "_roster_cache_path", lambda: str(tmp_path / "cache.json"))
+    api.refresh_coding_plan_roster()
+    assert len(calls) == 1
+    assert calls[0][0][:3] == [
+        r"C:\\node\\node.exe", r"C:\\npm\\node_modules\\arkcli\\run.js", "plans"]
+    assert calls[0][1]["shell"] is False
+
+
+def test_windows_arkcli_chat_refuses_unresolved_command_shim(monkeypatch):
+    import _arkcli_backend as ark
+
+    monkeypatch.setattr(ark.os, "name", "nt")
+    monkeypatch.setattr(ark.shutil, "which",
+                        lambda name: r"C:\\npm\\arkcli.cmd"
+                        if name in {"arkcli", "arkcli.cmd"} else None)
+    monkeypatch.setattr(ark, "_arkcli_node_entry", lambda _shim: None)
+    with pytest.raises(RuntimeError, match="package entry point"):
+        ark._arkcli_cmd()
+
+
+def test_windows_arkcli_chat_launcher_refusal_is_explicitly_not_run(monkeypatch):
+    import _arkcli_backend as ark
+
+    cwd = str(Path.cwd())
+    monkeypatch.setitem(_executor.BACKENDS, "arkcli", {
+        "call": ark.call, "kind": "api",
+    })
+    monkeypatch.setattr(ark.shutil, "which",
+                        lambda name: r"C:\\npm\\arkcli.cmd"
+                        if name in {"arkcli", "arkcli.cmd"} else None)
+    monkeypatch.setattr(ark.os, "name", "nt")
+    monkeypatch.setattr(ark, "_arkcli_node_entry", lambda _shim: None)
+    result = _executor.execute_agent(
+        _executor.AgentInvocation(
+            cli="arkcli", prompt="provider-inert", cwd=cwd,
+            model="concrete-model"),
+        timeout_ms=5000,
+    )
+    assert result["error_kind"] == "unsafe_windows_launcher"
+    assert result["attempts"] == 0
+    assert result["attempt_status"] == "not_run"
+    assert result["execution_status"] == "not_run"
+    assert result["provider_contacted"] is False
+    assert result["result_usable"] is False
 
 
 def test_direct_provider_attempt_gets_opaque_attempt_id(monkeypatch):

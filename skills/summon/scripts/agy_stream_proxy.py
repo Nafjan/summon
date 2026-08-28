@@ -158,7 +158,10 @@ def main() -> int:
             text=True,
             encoding="utf-8",
             errors="replace",
-            **popen_flags(),
+            # The executor already launches this proxy as a POSIX session/group
+            # leader. Keep AGY in that group so timeout/cancel killpg reaches
+            # both processes. Windows still receives the shared hidden flags.
+            **popen_flags(join_parent_group=True),
             env=env,
         )
     except Exception as e:  # noqa: BLE001

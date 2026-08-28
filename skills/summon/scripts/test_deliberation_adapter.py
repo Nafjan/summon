@@ -600,6 +600,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             generation=1,
             executor=lambda *args, **kwargs: {
                 "result": "{}", "exit_code": 0,
+                "served_model_evidence": "reported",
                 "model": {"targeted": "claude-opus-4-7",
                            "served": "claude-opus-4-7"},
             })
@@ -610,6 +611,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             spec, token_for_context(spec, context, "attempt-model"))
         self.assertEqual(result.evidence.model_targeted, "claude-opus-4-7")
         self.assertEqual(result.evidence.model_served, "claude-opus-4-7")
+        self.assertEqual(result.evidence.served_model_evidence, "reported")
 
         invalid = FreshDispatchAdapter(
             self.invocation(cli="claude", prompt="invalid model evidence"),
@@ -620,6 +622,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             generation=1,
             executor=lambda *args, **kwargs: {
                 "result": "{}", "exit_code": 0,
+                "served_model_evidence": "reported",
                 "model": {"served": r"C:\\private\\credential"},
             })
         invalid_context = turn_with_prompt("invalid model evidence",
@@ -630,6 +633,7 @@ class AdapterBoundaryTests(unittest.TestCase):
             invalid_spec,
             token_for_context(invalid_spec, invalid_context, "attempt-invalid-model"))
         self.assertIsNone(invalid_result.evidence.model_served)
+        self.assertEqual(invalid_result.evidence.served_model_evidence, "absent")
         self.assertNotIn("private", repr(invalid_result.evidence))
 
     def test_owner_refusal_after_profile_build_still_cleans_profile(self):

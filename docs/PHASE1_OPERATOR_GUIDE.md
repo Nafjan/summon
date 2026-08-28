@@ -11,6 +11,9 @@ or prompts containing command-shell metacharacters in a UTF-8 file and use
 `--prompt-file`; the batch launcher rejects raw `--prompt` text it cannot transport
 losslessly.
 
+In every example, replace `<ABSOLUTE_PROJECT_DIR>` with the existing absolute path to
+the project. Fleet and dispatch boundaries reject a relative working directory.
+
 ## 1. Inspect the installation and roster
 
 ```text
@@ -32,10 +35,10 @@ summon fleet propose review --seats reviewer,architect \
   --permission-ceiling read-only --data-boundary local_sanitized \
   --allow-subscription --max-provider-contacts 1 \
   --max-billable-attempts 0 --max-parallel 1 \
-  --cwd . --out review-fleet.json --json
-summon fleet validate review-fleet.json --cwd . --json
+  --cwd <ABSOLUTE_PROJECT_DIR> --out review-fleet.json --json
+summon fleet validate review-fleet.json --cwd <ABSOLUTE_PROJECT_DIR> --json
 summon fleet inspect review-fleet.json --json
-summon fleet explain review-fleet.json review --cwd . --json
+summon fleet explain review-fleet.json review --cwd <ABSOLUTE_PROJECT_DIR> --json
 ```
 
 `explain` reports candidates and losing constraints but selects nobody. A fleet file is
@@ -44,7 +47,8 @@ not authority. Record a short-lived approval only after reviewing the sealed pla
 ```text
 summon fleet approval status --json
 summon fleet approval approve review-fleet.json review \
-  --expires-in 1h --expect-generation GENERATION_FROM_STATUS --cwd . --json
+  --expires-in 1h --expect-generation GENERATION_FROM_STATUS \
+  --cwd <ABSOLUTE_PROJECT_DIR> --json
 ```
 
 Replace `GENERATION_FROM_STATUS` with the integer `generation` returned by the immediately
@@ -56,7 +60,7 @@ Use the returned approval ID in one provider-inert launch preflight:
 ```text
 summon dispatch --lane review --fleet-file review-fleet.json \
   --fleet-approval-id APPROVAL_ID --fleet-data-proof operator_attested \
-  --prompt-file review-task.txt --cwd . --dry-run --json
+  --prompt-file review-task.txt --cwd <ABSOLUTE_PROJECT_DIR> --dry-run --json
 ```
 
 Only remove `--dry-run` when the effective route is correct. One approval permits one
@@ -85,9 +89,11 @@ Put typed payload blocks in a `summon.context-input/v1` JSON file, then compare 
 safe compiler with the byte-preserving off switch:
 
 ```text
-summon dispatch --agent reviewer --prompt-file review-task.txt --cwd . \
+summon dispatch --agent reviewer --prompt-file review-task.txt \
+  --cwd <ABSOLUTE_PROJECT_DIR> \
   --context-input-file context.json --context-profile safe --dry-run --json
-summon dispatch --agent reviewer --prompt-file review-task.txt --cwd . \
+summon dispatch --agent reviewer --prompt-file review-task.txt \
+  --cwd <ABSOLUTE_PROJECT_DIR> \
   --context-input-file context.json --context-profile off --dry-run --json
 ```
 
@@ -100,7 +106,8 @@ and never gains routing authority.
 ## 5. Run and supervise a long job
 
 ```text
-summon dispatch --agent reviewer --prompt-file review-task.txt --cwd . \
+summon dispatch --agent reviewer --prompt-file review-task.txt \
+  --cwd <ABSOLUTE_PROJECT_DIR> \
   --background --adaptive-timeout --timeout 10m --max-runtime 4h --json
 summon jobs status JOB_ID --json
 summon jobs extend JOB_ID --duration 30m --json
@@ -126,7 +133,7 @@ Keep private execution envelopes outside public repositories. Derive a redacted 
 
 ```text
 summon result project --kind dispatch --from private-envelope.json \
-  --repo-root . --out portable-result.json --json
+  --repo-root <ABSOLUTE_PROJECT_DIR> --out portable-result.json --json
 summon result validate portable-result.json --json
 summon result consume portable-result.json --adapter reference --json
 python skills/summon/examples/phase1/consume_portable_result.py \
