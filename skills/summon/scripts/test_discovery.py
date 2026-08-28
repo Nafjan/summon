@@ -17079,7 +17079,7 @@ def test_v10_units_guard_precedes_every_side_effect():
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "run_subagent.py"), encoding="utf-8").read()
     guard = src.index('for _flag, _val in (("--timeout"')
-    worktree = src.index("if args.worktree is not None and not args.dry_run:")
+    worktree = src.index("_preflight_then_setup_worktree(", guard)
     assert guard < worktree, (
         "the units guard runs AFTER worktree creation, so a rejected dispatch still leaves "
         "a branch and a checkout on disk")
