@@ -587,6 +587,27 @@ def test_safe_inherited_lock_is_repaired_but_foreign_lock_refuses(private_store)
     assert not isinstance(caught.value, _fleet_approval.ApprovalBusyError)
 
 
+def test_windows_lock_repair_accepts_foreign_owner_only_with_current_user_acl():
+    sid = "S-1-5-21-current-user"
+    snapshot = {
+        "owner": "S-1-5-32-544",
+        "protected": False,
+        "rules": [{
+            "sid": sid,
+            "type": "Allow",
+            "rights": "FullControl",
+        }],
+    }
+    assert _fleet_approval._windows_lock_acl_is_repairable(snapshot, sid)
+
+    snapshot["rules"].append({
+        "sid": "S-1-1-0",
+        "type": "Allow",
+        "rights": "FullControl",
+    })
+    assert not _fleet_approval._windows_lock_acl_is_repairable(snapshot, sid)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACL regression")
 def test_windows_acl_snapshot_uses_native_api_not_shell(
         private_store, monkeypatch):

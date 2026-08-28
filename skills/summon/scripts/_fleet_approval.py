@@ -372,6 +372,19 @@ def _windows_acl_snapshot(path: str) -> dict:
             kernel.LocalFree(descriptor)
 
 
+def _windows_lock_acl_is_repairable(snapshot: dict, sid: str) -> bool:
+    """Return whether a lock ACL is safe to normalize to its sole current user."""
+    rules = snapshot.get("rules")
+    if isinstance(rules, dict):
+        rules = [rules]
+    return (
+        isinstance(rules, list) and bool(rules) and all(
+            isinstance(rule, dict) and rule.get("sid") == sid
+            and rule.get("type") == "Allow"
+            and "FullControl" in str(rule.get("rights", ""))
+            for rule in rules))
+
+
 def _verify_windows_acl(path: str, sid: str) -> None:
     value = _windows_acl_snapshot(path)
     rules = value.get("rules")
@@ -809,18 +822,17 @@ def _store_lock():
         except _evidence.EvidenceError as exc:
             repairable = False
             if os.name == "nt":
+                # The lock may inherit a service/admin owner even when it was
+                # created inside our already-verified current-user-only root.
+                # Prove that parent boundary again, then accept only an ACL
+                # whose every rule already grants FullControl exclusively to
+                # the current SID. _apply_windows_acl below normalizes both
+                # owner and protected DACL, and the post-lock verification
+                # catches any path swap before store access.
+                _verify_private(os.path.dirname(lock), directory=True)
                 snapshot = _windows_acl_snapshot(lock)
-                rules = snapshot.get("rules")
-                if isinstance(rules, dict):
-                    rules = [rules]
                 sid = _effective_user_sid()
-                repairable = (
-                    snapshot.get("owner") == sid and isinstance(rules, list)
-                    and bool(rules) and all(
-                        isinstance(rule, dict) and rule.get("sid") == sid
-                        and rule.get("type") == "Allow"
-                        and "FullControl" in str(rule.get("rights", ""))
-                        for rule in rules))
+                repairable = _windows_lock_acl_is_repairable(snapshot, sid)
             if not repairable:
                 raise _evidence.EvidenceError(
                     "fleet approval store lock is unsafe; after confirming no approval "
