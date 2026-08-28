@@ -16,6 +16,16 @@ import subprocess
 from typing import Any
 
 
+def _is_windows() -> bool:
+    """Return whether the active runtime uses Windows launch semantics.
+
+    Keeping this behind a tiny seam lets provider-inert tests exercise the
+    Windows shim policy on POSIX without mutating the process-wide ``os.name``
+    value (which also changes how ``pathlib.Path`` behaves).
+    """
+    return os.name == "nt"
+
+
 def _arkcli_cmd() -> list[str]:
     """Resolve an invocable arkcli argv prefix.
 
@@ -24,7 +34,7 @@ def _arkcli_cmd() -> list[str]:
     must not become shell injection). A shim without its package entry point
     is refused instead of falling back to a command shell.
     """
-    if os.name == "nt":
+    if _is_windows():
         path = shutil.which("arkcli.cmd") or shutil.which("arkcli")
         if path and str(path).lower().endswith((".cmd", ".bat")):
             node_js = _arkcli_node_entry(path)
@@ -60,7 +70,7 @@ def _arkcli_node_entry(shim_path: str) -> str | None:
 
 def call(inv, timeout_ms: int) -> dict:
     cli = "arkcli"
-    if not shutil.which("arkcli") and not (os.name == "nt" and shutil.which("arkcli.cmd")):
+    if not shutil.which("arkcli") and not (_is_windows() and shutil.which("arkcli.cmd")):
         return _err(cli, "arkcli not found on PATH — install @byteplus/ark-cli "
                          "and run arkcli auth login", not_run=True)
     model = getattr(inv, "model", None) or ""

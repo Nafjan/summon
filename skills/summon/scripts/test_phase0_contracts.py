@@ -34,7 +34,7 @@ def test_posix_arkcli_roster_refresh_fails_cleanly_without_shell_fallback(
         calls.append((argv, kwargs))
         raise FileNotFoundError("fixture missing")
 
-    monkeypatch.setattr(api.os, "name", "posix")
+    monkeypatch.setattr(ark, "_is_windows", lambda: False)
     monkeypatch.setattr(ark.shutil, "which", lambda _name: None)
     monkeypatch.setattr(subprocess, "run", missing)
     monkeypatch.setattr(api, "_roster_cache_path", lambda: str(tmp_path / "cache.json"))
@@ -60,7 +60,7 @@ def test_windows_arkcli_roster_refresh_uses_node_entry_without_shell(
             stderr="",
         )
 
-    monkeypatch.setattr(api.os, "name", "nt")
+    monkeypatch.setattr(ark, "_is_windows", lambda: True)
     monkeypatch.setattr(_spawn, "run_flags", dict)
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(ark.shutil, "which", lambda name: {
@@ -80,7 +80,7 @@ def test_windows_arkcli_roster_refresh_uses_node_entry_without_shell(
 def test_windows_arkcli_chat_refuses_unresolved_command_shim(monkeypatch):
     import _arkcli_backend as ark
 
-    monkeypatch.setattr(ark.os, "name", "nt")
+    monkeypatch.setattr(ark, "_is_windows", lambda: True)
     monkeypatch.setattr(ark.shutil, "which",
                         lambda name: r"C:\\npm\\arkcli.cmd"
                         if name in {"arkcli", "arkcli.cmd"} else None)
@@ -99,7 +99,7 @@ def test_windows_arkcli_chat_launcher_refusal_is_explicitly_not_run(monkeypatch)
     monkeypatch.setattr(ark.shutil, "which",
                         lambda name: r"C:\\npm\\arkcli.cmd"
                         if name in {"arkcli", "arkcli.cmd"} else None)
-    monkeypatch.setattr(ark.os, "name", "nt")
+    monkeypatch.setattr(ark, "_is_windows", lambda: True)
     monkeypatch.setattr(ark, "_arkcli_node_entry", lambda _shim: None)
     result = _executor.execute_agent(
         _executor.AgentInvocation(

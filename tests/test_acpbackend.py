@@ -288,13 +288,18 @@ def test_acp_child_env_comes_from_builder_minus_superseded_channels():
     assert "SUMMON_FLEET_APPROVAL_STORE" not in captured["env"]
 
 
-def test_acp_unsafe_launcher_refusal_is_explicitly_not_run(monkeypatch):
-    monkeypatch.setattr(_acpbackend, "_probe_acp", lambda _cli: None)
-    monkeypatch.setattr(
-        _executor, "_resolve_launch",
+def test_acp_unsafe_launcher_refusal_is_explicitly_not_run():
+    original_probe = _acpbackend._probe_acp
+    original_resolve = _executor._resolve_launch
+    _acpbackend._probe_acp = lambda _cli: None
+    _executor._resolve_launch = (
         lambda _command, _args: (_ for _ in ()).throw(
             ValueError("unsafe command shim")))
-    response = _acpbackend.call(_inv(), 1000)
+    try:
+        response = _acpbackend.call(_inv(), 1000)
+    finally:
+        _acpbackend._probe_acp = original_probe
+        _executor._resolve_launch = original_resolve
     assert response["error_kind"] == "unsafe_windows_launcher"
     assert response["attempts"] == 0
     assert response["attempt_status"] == "not_run"
