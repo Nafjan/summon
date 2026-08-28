@@ -2931,15 +2931,16 @@ def test_schema_null_value_parses_ok():
 
 
 def test_manifest_timeout_grammar_matches_child():
-    # W3: bare number is MILLISECONDS (like the child), suffixes ms/s/m; no 'h'.
+    # W3: bare number is MILLISECONDS (like the child), suffixes ms/s/m/h.
     import _manifest
     assert _manifest._timeout_seconds("600000") == 600.0      # bare == ms
     assert _manifest._timeout_seconds("30s") == 30.0
     assert _manifest._timeout_seconds("2m") == 120.0
     assert _manifest._timeout_seconds("500ms") == 1.0         # floored to >=1s
-    assert _manifest._timeout_seconds("2h") == 600.0          # 'h' unsupported -> default
+    assert _manifest._timeout_seconds("2h") == 7200.0
     # parent watchdog stays comfortably above the child's own budget
     assert _manifest._parent_timeout({"timeout": "30s"}) >= 90.0
+    assert _manifest._parent_timeout({"timeout": "2h"}) == 10_860.0
 
 
 def test_fable_runs_unsubstituted_and_reports_plan_dependent_billing():
@@ -8684,6 +8685,14 @@ def test_v7_absurd_timeout_is_rejected_not_overflowed():
     assert parse_timeout(str(_MAX_TIMEOUT_MS)) == _MAX_TIMEOUT_MS
     assert parse_timeout("600s") == 600_000
     assert parse_timeout("10m") == 600_000
+    assert parse_timeout("4h") == 14_400_000
+    help_text = __import__("_cli").build_parser("0.0.0", 1).format_help()
+    assert "4h" in help_text, "public --help omitted the accepted hour suffix"
+    skill = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "SKILL.md")
+    if os.path.isfile(skill):
+        skill_text = open(skill, encoding="utf-8").read()
+        assert "`h` for hours" in skill_text and "`--timeout 4h`" in skill_text
     # and the accepted maximum is a value the executor's own wait can actually take
     import threading
     threading.Event().wait(0)
@@ -13234,7 +13243,7 @@ def test_v10_public_timeout_examples_use_explicit_units():
         os.path.join(root, "skills", "summon", "SKILL.md"),
         os.path.join(root, "skills", "summon", "references", "codex.md"),
     )
-    bare = re.compile(r"--timeout(?:=|\s+)(\d+)(?!\d)(?!\s*(?:ms|s|m)\b)")
+    bare = re.compile(r"--timeout(?:=|\s+)(\d+)(?!\d)(?!\s*(?:ms|s|m|h)\b)")
     for path in paths:
         text = open(path, encoding="utf-8").read()
         matches = bare.findall(text)
@@ -13713,6 +13722,71 @@ def test_v8_every_public_flag_is_documented_in_skill_md():
         "these flags are public but undocumented in SKILL.md: %s. Either document them or "
         "mark them internal with argparse.SUPPRESS (currently suppressed: %s)"
         % (undocumented, sorted(suppressed) or "none"))
+
+
+def test_phase1_operator_guide_only_documents_live_commands_and_flags():
+    """Bind the Phase 1 runbook examples to argparse's actual public surface.
+
+    The guide is deliberately smaller than SKILL.md, so it must not list every public flag.
+    Every long option and command path that it *does* recommend must still exist in the
+    real parser. This catches a renamed or removed control before operators copy a stale
+    command from the runbook.
+    """
+    import re
+    import shlex
+
+    import _cli
+
+    scripts = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(scripts)))
+    guide = os.path.join(repo, "docs", "PHASE1_OPERATOR_GUIDE.md")
+    assert os.path.isfile(guide), "PHASE1_OPERATOR_GUIDE.md is a required release surface"
+    doc = open(guide, encoding="utf-8").read()
+    parser = _cli.build_parser("0.0.0", 1)
+
+    commands = []
+    for block in re.findall(
+            r"```(?:text|bash|sh|console)\s*\n(.*?)```", doc, flags=re.DOTALL):
+        logical = block.replace("\\\n", " ")
+        commands.extend(line.strip() for line in logical.splitlines()
+                        if line.lstrip().startswith("summon "))
+    all_guide_commands = re.findall(r"(?m)^\s*summon\b", doc)
+    assert len(commands) == len(all_guide_commands) == 26, (
+        "operator guide command coverage changed; review every added/removed command: %r"
+        % commands)
+
+    def command_path(command):
+        words = shlex.split(command, posix=True)[1:]
+        if words[0] == "fleet" and words[1] == "approval":
+            return tuple(words[:3])
+        if words[0] in {"fleet", "usage", "jobs", "result"}:
+            return tuple(words[:2])
+        return (words[0],)
+
+    assert {command_path(command) for command in commands} == {
+        ("doctor",), ("list",), ("models",), ("dispatch",),
+        ("fleet", "propose"), ("fleet", "validate"), ("fleet", "inspect"),
+        ("fleet", "explain"), ("fleet", "approval", "status"),
+        ("fleet", "approval", "approve"),
+        ("usage", "status"), ("usage", "example"), ("usage", "import"),
+        ("usage", "export"), ("usage", "refresh"),
+        ("jobs", "status"), ("jobs", "extend"), ("jobs", "steer"),
+        ("jobs", "cancel"), ("jobs", "resume"),
+        ("result", "project"), ("result", "validate"), ("result", "consume"),
+    }
+    assert "GENERATION_FROM_STATUS" in doc and "integer `generation`" in doc
+
+    for command in commands:
+        argv = shlex.split(command.replace("GENERATION_FROM_STATUS", "0"), posix=True)
+        assert argv.pop(0) == "summon"
+        rewritten, mode = _cli.rewrite_subcommand(argv)
+        assert mode is None, (command, rewritten, mode)
+        try:
+            parser.parse_args(rewritten)
+        except SystemExit as exc:
+            raise AssertionError(
+                "PHASE1_OPERATOR_GUIDE.md documents a command the public parser rejects: "
+                + command) from exc
 
 
 def test_v8_every_control_flag_reaches_the_background_child():
@@ -16727,10 +16801,12 @@ def test_v9_a_bare_sub_second_timeout_is_a_units_mistake():
             % (bare, bare))
 
     # explicit units are never flagged: writing the unit means the caller meant it
-    for explicit in ("300ms", "1000", "600000", "300s", "10m"):
+    for explicit in ("300ms", "1000", "600000", "300s", "10m", "0.0001h", "4h"):
         assert rs._parse_timeout(explicit).bare_sub_second is False, explicit
     assert rs._parse_timeout("300ms") == 300
     assert rs._parse_timeout("300s") == 300_000
+    assert rs._parse_timeout("0.0001h") == 360
+    assert rs._parse_timeout("4h") == 14_400_000
     assert rs._parse_timeout("600000") == 600_000, "bare ms stays backward compatible"
 
     # ...and the DISPATCH path is what refuses it, naming the likely intent

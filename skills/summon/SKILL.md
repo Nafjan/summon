@@ -441,8 +441,9 @@ run or recommending it to a user.
 
 ### Timeout units
 
-Use an explicit unit in every invocation: `ms` for milliseconds, `s` for seconds, or
-`m` for minutes (for example, `--timeout 900s` or `--timeout 600000ms`). A bare numeric
+Use an explicit unit in every invocation: `ms` for milliseconds, `s` for seconds,
+`m` for minutes, or `h` for hours (for example, `--timeout 900s`, `--timeout 4h`, or
+`--timeout 600000ms`). A bare numeric
 value is retained only for backward compatibility and is interpreted as milliseconds.
 Dispatches reject a bare value below one second because it is almost always a units
 mistake; write the intended unit instead. The read-only `jobs wait` poll still accepts
@@ -518,7 +519,7 @@ not bypass or rewrite the authenticated store.
 | `--prompt-file FILE` | Yes* | Read the prompt from a UTF-8 file (BOM tolerated; strict decoding). Mutually exclusive with `--prompt`. Quoting/encoding ergonomics for long prompts; it does **not** avoid the backend OS argv limit. Windows caps the whole assembled backend line at 32767 chars, POSIX commonly caps a single argument at 131072, and agy's own limit is about 28k. Over the limit Summon refuses before spawning. For larger material, keep it under `--cwd` and ask a tool-capable agent to read it. A fresh `--background` launch freezes the already-read prompt bytes beside its immutable per-job script bundle; the child does not reopen the caller's mutable prompt file. |
 | `--cwd` | Yes* | Working directory (absolute path) |
 | `--read-root DIR` | No | Repeatable additional **absolute** directory for an enforceable read-only Claude or Gemini turn. The directory must already exist and is passed through the backend's native allowlist (`--add-dir` / `--include-directories`). Other backends refuse the dispatch rather than silently ignoring it. Background children receive the same canonical roots, and the launch record keeps them for audit. Agent definitions can persist the same list with `read-roots` |
-| `--timeout` | No | Explicit `ms`, `s`, or `m` is recommended: `900s`, `10m`, or `600000ms` (default: `600000ms` = 10m). Bare numbers remain milliseconds for backward compatibility. A bare sub-second value on a dispatch is refused as a likely units mistake; write `300s` (or `300ms` if you truly mean it). `jobs wait` still accepts short bare polls. Set your host tool's own timeout ABOVE this value — the script needs a few seconds of overhead beyond the CLI deadline |
+| `--timeout` | No | Explicit `ms`, `s`, `m`, or `h` is recommended: `900s`, `10m`, `4h`, or `600000ms` (default: `600000ms` = 10m). Bare numbers remain milliseconds for backward compatibility. A bare sub-second value on a dispatch is refused as a likely units mistake; write `300s` (or `300ms` if you truly mean it). `jobs wait` still accepts short bare polls. Set your host tool's own timeout ABOVE this value — the script needs a few seconds of overhead beyond the CLI deadline |
 | `--agents-dir` | No | Directory of agent definitions (overrides `$SUB_AGENTS_DIR` and `{cwd}/.agents/`) |
 | `--strict-agents-dir` | No | Governance mode: fail closed when the requested agent is absent from the selected roster; do not fall back to bundled or plugin definitions. Opt-in only; default resolution is unchanged |
 | `--enable-roles` | No | Opt into approved user-global role aliases. Exact roster names win; malformed, retargeted, chained, or unapproved aliases fail closed. Children inherit the flag |
@@ -541,7 +542,7 @@ not bypass or rewrite the authenticated store.
 | `--background` | No | Dispatch detached; returns `{status:"background", job_id, result_file, job_dir, record_file}` at once. A launch record is written (fsynced) before the child spawns, so a job that dies before its result is still traceable. Parser/early-exit failures receive a typed terminal envelope, and result writes use bounded Windows sharing-violation retries; a hard-killed child remains `stale`. Fresh launches freeze both the exact prompt bytes and an immutable per-job scripts bundle before spawn. Trusted completion requires the nonce, scripts digest, and terminal prompt digest to match the launch record. |
 | `--job-dir DIR` | No | Where `--background` writes job records and results (default `{tempdir}/subagents_jobs`; env `SUMMON_JOBS_DIR`). Point it at a durable, private path. Single-user model: summon does not defend the registry against other local users on a shared host |
 | `jobs list` / `jobs status ID` / `jobs wait ID` | - | Read-only registry commands (flat: `--jobs-list` / `--jobs-status ID` / `--jobs-wait ID`; add `--job-dir` and `--json` for `list`/`status`, or `--job-dir` and `--timeout` for `wait`). `list` shows `prepared`, liveness-verified `running`, `stale` (pid gone with no result), `identity_mismatch` (the authenticated terminal scripts or prompt identity differs from the frozen launch record), `unverified` (probe unavailable), or a terminal status. `status` is a typed redacted projection: it omits prompts, report text, local paths, provider handles, profile/account data, non-schema heartbeat fields, and other execution capabilities; read roots appear as counts only. An available continuation is shown only after its private authenticated sidecar verifies. Use `jobs wait` (or the owner-readable result file named by the background launch response) when you need the complete private terminal envelope. `status` includes `liveness:alive|dead|unknown`; `wait` returns early on stale or identity mismatch instead of burning its timeout. Liveness proves that a pid exists, not that an old pid was never reused. |
-| `--adaptive-timeout` / `--hard-timeout` / `--max-runtime DURATION` | hard timeout | Adaptive mode treats `--timeout` as an activity checkpoint: meaningful progress can extend the turn up to the immutable `--max-runtime` job budget. `--hard-timeout` preserves a fixed wall-clock deadline. Durations require explicit units such as `10m` or `900s` |
+| `--adaptive-timeout` / `--hard-timeout` / `--max-runtime DURATION` | hard timeout | Adaptive mode treats `--timeout` as an activity checkpoint: meaningful progress can extend the turn up to the immutable `--max-runtime` job budget. `--hard-timeout` preserves a fixed wall-clock deadline. Durations require explicit units such as `10m`, `900s`, or `4h` |
 | `jobs extend ID --duration DURATION` / `jobs cancel ID` / `jobs steer ID --message TEXT` | - | Durable background controls (flat aliases: `--jobs-extend ID --job-duration DURATION`, `--jobs-cancel ID`, and `--jobs-steer ID --job-message TEXT`). Extend and cancel affect the active job. Steering is currently authenticated and queued for a later resume/follow-up; it is not claimed as live mid-turn prompt injection |
 | `jobs resume ID [--message TEXT \| --message-file FILE] [--request-id ID]` | - | Creates one authenticated background successor for an eligible terminal named-profile Claude subprocess job, consuming queued steering exactly once. Flat aliases are `--jobs-resume`, `--job-message-file`, and `--job-request-id`. The same request ID is idempotent; conflicting inputs fail closed. Permission can only stay equal or decrease, any prior gate is preserved, retries/fallback/repair are disabled, and credit/PAYG consent must be freshly supplied. Other backends remain unsupported until they expose provider-specific continuity evidence |
 | `--dry-run` | No | Print the fully resolved dispatch (command, model, permission flags) WITHOUT executing — catches wrong models/permissions/dead backends in zero paid runs |
@@ -688,6 +689,11 @@ re-paying**; `council status <run-id>` shows its state read-only. This is the du
 path for expensive councils — prefer it over re-running from scratch. See
 [references/fan-out.md](references/fan-out.md) for the run-directory layout, the
 carry-forward/invalidation rules, and the one documented single-machine lock limitation.
+
+The integrated provider-inert workflow is documented in
+`../../docs/PHASE1_OPERATOR_GUIDE.md` in a source checkout. Installed copies ship the
+standalone `examples/phase1/consume_portable_result.py` interoperability golden. It
+imports no Summon modules and grants no execution, routing, or native-subagent authority.
 
 ## Chaining & continuity (response fields)
 

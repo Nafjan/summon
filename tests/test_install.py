@@ -200,12 +200,18 @@ def test_shipped_examples_are_installed_and_owned():
         r = _run(home, "--hosts", "claude", "--no-agents")
         assert r.returncode == 0, r.stdout + r.stderr
         dest = _dest(home)
-        expected = os.path.join("examples", "document-audit.manifest.json")
-        assert os.path.isfile(os.path.join(dest, expected))
+        expected = {
+            os.path.join("examples", "document-audit.manifest.json"),
+            os.path.join("examples", "phase1", "consume_portable_result.py"),
+            os.path.join("examples", "phase1", "portable-result.sample.json"),
+            os.path.join("examples", "phase1", "portable-consumer.expected.json"),
+        }
+        for relative in expected:
+            assert os.path.isfile(os.path.join(dest, relative))
         with open(os.path.join(dest, ".summon-install.json"), encoding="utf-8") as fh:
             manifest = json.load(fh)
         normalized = {Path(name).as_posix() for name in manifest["files"]}
-        assert Path(expected).as_posix() in normalized
+        assert {Path(relative).as_posix() for relative in expected} <= normalized
     finally:
         shutil.rmtree(home, ignore_errors=True)
 

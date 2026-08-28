@@ -88,25 +88,37 @@ def assert_version_contract(root: Path = ROOT) -> dict[str, object]:
 
 
 def migration_contract(root: Path = ROOT) -> dict[str, object]:
-    """Read the required 2.x -> 3.x migration contract without executing it."""
-    path = root / "docs" / "VERSIONING_AND_3.0.md"
+    """Read the active, version-bound Phase 1 migration contract."""
+    path = root / "docs" / "PHASE1_MIGRATION_ROLLBACK.md"
+    canonical = version_facts(root).get("canonical")
     required = (
-        "2.x -> 3.0",
         "## Compatibility boundary",
         "## Upgrade procedure",
         "## Rollback procedure",
+        "## Phase 1 durable state",
         "## Release decision",
         "rollback",
         "envelope: 1",
         "telemetry",
         "managed installs",
+        "provider-inert",
+        "portable result",
+        "fleet approval",
+        "usage cache",
     )
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return {"path": path.relative_to(root).as_posix(), "present": False,
                 "complete": False, "missing": list(required)}
-    missing = [phrase for phrase in required if phrase not in text]
+    folded = text.casefold()
+    missing = [phrase for phrase in required if phrase.casefold() not in folded]
+    markers = re.findall(
+        r"(?m)^Current product version: ([^\r\n]+)$", text)
+    expected = canonical if isinstance(canonical, str) and canonical else None
+    if len(markers) != 1 or markers[0].strip() != expected:
+        missing.append(
+            f"unique current product version marker: {expected or 'unknown'}")
     return {"path": path.relative_to(root).as_posix(), "present": True,
             "complete": not missing, "missing": missing}
 

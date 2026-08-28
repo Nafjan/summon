@@ -13,6 +13,23 @@ never on added fields.
 
 ## Unreleased
 
+- **M8 integrated operator and compatibility closure:** added one end-to-end,
+  provider-inert operator test covering sealed fleet proposal/validation/explanation,
+  authenticated approval and dry-run activation, usage import/status/export/refresh
+  planning, safe/off context compilation, bounded stale-context labeling, trusted
+  liveness, the public status/extend/steer/cancel job-control surfaces, private-envelope
+  projection, and portable consumption. Resume remains covered by its dedicated authenticated
+  continuation suite because a successful resume needs terminal provider-session evidence.
+  The Windows wrapper
+  golden checks nonempty doctor JSON, typed refusal of unsafe raw multiline prompt
+  transport, and lossless prompt-file dispatch. A separate standard-library consumer
+  imports no Summon code, validates a checked-in portable receipt and digest, rejects a
+  forged named-model claim, and emits an authority-free golden. The release contract now
+  requires a canonical-version marker in the active Phase 1 migration document instead
+  of accepting the historical 3.0/3.1 document, and the migration gate proves private
+  durable state survives managed refresh and uninstall. CI, the fixed release registry,
+  installer ownership assertions, public docs, and migration guidance carry the same
+  artifacts.
 - **M7 portable dispatch/job projection:** an experimental, provider-inert result kernel
   projects only allowlisted execution, contact, model-proof, artifact, and digest facts
   from exact private receipt bytes. Dispatch inputs require an exact byte digest; job inputs

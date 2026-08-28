@@ -1,0 +1,12 @@
+{
+  "artifact_count": 1,
+  "authority_granted": false,
+  "execution_status": "success",
+  "named_model_verified": true,
+  "projection_sha256": "21d7cde60e2e5537888023cdb8dbf2ce3c6ba176910778c60981ee4bd2f7404f",
+  "result_usable": true,
+  "schema": "summon.portable-consumer/experimental-1",
+  "source_receipt_sha256": "09a723b6343fae1615d919fd09c24f2979b373b5bb9b5509364f93e0a6401035",
+  "source_surface": "dispatch",
+  "status": "accepted"
+}

@@ -43,7 +43,7 @@ class Milliseconds(int):
 
 def parse_timeout(value: str) -> int:
     """--timeout accepts bare milliseconds (backward compatible) or a human
-    suffix: '90s', '10m', '600000ms'. Returns whole milliseconds (>= 1;
+    suffix: '90s', '10m', '4h', '600000ms'. Returns whole milliseconds (>= 1;
     fractional input rounds). Zero, negative, and non-finite durations are
     rejected here so they fail as argparse errors, not as instantly-killed
     agents or an OverflowError from the executor."""
@@ -55,11 +55,14 @@ def parse_timeout(value: str) -> int:
             ms = float(s[:-1]) * 1000
         elif s.endswith("m"):
             ms = float(s[:-1]) * 60_000
+        elif s.endswith("h"):
+            ms = float(s[:-1]) * 3_600_000
         else:
             ms = float(s)
     except ValueError:
         raise argparse.ArgumentTypeError(
-            f"invalid --timeout {value!r}: use milliseconds or a suffix, e.g. 600000, 600s, 10m")
+            f"invalid --timeout {value!r}: use milliseconds or a suffix, "
+            "e.g. 600000, 600s, 10m, 4h")
     if not math.isfinite(ms) or ms <= 0:
         raise argparse.ArgumentTypeError(
             f"invalid --timeout {value!r}: must be a positive finite duration")
@@ -68,7 +71,7 @@ def parse_timeout(value: str) -> int:
     # kill the dispatch instantly -- which is exactly what it did to a four-member council
     # in the field (2026-07-27): every seat killed after ~1s, no work performed. An explicit
     # `300ms` is still accepted, because someone writing the unit means it.
-    _bare_sub_second = (not s.endswith(("ms", "s", "m"))) and ms < 1000
+    _bare_sub_second = (not s.endswith(("ms", "s", "m", "h"))) and ms < 1000
     # A finite but absurd value ('1e308') survived the checks above and then blew up far
     # downstream as an OverflowError inside threading.Event().wait() -- a traceback instead of a
     # dispatch. Nothing legitimate waits on a sub-agent for over a week, so cap it here where the
@@ -1174,7 +1177,8 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "do not fall back to bundled or plugin definitions")
     parser.add_argument(
         "--timeout", type=parse_timeout, default=600000,
-        help="Timeout: bare ms, or with suffix — 600s, 10m (default: 600000 ms = 10m)"
+        help="Timeout: bare ms, or with suffix — 600s, 10m, 4h "
+             "(default: 600000 ms = 10m)"
     )
     parser.add_argument("--cli", help="Force specific CLI (claude, cursor-agent, codex, gemini)")
     parser.add_argument("--model", help="Override the agent's frontmatter model for this call")

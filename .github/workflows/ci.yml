@@ -62,6 +62,7 @@ jobs:
           skills/summon/scripts/test_portable_result.py
           skills/summon/scripts/test_agy_1_1_22.py
           skills/summon/scripts/test_phase1_compatibility.py
+          skills/summon/scripts/test_phase1_operator_workflow.py
           skills/summon/scripts/test_phase1_fleet_dispatch.py
           skills/summon/scripts/test_phase1_fleet_activation.py
           skills/summon/scripts/test_phase1_fleet.py
@@ -70,6 +71,7 @@ jobs:
           skills/summon/scripts/test_evidence_kernel.py
           skills/summon/scripts/test_job_control.py
           skills/summon/scripts/test_job_continuation.py
+          skills/summon/scripts/test_job_resume.py
           skills/summon/scripts/test_resume_capabilities.py
           skills/summon/scripts/test_evidence_guards.py
           skills/summon/scripts/test_opencode.py

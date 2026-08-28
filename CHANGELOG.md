@@ -5,6 +5,17 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+- **Integrated Phase 1 operator and migration contract:** the shipped operator guide now
+  joins fleet explanation and approval, advisory usage evidence, safe/off context
+  compilation, adaptive job supervision, and portable-result consumption into one
+  provider-inert workflow. A standalone standard-library consumer validates a checked-in
+  portable golden without importing Summon internals and never grants authority. Windows
+  launcher coverage proves unsafe raw multiline prompts fail before provider contact and
+  `--prompt-file` preserves the exact text. The active migration gate is now bound to the
+  canonical product version and explicitly preserves Phase 1 job, room, approval, usage,
+  and telemetry state across refresh and uninstall; stale 3.0/3.1 prose can no longer make
+  a current release appear ready. The fixed CI/release registry includes the integrated
+  workflow.
 - **Experimental portable result receipts:** `summon result project` now derives a
   compact, provider-inert compatibility receipt from an exact private dispatch envelope
   or an authenticated terminal background job. The private envelope remains authoritative.

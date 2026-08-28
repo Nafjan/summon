@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +25,75 @@ class ReleaseContractTests(unittest.TestCase):
         migration = contract.migration_contract(ROOT)
         self.assertTrue(migration["present"], migration)
         self.assertTrue(migration["complete"], migration)
+        self.assertEqual(migration["path"], "docs/PHASE1_MIGRATION_ROLLBACK.md")
+
+    def test_current_release_rejects_a_stale_phase1_version_marker(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "skills/summon/scripts").mkdir(parents=True)
+            (root / "docs").mkdir()
+            (root / "plugin.json").write_text(
+                json.dumps({"version": "3.2.1"}), encoding="utf-8")
+            for name, assignment in (
+                ("run_subagent.py", "__version__"),
+                ("_telemetry.py", "SUMMON_VERSION"),
+                ("mcp_server.py", "SERVER_VERSION"),
+            ):
+                (root / "skills/summon/scripts" / name).write_text(
+                    f'{assignment} = "3.2.1"\n', encoding="utf-8")
+            current = (ROOT / "docs/PHASE1_MIGRATION_ROLLBACK.md").read_text(
+                encoding="utf-8")
+            (root / "docs/PHASE1_MIGRATION_ROLLBACK.md").write_text(
+                current.replace("Current product version: 3.2.1",
+                                "Current product version: 3.1.0"),
+                encoding="utf-8")
+            result = contract.release_contract(root)
+            self.assertFalse(result["ready"])
+            self.assertIn("unique current product version marker: 3.2.1",
+                          result["migration"]["missing"])
+
+    def test_stale_marker_cannot_be_hidden_by_a_correct_example(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = self._complete_release_root(Path(raw))
+            path = root / "docs/PHASE1_MIGRATION_ROLLBACK.md"
+            text = path.read_text(encoding="utf-8").replace(
+                "Current product version: 3.2.1",
+                "Current product version: 3.1.0\n\nExample: Current product version: 3.2.1",
+                1,
+            )
+            path.write_text(text, encoding="utf-8")
+            result = contract.release_contract(root)
+            self.assertFalse(result["ready"])
+            self.assertIn("unique current product version marker: 3.2.1",
+                          result["migration"]["missing"])
+
+    def test_duplicate_version_markers_fail_closed(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = self._complete_release_root(Path(raw))
+            path = root / "docs/PHASE1_MIGRATION_ROLLBACK.md"
+            text = path.read_text(encoding="utf-8")
+            path.write_text(
+                text + "\nCurrent product version: 3.2.1\n", encoding="utf-8")
+            result = contract.release_contract(root)
+            self.assertFalse(result["ready"])
+
+    @staticmethod
+    def _complete_release_root(root: Path) -> Path:
+        (root / "skills/summon/scripts").mkdir(parents=True)
+        (root / "docs").mkdir()
+        (root / "plugin.json").write_text(
+            json.dumps({"version": "3.2.1"}), encoding="utf-8")
+        for name, assignment in (
+            ("run_subagent.py", "__version__"),
+            ("_telemetry.py", "SUMMON_VERSION"),
+            ("mcp_server.py", "SERVER_VERSION"),
+        ):
+            (root / "skills/summon/scripts" / name).write_text(
+                f'{assignment} = "3.2.1"\n', encoding="utf-8")
+        shutil.copyfile(
+            ROOT / "docs/PHASE1_MIGRATION_ROLLBACK.md",
+            root / "docs/PHASE1_MIGRATION_ROLLBACK.md")
+        return root
 
     def test_mismatch_is_not_ready(self):
         with tempfile.TemporaryDirectory() as raw:

@@ -361,9 +361,9 @@ def _normalize_jobs(doc, manifest_dir: str) -> tuple:
 
 def _timeout_seconds(spec, default: float = 600.0) -> float:
     """Parse a job timeout the SAME way the child ``--timeout`` does — a bare
-    number is MILLISECONDS, suffixes are ms/s/m — and return seconds. (The old
-    version read a bare number as seconds and accepted 'h', disagreeing with the
-    child and sizing the watchdog 1000x too large.) Only sizes the parent
+    number is MILLISECONDS, suffixes are ms/s/m/h — and return seconds. (The old
+    version read a bare number as seconds, disagreeing with the child and sizing
+    the watchdog 1000x too large.) Only sizes the parent
     watchdog; the child enforces the real deadline, so odd input falls back to
     the default rather than raising."""
     if spec is None:
@@ -376,6 +376,8 @@ def _timeout_seconds(spec, default: float = 600.0) -> float:
             ms = float(s[:-1]) * 1000
         elif s.endswith("m"):
             ms = float(s[:-1]) * 60_000
+        elif s.endswith("h"):
+            ms = float(s[:-1]) * 3_600_000
         else:
             ms = float(s)  # bare number == milliseconds, matching the child
     except ValueError:

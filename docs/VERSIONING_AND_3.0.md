@@ -1,6 +1,9 @@
 # Summon 2.x -> 3.0 release and migration contract
 
-Status: 3.0.0 and 3.1.0 GA release contract. The release manifest is generated from the clean
+Status: superseded — historical only. The active release and migration contract is
+[`PHASE1_MIGRATION_ROLLBACK.md`](PHASE1_MIGRATION_ROLLBACK.md).
+
+This file records the 3.0.0 and 3.1.0 GA release contract. The release manifest is generated from the clean
 immutable release commit and records aggregate results for the fixed suites, eight gates,
 the migration packet, managed installs, and the redacted live-provider receipt. Keep the
 manifest, host inventory, and per-run evidence in the private release bundle.

@@ -258,7 +258,9 @@ evidence and must not be presented as certification.
 The installer preserves unmanaged host copies and reports local drift through `doctor`; it does
 not overwrite those copies automatically. The version, migration, compatibility, and rollback
 contract is documented in
-[`docs/VERSIONING_AND_3.0.md`](docs/VERSIONING_AND_3.0.md).
+[`docs/PHASE1_MIGRATION_ROLLBACK.md`](docs/PHASE1_MIGRATION_ROLLBACK.md). The older
+[`docs/VERSIONING_AND_3.0.md`](docs/VERSIONING_AND_3.0.md) is retained as historical
+3.0/3.1 release evidence.
 
 `install.py` stages atomically, never touches an agent file you already have, and uninstalls
 cleanly (`python install.py --uninstall`). Migrating from the old name? `--with-alias` adds a
@@ -398,12 +400,19 @@ providers. The boundary is documented in
 `summon` (no args) prints the command list. Everything below is documented in
 [the Summon skill instructions](skills/summon/SKILL.md).
 
+For a copy-paste path through fleet approval, usage evidence, context compilation,
+adaptive jobs, and portable results, use the
+[Phase 1 operator workflow](docs/PHASE1_OPERATOR_GUIDE.md). Upgrade and rollback state is
+covered by the [Phase 1 migration contract](docs/PHASE1_MIGRATION_ROLLBACK.md).
+
 Portable result receipts are compatibility views, not replacements for private execution
 envelopes and not dispatch capabilities. They omit prompts, response text, transcripts,
 sessions, local paths, account facts, and raw diagnostics. A reported exact model identity
 is verified only when requested, targeted, and served values agree; inferred or absent
 evidence stays unverified. The schema remains experimental while consumers validate the
-supported dispatch and authenticated-job surfaces.
+supported dispatch and authenticated-job surfaces. The shipped
+`examples/phase1/consume_portable_result.py` golden imports no Summon modules; it
+demonstrates interoperability but is not a claim of independent adoption.
 
 Fleet documents are drafts, not dispatch capabilities by themselves. `propose` returns a compiled
 projection bound to the current project directory object and a sanitized roster-catalog

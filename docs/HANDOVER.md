@@ -2,7 +2,8 @@
 
 > **Historical archive.** This document records older handoffs and provider smokes;
 > it is not the current release contract or support matrix. For present-day version,
-> migration, install, and evidence rules use [`docs/VERSIONING_AND_3.0.md`](VERSIONING_AND_3.0.md)
+> migration, install, and evidence rules use
+> [`docs/PHASE1_MIGRATION_ROLLBACK.md`](PHASE1_MIGRATION_ROLLBACK.md)
 > and [`docs/SUMMON_PRODUCT_ROADMAP.md`](SUMMON_PRODUCT_ROADMAP.md). Historical model
 > and “live-verified” wording below must not be treated as current served-model evidence.
 
