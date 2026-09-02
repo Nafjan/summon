@@ -27,6 +27,10 @@ never on added fields.
   resumes remain unsupported; no automatic account rotation or quota aggregation was added.
 - Usage-cache concurrency: serialize private-root setup with record writes. A
   deterministic lock-scope regression complements the concurrent refresh test.
+- Packaging: exclude only `.pytest_cache` directories from the installer, managed
+  payload fingerprints, and release-source identity. Cache mutations no longer
+  alter product identity; ordinary files and other dot-directories remain bound.
+  Existing ownership manifests that include cache entries require a normal refresh.
 - Deliberation profile identity: replace recursive history hashing with bounded
   backend-specific auth/configuration file bindings. Claude account/config JSON
   is canonicalized; only its known cache-refresh timestamp is excluded. Account,

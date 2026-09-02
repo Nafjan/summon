@@ -17,6 +17,8 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
   omit private account paths and raw auth-status output.
 - Fixed concurrent usage-cache initialization so record writes cannot race private
   directory setup.
+- Excluded generated pytest cache directories from skill installations and release
+  fingerprints so local test metadata does not ship or cause false install drift.
 - Deliberation now binds profile identity to known auth and configuration files,
   not changing session logs. Concurrent sessions no longer invalidate a pending
   launch just by writing runtime history.

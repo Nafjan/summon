@@ -22,6 +22,122 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ReleaseManifestTests(unittest.TestCase):
+    def test_pytest_cache_directories_are_not_installed_or_fingerprinted(self):
+        install_spec = importlib.util.spec_from_file_location(
+            "summon_install_cache_test", ROOT / "install.py")
+        install = importlib.util.module_from_spec(install_spec)
+        install_spec.loader.exec_module(install)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skill = root / "skills" / "summon"
+            scripts = skill / "scripts"
+            scripts.mkdir(parents=True)
+            product = scripts / "runner.py"
+            product.write_text("original\n", encoding="utf-8")
+            cache = scripts / ".pytest_cache" / "v" / "cache" / "nodeids"
+            cache.parent.mkdir(parents=True)
+            cache.write_text('["synthetic-test"]', encoding="utf-8")
+            dotfile = scripts / ".product-config"
+            dotfile.write_text("bound\n", encoding="utf-8")
+
+            source_before = MODULE.source_tree_sha256(root)
+            fingerprint_before, files_before, error = MODULE._tree_fingerprint(skill)
+            self.assertIsNone(error)
+            self.assertEqual(files_before, {"scripts/runner.py", "scripts/.product-config"})
+            for index, contents in enumerate(('[]', '["changed-test", "another-test"]')):
+                cache.write_text(contents, encoding="utf-8")
+                self.assertEqual(source_before, MODULE.source_tree_sha256(root))
+                self.assertEqual((fingerprint_before, files_before, None), MODULE._tree_fingerprint(skill))
+                target = root / f"installed-{index}"
+                target.mkdir()
+                with patch.object(install, "SKILL_SRC", str(skill)):
+                    installed_files = install._build_tree(str(target))
+                self.assertEqual({Path(name).as_posix() for name in installed_files}, files_before)
+                self.assertFalse((target / "scripts" / ".pytest_cache").exists())
+                self.assertEqual((fingerprint_before, files_before, None), MODULE._tree_fingerprint(target))
+
+            # Existing manifests listing cache entries are NOT silently normalized.
+            stale_manifest_files = files_before | {"scripts/.pytest_cache/v/cache/nodeids"}
+            self.assertNotEqual(stale_manifest_files, MODULE._tree_fingerprint(skill)[1])
+            product.write_text("changed product\n", encoding="utf-8")
+            self.assertNotEqual(source_before, MODULE.source_tree_sha256(root))
+            self.assertNotEqual(fingerprint_before, MODULE._tree_fingerprint(skill)[0])
+            before_dot_change = MODULE.source_tree_sha256(root)
+            dotfile.write_text("changed config\n", encoding="utf-8")
+            self.assertNotEqual(before_dot_change, MODULE.source_tree_sha256(root))
+
+    def test_pytest_cache_named_regular_file_remains_product_payload(self):
+        install_spec = importlib.util.spec_from_file_location(
+            "summon_install_cache_file_test", ROOT / "install.py")
+        install = importlib.util.module_from_spec(install_spec)
+        install_spec.loader.exec_module(install)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skill = root / "skills" / "summon"
+            scripts = skill / "scripts"
+            scripts.mkdir(parents=True)
+            ordinary = scripts / ".pytest_cache"
+            ordinary.write_text("real product\n", encoding="utf-8")
+            before = MODULE.source_tree_sha256(root)
+            digest, files, error = MODULE._tree_fingerprint(skill)
+            self.assertIsNone(error)
+            self.assertEqual(files, {"scripts/.pytest_cache"})
+            target = root / "installed"
+            target.mkdir()
+            with patch.object(install, "SKILL_SRC", str(skill)):
+                copied = install._build_tree(str(target))
+            self.assertEqual({Path(name).as_posix() for name in copied}, files)
+            self.assertEqual((target / "scripts" / ".pytest_cache").read_text(), "real product\n")
+            ordinary.write_text("changed product\n", encoding="utf-8")
+            self.assertNotEqual(before, MODULE.source_tree_sha256(root))
+            self.assertNotEqual(digest, MODULE._tree_fingerprint(skill)[0])
+
+    def test_stale_manifest_listing_pytest_cache_fails_install_validation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "source"
+            scripts = root / "skills" / "summon" / "scripts"
+            scripts.mkdir(parents=True)
+            installed = Path(temp_dir) / "installed" / "summon"
+            cache = installed / "scripts" / ".pytest_cache" / "v" / "cache" / "nodeids"
+            cache.parent.mkdir(parents=True)
+            cache.write_text("[]", encoding="utf-8")
+            (installed / "scripts" / "runner.py").write_text("pass\n", encoding="utf-8")
+            (root / "plugin.json").write_text('{"version":"3.4.0"}', encoding="utf-8")
+            (installed / ".summon-install.json").write_text(json.dumps({
+                "installed_by": "summon", "installed_at": 1, "version": "3.4.0",
+                "files": ["scripts/runner.py", "scripts/.pytest_cache/v/cache/nodeids"],
+            }), encoding="utf-8")
+            record = {"label": "synthetic-host", "managed": True, "present": True,
+                      "scripts_dir": str(installed / "scripts"), "sha256": "a" * 64}
+            # Hermetic detector, not a scan of the operator's installation roots.
+            (scripts / "_installs.py").write_text(
+                f"RECORD = {record!r}\n"
+                "def enumerate_installs(**kwargs): return [RECORD]\n"
+                "def drift_report(records): return {'reference_sha': 'a'*64, 'hashed': records}\n",
+                encoding="utf-8")
+            facts = MODULE._install_facts(root)
+            self.assertTrue(facts["available"])
+            self.assertFalse(facts["managed_converged"])
+            self.assertFalse(facts["managed"][0]["ownership_valid"])
+            self.assertEqual(facts["managed"][0]["payload_error"],
+                             "ownership manifest file list does not match tree")
+
+    def test_cache_exclusion_does_not_hide_product_symlinks(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            scripts = root / "skills" / "summon" / "scripts"
+            scripts.mkdir(parents=True)
+            target = root / "outside.txt"
+            target.write_text("synthetic\n", encoding="utf-8")
+            link = scripts / "product-link"
+            try:
+                link.symlink_to(target)
+            except OSError:
+                self.skipTest("symlink creation unavailable")
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                MODULE.source_tree_sha256(root)
+            self.assertIsNotNone(MODULE._tree_fingerprint(scripts.parent)[2])
+
     def test_managed_skill_fingerprint_matches_installer_payload(self):
         install_spec = importlib.util.spec_from_file_location(
             "summon_install_for_manifest_test", ROOT / "install.py"

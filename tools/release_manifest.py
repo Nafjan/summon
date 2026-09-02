@@ -254,6 +254,9 @@ def _tree_fingerprint(
     files: set[str] = set()
     try:
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            # Reserved pytest runtime directories are not product payload.
+            # An ordinary file with the same name is still bound below.
+            dirnames[:] = [name for name in dirnames if name != ".pytest_cache"]
             dirnames.sort()
             filenames.sort()
             relative_dir = Path(dirpath).relative_to(root)
@@ -288,6 +291,9 @@ def _tree_fingerprint(
 
 
 def _included_files(root: Path) -> list[Path]:
+    def fail_walk(error):
+        raise error
+
     files: list[Path] = []
     for relative in _PAYLOAD_ROOTS:
         path = root / relative
@@ -296,13 +302,16 @@ def _included_files(root: Path) -> list[Path]:
         if path.is_file():
             files.append(path)
         elif path.is_dir():
-            for item in path.rglob("*"):
-                if _link_like(item):
-                    raise ValueError(
-                        f"release payload contains a symlink: {item.relative_to(root).as_posix()}"
-                    )
-                if item.is_file() and "__pycache__" not in item.parts and item.suffix != ".pyc":
-                    files.append(item)
+            for directory, directories, filenames in os.walk(path, followlinks=False, onerror=fail_walk):
+                directories[:] = [name for name in directories if name != ".pytest_cache"]
+                for name in directories + filenames:
+                    item = Path(directory) / name
+                    if _link_like(item):
+                        raise ValueError(
+                            f"release payload contains a symlink: {item.relative_to(root).as_posix()}"
+                        )
+                    if item.is_file() and "__pycache__" not in item.parts and item.suffix != ".pyc":
+                        files.append(item)
     return sorted(set(files), key=lambda item: item.relative_to(root).as_posix())
 
 

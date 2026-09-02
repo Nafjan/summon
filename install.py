@@ -306,13 +306,19 @@ def _execution_lease_held(host_root: str) -> bool:
 
 def _build_tree(dst: str) -> list:
     """Copy the payload into dst; return the manifest file list."""
+    def ignore_runtime_cache(directory, names):
+        ignored = set(shutil.ignore_patterns("__pycache__", "*.pyc")(directory, names))
+        if ".pytest_cache" in names and os.path.isdir(os.path.join(directory, ".pytest_cache")):
+            ignored.add(".pytest_cache")
+        return ignored
+
     files = []
     for item in SKILL_PAYLOAD:
         src = os.path.join(SKILL_SRC, item)
         out = os.path.join(dst, item)
         if os.path.isdir(src):
             shutil.copytree(src, out,
-                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                            ignore=ignore_runtime_cache)
             for root, _, fnames in os.walk(out):
                 files += [os.path.relpath(os.path.join(root, f), dst) for f in fnames]
         elif os.path.isfile(src):
