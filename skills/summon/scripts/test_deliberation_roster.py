@@ -131,7 +131,7 @@ class FrozenRosterTests(unittest.TestCase):
         snap = self.freeze()
         public = snap.as_dict(native=False)
         display = public["model_display_by_seat"]["one"]
-        self.assertEqual(display["role"], "escalation")
+        self.assertEqual(display["role"], "previous-version escalation")
         self.assertEqual(display["name"], "Fable")
         self.assertEqual(display["version"], "5")
         self.assertEqual(display["label"], "frontier")
@@ -295,15 +295,82 @@ class FrozenRosterTests(unittest.TestCase):
             credential.write_text('{"account":"B"}', encoding="utf-8")
             self.assertFalse(snap.revalidate())
 
-    def test_profile_symlinked_content_is_refused(self):
+    def test_profile_runtime_transcripts_logs_and_caches_do_not_invalidate(self):
+        for cli, model in (("claude", "claude-fable-5-1"), ("codex", "gpt-5.6-sol")):
+            with self.subTest(cli=cli):
+                self.add_agent("worker", cli=cli, model=model)
+                profile_dir = self.root / (cli + "-runtime-profile")
+                profile_dir.mkdir()
+                registry = self.root / (cli + "-runtime-registry.json")
+                registry.write_text(json.dumps({"profiles": {
+                    "local": {"cli": cli, "config_dir": str(profile_dir)}
+                }}), encoding="utf-8")
+                with mock.patch.dict(os.environ, {"SUMMON_PROFILES_FILE": str(registry)}):
+                    snap = self.freeze(profile_overrides={"one": "local"})
+                    for relative in ("projects/task/session.jsonl", "debug/session.log",
+                                     "sessions/2026/turn.jsonl", "cache/usage.json"):
+                        path = profile_dir / relative
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text("synthetic runtime output", encoding="utf-8")
+                        self.assertTrue(snap.revalidate(), relative)
+                        path.write_text("changed runtime output", encoding="utf-8")
+                        self.assertTrue(snap.revalidate(), relative)
+                        path.unlink()
+                        self.assertTrue(snap.revalidate(), relative)
+
+    def test_known_profile_identity_creation_change_and_removal_invalidate(self):
+        cases = {
+            "claude": {
+                ".credentials.json": ('{"token":"A"}', '{"token":"B"}'),
+                ".claude.json": ('{"oauthAccount":{"accountUuid":"A"}}',
+                                 '{"oauthAccount":{"accountUuid":"B"}}'),
+                "account.json": ('{"account":"A"}', '{"account":"B"}'),
+                "auth.json": ('{"token":"A"}', '{"token":"B"}'),
+                "credentials.json": ('{"token":"A"}', '{"token":"B"}'),
+                "settings.json": ('{"model":"model-a"}', '{"model":"model-b"}'),
+                "settings.local.json": ('{"env":{"ANTHROPIC_BASE_URL":"route-a"}}',
+                                        '{"env":{"ANTHROPIC_BASE_URL":"route-b"}}'),
+            },
+            "codex": {
+                "auth.json": ('{"account_id":"A"}', '{"account_id":"B"}'),
+                "config.json": ('{"model":"model-a"}', '{"model":"model-b"}'),
+                "config.toml": ('model_provider = "route-a"', 'model_provider = "route-b"'),
+            },
+        }
+        for cli, files in cases.items():
+            self.add_agent("worker", cli=cli,
+                           model="gpt-5.6-sol" if cli == "codex" else "claude-fable-5-1")
+            profile_dir = self.root / (cli + "-identity-profile")
+            profile_dir.mkdir()
+            registry = self.root / (cli + "-identity-registry.json")
+            registry.write_text(json.dumps({"profiles": {
+                "local": {"cli": cli, "config_dir": str(profile_dir)}
+            }}), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"SUMMON_PROFILES_FILE": str(registry)}):
+                for name, (before, after) in files.items():
+                    with self.subTest(cli=cli, name=name):
+                        path = profile_dir / name
+                        absent = self.freeze(profile_overrides={"one": "local"})
+                        path.write_text(before, encoding="utf-8")
+                        self.assertFalse(absent.revalidate(), "creation must invalidate")
+                        present = self.freeze(profile_overrides={"one": "local"})
+                        path.write_text(after, encoding="utf-8")
+                        self.assertFalse(present.revalidate(), "identity change must invalidate")
+                        changed = self.freeze(profile_overrides={"one": "local"})
+                        public = json.dumps(changed.as_dict(native=False))
+                        self.assertNotIn(str(profile_dir), public)
+                        self.assertNotIn(after, public)
+                        path.unlink()
+                        self.assertFalse(changed.revalidate(), "removal must invalidate")
+
+    def test_profile_symlinked_identity_file_is_refused(self):
         self.add_agent("worker")
         profile_dir = self.root / "profile"
         profile_dir.mkdir()
-        target = self.root / "credentials-a"
-        target.mkdir()
-        (target / "token.json").write_text("A", encoding="utf-8")
+        target = self.root / "credentials-a.json"
+        target.write_text("A", encoding="utf-8")
         try:
-            os.symlink(str(target), str(profile_dir / "auth"), target_is_directory=True)
+            os.symlink(str(target), str(profile_dir / "credentials.json"))
         except (OSError, NotImplementedError):
             self.skipTest("symlink creation unavailable")
         registry = self.root / "profiles.json"
@@ -313,6 +380,94 @@ class FrozenRosterTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"SUMMON_PROFILES_FILE": str(registry)}, clear=False):
             with self.assertRaises(roster.RosterResolutionError):
                 self.freeze(profile_overrides={"one": "local"})
+
+    def test_profile_identity_file_bounds_and_non_regular_files_fail_closed(self):
+        profile_dir = self.root / "bounded-profile"
+        profile_dir.mkdir()
+        profile = {"cli": "claude", "env": {"CLAUDE_CONFIG_DIR": str(profile_dir)}}
+        path = profile_dir / "credentials.json"
+        path.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+        with self.assertRaisesRegex(roster.RosterResolutionError, "2 MiB"):
+            roster._profile_content_digest(profile)
+        path.unlink()
+        path.mkdir()
+        with self.assertRaisesRegex(roster.RosterResolutionError, "regular file"):
+            roster._profile_content_digest(profile)
+
+    def test_claude_cache_timestamp_does_not_refuse_prepared_invocation(self):
+        from _deliberation import TurnContext
+        from _deliberation_adapter import FreshDispatchAdapter
+        from _deliberation_invocation import build_invocation_plans
+
+        self.add_agent("worker", model="claude-fable-5-1")
+        profile_dir = self.root / "cache-timestamp-profile"
+        profile_dir.mkdir()
+        path = profile_dir / ".claude.json"
+        identity = {"oauthAccount": {"accountUuid": "synthetic-account"},
+                    "model": "claude-fable-5-1"}
+        path.write_text(json.dumps(identity), encoding="utf-8")
+        registry = self.root / "cache-timestamp-registry.json"
+        registry.write_text(json.dumps({"profiles": {
+            "local": {"cli": "claude", "config_dir": str(profile_dir)}
+        }}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"SUMMON_PROFILES_FILE": str(registry)}):
+            frozen = self.freeze(profile_overrides={"one": "local"})
+            plan = build_invocation_plans(
+                frozen, decision_id="decision", cwd=str(self.cwd), ballot_only=True)["one"]
+            text = "Synthetic choice."
+            adapter = FreshDispatchAdapter(
+                plan.template, snapshot_digest=plan.snapshot_digest,
+                current_snapshot_digest=lambda: plan.snapshot_digest if frozen.revalidate() else "0" * 64,
+                owner_is_current=lambda: True, timeout_ms=1000, generation=1,
+                invocation_for_context=lambda context: plan.for_context(context, text),
+                executor=lambda *a, **kw: self.fail("provider must not be called"))
+            # Creation, update with a different raw length, deletion, and key
+            # reordering/whitespace all retain the same semantic identity.
+            for index, document in enumerate((
+                    {**identity, "cachedGrowthBookFeaturesAt": 1},
+                    {"cachedGrowthBookFeaturesAt": 1234567890123, **identity},
+                    {"model": identity["model"], "oauthAccount": identity["oauthAccount"]})):
+                with self.subTest(index=index):
+                    path.write_text(json.dumps(document, indent=index + 1), encoding="utf-8")
+                    context = TurnContext("decision", "one", f"turn-{index}", index, _sha(text))
+                    adapter.prepare(context)
+                    self.assertTrue(frozen.revalidate())
+
+    def test_claude_json_preserves_account_config_and_unknown_keys(self):
+        profile_dir = self.root / "semantic-profile"
+        profile_dir.mkdir()
+        path = profile_dir / ".claude.json"
+        profile = {"cli": "claude", "env": {"CLAUDE_CONFIG_DIR": str(profile_dir)}}
+        original = {"oauthAccount": {"accountUuid": "A"}, "model": "model-a",
+                    "settings": {"route": "first-party"}, "unknownField": {"enabled": True}}
+        path.write_text(json.dumps(original), encoding="utf-8")
+        expected = roster._profile_content_digest(profile)
+        for key, replacement in (
+                ("oauthAccount", {"accountUuid": "B"}), ("model", "model-b"),
+                ("settings", {"route": "other"}), ("unknownField", {"enabled": False}),
+                ("futureUnknownField", "new"),
+                ("settings", {"cachedGrowthBookFeaturesAt": 123})):
+            with self.subTest(key=key, replacement=replacement):
+                path.write_text(json.dumps({**original, key: replacement}), encoding="utf-8")
+                self.assertNotEqual(expected, roster._profile_content_digest(profile))
+        deleted = dict(original)
+        del deleted["unknownField"]
+        path.write_text(json.dumps(deleted), encoding="utf-8")
+        self.assertNotEqual(expected, roster._profile_content_digest(profile))
+
+    def test_claude_json_invalid_or_ambiguous_identity_is_refused(self):
+        profile_dir = self.root / "invalid-metadata-profile"
+        profile_dir.mkdir()
+        path = profile_dir / ".claude.json"
+        profile = {"cli": "claude", "env": {"CLAUDE_CONFIG_DIR": str(profile_dir)}}
+        for raw in (b"not-json", b"[]", b"null", b"{\"model\":NaN}", b"{\"model\":Infinity}",
+                    b"{\"model\":\"A\",\"model\":\"B\"}",
+                    b"{\"cachedGrowthBookFeaturesAt\":1,\"cachedGrowthBookFeaturesAt\":2}",
+                    b"{\"oauthAccount\":{\"accountUuid\":\"A\",\"accountUuid\":\"B\"}}", b"\xff"):
+            with self.subTest(raw=raw):
+                path.write_bytes(raw)
+                with self.assertRaisesRegex(roster.RosterResolutionError, "JSON"):
+                    roster._profile_content_digest(profile)
 
     def test_transport_is_from_loaded_snapshot_not_a_second_file_read(self):
         self.add_agent("worker", cli="kimi", transport="acp", permission="yolo")

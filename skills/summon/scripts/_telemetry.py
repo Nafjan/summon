@@ -40,7 +40,7 @@ EVENT_SCHEMA_VERSION = 2
 # Keep the telemetry contract tied to the dispatcher release without importing
 # ``run_subagent`` (which would introduce a module cycle).  Release bumps must
 # update this alongside the dispatcher ``__version__``.
-SUMMON_VERSION = "3.3.0"
+SUMMON_VERSION = "3.4.0"
 # Backward-compatible name for callers that used the old event constant.  It
 # refers to event records, never the persisted opt-in configuration.
 SCHEMA_VERSION = EVENT_SCHEMA_VERSION

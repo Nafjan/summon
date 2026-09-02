@@ -99,7 +99,7 @@ from _resolver import discover_models, resolve_cli  # noqa: E402
 # Keep a literal assignment: the release-contract parser uses the dispatcher
 # source as a machine-checkable companion.  `_telemetry.SUMMON_VERSION` must be
 # updated in the same release; the release contract checks both literals.
-__version__ = "3.3.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "3.4.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -1670,6 +1670,7 @@ def main() -> None:
             allow=bool(getattr(args, "allow_auth_repair", False)),
             probe=bool(getattr(args, "probe", False)),
             timeout_s=max(1.0, int(getattr(args, "auth_timeout", 300000)) / 1000.0),
+            profile=getattr(args, "profile", None),
         )
         print(json.dumps(report, ensure_ascii=False) if args.json
               else (report.get("message") or json.dumps(report, ensure_ascii=False, indent=2)))
@@ -2691,6 +2692,7 @@ def main() -> None:
         allow_payg=getattr(args, "allow_payg", False),
         profile=profile_name,
         profile_env=(profile_selection or {}).get("env") if profile_selection else None,
+        profile_auth_mode=(profile_selection or {}).get("auth_mode", "profile"),
         profile_command=((profile_selection or {}).get("command")
                          if profile_selection else None),
         openrouter_options=_openrouter_options,
@@ -2715,6 +2717,7 @@ def main() -> None:
             "path_sha256": profile_selection["path_sha256"],
             "registry_sha256": profile_selection["registry_sha256"],
             "command_sha256": profile_selection.get("command_sha256"),
+            "auth_mode": profile_selection.get("auth_mode", "profile"),
         }
 
     if _governed_resume_context is not None:
@@ -3658,6 +3661,7 @@ def _run_gate(args, agents_dir, gated_inv, *, launch_control=None) -> dict:
         profile=gate_profile,
         profile_env=((gate_profile_selection or {}).get("env")
                      if gate_profile_selection else None),
+        profile_auth_mode=(gate_profile_selection or {}).get("auth_mode", "profile"),
         profile_command=((gate_profile_selection or {}).get("command")
                          if gate_profile_selection else None),
         # extra_args are DELIBERATELY DROPPED. build_invocation_args appends an

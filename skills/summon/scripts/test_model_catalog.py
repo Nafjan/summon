@@ -48,6 +48,15 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertFalse(display["served_exact"])
         self.assertNotIn("served", display)
 
+    def test_fable_successor_does_not_relabel_old_receipts(self):
+        current = catalog.display_for("claude", "claude-fable-5-1")
+        previous = catalog.display_for("claude", "claude-fable-5")
+        self.assertEqual(current["version"], "5.1")
+        self.assertEqual(current["role"], "decision lead")
+        self.assertEqual(previous["version"], "5")
+        self.assertFalse(current["served_exact"])
+        self.assertFalse(previous["served_exact"])
+
     def test_display_can_be_derived_from_redacted_model_hash(self):
         model_hash = __import__("hashlib").sha256(
             b"gemini-3.7-flash-high").hexdigest()

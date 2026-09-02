@@ -17,7 +17,8 @@ The current editorial bands are:
 | **Frontier** | 1–5 | Fable, Sol, Opus, Kimi, DeepSeek V4 Pro | escalation, architecture, synthesis, high-context research, deep reasoning |
 | **Near-frontier** | 1–7 | Grok 4.6, Gemini Flash 3.7, GLM 5.2, DeepSeek V4 Flash, Luna 5.6, Terra 5.6, Spark 5.3 | fast evidence, coding second opinions, and cost-efficient secondary work |
 
-These are Summon-curated labels as of 2026-08-20, not benchmark, safety, cost,
+The Fable entry was refreshed on 2026-09-02; other bands retain their previous
+editorial assessment. These are Summon-curated labels, not benchmark, safety, cost,
 availability, or vendor claims. A tooltip may show the role, model name, version,
 recommendation lane, catalog status, and whether an exact served-model match was
 observed. It must not show profiles, accounts, paths, prompts, credentials, or raw
@@ -125,7 +126,8 @@ emit neither form still truthfully retain `model.served: null` and
 | Agents | Backend | Model (verified) | Use for |
 |---|---|---|---|
 | `planner`, `architect`, `deep-debugger`, `security-auditor` | claude | `claude-opus-5` (pinned) | planning, architecture, gnarly debugging, security audits |
-| `fable` | claude | `claude-fable-5` | escalation tier: hardest problems, highest-stakes calls |
+| `fable` | claude | `claude-fable-5-1` (target; verify service) | lead architecture/design/strategy, orchestration plans, final technical approval and escalation; read-only, high effort |
+| `fable-api` | openai-compat | unavailable legacy route | retired: direct adapter lacks native Anthropic Messages support; explicitly select `fable` |
 | `pair`, `editor`, `quick-reviewer`, `pr-prep` | claude | `claude-sonnet-5` | balanced general work, prose, fast reviews, PR prep |
 | `reviewer`, `adversarial-reviewer`, `implementer`, `debugger`, `test-author` | codex | CLI config default (inspect `summon models --cli codex --refresh`) | code review, adversarial passes, implementation, tests |
 | `sol-review` | codex | `gpt-5.6-sol` (pinned) | adversarial architecture and release review |
@@ -180,8 +182,8 @@ The `cursor-agent` backend is not limited to Composer. A Cursor subscription exp
 large, multi-vendor model roster through the same CLI: GPT-5.x (including the codex,
 sol, terra, and luna families), Claude (Opus 4.5-4.8, Sonnet 4-5, Fable 5), Gemini 3.x,
 Grok 4.5/4.6, GLM 5.2, and Kimi K2.7. Cursor's current model page lists Grok 4.6 as
-available in the Cursor model pool, but the installed Cursor CLI here exposes no
-machine-readable model list. Treat the exact CLI slug and account eligibility as live
+available in the Cursor model pool. When a CLI exposes no machine-readable model
+list, treat the exact CLI slug and account eligibility as live
 facts: pass the candidate through, then require `model.served` to match before ranking
 it or adding it to a pinned agent:
 
@@ -198,9 +200,8 @@ for long-horizon coding and knowledge work. That makes it a strong candidate for
 second-opinion/coding seat, not an automatic replacement for the pinned Gemini Flash
 3.7 evidence lane: Cursor's transport has different billing, retention, permission, and
 read-only guarantees, and a local dispatch must prove `model.served`, `status`, and the
-expected permission envelope first. The local verification on 2026-08-13 could not
-complete because the Cursor team account reported its usage limit before serving a
-model, so Summon does **not** pin Grok 4.6 yet.
+expected permission envelope first. Summon does **not** pin Grok 4.6 without a
+verified exact-model receipt.
 
 Cursor's parameterized model syntax works too (the string is forwarded untouched):
 `--model '<cursor-model-id>[context=1m,effort=high,fast=false]'`. That `[effort=…]`

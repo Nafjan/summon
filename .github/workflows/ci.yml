@@ -51,6 +51,9 @@ jobs:
         run: >-
           python -m pytest -q
           skills/summon/scripts/test_phase0_contracts.py
+          skills/summon/scripts/test_account_profiles.py
+          skills/summon/scripts/test_fable_roster.py
+          skills/summon/scripts/test_claude_attribution.py
           skills/summon/scripts/test_install_drift.py
           skills/summon/scripts/test_kimi_timeout.py
           skills/summon/scripts/test_phase1_usage.py

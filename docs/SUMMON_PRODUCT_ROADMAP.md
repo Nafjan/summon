@@ -1,7 +1,7 @@
 # Summon product roadmap
 
 Last reviewed: 2026-08-28
-Current release: `3.3.0`
+Current release: `3.4.0`
 Product status: dispatch and council are public. The local chat atlas and swarm coordinator
 are public preview surfaces. Deliberation and provider lanes use independent evidence gates.
 

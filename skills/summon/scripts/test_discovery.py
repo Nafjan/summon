@@ -2777,13 +2777,13 @@ def test_no_false_success_on_backend_error_result():
 
 
 def test_stream_exposes_all_models_used():
-    # F17: models_used lists every model, resolved is only the dominant one.
+    # Aggregate usage preserves helper identities but cannot identify the lead.
     from _stream import StreamProcessor
     sp = StreamProcessor()
     sp.process_line('{"type":"result","result":"x","modelUsage":'
                     '{"claude-sonnet-5":{"outputTokens":900},'
                     '"claude-haiku-4-5":{"outputTokens":50}}}')
-    assert sp.model == "claude-sonnet-5", sp.model
+    assert sp.model is None, sp.model
     assert sp.models_used == ["claude-haiku-4-5", "claude-sonnet-5"], sp.models_used
 
 

@@ -195,7 +195,7 @@ MODE_FLAGS = {
                      "bug_report_submit", "github_repo", "bug_title",
                      "bug_description", "json", "job_file"},
     "auth": {"auth_action", "auth_backend", "allow_auth_repair", "auth_timeout",
-              "probe", "cli", "json", "job_file"},
+              "probe", "cli", "profile", "json", "job_file"},
 }
 MODE_HINTS = {
     "manifest": ("Put per-job settings (model, effort, timeout, json_schema, "
@@ -583,8 +583,8 @@ Generate a sanitized local Markdown report from the latest event or SOURCE (enve
 telemetry JSONL, debug directory). Review the existing REPORT.md, then submit that exact
 file in the separate `--submit-github` form; submission never regenerates it.
 """,
-    "auth": """summon auth status [--cli BACKEND] [--probe] [--json]
-summon auth repair BACKEND [--allow-auth-repair] [--auth-timeout 5m] [--json]
+    "auth": """summon auth status [--cli BACKEND] [--profile NAME] [--probe] [--json]
+summon auth repair BACKEND [--profile NAME] [--allow-auth-repair] [--auth-timeout 5m] [--json]
 
 Show provider authentication state without exposing credentials. `repair` is blocked
 unless `--allow-auth-repair` is explicit; it starts only the vendor login command,
@@ -1185,7 +1185,7 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--require-exact-model", dest="require_exact_model", action="store_true",
                         help="Require authoritative terminal evidence for the exact requested model; "
                              "mismatch or missing evidence blocks the result without retry/fallback")
-    parser.add_argument("--profile", help="Select a named private backend profile for this call; "
+    parser.add_argument("--profile", help="Select a named private Claude or Codex account/profile for this call; "
                         "the name is resolved from ~/.agents/summon-profiles.json and never a path")
     parser.add_argument(
         "--effort",

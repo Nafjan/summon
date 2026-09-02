@@ -138,9 +138,10 @@ def test_billing_is_derived_and_rechecked(monkeypatch):
     assert _fleet_activation.derive_billing_class(_invocation())["class"] == "payg"
 
 
-def test_plan_dependent_and_unsupported_billing_remain_unknown(monkeypatch):
+@pytest.mark.parametrize("model", ["claude-fable-5", "claude-fable-5-1"])
+def test_plan_dependent_and_unsupported_billing_remain_unknown(monkeypatch, model):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    fable = _invocation(cli="claude", model="claude-fable-5")
+    fable = _invocation(cli="claude", model=model)
     assert _fleet_activation.derive_billing_class(fable)["class"] == "unknown"
     assert _fleet_activation.derive_billing_class(
         _invocation(cli="opencode"))["class"] == "unknown"

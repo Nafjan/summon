@@ -86,6 +86,7 @@ class AgentInvocation:
     # receipts; the resolved path is kept only in profile_env and is never serialized.
     profile: str | None = None
     profile_env: dict | None = None
+    profile_auth_mode: str = "profile"  # login = explicitly isolated subscription account
     profile_command: str | None = None
     # Optional, validated OpenRouter request settings for the OpenCode gateway.
     # Only router/plugin fields are accepted; arbitrary OpenCode config is never
@@ -1071,6 +1072,8 @@ def _concatenated_args(
 
 
 def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
+    from _profiles import account_launch_policy
+    account_flags, profile_env = account_launch_policy(inv)
     perm = permission_flags(inv.cli, inv.permission)
     model_flag = ["--model", inv.model] if inv.model else []
     effort_flag = ["--effort", inv.effort] if inv.effort else []
@@ -1081,7 +1084,8 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     # Summon Claude seat away from its declared first-party account. A named
     # Summon profile is an explicit provider choice and keeps its own settings;
     # the ambient/default profile is isolated.
-    setting_sources = [] if inv.profile_env is not None else ["--setting-sources", ""]
+    setting_sources = (account_flags if inv.profile_auth_mode == "login" else
+                       [] if inv.profile_env is not None else ["--setting-sources", ""])
     common = (perm + model_flag + effort_flag
               + strip_boundary_flags(inv.cli, inv.extra_args)
               + root_flags
@@ -1097,7 +1101,7 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         return (command,
                 common
                 + ["--resume", inv.resume_id] + base_args,
-                inv.profile_env)
+                profile_env or None)
 
     system_prompt = f"cwd: {inv.cwd}\n\n{inv.system_context}"
     if inv.read_roots:
@@ -1117,7 +1121,7 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     return (command,
             common
             + ["--append-system-prompt", system_prompt] + base_args,
-            inv.profile_env)
+            profile_env or None)
 
 
 def _build_gemini_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
@@ -1220,16 +1224,16 @@ def infer_billing(cli: str) -> dict:
 # the requested model and reports the billing source as unknown unless an API-key
 # route indicates metered API billing.
 _CREDIT_ONLY_MODELS: set[str] = set()
-_PLAN_DEPENDENT_BILLING_MODELS = {"claude-fable-5"}
+_PLAN_DEPENDENT_BILLING_MODELS = {"claude-fable-5", "claude-fable-5-1"}
 # Premium models deserve a pre-dispatch billing notice even when summon cannot
 # determine which part of the vendor plan will pay for the run.
 _PREMIUM_MODELS = {
-    "claude-fable-5": (
+    model: (
         "plan-dependent billing: Max/premium seats may use Fable for up to 50% of "
         "their regular weekly limit at no extra cost, while Pro/standard seats use "
         "usage credits from the start; after that limit, eligible plans may continue "
         "on usage credits"
-    ),
+    ) for model in _PLAN_DEPENDENT_BILLING_MODELS
 }
 # The latest subscription-covered Opus, PINNED (not the `opus` alias). The alias
 # LAGS BADLY — re-verified 2026-07-25: `--model opus` still served claude-opus-4-7,
@@ -1366,7 +1370,7 @@ def infer_dispatch_billing(cli: str, model: str | None = None,
         return {
             "source": "unknown",
             "note": (
-                "Fable 5 billing is plan-dependent: included for up to 50% of regular "
+                "Fable billing is plan-dependent: included for up to 50% of regular "
                 "weekly usage on Max/premium seats; usage credits on Pro/standard "
                 "seats or after that limit. summon cannot inspect the plan or "
                 "remaining usage"
@@ -1490,6 +1494,8 @@ def _codex_env_override() -> dict | None:
 
 
 def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
+    from _profiles import account_launch_policy
+    account_flags, profile_env = account_launch_policy(inv)
     perm = permission_flags(inv.cli, inv.permission)
     selection = codex_model_selection(inv.model, inv.extra_args)
     if selection["conflict"]:
@@ -1507,19 +1513,19 @@ def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     if inv.effort:
         _e = "high" if inv.effort in ("xhigh", "max") else inv.effort
         effort_flag = ["-c", f"model_reasoning_effort={_e}"]
-    env = env_override_for("codex")
+    env = {**(env_override_for("codex") or {}), **profile_env} or None
     passthrough = strip_codex_model_selectors(inv.extra_args)
-    head = (perm + model_flag + effort_flag
+    head = (perm + model_flag + effort_flag + account_flags
             + strip_boundary_flags(inv.cli, passthrough))
     if inv.resume_id:
         # `codex exec resume <id>`: the thread holds the agent definition, so send
         # only the task + reminder (no [System Context] prefix). Permission/model
         # flags are global codex flags and still precede the subcommand.
-        return "codex", head + [
+        return inv.profile_command or "codex", head + [
             "exec", "resume", inv.resume_id, "--json", "--skip-git-repo-check",
             _resume_prompt(inv)], env
     command, base_args = build_command(inv.cli, _concatenated_prompt(inv))
-    return command, head + base_args, env
+    return inv.profile_command or command, head + base_args, env
 
 
 def _build_cursor_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:

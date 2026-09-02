@@ -222,8 +222,10 @@ emits one canonical selector where the backend supports it, refuses conflicting 
 before provider contact, and blocks an exact seat when the provider does not return an
 authoritative terminal served-model receipt. A handshake target, output-token estimate, or
 catalog entry is not proof that the requested model was served. Claude may report auxiliary
-models in `model.models_used`; that list is retained, but the dominant terminal model must
-still match an exact seat's requested pin. Use `--require-exact-model` or
+models in `model.models_used`; aggregate token counts do not identify the lead. A flat
+terminal model, an unambiguous single-model usage record, or root assistant metadata bound
+to the exact terminal response establishes identity. Mixed usage without that binding
+remains unverified, not a claimed fallback. Use `--require-exact-model` or
 `model-policy: exact` for a custom seat. See [`docs/SUMMON_3.2_PLAN.md`](docs/SUMMON_3.2_PLAN.md)
 for the routing and chat acceptance gates. The fixed-shell chat atlas is still preview-only
 until its rendered-browser and owner-lifecycle gates pass.
@@ -245,7 +247,7 @@ python tools/release_gates.py --require-clean --output "${RUNNER_TEMP:-${TMPDIR:
 python tools/release_manifest.py \
   --evidence-file "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json" \
   --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" \
-  --expected-version 3.3.0 --check
+  --expected-version 3.4.0 --check
 ```
 
 The runner executes the fixed suites, records output digests, strips backend credentials and
@@ -620,7 +622,7 @@ vendors.
   "raw_backend_exit_code": null,
   "normalized_exit_code": null,
   "exit_code": null,
-  "summon":  { "version": "3.3.0", "scripts_sha256": "<sha256>" },
+  "summon":  { "version": "3.4.0", "scripts_sha256": "<sha256>" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },

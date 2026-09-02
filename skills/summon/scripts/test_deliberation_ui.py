@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import json
 import hashlib
+import http.client
+import io
 import re
 import shutil
 import sys
 import subprocess
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -167,6 +170,58 @@ class DeliberationUITests(unittest.TestCase):
                              body={"action": "approve"},
                              origin=f"http://127.0.0.1:{self.surface.address[1]}")
             self.assertEqual(caught.exception.code, 400)
+            queue.assert_not_called()
+
+    def test_delayed_rejected_post_body_returns_401_without_queueing(self):
+        """Separate header/body writes must not turn rejection into a reset."""
+        origin = f"http://127.0.0.1:{self.surface.address[1]}"
+        body = b'{"action":"cancel"}'
+        original_send = http.client.HTTPConnection.send
+
+        def delayed_send(connection, data):
+            if data == body:
+                time.sleep(0.025)
+            return original_send(connection, data)
+
+        cases = (
+            {"Authorization": "Bearer " + self.surface.token},
+            {"Authorization": "Bearer " + self.surface.token,
+             "Origin": "http://foreign.invalid"},
+            {"Origin": origin},
+            {"Authorization": "Bearer " + self.surface.token,
+             "Origin": origin, "Host": "foreign.invalid"},
+        )
+        with mock.patch.object(http.client.HTTPConnection, "send", delayed_send), \
+             mock.patch.object(ui._store, "queue_cancel") as queue:
+            for index, headers in enumerate(cases):
+                with self.subTest(case=index):
+                    request = Request(
+                        origin + "/api/v1/runs/run-1/commands", data=body,
+                        headers={**headers, "Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with self.assertRaises(HTTPError) as caught:
+                        urlopen(request, timeout=3)
+                    with caught.exception as response:
+                        self.assertEqual(response.code, 401)
+                        self.assertEqual(json.load(response)["error_kind"],
+                                         "ui_request_failed")
+                    queue.assert_not_called()
+
+    def test_rejected_post_with_stalled_body_has_bounded_wait(self):
+        connection = http.client.HTTPConnection(*self.surface.address, timeout=2)
+        self.addCleanup(connection.close)
+        with mock.patch.object(ui, "REQUEST_TIMEOUT_SECONDS", 0.05), \
+             mock.patch.object(ui._store, "queue_cancel") as queue:
+            started = time.monotonic()
+            connection.putrequest("POST", "/api/v1/runs/run-1/commands")
+            connection.putheader("Authorization", "Bearer " + self.surface.token)
+            connection.putheader("Content-Length", "19")
+            connection.endheaders()
+            with connection.getresponse() as response:
+                self.assertEqual(response.status, 401)
+                response.read()
+            self.assertLess(time.monotonic() - started, 1.5)
             queue.assert_not_called()
 
     def test_extra_route_segments_are_refused(self):
@@ -387,6 +442,43 @@ class DeliberationUITests(unittest.TestCase):
         self.assertFalse(mixed_display["served_exact"])
         for private_model in ("gpt-5.6-sol", "gpt-5.6-luna"):
             self.assertNotIn(private_model, json.dumps(inferred))
+
+
+class RejectedPostBodyTests(unittest.TestCase):
+    def handler(self, length):
+        handler = object.__new__(ui._SurfaceHandler)
+        handler.headers = {"Content-Length": length}
+        handler.connection = mock.Mock()
+        handler.connection.gettimeout.return_value = ui.REQUEST_TIMEOUT_SECONDS
+        handler.rfile = mock.Mock()
+        handler.close_connection = False
+        return handler
+
+    def test_malformed_and_oversized_bodies_are_not_drained(self):
+        for length in (None, "-1", "invalid", str(ui.MAX_BODY_BYTES + 1)):
+            with self.subTest(length=length):
+                handler = self.handler(length)
+                handler._drain_rejected_body()
+                handler.rfile.read1.assert_not_called()
+                self.assertTrue(handler.close_connection)
+
+    def test_drain_never_consumes_more_than_the_bounded_content_length(self):
+        handler = self.handler(str(ui.MAX_BODY_BYTES))
+        handler.rfile = io.BytesIO(b"x" * ui.MAX_BODY_BYTES + b"extra")
+        handler._drain_rejected_body()
+        self.assertEqual(handler.rfile.read(), b"extra")
+
+    def test_trickling_body_cannot_extend_total_drain_deadline(self):
+        handler = self.handler("19")
+        handler.rfile.read1.return_value = b"x"
+        with mock.patch.object(ui, "REQUEST_TIMEOUT_SECONDS", 5.0), \
+             mock.patch.object(ui.time, "monotonic", side_effect=[10.0, 10.0, 12.0, 15.1]):
+            handler._drain_rejected_body()
+        self.assertEqual(handler.rfile.read1.call_count, 2)
+        self.assertTrue(handler.close_connection)
+        self.assertEqual(handler.connection.settimeout.call_args_list,
+                         [mock.call(5.0), mock.call(3.0),
+                          mock.call(ui.REQUEST_TIMEOUT_SECONDS)])
 
 
 if __name__ == "__main__":

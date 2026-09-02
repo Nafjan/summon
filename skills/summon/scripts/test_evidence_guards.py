@@ -97,7 +97,8 @@ class EvidenceGuardTests(unittest.TestCase):
     def _execute_claude_stream(self, *, served_model="claude-opus-5",
                                requested_model="claude-opus-5",
                                handshake_model="claude-opus-5",
-                               exact_required=True, include_model_usage=True) -> dict:
+                               exact_required=True, include_model_usage=True,
+                               aggregate_only=False) -> dict:
         """Drive the Claude JSONL result path with deterministic modelUsage."""
         import subprocess
         usage = {
@@ -125,6 +126,8 @@ class EvidenceGuardTests(unittest.TestCase):
             }
         if not include_model_usage:
             terminal.pop("modelUsage", None)
+        elif served_model is not None and not aggregate_only:
+            terminal["model"] = served_model
         lines = [
             {"type": "system", "subtype": "init", "session_id": "session-test",
              "model": handshake_model},
@@ -284,14 +287,16 @@ class EvidenceGuardTests(unittest.TestCase):
         self.assertFalse(result["result_usable"])
         self.assertEqual(result["model"]["targeted"], "gpt-5.6-luna")
 
-    def test_exact_claude_seat_blocks_auxiliary_model_as_dominant_served(self):
-        result = self._execute_claude_stream(served_model="claude-haiku-4-5-20251001")
+    def test_exact_claude_seat_does_not_attribute_dominant_auxiliary_model(self):
+        result = self._execute_claude_stream(
+            served_model="claude-haiku-4-5-20251001", aggregate_only=True)
         self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["error_kind"], "served_model_mismatch")
+        self.assertEqual(result["error_kind"], "served_model_unverified")
         self.assertFalse(result["retryable"])
         self.assertFalse(result["result_usable"])
         self.assertEqual(result["model"]["requested"], "claude-opus-5")
-        self.assertEqual(result["model"]["served"], "claude-haiku-4-5-20251001")
+        self.assertIsNone(result["model"]["served"])
+        self.assertEqual(result["served_model_evidence"], "absent")
         self.assertEqual(
             result["model"]["models_used"],
             ["claude-haiku-4-5-20251001", "claude-opus-5"],
@@ -303,6 +308,24 @@ class EvidenceGuardTests(unittest.TestCase):
         self.assertNotEqual(result.get("result_usable"), False)
         self.assertEqual(result["model"]["served"], "claude-opus-5")
         self.assertEqual(result["served_model_evidence"], "reported")
+
+    def test_best_effort_claude_mixed_usage_does_not_infer_lead(self):
+        result = self._execute_claude_stream(
+            exact_required=False, aggregate_only=True)
+        self.assertEqual(result["status"], "success")
+        self.assertIsNone(result["model"]["served"])
+        self.assertIsNone(result["model_match"])
+        self.assertFalse(result["named_model_verified"])
+        self.assertEqual(result["served_model_evidence"], "absent")
+        self.assertTrue(any("provenance" in w for w in result["warnings"]))
+
+    def test_ambiguous_claude_target_does_not_claim_backend_ran_model(self):
+        result = self._execute_claude_stream(
+            requested_model="claude-fable-5-1", exact_required=False,
+            aggregate_only=True)
+        self.assertIsNone(result["model"]["served"])
+        self.assertEqual(result["model"]["targeted"], "claude-opus-5")
+        self.assertFalse(any("backend ran" in w for w in result["warnings"]))
 
     def test_exact_claude_floating_alias_is_not_certified_as_exact(self):
         result = self._execute_claude_stream(

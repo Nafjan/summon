@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +35,18 @@ _SHA256_HEX = frozenset("0123456789abcdef")
 _TEXT_SEAT_CLIS = frozenset({"openai-compat", "arkcli"})
 _ACP_CLIS = frozenset({"cursor-agent", "gemini", "kimi"})
 _KNOWN_TRANSPORTS = frozenset({"subprocess", "acp"})
+# This filename set is the union of the named-profile files used by
+# _profiles._profile_state and _fleet_activation._profile_private_projection;
+# those helpers have different projections and are not identical contracts.
+# Runtime transcripts, debug logs and caches are not traversed. Claude's
+# mixed account/config JSON is canonicalized below, excluding only the cache
+# timestamp whose runtime churn was observed in the release pilot.
+_PROFILE_IDENTITY_FILES = {
+    "claude": (".credentials.json", ".claude.json", "account.json", "auth.json",
+               "credentials.json", "settings.json", "settings.local.json"),
+    "codex": ("auth.json", "config.json", "config.toml"),
+}
+_PROFILE_IDENTITY_FILE_LIMIT = 2 * 1024 * 1024
 _ENV_PREFIXES = {
     "claude": ("ANTHROPIC_",),
     "codex": ("OPENAI_", "CODEX_"),
@@ -168,8 +181,34 @@ def _git_head(path: str) -> str | None:
         return None
 
 
+def _claude_profile_identity(raw: bytes) -> bytes:
+    """Preserve all JSON state except the evidenced non-identity cache timestamp."""
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    def reject_constant(_value):
+        raise ValueError("non-finite JSON constant")
+
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object,
+                           parse_constant=reject_constant)
+        if not isinstance(value, dict):
+            raise ValueError("JSON root must be an object")
+        # Never discard unknown keys or identically named nested properties.
+        value.pop("cachedGrowthBookFeaturesAt", None)
+        return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=True, allow_nan=False).encode("ascii")
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise RosterResolutionError("profile account/config JSON is invalid or ambiguous") from exc
+
+
 def _profile_content_digest(profile: Mapping[str, object] | None) -> str | None:
-    """Hash profile file names, sizes and contents without exposing credentials."""
+    """Bind known auth/config files without following mutable runtime history."""
     if not profile:
         return None
     env = profile.get("env")
@@ -178,6 +217,9 @@ def _profile_content_digest(profile: Mapping[str, object] | None) -> str | None:
     root = next((value for value in env.values() if isinstance(value, str)), None)
     if not root:
         return None
+    names = _PROFILE_IDENTITY_FILES.get(profile.get("cli"))
+    if names is None:
+        raise RosterResolutionError("profile identity files are unknown for this backend")
     root_path = Path(root)
     try:
         root_path = root_path.resolve(strict=True)
@@ -185,35 +227,44 @@ def _profile_content_digest(profile: Mapping[str, object] | None) -> str | None:
         raise RosterResolutionError("profile config directory disappeared") from exc
     if not root_path.is_dir():
         raise RosterResolutionError("profile config directory is not a directory")
-    digest = hashlib.sha256(b"summon-profile-content-v1")
-    count = 0
-    total_bytes = 0
-    for current, dirs, files in os.walk(root_path, followlinks=False):
-        dirs.sort()
-        files.sort()
-        # A directory symlink can change the credential tree without changing
-        # the visible names returned by a non-following walk.  Refuse it rather
-        # than pretending the profile contents are frozen.
-        if any((Path(current) / name).is_symlink() for name in dirs + files):
-            raise RosterResolutionError("profile contains symlinked content")
-        for name in files:
-            path = Path(current) / name
-            try:
-                relative = path.relative_to(root_path).as_posix()
-                size = path.stat().st_size
-                child = _sha256_file(str(path))
-            except (OSError, ValueError) as exc:
-                raise RosterResolutionError("profile content could not be attested") from exc
-            if child is None:
-                raise RosterResolutionError("profile content disappeared during attestation")
-            count += 1
-            if count > 4096:
-                raise RosterResolutionError("profile contains too many files")
-            total_bytes += size
-            if total_bytes > 64 * 1024 * 1024:
-                raise RosterResolutionError("profile contents exceed attestation bound")
-            digest.update(relative.encode("utf-8") + b"\0" + str(size).encode("ascii")
-                          + b"\0" + child.encode("ascii") + b"\0")
+    digest = hashlib.sha256(b"summon-profile-identity-v3")
+    for name in names:
+        path = root_path / name
+        digest.update(name.encode("utf-8") + b"\0")
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            # Creating a previously absent auth/config file changes identity.
+            digest.update(b"absent\0")
+            continue
+        except OSError as exc:
+            raise RosterResolutionError("profile identity file could not be inspected") from exc
+        if (not stat.S_ISREG(before.st_mode)
+                or getattr(before, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+            raise RosterResolutionError("profile identity file is linked or not a regular file")
+        try:
+            with path.open("rb") as handle:
+                opened = os.fstat(handle.fileno())
+                if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise RosterResolutionError("profile identity file changed during attestation")
+                raw = handle.read(_PROFILE_IDENTITY_FILE_LIMIT + 1)
+            after = path.lstat()
+        except OSError as exc:
+            raise RosterResolutionError("profile identity file could not be read") from exc
+        if len(raw) > _PROFILE_IDENTITY_FILE_LIMIT:
+            raise RosterResolutionError("profile identity file exceeds the 2 MiB safety bound")
+        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                or len(raw) != before.st_size):
+            raise RosterResolutionError("profile identity file changed during attestation")
+        identity = (_claude_profile_identity(raw)
+                    if profile.get("cli") == "claude" and name == ".claude.json" else raw)
+        # The stable digest binds projected bytes and their length. Raw size
+        # and mtime above detect torn reads only; binding them here would
+        # reintroduce cache-timestamp and JSON-formatting churn.
+        digest.update(b"present\0" + str(len(identity)).encode("ascii") + b"\0"
+                      + hashlib.sha256(identity).digest() + b"\0")
     return digest.hexdigest()
 
 
@@ -904,6 +955,7 @@ def freeze_roster(
             "definition_source": str(definition_source),
             "profile_env": MappingProxyType(dict(profile_env)),
             "profile_command": ((profile_selection or {}).get("command")),
+            "profile_auth_mode": (profile_selection or {}).get("auth_mode", "profile"),
             "extra_args": tuple(extra_args),
             "custom_agent_definition_body": (
                 custom_agent.body if custom_agent is not None else None),

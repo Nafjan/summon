@@ -1,15 +1,15 @@
 {
   "schema": 1,
   "authority": "summon-editorial",
-  "as_of": "2026-08-20",
+  "as_of": "2026-09-02",
   "definition": "frontier and near-frontier are editorial routing labels, not guarantees of quality, safety, cost, availability, or vendor endorsement; exact model.served evidence remains authoritative",
   "entries": [
     {
-      "key": "claude/claude-fable-5",
-      "identity": {"vendor": "anthropic", "model_id": "claude-fable-5"},
-      "display": {"role": "escalation", "name": "Fable", "version": "5"},
-      "editorial": {"label": "frontier", "rank": 1, "lane": "high-stakes-escalation"},
-      "route": {"backend": "claude", "target": "claude-fable-5", "dispatchable": true}
+      "key": "claude/claude-fable-5-1",
+      "identity": {"vendor": "anthropic", "model_id": "claude-fable-5-1"},
+      "display": {"role": "decision lead", "name": "Fable", "version": "5.1"},
+      "editorial": {"label": "frontier", "rank": 1, "lane": "lead-planning-final-escalation"},
+      "route": {"backend": "claude", "target": "claude-fable-5-1", "dispatchable": true}
     },
     {
       "key": "codex/gpt-5.6-sol",
@@ -87,6 +87,13 @@
       "display": {"role": "fast quota-isolated", "name": "Spark", "version": "5.3"},
       "editorial": {"label": "near-frontier", "rank": 7, "lane": "fast-quota-isolated"},
       "route": {"backend": "codex", "target": "gpt-5.3-spark", "dispatchable": false, "availability": "declared_unverified"}
+    },
+    {
+      "key": "claude/claude-fable-5",
+      "identity": {"vendor": "anthropic", "model_id": "claude-fable-5"},
+      "display": {"role": "previous-version escalation", "name": "Fable", "version": "5"},
+      "editorial": {"label": "frontier", "rank": 6, "lane": "explicit-previous-version"},
+      "route": {"backend": "claude", "target": "claude-fable-5", "dispatchable": true}
     }
   ]
 }

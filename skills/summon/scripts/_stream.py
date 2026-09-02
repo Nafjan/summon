@@ -243,9 +243,12 @@ class StreamProcessor:
         # never masquerade as the served model (field case: a failed Fable
         # dispatch reported the handshake model as `resolved` with zero tokens).
         self.handshake_model = None  # from init / thread.started (targeted, not served)
-        self.model = None       # from the TERMINAL event only (model field / modelUsage)
-        self.models_used = []   # every model id seen in modelUsage (resolved is only the dominant one)
+        self.model = None       # terminal model or response-bound root assistant identity
+        self.models_used = []   # aggregate usage, never a vote for the lead model
         self.model_evidence_source = None
+        self._claude_session_id = None
+        self._claude_final_candidate = None
+        self._claude_identity_conflict = False
         self.is_error = False   # the terminal event itself reported an error (claude is_error / result status)
 
     def _remember_semantic_activity(self, kind: str, identity: object) -> str | None:
@@ -390,6 +393,9 @@ class StreamProcessor:
         if (data.get("type") == "system" and data.get("subtype") == "init"
                 and self._declared_cli in (None, "claude")):
             self._bind_session(data.get("session_id"), data)
+            self._claude_session_id = data.get("session_id")
+            self._claude_final_candidate = None
+            self._claude_identity_conflict = False
             if data.get("model"):
                 self.handshake_model = data["model"]
             return False
@@ -483,6 +489,7 @@ class StreamProcessor:
                 and self._declared_cli in (None, "claude")):
             message = data["message"]
             content = message.get("content")
+            self._capture_claude_root(data, message, content)
             if isinstance(content, list):
                 for index, block in enumerate(content):
                     if not isinstance(block, dict):
@@ -847,20 +854,63 @@ class StreamProcessor:
             if data.get(key):
                 self.session_id = data[key]
                 break
-        # Served model: claude's result carries modelUsage (a dict keyed by
-        # model id); some CLIs put a flat "model" field on the result object.
+        # Usage can include child agents. Token dominance says nothing about
+        # who authored the returned response. Keep aggregate identities separate.
+        model_usage = data.get("modelUsage")
+        if isinstance(model_usage, dict):
+            self.models_used = sorted(k for k in model_usage if isinstance(k, str))
+        self.model = None
+        self.model_evidence_source = None
+        if (self._claude_identity_conflict
+                or (self._claude_session_id and data.get("session_id")
+                    and data["session_id"] != self._claude_session_id)):
+            self.model_evidence_source = "claude_identity_conflict"
+            return
         if isinstance(data.get("model"), str) and data["model"]:
             self.model = data["model"]
-        elif isinstance(data.get("modelUsage"), dict) and data["modelUsage"]:
-            # `resolved` is only the DOMINANT model (most output tokens). A claude
-            # session often also uses a cheap auxiliary model (e.g. haiku for a
-            # background step), so exposing every model id in `models_used` keeps
-            # the telemetry honest — an orchestrator must not read `resolved` as
-            # "the one model that served this run".
-            def _out(v):
-                return v.get("outputTokens", 0) if isinstance(v, dict) else 0
-            self.models_used = sorted(data["modelUsage"])
-            self.model = max(data["modelUsage"], key=lambda k: _out(data["modelUsage"][k]))
+            self.model_evidence_source = "terminal_model"
+        elif self._claude_final_candidate and isinstance(data.get("result"), str):
+            model, session, digest = self._claude_final_candidate
+            if (data.get("type") == "result" and data.get("session_id") == session
+                    and hashlib.sha256(data["result"].encode("utf-8")).digest() == digest):
+                self.model = model
+                self.model_evidence_source = "claude_root_response"
+        # A single usage identity is unambiguous only if there is no contrary
+        # root-message candidate. Multiple identities remain unverified unless
+        # the actual final response is bound above; never select the largest.
+        if self.model is None and not self._claude_final_candidate:
+            if len(self.models_used) == 1:
+                self.model = self.models_used[0]
+                self.model_evidence_source = "terminal_single_model_usage"
+        if self.model is None and self.models_used:
+            self.model_evidence_source = "claude_aggregate_usage"
+
+    def _capture_claude_root(self, data, message, content) -> None:
+        """Keep only a digest of the latest root text, not private transcript text."""
+        if data.get("parent_tool_use_id") is not None:
+            return
+        # An unassociated assistant event cannot certify root authorship.
+        self._claude_final_candidate = None
+        if (self._claude_session_id and data.get("session_id")
+                and data["session_id"] != self._claude_session_id):
+            self._claude_identity_conflict = True
+        if ("parent_tool_use_id" not in data or not self._claude_session_id
+                or data.get("session_id") != self._claude_session_id
+                or not isinstance(content, list)
+                or message.get("stop_reason") not in (None, "end_turn", "stop_sequence")):
+            return
+        if any(not isinstance(b, dict) or b.get("type") not in ("text", "thinking")
+               for b in content):
+            return
+        model = _safe_kimi_model_id(message.get("model"))
+        parts = [b.get("text") for b in content if b.get("type") == "text"]
+        if not model or not parts or not all(isinstance(p, str) for p in parts):
+            return
+        text = "".join(parts)
+        if text.strip():
+            self._claude_final_candidate = (
+                model, self._claude_session_id,
+                hashlib.sha256(text.encode("utf-8")).digest())
 
     def _capture_kimi_metadata(self, data: dict) -> None:
         """Capture provider-authored identity/usage from Kimi JSONL records.

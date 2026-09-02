@@ -563,6 +563,34 @@ def test_key_checkpoint_is_authenticated(tmp_path):
         live.status(store_file=path, now=NOW)
 
 
+def test_private_root_setup_is_inside_process_lock(tmp_path, monkeypatch):
+    events = []
+
+    class CheckedLock:
+        held = False
+
+        def __enter__(self):
+            self.held = True
+            events.append("locked")
+
+        def __exit__(self, *args):
+            self.held = False
+            events.append("unlocked")
+
+    lock = CheckedLock()
+
+    def secure_root(path):
+        assert lock.held, "private root setup must be serialized with record writes"
+        events.append("secured")
+
+    monkeypatch.setattr(live, "_STORE_PROCESS_LOCK", lock)
+    monkeypatch.setattr(live, "_secure_root_for", secure_root)
+    with live._locked_store(str(tmp_path / "usage.json")):
+        assert lock.held
+        events.append("body")
+    assert events == ["locked", "secured", "body", "unlocked"]
+
+
 def test_concurrent_updates_are_serialized_and_monotonic(tmp_path):
     path = str(tmp_path / "usage.json")
     barrier = threading.Barrier(4)

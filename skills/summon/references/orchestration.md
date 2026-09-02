@@ -9,7 +9,7 @@ Project-agnostic and host-agnostic. Adopt the parts you need; every section is
 written so a single orchestrator (human or agent) can act on it without a
 house style guide.
 
-Semantics below were verified against summon **3.3.0**. Model ids and alias
+Semantics below were verified against summon **3.4.0**. Model ids and alias
 behaviour are volatile: re-check with `doctor`, `list`, `models`, and
 `--dry-run` before a run you care about.
 
@@ -109,6 +109,12 @@ Record these from every dispatch that matters:
 `served` is set from **either** a terminal event in which the backend names the
 model, **or** the weaker inference `output_tokens > 0 AND targeted is known`.
 When neither holds, `served` is `null`.
+
+Claude helper token totals do not identify the lead. A flat terminal model or
+unambiguous single-model usage record can establish identity. Otherwise Summon
+requires root assistant metadata bound to the same session and exact terminal
+response text. Mixed usage without that binding stays unverified, including on
+best-effort calls. A helper's larger output is not evidence of a fallback.
 
 That second path means **`served` can simply echo what you asked for**. It
 confirms that output was produced, not that the named model produced it. This
@@ -319,11 +325,41 @@ If quorum, independence, permissions, or receipts cannot be shown, call the
 result an informal consultation rather than a governance artifact.
 
 **Check what your chair costs.** The default chairman is `architect` (Opus 5).
-It used to be `fable`, which meant every council omitting `--chairman` routed
-SYNTHESIS -- the single most expensive stage -- to a credit-billed model at
-roughly twice the price, without it being the stronger model for that work. If
-your project pins its own chairman, check which model it actually resolves to;
-`--dry-run` will tell you in one call.
+Use `--chairman fable` explicitly for consequential plans, difficult architectural
+decisions, or unresolved dissent. Fable 5.1 is the lead decision and escalation
+seat, not the default for routine synthesis. Billing depends on the selected
+provider and plan. A dry run checks the target, not account eligibility.
+
+### Fable 5.1: lead decisions, delegate execution
+
+Use the exact `claude-fable-5-1` seat early when architectural, design, or strategic
+choices drive substantial downstream work. It can design an orchestration, research
+program, or codebase review without conducting every search or writing the code.
+For small, well-understood changes, let the ordinary implementer/reviewer finish
+without a ceremonial Fable round. Escalate when evidence conflicts, attempts fail,
+trade-offs are consequential, or the caller requires final technical approval.
+
+1. Have suitable lower-cost workers collect evidence and alternatives. Give Fable
+   a compact decision packet: objective, constraints, revision/diff, evidence
+   locators, test summary, disagreements, and acceptance criteria. Keep negative
+   evidence and uncertainty; omit duplicate logs and raw tool transcripts.
+2. Ask Fable to define work packages, dependencies, implementer/reviewer roles,
+   test gates, and stop conditions. The caller executes that plan. The read-only
+   `fable` seat does not edit product files or spawn an unbudgeted second council.
+3. Independent workers implement and verify. Fable returns APPROVE, CONCERNS
+   (revise and resubmit), or BLOCK for the exact revision. Revision findings need
+   stable IDs, severity, rationale, required changes, and closure tests.
+4. Resubmit the new revision with prior HANDOFF, finding dispositions, the diff,
+   and closure evidence. Review affected dependencies and new risks; do not pay
+   for a fresh whole-codebase review after every small correction. Preserve a
+   self-contained brief even when continuity is available. Do not call a model's
+   own revision check an independent endorsement.
+
+Default to high effort; request max for the hardest decisions. Prefer focused
+reports, not hard output truncation that can destroy the final contract. A Fable
+recommendation does not grant spending, deployment, or merge authority. Before a
+named-model approval counts, require exact provider-reported served identity;
+target selection, inferred identity, and a polished report are insufficient.
 
 **Budget the wall clock.** Members run at most 3 concurrent per backend, so
 roughly `rounds x waves x (timeout + 60s) + (timeout + 60s)`, where

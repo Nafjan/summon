@@ -64,7 +64,7 @@ _INVOCATION_FIELDS = frozenset({
     "model_exact_source", "effort", "resume_id", "resume_profile", "extra_args",
     "base_url", "api_key_env", "api_key_fingerprint", "allow_payg", "agy_account_sha256",
     "agy_account_checked", "permission_forced", "profile", "profile_env",
-    "profile_command", "openrouter_options", "worktree", "isolated_lane",
+    "profile_command", "profile_auth_mode", "openrouter_options", "worktree", "isolated_lane",
     "allow_tool_credentials", "read_roots", "output_contract", "attempt_id",
     "attempt_kind", "attempt_ordinal", "parent_attempt_id",
 })
@@ -181,9 +181,12 @@ def _profile_environment(invocation: Any) -> dict[str, str]:
     """Project the environment the pure backend builder actually gives its child."""
     effective = dict(os.environ)
     profile_env = getattr(invocation, "profile_env", None)
-    # Of the currently eligible builders only Claude forwards profile_env.  Do
-    # not pretend unused values affect Codex or Cursor execution.
-    if getattr(invocation, "cli", None) == "claude" and profile_env is not None:
+    # Both named-profile builders forward the selected home. Login-account
+    # mode additionally removes ambient credentials before applying that home.
+    if getattr(invocation, "profile_auth_mode", "profile") == "login":
+        from _profiles import account_launch_policy
+        _, profile_env = account_launch_policy(invocation)
+    if getattr(invocation, "cli", None) in ("claude", "codex") and profile_env is not None:
         if (not isinstance(profile_env, dict)
                 or not all(isinstance(key, str) and _ENV_NAME.fullmatch(key)
                            and (value is None or isinstance(value, str))
@@ -282,7 +285,7 @@ def derive_billing_class(invocation: Any) -> dict:
             billing, source = "unknown", "custom_provider_configuration"
         elif effective.get("ANTHROPIC_API_KEY"):
             billing, source = "payg", "anthropic_key_present"
-        elif model == "claude-fable-5":
+        elif model in {"claude-fable-5", "claude-fable-5-1"}:
             billing, source = "unknown", "plan_dependent_model"
         else:
             billing, source = "subscription", "anthropic_key_absent"
@@ -716,6 +719,8 @@ def _claude_settings_environment(
         (project, "settings.local.json",
          "Claude project settings/settings.local.json"),
     )
+    if getattr(invocation, "profile_auth_mode", "profile") == "login":
+        sources = sources[:1]  # matches --setting-sources user
     for directory, name, field in sources:
         raw = _private_file_bytes(
             os.path.join(directory, name), field)

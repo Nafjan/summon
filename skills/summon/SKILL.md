@@ -301,7 +301,17 @@ docs review. It is not the chairman, safety arbiter, or provider-execution seat.
 agy cannot enforce `read-only`, use it in a disposable clone/worktree for any task that
 may need file or shell access; inspect the resulting diff and report before accepting it.
 
-### Fable profile health
+### Fable 5.1 decision lead and profile health
+
+The `fable` seat is the lead architect, designer, strategist, orchestration planner,
+and final technical escalation for consequential work. It defaults to read-only and
+high effort; other agents collect evidence, implement, and test. Use compact decision
+packets and finding-ID resubmissions, not repeated whole-codebase reviews. Keep ordinary
+work on the balanced seats. Approval covers only the reviewed revision and never
+broadens user authority. See [the decision-lead workflow](references/orchestration.md#fable-51-lead-decisions-delegate-execution).
+
+Claude Code 2.1.250+ is required for Fable 5.1 according to the vendor. A catalog entry
+or dry run is not a live availability or served-model receipt.
 
 Fable is a separate Claude Code login profile, not an automatic fallback. Configure it in a
 private directory, then verify it before an expensive dispatch:
@@ -313,7 +323,7 @@ claude auth status
 skills\summon\scripts\summon.cmd doctor --json
 $prompt = New-TemporaryFile
 Set-Content -LiteralPath $prompt -Encoding utf8 -Value "Return the required Final report block."
-skills\summon\scripts\summon.cmd dispatch --agent fable --profile fable --model claude-fable-5 --cwd <project> --prompt-file $prompt
+skills\summon\scripts\summon.cmd dispatch --agent fable --profile fable --model claude-fable-5-1 --cwd <project> --prompt-file $prompt
 ```
 
 The dispatch envelope is authoritative: check `status`, `model.served`, `profile`, and the
@@ -526,7 +536,7 @@ not bypass or rewrite the authenticated store.
 | `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `kimi`, `agy`, `gemini`, `arkcli`, `opencode` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
 | `--model` | No | Override the agent's frontmatter model for this call. Summon performs a side-effect-free backend/model namespace preflight first: a known cross-vendor pairing such as `--cli codex --model claude-opus-5` is returned as `status:blocked`, `error_kind:backend_model_incompatible`, with explicit compatible reroutes; it never builds a profile or spawns a provider. Unknown/future IDs are passed through rather than guessed. `--dry-run` reports the same refusal. |
 | `--require-exact-model` | No | Require provider-authored terminal evidence for the exact requested model. A mismatch or missing receipt becomes `status:blocked` with a non-retryable model-trust error; no fallback, resume, or contract repair is attempted. Built-in governance seats (for example `architect`, `fable`, `sol-review`, and `researcher`) enable this policy automatically; custom seats can declare `model-policy: exact`. |
-| `--profile` | No | Select a named private backend profile from `~/.agents/summon-profiles.json` (currently Claude only). The name is safe metadata; the registry keeps config/auth paths out of agent definitions and receipts. `--profile` overrides frontmatter `profile:` |
+| `--profile` | No | Select a named private Claude or Codex account/profile from `~/.agents/summon-profiles.json`. Names are visible metadata; the registry keeps config/auth paths out of agent definitions and receipts. `--profile` overrides frontmatter `profile:` |
 | `--effort` | No | Reasoning / thinking intensity: `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none`/`default`/`off` = leave the backend alone). **Honored by claude + codex** (default **`high`**); **agy Gemini only when set explicitly** (rewrites model to `… (Low\|Medium\|High)`); **Kimi supported models via the isolated `config.toml` profile** (K3 maps `max` directly); **OpenCode maps the tier to its provider `variant`**; ignored for cursor-agent / gemini CLI / openai-compat / arkcli. Precedence: `--effort` > frontmatter `effort:` > `SUMMON_DEFAULT_EFFORT` > built-in `high`. Full matrix: [references/effort.md](references/effort.md) |
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy. Resume for implementation continuity; use a fresh context for final adversarial adjudication so a reviewer is not grading its own prior work. The envelope records `resumed:true|false` |
 | `--resume-profile` | No | agy only: the `resume.profile` path returned by the prior agy call |
@@ -733,7 +743,7 @@ Every response carries structured fields for programmatic orchestration:
 
 > **`cost_usd`/`usage` are the CLI's own list-price ESTIMATES, not a bill** — on a subscription they don't equal money spent, and `billing.source` is a best-effort guess. Know your plan's inclusions and limits, and check the provider's latest billing/model notices directly; summon can't see your account.
 
-**Premium models (Fable).** `claude-fable-5` billing is plan-dependent: Max/premium seats may use it for up to 50% of their regular weekly limit at no extra cost, while Pro/standard seats use usage credits from the first token; eligible plans may continue on credits after that limit. summon cannot inspect the seat or remaining usage, so it does **not** substitute the requested model, emits a warning before dispatch, and reports `billing.source:"unknown"` without an API key; API-key presence predicts `source:"api"` but vendor authentication remains authoritative. **cursor** serves Fable only after a **one-time data-handling agreement** accepted in the Cursor UI; summon can neither accept it for you nor detect whether you have, so a `cursor-agent` Fable dispatch warns that a vendor policy error is the likely cause if it fails. No model is unconditionally credit-only today, so `--allow-credit` / `SUMMON_ALLOW_FABLE=1` have nothing to authorize — they still parse for compatibility, and the guard stays ready for the next credit-only model.
+**Premium models (Fable).** `claude-fable-5-1` billing is plan-dependent: Max/premium seats may use it for up to 50% of their regular weekly limit at no extra cost, while Pro/standard seats use usage credits from the first token; eligible plans may continue on credits after that limit. summon cannot inspect the seat or remaining usage, so it does **not** substitute the requested model, emits a warning before dispatch, and reports `billing.source:"unknown"` without an API key; API-key presence predicts `source:"api"` but vendor authentication remains authoritative. **cursor** serves Fable only after a **one-time data-handling agreement** accepted in the Cursor UI; summon can neither accept it for you nor detect whether you have, so a `cursor-agent` Fable dispatch warns that a vendor policy error is the likely cause if it fails. No model is unconditionally credit-only today, so `--allow-credit` / `SUMMON_ALLOW_FABLE=1` have nothing to authorize — they still parse for compatibility, and the guard stays ready for the next credit-only model.
 
 **Shared memory:** if `{cwd}/.agents/memory.md` exists it is auto-injected into every
 agent's context (project conventions, standing constraints, durable decisions) — put
@@ -1099,12 +1109,24 @@ commit it) and give an agent only the opaque profile name:
 ```
 
 Use `profile: claude-review` in frontmatter or `--profile claude-review` for one call.
-The first supported profile boundary is Claude's `CLAUDE_CONFIG_DIR`; other backends keep
-their native isolation until their profile semantics are measured. Summon validates paths,
+Supported account homes are Claude's `CLAUDE_CONFIG_DIR` and Codex's `CODEX_HOME`.
+Named Codex profiles require an explicit model. Summon validates paths,
 keeps them outside the dispatch tree, and records only the profile name plus digests in the
 receipt. It does not automatically retry a failed model on another profile: a retry can
 duplicate side effects or charge twice, so fallback routing must be an explicit, reviewed
 choice by the caller.
+
+For separate subscription accounts, add `"auth_mode": "login"` to each private
+registry entry. This strips ambient auth overrides and selects account-scoped settings.
+Run `summon auth repair claude --profile claude-work --allow-auth-repair` (or `codex`)
+to sign into the chosen account, then `summon auth status --cli claude --profile
+claude-work --probe --json`. Named-profile probes run vendor auth status, not a model
+prompt. Browser sign-in remains the user's step. Do not auto-rotate accounts on quota
+or auth failures, apply personal usage evidence to a work profile, or switch a session
+between accounts. Named Codex account resume is not certified; use a fresh context handoff.
+These config homes are not OS sandboxes or provider account attestation. Existing custom
+provider profiles keep their semantics when `auth_mode` is omitted. See
+[multi-account setup and limitations](references/customizing.md#multiple-claude-and-codex-accounts).
 
 Default Claude dispatches are deliberately isolated from ambient Claude Code settings:
 Summon passes `--setting-sources ""` unless a named Claude profile was explicitly selected.
@@ -1118,7 +1140,7 @@ model, billing, and retention boundary explicitly.
 
 | CLI | Accepts | Example | Unpinned default |
 |-----|---------|---------|------------------|
-| claude | alias (floats to latest) or full ID | `opus`, `sonnet`, `claude-fable-5` | CLI's default |
+| claude | alias (floats to latest) or full ID | `opus`, `sonnet`, `claude-fable-5-1` | CLI's default |
 | codex | any codex model id (`-m`) | `gpt-5.6-sol` | `~/.codex/config.toml` `model` |
 | cursor-agent | cursor model ids | `composer-2.5` | `composer-2.5` |
 | gemini | gemini model ids (`-m`) | `gemini-3.1-pro` | CLI's default |
@@ -1141,10 +1163,12 @@ For an explicit Codex pin, Summon emits one canonical `-m` selector and refuses
   `--require-exact-model` to opt a one-off custom dispatch into the same policy.
 
   The run is blocked with a terminal model-trust error when the provider reports a
-  different dominant terminal model or no authoritative served-model receipt.
-  Auxiliary models may appear in `model.models_used` (Claude sessions commonly use
-  more than one model), but they do not satisfy the named seat when the terminal
-  served model differs. Summon does not retry, resume, contract-repair, or silently
+  different response model or no authoritative served-model receipt.
+  Auxiliary models may appear in `model.models_used`. Claude aggregate token counts
+  never identify the lead. Summon accepts a flat terminal model, a single-model usage
+  record, or root assistant metadata bound to the same session and exact terminal
+  response text. Mixed usage without response binding remains unverified; it does not
+  prove a fallback. Summon does not retry, resume, contract-repair, or silently
   switch an exact request. Inspect `model.requested`, `model.targeted`,
   `model.served`, `model.models_used`, `served_model_evidence`, `error_kind`, and
   `result_usable` together. See [`docs/SUMMON_3.2_PLAN.md`](../../docs/SUMMON_3.2_PLAN.md)
