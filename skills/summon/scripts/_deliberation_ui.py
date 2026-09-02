@@ -332,6 +332,42 @@ class _SurfaceHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(data)))
         self.end_headers(); self.wfile.write(data)
 
+    def _drain_rejected_body(self) -> None:
+        """Discard a small rejected body so Windows can deliver the 401.
+
+        Closing while the client is still sending its body can reset the
+        connection. Never parse rejected input or wait beyond one request
+        deadline, even when a client keeps trickling bytes into the socket.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "-1"))
+        except (TypeError, ValueError):
+            self.close_connection = True
+            return
+        if length < 0 or length > MAX_BODY_BYTES:
+            self.close_connection = True
+            return
+        deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
+        previous_timeout = self.connection.gettimeout()
+        try:
+            while length:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    self.close_connection = True
+                    break
+                self.connection.settimeout(timeout)
+                # read1 performs at most one underlying read, allowing the
+                # total deadline to be checked between arriving chunks.
+                chunk = self.rfile.read1(min(length, 8192))
+                if not chunk:
+                    self.close_connection = True
+                    break
+                length -= len(chunk)
+        except (OSError, TimeoutError):
+            self.close_connection = True
+        finally:
+            self.connection.settimeout(previous_timeout)
+
     def _run_id(self):
         parts = [unquote(p) for p in urlsplit(self.path).path.split("/") if p]
         if len(parts) != 5 or parts[:4] != ["api", "v1", "runs", self.surface.run_id]:
@@ -385,7 +421,9 @@ class _SurfaceHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            if not self._authorized(require_origin=True): raise DeliberationUIError("unauthorized")
+            if not self._authorized(require_origin=True):
+                self._drain_rejected_body()
+                raise DeliberationUIError("unauthorized")
             run_id = self._run_id()
             length = int(self.headers.get("Content-Length", "-1"))
             if length < 0 or length > MAX_BODY_BYTES: raise DeliberationUIError("request body is too large")

@@ -5,6 +5,32 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+## [3.4.0] - 2026-09-02
+
+- Corrected Claude model attribution for delegated research. Aggregate helper token
+  usage no longer identifies the lead. A matching root response can establish the
+  author; ambiguous multi-model output remains unverified instead of being called
+  a model fallback. Exact-model checks remain fail-closed.
+- Added named Codex account homes alongside Claude profiles, explicit login-account
+  mode, and profile-aware auth status/repair. Account selection is opt-in and never
+  falls back to another account. Login mode strips inherited auth overrides; receipts
+  omit private account paths and raw auth-status output.
+- Fixed concurrent usage-cache initialization so record writes cannot race private
+  directory setup.
+- Deliberation now binds profile identity to known auth and configuration files,
+  not changing session logs. Concurrent sessions no longer invalidate a pending
+  launch just by writing runtime history.
+- Fixed a Windows connection-reset race when the deliberation UI rejects a POST
+  before its request body arrives. Rejected bodies are discarded within strict
+  byte and time limits; authentication and same-origin requirements are unchanged.
+- Updated the Fable decision-lead roster to Claude Fable 5.1 with exact-model
+  verification, focused planning and revision-review guidance, and read-only CLI
+  defaults. Routine implementation stays with other agents. Premium billing
+  notices and fleet billing classification now cover Fable 5.1 without assuming
+  subscription coverage or silently changing the model.
+- Disabled the unsupported legacy `fable-api` route with an explicit `fable`
+  successor. The direct adapter does not implement Anthropic's Messages API.
+
 ## [3.3.0] - 2026-08-29
 
 - **ZCode and Z.AI Coding Plan routes:** added a native ZCode preview backend

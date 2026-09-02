@@ -13,6 +13,35 @@ never on added fields.
 
 ## Unreleased
 
+## 3.4.0 - 2026-09-02
+
+- Claude identity: separate aggregate `modelUsage` from response authorship. Bind
+  root assistant metadata to the initialized session, explicit root ancestry, and
+  the terminal response digest. Retain all helper identities without promoting the
+  largest token count to a served-model claim. Missing, mismatched, child-only, and
+  progress-only evidence stays unverified. Fixtures use synthetic data only.
+- Multi-account routing: forward named Codex `CODEX_HOME` and executable pins; retain
+  Claude `CLAUDE_CONFIG_DIR` routing. Opt-in login mode removes ambient credentials,
+  uses account-scoped settings, and binds local auth/config state to request identity.
+  Profile-aware auth status/repair shares dispatch's environment policy. Codex account
+  resumes remain unsupported; no automatic account rotation or quota aggregation was added.
+- Usage-cache concurrency: serialize private-root setup with record writes. A
+  deterministic lock-scope regression complements the concurrent refresh test.
+- Deliberation profile identity: replace recursive history hashing with bounded
+  backend-specific auth/configuration file bindings. Claude account/config JSON
+  is canonicalized; only its known cache-refresh timestamp is excluded. Account,
+  configuration, and unknown fields stay bound. Duplicate or invalid JSON is refused.
+- Deliberation HTTP rejection: discard bounded request bodies before returning an
+  authorization error. Delayed-body regressions cover the Windows reset race;
+  body-size and absolute-time limits preserve fail-closed rejection behavior.
+- Fable 5.1 roster refresh: pin the decision lead to `claude-fable-5-1`; make the CLI
+  decision lead read-only at high effort; document scoped approval and finding-ID
+  resubmissions. Preserve the Fable 5 catalog identity for historical receipts.
+  Cover the successor in premium warnings and provider-inert fleet billing so
+  absent account evidence does not become an assumed subscription entitlement.
+  Retire the unsupported direct Anthropic/OpenAI-compat seat before contact; no
+  native Messages adapter or automatic route switch is claimed.
+
 ## 3.3.0 - 2026-08-29
 
 - **Native ZCode / Z.AI Coding Plan integration:** introduced a tenth backend

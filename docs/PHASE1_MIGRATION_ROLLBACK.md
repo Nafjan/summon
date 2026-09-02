@@ -1,6 +1,6 @@
 # Phase 1 migration and rollback
 
-Current product version: 3.3.0
+Current product version: 3.4.0
 
 This is the active migration contract for the Phase 1 control plane. Historical 2.x to
 3.0 instructions remain in `VERSIONING_AND_3.0.md`, but a current release must satisfy
@@ -14,6 +14,9 @@ this document and the machine-checked canonical version.
   execution envelope and not an authority token.
 - Fleet approval and usage cache state are local control-plane data. They never become
   provider credentials or implicit spend consent.
+- Version 3.4 adds account login mode to invocation identity. Re-derive affected fleet
+  activations after upgrading; a prior structural digest cannot authorize a changed
+  account selection. Named Codex account resumes remain unsupported.
 - Managed installs are ownership-bound. Project-vendored and other unmanaged copies are
   reported separately and are updated only through an explicitly authorized path.
 

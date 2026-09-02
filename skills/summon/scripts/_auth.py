@@ -52,8 +52,65 @@ def _command_for(backend: str, plan: dict[str, Any]) -> list[str]:
     return [executable, *argv[1:]]
 
 
-def _repair(backend: str, *, allow: bool, timeout_s: float = 300.0) -> dict[str, Any]:
+def _profile_launch(backend: str, selection: dict, args: list[str]) -> tuple[list, dict]:
+    from types import SimpleNamespace
+    from _profiles import account_launch_policy
+    from _executor import _merge_env
+    invocation = SimpleNamespace(
+        cli=backend, profile=selection["name"], profile_env=selection["env"],
+        profile_auth_mode=selection.get("auth_mode", "profile"),
+        transport="subprocess", extra_args=(), resume_id=None)
+    flags, delta = account_launch_policy(invocation)
+    plan = {"argv": [backend, *flags, *args]}
+    if selection.get("command"):
+        command = [selection["command"], *flags, *args]
+    else:
+        command = _command_for(backend, plan)
+    return command, _merge_env(delta)
+
+
+def _profile_status(backend: str, selection: dict, *, probe: bool) -> dict:
+    name = selection["name"]
+    result = {"status": "success", "backend": backend, "profile": name,
+              "auth_mode": selection["auth_mode"], "auth_status": "unverified",
+              "probe_ran": False, "model_call_started": False,
+              "repair_command": f"summon auth repair {backend} --profile {name} --allow-auth-repair"}
+    if not probe:
+        result["message"] = "Profile resolves. Use --probe to run this account's vendor auth-status command; no model call."
+        return result
+    args = ["auth", "status", "--json"] if backend == "claude" else ["login", "status"]
+    try:
+        from _spawn import run_flags
+        command, environment = _profile_launch(backend, selection, args)
+        completed = subprocess.run(command, env=environment, stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", timeout=30, **run_flags())
+        # Vendor output can contain account emails, organizations, or key hints.
+        # Reduce it to typed state; never echo raw stdout/stderr into receipts.
+        authenticated = completed.returncode == 0
+        if backend == "claude":
+            import json
+            value = json.loads(completed.stdout)
+            if not isinstance(value, dict) or not isinstance(value.get("loggedIn"), bool):
+                raise ValueError("unsupported auth status shape")
+            authenticated = authenticated and value["loggedIn"]
+        result.update(probe_ran=True, auth_status=("authenticated" if authenticated else "not_authenticated"),
+                      auth_status_exit_code=completed.returncode)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        result.update(status="error", error_kind="account_status_unavailable",
+                      message="Account status did not return a supported response within 30s; no account switch or retry.")
+    return result
+
+
+def _repair(backend: str, *, allow: bool, timeout_s: float = 300.0,
+            selection: dict | None = None) -> dict[str, Any]:
     plan = _plan(backend)
+    if plan is not None and selection:
+        plan = dict(plan)
+        plan["profile"] = selection["name"]
+        plan["authorized_command"] += " --profile " + selection["name"]
+        # Do not recommend the bare command: it would log into the default home.
+        plan["command"] = plan["authorized_command"]
     if plan is None:
         return {
             "status": "error", "error_kind": "unknown_backend",
@@ -75,7 +132,10 @@ def _repair(backend: str, *, allow: bool, timeout_s: float = 300.0) -> dict[str,
                          f"run `{plan['command']}` in an interactive terminal, then retry"),
         }
     try:
-        command = _command_for(backend, plan)
+        if selection:
+            command, environment = _profile_launch(backend, selection, plan["argv"][1:])
+        else:
+            command, environment = _command_for(backend, plan), None
     except (OSError, ValueError) as exc:
         return {
             "status": "error", "error_kind": "backend_not_installed",
@@ -89,7 +149,7 @@ def _repair(backend: str, *, allow: bool, timeout_s: float = 300.0) -> dict[str,
         # visible in a real terminal; Summon never captures or stores it.
         process = subprocess.Popen(
             command, stdin=None, stdout=subprocess.DEVNULL, stderr=None,
-            shell=False, **popen_flags(),
+            shell=False, env=environment, **popen_flags(),
         )
         try:
             code = process.wait(timeout=max(1.0, float(timeout_s)))
@@ -160,14 +220,24 @@ def _status(*, backend: str | None = None, probe: bool = False) -> dict[str, Any
 
 def run_auth_action(action: str, *, backend: str | None = None,
                     allow: bool = False, probe: bool = False,
-                    timeout_s: float = 300.0) -> dict[str, Any]:
+                    timeout_s: float = 300.0, profile: str | None = None) -> dict[str, Any]:
     """Run a local auth-management action without dispatching a model."""
+    selection = None
+    if profile:
+        from _profiles import resolve_profile
+        try:
+            selection = resolve_profile(profile, backend, os.getcwd())
+        except ValueError:
+            return {"status": "error", "error_kind": "account_profile_invalid",
+                    "message": "Choose --cli claude or codex and a valid private profile outside the current directory."}
+    if action == "status" and selection:
+        return _profile_status(backend, selection, probe=probe)
     if action == "status":
         return _status(backend=backend, probe=probe)
     if action == "repair":
         if not backend:
             return {"status": "error", "error_kind": "missing_backend",
                     "message": "auth repair requires a backend (for example `kimi`)"}
-        return _repair(backend, allow=allow, timeout_s=timeout_s)
+        return _repair(backend, allow=allow, timeout_s=timeout_s, selection=selection)
     return {"status": "error", "error_kind": "unknown_auth_action",
             "message": f"unknown auth action {action!r}"}

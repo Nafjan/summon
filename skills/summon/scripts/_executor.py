@@ -1805,6 +1805,7 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         "profile_path_sha256": ((_profile_selection or {}).get("path_sha256")),
         "profile_registry_sha256": ((_profile_selection or {}).get("registry_sha256")),
         "profile_command_sha256": ((_profile_selection or {}).get("command_sha256")),
+        "profile_state_sha256": ((_profile_selection or {}).get("state_sha256")),
         # Strict roster provenance changes whether a bundled/pack definition is eligible;
         # keep it in the request identity so a cached fallback result cannot satisfy a
         # later governance request.
@@ -2451,7 +2452,7 @@ def model_match_state(requested, targeted, served,
 
 # These seats are governance-facing named-model claims rather than ordinary
 # implementation workers.  A provider is allowed to use an auxiliary model in
-# a session (``models_used`` remains an honest list), but the dominant terminal
+# a session (``models_used`` remains an honest list), but the response-bound
 # model must still match the requested pin before the result can be consumed as
 # the named review.  Custom seats can opt in with ``model-policy: exact`` or the
 # one-shot ``--require-exact-model`` flag.
@@ -3706,10 +3707,14 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # evidence and must never pollute what the session was pointed at
         # (they can legitimately differ, and that difference is the signal).
         _targeted = _handshake or _effective
+        _ambiguous_claude = inv.cli == "claude" and (
+            resp.get("model_evidence_source") in {
+                "claude_identity_conflict", "claude_aggregate_usage"}
+            or (len(_mu) > 1 and not _terminal_model))
         if _terminal_model and not _terminal_model_invalid:
             _served = _terminal_model
         elif (_out_tokens > 0 and _targeted
-              and not _exact_required):
+              and not _exact_required and not _ambiguous_claude):
             _served = None if _terminal_model_invalid else _targeted
         else:
             _served = None
@@ -3730,7 +3735,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             resp["served_model_evidence"] = (
                 "inferred" if _client_observed_kimi else "reported")
         elif (_out_tokens > 0 and _targeted and not _terminal_model_invalid
-              and not _exact_required):
+              and not _exact_required and not _ambiguous_claude):
             resp["served_model_evidence"] = "inferred"
         else:
             resp["served_model_evidence"] = "absent"
@@ -3775,7 +3780,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # Suppress only KNOWN alias expansions (opus/sonnet/haiku float to the
         # latest release, so requested 'opus' vs served 'claude-opus-5' is not a
         # mismatch); everything else warns.
-        _ran = _served or _legacy
+        _ran = _served if _ambiguous_claude else (_served or _legacy)
         if _model_mismatch(_requested_model, _ran):
             resp.setdefault("warnings", []).append(
                 f"requested model {_requested_model!r} but the backend ran {_ran!r}; "
@@ -3993,6 +3998,10 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     # a one-shot argv spawn. The call owns its session I/O and returns the
     # standard shape, like the api kind above. Placed AFTER the read-only guard
     # so an unenforceable tier fails closed identically on both transports.
+    if inv.profile and inv.transport != "subprocess":
+        return _stamp(_enrich(_error_response(
+            inv.cli, 2, "named account profiles require subprocess transport",
+            not_run=True), None))
     if inv.transport == "acp":
         if workspace_snapshot is not None:
             _workspace_before = workspace_snapshot(inv.cwd)

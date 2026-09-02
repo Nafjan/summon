@@ -499,8 +499,11 @@ def _advance_last_seen(path: str, store: dict | None, key: bytes | None,
 
 @contextmanager
 def _locked_store(path: str):
-    _secure_root_for(path)
     with _STORE_PROCESS_LOCK:
+        # First-use ACL verification/initialization is part of the critical
+        # section too: another thread must not create records while a peer
+        # is still deciding whether this empty directory can be claimed.
+        _secure_root_for(path)
         try:
             with _exclusive_control_lock(path + ".lock"):
                 yield

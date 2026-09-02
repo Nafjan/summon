@@ -244,6 +244,7 @@ def build_invocation_plans(
             agy_account_checked=seat.agy_account_checked, permission_forced=False,
             profile=seat.profile_name, profile_env=copy.deepcopy(dict(profile_env)),
             profile_command=runtime.get("profile_command"),
+            profile_auth_mode=runtime.get("profile_auth_mode", "profile"),
             output_contract="deliberation",
         )
         plans[seat.seat_id] = InvocationPlan(
