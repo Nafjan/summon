@@ -15,6 +15,7 @@ import pytest
 
 import _portable_result as portable
 import _jobs
+from _spawn import run_flags
 
 
 def _envelope(**changes):
@@ -98,7 +99,7 @@ def test_structural_refusal_recomputes_all_no_contact_facts(tmp_path):
 @pytest.mark.parametrize("path", [
     "safe.txt", "/tmp/x", "C:/x", "\\\\server\\x", "\\\\?\\C:\\x",
     "a/../b", "a//b", "a:stream", "a\n.txt", "",
-])
+], ids=['p001_case_001', 'p001_case_002', 'p001_case_003', 'p001_case_004', 'p001_case_005', 'p001_case_006', 'p001_case_007', 'p001_case_008', 'p001_case_009', 'p001_case_010'])
 def test_artifact_paths_are_never_exported_but_digest_is_preserved(tmp_path, path):
     out = _project(_envelope(artifacts={"files": [{
         "path": path, "sha256": "c" * 64, "bytes": 7,
@@ -172,7 +173,7 @@ def test_public_forgery_unknown_fields_and_digest_are_rejected(tmp_path):
     ("contact", "provider_contacted", 1),
     ("model", "model_match", 0),
     ("model", "model_match", 1),
-])
+], ids=['p002_case_001', 'p002_case_002', 'p002_case_003', 'p002_case_004', 'p002_case_005', 'p002_case_006', 'p002_case_007', 'p002_case_008'])
 def test_strict_boolean_fields_reject_json_integers(
         tmp_path, section, field, numeric):
     forged = json.loads(json.dumps(_project(_envelope(), tmp_path)))
@@ -205,7 +206,7 @@ def test_missing_attempt_and_contact_evidence_remain_unknown(tmp_path):
     assert out["outcome"]["attempt_status"] == "unknown"
 
 
-@pytest.mark.parametrize("status", ["running", "prepared", "unknown", None])
+@pytest.mark.parametrize("status", ["running", "prepared", "unknown", None], ids=['p003_case_001', 'p003_case_002', 'p003_case_003', 'p003_case_004'])
 def test_projector_rejects_nonterminal_private_status(tmp_path, status):
     with pytest.raises(portable.PortableResultError, match="terminal"):
         _project(_envelope(status=status), tmp_path)
@@ -369,7 +370,7 @@ def test_atomic_writer_success_is_not_confused_by_outer_exception(tmp_path):
     assert portable.load_projection_bytes(target.read_bytes()) == projected
 
 
-@pytest.mark.parametrize("code", [errno.EINVAL, errno.EPERM, errno.EXDEV])
+@pytest.mark.parametrize("code", [errno.EINVAL, errno.EPERM, errno.EXDEV], ids=['p004_case_001', 'p004_case_002', 'p004_case_003'])
 def test_atomic_writer_link_failure_cleans_owned_temporary(
         tmp_path, monkeypatch, code):
     projected = _project(_envelope(), tmp_path)
@@ -460,7 +461,7 @@ def test_cli_projects_validates_and_reference_consumes_without_provider(tmp_path
         sys.executable, str(runner), "result", "project", "--kind", "dispatch",
         "--from", str(private), "--repo-root", str(root), "--out", str(public),
         "--json",
-    ], capture_output=True, text=True, timeout=30, check=False)
+    ], capture_output=True, text=True, timeout=30, check=False, **run_flags())
     assert project.returncode == 0, project.stderr or project.stdout
     projected = json.loads(project.stdout)
     assert projected["source"]["receipt_sha256"] == hashlib.sha256(private_bytes).hexdigest()
@@ -468,14 +469,14 @@ def test_cli_projects_validates_and_reference_consumes_without_provider(tmp_path
 
     validate = subprocess.run([
         sys.executable, str(runner), "result", "validate", str(public), "--json",
-    ], capture_output=True, text=True, timeout=30, check=False)
+    ], capture_output=True, text=True, timeout=30, check=False, **run_flags())
     assert validate.returncode == 0, validate.stderr or validate.stdout
     assert json.loads(validate.stdout)["authority_granted"] is False
 
     consume = subprocess.run([
         sys.executable, str(runner), "result", "consume", str(public),
         "--adapter", "reference", "--json",
-    ], capture_output=True, text=True, timeout=30, check=False)
+    ], capture_output=True, text=True, timeout=30, check=False, **run_flags())
     assert consume.returncode == 0, consume.stderr or consume.stdout
     receipt = json.loads(consume.stdout)
     assert receipt["status"] == "accepted" and receipt["authority_granted"] is False
@@ -490,7 +491,7 @@ def test_cli_refuses_unimplemented_surface_before_provider_contact(tmp_path):
     result = subprocess.run([
         sys.executable, str(runner), "result", "project", "--kind", "chat",
         "--from", str(private), "--repo-root", str(root), "--json",
-    ], capture_output=True, text=True, timeout=30, check=False)
+    ], capture_output=True, text=True, timeout=30, check=False, **run_flags())
     assert result.returncode == 1
     error = json.loads(result.stdout)
     assert error["execution_status"] == "not_run"
@@ -530,7 +531,7 @@ def test_cli_projects_only_an_authenticated_terminal_job(tmp_path):
     command = subprocess.run([
         sys.executable, str(runner), "result", "project", "--kind", "job",
         "--from", str(result_path), "--repo-root", str(tmp_path), "--json",
-    ], capture_output=True, text=True, timeout=30, check=False)
+    ], capture_output=True, text=True, timeout=30, check=False, **run_flags())
     assert command.returncode == 0, command.stderr or command.stdout
     projected = json.loads(command.stdout)
     assert projected["source"]["surface"] == "job"
@@ -542,7 +543,7 @@ def test_cli_projects_only_an_authenticated_terminal_job(tmp_path):
     refused = subprocess.run([
         sys.executable, str(runner), "result", "project", "--kind", "job",
         "--from", str(result_path), "--repo-root", str(tmp_path), "--json",
-    ], capture_output=True, text=True, timeout=30, check=False)
+    ], capture_output=True, text=True, timeout=30, check=False, **run_flags())
     assert refused.returncode == 1
     refusal = json.loads(refused.stdout)
     assert refusal["provider_contacted"] is False
@@ -565,7 +566,7 @@ def test_cli_refuses_legacy_nonce_only_job_for_portable_provenance(tmp_path):
     refused = subprocess.run([
         sys.executable, str(runner), "result", "project", "--kind", "job",
         "--from", str(result_path), "--repo-root", str(tmp_path), "--json",
-    ], capture_output=True, text=True, timeout=30, check=False)
+    ], capture_output=True, text=True, timeout=30, check=False, **run_flags())
     assert refused.returncode == 1
     error = json.loads(refused.stdout)
     assert error["provider_contacted"] is False
@@ -604,7 +605,7 @@ def test_cli_refuses_authenticated_but_nonterminal_job(tmp_path):
     refused = subprocess.run([
         sys.executable, str(runner), "result", "project", "--kind", "job",
         "--from", str(result_path), "--repo-root", str(tmp_path), "--json",
-    ], capture_output=True, text=True, timeout=30, check=False)
+    ], capture_output=True, text=True, timeout=30, check=False, **run_flags())
     assert refused.returncode == 1
     error = json.loads(refused.stdout)
     assert error["execution_status"] == "not_run"

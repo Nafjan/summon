@@ -9,14 +9,16 @@ The immutable `v3.1.0` tag remains the prior source-bound GA release. The publis
 release established the routing, roster, and chat baseline; `v3.2.1` was the non-destructive
 security and OpenCode gateway patch on that line. `v3.3.0` completes the reviewed Phase 1
 operator workflow: approved fleet activation, advisory usage evidence, safe context
-compilation, adaptive job supervision, and portable results. The older `v3.0.0-ga` tag remains the historical provider-inert preview
-baseline. The certified source passed all 17 fixed
-suites and all eight release gates, with clean source and converged managed installs. The
-reviewed Claude matrix covered a normal decided run, durable cancellation after provider
-contact, and a deadline that recorded `adapter_indeterminate` with `uncertain_spend=true`.
-All three cases cleaned up without orphaned resources. Detailed redacted evidence stays
-outside the source tree. Additional provider receipts, remote execution, and multi-user
-hosting remain separately gated.
+compilation, adaptive job supervision, and portable results. The `v3.0.0-ga` tag remains
+the historical source-bound GA certification; the earlier `v3.0.0` tag is the
+provider-inert public-preview baseline. The historical `v3.3.0` release record reported 17 fixed suites and eight
+release gates, with clean source and converged managed installs. Its reviewed Claude
+matrix covered a normal decided run, durable cancellation after provider contact, and a
+deadline that recorded `adapter_indeterminate` with `uncertain_spend=true`. All three
+cases cleaned up without orphaned resources. This historical record is not a current
+working-tree or provider certification; detailed redacted evidence stays outside the
+source tree, and additional provider receipts, remote execution, and multi-user hosting
+remain separately gated.
 
 This roadmap records what is shipped, what is tested, and which provider lanes remain preview
 or independently live-provider-gated.
@@ -170,21 +172,23 @@ deliberation receipt.
    `chat open SESSION_ID --chat-browser ...`, keep one local surface per run, and
    preserve `--browser link`/`--chat-browser link` for non-interactive callers. These
    public observer paths remain separate from live-provider activation.
-6. **Keep model routing explicit.** The catalog records the current editorial order: Fable,
-   Sol, Opus, Kimi, then DeepSeek V4 Pro GA as the clear-frontier maximum-thinking lane;
-   Grok 4.6, Gemini Flash 3.7, GLM 5.2, and DeepSeek V4 Flash remain near-frontier/high-
-   value. The Ark entries are pinned to exact marketplace IDs and were metadata-checked on
-   2026-08-18; Coding Plan eligibility and live invocation still require their own
-   `plans model-list` plus minimal text smoke. Pin `researcher` to
-   `gemini-3.7-flash-high` as the fast independent evidence lane; keep Fable behind its
-   named `fable` profile and require `model.served`/profile evidence in every
-   release smoke. Tooltips may show role/name/version and the editorial lane, but labels
-   never imply availability: exact `model.served` evidence remains separate and no lane
+6. **Keep model routing explicit.** The catalog records a current editorial order that
+   includes Astra, Fable, Sol, Opus, Kimi, DeepSeek V4 Pro, and Gemini Flash 3.8 in its
+   frontier lane, with Gemini Flash 3.7, GLM 5.2, and DeepSeek V4 Flash among the
+   near-frontier/value entries. These are editorial labels, not benchmark, availability,
+   quota, or cost guarantees. Ark entries are pinned to exact marketplace IDs and were
+   metadata-checked on 2026-08-18; Coding Plan eligibility and live invocation still
+   require their own `plans model-list` plus minimal text smoke. Keep Fable behind its
+   named `fable` profile and require `model.served`/profile evidence in every release
+   smoke. Tooltips may show role/name/version and the editorial lane, but labels never
+   imply availability: exact `model.served` evidence remains separate and no lane
    silently falls back to another model.
 
-Exit gate: ✅ broad dispatcher suite is repeatable; install/doctor reports converged managed
-copies; no unexplained warnings; no dirty or foreign tree is overwritten. Publication is
-the explicit release-owner action; the local GA tag is already verified.
+Historical v3.3.0 exit-gate record: the broad dispatcher suite was repeatable, managed
+copies were reported converged, and no dirty or foreign tree was overwritten. This entry
+is a historical release note, not a current release-readiness decision. Re-run the
+current source-bound checks, privacy scan, install convergence, and all required live
+provider gates before publication; the release owner retains that decision.
 
 ## P1: make the deliberation product complete
 

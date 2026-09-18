@@ -30,6 +30,7 @@ Pure stdlib. No SDK, no node adapter.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -50,6 +51,8 @@ ACP_ARGV = {
 _PROTOCOL_VERSION = 1
 _TEARDOWN_GRACE_SEC = 3.0   # wait for exit after terminate() before kill-tree
 _PROBE_TIMEOUT_SEC = 10.0
+_MAX_ACP_FRAME_BYTES = 8 * 1024 * 1024
+_MAX_ACP_SESSION_ID_CHARS = 512
 
 # ACP stopReason -> summon status. Anything unknown maps conservative: a run we
 # cannot classify is not a success.
@@ -78,6 +81,15 @@ class _AcpError(Exception):
 
 class _AcpTimeout(Exception):
     """A request did not answer inside its slice of the wall-clock deadline."""
+
+
+class _AcpPayloadTooLarge(_AcpError):
+    """A complete JSON-RPC frame exceeded Summon's local wire ceiling."""
+
+    def __init__(self, budget: dict) -> None:
+        self.budget = budget
+        super().__init__(
+            "ACP JSON-RPC frame exceeds Summon's local 8 MiB transport ceiling")
 
 
 class _TurnState:
@@ -142,7 +154,8 @@ class _AcpClient:
     """
 
     def __init__(self, process: subprocess.Popen, permission: str,
-                 cancelled=None, deadline_reached=None) -> None:
+                 cancelled=None, deadline_reached=None,
+                 max_frame_bytes: int = _MAX_ACP_FRAME_BYTES) -> None:
         self._proc = process
         self._permission = permission
         self._cancelled = cancelled or (lambda: False)
@@ -150,6 +163,7 @@ class _AcpClient:
         self._write_lock = threading.Lock()
         self._id_lock = threading.Lock()
         self._next_id = 1
+        self._max_frame_bytes = max_frame_bytes
         self._pending: dict = {}
         self.turn = _TurnState()
         self.stderr_lines: list = []
@@ -162,6 +176,21 @@ class _AcpClient:
 
     def _send(self, msg: dict) -> None:
         line = json.dumps(msg, ensure_ascii=False) + "\n"
+        # Popen's text-mode stdin uses the host newline policy. On Windows the
+        # TextIOWrapper rewrites this delimiter to CRLF; measure those exact
+        # bytes rather than the pre-translation LF string. JSON string content
+        # is escaped, so the delimiter is the only literal newline here.
+        wire_line = line.replace("\n", "\r\n") if os.name == "nt" else line
+        from _transport_budget import evaluate_serialized_payload
+        budget = evaluate_serialized_payload(
+            operation_id=hashlib.sha256(
+                wire_line.encode("utf-8", errors="surrogatepass")).hexdigest()[:32],
+            payload=wire_line,
+            capability={"kind": "serialized", "platform": os.name,
+                         "max_serialized_bytes": self._max_frame_bytes},
+            boundary="acp_json_rpc")
+        if budget["status"] == "blocked":
+            raise _AcpPayloadTooLarge(budget)
         with self._write_lock:
             try:
                 self._proc.stdin.write(line)
@@ -473,6 +502,43 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
         return _err(
             cli, 2, str(exc), not_run=True,
             error_kind="unsafe_windows_launcher")
+    # Bound the complete prompt frame before creating adapter-owned profiles or
+    # the ACP child. The future session id is not known yet, so reserve a
+    # conservative local identifier envelope; _AcpClient re-measures the exact
+    # final frame before each write.
+    prompt_text = ((inv.system_context + "\n\n" + inv.prompt)
+                   if inv.system_context else inv.prompt)
+    try:
+        from _transport_budget import evaluate_serialized_payload
+        _prompt_frame = json.dumps({
+            "jsonrpc": "2.0", "id": 2**63 - 1, "method": "session/prompt",
+            "params": {"sessionId": "s" * _MAX_ACP_SESSION_ID_CHARS,
+                        "prompt": [{"type": "text", "text": prompt_text}]},
+        }, ensure_ascii=False) + "\n"
+        _prompt_wire_frame = (_prompt_frame.replace("\n", "\r\n")
+                              if os.name == "nt" else _prompt_frame)
+        _prompt_budget = evaluate_serialized_payload(
+            operation_id=hashlib.sha256(
+                _prompt_wire_frame.encode("utf-8", errors="surrogatepass")).hexdigest()[:32],
+            payload=_prompt_wire_frame,
+            capability={"kind": "serialized", "platform": os.name,
+                         "max_serialized_bytes": _MAX_ACP_FRAME_BYTES},
+            boundary="acp_json_rpc")
+    except Exception:
+        return _err(cli, 1, "ACP transport capability preflight refused",
+                    not_run=True, error_kind="transport_capability_invalid")
+    if _prompt_budget["status"] == "blocked":
+        response = _err(
+            cli, 1,
+            "serialized ACP prompt exceeds Summon's local 8 MiB transport "
+            "ceiling; shorten the required prompt or use a bounded file-aware "
+            "route",
+            not_run=True,
+            error_kind="transport_budget_exceeded",
+        )
+        response["transport_budget"] = _prompt_budget
+        return response
+
     # The subprocess builders install the per-backend identity (kimi's isolated
     # credential profile above all). Running ACP without that env would
     # authenticate as the AMBIENT account with the full real profile (MCP
@@ -564,7 +630,8 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
         process, inv.permission,
         cancelled=(launch_control.is_cancelled if launch_control is not None else None),
         deadline_reached=(launch_control.is_deadline_reached
-                          if launch_control is not None else None))
+                          if launch_control is not None else None),
+        max_frame_bytes=_MAX_ACP_FRAME_BYTES)
     stage = "initialize"
     try:
         def _remaining() -> float:
@@ -634,9 +701,6 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
                 "ACP has no system-prompt channel; the agent definition was "
                 "prepended to the user prompt (subprocess transport uses a "
                 "dedicated flag)")
-        prompt_text = ((inv.system_context + "\n\n" + inv.prompt)
-                       if inv.system_context else inv.prompt)
-
         # 4. The turn. Ends at the session/prompt RESPONSE, not at process
         # exit — ACP agents are long-lived by design.
         stage = "session/prompt"
@@ -713,6 +777,14 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
                       if client.stderr_lines else [])
         if raw:
             resp["_debug_raw"] = "\n".join(raw)
+        return resp
+    except _AcpPayloadTooLarge as e:
+        _, diag, _ = client.turn.snapshot()
+        resp = _err(cli, 1, str(e), diag or None,
+                    error_kind="transport_budget_exceeded")
+        resp["provider_contacted"] = True
+        resp["submission_state"] = "indeterminate"
+        resp["transport_budget"] = e.budget
         return resp
     except _AcpError as e:
         _, diag, _ = client.turn.snapshot()

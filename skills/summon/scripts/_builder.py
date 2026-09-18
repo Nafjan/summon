@@ -23,6 +23,7 @@ import math
 import secrets
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any, Mapping
 
 from _loader import DEFAULT_PERMISSION
 from _spawn import run_flags
@@ -88,6 +89,10 @@ class AgentInvocation:
     profile_env: dict | None = None
     profile_auth_mode: str = "profile"  # login = explicitly isolated subscription account
     profile_command: str | None = None
+    # Optional independently qualified vendor version.  When absent, the
+    # executor still binds the exact executable bytes as a measured revision;
+    # governed resume never treats an absent vendor version as a wildcard.
+    external_cli_version: str | None = None
     # Optional, validated OpenRouter request settings for the OpenCode gateway.
     # Only router/plugin fields are accepted; arbitrary OpenCode config is never
     # copied from an agent definition into the child process.
@@ -99,6 +104,11 @@ class AgentInvocation:
     worktree: str | None = None
     isolated_lane: bool = False
     allow_tool_credentials: bool = False
+    # Optional authoritative transport capability for the operation-specific
+    # budget seam. Legacy callers leave this unset and retain the older argv
+    # guard; adapter-owned capabilities (currently ZCode's private attachment
+    # route) are bound by the executor after the exact argv is built.
+    transport_capability: Mapping[str, Any] | None = None
     # Explicit additional directories the read-only seat may inspect.  These are
     # normalized absolute paths, never arbitrary backend flags.
     read_roots: tuple = ()
@@ -115,6 +125,9 @@ class AgentInvocation:
     attempt_kind: str = "initial"
     attempt_ordinal: int = 1
     parent_attempt_id: str | None = None
+    # Root request identity from the dispatcher receipt. Retries inherit it;
+    # adapter-material identity is independently derived for each submission.
+    request_sha256: str | None = None
 
 
 # Short report-contract nudge appended to RESUME prompts. On resume the session
@@ -924,10 +937,10 @@ def _utf8(s: str) -> bytes:
 def argv_length_error(cli: str, command: str, args: list, env=None) -> str | None:
     """Reject an over-long command line BEFORE spawning, with the real reason.
 
-    The prompt is passed via argv by every CLI backend, so a large prompt (a diff, a
-    packet, a pasted file) can exceed the OS limit. --prompt-file does NOT avoid this: it
-    is a quoting and encoding convenience, and the content still reaches the backend on
-    the command line.
+    Most CLI backends receive the prompt through argv, so a large prompt (a diff, a
+    packet, a pasted file) can exceed the OS limit. ZCode is the exception: its
+    attachment transport is checked separately. --prompt-file does NOT avoid argv
+    limits for backends that use argv; it is a quoting and encoding convenience there.
     """
     if os.name == "nt":
         # Measure what CreateProcess ACTUALLY receives, not a character sum of the parts.
@@ -1060,6 +1073,69 @@ def _concatenated_prompt(inv: AgentInvocation) -> str:
     return f"[System Context]\n{inv.system_context}\n\n[User Prompt]\n{inv.prompt}"
 
 
+def _claude_system_prompt(inv: AgentInvocation) -> str:
+    system_prompt = f"cwd: {inv.cwd}\n\n{inv.system_context}"
+    if inv.read_roots:
+        system_prompt += (
+            "\n\nExplicit additional read-only directories authorized for this turn:\n"
+            + "\n".join(f"- {root}" for root in inv.read_roots)
+            + "\nDo not access other directories."
+        )
+    if inv.output_contract != "deliberation":
+        system_prompt += (
+            "\n\nReminder before responding: your final message MUST end with the exact "
+            "'Final report' block from your agent definition above, with every field "
+            "present. Do not skip it, even for tiny or trivial tasks."
+        )
+    return system_prompt
+
+
+def _agy_prompt(inv: AgentInvocation) -> str:
+    if inv.resume_id:
+        return _resume_prompt(inv)
+    prompt = (f"[System Context]\n{inv.system_context}\n\n"
+              f"[User Prompt]\n{inv.prompt}")
+    if inv.output_contract != "deliberation":
+        prompt += (
+            "\n\n[Reminder] Your final message MUST end with the exact 'Final report' "
+            "block from your agent definition above, with every field present "
+            "(use \"none\" where it does not apply). Do not skip it, even for tiny tasks."
+        )
+    return prompt
+
+
+def submission_payload_parts(inv: AgentInvocation, boundary: str) -> list[tuple[str, str]]:
+    """Exact Summon-visible text represented by one adapter submission.
+
+    This intentionally excludes provider/CLI-added context.  Resumes represent
+    only the newly submitted text; retained remote session history is outside
+    Summon's observable boundary and is labeled as such by the accounting record.
+    """
+    if boundary == "api_message_content":
+        return [("system", inv.system_context or ""), ("user", inv.prompt)]
+    if boundary == "acp_prompt_text":
+        text = ((inv.system_context + "\n\n" + inv.prompt)
+                if inv.system_context else inv.prompt)
+        return [("user", text)]
+    if boundary != "subprocess_adapter_payload":
+        raise ValueError("unknown submission accounting boundary")
+    if inv.cli == "claude":
+        if inv.resume_id:
+            return [("user", _resume_prompt(inv))]
+        return [("system", _claude_system_prompt(inv)), ("user", inv.prompt)]
+    if inv.cli == "agy":
+        return [("user", _agy_prompt(inv))]
+    if inv.cli == "gemini" and inv.agent_file:
+        with open(inv.agent_file, encoding="utf-8-sig") as handle:
+            return [("system_file", handle.read()), ("user", inv.prompt)]
+    if inv.cli == "zcode":
+        text = _resume_prompt(inv) if inv.resume_id else _concatenated_prompt(inv)
+        return [("attachment", text), ("user", _ZCODE_FIXED_PROMPT)]
+    if inv.resume_id:
+        return [("user", _resume_prompt(inv))]
+    return [("user", _concatenated_prompt(inv))]
+
+
 def _concatenated_args(
     inv: AgentInvocation, perm_flags: list, env: dict | None
 ) -> tuple[str, list, dict | None]:
@@ -1103,19 +1179,7 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
                 + ["--resume", inv.resume_id] + base_args,
                 profile_env or None)
 
-    system_prompt = f"cwd: {inv.cwd}\n\n{inv.system_context}"
-    if inv.read_roots:
-        system_prompt += (
-            "\n\nExplicit additional read-only directories authorized for this turn:\n"
-            + "\n".join(f"- {root}" for root in inv.read_roots)
-            + "\nDo not access other directories."
-        )
-    if inv.output_contract != "deliberation":
-        system_prompt += (
-            "\n\nReminder before responding: your final message MUST end with the exact "
-            "'Final report' block from your agent definition above, with every field "
-            "present. Do not skip it, even for tiny or trivial tasks."
-        )
+    system_prompt = _claude_system_prompt(inv)
     command, base_args = build_command(inv.cli, inv.prompt)
     command = inv.profile_command or command
     return (command,
@@ -1507,11 +1571,15 @@ def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     # Codex config overrides such as model_reasoning_effort.
     model_flag = (["-m", selection["canonical"]]
                   if selection["canonical"] else [])
-    # Reasoning effort -> codex config override. gpt supports low|medium|high, so
-    # clamp claude's xhigh/max down to high. Global `-c` flags precede the subcommand.
+    # Reasoning effort -> Codex config override. Astra supports the full public
+    # low..max range. Preserve the historical high ceiling for other/unknown
+    # Codex targets until their provider contracts are reviewed independently.
+    # Global `-c` flags precede the subcommand.
     effort_flag = []
     if inv.effort:
-        _e = "high" if inv.effort in ("xhigh", "max") else inv.effort
+        _e = inv.effort
+        if selection["canonical"] != "gpt-6-astra" and _e in ("xhigh", "max"):
+            _e = "high"
         effort_flag = ["-c", f"model_reasoning_effort={_e}"]
     env = {**(env_override_for("codex") or {}), **profile_env} or None
     passthrough = strip_codex_model_selectors(inv.extra_args)
@@ -2025,7 +2093,11 @@ def _write_zcode_attachment(text: str) -> str:
         # bytes are written. Strict UTF-8 refuses an unencodable task rather
         # than silently rewriting it.
         _lock_zcode_attachment(path)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # Preserve the canonical prompt bytes across hosts.  The default text
+        # newline mode rewrites ``\n`` to CRLF on Windows, which changes the
+        # content that the attached backend actually receives and breaks any
+        # digest/byte-bound transport contract.
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(text)
         return path
     except Exception:
@@ -3391,14 +3463,7 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
         prompt = _resume_prompt(inv)
         cont = ["--continue"]
     else:
-        prompt = (f"[System Context]\n{inv.system_context}\n\n"
-                  f"[User Prompt]\n{inv.prompt}")
-        if inv.output_contract != "deliberation":
-            prompt += (
-                "\n\n[Reminder] Your final message MUST end with the exact 'Final report' "
-                "block from your agent definition above, with every field present "
-                "(use \"none\" where it does not apply). Do not skip it, even for tiny tasks."
-            )
+        prompt = _agy_prompt(inv)
         # CHECK BEFORE BUILDING. The guard below used to run after _ensure_agy_profile, so a
         # prompt that was never going to dispatch still created a profile directory and
         # copied OAuth material into it before raising -- orphaning credentials for a run
@@ -3482,11 +3547,14 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
 # See references/adding-a-backend.md.
 
 
-def _api_call(inv: AgentInvocation, timeout_ms: int, *, launch_control=None) -> dict:
+def _api_call(inv: AgentInvocation, timeout_ms: int, *, launch_control=None,
+              submission_accounting=None) -> dict:
     from _apibackend import call as _call   # lazy: keep _builder import-light
     if launch_control is None:
-        return _call(inv, timeout_ms)
-    return _call(inv, timeout_ms, launch_control=launch_control)
+        return _call(inv, timeout_ms,
+                     submission_accounting=submission_accounting)
+    return _call(inv, timeout_ms, launch_control=launch_control,
+                 submission_accounting=submission_accounting)
 
 
 def _acp_call(inv: AgentInvocation, timeout_ms: int, *, launch_control=None) -> dict:

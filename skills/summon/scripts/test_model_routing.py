@@ -18,6 +18,26 @@ import run_subagent
 
 
 class ModelRoutingTests(unittest.TestCase):
+    def test_explicit_effort_refuses_unreviewed_kimi_model(self):
+        refusal = run_subagent._unsupported_explicit_effort(
+            "kimi", "kimi-code/kimi-for-coding", "max")
+        self.assertIn("unsupported", refusal)
+        self.assertIn("kimi-code/k3", refusal)
+
+    def test_explicit_effort_refuses_backends_without_reviewed_transport(self):
+        for backend in ("gemini", "zcode", "openai-compat"):
+            with self.subTest(backend=backend):
+                refusal = run_subagent._unsupported_explicit_effort(
+                    backend, "some-model", "high")
+                self.assertTrue(
+                    "unsupported" in refusal or "no reviewed transport" in refusal,
+                    refusal,
+                )
+
+    def test_ambient_effort_remains_best_effort_for_unpinned_route(self):
+        self.assertIsNone(run_subagent._unsupported_explicit_effort(
+            "kimi", "kimi-code/kimi-for-coding", None))
+
     def test_roster_listing_exposes_declared_model_and_effort(self):
         from _loader import list_agents
         with tempfile.TemporaryDirectory() as roster:

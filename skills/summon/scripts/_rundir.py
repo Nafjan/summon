@@ -194,6 +194,28 @@ class OwnershipLostError(Exception):
     """The lock no longer carries our nonce (a successor took over)."""
 
 
+class JournalWriteError(OSError):
+    """A journal append failed at a bounded, named IO phase.
+
+    ``OSError`` remains the compatibility boundary for existing callers.  The
+    extra fields deliberately contain only bounded identity/provenance data;
+    they never include the record body or a local path.  ``durability`` is
+    ``"not_written"`` when the failure is known to precede the write and
+    ``"unknown"`` once bytes may have reached the file or the close/fence
+    outcome is ambiguous.
+    """
+
+    def __init__(self, message: str, *, phase: str,
+                 record_identity: dict, owner_identity: dict,
+                 durability: str, write_started: bool):
+        super().__init__(message)
+        self.phase = phase
+        self.record_identity = dict(record_identity)
+        self.owner_identity = dict(owner_identity)
+        self.durability = durability
+        self.write_started = bool(write_started)
+
+
 class Owner:
     """A held run ownership: the lock's identity plus this period's generation.
 
@@ -202,12 +224,16 @@ class Owner:
     SIDECAR), so byte-equality is the ownership test for every fenced
     operation -- a successor's lock can never be byte-identical (fresh nonce)."""
 
-    __slots__ = ("run_dir", "nonce", "generation", "lease_sec", "pid", "payload")
+    __slots__ = ("run_dir", "nonce", "generation", "lease_sec", "pid", "payload",
+                 "journal_poisoned")
 
     def __init__(self, run_dir: str, nonce: str, generation: int,
                  lease_sec: float, payload: bytes):
         self.run_dir, self.nonce, self.generation = run_dir, nonce, generation
         self.lease_sec, self.pid, self.payload = lease_sec, os.getpid(), payload
+        # Volatile per-instance state: a successor gets a fresh Owner object
+        # and must reconcile the prefix rather than inheriting this bit.
+        self.journal_poisoned = False
 
 
 def _lock_path(run_dir: str) -> str:
@@ -470,10 +496,115 @@ class CarryResidueError(Exception):
 
 
 def _journal_line(record: dict) -> str:
+    if "sha256" in record:
+        raise ValueError("sha256 is reserved for the journal checksum; use a namespaced field")
     ser = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     digest = hashlib.sha256(ser.encode("utf-8")).hexdigest()
     return json.dumps({**record, "sha256": digest}, sort_keys=True,
                       separators=(",", ":"), ensure_ascii=False)
+
+
+def encode_journal_record(record: dict, *, timestamp: float | int | None = None) -> bytes:
+    """Freeze one stamped/checksummed journal record as UTF-8 with one LF.
+
+    Capacity admission and the owned append seam must consume this exact byte
+    representation.  ``timestamp`` is injectable for deterministic boundary
+    tests; production callers leave it unset so it is sampled exactly once.
+    The returned bytes contain no platform newline translation.
+    """
+    stamped = {**record, "ts": time.time() if timestamp is None else timestamp}
+    return (_journal_line(stamped) + "\n").encode("utf-8")
+
+
+def _journal_record_identity(record: dict) -> dict:
+    """Return bounded, body-free identity data for append diagnostics."""
+    try:
+        canonical = json.dumps(record, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False).encode("utf-8")
+        record_sha = hashlib.sha256(canonical).hexdigest()
+    except (TypeError, ValueError, OverflowError):
+        # The append will raise the original serialization exception.  Keep the
+        # diagnostic identity bounded even for an invalid/unserializable input.
+        record_sha = None
+
+    def bounded(value, limit: int):
+        if isinstance(value, str):
+            return value[:limit]
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)[:limit]
+        return None
+
+    return {
+        "event": bounded(record.get("event"), 64),
+        "operation_id": bounded(record.get("operation_id"), 128),
+        "message_id": bounded(record.get("message_id"), 128),
+        "record_sha256": record_sha,
+    }
+
+
+def _owner_identity(owner: Owner) -> dict:
+    return {"generation": int(owner.generation), "nonce": owner.nonce[:32]}
+
+
+def _owned_run_dir(run_dir: str, owner: Owner) -> str:
+    """Bind a caller-supplied run directory to the held owner's namespace."""
+    supplied = os.path.normcase(os.path.abspath(os.fspath(run_dir)))
+    owned = os.path.normcase(os.path.abspath(os.fspath(owner.run_dir)))
+    if supplied != owned:
+        raise OwnershipLostError("journal write refused: run namespace differs from owner")
+    return owner.run_dir
+
+
+def _poison_owner(owner: Owner) -> None:
+    owner.journal_poisoned = True
+
+
+def _raise_journal_write_error(owner: Owner, record: dict, *, phase: str,
+                               durability: str, write_started: bool,
+                               cause: BaseException):
+    identity = _journal_record_identity(record)
+    owner_identity = _owner_identity(owner)
+    error = JournalWriteError(
+        f"journal append failed during {phase} (durability={durability})",
+        phase=phase, record_identity=identity, owner_identity=owner_identity,
+        durability=durability, write_started=write_started,
+    )
+    raise error from cause
+
+
+def _decode_frozen_journal_record(
+        payload: bytes, expected_record: dict | None = None) -> tuple[dict, dict]:
+    """Validate a frozen UTF-8/LF journal buffer without re-stamping it."""
+    if not isinstance(payload, bytes) or not payload.endswith(b"\n"):
+        raise ValueError("frozen journal bytes must be UTF-8 with one trailing LF")
+    body = payload[:-1]
+    if b"\n" in body or b"\r\n" in payload:
+        raise ValueError("frozen journal bytes must contain exactly one LF delimiter")
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("frozen journal bytes are not valid UTF-8 JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("frozen journal record is missing its checksum")
+    if not isinstance(parsed.get("sha256"), str):
+        raise ValueError("frozen journal record is missing its checksum")
+    if "ts" not in parsed:
+        raise ValueError("frozen journal record is missing its timestamp")
+    claimed = parsed.pop("sha256")
+    canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False).encode("utf-8")
+    if hashlib.sha256(canonical).hexdigest() != claimed:
+        raise ValueError("frozen journal record checksum mismatch")
+    canonical_payload = (_journal_line(parsed) + "\n").encode("utf-8")
+    if canonical_payload != payload:
+        raise ValueError("frozen journal record is not in canonical form")
+    if expected_record is not None:
+        if not isinstance(expected_record, dict):
+            raise TypeError("expected_record must be a dict")
+        timestamp = parsed.get("ts")
+        if encode_journal_record(expected_record, timestamp=timestamp) != payload:
+            raise ValueError("frozen journal bytes do not match expected record")
+    return parsed, _journal_record_identity(parsed)
 
 
 def _journal_path(run_dir: str, generation: int) -> str:
@@ -536,25 +667,155 @@ def _segment_generations(run_dir: str):
     return sorted(gens)
 
 
-def journal_append(run_dir: str, record: dict, owner: Owner) -> None:
-    """Append one checksummed line to the OWNER'S generation segment and FSYNC
-    it. ``owner`` is required: the segment path is derived from its generation,
-    which is what guarantees a single writer per file. The fence
-    (owner_still_current) is kept as defense so a deposed owner also STOPS
-    writing, but even without it a deposed owner could only ever touch its own
-    (now-abandoned) segment, never the successor's. ``ts`` is stamped here;
-    fsync before returning is the durability contract (an ``attempt started``
-    record must hit disk before the paid dispatch it announces)."""
-    rec = {**record, "ts": time.time()}
-    line = _journal_line(rec)
-    path = _journal_path(run_dir, owner.generation)
+def journal_append_encoded(run_dir: str, payload: bytes, owner: Owner, *,
+                           expected_record: dict | None = None) -> None:
+    """Append one already-frozen record through the owned generation seam.
+
+    ``payload`` is validated for checksum/identity and written exactly as
+    supplied.  It is never re-stamped or re-serialized.  ``expected_record``
+    is an optional caller-side identity check used by the legacy wrapper and
+    future capacity admission; a mismatch refuses before opening the file.
+    """
+    owned_run_dir = _owned_run_dir(run_dir, owner)
+    parsed_record, _identity = _decode_frozen_journal_record(
+        payload, expected_record=expected_record
+    )
+    declared_generation = parsed_record.get("generation")
+    if (declared_generation is not None
+            and (isinstance(declared_generation, bool)
+                 or not isinstance(declared_generation, int)
+                 or declared_generation != owner.generation)):
+        raise ValueError("frozen journal generation does not match owner generation")
+    record = parsed_record
+    path = _journal_path(owned_run_dir, owner.generation)
     with _JOURNAL_LOCK:
+        if owner.journal_poisoned:
+            _raise_journal_write_error(
+                owner, record, phase="owner_poisoned", durability="unknown",
+                write_started=False,
+                cause=RuntimeError("ownership instance was poisoned after an uncertain append"),
+            )
         if not owner_still_current(owner):
             raise OwnershipLostError("journal write refused: ownership changed")
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        fh = None
+        write_started = False
+        pending: BaseException | None = None
+        try:
+            try:
+                # Binary append is intentional: Windows text mode could
+                # translate the frozen LF into CRLF and invalidate byte
+                # accounting/checksums across platforms.
+                fh = open(path, "ab")
+            except OSError as exc:
+                _raise_journal_write_error(
+                    owner, record, phase="open", durability="not_written",
+                    write_started=False, cause=exc,
+                )
+
+            # A takeover may land between the initial fence and opening the
+            # file.  Refuse before any byte is written when that happens.
+            if not owner_still_current(owner):
+                raise OwnershipLostError("journal write refused: ownership changed")
+
+            write_started = True
+            try:
+                written = fh.write(payload)
+            except OSError as exc:
+                _poison_owner(owner)
+                _raise_journal_write_error(
+                    owner, record, phase="write", durability="unknown",
+                    write_started=True, cause=exc,
+                )
+            if not isinstance(written, int) or isinstance(written, bool) \
+                    or written != len(payload):
+                _poison_owner(owner)
+                _raise_journal_write_error(
+                    owner, record, phase="write", durability="unknown",
+                    write_started=True,
+                    cause=OSError(
+                        f"short journal write ({written!r}/{len(payload)} bytes)"
+                    ),
+                )
+            try:
+                fh.flush()
+            except OSError as exc:
+                _poison_owner(owner)
+                _raise_journal_write_error(
+                    owner, record, phase="flush", durability="unknown",
+                    write_started=True, cause=exc,
+                )
+            try:
+                os.fsync(fh.fileno())
+            except OSError as exc:
+                _poison_owner(owner)
+                _raise_journal_write_error(
+                    owner, record, phase="fsync", durability="unknown",
+                    write_started=True, cause=exc,
+                )
+
+            # The bytes are now flushed/fsynced, but a takeover that landed
+            # during the append still makes this owner's acknowledgement
+            # ambiguous.  Poison the owner and force successor reconciliation;
+            # never automatically replay the original event.
+            if not owner_still_current(owner):
+                _poison_owner(owner)
+                _raise_journal_write_error(
+                    owner, record, phase="owner_check_after_sync",
+                    durability="unknown", write_started=True,
+                    cause=OwnershipLostError("ownership changed after journal sync"),
+                )
+        except BaseException as exc:  # noqa: BLE001 - preserve exact caller error
+            # KeyboardInterrupt/SystemExit or a custom file-like exception can
+            # escape the narrower OSError handlers after bytes have started to
+            # flow.  Poison this ownership instance before preserving the
+            # original exception type for the caller.
+            if write_started:
+                _poison_owner(owner)
+            pending = exc
+            raise
+        finally:
+            if fh is not None:
+                try:
+                    fh.close()
+                except BaseException as exc:
+                    # If no earlier error exists, close failure leaves the
+                    # durability acknowledgement ambiguous.  Do not replace a
+                    # stronger ownership/IO error that is already in flight.
+                    if pending is None:
+                        if write_started:
+                            _poison_owner(owner)
+                        if isinstance(exc, OSError):
+                            _raise_journal_write_error(
+                                owner, record, phase="close",
+                                durability="unknown" if write_started else "not_written",
+                                write_started=write_started, cause=exc,
+                            )
+                        # Preserve interrupts/custom exceptions after poisoning;
+                        # callers must not mistake them for a clean append.
+                        raise
+
+        # Close is the final observable boundary for this append.  A takeover
+        # during close means this owner cannot honestly acknowledge the bytes;
+        # poison the instance and make the successor reconcile the prefix.
+        try:
+            still_current = owner_still_current(owner)
+        except BaseException:
+            if write_started:
+                _poison_owner(owner)
+            raise
+        if not still_current:
+            _poison_owner(owner)
+            _raise_journal_write_error(
+                owner, record, phase="owner_check_after_close",
+                durability="unknown", write_started=write_started,
+                cause=OwnershipLostError("ownership changed after journal close"),
+            )
+
+
+def journal_append(run_dir: str, record: dict, owner: Owner) -> None:
+    """Legacy wrapper: encode once, then use the frozen owned append seam."""
+    payload = encode_journal_record(record)
+    journal_append_encoded(run_dir, payload, owner, expected_record=record)
 
 
 def journal_read(run_dir: str):

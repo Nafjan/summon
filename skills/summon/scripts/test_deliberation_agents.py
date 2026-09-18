@@ -17,6 +17,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import _deliberation_agents as agents
+from _spawn import run_flags
 
 
 def manifest(name="reviewer", **changes):
@@ -72,6 +73,7 @@ class CustomAgentTests(unittest.TestCase):
             [sys.executable, str(HERE / "run_subagent.py"), "agents", "validate",
              "--cwd", str(self.workspace), "--json"],
             capture_output=True, text=True, check=False,
+            **run_flags(),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)

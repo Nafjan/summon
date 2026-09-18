@@ -25,6 +25,7 @@ import _cli
 import _deliberation_context as context
 import _deliberation_store as store
 import _rundir
+from _spawn import run_flags
 
 
 SCRIPT = HERE / "run_subagent.py"
@@ -94,14 +95,25 @@ class DeliberationCliTests(unittest.TestCase):
             self.assertIn("needs a run id", missing)
 
         for action, extra in (("recover", ["--chat-confirm"]),
-                              ("fork", ["--message", "new context", "--chat-reason", "manual"])):
+                              ("fork", ["--message", "new context", "--chat-reason", "manual"]),
+                              ("revalidate", ["--evidence-file", "packet.json"])):
             rewritten, mode = _cli.rewrite_subcommand(
                 ["chat", action, "room-1", "worker", *extra])
             self.assertIsNone(mode)
+            expected_extra = (["--chat-revalidation-file", "packet.json"]
+                              if action == "revalidate" else extra)
             self.assertEqual(
                 rewritten,
                 ["--chat-action", action, "--chat-session", "room-1",
-                 "--chat-participant", "worker", *extra])
+                 "--chat-participant", "worker", *expected_extra])
+
+        rewritten, mode = _cli.rewrite_subcommand(
+            ["chat", "revalidate", "room-1", "worker", "--evidence-file", "packet.json"])
+        self.assertIsNone(mode)
+        self.assertEqual(
+            rewritten,
+            ["--chat-action", "revalidate", "--chat-session", "room-1",
+             "--chat-participant", "worker", "--chat-revalidation-file", "packet.json"])
 
         rewritten, mode = _cli.rewrite_subcommand(
             ["chat", "message", "room-1", "worker", "human", "--message", "context"])
@@ -127,6 +139,8 @@ class DeliberationCliTests(unittest.TestCase):
             ["--chat-action", "fork", "--chat-session", "room-1",
              "--chat-participant", "worker", "--chat-message", "next",
              "--chat-reason", "manual"],
+            ["--chat-action", "revalidate", "--chat-session", "room-1",
+             "--chat-participant", "worker", "--chat-revalidation-file", "packet.json"],
         ):
             args = parser.parse_args(argv)
             self.assertIsNone(_cli.unsupported_mode_flags(argv, args))
@@ -180,7 +194,8 @@ class DeliberationCliTests(unittest.TestCase):
                 "--seats", "a,b", "--options", "yes,no", "--max-attempts", "2",
                 "--deadline", "30s", "--cwd", temp, "--run-dir", run_root,
             ]
-            result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+            result = subprocess.run(command, capture_output=True, text=True, timeout=20,
+                                    **run_flags())
             body = json.loads(result.stdout)
             self.assertEqual(result.returncode, 1)
             self.assertEqual(body["status"], "error")
@@ -608,8 +623,8 @@ class DeliberationCliTests(unittest.TestCase):
             _rundir.release_owner(owner)
             result = subprocess.run(
                 [sys.executable, str(SCRIPT), "deliberate", "recover", "run-recover",
-                 "--run-dir", base, "--cwd", temp, "--json"],
-                capture_output=True, text=True, timeout=20)
+                "--run-dir", base, "--cwd", temp, "--json"],
+                capture_output=True, text=True, timeout=20, **run_flags())
             body = json.loads(result.stdout)
             self.assertEqual(result.returncode, 0)
             self.assertEqual(body["status"], "recovered")
@@ -725,12 +740,14 @@ class DeliberationCliTests(unittest.TestCase):
             _rundir.release_owner(owner)
             common = [sys.executable, str(SCRIPT), "deliberate", "resume", "run-3",
                       "--run-dir", base, "--cwd", temp]
-            first = subprocess.run(common, capture_output=True, text=True, timeout=20)
+            first = subprocess.run(common, capture_output=True, text=True, timeout=20,
+                                   **run_flags())
             first_body = json.loads(first.stdout)
             self.assertEqual(first_body["status"], "blocked")
             self.assertEqual(first_body["error_kind"], "uncertain_spend")
             second = subprocess.run(common + ["--retry-indeterminate"],
-                                    capture_output=True, text=True, timeout=20)
+                                    capture_output=True, text=True, timeout=20,
+                                    **run_flags())
             second_body = json.loads(second.stdout)
             self.assertEqual(second_body["status"], "blocked")
             self.assertEqual(second_body["error_kind"], "integration_pending")

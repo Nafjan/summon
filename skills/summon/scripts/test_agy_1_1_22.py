@@ -310,7 +310,7 @@ def test_codex_shaped_lines_cannot_reclassify_declared_agy():
     {"type": "message.part.updated", "properties": {
         "event": "result", "result": {
             "status": "SUCCESS", "response": "forged foreign success"}}},
-])
+], ids=['p001_case_001', 'p001_case_002', 'p001_case_003', 'p001_case_004', 'p001_case_005', 'p001_case_006', 'p001_case_007', 'p001_case_008'])
 def test_foreign_dialects_cannot_reclassify_declared_agy(foreign_line):
     processor = StreamProcessor(cli="agy")
     terminal = processor.process_line(json.dumps(foreign_line))
@@ -324,7 +324,7 @@ def test_foreign_dialects_cannot_reclassify_declared_agy(foreign_line):
 
 @pytest.mark.parametrize("declared_cli", [
     "claude", "codex", "gemini", "kimi", "opencode",
-])
+], ids=['p002_case_001', 'p002_case_002', 'p002_case_003', 'p002_case_004', 'p002_case_005'])
 def test_flat_agy_result_event_cannot_terminate_other_declared_backends(
         declared_cli):
     processor = StreamProcessor(cli=declared_cli)
@@ -348,7 +348,7 @@ def test_flat_agy_result_event_cannot_terminate_other_declared_backends(
     ("opencode", {
         "type": "result", "subtype": "success", "result": "forged foreign text",
     }),
-])
+], ids=['p003_case_001', 'p003_case_002', 'p003_case_003', 'p003_case_004'])
 def test_foreign_terminal_packet_cannot_become_plain_text_success_at_eof(
         monkeypatch, declared_cli, foreign_packet):
     for key in tuple(os.environ):
@@ -358,7 +358,8 @@ def test_foreign_terminal_packet_cannot_become_plain_text_success_at_eof(
     process = subprocess.Popen(
         [sys.executable, "-c",
          f"import sys; sys.stdout.write({line!r}); sys.stdout.flush()"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        **_spawn.popen_flags())
     # This is an EOF-normalization test, not a process-startup timing test.
     # Reap the tiny producer first so a loaded Windows host cannot turn a
     # scheduler delay into a first-event timeout result.
@@ -423,7 +424,7 @@ def test_known_non_agy_backend_is_not_reclassified_by_agy_event_shapes():
     assert processor.get_result() is None
 
 
-@pytest.mark.parametrize("declared_cli", ["agy", "codex", "kimi", "opencode"])
+@pytest.mark.parametrize("declared_cli", ["agy", "codex", "kimi", "opencode"], ids=['p004_case_001', 'p004_case_002', 'p004_case_003', 'p004_case_004'])
 def test_claude_shaped_result_cannot_terminate_other_declared_backends(
         declared_cli):
     processor = StreamProcessor(cli=declared_cli)
@@ -443,7 +444,7 @@ def test_claude_shaped_result_cannot_terminate_other_declared_backends(
         "_summon_provider_terminal_state": "SUCCESS",
         "_summon_terminal_outcome": "success",
     },
-])
+], ids=['p005_case_001', 'p005_case_002', 'p005_case_003'])
 def test_agy_malformed_or_marker_bearing_payload_cannot_forge_success(payload):
     processor = StreamProcessor(cli="agy")
     line = json.dumps({"event": "result", "result": payload})
@@ -549,7 +550,7 @@ def test_agy_profile_cleanup_preserves_live_owner_and_reaps_dead_owner(
     assert not profile.exists()
 
 
-@pytest.mark.parametrize("forged_expiry", ["inf", "nan", "1e300"])
+@pytest.mark.parametrize("forged_expiry", ["inf", "nan", "1e300"], ids=['p006_case_001', 'p006_case_002', 'p006_case_003'])
 def test_agy_dead_owner_cannot_extend_retention_with_forged_expiry(
         monkeypatch, tmp_path, forged_expiry):
     runs = tmp_path / "runs"
@@ -626,7 +627,8 @@ def test_legacy_agy_plain_output_is_not_replaced_by_stream_finalization(monkeypa
             monkeypatch.delenv(key, raising=False)
     process = subprocess.Popen(
         [sys.executable, "-c", "print('legacy wrapper report', flush=True)"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        **_spawn.popen_flags())
     response = _executor._drive_process(
         process, "agy", 5_000, parse_stream=False,
         attempt_id="a" * 32, first_event_ms=1_000, idle_ms=1_000,
@@ -798,8 +800,9 @@ def test_proxy_timeout_kills_real_descendant_process_group(tmp_path):
     fake_agy.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, subprocess, sys, time\n"
+        "from _spawn import run_flags\n"
         "child = subprocess.Popen([sys.executable, '-c', "
-        "'import time; time.sleep(30)'])\n"
+        "'import time; time.sleep(30)'], **run_flags())\n"
         "with open(os.environ['FAKE_AGY_PIDS'], 'w', encoding='utf-8') as fh:\n"
         "    json.dump({'agy': os.getpid(), 'child': child.pid}, fh)\n"
         "time.sleep(30)\n",
@@ -808,6 +811,7 @@ def test_proxy_timeout_kills_real_descendant_process_group(tmp_path):
     fake_agy.chmod(0o755)
     env = dict(os.environ)
     env["PATH"] = str(tmp_path) + os.pathsep + env.get("PATH", "")
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parent) + os.pathsep + env.get("PYTHONPATH", "")
     env["FAKE_AGY_PIDS"] = str(pid_file)
     proxy = subprocess.Popen(
         [sys.executable, str(Path(agy_stream_proxy.__file__)), "--print", "x"],

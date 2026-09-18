@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 
 
@@ -236,6 +237,7 @@ class StreamProcessor:
         # Telemetry captured from stream events (None when the CLI doesn't emit it):
         self.session_id = None  # claude session_id / codex thread_id / cursor chat id
         self.usage = None       # token usage dict
+        self.usage_observation = None  # scope/provenance; values alone do not prove totals
         self.progress_usage = None  # advisory partial usage; never model-service evidence
         self.cost_usd = None    # claude total_cost_usd
         # Two model slots, split by EVIDENCE: the init handshake announces what
@@ -730,6 +732,8 @@ class StreamProcessor:
         if self.is_codex and data.get("type") == "turn.completed":
             if isinstance(data.get("usage"), dict):
                 self.usage = data["usage"]
+                self.usage_observation = {
+                    "scope": "attempt_total", "source": "codex_turn_completed"}
             # Newer Codex builds may expose the provider-served identity on the
             # terminal event. A thread.started model is only a handshake target;
             # never promote it to served evidence. Accept the documented/common
@@ -848,6 +852,8 @@ class StreamProcessor:
         result carries cost/usage/session_id; cursor's may carry a chat id."""
         if isinstance(data.get("usage"), dict):
             self.usage = data["usage"]
+            self.usage_observation = {
+                "scope": "attempt_total", "source": "terminal_result_usage"}
         if isinstance(data.get("total_cost_usd"), (int, float)):
             self.cost_usd = data["total_cost_usd"]
         for key in ("session_id", "chatId", "chat_id"):
@@ -1062,16 +1068,20 @@ class StreamProcessor:
         for container in containers:
             tokens = container.get("tokens")
             if isinstance(tokens, dict):
-                self.usage = {
-                    "input_tokens": tokens.get("input", 0),
-                    "output_tokens": tokens.get("output", 0),
-                    "total_tokens": tokens.get("total", 0),
-                    "reasoning_tokens": tokens.get("reasoning", 0),
-                }
+                # These are reported snapshots, not deltas. Preserve absence
+                # and explicit zero separately; neither fill missing counters
+                # nor merge a later partial snapshot with an earlier step.
+                counters = [(name + "_tokens", tokens.get(name))
+                            for name in ("input", "output", "total", "reasoning")]
                 cache = tokens.get("cache")
                 if isinstance(cache, dict):
-                    self.usage["cache_read_tokens"] = cache.get("read", 0)
-                    self.usage["cache_write_tokens"] = cache.get("write", 0)
+                    counters.extend(("cache_" + name + "_tokens", cache.get(name))
+                                    for name in ("read", "write"))
+                self.usage = {
+                    name: value for name, value in counters
+                    if type(value) in (int, float) and value >= 0
+                    and (not isinstance(value, float) or math.isfinite(value))
+                } or None
                 break
             usage = container.get("usage")
             if isinstance(usage, dict):

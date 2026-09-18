@@ -33,6 +33,68 @@ _INSTALL_MARKER = ".summon-install.json"
 _EXECUTION_LOCK = "summon.execution.lock"
 
 
+def _transient_retries_enabled(args: argparse.Namespace) -> bool:
+    """Mirror the dispatch loop's opt-in transient retry switch.
+
+    This is used only to reserve bounded accounting evidence; the launch loop
+    remains the authority that decides whether a transient retry is actually
+    taken.
+    """
+    return bool(getattr(args, "transient_retries", False)
+                or os.environ.get("SUMMON_TRANSIENT_RETRIES") == "1")
+
+
+def _submission_accounting_grants(args: argparse.Namespace) -> dict:
+    """Upper bounds for accounting writes already authorized by child argv.
+
+    These grants authorize evidence writes only; the dispatcher's existing
+    retry/gate predicates remain the sole launch authority.
+    """
+    retries = max(0, int(getattr(args, "retries", 0) or 0))
+    # agy's single empty-scrape recovery is an existing physical-attempt path
+    # even at --retries 0. It is only an extra path when the caller did not
+    # already authorize an ordinary retry; the retry loop promotes the budget
+    # from zero to one in that case.
+    agy_auto_retry = (
+        1 if getattr(args, "cli", None) == "agy" and retries == 0 else 0
+    )
+    # The opt-in transient retry is an additional outer attempt after the
+    # ordinary retry budget. It remains a launch decision made by the dispatch
+    # loop; this value only reserves its evidence slot.
+    transient_extra = 1 if _transient_retries_enabled(args) else 0
+    retry_grant = retries + agy_auto_retry + transient_extra
+    outer_attempts = 1 + retry_grant
+    return {
+        "initial": 1,
+        "transient_retry": retry_grant,
+        "acp_fallback": 0 if getattr(args, "no_acp_fallback", False) else 1,
+        "schema_correction": 1 if getattr(args, "json_schema", None) else 0,
+        "contract_repair": 0 if getattr(args, "no_contract_repair", False) else 1,
+        # Evidence authority only. The adapter's existing consent, endpoint,
+        # secondary-launch, and deadline gates remain unchanged. Standing
+        # operator consent is an already-authorized fresh path, but it must
+        # never leak into a governed continuation carrying fresh-consent-only.
+        # A PAYG fallback is an adapter-internal physical request. Each
+        # already-authorized outer attempt may reach that branch, so its
+        # evidence grant must be per outer attempt rather than one global slot.
+        "payg_fallback": outer_attempts * _payg_accounting_grant(args),
+    }
+
+
+def _payg_accounting_grant(args: argparse.Namespace) -> int:
+    if getattr(args, "allow_payg", False):
+        return 1
+    if os.environ.get("SUMMON_FRESH_CONSENT_ONLY") == "1":
+        return 0
+    try:
+        from _apibackend import payg_consent_allowed
+        return 1 if payg_consent_allowed(False) else 0
+    except Exception:
+        # Accounting authority is evidence-only; an unavailable consent
+        # reader must not broaden a launch or billing decision.
+        return 0
+
+
 def _managed_host_root(entry_path: str) -> str | None:
     """Return the host root for a managed dispatcher, else ``None``."""
     scripts = Path(entry_path).resolve().parent
@@ -427,7 +489,8 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
                      "request_id": resume_reservation.request_id,
                      "claim_id": resume_reservation.claim_id,
                      "request_sha256": resume_reservation.request_sha256}
-                    if resume_reservation is not None else None))
+                    if resume_reservation is not None else None),
+                accounting_grants=_submission_accounting_grants(args))
             resume_prepared = None
             if resume_reservation is not None:
                 from _job_resume import prepare_successor
@@ -450,6 +513,7 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
                         "stderr": subprocess.DEVNULL}
         child_env = {**os.environ, "SUMMON_JOB_NONCE": nonce,
                      "SUMMON_JOB_ID": job_id,
+                     "SUMMON_JOB_DIR": root,
                      "SUMMON_JOB_STARTED_AT": str(time.time()),
                      "SUMMON_JOB_SCRIPTS_SHA256": execution_summon["scripts_sha256"]}
         if resume_reservation is not None:
@@ -608,6 +672,29 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
     ``emit_error(message, exit_code=1)`` is the hub's error emitter (injected so
     this module does not import the entry point)."""
     root = _jobs.resolve_jobs_dir(args.job_dir)
+    if getattr(args, "jobs_revalidate", None):
+        from _job_resume import ResumeError, revalidate_source
+        try:
+            packet_path = os.path.abspath(args.job_revalidation_file or "")
+            if not packet_path:
+                raise ValueError("jobs revalidate requires --evidence-file")
+            info = os.stat(packet_path, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 512 * 1024:
+                raise ValueError("jobs revalidation packet has invalid type or size")
+            packet = json.loads(Path(packet_path).read_text(encoding="utf-8"))
+            if not isinstance(packet, dict):
+                raise ValueError("jobs revalidation packet must be an object")
+            observation = packet.get("observation")
+            qualification = packet.get("qualification")
+            report = revalidate_source(
+                root, args.jobs_revalidate, observation=observation,
+                qualification=qualification)
+            print(json.dumps(report, ensure_ascii=False))
+            return 0
+        except (ResumeError, OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            kind = getattr(exc, "kind", type(exc).__name__)
+            emit_error(f"governed revalidation refused ({kind})")
+            return 1
     if getattr(args, "jobs_resume", None):
         if not entry_path or not isinstance(summon, dict):
             emit_error("governed resume launcher is unavailable")

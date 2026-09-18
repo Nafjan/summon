@@ -18,6 +18,7 @@ import _evidence
 import _executor
 from _liveness import LivenessError, LivenessTracker
 from _stream import StreamProcessor
+from _spawn import popen_flags
 
 
 EMPTY_LIVENESS_COUNTS = {
@@ -41,7 +42,7 @@ def test_canonical_digest_binds_schema_and_mapping_order():
 
 @pytest.mark.parametrize("raw", [
     '{"a":1,"a":2}', '{"x":NaN}', '{"x":Infinity}',
-])
+], ids=['p001_case_001', 'p001_case_002', 'p001_case_003'])
 def test_evidence_parser_rejects_ambiguous_json(raw):
     with pytest.raises(_evidence.EvidenceError):
         _evidence.loads(raw)
@@ -211,7 +212,7 @@ def test_schema_validation_rejects_unknown_and_malformed_nested_fields():
 
 @pytest.mark.parametrize(("field", "requested_value"), [
     ("agent", []), ("provider", 7), ("model", "/etc/passwd"),
-])
+], ids=['p002_case_001', 'p002_case_002', 'p002_case_003'])
 def test_decision_schema_rejects_individual_malformed_request_values(field, requested_value):
     body = _decision.decide(
         request={"agent": "wanted", "lane": None},
@@ -232,7 +233,7 @@ def test_decision_schema_rejects_individual_malformed_request_values(field, requ
 @pytest.mark.parametrize("mutation", [
     {"phase": "bogus"}, {"expired": "anything"},
     {"first_trusted_event_ms": []},
-])
+], ids=['p003_case_001', 'p003_case_002', 'p003_case_003'])
 def test_liveness_schema_rejects_individual_malformed_values(mutation):
     payload = {"phase": "startup", "elapsed_ms": 0, "expired": None,
                "counts": dict(EMPTY_LIVENESS_COUNTS), "first_trusted_event_ms": None,
@@ -310,7 +311,7 @@ def test_argv_permission_mapping_alone_cannot_claim_enforcement(monkeypatch):
         "future-backend", "read-only") == "unknown"
 
 
-@pytest.mark.parametrize("backend", ["openai-compat", "arkcli"])
+@pytest.mark.parametrize("backend", ["openai-compat", "arkcli"], ids=['p004_case_001', 'p004_case_002'])
 def test_text_only_transport_permission_is_enforced_without_local_tools(backend):
     result = _decision.decide(
         request={"agent": "text-seat", "lane": None},
@@ -908,7 +909,7 @@ def test_executor_stream_integration_projects_meaningful_liveness():
         f"print(json.dumps({event!r}), flush=True)" for event in events)
     process = subprocess.Popen(
         [sys.executable, "-c", program], stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        stderr=subprocess.PIPE, text=True, encoding="utf-8", **popen_flags())
     response = _executor._drive_process(
         process, "codex", 5_000, parse_stream=True,
         attempt_id="a" * 32, first_event_ms=3_000, idle_ms=3_000)
@@ -921,7 +922,7 @@ def test_executor_startup_liveness_timeout_uses_existing_teardown():
     process = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(5)"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8")
+        text=True, encoding="utf-8", **popen_flags())
     response = _executor._drive_process(
         process, "codex", 2_000, parse_stream=True,
         attempt_id="b" * 32, first_event_ms=50, idle_ms=500)

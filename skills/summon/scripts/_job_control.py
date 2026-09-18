@@ -40,6 +40,21 @@ def heartbeat_path(root: str, job_id: str) -> str:
     return os.path.join(base, f"{job_id}.heartbeat.json")
 
 
+def source_admission_lock(root: str, job_id: str):
+    """Serialize source-bound launch admission with qualification revocation.
+
+    This lock is deliberately distinct from the job-control and resume-ledger
+    locks.  Callers acquire it first, then any ledger lock, so a revocation
+    that wins before admission is observed and a revocation that waits until
+    after the durable CAS is not retroactive cancellation.
+    """
+    if not _jobs.valid_job_id(job_id):
+        raise ValueError("source admission job id is invalid")
+    base = os.path.dirname(_jobs.record_path(root, job_id))
+    return _exclusive_control_lock(
+        os.path.join(base, f"{job_id}.resume-admission.lock"))
+
+
 def _auth(nonce: str, domain: str, payload: dict) -> str:
     """Bind a local control payload to one job secret.
 
@@ -588,9 +603,12 @@ class RuntimeControl:
                                if isinstance(job_started_at, (int, float))
                                else wall_clock())
         elapsed = max(0.0, wall_clock() - self.job_started_at)
-        self.started = clock() - elapsed
-        self.deadline = self.started + checkpoint_ms / 1000
+        admitted = clock()
+        self.started = admitted - elapsed
         self.hard_deadline = self.started + max_runtime_ms / 1000
+        # Each admitted attempt gets an observation interval, while the job's
+        # original hard budget (and authenticated extension replay) still binds.
+        self.deadline = min(admitted + checkpoint_ms / 1000, self.hard_deadline)
         self.attempt_id = attempt_id or job_id
         self.attempt_kind = attempt_kind
         self.attempt_ordinal = attempt_ordinal
@@ -604,6 +622,9 @@ class RuntimeControl:
         self.extension_ms = 0
         self.steers: list[dict] = []
         self._last_publish = 0.0
+        # Latched for the attempt: a later heartbeat cannot restore a missed
+        # observation. This is diagnostics, never command/launch authority.
+        self.heartbeat_unavailable = False
         self._last_refresh = float("-inf")
 
     @classmethod
@@ -770,10 +791,16 @@ class RuntimeControl:
                          "mode": "queued_for_resume"},
         }
         payload["auth"] = heartbeat_auth(self.nonce, payload)
-        _write_control_json(self.heartbeat, payload)
+        try:
+            _write_control_json(self.heartbeat, payload)
+        except OSError:
+            # Only the observational file write is fail-soft. Authentication,
+            # durable commands and provider launch fences remain strict.
+            self.heartbeat_unavailable = True
 
     def projection(self) -> dict:
         return {"enabled": True, "attention_required": self.attention_required,
+                "heartbeat_unavailable": self.heartbeat_unavailable,
                 "auto_extensions": self.auto_extensions,
                 "operator_extensions": self.operator_extensions,
                 "extension_ms": self.extension_ms,

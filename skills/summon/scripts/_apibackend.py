@@ -574,18 +574,28 @@ def _opener():
     return urllib.request.build_opener(_NoCrossHostAuthRedirect)
 
 
-def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
+def call(inv, timeout_ms: int, *, launch_control=None,
+         submission_accounting=None) -> dict:
     """Make one Chat Completions request for the invocation. Returns a response
     dict in the same shape the subprocess backends produce (result/status/
     exit_code/cli + usage/cost_usd/model_resolved), so it flows through _enrich."""
     cli = "openai-compat"
+
+    def _preflight_error(message: str) -> dict:
+        response = _err(cli, message)
+        response["provider_contacted"] = False
+        response["submission_state"] = "not_submitted"
+        return response
+
     if not inv.model:
-        return _err(cli, "openai-compat agent needs a `model:` (the API model id)")
+        return _preflight_error(
+            "openai-compat agent needs a `model:` (the API model id)")
     if not inv.base_url:
-        return _err(cli, "openai-compat: no base_url resolved (set provider: or base_url:)")
+        return _preflight_error(
+            "openai-compat: no base_url resolved (set provider: or base_url:)")
     _cp_model = coding_plan_model_error(inv.base_url, inv.model)
     if _cp_model:
-        return _err(cli, _cp_model)
+        return _preflight_error(_cp_model)
 
     api_key, _key_source = resolve_api_credential(
         inv.api_key_env, inv.base_url)
@@ -597,14 +607,13 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
                     "not a short-lived SSO token")
         if inv.api_key_env == "ZAI_CODING_API_KEY":
             msg += " - set it for the Z.AI Coding Plan endpoint"
-        return _err(cli, msg)
+        return _preflight_error(msg)
     expected_credential = getattr(inv, "api_key_fingerprint", None)
     if (expected_credential is not None
             and credential_fingerprint(inv.api_key_env, api_key) != expected_credential):
         # The identity was built with another helper/env credential. Do not let
         # a result-file reuse or a mid-dispatch helper edit cross accounts.
-        return _err(
-            cli,
+        return _preflight_error(
             "openai-compat credential changed after request identity was prepared; "
             "recompute the request identity before dispatch")
 
@@ -615,6 +624,15 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
     else:
         resp = _do_request(inv.base_url, inv.model, inv.system_context, inv.prompt,
                            api_key, timeout_ms, cli, launch_control=launch_control)
+    accounting_root_error = None
+    if isinstance(submission_accounting, dict):
+        try:
+            submission_accounting["settle_root"](resp)
+        except Exception as exc:  # evidence failure must not erase provider evidence
+            accounting_root_error = type(exc).__name__
+            resp.setdefault("warnings", []).append(
+                "the first request's durable accounting did not settle; "
+                "any adapter-internal second request will be refused")
     if (_key_source == "hermes_profile" and resp.get("status") != "success"
             and _nous_auth_rejection(resp.get("error"))):
         # A raw NOUS_API_KEY in an older Hermes profile is not interchangeable
@@ -682,6 +700,30 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
                 f"({remaining_ms}ms remaining after Coding Plan attempt)."
             )
             return resp
+        child_accounting = None
+        if isinstance(submission_accounting, dict):
+            if accounting_root_error is not None:
+                resp.pop("_payg_fallback_worthy", None)
+                resp.pop("_fallback_reason", None)
+                resp["error_kind"] = "submission_accounting_unavailable"
+                resp["error"] = (
+                    f"{_redact(primary_error, api_key)}\n\n"
+                    "PAYG fallback refused: the second physical request could "
+                    "not be durably prepared while preserving first-request evidence.")
+                return resp
+            try:
+                child_accounting = submission_accounting["prepare_child"](
+                    "payg_fallback")
+            except Exception as exc:
+                resp.pop("_payg_fallback_worthy", None)
+                resp.pop("_fallback_reason", None)
+                resp["error_kind"] = "submission_accounting_unavailable"
+                resp["accounting_error"] = type(exc).__name__
+                resp["error"] = (
+                    f"{_redact(primary_error, api_key)}\n\n"
+                    "PAYG fallback refused: the second physical request could "
+                    "not be durably prepared; the first request evidence was retained.")
+                return resp
         if launch_control is None:
             payg_resp = _do_request(payg_url, inv.model, inv.system_context,
                                     inv.prompt, api_key, remaining_ms, cli)
@@ -689,6 +731,16 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
             payg_resp = _do_request(payg_url, inv.model, inv.system_context,
                                     inv.prompt, api_key, remaining_ms, cli,
                                     launch_control=launch_control)
+        if child_accounting is not None:
+            try:
+                submission_accounting["settle_child"](
+                    child_accounting, payg_resp)
+            except Exception as exc:
+                payg_resp.setdefault("warnings", []).append(
+                    "the PAYG request was made but its durable accounting did not "
+                    "settle; the prelaunch possible-contact record remains authoritative")
+                payg_resp["uncertain_spend"] = True
+                payg_resp["accounting_error"] = type(exc).__name__
         payg_resp.pop("_payg_fallback_worthy", None)
         if payg_resp["status"] == "success":
             payg_resp["billing"] = dict(_PAYG_BILLING)
@@ -722,6 +774,30 @@ def _do_request(base_url: str, model: str, system_context: str | None,
         ],
         "stream": False,
     }).encode("utf-8")
+    # HTTP bodies bypass the subprocess argv budget seam. Measure the exact
+    # UTF-8 bytes that urllib will write and refuse the whole operation before
+    # any launch-control claim or socket contact. This is Summon's local
+    # operational ceiling, not a provider context-window or billing claim.
+    from _transport_budget import (
+        DEFAULT_STRUCTURED_PAYLOAD_BYTES, evaluate_serialized_payload,
+    )
+    _transport_budget = evaluate_serialized_payload(
+        operation_id=hashlib.sha256(body).hexdigest()[:32], payload=body,
+        capability={"kind": "serialized", "platform": os.name,
+                     "max_serialized_bytes": DEFAULT_STRUCTURED_PAYLOAD_BYTES},
+        boundary="openai_chat_completions")
+    if _transport_budget["status"] == "blocked":
+        response = _err(
+            cli,
+            "serialized API request exceeds Summon's local 8 MiB transport "
+            "ceiling; shorten the required prompt or use a bounded file-aware "
+            "route",
+            not_run=True,
+            error_kind="transport_budget_exceeded",
+        )
+        response["transport_budget"] = _transport_budget
+        response["submission_state"] = "not_submitted"
+        return response
     # Some provider edges (including the Nous inference edge) reject Python's
     # default ``urllib`` fingerprint with a generic 403/1010 response even when
     # the bearer is valid. Send an ordinary API client identity and an explicit
@@ -751,6 +827,8 @@ def _do_request(base_url: str, model: str, system_context: str | None,
             except Exception:
                 pass
             response = _err(cli, f"provider launch refused by control ({type(e).__name__})")
+            response["provider_contacted"] = False
+            response["submission_state"] = "not_submitted"
             error_kind = getattr(e, "error_kind", None)
             if error_kind == "context_source_drift":
                 response["error_kind"] = error_kind
@@ -770,15 +848,27 @@ def _do_request(base_url: str, model: str, system_context: str | None,
         rewritten = _rewrite_coding_plan_http_error(base_url, model, e.code, detail or e.reason)
         err_msg = rewritten or f"HTTP {e.code} from {base_url}: {detail or e.reason}"
         resp = _err(cli, _redact(err_msg, api_key))
+        resp["provider_contacted"] = True
+        # An HTTP response is endpoint evidence that this physical request was
+        # received, even when the provider rejected it.
+        resp["submission_state"] = "submitted"
         if fallback_worthy:
             resp["_payg_fallback_worthy"] = True
             resp["_fallback_reason"] = _classify_fallback_reason(e.code, detail)
         return resp
     except (urllib.error.URLError, TimeoutError) as e:
-        return _err(cli, _redact(f"request failed ({base_url}): {e}", api_key))
+        resp = _err(cli, _redact(f"request failed ({base_url}): {e}", api_key))
+        resp["provider_contacted"] = True
+        resp["submission_state"] = "indeterminate"
+        resp["uncertain_spend"] = True
+        return resp
     except (ValueError, http.client.HTTPException, OSError) as e:
-        return _err(cli, _redact(f"bad/failed response from {base_url}: "
+        resp = _err(cli, _redact(f"bad/failed response from {base_url}: "
                                  f"{type(e).__name__}: {e}", api_key))
+        resp["provider_contacted"] = True
+        resp["submission_state"] = "indeterminate"
+        resp["uncertain_spend"] = True
+        return resp
     finally:
         if launch_control is not None:
             try:
@@ -789,16 +879,23 @@ def _do_request(base_url: str, model: str, system_context: str | None,
     try:
         text = payload["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
-        return _err(cli, _redact(f"unexpected response shape: {json.dumps(payload)[:300]}", api_key))
+        resp = _err(cli, _redact(
+            f"unexpected response shape: {json.dumps(payload)[:300]}", api_key))
+        resp["provider_contacted"] = True
+        resp["submission_state"] = "submitted"
+        return resp
     if text is None:
         text = ""
     if not isinstance(text, str):
         text = json.dumps(text)
     text = _redact(text, api_key)
 
-    resp = {"result": text, "exit_code": 0, "status": "success", "cli": cli}
+    resp = {"result": text, "exit_code": 0, "status": "success", "cli": cli,
+            "provider_contacted": True, "submission_state": "submitted"}
     if isinstance(payload.get("usage"), dict):
         resp["usage"] = payload["usage"]
+        resp["usage_observation"] = {
+            "scope": "attempt_total", "source": "provider_response_usage"}
     if isinstance(payload.get("model"), str):
         resp["model_resolved"] = payload["model"]
     _bill = coding_plan_billing(base_url)
@@ -899,5 +996,19 @@ def _classify_fallback_reason(http_code: int, detail: str) -> str:
     return "plan-limit"
 
 
-def _err(cli: str, msg: str) -> dict:
-    return {"result": "", "exit_code": 1, "status": "error", "cli": cli, "error": msg}
+def _err(cli: str, msg: str, *, not_run: bool = False,
+         error_kind: str | None = None) -> dict:
+    value = {"result": "", "exit_code": 1, "status": "error", "cli": cli,
+             "error": msg}
+    if not_run:
+        value.update({
+            "attempts": 0,
+            "attempt_status": "not_run",
+            "execution_status": "not_run",
+            "provider_contacted": False,
+            "result_usable": False,
+            "retryable": False,
+        })
+    if error_kind:
+        value["error_kind"] = error_kind
+    return value

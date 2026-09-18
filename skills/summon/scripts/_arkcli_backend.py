@@ -10,6 +10,7 @@ CLI dual-wire for the same subscription family.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -93,11 +94,45 @@ def call(inv, timeout_ms: int) -> dict:
     cmd.append("--")
     cmd.append(prompt)
     from _spawn import run_flags, scrub_provider_env
+    child_env = scrub_provider_env(dict(os.environ))
+    # ArkCLI is registered as an API-kind route but launches a real CLI. It
+    # therefore needs the same final argv/environment measurement as ordinary
+    # subprocess adapters. This is a local OS ceiling only; it is not a claim
+    # about the provider's context window or plan quota.
+    try:
+        from _transport_budget import evaluate_invocation
+        capability = ({"kind": "argv", "platform": "nt",
+                       "max_utf16_units": 32767,
+                       "max_env_utf16_units": 32767}
+                      if os.name == "nt" else
+                      {"kind": "argv", "platform": "posix",
+                       "max_single_argument_bytes": 131072,
+                       "max_total_bytes": 2_000_000})
+        payload_text = ((system + "\n\n" + prompt) if system else prompt)
+        transport_budget = evaluate_invocation(
+            operation_id=hashlib.sha256(
+                payload_text.encode("utf-8", errors="surrogatepass")).hexdigest()[:32],
+            content=payload_text, command=cmd[0], args=cmd[1:], env=child_env,
+            platform=os.name, capability=capability)
+    except Exception:
+        return _err(cli, "arkcli transport capability preflight refused",
+                    not_run=True, error_kind="transport_capability_invalid")
+    if transport_budget["status"] == "blocked":
+        response = _err(
+            cli,
+            "serialized arkcli invocation exceeds the local command-line "
+            "transport ceiling; shorten the required prompt or use a bounded "
+            "file-aware route",
+            not_run=True,
+            error_kind="transport_budget_exceeded",
+        )
+        response["transport_budget"] = transport_budget
+        return response
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=max(1, int(timeout_ms) / 1000.0),
-            stdin=subprocess.DEVNULL, env=scrub_provider_env(dict(os.environ)),
+            stdin=subprocess.DEVNULL, env=child_env,
             **run_flags())
     except subprocess.TimeoutExpired:
         return _err(cli, f"arkcli +chat timed out after {timeout_ms}ms")

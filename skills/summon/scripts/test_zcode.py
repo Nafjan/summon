@@ -71,8 +71,9 @@ class ZCodeBuilderTests(unittest.TestCase):
     def _inv(self, **kw):
         permission = kw.pop("permission", "yolo")
         allow_tool_credentials = kw.pop("allow_tool_credentials", True)
+        prompt = kw.pop("prompt", "line one\nline two")
         return AgentInvocation(
-            cli="zcode", prompt="line one\nline two", system_context="system context",
+            cli="zcode", prompt=prompt, system_context="system context",
             cwd=tempfile.gettempdir(), permission=permission, isolated_lane=True,
             allow_tool_credentials=allow_tool_credentials, **kw)
 
@@ -214,6 +215,23 @@ class ZCodeBuilderTests(unittest.TestCase):
         self.assertNotIn("SUMMON_ZCODE_ATTACH_FILE", env or {})
         self.assertTrue(Path(attachment).is_file())
         _builder.cleanup_zcode_attachment(args)
+        self.assertFalse(Path(attachment).exists())
+
+    def test_64k_multiline_payload_uses_exact_private_attachment_transport(self):
+        prompt = ("header → λ\n" + "🙂quoted \\\"line\\\"\n") * 4096
+        invocation = self._inv(prompt=prompt)
+        with mock.patch("_zcode.resolve_zcode_cli", return_value=self._target()), \
+             mock.patch("_builder._lock_zcode_attachment"):
+            _command, args, _env = build_invocation_args(invocation)
+        attachment = args[args.index("--attach") + 1]
+        try:
+            expected = _builder._concatenated_prompt(invocation).encode("utf-8")
+            self.assertGreaterEqual(len(expected), 64 * 1024)
+            self.assertEqual(Path(attachment).read_bytes(), expected)
+            self.assertNotIn(prompt, args)
+            self.assertNotIn("header → λ", args)
+        finally:
+            _builder.cleanup_zcode_attachment(args)
         self.assertFalse(Path(attachment).exists())
 
     def test_builder_rejects_unsafe_modes_and_bad_resume(self):

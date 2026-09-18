@@ -21,11 +21,14 @@ import time
 from pathlib import Path
 
 import _jobs
+from _drivers import BACKEND_TYPE_CLI
 from _resume_capabilities import resume_capability
 
 
 SCHEMA = "summon.job-continuation-source/v1"
+SCHEMA_V2 = "summon.job-continuation-source/v2"
 PUBLIC_SCHEMA = "summon.job-continuation/v1"
+LAUNCH_BINDING_SCHEMA = "summon.job-launch-binding/v1"
 MAX_PRIVATE_BYTES = 512 * 1024
 MAX_JOB_BYTES = 512 * 1024
 MAX_HANDLE_CHARS = 4_096
@@ -48,6 +51,11 @@ _AGENT_FIELDS = {
     "role_target_sha256", "role_registry_sha256",
 }
 _BACKEND_FIELDS = {
+    "cli", "transport", "profile", "profile_path_sha256",
+    "profile_registry_sha256", "profile_command_sha256", "driver",
+    "backend_type", "served_via", "profile_path", "profile_state_sha256",
+}
+_LEGACY_BACKEND_FIELDS = {
     "cli", "transport", "profile", "profile_path_sha256",
     "profile_registry_sha256", "profile_command_sha256", "driver",
     "backend_type", "served_via",
@@ -92,14 +100,39 @@ def _digest(value) -> str:
 
 
 def _auth(nonce: str, body: dict) -> str:
+    schema = body.get("schema") if isinstance(body, dict) else None
+    domain = (b"summon-job-continuation-source/v2:"
+              if schema == SCHEMA_V2 else
+              b"summon-job-continuation-source/v1:")
     return hmac.new(nonce.encode("utf-8"),
-                    b"summon-job-continuation-source/v1:" + _canonical(body),
+                    domain + _canonical(body),
                     hashlib.sha256).hexdigest()
 
 
 def continuation_path(root: str, job_id: str) -> str:
     base = os.path.dirname(_jobs.record_path(root, job_id))
     return os.path.join(base, f"{job_id}.continuation.json")
+
+
+def launch_binding_path(root: str, job_id: str) -> str:
+    """Private additive v2 binding; the exact v1 source remains byte-compatible."""
+    base = os.path.dirname(_jobs.record_path(root, job_id))
+    return os.path.join(base, f"{job_id}.launch-binding.json")
+
+
+def launch_qualification_path(root: str, job_id: str) -> str:
+    """Return the private qualification sidecar path for one source job."""
+    from _launch_qualification import qualification_path
+    return qualification_path(root, job_id)
+
+
+def read_launch_qualification(root: str, job_id: str) -> dict | None:
+    """Read the optional authenticated runtime qualification sidecar."""
+    from _launch_qualification import QualificationError, read
+    try:
+        return read(root, job_id)
+    except QualificationError as exc:
+        raise ContinuationError(exc.kind, str(exc)) from exc
 
 
 def _is_sha(value) -> bool:
@@ -230,7 +263,7 @@ def _exact_fields(value, fields) -> bool:
 def _valid_source_shape(value: dict) -> bool:
     if not _exact_fields(value, _TOP_FIELDS):
         return False
-    if value.get("schema") != SCHEMA or not _is_id(value.get("job_id")) \
+    if value.get("schema") not in {SCHEMA, SCHEMA_V2} or not _is_id(value.get("job_id")) \
             or not _is_id(value.get("attempt_id")):
         return False
     if not all(_is_sha(value.get(key)) for key in (
@@ -262,17 +295,26 @@ def _valid_source_shape(value: dict) -> bool:
                     or _is_sha(agent.get("role_registry_sha256")))):
         return False
     backend = value.get("backend")
-    if (not _exact_fields(backend, _BACKEND_FIELDS)
+    expected_backend_fields = (_BACKEND_FIELDS if value.get("schema") == SCHEMA_V2
+                               else _LEGACY_BACKEND_FIELDS)
+    if (not _exact_fields(backend, expected_backend_fields)
             or not _bounded_text(backend.get("cli"), maximum=64)
             or not _bounded_text(backend.get("transport"), maximum=64)
             or not _bounded_text(backend.get("profile"), nullable=True, maximum=256)
             or backend.get("driver") != "cli"
             or backend.get("backend_type") != "cli"
             or backend.get("served_via") != "cli_agent"
+            or not _bounded_text(backend.get("profile_path"), nullable=True,
+                                 maximum=32_768)
             or not all(item is None or _is_profile_digest(item) for item in (
                 backend.get("profile_path_sha256"),
                 backend.get("profile_registry_sha256"),
-                backend.get("profile_command_sha256")))):
+                backend.get("profile_command_sha256"),
+                backend.get("profile_state_sha256")))):
+        return False
+    if (value.get("schema") == SCHEMA_V2 and backend.get("profile")
+            and (not isinstance(backend.get("profile_path"), str)
+                 or not _is_profile_digest(backend.get("profile_state_sha256")))):
         return False
     model = value.get("model")
     if (not _exact_fields(model, _MODEL_FIELDS)
@@ -451,7 +493,10 @@ def write_private_source(job_file: str, result: dict, invocation, args) -> dict:
                                 "continuation_route_mismatch")
     provider = result.get("provider")
     served = result.get("served")
-    if (result.get("backend_type") != "cli"
+    # Terminal executor envelopes use the driver's canonical taxonomy. The
+    # historical private v1 sidecar below deliberately retains its own "cli"
+    # spelling; that stored schema is not the public executor contract.
+    if (result.get("backend_type") != BACKEND_TYPE_CLI
             or result.get("served_via") != "cli_agent"
             or not isinstance(provider, dict) or provider.get("driver") != "cli"
             or set(provider) != {"driver"}
@@ -533,14 +578,28 @@ def write_private_source(job_file: str, result: dict, invocation, args) -> dict:
                 or profile.get("command_sha256") != expected_command_sha):
             return _unavailable(invocation.cli, invocation.transport,
                                 "profile_provenance_required")
+        try:
+            from _profiles import _profile_state
+            profile_state = _profile_state(profile_path, invocation.cli)
+        except Exception:
+            return _unavailable(invocation.cli, invocation.transport,
+                                "profile_provenance_required")
+        if (not isinstance(profile_path, str) or not profile_path
+                or "\x00" in profile_path or "\r" in profile_path
+                or "\n" in profile_path):
+            return _unavailable(invocation.cli, invocation.transport,
+                                "profile_provenance_required")
     elif profile:
         return _unavailable(invocation.cli, invocation.transport,
                             "profile_provenance_mismatch")
+    else:
+        profile_path = None
+        profile_state = None
     billing = result.get("billing") if isinstance(result.get("billing"), dict) else {}
     gate_decision = result.get("gate")
     gate_digest = _digest(gate_decision) if isinstance(gate_decision, dict) else None
     body = {
-        "schema": SCHEMA,
+        "schema": SCHEMA_V2,
         "job_id": job_id,
         "attempt_id": attempt_id,
         "launch_sha256": _digest({key: value for key, value in record.items()
@@ -569,6 +628,11 @@ def write_private_source(job_file: str, result: dict, invocation, args) -> dict:
             "profile_path_sha256": profile.get("path_sha256"),
             "profile_registry_sha256": profile.get("registry_sha256"),
             "profile_command_sha256": profile.get("command_sha256"),
+            # These are private continuation-source facts.  Public projections
+            # never serialize the path; the authenticated source binds it so a
+            # profile cannot rotate between reservation and child load.
+            "profile_path": os.path.abspath(profile_path) if profile_path else None,
+            "profile_state_sha256": profile_state,
             "driver": "cli", "backend_type": "cli", "served_via": "cli_agent",
         },
         "model": {"requested": models[0], "targeted": models[1],
@@ -617,6 +681,7 @@ def write_private_source(job_file: str, result: dict, invocation, args) -> dict:
     # this lock two terminal writers could both observe absence and each return
     # success while the later replace silently changed the authority handle.
     from _job_control import _exclusive_control_lock
+    existing_public = None
     with _exclusive_control_lock(path):
         if os.path.lexists(path):
             existing = _read_strict(path)
@@ -633,9 +698,56 @@ def write_private_source(job_file: str, result: dict, invocation, args) -> dict:
             if stable_existing != stable_new:
                 raise ContinuationError("continuation_source_conflict",
                                         "a different continuation source already exists")
-            return public_projection(existing)
-        _jobs._atomic_write_json(path, body)
-    return public_projection(body)
+            existing_public = public_projection(existing)
+        else:
+            _jobs._atomic_write_json(path, body)
+    # The v1 continuation source intentionally retains its exact field set.
+    # Fresh executor observations live in a separate authenticated sidecar so
+    # old readers remain valid while R02 can require launch-bound evidence.
+    launch = result.get("_private_launch_observation")
+    if isinstance(launch, dict):
+        from _launch_binding import binding_projection, valid_observation
+        projected = binding_projection(launch)
+        if projected is not None and valid_observation(launch):
+            launch_body = {
+                "schema": LAUNCH_BINDING_SCHEMA,
+                "job_id": job_id,
+                "attempt_id": attempt_id,
+                "result_binding_sha256": _result_binding(result),
+                "observation": projected,
+                "created_at": time.time(),
+            }
+            launch_auth_body = {
+                key: value for key, value in launch_body.items()
+                if key != "created_at"
+            }
+            launch_body["auth"] = hmac.new(
+                nonce.encode("utf-8"),
+                b"summon-job-launch-binding/v1:" + _canonical(launch_auth_body),
+                hashlib.sha256).hexdigest()
+            launch_path = launch_binding_path(root, job_id)
+            if os.path.lexists(launch_path):
+                existing_launch = _read_strict(launch_path, max_bytes=MAX_JOB_BYTES,
+                                               missing_kind="launch_binding_untrusted",
+                                               invalid_kind="launch_binding_untrusted")
+                existing_launch_body = {
+                    key: value for key, value in existing_launch.items()
+                    if key not in {"auth", "created_at"}}
+                new_launch_body = {
+                    key: value for key, value in launch_body.items()
+                    if key not in {"auth", "created_at"}}
+                existing_auth = hmac.new(
+                    nonce.encode("utf-8"),
+                    b"summon-job-launch-binding/v1:" + _canonical(existing_launch_body),
+                    hashlib.sha256).hexdigest()
+                if (existing_launch_body != new_launch_body
+                        or not hmac.compare_digest(
+                            str(existing_launch.get("auth", "")), existing_auth)):
+                    raise ContinuationError("launch_binding_conflict",
+                                            "a different launch observation already exists")
+            else:
+                _jobs._atomic_write_json(launch_path, launch_body)
+    return existing_public if existing_public is not None else public_projection(body)
 
 
 def read_private_source(root: str, job_id: str) -> dict:
@@ -701,8 +813,99 @@ def read_private_source(root: str, job_id: str) -> dict:
     return source
 
 
+def read_launch_binding(root: str, job_id: str) -> dict | None:
+    """Read the optional authenticated launch observation for a fresh source.
+
+    ``None`` is deliberately distinct from an invalid record: callers may keep
+    historical v1 sources readable, but governed R02 launch must refuse when no
+    current binding was sealed.
+    """
+    source = read_private_source(root, job_id)
+    record = _read_strict(
+        _jobs.record_path(root, job_id), max_bytes=MAX_JOB_BYTES,
+        missing_kind="source_job_untrusted", invalid_kind="source_job_untrusted")
+    nonce = record.get("nonce")
+    path = launch_binding_path(root, job_id)
+    try:
+        value = _read_strict(path, max_bytes=MAX_JOB_BYTES,
+                             missing_kind="launch_binding_missing",
+                             invalid_kind="launch_binding_untrusted")
+    except ContinuationError as exc:
+        if exc.kind == "launch_binding_missing":
+            return None
+        raise
+    if (value.get("schema") != LAUNCH_BINDING_SCHEMA
+            or value.get("job_id") != job_id
+            or value.get("attempt_id") != record.get("attempt_id")
+            or value.get("result_binding_sha256") != source.get("result_binding_sha256")
+            or not isinstance(value.get("observation"), dict)):
+        raise ContinuationError("launch_binding_untrusted", "launch binding identity is invalid")
+    body = {key: item for key, item in value.items()
+            if key not in {"auth", "created_at"}}
+    expected_auth = hmac.new(
+        str(nonce).encode("utf-8"),
+        b"summon-job-launch-binding/v1:" + _canonical(body),
+        hashlib.sha256).hexdigest()
+    if not isinstance(nonce, str) or not hmac.compare_digest(
+            str(value.get("auth", "")), expected_auth):
+        raise ContinuationError("launch_binding_auth_failed", "launch binding authentication failed")
+    from _launch_binding import valid_projection
+    observation = value["observation"]
+    # Sidecars intentionally persist only the immutable projection; validate
+    # that projection directly rather than rehydrating dummy transient fields.
+    if not valid_projection(observation):
+        raise ContinuationError("launch_binding_untrusted", "launch binding fields are invalid")
+    return dict(observation)
+
+
+def write_launch_binding(root: str, job_id: str, observation: dict) -> dict:
+    """Seal a fresh observation for an explicit non-launching revalidation."""
+    source = read_private_source(root, job_id)
+    record = _read_strict(
+        _jobs.record_path(root, job_id), max_bytes=MAX_JOB_BYTES,
+        missing_kind="source_job_untrusted", invalid_kind="source_job_untrusted")
+    from _launch_binding import binding_projection, valid_observation
+    projected = binding_projection(observation)
+    if projected is None or not valid_observation(observation):
+        raise ContinuationError("launch_binding_untrusted", "revalidation observation is invalid")
+    body = {
+        "schema": LAUNCH_BINDING_SCHEMA, "job_id": job_id,
+        "attempt_id": record["attempt_id"],
+        "result_binding_sha256": source["result_binding_sha256"],
+        "observation": projected, "created_at": time.time(),
+    }
+    auth_body = {key: value for key, value in body.items() if key != "created_at"}
+    body["auth"] = hmac.new(
+        str(record["nonce"]).encode("utf-8"),
+        b"summon-job-launch-binding/v1:" + _canonical(auth_body),
+        hashlib.sha256).hexdigest()
+    path = launch_binding_path(root, job_id)
+    if os.path.lexists(path):
+        existing = _read_strict(path, max_bytes=MAX_JOB_BYTES,
+                                missing_kind="launch_binding_untrusted",
+                                invalid_kind="launch_binding_untrusted")
+        existing_body = {key: value for key, value in existing.items()
+                         if key not in {"auth", "created_at"}}
+        existing_auth = hmac.new(
+            str(record["nonce"]).encode("utf-8"),
+            b"summon-job-launch-binding/v1:" + _canonical(
+                {key: value for key, value in existing_body.items()
+                 if key != "created_at"}), hashlib.sha256).hexdigest()
+        if (existing_body != {key: value for key, value in body.items()
+                              if key not in {"auth", "created_at"}}
+                or not hmac.compare_digest(str(existing.get("auth", "")), existing_auth)):
+            raise ContinuationError("launch_binding_conflict",
+                                    "a different launch observation already exists")
+        return dict(existing["observation"])
+    _jobs._atomic_write_json(path, body)
+    return dict(projected)
+
+
 __all__ = [
-    "SCHEMA", "PUBLIC_SCHEMA", "ContinuationError", "capture_workspace",
+    "SCHEMA", "PUBLIC_SCHEMA", "LAUNCH_BINDING_SCHEMA", "ContinuationError", "capture_workspace",
     "workspace_continuity", "continuation_path", "public_projection",
-    "write_private_source", "read_private_source", "result_binding_sha256",
+    "launch_binding_path", "launch_qualification_path", "write_private_source",
+    "read_private_source", "read_launch_binding", "write_launch_binding",
+    "read_launch_qualification",
+    "result_binding_sha256",
 ]

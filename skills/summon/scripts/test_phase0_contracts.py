@@ -21,6 +21,7 @@ import _manifest
 import _spawn
 import _telemetry
 import run_subagent
+from _spawn import run_flags
 
 
 def test_posix_arkcli_roster_refresh_fails_cleanly_without_shell_fallback(
@@ -362,6 +363,7 @@ def test_cmd_transport_rejects_unsafe_raw_prompt_without_launch(monkeypatch):
             text=True,
             encoding="utf-8",
             env=env,
+            **run_flags(),
         )
     assert completed.returncode == 1, completed.stdout + completed.stderr
     envelope = json.loads(completed.stdout)
@@ -397,7 +399,8 @@ def test_context_dry_run_is_provider_inert_and_reports_compilation_without_paths
              "--cwd", cwd, "--agents-dir", str(agents), "--strict-agents-dir",
              "--context-input-file", str(context_path), "--context-profile", "safe",
              "--dry-run", "--json"],
-            capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
+            capture_output=True, text=True, encoding="utf-8", env=env, timeout=60,
+            **run_flags())
         assert completed.returncode == 0, completed.stdout + completed.stderr
         view = json.loads(completed.stdout)
         projection = view["context_compilation"]
@@ -424,7 +427,8 @@ def test_context_input_outside_read_allowlist_refuses_before_provider_contact():
             [sys.executable, str(script), "--agent", "reviewer", "--prompt", "review",
              "--cwd", cwd, "--context-input-file", str(context_path),
              "--dry-run", "--json"],
-            capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
+            capture_output=True, text=True, encoding="utf-8", env=env, timeout=60,
+            **run_flags())
         assert completed.returncode == 1
         refusal = json.loads(completed.stdout)
         assert refusal["error_kind"] == "context_target_outside_allowlist"
@@ -444,6 +448,7 @@ def test_real_windows_cmd_refuses_all_raw_prompt_bytes_before_dispatch():
                 [str(launcher), "dispatch", "--agent", "reviewer", "--prompt", raw,
                  "--cwd", cwd, "--dry-run", "--json"],
                 stdout=stdout, stderr=stderr, text=True, encoding="utf-8", timeout=60,
+                **run_flags(),
             )
             stdout.seek(0)
             captured_stdout = stdout.read()

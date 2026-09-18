@@ -130,6 +130,7 @@ def release_contract(root: Path = ROOT) -> dict[str, object]:
         "schema": 1,
         "version": versions,
         "migration": migration,
+        "test_evidence": {"schema": 2, "skip_policy": "tools/release_skip_policy.json"},
         "ready": bool(versions["converged"] and migration["complete"]),
     }
 

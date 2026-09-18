@@ -22,6 +22,7 @@ import _fleet_dispatch
 import _fleet_runtime
 import _loader
 import run_subagent as dispatcher
+from _spawn import run_flags
 
 
 def _sha(text: str) -> str:
@@ -96,7 +97,7 @@ def test_lane_flag_exists_only_on_explicit_dispatch_subcommand():
     ["--usage-action", "status"],
     ["--telemetry-status"],
     ["--fleet-action", "inspect"],
-])
+], ids=['p001_case_001', 'p001_case_002', 'p001_case_003', 'p001_case_004', 'p001_case_005', 'p001_case_006', 'p001_case_007', 'p001_case_008', 'p001_case_009'])
 def test_lane_is_rejected_by_fanout_whitelist_before_handler(mode_args):
     argv, mode = _cli.rewrite_subcommand([
         "dispatch", "--lane", "review", *mode_args])
@@ -378,7 +379,7 @@ def test_approved_lane_dry_run_resolves_one_seat_without_reservation(
          "--cwd", str(tmp_path), "--agents-dir", str(agents_dir),
          "--dry-run", "--json"],
         capture_output=True, text=True, encoding="utf-8", timeout=45,
-        env=os.environ.copy())
+        env=os.environ.copy(), **run_flags())
     assert completed.returncode == 0, completed.stdout + completed.stderr
     envelope = json.loads(completed.stdout)
     assert envelope["provider_contacted"] is False

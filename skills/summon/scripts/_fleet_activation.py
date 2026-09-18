@@ -61,12 +61,13 @@ _PRIVATE_INVOCATION_FIELDS = frozenset({
 _INVOCATION_FIELDS = frozenset({
     "cli", "prompt", "cwd", "system_context", "agent_file", "permission",
     "transport", "model", "model_source", "model_exact_required",
-    "model_exact_source", "effort", "resume_id", "resume_profile", "extra_args",
+    "model_exact_source", "effort", "external_cli_version", "resume_id", "resume_profile", "extra_args",
     "base_url", "api_key_env", "api_key_fingerprint", "allow_payg", "agy_account_sha256",
     "agy_account_checked", "permission_forced", "profile", "profile_env",
     "profile_command", "profile_auth_mode", "openrouter_options", "worktree", "isolated_lane",
-    "allow_tool_credentials", "read_roots", "output_contract", "attempt_id",
+    "allow_tool_credentials", "transport_capability", "read_roots", "output_contract", "attempt_id",
     "attempt_kind", "attempt_ordinal", "parent_attempt_id",
+    "request_sha256",
 })
 
 _BINDING_HASHES = frozenset({
@@ -194,6 +195,21 @@ def _profile_environment(invocation: Any) -> dict[str, str]:
             raise FleetActivationError(
                 "fleet_activation_invocation_invalid",
                 "profile environment must contain bounded environment names and text")
+        selected_root = profile_env.get({
+            "claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME",
+        }[getattr(invocation, "cli")])
+        if selected_root is not None:
+            # The normal resolver rejects a profile home inside the dispatch
+            # tree.  Activation also receives constructed invocations, so it
+            # must enforce the same account-isolation fence rather than trust
+            # that an earlier builder performed the check.
+            from _profiles import _profile_dir
+            try:
+                _profile_dir(selected_root, getattr(invocation, "cwd", None))
+            except (OSError, ValueError) as exc:
+                raise FleetActivationError(
+                    "fleet_activation_private_binding_invalid",
+                    "profile home must be a dedicated directory outside the dispatch cwd") from exc
         for key, value in profile_env.items():
             if value is None:
                 effective.pop(key, None)

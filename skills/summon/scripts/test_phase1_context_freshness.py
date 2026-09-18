@@ -163,7 +163,7 @@ def test_forward_revision_delta_can_be_accepted_with_bounded_authority():
     assert "source_revision_advanced" in accepted.mismatch_reasons
 
 
-@pytest.mark.parametrize("relation", ["diverged", "rewound", "unknown"])
+@pytest.mark.parametrize("relation", ["diverged", "rewound", "unknown"], ids=['p001_case_001', 'p001_case_002', 'p001_case_003'])
 def test_unbounded_revision_relations_refuse_even_with_intent(relation):
     parsed = parse_context_packet(packet())
     value = bind(o=observation(relation=relation, revision=NEXT_REVISION,
@@ -187,7 +187,7 @@ def test_same_revision_content_drift_cannot_be_accepted():
     ("expires_at_unix_ms", NOW),
     ("max_age_ms", 20_001),
     ("max_revision_delta", 4),
-])
+], ids=['p002_case_001', 'p002_case_002', 'p002_case_003', 'p002_case_004', 'p002_case_005', 'p002_case_006', 'p002_case_007'])
 def test_forged_or_overbroad_acceptance_is_refused(field, value):
     p = packet(captured_at=NOW - 5_000)
     parsed = parse_context_packet(p)

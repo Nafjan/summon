@@ -40,7 +40,7 @@ EVENT_SCHEMA_VERSION = 2
 # Keep the telemetry contract tied to the dispatcher release without importing
 # ``run_subagent`` (which would introduce a module cycle).  Release bumps must
 # update this alongside the dispatcher ``__version__``.
-SUMMON_VERSION = "3.4.0"
+SUMMON_VERSION = "3.5.0"
 # Backward-compatible name for callers that used the old event constant.  It
 # refers to event records, never the persisted opt-in configuration.
 SCHEMA_VERSION = EVENT_SCHEMA_VERSION
@@ -127,6 +127,22 @@ _TIMEOUT_STAGES = {
 _TIMEOUT_STAGE_ALIASES = {
     "backend-execution": "backend_execution",
     "backend_execution": "backend_execution",
+    # Executor/liveness producer reasons are intentionally projected into the
+    # finite public vocabulary; the raw reason remains in the runtime result.
+    "startup_timeout": "backend_execution",
+    "startup-timeout": "backend_execution",
+    "overall_timeout": "backend_execution",
+    "overall-timeout": "backend_execution",
+    "adaptive_attention_timeout": "backend_execution",
+    "adaptive-attention-timeout": "backend_execution",
+    "adaptive_hard_timeout": "backend_execution",
+    "adaptive-hard-timeout": "backend_execution",
+    "adaptive_job_hard_timeout": "backend_execution",
+    "adaptive-job-hard-timeout": "backend_execution",
+    "finalization_timeout": "backend_execution",
+    "finalization-timeout": "backend_execution",
+    "generation_idle_timeout": "stream",
+    "generation-idle-timeout": "stream",
     "council-setup": "preflight",
     "council_setup": "preflight",
     "council_overall": "council_overall",

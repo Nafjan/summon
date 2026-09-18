@@ -33,7 +33,7 @@ name** instead.
 | Backend | Honors `--effort`? | What Summon actually does | Default if you set nothing |
 |---------|--------------------|---------------------------|----------------------------|
 | **claude** | Yes | Passes `--effort <level>` to the CLI | **`high`** (Summon default) |
-| **codex** | Yes | `-c model_reasoning_effort=<level>`; **`xhigh`/`max` clamp to `high`** | **`high`** (Summon default) |
+| **codex** | Yes | `-c model_reasoning_effort=<level>`; Astra passes `xhigh`/`max`, while other targets retain the historical `high` ceiling pending reviewed contracts | **`high`** (Summon default) |
 | **agy** + **Gemini** model | Yes, but only when **explicit** | Rewrites the model display name to `… (Low\|Medium\|High)`; `xhigh`/`max` → `High` | **No rewrite** — keeps whatever is in `model:` (e.g. already `(High)`). `SUMMON_DEFAULT_EFFORT` / built-in `high` do **not** change agy Gemini models |
 | **agy** + non-Gemini (e.g. Claude Thinking) | No via `--effort` | Pin thinking in `model:` itself, e.g. `Claude Opus 4.6 (Thinking)`. Explicit `--effort` prints a note and is ignored | Model string as written |
 | **cursor-agent** | No | Ignored (stderr note if you set it explicitly). Cursor's own `[effort=…]` syntax inside `--model 'id[…]'` is forwarded **verbatim** — that is Cursor's knob, not Summon `--effort` | Cursor / model-string default |
@@ -51,9 +51,16 @@ not provider-authored served-model evidence.
 
 | Field | When |
 |-------|------|
-| `effort` | The requested/applied level for **claude**, **codex**, supported Kimi models, and OpenCode. Kimi reports `effort_transport: "kimi-profile-config"`; OpenCode reports `effort_transport: "opencode-variant"`. These are local routing/configuration evidence, not provider receipts |
+| `effort` | The requested level retained in Summon's local routing record for **claude**, **codex**, supported Kimi models, and OpenCode. It does not prove the level applied by the CLI or served by the provider. Kimi reports `effort_transport: "kimi-profile-config"`; OpenCode reports `effort_transport: "opencode-variant"`. These transport labels are local configuration evidence, not provider receipts |
 | `model.requested` | For **agy** Gemini, shows the suffix Summon asked for (e.g. `Gemini 3.1 Pro (High)`) |
 | `model.served` | What the backend reported it ran (when available) |
+
+For example, a non-Astra Codex request with `--effort max` retains `effort: max`
+in the envelope while Summon generates `model_reasoning_effort=high`. Astra
+retains explicit `xhigh` and `max` in its generated argument. Additional Codex
+`-c` configuration overrides can introduce conflicting effort arguments; inspect
+those overrides before treating the local argument selection as unambiguous.
+Even an unambiguous argument is not evidence of provider-served effort.
 
 ## Practical rules for orchestrators
 

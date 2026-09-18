@@ -33,19 +33,22 @@ commercial, or high-volume service.
   subscription flat-out around the clock.
 
 ## Things that can change under you
-- **Programmatic billing may get metered.** In 2026 Anthropic proposed (then paused)
-  moving programmatic `claude -p`/Agent-SDK usage off subscription limits onto metered
-  credits. Providers can reintroduce this. Watch each CLI's release notes; summon's
-  `billing` envelope field tells you which source a run *currently* draws from.
-- **The Agent SDK is different from the CLI.** Anthropic's Agent SDK now requires an API
-  key (OAuth/subscription tokens are refused). summon deliberately uses the **CLI**
-  (`claude -p`), not the SDK — but if you point it at SDK-based tooling, API billing applies.
+- **Billing and authentication policies change.** Check the current provider documentation,
+  account portal, and installed CLI behavior before relying on a subscription, API key, or
+  automation route. Summon's `billing` field is an advisory classification, not an invoice
+  or a guarantee that a run is included in a plan.
+- **A vendor's CLI and SDK may have different contracts.** Summon invokes the configured
+  CLI or endpoint adapter. Do not assume that credentials, billing, automation permissions,
+  or model availability transfer between those products.
 
 ## API-key backends (opt-in, and cleaner for products)
-The `openai-compat` backend (OpenRouter, OpenAI, Anthropic, Google, local Ollama/LM
-Studio, …) uses **your API key and bills your API credits** — no subscription-ToS gray
-area, and the right choice for anything commercial or high-volume. You are responsible
-for those API costs and each provider's API terms.
+The `openai-compat` backend sends its supported `/chat/completions` subset to the endpoint
+and credentials you configure; a vendor catalog entry does not imply native support for a
+different protocol such as Anthropic Messages.
+Remote providers may charge an account, subscription, or credits; a local endpoint may not
+have provider billing at all. Confirm the current commercial terms, data handling, and costs
+for that exact endpoint. Summon does not provide a universal terms-compliance or billing
+guarantee.
 
 ## Provider terms
 

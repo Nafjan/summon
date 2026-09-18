@@ -27,6 +27,7 @@ if str(HERE) not in sys.path:
 import _deliberation_ui as ui
 import _deliberation_store as store
 import _rundir
+from _spawn import run_flags
 
 
 def _real_receipt(run_id: str) -> dict:
@@ -122,7 +123,7 @@ class DeliberationUITests(unittest.TestCase):
             script.write_text(scripts[-1], encoding="utf-8")
             checked = subprocess.run(
                 [node, "--check", str(script)], text=True,
-                capture_output=True, timeout=30, check=False,
+                capture_output=True, timeout=30, check=False, **run_flags(),
             )
         self.assertEqual(checked.returncode, 0, checked.stderr)
 

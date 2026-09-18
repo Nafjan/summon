@@ -17,14 +17,24 @@ import json
 import os
 import re
 import secrets
+import stat
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from _chat_resume import REASON_CODES as _CHAT_RESUME_REFUSAL_CODES
+import _context_policy
+import _conversation_economics
 
-SCHEMA_VERSION = 1
+
+# Conversation rooms are append-only mutable state.  Version 1 remains
+# readable for local history, but it is deliberately not writable: an older
+# runtime could otherwise reopen a v1 room and create an unaccounted turn.
+HISTORICAL_SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = frozenset({HISTORICAL_SCHEMA_VERSION, SCHEMA_VERSION})
 MAX_EVENTS = 4096
 MAX_EVENT_BYTES = 64 * 1024
 MAX_JOURNAL_BYTES = 8 * 1024 * 1024
@@ -251,7 +261,9 @@ def _public_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, An
                 "option_ids", "recommended_option", "evidence_sha256", "summary")
         if event_type in {"turn_started", "turn_finished"}:
             keys += ("status", "provider", "model_target", "model_served", "permission",
-                     "transport", "prompt_sha256", "result_sha256", "prompt_chars", "resumed")
+                     "transport", "prompt_sha256", "result_sha256", "prompt_chars", "resumed",
+                     "refusal_reason", "context_policy", "context_selected_count",
+                     "context_omitted_count", "turn_economics_summary")
         for key in keys:
             value = data.get(key)
             if key.endswith("_sha256"):
@@ -278,6 +290,34 @@ def _public_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, An
                     raise ConversationError("invalid resumed flag")
                 if value is not None:
                     out[key] = value
+            elif key == "refusal_reason":
+                if value is not None and value not in _CHAT_RESUME_REFUSAL_CODES:
+                    raise ConversationError("invalid refusal reason")
+                if value is not None:
+                    out[key] = value
+            elif key == "context_policy":
+                if value is None:
+                    continue
+                if not isinstance(value, Mapping):
+                    raise ConversationError("invalid context policy")
+                try:
+                    out[key] = _context_policy.validate_public(dict(value))
+                except _context_policy.ContextPolicyError as exc:
+                    raise ConversationError("invalid context policy") from exc
+            elif key in {"context_selected_count", "context_omitted_count"}:
+                if value is None:
+                    continue
+                if (not isinstance(value, int) or isinstance(value, bool)
+                        or not 0 <= value <= 1024):
+                    raise ConversationError("invalid context selection count")
+                out[key] = value
+            elif key == "turn_economics_summary":
+                if value is None:
+                    continue
+                try:
+                    out[key] = _conversation_economics.validate_public_summary(value)
+                except _conversation_economics.TurnEconomicsError as exc:
+                    raise ConversationError("invalid turn economics summary") from exc
             elif value is not None:
                 if key in {"turn_id", "participant", "asker", "target", "command_id"}:
                     out[key] = _safe_id(value, key)
@@ -298,6 +338,31 @@ def _public_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, An
         out["child_session_id"] = _safe_id(data.get("child_session_id"), "child session id")
         reason = _safe_display(data.get("reason"), "fork reason", required=True)
         out["reason"] = _redact_text(reason)
+        if "participant_replacement" in data:
+            binding = data["participant_replacement"]
+            if (type(binding) is not dict or set(binding) != {
+                    "from_participant", "to_participant", "agent_definition_sha256", "permission_ceiling"}):
+                raise ConversationError("invalid participant replacement")
+            source = _safe_id(binding["from_participant"], "replacement source")
+            target = _safe_id(binding["to_participant"], "replacement target")
+            digest = binding["agent_definition_sha256"]
+            if (source == target or type(digest) is not str or not _SHA256_RE.fullmatch(digest)
+                    or type(binding["permission_ceiling"]) is not str
+                    or binding["permission_ceiling"] not in {"read-only", "safe-edit", "yolo"}):
+                raise ConversationError("invalid participant replacement")
+            out["participant_replacement"] = dict(binding)
+        if data.get("parent_schema_version") is not None:
+            value = data["parent_schema_version"]
+            if type(value) is not int or value not in SUPPORTED_SCHEMA_VERSIONS:
+                raise ConversationError("invalid parent schema version")
+            out["parent_schema_version"] = value
+        if data.get("parent_history_sha256") is not None:
+            value = data["parent_history_sha256"]
+            if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+                raise ConversationError("invalid parent history digest")
+            out["parent_history_sha256"] = value
+        if data.get("lineage") is not None:
+            out["lineage"] = _safe_display(data["lineage"], "fork lineage", required=True)
         return out
     if event_type in _CONTROL_EVENTS:
         # Conversation views can display control facts, but the deliberation
@@ -492,7 +557,11 @@ class ConversationJournal:
 
     @staticmethod
     def _validate_header(header: Mapping[str, Any]) -> None:
-        if header.get("record") != "conversation_room" or header.get("schema_version") != SCHEMA_VERSION:
+        if header.get("record") != "conversation_room":
+            raise ConversationError("unsupported conversation room schema")
+        schema_version = header.get("schema_version")
+        if (type(schema_version) is not int
+                or schema_version not in SUPPORTED_SCHEMA_VERSIONS):
             raise ConversationError("unsupported conversation room schema")
         _safe_id(header.get("session_id"), "session id")
         _safe_id(header.get("project_id"), "project id")
@@ -523,7 +592,9 @@ class ConversationJournal:
         if not records or records[0].get("event") != "session_created":
             raise ConversationError("conversation journal has no session_created event")
         for record in records:
-            if record.get("record") != "conversation_event" or record.get("schema_version") != SCHEMA_VERSION:
+            if (record.get("record") != "conversation_event"
+                    or type(record.get("schema_version")) is not int
+                    or record.get("schema_version") != header.get("schema_version")):
                 raise ConversationError("invalid conversation event record")
             if record.get("cursor") != expected:
                 raise ConversationError("conversation cursor is not contiguous")
@@ -682,9 +753,21 @@ class ConversationJournal:
             created_at_ms=h["created_at_ms"], cursor=len(self._records),
         )
 
+    @property
+    def schema_version(self) -> int:
+        """Return the exact room schema version observed at open time."""
+        return int(self._header["schema_version"])
+
+    def ensure_mutable(self) -> None:
+        """Refuse writes to historical rooms before any runtime side effect."""
+        if self.schema_version != SCHEMA_VERSION:
+            raise ConversationError(
+                "historical conversation room is read-only; fork or create a new room")
+
     def append(self, event: str, actor_kind: str, actor_id: str,
                payload: Mapping[str, Any], *, expected_cursor: int | None = None,
                event_id: str | None = None, generation: int | None = None) -> dict[str, Any]:
+        self.ensure_mutable()
         if event not in _EVENTS:
             raise ConversationError("unsupported conversation event")
         if actor_kind not in _ACTOR_KINDS:
@@ -971,8 +1054,15 @@ def promote_recommendation(artifact: Mapping[str, Any], *, human_confirmed: bool
 
 
 def continuation_decision(parent_session_id: str, existing: Mapping[str, Any],
-                          requested: Mapping[str, Any]) -> ContinuationDecision:
-    """Decide whether a provider session can continue or must fork."""
+                          requested: Mapping[str, Any], *,
+                          check_owner_generation: bool = True) -> ContinuationDecision:
+    """Decide whether a provider session can continue or must fork.
+
+    Admission happens before the new owner lease exists, so callers must set
+    ``check_owner_generation=False`` for that pre-claim comparison.  The
+    acquired-owner and worker fences use the default and therefore retain the
+    monotonic generation check.
+    """
     parent = _safe_id(parent_session_id, "parent session id")
     left = _snapshot(dict(existing))
     right = _snapshot(dict(requested))
@@ -994,6 +1084,8 @@ def continuation_decision(parent_session_id: str, existing: Mapping[str, Any],
                     safe_key = "key-" + _sha256(key_text)[:16]
                 mismatches.append(f"unsupported_{label}_{safe_key}")
     for field in fields:
+        if field == "owner_generation" and not check_owner_generation:
+            continue
         if field not in left or field not in right:
             mismatches.append(f"missing_{field}")
         elif field in digest_fields and (not isinstance(left[field], str)
@@ -1297,10 +1389,39 @@ def run_command(args: Any) -> int:
             result = runtime.fork_turn(
                 session, participant, getattr(args, "chat_message", None) or "",
                 reason=getattr(args, "chat_reason", None) or "manual fork")
+        elif action == "revalidate":
+            from _conversation_runtime import ConversationRuntime
+            session = _safe_id(getattr(args, "chat_session", None), "session id")
+            participant = _safe_id(getattr(args, "chat_participant", None), "participant")
+            packet_name = getattr(args, "chat_revalidation_file", None)
+            if not isinstance(packet_name, str) or not packet_name.strip():
+                raise ConversationError("chat revalidate requires --evidence-file")
+            packet_path = os.path.abspath(packet_name)
+            try:
+                info = os.stat(packet_path, follow_symlinks=False)
+            except OSError as exc:
+                raise ConversationError("chat revalidation packet is unavailable") from exc
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 512 * 1024:
+                raise ConversationError("chat revalidation packet has invalid type or size")
+            try:
+                packet = json.loads(Path(packet_path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise ConversationError("chat revalidation packet is invalid") from exc
+            if not isinstance(packet, Mapping):
+                raise ConversationError("chat revalidation packet must be an object")
+            runtime = ConversationRuntime(
+                root,
+                cwd=getattr(args, "cwd", None) or os.getcwd(),
+                agents_dir=getattr(args, "agents_dir", None),
+                timeout_ms=int(getattr(args, "chat_timeout", None) or getattr(args, "timeout", 600_000)),
+                strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)
+                                       or getattr(args, "agents_dir", None)),
+            )
+            result = runtime.revalidate_chat_packet(session, participant, packet)
         else:
             raise ConversationError("chat action is required")
         print(json.dumps(result, ensure_ascii=False))
-        return 0
+        return 1 if isinstance(result, Mapping) and result.get("error_kind") == "chat_resume_refused" else 0
     except (ConversationError, OSError) as exc:
         # Keep CLI management failures bounded; do not echo filesystem paths or
         # user message bodies into a public error envelope.

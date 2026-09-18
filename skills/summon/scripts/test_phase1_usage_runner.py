@@ -234,7 +234,7 @@ def test_local_jsonrpc_errors_do_not_prove_provider_contact():
     assert runner._contact_from_stdout(wire) is None
 
 
-@pytest.mark.parametrize("late_stream", ["stdout", "stderr"])
+@pytest.mark.parametrize("late_stream", ["stdout", "stderr"], ids=['p001_case_001', 'p001_case_002'])
 def test_late_pipe_overflow_beats_logical_completion(late_stream):
     wire = b"\n".join([
         b'{"jsonrpc":"2.0","id":1,"result":{}}',

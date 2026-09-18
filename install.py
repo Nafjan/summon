@@ -462,6 +462,10 @@ def uninstall_skill(host: str, dry: bool) -> tuple:
                 f"running; retry shortly", False)
     lock, token = acq
     try:
+        if _execution_lease_held(HOSTS[host]):
+            return (f"[!!]  {host}: a background dispatch is preparing an immutable "
+                    f"scripts bundle (lock: {os.path.join(HOSTS[host], 'summon.execution.lock')}); "
+                    "retry shortly", False)
         if not os.path.isdir(dest):
             return (f"[--]  nothing at {dest}", True)
         if not _owned(dest):

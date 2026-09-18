@@ -21,6 +21,9 @@ if str(HERE) not in sys.path:
 from _conversation import ConversationJournal
 import _conversation_browser
 from _conversation_browser import ConversationBrowserError, ensure_surface, open_url
+from _chat_resume import build as build_refusal
+from _resume_capabilities import resume_capability
+from _spawn import run_flags
 from _conversation_ui import (ConversationSurface, MAX_ACTIVE_CLIENTS,
                                REQUEST_TIMEOUT_SECONDS, _surface_root_digest,
                                read_surface_record)
@@ -204,6 +207,29 @@ class ConversationUITests(unittest.TestCase):
         self.assertEqual(cancelling["status"], "cancelling")
         self.assertEqual(calls[-1], ("cancel", "session-1", "sol"))
 
+    def test_agent_turn_refusal_is_exact_http_409(self):
+        refusal = build_refusal("resume_candidate", resume_capability("codex", "subprocess"))
+
+        class FakeRuntime:
+            def start_turn(self, session, participant, prompt, *, wait=False):
+                return {"status": "blocked", "error_kind": "chat_resume_refused",
+                        "session_id": session, "participant": participant,
+                        "refusal": refusal}
+
+        self.surface.runtime = FakeRuntime()
+        with self.assertRaises(HTTPError) as refused:
+            self._request("/api/v1/rooms/session-1/turns", method="POST",
+                          body={"participant": "sol", "message": "continue", "reviewed": True},
+                          origin=True)
+        self.assertEqual(refused.exception.code, 409)
+        body = json.loads(refused.exception.read())
+        self.assertEqual(set(body), {
+            "status", "error_kind", "session_id", "participant", "refusal", "redaction",
+        })
+        self.assertEqual(body["status"], "blocked")
+        self.assertEqual(body["error_kind"], "chat_resume_refused")
+        self.assertEqual(body["refusal"], refusal)
+
     def test_bad_token_and_extra_route_are_refused(self):
         with self.assertRaises(HTTPError) as bad:
             self._request("/api/v1/rooms", token=False)
@@ -320,7 +346,7 @@ class ConversationUITests(unittest.TestCase):
         self.assertEqual(ready["url"], started["url"])
         if os.name == "nt":
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           capture_output=True, check=False)
+                           capture_output=True, check=False, **run_flags())
         else:
             os.kill(pid, 15)
 
@@ -335,7 +361,7 @@ class ConversationUITests(unittest.TestCase):
         pid = int(started["pid"])
         if os.name == "nt":
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           capture_output=True, check=False)
+                           capture_output=True, check=False, **run_flags())
         else:
             os.kill(pid, 15)
 
@@ -365,7 +391,7 @@ class ConversationUITests(unittest.TestCase):
         pid = int(results[0]["pid"])
         if os.name == "nt":
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           capture_output=True, check=False)
+                           capture_output=True, check=False, **run_flags())
         else:
             os.kill(pid, 15)
 

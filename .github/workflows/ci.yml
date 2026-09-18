@@ -15,15 +15,68 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          # L04 resolves one historical release commit from the repository
+          # history. A shallow checkout makes that selection ambiguous or
+          # unavailable and can turn a real rollback failure into a false pass.
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
 
+      - name: Set up Node.js for rollback/WebCrypto rehearsal
+        if: matrix.os == 'windows-latest' && matrix.python == '3.13'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: Verify L04 rollback prerequisites
+        if: matrix.os == 'windows-latest' && matrix.python == '3.13'
+        shell: pwsh
+        run: |
+          $git = Get-Command git -ErrorAction SilentlyContinue
+          $node = Get-Command node -ErrorAction SilentlyContinue
+          if (-not $git -or -not $node) {
+            throw 'L04 prerequisite failure: Git and Node.js are required.'
+          }
+          if (-not [Environment]::Is64BitOperatingSystem) {
+            throw 'L04 prerequisite failure: a 64-bit Windows runner is required.'
+          }
+          Write-Host 'L04 prerequisites present: Git and Node.js'
+
       - name: Install test dependency
-        run: python -m pip install "pytest>=8,<9"
+        run: python -m pip install "pytest>=8,<9" "playwright>=1.52,<2"
+
+      - name: Install Chromium for rendered UI tests (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: python -m playwright install --with-deps chromium
+
+      - name: Install Chromium for rendered UI tests (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: python -m playwright install chromium
 
       - name: Compile all modules
         run: python -m py_compile skills/summon/scripts/run_subagent.py skills/summon/scripts/_loader.py skills/summon/scripts/_resolver.py skills/summon/scripts/_builder.py skills/summon/scripts/_executor.py skills/summon/scripts/_spawn.py skills/summon/scripts/_stream.py skills/summon/scripts/_doctor.py skills/summon/scripts/_auth.py skills/summon/scripts/_rundir.py skills/summon/scripts/_council.py skills/summon/scripts/_manifest.py skills/summon/scripts/_jobs.py skills/summon/scripts/_receipt.py skills/summon/scripts/_installs.py skills/summon/scripts/_cli.py skills/summon/scripts/_background.py skills/summon/scripts/_telemetry.py skills/summon/scripts/_telemetry_audit.py skills/summon/scripts/_usage.py skills/summon/scripts/_usage_live.py skills/summon/scripts/_usage_runner.py skills/summon/scripts/_usage_advisory.py skills/summon/scripts/_context_compile.py skills/summon/scripts/_portable_result.py skills/summon/scripts/_apibackend.py skills/summon/scripts/_arkcli_backend.py skills/summon/scripts/_acpbackend.py skills/summon/scripts/_zcode.py skills/summon/scripts/_zai_coding_plan.py skills/summon/scripts/agy_stream_proxy.py skills/summon/scripts/_deliberation_context.py skills/summon/scripts/_deliberation_context_source.py skills/summon/scripts/_fleet.py skills/summon/scripts/_fleet_approval.py skills/summon/scripts/_fleet_dispatch.py skills/summon/scripts/_fleet_activation.py skills/summon/scripts/_fleet_runtime.py skills/summon/scripts/_deliberation.py skills/summon/scripts/_deliberation_agents.py skills/summon/scripts/_deliberation_store.py skills/summon/scripts/_deliberation_browser.py skills/summon/scripts/_deliberation_scheduler.py skills/summon/scripts/_deliberation_roster.py skills/summon/scripts/_deliberation_invocation.py skills/summon/scripts/_deliberation_replay.py skills/summon/scripts/_deliberation_recovery.py skills/summon/scripts/_deliberation_resume.py skills/summon/scripts/_deliberation_adapter.py skills/summon/scripts/_deliberation_phase_a.py skills/summon/scripts/_deliberation_live.py skills/summon/scripts/_deliberation_ui.py skills/summon/scripts/_conversation.py skills/summon/scripts/_conversation_page.py skills/summon/scripts/_conversation_runtime.py skills/summon/scripts/_swarm_protocol.py skills/summon/scripts/_swarm_coordinator.py skills/summon/scripts/_conversation_browser.py skills/summon/scripts/_conversation_ui.py skills/summon/scripts/_model_catalog.py tools/release_manifest.py tools/release_gates.py tools/release_contract.py summon.py install.py
+
+      - name: Compile workspace modules
+        run: >-
+          python -m py_compile
+          skills/summon/scripts/_chat_resume.py
+          skills/summon/scripts/_workspace_admission.py
+          skills/summon/scripts/_workspace_commands.py
+          skills/summon/scripts/_workspace_content.py
+          skills/summon/scripts/_workspace_demo.py
+          skills/summon/scripts/_workspace_entry.py
+          skills/summon/scripts/_workspace_layout.py
+          skills/summon/scripts/_workspace_page.py
+          skills/summon/scripts/_workspace_plan.py
+          skills/summon/scripts/_workspace_protocol.py
+          skills/summon/scripts/_workspace_runtime.py
+          skills/summon/scripts/_workspace_state.py
+          skills/summon/scripts/_workspace_transport.py
+          skills/summon/scripts/_workspace_ui.py
+          skills/summon/scripts/_workspace_view.py
 
       - name: Unit tests (dispatcher)
         run: python skills/summon/scripts/test_discovery.py
@@ -43,6 +96,12 @@ jobs:
           tests.test_migration_gate
           tests.test_telemetry_gate
           tests.test_telemetry_audit
+          tests.test_telemetry_producer
+
+      - name: Unit tests (L04 composed rollback and recovery)
+        if: matrix.os == 'windows-latest' && matrix.python == '3.13'
+        shell: pwsh
+        run: python -B tests/test_l04_composed_rollback.py
 
       - name: Unit tests (release evidence runner)
         run: python -m unittest tests.test_release_gates
@@ -52,6 +111,7 @@ jobs:
           python -m pytest -q
           skills/summon/scripts/test_phase0_contracts.py
           skills/summon/scripts/test_account_profiles.py
+          skills/summon/scripts/test_astra_roster.py
           skills/summon/scripts/test_fable_roster.py
           skills/summon/scripts/test_claude_attribution.py
           skills/summon/scripts/test_install_drift.py
@@ -71,10 +131,27 @@ jobs:
           skills/summon/scripts/test_phase1_fleet.py
           skills/summon/scripts/test_phase1_fleet_approval.py
           skills/summon/scripts/test_phase1_fleet_runtime.py
+          skills/summon/scripts/test_phase1_fleet_launch_evidence.py
           skills/summon/scripts/test_evidence_kernel.py
           skills/summon/scripts/test_job_control.py
+          skills/summon/scripts/test_attempt_and_wait_regressions.py
           skills/summon/scripts/test_job_continuation.py
+          skills/summon/scripts/test_background_publication_acceptance.py
+          skills/summon/scripts/test_submission_accounting_public_acceptance.py
+          skills/summon/scripts/test_submission_accounting.py
+          skills/summon/scripts/test_submission_accounting_grant_acceptance.py
+          skills/summon/scripts/test_submission_accounting_http_acceptance.py
+          skills/summon/scripts/test_context_policy.py
+          skills/summon/scripts/test_e07_context_economics.py
+          skills/summon/scripts/test_workspace_policy_v2.py
+          tests/test_e07_terminal_seal_acceptance.py
+          skills/summon/scripts/test_e12_turn_fork_acceptance.py
+          skills/summon/scripts/test_fork_and_claim_regressions.py
+          skills/summon/scripts/test_r01_queued_version_acceptance.py
+          skills/summon/scripts/test_r02_candidate_fork_acceptance.py
           skills/summon/scripts/test_job_resume.py
+          tests/test_profile_resume_rotation_acceptance.py
+          skills/summon/scripts/test_historical_job_claim_acceptance.py
           skills/summon/scripts/test_resume_capabilities.py
           skills/summon/scripts/test_evidence_guards.py
           skills/summon/scripts/test_opencode.py
@@ -82,8 +159,46 @@ jobs:
           skills/summon/scripts/test_background_read_roots.py
           skills/summon/scripts/test_codex_stream.py
           skills/summon/scripts/test_executor_ownership.py
+          skills/summon/scripts/test_executor_observation_regressions.py
           skills/summon/scripts/test_nous_credentials.py
           skills/summon/scripts/test_windows_credentials.py
+          skills/summon/scripts/test_launch_binding.py
+          skills/summon/scripts/test_launch_qualification.py
+          skills/summon/scripts/test_launch_observer_acceptance.py
+          skills/summon/scripts/test_job_revocation_admission_acceptance.py
+          skills/summon/scripts/test_r01_r02_launch_chain_acceptance.py
+          skills/summon/scripts/test_council_reader_acceptance.py
+          skills/summon/scripts/test_council_between_round_acceptance.py
+          tests/test_council_intermediate_process_acceptance.py
+          skills/summon/scripts/test_deliberation_public_history_acceptance.py
+          skills/summon/scripts/test_transport_refusal_acceptance.py
+          skills/summon/scripts/test_attachment_transport_acceptance.py
+          skills/summon/scripts/test_transport_adapter_acceptance.py
+          tests/test_transport_adapter_exact_acceptance.py
+          tests/test_operator_transport_boundary_acceptance.py
+          skills/summon/scripts/test_chat_launch_guard.py
+          skills/summon/scripts/test_chat_launch_guard_acceptance.py
+          skills/summon/scripts/test_resume_revalidation_acceptance.py
+          skills/summon/scripts/test_jobs_revalidation_cli_acceptance.py
+          skills/summon/scripts/test_roster_drift_acceptance.py
+          skills/summon/scripts/test_chat_source_family_acceptance.py
+          skills/summon/scripts/test_chat_guard_boundary_acceptance.py
+          skills/summon/scripts/test_chat_revalidation_refusal_acceptance.py
+          skills/summon/scripts/test_chat_source_family_runtime_acceptance.py
+          skills/summon/scripts/test_chat_revalidation_input_acceptance.py
+          skills/summon/scripts/test_chat_legacy_migration_acceptance.py
+          skills/summon/scripts/test_chat_public_migration_journey_acceptance.py
+          skills/summon/scripts/test_chat_migration_interruption_acceptance.py
+          skills/summon/scripts/test_conversation_numeric_version_acceptance.py
+          skills/summon/scripts/test_chat_dispatcher_guard_v2_acceptance.py
+          skills/summon/scripts/test_chat_parent_runtime_acceptance.py
+
+      - name: Unit tests (launch and provenance provider-inert contracts)
+        run: >-
+          python -m pytest -q
+          skills/summon/scripts/test_dispatcher_launch_publication_acceptance.py
+          skills/summon/scripts/test_launch_observer.py
+          tests/test_windows_silent_launch.py
 
       - name: Unit tests (ACP transport, fake subprocess only)
         run: python tests/test_acpbackend.py
@@ -95,11 +210,51 @@ jobs:
           skills.summon.scripts.test_conversation_runtime
           skills.summon.scripts.test_conversation_ui
 
+      - name: Unit tests (workspace UI loopback)
+        run: >-
+          python -m pytest -q
+          skills/summon/scripts/test_workspace_loopback_acceptance.py
+          skills/summon/scripts/test_workspace_capability_snapshot.py
+          skills/summon/scripts/test_workspace_details.py
+          skills/summon/scripts/test_workspace_canonical_rendered.py
+          skills/summon/scripts/test_workspace_delivery_rendered.py
+          skills/summon/scripts/test_workspace_accessibility_rendered.py
+          skills/summon/scripts/test_workspace_recovery_rendered.py
+
+      - name: Unit tests (Windows workspace privacy controls)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: python -m pytest -q skills/summon/scripts/test_workspace_os_privacy.py
+
+      - name: Unit tests (guarded workspace economics acceptance)
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          SUMMON_TELEMETRY: "0"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: >-
+          python -B -m pytest -q -p no:cacheprovider --rootdir=. --tb=short
+          skills/summon/scripts/test_workspace_economics_guarded_acceptance.py
+
       - name: Unit tests (swarm protocol contract)
         run: >-
           python -m unittest
           skills.summon.scripts.test_swarm_protocol
           skills.summon.scripts.test_swarm_coordinator
+
+      - name: Unit tests (F01 artifact identity acceptance)
+        run: >-
+          python -m pytest -q
+          skills/summon/scripts/test_f01_artifact_identity_acceptance.py
+
+      - name: Unit tests (F01 strict entity acceptance)
+        run: >-
+          python -m pytest -q
+          skills/summon/scripts/test_f01_strict_entity_acceptance.py
+
+      - name: Unit tests (workspace reconstruction acceptance)
+        run: >-
+          python -m pytest -q
+          skills/summon/scripts/test_workspace_rebuild_acceptance.py
 
       - name: Unit tests (deliberation preview kernel, adapter, scheduler, and CLI)
         run: >-
@@ -124,7 +279,7 @@ jobs:
         run: python -m unittest skills.summon.scripts.test_deliberation_resume
 
       - name: Unit tests (model catalog)
-        run: python -m unittest skills.summon.scripts.test_model_catalog
+        run: python -m pytest -q skills/summon/scripts/test_astra_roster.py skills/summon/scripts/test_model_catalog.py tests/test_gemini_roster.py
 
       - name: Unit tests (backend/model routing preflight)
         run: python -m unittest skills.summon.scripts.test_model_routing
@@ -170,6 +325,19 @@ jobs:
           assert _schema.validate(bad, schema)  # enum + maximum violations
           print("examples valid; schema validator agrees")
           PY
+
+      - name: Unit tests (format inventory)
+        run: >-
+          python -m pytest -q
+          tests/test_schema_inventory.py
+          tests/test_format_inventory.py
+          tests/test_format_inventory_l02_acceptance.py
+          tests/test_format_inventory_reader_contract.py
+          tests/test_format_inventory_context.py
+          tests/test_format_inventory_fleet.py
+          tests/test_format_inventory_nonworkspace.py
+          tests/test_format_inventory_workspace.py
+          tests/test_format_inventory_final_structures.py
 
       - name: Installer dry-run
         shell: bash
@@ -217,54 +385,243 @@ jobs:
           test ! -d "$HOME/.claude/skills/deliberate"
           echo "installed copy: bundled agents present + cold fallback dispatch + clean uninstall"
 
-  release-evidence:
-    # This job exercises the same machine-produced evidence path used for a
-    # release candidate, without pretending that the still-deferred live and
-    # migration gates have passed. The GA release job must add --check only
-    # after those fixed gate harnesses exist.
+  release-evidence-windows:
+    # Retain the platform-qualified candidate evidence produced on Windows.
+    # This is intentionally separate from the Ubuntu preview below: neither
+    # job may claim that the other platform ran its scoped gates.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+      - name: Install test and rendered-evidence dependencies
+        shell: pwsh
+        run: |
+          python -m pip install "pytest>=8,<9" "playwright>=1.52,<2"
+          python -m playwright install chromium
+      - name: Generate Windows-qualified candidate evidence
+        shell: pwsh
+        run: |
+          $version = (Get-Content -LiteralPath plugin.json -Raw | ConvertFrom-Json).version
+          $chromium = python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); print(p.chromium.executable_path); p.stop()"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/release_gates.py --require-clean --chromium-executable $chromium --output "$env:RUNNER_TEMP\release-evidence.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/release_manifest.py `
+            --evidence-file "$env:RUNNER_TEMP\release-evidence.json" `
+            --output "$env:RUNNER_TEMP\release-manifest.json" `
+            --expected-version $version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          evidence = json.loads((root / "release-evidence.json").read_text(encoding="utf-8"))
+          manifest = json.loads((root / "release-manifest.json").read_text(encoding="utf-8"))
+          qualification = evidence["platform_qualification"]
+          assert qualification["host"] == "windows", qualification
+          assert qualification["windows_evidence"] == "available", qualification
+          assert qualification["status"] == "qualified", qualification
+          assert set(qualification["windows_scoped_gates"].values()) == {"pass"}, qualification
+          assert manifest["evidence"]["source_tree_sha256"] == evidence["source_tree_sha256"]
+          print("Windows candidate evidence retained with qualified platform gates")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload Windows-qualified candidate evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: summon-release-evidence-windows-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/release-evidence.json
+            ${{ runner.temp }}/release-manifest.json
+            ${{ runner.temp }}/release-evidence.gates/gate.accessibility.json
+            ${{ runner.temp }}/release-evidence.gates/gate.browser_security.json
+            ${{ runner.temp }}/release-evidence.gates/gate.fake_lifecycle.json
+            ${{ runner.temp }}/release-evidence.gates/gate.live_provider.json
+            ${{ runner.temp }}/release-evidence.gates/gate.managed_installs.json
+            ${{ runner.temp }}/release-evidence.gates/gate.migration_rollback.json
+            ${{ runner.temp }}/release-evidence.gates/gate.model_identity.json
+            ${{ runner.temp }}/release-evidence.gates/gate.telemetry_privacy.json
+            ${{ runner.temp }}/release-evidence.gates/rendered/browser-toolchain.json
+            ${{ runner.temp }}/release-evidence.gates/rendered/measurements.json
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-observations.json
+            ${{ runner.temp }}/release-evidence.gates/rendered/canonical-artifact-separate-scope.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/canonical-focal-task-scope.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/terminal-guidance-and-model-uncertainty.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/pending-action-authentication-expiry.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/authentication-focus.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/desktop-workspace-focus.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/desktop-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/desktop-drawer.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/200-percent-equivalent-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/200-percent-equivalent-drawer.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/400-percent-equivalent-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/400-percent-equivalent-drawer.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/320-css-pixel-reflow-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/320-css-pixel-reflow-drawer.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/reduced-motion-timeline-focus.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-accepted-and-queued.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-included.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-submission-started.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-submitted.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-acknowledged.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-not-submitted-and-acknowledged.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-accepted.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-queued.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-included-in-attempt.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-submission-started.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-submitted.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-acknowledged.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-not-submitted.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-writer-loss-pending.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-natural-backoff-stale-owner.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-coalesced-reconnection-notice.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-pending-key-during-backoff.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-authorized-same-key-continuation.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-unresolved-effects-after-recovery.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-measurements.json
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-1-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-1-artifact.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-2-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-2-artifact.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-4-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-4-artifact.png
+
+  release-evidence-info:
+    # Ubuntu retains validated incomplete producer diagnostics only.
+    # It never constructs a qualifying release manifest or waives a gate.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
       - name: Install test dependency
-        run: python -m pip install "pytest>=8,<9"
-      - name: Generate and bind machine release evidence
+        run: python -m pip install "pytest>=8,<9" "playwright>=1.52,<2"
+      - name: Install Chromium for rendered release evidence
+        run: python -m playwright install --with-deps chromium
+      - name: Generate and validate incomplete producer diagnostics
         shell: bash
         run: |
-          VERSION="$(python -c 'import json; print(json.load(open("plugin.json", encoding="utf-8"))["version"])')"
-          python tools/release_gates.py --require-clean --output "$RUNNER_TEMP/release-evidence.json"
-          python tools/release_manifest.py \
-            --evidence-file "$RUNNER_TEMP/release-evidence.json" \
-            --output "$RUNNER_TEMP/release-manifest.json" \
-            --expected-version "$VERSION"
+          CHROMIUM="$(python -c 'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); print(p.chromium.executable_path); p.stop()')"
+          python tools/release_gates.py --require-clean --chromium-executable "$CHROMIUM" --output "$RUNNER_TEMP/release-evidence.json"
           python - <<'PY'
           import json
           import os
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "tools")
+          import release_gates
+          release_gates.validate_incomplete_diagnostics(Path(os.environ["RUNNER_TEMP"]) / "release-evidence.json", Path.cwd())
           evidence = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "release-evidence.json"), encoding="utf-8"))
-          manifest = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "release-manifest.json"), encoding="utf-8"))
           assert set(evidence["tests"]) == {
               "discovery", "install", "release_manifest", "acpbackend",
               "deliberation", "deliberation_resume", "model_catalog",
               "conversation", "conversation_runtime", "conversation_ui", "model_routing", "release_contract",
               "swarm_protocol", "swarm_coordinator", "account_evidence", "release_gates", "live_provider_gate",
-              "telemetry_audit",
-              "phase0_phase1",
+              "telemetry_audit", "workspace_plan", "workspace_core", "workspace_demo", "workspace_recovery", "workspace_ui",
+              "phase0_phase1", "phase0_launch", "release_outcomes", "schema_inventory",
           }
-          assert manifest["evidence"]["source_tree_sha256"] == evidence["source_tree_sha256"]
-          assert manifest["version_contract"]["ready"]
+          assert evidence["version_contract"]["ready"]
           expected_gates = {
               "accessibility", "browser_security", "fake_lifecycle",
               "live_provider", "managed_installs", "migration_rollback",
               "model_identity", "telemetry_privacy",
           }
           assert set(evidence["known_gates"]) == expected_gates
+          qualification = evidence["platform_qualification"]
+          assert set(qualification) == {
+              "schema", "host", "windows_evidence", "windows_scoped_gates", "status",
+          }
+          assert qualification["schema"] == 1
+          assert qualification["host"] == "non_windows"
+          assert qualification["windows_evidence"] == "unavailable"
+          assert qualification["status"] == "incomplete"
+          assert set(qualification["windows_scoped_gates"]) == {
+              "migration_rollback", "browser_security", "accessibility",
+          }
+          assert set(qualification["windows_scoped_gates"].values()) == {"unavailable"}
           assert evidence["known_gates"]["live_provider"] == "blocked"
+          scoped = set(qualification["windows_scoped_gates"])
           assert all(
               value == "pass"
               for name, value in evidence["known_gates"].items()
-              if name != "live_provider"
+              if name not in {"live_provider"} | scoped
           ), evidence["known_gates"]
-          print("machine evidence bound; only the explicitly deferred live-provider gate is blocked")
+          print("Validated incomplete producer diagnostics; no release manifest or qualification produced")
           PY
+
+      - name: Upload validated incomplete producer diagnostics
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: summon-release-diagnostics-ubuntu-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/release-evidence.json
+            ${{ runner.temp }}/release-evidence.gates/gate.accessibility.json
+            ${{ runner.temp }}/release-evidence.gates/gate.browser_security.json
+            ${{ runner.temp }}/release-evidence.gates/gate.fake_lifecycle.json
+            ${{ runner.temp }}/release-evidence.gates/gate.live_provider.json
+            ${{ runner.temp }}/release-evidence.gates/gate.managed_installs.json
+            ${{ runner.temp }}/release-evidence.gates/gate.migration_rollback.json
+            ${{ runner.temp }}/release-evidence.gates/gate.model_identity.json
+            ${{ runner.temp }}/release-evidence.gates/gate.telemetry_privacy.json
+            ${{ runner.temp }}/release-evidence.gates/rendered/browser-toolchain.json
+            ${{ runner.temp }}/release-evidence.gates/rendered/measurements.json
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-observations.json
+            ${{ runner.temp }}/release-evidence.gates/rendered/canonical-artifact-separate-scope.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/canonical-focal-task-scope.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/terminal-guidance-and-model-uncertainty.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/pending-action-authentication-expiry.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/authentication-focus.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/desktop-workspace-focus.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/desktop-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/desktop-drawer.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/200-percent-equivalent-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/200-percent-equivalent-drawer.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/400-percent-equivalent-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/400-percent-equivalent-drawer.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/320-css-pixel-reflow-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/320-css-pixel-reflow-drawer.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/reduced-motion-timeline-focus.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-accepted-and-queued.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-included.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-submission-started.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-submitted.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-acknowledged.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-not-submitted-and-acknowledged.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-accepted.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-queued.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-included-in-attempt.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-submission-started.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-submitted.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-acknowledged.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u04-worker-state-card-not-submitted.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-writer-loss-pending.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-natural-backoff-stale-owner.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-coalesced-reconnection-notice.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-pending-key-during-backoff.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-authorized-same-key-continuation.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/u08-unresolved-effects-after-recovery.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-measurements.json
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-1-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-1-artifact.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-2-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-2-artifact.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-4-workspace.png
+            ${{ runner.temp }}/release-evidence.gates/rendered/native-zoom-4-artifact.png

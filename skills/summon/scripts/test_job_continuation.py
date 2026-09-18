@@ -52,7 +52,7 @@ def _fixture(tmp_path):
                   "served": "claude-opus-5"},
         "served_model_evidence": "reported", "model_match": True,
         "named_model_verified": True,
-        "cli": "claude", "backend_type": "cli", "served_via": "cli_agent",
+        "cli": "claude", "backend_type": "cli_agent", "served_via": "cli_agent",
         "provider": {"driver": "cli"}, "served": {"via": "cli_agent"},
         "resume": {"cli": "claude", "session_id": "session-private"},
         "billing": {"source": "subscription"},
@@ -70,7 +70,10 @@ def test_private_source_round_trip_and_public_projection_redacts_capabilities(tm
     root, job_id, job_file, invocation, args, result = _fixture(tmp_path)
     public = continuation.write_private_source(job_file, result, invocation, args)
     _publish_result(job_file, result)
+    source_path = Path(continuation.continuation_path(root, job_id))
+    source_bytes = source_path.read_bytes()
     source = continuation.read_private_source(root, job_id)
+    assert source_path.read_bytes() == source_bytes
     assert public == {
         "schema": "summon.job-continuation/v1", "available": True,
         "resume_state": "certified", "resume_reason": "private_source_authenticated",
@@ -81,6 +84,7 @@ def test_private_source_round_trip_and_public_projection_redacts_capabilities(tm
     for private in ("session-private", str(tmp_path), "reviewer.md", "nonce"):
         assert private not in public_text
     assert source["continuation"]["handle"] == "session-private"
+    assert source["backend"]["backend_type"] == "cli"
     assert source["workspace"]["path"] == str((tmp_path / "workspace").resolve())
 
 
@@ -89,7 +93,7 @@ def test_private_source_round_trip_and_public_projection_redacts_capabilities(tm
     ("attempts", 2, "single_contact_source_required"),
     ("served_model_evidence", "inferred", "reported_exact_model_required"),
     ("named_model_verified", False, "reported_exact_model_required"),
-])
+], ids=['p001_case_001', 'p001_case_002', 'p001_case_003', 'p001_case_004'])
 def test_ineligible_source_writes_no_private_sidecar(tmp_path, field, value, kind):
     root, job_id, job_file, invocation, args, result = _fixture(tmp_path)
     result[field] = value
@@ -109,9 +113,13 @@ def test_unsupported_backend_is_fail_closed_without_handle_write(tmp_path):
 
 @pytest.mark.parametrize(("field", "value"), [
     ("cli", "opencode"), ("backend", "opencode"),
+    ("backend_type", "cli"), ("backend_type", "chat_completions"),
+    ("backend_type", None),
     ("transport", "api"), ("provider", "openrouter"),
+    ("provider", {"driver": "cli", "extra": "untrusted"}),
+    ("served", {"via": "cli_agent", "extra": "untrusted"}),
     ("resume.cli", "opencode"),
-])
+], ids=['p002_case_001', 'p002_case_002', 'p002_case_003', 'p002_case_004', 'p002_case_005', 'p002_case_006', 'p002_case_007', 'p002_case_008', 'p002_case_009', 'p002_case_010'])
 def test_terminal_route_must_match_certified_invocation_before_sealing(
         tmp_path, field, value):
     root, job_id, job_file, invocation, args, result = _fixture(tmp_path)
@@ -225,7 +233,7 @@ def test_launch_and_terminal_prompt_identity_must_match(tmp_path):
     (("billing", "source"), "credit", "source_result_changed"),
     (("gate",), {"approved": True}, "source_result_changed"),
     (("resume", "cli"), "codex", "source_result_changed"),
-])
+], ids=['p003_case_001', 'p003_case_002', 'p003_case_003', 'p003_case_004', 'p003_case_005', 'p003_case_006'])
 def test_each_bound_receipt_field_rejects_post_seal_mutation(
         tmp_path, path, value, kind):
     root, job_id, job_file, invocation, args, result = _fixture(tmp_path)
@@ -247,7 +255,7 @@ def test_each_bound_receipt_field_rejects_post_seal_mutation(
     ("provider_contacted", False),
     ("report_ok", True),
     ("attempts", 2),
-])
+], ids=['p004_case_001', 'p004_case_002', 'p004_case_003', 'p004_case_004', 'p004_case_005'])
 def test_each_terminal_field_is_bound_to_private_source(tmp_path, field, value):
     root, job_id, job_file, invocation, args, result = _fixture(tmp_path)
     continuation.write_private_source(job_file, result, invocation, args)
@@ -305,8 +313,8 @@ def test_deeply_nested_private_json_is_typed_fail_closed(tmp_path):
     assert error.value.kind == "invalid_private_source"
 
 
-@pytest.mark.parametrize("target", ["record", "result"])
-@pytest.mark.parametrize("corruption", ["duplicate", "nonfinite", "oversized"])
+@pytest.mark.parametrize("target", ["record", "result"], ids=['p005_case_001', 'p005_case_002'])
+@pytest.mark.parametrize("corruption", ["duplicate", "nonfinite", "oversized"], ids=['p006_case_001', 'p006_case_002', 'p006_case_003'])
 def test_launch_and_result_inputs_use_bounded_strict_json(
         tmp_path, target, corruption):
     root, job_id, job_file, invocation, args, result = _fixture(tmp_path)
@@ -327,7 +335,7 @@ def test_launch_and_result_inputs_use_bounded_strict_json(
     assert error.value.kind == "source_job_untrusted"
 
 
-@pytest.mark.parametrize("corruption", ["duplicate", "nonfinite", "oversized"])
+@pytest.mark.parametrize("corruption", ["duplicate", "nonfinite", "oversized"], ids=['p007_case_001', 'p007_case_002', 'p007_case_003'])
 def test_source_construction_strictly_reads_launch_record(tmp_path, corruption):
     root, job_id, job_file, invocation, args, result = _fixture(tmp_path)
     path = Path(_jobs.record_path(root, job_id))

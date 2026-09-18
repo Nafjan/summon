@@ -398,6 +398,16 @@ class _ConversationHandler(BaseHTTPRequestHandler):
                 participant = _safe_id(body.get("participant"), "participant")
                 result = self.surface.runtime.start_turn(
                     session, participant, body["message"], wait=False)
+                if result.get("error_kind") == "chat_resume_refused":
+                    self._send_json({
+                        "status": "blocked",
+                        "error_kind": "chat_resume_refused",
+                        "session_id": session,
+                        "participant": participant,
+                        "refusal": result.get("refusal"),
+                        "redaction": "public-redacted",
+                    }, status=409)
+                    return
                 self._send_json({"status": "started", **result,
                                  "redaction": "public-redacted"}, status=202)
                 return

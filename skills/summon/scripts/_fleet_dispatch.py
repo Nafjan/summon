@@ -81,6 +81,15 @@ _LAUNCH_EVIDENCE_FIELDS = frozenset({
     "schema", "backend", "transport", "command_sha256", "argv_sha256",
     "cwd_sha256", "env_names_sha256", "env_sha256",
 })
+_LAUNCH_DIGEST_FIELDS = _LAUNCH_EVIDENCE_FIELDS - {"schema", "backend", "transport"}
+_CURRENT_LAUNCH_EVIDENCE_FIELDS = _LAUNCH_EVIDENCE_FIELDS | {
+    "dispatch_payload_sha256", "attempt_id_sha256",
+}
+_LAUNCH_EVIDENCE_SHAPES = frozenset({
+    _LAUNCH_EVIDENCE_FIELDS,
+    _CURRENT_LAUNCH_EVIDENCE_FIELDS,
+    _CURRENT_LAUNCH_EVIDENCE_FIELDS | {"launch_observation"},
+})
 
 
 class FleetDispatchError(_evidence.EvidenceError):
@@ -1333,7 +1342,7 @@ def _validate_launch_evidence(value: Any, *, invocation: Any,
     records only the digest of this compact projection: no command, path, argv, or
     environment value can reach a public receipt.
     """
-    if (not isinstance(value, dict) or set(value) != _LAUNCH_EVIDENCE_FIELDS
+    if (not isinstance(value, dict) or frozenset(value) not in _LAUNCH_EVIDENCE_SHAPES
             or value.get("schema") != LAUNCH_EVIDENCE_SCHEMA):
         raise FleetDispatchError(
             "fleet_activation_launch_evidence_invalid",
@@ -1349,9 +1358,7 @@ def _validate_launch_evidence(value: Any, *, invocation: Any,
         raise FleetDispatchError(
             "fleet_activation_launch_evidence_invalid",
             "final launch evidence differs from the resolved backend or transport")
-    for field in (
-            "command_sha256", "argv_sha256", "cwd_sha256", "env_names_sha256",
-            "env_sha256"):
+    for field in sorted(name for name in value if name.endswith("_sha256")):
         try:
             _sha(value.get(field), f"launch_evidence.{field}")
         except FleetDispatchError as exc:
@@ -1364,7 +1371,41 @@ def _validate_launch_evidence(value: Any, *, invocation: Any,
         raise FleetDispatchError(
             "fleet_activation_launch_evidence_invalid",
             "final launch evidence differs from the frozen working directory")
-    return {field: value[field] for field in sorted(_LAUNCH_EVIDENCE_FIELDS)}
+    if "dispatch_payload_sha256" in value:
+        prompt = getattr(invocation, "prompt", None)
+        try:
+            expected_prompt = (hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                               if isinstance(prompt, str) else None)
+        except UnicodeEncodeError:
+            expected_prompt = None
+        if expected_prompt is None or not hmac.compare_digest(
+                value["dispatch_payload_sha256"], expected_prompt):
+            raise FleetDispatchError(
+                "fleet_activation_launch_evidence_invalid",
+                "final launch evidence differs from the frozen prompt")
+        attempt_id = getattr(invocation, "attempt_id", None)
+        if (isinstance(attempt_id, str) and _ID.fullmatch(attempt_id)
+                and not hmac.compare_digest(value["attempt_id_sha256"],
+                    hashlib.sha256(attempt_id.encode("utf-8")).hexdigest())):
+            raise FleetDispatchError(
+                "fleet_activation_launch_evidence_invalid",
+                "final launch evidence differs from the explicit attempt")
+    if "launch_observation" in value:
+        from _launch_binding import binding_projection, valid_observation, valid_projection
+        observation = value["launch_observation"]
+        projection = binding_projection(observation)
+        observation_fields = set(projection or {}) | _LAUNCH_DIGEST_FIELDS | {
+            "observation_nonce", "observed_at_ns",
+        }
+        if (not isinstance(observation, dict) or set(observation) != observation_fields
+                or not valid_observation(observation) or not valid_projection(projection)
+                or type(observation.get("observed_at_ns")) is not int
+                or any(observation.get(field) != value[field] for field in
+                       _LAUNCH_DIGEST_FIELDS | {"backend", "transport"})):
+            raise FleetDispatchError(
+                "fleet_activation_launch_evidence_invalid",
+                "final launch observation is malformed or differs from its envelope")
+    return {field: value[field] for field in sorted(value)}
 
 
 def _activation_request(*, bindings: dict, authority: dict, decision: dict,

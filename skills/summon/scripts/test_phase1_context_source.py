@@ -85,7 +85,7 @@ def test_git_descendant_delta_is_locally_derived(tmp_path):
 
 @pytest.mark.parametrize("forward,reverse,expected", [(1, 0, "rewound"),
                                                         (1, 1, "diverged"),
-                                                        (2, 2, "unknown")])
+                                                        (2, 2, "unknown")], ids=['p001_case_001', 'p001_case_002', 'p001_case_003'])
 def test_unbounded_git_relations_are_explicit(tmp_path, forward, reverse, expected):
     source = {"kind": "git_commit", "revision": OLD,
               "source_digest": "2" * 64, "captured_at_unix_ms": NOW}

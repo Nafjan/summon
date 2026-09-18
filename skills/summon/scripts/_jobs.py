@@ -21,6 +21,7 @@ been reused can still look alive.
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -245,7 +246,8 @@ def write_prepared(root: str, job_id: str, *, nonce: str, agent: str,
                    prompt_sha256: str | None, cwd: str, flags: dict,
                    summon: dict, attempt_id: str | None = None,
                    launcher_summon: dict | None = None,
-                   resume_lineage: dict | None = None) -> str:
+                   resume_lineage: dict | None = None,
+                   accounting_grants: dict | None = None) -> str:
     """Write the launch record BEFORE spawn. The record path never appears as a
     zero-byte file: the whole content is written to a temp file, fsynced, and
     atomically renamed into place (a reader sees either nothing or a complete
@@ -259,7 +261,23 @@ def write_prepared(root: str, job_id: str, *, nonce: str, agent: str,
         attempt_id = job_id
     if not valid_job_id(attempt_id):
         raise ValueError("attempt_id must be a 32-character lowercase hexadecimal token")
+    grants = accounting_grants or {"initial": 1}
+    allowed_kinds = {"initial", "transient_retry", "acp_fallback",
+                     "schema_correction", "contract_repair", "payg_fallback"}
+    if (not isinstance(grants, dict) or not grants
+            or not set(grants).issubset(allowed_kinds)
+            or grants.get("initial") != 1
+            or any(not isinstance(value, int) or isinstance(value, bool)
+                   or value < 0 or value > 64 for value in grants.values())):
+        raise ValueError("submission accounting grants are invalid")
+    # The journal is intentionally bounded so a malformed or overly broad
+    # retry plan cannot reserve an unbounded number of durable records. Reject
+    # the aggregate before the first provider boundary, rather than allowing a
+    # later attempt to discover capacity exhaustion after spend.
+    if sum(grants.values()) > 64:
+        raise ValueError("submission accounting grants exceed the 64-record journal budget")
     record = {
+        "schema": "summon.background-launch/v2",
         "job_id": job_id, "nonce": nonce, "agent": agent,
         # A background job is one physical attempt.  Keep the identity explicit
         # even though the current default equals job_id so future orchestration
@@ -267,6 +285,15 @@ def write_prepared(root: str, job_id: str, *, nonce: str, agent: str,
         "attempt_id": attempt_id,
         "prompt_sha256": prompt_sha256, "cwd": cwd, "flags": flags,
         "summon": summon, "prepared_at": time.time(), "pid": None,
+        "accounting_handoff": {
+            "schema": "summon.submission-accounting-handoff/v1",
+            "owner": "background-child",
+            "root_attempt_id": attempt_id,
+            "fence_sha256": hashlib.sha256(nonce.encode("utf-8")).hexdigest(),
+            "generation": 0,
+            "grants": grants,
+        },
+        "submission_accounting": [],
     }
     if launcher_summon is not None:
         # ``summon`` identifies the frozen child bundle. Keep the mutable
@@ -290,12 +317,160 @@ def update_spawned(root: str, job_id: str, pid: int) -> None:
     record is left as-is (the caller surfaces the failure); it is never
     recreated, so a lost record cannot masquerade as a fresh launch."""
     path = record_path(root, job_id)
-    rec, state = _read(path)
-    if state != _OK or rec is None:
-        raise FileNotFoundError(f"launch record unreadable for job {job_id} ({state})")
-    rec["pid"] = pid
-    rec["spawned_at"] = time.time()
-    _atomic_write_json(path, rec)
+    with _record_mutation(path):
+        rec, state = _read(path)
+        if state != _OK or rec is None:
+            raise FileNotFoundError(f"launch record unreadable for job {job_id} ({state})")
+        if rec.get("schema") != "summon.background-launch/v2":
+            raise ValueError("background launch record schema is not mutable")
+        rec["pid"] = pid
+        rec["spawned_at"] = time.time()
+        _atomic_write_json(path, rec)
+
+
+@contextmanager
+def _record_mutation(path: str):
+    """Serialize parent metadata and child accounting writers.
+
+    A leftover lock is intentionally fail-closed: silently breaking it could
+    overwrite an accounting settlement whose owner is still active.
+    """
+    lock = path + ".mutation.lock"
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + 5.0
+    fd = None
+    while fd is None:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("launch record mutation owner is unavailable")
+            time.sleep(0.01)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as handle:
+            handle.write(token)
+            handle.flush()
+            os.fsync(handle.fileno())
+        yield
+    finally:
+        try:
+            with open(lock, encoding="ascii") as handle:
+                owned = handle.read() == token
+            if owned:
+                os.unlink(lock)
+        except OSError:
+            pass
+
+
+def _accounting_owner(record: dict, job_id: str, nonce: str,
+                      accounting: dict) -> dict:
+    attempt = accounting.get("attempt") if isinstance(accounting, dict) else None
+    attempt_id = attempt.get("id") if isinstance(attempt, dict) else None
+    attempt_kind = attempt.get("kind") if isinstance(attempt, dict) else None
+    if record.get("schema") != "summon.background-launch/v2":
+        raise ValueError("background launch record version does not support accounting")
+    handoff = record.get("accounting_handoff")
+    if (not isinstance(handoff, dict)
+            or handoff.get("schema") != "summon.submission-accounting-handoff/v1"
+            or handoff.get("owner") != "background-child"
+            or record.get("job_id") != job_id
+            or handoff.get("fence_sha256")
+               != hashlib.sha256(nonce.encode("utf-8")).hexdigest()):
+        raise PermissionError("submission accounting owner fence rejected")
+    entries = record.get("submission_accounting")
+    grants = handoff.get("grants")
+    if not isinstance(entries, list) or not isinstance(grants, dict):
+        raise ValueError("submission accounting handoff is invalid")
+    same = [entry for entry in entries if isinstance(entry, dict)
+            and (entry.get("attempt") or {}).get("id") == attempt_id]
+    if not same:
+        used = sum(1 for entry in entries if isinstance(entry, dict)
+                   and (entry.get("attempt") or {}).get("kind") == attempt_kind)
+        if used >= grants.get(attempt_kind, 0):
+            raise PermissionError("submission accounting attempt kind exceeds its grant")
+        if attempt_kind == "initial":
+            if attempt_id != handoff.get("root_attempt_id") or entries:
+                raise PermissionError("submission accounting root attempt is invalid")
+        else:
+            parent_id = attempt.get("parent_id")
+            parent_exists = any(
+                isinstance(entry, dict)
+                and (entry.get("attempt") or {}).get("id") == parent_id
+                for entry in entries)
+            ordinal = attempt.get("ordinal")
+            if (not valid_job_id(parent_id) or not parent_exists
+                    or not isinstance(ordinal, int) or isinstance(ordinal, bool)
+                    or ordinal < 2 or ordinal > 64):
+                raise PermissionError("submission accounting lineage exceeds its grant")
+    return handoff
+
+
+def record_submission_prelaunch(root: str, job_id: str, *, nonce: str,
+                                accounting: dict) -> dict:
+    """Durably bind one possible submission before its provider boundary."""
+    path = record_path(root, job_id)
+    attempt_id = ((accounting.get("attempt") or {}).get("id")
+                  if isinstance(accounting, dict) else None)
+    if not valid_job_id(attempt_id):
+        raise ValueError("submission accounting attempt id is invalid")
+    with _record_mutation(path):
+        record = read_json(path)
+        handoff = _accounting_owner(record, job_id, nonce, accounting)
+        existing = record.get("submission_accounting")
+        if not isinstance(existing, list):
+            raise ValueError("submission accounting journal is invalid")
+        matches = [item for item in existing
+                   if isinstance(item, dict)
+                   and (item.get("attempt") or {}).get("id") == attempt_id]
+        if matches:
+            if matches[0] != accounting:
+                raise ValueError("submission accounting replay conflicts with durable identity")
+            return matches[0]
+        if len(existing) >= 64:
+            raise ValueError("submission accounting journal capacity exhausted")
+        if accounting.get("submission_state") != "possible":
+            raise ValueError("prelaunch accounting must retain possible-contact uncertainty")
+        record["submission_accounting"] = [*existing, accounting]
+        handoff["generation"] = int(handoff.get("generation", 0)) + 1
+        _atomic_write_json(path, record)
+        return accounting
+
+
+def settle_submission(root: str, job_id: str, *, nonce: str,
+                      accounting: dict) -> dict:
+    """Settle a prepared attempt once, retaining immutable identity/estimate."""
+    path = record_path(root, job_id)
+    attempt_id = ((accounting.get("attempt") or {}).get("id")
+                  if isinstance(accounting, dict) else None)
+    with _record_mutation(path):
+        record = read_json(path)
+        handoff = _accounting_owner(record, job_id, nonce, accounting)
+        existing = record.get("submission_accounting")
+        if not isinstance(existing, list):
+            raise ValueError("submission accounting journal is invalid")
+        indices = [i for i, item in enumerate(existing)
+                   if isinstance(item, dict)
+                   and (item.get("attempt") or {}).get("id") == attempt_id]
+        if len(indices) != 1:
+            raise ValueError("submission accounting prelaunch record is unavailable")
+        index = indices[0]
+        prior = existing[index]
+        if prior == accounting:
+            return prior
+        for key in ("schema", "attempt", "identity", "estimate"):
+            if prior.get(key) != accounting.get(key):
+                raise ValueError("submission accounting settlement changed immutable identity")
+        if prior.get("submission_state") != "possible":
+            raise ValueError("submission accounting settlement already finalized")
+        if accounting.get("submission_state") not in {
+                "submitted", "not_submitted", "indeterminate"}:
+            raise ValueError("submission accounting settlement state is invalid")
+        updated = list(existing)
+        updated[index] = accounting
+        record["submission_accounting"] = updated
+        handoff["generation"] = int(handoff.get("generation", 0)) + 1
+        _atomic_write_json(path, record)
+        return accounting
 
 
 # A record's authenticity turns on a non-empty string nonce; a result's on a
@@ -598,6 +773,16 @@ def public_job_status(status: dict) -> dict:
         if launcher:
             public_record["launcher_summon"] = launcher
         projected["record"] = public_record
+        # Derive, never copy, the purpose-limited public accounting view. The
+        # private journal carries request/material hashes and attempt identities
+        # which must not escape through `jobs status`.
+        try:
+            from _submission_accounting import public_summary
+            private_accounting = record.get("submission_accounting")
+            if isinstance(private_accounting, list) and private_accounting:
+                projected["submission_summary"] = public_summary(private_accounting)
+        except Exception:
+            pass
     else:
         projected["record"] = None
     result = status.get("result")
@@ -803,5 +988,8 @@ def wait_job(root: str, job_id: str, timeout_ms: int, poll_sec: float = 0.5):
         if time.monotonic() >= deadline:
             return None, "timeout"
         time.sleep(min(poll_sec, max(0.0, deadline - time.monotonic())))
-        if rec_state != _OK:                # record may land (or repair) late
+        # Prepared is a valid record, but PID publication is a later atomic
+        # update. Refresh until that transition, as well as after missing or
+        # corrupt records; result trust and the caller's deadline stay above.
+        if rec_state != _OK or rec is None or rec.get("pid") is None:
             rec, rec_state = _read(record_path(root, job_id))

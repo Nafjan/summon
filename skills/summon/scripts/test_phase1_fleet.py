@@ -16,6 +16,7 @@ import _evidence
 import _fleet
 import _fleet_compile
 import _loader
+from _spawn import run_flags
 
 
 def _agents():
@@ -413,7 +414,8 @@ def test_retired_agent_refuses_before_provider_and_names_successor(tmp_path):
         [sys.executable, str(script), "--agent", "old-seat", "--prompt", "test",
          "--cwd", str(tmp_path), "--agents-dir", str(agents_dir),
          "--strict-agents-dir", "--json"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags())
     assert completed.returncode == 1
     envelope = json.loads(completed.stdout)
     assert envelope["error_kind"] == "agent_retired"
@@ -426,7 +428,7 @@ def test_retired_agent_refuses_before_provider_and_names_successor(tmp_path):
     ("openai-compat", "stealth/ox-alpha"),
     ("opencode", "openrouter/stealth/ox-alpha"),
     ("opencode", "nous/stealth/ox-alpha"),
-])
+], ids=['p001_case_001', 'p001_case_002', 'p001_case_003'])
 def test_ended_ox_alias_is_route_retired_even_in_stale_custom_roster(
         tmp_path, backend, model):
     """An old user definition cannot bypass the provider-alias tombstone."""
@@ -457,7 +459,8 @@ def test_ended_ox_alias_is_route_retired_even_in_stale_custom_roster(
         [sys.executable, str(script), "--agent", "old-ox", "--prompt", "test",
          "--cwd", str(tmp_path), "--agents-dir", str(agents_dir),
          "--strict-agents-dir", "--json"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags())
     assert completed.returncode == 1
     envelope = json.loads(completed.stdout)
     assert envelope["error_kind"] == "agent_retired"
@@ -475,7 +478,7 @@ def test_ended_ox_alias_is_route_retired_even_in_stale_custom_roster(
     ("codex", "current-model",
      ["--cli", "opencode", "--model", "nous/stealth/ox-alpha"]),
     ("openai-compat", "current-model", ["--model", "stealth/ox-alpha"]),
-])
+], ids=['p002_case_001', 'p002_case_002', 'p002_case_003', 'p002_case_004'])
 def test_effective_cli_and_model_overrides_cannot_bypass_ended_route_tombstone(
         tmp_path, declared_backend, declared_model, overrides):
     agents_dir = tmp_path / "agents"
@@ -493,7 +496,8 @@ def test_effective_cli_and_model_overrides_cannot_bypass_ended_route_tombstone(
         [sys.executable, str(script), "--agent", "active-seat", "--prompt", "test",
          "--cwd", str(tmp_path), "--agents-dir", str(agents_dir),
          "--strict-agents-dir", "--dry-run", "--json", *overrides],
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags())
     assert completed.returncode == 1
     envelope = json.loads(completed.stdout)
     assert envelope["error_kind"] == "agent_retired"
@@ -525,7 +529,8 @@ def test_real_dispatch_override_hits_route_tombstone_before_backend_preflight(tm
          "--cwd", str(tmp_path), "--agents-dir", str(agents_dir),
          "--strict-agents-dir", "--cli", "opencode", "--model",
          "nous/stealth/ox-alpha", "--json"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags())
     assert completed.returncode == 1
     envelope = json.loads(completed.stdout)
     assert envelope["error_kind"] == "agent_retired"
@@ -595,7 +600,8 @@ def test_cli_rejects_clobber_and_action_specific_flags_before_roster_or_provider
     ):
         completed = subprocess.run(
             [sys.executable, str(script), *argv, "--json"],
-            capture_output=True, text=True, encoding="utf-8", timeout=30)
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+            **run_flags())
         assert completed.returncode == 1
         envelope = json.loads(completed.stdout)
         assert message in envelope["error"]
@@ -610,7 +616,8 @@ def test_cli_rejects_clobber_and_action_specific_flags_before_roster_or_provider
          "--seats", "architect", "--cwd", str(tmp_path),
          "--agents-dir", str(Path(__file__).parents[1] / "agents"),
          "--out", str(existing), "--json"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags())
     assert completed.returncode == 1
     assert existing.read_text(encoding="utf-8") == "do not replace"
     assert json.loads(completed.stdout)["provider_contacted"] is False
@@ -639,7 +646,8 @@ def test_fleet_rejects_plan_input_absent_lane_and_dispatch_only_flags(tmp_path):
     ]
     for argv in cases:
         completed = subprocess.run(
-            argv, capture_output=True, text=True, encoding="utf-8", timeout=30)
+            argv, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            **run_flags())
         assert completed.returncode == 1
         envelope = json.loads(completed.stdout)
         assert envelope["provider_contacted"] is False
@@ -674,7 +682,8 @@ def test_windows_cmd_full_fleet_control_plane_never_contacts_provider(tmp_path):
         [*base, "fleet", "propose", "review", "--seats", "reviewer",
          "--cwd", str(tmp_path), "--agents-dir", str(agents_dir),
          "--out", str(fleet_path), "--json"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags())
     assert proposed.returncode == 0, proposed.stdout + proposed.stderr
     proposed_json = json.loads(proposed.stdout)
     assert proposed_json["provider_contacted"] is False
@@ -683,7 +692,8 @@ def test_windows_cmd_full_fleet_control_plane_never_contacts_provider(tmp_path):
     validated = subprocess.run(
         [*base, "fleet", "validate", str(fleet_path), "--cwd", str(tmp_path),
          "--agents-dir", str(agents_dir), "--json"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags())
     assert validated.returncode == 0, validated.stdout + validated.stderr
     assert json.loads(validated.stdout)["provider_contacted"] is False
 
@@ -691,14 +701,16 @@ def test_windows_cmd_full_fleet_control_plane_never_contacts_provider(tmp_path):
     # the live roster changes or disappears and therefore rejects roster/cwd flags.
     inspected = subprocess.run(
         [*base, "fleet", "inspect", str(fleet_path), "--json"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags())
     assert inspected.returncode == 0, inspected.stdout + inspected.stderr
     assert json.loads(inspected.stdout)["provider_contacted"] is False
 
     explained = subprocess.run(
         [*base, "fleet", "explain", str(fleet_path), "review",
          "--cwd", str(tmp_path), "--agents-dir", str(agents_dir), "--json"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags())
     assert explained.returncode == 0, explained.stdout + explained.stderr
     projection = json.loads(explained.stdout)
     assert projection["provider_contacted"] is False

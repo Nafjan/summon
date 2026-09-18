@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import unittest
 import tempfile
 from pathlib import Path
 
@@ -599,12 +600,25 @@ if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
     failed = 0
+    skipped = 0
+    _collector = sys.modules.get("_summon_release_collector")
+    if _collector:
+        _collector.custom_start(__file__, [t.__name__ for t in tests])
     for t in tests:
+        _outcome, _reason = "passed", None
         try:
             t()
             print(f"[PASS] {t.__name__}")
+        except unittest.SkipTest as e:
+            skipped += 1
+            _outcome, _reason = "skipped", str(e)
+            print(f"[SKIP] {t.__name__}")
         except Exception as e:  # noqa: BLE001
             failed += 1
+            _outcome = "failed"
             print(f"[FAIL] {t.__name__}: {type(e).__name__}: {e}")
-    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+        if _collector:
+            _collector.custom_result(__file__, t.__name__, _outcome, _reason)
+    print(f"\n{len(tests) - failed - skipped}/{len(tests)} passed")
+    print(f"{skipped} skipped")
     sys.exit(1 if failed else 0)
