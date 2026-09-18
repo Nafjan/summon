@@ -433,9 +433,18 @@ entitlement:
 
 | Editorial lane | Exact Ark marketplace ID | Metadata |
 |---|---|---|
+| Near-frontier / fast coding (primary) | `deepseek-v4-1-flash-260910` | DeepSeek V4.1 Flash 260910; text-only |
+| Near-frontier / fast coding | `glm-5-3-flash-260828` | GLM 5.3 Flash 260828; text via `arkcli`; file-capable inputs via the `modelark` OpenCode provider |
 | Frontier / maximum thinking | `deepseek-v4-pro-ga-260813` | DeepSeek V4 Pro GA; thinking; 1M context |
 | Near-frontier / long context | `glm-5-2-260617` | GLM 5.2; thinking; 1M context |
 | Near-frontier / fast coding | `deepseek-v4-flash-ga-260731` | DeepSeek V4 Flash GA; thinking; 1M context |
+
+The 2026-09-18 subscription refresh enables exactly two chat models on the
+account: `deepseek-v4-1-flash-260910` and `glm-5-3-flash-260828`; they are also
+configured as the `modelark` provider in OpenCode (`modelark/<model-id>`).
+Older marketplace IDs above remain cataloged but are not entitled on this
+subscription; entitlement is an account fact and roster presence is not proof
+of availability.
 
 Treat these as separate facts:
 

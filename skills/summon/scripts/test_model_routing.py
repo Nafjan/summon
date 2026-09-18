@@ -119,6 +119,17 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(refusal["recommended_backend"], "claude")
         self.assertIn("claude", refusal["compatible_backends"])
 
+    def test_modelark_subscription_models_are_arkcli_compatible(self):
+        # The BytePlus ModelArk backend is exactly the deepseek/zhipu case:
+        # arkcli +chat with a concrete marketplace model id must pass the
+        # namespace preflight instead of being refused as cross-vendor.
+        self.assertIsNone(model_backend_compatibility("arkcli", "deepseek-v4-1-flash-260910"))
+        self.assertIsNone(model_backend_compatibility("arkcli", "glm-5-3-flash-260828"))
+        self.assertIsNone(model_backend_compatibility("openai-compat", "deepseek-v4-1-flash-260910"))
+        refusal = model_backend_compatibility("codex", "deepseek-v4-1-flash-260910")
+        self.assertIsNotNone(refusal)
+        self.assertIn("arkcli", refusal["compatible_backends"])
+
     def test_known_compatible_and_unknown_models_are_not_guessed(self):
         self.assertIsNone(model_backend_compatibility("claude", "claude-opus-5"))
         self.assertIsNone(model_backend_compatibility("codex", "gpt-5.6-sol"))

@@ -3629,8 +3629,8 @@ _MODEL_COMPATIBLE_BACKENDS = {
     "openai": ("agy", "codex", "cursor-agent", "openai-compat", "opencode"),
     "google": ("agy", "cursor-agent", "gemini", "openai-compat", "opencode"),
     "moonshot": ("agy", "kimi", "cursor-agent", "openai-compat", "opencode"),
-    "deepseek": ("agy", "openai-compat", "opencode"),
-    "zhipu": ("agy", "openai-compat", "opencode"),
+    "deepseek": ("agy", "arkcli", "openai-compat", "opencode"),
+    "zhipu": ("agy", "arkcli", "openai-compat", "opencode"),
     "xai": ("agy", "cursor-agent", "openai-compat", "opencode"),
 }
 

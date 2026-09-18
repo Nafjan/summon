@@ -23,7 +23,8 @@ class ModelCatalogTests(unittest.TestCase):
         near = [item for item in entries if item["label"] == "near-frontier"]
         self.assertEqual([item["name"] for item in near],
                          ["Grok", "Gemini Flash", "GLM", "DeepSeek V4 Flash",
-                          "Luna", "Terra", "Spark"])
+                          "Luna", "Terra", "Spark", "DeepSeek V4.1 Flash",
+                          "GLM 5.3 Flash"])
 
     def test_keys_and_routes_are_unique_and_dispatchability_is_explicit(self):
         value = catalog.load_catalog()
