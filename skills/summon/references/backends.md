@@ -439,12 +439,17 @@ entitlement:
 | Near-frontier / long context | `glm-5-2-260617` | GLM 5.2; thinking; 1M context |
 | Near-frontier / fast coding | `deepseek-v4-flash-ga-260731` | DeepSeek V4 Flash GA; thinking; 1M context |
 
-The 2026-09-18 subscription refresh enables exactly two chat models on the
-account: `deepseek-v4-1-flash-260910` and `glm-5-3-flash-260828`; they are also
-configured as the `modelark` provider in OpenCode (`modelark/<model-id>`).
-Older marketplace IDs above remain cataloged but are not entitled on this
-subscription; entitlement is an account fact and roster presence is not proof
-of availability.
+The 2026-09-18/19 subscription refresh activates exactly two chat models on
+the account, on the ModelArk **Platform** `/api/v3` chat endpoint (API/PAYG
+billing is disabled; the calls draw on the subscription activation):
+`deepseek-v4-1-flash-260910` and `glm-5-3-flash-260828`, wired as the `modelark`
+OpenAI-compatible provider. Live-verified 2026-09-19 with provider-stamped
+served identities. `glm-5-3-flash-260828` additionally answers on the Coding
+Plan endpoint via `arkcli +chat`; `deepseek-v4-1-flash-260910` does NOT — the
+Coding Plan endpoint refuses it ("does not support the coding plan feature",
+both ID forms, request IDs retained) despite console activation. Older
+marketplace IDs above remain cataloged; entitlement is an account fact and
+roster presence is not proof of availability.
 
 Treat these as separate facts:
 

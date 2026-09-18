@@ -338,7 +338,7 @@
       }
     },
     {
-      "key": "opencode/deepseek-v4-1-flash-260910",
+      "key": "openai-compat/deepseek-v4-1-flash-260910",
       "identity": {
         "vendor": "deepseek",
         "model_id": "deepseek-v4-1-flash-260910"
@@ -354,13 +354,13 @@
         "lane": "fast-primary"
       },
       "route": {
-        "backend": "opencode",
+        "backend": "openai-compat",
         "target": "deepseek-v4-1-flash-260910",
         "dispatchable": true
       }
     },
     {
-      "key": "opencode/glm-5-3-flash-260828",
+      "key": "openai-compat/glm-5-3-flash-260828",
       "identity": {
         "vendor": "zhipu",
         "model_id": "glm-5-3-flash-260828"
@@ -376,7 +376,7 @@
         "lane": "coding-secondary"
       },
       "route": {
-        "backend": "opencode",
+        "backend": "openai-compat",
         "target": "glm-5-3-flash-260828",
         "dispatchable": true
       }
