@@ -1,6 +1,9 @@
 # Expected next release: 3.5.0 workspace preview
 
-Planning draft, updated 2026-09-14. Comparison baseline: released Summon 3.4.0, dated 2026-09-02 in CHANGELOG.md. **3.5.0 is a provisional version target, not a published version, release candidate, release date or readiness claim.** The product version has not been changed. This draft describes the intended narrow P0/P1 preview from WORKSPACE_CHECKLIST_V3.md; the broader roadmap remains separate.
+Planning draft, updated 2026-09-19. Comparison baseline: released Summon
+3.4.0, dated 2026-09-02 in CHANGELOG.md. **3.5.0 is committed locally but
+has not been published.** This document describes the intended narrow P0/P1
+preview and its remaining gates; it is not a publication or readiness claim.
 
 The release boundary is explicit: the default `stable` manifest profile still
 requires every fixed gate, including live-provider evidence. The reviewed

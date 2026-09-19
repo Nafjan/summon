@@ -13,10 +13,11 @@ never on added fields.
 
 ## [3.5.0] - 2026-09-18
 
-The following source changes form the 3.5.0 provider-free workspace preview
-release. They do not qualify additional live adapters, revive retired selectors,
-or authorize publication; unsupported live adapters and native device acceptance
-remain separately gated.
+The following source changes form the locally committed 3.5.0 provider-free
+workspace preview candidate. The version has not been published. These notes do
+not qualify additional live adapters, revive retired selectors, or authorize
+publication; unsupported live adapters and native device acceptance remain
+separately gated.
 
 - **Durable ordinary workspace operations:** the host and authenticated client
   bind human-context requests, scoped commands/dispositions, retained holds, and

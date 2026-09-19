@@ -1,6 +1,6 @@
 # 3.5.0 minimum-slice coverage matrix
 
-Updated 2026-09-14. This matrix maps the minimum preview cut in
+Updated 2026-09-19. This matrix maps the minimum preview cut in
 `WORKSPACE_CHECKLIST_V3.md` to current provider-free evidence. The tables below
 use `Status` as an evidence state: a broad item is never marked `VERIFIED`
 solely because a narrower fixture passes. `PARTIAL` means the bounded local
@@ -10,7 +10,12 @@ evidence is missing. The authoritative release decision is the separate
 `BLOCKING`, or `DEFERRED-FROM-3.5`. Post-3.5/live remainder is recorded there
 instead of being hidden inside a green status.
 
-**2026-09-14 strict aggregate update:** the corrected Windows capture used an
+Current audit note (2026-09-19): the 3.5.0 contract is converged and committed
+locally, but the release has not been published. The only clean full capture
+retained for this release is bound to `fb41dae`; later route/document commits
+and the current audit tree have no HEAD-bound full capture.
+
+**Historical 2026-09-14 strict aggregate update:** the corrected Windows capture used an
 explicit Chromium executable and completed all 27 fixed suites with 4,920
 passed cases, 3 reviewed-policy skips, and zero failures or errors. Windows
 qualification is available and every fixed gate passes except the intentional
@@ -26,8 +31,8 @@ The current browser-security and accessibility gates independently pass
 reruns do not replace native assistive-technology/mobile-keyboard or final
 candidate evidence.
 
-**2026-09-18 strict aggregate update:** a fresh quiet-host capture from the
-frozen dirty tree completed all 27 fixed suites with 5,488 passed case
+**Historical 2026-09-18 strict aggregate update:** a fresh quiet-host capture from the
+ then-frozen candidate tree completed all 27 fixed suites with 5,488 passed case
 outcomes, zero failures/errors and exactly the three reviewed-policy skips.
 Windows qualification is available with a combined-run browser-security pass
 (204/204); all 44 required rendered artifacts are bound in the same

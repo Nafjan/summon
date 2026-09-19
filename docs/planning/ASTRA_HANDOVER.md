@@ -1,45 +1,49 @@
 # Astra handover — Summon development lead
 
-Written 2026-09-19 by the outgoing conductor (GLM 5.3 Flash session). Astra
-(GPT-6 Astra, exact-pinned `codex/gpt-6-astra`) takes over development,
-review, and release stewardship. Everything below is source-backed; the
-private run ledger at `I:\Antigravity projects\summon-evidence-350\LOOP_LEDGER.md`
-records 19 iterations of dispositions and evidence.
+Written 2026-09-19 by the outgoing conductor. Astra takes over development,
+review, and release stewardship. Everything below is source-backed where
+identified; private run ledgers and provider receipts remain outside public
+source and are not reproduced here.
 
 ## 1. Current state
 
-- Branch `codex/gemini-flash-3.8`, HEAD `822bc63`, clean tree. Product version
-  **3.5.0** (converged: plugin.json, dispatcher `__version__`, telemetry,
-  mcp_server, migration-doc marker; `tools/release_contract.py` ready=True).
+- The outgoing record named `822bc63`; subsequent documentation commits are
+  now present and the current tree must be revalidated before any release
+  claim. Product version **3.5.0** is converged across the contract sources
+  (`tools/release_contract.py` reports ready), committed locally, and not
+  published.
 - Three commits tell the story:
   - `fb41dae` — **release: Summon 3.5.0 workspace preview** (352 files). The
-    3.5.0 release candidate. A clean-source canonical capture is BOUND TO THIS
-    COMMIT: 27/27 fixed suites, 4,920 cases + 164 subtests passed, 0 failed,
+    3.5.0 candidate. A clean-source canonical capture is bound to this
+    commit: 27/27 fixed suites, 4,920 cases + 164 subtests passed, 0 failed,
     exactly 3 reviewed-policy skips, suites+gates aggregate 5,488 passed, 7/8
     gates pass with `live_provider=blocked` (intentional), Windows platform
     qualified, 44/44 rendered artifacts. `release_manifest.py --check
-    --profile workspace-preview --expected-version 3.5.0` **PASSES** against
-    it (exit 0); `stable` refuses only on `live_provider`.
+    --profile workspace-preview --expected-version 3.5.0` passed against that
+    historical commit; `stable` refused on the intentionally missing
+    live-provider evidence.
   - `443635e` — ModelArk platform routes (catalog entries for
     `glm-5-3-flash-260828` + `deepseek-v4-1-flash-260910`, arkcli
     namespace-compatibility fix + routing test, backends.md subscription
-    note). Focused suites green (catalog/routing 22, inventory/discovery
-    124); **no full clean capture exists for this commit or HEAD**.
+    note). Focused catalog/routing and inventory/discovery suites were green;
+    **no full clean capture exists for this commit or the current HEAD**.
   - `822bc63` — docs correction (platform-vs-coding-plan route facts).
 - NOT done (owner-reserved): push, PR, tag, GitHub release, publication
-  decision. **Summon 3.5.0 is committed and machine-accepted locally; it has
-  not been published.**
+  decision. **Summon 3.5.0 is committed locally and contract-checked; it has
+  not been published, and no current clean-candidate acceptance is implied.**
+  The historical capture does not qualify the current tree; its retained
+  history and any publication decision remain owner-gated.
 
 ## 2. Release gates and what remains
 
 | Gate | State |
 | --- | --- |
-| workspace-preview manifest | **PASS** at fb41dae (evidence: `summon-evidence-350\release_evidence_350_clean.json`, `manifest_350_workspace_preview.json`) |
-| stable profile | Refuses ONLY `live_provider=blocked` — needs an authoritative provider receipt |
+| workspace-preview manifest | **PASS** for the historical fb41dae candidate; retained evidence is outside public source |
+| stable profile | Historical fb41dae evidence refused only on `live_provider=blocked`; the current HEAD has no qualifying full packet and still needs an authoritative provider receipt |
 | U03/U07 device acceptance | NOT RUN — human operator with screen reader + native mobile keyboard; fixtures prepared (`U03_U07_DEVICE_ACCEPTANCE.md`) |
-| L06 final privacy scan | Pre-staging scan clean; must be rerun on the staged/committed publication candidate |
-| L09 final retention / L12 | Require the clean committed candidate (exists) + owner publication decision |
-| HEAD full capture | **OPEN: HEAD `822bc63` is not full-capture-bound** (two post-release commits came after the last full capture; focused partitions green). Run a fresh `--require-clean` capture when you want HEAD-bound evidence. |
+| L06 final privacy scan | Historical pre-staging scan was clean; this audit found public-document leaks that require correction, followed by a staged-candidate scan |
+| L09 final retention / L12 | Historical disposition remains owner-gated; re-run clean-candidate retention and the owner publication decision for the current tree |
+| HEAD full capture | **OPEN:** the current tree is not full-capture-bound after post-capture commits; focused partitions do not qualify it. Run a fresh `--require-clean` capture for HEAD-bound evidence. |
 
 ## 3. Review targets — the outgoing conductor's work to adversarially verify
 
@@ -58,35 +62,26 @@ records 19 iterations of dispositions and evidence.
    `test_model_catalog.py`); `_builder.py` routing preflight now treats
    `arkcli` as compatible with deepseek/zhipu namespaces (pinned by
    `test_modelark_subscription_models_are_arkcli_compatible`); backends.md
-   dated subscription note. Live smokes: both models dispatch with
-   provider-`reported` served evidence.
-3. **Known defect found and worked around, fix still OPEN**: install.py's
-   convergence gate hashes `scripts/` only — a **docs-only commit can skip
-   propagation into installed copies** (observed: backends.md/catalog
-   corrections did not reach any managed copy until a forced reinstall).
-   Structural fix candidate: extend the convergence/inventory gate to include
-   `references/` (and test it). This is backlog item DOC1.
-4. **Machine-local wiring** (not in the repo; documented in
-   `C:\Users\nside\.agents\memory.md` which auto-injects into every dispatch):
-   `modelark` provider in `~/.agents/providers.json` (`MODELARK_API_KEY`,
-   User scope); operator seats `deepseek-41-flash`, `modelark-glm-coder`
-   (openai-compat, platform `/api/v3`) and `glm-coder` (opencode
-   `coding-plan/glm-5-3-flash`, **file-capable**, live-verified reading
-   files); cursor-agent shim at `C:\Users\nside\.local\bin\cursor-agent.cmd`
-   → `AppData\Local\cursor-agent\agent.cmd`.
-5. **Provider facts you must not un-learn**: DeepSeek V4.1 Flash is NOT a
-   Coding-Plan model (`/api/coding/v3` refuses it in all ID forms; request
-   IDs retained in the ledger) — its only route is the Platform `/api/v3`
-   under the subscription activation. API/PAYG billing is disabled on this
-   account. OpenCode's `modelark` platform-provider adapter errors upstream
-   (refs `err_5ccf986a`, `err_9288ba06`, `err_dbb35055`, `err_b84cce21`) —
-   the coding-plan provider works. GLM's Coding-Plan route via arkcli 1.0.32
-   requires SSO (`arkcli auth login`; done 2026-09-19).
+   dated route note. Live availability and served identity remain separately
+   qualified.
+3. **Known defect found and worked around, fixed in this review slice**: the
+   installer copies the complete skill payload, but doctor and the post-install
+   drift check previously hashed `scripts/` only. A docs-only change could
+   therefore leave generic convergence green while installed references stayed
+   stale. DOC1 adds a bounded payload fingerprint for `SKILL.md`, `scripts/`,
+   `references/`, `agents/`, and `examples/`, with fail-closed unknown states.
+4. **Machine-local wiring and provider receipts** are deliberately excluded
+   from public planning. Account entitlements, credentials, subscription
+   activation, adapter incidents, and request identifiers are private facts;
+   public route documentation must state endpoint/product distinctions without
+   claiming availability for a particular account.
 
 ## 4. 3.5.1 backlog (priority order)
 
-- **DOC1**: install.py convergence gate must cover `references/` (docs-only
-  releases silently skip installed copies today). Add test.
+- **DOC1 (complete in the current local candidate)**: doctor and post-install
+  convergence cover the complete staged skill payload, including `references/`,
+  while preserving the scripts receipt hash. Bounded unknown-state and docs-only
+  refresh regressions are registered in the fixed release suite.
 - **SKILL1**: SKILL.md is 132 KB (~40-44k tokens) loaded per invocation.
   Progressive-disclosure restructure: keep dispatch happy path + fail-closed
   safety rules + status handling inline; move the Parameters table (~37%) and
@@ -113,8 +108,9 @@ records 19 iterations of dispositions and evidence.
 ## 5. Authority boundaries (unchanged)
 
 You may: implement, test, review, document, and **commit locally**; run
-gates/manifest/doctor; dispatch subscription seats for bounded smokes and
-reviews (records: `MODELARK_API_KEY` User-scope env; arkcli SSO done).
+provider-inert gates, manifest checks, and doctor. Any provider/account,
+credential, or subscription evidence requires a separately retained owner
+receipt and must not be copied into public planning.
 You must NOT (owner-reserved): push, PR, tag, publish, bump versions again,
 enable PAYG/credit, repair credentials, or claim 3.5.0 is published. U03/U07
 device observations require the human operator. Exact-model and
@@ -124,14 +120,13 @@ served-evidence gates stay fail-closed: catalog presence is not availability;
 ## 6. Verification quickstart
 
 ```
-git log --oneline -3 && git status --porcelain          # 822bc63, clean
+git log --oneline -3 && git status --porcelain          # inspect current tree
 python tools/release_contract.py                        # canonical 3.5.0, ready
 python -m pytest -q tests/test_release_contract.py tests/test_migration_gate.py tests/test_release_manifest.py -p no:cacheprovider
-python skills/summon/scripts/run_subagent.py doctor --json   # 9 usable backends (with current User PATH)
+python skills/summon/scripts/run_subagent.py doctor --json   # bounded local inventory; counts and auth/availability are environment facts
 python tools/release_gates.py --require-clean --output <outside-tree>.json --chromium-executable <path>   # fresh HEAD-bound capture (~50 min)
 python tools/release_manifest.py --check --profile workspace-preview --expected-version 3.5.0 --evidence-file <that json>
 ```
 
-Machine notes (PATH, OpenCode cwd restriction, runs-root ACL contract,
-zcode-copy manual refresh) are in `C:\Users\nside\.agents\memory.md` and the
-ledger. Telemetry: `~\.agents\summon-telemetry.jsonl` (enabled).
+Machine-local notes, private receipts, credentials, and telemetry locations are
+outside this public handover. Keep release evidence outside the source tree.

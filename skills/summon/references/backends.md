@@ -434,22 +434,18 @@ entitlement:
 | Editorial lane | Exact Ark marketplace ID | Metadata |
 |---|---|---|
 | Near-frontier / fast coding (primary) | `deepseek-v4-1-flash-260910` | DeepSeek V4.1 Flash 260910; text-only |
-| Near-frontier / fast coding | `glm-5-3-flash-260828` | GLM 5.3 Flash 260828; text via `arkcli`; file-capable inputs via the `modelark` OpenCode provider |
+| Near-frontier / fast coding | `glm-5-3-flash-260828` | GLM 5.3 Flash 260828; text via `arkcli`; tool/file access depends on a separately qualified adapter |
 | Frontier / maximum thinking | `deepseek-v4-pro-ga-260813` | DeepSeek V4 Pro GA; thinking; 1M context |
 | Near-frontier / long context | `glm-5-2-260617` | GLM 5.2; thinking; 1M context |
 | Near-frontier / fast coding | `deepseek-v4-flash-ga-260731` | DeepSeek V4 Flash GA; thinking; 1M context |
 
-The 2026-09-18/19 subscription refresh activates exactly two chat models on
-the account, on the ModelArk **Platform** `/api/v3` chat endpoint (API/PAYG
-billing is disabled; the calls draw on the subscription activation):
-`deepseek-v4-1-flash-260910` and `glm-5-3-flash-260828`, wired as the `modelark`
-OpenAI-compatible provider. Live-verified 2026-09-19 with provider-stamped
-served identities. `glm-5-3-flash-260828` additionally answers on the Coding
-Plan endpoint via `arkcli +chat`; `deepseek-v4-1-flash-260910` does NOT — the
-Coding Plan endpoint refuses it ("does not support the coding plan feature",
-both ID forms, request IDs retained) despite console activation. Older
-marketplace IDs above remain cataloged; entitlement is an account fact and
-roster presence is not proof of availability.
+ModelArk has two separate route families: the **Platform** `/api/v3` endpoint
+and the **Coding Plan** `/api/coding/v3` endpoint. A model listed in the
+editorial catalog is not proof that either route is enabled for the current
+account, nor that the provider will report the requested served identity.
+Route and entitlement checks must be performed with an explicitly authorized,
+current receipt; public documentation does not record account-specific
+activation, billing state, request identifiers, or adapter incidents.
 
 Treat these as separate facts:
 

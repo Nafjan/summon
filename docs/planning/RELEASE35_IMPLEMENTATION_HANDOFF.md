@@ -1,6 +1,6 @@
 # 3.5.0 implementation handoff
 
-Updated 2026-09-14. This is an execution handoff for the narrow workspace preview, not a replacement for WORKSPACE_CHECKLIST_V3.md or release approval. Released baseline remains 3.4.0; 3.5.0 is provisional. General implementation and bounded technical review are authorized. Installation, credentials, commits and publication remain separately restricted.
+Updated 2026-09-19. This is an execution handoff for the narrow workspace preview, not a replacement for WORKSPACE_CHECKLIST_V3.md or release approval. Released baseline remains 3.4.0; 3.5.0 is committed locally but has not been published. General implementation and bounded technical review are authorized. Installation, credentials, and publication remain separately restricted.
 
 ## Current strict-QA handoff, 2026-09-18
 
@@ -26,15 +26,16 @@ credentials, receipts, telemetry contents or machine fingerprints in the
 candidate tree, planning documents included; the final staged-candidate scan
 remains reserved.
 
-Both release manifest profiles refuse this evidence with
+Both release manifest profiles refused this evidence with
 `evidence was not produced from a clean Git tree` — the exact reserved
 boundary. Remaining blockers are unchanged: U03/U07 native device observations
 (operator-supplied screen reader and mobile keyboard, fixtures prepared per
 U03_U07_DEVICE_ACCEPTANCE.md) and the reserved L06 final scan / L09
-final-candidate retention / L12 clean-commit plus publication chain. No
-commit, install, version bump or publication occurred.
+final-candidate retention / L12 clean-commit plus publication chain. This
+historical packet did not qualify the later committed candidate; no
+publication occurred.
 
-Closure advisory review, 2026-09-18: one bounded provider-seat review of a
+Closure advisory review, 2026-09-18: one bounded advisory review of a
 sanitized packet copy (read-only clamped, no candidate access) returned
 SUPPORT with no blocking findings: the changelog additions match their feature
 sources, the workspace-preview manifest boundary is correctly enforced, and no
@@ -42,9 +43,8 @@ document overclaims readiness. Its single follow-up — explicitly verify the
 escaped guarded child from the discarded first capture is gone before the
 final clean-commit capture — is now resolved: the process exited on its own
 and its absence was verified the same day. Advisory verdicts are context, not
-release approval. The Kimi K3 and AGY Flash-persona seats were unavailable
-(their CLI backends are not installed on this host) and were recorded as an
-external unblock rather than repaired.
+release approval. Optional advisory lanes were unavailable and remain
+unqualified; no credential or provider repair was performed.
 
 ## Release execution checkpoint, 2026-09-18
 
@@ -59,7 +59,7 @@ the `workspace-preview` manifest check with `--expected-version 3.5.0`. Push,
 PR, tag, and publication remain separately reserved; U03/U07 device evidence
 remains outstanding release evidence independent of every machine profile.
 
-## Prior strict-QA handoff, 2026-09-14
+## Historical prior strict-QA handoff, 2026-09-14
 
 The corrected aggregate, run with an explicit Chromium executable, completed
 all 27 fixed suites with 4,920 passed cases, 3 reviewed-policy skips and zero

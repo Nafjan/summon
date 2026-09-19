@@ -5,9 +5,18 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+This section records changes in the current local candidate. Summon 3.5.0 is
+committed locally and has not been published; entries below are not release
+approval.
+
+- Extend installer/doctor convergence checks to the complete managed skill
+  payload, including references and documentation, while preserving the
+  scripts receipt identity. Unknown or linked payloads remain fail-closed.
+
 ## [3.5.0] - 2026-09-18
 
-These entries describe the 3.5.0 workspace preview release. Provider-free
+These entries describe the locally committed 3.5.0 workspace preview
+candidate. Provider-free
 acceptance does not certify live adapters or satisfy stable/public publication
 gates; unsupported live adapters and native device acceptance remain separately
 gated, and retired selectors and historical receipts retain their existing

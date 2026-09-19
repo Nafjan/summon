@@ -6952,6 +6952,18 @@ def _mk_summon_install(home, host_dir, py_files, *, installed_at=1000, manifest=
     return scripts
 
 
+def _complete_v6_skill_payload(scripts):
+    """Add the non-script roots required for full-payload convergence fixtures."""
+    summon_dir = os.path.dirname(scripts)
+    with open(os.path.join(summon_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
+        fh.write("---\nname: summon\n---\n")
+    for directory in ("references", "agents", "examples"):
+        root = os.path.join(summon_dir, directory)
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "fixture.txt"), "w", encoding="utf-8") as fh:
+            fh.write("fixture\n")
+
+
 def test_v6_installs_enumerate_and_converged():
     # every host copy identical -> all present, versions read from run_subagent.py,
     # drift converged, and the copy we "run from" is tagged (not double-listed).
@@ -6960,7 +6972,8 @@ def test_v6_installs_enumerate_and_converged():
     try:
         files = {"run_subagent.py": '__version__ = "1.2.3"\n', "_x.py": "x = 1\n"}
         for hd in _installs.HOST_DIRS.values():
-            _mk_summon_install(home, hd, files)
+            scripts = _mk_summon_install(home, hd, files)
+            _complete_v6_skill_payload(scripts)
         run = os.path.join(home, ".claude", "skills", "summon", "scripts")
         recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
         present = [r for r in recs if r["present"]]
@@ -7620,8 +7633,10 @@ def test_v6_enumerate_dedups_symlink_aliases():
     import _installs
     home = tempfile.mkdtemp(prefix="summon-v6sym-")
     try:
-        _mk_summon_install(home, ".claude",
-                           {"run_subagent.py": '__version__ = "2.0.0"\n', "_x.py": "x = 1\n"})
+        scripts = _mk_summon_install(
+            home, ".claude",
+            {"run_subagent.py": '__version__ = "2.0.0"\n', "_x.py": "x = 1\n"})
+        _complete_v6_skill_payload(scripts)
         codex_summon = os.path.join(home, ".codex", "skills", "summon")
         os.makedirs(os.path.dirname(codex_summon), exist_ok=True)
         try:
