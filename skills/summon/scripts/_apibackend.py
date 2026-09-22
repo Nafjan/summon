@@ -581,8 +581,8 @@ def call(inv, timeout_ms: int, *, launch_control=None,
     exit_code/cli + usage/cost_usd/model_resolved), so it flows through _enrich."""
     cli = "openai-compat"
 
-    def _preflight_error(message: str) -> dict:
-        response = _err(cli, message)
+    def _preflight_error(message: str, *, error_kind: str | None = None) -> dict:
+        response = _err(cli, message, error_kind=error_kind)
         response["provider_contacted"] = False
         response["submission_state"] = "not_submitted"
         return response
@@ -607,7 +607,7 @@ def call(inv, timeout_ms: int, *, launch_control=None,
                     "not a short-lived SSO token")
         if inv.api_key_env == "ZAI_CODING_API_KEY":
             msg += " - set it for the Z.AI Coding Plan endpoint"
-        return _preflight_error(msg)
+        return _preflight_error(msg, error_kind="credential_missing")
     expected_credential = getattr(inv, "api_key_fingerprint", None)
     if (expected_credential is not None
             and credential_fingerprint(inv.api_key_env, api_key) != expected_credential):

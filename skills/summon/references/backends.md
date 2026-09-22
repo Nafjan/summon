@@ -313,6 +313,23 @@ When prompted, enter the OpenRouter key. Check presence with
 
 ---
 
+## Kimi headless (`-p`) tool-loop behavior
+
+Field-verified 2026-09-19: Kimi's non-interactive `--prompt` mode blocks
+indefinitely the moment the model attempts a tool call — `-y`/`--yolo` is
+"ask when needed" and still blocks, and `--auto` cannot be combined with
+`--prompt`. Two working patterns:
+
+1. **ACP transport (recommended for tool-using kimi seats)**: declare
+   `transport: acp` on a yolo kimi seat; permission requests are auto-answered
+   per-step and the tool loop completes (verified: file read + report in 34s).
+2. **Text-constrained prompt**: for pure text review/analysis, instruct the
+   seat not to use tools and emit its report directly (completes in ~45s).
+
+`summon dispatch --allow-kimi-acp-fallback` additionally permits ONE ACP
+recovery turn after a subprocess timeout/stream failure (off by default: a
+second turn can duplicate spend without recovering the task).
+
 ## BytePlus ModelArk (Coding Plan + Platform PAYG)
 
 ModelArk is BytePlus's model platform. You can reach it two ways — both work

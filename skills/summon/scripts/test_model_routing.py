@@ -119,6 +119,48 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(refusal["recommended_backend"], "claude")
         self.assertIn("claude", refusal["compatible_backends"])
 
+    def test_credential_missing_is_typed_refusal_dry_and_live(self):
+        import os as _os
+        from _apibackend import api_key_available, resolve_api_credential
+        env = {k: v for k, v in _os.environ.items()
+               if k != "MODELARK_API_KEY"}
+        env["MODELARK_API_KEY"] = ""
+        assert resolve_api_credential("MODELARK_API_KEY",
+                                      "https://ark.ap-southeast.bytepluses.com/api/v3",
+                                      environ=env) == ("", None)  # empty key still refuses
+        with mock.patch.dict(_os.environ, env, clear=True):
+            assert api_key_available("MODELARK_API_KEY",
+                                     "https://ark.ap-southeast.bytepluses.com/api/v3") is False
+            assert api_key_available("", "http://127.0.0.1:8000/v1") is True  # local, no key
+
+    def test_agent_required_message_lists_registered_agents_for_the_cli(self):
+        rows = [{"name": "kimi-worker", "run_agent": "kimi"},
+                {"name": "kimi-coder", "run_agent": "kimi"},
+                {"name": "editor", "run_agent": "claude"}]
+        args = SimpleNamespace(cli="kimi")
+        msg = run_subagent._agent_required_message(args, rows)
+        self.assertIn("--agent is required", msg)
+        self.assertIn("Registered agents for CLI 'kimi'", msg)
+        self.assertIn("kimi-worker", msg)
+        self.assertIn("kimi-coder", msg)
+        self.assertNotIn("editor", msg)
+        empty = run_subagent._agent_required_message(SimpleNamespace(cli="kimi"), [])
+        self.assertIn("No registered agents for CLI 'kimi'", empty)
+        plain = run_subagent._agent_required_message(SimpleNamespace(cli=None), rows)
+        self.assertEqual(plain, "--agent is required")
+
+    def test_agents_table_renders_human_columns(self):
+        table = run_subagent._format_agents_table([
+            {"name": "kimi-worker", "run_agent": "kimi", "model": "kimi-code/k3",
+             "permission": "yolo", "capability": None},
+            {"name": "editor", "run_agent": "claude", "model": None,
+             "permission": "read-only"}])
+        self.assertIn("NAME", table)
+        self.assertIn("CLI", table)
+        self.assertIn("kimi-worker", table)
+        self.assertIn("editor", table)
+        self.assertIn("-", table)  # empty cells render as dash
+
     def test_modelark_subscription_models_are_arkcli_compatible(self):
         # The BytePlus ModelArk backend is exactly the deepseek/zhipu case:
         # arkcli +chat with a concrete marketplace model id must pass the

@@ -1151,6 +1151,8 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Opt into approved user-global role aliases for this dispatch; "
                              "disabled by default and never changes an exact agent match")
     parser.add_argument("--list", action="store_true", help="List available agents")
+    parser.add_argument("--format", choices=["json", "table"], default="json",
+                        help="Output format for --list (default: json)")
     parser.add_argument("--validate-agents", dest="validate_agents", action="store_true",
                         help="Validate provider-inert custom-agent manifests under the workspace")
     parser.add_argument("--list-models", dest="list_models", action="store_true",

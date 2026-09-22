@@ -2414,6 +2414,15 @@ def main() -> None:
     if args.list:
         agents_dir = get_agents_dir(args.agents_dir, args.cwd)
         agents = list_agents(agents_dir)
+        if getattr(args, "cli", None):
+            agents = [a for a in agents
+                      if (a.get("run_agent") or a.get("cli")) == args.cli]
+        if getattr(args, "format", "json") == "table":
+            from _builder import roster_permission_lint
+            sys.stdout.write(_format_agents_table(agents))
+            for _w in roster_permission_lint(agents):
+                print(f"warning: {_w}", file=sys.stderr)
+            sys.exit(0)
         # Roster-level tier lint. Per-dispatch refusal is correct but arrives too late for
         # anyone maintaining a roster as a controlled artifact: a definition whose declared
         # tier its backend cannot enforce sits unnoticed until someone dispatches it (field
@@ -2439,7 +2448,12 @@ def main() -> None:
 
     # Validate required args for execution
     if not args.agent:
-        _die("--agent is required")
+        try:
+            _agents_dir = get_agents_dir(args.agents_dir, args.cwd)
+            _rows = list_agents(_agents_dir)
+        except Exception:  # noqa: BLE001 - the refusal must never depend on the hint
+            _rows = []
+        _die(_agent_required_message(args, _rows))
     if not args.prompt:
         _die("--prompt is required")
     if not args.cwd:
@@ -3375,6 +3389,46 @@ def _sync_effective_decision_refusal(view: dict) -> None:
     _reseal_effective_decision(decision)
 
 
+def _agent_required_message(args, agents_rows: list[dict]) -> str:
+    """Envelope for the missing --agent refusal: name the seats that exist.
+
+    Field report 2026-09-19: `--cli kimi` without `--agent` refused with no
+    hint that kimi-worker/kimi-coder were registered. When a --cli filter is
+    present, list the agents for that backend so the caller can pick one
+    without grepping the roster.
+    """
+    message = "--agent is required"
+    if getattr(args, "cli", None):
+        matches = [str(r.get("name")) for r in agents_rows
+                   if (r.get("run_agent") or r.get("cli")) == args.cli]
+        if matches:
+            message += (f". Registered agents for CLI '{args.cli}': "
+                        + ", ".join(matches))
+        else:
+            message += f". No registered agents for CLI '{args.cli}'"
+    return message
+
+
+def _format_agents_table(rows: list[dict]) -> str:
+    """Human-readable --list rendering. JSON stays the machine default."""
+    headers = ("NAME", "CLI", "MODEL", "PERMISSION", "CAPABILITY")
+    def _cell(row, key):
+        value = row.get(key)
+        return str(value) if value not in (None, "") else "-"
+    table_rows = sorted(rows, key=lambda r: str(r.get("name", "")).lower())
+    widths = [max(len(h), *(len(_cell(r, k.lower())) for r in table_rows) or [0])
+              for h, k in zip(headers, ("name", "run_agent", "model",
+                                        "permission", "capability"))]
+    lines = ["  ".join(h.ljust(w) for h, w in zip(headers, widths))]
+    lines.append("  ".join("-" * w for w in widths))
+    for r in table_rows:
+        lines.append("  ".join(_cell(r, k.lower()).ljust(w)
+                               for k, w in zip(("name", "run_agent", "model",
+                                                "permission", "capability"),
+                                               widths)))
+    return "\n".join(lines) + "\n"
+
+
 def _dry_run_view(invocation, args, agents_dir: str,
                   agent_file: str | None = None,
                   artifact_manifest: dict | None = None,
@@ -3541,6 +3595,21 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 view["model_vendor"] = _compat["model_vendor"]
             view["compatible_backends"] = list(_compat["compatible_backends"])
             view["recommended_backend"] = _compat["recommended_backend"]
+    if (invocation.cli == "openai-compat" and not _decision_projection_invalid
+            and getattr(invocation, "api_key_env", None)):
+        # Fail closed on a missing provider credential before anyone mistakes a
+        # slow unauthenticated request for a hang (field report 2026-09-19).
+        try:
+            from _apibackend import api_key_available as _key_ok
+            if not _key_ok(invocation.api_key_env, invocation.base_url):
+                view["would_refuse"] = True
+                view["error_kind"] = "credential_missing"
+                view["refusal"] = (f"openai-compat: ${invocation.api_key_env} is not "
+                                   "set or could not be resolved for this endpoint")
+                view["provider_contacted"] = False
+                view["result_usable"] = False
+        except Exception:  # noqa: BLE001 - preflight view stays renderable
+            pass
     _role_info = (getattr(args, "_role_provenance", {}) or {}).get("role")
     if isinstance(_role_info, dict) and not _decision_projection_invalid:
         view["role"] = dict(_role_info)
