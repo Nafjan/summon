@@ -5,9 +5,13 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
-This section records changes in the current local candidate. Summon 3.5.0 is
-committed locally and has not been published; entries below are not release
-approval.
+## [3.5.0] - 2026-09-23
+
+Summon 3.5.0 pairs dispatcher reliability fixes driven by field telemetry with a
+provider-free workspace preview. It is accepted under the `workspace-preview`
+release profile: provider-free acceptance does not certify live adapters,
+native device acceptance (U03/U07) remains separately gated, and retired
+selectors and historical receipts retain their existing identities.
 
 - Extend installer/doctor convergence checks to the complete managed skill
   payload, including references and documentation, while preserving the
@@ -27,15 +31,6 @@ approval.
   token cap), and the OpenCode/ZCode yolo gates name every missing flag at once.
 - Test runs redirect telemetry, reports, and the agy capability cache away from
   the operator's home directory.
-
-## [3.5.0] - 2026-09-18
-
-These entries describe the locally committed 3.5.0 workspace preview
-candidate. Provider-free
-acceptance does not certify live adapters or satisfy stable/public publication
-gates; unsupported live adapters and native device acceptance remain separately
-gated, and retired selectors and historical receipts retain their existing
-identities.
 
 - Support durable human-context requests, scoped dispositions, retained holds,
   and explicitly authorized linked replacements through the ordinary workspace

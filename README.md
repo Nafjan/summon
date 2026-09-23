@@ -145,11 +145,11 @@ not installed or required.
 - **Route named local logins:** keep multiple Claude config directories behind private
   profile names, so a public agent definition never carries a machine path or credential.
 
-The workspace and pending roster changes above belong to the **unreleased 3.5.0
-source preview**. The latest published baseline is 3.4.0; see the
-[expected changes and release gates](docs/planning/EXPECTED_NEXT_RELEASE.md)
-for the comparison. A local test pass does not mean an installed copy contains
-these changes.
+The workspace and roster changes above ship in **Summon 3.5.0**, whose workspace
+features are a preview: provider-free acceptance covers them, but live adapters are
+not stable-certified. See the
+[release gates](docs/planning/EXPECTED_NEXT_RELEASE.md) for what each profile
+certifies. A local test pass does not mean an installed copy contains these changes.
 
 For a minimal provider-free workspace, save this synthetic plan as
 `workspace-plan.json` in a private directory:
@@ -354,7 +354,7 @@ python tools/release_gates.py --require-clean --output "${RUNNER_TEMP:-${TMPDIR:
 python tools/release_manifest.py \
   --evidence-file "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json" \
   --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" \
-  --expected-version 3.4.0 --check
+  --expected-version 3.5.0 --check
 ```
 
 The runner executes the fixed suites, records output digests, strips backend credentials and
