@@ -925,6 +925,10 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
             state, message = "prepared", (
                 f"job {args.jobs_wait!r} has not published a process id yet; if this "
                 "persists, its launch failed -- check `jobs status` before relaunching")
+        elif liveness == "dead":
+            state, message = "unverified", (
+                f"job {args.jobs_wait!r} has no verified result and its process has just "
+                "exited; check `jobs status` (it may be stale) before relaunching")
         else:
             state, message = "unverified", (
                 f"job {args.jobs_wait!r} has no verified result and its process liveness "

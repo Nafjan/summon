@@ -688,6 +688,47 @@ def test_unusable_cache_location_degrades_to_an_unserialized_probe(
     assert probed == ["C:/bin/agy.exe"]
 
 
+def test_lock_of_a_dead_owner_is_stolen_without_waiting_for_the_stale_window(
+        monkeypatch, agy_probe_env):
+    """An owner killed mid-probe must not hold every agy dispatch for ~150s."""
+    import time
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    lock = Path(str(agy_probe_env) + ".lock")
+    lock.write_text(f"{child.pid}:{'0' * 32}", encoding="ascii")  # fresh mtime
+    probed = []
+    monkeypatch.setattr(_builder, "_probe_agy_print_timeout",
+                        lambda path: probed.append(path) or True)
+    started = time.monotonic()
+    _builder._require_agy_print_timeout_support()
+    assert time.monotonic() - started < 5
+    assert probed == ["C:/bin/agy.exe"]
+
+
+def test_live_owner_lock_is_not_stolen_early(monkeypatch, agy_probe_env):
+    slot = _builder._agy_capability_probe_slot(("C:/bin/agy.exe", 7))
+    lock = Path(str(agy_probe_env) + ".lock")
+    lock.write_text(f"{os.getpid()}:{'0' * 32}", encoding="ascii")
+    assert slot._owner_exited() is False
+    lock.write_text("not-a-token", encoding="ascii")
+    assert slot._owner_exited() is False
+
+
+def test_lock_open_error_rechecks_the_cache_before_probing(monkeypatch, agy_probe_env):
+    _builder._store_agy_capability(("C:/bin/agy.exe", 7))
+    slot = _builder._agy_capability_probe_slot(("C:/bin/agy.exe", 7))
+    real_open = _builder.os.open
+
+    def denied(path, *args, **kwargs):
+        if str(path).endswith(".lock"):
+            raise PermissionError("delete pending")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(_builder.os, "open", denied)
+    with slot as cached:
+        assert cached is True
+
+
 def test_probe_owner_never_releases_a_lock_it_no_longer_owns(agy_probe_env):
     slot = _builder._agy_capability_probe_slot(("C:/bin/agy.exe", 7))
     with slot:
@@ -820,10 +861,12 @@ def test_legacy_agy_plain_output_is_not_replaced_by_stream_finalization(monkeypa
         [sys.executable, "-c", "print('legacy wrapper report', flush=True)"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
         **_spawn.popen_flags())
+    # Generous clocks: this pins output handling, not startup latency, and a loaded
+    # host can take over a second just to start the interpreter.
     response = _executor._drive_process(
-        process, "agy", 5_000, parse_stream=False,
-        attempt_id="a" * 32, first_event_ms=1_000, idle_ms=1_000,
-        finalization_ms=1_000)
+        process, "agy", 30_000, parse_stream=False,
+        attempt_id="a" * 32, first_event_ms=15_000, idle_ms=15_000,
+        finalization_ms=15_000)
     assert response["status"] == "success"
     assert response["result"].strip() == "legacy wrapper report"
     assert "provider_terminal_state" not in response

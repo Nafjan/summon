@@ -3282,7 +3282,9 @@ def _drive_process_loop(
         return int((time.monotonic() - loop_started) * 1000)
 
     def _wall_clock_stage() -> str:
-        return "adaptive_hard_timeout" if runtime_control is not None else "overall_timeout"
+        # "backend-execution" is the documented public stage for an ordinary
+        # subprocess wall-clock timeout; keep it.
+        return "adaptive_hard_timeout" if runtime_control is not None else "backend-execution"
 
     # Non-stream CLIs can still return useful plain output on non-zero status; only
     # the wrapper that emits line-delimited JSON events is safe to parse.

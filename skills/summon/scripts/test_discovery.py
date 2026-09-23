@@ -17704,6 +17704,28 @@ def test_early_liveness_stop_reports_elapsed_and_stage_not_the_budget():
     assert at_budget["error"] == "Timeout after 360000ms", at_budget["error"]
 
 
+def test_plain_wall_clock_timeout_keeps_the_documented_stage():
+    """SKILL.md documents `backend-execution` for a subprocess wall-clock timeout."""
+    import subprocess as sp
+    import _executor
+    from _stream import StreamProcessor
+
+    child = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                     stdout=sp.PIPE, stderr=sp.PIPE, stdin=sp.DEVNULL,
+                     **_spawn.run_flags())
+    try:
+        resp = _executor._drive_process_loop(child, "claude", 800, StreamProcessor())
+    finally:
+        # The driver owns the pipes and has already reaped the child; a second
+        # communicate() would race its reader thread.
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+    assert resp["exit_code"] == 124, resp
+    assert resp["timeout"]["stage"] == "backend-execution", resp["timeout"]
+    assert resp["error"] == "Timeout after 800ms", resp["error"]
+
+
 def test_drive_loop_threads_elapsed_time_into_a_startup_stall():
     """The read loop must hand the real elapsed time to the payload, not only the budget."""
     import subprocess as sp
@@ -17715,9 +17737,11 @@ def test_drive_loop_threads_elapsed_time_into_a_startup_stall():
     try:
         resp = _executor._drive_process(child, "claude", 60_000, first_event_ms=500)
     finally:
+        # The driver owns the pipes and has already reaped the child; a second
+        # communicate() would race its reader thread.
         if child.poll() is None:
             child.kill()
-        child.communicate()
+            child.wait()
     assert resp["exit_code"] == 124, resp
     assert resp["timeout"]["stage"] == "startup_timeout", resp["timeout"]
     assert resp["timeout"]["elapsed_ms"] < 30_000, resp["timeout"]

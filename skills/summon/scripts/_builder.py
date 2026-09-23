@@ -2366,7 +2366,7 @@ def agy_prompt_length_refusal(inv: AgentInvocation) -> str | None:
 _AGY_RUN_TTL_SEC = 900   # don't clean run dirs younger than this (may be in use)
 _AGY_ORPHAN_RETENTION_SEC = 24 * 60 * 60
 _AGY_OWNER_PID_FILE = ".summon_owner_pid"
-_AGY_PRINT_TIMEOUT_CAPABILITY: dict[tuple[str, int | None], bool] = {}
+_AGY_PRINT_TIMEOUT_CAPABILITY: dict[tuple[str, object], bool] = {}
 _AGY_PROFILE_LEASES: dict[str, tuple[object, str]] = {}
 _AGY_LEASE_LOCK_OFFSET = 4096
 _AGY_LEASE_SCHEMA = "summon.agy-profile-lease/v2"
@@ -2794,12 +2794,20 @@ class _agy_capability_probe_slot:
             except FileExistsError:
                 pass
             except OSError:
-                return False
+                # e.g. Windows access-denied while a just-released lock is still being
+                # deleted: its owner may have published the answer a moment ago.
+                return _agy_capability_cached(self._identity)
             else:
                 try:
                     os.write(fd, self._token)
-                finally:
+                except OSError:
                     os.close(fd)
+                    try:
+                        self._lock.unlink()  # never leave an ownerless, tokenless lock
+                    except OSError:
+                        pass
+                    return False
+                os.close(fd)
                 self._owned = True
                 # A peer may have finished between our cache miss and the lock.
                 return _agy_capability_cached(self._identity)
@@ -2812,8 +2820,8 @@ class _agy_capability_probe_slot:
             except FileNotFoundError:
                 continue  # released between attempts; try to take it
             except OSError:
-                return False
-            if age > _AGY_PROBE_LOCK_STALE_SEC:
+                return _agy_capability_cached(self._identity)
+            if age > _AGY_PROBE_LOCK_STALE_SEC or self._owner_exited():
                 try:
                     self._lock.unlink()
                 except FileNotFoundError:
@@ -2822,6 +2830,27 @@ class _agy_capability_probe_slot:
                     return False  # an abandoned lock we cannot remove: never spin on it
                 continue
             time.sleep(0.25)
+
+    def _owner_exited(self) -> bool:
+        """True only when the lock's recorded owner pid is positively dead.
+
+        An owner killed mid-probe (e.g. by a tree kill on its own dispatch timeout)
+        would otherwise hold every agy dispatch for the full stale window before its
+        probe could even start. Unknown liveness is never treated as dead.
+        """
+        try:
+            with open(self._lock, "rb") as fh:
+                owner = fh.read(128).decode("ascii").split(":", 1)[0]
+            pid = int(owner)
+        except (OSError, ValueError, UnicodeDecodeError):
+            return False
+        if pid == os.getpid():
+            return False
+        try:
+            from _jobs import _pid_liveness
+        except ImportError:
+            return False
+        return _pid_liveness(pid) == "dead"
 
     def __exit__(self, *_exc) -> None:
         if not self._owned:
