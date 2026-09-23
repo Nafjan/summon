@@ -44,6 +44,37 @@ def _launch_material_paths(cli: object, command: object,
     return [args[0]]
 
 
+def argv_overflow_reroutes_to_acp(inv, args: list[object],
+                                  launch_control=None) -> bool:
+    """Would a command line that overflows the OS limit be rerouted over ACP?
+
+    One predicate for the live executor and the dry-run preview, so the preview
+    never promises a reroute the dispatch will refuse (or the reverse).
+    """
+    from _builder import supports_acp
+    return bool(
+        _adapter_transport_capability(inv, args) is None
+        and supports_acp(inv.cli)
+        and (launch_control is None or launch_control.allow_secondary)
+        and os.environ.get("SUMMON_ACP_FALLBACK") != "0"
+        and (inv.cli != "kimi" or os.environ.get("SUMMON_KIMI_ACP_FALLBACK") == "1"))
+
+
+def dry_run_argv_length_error(inv, command: str, args: list,
+                              env_override: Mapping[str, object] | None) -> str | None:
+    """Measure the command line the live dispatch would actually spawn.
+
+    Mirrors the executor: the launcher is resolved first (a Windows ``.cmd`` shim
+    becomes ``node.exe <script>``) and POSIX measurement counts the merged child
+    environment. A launcher that cannot be resolved is left to the live refusal.
+    """
+    try:
+        command, args = _resolve_launch(command, args)
+    except ValueError:
+        return None
+    return argv_length_error(inv.cli, command, args, _merge_env(env_override))
+
+
 def _adapter_transport_capability(inv, args: list[object]) -> Mapping[str, object] | None:
     """Resolve only adapter-owned transport facts for this exact operation.
 
@@ -2989,6 +3020,7 @@ _TIMEOUT_STAGE_TEXT = {
     "adaptive_attention_timeout": "no meaningful activity at the adaptive checkpoint",
     "adaptive_hard_timeout": "the adaptive max runtime was reached",
     "overall_timeout": "the overall budget was reached",
+    "deliberation_deadline": "the deliberation's attempt deadline was reached",
 }
 
 
@@ -3249,6 +3281,9 @@ def _drive_process_loop(
     def _elapsed_ms() -> int:
         return int((time.monotonic() - loop_started) * 1000)
 
+    def _wall_clock_stage() -> str:
+        return "adaptive_hard_timeout" if runtime_control is not None else "overall_timeout"
+
     # Non-stream CLIs can still return useful plain output on non-zero status; only
     # the wrapper that emits line-delimited JSON events is safe to parse.
     parse_stream = bool(parse_stream)
@@ -3383,6 +3418,7 @@ def _drive_process_loop(
                         _safe_communicate(process)
                         return _attach_raw(
                             _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                             stage="deliberation_deadline",
                                              elapsed_ms=_elapsed_ms()),
                             stdout_lines)
                 except ProviderDeadlineError as exc:
@@ -3399,6 +3435,7 @@ def _drive_process_loop(
                 _drain_to_eof(line_q)
                 _safe_communicate(process)
                 return _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                        stage=_wall_clock_stage(),
                                         elapsed_ms=_elapsed_ms())
 
             try:
@@ -3425,6 +3462,7 @@ def _drive_process_loop(
                 _drain_to_eof(line_q)
                 _safe_communicate(process)
                 return _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                        stage=_wall_clock_stage(),
                                         elapsed_ms=_elapsed_ms())
 
             if kind == _EOF:
@@ -4555,16 +4593,10 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # Only for backends with NATIVE ACP support; the kill switch and the
         # fallback envelope field apply even to an explicit --transport
         # subprocess pin, because the alternative here is certain failure.
-        from _builder import supports_acp as _supports_acp
-        if (_declared_capability is None
-                and (_transport_budget_result is None
-                     or _transport_budget_result.get("capability", {}).get("kind")
-                     != "private_attachment")
-                and _supports_acp(inv.cli)
-                and (launch_control is None or launch_control.allow_secondary)
-                and os.environ.get("SUMMON_ACP_FALLBACK") != "0"
-                and (inv.cli != "kimi"
-                     or os.environ.get("SUMMON_KIMI_ACP_FALLBACK") == "1")):
+        # (A transport budget is only evaluated for a declared capability, so the
+        # shared predicate's "no declared capability" clause also excludes the
+        # private-attachment case.)
+        if argv_overflow_reroutes_to_acp(inv, args, launch_control):
             from dataclasses import replace as _replace_inv
             _routed = execute_agent(_replace_inv(inv, transport="acp"),
                                     timeout_ms=timeout_ms, debug_dir=debug_dir,

@@ -3796,13 +3796,9 @@ def _dry_run_view(invocation, args, agents_dir: str,
             view["env_overrides"] = sorted(env) if env else []
             # The live dispatch refuses an over-long command line before spawn; say
             # so here, before anyone pays for a launch to learn it.
-            from _builder import argv_length_error, supports_acp
-            _argv_refusal = argv_length_error(invocation.cli, cmd, argv, env)
-            _acp_reroute = (supports_acp(invocation.cli)
-                            and os.environ.get("SUMMON_ACP_FALLBACK") != "0"
-                            and (invocation.cli != "kimi"
-                                 or os.environ.get("SUMMON_KIMI_ACP_FALLBACK") == "1"))
-            if _argv_refusal and _acp_reroute:
+            from _executor import argv_overflow_reroutes_to_acp, dry_run_argv_length_error
+            _argv_refusal = dry_run_argv_length_error(invocation, cmd, argv, env)
+            if _argv_refusal and argv_overflow_reroutes_to_acp(invocation, argv):
                 # Mirrors the executor: a native-ACP backend is rerouted, not refused.
                 view.setdefault("warnings", []).append(
                     "the prompt exceeds the OS command-line limit for the subprocess "

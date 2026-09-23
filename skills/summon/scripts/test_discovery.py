@@ -6931,10 +6931,33 @@ def test_jobs_cli_wait_timeout_and_bare():
         r = sp.run([sys.executable, script, "jobs", "wait", jid, "--job-dir", d,
                     "--timeout", "300"], capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r.returncode == 124, (r.returncode, r.stdout, r.stderr)
-        # An expired WAIT is not a failed job: the envelope must say "unfinished".
+        # An expired WAIT is not a failed job, but a prepared record with no pid is not
+        # "running" either: the envelope says exactly what is known.
         waited = json.loads(r.stdout)
-        assert waited["status"] == "running" and waited["terminal"] is False
+        assert waited["status"] == "prepared" and waited["terminal"] is False
         assert waited["wait_outcome"] == "timeout" and waited["job_id"] == jid
+        # A job id that does not exist in this directory is an error, never "wait again".
+        missing = sp.run([sys.executable, script, "jobs", "wait", _jobs.new_job_id(),
+                          "--job-dir", d, "--timeout", "300"], capture_output=True,
+                         text=True, encoding="utf-8", **_spawn.run_flags())
+        assert missing.returncode == 1, (missing.returncode, missing.stdout)
+        assert json.loads(missing.stdout)["status"] == "error"
+        assert "not found" in missing.stdout
+        # Only an observed-alive pid is reported as running.
+        live = _jobs.new_job_id()
+        _jobs.write_prepared(d, live, nonce="u" * 32, agent="a", prompt_sha256=None,
+                             cwd="/w", flags={}, summon={})
+        rec_path = _jobs.record_path(d, live)
+        with open(rec_path, encoding="utf-8") as fh:
+            rec = json.load(fh)
+        rec["pid"] = os.getpid()
+        with open(rec_path, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh)
+        alive = sp.run([sys.executable, script, "jobs", "wait", live, "--job-dir", d,
+                        "--timeout", "300"], capture_output=True, text=True,
+                       encoding="utf-8", **_spawn.run_flags())
+        assert alive.returncode == 124, (alive.returncode, alive.stdout, alive.stderr)
+        assert json.loads(alive.stdout)["status"] == "running", alive.stdout
         # bare `jobs` -> usage, exit 0
         rb = sp.run([sys.executable, script, "jobs"], capture_output=True, text=True,
                     encoding="utf-8", **_spawn.run_flags())
@@ -14685,6 +14708,41 @@ def test_dry_run_refuses_a_prompt_that_cannot_fit_the_command_line():
     assert view["error_kind"] == "prompt_too_long_for_argv", view
     assert {"refusal": view["refusal"], "error_kind": "prompt_too_long_for_argv"} \
         in view["refusals"]
+
+
+def test_dry_run_acp_reroute_matches_the_live_predicate():
+    """Review finding (2026-09-23): dry-run promised an ACP reroute for a gemini turn with
+    an agent file, which the live executor refuses (a declared system-file transport never
+    reroutes). Both paths must share one predicate."""
+    import _executor
+    import run_subagent
+    from _builder import AgentInvocation
+    saved = _executor._resolve_launch
+    _executor._resolve_launch = lambda command, args: (command, args)
+    try:
+        args = types.SimpleNamespace(
+            agent="size-probe", _resolved_agent="size-probe", strict_agents_dir=False,
+            timeout=600_000, worktree=None, _role_provenance={}, agents_dir=None,
+            gate_with=None, allow_text_only=False, require_tools=False)
+        agent_file = os.path.join(tempfile.mkdtemp(prefix="summon-acp-"), "a.md")
+        with open(agent_file, "w", encoding="utf-8") as fh:
+            fh.write("---\nname: a\n---\nbody\n")
+        with_file = AgentInvocation(cli="gemini", prompt="x" * 140_000,
+                                    cwd=tempfile.gettempdir(), permission="read-only",
+                                    agent_file=agent_file)
+        without_file = AgentInvocation(cli="gemini", prompt="x" * 140_000,
+                                       cwd=tempfile.gettempdir(), permission="read-only")
+        for inv in (with_file, without_file):
+            rerouted = _executor.argv_overflow_reroutes_to_acp(inv, [])
+            view = run_subagent._dry_run_view(inv, args, None, None)
+            size_refused = any(entry.get("error_kind") == "prompt_too_long_for_argv"
+                               for entry in view.get("refusals", []))
+            assert size_refused is (not rerouted), (inv.agent_file, view.get("refusals"))
+            if rerouted:
+                assert any("routed over ACP" in w for w in view.get("warnings", []))
+        assert _executor.argv_overflow_reroutes_to_acp(with_file, []) is False
+    finally:
+        _executor._resolve_launch = saved
 
 
 def test_dry_run_refuses_an_oversized_agy_prompt_without_building_a_profile():

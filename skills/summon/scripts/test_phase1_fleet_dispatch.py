@@ -24,6 +24,18 @@ import _fleet_compile
 import _fleet_dispatch
 
 
+@pytest.fixture(autouse=True)
+def _host_provider_routing_is_not_inherited(monkeypatch):
+    """Billing derivation reads provider-routing variables. A host that runs these
+    tests from inside a Claude Code session exports ANTHROPIC_BASE_URL, which turns
+    every Claude fixture into "custom provider" billing; the release gate scrubs
+    the environment, so ordinary runs must too."""
+    for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
+                 "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_BEDROCK_BASE_URL",
+                 "ANTHROPIC_VERTEX_PROJECT_ID"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _agents(two: bool = False):
     values = [{
         "name": "alpha", "run_agent": "claude", "provider": "anthropic",

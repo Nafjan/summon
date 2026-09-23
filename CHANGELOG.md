@@ -19,8 +19,9 @@ approval.
   identity, and concurrent dispatches share one probe.
 - Timeouts that stop before the budget now say so: the error names the elapsed
   time and the liveness stage that fired, and `timeout.elapsed_ms` is recorded.
-- `jobs wait` reports an expired wait as `status: "running"`, `terminal: false`
-  (exit code still 124) instead of an error for a job that is still alive.
+- `jobs wait` no longer reports an expired wait as a failed job: it exits 124
+  with `terminal: false` and `status` `running` (pid observed alive),
+  `prepared`, or `unverified`; an unknown job id is an error.
 - Dry-run lists every refusing gate in `refusals`, refuses prompts that cannot
   fit the OS command line (`prompt_too_long_for_argv`, including agy's 28k
   token cap), and the OpenCode/ZCode yolo gates name every missing flag at once.

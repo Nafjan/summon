@@ -906,18 +906,37 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
     except ValueError as e:
         emit_error(str(e)); return 1
     if outcome == "timeout":
-        # The WAIT expired, not the job. Reporting status:"error" here made callers
-        # treat live jobs as failed and relaunch them (field record 2026-09-22), so
-        # say plainly that the job is unfinished. Exit 124 is kept for scripts.
+        # The WAIT expired, not necessarily the job. Reporting status:"error" here made
+        # callers treat live jobs as failed and relaunch them (field record 2026-09-22).
+        # Say what is actually known, and claim "running" only for an observed-alive pid.
+        # Exit 124 is kept for scripts.
+        rec, rec_state = _jobs._read(_jobs.record_path(root, args.jobs_wait))
+        if rec is None and rec_state == "missing":
+            emit_error(f"background job {args.jobs_wait!r} was not found in this job "
+                       "directory; check --job-dir (nothing to wait for)")
+            return 1
+        pid = rec.get("pid") if isinstance(rec, dict) else "unreadable"
+        liveness = _jobs._pid_liveness(pid) if pid is not None else None
+        if liveness == "alive":
+            state, message = "running", (
+                f"job {args.jobs_wait!r} is still running (pid observed alive) and has no "
+                "verified result yet; wait again -- it is NOT failed")
+        elif pid is None:
+            state, message = "prepared", (
+                f"job {args.jobs_wait!r} has not published a process id yet; if this "
+                "persists, its launch failed -- check `jobs status` before relaunching")
+        else:
+            state, message = "unverified", (
+                f"job {args.jobs_wait!r} has no verified result and its process liveness "
+                "could not be determined; check `jobs status` before relaunching")
         print(json.dumps({
-            "status": "running",
+            "status": state,
             "job_id": args.jobs_wait,
             "terminal": False,
             "wait_outcome": "timeout",
             "exit_code": 124,
             "retryable": True,
-            "message": (f"job {args.jobs_wait!r} has no verified result yet and its process "
-                        "has not been observed dead; wait again (it is NOT failed)"),
+            "message": message,
         }, ensure_ascii=False))
         return 124
     if outcome == "stale":

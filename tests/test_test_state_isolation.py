@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from _test_state_isolation import ISOLATED_STATE
+from conftest import ISOLATED_STATE
 
 
 def test_conftest_redirects_every_home_state_override():

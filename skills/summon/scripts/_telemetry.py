@@ -132,6 +132,7 @@ _TIMEOUT_STAGE_ALIASES = {
     "startup_timeout": "backend_execution",
     "startup-timeout": "backend_execution",
     "overall_timeout": "backend_execution",
+    "deliberation_deadline": "backend_execution",
     "overall-timeout": "backend_execution",
     "adaptive_attention_timeout": "backend_execution",
     "adaptive-attention-timeout": "backend_execution",

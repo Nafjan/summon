@@ -1019,6 +1019,12 @@ _add("agy-profile-lease-v2", "summon.agy-profile-lease/v2",
      fixtures=[_test("agy_1_1_22", "test_agy_profile_lease_is_locked_before_publication"),
                _test("agy_1_1_22", "test_lease_metadata_is_bound_to_profile_token")],
      gaps=["Host resource-retention lease only. Token-bound metadata, an OS-held lock and process-birth checks are distinct boundaries; metadata alone is not liveness or dispatch authority. No earlier lease schema migration was established."])
+_add("agy-capability-cache-v1", "summon.agy-capability/v1",
+     _ref("_builder", "_store_agy_capability"), _ref("_builder", "_agy_capability_cached"),
+     authority="private_evidence", shape=["schema", "supported (normalized realpath|mtime_ns keys, bounded)"],
+     fixtures=[_test("agy_1_1_22", "test_agy_capability_positive_answer_survives_a_new_process"),
+               _test("agy_1_1_22", "test_concurrent_agy_dispatches_share_one_capability_probe")],
+     gaps=["Local optimisation cache of positive `agy --help` probes only. A changed binary identity is re-probed; negative or stalled probes are never persisted. It is not qualification of served model, account, or runtime behaviour."])
 _add("resume-capabilities-v1-current", "summon.resume-capabilities/v1",
      _ref("_resume_capabilities", "resume_capability"), _ref("_resume_capabilities", "is_exact_capability"),
      authority="public_projection", shape=["backend", "transport", "resume_state", "resume_reason", "steering_mode", "live_steering_acknowledged", "current registry equality"],

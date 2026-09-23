@@ -2647,8 +2647,10 @@ def _require_agy_print_timeout_support() -> None:
     if supported is None:
         with _agy_capability_probe_slot(identity) as cached:
             supported = True if cached else _probe_agy_print_timeout(path)
-        if supported:
-            _store_agy_capability(identity)
+            if supported and not cached:
+                # Publish BEFORE releasing the slot, so a waiter that takes the lock
+                # next finds the answer instead of starting a probe of its own.
+                _store_agy_capability(identity)
         _AGY_PRINT_TIMEOUT_CAPABILITY[identity] = supported
     if not supported:
         raise AgyCapabilityError(
@@ -2664,6 +2666,9 @@ def _require_agy_print_timeout_support() -> None:
 # completed probe that lacks the flag is reported as outdated, a positive answer is
 # remembered per binary identity on disk, and concurrent dispatches share one probe.
 _AGY_PROBE_TIMEOUT_SEC = 60
+# A lock older than this is abandoned: an owner holds it for at most one bounded probe
+# plus its tree kill, so twice the probe bound leaves a wide margin before stealing.
+_AGY_PROBE_LOCK_STALE_SEC = 2 * _AGY_PROBE_TIMEOUT_SEC + 30
 _AGY_CAPABILITY_CACHE_SCHEMA = "summon.agy-capability/v1"
 _AGY_CAPABILITY_CACHE_MAX = 8
 
@@ -2687,9 +2692,12 @@ class AgyCapabilityError(BuildRefusal):
     """The installed agy could not be qualified for a bounded print turn."""
 
 
-def _agy_binary_identity(path: str) -> tuple[str, int | None]:
+def _agy_binary_identity(path: str) -> tuple[str, str | None]:
+    """realpath plus mtime and size: a replaced binary is a new identity even when a
+    copy preserved its modification time."""
     try:
-        return (os.path.realpath(path), os.stat(path).st_mtime_ns)
+        info = os.stat(path)
+        return (os.path.realpath(path), f"{info.st_mtime_ns}:{info.st_size}")
     except OSError:
         return (os.path.realpath(path), None)
 
@@ -2701,14 +2709,14 @@ def _agy_capability_cache_path() -> Path:
     return Path.home() / ".agents" / "summon-agy-capability.json"
 
 
-def _agy_capability_key(identity: tuple[str, int | None]) -> str | None:
-    path, mtime_ns = identity
-    # Without a modification time the identity cannot notice an upgrade/downgrade,
-    # so it is never persisted.
-    return None if mtime_ns is None else f"{os.path.normcase(path)}|{mtime_ns}"
+def _agy_capability_key(identity: tuple[str, object]) -> str | None:
+    path, stamp = identity
+    # Without a file stamp the identity cannot notice an upgrade/downgrade, so it is
+    # never persisted.
+    return None if stamp is None else f"{os.path.normcase(path)}|{stamp}"
 
 
-def _agy_capability_cached(identity: tuple[str, int | None]) -> bool:
+def _agy_capability_cached(identity: tuple[str, object]) -> bool:
     key = _agy_capability_key(identity)
     if key is None:
         return False
@@ -2721,7 +2729,7 @@ def _agy_capability_cached(identity: tuple[str, int | None]) -> bool:
             and isinstance(data.get("supported"), list) and key in data["supported"])
 
 
-def _store_agy_capability(identity: tuple[str, int | None]) -> None:
+def _store_agy_capability(identity: tuple[str, object]) -> None:
     """Persist a POSITIVE probe only; a negative answer is re-probed next process."""
     key = _agy_capability_key(identity)
     if key is None:
@@ -2758,66 +2766,113 @@ def _store_agy_capability(identity: tuple[str, int | None]) -> None:
 class _agy_capability_probe_slot:
     """Serialize first-time probes across concurrently launched dispatches.
 
-    The first process takes an exclusive lock file and probes; the others wait
-    (bounded) for its positive answer in the cache instead of adding load with
-    probes of their own. A stale or abandoned lock only costs the wait bound.
-    Entering yields True when another process's probe already answered.
+    The first process takes an exclusive, owner-tokened lock file and probes; the
+    others wait (bounded) for its positive answer in the cache instead of adding
+    load with probes of their own. Every failure mode of the lock itself -- an
+    unwritable or malformed cache location, a stale lock that cannot be removed, a
+    wait past the deadline -- degrades to probing unserialized, never to waiting
+    without bound. Entering yields True when another process already answered.
     """
 
-    def __init__(self, identity: tuple[str, int | None]) -> None:
+    def __init__(self, identity: tuple[str, object]) -> None:
         self._identity = identity
         self._lock = Path(str(_agy_capability_cache_path()) + ".lock")
+        self._token = f"{os.getpid()}:{secrets.token_hex(16)}".encode("ascii")
         self._owned = False
 
     def __enter__(self) -> bool:
         if _agy_capability_key(self._identity) is None:
             return False
-        deadline = time.monotonic() + _AGY_PROBE_TIMEOUT_SEC + 5
+        try:
+            self._lock.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False  # e.g. the cache path sits under a regular file
+        deadline = time.monotonic() + _AGY_PROBE_LOCK_STALE_SEC
         while True:
             try:
-                self._lock.parent.mkdir(parents=True, exist_ok=True)
                 fd = os.open(str(self._lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                os.close(fd)
+            except FileExistsError:
+                pass
+            except OSError:
+                return False
+            else:
+                try:
+                    os.write(fd, self._token)
+                finally:
+                    os.close(fd)
                 self._owned = True
                 # A peer may have finished between our cache miss and the lock.
                 return _agy_capability_cached(self._identity)
-            except FileExistsError:
-                if _agy_capability_cached(self._identity):
-                    return True
-                try:
-                    stale = time.time() - self._lock.stat().st_mtime > _AGY_PROBE_TIMEOUT_SEC + 5
-                except OSError:
-                    continue  # released between attempts; try to take it
-                if stale:
-                    try:
-                        self._lock.unlink()
-                    except OSError:
-                        pass
-                    continue
-                if time.monotonic() >= deadline:
-                    return False  # probe ourselves rather than wait forever
-                time.sleep(0.25)
+            if _agy_capability_cached(self._identity):
+                return True
+            if time.monotonic() >= deadline:
+                return False  # probe ourselves rather than wait any longer
+            try:
+                age = time.time() - self._lock.stat().st_mtime
+            except FileNotFoundError:
+                continue  # released between attempts; try to take it
             except OSError:
-                return False  # unwritable cache dir: probe unserialized
+                return False
+            if age > _AGY_PROBE_LOCK_STALE_SEC:
+                try:
+                    self._lock.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return False  # an abandoned lock we cannot remove: never spin on it
+                continue
+            time.sleep(0.25)
 
     def __exit__(self, *_exc) -> None:
-        if self._owned:
+        if not self._owned:
+            return
+        try:
+            # Release only our own lock: after a steal the file belongs to a peer.
+            with open(self._lock, "rb") as fh:
+                if fh.read(128) != self._token:
+                    return
+            self._lock.unlink()
+        except OSError:
+            pass
+
+
+def _run_agy_help(command: list, timeout_sec: float) -> tuple[int, str]:
+    """Run ``agy --help`` with a bound that holds on Windows.
+
+    ``subprocess.run`` kills only the direct child on timeout and then waits on the
+    pipes, which a ``cmd /c`` grandchild can hold open indefinitely. Output goes to
+    a temporary file instead, and a timeout kills the whole tree.
+    """
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.Popen(command, stdout=out, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, **run_flags())
+        try:
+            returncode = proc.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            if os.name == "nt":
+                try:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=10, **run_flags())
+                except (OSError, subprocess.SubprocessError):
+                    pass
             try:
-                self._lock.unlink()
-            except OSError:
+                proc.kill()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
                 pass
+            raise
+        out.seek(0)
+        return returncode, out.read(1024 * 1024).decode("utf-8", "replace")
 
 
 def _probe_agy_print_timeout(path: str) -> bool:
-    """True/False only for a COMPLETED probe; raise a retryable refusal otherwise."""
+    """True/False only for a COMPLETED probe; raise a typed refusal otherwise."""
     command = [path, "--help"]
     if os.name == "nt" and path.lower().endswith((".cmd", ".bat")):
         command = ["cmd", "/d", "/c", path, "--help"]
     try:
-        completed = subprocess.run(
-            command, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=_AGY_PROBE_TIMEOUT_SEC, stdin=subprocess.DEVNULL,
-            **run_flags())
+        returncode, help_text = _run_agy_help(command, _AGY_PROBE_TIMEOUT_SEC)
     except subprocess.TimeoutExpired:
         raise AgyCapabilityError(
             f"agy capability probe (`agy --help`) did not answer within "
@@ -2829,10 +2884,9 @@ def _probe_agy_print_timeout(path: str) -> bool:
             f"agy capability probe could not run ({type(exc).__name__}); nothing was "
             "dispatched. Check that the agy executable launches from this shell",
             kind="agy_capability_probe_failed", retryable=False) from None
-    help_text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
-    if completed.returncode != 0:
+    if returncode != 0:
         raise AgyCapabilityError(
-            f"agy capability probe exited {completed.returncode}; nothing was dispatched. "
+            f"agy capability probe exited {returncode}; nothing was dispatched. "
             "Run `agy --help` to see why the CLI cannot start",
             kind="agy_capability_probe_failed", retryable=False)
     return "--print-timeout" in help_text

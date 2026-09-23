@@ -59,8 +59,10 @@ def test_finite_nonworkspace_literal_pairs_are_mapped_without_runtime_imports(ch
     assert report["limits"] and report["manual_formats"] and report["evidence_gaps"]
     print({"format_rows": len(checked["formats"]), "new_source_literal_pairs": len(expected),
            "remaining_workspace_pairs": len(unmapped), "remaining_nonworkspace_pairs": 0})
+    # conftest.py is pytest infrastructure, not a runtime module; its stem is shared
+    # by every test root's conftest in sys.modules.
     runtime_names = {path.stem for path in (ROOT / inventory.SCRIPT_DIR).glob("*.py")
-                     if not path.name.startswith("test_")}
+                     if not path.name.startswith("test_") and path.name != "conftest.py"}
     assert not (runtime_names & set(sys.modules))
 
 
