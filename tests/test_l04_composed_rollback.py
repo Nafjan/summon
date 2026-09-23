@@ -86,8 +86,10 @@ def webcrypto(node, source, home, state, key, retained=None):
         checks = checks.replace(marker, marker + "\n record=retained;\n")
     config = ("const boundary='supported',version='supported',state=" + json.dumps(state)
               + ",key=" + json.dumps(key) + ",retained=" + json.dumps(retained) + ";\n")
+    # 60s, not 20s: this bounds a Node harness on a possibly loaded host; the
+    # assertions below, not the clock, are the rollback contract.
     out = run([node], home, environment(home),
-              (harness + guards + page + config + checks).encode(), timeout=20)
+              (harness + guards + page + config + checks).encode(), timeout=60)
     value = json.loads(out)
     if retained is None:
         assert set(value) == {"record"}

@@ -2873,8 +2873,9 @@ def _run_agy_help(command: list, timeout_sec: float) -> tuple[int, str]:
     a temporary file instead, and a timeout kills the whole tree.
     """
     with tempfile.TemporaryFile() as out:
+        from _spawn import popen_flags
         proc = subprocess.Popen(command, stdout=out, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, **run_flags())
+                                stdin=subprocess.DEVNULL, **popen_flags())
         try:
             returncode = proc.wait(timeout=timeout_sec)
         except subprocess.TimeoutExpired:
@@ -2884,6 +2885,12 @@ def _run_agy_help(command: list, timeout_sec: float) -> tuple[int, str]:
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, timeout=10, **run_flags())
                 except (OSError, subprocess.SubprocessError):
+                    pass
+            else:
+                try:
+                    # popen_flags() gave the probe its own session: kill the group.
+                    os.killpg(proc.pid, 9)
+                except (OSError, AttributeError):
                     pass
             try:
                 proc.kill()
