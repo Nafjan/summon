@@ -906,8 +906,19 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
     except ValueError as e:
         emit_error(str(e)); return 1
     if outcome == "timeout":
-        emit_error(f"timed out waiting for job {args.jobs_wait!r} (no verified result yet)",
-                   exit_code=124)
+        # The WAIT expired, not the job. Reporting status:"error" here made callers
+        # treat live jobs as failed and relaunch them (field record 2026-09-22), so
+        # say plainly that the job is unfinished. Exit 124 is kept for scripts.
+        print(json.dumps({
+            "status": "running",
+            "job_id": args.jobs_wait,
+            "terminal": False,
+            "wait_outcome": "timeout",
+            "exit_code": 124,
+            "retryable": True,
+            "message": (f"job {args.jobs_wait!r} has no verified result yet and its process "
+                        "has not been observed dead; wait again (it is NOT failed)"),
+        }, ensure_ascii=False))
         return 124
     if outcome == "stale":
         emit_error(f"background job {args.jobs_wait!r} is stale: its process is no longer "

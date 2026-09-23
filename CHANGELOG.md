@@ -12,6 +12,20 @@ approval.
 - Extend installer/doctor convergence checks to the complete managed skill
   payload, including references and documentation, while preserving the
   scripts receipt identity. Unknown or linked payloads remain fail-closed.
+- Stop misreporting a slow agy capability probe as an outdated agy. The probe
+  bound is 60s, a stalled or failed probe is a typed retryable/non-retryable
+  refusal (`agy_capability_probe_stalled` / `agy_capability_probe_failed`)
+  distinct from `agy_cli_outdated`, positive answers are cached per binary
+  identity, and concurrent dispatches share one probe.
+- Timeouts that stop before the budget now say so: the error names the elapsed
+  time and the liveness stage that fired, and `timeout.elapsed_ms` is recorded.
+- `jobs wait` reports an expired wait as `status: "running"`, `terminal: false`
+  (exit code still 124) instead of an error for a job that is still alive.
+- Dry-run lists every refusing gate in `refusals`, refuses prompts that cannot
+  fit the OS command line (`prompt_too_long_for_argv`, including agy's 28k
+  token cap), and the OpenCode/ZCode yolo gates name every missing flag at once.
+- Test runs redirect telemetry, reports, and the agy capability cache away from
+  the operator's home directory.
 
 ## [3.5.0] - 2026-09-18
 

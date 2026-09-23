@@ -2979,8 +2979,32 @@ def _attach_raw(resp: dict, stdout_lines: list | None) -> dict:
     return resp
 
 
+# Why a run stopped before its overall budget.  Field record 2026-09-17..23: lanes that
+# died 3-15 minutes in reported "Timeout after 5400000ms", so callers concluded the
+# budget was too short and relaunched with a longer one instead of fixing a stall.
+_TIMEOUT_STAGE_TEXT = {
+    "startup_timeout": "the backend produced no first event",
+    "generation_idle_timeout": "the backend went idle mid-run",
+    "finalization_timeout": "the backend closed its output but never exited",
+    "adaptive_attention_timeout": "no meaningful activity at the adaptive checkpoint",
+    "adaptive_hard_timeout": "the adaptive max runtime was reached",
+    "overall_timeout": "the overall budget was reached",
+}
+
+
+def _timeout_headline(budget_ms: int, stage: str | None, elapsed_ms: int | None) -> str:
+    """"Timeout after <budget>" only when the budget is what actually ran out."""
+    if elapsed_ms is None or elapsed_ms >= budget_ms * 0.95:
+        return f"Timeout after {budget_ms}ms"
+    cause = _TIMEOUT_STAGE_TEXT.get(stage or "", "a liveness guard fired")
+    return (f"Stopped after {elapsed_ms}ms of a {budget_ms}ms budget: {cause} "
+            f"(stage {stage or 'unknown'}); a longer --timeout would not have helped")
+
+
 def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
-                     stdout_lines: list | None = None) -> dict:
+                     stdout_lines: list | None = None, *,
+                     stage: str | None = None,
+                     elapsed_ms: int | None = None) -> dict:
     """Timeout envelope, with the diagnostic promoted out of `output_tail`.
 
     A timeout whose `result` is empty used to say only "Timeout after Nms" while the real
@@ -3003,11 +3027,14 @@ def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
     # forwarding. Diagnostic text owns its own unit, so format the numeric value
     # explicitly rather than producing ``360000msms``.
     timeout_budget_ms = int(timeout_ms)
-    resp = _partial_response(cli, result, 124, f"Timeout after {timeout_budget_ms}ms")
+    headline = _timeout_headline(timeout_budget_ms, stage, elapsed_ms)
+    resp = _partial_response(cli, result, 124, headline)
     captured = "".join(stdout_lines or [])
     resp["timeout"] = {"budget_ms": timeout_budget_ms,
-                       "stage": "backend-execution",
+                       "stage": stage or "backend-execution",
                        "partial_output": bool(result) or bool(captured.strip())}
+    if elapsed_ms is not None:
+        resp["timeout"]["elapsed_ms"] = int(elapsed_ms)
     resp = _attach_raw(resp, stdout_lines)
 
     # `processor.get_result()` returns the parsed result JSON (a dict) or None -- NOT a
@@ -3020,7 +3047,7 @@ def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
         hint = salient_error(captured)
         if hint:
             resp["error_hint"] = hint
-            resp["error"] = f"Timeout after {timeout_budget_ms}ms -- likely cause: {hint}"
+            resp["error"] = f"{headline} -- likely cause: {hint}"
         resp.setdefault("warnings", []).append(
             "this run timed out with no parsed result; the captured output is in "
             "`output_tail` and usually names the real cause (a missing tool, a wrong "
@@ -3038,7 +3065,7 @@ def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
             "remediation_code": "opencode_output_timeout",
         })
         resp["error"] = (
-            f"Timeout after {timeout_budget_ms}ms; OpenCode produced no usable "
+            f"{headline}; OpenCode produced no usable "
             "output. For an OpenRouter model, verify the provider credential "
             "with `opencode auth login` (or the configured local credential), "
             "then retry explicitly; Summon did not retry or switch providers."
@@ -3216,7 +3243,12 @@ def _drive_process_loop(
     reader thread reports EOF before calling ``communicate()`` — that way
     only one consumer ever reads ``process.stdout``.
     """
-    deadline = time.monotonic() + timeout_ms / 1000
+    loop_started = time.monotonic()
+    deadline = loop_started + timeout_ms / 1000
+
+    def _elapsed_ms() -> int:
+        return int((time.monotonic() - loop_started) * 1000)
+
     # Non-stream CLIs can still return useful plain output on non-zero status; only
     # the wrapper that emits line-delimited JSON events is safe to parse.
     parse_stream = bool(parse_stream)
@@ -3304,10 +3336,11 @@ def _drive_process_loop(
                     _kill_tree(process)
                     _drain_to_eof(line_q)
                     _safe_communicate(process)
-                    timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
-                    timed.setdefault("timeout", {})["stage"] = (
-                        "adaptive_attention_timeout" if runtime_control.attention_required
-                        else "adaptive_hard_timeout")
+                    timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                             stage=("adaptive_attention_timeout"
+                                                    if runtime_control.attention_required
+                                                    else "adaptive_hard_timeout"),
+                                             elapsed_ms=_elapsed_ms())
                     return timed
             if not saw_terminal and liveness is not None:
                 reason = liveness.expired()
@@ -3315,8 +3348,9 @@ def _drive_process_loop(
                     _kill_tree(process)
                     _drain_to_eof(line_q)
                     _safe_communicate(process)
-                    timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
-                    timed.setdefault("timeout", {})["stage"] = reason
+                    timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                             stage=reason,
+                                             elapsed_ms=_elapsed_ms())
                     return timed
             # Once a trusted terminal event has been parsed, provider-side
             # cancellation/deadline state may only influence cleanup.  It must
@@ -3348,7 +3382,8 @@ def _drive_process_loop(
                         _drain_to_eof(line_q)
                         _safe_communicate(process)
                         return _attach_raw(
-                            _timeout_payload(cli, processor, timeout_ms, stdout_lines),
+                            _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                             elapsed_ms=_elapsed_ms()),
                             stdout_lines)
                 except ProviderDeadlineError as exc:
                     _kill_tree(process)
@@ -3363,7 +3398,8 @@ def _drive_process_loop(
                 _kill_tree(process)
                 _drain_to_eof(line_q)
                 _safe_communicate(process)
-                return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
+                return _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                        elapsed_ms=_elapsed_ms())
 
             try:
                 wait_for = remaining
@@ -3388,7 +3424,8 @@ def _drive_process_loop(
                 _kill_tree(process)
                 _drain_to_eof(line_q)
                 _safe_communicate(process)
-                return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
+                return _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                        elapsed_ms=_elapsed_ms())
 
             if kind == _EOF:
                 break
@@ -3485,16 +3522,18 @@ def _drive_process_loop(
                         "post_eof_terminal_reap_timeout")
                 _kill_tree(process)
                 _safe_communicate(process)
-                timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
-                timed.setdefault("timeout", {})["stage"] = "finalization_timeout"
+                timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                         stage="finalization_timeout",
+                                         elapsed_ms=_elapsed_ms())
                 return timed
             reason = (liveness.expired()
                       if not saw_terminal and liveness is not None else None)
             if reason is not None:
                 _kill_tree(process)
                 _safe_communicate(process)
-                timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
-                timed.setdefault("timeout", {})["stage"] = reason
+                timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                         stage=reason,
+                                         elapsed_ms=_elapsed_ms())
                 return timed
             if (launch_control is not None and not saw_terminal
                     and launch_control.is_cancelled()):
@@ -4421,7 +4460,15 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # deliberation envelope exposes only the exception class.
         _detail = (f"provider preparation refused ({type(_build_err).__name__})"
                    if launch_control is not None else str(_build_err))
-        return _stamp(_enrich(_error_response(inv.cli, 1, _detail, not_run=True), None))
+        _resp = _error_response(inv.cli, 1, _detail, not_run=True)
+        # Typed refusals (e.g. an agy capability probe that stalled under load versus a
+        # genuinely outdated agy) say whether a retry can help, so a caller does not
+        # have to infer it from prose.
+        _kind = getattr(_build_err, "kind", None)
+        if launch_control is None and isinstance(_kind, str) and _kind:
+            _resp["error_kind"] = _kind
+            _resp["retryable"] = bool(getattr(_build_err, "retryable", False))
+        return _stamp(_enrich(_resp, None))
     try:
         command, args = _resolve_launch(command, args)
     except ValueError as _launch_err:
@@ -4540,6 +4587,11 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             _resp["retryable"] = False
         elif _transport_budget_error is not None:
             _resp["error_kind"] = "transport_capability_invalid"
+            _resp["retryable"] = False
+        else:
+            # Typed so a caller (and the transient-retry predicate) never re-sends the
+            # same oversized prompt expecting a different result.
+            _resp["error_kind"] = "prompt_too_long_for_argv"
             _resp["retryable"] = False
         # agy builds its per-invocation profile during build_invocation_args, so a rejection
         # HERE leaves a populated profile on disk with no handle to it: the caller could

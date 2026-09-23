@@ -607,6 +607,17 @@ def _digest(value: object) -> str | None:
     return hashlib.sha256(payload).hexdigest()
 
 
+# Typed error kinds whose class is known exactly; prose matching is only the fallback.
+_FAILURE_CLASS_BY_KIND = {
+    "agy_cli_outdated": "missing_cli",
+    "agy_capability_probe_stalled": "dispatch",
+    "agy_capability_probe_failed": "dispatch",
+    "prompt_too_long_for_argv": "invalid_input",
+}
+# "timeout" as a word, not inside a flag name such as "--print-timeout".
+_TIMEOUT_TEXT_RE = re.compile(r"(?<!-)timeout")
+
+
 def _failure_class(envelope: dict) -> str:
     status = str(envelope.get("status") or "").lower()
     kind = str(envelope.get("error_kind") or "").lower()
@@ -618,7 +629,9 @@ def _failure_class(envelope: dict) -> str:
         return "blocked"
     if status == "partial":
         return "partial"
-    if "timeout" in text or stage:
+    if kind in _FAILURE_CLASS_BY_KIND:
+        return _FAILURE_CLASS_BY_KIND[kind]
+    if _TIMEOUT_TEXT_RE.search(text) or stage:
         return "timeout"
     if any(word in text for word in ("auth", "login", "unauthorized", "forbidden")):
         return "authentication"

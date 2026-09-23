@@ -73,6 +73,33 @@ class OpenCodeBuilderTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "allow-tool-credentials"):
                 build_invocation_args(self._inv(permission="yolo", isolated_lane=True))
 
+    def test_yolo_names_every_missing_acknowledgement_in_one_refusal(self):
+        """Field record 2026-09-17: the gates surfaced one per launch (four dispatches
+        to learn two flags). One refusal must name the whole set, in dry-run too."""
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}, clear=False):
+            inv = self._inv(permission="yolo")
+            message = _builder.opencode_yolo_isolation_error(inv)
+            self.assertIn("--worktree or --isolated-lane", message)
+            self.assertIn("missing: --isolated-lane, --allow-tool-credentials", message)
+            with self.assertRaisesRegex(ValueError, "missing: --isolated-lane, "
+                                                    "--allow-tool-credentials"):
+                build_invocation_args(inv)
+            # Supplying exactly the named flags clears the gate.
+            self.assertIsNone(_builder.opencode_yolo_isolation_error(self._inv(
+                permission="yolo", isolated_lane=True, allow_tool_credentials=True)))
+
+    def test_yolo_without_private_credential_names_only_isolation(self):
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch("_windows_credentials.resolve_openrouter_api_key",
+                        return_value=(None, None)), \
+             mock.patch("_nous_credentials.resolve_nous_api_key",
+                        return_value=(None, None)):
+            os.environ.pop("OPENROUTER_API_KEY", None)
+            os.environ.pop("NOUS_API_KEY", None)
+            message = _builder.opencode_yolo_isolation_error(self._inv(permission="yolo"))
+            self.assertIn("--worktree or --isolated-lane", message)
+            self.assertNotIn("allow-tool-credentials", message)
+
     def test_worktree_does_not_authorize_private_credential_bridge(self):
         """A worktree is mutation isolation, not the OS boundary a yolo key bridge needs."""
         with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}, clear=False):

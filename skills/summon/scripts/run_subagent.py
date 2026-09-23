@@ -3363,6 +3363,20 @@ def _effective_decision_view(invocation, args) -> dict:
     return _reseal_effective_decision(view)
 
 
+def _note_refusal(view: dict, kind: str | None = None) -> None:
+    """Collect every dry-run refusal, not just the last one written to ``refusal``.
+
+    Field record 2026-09-17: independent gates surfaced one per launch, so callers
+    paid a dispatch to learn each flag. ``refusal``/``error_kind`` keep their
+    historical meaning; ``refusals`` lists every gate that would refuse.
+    """
+    entry = {"refusal": view.get("refusal")}
+    if kind:
+        entry["error_kind"] = kind
+    if entry not in view.setdefault("refusals", []):
+        view["refusals"].append(entry)
+
+
 def _sync_effective_decision_refusal(view: dict) -> None:
     """Keep the decision explanation consistent with a later dry-run refusal."""
     if not view.get("would_refuse"):
@@ -3554,6 +3568,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
         view["refusal"] = (
             "conflicting model selectors make this dispatch ambiguous"
             if _decision_projection_invalid else _selection_conflict)
+        _note_refusal(view, view["error_kind"])
         view["provider_contacted"] = False
         view["result_usable"] = False
     if view["read_allowlist"].get("would_refuse"):
@@ -3562,6 +3577,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
             "error_kind", "read_allowlist_unsupported")
         view["refusal"] = view["read_allowlist"].get(
             "refusal", "read allowlist cannot be enforced by this backend")
+        _note_refusal(view, view["error_kind"])
         for _key in ("recommended_backends", "reroute", "allowed_root",
                      "requires_packet_refreeze"):
             if view["read_allowlist"].get(_key) is not None:
@@ -3585,6 +3601,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
         view["refusal"] = (
             "requested model is incompatible with the selected backend"
             if _decision_projection_invalid else _compat["message"])
+        _note_refusal(view, view["error_kind"])
         if not _decision_projection_invalid:
             # A backend-specific refusal (native ZCode has no reviewed model
             # selector) does not invent a model vendor.  Generic namespace
@@ -3605,6 +3622,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 view["error_kind"] = "credential_missing"
                 view["refusal"] = (f"openai-compat: ${invocation.api_key_env} is not "
                                    "set or could not be resolved for this endpoint")
+                _note_refusal(view, "credential_missing")
                 view["provider_contacted"] = False
                 view["result_usable"] = False
         except Exception:  # noqa: BLE001 - preflight view stays renderable
@@ -3633,6 +3651,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 "text seat (no FS/tools): refused unless --allow-text-only / "
                 "SUMMON_ALLOW_TEXT_ONLY=1 / capability: text-only; "
                 "--require-tools always refuses")
+            _note_refusal(view, "text_seat_no_tools")
         if text_seat_decision.get("warning"):
             view.setdefault("warnings", []).append(text_seat_decision["warning"])
     if artifact_manifest and not _decision_projection_invalid:
@@ -3654,18 +3673,31 @@ def _dry_run_view(invocation, args, agents_dir: str,
         # reporting: the dispatch would be refused, AND the preview is partial.
         view["would_refuse"] = True
         view["refusal"] = _ro
+        _note_refusal(view)
     _oy = opencode_yolo_isolation_error(invocation)
     if _oy:
         view["would_refuse"] = True
         view["refusal"] = _oy
+        _note_refusal(view)
     from _builder import zcode_invocation_preflight
     _zcode_refusal = zcode_invocation_preflight(invocation)
     if _zcode_refusal:
         view["would_refuse"] = True
         view["error_kind"] = _zcode_refusal["error_kind"]
         view["refusal"] = _zcode_refusal["message"]
+        _note_refusal(view, view["error_kind"])
         view["provider_contacted"] = False
         view["result_usable"] = False
+    from _builder import agy_prompt_length_refusal
+    try:
+        _agy_size = agy_prompt_length_refusal(invocation)
+    except Exception:  # noqa: BLE001 - a preflight view must always render
+        _agy_size = None
+    if _agy_size:
+        view["would_refuse"] = True
+        view["error_kind"] = "prompt_too_long_for_argv"
+        view["refusal"] = _agy_size
+        _note_refusal(view, "prompt_too_long_for_argv")
     if _decision_projection_invalid:
         # Continue through all independent, generic refusal checks above, but
         # stop before rendering commands, warnings, profiles, receipts, or API
@@ -3727,6 +3759,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
             if _cpm:
                 view["would_refuse"] = True
                 view["refusal"] = _cpm
+                _note_refusal(view)
             # Z.AI Coding Plan has its own subscription endpoint.  It is not
             # a BytePlus PAYG-fallback route, so never advertise consent for
             # a different provider's billing path in its dry-run evidence.
@@ -3761,6 +3794,24 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 view["command"] = cmd
             view["args"] = [_dry_run_arg_preview(a) for a in argv]
             view["env_overrides"] = sorted(env) if env else []
+            # The live dispatch refuses an over-long command line before spawn; say
+            # so here, before anyone pays for a launch to learn it.
+            from _builder import argv_length_error, supports_acp
+            _argv_refusal = argv_length_error(invocation.cli, cmd, argv, env)
+            _acp_reroute = (supports_acp(invocation.cli)
+                            and os.environ.get("SUMMON_ACP_FALLBACK") != "0"
+                            and (invocation.cli != "kimi"
+                                 or os.environ.get("SUMMON_KIMI_ACP_FALLBACK") == "1"))
+            if _argv_refusal and _acp_reroute:
+                # Mirrors the executor: a native-ACP backend is rerouted, not refused.
+                view.setdefault("warnings", []).append(
+                    "the prompt exceeds the OS command-line limit for the subprocess "
+                    "transport; the dispatch would be routed over ACP instead")
+            elif _argv_refusal:
+                view["would_refuse"] = True
+                view["error_kind"] = "prompt_too_long_for_argv"
+                view["refusal"] = _argv_refusal
+                _note_refusal(view, "prompt_too_long_for_argv")
         except ValueError as e:
             view["error"] = str(e)
     _tags = _agent_tags_from_file(agent_file)
@@ -4141,6 +4192,11 @@ def _is_transient_dispatch_error(result: dict) -> bool:
     Never true for auth, permission, or structural failures."""
     if result.get("status") not in ("error", "partial"):
         return False
+    # A typed preflight refusal already knows whether a retry can help; prose matching
+    # below would read e.g. "--print-timeout" as a timeout.
+    from _builder import TYPED_PREFLIGHT_KINDS
+    if result.get("error_kind") in TYPED_PREFLIGHT_KINDS:
+        return result.get("retryable") is True
     err = " ".join([
         str(result.get("error") or ""),
         str(result.get("normalization_reason") or ""),

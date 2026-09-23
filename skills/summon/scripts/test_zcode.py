@@ -114,6 +114,35 @@ class ZCodeBuilderTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, refusal["message"].split(";")[0]):
                 build_invocation_args(invocation)
 
+    def test_dry_run_lists_every_independent_refusal(self):
+        """One preflight must surface every gate, not only the last one written."""
+        invocation = AgentInvocation(
+            cli="zcode", prompt="p", cwd=tempfile.gettempdir(), permission="yolo",
+            read_roots=(os.path.dirname(os.path.abspath(__file__)),))
+        args = SimpleNamespace(
+            agent="zcode-native", _resolved_agent="zcode-native",
+            strict_agents_dir=False, timeout=1000, worktree=None,
+            _role_provenance={}, agents_dir=None, gate_with=None,
+            allow_text_only=False, require_tools=False,
+        )
+        view = run_subagent._dry_run_view(invocation, args, None, None)
+        self.assertTrue(view["would_refuse"])
+        kinds = [entry.get("error_kind") for entry in view["refusals"]]
+        self.assertTrue(view["read_allowlist"].get("would_refuse"), view["read_allowlist"])
+        self.assertIn(view["read_allowlist"].get("error_kind", "read_allowlist_unsupported"),
+                      kinds)
+        self.assertIn("zcode_isolation_required", kinds)
+        # The historical single-refusal fields are unchanged: the last gate wins.
+        self.assertEqual(view["refusal"], view["refusals"][-1]["refusal"])
+
+    def test_native_yolo_refusal_names_both_missing_acknowledgements(self):
+        both_missing = AgentInvocation(
+            cli="zcode", prompt="p", cwd=tempfile.gettempdir(), permission="yolo")
+        refusal = _builder.zcode_invocation_preflight(both_missing)
+        self.assertEqual(refusal["error_kind"], "zcode_isolation_required")
+        self.assertIn("--worktree or --isolated-lane", refusal["message"])
+        self.assertIn("--allow-tool-credentials", refusal["message"])
+
     def test_refused_native_zcode_preflight_never_creates_worktree(self):
         refused = (
             self._inv(model="glm-5.3-flash"),

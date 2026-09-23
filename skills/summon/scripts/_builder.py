@@ -1637,14 +1637,54 @@ def _opencode_permission_env(permission: str) -> str:
     return json.dumps(allowed, separators=(",", ":"))
 
 
+_OPENCODE_CREDENTIAL_CONSENT = (
+    "OpenCode yolo with a private provider credential requires "
+    "--isolated-lane and --allow-tool-credentials; use a separate "
+    "clone/Git directory, account, container, or VM when the child "
+    "must not be able to inspect credentials")
+
+
+def _opencode_yolo_bridges_private_credential(model: str | None) -> bool:
+    """Would a yolo OpenCode child be handed a Summon-managed provider key?"""
+    normalized = model.strip().lower() if isinstance(model, str) else ""
+    if not normalized.startswith(("openrouter/", "nous/")):
+        return False
+    if any(name in os.environ for name in ("OPENROUTER_API_KEY", "NOUS_API_KEY")):
+        return True
+    try:
+        from _windows_credentials import resolve_openrouter_api_key
+        from _nous_credentials import resolve_nous_api_key
+        key = (resolve_openrouter_api_key()[0]
+               if normalized.startswith("openrouter/")
+               else resolve_nous_api_key()[0])
+    except Exception:  # noqa: BLE001 — preflight must stay deterministic
+        key = None
+    return bool(key)
+
+
 def opencode_yolo_isolation_error(inv: AgentInvocation) -> str | None:
-    """Explain why a broad OpenCode turn cannot run on an unqualified checkout."""
-    if inv.cli == "opencode" and inv.permission == "yolo":
-        if inv.worktree is None and not inv.isolated_lane:
-            return (
-                "OpenCode yolo requires --worktree or --isolated-lane; broad authority is "
-                "available for disposable copies, not active shared checkouts")
-    return None
+    """Explain why a broad OpenCode turn cannot run on an unqualified checkout.
+
+    Every missing acknowledgement is named at once. Field record 2026-09-17: the
+    isolation and credential gates surfaced one per dispatch, costing four launches
+    to learn two flags.
+    """
+    if inv.cli != "opencode" or inv.permission != "yolo":
+        return None
+    needs_isolation = inv.worktree is None and not inv.isolated_lane
+    needs_consent = (not (inv.isolated_lane and inv.allow_tool_credentials)
+                     and _opencode_yolo_bridges_private_credential(inv.model))
+    parts = []
+    if needs_isolation:
+        parts.append(
+            "OpenCode yolo requires --worktree or --isolated-lane; broad authority is "
+            "available for disposable copies, not active shared checkouts")
+    if needs_consent:
+        missing = [flag for flag, present in (
+            ("--isolated-lane", inv.isolated_lane),
+            ("--allow-tool-credentials", inv.allow_tool_credentials)) if not present]
+        parts.append(f"{_OPENCODE_CREDENTIAL_CONSENT} (missing: {', '.join(missing)})")
+    return "; ".join(parts) or None
 
 
 def _opencode_credential_env_keys() -> tuple[str, ...]:
@@ -1691,22 +1731,8 @@ def opencode_env_override(model: str | None, *, permission: str = "safe-edit",
     if permission == "yolo":
         scrub = {key: None for key in _opencode_credential_env_keys()}
         if not (isolated_lane and allow_tool_credentials):
-            if normalized.startswith(("openrouter/", "nous/")):
-                try:
-                    from _windows_credentials import resolve_openrouter_api_key
-                    from _nous_credentials import resolve_nous_api_key
-                    key = (resolve_openrouter_api_key()[0]
-                           if normalized.startswith("openrouter/")
-                           else resolve_nous_api_key()[0])
-                except Exception:  # noqa: BLE001 — preflight must stay deterministic
-                    key = None
-                if key or any(name in os.environ for name in ("OPENROUTER_API_KEY",
-                                                               "NOUS_API_KEY")):
-                    raise ValueError(
-                        "OpenCode yolo with a private provider credential requires "
-                        "--isolated-lane and --allow-tool-credentials; use a separate "
-                        "clone/Git directory, account, container, or VM when the child "
-                        "must not be able to inspect credentials")
+            if _opencode_yolo_bridges_private_credential(model):
+                raise ValueError(_OPENCODE_CREDENTIAL_CONSENT)
             # No Summon-managed key is available.  Still scrub inherited provider
             # credentials before launching an unrestricted tool loop.
             return scrub
@@ -2166,12 +2192,13 @@ def zcode_invocation_preflight(inv: AgentInvocation) -> dict | None:
                 "=1 to run a clearly labeled advisory plan turn."),
         }
     if inv.permission == "yolo" and inv.worktree is None and not inv.isolated_lane:
-        return {
-            "error_kind": "zcode_isolation_required",
-            "message": (
-                "ZCode yolo requires --worktree or --isolated-lane; broad authority is "
-                "available for disposable copies, not active shared checkouts"),
-        }
+        message = ("ZCode yolo requires --worktree or --isolated-lane; broad authority is "
+                   "available for disposable copies, not active shared checkouts")
+        if not inv.allow_tool_credentials:
+            # Name the second acknowledgement now rather than on the next launch.
+            message += ("; it also requires --allow-tool-credentials because ZCode can "
+                        "access its local provider configuration")
+        return {"error_kind": "zcode_isolation_required", "message": message}
     if inv.permission == "yolo" and not inv.allow_tool_credentials:
         return {
             "error_kind": "zcode_tool_credentials_consent_required",
@@ -2308,14 +2335,34 @@ def _normalize_agy_model(model: str | None) -> str | None:
     return _AGY_MODEL_ALIASES.get(key, trimmed)
 
 
-def _reject_oversized_agy_prompt(prompt: str) -> None:
-    """Raise if the assembled agy prompt cannot be passed as one argv token."""
+def _oversized_agy_prompt_error(prompt: str) -> str | None:
     if len(prompt) > _AGY_MAX_PROMPT:
-        raise ValueError(
+        return (
             f"agy prompt is {len(prompt)} chars (> {_AGY_MAX_PROMPT}); it is passed as one "
             "Windows argv token and would risk CreateProcess truncation. Shorten the "
             "agent definition or task prompt, or write the material to a file under --cwd "
             "and ask the agent to READ it.")
+    return None
+
+
+def _reject_oversized_agy_prompt(prompt: str) -> None:
+    """Raise if the assembled agy prompt cannot be passed as one argv token."""
+    error = _oversized_agy_prompt_error(prompt)
+    if error:
+        raise BuildRefusal(error, kind="prompt_too_long_for_argv", retryable=False)
+
+
+def agy_prompt_length_refusal(inv: AgentInvocation) -> str | None:
+    """Side-effect-free twin of the agy build guard, for dry-run preflight.
+
+    agy's build creates a profile, so dry-run never builds it; without this the
+    size refusal only appeared on a real launch (field record 2026-09-22: six agy
+    prompts of 42-79k characters, each learned by dispatching).
+    """
+    if inv.cli != "agy":
+        return None
+    return _oversized_agy_prompt_error(
+        _resume_prompt(inv) if inv.resume_id else _agy_prompt(inv))
 _AGY_RUN_TTL_SEC = 900   # don't clean run dirs younger than this (may be in use)
 _AGY_ORPHAN_RETENTION_SEC = 24 * 60 * 60
 _AGY_OWNER_PID_FILE = ".summon_owner_pid"
@@ -2593,30 +2640,202 @@ def _require_agy_print_timeout_support() -> None:
             path = fallback
     if not path:
         raise ValueError("agy executable not found; install AGY 1.1.22 or newer")
-    try:
-        identity = (os.path.realpath(path), os.stat(path).st_mtime_ns)
-    except OSError:
-        identity = (os.path.realpath(path), None)
+    identity = _agy_binary_identity(path)
     supported = _AGY_PRINT_TIMEOUT_CAPABILITY.get(identity)
+    if supported is None and _agy_capability_cached(identity):
+        supported = True
     if supported is None:
-        command = [path, "--help"]
-        if os.name == "nt" and path.lower().endswith((".cmd", ".bat")):
-            command = ["cmd", "/d", "/c", path, "--help"]
-        try:
-            from _spawn import run_flags
-            completed = subprocess.run(
-                command, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=20, stdin=subprocess.DEVNULL,
-                **run_flags())
-            help_text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
-            supported = completed.returncode == 0 and "--print-timeout" in help_text
-        except (OSError, ValueError, subprocess.SubprocessError):
-            supported = False
+        with _agy_capability_probe_slot(identity) as cached:
+            supported = True if cached else _probe_agy_print_timeout(path)
+        if supported:
+            _store_agy_capability(identity)
         _AGY_PRINT_TIMEOUT_CAPABILITY[identity] = supported
     if not supported:
-        raise ValueError(
+        raise AgyCapabilityError(
             "agy does not expose --print-timeout; install AGY 1.1.22 or newer "
-            "before dispatch so Summon can enforce the adaptive hard budget")
+            "before dispatch so Summon can enforce the adaptive hard budget",
+            kind="agy_cli_outdated", retryable=False)
+
+
+# `agy --help` is a capability probe, not a dispatch: a slow answer says the host is
+# loaded, never that agy is old. Field record 2026-09-23: a five-lane fan-out lost every
+# lane at ~20s because five concurrent probes each overran a 20s bound and the refusal
+# read "install AGY 1.1.22" against an up-to-date agy. The bound is now generous, only a
+# completed probe that lacks the flag is reported as outdated, a positive answer is
+# remembered per binary identity on disk, and concurrent dispatches share one probe.
+_AGY_PROBE_TIMEOUT_SEC = 60
+_AGY_CAPABILITY_CACHE_SCHEMA = "summon.agy-capability/v1"
+_AGY_CAPABILITY_CACHE_MAX = 8
+
+
+TYPED_PREFLIGHT_KINDS = frozenset({
+    "agy_cli_outdated", "agy_capability_probe_stalled", "agy_capability_probe_failed",
+    "prompt_too_long_for_argv",
+})
+
+
+class BuildRefusal(ValueError):
+    """A typed build-time refusal; ``kind`` and ``retryable`` reach the envelope."""
+
+    def __init__(self, message: str, *, kind: str, retryable: bool) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.retryable = retryable
+
+
+class AgyCapabilityError(BuildRefusal):
+    """The installed agy could not be qualified for a bounded print turn."""
+
+
+def _agy_binary_identity(path: str) -> tuple[str, int | None]:
+    try:
+        return (os.path.realpath(path), os.stat(path).st_mtime_ns)
+    except OSError:
+        return (os.path.realpath(path), None)
+
+
+def _agy_capability_cache_path() -> Path:
+    override = os.environ.get("SUMMON_AGY_CAPABILITY_CACHE")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".agents" / "summon-agy-capability.json"
+
+
+def _agy_capability_key(identity: tuple[str, int | None]) -> str | None:
+    path, mtime_ns = identity
+    # Without a modification time the identity cannot notice an upgrade/downgrade,
+    # so it is never persisted.
+    return None if mtime_ns is None else f"{os.path.normcase(path)}|{mtime_ns}"
+
+
+def _agy_capability_cached(identity: tuple[str, int | None]) -> bool:
+    key = _agy_capability_key(identity)
+    if key is None:
+        return False
+    try:
+        with open(_agy_capability_cache_path(), "rb") as fh:
+            data = json.loads(fh.read(64 * 1024).decode("utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (isinstance(data, dict) and data.get("schema") == _AGY_CAPABILITY_CACHE_SCHEMA
+            and isinstance(data.get("supported"), list) and key in data["supported"])
+
+
+def _store_agy_capability(identity: tuple[str, int | None]) -> None:
+    """Persist a POSITIVE probe only; a negative answer is re-probed next process."""
+    key = _agy_capability_key(identity)
+    if key is None:
+        return
+    cache = _agy_capability_cache_path()
+    try:
+        with open(cache, "rb") as fh:
+            data = json.loads(fh.read(64 * 1024).decode("utf-8"))
+        entries = [e for e in data.get("supported", []) if isinstance(e, str) and e != key]
+    except (OSError, ValueError, AttributeError):
+        entries = []
+    entries = (entries + [key])[-_AGY_CAPABILITY_CACHE_MAX:]
+    payload = json.dumps({"schema": _AGY_CAPABILITY_CACHE_SCHEMA, "supported": entries},
+                         sort_keys=True).encode("utf-8")
+    tmp = None
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".summon-agy-cap-", suffix=".tmp",
+                                   dir=str(cache.parent))
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+        os.replace(tmp, cache)
+        tmp = None
+    except OSError:
+        pass  # the cache is an optimisation; the probe result already holds in-process
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+class _agy_capability_probe_slot:
+    """Serialize first-time probes across concurrently launched dispatches.
+
+    The first process takes an exclusive lock file and probes; the others wait
+    (bounded) for its positive answer in the cache instead of adding load with
+    probes of their own. A stale or abandoned lock only costs the wait bound.
+    Entering yields True when another process's probe already answered.
+    """
+
+    def __init__(self, identity: tuple[str, int | None]) -> None:
+        self._identity = identity
+        self._lock = Path(str(_agy_capability_cache_path()) + ".lock")
+        self._owned = False
+
+    def __enter__(self) -> bool:
+        if _agy_capability_key(self._identity) is None:
+            return False
+        deadline = time.monotonic() + _AGY_PROBE_TIMEOUT_SEC + 5
+        while True:
+            try:
+                self._lock.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(str(self._lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(fd)
+                self._owned = True
+                # A peer may have finished between our cache miss and the lock.
+                return _agy_capability_cached(self._identity)
+            except FileExistsError:
+                if _agy_capability_cached(self._identity):
+                    return True
+                try:
+                    stale = time.time() - self._lock.stat().st_mtime > _AGY_PROBE_TIMEOUT_SEC + 5
+                except OSError:
+                    continue  # released between attempts; try to take it
+                if stale:
+                    try:
+                        self._lock.unlink()
+                    except OSError:
+                        pass
+                    continue
+                if time.monotonic() >= deadline:
+                    return False  # probe ourselves rather than wait forever
+                time.sleep(0.25)
+            except OSError:
+                return False  # unwritable cache dir: probe unserialized
+
+    def __exit__(self, *_exc) -> None:
+        if self._owned:
+            try:
+                self._lock.unlink()
+            except OSError:
+                pass
+
+
+def _probe_agy_print_timeout(path: str) -> bool:
+    """True/False only for a COMPLETED probe; raise a retryable refusal otherwise."""
+    command = [path, "--help"]
+    if os.name == "nt" and path.lower().endswith((".cmd", ".bat")):
+        command = ["cmd", "/d", "/c", path, "--help"]
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=_AGY_PROBE_TIMEOUT_SEC, stdin=subprocess.DEVNULL,
+            **run_flags())
+    except subprocess.TimeoutExpired:
+        raise AgyCapabilityError(
+            f"agy capability probe (`agy --help`) did not answer within "
+            f"{_AGY_PROBE_TIMEOUT_SEC}s; the host looks overloaded. agy was NOT judged "
+            "outdated and nothing was dispatched: retry, or stagger concurrent agy launches",
+            kind="agy_capability_probe_stalled", retryable=True) from None
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise AgyCapabilityError(
+            f"agy capability probe could not run ({type(exc).__name__}); nothing was "
+            "dispatched. Check that the agy executable launches from this shell",
+            kind="agy_capability_probe_failed", retryable=False) from None
+    help_text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+    if completed.returncode != 0:
+        raise AgyCapabilityError(
+            f"agy capability probe exited {completed.returncode}; nothing was dispatched. "
+            "Run `agy --help` to see why the CLI cannot start",
+            kind="agy_capability_probe_failed", retryable=False)
+    return "--print-timeout" in help_text
 
 
 def _has_pty_modules(python: str) -> bool:
@@ -3443,6 +3662,10 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
                                else budget["max_runtime_ms"])
         internal_timeout_ms = max(1, int(internal_timeout_ms))
     deadline_sec = internal_timeout_ms / 1000
+    # A prompt that can never fit is refused before the capability probe spends time.
+    _size_error = agy_prompt_length_refusal(inv)
+    if _size_error:
+        raise BuildRefusal(_size_error, kind="prompt_too_long_for_argv", retryable=False)
     _require_agy_print_timeout_support()
     wrapper = _agy_wrapper()  # FIRST: fails fast on POSIX before any profile is built
     perm = permission_flags(inv.cli, inv.permission)  # --dangerously-skip-permissions

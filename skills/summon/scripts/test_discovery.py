@@ -20,6 +20,11 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# This suite is also run as a plain script (release manifest), where no conftest
+# applies; isolate home state before any dispatcher module can record telemetry.
+from _test_state_isolation import isolate as _isolate_test_state  # noqa: E402
+_isolate_test_state()
+
 import _spawn  # noqa: E402
 import _resolver  # noqa: E402
 from _resolver import _codex_default_model_scan, discover_models  # noqa: E402
@@ -6926,6 +6931,10 @@ def test_jobs_cli_wait_timeout_and_bare():
         r = sp.run([sys.executable, script, "jobs", "wait", jid, "--job-dir", d,
                     "--timeout", "300"], capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r.returncode == 124, (r.returncode, r.stdout, r.stderr)
+        # An expired WAIT is not a failed job: the envelope must say "unfinished".
+        waited = json.loads(r.stdout)
+        assert waited["status"] == "running" and waited["terminal"] is False
+        assert waited["wait_outcome"] == "timeout" and waited["job_id"] == jid
         # bare `jobs` -> usage, exit 0
         rb = sp.run([sys.executable, script, "jobs"], capture_output=True, text=True,
                     encoding="utf-8", **_spawn.run_flags())
@@ -14645,6 +14654,71 @@ def test_v8_every_test_is_actually_collected_by_the_runner():
         sorted(name for name in set(names) if names.count(name) > 1))
 
 
+def test_test_runs_never_write_the_operators_real_summon_state():
+    """FIELD RECORD (2026-09-19..23): about a third of ~/.agents/summon-telemetry.jsonl was
+    test bursts and fixture models. Every test entry point must redirect home state."""
+    import _telemetry
+    import _builder
+    home = (Path.home() / ".agents").resolve()
+    for path in (_telemetry._events_path(), _telemetry._config_path(),
+                 _telemetry._reports_dir(), _builder._agy_capability_cache_path()):
+        assert home not in Path(path).resolve().parents, path
+
+
+def _oversized_dry_run(cli, prompt):
+    import run_subagent
+    from _builder import AgentInvocation
+    invocation = AgentInvocation(cli=cli, prompt=prompt, cwd=tempfile.gettempdir(),
+                                 permission="read-only")
+    args = types.SimpleNamespace(
+        agent="size-probe", _resolved_agent="size-probe", strict_agents_dir=False,
+        timeout=600_000, worktree=None, _role_provenance={}, agents_dir=None,
+        gate_with=None, allow_text_only=False, require_tools=False)
+    return run_subagent._dry_run_view(invocation, args, None, None)
+
+
+def test_dry_run_refuses_a_prompt_that_cannot_fit_the_command_line():
+    """FIELD RECORD (2026-09-22): oversized prompts were only refused on a real launch
+    (six agy prompts of 42-79k chars, a 52k Claude prompt). Preflight must say so."""
+    view = _oversized_dry_run("claude", "x" * 140_000)
+    assert view["would_refuse"] is True, view
+    assert view["error_kind"] == "prompt_too_long_for_argv", view
+    assert {"refusal": view["refusal"], "error_kind": "prompt_too_long_for_argv"} \
+        in view["refusals"]
+
+
+def test_dry_run_refuses_an_oversized_agy_prompt_without_building_a_profile():
+    import _builder
+    saved = _builder._ensure_agy_profile
+    _builder._ensure_agy_profile = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("dry-run built an agy profile"))
+    try:
+        view = _oversized_dry_run("agy", "x" * (_builder._AGY_MAX_PROMPT + 1))
+    finally:
+        _builder._ensure_agy_profile = saved
+    assert view["would_refuse"] is True, view
+    assert view["error_kind"] == "prompt_too_long_for_argv", view
+    assert "agy prompt is" in view["refusal"], view["refusal"]
+
+
+def test_oversized_agy_prompt_is_refused_before_the_capability_probe():
+    import _builder
+    saved_probe = _builder._require_agy_print_timeout_support
+    _builder._require_agy_print_timeout_support = lambda: (_ for _ in ()).throw(
+        AssertionError("capability probe ran for a prompt that can never dispatch"))
+    try:
+        inv = _builder.AgentInvocation(cli="agy", prompt="x" * (_builder._AGY_MAX_PROMPT + 1),
+                                       cwd=tempfile.gettempdir())
+        try:
+            _builder.build_invocation_args(inv, 600_000)
+        except _builder.BuildRefusal as exc:
+            assert exc.kind == "prompt_too_long_for_argv" and exc.retryable is False
+        else:
+            raise AssertionError("oversized agy prompt was not refused")
+    finally:
+        _builder._require_agy_print_timeout_support = saved_probe
+
+
 def test_v8_over_long_argv_is_diagnosed_as_argv_not_a_missing_cli():
     """Windows caps a command line at 32767 chars and reports the overflow as
     ERROR_FILE_NOT_FOUND -- so Python raised FileNotFoundError and summon reported
@@ -17546,6 +17620,51 @@ def test_v11_opencode_empty_timeout_is_typed_and_not_auto_retried():
     assert env["remediation_code"] == "opencode_output_timeout", env
     assert "opencode auth login" in env["error"], env
     assert env.get("model_served") is None
+
+
+def test_early_liveness_stop_reports_elapsed_and_stage_not_the_budget():
+    """FIELD REPORT (2026-09-17..23). OpenCode lanes that died 3-15 minutes into a
+    90-minute budget reported "Timeout after 5400000ms", so callers relaunched with a
+    LONGER budget. An early stop must name the elapsed time and the guard that fired;
+    a stop at the budget keeps the historical headline."""
+    from _executor import _timeout_payload
+
+    class _P:
+        def get_result(self):
+            return ""
+
+    early = _timeout_payload("opencode", _P(), 5_400_000, [],
+                             stage="generation_idle_timeout", elapsed_ms=312_000)
+    assert early["error"].startswith("Stopped after 312000ms of a 5400000ms budget"), early
+    assert "went idle" in early["error"] and "longer --timeout" in early["error"]
+    assert "Timeout after" not in early["error"]
+    assert early["timeout"] == {"budget_ms": 5_400_000, "stage": "generation_idle_timeout",
+                                "partial_output": False, "elapsed_ms": 312_000}
+
+    at_budget = _timeout_payload("claude", _P(), 360_000, [],
+                                 stage="overall_timeout", elapsed_ms=360_050)
+    assert at_budget["error"] == "Timeout after 360000ms", at_budget["error"]
+
+
+def test_drive_loop_threads_elapsed_time_into_a_startup_stall():
+    """The read loop must hand the real elapsed time to the payload, not only the budget."""
+    import subprocess as sp
+    import _executor
+
+    child = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                     stdout=sp.PIPE, stderr=sp.PIPE, stdin=sp.DEVNULL,
+                     **_spawn.run_flags())
+    try:
+        resp = _executor._drive_process(child, "claude", 60_000, first_event_ms=500)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.communicate()
+    assert resp["exit_code"] == 124, resp
+    assert resp["timeout"]["stage"] == "startup_timeout", resp["timeout"]
+    assert resp["timeout"]["elapsed_ms"] < 30_000, resp["timeout"]
+    assert resp["error"].startswith("Stopped after "), resp["error"]
+    assert "no first event" in resp["error"], resp["error"]
 
 
 def test_v10_roster_paths_are_emitted_normalised():

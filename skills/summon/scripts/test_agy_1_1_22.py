@@ -508,29 +508,144 @@ def test_agy_orphan_profile_retention_is_bounded_without_clamping_runtime():
     assert _builder._agy_profile_retention_sec(7 * 24 * 60 * 60) == 24 * 60 * 60
 
 
-def test_agy_print_timeout_capability_gate_is_provider_inert_and_cached(monkeypatch):
+@pytest.fixture
+def agy_probe_env(monkeypatch, tmp_path):
+    """Isolated capability cache plus a fake agy identity; returns the cache path."""
+    cache = tmp_path / "agy-capability.json"
+    monkeypatch.setenv("SUMMON_AGY_CAPABILITY_CACHE", str(cache))
+    monkeypatch.setattr(_builder.shutil, "which", lambda _name: "C:/bin/agy.exe")
+    monkeypatch.setattr(_builder, "_agy_binary_identity",
+                        lambda _path: ("C:/bin/agy.exe", 7))
+    monkeypatch.setattr(_builder, "_AGY_PRINT_TIMEOUT_CAPABILITY", {})
+    return cache
+
+
+def test_agy_print_timeout_capability_gate_is_provider_inert_and_cached(
+        monkeypatch, agy_probe_env):
     fake = SimpleNamespace(returncode=0, stdout="--print-timeout duration", stderr="")
     calls = []
-    monkeypatch.setattr(_builder.shutil, "which", lambda _name: "C:/bin/agy.exe")
-    monkeypatch.setattr(_builder.os, "stat", lambda _path: SimpleNamespace(st_mtime_ns=7))
     monkeypatch.setattr(
         _builder.subprocess, "run",
         lambda *args, **kwargs: calls.append((args, kwargs)) or fake)
-    _builder._AGY_PRINT_TIMEOUT_CAPABILITY.clear()
     _builder._require_agy_print_timeout_support()
     _builder._require_agy_print_timeout_support()
     assert len(calls) == 1
     assert calls[0][0][0][-1] == "--help"
+    assert calls[0][1]["timeout"] == _builder._AGY_PROBE_TIMEOUT_SEC >= 60
 
 
-def test_agy_print_timeout_capability_gate_rejects_old_cli(monkeypatch):
+def test_agy_print_timeout_capability_gate_rejects_old_cli(monkeypatch, agy_probe_env):
     fake = SimpleNamespace(returncode=0, stdout="usage without flag", stderr="")
-    monkeypatch.setattr(_builder.shutil, "which", lambda _name: "C:/bin/agy.exe")
-    monkeypatch.setattr(_builder.os, "stat", lambda _path: SimpleNamespace(st_mtime_ns=8))
     monkeypatch.setattr(_builder.subprocess, "run", lambda *args, **kwargs: fake)
-    _builder._AGY_PRINT_TIMEOUT_CAPABILITY.clear()
-    with pytest.raises(ValueError, match="1.1.22"):
+    with pytest.raises(_builder.AgyCapabilityError, match="1.1.22") as caught:
         _builder._require_agy_print_timeout_support()
+    assert caught.value.kind == "agy_cli_outdated"
+    assert caught.value.retryable is False
+    # A negative answer is never persisted: an upgrade must not be masked.
+    assert not agy_probe_env.exists()
+
+
+def test_agy_capability_probe_stall_is_retryable_and_not_called_outdated(
+        monkeypatch, agy_probe_env):
+    calls = []
+
+    def stalled(*args, **kwargs):
+        calls.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(_builder.subprocess, "run", stalled)
+    for _ in range(2):
+        with pytest.raises(_builder.AgyCapabilityError) as caught:
+            _builder._require_agy_print_timeout_support()
+        assert caught.value.kind == "agy_capability_probe_stalled"
+        assert caught.value.retryable is True
+        assert "1.1.22" not in str(caught.value)
+    # A stall is not an answer: it is neither memoized nor persisted.
+    assert len(calls) == 2
+    assert not agy_probe_env.exists()
+
+
+def test_agy_capability_probe_nonzero_exit_is_not_called_outdated(
+        monkeypatch, agy_probe_env):
+    fake = SimpleNamespace(returncode=3, stdout="", stderr="boom")
+    monkeypatch.setattr(_builder.subprocess, "run", lambda *args, **kwargs: fake)
+    with pytest.raises(_builder.AgyCapabilityError) as caught:
+        _builder._require_agy_print_timeout_support()
+    assert caught.value.kind == "agy_capability_probe_failed"
+    assert "1.1.22" not in str(caught.value)
+
+
+def test_agy_capability_positive_answer_survives_a_new_process(
+        monkeypatch, agy_probe_env):
+    fake = SimpleNamespace(returncode=0, stdout="--print-timeout duration", stderr="")
+    monkeypatch.setattr(_builder.subprocess, "run", lambda *args, **kwargs: fake)
+    _builder._require_agy_print_timeout_support()
+    assert agy_probe_env.exists()
+
+    # A fresh dispatcher process (empty in-memory memo) must not probe again.
+    monkeypatch.setattr(_builder, "_AGY_PRINT_TIMEOUT_CAPABILITY", {})
+    monkeypatch.setattr(_builder.subprocess, "run",
+                        lambda *a, **k: pytest.fail("probe re-ran despite disk cache"))
+    _builder._require_agy_print_timeout_support()
+
+    # A changed binary (upgrade/downgrade) is a new identity and is probed again.
+    monkeypatch.setattr(_builder, "_agy_binary_identity",
+                        lambda _path: ("C:/bin/agy.exe", 8))
+    monkeypatch.setattr(_builder.subprocess, "run", lambda *args, **kwargs: fake)
+    probed = []
+    monkeypatch.setattr(_builder, "_probe_agy_print_timeout",
+                        lambda path: probed.append(path) or True)
+    _builder._require_agy_print_timeout_support()
+    assert probed == ["C:/bin/agy.exe"]
+
+
+def test_concurrent_agy_dispatches_share_one_capability_probe(
+        monkeypatch, agy_probe_env):
+    import threading
+
+    # Another dispatcher holds the probe lock and publishes a positive answer.
+    lock = Path(str(agy_probe_env) + ".lock")
+    lock.write_text("", encoding="utf-8")
+
+    def peer_finishes():
+        _builder._store_agy_capability(("C:/bin/agy.exe", 7))
+        lock.unlink()
+
+    timer = threading.Timer(0.5, peer_finishes)
+    timer.start()
+    try:
+        monkeypatch.setattr(_builder, "_probe_agy_print_timeout",
+                            lambda path: pytest.fail("waiter probed instead of sharing"))
+        _builder._require_agy_print_timeout_support()
+    finally:
+        timer.cancel()
+
+
+def test_typed_agy_refusal_reaches_envelope_and_telemetry(monkeypatch, tmp_path):
+    import _telemetry
+    import run_subagent
+
+    def refuse(*_args, **_kwargs):
+        raise _builder.AgyCapabilityError("agy capability probe (`agy --help`) stalled",
+                                          kind="agy_capability_probe_stalled",
+                                          retryable=True)
+
+    monkeypatch.setattr(_executor, "build_invocation_args", refuse)
+    inv = _builder.AgentInvocation(cli="agy", prompt="hi", cwd=str(tmp_path))
+    envelope = _executor.execute_agent(inv, timeout_ms=60_000)
+    assert envelope["status"] == "error"
+    assert envelope["error_kind"] == "agy_capability_probe_stalled"
+    assert envelope["retryable"] is True
+    assert run_subagent._is_transient_dispatch_error(envelope) is True
+    assert _telemetry._failure_class(envelope) == "dispatch"
+
+    outdated = dict(envelope, error_kind="agy_cli_outdated", retryable=False,
+                    error="agy does not expose --print-timeout; install AGY 1.1.22")
+    assert run_subagent._is_transient_dispatch_error(outdated) is False
+    assert _telemetry._failure_class(outdated) == "missing_cli"
+    # Untyped prose naming the flag is not a timeout either.
+    untyped = {"status": "error", "error": "agy does not expose --print-timeout"}
+    assert _telemetry._failure_class(untyped) != "timeout"
 
 
 def test_agy_profile_cleanup_preserves_live_owner_and_reaps_dead_owner(
