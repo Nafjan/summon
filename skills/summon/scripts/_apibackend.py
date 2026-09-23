@@ -967,7 +967,8 @@ def api_key_available(api_key_env: str | None, base_url: str | None) -> bool:
             return bool(key)
         except Exception:  # noqa: BLE001 — dry-run must remain diagnostic-only
             return False
-    if api_key_env == "BYTEPLUS_CODING_API_KEY":
+    if (api_key_env == "BYTEPLUS_CODING_API_KEY"
+            and _is_byteplus_coding_plan_endpoint(base_url)):
         try:
             from _arkcli_creds import resolve_byteplus_coding_api_key
             key, _source = resolve_byteplus_coding_api_key()

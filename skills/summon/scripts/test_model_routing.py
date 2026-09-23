@@ -119,6 +119,52 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(refusal["recommended_backend"], "claude")
         self.assertIn("claude", refusal["compatible_backends"])
 
+    def test_dry_run_refuses_openai_compat_dispatch_with_missing_credential(self):
+        # FF-01: pins the dry-run credential gate itself -- deleting the
+        # _dry_run_view credential block must fail this test.
+        import os as _os
+        with tempfile.TemporaryDirectory() as cwd:
+            invocation = AgentInvocation(
+                cli="openai-compat", prompt="probe", cwd=cwd,
+                permission="read-only",
+                model="deepseek-v4-1-flash-260910",
+                base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
+                api_key_env="SUMMON_TEST_MISSING_MODELARK_KEY")
+            args = SimpleNamespace(
+                agent="deepseek-41-flash", _resolved_agent="deepseek-41-flash",
+                strict_agents_dir=False, timeout=1000, worktree=None,
+                _role_provenance={}, agents_dir=None, gate_with=None,
+                allow_text_only=True)
+            env = {k: v for k, v in _os.environ.items()
+                   if k != "SUMMON_TEST_MISSING_MODELARK_KEY"}
+            with mock.patch.dict(_os.environ, env, clear=True):
+                view = run_subagent._dry_run_view(invocation, args, None, None)
+        self.assertTrue(view.get("would_refuse"))
+        self.assertEqual(view.get("error_kind"), "credential_missing")
+        self.assertIn("SUMMON_TEST_MISSING_MODELARK_KEY", view.get("refusal"))
+        self.assertFalse(view.get("provider_contacted"))
+
+    def test_live_openai_compat_preflight_refuses_before_any_request(self):
+        # FF-01: the live call() preflight must refuse typed and never issue
+        # the HTTP request when the declared credential is missing.
+        import _apibackend
+        with tempfile.TemporaryDirectory() as cwd:
+            invocation = AgentInvocation(
+                cli="openai-compat", prompt="probe", cwd=cwd,
+                permission="read-only",
+                model="deepseek-v4-1-flash-260910",
+                base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
+                api_key_env="SUMMON_TEST_MISSING_MODELARK_KEY")
+            env = {k: v for k, v in os.environ.items()
+                   if k != "SUMMON_TEST_MISSING_MODELARK_KEY"}
+            with mock.patch.dict(os.environ, env, clear=True),                     mock.patch("_apibackend._do_request") as request:
+                response = _apibackend.call(invocation, 1000)
+            self.assertEqual(response.get("provider_contacted"), False)
+            self.assertEqual(response.get("error_kind"), "credential_missing")
+            self.assertIn("SUMMON_TEST_MISSING_MODELARK_KEY",
+                          str(response.get("error")))
+            request.assert_not_called()
+
     def test_credential_missing_is_typed_refusal_dry_and_live(self):
         import os as _os
         from _apibackend import api_key_available, resolve_api_credential
@@ -152,14 +198,17 @@ class ModelRoutingTests(unittest.TestCase):
     def test_agents_table_renders_human_columns(self):
         table = run_subagent._format_agents_table([
             {"name": "kimi-worker", "run_agent": "kimi", "model": "kimi-code/k3",
-             "permission": "yolo", "capability": None},
+             "permission": "yolo"},
             {"name": "editor", "run_agent": "claude", "model": None,
              "permission": "read-only"}])
         self.assertIn("NAME", table)
         self.assertIn("CLI", table)
+        self.assertNotIn("CAPABILITY", table)  # column dropped: never populated
         self.assertIn("kimi-worker", table)
         self.assertIn("editor", table)
         self.assertIn("-", table)  # empty cells render as dash
+        empty = run_subagent._format_agents_table([])
+        self.assertIn("NAME", empty)  # empty roster renders headers, no crash
 
     def test_modelark_subscription_models_are_arkcli_compatible(self):
         # The BytePlus ModelArk backend is exactly the deepseek/zhipu case:

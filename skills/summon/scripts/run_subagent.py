@@ -3411,21 +3411,19 @@ def _agent_required_message(args, agents_rows: list[dict]) -> str:
 
 def _format_agents_table(rows: list[dict]) -> str:
     """Human-readable --list rendering. JSON stays the machine default."""
-    headers = ("NAME", "CLI", "MODEL", "PERMISSION", "CAPABILITY")
+    keys = ("name", "run_agent", "model", "permission")
+    headers = ("NAME", "CLI", "MODEL", "PERMISSION")
     def _cell(row, key):
         value = row.get(key)
         return str(value) if value not in (None, "") else "-"
     table_rows = sorted(rows, key=lambda r: str(r.get("name", "")).lower())
-    widths = [max(len(h), *(len(_cell(r, k.lower())) for r in table_rows) or [0])
-              for h, k in zip(headers, ("name", "run_agent", "model",
-                                        "permission", "capability"))]
+    widths = [max([len(h)] + [len(_cell(r, k)) for r in table_rows])
+              for h, k in zip(headers, keys)]
     lines = ["  ".join(h.ljust(w) for h, w in zip(headers, widths))]
     lines.append("  ".join("-" * w for w in widths))
     for r in table_rows:
-        lines.append("  ".join(_cell(r, k.lower()).ljust(w)
-                               for k, w in zip(("name", "run_agent", "model",
-                                                "permission", "capability"),
-                                               widths)))
+        lines.append("  ".join(_cell(r, k).ljust(w)
+                               for k, w in zip(keys, widths)))
     return "\n".join(lines) + "\n"
 
 
@@ -3595,7 +3593,8 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 view["model_vendor"] = _compat["model_vendor"]
             view["compatible_backends"] = list(_compat["compatible_backends"])
             view["recommended_backend"] = _compat["recommended_backend"]
-    if (invocation.cli == "openai-compat" and not _decision_projection_invalid
+    if (invocation.cli == "openai-compat" and not view.get("would_refuse")
+            and not _decision_projection_invalid
             and getattr(invocation, "api_key_env", None)):
         # Fail closed on a missing provider credential before anyone mistakes a
         # slow unauthenticated request for a hang (field report 2026-09-19).
