@@ -11,7 +11,109 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
-## Unreleased
+## [3.5.0] - 2026-09-18
+
+The following source changes form the locally committed 3.5.0 provider-free
+workspace preview candidate. The version has not been published. These notes do
+not qualify additional live adapters, revive retired selectors, or authorize
+publication; unsupported live adapters and native device acceptance remain
+separately gated.
+
+- **Durable ordinary workspace operations:** the host and authenticated client
+  bind human-context requests, scoped commands/dispositions, retained holds, and
+  authorized linked replacements to durable operation identities. Lookup retains
+  the original operation after later child advancement; lost responses preserve
+  uncertainty and require same-key reconciliation. Message authority remains
+  separate from disposition and worker authority, and parent lineage is immutable.
+- **Continuation provenance at the accepted preview boundary:** operation-specific
+  v2 capability declarations remain non-authorizing. The governed launch path
+  checks authenticated observation/qualification, registry and adapter versions,
+  revocation, ownership, and exact model evidence before contact, including after
+  queued waits. Selected-profile job sources use a v2 authenticated state binding;
+  missing legacy bindings and rotated state refuse rather than accepting the
+  current account as a baseline. Non-launching job/chat revalidation remains
+  limited to supported legacy-source policies; no new provider is certified.
+- **Submission accounting and settlement capacity:** per-attempt records separate
+  Summon-visible input estimates from reported token/cache metrics and missing
+  coverage. Public summaries omit malformed metrics without discarding valid
+  reported values, and token reports do not erase unknown contact or spend.
+  Explicit context policy and workspace economics reservations bind selected
+  context to the physical attempt; settlement requires the bound private record,
+  exact duplicates are idempotent, and changed outcomes conflict. Workspace economics
+  admission currently requires the off policy and refuses unsupported modes. Ordinary
+  foreground calls retain their existing ephemeral storage.
+- **Explicit participant replacement:** the integrated trusted-host fork path
+  freezes the replacement name/definition under the historical permission ceiling.
+  It preserves the parent journal and does not promote the replacement to a
+  qualified continuation or widen browser command authority.
+
+- **Telemetry producer and timeout-stage hardening:** the executor can now authenticate fresh
+  `reported`, `inferred`, and `absent` provenance classifications without treating the latter two
+  as named-model proof. Malformed evidence remains an explicit invalid record. Liveness/executor
+  timeout reasons (`generation_idle_timeout`, startup/overall/adaptive/finalization variants) map
+  to the bounded public `stream` or `backend_execution` stages; unknown values remain `unknown`,
+  while the raw reason stays in the private runtime result. Added provider-free producer and alias
+  regressions with no provider, shell, or network activity.
+- **Workspace detail overlay reliability:** typed detail errors retain their error code; expiry
+  clears every privileged drawer/body and restores focus; scrim clicks close the active overlay;
+  linked pending recovery runs on normal renders; and detail metadata/body rendering exposes the
+  structured fields once with an idempotent authorized-body action.
+- **Private policy replacement hardening:** `_replace_private_bytes` now applies the existing
+  private-file protection while its same-directory temporary is empty, before any policy bytes are
+  written. Reopen tests cover unverifiable ancestors and retain a junction sentinel check; failure
+  remains fail-closed without changing the policy contract.
+- **Late detail response suppression:** detail metadata/body requests carry a generation bound to
+  the drawer and authenticated view. Expiry, close, and selection changes invalidate prior
+  generations, so a delayed successful response cannot restore cleared private DOM.
+
+- Provider-free workspace plan creation: add the strict
+  `summon.workspace.plan/v1` contract and `workspace create --plan FILE` entry
+  path. Plans are bounded, dependency-checked descriptions only; they cannot
+  select a provider, account, model, spend, permission, command, resume
+  operation, or worker launch. Creation stages privately, publishes with
+  no-replace semantics, stores a private copy, and emits no provider call.
+  Reopen/inspect recompiles the copied plan with the host-bound expiry and
+  verifies its compiled digest, durable goal/lane projection, and source
+  references. The synthetic `workspace demo create` fixture remains separate.
+- Plan-created recipients are persisted as dormant operator-message
+  destinations, not coordinator workers. Their explicit instance binding can
+  receive queued context, but worker mutation authority requires a separate
+  adapter registration.
+- The public workspace promise is intentionally narrower than a live agent
+  bridge: the plan path creates and inspects provider-free task/message records
+  and exercises simulated protocol boundaries only. Real worker attachment,
+  provider submission, result import, and external-session messaging remain
+  separately qualified work.
+- Preserve target-specific operator retention for multi-target plans and keep
+  legacy synthetic demo grants isolated from the versioned plan grant schema.
+  Provider-free regressions cover the 16-target create/open/send/reconcile path,
+  cross-version host-config rejection, copied-plan tamper refusal, operator
+  runtime/admission, and rendered page/UI contracts. No provider or account
+  was contacted for this change.
+
+- GPT-6 Astra roster adoption: add a read-only, high-effort `astra` seat pinned to
+  `gpt-6-astra` with an exact-model policy; add provider-inert routing, catalog,
+  and report-contract coverage. Position Astra as the default OpenAI ceiling for
+  consequential planning and review without removing Fable's independent
+  cross-vendor escalation role or claiming that a configured target proves service.
+
+- Add a separate `flash-reviewer` advisory seat. Preserve `researcher`'s strict
+  identity policy and document its blocked result when AGY lacks served-model proof.
+
+- Gemini defaults: pin four AGY seats to `gemini-3.8-flash-high` and retain the
+  separate Flash 3.7 catalog identity. Roster discovery is not a served-model receipt.
+  Regression coverage checks the pins, effort overrides, historical identity, and
+  advisory catalog evidence. Public guidance distinguishes model multimodality from
+  transport support and keeps account-specific quota preferences outside the product.
+- AGY effort mapping now preserves slug syntax and generation when replacing the
+  thinking tier; display-name handling and explicit older model pins stay supported.
+
+- **Explicit preview release boundary:** `tools/release_manifest.py` keeps
+  `stable` as the all-gates publication profile and adds an opt-in
+  `workspace-preview` profile for the provider-free 3.5 slice. Only the exact
+  redacted missing-live-evidence result is permitted there; all other suites,
+  gates, source, rendered, privacy, migration and installation checks remain
+  mandatory. Stable/public release evidence is unchanged.
 
 ## 3.4.0 - 2026-09-02
 

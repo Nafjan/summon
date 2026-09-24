@@ -1,99 +1,385 @@
 {
   "schema": 1,
   "authority": "summon-editorial",
-  "as_of": "2026-09-02",
+  "as_of": "2026-09-05",
   "definition": "frontier and near-frontier are editorial routing labels, not guarantees of quality, safety, cost, availability, or vendor endorsement; exact model.served evidence remains authoritative",
   "entries": [
     {
+      "key": "codex/gpt-6-astra",
+      "identity": {
+        "vendor": "openai",
+        "model_id": "gpt-6-astra"
+      },
+      "display": {
+        "role": "frontier lead",
+        "name": "Astra",
+        "version": "6"
+      },
+      "editorial": {
+        "label": "frontier",
+        "rank": 1,
+        "lane": "architecture-planning-review"
+      },
+      "route": {
+        "backend": "codex",
+        "target": "gpt-6-astra",
+        "dispatchable": true
+      }
+    },
+    {
       "key": "claude/claude-fable-5-1",
-      "identity": {"vendor": "anthropic", "model_id": "claude-fable-5-1"},
-      "display": {"role": "decision lead", "name": "Fable", "version": "5.1"},
-      "editorial": {"label": "frontier", "rank": 1, "lane": "lead-planning-final-escalation"},
-      "route": {"backend": "claude", "target": "claude-fable-5-1", "dispatchable": true}
+      "identity": {
+        "vendor": "anthropic",
+        "model_id": "claude-fable-5-1"
+      },
+      "display": {
+        "role": "decision lead",
+        "name": "Fable",
+        "version": "5.1"
+      },
+      "editorial": {
+        "label": "frontier",
+        "rank": 2,
+        "lane": "lead-planning-final-escalation"
+      },
+      "route": {
+        "backend": "claude",
+        "target": "claude-fable-5-1",
+        "dispatchable": true
+      }
     },
     {
       "key": "codex/gpt-5.6-sol",
-      "identity": {"vendor": "openai", "model_id": "gpt-5.6-sol"},
-      "display": {"role": "architecture", "name": "Sol", "version": "5.6"},
-      "editorial": {"label": "frontier", "rank": 2, "lane": "architecture-implementation"},
-      "route": {"backend": "codex", "target": "gpt-5.6-sol", "dispatchable": true}
+      "identity": {
+        "vendor": "openai",
+        "model_id": "gpt-5.6-sol"
+      },
+      "display": {
+        "role": "architecture",
+        "name": "Sol",
+        "version": "5.6"
+      },
+      "editorial": {
+        "label": "frontier",
+        "rank": 3,
+        "lane": "architecture-implementation"
+      },
+      "route": {
+        "backend": "codex",
+        "target": "gpt-5.6-sol",
+        "dispatchable": true
+      }
     },
     {
       "key": "claude/claude-opus-5",
-      "identity": {"vendor": "anthropic", "model_id": "claude-opus-5"},
-      "display": {"role": "synthesis", "name": "Opus", "version": "5"},
-      "editorial": {"label": "frontier", "rank": 3, "lane": "architecture-synthesis"},
-      "route": {"backend": "claude", "target": "claude-opus-5", "dispatchable": true}
+      "identity": {
+        "vendor": "anthropic",
+        "model_id": "claude-opus-5"
+      },
+      "display": {
+        "role": "synthesis",
+        "name": "Opus",
+        "version": "5"
+      },
+      "editorial": {
+        "label": "frontier",
+        "rank": 4,
+        "lane": "architecture-synthesis"
+      },
+      "route": {
+        "backend": "claude",
+        "target": "claude-opus-5",
+        "dispatchable": true
+      }
     },
     {
       "key": "kimi/kimi-code/k3",
-      "identity": {"vendor": "moonshot", "model_id": "kimi-code/k3"},
-      "display": {"role": "high-context research", "name": "Kimi", "version": "K3"},
-      "editorial": {"label": "frontier", "rank": 4, "lane": "high-context-research"},
-      "route": {"backend": "kimi", "target": "kimi-code/k3", "dispatchable": true}
+      "identity": {
+        "vendor": "moonshot",
+        "model_id": "kimi-code/k3"
+      },
+      "display": {
+        "role": "high-context research",
+        "name": "Kimi",
+        "version": "K3"
+      },
+      "editorial": {
+        "label": "frontier",
+        "rank": 5,
+        "lane": "high-context-research"
+      },
+      "route": {
+        "backend": "kimi",
+        "target": "kimi-code/k3",
+        "dispatchable": true
+      }
+    },
+    {
+      "key": "agy/gemini-3.8-flash-high",
+      "identity": {
+        "vendor": "google",
+        "model_id": "gemini-3.8-flash-high"
+      },
+      "display": {
+        "role": "vision research and review",
+        "name": "Gemini Flash",
+        "version": "3.8"
+      },
+      "editorial": {
+        "label": "frontier",
+        "rank": 8,
+        "lane": "multimodal-research-review"
+      },
+      "route": {
+        "backend": "agy",
+        "target": "gemini-3.8-flash-high",
+        "dispatchable": true
+      }
     },
     {
       "key": "cursor-agent/grok-4.6",
-      "identity": {"vendor": "xai", "model_id": "grok-4.6"},
-      "display": {"role": "coding second opinion", "name": "Grok", "version": "4.6"},
-      "editorial": {"label": "near-frontier", "rank": 1, "lane": "coding-second-opinion"},
-      "route": {"backend": "cursor-agent", "target": "grok-4.6", "dispatchable": true}
+      "identity": {
+        "vendor": "xai",
+        "model_id": "grok-4.6"
+      },
+      "display": {
+        "role": "coding second opinion",
+        "name": "Grok",
+        "version": "4.6"
+      },
+      "editorial": {
+        "label": "near-frontier",
+        "rank": 1,
+        "lane": "coding-second-opinion"
+      },
+      "route": {
+        "backend": "cursor-agent",
+        "target": "grok-4.6",
+        "dispatchable": true
+      }
     },
     {
       "key": "agy/gemini-3.7-flash-high",
-      "identity": {"vendor": "google", "model_id": "gemini-3.7-flash-high"},
-      "display": {"role": "evidence research", "name": "Gemini Flash", "version": "3.7"},
-      "editorial": {"label": "near-frontier", "rank": 2, "lane": "evidence-research"},
-      "route": {"backend": "agy", "target": "gemini-3.7-flash-high", "dispatchable": true}
+      "identity": {
+        "vendor": "google",
+        "model_id": "gemini-3.7-flash-high"
+      },
+      "display": {
+        "role": "evidence research",
+        "name": "Gemini Flash",
+        "version": "3.7"
+      },
+      "editorial": {
+        "label": "near-frontier",
+        "rank": 2,
+        "lane": "evidence-research"
+      },
+      "route": {
+        "backend": "agy",
+        "target": "gemini-3.7-flash-high",
+        "dispatchable": true
+      }
     },
     {
       "key": "arkcli/deepseek-v4-pro-ga-260813",
-      "identity": {"vendor": "deepseek", "model_id": "deepseek-v4-pro-ga-260813"},
-      "display": {"role": "deep reasoning", "name": "DeepSeek V4 Pro", "version": "V4 Pro GA"},
-      "editorial": {"label": "frontier", "rank": 5, "lane": "deep-reasoning"},
-      "route": {"backend": "arkcli", "target": "deepseek-v4-pro-ga-260813", "dispatchable": true}
+      "identity": {
+        "vendor": "deepseek",
+        "model_id": "deepseek-v4-pro-ga-260813"
+      },
+      "display": {
+        "role": "deep reasoning",
+        "name": "DeepSeek V4 Pro",
+        "version": "V4 Pro GA"
+      },
+      "editorial": {
+        "label": "frontier",
+        "rank": 6,
+        "lane": "deep-reasoning"
+      },
+      "route": {
+        "backend": "arkcli",
+        "target": "deepseek-v4-pro-ga-260813",
+        "dispatchable": true
+      }
     },
     {
       "key": "arkcli/glm-5-2-260617",
-      "identity": {"vendor": "zhipu", "model_id": "glm-5-2-260617"},
-      "display": {"role": "long-context generalist", "name": "GLM", "version": "5.2"},
-      "editorial": {"label": "near-frontier", "rank": 3, "lane": "long-context-secondary"},
-      "route": {"backend": "arkcli", "target": "glm-5-2-260617", "dispatchable": true}
+      "identity": {
+        "vendor": "zhipu",
+        "model_id": "glm-5-2-260617"
+      },
+      "display": {
+        "role": "long-context generalist",
+        "name": "GLM",
+        "version": "5.2"
+      },
+      "editorial": {
+        "label": "near-frontier",
+        "rank": 3,
+        "lane": "long-context-secondary"
+      },
+      "route": {
+        "backend": "arkcli",
+        "target": "glm-5-2-260617",
+        "dispatchable": true
+      }
     },
     {
       "key": "arkcli/deepseek-v4-flash-ga-260731",
-      "identity": {"vendor": "deepseek", "model_id": "deepseek-v4-flash-ga-260731"},
-      "display": {"role": "fast coding", "name": "DeepSeek V4 Flash", "version": "V4 Flash GA"},
-      "editorial": {"label": "near-frontier", "rank": 4, "lane": "fast-secondary"},
-      "route": {"backend": "arkcli", "target": "deepseek-v4-flash-ga-260731", "dispatchable": true}
+      "identity": {
+        "vendor": "deepseek",
+        "model_id": "deepseek-v4-flash-ga-260731"
+      },
+      "display": {
+        "role": "fast coding",
+        "name": "DeepSeek V4 Flash",
+        "version": "V4 Flash GA"
+      },
+      "editorial": {
+        "label": "near-frontier",
+        "rank": 4,
+        "lane": "fast-secondary"
+      },
+      "route": {
+        "backend": "arkcli",
+        "target": "deepseek-v4-flash-ga-260731",
+        "dispatchable": true
+      }
     },
     {
       "key": "codex/gpt-5.6-luna",
-      "identity": {"vendor": "openai", "model_id": "gpt-5.6-luna"},
-      "display": {"role": "cost-efficient frontier alternative", "name": "Luna", "version": "5.6"},
-      "editorial": {"label": "near-frontier", "rank": 5, "lane": "cost-efficient-reasoning"},
-      "route": {"backend": "codex", "target": "gpt-5.6-luna", "dispatchable": true, "availability": "config_observed"}
+      "identity": {
+        "vendor": "openai",
+        "model_id": "gpt-5.6-luna"
+      },
+      "display": {
+        "role": "cost-efficient frontier alternative",
+        "name": "Luna",
+        "version": "5.6"
+      },
+      "editorial": {
+        "label": "near-frontier",
+        "rank": 5,
+        "lane": "cost-efficient-reasoning"
+      },
+      "route": {
+        "backend": "codex",
+        "target": "gpt-5.6-luna",
+        "dispatchable": true,
+        "availability": "config_observed"
+      }
     },
     {
       "key": "codex/gpt-5.6-terra",
-      "identity": {"vendor": "openai", "model_id": "gpt-5.6-terra"},
-      "display": {"role": "balanced mid-range", "name": "Terra", "version": "5.6"},
-      "editorial": {"label": "near-frontier", "rank": 6, "lane": "balanced-secondary"},
-      "route": {"backend": "codex", "target": "gpt-5.6-terra", "dispatchable": false, "availability": "declared_unverified"}
+      "identity": {
+        "vendor": "openai",
+        "model_id": "gpt-5.6-terra"
+      },
+      "display": {
+        "role": "balanced mid-range",
+        "name": "Terra",
+        "version": "5.6"
+      },
+      "editorial": {
+        "label": "near-frontier",
+        "rank": 6,
+        "lane": "balanced-secondary"
+      },
+      "route": {
+        "backend": "codex",
+        "target": "gpt-5.6-terra",
+        "dispatchable": false,
+        "availability": "declared_unverified"
+      }
     },
     {
       "key": "codex/gpt-5.3-spark",
-      "identity": {"vendor": "openai", "model_id": "gpt-5.3-spark"},
-      "display": {"role": "fast quota-isolated", "name": "Spark", "version": "5.3"},
-      "editorial": {"label": "near-frontier", "rank": 7, "lane": "fast-quota-isolated"},
-      "route": {"backend": "codex", "target": "gpt-5.3-spark", "dispatchable": false, "availability": "declared_unverified"}
+      "identity": {
+        "vendor": "openai",
+        "model_id": "gpt-5.3-spark"
+      },
+      "display": {
+        "role": "fast quota-isolated",
+        "name": "Spark",
+        "version": "5.3"
+      },
+      "editorial": {
+        "label": "near-frontier",
+        "rank": 7,
+        "lane": "fast-quota-isolated"
+      },
+      "route": {
+        "backend": "codex",
+        "target": "gpt-5.3-spark",
+        "dispatchable": false,
+        "availability": "declared_unverified"
+      }
     },
     {
       "key": "claude/claude-fable-5",
-      "identity": {"vendor": "anthropic", "model_id": "claude-fable-5"},
-      "display": {"role": "previous-version escalation", "name": "Fable", "version": "5"},
-      "editorial": {"label": "frontier", "rank": 6, "lane": "explicit-previous-version"},
-      "route": {"backend": "claude", "target": "claude-fable-5", "dispatchable": true}
+      "identity": {
+        "vendor": "anthropic",
+        "model_id": "claude-fable-5"
+      },
+      "display": {
+        "role": "previous-version escalation",
+        "name": "Fable",
+        "version": "5"
+      },
+      "editorial": {
+        "label": "frontier",
+        "rank": 7,
+        "lane": "explicit-previous-version"
+      },
+      "route": {
+        "backend": "claude",
+        "target": "claude-fable-5",
+        "dispatchable": true
+      }
+    },
+    {
+      "key": "openai-compat/deepseek-v4-1-flash-260910",
+      "identity": {
+        "vendor": "deepseek",
+        "model_id": "deepseek-v4-1-flash-260910"
+      },
+      "display": {
+        "role": "fast coding and review",
+        "name": "DeepSeek V4.1 Flash",
+        "version": "V4.1 Flash 260910"
+      },
+      "editorial": {
+        "label": "near-frontier",
+        "rank": 8,
+        "lane": "fast-primary"
+      },
+      "route": {
+        "backend": "openai-compat",
+        "target": "deepseek-v4-1-flash-260910",
+        "dispatchable": true
+      }
+    },
+    {
+      "key": "openai-compat/glm-5-3-flash-260828",
+      "identity": {
+        "vendor": "zhipu",
+        "model_id": "glm-5-3-flash-260828"
+      },
+      "display": {
+        "role": "fast coding",
+        "name": "GLM 5.3 Flash",
+        "version": "5.3 Flash 260828"
+      },
+      "editorial": {
+        "label": "near-frontier",
+        "rank": 9,
+        "lane": "coding-secondary"
+      },
+      "route": {
+        "backend": "openai-compat",
+        "target": "glm-5-3-flash-260828",
+        "dispatchable": true
+      }
     }
   ]
 }

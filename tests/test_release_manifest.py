@@ -182,9 +182,24 @@ class ReleaseManifestTests(unittest.TestCase):
         end = ci.index("Unit tests (ACP transport", start)
         pattern = r"skills/summon/(?:scripts|tests)/test_[A-Za-z0-9_]+\.py"
         ci_files = set(re.findall(pattern, ci[start:end]))
-        release_files = set(re.findall(
-            pattern, MODULE.REQUIRED_COMMANDS["phase0_phase1"]))
+        release_files = set()
+        for suite in ("phase0_phase1", "phase0_launch"):
+            release_files.update(re.findall(
+                pattern, MODULE.REQUIRED_COMMANDS[suite]))
         self.assertEqual(release_files, ci_files)
+
+    def test_ci_machine_registry_matches_fixed_release_registry(self):
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8")
+        test_match = re.search(
+            r'assert set\(evidence\["tests"\]\) == \{(.*?)\n\s+\}', ci, re.S)
+        gate_match = re.search(r'expected_gates = \{(.*?)\n\s+\}', ci, re.S)
+        self.assertIsNotNone(test_match)
+        self.assertIsNotNone(gate_match)
+        ci_tests = set(re.findall(r'"([a-z][a-z0-9_]*)"', test_match.group(1)))
+        ci_gates = set(re.findall(r'"([a-z][a-z0-9_]*)"', gate_match.group(1)))
+        self.assertEqual(ci_tests, MODULE.REQUIRED_TESTS)
+        self.assertEqual(ci_gates, MODULE.REQUIRED_GATES)
 
     def test_source_hash_is_deterministic_and_excludes_python_cache(self):
         first = MODULE.source_tree_sha256(ROOT)
@@ -197,10 +212,66 @@ class ReleaseManifestTests(unittest.TestCase):
             ROOT, tests={"deliberation": "334/334"},
             gates={"live_provider": "blocked"},
         )
+        self.assertEqual(
+            manifest["release_profile"],
+            {"schema": 1, "name": "stable", "live_provider": "required"},
+        )
         self.assertEqual(manifest["tests"], {"deliberation": "334/334"})
         self.assertEqual(manifest["known_gates"]["live_provider"], "blocked")
         encoded = json.dumps(manifest)
         self.assertNotIn(str(ROOT), encoded)
+
+    def test_workspace_preview_profile_is_explicit_and_versioned(self):
+        manifest = MODULE.build_manifest(
+            ROOT, release_profile=MODULE.WORKSPACE_PREVIEW_RELEASE_PROFILE,
+        )
+        self.assertEqual(
+            manifest["release_profile"],
+            {"schema": 1, "name": "workspace-preview", "live_provider": "separate"},
+        )
+        with self.assertRaises(ValueError):
+            MODULE._validated_release_profile(
+                {"schema": 1, "name": "workspace-preview", "live_provider": "required"}
+            )
+        with self.assertRaises(ValueError):
+            MODULE._release_profile_contract("invented-preview")
+
+    def test_platform_qualification_is_scoped_and_fail_closed(self):
+        value = {
+            "schema": 1,
+            "host": "non_windows",
+            "windows_evidence": "unavailable",
+            "windows_scoped_gates": {
+                "migration_rollback": "unavailable",
+                "browser_security": "unavailable",
+                "accessibility": "unavailable",
+            },
+            "status": "incomplete",
+        }
+        self.assertEqual(MODULE._validate_platform_qualification(value), value)
+        forged = dict(value)
+        forged["windows_scoped_gates"] = dict(value["windows_scoped_gates"])
+        forged["windows_scoped_gates"]["migration_rollback"] = "pass"
+        with self.assertRaises(ValueError):
+            MODULE._validate_platform_qualification(forged)
+        unknown = dict(value, unexpected="private")
+        with self.assertRaises(ValueError):
+            MODULE._validate_platform_qualification(unknown)
+
+    def test_rendered_evidence_requires_canonical_source_bound_files(self):
+        value = {
+            "schema": 1,
+            "policy": "synthetic-loopback-only",
+            "producer": "tools/release_gates.py",
+            "source_tree_sha256": "a" * 64,
+            "producers": ["workspace_ui", "browser_security", "accessibility"],
+            "files": [{"name": "browser-toolchain.json", "bytes": 4,
+                       "sha256": "b" * 64}],
+        }
+        self.assertEqual(MODULE._validate_rendered_evidence(value, "a" * 64), value)
+        forged = dict(value, files=[dict(value["files"][0], name="secret.log")])
+        with self.assertRaises(ValueError):
+            MODULE._validate_rendered_evidence(forged, "a" * 64)
 
     def test_pairs_reject_malformed_and_duplicate_facts(self):
         with self.assertRaises(ValueError):

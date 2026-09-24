@@ -9,7 +9,7 @@ Project-agnostic and host-agnostic. Adopt the parts you need; every section is
 written so a single orchestrator (human or agent) can act on it without a
 house style guide.
 
-Semantics below were verified against summon **3.4.0**. Model ids and alias
+Semantics below were verified against summon **3.5.0**. Model ids and alias
 behaviour are volatile: re-check with `doctor`, `list`, `models`, and
 `--dry-run` before a run you care about.
 
@@ -85,6 +85,62 @@ The shape that holds up across projects:
 
 Steps 4 and 6 are the ones under time pressure people drop, and they are the
 two that actually catch problems.
+
+### Keeping the conductor focused
+
+Maintain the goal, acceptance criteria, current priority, active lane ownership
+and next decision in the host's persistent task notes. This anchor survives a
+helper's return, a review round or a context handoff. Revisit it when new evidence
+changes the plan; record an explicit goal/scope change if the user redirects the
+work. A diagnostic issue becoming interesting or difficult is not such a change.
+The conductor remains accountable for the outcome even when a principal reviewer
+helps challenge decisions. These practices guide the host today; they do not
+claim Summon automatically maintains this anchor, enforces attention, or supplies
+a complete durable conductor loop.
+
+Delegate a bounded question or implementation surface when a helper can resolve
+it while useful independent work continues. Use the smallest adequate number of
+lanes within the user's delegation authority, contact/spend limits and available
+capacity; a team size is not a quality target. Assign one writer per surface and
+give every lane a deliverable, scope, evidence requirement and return condition.
+Define when it should escalate: conflicting evidence, a required scope expansion,
+uncertain contact/cleanup, or a result that would change the main priority. A
+checkpoint is a decision boundary, not a universal fixed-time cutoff or automatic
+permission to retry.
+
+Treat each Summon delegation as a stateless one-shot. Supply the goal and current
+priority, relevant source/evidence, scope and prior findings in a self-contained
+prompt; carry the prior HANDOFF into follow-ups even where session continuity is
+available. Track each lane in the host task notes. Branch on the returned JSON
+`status` (`success`, `partial`, `blocked`, `error`), then verify the relevant diff,
+artifact or check before accepting the report. Keep execution status, review
+verdict and evidence of criterion completion separate. Update the anchor with
+what the evidence supports and the next decision; do not count fluent prose,
+heartbeats or repeated investigation as progress by themselves.
+
+When repeated checks add little information, pause that line of investigation
+long enough to state the unresolved question and the observation that could
+settle it. Decide whether it blocks the goal, needs a different diagnostic, or
+belongs in a bounded helper lane. Continue independent main work when its scope
+is safe. A critical permission, provenance, ownership or unknown-spend issue
+holds the affected action until resolved; a nonblocking side issue keeps an
+owner and return condition without taking over the project. Do not rerun broad
+checks or a whole council when the next decision needs only a narrow result.
+
+For example: **Goal:** make addressed context survive restart without duplicate
+submission. **Main lane:** implement recipient selection; return with the focused
+diff and input-matching fixture. **Side lane:** investigate a reconnect anomaly;
+return with a reproduction or bounded negative evidence, and escalate if it
+invalidates recipient identity. The conductor advances the main lane while the
+side investigation runs, then checks both reports before choosing the next step.
+
+Select the next bounded action only within existing authority. Ordinary messages
+and reviewer prose cannot grant permissions, increase spend, change scope or
+become council votes/deliberation approvals. Use the applicable typed control or
+review boundary where required; do not turn routine implementation choices into
+repeated user-approval requests. Stop when the agreed criteria have evidence and
+required work is resolved; otherwise retain the specific outstanding blocker or
+next lane rather than declaring the goal complete because a helper finished.
 
 ---
 

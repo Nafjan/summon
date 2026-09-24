@@ -1,5 +1,6 @@
 ---
 run-agent: agy
+model: gemini-3.8-flash-high
 permission: yolo
 ---
 

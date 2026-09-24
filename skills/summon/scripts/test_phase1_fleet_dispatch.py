@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import concurrent.futures
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -21,6 +22,18 @@ import _fleet_activation
 import _fleet_approval
 import _fleet_compile
 import _fleet_dispatch
+
+
+@pytest.fixture(autouse=True)
+def _host_provider_routing_is_not_inherited(monkeypatch):
+    """Billing derivation reads provider-routing variables. A host that runs these
+    tests from inside a Claude Code session exports ANTHROPIC_BASE_URL, which turns
+    every Claude fixture into "custom provider" billing; the release gate scrubs
+    the environment, so ordinary runs must too."""
+    for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
+                 "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_BEDROCK_BASE_URL",
+                 "ANTHROPIC_VERTEX_PROJECT_ID"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _agents(two: bool = False):
@@ -101,7 +114,11 @@ def _claim(context, reservation):
 
 
 def _activation_material(context, *, claim_id="a" * 32, prompt="review this"):
-    profile = Path(context["cwd"]) / ".claude-activation-profile"
+    # Named account homes must be dedicated and outside the dispatch tree.  Keep
+    # the synthetic profile beside (not inside) the provider-free task root so
+    # these fixtures exercise the same isolation rule as the runtime.
+    dispatch = Path(context["cwd"])
+    profile = dispatch.parent / f"{dispatch.name}-claude-activation-profile"
     profile.mkdir(exist_ok=True)
     invocation = AgentInvocation(
         cli="claude", prompt=prompt, cwd=context["cwd"],
@@ -238,7 +255,7 @@ def test_activation_launch_claim_is_atomic_private_and_consumes_once(approved):
     ("transport", "acp"),
     ("argv_sha256", "not-a-digest"),
     ("cwd_sha256", _sha("different-cwd")),
-])
+], ids=['p001_case_001', 'p001_case_002', 'p001_case_003', 'p001_case_004', 'p001_case_005'])
 def test_activation_launch_evidence_drift_refuses_before_capacity_consumption(
         approved, field, value):
     reservation = _reserve_activation(approved)
@@ -337,7 +354,8 @@ def test_activation_profile_content_rotation_fails_preflight(approved, monkeypat
     for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
                  "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_BASE_URL"):
         monkeypatch.delenv(name, raising=False)
-    profile = Path(approved["cwd"]) / ".claude-activation-profile"
+    dispatch = Path(approved["cwd"])
+    profile = dispatch.parent / f"{dispatch.name}-claude-activation-profile"
     profile.mkdir(exist_ok=True)
     settings = profile / "settings.json"
     settings.write_text('{"account":"first"}', encoding="utf-8")
@@ -353,6 +371,32 @@ def test_activation_profile_content_rotation_fails_preflight(approved, monkeypat
             invocation=invocation, activation_candidate=candidate,
             agent_definition_sha256=definition_sha,
             current_request_identity_sha256=request_sha)
+
+
+def test_activation_profile_home_rotation_fails_preflight(approved):
+    """A selected account home cannot rotate after approval or auto-switch."""
+    reservation = _reserve_activation(approved)
+    invocation, candidate, definition_sha, request_sha = _activation_material(approved)
+    dispatch = Path(approved["cwd"])
+    rotated = dispatch.parent / f"{dispatch.name}-rotated-claude-profile"
+    rotated.mkdir(exist_ok=True)
+    changed_invocation = replace(
+        invocation,
+        profile_env={"CLAUDE_CONFIG_DIR": str(rotated)},
+    )
+    with pytest.raises(_fleet_dispatch.FleetDispatchError) as changed:
+        _fleet_dispatch.preflight_activation_dispatch(
+            reservation, fleet=approved["fleet"], plan=approved["plan"],
+            catalog=approved["catalog"], lane_name="review", cwd=approved["cwd"],
+            data_boundary={"boundary": "local_sanitized", "proof": "operator_attested",
+                           "evidence_sha256": _fleet_activation._sha(invocation.prompt)},
+            invocation=changed_invocation, activation_candidate=candidate,
+            agent_definition_sha256=definition_sha,
+            current_request_identity_sha256=request_sha)
+    assert changed.value.kind == "fleet_activation_context_changed"
+    claim = _fleet_dispatch.get_claim(reservation)
+    assert claim["phase"] == "reserved"
+    assert claim["contact_slot_consumed"] is False
 
 
 def test_activation_unknown_billing_and_stale_identity_refuse(approved, monkeypatch):
@@ -505,7 +549,7 @@ def test_forged_effective_permission_and_enforcement_cannot_bypass_ceiling(
     assert refused.value.kind == "fleet_dispatch_no_eligible_route"
 
 
-@pytest.mark.parametrize("declared", ["public", "private_local"])
+@pytest.mark.parametrize("declared", ["public", "private_local"], ids=['p002_case_001', 'p002_case_002'])
 def test_public_proof_is_prompt_bound_and_private_local_is_not_implemented(
         tmp_path, monkeypatch, declared):
     root = tmp_path / "private"
@@ -1037,7 +1081,7 @@ def test_public_receipt_forgery_is_detected_and_never_authoritative(approved):
     assert not hasattr(_fleet_dispatch, "claim_from_public_receipt")
 
 
-@pytest.mark.parametrize("mutation", ["cyclic", "deep", "oversize"])
+@pytest.mark.parametrize("mutation", ["cyclic", "deep", "oversize"], ids=['p003_case_001', 'p003_case_002', 'p003_case_003'])
 def test_public_receipt_is_bounded_before_digesting(approved, mutation):
     receipt = _fleet_dispatch.public_receipt(_reserve(approved))
     if mutation == "cyclic":

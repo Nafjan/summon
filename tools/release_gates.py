@@ -2,8 +2,9 @@
 """Run Summon's fixed release-test registry and emit bound evidence.
 
 This runner is deliberately boring: it executes only the checked-in commands,
-captures bounded output, and refuses to emit evidence when any command fails or
-the source tree changes during the run. It never launches a provider directly.
+captures structured outcomes, and refuses release acceptance for failed or
+incomplete cases. Diagnostic evidence may retain blocking outcomes; source
+changes invalidate the run. It never launches a provider directly.
 """
 
 from __future__ import annotations
@@ -31,6 +32,36 @@ _PYTEST_RESULT = re.compile(
     r"(?P<extras>(?:, [0-9]+ [a-z]+(?: passed)?)*) "
     r"in [0-9.]+s(?: \([^\r\n]+\))?[= ]*$"
 )
+_SAFE_ERROR_KINDS = frozenset({
+    "gate_command_failed",
+    "live_provider_evidence_missing",
+    "live_provider_evidence_invalid",
+})
+_SAFE_EVIDENCE_FILE = "redacted-live-provider-receipt.json"
+# These gates include Windows-only rollback/OS-privacy evidence.  A non-Windows
+# run may execute the portable portions, but it must not project that run as
+# qualification of the Windows release boundary.
+WINDOWS_SCOPED_GATES = frozenset({
+    "migration_rollback", "browser_security", "accessibility",
+})
+_RENDERED_FILE_PATTERNS = (
+    re.compile(r"(?:browser-toolchain|measurements|u08-observations|native-zoom-measurements)\.json\Z"),
+    re.compile(r"native-zoom-(?:1|2|4)-(?:workspace|artifact)\.png\Z"),
+    re.compile(r"(?:canonical-artifact-separate-scope|canonical-focal-task-scope|"
+               r"terminal-guidance-and-model-uncertainty|pending-action-authentication-expiry)\.png\Z"),
+    re.compile(r"(?:authentication-focus|desktop-workspace-focus|"
+               r"(?:desktop|200-percent-equivalent|400-percent-equivalent|320-css-pixel-reflow)-"
+               r"(?:workspace|drawer)|reduced-motion-timeline-focus)\.png\Z"),
+    re.compile(r"u04-worker-(?:accepted-and-queued|included|not-submitted-and-acknowledged|failure|"
+               r"(?:submission-started|submitted|acknowledged|not-submitted)|"
+               r"state-card-(?:accepted|queued|included-in-attempt|submission-started|submitted|"
+               r"acknowledged|not-submitted))\.png\Z"),
+    re.compile(r"u08-(?:writer-loss-pending|natural-backoff-stale-owner|"
+               r"coalesced-reconnection-notice|pending-key-during-backoff|"
+               r"authorized-same-key-continuation|unresolved-effects-after-recovery|failure-shell)\.png\Z"),
+)
+_MAX_RENDERED_FILES = 64
+_MAX_RENDERED_FILE_BYTES = 8 * 1024 * 1024
 
 
 def _absolute_lexical(value: str | os.PathLike[str]) -> Path:
@@ -82,6 +113,8 @@ def _load_manifest_module():
 
 
 _MANIFEST = _load_manifest_module()
+_SAFE_ERROR_KINDS = _MANIFEST._OUTCOMES.GATE_DIAGNOSTIC_CODES
+_SAFE_EVIDENCE_FILE = _MANIFEST._OUTCOMES.GATE_EVIDENCE_FILE
 # One canonical registry is shared by manifest validation, execution, and CI
 # review.  The runner never accepts caller-supplied command text.
 COMMANDS = dict(_MANIFEST.REQUIRED_COMMANDS)
@@ -94,6 +127,12 @@ REQUIRED_GATES = frozenset(_MANIFEST.REQUIRED_GATES)
 # Keep this bounded, but do not let a healthy clean-tree check invalidate an
 # otherwise complete release run because of a transient storage stall.
 GIT_METADATA_TIMEOUT_SECONDS = 60.0
+# The Windows aggregate is intentionally serialized.  The current provider-free
+# evidence run showed the two large partitions completing below this bound,
+# while the former 900-second default could expire under ordinary browser and
+# process-tree contention.  This remains a bounded per-child timeout; it is not
+# permission to accept partial output or to skip a slow partition.
+RELEASE_SUITE_TIMEOUT_SECONDS = 1800.0
 
 
 def _canonical_bytes(path: Path) -> bytes:
@@ -101,6 +140,11 @@ def _canonical_bytes(path: Path) -> bytes:
     if path.suffix.lower() in {".md", ".json", ".py", ".txt", ".yml", ".yaml"}:
         data = data.replace(b"\r\n", b"\n")
     return data
+
+
+def _raw_sha256_file(path: Path) -> str:
+    """Hash rendered artifacts byte-for-byte; line-ending normalization is not allowed."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _source_hash() -> str:
@@ -115,6 +159,7 @@ def _git_head() -> str:
          "rev-parse", "--show-toplevel"],
         cwd=str(ROOT), env=env, capture_output=True, text=True,
         encoding="utf-8", timeout=GIT_METADATA_TIMEOUT_SECONDS, check=True,
+        **_MANIFEST.run_flags(),
     ).stdout.strip()
     if Path(top).resolve() != ROOT.resolve():
         raise RuntimeError("Git repository top-level does not match release root")
@@ -123,6 +168,7 @@ def _git_head() -> str:
          "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
          "rev-parse", "HEAD"], cwd=str(ROOT), env=env, capture_output=True,
         text=True, encoding="utf-8", timeout=GIT_METADATA_TIMEOUT_SECONDS, check=True,
+        **_MANIFEST.run_flags(),
     )
     return result.stdout.strip()
 
@@ -177,7 +223,7 @@ def _parse_count(name: str, output: str) -> str:
 
 
 _ENV_ALLOWLIST = {
-    "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "TEMP", "TMP", "TMPDIR",
+    "PATH", "PATHEXT", "COMSPEC", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "TEMP", "TMP", "TMPDIR",
     "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
     "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "COMMONPROGRAMFILES",
     "COMMONPROGRAMFILES(X86)", "PYTHONIOENCODING", "PYTHONUNBUFFERED", "LANG", "LC_ALL",
@@ -185,8 +231,43 @@ _ENV_ALLOWLIST = {
 }
 
 
-def _hermetic_environment() -> dict[str, str]:
-    """Keep platform basics while removing credentials, proxies, and backend knobs."""
+def _validated_external_directory(value: str | os.PathLike[str]) -> Path:
+    """Return an owned, external directory for synthetic rendered evidence."""
+    path = _absolute_lexical(value)
+    _assert_external_path(path, "rendered evidence")
+    if path.exists() and (path.is_symlink() or not path.is_dir()):
+        raise ValueError("rendered evidence directory must be a real directory")
+    path.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise ValueError("rendered evidence directory must not be a symlink")
+    return path
+
+
+def _prepare_rendered_evidence_directory(value: Path) -> Path:
+    """Require a fresh run-owned rendered directory before any child starts."""
+    path = _validated_external_directory(value)
+    if any(path.iterdir()):
+        raise RuntimeError("rendered evidence directory must be empty for a fresh run")
+    return path
+
+
+def _validated_browser_executable(value: str | os.PathLike[str]) -> Path:
+    """Validate an explicitly selected browser binary without trusting ambient env."""
+    path = _absolute_lexical(value)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("explicit Chromium executable must be an existing regular file")
+    return path
+
+
+def _hermetic_environment(*, rendered_evidence_dir: Path | None = None,
+                          chromium_executable: str | os.PathLike[str] | None = None
+                          ) -> dict[str, str]:
+    """Keep platform basics while removing credentials, proxies, and backend knobs.
+
+    The two UI variables are opt-in function arguments, never inherited from the
+    caller's environment.  The runner owns the evidence directory and only
+    forwards a browser executable after explicit regular-file validation.
+    """
     env = {}
     for key, value in os.environ.items():
         if key.upper() not in _ENV_ALLOWLIST:
@@ -197,21 +278,183 @@ def _hermetic_environment() -> dict[str, str]:
         "SUMMON_TELEMETRY": "0",
         "SUMMON_TRANSIENT_RETRIES": "0",
         "CI": "1",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
     })
+    if rendered_evidence_dir is not None:
+        env["SUMMON_UI_RENDERED_EVIDENCE_DIR"] = str(
+            _validated_external_directory(rendered_evidence_dir))
+    if chromium_executable is not None:
+        env["SUMMON_UI_CHROMIUM_EXECUTABLE"] = str(
+            _validated_browser_executable(chromium_executable))
     return env
 
 
-def run_suite(name: str, timeout: float) -> tuple[str, str]:
-    env = _hermetic_environment()
-    result = subprocess.run(
-        _argv(name), cwd=str(ROOT), env=env, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=timeout, check=False,
-    )
-    output = (result.stdout or "") + "\n" + (result.stderr or "")
-    if result.returncode != 0:
-        tail = output[-2000:].replace("\x00", "")
-        raise RuntimeError(f"{name} failed with exit {result.returncode}: {tail}")
-    return _parse_count(name, output), hashlib.sha256(output.encode("utf-8")).hexdigest()
+def _platform_qualification(gate_status: dict[str, str]) -> dict[str, object]:
+    """Project platform-scoped release truth without promoting unavailable proof."""
+    host_platform = "windows" if os.name == "nt" else "non_windows"
+    windows_evidence = "available" if host_platform == "windows" else "unavailable"
+    scoped_gates = {
+        name: (gate_status.get(name) if host_platform == "windows" else "unavailable")
+        for name in sorted(WINDOWS_SCOPED_GATES)
+    }
+    return {
+        "schema": 1,
+        "host": host_platform,
+        "windows_evidence": windows_evidence,
+        "windows_scoped_gates": scoped_gates,
+        "status": (
+            "qualified"
+            if host_platform == "windows" and all(value == "pass" for value in scoped_gates.values())
+            else "incomplete"
+        ),
+    }
+
+
+def _rendered_file_allowed(name: str) -> bool:
+    return any(pattern.fullmatch(name) for pattern in _RENDERED_FILE_PATTERNS)
+
+
+def _collect_rendered_evidence(directory: Path, source_hash: str) -> dict[str, object]:
+    """Bind a fresh, bounded, source-attributed synthetic rendered bundle."""
+    if not directory.is_dir() or directory.is_symlink():
+        raise RuntimeError("rendered evidence directory is unavailable")
+    entries = []
+    for path in sorted(directory.iterdir(), key=lambda item: item.name):
+        if path.is_symlink() or not path.is_file() or not _rendered_file_allowed(path.name):
+            raise RuntimeError("rendered evidence contains an unexpected file")
+        size = path.stat().st_size
+        if size > _MAX_RENDERED_FILE_BYTES:
+            raise RuntimeError("rendered evidence file exceeds the bounded size")
+        entries.append({
+            "name": path.name,
+            "bytes": size,
+            "sha256": _raw_sha256_file(path),
+        })
+    if len(entries) > _MAX_RENDERED_FILES:
+        raise RuntimeError("rendered evidence contains too many files")
+    return {
+        "schema": 1,
+        "policy": "synthetic-loopback-only",
+        "producer": "tools/release_gates.py",
+        "source_tree_sha256": source_hash,
+        "producers": ["workspace_ui", "browser_security", "accessibility"],
+        "files": entries,
+    }
+
+def validate_incomplete_diagnostics(path: Path, root: Path) -> None:
+    """Validate Ubuntu producer diagnostics without constructing a manifest.
+
+    Incomplete outcomes remain incomplete. This entry point grants no release
+    eligibility and does not change strict manifest intake or final checking.
+    """
+    if path.is_symlink():
+        raise ValueError("diagnostic evidence may not be a symlink")
+    value = _MANIFEST._OUTCOMES.read_json(path)
+    if not isinstance(value, dict) or type(value.get("schema")) is not int or value["schema"] != 2:
+        raise ValueError("diagnostics require current structured evidence")
+    source_hash = _MANIFEST.source_tree_sha256(root)
+    git = _MANIFEST._git_facts(root)
+    if (value.get("source_tree_sha256") != source_hash
+            or not isinstance(value.get("git_head"), str)
+            or value["git_head"] != git.get("head")
+            or value.get("git_status_clean") is not True or git.get("dirty") is not False):
+        raise ValueError("diagnostic source binding does not match a clean tree")
+    if (value.get("producer") != "tools/release_gates.py"
+            or value.get("producer_sha256") != _MANIFEST._sha256_file(root / "tools/release_gates.py")
+            or value.get("version_contract") != _MANIFEST._version_contract(root)):
+        raise ValueError("diagnostic producer or version contract does not match")
+    if (value.get("commands") != _MANIFEST.REQUIRED_COMMANDS
+            or value.get("gate_commands") != _MANIFEST.REQUIRED_GATE_COMMANDS
+            or not isinstance(value.get("tests"), dict)
+            or set(value["tests"]) != _MANIFEST.REQUIRED_TESTS
+            or not isinstance(value.get("known_gates"), dict)
+            or set(value["known_gates"]) != _MANIFEST.REQUIRED_GATES):
+        raise ValueError("diagnostic registry does not match")
+    qualification = _MANIFEST._validate_platform_qualification(value.get("platform_qualification"))
+    if (qualification["host"] != "non_windows" or qualification["status"] != "incomplete"
+            or qualification["windows_evidence"] != "unavailable"
+            or set(qualification["windows_scoped_gates"].values()) != {"unavailable"}
+            or value["known_gates"].get("live_provider") != "blocked"):
+        raise ValueError("diagnostics cannot claim platform or live-provider qualification")
+    _MANIFEST._validate_machine_outcomes(value, root, require_pass=False)
+    for name, row in value["test_results"].items():
+        if value["tests"][name] != row["count"]:
+            raise ValueError("diagnostic display counts do not match")
+    for name, artifact in value["gate_results"].items():
+        _MANIFEST._OUTCOMES.validate_gate_artifact(
+            artifact, root=root, name=name, status=value["known_gates"].get(name),
+            command=_MANIFEST.REQUIRED_GATE_COMMANDS[name], source_hash=source_hash,
+            git_head=value["git_head"])
+    rendered = _MANIFEST._validate_rendered_evidence(value.get("rendered_evidence"), source_hash)
+    directory = path.with_name(path.stem + ".gates") / "rendered"
+    if _collect_rendered_evidence(directory, source_hash) != rendered:
+        raise ValueError("diagnostic rendered files do not match their source binding")
+
+def _child_environment(*, rendered_evidence_dir: Path | None = None,
+                       chromium_executable: str | os.PathLike[str] | None = None
+                       ) -> dict[str, str]:
+    """Preserve the zero-argument test seam for ordinary non-rendered gates."""
+    if rendered_evidence_dir is None and chromium_executable is None:
+        return _hermetic_environment()
+    return _hermetic_environment(
+        rendered_evidence_dir=rendered_evidence_dir,
+        chromium_executable=chromium_executable)
+
+
+def _run_outcomes(kind, name, timeout, source_hash, git_head, *,
+                  rendered_evidence_dir: Path | None = None,
+                  chromium_executable: str | os.PathLike[str] | None = None):
+    contract = _MANIFEST._OUTCOMES
+    registry = COMMANDS if kind == "suite" else GATE_COMMANDS
+    # The runtime-only output path is private; the source-bound template uses
+    # a fixed placeholder and cannot disguise a free-form executed command.
+    with tempfile.TemporaryDirectory(prefix="summon-release-collector-") as private:
+        path = Path(private) / "outcomes.json"
+        argv = [sys.executable, str(ROOT / contract.COLLECTOR), "--kind", kind,
+                "--name", name, "--output", str(path)]
+        result = subprocess.run(
+            argv, cwd=str(ROOT), env=_child_environment(
+                rendered_evidence_dir=rendered_evidence_dir,
+                chromium_executable=chromium_executable), capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            check=False, **_MANIFEST.run_flags())
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        if result.returncode != 0 or not path.is_file() or path.is_symlink():
+            raise RuntimeError("structured test capture failed")
+        if path.stat().st_size > contract.MAX_BYTES:
+            raise RuntimeError("structured test capture exceeds limit")
+        outcomes = contract.read_json(path)
+        outcomes["output_sha256"] = hashlib.sha256(output.encode("utf-8")).hexdigest()
+        outcomes.pop("artifact_sha256", None)
+        outcomes["artifact_sha256"] = contract.digest(outcomes)
+        count = contract.validate_outcomes(
+            outcomes, root=ROOT, kind=kind, name=name, command=registry[name],
+            source_hash=source_hash, git_head=git_head, require_pass=False)
+        return count, output, outcomes
+
+
+def _invoke_outcomes(kind, name, timeout, source_hash, git_head, *,
+                     rendered_evidence_dir: Path | None = None,
+                     chromium_executable: str | os.PathLike[str] | None = None):
+    """Call the outcome runner without widening legacy test seams."""
+    options = {}
+    if rendered_evidence_dir is not None:
+        options["rendered_evidence_dir"] = rendered_evidence_dir
+    if chromium_executable is not None:
+        options["chromium_executable"] = chromium_executable
+    return _run_outcomes(kind, name, timeout, source_hash, git_head, **options)
+
+
+def run_suite(name: str, timeout: float, *, source_hash=None, git_head=None,
+              rendered_evidence_dir: Path | None = None,
+              chromium_executable: str | os.PathLike[str] | None = None):
+    count, output, outcomes = _invoke_outcomes(
+        "suite", name, timeout,
+        source_hash if source_hash is not None else _source_hash(),
+        git_head if git_head is not None else _git_head(),
+        rendered_evidence_dir=rendered_evidence_dir,
+        chromium_executable=chromium_executable)
+    return count, hashlib.sha256(output.encode("utf-8")).hexdigest(), outcomes
 
 
 def _marker(output: str, name: str) -> dict[str, object] | None:
@@ -231,7 +474,8 @@ def _marker(output: str, name: str) -> dict[str, object] | None:
 
 def _artifact(name: str, *, status: str, command: str, source_hash: str,
               git_head: str, output: str, test_count: str | None = None,
-              marker: dict[str, object] | None = None) -> dict[str, object]:
+              marker: dict[str, object] | None = None,
+              outcomes: dict[str, object] | None = None) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema": 1,
         "gate": name,
@@ -244,6 +488,8 @@ def _artifact(name: str, *, status: str, command: str, source_hash: str,
     }
     if test_count is not None:
         payload["test_count"] = test_count
+    if outcomes is not None:
+        payload["outcomes"] = outcomes
     if marker:
         # Keep only the fixed marker fields; no provider output or arbitrary
         # environment/path data enters a release artifact.
@@ -252,10 +498,19 @@ def _artifact(name: str, *, status: str, command: str, source_hash: str,
         # retained before it is computed.  The live-provider producer's hash
         # is different: it is the digest of the reviewed receipt itself, so
         # retain it under an explicit field for release-manifest binding.
-        # Gates may also expose bounded evidence-file names and error detail.
-        for key in ("error_kind", "detail", "evidence_file"):
-            if key in marker and isinstance(marker[key], str):
-                payload[key] = marker[key]
+        # Never copy arbitrary provider/host diagnostics into a release
+        # projection. Only source-defined codes and the single redacted
+        # receipt label are public; raw detail remains in the private process
+        # output digest.
+        error_kind = marker.get("error_kind")
+        if error_kind in _SAFE_ERROR_KINDS:
+            payload["error_kind"] = error_kind
+        elif isinstance(error_kind, str):
+            payload["error_kind"] = _MANIFEST._OUTCOMES.GATE_REDACTED
+        if marker.get("evidence_file") == _SAFE_EVIDENCE_FILE:
+            payload["evidence_file"] = _SAFE_EVIDENCE_FILE
+        if marker.get("detail") is not None:
+            payload["detail"] = _MANIFEST._OUTCOMES.GATE_REDACTED
         if (name == "live_provider" and marker.get("status") == "pass"
                 and isinstance(marker.get("artifact_sha256"), str)
                 and re.fullmatch(r"[0-9a-f]{64}", marker["artifact_sha256"])):
@@ -290,12 +545,36 @@ def _write_artifact(directory: Path | None, artifact: dict[str, object]) -> None
 
 
 def run_gate(name: str, timeout: float, *, source_hash: str, git_head: str,
-             artifact_dir: Path | None = None) -> tuple[str, dict[str, object]]:
+             artifact_dir: Path | None = None,
+             rendered_evidence_dir: Path | None = None,
+    chromium_executable: str | os.PathLike[str] | None = None
+             ) -> tuple[str, dict[str, object]]:
+    if name != "live_provider":
+        count, output, outcomes = _invoke_outcomes(
+            "gate", name, timeout, source_hash, git_head,
+            rendered_evidence_dir=rendered_evidence_dir,
+            chromium_executable=chromium_executable)
+        marker = _marker(output, name)
+        try:
+            _MANIFEST._OUTCOMES.validate_outcomes(
+                outcomes, root=ROOT, kind="gate", name=name,
+                command=GATE_COMMANDS[name], source_hash=source_hash, git_head=git_head)
+            status = "blocked" if marker is not None and marker.get("status") == "blocked" else "pass"
+        except ValueError:
+            status = "blocked"
+        artifact = _artifact(name, status=status, command=GATE_COMMANDS[name],
+            source_hash=source_hash, git_head=git_head, output=output,
+            test_count=count, outcomes=outcomes, marker=marker)
+        _write_artifact(artifact_dir, artifact)
+        return status, artifact
     command = GATE_COMMANDS[name]
-    env = _hermetic_environment()
+    env = _child_environment(
+        rendered_evidence_dir=rendered_evidence_dir,
+        chromium_executable=chromium_executable)
     result = subprocess.run(
         _gate_argv(name), cwd=str(ROOT), env=env, capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=timeout, check=False,
+        **_MANIFEST.run_flags(),
     )
     output = (result.stdout or "") + "\n" + (result.stderr or "")
     marker = _marker(output, name)
@@ -324,7 +603,9 @@ def run_gate(name: str, timeout: float, *, source_hash: str, git_head: str,
 
 
 def build_evidence(timeout: float, *, require_clean: bool = False,
-                   artifact_dir: Path | None = None) -> dict[str, object]:
+                   artifact_dir: Path | None = None,
+                   chromium_executable: str | os.PathLike[str] | None = None
+                   ) -> dict[str, object]:
     before_hash = _source_hash()
     head = _git_head()
     status_before = subprocess.run(
@@ -333,19 +614,42 @@ def build_evidence(timeout: float, *, require_clean: bool = False,
          "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"],
         cwd=str(ROOT), env=_MANIFEST._git_env(), capture_output=True,
         text=True, encoding="utf-8", timeout=GIT_METADATA_TIMEOUT_SECONDS, check=True,
+        **_MANIFEST.run_flags(),
     ).stdout
     if require_clean and status_before.strip():
         raise RuntimeError("--require-clean refuses a dirty source tree")
-    results = {name: run_suite(name, timeout) for name in COMMANDS}
-    gate_results: dict[str, dict[str, object]] = {}
-    gate_status: dict[str, str] = {}
-    for name in sorted(GATE_COMMANDS):
-        status, artifact = run_gate(
-            name, timeout, source_hash=before_hash, git_head=head,
-            artifact_dir=artifact_dir,
+    # One owned directory is shared by all rendered checks in this run.  It is
+    # retained only when the caller explicitly requested an external artifact
+    # directory; otherwise it is deleted with the bounded run temporary.
+    with tempfile.TemporaryDirectory(prefix="summon-release-rendered-") as private_rendered:
+        rendered_evidence_dir = (
+            (artifact_dir / "rendered") if artifact_dir is not None
+            else Path(private_rendered)
         )
-        gate_status[name] = status
-        gate_results[name] = artifact
+        _prepare_rendered_evidence_directory(rendered_evidence_dir)
+        results = {
+            name: run_suite(
+                name, timeout, source_hash=before_hash, git_head=head,
+                rendered_evidence_dir=rendered_evidence_dir,
+                chromium_executable=chromium_executable)
+            for name in COMMANDS
+        }
+        gate_results: dict[str, dict[str, object]] = {}
+        gate_status: dict[str, str] = {}
+        for name in sorted(GATE_COMMANDS):
+            status, artifact = run_gate(
+                name, timeout, source_hash=before_hash, git_head=head,
+                artifact_dir=artifact_dir,
+                rendered_evidence_dir=rendered_evidence_dir,
+                chromium_executable=chromium_executable,
+            )
+            gate_status[name] = status
+            gate_results[name] = artifact
+        # Collect while the run-owned temporary directory is still alive.  A
+        # caller-provided artifact directory remains available for manifest
+        # validation and exact CI retention after this scope exits.
+        rendered_evidence = _collect_rendered_evidence(
+            rendered_evidence_dir, before_hash)
     after_hash = _source_hash()
     status_after = subprocess.run(
         ["git", "-c", f"safe.directory={ROOT.resolve()}",
@@ -353,13 +657,15 @@ def build_evidence(timeout: float, *, require_clean: bool = False,
          "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"],
         cwd=str(ROOT), env=_MANIFEST._git_env(), capture_output=True,
         text=True, encoding="utf-8", timeout=GIT_METADATA_TIMEOUT_SECONDS, check=True,
+        **_MANIFEST.run_flags(),
     ).stdout
     after_head = _git_head()
     if before_hash != after_hash or head != after_head or status_before != status_after:
         raise RuntimeError("source or Git state changed while release suites ran")
     tests = {name: value[0] for name, value in results.items()}
+    platform_qualification = _platform_qualification(gate_status)
     return {
-        "schema": 1,
+        "schema": 2,
         "producer": "tools/release_gates.py",
         "producer_sha256": hashlib.sha256(_canonical_bytes(Path(__file__))).hexdigest(),
         "source_tree_sha256": before_hash,
@@ -370,13 +676,16 @@ def build_evidence(timeout: float, *, require_clean: bool = False,
         "known_gates": gate_status,
         "gate_results": gate_results,
         "gate_artifact_dir": (artifact_dir.name if artifact_dir is not None else None),
+        "platform_qualification": platform_qualification,
+        "rendered_evidence": rendered_evidence,
         "commands": dict(COMMANDS),
         "gate_commands": dict(GATE_COMMANDS),
         "test_results": {
-            name: {"count": count, "output_sha256": output_sha256}
-            for name, (count, output_sha256) in results.items()
+            name: {"count": count, "output_sha256": output_sha256, "outcomes": outcomes}
+            for name, (count, output_sha256, outcomes) in results.items()
         },
-        "runtime": {"python": platform.python_version(), "system": platform.platform()},
+        "runtime": {"python_version": platform.python_version(), "sys_platform": sys.platform,
+                    "os_name": os.name},
         "captured_at_unix": int(time.time()),
     }
 
@@ -384,9 +693,13 @@ def build_evidence(timeout: float, *, require_clean: bool = False,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--output", help="write evidence JSON to this path")
-    parser.add_argument("--timeout", type=float, default=900.0)
+    parser.add_argument("--timeout", type=float, default=RELEASE_SUITE_TIMEOUT_SECONDS)
     parser.add_argument("--require-clean", action="store_true",
                         help="refuse to run unless the Git worktree is clean")
+    parser.add_argument(
+        "--chromium-executable",
+        help="explicit regular-file Chromium executable for rendered checks",
+    )
     args = parser.parse_args(argv)
     try:
         artifact_dir = None
@@ -395,8 +708,12 @@ def main(argv: list[str] | None = None) -> int:
             output_path = _absolute_lexical(args.output)
             _assert_external_path(output_path, "release evidence output")
             artifact_dir = output_path.with_name(output_path.stem + ".gates")
-        evidence = build_evidence(args.timeout, require_clean=args.require_clean,
-                                  artifact_dir=artifact_dir)
+        evidence = build_evidence(
+            args.timeout,
+            require_clean=args.require_clean,
+            artifact_dir=artifact_dir,
+            chromium_executable=args.chromium_executable,
+        )
         encoded = json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         if output_path is not None:
             if output_path.is_symlink():
@@ -419,8 +736,16 @@ def main(argv: list[str] | None = None) -> int:
         else:
             sys.stdout.write(encoded)
         return 0
-    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+    except subprocess.TimeoutExpired:
+        print("release evidence: capture_timeout (timed out)", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        # Keep safe, machine-actionable path/contract refusals visible without
+        # exposing arbitrary subprocess output.
         print(f"release evidence: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        print("release evidence: capture_or_publication_failed", file=sys.stderr)
         return 2
 
 

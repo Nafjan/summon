@@ -16,6 +16,7 @@ import pytest
 import _deliberation_context as durable_context
 import _executor
 import _jobs
+from _spawn import popen_flags, run_flags
 
 
 HERE = Path(__file__).resolve().parent
@@ -44,7 +45,7 @@ def _windows_system_directory() -> Path:
 def _run(args: list[str], *, env: dict[str, str], expected: int = 0) -> dict:
     completed = subprocess.run(
         [sys.executable, str(RUNNER), *args], capture_output=True, text=True,
-        encoding="utf-8", timeout=60, env=env)
+        encoding="utf-8", timeout=60, env=env, **run_flags())
     assert completed.returncode == expected, completed.stdout + completed.stderr
     assert completed.stdout.strip(), completed.stderr
     return json.loads(completed.stdout)
@@ -64,7 +65,7 @@ def _standalone_consume(path: Path, *, expected: int = 0) -> subprocess.Complete
     consumer = PHASE1_EXAMPLES / "consume_portable_result.py"
     completed = subprocess.run(
         [sys.executable, str(consumer), str(path)], capture_output=True,
-        text=True, encoding="utf-8", timeout=30)
+        text=True, encoding="utf-8", timeout=30, **run_flags())
     assert completed.returncode == expected, completed.stdout + completed.stderr
     return completed
 
@@ -305,7 +306,8 @@ def test_phase1_operator_workflow_is_coherent_provider_inert_and_private(
     })
     process = subprocess.Popen(
         [sys.executable, "-c", f"print({terminal!r})"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        **popen_flags())
     live = _executor._drive_process(
         process, "claude", 5_000, parse_stream=True,
         attempt_id="f" * 32, first_event_ms=1_000, idle_ms=1_000,
@@ -406,7 +408,7 @@ def test_windows_wrapper_emits_doctor_json_and_preserves_multiline_prompt(tmp_pa
 
     doctor = subprocess.run(
         [*base, "doctor", "--json"], capture_output=True, text=True,
-        encoding="utf-8", timeout=90, env=env)
+        encoding="utf-8", timeout=90, env=env, **run_flags())
     assert doctor.returncode == 0, doctor.stdout + doctor.stderr
     assert json.loads(doctor.stdout)["platform"].startswith("Windows")
 
@@ -415,7 +417,8 @@ def test_windows_wrapper_emits_doctor_json_and_preserves_multiline_prompt(tmp_pa
         *base, "dispatch", "--agent", "reviewer", "--prompt", prompt,
         "--cwd", str(tmp_path), "--agents-dir", str(agents),
         "--dry-run", "--json",
-    ], capture_output=True, text=True, encoding="utf-8", timeout=60, env=env)
+    ], capture_output=True, text=True, encoding="utf-8", timeout=60, env=env,
+       **run_flags())
     assert unsafe.returncode == 1
     refusal = json.loads(unsafe.stdout)
     assert refusal["error_kind"] == "prompt_transport_unsafe"
@@ -428,7 +431,8 @@ def test_windows_wrapper_emits_doctor_json_and_preserves_multiline_prompt(tmp_pa
         *base, "dispatch", "--agent", "reviewer", "--prompt-file",
         str(prompt_file), "--cwd", str(tmp_path), "--agents-dir", str(agents),
         "--dry-run", "--json",
-    ], capture_output=True, text=True, encoding="utf-8", timeout=60, env=env)
+    ], capture_output=True, text=True, encoding="utf-8", timeout=60, env=env,
+       **run_flags())
     assert dry.returncode == 0, dry.stdout + dry.stderr
     envelope = json.loads(dry.stdout)
     assert envelope["args"][-1] == prompt
@@ -490,7 +494,7 @@ def test_standalone_consumer_has_no_summon_import_or_path_injection():
         "sha256": "b" * 64, "bytes": -1}), "invalid artifact bytes"),
     (lambda value: value["attestation"].__setitem__("transport", "magic"),
      "invalid transport"),
-])
+], ids=['p001_case_001', 'p001_case_002', 'p001_case_003'])
 def test_standalone_consumer_rejects_resealed_contract_forgeries(
         tmp_path, mutator, label):
     value = json.loads((PHASE1_EXAMPLES / "portable-result.sample.json").read_text(
@@ -556,7 +560,7 @@ def test_standalone_consumer_accepts_nullable_unknown_no_contact_and_job_shapes(
 
 @pytest.mark.parametrize("digest_field", (
     "receipt", "job-binding", "artifact", "scripts",
-))
+), ids=['p002_case_001', 'p002_case_002', 'p002_case_003', 'p002_case_004'])
 def test_standalone_consumer_matches_canonical_case_insensitive_sha_contract(
         tmp_path, digest_field):
     value = json.loads((PHASE1_EXAMPLES / "portable-result.sample.json").read_text(

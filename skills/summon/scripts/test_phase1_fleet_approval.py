@@ -19,6 +19,7 @@ import _fleet
 import _fleet_approval
 import _fleet_compile
 import _job_control
+from _spawn import run_flags
 
 
 def _agents():
@@ -518,7 +519,7 @@ def test_windows_hardening_removes_foreign_explicit_ace(
     private_store.mkdir(parents=True)
     seeded = subprocess.run(
         ["icacls", str(private_store), "/grant", "*S-1-1-0:(OI)(CI)R"],
-        capture_output=True, text=True, timeout=15)
+        capture_output=True, text=True, timeout=15, **run_flags())
     assert seeded.returncode == 0, seeded.stdout + seeded.stderr
     before = _fleet_approval._windows_acl_snapshot(str(private_store))
     before_rules = before["rules"] if isinstance(before["rules"], list) else [before["rules"]]
@@ -533,7 +534,7 @@ def test_windows_hardening_removes_foreign_explicit_ace(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACL regression")
-@pytest.mark.parametrize("collision", ["unrelated.txt", "store.json"])
+@pytest.mark.parametrize("collision", ["unrelated.txt", "store.json"], ids=['p001_case_001', 'p001_case_002'])
 def test_windows_refuses_to_reacl_shared_override_directory(
         tmp_path, private_store, collision):
     private_store.mkdir(parents=True)
@@ -579,7 +580,7 @@ def test_safe_inherited_lock_is_repaired_but_foreign_lock_refuses(private_store)
 
     seeded = subprocess.run(
         ["icacls", str(lock), "/grant", "*S-1-1-0:R"],
-        capture_output=True, text=True, timeout=15)
+        capture_output=True, text=True, timeout=15, **run_flags())
     assert seeded.returncode == 0, seeded.stdout + seeded.stderr
     with pytest.raises(_evidence.EvidenceError, match="lock is unsafe") as caught:
         with _fleet_approval._store_lock():
@@ -678,7 +679,7 @@ def test_read_refuses_foreign_explicit_key_ace(tmp_path, private_store):
         expires_in_seconds=3600, expected_generation=0)
     seeded = subprocess.run(
         ["icacls", _fleet_approval.key_path(), "/grant", "*S-1-1-0:R"],
-        capture_output=True, text=True, timeout=15)
+        capture_output=True, text=True, timeout=15, **run_flags())
     assert seeded.returncode == 0, seeded.stdout + seeded.stderr
     with pytest.raises(_evidence.EvidenceError, match="owner-only"):
         _fleet_approval.status()
@@ -698,7 +699,8 @@ def test_cli_records_without_launching_missing_backend(tmp_path, private_store):
          "--seats", "reviewer", "--allow-subscription",
          "--cwd", str(tmp_path), "--agents-dir", str(agents),
          "--out", str(fleet_path), "--json"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags())
     assert proposed.returncode == 0, proposed.stdout + proposed.stderr
 
     approved = subprocess.run(
@@ -706,7 +708,8 @@ def test_cli_records_without_launching_missing_backend(tmp_path, private_store):
          str(fleet_path), "review", "--expires-in", "1h",
          "--expect-generation", "0", "--cwd", str(tmp_path),
          "--agents-dir", str(agents), "--json"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags())
     assert approved.returncode == 0, approved.stdout + approved.stderr
     result = json.loads(approved.stdout)
     assert result["provider_contacted"] is False
@@ -719,7 +722,8 @@ def test_cli_records_without_launching_missing_backend(tmp_path, private_store):
          str(fleet_path), "review", "--expires-in", "1",
          "--expect-generation", "1", "--cwd", str(tmp_path),
          "--agents-dir", str(agents), "--json"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags())
     assert refused.returncode == 1
     error = json.loads(refused.stdout)
     assert error["provider_contacted"] is False
@@ -749,7 +753,8 @@ def test_cli_occupied_receipt_refuses_before_recording_authority(
          str(fleet_path), "review", "--expires-in", "1h",
          "--expect-generation", "0", "--cwd", str(tmp_path),
          "--agents-dir", str(agents), "--out", str(occupied), "--json"],
-        capture_output=True, text=True, encoding="utf-8", timeout=30)
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags())
     assert completed.returncode == 1
     assert occupied.read_text(encoding="utf-8") == "do not replace"
     result = json.loads(completed.stdout)
@@ -787,7 +792,7 @@ def test_cli_revoke_receipt_failure_reports_durable_mutation(
         encoding="utf-8")
     completed = subprocess.run(
         [sys.executable, str(wrapper)], capture_output=True, text=True,
-        encoding="utf-8", timeout=30)
+        encoding="utf-8", timeout=30, **run_flags())
 
     assert completed.returncode == 1
     error = json.loads(completed.stdout)

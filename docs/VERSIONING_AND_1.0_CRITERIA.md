@@ -2,7 +2,7 @@
 
 Status: **historical; criteria met and 1.0.0 publication authorized on 2026-07-29.**
 This document predates the current 3.0.0 public-preview baseline; it is not a 3.0 GA
-certification. Current line is 3.4.x; see `docs/VERSIONING_AND_3.0.md` for the
+certification. Current line is 3.5.x; see `docs/VERSIONING_AND_3.0.md` for the
 historical 3.0 boundary and `docs/PHASE1_MIGRATION_ROLLBACK.md` for the active release
 contract.
 
@@ -87,7 +87,7 @@ silently leave a host running old code.
 | C1 | Surface enumerated and frozen | **MET** | Every public flag is documented; a structural test parses the argparse spec and fails the suite on any undocumented flag. `--job-file` is the only suppressed one. |
 | C2 | Docs match behaviour | **MET** | Version/sample claims are bound to `__version__`; volatile backend claims are measured and qualified; the 0.19 feedback corrections are regression-bound. |
 | C3 | Green across the matrix | **MET** | CI was green on ubuntu/windows x 3.10/3.13 before the final surface; the corrected 1.0 candidate passes 429/429 discovery and 22/22 installer tests locally, with platform-only cases explicitly skipped where unavailable. |
-| C4 | Defect discovery flattened | **MET (3/3)** | Three fresh Cursor/Composer adversarial reviews returned CLEAN on production-script hash `21aecdd7aa3dd84653b9c8ef5630e20869fce8b1b3e94d797b37c13a69b4c1e4`. Invalid, timed-out, repaired, resumed, BLOCK, and CONCERNS attempts were excluded. |
+| C4 | Defect discovery flattened | **MET (3/3)** | Three fresh Cursor/Composer adversarial reviews returned CLEAN on the then-current production-script identity recorded in the private evidence packet. Invalid, timed-out, repaired, resumed, BLOCK, and CONCERNS attempts were excluded. |
 | C5 | Security controls hold | **MET** | Gate/clamp bypass fixes are mutation-verified. Round 1 exercised a real `--max-permission read-only` clamp; a separate current-surface gated dispatch explicitly approved and then returned CLEAN. No repo mutation occurred. |
 | C6 | The envelope never lies | **MET** | `execution_status` now snapshots executor outcome independently from normalized `verdict`; `resumed`, model evidence, gate decisions, artifact stability, and null/unknown states are explicit and regression-bound. |
 | C7 | Upgrade and drift handled | **MET** | `doctor` enumerates host installs, the running copy, and project-local copies; drift reports a stale copy by hash. |
@@ -98,16 +98,16 @@ silently leave a host running old code.
 
 ## Current C4 closure evidence: three clean rounds on the corrected surface
 
-The production surface froze at script hash
-`21aecdd7aa3dd84653b9c8ef5630e20869fce8b1b3e94d797b37c13a69b4c1e4`.
+The production surface froze at the script identity recorded in the private evidence
+packet for that historical candidate.
 All three counting reviews were fresh Cursor/Composer sessions over Codex-authored code
 and used the same bounded evidence packet. No production file changed between rounds.
 
-| Round | Job | Focus | Structured evidence | Verdict |
-|---|---|---|---|---|
-| 1 | `25aa0191accf4d3b977fd2c028112450` | Runtime billing, argv precedence, resume evidence | `status:success`, `execution_status:success`, `report_ok:true`, `verdict:pass`, one attempt, no repair/resume | **CLEAN** — notes only |
-| 2 | `26d46c22aaf24e8182600a185e6133d8` | Negative cases, warning parity, security disposition | Same success/pass fields; one attempt, no repair/resume | **CLEAN** — no findings |
-| 3 | `6901603cb84441c890ccdb05df975071` | Public-contract truth, cross-platform consistency | Same success/pass fields; one attempt, no repair/resume | **CLEAN** — no findings |
+| Round | Focus | Structured evidence | Verdict |
+|---|---|---|---|
+| 1 | Runtime billing, argv precedence, resume evidence | `status:success`, `execution_status:success`, `report_ok:true`, `verdict:pass`, one attempt, no repair/resume | **CLEAN** — notes only |
+| 2 | Negative cases, warning parity, security disposition | Same success/pass fields; one attempt, no repair/resume | **CLEAN** — no findings |
+| 3 | Public-contract truth, cross-platform consistency | Same success/pass fields; one attempt, no repair/resume | **CLEAN** — no findings |
 
 Cursor reported the pinned `composer-2.5` target and nonzero usage but does not expose a
 served-model identity, so the record does not invent one. Failed Claude 529 attempts,

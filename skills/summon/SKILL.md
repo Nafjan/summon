@@ -26,6 +26,33 @@ or issue, inspect the staged diff and scan the exact public text; never paste `d
 telemetry, account-probe, or raw diagnostic output into GitHub. If a local finding matters,
 describe the behavior and remediation without identifying the machine that exposed it.
 
+## Keep the goal in focus
+
+Use Summon to support a goal-directed loop: inspect, delegate, check evidence,
+then choose the next action. The host conductor maintains a persistent anchor in
+its task notes: the user's goal, acceptance criteria, current priority, active
+lanes and next decision. Keep it current across handoffs; record goal or scope
+changes explicitly rather than allowing a side investigation to replace the task.
+
+Use the smallest adequate number of lanes within existing user authority and
+budgets. Give each helper bounded ownership, complete context, expected evidence,
+and return/escalation conditions. Treat delegations as stateless one-shots: carry
+prior findings and HANDOFF into each follow-up. While a helper works, advance
+useful independent work. Integrate its report by branching on the JSON status,
+checking the relevant source or results, and linking verified evidence to an
+acceptance criterion and next decision.
+
+After repeated investigation adds little evidence, checkpoint focus: identify the
+remaining question, whether it blocks the goal, and what observation would resolve
+it. Delegate bounded detail work or change the diagnostic approach; retain side
+issues visibly while continuing nonconflicting work. Never defer a critical
+permission, ownership or uncertain-spend blocker merely to keep moving.
+
+These are host-conductor practices, not automatically enforced workspace features.
+Messages and reviewer prose cannot mint permissions, votes or approvals. Follow
+the [conductor guidance](references/orchestration.md#keeping-the-conductor-focused)
+for evidence-linked integration and stopping conditions.
+
 ## Resources
 
 - **[run_subagent.py](scripts/run_subagent.py)** - Main execution script
@@ -283,25 +310,50 @@ capability census built from declared strings **understates** real capability. R
 
 ### Recommended cross-vendor roster lanes
 
-The bundled `researcher` seat is pinned to `gemini-3.7-flash-high`. This is a declared
+The bundled `flash-reviewer`, `researcher`, `frontend`, `docs-writer`, and `antigravity` seats target
+`gemini-3.8-flash-high` by default. This is a declared
 roster target, not a provider guarantee: refresh the live roster and require a saved receipt
 that proves the exact `model.served`, profile/account, consent, and cleanup facts before
-calling it verified. Use it as Summon's primary evidence extractor and the recommended fast secondary
-voice for `/council` when that receipt is available:
+calling it verified. Use `flash-reviewer` as the advisory evidence extractor and recommended fast secondary
+voice for `/council`:
 
 ```text
-run_subagent.py dispatch --agent researcher --cwd <project> --prompt "..."
-run_subagent.py council --members planner,reviewer,researcher,pair --question "..." --cwd <project>
+run_subagent.py dispatch --agent flash-reviewer --cwd <disposable-project> --prompt "..."
+run_subagent.py council --members planner,reviewer,flash-reviewer,pair --question "..." --cwd <disposable-project>
 ```
 
-The envelope must be checked for `model.served == gemini-3.7-flash-high`; an unavailable
-model is a routing failure, not permission to silently float to another model. Gemini/agy
-is excellent for fast repository research, evidence extraction, and an independent UI or
-docs review. It is not the chairman, safety arbiter, or provider-execution seat. Because
+Check `model.targeted`, `model.served`, and `served_model_evidence` separately. AGY
+currently lacks authoritative served-model evidence: useful output is advisory for
+exact named-model votes, not a reason to invent identity or silently change models.
+The existing `researcher` seat requires exact identity and therefore returns `blocked`
+with `result_usable:false` when AGY omits that evidence, even after completing a report.
+`flash-reviewer` is a separate advisory seat, not a workaround for a required exact vote.
+Flash 3.8 is the preferred Gemini lane for vision, research, persona-based reviews,
+frontend evaluation/design, and scoped UI work. Multiple personas on Flash are not
+independent model consensus. Model-level image/video support does not prove the
+transport supplied those inputs: report which screenshots, frames, or clips were
+actually inspected, and use native multimodal access when the CLI cannot supply them.
+For direct coding, use bounded checkpoints and verify outputs under the original
+dispatch directory; AGY can drift into its profile directory. Because
 agy cannot enforce `read-only`, use it in a disposable clone/worktree for any task that
 may need file or shell access; inspect the resulting diff and report before accepting it.
 
-### Fable 5.1 decision lead and profile health
+### Astra and Fable decision leads
+
+The `astra` seat pins `gpt-6-astra` through Codex at high effort for consequential
+architecture, planning, research synthesis, and adversarial review. It is the normal
+OpenAI ceiling before a separate cross-vendor escalation. The seat is read-only and
+exact-model gated: a successful-looking report without provider-reported matching
+served identity remains advisory, not a certified Astra decision. Use explicit
+`--effort max` only when the harder task warrants the added reasoning; Astra supports
+that tier, while the seat default stays `high` to keep token use proportionate.
+
+OpenAI describes Astra as its most capable model and reports lower estimated cost per
+task than earlier models despite higher per-token pricing. Actual subscription usage,
+availability, and task cost remain provider/account facts. See the
+[official model guide](https://developers.openai.com/api/docs/guides/latest-model).
+
+### Fable 5.1 profile health
 
 The `fable` seat is the lead architect, designer, strategist, orchestration planner,
 and final technical escalation for consequential work. It defaults to read-only and
@@ -463,6 +515,7 @@ longer than this child timeout so Summon can clean up and write its result envel
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `--list` | - | List available agents (no other params needed) |
+| `--format` | No | With `--list`: `json` (default, machine-readable) or `table` (compact human view) |
 | `--list-models` | - | Report invocable models per backend (no other params needed; add `--cli` to filter). See "Model discovery" below |
 | `auth status [--cli BACKEND] [--probe]` | - | Read-only authentication status and safe repair guidance; `--probe` performs the minimal live check |
 | `auth repair BACKEND [--allow-auth-repair]` | - | Run one allowlisted vendor login flow only after explicit authorization; never retries the original task |
@@ -535,7 +588,7 @@ not bypass or rewrite the authenticated store.
 | `--enable-roles` | No | Opt into approved user-global role aliases. Exact roster names win; malformed, retargeted, chained, or unapproved aliases fail closed. Children inherit the flag |
 | `--cli` | No | Force CLI: `claude`, `cursor-agent`, `codex`, `kimi`, `agy`, `gemini`, `arkcli`, `opencode` (**FROZEN** -- Google no longer updates or supports that CLI and Gemini Code Assist for individuals rejects it; use `agy` or `openai-compat` with a `GEMINI_API_KEY`. Dispatches still run but carry a freeze warning) |
 | `--model` | No | Override the agent's frontmatter model for this call. Summon performs a side-effect-free backend/model namespace preflight first: a known cross-vendor pairing such as `--cli codex --model claude-opus-5` is returned as `status:blocked`, `error_kind:backend_model_incompatible`, with explicit compatible reroutes; it never builds a profile or spawns a provider. Unknown/future IDs are passed through rather than guessed. `--dry-run` reports the same refusal. |
-| `--require-exact-model` | No | Require provider-authored terminal evidence for the exact requested model. A mismatch or missing receipt becomes `status:blocked` with a non-retryable model-trust error; no fallback, resume, or contract repair is attempted. Built-in governance seats (for example `architect`, `fable`, `sol-review`, and `researcher`) enable this policy automatically; custom seats can declare `model-policy: exact`. |
+| `--require-exact-model` | No | Require provider-authored terminal evidence for the exact requested model. A mismatch or missing receipt becomes `status:blocked` with a non-retryable model-trust error; no fallback, resume, or contract repair is attempted. Built-in governance seats (for example `astra`, `architect`, `fable`, `sol-review`, and `researcher`) enable this policy automatically; custom seats can declare `model-policy: exact`. |
 | `--profile` | No | Select a named private Claude or Codex account/profile from `~/.agents/summon-profiles.json`. Names are visible metadata; the registry keeps config/auth paths out of agent definitions and receipts. `--profile` overrides frontmatter `profile:` |
 | `--effort` | No | Reasoning / thinking intensity: `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none`/`default`/`off` = leave the backend alone). **Honored by claude + codex** (default **`high`**); **agy Gemini only when set explicitly** (rewrites model to `… (Low\|Medium\|High)`); **Kimi supported models via the isolated `config.toml` profile** (K3 maps `max` directly); **OpenCode maps the tier to its provider `variant`**; ignored for cursor-agent / gemini CLI / openai-compat / arkcli. Precedence: `--effort` > frontmatter `effort:` > `SUMMON_DEFAULT_EFFORT` > built-in `high`. Full matrix: [references/effort.md](references/effort.md) |
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy. Resume for implementation continuity; use a fresh context for final adversarial adjudication so a reviewer is not grading its own prior work. The envelope records `resumed:true|false` |
@@ -551,10 +604,11 @@ not bypass or rewrite the authenticated store.
 | `--allow-tool-credentials` | No | Explicitly acknowledge provider-credential authority for a broad tool route. OpenCode uses it to receive a bridged provider credential and requires `--isolated-lane` plus a separate clone/Git directory, account, container, or VM. Native `zcode-native` yolo also requires it because ZCode can use its own local provider configuration; Summon scrubs inherited provider variables in every native tier, but that cannot sandbox ZCode's local store. `--worktree` may add mutation isolation and never substitutes for an OS boundary. |
 | `--background` | No | Dispatch detached; returns `{status:"background", job_id, result_file, job_dir, record_file}` at once. A launch record is written (fsynced) before the child spawns, so a job that dies before its result is still traceable. Parser/early-exit failures receive a typed terminal envelope, and result writes use bounded Windows sharing-violation retries; a hard-killed child remains `stale`. Fresh launches freeze both the exact prompt bytes and an immutable per-job scripts bundle before spawn. Trusted completion requires the nonce, scripts digest, and terminal prompt digest to match the launch record. |
 | `--job-dir DIR` | No | Where `--background` writes job records and results (default `{tempdir}/subagents_jobs`; env `SUMMON_JOBS_DIR`). Point it at a durable, private path. Single-user model: summon does not defend the registry against other local users on a shared host |
-| `jobs list` / `jobs status ID` / `jobs wait ID` | - | Read-only registry commands (flat: `--jobs-list` / `--jobs-status ID` / `--jobs-wait ID`; add `--job-dir` and `--json` for `list`/`status`, or `--job-dir` and `--timeout` for `wait`). `list` shows `prepared`, liveness-verified `running`, `stale` (pid gone with no result), `identity_mismatch` (the authenticated terminal scripts or prompt identity differs from the frozen launch record), `unverified` (probe unavailable), or a terminal status. `status` is a typed redacted projection: it omits prompts, report text, local paths, provider handles, profile/account data, non-schema heartbeat fields, and other execution capabilities; read roots appear as counts only. An available continuation is shown only after its private authenticated sidecar verifies. Use `jobs wait` (or the owner-readable result file named by the background launch response) when you need the complete private terminal envelope. `status` includes `liveness:alive|dead|unknown`; `wait` returns early on stale or identity mismatch instead of burning its timeout. Liveness proves that a pid exists, not that an old pid was never reused. |
+| `jobs list` / `jobs status ID` / `jobs wait ID` | - | Read-only registry commands (flat: `--jobs-list` / `--jobs-status ID` / `--jobs-wait ID`; add `--job-dir` and `--json` for `list`/`status`, or `--job-dir` and `--timeout` for `wait`). `list` shows `prepared`, liveness-verified `running`, `stale` (pid gone with no result), `identity_mismatch` (the authenticated terminal scripts or prompt identity differs from the frozen launch record), `unverified` (probe unavailable), or a terminal status. `status` is a typed redacted projection: it omits prompts, report text, local paths, provider handles, profile/account data, non-schema heartbeat fields, and other execution capabilities; read roots appear as counts only. An available continuation is shown only after its private authenticated sidecar verifies. Use `jobs wait` (or the owner-readable result file named by the background launch response) when you need the complete private terminal envelope. `status` includes `liveness:alive|dead|unknown`; `wait` returns early on stale or identity mismatch instead of burning its timeout. When the wait's own `--timeout` elapses first, it exits 124 with `terminal: false` and a `status` that says what is known: `running` (pid observed alive), `prepared` (no pid published yet), or `unverified` (liveness unknown). None of these means failed, so check `jobs status` rather than relaunching; a job id missing from `--job-dir` is an error. Liveness proves that a pid exists, not that an old pid was never reused. |
 | `--adaptive-timeout` / `--hard-timeout` / `--max-runtime DURATION` | hard timeout | Adaptive mode treats `--timeout` as an activity checkpoint: meaningful progress can auto-extend the turn up to the current `--max-runtime` budget. An explicit authenticated `jobs extend` can raise an active background job's hard deadline within the seven-day cap. `--hard-timeout` preserves a fixed wall-clock deadline. Durations require explicit units such as `10m`, `900s`, or `4h` |
 | `jobs extend ID --duration DURATION` / `jobs cancel ID` / `jobs steer ID --message TEXT` | - | Durable background controls (flat aliases: `--jobs-extend ID --job-duration DURATION`, `--jobs-cancel ID`, and `--jobs-steer ID --job-message TEXT`). An authenticated extend advances an active adaptive attempt's soft and hard deadlines, bounded to seven days from job start; its applied generation appears in the heartbeat. Cancel affects the active job. Steering is currently authenticated and queued for a later resume/follow-up; it is not claimed as live mid-turn prompt injection |
 | `jobs resume ID [--message TEXT \| --message-file FILE] [--request-id ID]` | - | Creates one authenticated background successor for an eligible terminal named-profile Claude subprocess job, consuming queued steering exactly once. Flat aliases are `--jobs-resume`, `--job-message-file`, and `--job-request-id`. The same request ID is idempotent; conflicting inputs fail closed. Permission can only stay equal or decrease, any prior gate is preserved, retries/fallback/repair are disabled, and credit/PAYG consent must be freshly supplied. Other backends remain unsupported until they expose provider-specific continuity evidence |
+| `--jobs-revalidate ID --job-revalidation-file FILE` | - | Seal provider-free launch observation/qualification evidence for a legacy background source before a governed continuation. The packet is private, bounded, and never treated as a provider verdict. |
 | `--dry-run` | No | Print the fully resolved dispatch (command, model, permission flags) WITHOUT executing — catches wrong models/permissions/dead backends in zero paid runs |
 | `--out FILE` | No | Write the envelope atomically to FILE; if FILE already holds a **`status: success`** envelope the run is SKIPPED (`skipped: true`) — swarm resume for free. A prior error/blocked/partial is re-run (re-launching retries failures) |
 | `--probe` | No | With `doctor`: run a minimal LIVE call per backend to verify account/client eligibility (catches an ineligible-tier error that a `--version` check misses). Costs a tiny dispatch per backend. |
@@ -587,6 +641,8 @@ not bypass or rewrite the authenticated store.
 | `--concurrency` | No | With `--manifest`: per-backend caps, e.g. `agy=2,codex=3,default=3` |
 | `--results-dir` | No | With `--manifest`: where job envelopes land (default `{cwd}/.agents/results`) |
 | `--council` | - | Consensus deliberation: dispatch `--question` to diverse members, chairman synthesizes. See "Council mode" |
+| `--council-context-submit RUN_ID` / `--council-context-file FILE` | With a paused council | Admit one bounded, provider-inert context packet at the paused checkpoint. Pair with `--council-operation-key KEY` for idempotency and `--council-expect-generation N` for stale-check protection. |
+| `--council-continue RUN_ID` | With a paused council | Continue the next council round after its checkpoint and any explicitly admitted context. It does not silently retry a completed member. |
 | `--question` / `--question-file` | With `--council` or `--deliberate` | The decision question; deliberate requires the question to be fixed before the receipt is created |
 | `--members` / `--chairman` | No | With `--council`: member agents (default is a vendor-diverse, **repo-capable** set — claude+codex+cursor; `agy` members can read `--cwd` since 0.13.9, so they may serve as repo council members; AGY 1.1.22 reports session/target/activity/terminal usage but not authoritative served-model identity, so named-model votes remain advisory), synthesizer (default `architect`, which is Opus 5; pass `fable` explicitly for the pricier escalation tier) |
 | `--rounds` | With `--deliberate`; optional with `--council` | Explicit bounded rounds for deliberate; council accepts 1 or 2 rounds. Do not rely on a deliberate parser default |
@@ -630,6 +686,8 @@ not bypass or rewrite the authenticated store.
 | `--chat-timeout DURATION` (or `--timeout` after `chat`) | With `chat turn` | Per-turn bounded child timeout. It is separate from the dispatch/jobs `--timeout`; the chat subcommand rewrites its alias safely. |
 | `--chat-confirm` | With `chat recover` | Required human attestation for closing an unmatched turn as indeterminate; never retries or asserts zero spend. |
 | `--chat-reason TEXT` | With `chat fork` | Bounded explanation recorded on the parent fork event. |
+| `--chat-revalidation-file FILE` | With `chat revalidate` | Private authenticated observation/qualification packet used to revalidate a paused or resumed turn; it is never included in the public room projection. |
+| `--pause-after-round` | With a two-round `--council` | Pause after round 1 so the caller can inspect or admit bounded context before cross-examination. It accepts only the explicit value `1`. |
 | `--swarm-action {create,status,events,register,claim,renew,cancel,close}` | With `swarm` | Provider-neutral local coordinator action. It journals claims, leases, cancellation, artifacts, and uncertain-spend recovery; it never launches a provider. |
 | `--swarm-run-id RUN_ID` | With `swarm` | Durable coordinator run id. The subcommand form accepts it positionally. |
 | `--swarm-dir DIR` | With `swarm` | Private root containing coordinator run directories. Defaults to `{cwd}/.agents/swarm`. |
@@ -720,7 +778,7 @@ Every response carries structured fields for programmatic orchestration:
 | `session_id`, `usage`, `cost_usd` | Telemetry (claude/codex expose all; AGY 1.1.22 exposes session plus terminal usage but not cost or authoritative served identity; openai-compat returns the API's `usage`). Track spend/tokens across a chain. Partial AGY progress usage stays separate and cannot prove model service. |
 | `billing` | `{source, note}` — did this run draw from a vendor **subscription** (CLI login), metered **api** credits, account **credit** (a subscription-CLI model that bills like API), or is the source **unknown**? Pairs with `usage`/`cost_usd` to attribute spend. Advisory (the vendor's billing is truth). |
 | `elapsed_ms` | Wall-clock for the dispatch — on every DISPATCH envelope (success/blocked/partial/error/timeout, incl. spawn failures). Not on the `--background` handle or pre-dispatch validation errors. Use it to tune swarm concurrency. |
-| `timeout` | On a timeout, `{budget_ms, stage, partial_output}` says which bounded budget expired and whether usable text was preserved. ACP names the exact protocol stage (`initialize`, `session/new`, `session/set_model`, or `session/prompt`). A subprocess backend reports `backend-execution`: summon can attest its own deadline but cannot truthfully separate vendor startup, model reasoning, and an agent's tool call without provider telemetry. |
+| `timeout` | On a timeout, `{budget_ms, stage, partial_output}` says which bounded budget expired and whether usable text was preserved. ACP names the exact protocol stage (`initialize`, `session/new`, `session/set_model`, or `session/prompt`). A subprocess backend reports `backend-execution` when its wall-clock budget ran out: summon can attest its own deadline but cannot truthfully separate vendor startup, model reasoning, and an agent's tool call without provider telemetry. When a guard stops the run earlier, `stage` names it (`startup_timeout`, `generation_idle_timeout`, `finalization_timeout`, `adaptive_*`, `deliberation_deadline`), `elapsed_ms` records the real runtime, and `error` says a longer `--timeout` would not have helped. |
 | `partial` | Kimi-only timeout diagnostics, when assistant text arrived before clean EOF: `{text, authoritative:false, source:"stream_parts_pre_eof", finalized:false, part_count, captured_chars, bytes_retained, truncated, truncated_chars}`. This bounded, redacted snapshot is advisory only; it is never parsed as `report`, copied into `result`, used for resume/cache reuse, or treated as model evidence. |
 | `model` | `{requested, targeted, served, resolved, models_used, exact_required, exact_source, evidence_source}`, split by EVIDENCE. `requested` = what the caller asked for. `targeted` = what the session was POINTED AT (init handshake, else the post-credit-guard effective model, else the backend's knowable default). `served` = the model that actually did work, set ONLY on service evidence (a trusted terminal/runtime model report, or output tokens with a known target). `served` is null whenever no service evidence was observed (typical for failed runs) even when `targeted` names a model, and task status is never used as evidence in either direction (a served run can be legitimately downgraded to `blocked`). `resolved` = LEGACY v1 compatibility: handshake-or-terminal, plus the Codex config backfill only for unpinned requests. An explicit Codex pin never inherits the ambient default into `resolved`; that default is not evidence about the turn. Migrate to `targeted`/`served`. `models_used` lists every model id seen (a Claude session often also runs a cheap auxiliary model). `exact_required` reports the active fail-closed named-model policy, and `exact_source` identifies `named-seat`, `frontmatter`, or `cli` when present. `evidence_source` identifies the bounded backend/provider record used when available (for example Kimi's `kimi_assistant_record` or `kimi_wire_usage_record`); it is null when the backend exposes no identity. AGY reports `targeted` but no provider-authored served identity; an ordinary non-exact turn may derive `served` only as `inferred` from positive terminal token usage, while exact named-model verification remains unavailable. Use `served_model_evidence` to distinguish a report from an inference. Aliases (`opus`/`sonnet`) can lag a launch; pin the explicit ID for a guaranteed-latest run. |
 | `served_model_evidence` | `reported`, `inferred`, or `absent`. How Summon established `model.served`: `reported` is an authoritative backend/provider terminal identity; `inferred` is client-observed routing evidence; `absent` means neither was observed. Kimi 0.38 stdout and per-call `usage.record` journals are child-writable, so even a positive-output record followed by `turn.ended:completed` is labeled `inferred`, never authoritative named-model proof. Unsafe, malformed, stale, linked, mixed-model, incomplete, or conflicting values are discarded. This field never invents a model. Missing or inferred evidence does not make an ordinary success nonterminal, but provenance-required workflows reject it. A success with an empty or missing result is normalized to `status:"error"` with a consistent exit tuple and `error_kind:"empty_terminal_result"`. |
@@ -862,7 +920,8 @@ Honest edges — plan around these, don't be surprised by them:
   that enforces the tier (claude/codex/cursor-agent), or set
   `SUMMON_ALLOW_UNENFORCED_READONLY=1` to dispatch
   anyway — which marks the tier advisory and says so in `warnings`. `--dry-run` reports
-  `would_refuse` so you learn this before spending anything.
+  `would_refuse` so you learn this before spending anything (every refusing gate is
+  listed in `refusals`, including a prompt too long for the OS command line).
   (AGY 1.1.22 reports terminal token usage and the targeted model, but still no
   authoritative served-model identity; its `safe-edit` tier is a full bypass — see the
   permission note.)
@@ -897,10 +956,12 @@ Honest edges — plan around these, don't be surprised by them:
   rejected, Summon returns a non-retryable auth diagnostic with `hermes auth status nous` /
   `hermes auth add nous` guidance and never falls back to another provider.
 - **OpenCode is a toolful gateway, not an unlimited transport.** An `opencode` seat can
-  use OpenCode's file and tool loop. The former `stealth/ox-alpha` preview was revealed as
-  Z.ai GLM 5.3 Flash. Historical direct and OpenCode Ox routes are retired without
-  relabeling old receipts; stale custom definitions using the ended selector are refused.
-  A distinct successor targets the paid `openrouter/z-ai/glm-5.3-flash` route.
+  use OpenCode's file and tool loop. The former `stealth/ox-alpha` preview was reported as
+  corresponding to Z.AI GLM 5.3 Flash. Historical direct and OpenCode Ox routes are retired
+  without relabeling old receipts; stale custom definitions using the ended selector are
+  refused. A currently documented, optional successor targets the paid
+  `openrouter/z-ai/glm-5.3-flash` route; it is not a permanent availability or pricing
+  promise.
   Model names, prices, discounts, and availability
   can change without a Summon release. The model context/output limits, provider quotas,
   OpenCode compaction, and OS/CLI transport limits still apply. Put large inputs under
@@ -1008,8 +1069,9 @@ The dispatch essentials are above. Deeper capabilities live in focused reference
   agy Gemini suffixes, what the envelope reports.
 - **[Custom & API backends](references/backends.md)** — `run-agent: opencode` for a
   toolful OpenCode gateway (including OpenRouter) or `run-agent: openai-compat` to reach
-  any direct OpenAI-compatible API (OpenRouter, OpenAI, Anthropic, Google, Groq, local
-  Ollama/LM Studio) and `providers.json`.
+  a configured endpoint implementing Summon's supported OpenAI-compatible
+  `/chat/completions` subset (including common cloud providers and local Ollama/LM Studio)
+  through `providers.json`.
 - **[Customizing agents & the roster](references/customizing.md)** — override model/
   effort per call, and `--new-agent`/`--set-agent` to scaffold and retune definitions.
 - **[Fan-out & council](references/fan-out.md)** — `--manifest` swarms (per-backend
@@ -1062,7 +1124,7 @@ permissions.
 
 | Field | Values | Description |
 |-------|--------|-------------|
-| `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `kimi`, `agy`, `opencode`, `openai-compat` | Which backend executes this agent (`opencode` = OpenCode's toolful CLI gateway; `openai-compat` = any direct OpenAI-compatible API — see "Custom & API backends") |
+| `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `kimi`, `agy`, `opencode`, `openai-compat` | Which backend executes this agent (`opencode` = OpenCode's toolful CLI gateway; `openai-compat` = a configured endpoint implementing Summon's supported OpenAI-compatible API subset — see "Custom & API backends") |
 | `permission` | `read-only`, `safe-edit` (default), `yolo` | Approval/sandbox level the sub-agent runs with |
 | `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.served` |
 | `model-policy` | `exact` (optional) | Require provider-authored terminal evidence for the pinned model. A mismatch or missing served-model receipt blocks the result without fallback, resume, or contract repair. Built-in governance seats use this policy automatically. |
@@ -1141,11 +1203,11 @@ model, billing, and retention boundary explicitly.
 | CLI | Accepts | Example | Unpinned default |
 |-----|---------|---------|------------------|
 | claude | alias (floats to latest) or full ID | `opus`, `sonnet`, `claude-fable-5-1` | CLI's default |
-| codex | any codex model id (`-m`) | `gpt-5.6-sol` | `~/.codex/config.toml` `model` |
+| codex | any codex model id (`-m`) | `gpt-6-astra` | `~/.codex/config.toml` `model` |
 | cursor-agent | cursor model ids | `composer-2.5` | `composer-2.5` |
 | gemini | gemini model ids (`-m`) | `gemini-3.1-pro` | CLI's default |
 | kimi | Kimi provider/model id (`--model`) | `kimi-code/k3`, `kimi-code/kimi-for-coding` | K3 Max in the bundled seats; K2.7 is explicit |
-| agy | display name or slug (see `agy models`) | `Claude Opus 4.6 (Thinking)`, `gemini-3.7-flash-high` | Gemini Flash tier |
+| agy | display name or slug (see `agy models`) | `Claude Opus 4.6 (Thinking)`, `gemini-3.8-flash-high` | bundled Gemini seats pin Flash 3.8 High |
 | arkcli | Coding Plan model id | `glm-5-2-260617` | ArkCLI plan selection |
 
 Run `--list-models` to see what each backend can run right now. Use `summon models --refresh`
@@ -1157,7 +1219,7 @@ successful dispatch envelope with exact `model.served` evidence establishes what
 For an explicit Codex pin, Summon emits one canonical `-m` selector and refuses
   conflicting `-m`/`--model`/`-c model=...` values before contacting Codex. The same
   terminal model-trust gate is used for every backend when a seat is
-  provenance-required: a built-in governance seat (including `architect`, `fable`,
+  provenance-required: a built-in governance seat (including `astra`, `architect`, `fable`,
   `sol-review`, and `researcher`) or a custom seat with `model-policy: exact` must
   receive provider-authored evidence for the exact requested model. Use
   `--require-exact-model` to opt a one-off custom dispatch into the same policy.

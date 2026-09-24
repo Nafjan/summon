@@ -22,6 +22,8 @@ Implementation is split into sibling modules:
 from __future__ import annotations
 
 import argparse
+import copy
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -99,7 +101,7 @@ from _resolver import discover_models, resolve_cli  # noqa: E402
 # Keep a literal assignment: the release-contract parser uses the dispatcher
 # source as a machine-checkable companion.  `_telemetry.SUMMON_VERSION` must be
 # updated in the same release; the release contract checks both literals.
-__version__ = "3.4.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "3.5.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -517,6 +519,40 @@ def _stamp_job(env: dict) -> dict:
     return env
 
 
+def _public_submission_projection(envelope: dict) -> dict:
+    """Return the public copy while retaining private accounting in-process.
+
+    Attempt IDs, request/material hashes, launch observations, and provider
+    account details remain available to the private retry/continuation and
+    telemetry paths.  Stdout, ``--out``, and background terminal files receive
+    only the purpose-limited submission summary.
+    """
+    projected = copy.deepcopy(envelope)
+    try:
+        from _submission_accounting import attach_public_summary, public_summary
+        attach_public_summary(projected)
+        history = projected.get("attempt_history")
+        if isinstance(history, list):
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                private = item.pop("submission_accounting", None)
+                if isinstance(private, (dict, list)):
+                    item["submission_summary"] = public_summary(private)
+    except Exception as exc:  # observability must not publish private fields
+        projected.setdefault("warnings", []).append(
+            "submission accounting public projection unavailable "
+            f"({type(exc).__name__})")
+        history = projected.get("attempt_history")
+        if isinstance(history, list):
+            for item in history:
+                if isinstance(item, dict):
+                    item.pop("submission_accounting", None)
+    projected.pop("submission_accounting", None)
+    projected.pop("_private_launch_observation", None)
+    return projected
+
+
 def _emit(obj: dict, *, operation: str | None = None,
           trusted_executor_result: bool = False,
           continuation_context=None) -> None:
@@ -553,6 +589,10 @@ def _emit(obj: dict, *, operation: str | None = None,
                 "steering_mode": "queued_for_resume",
                 "live_steering_acknowledged": False,
             }
+    # Executor launch observations are private continuation material.  The
+    # continuation writer consumes them above; never place executable digests,
+    # local scope details or other launch-bound data in the public envelope.
+    obj.pop("_private_launch_observation", None)
     # Diagnostics are strictly opt-in and fail-soft. A malformed local telemetry
     # file must never change dispatch behavior or hide the real envelope.
     try:
@@ -576,20 +616,25 @@ def _emit(obj: dict, *, operation: str | None = None,
         _telemetry.record(_telemetry_obj, operation=operation or _EMIT_OPERATION)
     except Exception:  # noqa: BLE001 - observability cannot block a dispatch
         pass
-    text = json.dumps(obj, ensure_ascii=False)
+    # The exact public object is the canonical terminal result.  Governed
+    # resume sealing verifies the digest of the stored result; passing the
+    # private in-process envelope here would make every private/public split
+    # look like a tampered terminal receipt.
+    public_obj = _public_submission_projection(obj)
+    text = json.dumps(public_obj, ensure_ascii=False)
     if _JOB_FILE:
         _write_job_file_text(text, _JOB_FILE)
         if _GOVERNED_RESUME_LINEAGE is not None:
             try:
                 from _job_resume import mark_terminal_for_job
-                mark_terminal_for_job(_JOB_FILE, obj)
+                mark_terminal_for_job(_JOB_FILE, public_obj)
             except Exception as exc:
                 # Keep the immutable provider receipt, but never hide a failed
                 # result-to-claim seal. Record a bounded typed marker in the
                 # authenticated source ledger so status/resume remains blocked.
                 from _job_resume import record_terminalization_failure
                 record_terminalization_failure(
-                    _JOB_FILE, obj,
+                    _JOB_FILE, public_obj,
                     getattr(exc, "kind", "resume_terminalization_failed"))
     else:
         print(text)
@@ -839,8 +884,50 @@ def _apply_gemini_thinking(model: str, effort: str) -> str:
               "xhigh": "High", "max": "High"}.get(effort)
     if not suffix:
         return model
+    # Live AGY rosters expose slugs as well as display names. Replace a slug's
+    # effort suffix rather than appending an incompatible display-name suffix.
+    slug = model.strip()
+    if re.fullmatch(r"gemini-[a-z0-9][a-z0-9.-]*", slug, re.IGNORECASE):
+        base = re.sub(r"-(?:low|medium|high)$", "", slug, flags=re.IGNORECASE)
+        return f"{base}-{suffix.lower()}"
     base = re.sub(r"\s*\([^)]*\)\s*$", "", model).strip()
     return f"{base} ({suffix})"
+
+
+def _unsupported_explicit_effort(cli: str | None, model: str | None,
+                                 effort: str | None) -> str | None:
+    """Return a refusal for an explicit effort that this route cannot honor.
+
+    A roster ``effort:`` pin is part of the model identity, not a hint that a
+    backend may silently ignore.  Kimi only exposes the reviewed effort
+    controls for K3, AGY maps effort only onto Gemini model variants, and the
+    remaining backends have no reviewed effort transport.  Ambient/default
+    effort remains best-effort; this guard applies only when the caller or
+    roster explicitly asked for a level.
+    """
+    if not effort:
+        return None
+    backend = (cli or "").strip().lower()
+    selected = (model or "").strip().lower()
+    if backend == "kimi":
+        if re.fullmatch(r"(?:kimi-code/)?k3(?:-256k)?", selected):
+            return None
+        return (f"explicit effort {effort!r} is unsupported for Kimi model "
+                f"{model!r}; use kimi-code/k3 or kimi-code/k3-256k, or remove "
+                "the effort pin")
+    if backend == "agy":
+        if selected.startswith("gemini"):
+            return None
+        return (f"explicit effort {effort!r} is unsupported for AGY model "
+                f"{model!r}; AGY effort requires a Gemini model variant")
+    if backend == "gemini":
+        return (f"explicit effort {effort!r} is unsupported for the frozen "
+                "gemini CLI; use the agy Gemini route or remove the effort pin")
+    if backend not in {"claude", "codex", "opencode"}:
+        return (f"explicit effort {effort!r} has no reviewed transport for "
+                f"backend {cli!r}; remove the effort pin or select a supported "
+                "backend")
+    return None
 
 
 def _inject_memory(system_context: str, cwd: str, raw: bytes | None = None) -> str:
@@ -1012,6 +1099,13 @@ def main() -> None:
 
     parser = _cli.build_parser(__version__, _ENVELOPE_VERSION)
     args = parser.parse_args(argv)
+
+    # Workspace bootstrap is a human-only handoff.  Create a listener only when
+    # stderr is an interactive TTY and JSON was not requested; this keeps the
+    # one-time code out of machine-readable output and avoids an inaccessible host.
+    if getattr(args, "workspace_action", None):
+        args.workspace_interactive = bool(
+            args.workspace_action != "create" and sys.stderr.isatty() and not args.json)
 
     if getattr(args, "adaptive_timeout", False) and getattr(args, "hard_timeout", False):
         parser.error("--adaptive-timeout and --hard-timeout are mutually exclusive")
@@ -1776,7 +1870,7 @@ def main() -> None:
     # exit before any agent/prompt/cwd validation.
     if (args.jobs_list or args.jobs_status or args.jobs_wait
             or args.jobs_extend or args.jobs_cancel or args.jobs_steer
-            or args.jobs_resume):
+            or args.jobs_resume or getattr(args, "jobs_revalidate", None)):
         sys.exit(_background.run_jobs_query(
             args, _print_error, entry_path=os.path.abspath(__file__),
             summon=_receipt_base()["summon"]))
@@ -1784,6 +1878,10 @@ def main() -> None:
     # Conversation rooms are a local context surface. Opening a room or
     # posting human context is authority-inert; the explicit chat turn action
     # is routed here too but owns its separate durable provider fence.
+    if getattr(args, "workspace_action", None):
+        from _workspace_entry import run_command as _run_workspace_command
+        sys.exit(_run_workspace_command(args))
+
     if getattr(args, "chat_action", None):
         from _conversation import run_command as _run_conversation_command
         sys.exit(_run_conversation_command(args))
@@ -1942,6 +2040,14 @@ def main() -> None:
         sys.exit(run_manifest(args))
 
     # council status: read-only durable-state view. No dispatch, no lock.
+    if getattr(args, "council_context_submit", None):
+        from _council import run_council_context_submit
+        sys.exit(run_council_context_submit(args))
+
+    if getattr(args, "council_continue", None):
+        from _council import run_council_continue
+        sys.exit(run_council_continue(args))
+
     if args.council_status:
         from _council import run_council_status
         sys.exit(run_council_status(args))
@@ -1953,8 +2059,11 @@ def main() -> None:
         sys.exit(run_council(args))
 
     # --prompt-file: resolve to a prompt BEFORE the background handler (its
-    # validation needs args.prompt). utf-8-sig strips a BOM; strict decoding so
-    # mojibake fails loudly instead of reaching a paid model. NOTE: this is
+    # validation needs args.prompt). The public/external form retains the
+    # historical utf-8-sig + universal-newline behavior for compatibility.
+    # Council's private local hop opts into lossless decoded text so CRLF and a
+    # leading U+FEFF remain part of the prompt identity. Strict decoding makes
+    # mojibake fail loudly instead of reaching a paid model. NOTE: this is
     # quoting/encoding ergonomics, not argv-limit relief -- builders still pass
     # the prompt as one argv token (agy's ~28k guard still applies). Presence
     # checks (is not None) on BOTH sides, not truthiness: --prompt "" plus
@@ -1964,8 +2073,12 @@ def main() -> None:
         _die("give --prompt or --prompt-file, not both")
     if args.prompt_file is not None:
         try:
-            with open(args.prompt_file, encoding="utf-8-sig") as fh:
-                args.prompt = fh.read()
+            if getattr(args, "prompt_file_internal_exact", False):
+                with open(args.prompt_file, encoding="utf-8", newline="") as fh:
+                    args.prompt = fh.read()
+            else:
+                with open(args.prompt_file, encoding="utf-8-sig") as fh:
+                    args.prompt = fh.read()
         except (OSError, UnicodeDecodeError, ValueError) as e:
             _die(f"cannot read --prompt-file {args.prompt_file}: {e}")
         if not args.prompt.strip():
@@ -2301,6 +2414,15 @@ def main() -> None:
     if args.list:
         agents_dir = get_agents_dir(args.agents_dir, args.cwd)
         agents = list_agents(agents_dir)
+        if getattr(args, "cli", None):
+            agents = [a for a in agents
+                      if (a.get("run_agent") or a.get("cli")) == args.cli]
+        if getattr(args, "format", "json") == "table":
+            from _builder import roster_permission_lint
+            sys.stdout.write(_format_agents_table(agents))
+            for _w in roster_permission_lint(agents):
+                print(f"warning: {_w}", file=sys.stderr)
+            sys.exit(0)
         # Roster-level tier lint. Per-dispatch refusal is correct but arrives too late for
         # anyone maintaining a roster as a controlled artifact: a definition whose declared
         # tier its backend cannot enforce sits unnoticed until someone dispatches it (field
@@ -2326,7 +2448,12 @@ def main() -> None:
 
     # Validate required args for execution
     if not args.agent:
-        _die("--agent is required")
+        try:
+            _agents_dir = get_agents_dir(args.agents_dir, args.cwd)
+            _rows = list_agents(_agents_dir)
+        except Exception:  # noqa: BLE001 - the refusal must never depend on the hint
+            _rows = []
+        _die(_agent_required_message(args, _rows))
     if not args.prompt:
         _die("--prompt is required")
     if not args.cwd:
@@ -2561,6 +2688,17 @@ def main() -> None:
         _die(f"invalid effort {effort!r}: use one of {', '.join(_EFFORT_LEVELS)} "
              "(or none/default to use the backend's own default)")
     _explicit_effort = bool(args.effort or effort_fm)
+    _effort_error = _unsupported_explicit_effort(
+        cli, final_model, effort) if _explicit_effort else None
+    if _effort_error:
+        _die(
+            _effort_error,
+            error_kind="effort_unsupported",
+            extra={"provider_contacted": False, "result_usable": False,
+                   "retryable": False,
+                   "effort_policy": {"requested": effort, "backend": cli,
+                                     "model": final_model, "explicit": True}},
+        )
     if cli == "agy":
         # agy has no --effort flag; thinking is the model-name suffix. Apply an
         # EXPLICIT effort to a Gemini model; the global default never rewrites an
@@ -2652,6 +2790,15 @@ def main() -> None:
         "exact_required": bool(_model_exact_required),
         "source": _model_exact_source,
     }
+    _chat_attempt_id = os.environ.get("SUMMON_CHAT_LAUNCH_ATTEMPT_ID", "")
+    _job_attempt_id = os.environ.get("SUMMON_JOB_ID", "")
+    if re.fullmatch(r"[0-9a-f]{32}", _chat_attempt_id):
+        _initial_attempt_id = _chat_attempt_id
+    elif (_resolve_job_file() is not None
+          and re.fullmatch(r"[0-9a-f]{32}", _job_attempt_id)):
+        _initial_attempt_id = _job_attempt_id
+    else:
+        _initial_attempt_id = None
     invocation = AgentInvocation(
         cli=cli,
         prompt=args.prompt,
@@ -2700,11 +2847,13 @@ def main() -> None:
         worktree=getattr(args, "worktree", None),
         isolated_lane=bool(getattr(args, "isolated_lane", False)),
         allow_tool_credentials=bool(getattr(args, "allow_tool_credentials", False)),
-        attempt_id=(os.environ.get("SUMMON_JOB_ID")
-                    if _resolve_job_file() is not None
-                    and re.fullmatch(r"[0-9a-f]{32}",
-                                     os.environ.get("SUMMON_JOB_ID", ""))
-                    else None),
+        # A chat dispatcher receives the parent guard's physical attempt in
+        # the authenticated environment. It must win over job-id derivation;
+        # otherwise the child creates a new UUID and the v2 guard correctly
+        # refuses the real launch. Background jobs still use their committed
+        # job id when no chat attempt is present.
+        attempt_id=_initial_attempt_id,
+        request_sha256=receipt.get("request_sha256"),
     )
 
     if profile_selection:
@@ -2796,7 +2945,11 @@ def main() -> None:
                     "result_usable": False, "retryable": False})
     if worktree_info is not None:
         args.cwd = worktree_info["cwd"]
-        invocation.cwd = worktree_info["cwd"]
+        # AgentInvocation is immutable so the worktree boundary cannot be
+        # retrofitted by mutating the request.  Rebind the local request with
+        # the resolved checkout path while preserving the original identity
+        # fields used for preflight and receipt provenance.
+        invocation = replace(invocation, cwd=worktree_info["cwd"])
 
     if _read_policy.get("would_refuse"):
         _reroute = {
@@ -2930,7 +3083,9 @@ def main() -> None:
                 launch_control=_fleet_runtime_state.control())
             result = _fleet_runtime_state.finalize(result)
         else:
-            result = _dispatch_with_retries(invocation, args, agents_dir)
+            result = _dispatch_with_retries(
+                invocation, args, agents_dir,
+                launch_control=_chat_launch_control(invocation))
     except (OSError, ValueError, _evidence.EvidenceError) as e:
         if _fleet_runtime_state is not None:
             try:
@@ -2999,6 +3154,15 @@ def main() -> None:
     # the envelope, and this keeps prompt_sha256 bound to the ROOT prompt (the
     # correction prompt must never restamp it).
     result.update(receipt)
+    # Public accounting is rebuilt from the private per-attempt records only
+    # after all retry/repair paths have finished. Replaying the same attempt id
+    # cannot inflate it; repeated physical submissions with different ids do.
+    try:
+        from _submission_accounting import attach_public_summary
+        attach_public_summary(result)
+    except Exception as exc:  # noqa: BLE001 - retain private evidence on projection failure
+        result.setdefault("warnings", []).append(
+            f"submission accounting public projection unavailable ({type(exc).__name__})")
     _complete_artifact_provenance(result, args, _artifact_manifest)
     # An explicit --agents-dir that fell through to the BUNDLED roster is an intent
     # violation: the caller named a directory and got something else. `--agents-dir` selects
@@ -3199,6 +3363,20 @@ def _effective_decision_view(invocation, args) -> dict:
     return _reseal_effective_decision(view)
 
 
+def _note_refusal(view: dict, kind: str | None = None) -> None:
+    """Collect every dry-run refusal, not just the last one written to ``refusal``.
+
+    Field record 2026-09-17: independent gates surfaced one per launch, so callers
+    paid a dispatch to learn each flag. ``refusal``/``error_kind`` keep their
+    historical meaning; ``refusals`` lists every gate that would refuse.
+    """
+    entry = {"refusal": view.get("refusal")}
+    if kind:
+        entry["error_kind"] = kind
+    if entry not in view.setdefault("refusals", []):
+        view["refusals"].append(entry)
+
+
 def _sync_effective_decision_refusal(view: dict) -> None:
     """Keep the decision explanation consistent with a later dry-run refusal."""
     if not view.get("would_refuse"):
@@ -3223,6 +3401,44 @@ def _sync_effective_decision_refusal(view: dict) -> None:
                        "model_targeted": None,
                        "winning_rule": "no_eligible_candidate"})
     _reseal_effective_decision(decision)
+
+
+def _agent_required_message(args, agents_rows: list[dict]) -> str:
+    """Envelope for the missing --agent refusal: name the seats that exist.
+
+    Field report 2026-09-19: `--cli kimi` without `--agent` refused with no
+    hint that kimi-worker/kimi-coder were registered. When a --cli filter is
+    present, list the agents for that backend so the caller can pick one
+    without grepping the roster.
+    """
+    message = "--agent is required"
+    if getattr(args, "cli", None):
+        matches = [str(r.get("name")) for r in agents_rows
+                   if (r.get("run_agent") or r.get("cli")) == args.cli]
+        if matches:
+            message += (f". Registered agents for CLI '{args.cli}': "
+                        + ", ".join(matches))
+        else:
+            message += f". No registered agents for CLI '{args.cli}'"
+    return message
+
+
+def _format_agents_table(rows: list[dict]) -> str:
+    """Human-readable --list rendering. JSON stays the machine default."""
+    keys = ("name", "run_agent", "model", "permission")
+    headers = ("NAME", "CLI", "MODEL", "PERMISSION")
+    def _cell(row, key):
+        value = row.get(key)
+        return str(value) if value not in (None, "") else "-"
+    table_rows = sorted(rows, key=lambda r: str(r.get("name", "")).lower())
+    widths = [max([len(h)] + [len(_cell(r, k)) for r in table_rows])
+              for h, k in zip(headers, keys)]
+    lines = ["  ".join(h.ljust(w) for h, w in zip(headers, widths))]
+    lines.append("  ".join("-" * w for w in widths))
+    for r in table_rows:
+        lines.append("  ".join(_cell(r, k).ljust(w)
+                               for k, w in zip(keys, widths)))
+    return "\n".join(lines) + "\n"
 
 
 def _dry_run_view(invocation, args, agents_dir: str,
@@ -3352,6 +3568,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
         view["refusal"] = (
             "conflicting model selectors make this dispatch ambiguous"
             if _decision_projection_invalid else _selection_conflict)
+        _note_refusal(view, view["error_kind"])
         view["provider_contacted"] = False
         view["result_usable"] = False
     if view["read_allowlist"].get("would_refuse"):
@@ -3360,6 +3577,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
             "error_kind", "read_allowlist_unsupported")
         view["refusal"] = view["read_allowlist"].get(
             "refusal", "read allowlist cannot be enforced by this backend")
+        _note_refusal(view, view["error_kind"])
         for _key in ("recommended_backends", "reroute", "allowed_root",
                      "requires_packet_refreeze"):
             if view["read_allowlist"].get(_key) is not None:
@@ -3383,6 +3601,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
         view["refusal"] = (
             "requested model is incompatible with the selected backend"
             if _decision_projection_invalid else _compat["message"])
+        _note_refusal(view, view["error_kind"])
         if not _decision_projection_invalid:
             # A backend-specific refusal (native ZCode has no reviewed model
             # selector) does not invent a model vendor.  Generic namespace
@@ -3391,6 +3610,23 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 view["model_vendor"] = _compat["model_vendor"]
             view["compatible_backends"] = list(_compat["compatible_backends"])
             view["recommended_backend"] = _compat["recommended_backend"]
+    if (invocation.cli == "openai-compat" and not view.get("would_refuse")
+            and not _decision_projection_invalid
+            and getattr(invocation, "api_key_env", None)):
+        # Fail closed on a missing provider credential before anyone mistakes a
+        # slow unauthenticated request for a hang (field report 2026-09-19).
+        try:
+            from _apibackend import api_key_available as _key_ok
+            if not _key_ok(invocation.api_key_env, invocation.base_url):
+                view["would_refuse"] = True
+                view["error_kind"] = "credential_missing"
+                view["refusal"] = (f"openai-compat: ${invocation.api_key_env} is not "
+                                   "set or could not be resolved for this endpoint")
+                _note_refusal(view, "credential_missing")
+                view["provider_contacted"] = False
+                view["result_usable"] = False
+        except Exception:  # noqa: BLE001 - preflight view stays renderable
+            pass
     _role_info = (getattr(args, "_role_provenance", {}) or {}).get("role")
     if isinstance(_role_info, dict) and not _decision_projection_invalid:
         view["role"] = dict(_role_info)
@@ -3415,6 +3651,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 "text seat (no FS/tools): refused unless --allow-text-only / "
                 "SUMMON_ALLOW_TEXT_ONLY=1 / capability: text-only; "
                 "--require-tools always refuses")
+            _note_refusal(view, "text_seat_no_tools")
         if text_seat_decision.get("warning"):
             view.setdefault("warnings", []).append(text_seat_decision["warning"])
     if artifact_manifest and not _decision_projection_invalid:
@@ -3436,18 +3673,31 @@ def _dry_run_view(invocation, args, agents_dir: str,
         # reporting: the dispatch would be refused, AND the preview is partial.
         view["would_refuse"] = True
         view["refusal"] = _ro
+        _note_refusal(view)
     _oy = opencode_yolo_isolation_error(invocation)
     if _oy:
         view["would_refuse"] = True
         view["refusal"] = _oy
+        _note_refusal(view)
     from _builder import zcode_invocation_preflight
     _zcode_refusal = zcode_invocation_preflight(invocation)
     if _zcode_refusal:
         view["would_refuse"] = True
         view["error_kind"] = _zcode_refusal["error_kind"]
         view["refusal"] = _zcode_refusal["message"]
+        _note_refusal(view, view["error_kind"])
         view["provider_contacted"] = False
         view["result_usable"] = False
+    from _builder import agy_prompt_length_refusal
+    try:
+        _agy_size = agy_prompt_length_refusal(invocation)
+    except Exception:  # noqa: BLE001 - a preflight view must always render
+        _agy_size = None
+    if _agy_size:
+        view["would_refuse"] = True
+        view["error_kind"] = "prompt_too_long_for_argv"
+        view["refusal"] = _agy_size
+        _note_refusal(view, "prompt_too_long_for_argv")
     if _decision_projection_invalid:
         # Continue through all independent, generic refusal checks above, but
         # stop before rendering commands, warnings, profiles, receipts, or API
@@ -3509,6 +3759,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
             if _cpm:
                 view["would_refuse"] = True
                 view["refusal"] = _cpm
+                _note_refusal(view)
             # Z.AI Coding Plan has its own subscription endpoint.  It is not
             # a BytePlus PAYG-fallback route, so never advertise consent for
             # a different provider's billing path in its dry-run evidence.
@@ -3543,6 +3794,20 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 view["command"] = cmd
             view["args"] = [_dry_run_arg_preview(a) for a in argv]
             view["env_overrides"] = sorted(env) if env else []
+            # The live dispatch refuses an over-long command line before spawn; say
+            # so here, before anyone pays for a launch to learn it.
+            from _executor import argv_overflow_reroutes_to_acp, dry_run_argv_length_error
+            _argv_refusal = dry_run_argv_length_error(invocation, cmd, argv, env)
+            if _argv_refusal and argv_overflow_reroutes_to_acp(invocation, argv):
+                # Mirrors the executor: a native-ACP backend is rerouted, not refused.
+                view.setdefault("warnings", []).append(
+                    "the prompt exceeds the OS command-line limit for the subprocess "
+                    "transport; the dispatch would be routed over ACP instead")
+            elif _argv_refusal:
+                view["would_refuse"] = True
+                view["error_kind"] = "prompt_too_long_for_argv"
+                view["refusal"] = _argv_refusal
+                _note_refusal(view, "prompt_too_long_for_argv")
         except ValueError as e:
             view["error"] = str(e)
     _tags = _agent_tags_from_file(agent_file)
@@ -3923,6 +4188,11 @@ def _is_transient_dispatch_error(result: dict) -> bool:
     Never true for auth, permission, or structural failures."""
     if result.get("status") not in ("error", "partial"):
         return False
+    # A typed preflight refusal already knows whether a retry can help; prose matching
+    # below would read e.g. "--print-timeout" as a timeout.
+    from _builder import TYPED_PREFLIGHT_KINDS
+    if result.get("error_kind") in TYPED_PREFLIGHT_KINDS:
+        return result.get("retryable") is True
     err = " ".join([
         str(result.get("error") or ""),
         str(result.get("normalization_reason") or ""),
@@ -3959,7 +4229,54 @@ def _is_transient_dispatch_error(result: dict) -> bool:
     return False
 
 
-def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
+def _chat_launch_control(invocation):
+    """Build the child-side authenticated chat provider boundary, if requested."""
+    path = os.environ.get("SUMMON_CHAT_LAUNCH_GUARD_PATH")
+    token = os.environ.get("SUMMON_CHAT_LAUNCH_GUARD_TOKEN")
+    if not path or not token or invocation.transport != "subprocess":
+        return None
+    from _executor import ProviderLaunchControl, ProviderLaunchRefusal
+    import _chat_launch_guard
+    guard_version = os.environ.get("SUMMON_CHAT_LAUNCH_GUARD_VERSION", "1")
+
+    def before_launch(evidence):
+        try:
+            presented = os.environ.get("SUMMON_CHAT_LAUNCH_QUALIFICATION")
+            if presented:
+                try:
+                    qualification = json.loads(presented)
+                except (ValueError, TypeError, RecursionError) as exc:
+                    raise ValueError("chat launch qualification is invalid") from exc
+                if not isinstance(qualification, dict):
+                    raise ValueError("chat launch qualification is invalid")
+                evidence = dict(evidence)
+                evidence["launch_qualification"] = qualification
+            before = (_chat_launch_guard.before_launch_v2
+                      if guard_version == "2" else _chat_launch_guard.before_launch)
+            before(
+                path, token, evidence, backend=invocation.cli,
+                transport=invocation.transport,
+                attempt_id=(os.environ.get("SUMMON_CHAT_LAUNCH_ATTEMPT_ID")
+                            or invocation.attempt_id or ""),
+                qualification_token=os.environ.get("SUMMON_CHAT_QUALIFICATION_TOKEN"),
+                source_family_path=os.environ.get("SUMMON_CHAT_SOURCE_FAMILY_PATH"))
+        except Exception as exc:  # no provider contact; keep the reason typed
+            message = str(exc).lower()
+            kind = ("chat_launch_qualification_missing"
+                    if "qualification is missing" in message
+                    else "chat_launch_qualification_revoked"
+                    if "qualification is revoked" in message
+                    else "chat_launch_qualification_invalid"
+                    if "qualification" in message
+                    else "chat_launch_observation_invalid")
+            raise ProviderLaunchRefusal(kind) from exc
+
+    return ProviderLaunchControl(
+        before_launch=before_launch, requires_launch_observation=True)
+
+
+def _dispatch_with_retries(invocation, args, agents_dir=None, *,
+                           launch_control=None) -> dict:
     """execute_agent with --retries: exponential backoff on error/partial only
     (blocked won't improve by retrying — its cause is structural).
 
@@ -3990,8 +4307,10 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
             attempt_ordinal=attempt + 1,
             parent_attempt_id=(_attempt_history[-1].get("attempt_id")
                                if _attempt_history else None))
-        result = execute_agent(attempt_invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
-                               max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))
+        result = execute_agent(
+            attempt_invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
+            max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None),
+            launch_control=(launch_control if attempt == 0 else None))
         attempt += 1
         _attempt_history.append(_attempt_projection(result, attempt_id))
         # Structural preflight/refusal paths never reach a provider. Stop before
@@ -4132,7 +4451,7 @@ def _dispatch_with_retries(invocation, args, agents_dir=None) -> dict:
 def _attempt_projection(envelope: dict, attempt_id: str | None) -> dict:
     """Return a compact, prompt-free receipt for one physical provider attempt."""
     model = envelope.get("model") if isinstance(envelope.get("model"), dict) else {}
-    return {
+    projected = {
         "attempt_id": attempt_id,
         "attempt_kind": envelope.get("attempt_kind", "initial"),
         "attempt_ordinal": envelope.get("attempt_ordinal"),
@@ -4149,6 +4468,10 @@ def _attempt_projection(envelope: dict, attempt_id: str | None) -> dict:
         "liveness": envelope.get("liveness"),
         "runtime_control": envelope.get("runtime_control"),
     }
+    accounting = envelope.get("submission_accounting")
+    if isinstance(accounting, (dict, list)):
+        projected["submission_accounting"] = copy.deepcopy(accounting)
+    return projected
 
 
 def _blocked_after_attempt(decision: dict, primary: dict, invocation, args,
@@ -4483,7 +4806,9 @@ def _write_out(path: str, result: dict) -> None:
         os.makedirs(d, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=d, prefix=".summon-out-", suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(result, fh, ensure_ascii=False)
+            # --out is public and precedes _emit's private continuation seal.
+            public_result = _public_submission_projection(result)
+            json.dump(public_result, fh, ensure_ascii=False)
         # Reuse the bounded Windows sharing/access retry used by background
         # receipts. Antivirus and indexer handles can briefly make an otherwise
         # valid atomic replacement fail with WinError 5/32; leaving the stale

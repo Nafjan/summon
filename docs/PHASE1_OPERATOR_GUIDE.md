@@ -6,10 +6,12 @@ matches the intended seat, model, permission, data boundary, and spend boundary.
 The authoritative current-version and rollback marker lives in
 `docs/PHASE1_MIGRATION_ROLLBACK.md` so this workflow cannot silently drift from it.
 
-Use `summon.cmd` on Windows and `summon` on POSIX. On Windows, put multiline prompts
-or prompts containing command-shell metacharacters in a UTF-8 file and use
-`--prompt-file`; the batch launcher rejects raw `--prompt` text it cannot transport
-losslessly.
+Use `summon.cmd` on Windows and `summon` on POSIX. Through `summon.cmd`, put every
+dispatch prompt in a UTF-8 file and use `--prompt-file`, including simple one-line
+prompts. The dispatcher refuses all raw `--prompt` input through the batch launcher
+because expansion happens before Python can verify its bytes. This protects the
+launcher input; it does not make every backend transport argv-free or remove its
+command-line size limits.
 
 In every example, replace `<ABSOLUTE_PROJECT_DIR>` with the existing absolute path to
 the project. Fleet and dispatch boundaries reject a relative working directory.
@@ -127,8 +129,11 @@ eligible Claude subprocess job, create one explicit successor with:
 summon jobs resume JOB_ID --message "Continue from the verified checkpoint" --json
 ```
 
-Resume preserves the source authority ceiling, requires fresh spend consent, and does
-not retry ambiguous provider contact.
+Resume requires an eligible authenticated source, preserves its authority ceiling,
+and requires fresh spend consent. A session handle alone is insufficient, and
+ambiguous provider contact is not retried. If the continuation path is unavailable
+or identity/profile checks fail, preserve the history and handoff in an explicit
+fork where supported, or an explicitly authorized fresh task.
 
 ## 6. Export a portable result
 

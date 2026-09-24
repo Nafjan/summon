@@ -17,9 +17,11 @@ if str(HERE) not in os.sys.path:
 
 from _conversation import (ConversationError, ConversationJournal,
                            MAX_JOURNAL_BYTES, council_recommendation,
+                           SCHEMA_VERSION, HISTORICAL_SCHEMA_VERSION,
                            continuation_decision, group_rooms, list_rooms,
                            promote_recommendation)
 from _conversation import run_command
+from _spawn import run_flags
 
 
 class ConversationJournalTests(unittest.TestCase):
@@ -52,6 +54,49 @@ class ConversationJournalTests(unittest.TestCase):
         self.assertEqual(reopened.room.cursor, 2)
         self.assertNotIn("SECRET_TOKEN", json.dumps(reopened.as_dict()))
         self.assertIn("SECRET_TOKEN", json.dumps(reopened.as_dict(native=True)))
+
+    def test_legacy_room_id_is_readable_without_relaunch_or_duplicate_room(self):
+        # A room created by the preview contract is still a readable local
+        # context. Opening/listing it must not create a replacement room or
+        # cross the live-turn/provider boundary.
+        self._room()
+        before = sorted(path.name for path in self.root.glob("*.jsonl"))
+        self.assertEqual(before, ["session-1.jsonl"])
+        reopened = ConversationJournal.open(self.root, "session-1")
+        self.assertEqual(reopened.room.session_id, "session-1")
+        grouped = list_rooms(self.root)
+        project_key = "summon@" + reopened.room.project_root_sha256
+        self.assertEqual(grouped[project_key]["codex/sol"][0]["session_id"], "session-1")
+        args = SimpleNamespace(
+            chat_action="open", chat_session="session-1",
+            conversation_dir=str(self.root), cwd=str(self.project),
+            chat_browser=None,
+        )
+        from io import StringIO
+        with patch("sys.stdout", new_callable=StringIO) as output:
+            self.assertEqual(run_command(args), 0)
+        self.assertEqual(json.loads(output.getvalue())["status"], "opened")
+        self.assertEqual(sorted(path.name for path in self.root.glob("*.jsonl")), before)
+
+    def test_historical_room_is_readable_but_mutations_are_version_fenced(self):
+        room = self._room()
+        path = room.path
+        lines = path.read_text(encoding="utf-8").splitlines()
+        header = json.loads(lines[0])
+        header["schema_version"] = HISTORICAL_SCHEMA_VERSION
+        record = json.loads(lines[1])
+        record["schema_version"] = HISTORICAL_SCHEMA_VERSION
+        path.write_text(
+            json.dumps(header, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "\n" + json.dumps(record, ensure_ascii=False, sort_keys=True,
+                                   separators=(",", ":")) + "\n",
+            encoding="utf-8")
+        legacy = ConversationJournal.open(self.root, "session-1")
+        self.assertEqual(legacy.schema_version, HISTORICAL_SCHEMA_VERSION)
+        self.assertNotEqual(legacy.schema_version, SCHEMA_VERSION)
+        self.assertEqual(legacy.room.session_id, "session-1")
+        with self.assertRaises(ConversationError):
+            legacy.append_human_message("must not mutate legacy room")
 
     def test_room_subject_is_bounded_redacted_context_for_orientation(self):
         room = self._room()
@@ -394,6 +439,35 @@ class ConversationJournalTests(unittest.TestCase):
         self.assertEqual(received["delivery"], "local-native")
         self.assertEqual(received["events"][0]["payload"]["text"], "context from Sol")
 
+    def test_cli_chat_resume_refusal_returns_exit_one(self):
+        from _chat_resume import build as build_refusal
+        from _resume_capabilities import resume_capability
+        refusal = build_refusal("resume_candidate", resume_capability("codex", "subprocess"))
+        args = SimpleNamespace(
+            chat_action="turn", chat_session="session-1", chat_participant="sol",
+            chat_message="continue", chat_timeout=None, timeout=600_000,
+            conversation_dir=str(self.root), cwd=str(self.project), agents_dir=None,
+            strict_agents_dir=False,
+        )
+        from io import StringIO
+        for result in (
+                {"status": "blocked", "error_kind": "chat_resume_refused",
+                 "session_id": "session-1", "participant": "sol", "refusal": refusal},
+                {"status": "blocked", "error_kind": "chat_resume_refused",
+                 "turn_id": "turn-late", "session_id": "session-1", "participant": "sol",
+                 "event": {"event": "turn_finished"}, "refusal": refusal}):
+            class FakeRuntime:
+                def __init__(self, *args, **kwargs):
+                    pass
+                def start_turn(self, session, participant, prompt, *, timeout_ms=None, wait=False):
+                    return result
+            with self.subTest(late="turn_id" in result), \
+                    patch("_conversation_runtime.ConversationRuntime", FakeRuntime), \
+                    patch("sys.stdout", new_callable=StringIO) as output:
+                self.assertEqual(run_command(args), 1)
+                self.assertEqual(json.loads(output.getvalue())["error_kind"],
+                                 "chat_resume_refused")
+
     def test_chat_open_freezes_safe_roster_model_identity(self):
         roster = self.project / ".agents"
         roster.mkdir()
@@ -440,6 +514,16 @@ class ConversationPolicyTests(unittest.TestCase):
         newer_owner = dict(common)
         newer_owner["owner_generation"] = 2
         self.assertEqual(continuation_decision("session-1", common, newer_owner).action, "continue")
+        stored_owner = dict(common)
+        stored_owner["owner_generation"] = 2
+        preclaim_placeholder = dict(common)
+        self.assertEqual(
+            continuation_decision("session-1", stored_owner, preclaim_placeholder,
+                                  check_owner_generation=False).action,
+            "continue")
+        self.assertEqual(
+            continuation_decision("session-1", stored_owner, preclaim_placeholder).action,
+            "fork")
         stale_owner = dict(common)
         stale_owner["owner_generation"] = 0
         self.assertEqual(continuation_decision("session-1", common, stale_owner).action, "fork")
@@ -493,7 +577,8 @@ class ConversationPolicyTests(unittest.TestCase):
             for command in commands:
                 completed = subprocess.run([sys.executable, str(script), *command],
                                            cwd=str(HERE.parent.parent.parent),
-                                           capture_output=True, text=True, check=False)
+                                           capture_output=True, text=True, check=False,
+                                           **run_flags())
                 self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
                 results.append(json.loads(completed.stdout))
             project_key = next(key for key in results[-1]["rooms"] if key.startswith("demo@"))

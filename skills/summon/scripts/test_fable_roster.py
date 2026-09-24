@@ -13,7 +13,7 @@ from _loader import parse_frontmatter
 AGENTS = Path(__file__).resolve().parents[1] / "agents"
 
 
-@pytest.mark.parametrize("seat", ["fable", "fable-api"])
+@pytest.mark.parametrize("seat", ["fable", "fable-api"], ids=['p001_case_001', 'p001_case_002'])
 def test_fable_decision_leads_are_pinned_and_exact(seat):
     metadata, body = parse_frontmatter((AGENTS / f"{seat}.md").read_text(encoding="utf-8"))
     assert metadata["model"] == "claude-fable-5-1"
@@ -37,7 +37,7 @@ def test_revision_verdict_is_machine_readable_and_default_chair_stays_balanced()
     assert _council.DEFAULT_CHAIRMAN == "architect"
 
 
-@pytest.mark.parametrize("model", ["claude-fable-5", "claude-fable-5-1"])
+@pytest.mark.parametrize("model", ["claude-fable-5", "claude-fable-5-1"], ids=['p002_case_001', 'p002_case_002'])
 def test_fable_billing_has_no_silent_substitution_or_assumed_subscription(monkeypatch, model):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     for cli in ("claude", "cursor-agent"):

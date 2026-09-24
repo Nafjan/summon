@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import glob
+import copy
 import hashlib
+import inspect
 import json
 import os
 import queue
@@ -22,6 +24,88 @@ _SENSITIVE_ARG_KEYS = {
     "api", "api-key", "token", "secret", "password", "private-key",
     "access-token", "oauth-token", "auth-token", "authorization",
 }
+
+
+def _launch_material_paths(cli: object, command: object,
+                           args: list[object]) -> list[str]:
+    """Return adapter-declared provider entry materials, never arbitrary argv.
+
+    The Windows resolver rewrites a few npm shims to ``node <entry-script>``.
+    Only those known rewrites may contribute a script to the stable launch
+    identity; prompts and attachments remain invocation data.
+    """
+    if cli not in {"cursor-agent", "arkcli", "codex"}:
+        return []
+    if not isinstance(command, str) or os.path.basename(command).lower() not in {
+            "node", "node.exe"}:
+        return []
+    if not args or not isinstance(args[0], str):
+        return [""]
+    return [args[0]]
+
+
+def argv_overflow_reroutes_to_acp(inv, args: list[object],
+                                  launch_control=None) -> bool:
+    """Would a command line that overflows the OS limit be rerouted over ACP?
+
+    One predicate for the live executor and the dry-run preview, so the preview
+    never promises a reroute the dispatch will refuse (or the reverse).
+    """
+    from _builder import supports_acp
+    return bool(
+        _adapter_transport_capability(inv, args) is None
+        and supports_acp(inv.cli)
+        and (launch_control is None or launch_control.allow_secondary)
+        and os.environ.get("SUMMON_ACP_FALLBACK") != "0"
+        and (inv.cli != "kimi" or os.environ.get("SUMMON_KIMI_ACP_FALLBACK") == "1"))
+
+
+def dry_run_argv_length_error(inv, command: str, args: list,
+                              env_override: Mapping[str, object] | None) -> str | None:
+    """Measure the command line the live dispatch would actually spawn.
+
+    Mirrors the executor: the launcher is resolved first (a Windows ``.cmd`` shim
+    becomes ``node.exe <script>``) and POSIX measurement counts the merged child
+    environment. A launcher that cannot be resolved is left to the live refusal.
+    """
+    try:
+        command, args = _resolve_launch(command, args)
+    except ValueError:
+        return None
+    return argv_length_error(inv.cli, command, args, _merge_env(env_override))
+
+
+def _adapter_transport_capability(inv, args: list[object]) -> Mapping[str, object] | None:
+    """Resolve only adapter-owned transport facts for this exact operation.
+
+    Callers may supply an explicit, validated capability.  The ZCode adapter is
+    the one built-in exception: its subprocess builder always creates a private
+    ``--attach`` file for both fresh and resumed turns, so the executor binds
+    that adapter contract to the host platform and its fixed 8 MiB ceiling.
+    No generic route, platform, or limit is inferred for other backends.
+    """
+    declared = getattr(inv, "transport_capability", None)
+    if declared is not None:
+        return declared
+    if (getattr(inv, "cli", None) == "gemini"
+            and getattr(inv, "transport", None) == "subprocess"
+            and getattr(inv, "agent_file", None)):
+        from _transport_budget import DEFAULT_SYSTEM_FILE_BYTES
+        return {
+            "kind": "system_file",
+            "platform": os.name,
+            "max_attachment_bytes": DEFAULT_SYSTEM_FILE_BYTES,
+        }
+    if (getattr(inv, "cli", None) == "zcode"
+            and getattr(inv, "transport", None) == "subprocess"
+            and any(item == "--attach" for item in args)):
+        from _transport_budget import DEFAULT_ZCODE_ATTACHMENT_BYTES
+        return {
+            "kind": "private_attachment",
+            "platform": os.name,
+            "max_attachment_bytes": DEFAULT_ZCODE_ATTACHMENT_BYTES,
+        }
+    return None
 
 
 def _cleanup_launch_artifacts(cli: str, env_override: dict | None,
@@ -47,7 +131,10 @@ def _canonical_sha256(value: object) -> str:
 
 def _subprocess_launch_evidence(command: object, args: list[object], cwd: str,
                                 proc_env: Mapping[str, object] | None,
-                                *, backend: str) -> dict[str, object]:
+                                *, backend: str, transport: str = "subprocess",
+                                external_cli_version: str | None = None,
+                                include_launch_observation: bool = False,
+                                require_trusted_observation: bool = False) -> dict[str, object]:
     """Return private, content-bound evidence for the exact Popen boundary.
 
     Only digests and bounded identifiers cross into the durable controller. In
@@ -62,7 +149,7 @@ def _subprocess_launch_evidence(command: object, args: list[object], cwd: str,
     env_projection = {
         str(name): str(effective_env[name]) for name in sorted(effective_env)
     }
-    return {
+    evidence = {
         "schema": "summon.fleet-launch-evidence/v1",
         "backend": str(backend),
         "transport": "subprocess",
@@ -73,6 +160,63 @@ def _subprocess_launch_evidence(command: object, args: list[object], cwd: str,
         "env_names_sha256": _canonical_sha256(env_names),
         "env_sha256": _canonical_sha256(env_projection),
     }
+    # Keep the established fleet evidence shape and add a private, fresh host
+    # observation.  The governed resume controller consumes this exact object
+    # immediately before Popen; ordinary dispatches simply retain the additive
+    # evidence without changing routing or fallback behavior.
+    if include_launch_observation:
+        try:
+            from _launch_binding import observation
+            _observed_version = external_cli_version
+            _material_paths = _launch_material_paths(backend, command, args)
+            _route_observation = None
+            if (require_trusted_observation and backend == "claude"
+                    and transport == "subprocess"):
+                # Never accept a caller/qualification/catalog scalar as the
+                # observed version.  The route resolver measures the exact
+                # executable and any explicitly qualified entry material at
+                # this boundary, then returns the vendor-reported version.
+                from _launch_observer import LaunchObservationError, observe_claude_launch
+                _route = observe_claude_launch(command, args, cwd, proc_env)
+                _observed_version = _route["external_cli_version"]
+                _material_paths = list(_route["material_paths"])
+                _route_observation = _route
+            _launch_observation = observation(
+                command, args, cwd, proc_env, backend=backend,
+                transport=transport, external_cli_version=_observed_version,
+                material_paths=_material_paths)
+            if _route_observation is not None:
+                measured = _route_observation.get("executable") or {}
+                if (_launch_observation.get("executable_sha256")
+                        != measured.get("executable_sha256")
+                        or _launch_observation.get("launch_material_sha256")
+                        != _route_observation.get("launch_material_sha256")
+                        or _launch_observation.get("external_cli_version")
+                        != _route_observation.get("external_cli_version")):
+                    raise LaunchObservationError("launch_observation_changed")
+            evidence["launch_observation"] = _launch_observation
+        except Exception:
+            if require_trusted_observation and backend == "claude" \
+                    and transport == "subprocess":
+                # Preserve the typed producer reason for the executor.  The
+                # ordinary path remains fail-soft for historical dispatches.
+                raise
+            # A missing measurement is represented as absent evidence. Governed
+            # continuations fail closed; ordinary dispatch retains its historical
+            # behavior and does not claim a qualification it could not measure.
+            evidence["launch_observation"] = None
+    return evidence
+
+
+def _same_launch_observation(left: Mapping[str, object] | None,
+                             right: Mapping[str, object] | None) -> bool:
+    """Compare immutable launch facts while ignoring nonce/time metadata."""
+    try:
+        from _launch_binding import binding_projection
+        return (binding_projection(left) is not None
+                and binding_projection(left) == binding_projection(right))
+    except Exception:
+        return False
 
 
 class ProviderLaunchError(RuntimeError):
@@ -86,7 +230,21 @@ class ProviderDeadlineError(ProviderLaunchError):
 class ProviderLaunchRefusal(ProviderLaunchError):
     """A typed, provider-free policy fence refused a controlled launch."""
 
-    _KINDS = {"context_source_drift"}
+    _KINDS = {
+        "context_source_drift", "resume_launch_observation_missing",
+        "resume_launch_observation_invalid", "resume_launch_observation_stale",
+        "resume_launch_observation_replayed",
+        "resume_child_drift", "resume_profile_drift", "resume_profile_unverified",
+        "launch_executable_unavailable", "launch_resolver_unsupported",
+        "launch_material_unavailable", "launch_material_changed",
+        "launch_version_timeout", "launch_version_probe_failed",
+        "launch_version_output_invalid", "launch_version_untrusted",
+        "resume_launch_qualification_missing", "resume_launch_qualification_invalid",
+        "resume_launch_qualification_stale", "resume_launch_qualification_expired",
+        "resume_launch_qualification_revoked",
+        "chat_launch_observation_invalid", "chat_launch_qualification_missing",
+        "chat_launch_qualification_invalid", "chat_launch_qualification_revoked",
+    }
 
     def __init__(self, error_kind: str) -> None:
         if error_kind not in self._KINDS:
@@ -113,7 +271,8 @@ class ProviderLaunchControl:
                  on_resource: Callable[[object, str], None] | None = None,
                  cancelled: Callable[[], bool] | None = None,
                  deadline_reached: Callable[[], bool] | None = None,
-                 allow_secondary: bool = False) -> None:
+                 allow_secondary: bool = False,
+                 requires_launch_observation: bool = False) -> None:
         if not callable(before_launch):
             raise TypeError("before_launch must be callable")
         self._before_launch = before_launch
@@ -125,6 +284,7 @@ class ProviderLaunchControl:
         self._cancelled = cancelled or (lambda: False)
         self._deadline_reached = deadline_reached or (lambda: False)
         self.allow_secondary = bool(allow_secondary)
+        self.requires_launch_observation = bool(requires_launch_observation)
         self._lock = threading.Lock()
         self._claimed = False
 
@@ -485,6 +645,9 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     # populated these from its HTTP response isn't clobbered with None.
     response.setdefault("session_id", processor.session_id if processor else None)
     response.setdefault("usage", processor.usage if processor else None)
+    response.setdefault(
+        "usage_observation",
+        getattr(processor, "usage_observation", None) if processor else None)
     response.setdefault("cost_usd", processor.cost_usd if processor else None)
     response.setdefault("model_resolved", processor.model if processor else None)
     response.setdefault("model_targeted", processor.handshake_model if processor else None)
@@ -2458,7 +2621,7 @@ def model_match_state(requested, targeted, served,
 # one-shot ``--require-exact-model`` flag.
 _EXACT_MODEL_SEATS = frozenset({
     "architect", "planner", "deep-debugger", "security-auditor",
-    "fable", "fable-api", "sol-review", "terra-review", "luna-review",
+    "astra", "fable", "fable-api", "sol-review", "terra-review", "luna-review",
     "researcher",
 })
 
@@ -2491,16 +2654,22 @@ def trusted_telemetry_model_evidence(response: object):
     Keeping marker construction behind the executor result path lets the
     dispatcher distinguish a fresh in-process response from a disk-loaded
     ``--out``/resume object.  Telemetry is optional and this helper is fail-soft.
+    Inferred and absent states authenticate only their provenance classification;
+    they never assert a mismatch or certify a named model.
     """
-    if not isinstance(response, dict) or response.get("served_model_evidence") != "reported":
+    if not isinstance(response, dict):
+        return None
+    evidence = response.get("served_model_evidence")
+    if not isinstance(evidence, str) or evidence not in {"reported", "inferred", "absent"}:
         return None
     model = response.get("model")
     model = model if isinstance(model, dict) else {}
     try:
         import _telemetry
-        mismatch = _model_mismatch(model.get("requested"), model.get("served"))
+        mismatch = (_model_mismatch(model.get("requested"), model.get("served"))
+                    if evidence == "reported" else None)
         return _telemetry._trusted_model_evidence(
-            "reported", mismatch, _capability=_telemetry._EVIDENCE_CAPABILITY)
+            evidence, mismatch, _capability=_telemetry._EVIDENCE_CAPABILITY)
     except Exception:  # noqa: BLE001 - telemetry must never affect execution
         return None
 
@@ -2841,8 +3010,33 @@ def _attach_raw(resp: dict, stdout_lines: list | None) -> dict:
     return resp
 
 
+# Why a run stopped before its overall budget.  Field record 2026-09-17..23: lanes that
+# died 3-15 minutes in reported "Timeout after 5400000ms", so callers concluded the
+# budget was too short and relaunched with a longer one instead of fixing a stall.
+_TIMEOUT_STAGE_TEXT = {
+    "startup_timeout": "the backend produced no first event",
+    "generation_idle_timeout": "the backend went idle mid-run",
+    "finalization_timeout": "the backend closed its output but never exited",
+    "adaptive_attention_timeout": "no meaningful activity at the adaptive checkpoint",
+    "adaptive_hard_timeout": "the adaptive max runtime was reached",
+    "overall_timeout": "the overall budget was reached",
+    "deliberation_deadline": "the deliberation's attempt deadline was reached",
+}
+
+
+def _timeout_headline(budget_ms: int, stage: str | None, elapsed_ms: int | None) -> str:
+    """"Timeout after <budget>" only when the budget is what actually ran out."""
+    if elapsed_ms is None or elapsed_ms >= budget_ms * 0.95:
+        return f"Timeout after {budget_ms}ms"
+    cause = _TIMEOUT_STAGE_TEXT.get(stage or "", "a liveness guard fired")
+    return (f"Stopped after {elapsed_ms}ms of a {budget_ms}ms budget: {cause} "
+            f"(stage {stage or 'unknown'}); a longer --timeout would not have helped")
+
+
 def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
-                     stdout_lines: list | None = None) -> dict:
+                     stdout_lines: list | None = None, *,
+                     stage: str | None = None,
+                     elapsed_ms: int | None = None) -> dict:
     """Timeout envelope, with the diagnostic promoted out of `output_tail`.
 
     A timeout whose `result` is empty used to say only "Timeout after Nms" while the real
@@ -2865,11 +3059,14 @@ def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
     # forwarding. Diagnostic text owns its own unit, so format the numeric value
     # explicitly rather than producing ``360000msms``.
     timeout_budget_ms = int(timeout_ms)
-    resp = _partial_response(cli, result, 124, f"Timeout after {timeout_budget_ms}ms")
+    headline = _timeout_headline(timeout_budget_ms, stage, elapsed_ms)
+    resp = _partial_response(cli, result, 124, headline)
     captured = "".join(stdout_lines or [])
     resp["timeout"] = {"budget_ms": timeout_budget_ms,
-                       "stage": "backend-execution",
+                       "stage": stage or "backend-execution",
                        "partial_output": bool(result) or bool(captured.strip())}
+    if elapsed_ms is not None:
+        resp["timeout"]["elapsed_ms"] = int(elapsed_ms)
     resp = _attach_raw(resp, stdout_lines)
 
     # `processor.get_result()` returns the parsed result JSON (a dict) or None -- NOT a
@@ -2882,7 +3079,7 @@ def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
         hint = salient_error(captured)
         if hint:
             resp["error_hint"] = hint
-            resp["error"] = f"Timeout after {timeout_budget_ms}ms -- likely cause: {hint}"
+            resp["error"] = f"{headline} -- likely cause: {hint}"
         resp.setdefault("warnings", []).append(
             "this run timed out with no parsed result; the captured output is in "
             "`output_tail` and usually names the real cause (a missing tool, a wrong "
@@ -2900,7 +3097,7 @@ def _timeout_payload(cli: str, processor: StreamProcessor, timeout_ms: int,
             "remediation_code": "opencode_output_timeout",
         })
         resp["error"] = (
-            f"Timeout after {timeout_budget_ms}ms; OpenCode produced no usable "
+            f"{headline}; OpenCode produced no usable "
             "output. For an OpenRouter model, verify the provider credential "
             "with `opencode auth login` (or the configured local credential), "
             "then retry explicitly; Summon did not retry or switch providers."
@@ -3078,7 +3275,17 @@ def _drive_process_loop(
     reader thread reports EOF before calling ``communicate()`` — that way
     only one consumer ever reads ``process.stdout``.
     """
-    deadline = time.monotonic() + timeout_ms / 1000
+    loop_started = time.monotonic()
+    deadline = loop_started + timeout_ms / 1000
+
+    def _elapsed_ms() -> int:
+        return int((time.monotonic() - loop_started) * 1000)
+
+    def _wall_clock_stage() -> str:
+        # "backend-execution" is the documented public stage for an ordinary
+        # subprocess wall-clock timeout; keep it.
+        return "adaptive_hard_timeout" if runtime_control is not None else "backend-execution"
+
     # Non-stream CLIs can still return useful plain output on non-zero status; only
     # the wrapper that emits line-delimited JSON events is safe to parse.
     parse_stream = bool(parse_stream)
@@ -3166,10 +3373,11 @@ def _drive_process_loop(
                     _kill_tree(process)
                     _drain_to_eof(line_q)
                     _safe_communicate(process)
-                    timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
-                    timed.setdefault("timeout", {})["stage"] = (
-                        "adaptive_attention_timeout" if runtime_control.attention_required
-                        else "adaptive_hard_timeout")
+                    timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                             stage=("adaptive_attention_timeout"
+                                                    if runtime_control.attention_required
+                                                    else "adaptive_hard_timeout"),
+                                             elapsed_ms=_elapsed_ms())
                     return timed
             if not saw_terminal and liveness is not None:
                 reason = liveness.expired()
@@ -3177,8 +3385,9 @@ def _drive_process_loop(
                     _kill_tree(process)
                     _drain_to_eof(line_q)
                     _safe_communicate(process)
-                    timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
-                    timed.setdefault("timeout", {})["stage"] = reason
+                    timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                             stage=reason,
+                                             elapsed_ms=_elapsed_ms())
                     return timed
             # Once a trusted terminal event has been parsed, provider-side
             # cancellation/deadline state may only influence cleanup.  It must
@@ -3210,7 +3419,9 @@ def _drive_process_loop(
                         _drain_to_eof(line_q)
                         _safe_communicate(process)
                         return _attach_raw(
-                            _timeout_payload(cli, processor, timeout_ms, stdout_lines),
+                            _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                             stage="deliberation_deadline",
+                                             elapsed_ms=_elapsed_ms()),
                             stdout_lines)
                 except ProviderDeadlineError as exc:
                     _kill_tree(process)
@@ -3225,7 +3436,9 @@ def _drive_process_loop(
                 _kill_tree(process)
                 _drain_to_eof(line_q)
                 _safe_communicate(process)
-                return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
+                return _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                        stage=_wall_clock_stage(),
+                                        elapsed_ms=_elapsed_ms())
 
             try:
                 wait_for = remaining
@@ -3250,7 +3463,9 @@ def _drive_process_loop(
                 _kill_tree(process)
                 _drain_to_eof(line_q)
                 _safe_communicate(process)
-                return _timeout_payload(cli, processor, timeout_ms, stdout_lines)
+                return _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                        stage=_wall_clock_stage(),
+                                        elapsed_ms=_elapsed_ms())
 
             if kind == _EOF:
                 break
@@ -3347,16 +3562,18 @@ def _drive_process_loop(
                         "post_eof_terminal_reap_timeout")
                 _kill_tree(process)
                 _safe_communicate(process)
-                timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
-                timed.setdefault("timeout", {})["stage"] = "finalization_timeout"
+                timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                         stage="finalization_timeout",
+                                         elapsed_ms=_elapsed_ms())
                 return timed
             reason = (liveness.expired()
                       if not saw_terminal and liveness is not None else None)
             if reason is not None:
                 _kill_tree(process)
                 _safe_communicate(process)
-                timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines)
-                timed.setdefault("timeout", {})["stage"] = reason
+                timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                         stage=reason,
+                                         elapsed_ms=_elapsed_ms())
                 return timed
             if (launch_control is not None and not saw_terminal
                     and launch_control.is_cancelled()):
@@ -3563,6 +3780,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     """
     started = time.monotonic()
     started_wall_ms = int(time.time() * 1000)
+    _last_launch_evidence: dict[str, object] | None = None
     # A physical attempt is the unit used for lifecycle accounting.  Keep the
     # value opaque and bounded; the retry loop supplies a fresh ID for each
     # provider launch, while direct callers get one lazily here.  Structural
@@ -3570,6 +3788,134 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     _attempt_id = getattr(inv, "attempt_id", None)
     if not isinstance(_attempt_id, str) or re.fullmatch(r"[0-9a-f]{32}", _attempt_id) is None:
         _attempt_id = uuid.uuid4().hex
+    _accounting_estimate = None
+    _accounting_prepared = False
+    _accounting_boundary = None
+    _local_process_created = None
+    _api_accounting_records: list[dict] = []
+    _api_root_settled = False
+    _api_durable_unknown = False
+
+    def _prepare_submission_accounting(boundary: str) -> None:
+        """Freeze the final Summon-visible adapter payload before contact.
+
+        Detached children additionally append a nonce-fenced possible-contact
+        record to their existing launch record. Foreground calls retain this
+        evidence only in their eventual terminal envelope.
+        """
+        nonlocal _accounting_estimate, _accounting_prepared, _accounting_boundary
+        from _builder import submission_payload_parts
+        from _submission_accounting import estimate_payload, private_record
+        excludes = ["provider_resume_history"] if inv.resume_id else []
+        _accounting_estimate = estimate_payload(
+            submission_payload_parts(inv, boundary), boundary=boundary,
+            excludes=excludes)
+        _accounting_boundary = boundary
+        root = os.environ.get("SUMMON_JOB_DIR")
+        job_id = os.environ.get("SUMMON_JOB_ID")
+        nonce = os.environ.get("SUMMON_JOB_NONCE")
+        if not (root or job_id or nonce):
+            return
+        if not (isinstance(root, str) and isinstance(job_id, str)
+                and isinstance(nonce, str)):
+            raise ValueError("background accounting handoff is incomplete")
+        from _jobs import record_submission_prelaunch
+        possible = private_record(
+            attempt_id=_attempt_id,
+            attempt_kind=getattr(inv, "attempt_kind", "initial"),
+            attempt_ordinal=getattr(inv, "attempt_ordinal", 1),
+            parent_attempt_id=getattr(inv, "parent_attempt_id", None),
+            request_sha256=getattr(inv, "request_sha256", None),
+            estimate=_accounting_estimate, envelope={},
+            submission_state="possible")
+        record_submission_prelaunch(root, job_id, nonce=nonce,
+                                    accounting=possible)
+        _accounting_prepared = True
+
+    def _accounting_record(response: dict, *, attempt_id: str, kind: str,
+                           ordinal: int, parent_id: str | None) -> dict:
+        from _submission_accounting import private_record
+        accounting_env = dict(response)
+        if _local_process_created is not None:
+            accounting_env["local_process_created"] = _local_process_created
+        return private_record(
+            attempt_id=attempt_id, attempt_kind=kind,
+            attempt_ordinal=ordinal, parent_attempt_id=parent_id,
+            request_sha256=getattr(inv, "request_sha256", None),
+            estimate=_accounting_estimate, envelope=accounting_env)
+
+    def _settle_api_root(response: dict) -> None:
+        nonlocal _api_root_settled, _api_durable_unknown
+        accounting = _accounting_record(
+            response, attempt_id=_attempt_id,
+            kind=getattr(inv, "attempt_kind", "initial"),
+            ordinal=getattr(inv, "attempt_ordinal", 1),
+            parent_id=getattr(inv, "parent_attempt_id", None))
+        _api_accounting_records.append(accounting)
+        if _accounting_prepared:
+            try:
+                from _jobs import settle_submission
+                settle_submission(os.environ["SUMMON_JOB_DIR"],
+                                  os.environ["SUMMON_JOB_ID"],
+                                  nonce=os.environ["SUMMON_JOB_NONCE"],
+                                  accounting=accounting)
+            except Exception:
+                _api_durable_unknown = True
+                raise
+        _api_root_settled = True
+
+    def _prepare_api_child(kind: str) -> dict:
+        child_id = uuid.uuid4().hex
+        ordinal = getattr(inv, "attempt_ordinal", 1) + 1
+        possible = _accounting_record(
+            {}, attempt_id=child_id, kind=kind, ordinal=ordinal,
+            parent_id=_attempt_id)
+        possible["submission_state"] = "possible"
+        possible["unknown_spend"] = True
+        possible["contact"]["possible_submission"] = None
+        if _accounting_prepared:
+            from _jobs import record_submission_prelaunch
+            record_submission_prelaunch(
+                os.environ["SUMMON_JOB_DIR"], os.environ["SUMMON_JOB_ID"],
+                nonce=os.environ["SUMMON_JOB_NONCE"], accounting=possible)
+        return {"id": child_id, "kind": kind, "ordinal": ordinal,
+                "parent_id": _attempt_id}
+
+    def _settle_api_child(child: dict, response: dict) -> None:
+        nonlocal _api_durable_unknown
+        accounting = _accounting_record(
+            response, attempt_id=child["id"], kind=child["kind"],
+            ordinal=child["ordinal"], parent_id=child["parent_id"])
+        _api_accounting_records.append(accounting)
+        if _accounting_prepared:
+            try:
+                from _jobs import settle_submission
+                settle_submission(os.environ["SUMMON_JOB_DIR"],
+                                  os.environ["SUMMON_JOB_ID"],
+                                  nonce=os.environ["SUMMON_JOB_NONCE"],
+                                  accounting=accounting)
+            except Exception:
+                _api_durable_unknown = True
+                raise
+
+    _api_submission_accounting = {
+        "settle_root": _settle_api_root,
+        "prepare_child": _prepare_api_child,
+        "settle_child": _settle_api_child,
+    }
+
+    def _accounting_refusal(exc: Exception) -> dict:
+        refused = _error_response(
+            inv.cli, 1, "submission accounting could not be durably prepared",
+            not_run=True)
+        refused.update({
+            "error_kind": "submission_accounting_unavailable",
+            "provider_contacted": False,
+            "retryable": False,
+            "result_usable": False,
+            "accounting_error": type(exc).__name__,
+        })
+        return _stamp(_enrich(refused, None))
     # Credit-only model guard: build_invocation_args enforces it in the
     # argv/env (so --dry-run and real dispatch agree); here we keep the ORIGINAL
     # request, the GUARDED effective model (feeds model.targeted), and the guard
@@ -3600,6 +3946,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         or (inv.cli == "codex" and _codex_selection.get("exact_required"))
     )
     _guarded_inv, _, _guard_warnings = apply_credit_guard(inv)
+    _transport_budget_result = None
+    _transport_budget_error = None
     debug_argv = [inv.cli]  # what --debug-dir records; each path refines it
     # Defer the initial workspace snapshot until an actual backend spawn is known to fit.
     # An over-long argv must not cause any utility Popen merely to build its refusal
@@ -3616,6 +3964,16 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # Wall-clock per dispatch — orchestrators need this for concurrency
         # tuning and it costs nothing to provide.
         resp["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+        # This is intentionally private.  run_subagent seals it into the
+        # authenticated continuation sidecar and removes the marker before
+        # publishing the public envelope.  Keeping it on the in-process result
+        # lets a governed background child bind the exact executable that was
+        # actually measured at Popen without leaking paths or environment data.
+        if _last_launch_evidence is not None:
+            resp["_private_launch_observation"] = copy.deepcopy(
+                _last_launch_evidence.get("launch_observation"))
+        if _transport_budget_result is not None:
+            resp.setdefault("transport_budget", copy.deepcopy(_transport_budget_result))
         # Provider contact is the boundary between a structural refusal and a
         # physical attempt.  Only the latter receives an attempt identity and
         # completed attempt state; this prevents preflight errors from being
@@ -3711,10 +4069,14 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             resp.get("model_evidence_source") in {
                 "claude_identity_conflict", "claude_aggregate_usage"}
             or (len(_mu) > 1 and not _terminal_model))
+        _conflicting_kimi = (inv.cli == "kimi" and
+                             resp.get("model_evidence_source") ==
+                             "kimi_model_evidence_conflict")
         if _terminal_model and not _terminal_model_invalid:
             _served = _terminal_model
         elif (_out_tokens > 0 and _targeted
-              and not _exact_required and not _ambiguous_claude):
+              and not _exact_required and not _ambiguous_claude
+              and not _conflicting_kimi):
             _served = None if _terminal_model_invalid else _targeted
         else:
             _served = None
@@ -3735,7 +4097,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             resp["served_model_evidence"] = (
                 "inferred" if _client_observed_kimi else "reported")
         elif (_out_tokens > 0 and _targeted and not _terminal_model_invalid
-              and not _exact_required and not _ambiguous_claude):
+              and not _exact_required and not _ambiguous_claude
+              and not _conflicting_kimi):
             resp["served_model_evidence"] = "inferred"
         else:
             resp["served_model_evidence"] = "absent"
@@ -3829,7 +4192,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                     "fallback, ACP fallback, repair, or resume was attempted")
         resp["permission"] = inv.permission
         resp["transport"] = inv.transport   # which path served the run (subprocess|acp)
-        resp["effort"] = inv.effort   # reasoning effort actually applied (None = backend default)
+        resp["effort"] = inv.effort   # requested effort; not proof of applied/served effort
         # True only for a caller-requested continuation. Automatic schema/report
         # repair retries have their own explicit fields and do not relabel the root run.
         resp["resumed"] = bool(inv.resume_id)
@@ -3887,6 +4250,38 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 resp["billing"] = {"source": "unknown",
                     "note": "resumed claude session runs its original model (guard can't re-pin "
                             "on --resume); billing cannot be proven"}
+        if _api_accounting_records:
+            resp["submission_accounting"] = copy.deepcopy(_api_accounting_records)
+            if _accounting_prepared:
+                resp["submission_accounting_durable"] = {
+                    "state": ("unknown" if _api_durable_unknown else "settled"),
+                    "owner_fenced": True,
+                }
+        elif _accounting_estimate is not None:
+            try:
+                accounting = _accounting_record(
+                    resp, attempt_id=_attempt_id,
+                    kind=getattr(inv, "attempt_kind", "initial"),
+                    ordinal=getattr(inv, "attempt_ordinal", 1),
+                    parent_id=getattr(inv, "parent_attempt_id", None))
+                if resp.get("provider_contacted") is True or _accounting_prepared:
+                    resp["submission_accounting"] = accounting
+                if _accounting_prepared:
+                    from _jobs import settle_submission
+                    settle_submission(
+                        os.environ["SUMMON_JOB_DIR"], os.environ["SUMMON_JOB_ID"],
+                        nonce=os.environ["SUMMON_JOB_NONCE"], accounting=accounting)
+                    resp["submission_accounting_durable"] = {
+                        "state": "settled", "owner_fenced": True,
+                    }
+            except Exception as exc:  # post-contact failure stays unknown, never zero
+                resp.setdefault("warnings", []).append(
+                    "durable submission accounting did not settle; the prelaunch "
+                    "possible-contact record remains authoritative")
+                resp["submission_accounting_durable"] = {
+                    "state": "unknown", "owner_fenced": True,
+                    "error_kind": type(exc).__name__,
+                }
         raw = resp.pop("_debug_raw", None)
         _finalize_diagnostics(resp, raw, debug_dir, debug_argv, max_tool_output_bytes)
         _attach_eligibility(resp)
@@ -3967,11 +4362,36 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 inv.cli, 1,
                 f"backend {inv.cli!r} has no controlled provider-launch boundary; "
                 "deliberation refused it before contact", not_run=True), None))
+        try:
+            _prepare_submission_accounting("api_message_content")
+        except Exception as exc:
+            return _accounting_refusal(exc)
+        _accounting_kw = ({"submission_accounting": _api_submission_accounting}
+                          if inv.cli == "openai-compat" else {})
+        # Keep test doubles and older third-party adapters compatible without
+        # catching a TypeError after a request has already been sent.  The
+        # production openai-compatible adapter declares this keyword; a
+        # replacement callable that does not declare it is called without the
+        # optional accounting hook, so the executor never retries a possibly
+        # contacted provider on a signature error.
+        if _accounting_kw:
+            try:
+                signature = inspect.signature(BACKENDS[inv.cli]["call"])
+                accepts_accounting = (
+                    "submission_accounting" in signature.parameters
+                    or any(parameter.kind is inspect.Parameter.VAR_KEYWORD
+                           for parameter in signature.parameters.values()))
+            except (TypeError, ValueError):
+                accepts_accounting = False
+            if not accepts_accounting:
+                _accounting_kw = {}
         if launch_control is None:
-            _backend_resp = BACKENDS[inv.cli]["call"](inv, timeout_ms)
+            _backend_resp = BACKENDS[inv.cli]["call"](
+                inv, timeout_ms, **_accounting_kw)
         else:
             _backend_resp = BACKENDS[inv.cli]["call"](
-                inv, timeout_ms, launch_control=launch_control)
+                inv, timeout_ms, launch_control=launch_control,
+                **_accounting_kw)
         resp = _enrich(_backend_resp, None)
         resp["resume"] = {"cli": inv.cli, "session_id": None}  # stateless: no resume
         return _stamp(resp)
@@ -4033,6 +4453,10 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             })
             return _stamp(_enrich(_permission_refusal, None))
         debug_argv = [inv.cli, "<acp>"]
+        try:
+            _prepare_submission_accounting("acp_prompt_text")
+        except Exception as exc:
+            return _accounting_refusal(exc)
         if launch_control is None:
             _acp_resp = BACKENDS[inv.cli]["acp"]["call"](inv, timeout_ms)
         else:
@@ -4076,7 +4500,15 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # deliberation envelope exposes only the exception class.
         _detail = (f"provider preparation refused ({type(_build_err).__name__})"
                    if launch_control is not None else str(_build_err))
-        return _stamp(_enrich(_error_response(inv.cli, 1, _detail, not_run=True), None))
+        _resp = _error_response(inv.cli, 1, _detail, not_run=True)
+        # Typed refusals (e.g. an agy capability probe that stalled under load versus a
+        # genuinely outdated agy) say whether a retry can help, so a caller does not
+        # have to infer it from prose.
+        _kind = getattr(_build_err, "kind", None)
+        if launch_control is None and isinstance(_kind, str) and _kind:
+            _resp["error_kind"] = _kind
+            _resp["retryable"] = bool(getattr(_build_err, "retryable", False))
+        return _stamp(_enrich(_resp, None))
     try:
         command, args = _resolve_launch(command, args)
     except ValueError as _launch_err:
@@ -4105,19 +4537,68 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         proc_env = scrub_provider_env(dict(os.environ))
     # AFTER _merge_env: the POSIX total counts the environment, and the environment that
     # matters is the one Popen receives -- overrides included, stripped keys excluded.
+    # Evaluate the exact operation-specific transport fact only when the caller
+    # supplies an authoritative capability.  Legacy invocations retain the
+    # established argv guard; the structured budget path never infers a route,
+    # platform, or limit.  Private-attachment callers pass the exact bytes from
+    # their own attachment contract instead of silently treating them as argv.
+    _declared_capability = _adapter_transport_capability(inv, args)
+    if _declared_capability is not None:
+        try:
+            from _transport_budget import evaluate_invocation as _evaluate_transport_budget
+            if type(_declared_capability) is not dict:
+                raise ValueError("transport capability must be an object")
+            _capability = copy.deepcopy(_declared_capability)
+            _platform = _capability.pop("platform", None)
+            if _platform not in {"nt", "posix"}:
+                raise ValueError("transport capability requires an explicit platform")
+            if _platform != os.name:
+                raise ValueError("transport capability platform does not match the host")
+            _attachment_bytes = None
+            _transport_content = inv.prompt
+            if _capability.get("kind") in {"private_attachment", "system_file"}:
+                if _capability.get("kind") == "private_attachment":
+                    if "--attach" not in args:
+                        raise ValueError("private attachment capability requires an attachment argument")
+                    _attach_index = args.index("--attach") + 1
+                    _attachment_path = args[_attach_index]
+                else:
+                    _attachment_path = (proc_env or {}).get("GEMINI_SYSTEM_MD")
+                    if not isinstance(_attachment_path, str) or not _attachment_path:
+                        raise ValueError("system file capability requires GEMINI_SYSTEM_MD")
+                if not os.path.isfile(_attachment_path):
+                    raise ValueError("transport system file is unavailable")
+                with open(_attachment_path, "rb") as _attachment_file:
+                    _attachment_file.seek(0, os.SEEK_END)
+                    _attachment_bytes = _attachment_file.tell()
+                    _attachment_file.seek(0)
+                    _transport_content = _attachment_file.read(16 * 1024 * 1024 + 1)
+            _transport_budget_result = _evaluate_transport_budget(
+                operation_id=_attempt_id, content=_transport_content,
+                command=command, args=args, env=proc_env, platform=_platform,
+                capability=_capability, attachment_bytes=_attachment_bytes)
+            _transport_budget_result["operation"] = (
+                "resume" if getattr(inv, "resume_id", None) else "fresh")
+        except Exception as _budget_exc:  # noqa: BLE001 - fail closed before spawn
+            _transport_budget_error = "transport capability preflight refused"
     _argv_err = argv_length_error(inv.cli, command, args, proc_env)
+    if _transport_budget_result is not None and _transport_budget_result.get("status") == "blocked":
+        if _transport_budget_result.get("capability", {}).get("kind") == "private_attachment":
+            _argv_err = "transport budget refused the complete invocation before provider contact"
+        elif not _argv_err:
+            _argv_err = "transport budget refused the complete invocation before provider contact"
+    elif _transport_budget_error is not None:
+        _argv_err = _transport_budget_error
     if _argv_err:
         # A prompt that cannot fit in argv can still go over ACP — the prompt is
         # a JSON-RPC parameter on stdin there, with no OS command-line limit.
         # Only for backends with NATIVE ACP support; the kill switch and the
         # fallback envelope field apply even to an explicit --transport
         # subprocess pin, because the alternative here is certain failure.
-        from _builder import supports_acp as _supports_acp
-        if (_supports_acp(inv.cli)
-                and (launch_control is None or launch_control.allow_secondary)
-                and os.environ.get("SUMMON_ACP_FALLBACK") != "0"
-                and (inv.cli != "kimi"
-                     or os.environ.get("SUMMON_KIMI_ACP_FALLBACK") == "1")):
+        # (A transport budget is only evaluated for a declared capability, so the
+        # shared predicate's "no declared capability" clause also excludes the
+        # private-attachment case.)
+        if argv_overflow_reroutes_to_acp(inv, args, launch_control):
             from dataclasses import replace as _replace_inv
             _routed = execute_agent(_replace_inv(inv, transport="acp"),
                                     timeout_ms=timeout_ms, debug_dir=debug_dir,
@@ -4135,6 +4616,17 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # exit 1, not 127: 127 means "CLI not found", and reporting this as a missing
         # binary is precisely the misdiagnosis being fixed.
         _resp = _error_response(inv.cli, 1, _argv_err, not_run=True)
+        if _transport_budget_result is not None and _transport_budget_result.get("status") == "blocked":
+            _resp["error_kind"] = "transport_budget_exceeded"
+            _resp["retryable"] = False
+        elif _transport_budget_error is not None:
+            _resp["error_kind"] = "transport_capability_invalid"
+            _resp["retryable"] = False
+        else:
+            # Typed so a caller (and the transient-retry predicate) never re-sends the
+            # same oversized prompt expecting a different result.
+            _resp["error_kind"] = "prompt_too_long_for_argv"
+            _resp["retryable"] = False
         # agy builds its per-invocation profile during build_invocation_args, so a rejection
         # HERE leaves a populated profile on disk with no handle to it: the caller could
         # neither resume nor clean it up, and it lingered until a TTL sweep. Hand it back.
@@ -4147,19 +4639,98 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         _workspace_before = workspace_snapshot(inv.cwd)
     debug_argv = [command, *args]
 
+    try:
+        _prepare_submission_accounting("subprocess_adapter_payload")
+    except Exception as exc:
+        _cleanup_launch_artifacts(inv.cli, env_override, args)
+        return _accounting_refusal(exc)
+
     # POSIX: put the child in its own session so _kill_tree can signal the whole
     # group (a shim's grandchild otherwise survives process.kill() and keeps
     # stdout open, defeating the timeout). Windows walks the tree via taskkill /T.
     from _spawn import popen_flags
     if launch_control is not None:
         try:
-            launch_control.before_provider_launch(_subprocess_launch_evidence(
-                command, args, inv.cwd, proc_env, backend=inv.cli))
+            from _launch_observer import LaunchObservationError
+            _last_launch_evidence = _subprocess_launch_evidence(
+                command, args, inv.cwd, proc_env, backend=inv.cli,
+                transport=inv.transport,
+                external_cli_version=getattr(inv, "external_cli_version", None),
+                include_launch_observation=bool(
+                    getattr(launch_control, "requires_launch_observation", False)),
+                require_trusted_observation=bool(
+                    getattr(launch_control, "requires_launch_observation", False)))
+            # Keep the exact final prompt and physical attempt bound to the
+            # child-side authenticated guard without retaining prompt bytes.
+            # The parent created the guard from the same final invocation
+            # prompt; the child proves it is launching those bytes now.
+            _last_launch_evidence["dispatch_payload_sha256"] = hashlib.sha256(
+                inv.prompt.encode("utf-8")).hexdigest()
+            _last_launch_evidence["attempt_id_sha256"] = hashlib.sha256(
+                _attempt_id.encode("utf-8")).hexdigest()
+            launch_control.before_provider_launch(_last_launch_evidence)
+            if (getattr(launch_control, "requires_launch_observation", False)
+                    and inv.cli == "claude" and inv.transport == "subprocess"):
+                # The durable gate callback can take time.  Re-measure only
+                # executable/material identity after it returns and before
+                # Popen; running a second ungoverned version subprocess here
+                # would add a new blocking side effect after the gate claim.
+                from _launch_binding import measure_executable, measure_launch_material
+                from _launch_observer import claude_launch_identity, resolve_claude_layout
+                _expected_observation = (_last_launch_evidence or {}).get(
+                    "launch_observation") or {}
+                try:
+                    _identity = claude_launch_identity(command, args)
+                    _layout = resolve_claude_layout(command, args)
+                    _current_executable = measure_executable(_layout["command"])
+                    _current_material = measure_launch_material(
+                        _layout["command"], args, list(_layout["material_paths"]))
+                except LaunchObservationError as _identity_error:
+                    raise LaunchObservationError("launch_observation_changed") from _identity_error
+                if (_identity.get("executable_sha256")
+                        != _expected_observation.get("executable_sha256")
+                        or _identity.get("launch_material_sha256")
+                        != _expected_observation.get("launch_material_sha256")
+                        or not _current_executable
+                        or _current_material != _identity.get("launch_material_sha256")):
+                    raise LaunchObservationError("launch_observation_changed")
+                # The identity-only recheck is still local work and may have
+                # crossed an owner/deadline transition.  Re-run both fences
+                # after it and before Popen; otherwise a cancellation observed
+                # by the durable callback could still consume a provider slot.
+                if launch_control.is_cancelled():
+                    raise ProviderLaunchError("provider launch cancelled before contact")
+                if launch_control.is_deadline_reached():
+                    raise ProviderDeadlineError("provider launch deadline exceeded")
+        except LaunchObservationError as e:
+            # The producer failed before the durable provider claim.  Release
+            # any reservation without calling the provider and expose only its
+            # typed, path-free reason.
+            try:
+                launch_control.pre_spawn_failed(e)
+            except Exception:
+                pass
+            _cleanup_launch_artifacts(inv.cli, env_override, args)
+            _resp = _error_response(
+                inv.cli, 1, "trusted launch observation refused", not_run=True)
+            _resp.update({
+                "error_kind": e.kind,
+                "retryable": False,
+                "result_usable": False,
+                "provider_contacted": False,
+            })
+            return _stamp(_enrich(_resp, None))
         except ProviderDeadlineError:
+            try:
+                launch_control.pre_spawn_failed(ProviderDeadlineError(
+                    "provider launch deadline exceeded"))
+            except Exception:
+                pass
             _deadline_response = _error_response(
                 inv.cli, 124, "provider launch deadline exceeded", partial_result=None,
                 not_run=True)
             _deadline_response["timeout"] = True
+            _deadline_response["provider_contacted"] = False
             _cleanup_launch_artifacts(inv.cli, env_override, args)
             return _stamp(_enrich(_deadline_response, None))
         except ProviderLaunchRefusal as e:
@@ -4167,6 +4738,21 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             return _stamp(_enrich(_blocked_response(
                 inv.cli, e.error_kind,
                 "provider launch refused by a verified local policy fence"), None))
+        except ProviderLaunchError as e:
+            try:
+                launch_control.pre_spawn_failed(e)
+            except Exception:
+                pass
+            _cleanup_launch_artifacts(inv.cli, env_override, args)
+            _refused = _error_response(
+                inv.cli, 1, "provider launch cancelled before contact", not_run=True)
+            _refused.update({
+                "error_kind": "provider_launch_cancelled",
+                "retryable": False,
+                "result_usable": False,
+                "provider_contacted": False,
+            })
+            return _stamp(_enrich(_refused, None))
         except Exception as e:
             try:
                 launch_control.launch_indeterminate(e)
@@ -4180,6 +4766,15 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 f"provider launch refused by control ({type(e).__name__})",
                 not_run=True), None))
     try:
+        if _last_launch_evidence is None:
+            # Fresh ordinary dispatches also receive a private observation for
+            # continuation-source sealing.  No provider is contacted by this
+            # local measurement; it happens before Popen below.
+            _last_launch_evidence = _subprocess_launch_evidence(
+                command, args, inv.cwd, proc_env, backend=inv.cli,
+                transport=inv.transport,
+                external_cli_version=getattr(inv, "external_cli_version", None),
+                include_launch_observation=True)
         # stdin=DEVNULL: sub-agent CLIs (notably codex) probe stdin for "additional
         # input" and block reading from a TTY inherited from the parent. We never
         # have stdin to give them.
@@ -4196,6 +4791,9 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             env=proc_env,
             **popen_flags(),
         )
+        # This is direct Popen evidence only. It says nothing about whether the
+        # child later submitted the request to a remote provider.
+        _local_process_created = True
     except FileNotFoundError as e:
         if launch_control is not None:
             try:

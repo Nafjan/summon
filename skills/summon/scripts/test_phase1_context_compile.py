@@ -17,6 +17,7 @@ import pytest
 
 import _context_compile as compiler
 import _context_target as target_adapter
+from _spawn import run_flags
 
 
 def sample(*blocks):
@@ -254,7 +255,7 @@ def test_reference_adapter_rejects_windows_junction_indirection():
         target.write_bytes(body)
         created = subprocess.run(
             ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(real)],
-            capture_output=True, text=True, encoding="utf-8")
+            capture_output=True, text=True, encoding="utf-8", **run_flags())
         if created.returncode != 0:
             pytest.skip("junction creation is unavailable")
         with pytest.raises(compiler.ContextCompileError) as raised:
@@ -275,7 +276,7 @@ def test_reference_adapter_rejects_windows_junction_allowed_root():
         target.write_bytes(body)
         created = subprocess.run(
             ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(real)],
-            capture_output=True, text=True, encoding="utf-8")
+            capture_output=True, text=True, encoding="utf-8", **run_flags())
         if created.returncode != 0:
             pytest.skip("junction creation is unavailable")
         with pytest.raises(compiler.ContextCompileError) as raised:
@@ -386,7 +387,7 @@ def test_safe_dry_run_mapping_counts_lineage_and_rollback_are_deterministic():
 @pytest.mark.parametrize("raw,kind", [
     ('{"schema":"summon.context-input/v1","schema":"summon.context-input/v1","blocks":[]}', "context_duplicate_key"),
     ('{"schema":"summon.context-input/v1","blocks":[],"n":NaN}', "context_nonfinite"),
-])
+], ids=['p001_case_001', 'p001_case_002'])
 def test_raw_parser_rejects_duplicate_keys_and_nonfinite_values(raw, kind):
     with pytest.raises(compiler.ContextCompileError) as raised:
         compiler.parse_context_json(raw)
@@ -396,7 +397,7 @@ def test_raw_parser_rejects_duplicate_keys_and_nonfinite_values(raw, kind):
 @pytest.mark.parametrize("raw,kind", [
     ('{"schema":"summon.context-input/v1","blocks":[],"n":1e400}', "context_nonfinite"),
     ("[" * 2000 + "0" + "]" * 2000, "context_malformed"),
-])
+], ids=['p002_case_001', 'p002_case_002'])
 def test_raw_parser_turns_overflow_and_extreme_nesting_into_typed_errors(raw, kind):
     with pytest.raises(compiler.ContextCompileError) as raised:
         compiler.parse_context_json(raw)

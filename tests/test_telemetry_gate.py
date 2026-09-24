@@ -109,6 +109,30 @@ class TelemetryGateTests(unittest.TestCase):
             self.assertIn(key, event)
             self.assertIsNone(event[key])
 
+    def test_executor_timeout_reasons_map_to_finite_public_stages(self):
+        expected = {
+            "generation_idle_timeout": "stream",
+            "generation-idle-timeout": "stream",
+            "startup_timeout": "backend_execution",
+            "startup-timeout": "backend_execution",
+            "overall_timeout": "backend_execution",
+            "overall-timeout": "backend_execution",
+            "adaptive_attention_timeout": "backend_execution",
+            "adaptive-attention-timeout": "backend_execution",
+            "adaptive_hard_timeout": "backend_execution",
+            "adaptive-hard-timeout": "backend_execution",
+            "adaptive_job_hard_timeout": "backend_execution",
+            "adaptive-job-hard-timeout": "backend_execution",
+            "finalization_timeout": "backend_execution",
+            "finalization-timeout": "backend_execution",
+            "future_timeout_reason": "unknown",
+        }
+        for raw, stage in expected.items():
+            with self.subTest(raw=raw):
+                event = MODULE.event_from_envelope(
+                    {"status": "error", "timeout": {"stage": raw}})
+                self.assertEqual(event["timeout_stage"], stage)
+
     def test_operation_context_is_opaque_and_closes_after_one_terminal(self):
         parent = "a" * 32
         context = MODULE.new_operation_context("manifest", parent_operation_id=parent,

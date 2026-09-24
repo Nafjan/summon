@@ -56,7 +56,7 @@ def test_codex_named_profile_requires_explicit_model(account):
         _profiles.validate_model(selected, None)
 
 
-@pytest.mark.parametrize("backend", ["claude", "codex"])
+@pytest.mark.parametrize("backend", ["claude", "codex"], ids=['p001_case_001', 'p001_case_002'])
 def test_named_builder_isolates_child_without_mutating_parent(account, monkeypatch, backend):
     monkeypatch.setenv("OPENAI_API_KEY", "private-personal-key")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "private-personal-key")
@@ -83,7 +83,7 @@ def test_named_builder_isolates_child_without_mutating_parent(account, monkeypat
     {"extra_args": ("--config", "model_provider=other")},
     {"transport": "acp"},
     {"resume_id": "some-session"},
-])
+], ids=['p002_case_001', 'p002_case_002', 'p002_case_003'])
 def test_account_rejects_unbound_overrides_and_codex_resume(account, changes):
     with pytest.raises(ValueError):
         _builder.build_invocation_args(invocation(account, **changes))
@@ -131,6 +131,72 @@ def test_background_argv_preserves_account_selection(account):
     assert args[args.index("--profile") + 1] == "work"
 
 
+def test_two_named_accounts_stay_isolated_through_detached_dispatch(account):
+    """A background child keeps the chosen account; it never rotates silently.
+
+    This is deliberately provider-free: the registry and two private homes are
+    synthetic, while the assertions exercise the real profile resolver, builder,
+    environment scrubber, launch-record projection, and detached argv path.
+    """
+    import _background
+    import _jobs
+
+    work_home, cwd, registry = account
+    personal_home = cwd.parent / "personal-account"
+    personal_home.mkdir()
+    (work_home / "auth.json").write_text('{"account":"work-secret"}', encoding="utf-8")
+    (personal_home / "auth.json").write_text('{"account":"personal-secret"}', encoding="utf-8")
+    document = json.loads(registry.read_text(encoding="utf-8"))
+    document["profiles"]["personal"] = {
+        "cli": "codex", "config_dir": str(personal_home), "auth_mode": "login",
+    }
+    registry.write_text(json.dumps(document), encoding="utf-8")
+
+    work = _profiles.resolve_profile("work", "codex", str(cwd))
+    personal = _profiles.resolve_profile("personal", "codex", str(cwd))
+    assert work["env"] != personal["env"]
+    assert work["path_sha256"] != personal["path_sha256"]
+    assert work["state_sha256"] != personal["state_sha256"]
+
+    work_invocation = invocation(account, profile="work")
+    personal_invocation = replace(
+        work_invocation,
+        profile="personal",
+        profile_env={_profiles.PROFILE_ENV_VARS["codex"]: str(personal_home)},
+    )
+    for selected, expected_home, expected_name in (
+            (work_invocation, work_home, "work"),
+            (personal_invocation, personal_home, "personal")):
+        _command, _args, env_delta = _builder.build_invocation_args(selected)
+        child_env = _executor._merge_env(env_delta)
+        assert child_env["CODEX_HOME"] == str(expected_home)
+        assert "OPENAI_API_KEY" not in child_env
+        assert "work-secret" not in json.dumps(child_env)
+        assert "personal-secret" not in json.dumps(child_env)
+
+        ns = _cli.build_parser("test", 1).parse_args([
+            "--agent", "sol", "--prompt", "public", "--cwd", str(cwd),
+            "--profile", expected_name, "--background"])
+        child = _background.child_argv(ns, str(cwd / (expected_name + ".json")))
+        assert child[child.index("--profile") + 1] == expected_name
+        assert str(work_home) not in child and str(personal_home) not in child
+        projected = _jobs.flags_projection(ns)
+        assert projected["profile"] == expected_name
+
+    # Changing the registry is a new request identity, not permission to reuse
+    # the old detached selection or silently fall back to the other account.
+    before = _executor.build_request_identity(
+        agent="sol", prompt="public", cwd=str(cwd),
+        agents_dir=str(cwd), profile="work")
+    document["profiles"]["work"]["config_dir"] = str(personal_home)
+    registry.write_text(json.dumps(document), encoding="utf-8")
+    after = _executor.build_request_identity(
+        agent="sol", prompt="public", cwd=str(cwd),
+        agents_dir=str(cwd), profile="work")
+    assert before["profile_registry_sha256"] != after["profile_registry_sha256"]
+    assert before["profile_path_sha256"] != after["profile_path_sha256"]
+
+
 def test_dry_run_matches_account_builder_without_exposing_home(account):
     import run_subagent
     inv = invocation(account)
@@ -152,7 +218,7 @@ def test_profile_auth_status_is_local_until_probe(account, monkeypatch):
 @pytest.mark.parametrize("backend,name,stdout", [
     ("claude", "claude-work", '{"loggedIn":true,"email":"private@example.invalid"}'),
     ("codex", "work", "Logged in using ChatGPT: private@example.invalid"),
-])
+], ids=['p003_case_001', 'p003_case_002'])
 def test_auth_probe_uses_account_and_redacts_vendor_output(account, monkeypatch, backend, name, stdout):
     monkeypatch.setattr(_auth, "_command_for", lambda cli, plan: plan["argv"])
     def run(command, **kwargs):

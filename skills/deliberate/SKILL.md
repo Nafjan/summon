@@ -25,12 +25,19 @@ evidence. If any of those facts are missing, ask the user or choose another mode
 The CLI is the same dispatcher:
 
 ```text
-../summon/scripts/run_subagent.py deliberate --question "…" --seats A,B \
-  --options X,Y --quorum all --rounds 1 --max-attempts 4 --deadline 30m \
+  ../summon/scripts/run_subagent.py deliberate --question "…" --seats A,B \
+  --options X,Y --quorum all --rounds 1 --max-attempts 2 --deadline 30m \
   --run-dir <private-runs-root> --cwd <project>
 ```
 
-The current fresh/resume provider path is `integration_pending`; it never silently
-falls back to another mode. `status`, `replay`, `recover`, `cancel`, and `open` are
-provider-inert. An unmatched physical start is `uncertain_spend`; do not retry it
-unless the user explicitly supplies `--retry-indeterminate`.
+The fresh provider path is limited to an explicit quorum, one round, one physical
+attempt per seat, and enforceable read-only subprocess seats with executable
+evidence. Unsupported configurations refuse before provider contact; the lane
+never silently retries, falls back, or changes mode. The example's two seats
+therefore use `--max-attempts 2`. These are runtime admission constraints, not
+proof of current provider availability or served-model identity.
+
+`deliberate resume` and human approval remain `integration_pending`. `status`,
+`replay`, `recover`, `cancel`, and `open` are provider-inert. An unmatched physical
+start is `uncertain_spend`; `--retry-indeterminate` only acknowledges that
+uncertainty and does not activate the gated resume path or grant launch permission.

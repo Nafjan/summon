@@ -16,6 +16,7 @@ doctor or the installer, and never exhausts memory.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import stat as _stat
@@ -35,10 +36,21 @@ HOST_DIRS = {"claude": ".claude", "codex": ".codex", "cursor": ".cursor",
              "antigravity-cli": os.path.join(".gemini", "antigravity-cli"),
              "antigravity-ide": os.path.join(".gemini", "antigravity-ide")}
 _MANIFEST = ".summon-install.json"
+# Keep this list in lockstep with install.py's staged skill payload.  The receipt
+# hash intentionally remains scripts-only for dispatch compatibility; this
+# separate fingerprint is the convergence identity for the complete installed
+# skill, including documentation and references.
+SKILL_PAYLOAD = frozenset({"SKILL.md", "scripts", "references", "agents", "examples"})
 # Per-file ceiling for hashing/parsing an install we do NOT own (drift enumeration of
 # other copies). Real production modules are well under 200 KB; this only bounds a
 # foreign/compromised copy so it cannot exhaust memory during doctor or install.
 _ENUM_MAX_BYTES = 4_000_000
+_PAYLOAD_MAX_FILES = 10_000
+_PAYLOAD_MAX_TOTAL_BYTES = 64_000_000
+_PAYLOAD_MAX_DIRS = 5_000
+_PAYLOAD_MAX_ENTRIES_PER_DIR = 20_000
+_PAYLOAD_MAX_ENTRIES_TOTAL = 100_000
+_PAYLOAD_MAX_DEPTH = 64
 
 
 def _canonical(path: str) -> str:
@@ -57,6 +69,113 @@ def _host_root(name: str, relative: str, home: str) -> str:
     if name == "kimi":
         return os.environ.get("KIMI_CODE_HOME") or os.path.join(home, relative)
     return os.path.join(home, relative)
+
+
+def _link_like(path: Path) -> bool:
+    """Reject symlinks and Windows reparse/junction entries without following them."""
+    try:
+        if path.is_symlink():
+            return True
+        checker = getattr(path, "is_junction", None)
+        if checker is not None and checker():
+            return True
+        # Python versions without Path.is_junction still expose the reparse bit
+        # through stat on Windows.  Treating an uncertain reparse point as a link
+        # keeps an untrusted install from escaping its payload root.
+        st = path.lstat()
+        reparse = getattr(_stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        return bool(getattr(st, "st_file_attributes", 0) & reparse)
+    except OSError:
+        return True
+
+
+def _payload_fingerprint(skill_root: str | Path) -> tuple[str | None, int, str | None]:
+    """Hash the staged skill payload with bounded, regular-file-only reads.
+
+    The result is ``(sha256, file_count, error)``.  A link, unreadable file,
+    non-regular entry, oversized file, or bounded scan is unknown rather than
+    silently omitted.  Runtime caches are excluded because install.py excludes
+    them from the managed copy as well.  Text line endings are normalized to
+    match the release manifest's payload identity across checkout platforms.
+    """
+    root = Path(skill_root)
+    try:
+        if not root.is_dir() or _link_like(root):
+            return None, 0, "payload root missing or linked"
+    except OSError:
+        return None, 0, "payload root unreadable"
+    for required in SKILL_PAYLOAD:
+        component = root / required
+        try:
+            if not component.exists() or _link_like(component):
+                return None, 0, f"payload component missing or linked: {required}"
+        except OSError:
+            return None, 0, f"payload component unreadable: {required}"
+    digest = hashlib.sha256()
+    files = 0
+    directories = 0
+    entries_seen = 0
+    total = 0
+    pending = [(root, Path(""))]
+    try:
+        while pending:
+            directory, relative_dir = pending.pop()
+            directories += 1
+            if directories > _PAYLOAD_MAX_DIRS:
+                return None, files, "payload directory-count limit exceeded"
+            if len(relative_dir.parts) > _PAYLOAD_MAX_DEPTH:
+                return None, files, "payload directory-depth limit exceeded"
+            entries = []
+            with os.scandir(directory) as iterator:
+                for index, entry in enumerate(iterator):
+                    if index >= _PAYLOAD_MAX_ENTRIES_PER_DIR:
+                        return None, files, "payload directory-entry limit exceeded"
+                    entries_seen += 1
+                    if entries_seen > _PAYLOAD_MAX_ENTRIES_TOTAL:
+                        return None, files, "payload total-entry limit exceeded"
+                    entries.append(entry)
+            entries.sort(key=lambda entry: entry.name)
+            for entry in entries:
+                relative = relative_dir / entry.name
+                if not relative_dir.parts and entry.name == _MANIFEST:
+                    continue
+                if not relative_dir.parts and entry.name not in SKILL_PAYLOAD:
+                    continue
+                path = Path(entry.path)
+                if _link_like(path):
+                    return None, files, f"linked payload entry: {relative.as_posix()}"
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name in {".pytest_cache", "__pycache__"}:
+                        continue
+                    if directories + len(pending) >= _PAYLOAD_MAX_DIRS:
+                        return None, files, "payload directory-count limit exceeded"
+                    pending.append((path, relative))
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    return None, files, f"non-regular payload entry: {relative.as_posix()}"
+                if relative.suffix.lower() == ".pyc" or "__pycache__" in relative.parts:
+                    continue
+                files += 1
+                if files > _PAYLOAD_MAX_FILES:
+                    return None, files, "payload file-count limit exceeded"
+                payload, note = _read_regular_bounded(str(path), _ENUM_MAX_BYTES)
+                if note is not None or payload is None:
+                    return None, files, f"unreadable or oversized payload file: {relative.as_posix()}"
+                if len(payload) > _ENUM_MAX_BYTES:
+                    return None, files, f"oversized payload file: {relative.as_posix()}"
+                total += len(payload)
+                if total > _PAYLOAD_MAX_TOTAL_BYTES:
+                    return None, files, "payload byte limit exceeded"
+                if relative.suffix.lower() in {".md", ".json", ".py", ".txt", ".yml", ".yaml"}:
+                    payload = payload.replace(b"\r\n", b"\n")
+                name = relative.as_posix().encode("utf-8")
+                digest.update(len(name).to_bytes(8, "big"))
+                digest.update(name)
+                digest.update(len(payload).to_bytes(8, "big"))
+                digest.update(payload)
+    except (OSError, UnicodeError, ValueError):
+        return None, files, "payload scan failed"
+    return digest.hexdigest(), files, None
 
 
 def _read_installed_at(install_dir: str):
@@ -317,7 +436,8 @@ def _probe(label: str, scripts_dir: str, managed: bool) -> dict:
     present = os.path.isdir(scripts_dir)
     rec = {"label": label, "scripts_dir": scripts_dir, "present": present,
            "managed": managed, "running": False, "sha256": None, "version": None,
-           "installed_at": None, "duplicates": [], "duplicates_truncated": False}
+           "installed_at": None, "duplicates": [], "duplicates_truncated": False,
+           "payload_sha256": None, "payload_file_count": 0, "payload_error": None}
     if present:
         try:
             rec["sha256"] = scripts_sha256(scripts_dir, max_bytes=_ENUM_MAX_BYTES)
@@ -325,6 +445,11 @@ def _probe(label: str, scripts_dir: str, managed: bool) -> dict:
             rec["sha256"] = None
         rec["version"] = _read_version(scripts_dir)
         rec["installed_at"] = _read_installed_at(os.path.dirname(scripts_dir))
+    payload_sha, payload_count, payload_error = _payload_fingerprint(
+        Path(scripts_dir).parent)
+    rec["payload_sha256"] = payload_sha
+    rec["payload_file_count"] = payload_count
+    rec["payload_error"] = payload_error
     # Sibling dirs the HOST would load as a SECOND 'summon' skill (a stale pre-refresh backup, a
     # hand-copied dupe) -- invisible to the hash check, which only inspects the canonical path.
     # Computed even when the canonical is ABSENT: a host can carry a summon.pre-refresh-* copy
@@ -420,8 +545,11 @@ def drift_report(records: list, reference_sha: str | None = None) -> dict:
     managed reference and ignores explicitly unmanaged project/plugin copies. Global
     convergence requires a running reference; managed convergence requires a comparable
     managed reference. Each also requires no unknown or duplicate copy in its own scope.
-    Returns the legacy fields plus managed/unmanaged partitions and an explicit
-    ``running_matches_managed`` fact."""
+    Returns the legacy fields plus managed/unmanaged partitions and explicit
+    script/payload matching facts.  ``scripts_sha256`` remains the dispatch
+    receipt identity; payload convergence additionally covers documentation and
+    other installed skill assets.
+    """
     if reference_sha is None:
         run = next((r for r in records if r.get("running") and r.get("sha256")), None)
         reference_sha = run["sha256"] if run else None
@@ -429,6 +557,23 @@ def drift_report(records: list, reference_sha: str | None = None) -> dict:
     hashed = [r for r in present if r["sha256"]]
     unknown = [r for r in present if not r["sha256"]]
     drifted = [r for r in hashed if reference_sha and r["sha256"] != reference_sha]
+    # Any modern record opts the report into payload convergence.  A mixed
+    # modern/legacy set is unsafe: records without the field are unknown rather
+    # than silently falling back to scripts-only convergence.
+    payload_tracking = bool(present) and any("payload_sha256" in r for r in present)
+    payload_reference_sha = None
+    if payload_tracking:
+        run_payload = next((r for r in present
+                            if r.get("running") and r.get("payload_sha256")), None)
+        payload_reference_sha = run_payload.get("payload_sha256") if run_payload else None
+    payload_hashed = [r for r in present if r.get("payload_sha256")]
+    payload_unknown = ([r for r in present
+                        if "payload_sha256" not in r or not r.get("payload_sha256")]
+                       if payload_tracking else [])
+    payload_drifted = ([r for r in payload_hashed
+                        if payload_reference_sha
+                        and r.get("payload_sha256") != payload_reference_sha]
+                       if payload_tracking else [])
     # Duplicate 'summon' skills a host loads beside its canonical copy. Hash-convergence says
     # NOTHING about these: a host can be byte-identical on the canonical path yet still show TWO
     # summon entries (the field symptom), so any duplicate blocks `converged`. A truncated scan
@@ -457,17 +602,62 @@ def drift_report(records: list, reference_sha: str | None = None) -> dict:
     unmanaged_truncated = [label for label in truncated
                            if not any(r.get("label") == label and r.get("managed")
                                       for r in records)]
-    managed_converged = (
+    managed_payload_hashed = [r for r in managed_present if r.get("payload_sha256")]
+    managed_payload_reference_sha = (managed_payload_hashed[0]["payload_sha256"]
+                                     if managed_payload_hashed else None)
+    managed_payload_drifted = ([r for r in managed_payload_hashed
+                                if managed_payload_reference_sha
+                                and r.get("payload_sha256") != managed_payload_reference_sha]
+                               if payload_tracking else [])
+    managed_payload_unknown = ([r for r in managed_present
+                                if "payload_sha256" not in r or not r.get("payload_sha256")]
+                               if payload_tracking else [])
+    managed_payload_stale = ([r for r in managed_payload_hashed
+                              if payload_reference_sha
+                              and r.get("payload_sha256") != payload_reference_sha]
+                             if payload_tracking else [])
+    managed_script_stale = ([r for r in managed_hashed
+                             if reference_sha and r.get("sha256") != reference_sha]
+                            if reference_sha else [])
+    unmanaged_payload_drifted = ([r for r in payload_drifted if not r.get("managed")]
+                                 if payload_tracking else [])
+    unmanaged_payload_unknown = ([r for r in payload_unknown if not r.get("managed")]
+                                 if payload_tracking else [])
+    managed_internal_converged = (
         bool(managed_reference_sha) and bool(managed_present) and not managed_drifted
-        and not managed_unknown and not managed_duplicates and not managed_truncated)
+        and not managed_unknown and not managed_duplicates and not managed_truncated
+        and (not payload_tracking or (
+            bool(managed_payload_reference_sha) and not managed_payload_drifted
+            and not managed_payload_unknown)))
+    managed_source_converged = (managed_internal_converged
+                                and not managed_script_stale
+                                and (not payload_tracking or
+                                     (bool(payload_reference_sha)
+                                      and not managed_payload_stale)))
+    script_converged = (bool(reference_sha) and not drifted and not unknown
+                        and not duplicates and not truncated)
+    payload_converged = (None if not payload_tracking else
+                         bool(payload_reference_sha) and not payload_drifted
+                         and not payload_unknown and not duplicates and not truncated)
     return {"reference_sha": reference_sha,
             "managed_reference_sha": managed_reference_sha,
             "running_matches_managed": bool(
                 reference_sha and managed_reference_sha
                 and reference_sha == managed_reference_sha),
-            "converged": (bool(reference_sha) and not drifted and not unknown
-                          and not duplicates and not truncated),
-            "managed_converged": managed_converged,
+            "payload_tracking": payload_tracking,
+            "payload_reference_sha": payload_reference_sha,
+            "managed_payload_reference_sha": managed_payload_reference_sha,
+            "running_matches_managed_payload": bool(
+                payload_reference_sha and managed_payload_reference_sha
+                and payload_reference_sha == managed_payload_reference_sha),
+            "payload_converged": payload_converged,
+            "converged": script_converged and (payload_converged is not False),
+            # Legacy meaning: all installer-managed copies agree with each
+            # other.  Source-bound status is separate so existing consumers do
+            # not silently change scope.
+            "managed_converged": managed_internal_converged,
+            "managed_internal_converged": managed_internal_converged,
+            "managed_source_converged": managed_source_converged,
             "present": present, "hashed": hashed, "drifted": drifted,
             "unknown": unknown, "duplicates": duplicates, "scan_truncated": truncated,
             "managed_drifted": managed_drifted, "managed_unknown": managed_unknown,
@@ -475,4 +665,12 @@ def drift_report(records: list, reference_sha: str | None = None) -> dict:
             "managed_scan_truncated": managed_truncated,
             "unmanaged_drifted": unmanaged_drifted, "unmanaged_unknown": unmanaged_unknown,
             "unmanaged_duplicates": unmanaged_duplicates,
-            "unmanaged_scan_truncated": unmanaged_truncated}
+            "unmanaged_scan_truncated": unmanaged_truncated,
+            "payload_drifted": payload_drifted,
+            "payload_unknown": payload_unknown,
+            "managed_payload_drifted": managed_payload_drifted,
+            "managed_payload_unknown": managed_payload_unknown,
+            "managed_payload_stale": managed_payload_stale,
+            "managed_script_stale": managed_script_stale,
+            "unmanaged_payload_drifted": unmanaged_payload_drifted,
+            "unmanaged_payload_unknown": unmanaged_payload_unknown}

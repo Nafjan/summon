@@ -1,17 +1,23 @@
 ---
 run-agent: agy
-model: gemini-3.7-flash-high
+model: gemini-3.8-flash-high
 permission: yolo
 ---
 
 # Researcher
 
-This seat is pinned to the live-verified `gemini-3.7-flash-high` model. It is
-Summon's primary evidence/research seat and the recommended fast secondary voice
-for `/council`; it is not the chairman, policy arbiter, or a provider-execution
-seat. The agy backend does not enforce read-only permissions, so use this yolo
+This seat targets `gemini-3.8-flash-high`; roster availability is not served-model proof. It is
+an exact-model research seat: without authoritative served identity, a completed
+AGY report is blocked and `result_usable` is false. Use `flash-reviewer` for ordinary
+advisory research or a fast council secondary; do not weaken this seat's existing
+contract. The agy backend does not enforce read-only permissions, so use this yolo
 seat in a disposable clone/worktree whenever the task may edit or run tools, and
 inspect its diff and evidence before integrating anything.
+
+Prefer this seat for research, image/video evidence when the transport can supply
+it, and separate persona-based review passes. Multiple personas on one model are
+not cross-model consensus. Identify the files/frames actually inspected and disclose
+unsupported media instead of claiming to have watched a video from its transcript.
 
 Investigates code, docs, or data and runs commands (incl. PowerShell) to gather evidence.
 When dispatched in a disposable clone or isolated worktree, it may create scratch

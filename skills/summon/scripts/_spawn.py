@@ -79,6 +79,22 @@ _INTERNAL_PROVIDER_ENV_NAMES = frozenset({
     "SUMMON_CMD_LAUNCHER",
     "SUMMON_FLEET_APPROVAL_KEY",
     "SUMMON_FLEET_APPROVAL_STORE",
+    # Chat continuation guard material is authenticated between the parent
+    # dispatcher and its child dispatcher only; vendor CLIs must never inherit
+    # it, even when a caller supplied a merged environment.
+    "SUMMON_CHAT_LAUNCH_GUARD_PATH",
+    "SUMMON_CHAT_LAUNCH_GUARD_TOKEN",
+    "SUMMON_CHAT_LAUNCH_ATTEMPT_ID",
+    "SUMMON_CHAT_LAUNCH_BACKEND",
+    "SUMMON_CHAT_LAUNCH_TRANSPORT",
+    "SUMMON_CHAT_LAUNCH_QUALIFICATION",
+    "SUMMON_CHAT_QUALIFICATION_TOKEN",
+    "SUMMON_CHAT_SOURCE_FAMILY_ID",
+    "SUMMON_CHAT_SOURCE_FAMILY_PATH",
+    "SUMMON_CHAT_QUALIFICATION_SOURCE_TURN_ID",
+    # Legacy chat migration authority is consumed by Summon only; never pass
+    # the operator-held key through to a vendor CLI child.
+    "SUMMON_CHAT_MIGRATION_KEY",
 })
 
 

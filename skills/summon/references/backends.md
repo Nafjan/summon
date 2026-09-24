@@ -11,9 +11,10 @@ when its Summon permission tier allows it. The selected model still needs to
 support the tool-calling features that the task requires; OpenRouter maintains
 a [tool-support model filter](https://openrouter.ai/docs/guides/features/tool-calling).
 
-The retired compatibility-named Ox seat remains pinned to its historical selector.
-Its distinct paid successor targets the model that the preview was revealed to be,
-GLM 5.3 Flash, through OpenRouter:
+The retired compatibility-named Ox seat is documented only as a historical selector;
+it is not a permanent or dispatchable model promise. A currently documented paid
+successor targets the model the preview was reported to correspond to, GLM 5.3 Flash,
+through OpenRouter:
 
 ```markdown
 ---
@@ -149,6 +150,37 @@ The ZCode bundle-discovery and attached-brief approach was informed by the
 [MIT-licensed delegate-skills project](https://github.com/amElnagdy/delegate-skills).
 Summon's implementation and provenance contract are independent.
 
+### Transport budgets for fresh and resumed turns
+
+Summon evaluates the complete operation at the subprocess boundary before it
+contacts a backend. The budget is operation-specific: a fresh turn is measured
+from the assembled system context and user prompt, while a resumed turn is
+measured from the resume prompt that the selected adapter actually builds. A
+budget receipt includes `operation: "fresh"` or `"resume"`, the caller-prompt
+digest, the host platform, and `provider_contacted: false` for a preflight
+refusal. For an argv route, the measured size is the complete assembled argv
+line, not just that caller-prompt digest. For an attachment route, the digest
+covers the exact bytes written to the attachment. ACP, stdin, and API routes
+remain backend-specific unless their adapter supplies an explicit capability;
+Summon does not infer a generic size contract for them.
+
+The routes have different, explicit contracts:
+
+| Route | Budget fact | Oversize behavior | Fallback |
+|---|---|---|---|
+| Ordinary subprocess argv | The adapter or caller must provide the host-specific argv limits; legacy calls retain the existing OS argv guard | Refuse the whole operation before `Popen` | Only the legacy, unqualified argv guard may route to native ACP where that backend supports it |
+| Native ZCode subprocess | The adapter always writes the complete fresh or resumed message to an owner-restricted UTF-8 `--attach` file; the default ceiling is 8 MiB | Refuse before `Popen`, then remove the attachment | No ACP fallback for an explicit or adapter-owned attachment contract |
+| ACP or other non-subprocess transports | No subprocess capability is inferred | Backend-specific preflight rules apply | Never infer an argv or attachment budget, and never claim that ACP carries a file budget |
+
+An explicit capability whose platform does not equal the current host, whose
+fields mix argv and attachment limits, or whose shape is unknown is invalid and
+blocks without selecting another transport. The ZCode attachment path is the
+adapter-owned exception: its platform and 8 MiB ceiling are bound only after
+the exact command and `--attach` argument are built. Fresh and resumed Unicode,
+newline, quote, and BOM payloads are covered by
+`test_attachment_transport_acceptance.py`; capability refusal and legacy
+fallback behavior are covered by `test_transport_refusal_acceptance.py`.
+
 ### OpenRouter routers through OpenCode
 
 OpenCode can use OpenRouter's concrete models and router aliases as model
@@ -157,7 +189,7 @@ ID, the selectors shown by `opencode models openrouter` are normally:
 
 | OpenCode selector | OpenRouter behavior | Use it for |
 |---|---|---|
-| `openrouter/z-ai/glm-5.3-flash` | A paid pinned model; formerly the Ox Alpha preview | Reproducible tool/file work |
+| `openrouter/z-ai/glm-5.3-flash` | A currently documented paid selector; formerly the Ox Alpha preview | Reproducible tool/file work |
 | `openrouter/openrouter/auto` | Auto Router | Let OpenRouter choose a paid model |
 | `openrouter/openrouter/free` | Free Models Router | Low-volume experiments |
 | `openrouter/openrouter/fusion` | Fusion model alias | Panel-and-judge synthesis |
@@ -220,11 +252,16 @@ the result as a named-model review.
 
 ## Custom & API backends (`openai-compat`) — direct text seat
 
-The direct API backend can run against **any OpenAI-compatible
-`/chat/completions` API** — OpenRouter, OpenAI, Anthropic, Google (Gemini compat),
-Groq, DeepSeek, Together, or a LOCAL server (Ollama, LM Studio, vLLM, llama.cpp).
-Pure stdlib HTTP, no SDK. This bills your **API key/credits**, not a subscription
-(cleaner for commercial or high-volume use; see [provider terms](../../../TERMS.md)).
+The direct API backend targets a configured endpoint that implements the subset of the
+OpenAI-compatible `/chat/completions` contract that Summon sends and parses. Built-in
+examples include OpenRouter, OpenAI, Google-compatible gateways, Groq, DeepSeek,
+Together, and local servers such as Ollama or LM Studio. The bundled Anthropic catalog
+entry is not native Messages-protocol support and requires a compatible gateway;
+compatibility, authentication,
+and extensions still depend on the endpoint. The adapter uses stdlib HTTP and no SDK.
+For non-Coding-Plan endpoints, Summon labels the route as API billing by default, but
+actual subscriptions, credits, invoices, and no-cost local operation remain
+provider/account facts outside Summon's universal visibility (see [provider terms](../../../TERMS.md)).
 
 ```markdown
 ---
@@ -275,6 +312,23 @@ When prompted, enter the OpenRouter key. Check presence with
 `cmdkey /list:summonOpenRouter`; that command does not display the secret.
 
 ---
+
+## Kimi headless (`-p`) tool-loop behavior
+
+Field-verified 2026-09-19: Kimi's non-interactive `--prompt` mode blocks
+indefinitely the moment the model attempts a tool call — `-y`/`--yolo` is
+"ask when needed" and still blocks, and `--auto` cannot be combined with
+`--prompt`. Two working patterns:
+
+1. **ACP transport (recommended for tool-using kimi seats)**: declare
+   `transport: acp` on a yolo kimi seat; permission requests are auto-answered
+   per-step and the tool loop completes (verified: file read + report in 34s).
+2. **Text-constrained prompt**: for pure text review/analysis, instruct the
+   seat not to use tools and emit its report directly (completes in ~45s).
+
+`summon dispatch --allow-kimi-acp-fallback` additionally permits ONE ACP
+recovery turn after a subprocess timeout/stream failure (off by default: a
+second turn can duplicate spend without recovering the task).
 
 ## BytePlus ModelArk (Coding Plan + Platform PAYG)
 
@@ -396,9 +450,19 @@ entitlement:
 
 | Editorial lane | Exact Ark marketplace ID | Metadata |
 |---|---|---|
+| Near-frontier / fast coding (primary) | `deepseek-v4-1-flash-260910` | DeepSeek V4.1 Flash 260910; text-only |
+| Near-frontier / fast coding | `glm-5-3-flash-260828` | GLM 5.3 Flash 260828; text via `arkcli`; tool/file access depends on a separately qualified adapter |
 | Frontier / maximum thinking | `deepseek-v4-pro-ga-260813` | DeepSeek V4 Pro GA; thinking; 1M context |
 | Near-frontier / long context | `glm-5-2-260617` | GLM 5.2; thinking; 1M context |
 | Near-frontier / fast coding | `deepseek-v4-flash-ga-260731` | DeepSeek V4 Flash GA; thinking; 1M context |
+
+ModelArk has two separate route families: the **Platform** `/api/v3` endpoint
+and the **Coding Plan** `/api/coding/v3` endpoint. A model listed in the
+editorial catalog is not proof that either route is enabled for the current
+account, nor that the provider will report the requested served identity.
+Route and entitlement checks must be performed with an explicitly authorized,
+current receipt; public documentation does not record account-specific
+activation, billing state, request identifiers, or adapter incidents.
 
 Treat these as separate facts:
 

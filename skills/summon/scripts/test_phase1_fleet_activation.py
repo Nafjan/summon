@@ -105,7 +105,7 @@ def test_api_credential_fingerprint_is_private_structure_not_exported_value():
 @pytest.mark.parametrize("change", [
     {"permission": "safe-edit"},
     {"model": "gpt-other"},
-])
+], ids=['p001_case_001', 'p001_case_002'])
 def test_public_structural_change_cannot_be_certified(change):
     original = _invocation()
     contract = _freeze(original)
@@ -138,7 +138,7 @@ def test_billing_is_derived_and_rechecked(monkeypatch):
     assert _fleet_activation.derive_billing_class(_invocation())["class"] == "payg"
 
 
-@pytest.mark.parametrize("model", ["claude-fable-5", "claude-fable-5-1"])
+@pytest.mark.parametrize("model", ["claude-fable-5", "claude-fable-5-1"], ids=['p002_case_001', 'p002_case_002'])
 def test_plan_dependent_and_unsupported_billing_remain_unknown(monkeypatch, model):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     fable = _invocation(cli="claude", model=model)
@@ -155,7 +155,7 @@ def test_unknown_billing_is_explicitly_ineligible(monkeypatch):
     assert contract["candidate_eligible"] is False
 
 
-@pytest.mark.parametrize("name", ["CLI_API_KEY", "CURSOR_API_KEY"])
+@pytest.mark.parametrize("name", ["CLI_API_KEY", "CURSOR_API_KEY"], ids=['p003_case_001', 'p003_case_002'])
 def test_cursor_api_keys_never_project_subscription(monkeypatch, name):
     monkeypatch.setenv(name, "rotating-test-value")
     result = _fleet_activation.derive_billing_class(
@@ -177,7 +177,7 @@ def test_cursor_subscription_account_is_ineligible_until_privately_attested(monk
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
     "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_PROJECT_ID",
     "ANTHROPIC_BASE_URL",
-])
+], ids=['p004_case_001', 'p004_case_002', 'p004_case_003', 'p004_case_004', 'p004_case_005'])
 def test_claude_custom_provider_routes_are_unknown(monkeypatch, name):
     monkeypatch.setenv(name, "configured")
     assert _fleet_activation.derive_billing_class(
@@ -244,6 +244,18 @@ def test_named_claude_profile_binds_project_settings_billing_and_bytes(
     assert first != second
 
 
+def test_activation_rechecks_profile_home_outside_dispatch_tree(tmp_path):
+    dispatch = tmp_path / "workspace"
+    profile = dispatch / "profile"
+    dispatch.mkdir()
+    profile.mkdir()
+    invocation = _invocation(
+        cli="claude", cwd=str(dispatch),
+        profile_env={"CLAUDE_CONFIG_DIR": str(profile)})
+    with pytest.raises(_fleet_activation.FleetActivationError, match="outside the dispatch cwd"):
+        _fleet_activation.derive_billing_class(invocation)
+
+
 def test_arbitrary_api_key_environment_value_is_keyed(monkeypatch):
     invocation = _invocation(api_key_env="PRIVATE_VENDOR_KEY")
     kwargs = {
@@ -262,7 +274,7 @@ def test_arbitrary_api_key_environment_value_is_keyed(monkeypatch):
 @pytest.mark.parametrize("name", [
     "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
     "GOOGLE_GENAI_USE_VERTEXAI",
-])
+], ids=['p005_case_001', 'p005_case_002', 'p005_case_003'])
 def test_gemini_vertex_and_adc_routes_are_unknown(monkeypatch, name):
     monkeypatch.setenv(name, "configured")
     assert _fleet_activation.derive_billing_class(
@@ -279,7 +291,7 @@ def test_codex_custom_provider_args_are_unknown():
 @pytest.mark.parametrize("selector", [
     ("--profile", "custom"), ("-p", "custom"),
     ("--profile=custom",), ("-p=custom",),
-])
+], ids=['p006_case_001', 'p006_case_002', 'p006_case_003', 'p006_case_004'])
 def test_codex_profile_selector_is_unknown_until_profile_is_privately_bound(selector):
     billing = _fleet_activation.derive_billing_class(
         _invocation(extra_args=selector))
@@ -359,7 +371,7 @@ def test_private_environment_and_profile_values_are_not_plain_hash_inputs():
     {"attempt_id": "2" * 32}, {"attempt_kind": "retry"},
     {"attempt_ordinal": 2}, {"parent_attempt_id": "3" * 32},
     {"cli": "kimi"}, {"cli": "opencode"}, {"cli": "agy"}, {"cli": "gemini"},
-])
+], ids=['p007_case_001', 'p007_case_002', 'p007_case_003', 'p007_case_004', 'p007_case_005', 'p007_case_006', 'p007_case_007', 'p007_case_008', 'p007_case_009', 'p007_case_010'])
 def test_secondary_and_side_effectful_paths_are_structurally_refused(change):
     with pytest.raises(_fleet_activation.FleetActivationError):
         _freeze(_invocation(**change))
@@ -388,7 +400,7 @@ def test_prompt_binding_and_contract_forgery_fail_closed():
         _fleet_activation.validate_activation_contract(resealed)
 
 
-@pytest.mark.parametrize("mutation", ["cyclic", "deep", "oversize"])
+@pytest.mark.parametrize("mutation", ["cyclic", "deep", "oversize"], ids=['p008_case_001', 'p008_case_002', 'p008_case_003'])
 def test_contract_validation_is_bounded_before_digesting(mutation):
     contract = _freeze()
     if mutation == "cyclic":

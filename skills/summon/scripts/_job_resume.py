@@ -25,7 +25,8 @@ import _jobs
 from _job_continuation import (ContinuationError, read_private_source,
                                result_binding_sha256)
 from _job_control import (_exclusive_control_lock,
-                          authenticated_steering_commands)
+                          authenticated_steering_commands,
+                          source_admission_lock)
 
 
 LEDGER_SCHEMA = "summon.job-resume-ledger/v1"
@@ -45,10 +46,14 @@ _CLAIM_KEYS = {
     "control_sha256", "permission", "gate_with", "allow_credit",
     "allow_payg", "timeout_ms", "gate_timeout_ms", "max_runtime_ms", "parent_phase",
     "gate_phase", "provider_phase", "provider_contacted",
+    "launch_binding", "launch_qualification", "gate_launch_binding", "provider_launch_binding",
     "successor_record_sha256", "bundle_sha256", "claim_sha256", "pid",
     "gate_pid", "provider_pid", "gate_decision_sha256", "terminal_sha256",
     "terminalization_error_kind",
     "created_at", "updated_at",
+}
+_LEGACY_CLAIM_KEYS = _CLAIM_KEYS - {
+    "launch_binding", "launch_qualification", "gate_launch_binding", "provider_launch_binding",
 }
 
 
@@ -99,6 +104,14 @@ class ChildContext:
     allow_payg: bool
     timeout_ms: int
     max_runtime_ms: int
+    launch_binding: dict | None
+    launch_qualification: dict | None
+    # Private, source-authenticated snapshot of the selected profile's local
+    # credential/config state.  It never enters public projections.
+    profile_state_sha256: str | None = None
+    # Set only after the loaded invocation supplies the private config path; this
+    # is process-local and is used to re-check the state at the final launch fence.
+    profile_path: str | None = None
 
 
 def _canonical(value) -> bytes:
@@ -251,6 +264,106 @@ def _record_binding(record: dict) -> str:
         "resume_lineage")})
 
 
+def _source_launch_binding(root: str, source_job_id: str) -> dict | None:
+    """Load the optional authenticated observation sealed with a fresh source."""
+    try:
+        from _job_continuation import read_launch_binding
+        return read_launch_binding(root, source_job_id)
+    except ContinuationError as exc:
+        raise ResumeError(exc.kind, str(exc)) from exc
+
+
+def _source_launch_qualification(root: str, source_job_id: str) -> dict | None:
+    """Load the separate authenticated runtime qualification, if present."""
+    try:
+        from _job_continuation import read_launch_qualification
+        return read_launch_qualification(root, source_job_id)
+    except ContinuationError as exc:
+        raise ResumeError(exc.kind, str(exc)) from exc
+
+
+def revalidate_source(root: str, source_job_id: str, *, observation: dict,
+                      qualification: dict) -> dict:
+    """Non-launching migration of a legacy source onto current evidence.
+
+    The source journal/result remain byte-for-byte untouched.  The caller must
+    provide a qualification already issued by the trusted adapter revalidator;
+    this function only checks the current source identity and publishes the
+    authenticated private sidecar.  It never starts a child or provider.
+    """
+    root = _jobs.resolve_jobs_dir(root)
+    if not _jobs.valid_job_id(source_job_id):
+        raise ResumeError("invalid_job_id", "source job id is invalid")
+    try:
+        source = read_private_source(root, source_job_id)
+    except ContinuationError as exc:
+        raise ResumeError(exc.kind, str(exc)) from exc
+    from _launch_binding import valid_observation
+    if not valid_observation(observation):
+        raise ResumeError("resume_launch_observation_invalid",
+                          "revalidation observation is malformed")
+    expected_backend = source["backend"]["cli"]
+    expected_transport = source["backend"]["transport"]
+    if (expected_backend, expected_transport) != ("claude", "subprocess"):
+        raise ResumeError("resume_revalidation_unsupported",
+                          "this source has no reviewed revalidation policy")
+    if (observation.get("backend") != expected_backend
+            or observation.get("transport") != expected_transport):
+        raise ResumeError("resume_launch_observation_stale",
+                          "revalidation route differs from source")
+    from _launch_qualification import (QualificationError, is_revoked,
+                                       validate as validate_qualification)
+    if not validate_qualification(
+            qualification, observation, operation="resume",
+            backend=expected_backend, transport=expected_transport):
+        raise ResumeError("resume_launch_qualification_invalid",
+                          "revalidation qualification does not match observation")
+    try:
+        if is_revoked(root, source_job_id, qualification["revocation_id"]):
+            raise ResumeError("resume_launch_qualification_revoked",
+                              "revalidation qualification has been revoked")
+    except QualificationError as exc:
+        raise ResumeError(exc.kind, str(exc)) from exc
+    try:
+        from _launch_qualification import write
+        value = write(root, source_job_id, qualification)
+        # Authenticate and publish the qualification before the linked launch
+        # binding. A forged packet therefore cannot leave a migration sidecar.
+        from _job_continuation import write_launch_binding
+        write_launch_binding(root, source_job_id, observation)
+    except Exception as exc:  # typed/private details stay out of public output
+        if isinstance(exc, ResumeError):
+            raise
+        raise ResumeError(getattr(exc, "kind", "resume_launch_qualification_invalid"),
+                          "revalidation qualification could not be sealed") from exc
+    return {
+        "schema": "summon.resume-revalidation/v1", "status": "revalidated",
+        "source_job_id": source_job_id,
+        "qualification_sha256": hashlib.sha256(_canonical(value)).hexdigest(),
+        "compatibility_policy": "claude-subprocess/v1",
+        "provider_contacted": False, "launch_started": False,
+    }
+
+
+def _valid_launch_binding(value: object) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    required = {
+        "schema", "backend", "transport", "executable_path_sha256",
+        "executable_sha256", "executable_size", "executable_mtime_ns",
+        "launch_material_sha256",
+        "executable_content_revision",
+        "external_cli_version", "registry_generation", "registry_digest",
+        "adapter", "adapter_version", "external_cli_version_scope",
+    }
+    if set(value) != required:
+        return False
+    from _launch_binding import valid_projection
+    return valid_projection(value)
+
+
 def _write_private_prompt(path: str, prompt: str) -> None:
     raw = prompt.encode("utf-8")
     if len(raw) > MAX_PROMPT_BYTES:
@@ -400,7 +513,10 @@ def _validate_ledger(value: dict, source_job_id: str, source: dict) -> None:
             or value["generation"] != len(value["claims"])):
         raise ResumeError("resume_claim_untrusted", "resume ledger shape or source binding is invalid")
     for ordinal, claim in enumerate(value["claims"], 1):
-        if (not isinstance(claim, dict) or set(claim) != _CLAIM_KEYS
+        if (not isinstance(claim, dict)
+                or (set(claim) != _CLAIM_KEYS and set(claim) != _LEGACY_CLAIM_KEYS)
+                or not isinstance(claim.get("generation"), int)
+                or isinstance(claim.get("generation"), bool)
                 or claim.get("generation") != ordinal
                 or not _is_id(claim.get("request_id"))
                 or not _is_sha(claim.get("request_sha256"))
@@ -445,7 +561,13 @@ def _validate_ledger(value: dict, source_job_id: str, source: dict) -> None:
                 or claim.get("provider_phase") not in {
                     "pending", "launch_claimed", "spawned", "reaped",
                     "spawn_failed", "terminal", "indeterminate"}
-                or claim.get("provider_contacted") not in {None, True, False}
+                or not (claim.get("provider_contacted") is None
+                        or isinstance(claim.get("provider_contacted"), bool))
+                or not _valid_launch_binding(claim.get("launch_binding"))
+                or (claim.get("launch_qualification") is not None
+                    and not isinstance(claim.get("launch_qualification"), dict))
+                or not _valid_launch_binding(claim.get("gate_launch_binding"))
+                or not _valid_launch_binding(claim.get("provider_launch_binding"))
                 or any(item is not None and not _is_sha(item) for item in (
                     claim.get("successor_record_sha256"), claim.get("bundle_sha256"),
                     claim.get("claim_sha256"), claim.get("gate_decision_sha256"),
@@ -587,6 +709,9 @@ def reserve_request(root: str, source_job_id: str, *, message: str | None = None
             "parent_phase": "reserved",
             "gate_phase": "pending" if effective_gate else "not_required",
             "provider_phase": "pending", "provider_contacted": None,
+            "launch_binding": _source_launch_binding(root, source_job_id),
+            "launch_qualification": _source_launch_qualification(root, source_job_id),
+            "gate_launch_binding": None, "provider_launch_binding": None,
             "successor_record_sha256": None, "bundle_sha256": None,
             "claim_sha256": None, "pid": None, "terminal_sha256": None,
             "terminalization_error_kind": None,
@@ -760,6 +885,8 @@ def prepare_successor(reservation: Reservation, *, successor_record: dict,
                   "allow_payg": ledger_claim["allow_payg"]},
         "timeout": {"checkpoint_ms": ledger_claim["timeout_ms"],
                     "max_runtime_ms": ledger_claim["max_runtime_ms"]},
+        "launch_binding": ledger_claim.get("launch_binding"),
+        "launch_qualification": ledger_claim.get("launch_qualification"),
         "created_at": reservation.created_at,
     }
     key = _claim_key(source_nonce, successor_nonce)
@@ -829,14 +956,21 @@ def load_child_context(job_file: str, claim_file: str | None = None) -> ChildCon
         "source_result_binding_sha256", "source_sha256", "request_id",
         "request_sha256", "claim_id", "successor_job_id", "successor_attempt_id",
         "successor_record_sha256", "bundle_sha256", "prompt_sha256", "steering",
-        "authority", "gate", "spend", "timeout", "created_at", "auth",
+        "authority", "gate", "spend", "timeout", "launch_binding", "launch_qualification",
+        "created_at", "auth",
     }
-    if (set(value) != required or value.get("schema") != CLAIM_SCHEMA
+    legacy_claim = set(value) == required - {"launch_binding", "launch_qualification"}
+    if (not legacy_claim and set(value) != required
+            or value.get("schema") != CLAIM_SCHEMA
             or value.get("successor_job_id") != successor_job_id
             or value.get("successor_attempt_id") != successor_record.get("attempt_id")
             or value.get("successor_record_sha256") != _record_binding(successor_record)
             or value.get("bundle_sha256") !=
-               ((successor_record.get("summon") or {}).get("scripts_sha256"))):
+               ((successor_record.get("summon") or {}).get("scripts_sha256"))
+            or not isinstance(value.get("created_at"), (int, float))
+            or isinstance(value.get("created_at"), bool)
+            or not math.isfinite(value.get("created_at"))
+            or not _valid_launch_binding(value.get("launch_binding"))):
         raise ResumeError("resume_claim_untrusted", "successor claim binding is invalid")
     source = read_private_source(root, source_job_id)
     if (value.get("source_attempt_id") != source.get("attempt_id")
@@ -887,11 +1021,14 @@ def load_child_context(job_file: str, claim_file: str | None = None) -> ChildCon
             or spend != {"allow_credit": ledger_claim["allow_credit"],
                          "allow_payg": ledger_claim["allow_payg"]}
             or timeout != {"checkpoint_ms": ledger_claim["timeout_ms"],
-                           "max_runtime_ms": ledger_claim["max_runtime_ms"]}):
+                           "max_runtime_ms": ledger_claim["max_runtime_ms"]}
+            or value.get("launch_binding") != ledger_claim.get("launch_binding")
+            or value.get("launch_qualification") != ledger_claim.get("launch_qualification")):
         raise ResumeError("resume_claim_untrusted", "successor policy differs from its ledger")
     handle = source.get("continuation", {}).get("handle")
     if not isinstance(handle, str) or not handle:
         raise ResumeError("resume_handle_unavailable", "source continuation handle is unavailable")
+    profile_state_sha256, profile_path = _profile_source_snapshot(source)
     return ChildContext(
         root=root, source_job_id=source_job_id, successor_job_id=successor_job_id,
         claim_id=value["claim_id"], claim_sha256=_digest(value), source=source,
@@ -901,7 +1038,97 @@ def load_child_context(job_file: str, claim_file: str | None = None) -> ChildCon
         allow_credit=spend.get("allow_credit") is True,
         allow_payg=spend.get("allow_payg") is True,
         timeout_ms=value["timeout"]["checkpoint_ms"],
-        max_runtime_ms=value["timeout"]["max_runtime_ms"])
+        max_runtime_ms=value["timeout"]["max_runtime_ms"],
+        launch_binding=value.get("launch_binding"),
+        launch_qualification=value.get("launch_qualification"),
+        profile_state_sha256=profile_state_sha256,
+        profile_path=profile_path)
+
+
+def _profile_source_snapshot(source: dict) -> tuple[str | None, str | None]:
+    """Validate the source-bound profile state before constructing the child.
+
+    Fresh sources bind both the private config path and its bounded state digest.
+    Older sources may omit these fields, but a named profile then has no
+    authenticated state evidence and is refused rather than baselined from the
+    current filesystem.
+    """
+    backend = source.get("backend") if isinstance(source, dict) else None
+    if not isinstance(backend, dict) or not backend.get("profile"):
+        return None, None
+    from _job_continuation import SCHEMA_V2
+    if source.get("schema") != SCHEMA_V2:
+        raise ResumeError("resume_profile_unverified",
+                          "legacy profile source has no authenticated state binding")
+    path = backend.get("profile_path")
+    state = backend.get("profile_state_sha256")
+    if (not _is_profile_state_digest(state)
+            or not isinstance(path, str) or not path):
+        raise ResumeError("resume_profile_unverified",
+                          "selected profile state is unavailable")
+    try:
+        from _profiles import _profile_state
+        current = _profile_state(path, backend["cli"])
+    except Exception as exc:
+        raise ResumeError("resume_profile_unverified",
+                          "selected profile state cannot be revalidated") from exc
+    if current != state:
+        raise ResumeError("resume_profile_drift",
+                          "selected profile state changed before child load")
+    return state, path
+
+
+def _is_profile_state_digest(value: object) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{32}", value))
+
+
+def _profile_path_and_state(invocation) -> tuple[str | None, str | None]:
+    """Return the selected private profile path and its bounded state digest."""
+    if not getattr(invocation, "profile", None):
+        return None, None
+    values = getattr(invocation, "profile_env", None) or {}
+    path = next(iter(values.values()), None)
+    if not isinstance(path, str) or not path:
+        return None, None
+    try:
+        from _profiles import _profile_state
+        return path, _profile_state(path, invocation.cli)
+    except Exception:
+        return path, None
+
+
+def _validate_profile_state(context: ChildContext, invocation=None, *,
+                            require_path: bool = False) -> None:
+    """Refuse a selected-profile rotation before the durable launch CAS.
+
+    The source digest is private authenticated evidence.  A missing current path
+    is tolerated for legacy synthetic callers that never construct a loaded
+    invocation, but the real final fence requires a path once validation has
+    established the child invocation.
+    """
+    expected = getattr(context, "profile_state_sha256", None)
+    if expected is None:
+        return
+    path = getattr(context, "profile_path", None)
+    state = None
+    if invocation is not None:
+        path, state = _profile_path_and_state(invocation)
+        if path is not None:
+            object.__setattr__(context, "profile_path", path)
+    elif path is not None:
+        try:
+            from _profiles import _profile_state
+            state = _profile_state(path, context.source["backend"]["cli"])
+        except Exception:
+            state = None
+    if state is None:
+        if require_path:
+            raise ResumeError("resume_profile_unverified",
+                              "selected profile state cannot be revalidated")
+        return
+    if state != expected:
+        raise ResumeError("resume_child_drift",
+                          "selected profile state changed after authentication")
 
 
 def validate_loaded_invocation(context: ChildContext, invocation, args, receipt: dict) -> None:
@@ -964,28 +1191,153 @@ def validate_loaded_invocation(context: ChildContext, invocation, args, receipt:
             or not bool(getattr(args, "no_contract_repair", False))
             or not bool(getattr(args, "no_acp_fallback", False))):
         raise ResumeError("resume_child_drift", "resolved successor differs from its authenticated claim")
+    _validate_profile_state(context, invocation, require_path=False)
+
+
+def _validate_launch_observation(context: ChildContext, evidence: object,
+                                 *, gate: bool) -> dict:
+    """Validate fresh host facts before consuming the durable launch claim."""
+    from _launch_binding import binding_projection, valid_observation
+    from _resume_capabilities import resume_capability_v2
+    if not isinstance(evidence, dict) or evidence.get("schema") != \
+            "summon.fleet-launch-evidence/v1":
+        raise ResumeError("resume_launch_observation_invalid",
+                          "governed launch evidence is missing")
+    observation = evidence.get("launch_observation")
+    if not valid_observation(observation):
+        raise ResumeError("resume_launch_observation_invalid",
+                          "fresh executable observation is malformed")
+    expected_backend = context.source.get("backend", {}).get("cli")
+    expected_transport = context.source.get("backend", {}).get("transport")
+    if (observation.get("backend") != expected_backend
+            or observation.get("transport") != expected_transport):
+        raise ResumeError("resume_launch_observation_stale",
+                          "launch observation route differs from the authenticated source")
+    capability = resume_capability_v2("resume", expected_backend, expected_transport)
+    expected_scope = {
+        "registry_generation": capability.get("registry_generation"),
+        "registry_digest": capability.get("registry_digest"),
+        "adapter": capability.get("adapter"),
+        "adapter_version": capability.get("adapter_version_scope"),
+        "external_cli_version_scope": capability.get("external_cli_version_scope"),
+    }
+    if any(observation.get(key) != value for key, value in expected_scope.items()):
+        raise ResumeError("resume_launch_observation_stale",
+                          "resume registry or adapter scope changed")
+    # A `not_declared` vendor-version scope is not a wildcard. Executable
+    # content identity is necessary but not sufficient; a separate
+    # authenticated qualification must bind the exact accepted version and
+    # material contract. Never infer qualification from registry equality.
+    executable_sha = observation.get("executable_sha256")
+    revision = observation.get("executable_content_revision")
+    if (not isinstance(executable_sha, str) or not _is_sha(executable_sha)
+            or revision != f"sha256:{executable_sha}"):
+        raise ResumeError("resume_launch_observation_invalid",
+                          "launch observation lacks executable content identity")
+    qualification = context.launch_qualification
+    if qualification is None:
+        raise ResumeError("resume_launch_qualification_missing",
+                          "no authenticated runtime launch qualification is sealed")
+    from _launch_qualification import (QualificationError, is_revoked,
+                                       validate as validate_qualification)
+    try:
+        current_qualification = _source_launch_qualification(
+            context.root, context.source_job_id)
+        revoked = is_revoked(
+            context.root, context.source_job_id,
+            qualification.get("revocation_id"))
+    except ResumeError:
+        raise
+    except QualificationError as exc:
+        raise ResumeError(exc.kind, str(exc)) from exc
+    if current_qualification != qualification:
+        raise ResumeError("resume_launch_qualification_stale",
+                          "runtime launch qualification changed after reservation")
+    if revoked:
+        raise ResumeError("resume_launch_qualification_revoked",
+                          "runtime launch qualification was revoked")
+    if not validate_qualification(
+            qualification, observation, operation="resume",
+            backend=str(expected_backend), transport=str(expected_transport)):
+        if isinstance(qualification, dict) and qualification.get("status") == "revoked":
+            raise ResumeError("resume_launch_qualification_revoked",
+                              "runtime launch qualification was revoked")
+        expires = qualification.get("expires_at") if isinstance(qualification, dict) else None
+        if isinstance(expires, (int, float)) and expires <= time.time():
+            raise ResumeError("resume_launch_qualification_expired",
+                              "runtime launch qualification has expired")
+        raise ResumeError("resume_launch_qualification_invalid",
+                          "runtime launch qualification does not match the fresh observation")
+    projection = binding_projection(observation)
+    expected_binding = context.launch_binding
+    if not gate:
+        if not _valid_launch_binding(expected_binding):
+            raise ResumeError("resume_launch_observation_missing",
+                              "historical continuation has no sealed launch binding; fork or re-seal it")
+        # Compare the full immutable host identity captured by the source.  The
+        # argv/cwd/environment digests remain per-attempt evidence and are not
+        # compared here because the resumed prompt necessarily changes them.
+        if projection != expected_binding:
+            raise ResumeError("resume_launch_observation_stale",
+                              "provider executable or launch scope changed since reservation")
+    if projection is None:
+        raise ResumeError("resume_launch_observation_invalid",
+                          "launch observation projection is unavailable")
+    return projection
 
 
 def provider_launch_control(context: ChildContext, *, gate: bool = False):
     """Return a single-use executor boundary backed by durable CAS."""
-    from _executor import ProviderLaunchControl
+    from _executor import ProviderLaunchControl, ProviderLaunchRefusal
     field = "gate_phase" if gate else "provider_phase"
 
-    def before_launch(_evidence):
-        def mutate(claim):
-            if claim.get("parent_phase") not in {"child_launch_claimed", "spawned"}:
-                raise ResumeError("resume_parent_not_launched", "successor parent launch is not committed")
-            if gate:
-                if claim.get("gate_phase") != "pending":
-                    raise ResumeError("resume_launch_claimed", "gate launch was already consumed")
-                claim["gate_phase"] = "launch_claimed"
-            else:
-                if claim.get("gate_phase") not in {"not_required", "approved"}:
-                    raise ResumeError("resume_gate_not_approved", "resume provider launch lacks gate approval")
-                if claim.get("provider_phase") != "pending":
-                    raise ResumeError("resume_launch_claimed", "provider launch was already consumed")
-                claim["provider_phase"] = "launch_claimed"
-        _mutate_claim(context.root, context.source_job_id, context.claim_id, mutate)
+    def before_launch(evidence):
+        # Refuse known-invalid or historical continuations before creating the
+        # source-admission lock.  The check is repeated inside the critical
+        # section below for revocation/qualification TOCTOU safety, but a
+        # read-only refusal must not leave a new lock artifact behind.
+        try:
+            _validate_profile_state(context, require_path=False)
+            _validate_launch_observation(context, evidence, gate=gate)
+        except ResumeError as exc:
+            from _executor import ProviderLaunchRefusal
+            raise ProviderLaunchRefusal(exc.kind) from exc
+        # Qualification validation and the authenticated phase CAS are one
+        # source-bound admission critical section.  Revocation uses the same
+        # lock, so a completed revoke before this section wins; a revoke that
+        # waits until after the CAS is explicitly non-retroactive.
+        with source_admission_lock(context.root, context.source_job_id):
+            try:
+                _validate_profile_state(context, require_path=True)
+                projection = _validate_launch_observation(
+                    context, evidence, gate=gate)
+            except ResumeError as exc:
+                # The executor recognizes this typed refusal and emits a boundary
+                # refusal rather than claiming a provider launch or an ambiguous
+                # post-contact failure.
+                raise ProviderLaunchRefusal(exc.kind) from exc
+            def mutate(claim):
+                if claim.get("parent_phase") not in {"child_launch_claimed", "spawned"}:
+                    raise ResumeError("resume_parent_not_launched", "successor parent launch is not committed")
+                if gate:
+                    if claim.get("gate_phase") != "pending":
+                        raise ResumeError("resume_launch_claimed", "gate launch was already consumed")
+                    if claim.get("gate_launch_binding") is not None:
+                        raise ResumeError("resume_launch_observation_replayed",
+                                          "gate launch observation was already recorded")
+                    claim["gate_phase"] = "launch_claimed"
+                    claim["gate_launch_binding"] = projection
+                else:
+                    if claim.get("gate_phase") not in {"not_required", "approved"}:
+                        raise ResumeError("resume_gate_not_approved", "resume provider launch lacks gate approval")
+                    if claim.get("provider_phase") != "pending":
+                        raise ResumeError("resume_launch_claimed", "provider launch was already consumed")
+                    if claim.get("provider_launch_binding") is not None:
+                        raise ResumeError("resume_launch_observation_replayed",
+                                          "provider launch observation was already recorded")
+                    claim["provider_phase"] = "launch_claimed"
+                    claim["provider_launch_binding"] = projection
+            _mutate_claim(context.root, context.source_job_id, context.claim_id, mutate)
 
     def spawned(process):
         pid = getattr(process, "pid", None)
@@ -1027,7 +1379,8 @@ def provider_launch_control(context: ChildContext, *, gate: bool = False):
                                  on_spawn=spawned, on_reap=reaped,
                                  on_pre_spawn_failure=pre_spawn_failed,
                                  on_indeterminate=indeterminate,
-                                 allow_secondary=False)
+                                 allow_secondary=False,
+                                 requires_launch_observation=True)
 
 
 def mark_gate_terminal(context: ChildContext, *, approved: bool,
@@ -1258,7 +1611,7 @@ def public_projection(claim: dict) -> dict:
 __all__ = [
     "LEDGER_SCHEMA", "CLAIM_SCHEMA", "PUBLIC_SCHEMA", "ResumeError",
     "Reservation", "ChildContext", "ledger_path", "claim_path", "prompt_path",
-    "reserve_request", "prepare_successor", "load_child_context",
+    "reserve_request", "revalidate_source", "prepare_successor", "load_child_context",
     "get_claim",
     "validate_loaded_invocation", "provider_launch_control",
     "mark_gate_terminal", "mark_terminal", "mark_terminal_for_job",

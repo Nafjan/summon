@@ -71,8 +71,9 @@ class ZCodeBuilderTests(unittest.TestCase):
     def _inv(self, **kw):
         permission = kw.pop("permission", "yolo")
         allow_tool_credentials = kw.pop("allow_tool_credentials", True)
+        prompt = kw.pop("prompt", "line one\nline two")
         return AgentInvocation(
-            cli="zcode", prompt="line one\nline two", system_context="system context",
+            cli="zcode", prompt=prompt, system_context="system context",
             cwd=tempfile.gettempdir(), permission=permission, isolated_lane=True,
             allow_tool_credentials=allow_tool_credentials, **kw)
 
@@ -112,6 +113,35 @@ class ZCodeBuilderTests(unittest.TestCase):
             self.assertEqual(refusal["error_kind"], kind)
             with self.assertRaisesRegex(ValueError, refusal["message"].split(";")[0]):
                 build_invocation_args(invocation)
+
+    def test_dry_run_lists_every_independent_refusal(self):
+        """One preflight must surface every gate, not only the last one written."""
+        invocation = AgentInvocation(
+            cli="zcode", prompt="p", cwd=tempfile.gettempdir(), permission="yolo",
+            read_roots=(os.path.dirname(os.path.abspath(__file__)),))
+        args = SimpleNamespace(
+            agent="zcode-native", _resolved_agent="zcode-native",
+            strict_agents_dir=False, timeout=1000, worktree=None,
+            _role_provenance={}, agents_dir=None, gate_with=None,
+            allow_text_only=False, require_tools=False,
+        )
+        view = run_subagent._dry_run_view(invocation, args, None, None)
+        self.assertTrue(view["would_refuse"])
+        kinds = [entry.get("error_kind") for entry in view["refusals"]]
+        self.assertTrue(view["read_allowlist"].get("would_refuse"), view["read_allowlist"])
+        self.assertIn(view["read_allowlist"].get("error_kind", "read_allowlist_unsupported"),
+                      kinds)
+        self.assertIn("zcode_isolation_required", kinds)
+        # The historical single-refusal fields are unchanged: the last gate wins.
+        self.assertEqual(view["refusal"], view["refusals"][-1]["refusal"])
+
+    def test_native_yolo_refusal_names_both_missing_acknowledgements(self):
+        both_missing = AgentInvocation(
+            cli="zcode", prompt="p", cwd=tempfile.gettempdir(), permission="yolo")
+        refusal = _builder.zcode_invocation_preflight(both_missing)
+        self.assertEqual(refusal["error_kind"], "zcode_isolation_required")
+        self.assertIn("--worktree or --isolated-lane", refusal["message"])
+        self.assertIn("--allow-tool-credentials", refusal["message"])
 
     def test_refused_native_zcode_preflight_never_creates_worktree(self):
         refused = (
@@ -214,6 +244,23 @@ class ZCodeBuilderTests(unittest.TestCase):
         self.assertNotIn("SUMMON_ZCODE_ATTACH_FILE", env or {})
         self.assertTrue(Path(attachment).is_file())
         _builder.cleanup_zcode_attachment(args)
+        self.assertFalse(Path(attachment).exists())
+
+    def test_64k_multiline_payload_uses_exact_private_attachment_transport(self):
+        prompt = ("header → λ\n" + "🙂quoted \\\"line\\\"\n") * 4096
+        invocation = self._inv(prompt=prompt)
+        with mock.patch("_zcode.resolve_zcode_cli", return_value=self._target()), \
+             mock.patch("_builder._lock_zcode_attachment"):
+            _command, args, _env = build_invocation_args(invocation)
+        attachment = args[args.index("--attach") + 1]
+        try:
+            expected = _builder._concatenated_prompt(invocation).encode("utf-8")
+            self.assertGreaterEqual(len(expected), 64 * 1024)
+            self.assertEqual(Path(attachment).read_bytes(), expected)
+            self.assertNotIn(prompt, args)
+            self.assertNotIn("header → λ", args)
+        finally:
+            _builder.cleanup_zcode_attachment(args)
         self.assertFalse(Path(attachment).exists())
 
     def test_builder_rejects_unsafe_modes_and_bad_resume(self):

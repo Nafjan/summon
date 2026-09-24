@@ -17,12 +17,14 @@ class ModelCatalogTests(unittest.TestCase):
         value = catalog.load_catalog()
         self.assertEqual(value["schema"], 1)
         entries = value["entries"]
-        self.assertEqual([item["name"] for item in entries[:4]], ["Fable", "Sol", "Opus", "Kimi"])
-        self.assertEqual([item["label"] for item in entries[:4]], ["frontier"] * 4)
+        self.assertEqual([item["name"] for item in entries[:5]],
+                         ["Astra", "Fable", "Sol", "Opus", "Kimi"])
+        self.assertEqual([item["label"] for item in entries[:5]], ["frontier"] * 5)
         near = [item for item in entries if item["label"] == "near-frontier"]
         self.assertEqual([item["name"] for item in near],
                          ["Grok", "Gemini Flash", "GLM", "DeepSeek V4 Flash",
-                          "Luna", "Terra", "Spark"])
+                          "Luna", "Terra", "Spark", "DeepSeek V4.1 Flash",
+                          "GLM 5.3 Flash"])
 
     def test_keys_and_routes_are_unique_and_dispatchability_is_explicit(self):
         value = catalog.load_catalog()

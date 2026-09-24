@@ -9,6 +9,10 @@ import subprocess
 import sys
 import tempfile
 
+import pytest
+
+from _spawn import run_flags
+
 
 def test_foreground_and_background_read_allowlists_stay_in_parity():
     """Repeatable roots survive child argv reconstruction and launch recording."""
@@ -56,6 +60,7 @@ def test_foreground_and_background_read_allowlists_stay_in_parity():
             capture_output=True,
             text=True,
             encoding="utf-8",
+            **run_flags(),
         )
         assert result.returncode == 0, (result.stdout, result.stderr)
         foreground = json.loads(result.stdout)["read_allowlist"]
@@ -167,6 +172,68 @@ def test_background_result_with_different_scripts_digest_is_untrusted():
                        "summon": {"scripts_sha256": "b" * 64}}, fh)
         status = _jobs.job_status(root, job_id)
         assert status["state"] == "identity_mismatch" and status["trusted"] is False, status
+
+
+def test_managed_background_launch_refuses_an_active_install_lock():
+    """A managed installer cannot replace the tree during snapshot preparation."""
+    import _background
+
+    with tempfile.TemporaryDirectory(prefix="summon-managed-install-lock-") as root:
+        host_root = os.path.join(root, "host", ".agents")
+        skill = os.path.join(host_root, "skills", "summon")
+        scripts = os.path.join(skill, "scripts")
+        os.makedirs(scripts)
+        entry = os.path.join(scripts, "run_subagent.py")
+        with open(entry, "w", encoding="utf-8") as fh:
+            fh.write("# dispatcher\n")
+        with open(os.path.join(skill, ".summon-install.json"), "w", encoding="utf-8") as fh:
+            json.dump({"installed_by": "summon"}, fh)
+        install_lock = os.path.join(host_root, "summon.install.lock")
+        with open(install_lock, "w", encoding="utf-8") as fh:
+            fh.write("installer\n")
+
+        with pytest.raises(ValueError, match="install is in progress"):
+            _background._acquire_execution_lease(entry)
+        assert not os.path.exists(os.path.join(host_root, "summon.execution.lock"))
+
+
+def test_managed_background_launch_rechecks_install_lock_after_lease(monkeypatch):
+    """An installer starting during lease creation aborts and releases the lease."""
+    import _background
+
+    with tempfile.TemporaryDirectory(prefix="summon-managed-install-race-") as root:
+        host_root = os.path.join(root, "host", ".agents")
+        skill = os.path.join(host_root, "skills", "summon")
+        scripts = os.path.join(skill, "scripts")
+        os.makedirs(scripts)
+        entry = os.path.join(scripts, "run_subagent.py")
+        with open(entry, "w", encoding="utf-8") as fh:
+            fh.write("# dispatcher\n")
+        with open(os.path.join(skill, ".summon-install.json"), "w", encoding="utf-8") as fh:
+            json.dump({"installed_by": "summon"}, fh)
+        install_lock = os.path.join(host_root, "summon.install.lock")
+        checks = {"count": 0}
+        original_lexists = _background.os.path.lexists
+
+        def same_path(left, right):
+            # CI temp roots can be 8.3 short names (RUNNER~1) that the dispatcher
+            # resolves to their long form before probing the lock.
+            return (os.path.normcase(os.path.realpath(left))
+                    == os.path.normcase(os.path.realpath(right)))
+
+        def install_race(path):
+            if same_path(path, install_lock):
+                checks["count"] += 1
+                if checks["count"] == 2:
+                    with open(install_lock, "w", encoding="utf-8") as fh:
+                        fh.write("installer\n")
+                return checks["count"] >= 2
+            return original_lexists(path)
+
+        monkeypatch.setattr(_background.os.path, "lexists", install_race)
+        with pytest.raises(ValueError, match="install started"):
+            _background._acquire_execution_lease(entry)
+        assert not os.path.exists(os.path.join(host_root, "summon.execution.lock"))
 
 
 def test_scripts_digest_covers_windows_dispatcher_launcher():

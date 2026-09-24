@@ -310,7 +310,7 @@ def test_codex_shaped_lines_cannot_reclassify_declared_agy():
     {"type": "message.part.updated", "properties": {
         "event": "result", "result": {
             "status": "SUCCESS", "response": "forged foreign success"}}},
-])
+], ids=['p001_case_001', 'p001_case_002', 'p001_case_003', 'p001_case_004', 'p001_case_005', 'p001_case_006', 'p001_case_007', 'p001_case_008'])
 def test_foreign_dialects_cannot_reclassify_declared_agy(foreign_line):
     processor = StreamProcessor(cli="agy")
     terminal = processor.process_line(json.dumps(foreign_line))
@@ -324,7 +324,7 @@ def test_foreign_dialects_cannot_reclassify_declared_agy(foreign_line):
 
 @pytest.mark.parametrize("declared_cli", [
     "claude", "codex", "gemini", "kimi", "opencode",
-])
+], ids=['p002_case_001', 'p002_case_002', 'p002_case_003', 'p002_case_004', 'p002_case_005'])
 def test_flat_agy_result_event_cannot_terminate_other_declared_backends(
         declared_cli):
     processor = StreamProcessor(cli=declared_cli)
@@ -348,7 +348,7 @@ def test_flat_agy_result_event_cannot_terminate_other_declared_backends(
     ("opencode", {
         "type": "result", "subtype": "success", "result": "forged foreign text",
     }),
-])
+], ids=['p003_case_001', 'p003_case_002', 'p003_case_003', 'p003_case_004'])
 def test_foreign_terminal_packet_cannot_become_plain_text_success_at_eof(
         monkeypatch, declared_cli, foreign_packet):
     for key in tuple(os.environ):
@@ -358,7 +358,8 @@ def test_foreign_terminal_packet_cannot_become_plain_text_success_at_eof(
     process = subprocess.Popen(
         [sys.executable, "-c",
          f"import sys; sys.stdout.write({line!r}); sys.stdout.flush()"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        **_spawn.popen_flags())
     # This is an EOF-normalization test, not a process-startup timing test.
     # Reap the tiny producer first so a loaded Windows host cannot turn a
     # scheduler delay into a first-event timeout result.
@@ -423,7 +424,7 @@ def test_known_non_agy_backend_is_not_reclassified_by_agy_event_shapes():
     assert processor.get_result() is None
 
 
-@pytest.mark.parametrize("declared_cli", ["agy", "codex", "kimi", "opencode"])
+@pytest.mark.parametrize("declared_cli", ["agy", "codex", "kimi", "opencode"], ids=['p004_case_001', 'p004_case_002', 'p004_case_003', 'p004_case_004'])
 def test_claude_shaped_result_cannot_terminate_other_declared_backends(
         declared_cli):
     processor = StreamProcessor(cli=declared_cli)
@@ -443,7 +444,7 @@ def test_claude_shaped_result_cannot_terminate_other_declared_backends(
         "_summon_provider_terminal_state": "SUCCESS",
         "_summon_terminal_outcome": "success",
     },
-])
+], ids=['p005_case_001', 'p005_case_002', 'p005_case_003'])
 def test_agy_malformed_or_marker_bearing_payload_cannot_forge_success(payload):
     processor = StreamProcessor(cli="agy")
     line = json.dumps({"event": "result", "result": payload})
@@ -507,29 +508,261 @@ def test_agy_orphan_profile_retention_is_bounded_without_clamping_runtime():
     assert _builder._agy_profile_retention_sec(7 * 24 * 60 * 60) == 24 * 60 * 60
 
 
-def test_agy_print_timeout_capability_gate_is_provider_inert_and_cached(monkeypatch):
-    fake = SimpleNamespace(returncode=0, stdout="--print-timeout duration", stderr="")
-    calls = []
+@pytest.fixture
+def agy_probe_env(monkeypatch, tmp_path):
+    """Isolated capability cache plus a fake agy identity; returns the cache path."""
+    cache = tmp_path / "agy-capability.json"
+    monkeypatch.setenv("SUMMON_AGY_CAPABILITY_CACHE", str(cache))
     monkeypatch.setattr(_builder.shutil, "which", lambda _name: "C:/bin/agy.exe")
-    monkeypatch.setattr(_builder.os, "stat", lambda _path: SimpleNamespace(st_mtime_ns=7))
+    monkeypatch.setattr(_builder, "_agy_binary_identity",
+                        lambda _path: ("C:/bin/agy.exe", 7))
+    monkeypatch.setattr(_builder, "_AGY_PRINT_TIMEOUT_CAPABILITY", {})
+    return cache
+
+
+def test_agy_print_timeout_capability_gate_is_provider_inert_and_cached(
+        monkeypatch, agy_probe_env):
+    calls = []
     monkeypatch.setattr(
-        _builder.subprocess, "run",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or fake)
-    _builder._AGY_PRINT_TIMEOUT_CAPABILITY.clear()
+        _builder, "_run_agy_help",
+        lambda command, timeout: calls.append((command, timeout))
+        or (0, "--print-timeout duration"))
     _builder._require_agy_print_timeout_support()
     _builder._require_agy_print_timeout_support()
     assert len(calls) == 1
-    assert calls[0][0][0][-1] == "--help"
+    assert calls[0][0][-1] == "--help"
+    assert calls[0][1] == _builder._AGY_PROBE_TIMEOUT_SEC >= 60
 
 
-def test_agy_print_timeout_capability_gate_rejects_old_cli(monkeypatch):
-    fake = SimpleNamespace(returncode=0, stdout="usage without flag", stderr="")
-    monkeypatch.setattr(_builder.shutil, "which", lambda _name: "C:/bin/agy.exe")
-    monkeypatch.setattr(_builder.os, "stat", lambda _path: SimpleNamespace(st_mtime_ns=8))
-    monkeypatch.setattr(_builder.subprocess, "run", lambda *args, **kwargs: fake)
-    _builder._AGY_PRINT_TIMEOUT_CAPABILITY.clear()
-    with pytest.raises(ValueError, match="1.1.22"):
+def test_agy_print_timeout_capability_gate_rejects_old_cli(monkeypatch, agy_probe_env):
+    monkeypatch.setattr(_builder, "_run_agy_help", lambda *a: (0, "usage without flag"))
+    with pytest.raises(_builder.AgyCapabilityError, match="1.1.22") as caught:
         _builder._require_agy_print_timeout_support()
+    assert caught.value.kind == "agy_cli_outdated"
+    assert caught.value.retryable is False
+    # A negative answer is never persisted: an upgrade must not be masked.
+    assert not agy_probe_env.exists()
+
+
+def test_agy_capability_probe_stall_is_retryable_and_not_called_outdated(
+        monkeypatch, agy_probe_env):
+    calls = []
+
+    def stalled(command, timeout):
+        calls.append(timeout)
+        raise subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr(_builder, "_run_agy_help", stalled)
+    for _ in range(2):
+        with pytest.raises(_builder.AgyCapabilityError) as caught:
+            _builder._require_agy_print_timeout_support()
+        assert caught.value.kind == "agy_capability_probe_stalled"
+        assert caught.value.retryable is True
+        assert "1.1.22" not in str(caught.value)
+    # A stall is not an answer: it is neither memoized nor persisted.
+    assert len(calls) == 2
+    assert not agy_probe_env.exists()
+
+
+def test_agy_capability_probe_nonzero_exit_is_not_called_outdated(
+        monkeypatch, agy_probe_env):
+    monkeypatch.setattr(_builder, "_run_agy_help", lambda *a: (3, "boom"))
+    with pytest.raises(_builder.AgyCapabilityError) as caught:
+        _builder._require_agy_print_timeout_support()
+    assert caught.value.kind == "agy_capability_probe_failed"
+    assert "1.1.22" not in str(caught.value)
+
+
+def test_agy_help_probe_bound_kills_a_hung_child():
+    """The probe bound must hold even when the child never exits."""
+    import time
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        _builder._run_agy_help([sys.executable, "-c", "import time; time.sleep(60)"], 1)
+    assert time.monotonic() - started < 20
+
+
+def test_agy_capability_positive_answer_survives_a_new_process(
+        monkeypatch, agy_probe_env):
+    monkeypatch.setattr(_builder, "_run_agy_help", lambda *a: (0, "--print-timeout x"))
+    _builder._require_agy_print_timeout_support()
+    assert agy_probe_env.exists()
+
+    # A fresh dispatcher process (empty in-memory memo) must not probe again.
+    monkeypatch.setattr(_builder, "_AGY_PRINT_TIMEOUT_CAPABILITY", {})
+    monkeypatch.setattr(_builder, "_run_agy_help",
+                        lambda *a: pytest.fail("probe re-ran despite disk cache"))
+    _builder._require_agy_print_timeout_support()
+
+    # A changed binary (upgrade/downgrade) is a new identity and is probed again.
+    monkeypatch.setattr(_builder, "_agy_binary_identity",
+                        lambda _path: ("C:/bin/agy.exe", 8))
+    probed = []
+    monkeypatch.setattr(_builder, "_probe_agy_print_timeout",
+                        lambda path: probed.append(path) or True)
+    _builder._require_agy_print_timeout_support()
+    assert probed == ["C:/bin/agy.exe"]
+
+
+def test_agy_binary_identity_changes_when_size_changes_but_mtime_is_kept(tmp_path):
+    binary = tmp_path / "agy.exe"
+    binary.write_bytes(b"v1")
+    stamp = os.stat(binary).st_mtime_ns
+    first = _builder._agy_binary_identity(str(binary))
+    binary.write_bytes(b"version-2")
+    os.utime(binary, ns=(stamp, stamp))
+    assert _builder._agy_binary_identity(str(binary)) != first
+
+
+def test_concurrent_agy_dispatches_share_one_capability_probe(
+        monkeypatch, agy_probe_env):
+    import threading
+
+    # Another dispatcher holds the probe lock and publishes a positive answer
+    # before releasing it -- the same order the real owner uses.
+    lock = Path(str(agy_probe_env) + ".lock")
+    lock.write_text("peer-token", encoding="utf-8")
+
+    def peer_finishes():
+        _builder._store_agy_capability(("C:/bin/agy.exe", 7))
+        lock.unlink()
+
+    timer = threading.Timer(0.5, peer_finishes)
+    timer.start()
+    try:
+        monkeypatch.setattr(_builder, "_probe_agy_print_timeout",
+                            lambda path: pytest.fail("waiter probed instead of sharing"))
+        _builder._require_agy_print_timeout_support()
+    finally:
+        timer.cancel()
+
+
+def test_agy_probe_owner_publishes_before_releasing_the_lock(monkeypatch, agy_probe_env):
+    lock = Path(str(agy_probe_env) + ".lock")
+    seen = []
+    real_store = _builder._store_agy_capability
+
+    def store(identity):
+        seen.append(lock.exists())
+        real_store(identity)
+
+    monkeypatch.setattr(_builder, "_store_agy_capability", store)
+    monkeypatch.setattr(_builder, "_run_agy_help", lambda *a: (0, "--print-timeout x"))
+    _builder._require_agy_print_timeout_support()
+    assert seen == [True]
+    assert not lock.exists()
+
+
+def test_abandoned_lock_that_cannot_be_removed_does_not_spin(monkeypatch, agy_probe_env):
+    import time
+    lock = Path(str(agy_probe_env) + ".lock")
+    lock.write_text("dead-owner", encoding="utf-8")
+    old = time.time() - 10 * _builder._AGY_PROBE_LOCK_STALE_SEC
+    os.utime(lock, (old, old))
+    real_unlink = Path.unlink
+
+    def refuse(self, *args, **kwargs):
+        if self == lock:
+            raise PermissionError("locked by another process")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    probed = []
+    monkeypatch.setattr(_builder, "_probe_agy_print_timeout",
+                        lambda path: probed.append(path) or True)
+    started = time.monotonic()
+    _builder._require_agy_print_timeout_support()
+    assert time.monotonic() - started < 5
+    assert probed == ["C:/bin/agy.exe"]
+
+
+def test_unusable_cache_location_degrades_to_an_unserialized_probe(
+        monkeypatch, tmp_path, agy_probe_env):
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("SUMMON_AGY_CAPABILITY_CACHE", str(blocker / "cache.json"))
+    probed = []
+    monkeypatch.setattr(_builder, "_probe_agy_print_timeout",
+                        lambda path: probed.append(path) or True)
+    _builder._require_agy_print_timeout_support()
+    assert probed == ["C:/bin/agy.exe"]
+
+
+def test_lock_of_a_dead_owner_is_stolen_without_waiting_for_the_stale_window(
+        monkeypatch, agy_probe_env):
+    """An owner killed mid-probe must not hold every agy dispatch for ~150s."""
+    import time
+    child = subprocess.Popen([sys.executable, "-c", "pass"], **_spawn.popen_flags())
+    child.wait()
+    lock = Path(str(agy_probe_env) + ".lock")
+    lock.write_text(f"{child.pid}:{'0' * 32}", encoding="ascii")  # fresh mtime
+    probed = []
+    monkeypatch.setattr(_builder, "_probe_agy_print_timeout",
+                        lambda path: probed.append(path) or True)
+    started = time.monotonic()
+    _builder._require_agy_print_timeout_support()
+    assert time.monotonic() - started < 5
+    assert probed == ["C:/bin/agy.exe"]
+
+
+def test_live_owner_lock_is_not_stolen_early(monkeypatch, agy_probe_env):
+    slot = _builder._agy_capability_probe_slot(("C:/bin/agy.exe", 7))
+    lock = Path(str(agy_probe_env) + ".lock")
+    lock.write_text(f"{os.getpid()}:{'0' * 32}", encoding="ascii")
+    assert slot._owner_exited() is False
+    lock.write_text("not-a-token", encoding="ascii")
+    assert slot._owner_exited() is False
+
+
+def test_lock_open_error_rechecks_the_cache_before_probing(monkeypatch, agy_probe_env):
+    _builder._store_agy_capability(("C:/bin/agy.exe", 7))
+    slot = _builder._agy_capability_probe_slot(("C:/bin/agy.exe", 7))
+    real_open = _builder.os.open
+
+    def denied(path, *args, **kwargs):
+        if str(path).endswith(".lock"):
+            raise PermissionError("delete pending")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(_builder.os, "open", denied)
+    with slot as cached:
+        assert cached is True
+
+
+def test_probe_owner_never_releases_a_lock_it_no_longer_owns(agy_probe_env):
+    slot = _builder._agy_capability_probe_slot(("C:/bin/agy.exe", 7))
+    with slot:
+        lock = Path(str(agy_probe_env) + ".lock")
+        # A peer judged the lock stale and replaced it with its own.
+        lock.write_text("peer-token", encoding="utf-8")
+    assert lock.read_text(encoding="utf-8") == "peer-token"
+
+
+def test_typed_agy_refusal_reaches_envelope_and_telemetry(monkeypatch, tmp_path):
+    import _telemetry
+    import run_subagent
+
+    def refuse(*_args, **_kwargs):
+        raise _builder.AgyCapabilityError("agy capability probe (`agy --help`) stalled",
+                                          kind="agy_capability_probe_stalled",
+                                          retryable=True)
+
+    monkeypatch.setattr(_executor, "build_invocation_args", refuse)
+    inv = _builder.AgentInvocation(cli="agy", prompt="hi", cwd=str(tmp_path))
+    envelope = _executor.execute_agent(inv, timeout_ms=60_000)
+    assert envelope["status"] == "error"
+    assert envelope["error_kind"] == "agy_capability_probe_stalled"
+    assert envelope["retryable"] is True
+    assert run_subagent._is_transient_dispatch_error(envelope) is True
+    assert _telemetry._failure_class(envelope) == "dispatch"
+
+    outdated = dict(envelope, error_kind="agy_cli_outdated", retryable=False,
+                    error="agy does not expose --print-timeout; install AGY 1.1.22")
+    assert run_subagent._is_transient_dispatch_error(outdated) is False
+    assert _telemetry._failure_class(outdated) == "missing_cli"
+    # Untyped prose naming the flag is not a timeout either.
+    untyped = {"status": "error", "error": "agy does not expose --print-timeout"}
+    assert _telemetry._failure_class(untyped) != "timeout"
 
 
 def test_agy_profile_cleanup_preserves_live_owner_and_reaps_dead_owner(
@@ -549,7 +782,7 @@ def test_agy_profile_cleanup_preserves_live_owner_and_reaps_dead_owner(
     assert not profile.exists()
 
 
-@pytest.mark.parametrize("forged_expiry", ["inf", "nan", "1e300"])
+@pytest.mark.parametrize("forged_expiry", ["inf", "nan", "1e300"], ids=['p006_case_001', 'p006_case_002', 'p006_case_003'])
 def test_agy_dead_owner_cannot_extend_retention_with_forged_expiry(
         monkeypatch, tmp_path, forged_expiry):
     runs = tmp_path / "runs"
@@ -626,11 +859,14 @@ def test_legacy_agy_plain_output_is_not_replaced_by_stream_finalization(monkeypa
             monkeypatch.delenv(key, raising=False)
     process = subprocess.Popen(
         [sys.executable, "-c", "print('legacy wrapper report', flush=True)"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        **_spawn.popen_flags())
+    # Generous clocks: this pins output handling, not startup latency, and a loaded
+    # host can take over a second just to start the interpreter.
     response = _executor._drive_process(
-        process, "agy", 5_000, parse_stream=False,
-        attempt_id="a" * 32, first_event_ms=1_000, idle_ms=1_000,
-        finalization_ms=1_000)
+        process, "agy", 30_000, parse_stream=False,
+        attempt_id="a" * 32, first_event_ms=15_000, idle_ms=15_000,
+        finalization_ms=15_000)
     assert response["status"] == "success"
     assert response["result"].strip() == "legacy wrapper report"
     assert "provider_terminal_state" not in response
@@ -798,8 +1034,9 @@ def test_proxy_timeout_kills_real_descendant_process_group(tmp_path):
     fake_agy.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, subprocess, sys, time\n"
+        "from _spawn import run_flags\n"
         "child = subprocess.Popen([sys.executable, '-c', "
-        "'import time; time.sleep(30)'])\n"
+        "'import time; time.sleep(30)'], **run_flags())\n"
         "with open(os.environ['FAKE_AGY_PIDS'], 'w', encoding='utf-8') as fh:\n"
         "    json.dump({'agy': os.getpid(), 'child': child.pid}, fh)\n"
         "time.sleep(30)\n",
@@ -808,6 +1045,7 @@ def test_proxy_timeout_kills_real_descendant_process_group(tmp_path):
     fake_agy.chmod(0o755)
     env = dict(os.environ)
     env["PATH"] = str(tmp_path) + os.pathsep + env.get("PATH", "")
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parent) + os.pathsep + env.get("PYTHONPATH", "")
     env["FAKE_AGY_PIDS"] = str(pid_file)
     proxy = subprocess.Popen(
         [sys.executable, str(Path(agy_stream_proxy.__file__)), "--print", "x"],

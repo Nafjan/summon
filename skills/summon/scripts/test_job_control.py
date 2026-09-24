@@ -8,6 +8,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,7 @@ import _cli
 import _job_control
 import _job_continuation
 import _jobs
+from _spawn import popen_flags
 from _liveness import LivenessTracker
 from _stream import StreamProcessor
 
@@ -32,6 +34,48 @@ class Clock:
 
     def advance(self, seconds):
         self.value += seconds
+
+
+def _wait_for_marker(path: Path, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError("fixture child did not publish its readiness marker")
+
+
+def _barriered_child(tmp_path, *, output: bool, linger: float = 2.0):
+    ready = tmp_path / "child-ready.marker"
+    release = tmp_path / "child-release.marker"
+    ready_literal = json.dumps(str(ready))
+    release_literal = json.dumps(str(release))
+    output_code = (
+        "print('{\"type\":\"thread.started\",\"thread_id\":\"fixture\"}', "
+        "flush=True)\n"
+        "time.sleep(.1)\n"
+        "os.close(1)\n"
+        if output else "")
+    program = (
+        "import os, pathlib, time\n"
+        f"ready=pathlib.Path({ready_literal})\n"
+        f"release=pathlib.Path({release_literal})\n"
+        "ready.write_text('ready', encoding='utf-8')\n"
+        "while not release.exists():\n"
+        "    time.sleep(.005)\n"
+        f"{output_code}"
+        f"time.sleep({linger!r})\n")
+    compile(program, "<barriered-child>", "exec")
+    process = subprocess.Popen(
+        [sys.executable, "-c", program], stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, encoding="utf-8", **popen_flags())
+    try:
+        _wait_for_marker(ready)
+    except BaseException:
+        process.kill()
+        process.communicate(timeout=2)
+        raise
+    return process, release
 
 
 def _prepared(tmp_path):
@@ -135,7 +179,7 @@ def test_control_summary_distinguishes_corrupt_file(tmp_path):
 
 
 @pytest.mark.parametrize("bad_timestamp", (
-    float("nan"), float("inf"), float("-inf"), 10 ** 500))
+    float("nan"), float("inf"), float("-inf"), 10 ** 500), ids=['p001_case_001', 'p001_case_002', 'p001_case_003', 'p001_case_004'])
 def test_control_rejects_nonfinite_timestamp_without_stopping_live_work(
         tmp_path, bad_timestamp):
     root, job_id = _prepared(tmp_path)
@@ -362,6 +406,177 @@ def test_driver_consumes_extend_while_subprocess_stream_is_silent(
     assert tracker.overall_ms == 400
 
 
+def test_liveness_deadline_stages_are_deterministic_with_injected_clock():
+    startup_clock = Clock()
+    startup = LivenessTracker(
+        attempt_id="startup", overall_ms=10_000, first_event_ms=100,
+        idle_ms=1_000, finalization_ms=100, clock=startup_clock)
+    startup_clock.advance(0.099)
+    assert startup.expired() is None
+    startup_clock.advance(0.001)
+    assert startup.expired() == "startup_timeout"
+
+    idle_clock = Clock()
+    idle = LivenessTracker(
+        attempt_id="idle", overall_ms=10_000, first_event_ms=1_000,
+        idle_ms=100, finalization_ms=100, clock=idle_clock)
+    idle_emitter = idle.emitter()
+    idle_emitter.emit("transport_started", session_id="session")
+    idle_clock.advance(0.01)
+    idle_emitter.emit("output_text", session_id="session", output_chars=1)
+    idle_clock.advance(0.1)
+    assert idle.expired() == "generation_idle_timeout"
+
+    final_clock = Clock()
+    finalizing = LivenessTracker(
+        attempt_id="finalizing", overall_ms=10_000, first_event_ms=1_000,
+        idle_ms=10_000, finalization_ms=100, clock=final_clock)
+    final_emitter = finalizing.emitter()
+    final_emitter.emit("transport_started", session_id="session")
+    final_clock.advance(0.01)
+    final_emitter.emit("finalizing", session_id="session")
+    final_clock.advance(0.1)
+    assert finalizing.expired() == "finalization_timeout"
+
+    terminal_clock = Clock()
+    terminal = LivenessTracker(
+        attempt_id="terminal", overall_ms=100, first_event_ms=50,
+        idle_ms=50, finalization_ms=50, clock=terminal_clock)
+    terminal_emitter = terminal.emitter()
+    terminal_emitter.emit("transport_started", session_id="session")
+    terminal_clock.advance(0.01)
+    terminal_emitter.emit("finalizing", session_id="session")
+    terminal_emitter.emit("terminal", session_id="session")
+    terminal_clock.advance(10)
+    assert terminal.expired() is None
+    assert terminal.phase == "terminal"
+
+
+def test_driver_finalization_classification_uses_ordered_queue_and_clock(
+        monkeypatch):
+    clock = Clock()
+    tracker = LivenessTracker(
+        attempt_id="driver-finalization", overall_ms=1_000,
+        first_event_ms=1_000, idle_ms=1_000, finalization_ms=100,
+        clock=clock)
+    emitter = tracker.emitter()
+
+    class OrderedQueue:
+        def __init__(self):
+            self.items = [("line", "startup"), (_executor._EOF, None)]
+
+        def get(self, timeout):
+            del timeout
+            return self.items.pop(0)
+
+    class Processor:
+        session_id = None
+
+        def process_line(self, line):
+            assert line == "startup"
+            emitter.emit("transport_started", session_id="session")
+            self.session_id = "session"
+            return False
+
+        def get_result(self):
+            return None
+
+        def finalize_stream(self):
+            return None
+
+    class RunningProcess:
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+    killed = []
+    monkeypatch.setattr(_executor.time, "monotonic", clock)
+    monkeypatch.setattr(_executor.time, "sleep", lambda seconds: clock.advance(seconds))
+    monkeypatch.setattr(_executor, "_spawn_reader", lambda _process: OrderedQueue())
+    monkeypatch.setattr(_executor, "_kill_tree", lambda _process: killed.append(True))
+    monkeypatch.setattr(_executor, "_drain_to_eof", lambda _queue: None)
+    monkeypatch.setattr(_executor, "_safe_communicate", lambda _process: (None, ""))
+
+    response = _executor._drive_process_loop(
+        RunningProcess(), "codex", 1_000, Processor(), parse_stream=True,
+        liveness=tracker, liveness_emitter=emitter)
+
+    assert response["timeout"]["stage"] == "finalization_timeout"
+    assert tracker.phase == "finalization"
+    assert killed == [True]
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected"),
+    [("startup", "startup_timeout"), ("idle", "generation_idle_timeout")],
+ ids=['p002_case_001', 'p002_case_002'])
+def test_driver_expiry_classification_uses_ordered_queue_and_clock(
+        monkeypatch, phase, expected):
+    clock = Clock()
+    tracker = LivenessTracker(
+        attempt_id=f"driver-{phase}", overall_ms=1_000,
+        first_event_ms=100 if phase == "startup" else 1_000,
+        idle_ms=100, finalization_ms=100, clock=clock)
+    emitter = tracker.emitter()
+
+    class OrderedQueue:
+        def __init__(self):
+            self.items = [] if phase == "startup" else [
+                ("line", "startup"), ("line", "output")]
+
+        def get(self, timeout):
+            if self.items:
+                return self.items.pop(0)
+            clock.advance(timeout)
+            raise queue.Empty
+
+    class Processor:
+        session_id = None
+
+        def process_line(self, line):
+            if line == "startup":
+                emitter.emit("transport_started", session_id="session")
+                self.session_id = "session"
+            else:
+                assert line == "output"
+                emitter.emit("output_text", session_id="session", output_chars=1)
+            return False
+
+        def get_result(self):
+            return None
+
+        def finalize_stream(self):
+            return None
+
+    class RunningProcess:
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+    killed = []
+    monkeypatch.setattr(_executor.time, "monotonic", clock)
+    monkeypatch.setattr(_executor, "_spawn_reader", lambda _process: OrderedQueue())
+    monkeypatch.setattr(_executor, "_kill_tree", lambda _process: killed.append(True))
+    monkeypatch.setattr(_executor, "_drain_to_eof", lambda _queue: None)
+    monkeypatch.setattr(_executor, "_safe_communicate", lambda _process: (None, ""))
+
+    response = _executor._drive_process_loop(
+        RunningProcess(), "codex", 1_000, Processor(), parse_stream=True,
+        liveness=tracker, liveness_emitter=emitter)
+
+    assert response["timeout"]["stage"] == expected
+    assert tracker.timeout_reason == expected
+    assert killed == [True]
+
+
 def test_retry_control_preserves_job_origin_and_exposes_attempt_identity(tmp_path):
     root, job_id = _prepared(tmp_path)
     monotonic = Clock()
@@ -405,7 +620,7 @@ def test_expired_job_budget_refuses_before_provider_spawn(tmp_path, monkeypatch)
     assert response["timeout"]["stage"] == "adaptive_job_hard_timeout"
 
 
-@pytest.mark.parametrize("origin", ("nan", "inf", "-inf"))
+@pytest.mark.parametrize("origin", ("nan", "inf", "-inf"), ids=['p003_case_001', 'p003_case_002', 'p003_case_003'])
 def test_nonfinite_job_origin_is_legacy_unknown_not_an_exception(
         tmp_path, monkeypatch, origin):
     monkeypatch.setenv("SUMMON_ADAPTIVE_TIMEOUT", "1")
@@ -636,7 +851,7 @@ def test_jobs_status_preserves_certified_but_ineligible_continuation(tmp_path, c
     assert status["result"]["continuation"]["resume_state"] == "certified"
 
 
-@pytest.mark.parametrize("sidecar", [None, b"{}", b'{"job_id":"wrong"}'])
+@pytest.mark.parametrize("sidecar", [None, b"{}", b'{"job_id":"wrong"}'], ids=['p004_case_001', 'p004_case_002', 'p004_case_003'])
 def test_jobs_status_never_trusts_available_result_without_authenticated_sidecar(
         tmp_path, capsys, sidecar):
     root, job_id = _prepared(tmp_path)
@@ -890,13 +1105,10 @@ def test_stream_processor_counts_claude_codex_gemini_and_kimi_tool_progress():
         assert snapshot["last_activity_kind"] == "tool"
 
 
-def test_eof_finalization_timeout_still_reaps_child():
-    program = ("import os,time; "
-               "print('{\"type\":\"thread.started\",\"thread_id\":\"fixture\"}', "
-               "flush=True); time.sleep(.1); os.close(1); time.sleep(2)")
-    process = subprocess.Popen(
-        [sys.executable, "-c", program], stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, encoding="utf-8")
+def test_eof_finalization_timeout_still_reaps_child(tmp_path):
+    process, release = _barriered_child(
+        tmp_path, output=True)
+    release.write_text("release", encoding="utf-8")
     response = _executor._drive_process(
         process, "codex", 2_000, parse_stream=True,
         attempt_id="d" * 32, first_event_ms=1_000, idle_ms=1_000,
@@ -906,18 +1118,26 @@ def test_eof_finalization_timeout_still_reaps_child():
     assert process.poll() is not None
 
 
-def test_eof_finalization_keeps_its_grace_after_dispatch_budget(monkeypatch):
+def test_real_silent_startup_timeout_reaps_child(tmp_path):
+    process, _release = _barriered_child(tmp_path, output=False, linger=2.0)
+    response = _executor._drive_process(
+        process, "codex", 2_000, parse_stream=True,
+        attempt_id="s" * 32, first_event_ms=75, idle_ms=1_000,
+        finalization_ms=75)
+    assert response["timeout"]["stage"] == "startup_timeout"
+    assert response["liveness"]["phase"] == "timed_out"
+    assert process.poll() is not None
+
+
+def test_eof_finalization_starts_grace_after_dispatch_budget(
+        tmp_path, monkeypatch, record_property):
     # Leave ample scheduler headroom before the overall deadline while making
     # the EOF finalization deadline extend beyond that original budget. This
     # proves EOF starts a fresh grace period instead of inheriting the dispatch
     # deadline; a shorter grace would not exercise that boundary.
-    program = ("import os,time; "
-               "print('{\"type\":\"thread.started\",\"thread_id\":\"fixture\"}', "
-               "flush=True); time.sleep(.1); os.close(1); time.sleep(5)")
-    process = subprocess.Popen(
-        [sys.executable, "-c", program], stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, encoding="utf-8")
-    started = __import__("time").monotonic()
+    process, release = _barriered_child(tmp_path, output=True, linger=2.0)
+    release.write_text("release", encoding="utf-8")
+    started = time.monotonic()
     kill_started = []
     real_kill_tree = _executor._kill_tree
 
@@ -930,14 +1150,28 @@ def test_eof_finalization_keeps_its_grace_after_dispatch_budget(monkeypatch):
         process, "codex", 1_000, parse_stream=False,
         attempt_id="f" * 32, first_event_ms=1_000, idle_ms=1_000,
         finalization_ms=1_200)
-    elapsed = __import__("time").monotonic() - started
     assert response["timeout"]["stage"] == "finalization_timeout"
     assert len(kill_started) == 1
-    assert kill_started[0] - started >= 1.20
-    # Windows process-tree teardown can add several seconds under a loaded full
-    # suite. The kill-start assertion above proves deadline behavior; this upper
-    # bound only detects an unbounded cleanup hang.
-    assert elapsed < 6.0
+    kill_start_ms = (kill_started[0] - started) * 1000
+    record_property("kill_start_ms", round(kill_start_ms, 3))
+    assert kill_start_ms >= 1_200
+    assert process.poll() is not None
+
+
+def test_eof_finalization_cleanup_remains_bounded(tmp_path, record_property):
+    # Keep the six-second ceiling as a hard cleanup bound, separate from the
+    # semantic kill-start deadline assertion above.
+    process, release = _barriered_child(tmp_path, output=True, linger=2.0)
+    release.write_text("release", encoding="utf-8")
+    started = time.monotonic()
+    response = _executor._drive_process(
+        process, "codex", 1_000, parse_stream=False,
+        attempt_id="c" * 32, first_event_ms=1_000, idle_ms=1_000,
+        finalization_ms=1_200)
+    elapsed_ms = (time.monotonic() - started) * 1000
+    record_property("total_cleanup_ms", round(elapsed_ms, 3))
+    assert response["timeout"]["stage"] == "finalization_timeout"
+    assert elapsed_ms < 6_000
     assert process.poll() is not None
 
 
@@ -1055,7 +1289,7 @@ def test_adaptive_expiry_cannot_replace_a_trusted_terminal_result(monkeypatch):
     assert response.get("error_kind") != "operator_cancelled"
 
 
-@pytest.mark.parametrize("control_kind", ("cancel", "deadline"))
+@pytest.mark.parametrize("control_kind", ("cancel", "deadline"), ids=['p005_case_001', 'p005_case_002'])
 def test_launch_control_cannot_replace_a_trusted_terminal_result(
         monkeypatch, control_kind):
     events = queue.Queue()

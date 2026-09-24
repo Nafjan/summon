@@ -197,7 +197,7 @@ def test_missing_binary_failure_is_not_mislabeled_as_schema_mismatch(tmp_path):
     assert result["attempts"] == 1
 
 
-@pytest.mark.parametrize("escaped_key", ["e\\u006dail", "access\\u0054oken"])
+@pytest.mark.parametrize("escaped_key", ["e\\u006dail", "access\\u0054oken"], ids=['p001_case_001', 'p001_case_002'])
 def test_escaped_sensitive_json_keys_fail_before_parse(tmp_path, escaped_key):
     payload = (
         '{"jsonrpc":"2.0","id":1,"result":{}}\n'
@@ -213,7 +213,7 @@ def test_escaped_sensitive_json_keys_fail_before_parse(tmp_path, escaped_key):
     assert not (tmp_path / "usage.json").exists()
 
 
-@pytest.mark.parametrize("ids", [(True, 2, 3), (1, 2.0, 3.0)])
+@pytest.mark.parametrize("ids", [(True, 2, 3), (1, 2.0, 3.0)], ids=['p002_case_001', 'p002_case_002'])
 def test_jsonrpc_response_ids_must_be_exact_integers(tmp_path, ids):
     payload = "\n".join(json.dumps({"jsonrpc": "2.0", "id": value, "result": {}})
                         for value in ids) + "\n"
@@ -367,7 +367,7 @@ def test_auth_failure_preserves_fresh_cache_and_never_returns_stderr(tmp_path):
 @pytest.mark.parametrize("field,size,kind", [
     ("stdout", 64 * 1024 + 1, "stdout_limit_exceeded"),
     ("stderr", 8 * 1024 + 1, "stderr_limit_exceeded"),
-])
+], ids=['p003_case_001', 'p003_case_002'])
 def test_output_bounds_fail_closed_without_persistence(tmp_path, field, size, kind):
     value = {
         "stdout": wire(), "stderr": "", "exit_code": 0, "elapsed_ms": 1,

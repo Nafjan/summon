@@ -462,6 +462,10 @@ def uninstall_skill(host: str, dry: bool) -> tuple:
                 f"running; retry shortly", False)
     lock, token = acq
     try:
+        if _execution_lease_held(HOSTS[host]):
+            return (f"[!!]  {host}: a background dispatch is preparing an immutable "
+                    f"scripts bundle (lock: {os.path.join(HOSTS[host], 'summon.execution.lock')}); "
+                    "retry shortly", False)
         if not os.path.isdir(dest):
             return (f"[--]  nothing at {dest}", True)
         if not _owned(dest):
@@ -803,15 +807,22 @@ def _drift_check() -> None:
         ref = dr["reference_sha"]
         if not ref:
             return
-        stale = [r for r in dr["drifted"] if r.get("managed")]
-        unknown = [r for r in dr["unknown"] if r.get("managed")]
-        ok = [r for r in dr["hashed"] if r.get("managed") and r["sha256"] == ref]
+        stale = {r["label"] for r in dr["drifted"] if r.get("managed")}
+        stale.update(r["label"] for r in dr.get("payload_drifted", ())
+                     if r.get("managed"))
+        unknown = {r["label"] for r in dr["unknown"] if r.get("managed")}
+        unknown.update(r["label"] for r in dr.get("payload_unknown", ())
+                       if r.get("managed"))
+        ok = [r for r in dr["hashed"] if r.get("managed") and r["sha256"] == ref
+              and (not dr.get("payload_tracking")
+                   or (r.get("payload_sha256")
+                       and r.get("payload_sha256") == dr.get("payload_reference_sha")))]
         if stale or unknown:
             bits = []
             if stale:
-                bits.append(f"{len(stale)} differ ({', '.join(s['label'] for s in stale)})")
+                bits.append(f"{len(stale)} differ ({', '.join(sorted(stale))})")
             if unknown:
-                bits.append(f"{len(unknown)} unhashable ({', '.join(u['label'] for u in unknown)})")
+                bits.append(f"{len(unknown)} unhashable ({', '.join(sorted(unknown))})")
             print(f"\n[~?] install-drift: {'; '.join(bits)} from the source - a refresh was "
                   "refused or failed; re-run, or move a foreign copy aside")
         elif ok:

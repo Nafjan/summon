@@ -117,7 +117,13 @@ MODE_FLAGS = {
                 "rounds", "cwd", "agents_dir", "timeout", "out", "run_dir", "results_dir",
                 "job_file", "quorum", "chairman_fallback", "member_timeout",
                 "chair_timeout", "overall_timeout", "min_successful", "strict_agents_dir",
-                "enable_roles", "allow_kimi_acp_fallback"},
+                "enable_roles", "allow_kimi_acp_fallback", "pause_after_round"},
+    "council-context-submit": {"council_context_submit", "council_context_file",
+                                "council_operation_key", "council_expect_generation",
+                                "run_dir", "cwd", "json", "job_file"},
+    "council-continue": {"council_continue", "council_context_file",
+                          "council_expect_generation", "run_dir", "cwd", "out",
+                          "job_file", "json"},
     # A resume may change how the SAME run's stages are gated/timed (quorum,
     # fallback, per-stage timeouts) without changing its identity; question,
     # members, chairman, and rounds still come from the receipt.
@@ -152,7 +158,7 @@ MODE_FLAGS = {
               "chat_timeout", "chat_participants", "chat_project_id",
               "chat_project_root", "chat_initiator_host", "chat_initiator_agent",
               "chat_mode", "chat_browser", "chat_confirm", "chat_reason",
-              "chat_to", "chat_after",
+              "chat_to", "chat_after", "chat_revalidation_file",
               "conversation_dir", "agents_dir",
               "strict_agents_dir", "json", "cwd", "job_file"},
     "swarm": {"swarm_action", "swarm_run_id", "swarm_dir", "swarm_tasks",
@@ -160,6 +166,14 @@ MODE_FLAGS = {
                "swarm_worker", "swarm_instance", "swarm_task_id", "swarm_request_sha256",
                "swarm_lease_ms", "swarm_claim_id", "swarm_lease_generation",
                "swarm_reason", "json", "job_file", "cwd"},
+    "workspace": {"workspace_action", "workspace_run_id", "workspace_runs_root",
+                   "workspace_objective", "workspace_port", "workspace_plan_file",
+                   "workspace_command_policy", "workspace_host_url",
+                   "workspace_token_file", "workspace_request_file",
+                   "workspace_request_kind", "workspace_lookup",
+                   "workspace_control_token_file", "workspace_request_id",
+                   "workspace_operation_key", "workspace_actions",
+                   "json", "job_file"},
     # jobs read commands: registry query only.
     "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
     "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
@@ -171,6 +185,8 @@ MODE_FLAGS = {
                     "job_request_id", "job_dir", "timeout", "max_runtime",
                     "max_permission", "gate_with", "gate_timeout",
                     "allow_credit", "allow_payg", "json", "job_file"},
+    "jobs-revalidate": {"jobs_revalidate", "job_revalidation_file",
+                         "job_dir", "json", "job_file"},
     # Diagnostics are local management commands. They never dispatch an agent;
     # bug-report submission is an explicit, user-authenticated gh invocation.
     "telemetry": {"telemetry_enable", "telemetry_disable", "telemetry_status",
@@ -207,6 +223,12 @@ MODE_HINTS = {
     "council-resume": ("a resume re-runs the SAME run: question, members, chairman, "
                        "and rounds come from the run's receipt.json, so they cannot "
                        "be changed here -- start a fresh council to change them."),
+    "council-context-submit": ("context submit admits one bounded, provider-inert "
+                               "packet for a paused council; it does not dispatch "
+                               "a provider turn."),
+    "council-continue": ("continue resumes only a paused council after its "
+                         "checkpoint, context, ledger, deadline, and agent "
+                         "definitions pass revalidation."),
     "council-status": ("status is read-only: it takes only the run id, --run-dir, "
                        "and --json."),
     "deliberation": ("a fresh deliberation takes only its immutable question, seats, "
@@ -231,6 +253,12 @@ MODE_HINTS = {
     "swarm": ("swarm is a provider-neutral local coordinator. It journals claims, "
               "leases, cancellation, and artifacts but never owns an ordinary fleet "
               "dispatch or silently consumes dispatch flags."),
+    "workspace": ("workspace is a preview: open/inspect is a provider-free "
+                   "foreground-owned local shell; `workspace demo create` is an explicit qualification fixture "
+                   "with a five-minute operator scope. Use a dedicated private "
+                   "--runs-root. Open requires an explicit loopback port, never resumes "
+                   "workers or providers, and stops on Ctrl+C; inspect is read-only and "
+                   "emits only bounded counts."),
     "jobs-list": ("jobs list is read-only: it takes only --job-dir and --json."),
     "jobs-status": ("jobs status is read-only: it takes only the job id, --job-dir, "
                     "and --json."),
@@ -300,6 +328,12 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "jobs-steer"
     if getattr(args, "jobs_resume", None):
         return "jobs-resume"
+    if getattr(args, "jobs_revalidate", None):
+        return "jobs-revalidate"
+    if getattr(args, "council_context_submit", None):
+        return "council-context-submit"
+    if getattr(args, "council_continue", None):
+        return "council-continue"
     if getattr(args, "council_status", None):
         return "council-status"
     if getattr(args, "deliberate_status", None):
@@ -318,6 +352,8 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "chat"
     if getattr(args, "swarm_action", None):
         return "swarm"
+    if getattr(args, "workspace_action", None):
+        return "workspace"
     if getattr(args, "deliberate", False):
         return "deliberation"
     if args.council:
@@ -381,7 +417,7 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
                "onboard", "manifest", "council", "deliberate", "agent", "jobs", "version",
                "chat", "swarm", "role", "telemetry", "usage", "bug-report", "auth",
-               "fleet", "result", "help", "--help", "-h"}
+               "fleet", "result", "workspace", "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -406,6 +442,18 @@ Commands:
   deliberate status|replay|cancel|recover RUN_ID       inspect/control/recover a run
   deliberate open RUN_ID [--browser auto|builtin|ide|system|link]  open its local ledger
   deliberate resume RUN_ID [--retry-indeterminate]     resume with spend consent
+  workspace create RUN_ID --plan FILE --runs-root DIR  create from a bounded plan
+  workspace open RUN_ID --runs-root DIR --port PORT [--command-policy FILE]
+                                                       [--control-token-file FILE]
+                                                       reopen a foreground workspace
+  workspace demo create RUN_ID --runs-root DIR --port PORT  run the explicit fixture
+  workspace inspect RUN_ID --runs-root DIR              read bounded workspace counts
+  workspace request RUN_ID --runs-root DIR --url URL --token-file FILE
+  workspace refresh RUN_ID --url URL --control-token-file FILE
+  workspace refresh-status RUN_ID --url URL --control-token-file FILE --request-id HEX
+                                                       reload an explicit command policy
+                   --request-file FILE --kind command|message [--lookup]
+                                                       call an existing host
   chat open SESSION_ID [--mode chat|council|deliberate]  create/reuse a local room
   chat post SESSION_ID --message "…"                    add a typed human context message
   chat turn SESSION_ID AGENT --message "…"              run one resumable agent turn
@@ -536,6 +584,46 @@ summon swarm close RUN_ID
 This is a local, provider-neutral coordinator. It durably fences claims,
 leases, cancellation, artifacts, and uncertain spend; it never launches a
 provider or attaches to an IDE-native swarm by itself.
+""",
+    "workspace": """summon workspace open RUN_ID --runs-root DIR --port PORT [--command-policy FILE]
+                                       [--control-token-file FILE]
+summon workspace create RUN_ID --plan FILE --runs-root DIR
+summon workspace demo create RUN_ID --runs-root DIR --port PORT [--objective TEXT]
+summon workspace inspect RUN_ID --runs-root DIR
+summon workspace request RUN_ID --runs-root DIR --url URL --token-file FILE
+summon workspace refresh RUN_ID --url URL --control-token-file FILE
+summon workspace refresh-status RUN_ID --url URL --control-token-file FILE --request-id HEX
+summon workspace provision-message RUN_ID --url URL --control-token-file FILE
+  --operation-key HEX --actions cancel_queued_context[,dispose_held_context]
+  --request-file FILE --kind command|message [--lookup]
+
+Workspace preview. Create a provider-free task workspace from a strict versioned
+plan, reopen the workspace shell in the foreground, or run the explicit fixed qualification
+fixture. Plan creation starts no server, worker, provider, background job, or
+resume operation.
+`workspace open` accepts an optional private versioned command policy; without
+that policy disposition controls remain unavailable. The policy is read once
+for the foreground host and never provisioned through browser credentials.
+When a command policy is enabled, `--control-token-file FILE` asks the
+foreground host to create a new protected control-token file without replacing
+an existing file. Use `workspace refresh RUN_ID` with that file after changing
+the policy; the refresh path is loopback-only, provider-free, idempotency-bound,
+and returns an explicit unknown outcome if reconciliation cannot prove whether
+the policy was applied. `--request-id HEX` can be retained for a later status
+reconciliation; use `workspace refresh-status` for that lookup. The status
+action is read-only and never posts another refresh request.
+Use `workspace provision-message RUN_ID` with the same protected control token
+after a browser message has been durably sent. The owner-only loopback bridge
+resolves the opaque send operation key to its private delivery identity and
+adds only the requested finite command scope; it never accepts a browser
+delivery id or message text as authority. Reuse the same request id to
+reconcile a lost response; changed operation/actions are refused.
+The port is explicit (there is no fallback); the URL never contains the one-time
+bootstrap code. Demo-create/open start no workers, providers, background jobs, or
+implicit resumes. Demo-create's operator scope lasts five minutes and
+`--runs-root` must be a dedicated private namespace (not a durable production
+credential or shared-workspace directory). Press Ctrl+C to stop the owned server.
+Inspect is read-only.
 """,
     "agents": """summon agents validate [--cwd DIR] [--agents-dir DIR] [--json]
 
@@ -673,6 +761,37 @@ def rewrite_subcommand(argv: list) -> tuple:
             # NO --council: status dispatches on --council-status alone (and its
             # whitelist would reject a stray --council).
             return ["--council-status", rest[1], *rest[2:]], None
+        if rest and rest[0] == "context":
+            if len(rest) < 3 or rest[1] != "submit" or rest[2].startswith("-"):
+                return argv, "error: 'council context submit' needs a run id"
+            translated = []
+            aliases = {
+                "--context-file": "--council-context-file",
+                "--operation-key": "--council-operation-key",
+                "--expect-generation": "--council-expect-generation",
+            }
+            for item in rest[3:]:
+                if "=" in item and item.split("=", 1)[0] in aliases:
+                    name, value = item.split("=", 1)
+                    translated.append(aliases[name] + "=" + value)
+                else:
+                    translated.append(aliases.get(item, item))
+            return ["--council-context-submit", rest[2], *translated], None
+        if rest and rest[0] == "continue":
+            if len(rest) < 2 or rest[1].startswith("-"):
+                return argv, "error: 'council continue' needs a run id"
+            translated = []
+            aliases = {
+                "--context-file": "--council-context-file",
+                "--expect-generation": "--council-expect-generation",
+            }
+            for item in rest[2:]:
+                if "=" in item and item.split("=", 1)[0] in aliases:
+                    name, value = item.split("=", 1)
+                    translated.append(aliases[name] + "=" + value)
+                else:
+                    translated.append(aliases.get(item, item))
+            return ["--council-continue", rest[1], *translated], None
         return ["--council", *rest], None
     if head == "deliberate":
         if rest and rest[0] in ("resume", "status", "replay", "cancel", "recover", "open"):
@@ -717,21 +836,70 @@ def rewrite_subcommand(argv: list) -> tuple:
         else:
             translated += rest[2:]
         return translated, None
+    if head == "workspace":
+        if not rest:
+            return argv, "help:workspace"
+        action = rest[0]
+        if action == "demo":
+            if len(rest) < 2 or rest[1] != "create":
+                return argv, "error: 'workspace demo' only supports create"
+            action = "demo-create"
+            run_index = 2
+        elif action in ("open", "inspect", "request", "refresh", "refresh-status", "provision-message"):
+            run_index = 1
+        elif action == "create":
+            run_index = 1
+        else:
+            return argv, f"error: unknown 'workspace' action {rest[0]!r} (use create/open/inspect/request/refresh/refresh-status/provision-message/demo create)"
+        if len(rest) <= run_index or rest[run_index].startswith("-"):
+            return argv, f"error: 'workspace {action}' needs a run id"
+        translated = ["--workspace-action", action, "--workspace-run-id", rest[run_index]]
+        tail = list(rest[run_index + 1:])
+        aliases = {
+            "--runs-root": "--workspace-runs-root",
+            "--port": "--workspace-port",
+            "--objective": "--workspace-objective",
+            "--plan": "--workspace-plan-file",
+            "--command-policy": "--workspace-command-policy",
+            "--url": "--workspace-host-url",
+            "--token-file": "--workspace-token-file",
+            "--request-file": "--workspace-request-file",
+            "--kind": "--workspace-request-kind",
+            "--lookup": "--workspace-lookup",
+            "--control-token-file": "--workspace-control-token-file",
+            "--command-refresh-token-file": "--workspace-control-token-file",
+            "--request-id": "--workspace-request-id",
+            "--operation-key": "--workspace-operation-key",
+            "--actions": "--workspace-actions",
+        }
+        rewritten = []
+        for token in tail:
+            if token.startswith("--"):
+                name, separator, value = token.partition("=")
+                name = aliases.get(name, name)
+                token = name + (separator + value if separator else "")
+            rewritten.append(token)
+        return translated + rewritten, None
     if head == "chat":
         if not rest:
             return argv, "help:chat"
         action = rest[0]
-        if action not in ("open", "post", "show", "list", "turn", "cancel", "message", "inbox", "recover", "fork"):
-            return argv, f"error: unknown 'chat' action {action!r} (use open/post/show/list/turn/cancel/message/inbox/recover/fork)"
+        if action not in ("open", "post", "show", "list", "turn", "cancel", "message", "inbox", "recover", "fork", "revalidate"):
+            return argv, f"error: unknown 'chat' action {action!r} (use open/post/show/list/turn/cancel/message/inbox/recover/fork/revalidate)"
         if action == "list":
             return ["--chat-action", "list", *rest[1:]], None
         if len(rest) < 2 or rest[1].startswith("-"):
             return argv, f"error: 'chat {action}' needs a session id"
         translated = ["--chat-action", action, "--chat-session", rest[1]]
-        if action in ("turn", "cancel", "inbox", "recover", "fork"):
+        if action in ("turn", "cancel", "inbox", "recover", "fork", "revalidate"):
             if len(rest) < 3 or rest[2].startswith("-"):
                 return argv, f"error: 'chat {action}' needs a participant id"
-            translated += ["--chat-participant", rest[2], *rest[3:]]
+            tail = list(rest[3:])
+            if action == "revalidate":
+                tail = [("--chat-revalidation-file" + token[len("--evidence-file"):])
+                        if token == "--evidence-file" or token.startswith("--evidence-file=")
+                        else token for token in tail]
+            translated += ["--chat-participant", rest[2], *tail]
         elif action == "message":
             if len(rest) < 4 or rest[2].startswith("-") or rest[3].startswith("-"):
                 return argv, "error: 'chat message' needs sender and recipient ids"
@@ -756,12 +924,13 @@ def rewrite_subcommand(argv: list) -> tuple:
             return argv, "help"       # bare `summon jobs` -> usage, not a silent list
         if rest[0] == "list":
             return ["--jobs-list", *rest[1:]], None
-        if rest[0] in ("status", "wait", "extend", "cancel", "steer", "resume"):
+        if rest[0] in ("status", "wait", "extend", "cancel", "steer", "resume", "revalidate"):
             if len(rest) < 2 or rest[1].startswith("-"):
                 return argv, f"error: 'jobs {rest[0]}' needs a job id"
             flag = {"status": "--jobs-status", "wait": "--jobs-wait",
                     "extend": "--jobs-extend", "cancel": "--jobs-cancel",
-                    "steer": "--jobs-steer", "resume": "--jobs-resume"}[rest[0]]
+                    "steer": "--jobs-steer", "resume": "--jobs-resume",
+                    "revalidate": "--jobs-revalidate"}[rest[0]]
             tail = list(rest[2:])
             if rest[0] == "extend":
                 tail = [("--job-duration" + token[len("--duration"):])
@@ -782,9 +951,13 @@ def rewrite_subcommand(argv: list) -> tuple:
                         token = "--job-request-id" + token[len("--request-id"):]
                     translated_tail.append(token)
                 tail = translated_tail
+            elif rest[0] == "revalidate":
+                tail = [("--job-revalidation-file" + token[len("--evidence-file"):])
+                        if token == "--evidence-file" or token.startswith("--evidence-file=")
+                        else token for token in tail]
             return [flag, rest[1], *tail], None
         return argv, (f"error: unknown 'jobs' action {rest[0]!r} "
-                      "(use list/status/wait/extend/cancel/steer/resume)")
+                      "(use list/status/wait/extend/cancel/steer/resume/revalidate)")
     if head == "version":
         return ["--version", *rest], None
     if head == "manifest":            # first positional is the manifest file
@@ -978,6 +1151,8 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Opt into approved user-global role aliases for this dispatch; "
                              "disabled by default and never changes an exact agent match")
     parser.add_argument("--list", action="store_true", help="List available agents")
+    parser.add_argument("--format", choices=["json", "table"], default="json",
+                        help="Output format for --list (default: json)")
     parser.add_argument("--validate-agents", dest="validate_agents", action="store_true",
                         help="Validate provider-inert custom-agent manifests under the workspace")
     parser.add_argument("--list-models", dest="list_models", action="store_true",
@@ -1165,6 +1340,8 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "Mutually exclusive with --prompt. Ergonomics for long/"
                              "quoted prompts -- backends still receive the prompt via "
                              "argv, so backend argv limits (e.g. agy ~28k chars) apply")
+    parser.add_argument("--prompt-file-internal-exact", dest="prompt_file_internal_exact",
+                        action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--cwd", help="Working directory (absolute path)")
     parser.add_argument("--agents-dir", help="Directory containing agent definitions")
     parser.add_argument("--read-root", dest="read_root", action="append", default=None,
@@ -1326,6 +1503,40 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "[payload omitted: type, N bytes, sha256 ...] marker "
                              "(data: URIs are always elided; --debug-dir keeps the "
                              "full transcript). Default ~2048")
+    parser.add_argument("--workspace-action", dest="workspace_action",
+                        choices=("create", "open", "inspect", "demo-create", "request",
+                                 "refresh", "refresh-status", "provision-message"),
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-run-id", dest="workspace_run_id",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-runs-root", dest="workspace_runs_root",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-objective", dest="workspace_objective",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-plan-file", dest="workspace_plan_file",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-command-policy", dest="workspace_command_policy",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-host-url", dest="workspace_host_url",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-token-file", dest="workspace_token_file",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-control-token-file", dest="workspace_control_token_file",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-request-id", dest="workspace_request_id",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-operation-key", dest="workspace_operation_key",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-actions", dest="workspace_actions",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-request-file", dest="workspace_request_file",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-request-kind", dest="workspace_request_kind",
+                        choices=("command", "message"), help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-lookup", dest="workspace_lookup", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-port", dest="workspace_port", type=int,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--job-file", dest="job_file", help=argparse.SUPPRESS)  # internal
     parser.add_argument("--manifest", help="Run a batch of jobs from a JSON manifest (see SKILL.md)")
     parser.add_argument("--concurrency", help="With --manifest: per-backend caps, e.g. agy=2,codex=3,default=3")
@@ -1336,6 +1547,16 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--council", action="store_true",
                         help="Decide by consensus: dispatch --question to diverse members, "
                              "then a chairman synthesizes. See SKILL.md")
+    parser.add_argument("--council-context-submit", dest="council_context_submit",
+                        metavar="RUN_ID", help="Admit provider-inert context for a paused council")
+    parser.add_argument("--council-continue", dest="council_continue",
+                        metavar="RUN_ID", help="Continue a paused council's next round")
+    parser.add_argument("--council-context-file", dest="council_context_file",
+                        help="With council context submit: bounded UTF-8 context JSON")
+    parser.add_argument("--council-operation-key", dest="council_operation_key",
+                        help="With council context submit: idempotency key")
+    parser.add_argument("--council-expect-generation", dest="council_expect_generation",
+                        type=int, help="Expected paused council checkpoint generation")
     parser.add_argument("--question", help="With --council: the decision/question to deliberate")
     parser.add_argument("--question-file", dest="question_file",
                         help="With --council: read the question from a file")
@@ -1360,7 +1581,7 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--deliberate-open", dest="deliberate_open", metavar="RUN_ID",
                         help="Open/reuse the authenticated local deliberation ledger")
     parser.add_argument("--chat-action", dest="chat_action",
-                        choices=("open", "post", "show", "list", "turn", "cancel", "message", "inbox", "recover", "fork"),
+                        choices=("open", "post", "show", "list", "turn", "cancel", "message", "inbox", "recover", "fork", "revalidate"),
                         help="Conversation room action; turn launches one bounded roster agent; "
                              "recover/fork never retry a provider")
     parser.add_argument("--chat-session", dest="chat_session", metavar="SESSION_ID",
@@ -1382,6 +1603,8 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "never retries the provider")
     parser.add_argument("--chat-reason", dest="chat_reason",
                         help="With chat fork: bounded human-readable reason for the new lineage")
+    parser.add_argument("--chat-revalidation-file", dest="chat_revalidation_file",
+                        help="With chat revalidate: private authenticated observation/qualification packet")
     parser.add_argument("--chat-project-id", "--project-id", dest="chat_project_id",
                         help="Bounded project label for a new room")
     parser.add_argument("--chat-project-root", "--project-root", dest="chat_project_root",
@@ -1460,6 +1683,10 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         "escalation tier)")
     parser.add_argument("--rounds", type=int, default=1,
                         help="With --council: 1 (independent) or 2 (adds cross-examination)")
+    parser.add_argument("--pause-after-round", dest="pause_after_round", nargs="?",
+                        const=1, default=0, type=int, choices=(1,),
+                        help="With a two-round council: pause after round 1 for explicit context "
+                             "(accepts an optional explicit `1`)")
     parser.add_argument("--run-dir", dest="run_dir",
                         help="With --council: root for the durable run directory "
                              "(default {cwd}/.agents/runs; env SUMMON_RUNS_DIR)")
@@ -1513,6 +1740,8 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Queue a follow-up steering prompt; subprocess turns resume later")
     parser.add_argument("--jobs-resume", dest="jobs_resume", metavar="JOB_ID",
                         help="Create one governed background continuation successor")
+    parser.add_argument("--jobs-revalidate", dest="jobs_revalidate", metavar="JOB_ID",
+                        help="Seal current provider-free launch evidence for a legacy source")
     parser.add_argument("--job-duration", dest="job_duration", type=parse_timeout,
                         help="With jobs extend: duration to add")
     parser.add_argument("--job-message", dest="job_message",
@@ -1521,4 +1750,6 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="With jobs resume: UTF-8 follow-up prompt file")
     parser.add_argument("--job-request-id", dest="job_request_id",
                         help="With jobs resume: stable 32-hex idempotency key")
+    parser.add_argument("--job-revalidation-file", dest="job_revalidation_file",
+                        help="With jobs revalidate: private JSON observation/qualification packet")
     return parser

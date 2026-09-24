@@ -18,6 +18,7 @@ import _usage_advisory
 import _usage_live
 import run_subagent
 from _builder import AgentInvocation
+from _spawn import run_flags
 
 
 def _observation(**updates):
@@ -623,7 +624,7 @@ def test_unknown_or_missing_values_are_never_comparable():
     {"dimension": "unknown", "remaining": {"value": 1, "unit": "unknown"}},
     {"support": "unsupported"},
     {"support": "unknown"},
-])
+], ids=['p001_case_001', 'p001_case_002', 'p001_case_003'])
 def test_unknown_or_unsupported_observations_cannot_carry_remaining(tmp_path, updates):
     source = tmp_path / "source.json"
     source.write_text(json.dumps({
@@ -647,7 +648,7 @@ def test_operator_exports_never_claim_semantic_comparability():
     {"ttl_seconds": 1.5},
     {"latency_ms": 1.5},
     {"retrieved_at": "9999-12-31T23:59:59Z"},
-])
+], ids=['p002_case_001', 'p002_case_002', 'p002_case_003', 'p002_case_004', 'p002_case_005', 'p002_case_006'])
 def test_schema_mutations_are_bounded_value_errors(tmp_path, updates):
     source = tmp_path / "source.json"
     source.write_text(json.dumps({
@@ -755,11 +756,13 @@ def test_effective_decision_explains_explicit_usage_cache_without_rerouting(
 
 def test_usage_advisory_omits_values_account_identity_and_paths():
     result = _usage_advisory.project(live={
+        "status": "success",
         "observations": [{
             "provider": "codex", "dimension": "rate_limit",
-            "support": "supported", "freshness": "fresh",
-            "remaining": {"value": 25, "unit": "percent"},
+            "support": "supported", "status": "success", "freshness": "fresh",
+            "execution_status": "success", "provider_contacted": True,
             "account_scope_hmac": "a" * 64,
+            "remaining": {"value": 25, "unit": "percent"},
             "path": "C:/private/account",
         }],
     })
@@ -770,6 +773,23 @@ def test_usage_advisory_omits_values_account_identity_and_paths():
     assert "private/account" not in rendered
 
 
+@pytest.mark.parametrize("updates", [
+    {"provider_contacted": False},
+    {"provider_contacted": None},
+    {"account_scope_hmac": "not-a-scope"},
+], ids=['p003_case_001', 'p003_case_002', 'p003_case_003'])
+def test_usage_advisory_rejects_unattested_live_observation(updates):
+    item = {
+        "provider": "codex", "dimension": "rate_limit",
+        "support": "supported", "freshness": "fresh",
+        "status": "success", "execution_status": "success",
+        "provider_contacted": True, "account_scope_hmac": "a" * 64,
+    }
+    item.update(updates)
+    with pytest.raises(ValueError, match="live usage observation"):
+        _usage_advisory.project(live={"status": "success", "observations": [item]})
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows launcher contract")
 def test_windows_cmd_usage_status_preserves_provider_inert_json(tmp_path):
     wrapper = Path(__file__).with_name("summon.cmd")
@@ -777,6 +797,7 @@ def test_windows_cmd_usage_status_preserves_provider_inert_json(tmp_path):
         ["cmd.exe", "/d", "/s", "/c", "call", str(wrapper), "usage", "status",
          "--cache", str(tmp_path / "missing.json"), "--json"],
         capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags(),
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     report = json.loads(completed.stdout)
@@ -796,6 +817,7 @@ def test_windows_cmd_malformed_usage_import_is_bounded(tmp_path):
         ["cmd.exe", "/d", "/s", "/c", "call", str(wrapper), "usage", "import",
          "--from", str(source), "--cache", str(tmp_path / "cache.json"), "--json"],
         capture_output=True, text=True, encoding="utf-8", timeout=30,
+        **run_flags(),
     )
     assert completed.returncode == 1
     envelope = json.loads(completed.stdout)

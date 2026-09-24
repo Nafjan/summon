@@ -5,6 +5,123 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-09-23
+
+Summon 3.5.0 pairs dispatcher reliability fixes driven by field telemetry with a
+provider-free workspace preview. It is accepted under the `workspace-preview`
+release profile: provider-free acceptance does not certify live adapters,
+native device acceptance (U03/U07) remains separately gated, and retired
+selectors and historical receipts retain their existing identities.
+
+- Extend installer/doctor convergence checks to the complete managed skill
+  payload, including references and documentation, while preserving the
+  scripts receipt identity. Unknown or linked payloads remain fail-closed.
+- Stop misreporting a slow agy capability probe as an outdated agy. The probe
+  bound is 60s, a stalled or failed probe is a typed retryable/non-retryable
+  refusal (`agy_capability_probe_stalled` / `agy_capability_probe_failed`)
+  distinct from `agy_cli_outdated`, positive answers are cached per binary
+  identity, and concurrent dispatches share one probe.
+- Timeouts that stop before the budget now say so: the error names the elapsed
+  time and the liveness stage that fired, and `timeout.elapsed_ms` is recorded.
+- `jobs wait` no longer reports an expired wait as a failed job: it exits 124
+  with `terminal: false` and `status` `running` (pid observed alive),
+  `prepared`, or `unverified`; an unknown job id is an error.
+- Dry-run lists every refusing gate in `refusals`, refuses prompts that cannot
+  fit the OS command line (`prompt_too_long_for_argv`, including agy's 28k
+  token cap), and the OpenCode/ZCode yolo gates name every missing flag at once.
+- Test runs redirect telemetry, reports, and the agy capability cache away from
+  the operator's home directory.
+
+- Support durable human-context requests, scoped dispositions, retained holds,
+  and explicitly authorized linked replacements through the ordinary workspace
+  host. Same-key lookup reconciles interrupted responses without replaying a
+  message or command. Parent lineage and uncertain effects remain preserved;
+  message delivery grants no worker or provider authority.
+- Recheck governed continuation against the current capability, launch evidence,
+  and selected-profile state. The existing named-profile Claude subprocess lane
+  retains its certified scope; rotation, missing evidence, and queued version
+  changes refuse continuation. Candidate adapters are not newly certified, and
+  explicit non-launching revalidation applies only to supported legacy sources.
+- Add attempt-scoped submission accounting and explicit context policy to the
+  preview. Scoped input estimates, reported token/cache usage, missing coverage,
+  and uncertain spend remain distinct. Workspace admission reserves accounting
+  settlement capacity; repeated settlement is idempotent. These records do not
+  establish complete provider cost or authorize quota-based routing.
+- Keep participant replacement explicit after roster drift. A trusted-host
+  replacement fork freezes the selected definition and preserves the recorded
+  permission ceiling and parent history; it does not grant launch qualification.
+- Add a taskless supervisor inbox, so a worker can report to its conductor
+  without creating a placeholder task. Messages carry context; they do not
+  grant permissions, approve work, or cast votes.
+- Add an explicit between-round human-context checkpoint for the advisory
+  council. A paused run accepts bounded human context and continues only under
+  an explicit continuation that preserves the original seats, budgets, and
+  deadline; submitted context never becomes a deliberation ballot or approval.
+  Downstream adapter transport limits still apply.
+
+- Apply shared silent-launch handling to the corrected Summon-owned Windows
+  tooling and test paths, including generated test children, with regression
+  coverage and caller guidance. This does not claim every observed workstation
+  process flash is fixed.
+
+- Harden local diagnostics around executor/liveness timeouts. Known producer reasons now map to
+  the finite public stages `stream` or `backend_execution`; unknown reasons remain `unknown`.
+  Fresh in-process telemetry preserves inferred or absent model provenance without certifying a
+  named model, and malformed evidence is recorded as invalid instead of being silently dropped.
+
+- Improve the workspace detail surface: typed detail refusals retain their error code, expiry
+  clears both privileged drawers and their bodies, overlay focus and scrim ownership stay paired,
+  linked recovery runs during ordinary snapshot rendering, and structured detail fields/body
+  loading are rendered without duplicate content.
+
+- Harden workspace policy replacement on Windows and other inherited-permission filesystems by
+  securing the empty temporary before writing private bytes; reparse and unverifiable-ancestor
+  reopen paths remain fail-closed.
+
+- Prevent late authorized-detail responses from repopulating private UI after expiry, drawer close,
+  or a new detail selection.
+
+- Clarify the conversation migration and resume boundary. Historical v1 rooms remain
+  readable for history and inspection, but current mutation, cancellation, recovery,
+  and continuation refuse until the operator uses the explicit `chat fork` path to
+  create a separately bound v2 lineage. Older readers refuse v2 records rather than
+  mutating them. Only the named-profile Claude subprocess lane is currently certified
+  for governed continuation after exact identity, ownership, handle, and provider
+  evidence checks; candidate and unsupported adapters remain fail-closed. `jobs steer`
+  queues guidance for a later eligible successor and is not live mid-turn injection;
+  Summon does not claim universal native IDE-session attachment.
+
+- Add a provider-free `workspace create --plan FILE` path for strict,
+  bounded task plans. Creation stores a private copy, uses atomic staging and
+  no-replace publication, and starts no providers, workers, sessions, or
+  background jobs. Reopen and inspect verify that the copied plan still matches
+  the durable workspace before reinstalling message-only operator authority.
+- Keep plan-created operator-message destinations out of the worker registry;
+  queued context cannot claim, lease, publish, complete, or otherwise mutate
+  a run until a separate worker adapter explicitly registers.
+- Label the workspace plan path as a provider-free protocol preview: it can
+  create, inspect, and exercise bounded simulated task/message records, but it
+  does not attach a real worker, dispatch a provider, import provider results,
+  or connect to an external session.
+
+- Add an exact-pinned `astra` seat for GPT-6 Astra at high effort. It is the
+  primary OpenAI ceiling for consequential architecture, planning, research
+  synthesis, and adversarial review; Fable remains a separate cross-vendor
+  escalation. Catalog or target selection never substitutes for served-model proof.
+
+- Add `flash-reviewer` for advisory research, vision, and review without changing
+  the existing `researcher` seat's exact-model evidence requirement.
+
+- Default the bundled Gemini/AGY research, frontend, documentation, and general seats
+  to Flash 3.8 High. Add its catalog identity while preserving Flash 3.7 labels;
+  document multimodal delivery, persona-review, quota, and coding-drift boundaries.
+- Correct AGY Gemini slug effort overrides so `--effort low` selects the `-low`
+  variant rather than appending a display-name suffix to an existing slug.
+
+- Define explicit `stable` and `workspace-preview` release profiles. Stable/public
+  evidence still requires every fixed gate, while the provider-inert preview may
+  retain only the typed missing-live-provider boundary; no gate is waived implicitly.
+
 ## [3.4.0] - 2026-09-02
 
 - Corrected Claude model attribution for delegated research. Aggregate helper token

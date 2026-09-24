@@ -31,9 +31,10 @@ and configured endpoints wherever the host can execute a shell command:
 - **A plain terminal,** where you drive it yourself.
 
 From any of those hosts, you can hand a task to another model, run several at once, convene a
-council, or start a governed deliberation. It also reaches any OpenAI-compatible API directly,
-or through OpenCode's toolful gateway when the agent needs a file/tool loop. OpenRouter, OpenAI,
-Anthropic, Google, and local models (Ollama, LM Studio) work as agents too.
+council, or start a governed deliberation. It also reaches configured endpoints that implement
+Summon's supported OpenAI-compatible API subset directly, or through OpenCode's toolful gateway
+when the agent needs a file/tool loop. OpenRouter, OpenAI, Google-compatible endpoints, and local models
+(Ollama, LM Studio) are supported examples; endpoint compatibility and account access still vary.
 
 ```
                           ┌──────────────────────┐
@@ -47,7 +48,7 @@ Anthropic, Google, and local models (Ollama, LM Studio) work as agents too.
                                                     ├──► opencode       (OpenCode gateway)
                                                     ├──► zcode          (native ZCode preview)
                                                     └──► openai-compat  (ModelArk / OpenRouter /
-                                                         Z.AI Coding Plan / OpenAI / Anthropic / …)
+                                                         Z.AI Coding Plan / OpenAI-compatible gateways / …)
 ```
 
 Most multi-agent tools assume one specific CLI is the orchestrator. Summon inverts that:
@@ -78,8 +79,10 @@ boundary.
 - **People who want an actual multi-agent room:** the authenticated conversation atlas
   keeps a persistent, project-grouped session across Codex, Claude Code, Cursor, and
   terminal initiators, with human messages and explicit, bounded roster-agent turns that
-  can resume a compatible provider session or fork visibly on drift. Interactive council
-  rounds and the separate governed-decision view remain context/control-plane boundaries.
+  can inspect history, resume an eligible certified provider session, or fork visibly on
+  drift. Candidate and unsupported backends refuse continuation rather than implying
+  that a compatible session exists. Interactive council rounds and the separate
+  governed-decision view remain context/control-plane boundaries.
   See
   [`docs/SUMMON_CONVERSATION_PLAN.md`](docs/SUMMON_CONVERSATION_PLAN.md).
 - **Power users running fleets of agents:** fan a task across N models in parallel, with
@@ -122,9 +125,111 @@ not installed or required.
   enforceable read-only subprocess seats after durable receipt/owner fencing; approval,
   resume, ACP/HTTP, and writable routes remain explicitly gated. The local browser is
   an observer/control surface and never silently changes the decision policy.
+- **Create a provider-free workspace preview from a plan:** `summon workspace create RUN_ID --plan FILE --runs-root DIR` validates a strict plan, publishes it atomically, and
+  creates only dormant operator-message destinations for inspection and simulated
+  protocol work. It does not delegate to a real provider or attach a worker, and starts no provider, worker,
+  session, server, or background job; `workspace open` and `workspace inspect` verify the
+  copied plan against the durable workspace before reuse.
+  An explicitly configured command policy can be refreshed without browser
+  credentials: `workspace open ... --command-policy FILE --control-token-file FILE`
+  creates a protected one-time control-token file, and
+  `workspace refresh RUN_ID --url URL --control-token-file FILE` reloads a newer
+  generation through the loopback control surface. The refresh is provider-free,
+  binds the request to the workspace/run, and reports an unknown outcome rather
+  than replaying when a response cannot be reconciled.
 - **Use local + frontier models together:** an Ollama model and Claude in the same council.
+- **Call Astra explicitly:** `astra` pins `gpt-6-astra` at high effort for
+  consequential planning, architecture, research synthesis, and adversarial review.
+  It does not inherit the ambient Codex default, and exact-model workflows still
+  require a provider-reported served identity.
 - **Route named local logins:** keep multiple Claude config directories behind private
   profile names, so a public agent definition never carries a machine path or credential.
+
+The workspace and roster changes above ship in **Summon 3.5.0**, whose workspace
+features are a preview: provider-free acceptance covers them, but live adapters are
+not stable-certified. See the
+[release gates](docs/planning/EXPECTED_NEXT_RELEASE.md) for what each profile
+certifies. A local test pass does not mean an installed copy contains these changes.
+
+For a minimal provider-free workspace, save this synthetic plan as
+`workspace-plan.json` in a private directory:
+
+```json
+{
+  "schema": "summon.workspace.plan/v1",
+  "goal": {
+    "goal_id": "preview-goal",
+    "objective": "Inspect a dormant task workspace.",
+    "criteria": [{
+      "criterion_id": "ready",
+      "description": "The task is visible for inspection.",
+      "evidence_requirement": "Workspace inspection succeeds."
+    }],
+    "constraints": ["No provider or worker execution."],
+    "active_priority": "main-task",
+    "unresolved_decisions": []
+  },
+  "tasks": [{
+    "task_id": "main-task",
+    "role": "main",
+    "outcome": "A task ready for inspection.",
+    "scope": "This workspace preview.",
+    "depends_on": [],
+    "criterion_ids": ["ready"],
+    "return_condition": "The task can be inspected.",
+    "escalation_trigger": "The plan cannot be validated.",
+    "limits": {
+      "max_duration_ms": 60000,
+      "max_attempts": 1,
+      "max_context_bytes": 1024
+    }
+  }],
+  "operator_message_targets": [{"target": "main", "task_id": "main-task"}]
+}
+```
+
+Replace `PRIVATE_RUNS_DIR` with a dedicated private directory outside the source
+checkout; use a new run ID. Run these from the directory containing the plan
+(`summon.cmd` on Windows):
+
+```text
+summon workspace create preview-run --plan workspace-plan.json --runs-root PRIVATE_RUNS_DIR --json
+summon workspace open preview-run --runs-root PRIVATE_RUNS_DIR --port 8765
+```
+
+Creation validates and copies the plan without starting a server or worker.
+Open requires an available explicit port from 1 to 65535; 8765 is an example,
+and there is no automatic fallback. Run open in a private interactive terminal
+with stderr attached and without `--json`. Visit the printed loopback URL and
+enter the one-time bootstrap code shown privately on stderr; the URL itself
+contains no code. Keep that terminal running: the server is owned by the
+foreground command, and Ctrl+C stops it.
+
+From a second terminal, inspect the durable workspace:
+
+```text
+summon workspace inspect preview-run --runs-root PRIVATE_RUNS_DIR --json
+```
+
+The plan defines dormant message destinations. Message delivery and browser
+bootstrap do not grant command authority: disposition controls require a
+separate explicit private `--command-policy` on open. If a later command or
+message returns an unknown outcome, retain the exact request and operation key
+and use `workspace request ... --lookup` before another send. For an unknown
+policy refresh, use `workspace refresh-status` with the same `--request-id`
+before another refresh; changing the key is not recovery.
+
+**Messaging an existing session:** addressed Summon messages are durable context
+for an eligible recipient. Delivering into an already-running Claude Code,
+Claude Desktop, Codex or Antigravity session requires a verified adapter for
+that specific operation. At the current preview boundary, governed continuation
+is certified only for the named-profile Claude subprocess lane after its evidence
+and ownership checks pass; other backends are candidates or unsupported and may
+refuse before provider contact. The workspace preview demonstrates simulated
+workers; it does not provide universal native-session attachment. `jobs steer`
+queues guidance for a later eligible continuation, not live mid-turn injection.
+Council recommendations and agent messages remain separate from permissions,
+approvals and deliberation ballots.
 
 ---
 
@@ -199,7 +304,8 @@ python summon.py auth repair kimi --allow-auth-repair
 
 Without that authorization, run the vendor command yourself (`kimi login`, `arkcli auth
 login`, or the command shown in the error). A successful login command is not proof that a
-model was served; inspect the next dispatch envelope's `model.served` field.
+model was served; inspect the next dispatch envelope's `model.served` and
+`served_model_evidence` fields, and require `named_model_verified: true` for an exact pin.
 
 ### Keep the model roster fresh
 
@@ -214,8 +320,9 @@ python summon.py models --cli arkcli --refresh
 `source: live` is a fresh provider response, `source: cache` is a cached roster, `source:
 config` is a local CLI default, and `source: static` is documentation only. Codex does not
 expose a complete enumeration command, so its configured default and catalog candidates are
-advisory. Pin a candidate only after a real dispatch proves the exact `model.served` value;
-never infer a new model from a display label or a task name.
+advisory. Treat a candidate as verified only after a real dispatch returns `reported`
+served evidence and `named_model_verified: true`; a display label, task name, or inferred
+`model.served` value does not prove an exact pin.
 
 The exact-model contract applies to provenance-required named seats across providers. Summon
 emits one canonical selector where the backend supports it, refuses conflicting selectors
@@ -247,7 +354,7 @@ python tools/release_gates.py --require-clean --output "${RUNNER_TEMP:-${TMPDIR:
 python tools/release_manifest.py \
   --evidence-file "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json" \
   --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" \
-  --expected-version 3.4.0 --check
+  --expected-version 3.5.0 --check
 ```
 
 The runner executes the fixed suites, records output digests, strips backend credentials and
@@ -258,6 +365,12 @@ source tree dirty before the manifest verifies Git cleanliness.
 The `--check` option is the GA gate. It requires a clean tree, converged owned installs, and
 every named release gate recorded as `pass`. A diagnostic run with missing gates is not release
 evidence and must not be presented as certification.
+The unreleased provider-free workspace slice has a separate explicit
+`--profile workspace-preview` check. That profile still requires every fixed
+suite and every non-live gate to pass and accepts only the redacted
+`live_provider_evidence_missing` boundary; it produces preview evidence and
+cannot be used as stable/public-release evidence. A blocked or invalid live
+receipt never selects this profile implicitly.
 The installer preserves unmanaged host copies and reports local drift through `doctor`; it does
 not overwrite those copies automatically. The version, migration, compatibility, and rollback
 contract is documented in
@@ -478,9 +591,9 @@ implemented, separately reviewed, and remains intentionally narrower than ordina
    and a recognised approval request in the run's final output, are downgraded to
    `blocked`. Approval detection matches known markers rather than reading intent, so also
    treat `suspect: true` as unverified rather than assuming every stalled run is caught. Check
-   `model.served` to confirm which model actually did the work (`served: null` means
-   summon saw no service evidence: no terminal model report and no output tokens, even
-   when `targeted` names a model).
+   `model.served` together with `served_model_evidence`: a non-null identity can be
+   inferred, and `null` means no usable served identity was established. Exact-model
+   proof requires `reported` evidence and matching requested, targeted, and served IDs.
 4. **Review across vendors.** Send code written by one vendor to a reviewer on another.
    `docs/PROTOCOL.md` has the rule and the named patterns (debate, async build, competing
    hypotheses, consensus).
@@ -520,33 +633,50 @@ dispatch it with the **summon** skill instead of doing everything yourself:
   policy explicitly. Never infer a missing policy field or silently fall back to council.
 - **Independent work → `--manifest`.** Fan several jobs out with per-backend
   concurrency; each writes its own result envelope you can inspect.
-- **Use the curated model bands deliberately.** The 2026-08-18 catalog snapshot places
-  Fable, Sol, Opus, Kimi, and DeepSeek V4 Pro GA in the editorial frontier lane for
+- **Use the curated model bands deliberately.** The catalog places
+  Astra, Fable, Sol, Opus, Kimi, DeepSeek V4 Pro GA, and Gemini Flash 3.8 in the
+  editorial frontier lane for
   maximum-thinking coding work. It places Grok 4.6, Gemini Flash 3.7, GLM 5.2, and
   DeepSeek V4 Flash in a near-frontier/value lane. These are editorial labels, not benchmark
-  results or availability guarantees.
+  results or availability guarantees. Flash 3.7 remains separately labeled for older
+  explicit requests and receipts.
   The Ark entries use exact versioned IDs (`deepseek-v4-pro-ga-260813`,
   `deepseek-v4-flash-ga-260731`, and `glm-5-2-260617`) from the 2026-08-18 marketplace
   check. These are editorial routing labels; the model catalog and UI tooltips show the
-  role/name/version, while only `model.served` proves what actually ran.
+  role/name/version. Check `model.served` and its provenance; only `reported` evidence
+  can establish served identity, and exact pins also require `named_model_verified: true`.
 - **Escalate the hardest problems** to a frontier-lane seat when the task justifies it.
   Billing and quota depend on the provider account and route; Summon does not infer a plan's
   allowance. Review the warning and envelope before you continue. Keep councils and swarms
   diverse so that independent reviewers can expose different failure modes.
-- **Use Gemini Flash 3.7 as a fast independent evidence lane.** The bundled
-  `researcher` seat is pinned to `gemini-3.7-flash-high` through agy and is the recommended
+- **Use Gemini Flash 3.8 for fast vision, research, and review.** The bundled
+  `flash-reviewer`, `researcher`, `frontend`, `docs-writer`, and `antigravity` seats target
+  `gemini-3.8-flash-high` through agy. Flash reviewer is the recommended advisory
   secondary voice for a cross-vendor council. AGY 1.1.22 reports the targeted model,
   session, activity, and terminal usage, but not authoritative `model.served`; treat the
   named-model vote as advisory. AGY cannot enforce read-only, so keep this seat in a
   disposable research/review lane when a hard filesystem boundary matters.
+  The older `researcher` seat retains its exact-model contract: absent authoritative
+  served identity, it returns `blocked` with `result_usable:false`, even if useful
+  report text exists. Use `flash-reviewer` for ordinary advisory work, not to bypass
+  a workflow that requires certified identity.
+  Use separate persona passes for different review angles, not as a substitute for
+  cross-model consensus. Verify media delivery before claiming image/video inspection.
+  Direct coding remains useful in disposable copies, with checkpoints and tests under
+  the original dispatch directory to catch AGY working-directory drift. Cost and quota
+  are account-specific; no route assumes free or unlimited use.
 - **Use Grok 4.6 as a near-frontier candidate, not a blind default.** Probe it
-  with `--cli cursor-agent --model grok-4.6`, require the envelope's `model.served` to match,
+  with `--cli cursor-agent --model grok-4.6`, require `reported` served evidence and
+  `named_model_verified: true`,
   and keep Gemini pinned until a local smoke proves eligibility, evidence quality, and the
   required permission/retention contract. Never silently fall back to another Cursor model.
 
 Verify, don't trust: branch on the returned `status`; a `report_ok:false` or
-`suspect:true` "success" means re-dispatch. Read `warnings` (model fallback, premium
-model cost, or an agy read-only dispatch refused/advisory-only). `model.served` proves what actually ran.
+`suspect:true` result needs review. Check typed errors, provider contact, spend, and
+`retryable` before another attempt; suspicion alone does not authorize a retry or
+fallback. Read `warnings` (model fallback, premium model cost, or an agy read-only
+dispatch refused/advisory-only). Served identity requires `reported` evidence;
+an inferred or absent identity cannot certify an exact named model.
 Preview a paid fan-out with `--dry-run`, pass `--json-schema` when you need structured
 output, chain via `report.handoff` into the next call, and pass `--out` on any
 council you cannot afford to lose (the envelope is checkpointed each phase).
@@ -622,7 +752,7 @@ vendors.
   "raw_backend_exit_code": null,
   "normalized_exit_code": null,
   "exit_code": null,
-  "summon":  { "version": "3.4.0", "scripts_sha256": "<sha256>" },
+  "summon":  { "version": "3.5.0", "scripts_sha256": "<sha256>" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -644,8 +774,9 @@ values for a structural `not_run` refusal.
   summon, decides whether to retain or clean them. `declared: false` means no account was made.
 - `report_ok: false` on a "success" → also gets `suspect: true`. Agents that skip their
   contract don't get believed.
-- `model.served` → the model that actually did the work (evidence-based; `null` = no
-  service evidence observed). `targeted` = what the session was pointed at.
+- `model.served` → the served-model identity or a bounded inference, distinguished by
+  `served_model_evidence`. `null` means no usable served identity was established,
+  even if other activity or usage was observed. `targeted` is the session's target.
 - `model_match` / `named_model_verified` → exact-model proof, not a guess. The tri-state
   `model_match` is `true` only for a trusted backend/provider completion record showing
   equality of requested, targeted, and served IDs; it is `false` for a reported mismatch
@@ -656,25 +787,33 @@ values for a structural `not_run` refusal.
   `served_model_unverified` is a terminal trust result. It is not automatically retried or
   rerouted, and `result_usable` is false. The envelope's `model.exact_required` and
   `model.exact_source` explain why the gate applied.
-- `served_model_evidence` → `reported`, `inferred`, or `absent`: whether the served
-  model came from a trusted terminal/runtime completion record, bounded telemetry inference, or no
-  service evidence. Missing provenance does not make a usable success retryable;
+- `served_model_evidence` → `reported` for trusted backend/provider completion evidence,
+  `inferred` for a non-authoritative model observation or bounded telemetry inference,
+  or `absent` when no usable served identity was established.
+  Missing provenance does not make a usable success retryable;
   an empty terminal result is instead a typed non-retryable error.
-- `model.evidence_source` → the bounded backend/provider record used for a reported
-  identity when one exists. Kimi 0.38 can use positive-output `usage.record` entries
-  plus the completed-turn marker in Summon's fresh isolated per-call profile; request
-  and configuration records never count. Kimi versions that emit neither that runtime
-  accounting nor an assistant model leave `model.served` null and provenance `absent`.
-  Summon never infers K3 from the requested model or local profile configuration.
+- `model.evidence_source` → the bounded source of a served-model observation; the source
+  label alone does not make it authoritative. Kimi 0.38 observations can come from
+  assistant stdout or positive-output `usage.record` entries with a completed-turn marker
+  in Summon's fresh isolated per-call profile. Both channels are writable by the child,
+  so their identity is `inferred`, never authoritative named-model proof. Request and
+  configuration records do not establish served identity; missing usable observations
+  leave `model.served` null and provenance `absent`.
 - `tool_failure` → a safe, typed missing-executable diagnostic. On Windows, use `rg`,
   PowerShell, or Python when a child cannot run a POSIX convenience command such as
   `grep`; a complete report is preserved and the raw backend exit remains visible.
 - `raw_backend_exit_code` and `normalized_exit_code` → explicit child and Summon outcome
   codes. The legacy `exit_code` remains for compatibility but is ambiguous after report
   normalization, so automation should use the explicit fields.
-- `timeout` → the timeout budget, whether partial output survived, and the phase Summon can
-  prove. ACP names its exact protocol stage; a generic CLI remains `backend-execution` because
-  Summon cannot honestly infer whether the vendor was starting, reasoning, or running a tool.
+- `timeout` → the timeout budget, whether partial output survived, and the raw stage or
+  reason the execution path established. ACP can name a protocol stage; generic CLI
+  timeouts can use `backend-execution` or a specific adaptive/liveness reason such as
+  `adaptive_attention_timeout`, `adaptive_hard_timeout`, `generation_idle_timeout`, or
+  `finalization_timeout`. The separate `liveness` snapshot records observed progress.
+  Opt-in telemetry normalizes these into a finite `timeout_stage` vocabulary: adaptive
+  and finalization reasons map to `backend_execution`, and generation-idle reasons to
+  `stream`. That projection does not replace the raw receipt or identify a vendor's
+  internal reasoning/tool phase.
 - Situational fields appear only when they apply: `exit_history` + `original_exit` (a
   corrective resume superseded an earlier attempt; every superseded attempt is kept in
   order), `result_from_repair` (the first attempt produced no text, so the repaired text is
@@ -685,7 +824,11 @@ values for a structural `not_run` refusal.
 - `summon.scripts_sha256` + `agent_def.sha256` → provenance: which dispatcher build and
   which agent definition produced this envelope.
 - `billing.source` → did this draw from a **subscription** or metered **api** credits.
-- `resume.session_id` → `--resume` for a cheap follow-up.
+- `resume.session_id` → a candidate session handle, not continuation authority. Use
+  `--resume` only when the route is eligible and its identity, profile, permissions,
+  and history remain compatible. Governed job continuation also requires authenticated
+  source evidence and fresh spend consent. Otherwise preserve the handoff and history
+  in an explicit fork where supported, or an explicitly authorized fresh task.
 
 > **Costs are estimates.** `cost_usd`/`usage` are the CLI's own list-price figures, not a bill. On a subscription they don't equal money spent, and `billing.source` is a best-effort guess. Know your plan's inclusions and limits, and check your provider's latest billing and model notices directly.
 
@@ -797,16 +940,18 @@ model: anthropic/claude-3.5-sonnet
 Built-in providers, plus your own in `providers.json` (or inline `base_url` + `api_key_env`,
 empty key for local servers). Same envelope, same `manifest`/`council`. This is how you add
 local models and multi-model API access, and how a council becomes a genuine multi-vendor
-board. These backends bill your API credits, not a subscription (see the [provider terms](TERMS.md)).
+board. Summon classifies non-Coding-Plan direct API routes as API billing by default; actual
+credits, subscriptions, invoices, and no-cost local operation depend on the endpoint and
+account and are not universally observable (see the [provider terms](TERMS.md)).
 
 ---
 
 ## The starter roster
 
-Planning/architecture on Claude (`planner`, `architect`, `deep-debugger`,
-`security-auditor`, `fable`), implementation + adversarial review on Codex (`implementer`,
+Frontier planning and review on OpenAI (`astra`), planning/architecture on Claude
+(`planner`, `architect`, `deep-debugger`, `security-auditor`, `fable`), implementation + adversarial review on Codex (`implementer`,
 `reviewer`, `adversarial-reviewer`, `debugger`, `test-author`), coding on Cursor (`coder`,
-`bug-fixer`), research on Gemini Flash 3.7 through agy (`researcher`), docs/frontend on
+`bug-fixer`), advisory research/review on Gemini Flash 3.8 through agy (`flash-reviewer`), docs/frontend on
 Antigravity (`docs-writer`, `frontend`), and balanced lanes on Sonnet 5 (`pair`, `editor`,
 `quick-reviewer`, `pr-prep`).
 Each is a plain `.md` file: edit, delete, or add your own with `summon agent new`.
@@ -911,14 +1056,15 @@ You bring model access. Summon orchestrates the CLIs and APIs you already use.
   accounts, build a product on subscription auth, or hammer parallel volume; use API-key
   backends for commercial or high-volume work. Providers can change programmatic-billing
   rules. Read the full guidance in **[the provider terms](TERMS.md)**.
-- **Prompt size is bounded by the OS, not by summon.** Every CLI backend receives the
-  prompt through `argv`. Windows caps the whole assembled command line at 32767 characters
+- **Prompt size depends on the backend transport and OS.** On CLI routes that pass the
+  prompt through `argv`, Windows caps the whole assembled command line at 32767 characters
   and reports the overflow as a *missing file*, which summon used to relay as a bogus
   `CLI not found`; POSIX caps a single argument at 128 KiB and the total (including your
   environment) at `ARG_MAX`. Summon now measures the real, serialized line before spawning
-  and refuses with an error that names argv as the cause. `--prompt-file` does **not** avoid
-  this -- it is a quoting convenience and the content still travels on the command line. For
-  material that large, write it to a file under `--cwd` and ask the agent to read it.
+  and refuses with an error that names argv as the cause. `--prompt-file` protects prompt
+  input at Summon's launcher; it is not a universal argv-free backend transport. When a
+  backend still receives the content on its command line, those limits apply. For material
+  that large, write it to a file under `--cwd` and ask the agent to read it.
 - **Windows batch transport is fail-closed.** `summon.cmd` marks the batch path and refuses
   every raw `--prompt` before any roster/backend work. Batch expansion occurs before Python
   receives argv, so surviving bytes cannot prove that even apparently simple text was not
@@ -939,9 +1085,10 @@ You bring model access. Summon orchestrates the CLIs and APIs you already use.
 
 **What happens when a vendor ships a new model?** Nothing breaks. Model strings pass
 through verbatim; aliases like `opus` and `sonnet` float, `summon models` shows what's
-available, and the envelope's `model.served` confirms what ran (`resolved` is the legacy
-field). Aliases can lag a launch by a day or two, so pin the explicit ID when you need
-the newest.
+available, and the envelope pairs `model.served` with `served_model_evidence`
+(`resolved` is the legacy field). Inferred or absent evidence cannot certify a named
+model; exact proof requires `named_model_verified: true`. Aliases can lag a launch,
+so use the explicit ID when you need a particular model.
 
 **Does it need API keys?** For the eight CLI backends, no. It drives the logins you already
 have, and it strips `OPENAI_API_KEY` from codex children so you're not silently billed at
@@ -981,7 +1128,8 @@ with nonce-verified results); install-drift detection in `doctor` and `install.p
 `--gate-with` approval gating across every execution path; and the argv preflight that
 turned an OS command-line overflow from a bogus `CLI not found` into an accurate error.
 The bundled roster now also includes explicit target seats for Sol, Terra, and Luna reviews;
-the dispatch receipt still verifies the exact served model. `--list --json` shows each
+the dispatch receipt must carry `reported` evidence and `named_model_verified: true`
+before an exact served-model claim is accepted. `--list --json` shows each
 seat's declared model and effort. Luna is deliberately separate from Sol and Terra, so a
 cost-efficient Luna turn cannot be mistaken for a Sol review.
 

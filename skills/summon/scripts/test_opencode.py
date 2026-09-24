@@ -73,6 +73,33 @@ class OpenCodeBuilderTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "allow-tool-credentials"):
                 build_invocation_args(self._inv(permission="yolo", isolated_lane=True))
 
+    def test_yolo_names_every_missing_acknowledgement_in_one_refusal(self):
+        """Field record 2026-09-17: the gates surfaced one per launch (four dispatches
+        to learn two flags). One refusal must name the whole set, in dry-run too."""
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}, clear=False):
+            inv = self._inv(permission="yolo")
+            message = _builder.opencode_yolo_isolation_error(inv)
+            self.assertIn("--worktree or --isolated-lane", message)
+            self.assertIn("missing: --isolated-lane, --allow-tool-credentials", message)
+            with self.assertRaisesRegex(ValueError, "missing: --isolated-lane, "
+                                                    "--allow-tool-credentials"):
+                build_invocation_args(inv)
+            # Supplying exactly the named flags clears the gate.
+            self.assertIsNone(_builder.opencode_yolo_isolation_error(self._inv(
+                permission="yolo", isolated_lane=True, allow_tool_credentials=True)))
+
+    def test_yolo_without_private_credential_names_only_isolation(self):
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch("_windows_credentials.resolve_openrouter_api_key",
+                        return_value=(None, None)), \
+             mock.patch("_nous_credentials.resolve_nous_api_key",
+                        return_value=(None, None)):
+            os.environ.pop("OPENROUTER_API_KEY", None)
+            os.environ.pop("NOUS_API_KEY", None)
+            message = _builder.opencode_yolo_isolation_error(self._inv(permission="yolo"))
+            self.assertIn("--worktree or --isolated-lane", message)
+            self.assertNotIn("allow-tool-credentials", message)
+
     def test_worktree_does_not_authorize_private_credential_bridge(self):
         """A worktree is mutation isolation, not the OS boundary a yolo key bridge needs."""
         with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}, clear=False):
@@ -154,8 +181,12 @@ class OpenCodeBuilderTests(unittest.TestCase):
 
         with mock.patch.object(_executor, "_resolve_launch", side_effect=fake_launch), \
              mock.patch("_receipt.workspace_snapshot", return_value={"coverage": "none"}), \
-             mock.patch("_receipt.workspace_evidence", return_value={}):
+             mock.patch("_receipt.workspace_evidence", return_value={}), \
+             mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}), \
+             mock.patch("_windows_credentials.resolve_openrouter_api_key",
+                        return_value=(None, None)) as credential_bridge:
             out = _executor.execute_agent(invocation, timeout_ms=5000)
+        credential_bridge.assert_called_once_with()
         self.assertEqual(out["status"], "success")
         self.assertEqual(out["result"], "fixture ok")
         self.assertEqual(out["served_model_evidence"], "inferred")
@@ -178,12 +209,19 @@ class OpenCodeBuilderTests(unittest.TestCase):
                                              ("-c", code))), \
              mock.patch("_receipt.workspace_snapshot",
                         return_value={"coverage": "none"}), \
-             mock.patch("_receipt.workspace_evidence", return_value={}):
+             mock.patch("_receipt.workspace_evidence", return_value={}), \
+             mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}), \
+             mock.patch("_windows_credentials.resolve_openrouter_api_key",
+                        return_value=(None, None)) as credential_bridge:
             out = _executor.execute_agent(invocation, timeout_ms=5000)
+        credential_bridge.assert_called_once_with()
         self.assertEqual(out["status"], "error")
         self.assertEqual(out["error_kind"], "empty_terminal_result")
         self.assertTrue(out["opencode_stream"]["zero_output_finish"])
         self.assertTrue(out["opencode_stream"]["zero_token_finish"])
+        self.assertEqual(out["usage"], {
+            "input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
+            "cache_read_tokens": 0, "cache_write_tokens": 0})
 
     def test_bare_endorse_with_inferred_model_is_not_authoritative_review(self):
         """A bare decision word must stay suspect when the report contract is absent.
@@ -211,8 +249,12 @@ class OpenCodeBuilderTests(unittest.TestCase):
                                              ("-c", code))), \
              mock.patch("_receipt.workspace_snapshot",
                         return_value={"coverage": "none"}), \
-             mock.patch("_receipt.workspace_evidence", return_value={}):
+             mock.patch("_receipt.workspace_evidence", return_value={}), \
+             mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}), \
+             mock.patch("_windows_credentials.resolve_openrouter_api_key",
+                        return_value=(None, None)) as credential_bridge:
             out = _executor.execute_agent(invocation, timeout_ms=5000)
+        credential_bridge.assert_called_once_with()
         self.assertEqual(out["status"], "success")
         self.assertEqual(out["execution_status"], "success")
         self.assertEqual(out["result"], "ENDORSE")
@@ -392,6 +434,115 @@ class OpenCodeBuilderTests(unittest.TestCase):
         self.assertIsNone(model_backend_compatibility("opencode", "claude-opus-5"))
 
 
+class OpenCodeReportedTokenTests(unittest.TestCase):
+    def _parse(self, tokens):
+        processor = StreamProcessor(cli="opencode")
+        processor.process_line(json.dumps({
+            "type": "step_finish", "part": {"reason": "stop", "tokens": tokens}}))
+        return processor
+
+    def test_partial_tokens_preserve_unknown_counters(self):
+        processor = self._parse({"output": 3, "cache": {"read": 2}})
+        self.assertEqual(processor.usage, {"output_tokens": 3, "cache_read_tokens": 2})
+        self.assertFalse(processor.opencode_zero_output_finish)
+        self.assertFalse(processor.opencode_zero_token_finish)
+
+    def test_explicit_zero_and_fractional_counters_are_preserved(self):
+        self.assertEqual(self._parse({
+            "input": 0, "output": 0, "total": 0, "reasoning": 0,
+            "cache": {"read": 0, "write": 0}}).usage, {
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+            "reasoning_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0})
+        self.assertEqual(self._parse({"output": 1.5, "cache": {"read": 0.5}}).usage,
+                         {"output_tokens": 1.5, "cache_read_tokens": 0.5})
+
+    def test_missing_and_empty_token_snapshots_stay_unknown(self):
+        processor = StreamProcessor(cli="opencode")
+        processor.process_line(json.dumps({"type": "step_finish", "part": {"reason": "stop"}}))
+        self.assertIsNone(processor.usage)
+        self.assertIsNone(self._parse({}).usage)
+        self.assertIsNone(self._parse({"cache": {}}).usage)
+        self.assertIsNone(self._parse(None).usage)
+
+    def test_invalid_token_and_cache_counters_are_not_measured(self):
+        for label, invalid in (("null", None), ("boolean", True), ("false", False),
+                               ("negative", -1), ("negative_fraction", -0.5),
+                               ("string", "0"), ("list", []), ("object", {}),
+                               ("nan", float("nan")), ("infinity", float("inf")),
+                               ("negative_infinity", float("-inf"))):
+            with self.subTest(case=label):
+                processor = self._parse({
+                    "input": invalid, "output": invalid, "total": invalid,
+                    "reasoning": invalid, "cache": {"read": invalid, "write": invalid}})
+                self.assertIsNone(processor.usage)
+                mixed = self._parse({"input": invalid, "output": 3,
+                                     "cache": {"read": 2, "write": invalid}})
+                self.assertEqual(mixed.usage, {"output_tokens": 3, "cache_read_tokens": 2})
+
+    def test_malformed_cache_does_not_invent_counters_or_total(self):
+        for label, cache in (("null", None), ("number", 0), ("boolean", False),
+                             ("list", []), ("string", "invalid")):
+            with self.subTest(case=label):
+                self.assertEqual(self._parse({"input": 2, "output": 3, "cache": cache}).usage,
+                                 {"input_tokens": 2, "output_tokens": 3})
+
+    def test_later_snapshot_replaces_without_summing_or_backfilling(self):
+        processor = self._parse({"input": 9, "output": 4, "total": 13,
+                                 "cache": {"read": 5, "write": 1}})
+        event = {"type": "step_finish", "part": {"tokens": {"output": 3, "cache": {"read": 2}}}}
+        processor.process_line(json.dumps(event))
+        processor.process_line(json.dumps(event))
+        self.assertEqual(processor.usage, {"output_tokens": 3, "cache_read_tokens": 2})
+        processor.process_line(json.dumps({"type": "step_finish", "part": {"tokens": {}}}))
+        self.assertIsNone(processor.usage)
+
+    def test_raw_usage_fallback_remains_provider_reported(self):
+        processor = StreamProcessor(cli="opencode")
+        reported = {"input_tokens": 4, "provider_extension": {"observed": True}}
+        processor.process_line(json.dumps({"type": "step_finish", "part": {"usage": reported}}))
+        self.assertEqual(processor.usage, reported)
+
+    def test_synthetic_child_publication_preserves_missing_and_zero_counters(self):
+        cases = (
+            ("partial", {"tokens": {"output": 3, "cache": {"read": 2}}},
+             {"output_tokens": 3, "cache_read_tokens": 2}),
+            ("explicit_zero", {"tokens": {"input": 0, "output": 3, "reasoning": 0,
+                                            "cache": {"read": 0, "write": 0}}},
+             {"input_tokens": 0, "output_tokens": 3, "reasoning_tokens": 0,
+              "cache_read_tokens": 0, "cache_write_tokens": 0}),
+            ("absent", {}, None),
+            ("invalid_fields", {"tokens": {"input": True, "output": 3,
+                                             "total": float("nan"), "reasoning": -1,
+                                             "cache": {"read": float("inf"), "write": "0"}}},
+             {"output_tokens": 3}),
+        )
+        for label, fields, expected in cases:
+            with self.subTest(case=label):
+                events = [
+                    {"type": "step_start", "sessionID": "fixture-session",
+                     "part": {"modelID": "fixture/model"}},
+                    {"type": "text", "part": {"text": "fixture ok"}},
+                    {"type": "step_finish", "part": {"reason": "stop", **fields}},
+                ]
+                code = "; ".join("print(" + repr(json.dumps(event)) + ")" for event in events)
+                invocation = AgentInvocation(cli="opencode", prompt="fixture", cwd=tempfile.gettempdir(),
+                                             system_context="fixture", permission="read-only", model="fixture/model")
+                with mock.patch.object(_executor, "_resolve_launch", return_value=(sys.executable, ("-c", code))), \
+                     mock.patch("_receipt.workspace_snapshot", return_value={"coverage": "none"}), \
+                     mock.patch("_receipt.workspace_evidence", return_value={}), \
+                     mock.patch("_windows_credentials.resolve_openrouter_api_key",
+                                side_effect=AssertionError("synthetic route reached credential bridge")) as credential_bridge:
+                    result = _executor.execute_agent(invocation, timeout_ms=5000)
+                credential_bridge.assert_not_called()
+                published = json.loads(json.dumps(result, allow_nan=False))
+                self.assertEqual(published["status"], "success")
+                self.assertEqual(published["result"], "fixture ok")
+                self.assertEqual(published["usage"], expected)
+                self.assertEqual(published["served_model_evidence"],
+                                 "absent" if expected is None else "inferred")
+                self.assertEqual(published["opencode_stream"]["completion_evidence"], "step_finish")
+
+
 class OpenCodeStreamTests(unittest.TestCase):
     def test_event_stream_finishes_at_eof_and_preserves_telemetry(self):
         p = StreamProcessor()
@@ -539,7 +690,9 @@ class OpenCodeStreamTests(unittest.TestCase):
         with mock.patch.object(_executor, "build_invocation_args",
                                return_value=(sys.executable, ("-c", code), None)), \
              mock.patch("_receipt.workspace_snapshot", return_value={"coverage": "none"}), \
-             mock.patch("_receipt.workspace_evidence", return_value={}):
+             mock.patch("_receipt.workspace_evidence", return_value={}), \
+             mock.patch("_windows_credentials.resolve_openrouter_api_key",
+                        return_value=(None, None)):
             out = _executor.execute_agent(invocation, timeout_ms=5000)
         self.assertEqual(out["status"], "error")
         self.assertEqual(out["served_model_evidence"], "absent")

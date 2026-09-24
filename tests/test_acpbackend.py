@@ -13,6 +13,7 @@ import os
 import json
 import stat
 import sys
+import unittest
 import tempfile
 import time
 import types
@@ -107,6 +108,34 @@ def test_empty_end_turn_is_an_error_at_the_acp_boundary():
     assert resp["error_kind"] == "empty_terminal_result"
     assert resp["retryable"] is False
     assert "empty ACP completion" in resp["normalization_reason"]
+
+
+def test_oversize_prompt_refuses_before_acp_child_spawn():
+    """The complete JSON-RPC prompt frame is bounded before Popen."""
+    orig_argv = dict(_acpbackend.ACP_ARGV)
+    _acpbackend.ACP_ARGV["gemini"] = ["acp", "happy"]
+    patched = _patch_launch()
+    original_popen = _acpbackend.subprocess.Popen
+    called = {"popen": 0}
+
+    def forbidden(*_args, **_kwargs):
+        called["popen"] += 1
+        raise AssertionError("ACP child was launched after payload refusal")
+
+    _acpbackend.subprocess.Popen = forbidden
+    try:
+        resp = _acpbackend.call(_inv(prompt="x" * (8 * 1024 * 1024)), 30_000)
+    finally:
+        _acpbackend.subprocess.Popen = original_popen
+        _acpbackend.ACP_ARGV.update(orig_argv)
+        _restore(patched)
+    assert called["popen"] == 0
+    assert resp["status"] == "error", resp
+    assert resp["error_kind"] == "transport_budget_exceeded"
+    assert resp["attempts"] == 0
+    assert resp["attempt_status"] == "not_run"
+    assert resp["provider_contacted"] is False
+    assert resp["transport_budget"]["boundary"] == "acp_json_rpc"
 
 
 def test_empty_end_turn_is_consistent_through_full_executor_path():
@@ -689,15 +718,28 @@ if __name__ == "__main__":
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]
     failed = 0
+    skipped = 0
+    _collector = sys.modules.get("_summon_release_collector")
+    if _collector:
+        _collector.custom_start(__file__, [name for name, fn in fns])
     try:
         for name, fn in fns:
+            _outcome, _reason = "passed", None
             try:
                 fn()
                 print(f"PASS {name}")
+            except unittest.SkipTest as e:
+                skipped += 1
+                _outcome, _reason = "skipped", str(e)
+                print(f"SKIP {name}")
             except Exception as e:  # noqa: BLE001
                 failed += 1
+                _outcome = "failed"
                 print(f"FAIL {name}: {type(e).__name__}: {e}")
-        print(f"\n{len(fns) - failed}/{len(fns)} passed")
+            if _collector:
+                _collector.custom_result(__file__, name, _outcome, _reason)
+        print(f"\n{len(fns) - failed - skipped}/{len(fns)} passed")
+        print(f"{skipped} skipped")
         sys.exit(1 if failed else 0)
     finally:
         if _ambient_fallback is not None:

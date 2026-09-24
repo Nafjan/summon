@@ -16,9 +16,16 @@ import tempfile
 import time
 from pathlib import Path
 import types
+import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# This suite is also run as a plain script (release manifest), where no conftest
+# applies; isolate home state before any dispatcher module can record telemetry.
+from _test_state_isolation import isolate as _isolate_test_state  # noqa: E402
+_isolate_test_state()
+
+import _spawn  # noqa: E402
 import _resolver  # noqa: E402
 from _resolver import _codex_default_model_scan, discover_models  # noqa: E402
 
@@ -518,7 +525,7 @@ def test_envelope_version_and_cli_version():
     # --version flag prints and exits 0
     import subprocess as sp
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
-    r = sp.run([sys.executable, script, "--version"], capture_output=True, text=True)
+    r = sp.run([sys.executable, script, "--version"], capture_output=True, text=True, **_spawn.run_flags())
     assert r.returncode == 0 and "summon" in r.stdout and "envelope schema" in r.stdout
 
 
@@ -998,7 +1005,7 @@ def test_out_skip_short_circuits(tmp_base=None):
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
         r = sp.run([sys.executable, script, "--agent", "cheap", "--prompt", "p",
                     "--cwd", os.getcwd(), "--out", out, "--agents-dir", roster],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env = _json.loads(r.stdout)
         assert env["skipped"] is True and env["status"] == "success" and r.returncode == 0
     finally:
@@ -1021,7 +1028,7 @@ def test_v1_out_skip_respects_suspect():
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
         r = sp.run([sys.executable, script, "--agent", "does-not-exist-xyz", "--prompt", "p",
                     "--cwd", os.getcwd(), "--out", out],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env = _json.loads(r.stdout)
         # it re-ran (agent missing -> error) rather than emitting the prior as skipped
         assert env.get("skipped") is not True, env
@@ -1206,7 +1213,7 @@ def test_v1_background_parser_exit_gets_terminal_envelope():
         completed = subprocess.run(
             [sys.executable, script, "--agent", "missing", "--prompt", "x",
              "--cwd", root, "--job-file", result, "--bogus"],
-            capture_output=True, text=True, encoding="utf-8")
+            capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert completed.returncode == 2, completed.returncode
         with open(result, encoding="utf-8") as fh:
             envelope = json.load(fh)
@@ -1317,7 +1324,7 @@ def test_dry_run_refuses_background_and_manifest():
     for extra in (["--background"], ["--manifest", "x.json"]):
         r = sp.run([sys.executable, script, "--agent", "a", "--prompt", "p",
                     "--cwd", os.getcwd(), "--dry-run", *extra],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env = _json.loads(r.stdout)
         assert env["status"] == "error" and "dry-run" in env["error"], (extra, env)
         assert r.returncode == 1
@@ -1720,7 +1727,7 @@ def test_background_and_out_rejected():
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
     r = sp.run([sys.executable, script, "--agent", "a", "--prompt", "p",
                 "--cwd", os.getcwd(), "--background", "--out", "x.json"],
-               capture_output=True, text=True, encoding="utf-8")
+               capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
     env = _json.loads(r.stdout)
     assert env["status"] == "error" and "incompatible" in env["error"] and r.returncode == 1
 
@@ -1734,7 +1741,7 @@ def test_roster_new_agent_scaffolds_house_format():
         r = sp.run([sys.executable, script, "--new-agent", "fact-checker",
                     "--set", "run-agent=codex", "--set", "permission=read-only",
                     "--set", "model=gpt-5.6-sol", "--agents-dir", d],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         info = _json.loads(r.stdout)
         assert r.returncode == 0 and info["status"] == "success", info
         body = open(info["path"], encoding="utf-8").read()
@@ -1745,18 +1752,18 @@ def test_roster_new_agent_scaffolds_house_format():
             assert must in body, must
         # registers instantly
         r2 = sp.run([sys.executable, script, "--list", "--agents-dir", d],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         agents = _json.loads(r2.stdout)["agents"]
         assert any(a["name"] == "fact-checker" for a in agents)
         # and is dispatch-ready (dry-run resolves it)
         r3 = sp.run([sys.executable, script, "--agent", "fact-checker", "--prompt", "x",
                      "--cwd", os.getcwd(), "--agents-dir", d, "--dry-run"],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         view = _json.loads(r3.stdout)
         assert view["cli"] == "codex" and view["permission"] == "read-only"
         # never overwrites
         r4 = sp.run([sys.executable, script, "--new-agent", "fact-checker",
-                     "--agents-dir", d], capture_output=True, text=True, encoding="utf-8")
+                     "--agents-dir", d], capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r4.returncode == 1 and "already exists" in _json.loads(r4.stdout)["error"]
     finally:
         import shutil as _sh
@@ -1770,7 +1777,7 @@ def test_roster_set_agent_edits_frontmatter_only():
     d = tempfile.mkdtemp(prefix="summon-roster-")
     try:
         sp.run([sys.executable, script, "--new-agent", "probe", "--agents-dir", d],
-               capture_output=True, text=True, encoding="utf-8")
+               capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         path = os.path.join(d, "probe.md")
         body_before = open(path, encoding="utf-8").read().split("---", 2)[2]
         # update model + permission, add args and a lifecycle handoff
@@ -1778,7 +1785,7 @@ def test_roster_set_agent_edits_frontmatter_only():
                     "--set", "model=claude-sonnet-5", "--set", "permission=yolo",
                     "--set", 'args=--flag', "--set", "lifecycle=retired",
                     "--set", "successor=probe-v2", "--agents-dir", d],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         info = _json.loads(r.stdout)
         assert info["frontmatter"]["model"] == "claude-sonnet-5"
         assert info["frontmatter"]["permission"] == "yolo"
@@ -1787,29 +1794,29 @@ def test_roster_set_agent_edits_frontmatter_only():
         assert open(path, encoding="utf-8").read().split("---", 2)[2] == body_before
         # empty value removes the key
         r = sp.run([sys.executable, script, "--set-agent", "probe", "--set", "model=",
-                    "--agents-dir", d], capture_output=True, text=True, encoding="utf-8")
+                    "--agents-dir", d], capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert "model" not in _json.loads(r.stdout)["frontmatter"]
         # invalid enum rejected, file untouched
         r = sp.run([sys.executable, script, "--set-agent", "probe",
                     "--set", "permission=godmode", "--agents-dir", d],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r.returncode == 1 and "permission" in _json.loads(r.stdout)["error"]
         r = sp.run([sys.executable, script, "--set-agent", "probe",
                     "--set", "lifecycle=immortal", "--agents-dir", d],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r.returncode == 1 and "lifecycle" in _json.loads(r.stdout)["error"]
         r = sp.run([sys.executable, script, "--set-agent", "probe",
                     "--set", "successor=../escape", "--agents-dir", d],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r.returncode == 1 and "agent name" in _json.loads(r.stdout)["error"].lower()
         # unknown key rejected
         r = sp.run([sys.executable, script, "--set-agent", "probe",
                     "--set", "prompt=evil", "--agents-dir", d],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r.returncode == 1 and "unknown key" in _json.loads(r.stdout)["error"]
         # path-traversal name rejected
         r = sp.run([sys.executable, script, "--new-agent", "../evil", "--agents-dir", d],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r.returncode == 1
     finally:
         import shutil as _sh
@@ -1832,7 +1839,7 @@ def test_new_agent_refuses_to_write_into_bundled_roster():
     try:
         r = sp.run([sys.executable, script, "--new-agent", "guardtest_zzz",
                     "--agents-dir", bundled, "--cwd", cwd],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
         assert "bundled" in (r.stdout + r.stderr).lower(), (r.stdout, r.stderr)
         assert not os.path.exists(victim), "guard failed: wrote INTO the bundled roster"
@@ -1961,7 +1968,7 @@ def test_roster_modes_mutually_exclusive():
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
     r = sp.run([sys.executable, script, "--new-agent", "a", "--set-agent", "b",
                 "--agents-dir", tempfile.gettempdir()],
-               capture_output=True, text=True, encoding="utf-8")
+               capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
     assert r.returncode == 1 and "mutually exclusive" in _json.loads(r.stdout)["error"]
 
 
@@ -1991,7 +1998,7 @@ def test_openai_compat_http_roundtrip():
         r = sp.run([sys.executable, script, "--agent", "bot", "--prompt", "ping",
                     "--cwd", d, "--agents-dir", d, "--timeout", "30s",
                     "--allow-text-only"],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env = _json.loads(r.stdout)
         assert env["status"] == "success" and env["result"].startswith("PONG")
         # API reported the model on the terminal response -> served evidence
@@ -2041,7 +2048,7 @@ def test_openai_compat_redacts_key_and_survives_errors():
         H.mode = "reflect"
         r = sp.run([sys.executable, script, "--agent", "b", "--prompt", "x", "--cwd", d,
                     "--agents-dir", d, "--timeout", "20s", "--allow-text-only"],
-                   capture_output=True, text=True, env=env_with_key)
+                   capture_output=True, text=True, env=env_with_key, **_spawn.run_flags())
         assert SECRET not in r.stdout and "REDACTED" in r.stdout, r.stdout[:300]
         assert _json.loads(r.stdout)["status"] == "error"
         # bad shape + non-string content: clean error / no crash
@@ -2049,7 +2056,7 @@ def test_openai_compat_redacts_key_and_survives_errors():
             H.mode = mode
             r = sp.run([sys.executable, script, "--agent", "b", "--prompt", "x", "--cwd", d,
                         "--agents-dir", d, "--timeout", "20s", "--allow-text-only"],
-                       capture_output=True, text=True, env=env_with_key)
+                       capture_output=True, text=True, env=env_with_key, **_spawn.run_flags())
             env = _json.loads(r.stdout)
             assert "Traceback" not in r.stderr and env["status"] in ("error", "success"), mode
     finally:
@@ -2065,7 +2072,7 @@ def test_openai_compat_dry_run_no_crash():
             '---\nrun-agent: openai-compat\nprovider: ollama\nmodel: llama3.1\n---\n# B\n')
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
         r = sp.run([sys.executable, script, "--agent", "b", "--prompt", "x", "--cwd", d,
-                    "--agents-dir", d, "--dry-run"], capture_output=True, text=True)
+                    "--agents-dir", d, "--dry-run"], capture_output=True, text=True, **_spawn.run_flags())
         view = _json.loads(r.stdout)
         assert view["dry_run"] is True and view["cli"] == "openai-compat"
         assert view["permission_flags"] is None and "11434" in view["base_url"]
@@ -2261,12 +2268,12 @@ def test_subcommand_and_flat_equivalent_live():
     import json as _json, subprocess as sp
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
     a = sp.run([sys.executable, script, "list", "--agents-dir",
-                os.path.dirname(script)], capture_output=True, text=True)  # scripts/ has no .md -> 0
+                os.path.dirname(script)], capture_output=True, text=True, **_spawn.run_flags())  # scripts/ has no .md -> 0
     b = sp.run([sys.executable, script, "--list", "--agents-dir",
-                os.path.dirname(script)], capture_output=True, text=True)
+                os.path.dirname(script)], capture_output=True, text=True, **_spawn.run_flags())
     assert _json.loads(a.stdout)["agents"] == _json.loads(b.stdout)["agents"]
     # `summon` with no args prints usage and exits 0
-    u = sp.run([sys.executable, script], capture_output=True, text=True)
+    u = sp.run([sys.executable, script], capture_output=True, text=True, **_spawn.run_flags())
     assert u.returncode == 0 and "summon" in u.stdout and "Commands:" in u.stdout
 
 
@@ -2434,7 +2441,7 @@ def test_council_dry_run_rejected():
     import json as _json, subprocess as sp
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
     r = sp.run([sys.executable, script, "--council", "--question", "x",
-                "--cwd", os.getcwd(), "--dry-run"], capture_output=True, text=True)
+                "--cwd", os.getcwd(), "--dry-run"], capture_output=True, text=True, **_spawn.run_flags())
     env = _json.loads(r.stdout)
     assert env["status"] == "error" and "council" in env["error"] and r.returncode == 1
 
@@ -2450,7 +2457,7 @@ def test_dry_run_resolves_without_executing():
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
         r = sp.run([sys.executable, script, "--agent", "probe", "--prompt", "hello",
                     "--cwd", os.getcwd(), "--agents-dir", agents, "--dry-run"],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         view = _json.loads(r.stdout)
         assert view["dry_run"] is True and r.returncode == 0
         assert view["cli"] == "claude" and view["model_requested"] == "opus"
@@ -2527,7 +2534,7 @@ def test_read_only_allowlist_is_enforced_by_claude_and_gemini_only():
         try:
             os.symlink(one, link, target_is_directory=True)
         except (OSError, NotImplementedError):
-            link = None  # Windows CI without link privilege: skip this assertion.
+            raise unittest.SkipTest("Symlink assertion unavailable")
         if link:
             try:
                 normalize_read_roots([link])
@@ -2559,7 +2566,7 @@ def test_read_only_allowlist_dry_run_reports_effective_paths_without_provider_co
                     "--cwd", d, "--agents-dir", roster, "--strict-agents-dir",
                     "--read-root", one, "--read-root", two, "--timeout", "30s",
                     "--dry-run", "--json"], capture_output=True, text=True,
-                   encoding="utf-8")
+                   encoding="utf-8", **_spawn.run_flags())
         assert r.returncode == 0, (r.stdout, r.stderr)
         view = json.loads(r.stdout)
         policy = view["read_allowlist"]
@@ -2602,7 +2609,7 @@ def test_read_only_allowlist_foreground_and_background_record_stay_in_parity():
                     "--cwd", d, "--agents-dir", roster, "--strict-agents-dir",
                     "--read-root", one, "--read-root", two, "--timeout", "30s",
                     "--dry-run", "--json"], capture_output=True, text=True,
-                   encoding="utf-8")
+                   encoding="utf-8", **_spawn.run_flags())
         assert r.returncode == 0, (r.stdout, r.stderr)
         foreground = json.loads(r.stdout)["read_allowlist"]
         assert foreground["requested_paths"] == list(roots), foreground
@@ -2651,7 +2658,7 @@ def test_read_only_allowlist_dry_run_marks_unsupported_backend_without_contact()
         r = sp.run([sys.executable, script, "--agent", "reviewer", "--prompt", "inspect",
                     "--cwd", d, "--agents-dir", roster, "--strict-agents-dir",
                     "--read-root", root, "--dry-run", "--json"],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r.returncode == 0, (r.stdout, r.stderr)
         view = json.loads(r.stdout)
         assert view["would_refuse"] is True
@@ -2690,7 +2697,7 @@ def test_read_root_refusal_surfaces_machine_reroute_before_provider_contact():
         r = sp.run([sys.executable, script, "--agent", "reviewer", "--prompt", "inspect",
                     "--cwd", d, "--agents-dir", roster, "--strict-agents-dir",
                     "--read-root", root], capture_output=True, text=True,
-                   encoding="utf-8", env=env)
+                   encoding="utf-8", env=env, **_spawn.run_flags())
         assert r.returncode == 1, (r.stdout, r.stderr)
         refusal = json.loads(r.stdout)
         assert refusal["error_kind"] == "read_allowlist_unsupported", refusal
@@ -2862,12 +2869,13 @@ def test_timeout_does_not_hang_on_grandchild_holding_stdout():
     # communicate). Guards the wall-clock-timeout guarantee.
     import time as _t, subprocess as _sp, _executor
     child = ("import subprocess,sys,time;"
-             "subprocess.Popen([sys.executable,'-c','import time;time.sleep(20)']);"
+             f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r});"
+             "from _spawn import run_flags;"
+             "subprocess.Popen([sys.executable,'-c','import time;time.sleep(20)'], **run_flags());"
              "time.sleep(0.3)")  # child spawns a 20s grandchild (inherits stdout), then exits
-    extra = {"start_new_session": True} if os.name != "nt" else {}
     proc = _sp.Popen([sys.executable, "-c", child], stdin=_sp.DEVNULL,
                      stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
-                     encoding="utf-8", errors="replace", bufsize=1, **extra)
+                     encoding="utf-8", errors="replace", bufsize=1, **_spawn.popen_flags())
     t0 = _t.monotonic()
     resp = _executor._drive_process(proc, "claude", timeout_ms=1000)
     elapsed = _t.monotonic() - t0
@@ -2955,7 +2963,7 @@ def test_child_out_does_not_skip_on_non_success_envelope():
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
         r = _sp.run([sys.executable, script, "--agent", "definitely-missing-agent",
                      "--prompt", "p", "--cwd", os.getcwd(), "--out", out],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env = _json.loads(r.stdout)
         # It re-dispatched (and failed on the missing agent) rather than emitting
         # the prior envelope with skipped=True.
@@ -3282,14 +3290,14 @@ def test_cli_telemetry_and_bug_report_commands_are_local():
                 "SUMMON_TELEMETRY": "0"})
     try:
         r = sp.run([sys.executable, script, "telemetry", "status", "--json"],
-                   capture_output=True, text=True, encoding="utf-8", env=env)
+                   capture_output=True, text=True, encoding="utf-8", env=env, **_spawn.run_flags())
         assert r.returncode == 0, r.stderr
         assert json.loads(r.stdout)["enabled"] is False
         # The process-local opt-out wins over persisted state. Remove it before
         # testing the explicit persistent enable command.
         env.pop("SUMMON_TELEMETRY")
         r = sp.run([sys.executable, script, "telemetry", "enable", "--json"],
-                   capture_output=True, text=True, encoding="utf-8", env=env)
+                   capture_output=True, text=True, encoding="utf-8", env=env, **_spawn.run_flags())
         assert r.returncode == 0 and json.loads(r.stdout)["enabled"] is True, r.stdout
         envelope = os.path.join(d, "envelope.json")
         Path(envelope).write_text(json.dumps({"status": "error", "error": "probe failure",
@@ -3297,16 +3305,16 @@ def test_cli_telemetry_and_bug_report_commands_are_local():
         output = os.path.join(d, "bug.md")
         r = sp.run([sys.executable, script, "bug-report", "--from", envelope,
                     "--output", output, "--json"], capture_output=True, text=True,
-                   encoding="utf-8", env=env)
+                   encoding="utf-8", env=env, **_spawn.run_flags())
         assert r.returncode == 0, (r.stdout, r.stderr)
         result = json.loads(r.stdout)
         assert result["ok"] is True and Path(output).is_file()
         r = sp.run([sys.executable, script, "bug-report", "--submit-github",
                     "--from", envelope, "--json"], capture_output=True, text=True,
-                   encoding="utf-8", env=env)
+                   encoding="utf-8", env=env, **_spawn.run_flags())
         assert r.returncode == 1 and "reviewed Summon Markdown" in json.loads(r.stdout)["error"]
         r = sp.run([sys.executable, script, "--github-repo", "Nafjan/summon"],
-                   capture_output=True, text=True, encoding="utf-8", env=env)
+                   capture_output=True, text=True, encoding="utf-8", env=env, **_spawn.run_flags())
         assert r.returncode == 1 and "bug-report options" in json.loads(r.stdout)["error"]
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -3532,13 +3540,13 @@ def test_council_model_label_and_repo_capable_defaults():
     assert "researcher" not in c.DEFAULT_MEMBERS, c.DEFAULT_MEMBERS
 
 
-def test_researcher_is_pinned_to_gemini_flash_37():
+def test_researcher_is_pinned_to_gemini_flash_38():
     """The evidence lane must not silently float to an unverified agy default."""
     from pathlib import Path
     definition = (Path(__file__).resolve().parents[1] / "agents" / "researcher.md").read_text(encoding="utf-8")
     frontmatter = definition.split("---", 2)[1]
     assert "run-agent: agy" in frontmatter
-    assert "model: gemini-3.7-flash-high" in frontmatter
+    assert "model: gemini-3.8-flash-high" in frontmatter
     assert "permission: yolo" in frontmatter
 
 
@@ -3712,7 +3720,7 @@ def test_mode_flag_matrix_rejects_swallowed_flags():
     ]
     for argv, flag in cases:
         r = sp.run([sys.executable, script, *argv], capture_output=True, text=True,
-                   encoding="utf-8")
+                   encoding="utf-8", **_spawn.run_flags())
         env = _json.loads(r.stdout)
         assert env["status"] == "error" and flag in env["error"], (argv, env)
         assert "silently ignored" in env["error"], env["error"]
@@ -3721,7 +3729,7 @@ def test_mode_flag_matrix_rejects_swallowed_flags():
     # validation (fails on the missing question, NOT on the flag matrix).
     r = sp.run([sys.executable, script, "--council", "--cwd", os.getcwd(),
                 "--out", os.path.join(tempfile.gettempdir(), "cx.json")],
-               capture_output=True, text=True, encoding="utf-8")
+               capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
     env = _json.loads(r.stdout)
     assert "silently ignored" not in (env.get("error") or ""), env
     assert "--question" in env["error"], env
@@ -3908,7 +3916,7 @@ def test_prompt_file_load_conflicts_and_bom():
         # BOM stripped, no dispatch executed
         r = sp.run([sys.executable, script, "--agent", "pf-probe", "--prompt-file", pf,
                     "--cwd", os.getcwd(), "--agents-dir", agents, "--dry-run"],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         view = _json.loads(r.stdout)
         assert view.get("dry_run") is True, view
         assert any("THE-MAGIC-TOKEN" in a for a in view["args"]), view["args"]
@@ -3916,14 +3924,14 @@ def test_prompt_file_load_conflicts_and_bom():
         # --prompt + --prompt-file -> rejected
         r2 = sp.run([sys.executable, script, "--agent", "pf-probe", "--prompt", "x",
                      "--prompt-file", pf, "--cwd", os.getcwd(), "--agents-dir", agents],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env2 = _json.loads(r2.stdout)
         assert env2["status"] == "error" and "not both" in env2["error"], env2
         # missing file -> clean error, no traceback
         r3 = sp.run([sys.executable, script, "--agent", "pf-probe",
                      "--prompt-file", os.path.join(d, "nope.md"),
                      "--cwd", os.getcwd(), "--agents-dir", agents],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env3 = _json.loads(r3.stdout)
         assert env3["status"] == "error" and "cannot read --prompt-file" in env3["error"], env3
         # empty file -> clean error
@@ -3931,7 +3939,7 @@ def test_prompt_file_load_conflicts_and_bom():
         open(ef, "w", encoding="utf-8").close()
         r4 = sp.run([sys.executable, script, "--agent", "pf-probe", "--prompt-file", ef,
                      "--cwd", os.getcwd(), "--agents-dir", agents],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env4 = _json.loads(r4.stdout)
         assert env4["status"] == "error" and "is empty" in env4["error"], env4
     finally:
@@ -3973,7 +3981,7 @@ def test_allow_credit_flag_dry_run_and_fanout_rejection():
     base = [sys.executable, script, "--agent", "planner", "--prompt", "x",
             "--cwd", os.getcwd(), "--agents-dir", agents,
             "--model", "claude-fable-5", "--dry-run"]
-    r = sp.run(base, capture_output=True, text=True, encoding="utf-8", env=env)
+    r = sp.run(base, capture_output=True, text=True, encoding="utf-8", env=env, **_spawn.run_flags())
     view = _json.loads(r.stdout)
     # Fable runs UNSUBSTITUTED with no blanket credit authorization. The dry-run cannot
     # inspect the Claude seat or remaining allowance, so it says that billing is
@@ -3983,7 +3991,7 @@ def test_allow_credit_flag_dry_run_and_fanout_rejection():
     assert "plan-dependent" in view["billing_predicted"]["note"], view
     assert any("plan-dependent billing" in w for w in view.get("warnings") or []), view
     r2 = sp.run(base + ["--allow-credit"], capture_output=True, text=True,
-                encoding="utf-8", env=env)
+                encoding="utf-8", env=env, **_spawn.run_flags())
     view2 = _json.loads(r2.stdout)
     assert view2["model_effective"] == "claude-fable-5", view2
     # --allow-credit still PARSES so existing scripts carrying it keep working; it simply
@@ -3993,7 +4001,7 @@ def test_allow_credit_flag_dry_run_and_fanout_rejection():
     # authorize every child)
     r3 = sp.run([sys.executable, script, "--council", "--question", "q",
                  "--cwd", os.getcwd(), "--allow-credit"],
-                capture_output=True, text=True, encoding="utf-8", env=env)
+                capture_output=True, text=True, encoding="utf-8", env=env, **_spawn.run_flags())
     env3 = _json.loads(r3.stdout)
     assert env3["status"] == "error" and "--allow-credit" in env3["error"], env3
 
@@ -4014,7 +4022,7 @@ def test_agy_safe_edit_warning_helper_and_dry_run():
             "---\nrun-agent: agy\npermission: safe-edit\n---\n# agy agent\nrole.\n")
         r = sp.run([sys.executable, script, "--agent", "agy-agent", "--prompt", "x",
                     "--cwd", os.getcwd(), "--agents-dir", d, "--dry-run"],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         view = _json.loads(r.stdout)
         warns = view.get("warnings") or []
         assert sum("workspace-write tier" in w for w in warns) == 1, warns
@@ -4064,7 +4072,7 @@ def test_receipt_and_model_evidence_on_error_dispatch():
         r = sp.run([sys.executable, script, "--agent", "dead-api", "--prompt", "hello",
                     "--cwd", os.getcwd(), "--agents-dir", d, "--timeout", "8s",
                     "--allow-text-only"],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env = _json.loads(r.stdout)
         assert env["status"] == "error", env
         # model honesty: pointed at probe-model, nothing served
@@ -4088,9 +4096,9 @@ def test_receipt_and_model_evidence_on_error_dispatch():
         # rather than skip. A legitimate environment skip, unlike an escape hatch that hides
         # a real failure: with no git there is nothing to agree with.
         if shutil.which("git") is None:
-            return
+            raise unittest.SkipTest('Git is unavailable')
         gh = sp.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-                    cwd=os.getcwd())
+                    cwd=os.getcwd(), **_spawn.run_flags())
         head = gh.stdout.strip() if gh.returncode == 0 else ""
         assert env.get("git_head_before") == (head or None), (env.get("git_head_before"), head)
         # a different cwd: the key is present and matches git's OWN answer for
@@ -4100,9 +4108,9 @@ def test_receipt_and_model_evidence_on_error_dispatch():
         r5 = sp.run([sys.executable, script, "--agent", "dead-api", "--prompt", "hello",
                      "--cwd", d, "--agents-dir", d, "--timeout", "8s",
                      "--allow-text-only"],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env5 = _json.loads(r5.stdout)
-        gh5 = sp.run(["git", "-C", d, "rev-parse", "HEAD"], capture_output=True, text=True)
+        gh5 = sp.run(["git", "-C", d, "rev-parse", "HEAD"], capture_output=True, text=True, **_spawn.run_flags())
         head5 = gh5.stdout.strip() if gh5.returncode == 0 else ""
         assert "git_head_before" in env5, env5
         assert env5["git_head_before"] == (head5 or None), (env5["git_head_before"], head5)
@@ -4168,12 +4176,12 @@ def test_workspace_evidence_real_git_catches_status_and_clean_child_commit():
     import _receipt
     import subprocess
     if shutil.which("git") is None:
-        return
+        raise unittest.SkipTest('Git is unavailable')
     d = tempfile.mkdtemp(prefix="summon-evidence-")
     try:
         def git(*args, check=True):
             return subprocess.run(["git", *args], cwd=d, check=check,
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, **_spawn.run_flags())
         git("init", "-q")
         git("config", "user.email", "summon@example.invalid")
         git("config", "user.name", "Summon Test")
@@ -4249,19 +4257,19 @@ def test_mode_matrix_default_values_and_early_combos():
     ]
     for argv, flag in cases:
         r = sp.run([sys.executable, script, *argv], capture_output=True, text=True,
-                   encoding="utf-8")
+                   encoding="utf-8", **_spawn.run_flags())
         env = _json.loads(r.stdout)
         assert env["status"] == "error" and flag in env["error"], (argv, env)
         assert r.returncode == 1, (argv, r.returncode)
     # empty values on EITHER side are still two competing inputs (presence)
     r2 = sp.run([sys.executable, script, "--agent", "a", "--prompt", "",
                  "--prompt-file", "x.md", "--cwd", os.getcwd()],
-                capture_output=True, text=True, encoding="utf-8")
+                capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
     env2 = _json.loads(r2.stdout)
     assert env2["status"] == "error" and "not both" in env2["error"], env2
     r3 = sp.run([sys.executable, script, "--agent", "a", "--prompt", "x",
                  "--prompt-file", "", "--cwd", os.getcwd()],
-                capture_output=True, text=True, encoding="utf-8")
+                capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
     env3 = _json.loads(r3.stdout)
     assert env3["status"] == "error" and "not both" in env3["error"], env3
 
@@ -4278,7 +4286,7 @@ def test_receipt_on_missing_agent_and_preflight():
         # missing agent -> error envelope with summon identity, no agent_def
         r = sp.run([sys.executable, script, "--agent", "nope-agent-xyz", "--prompt", "p",
                     "--cwd", os.getcwd(), "--agents-dir", d],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env = _json.loads(r.stdout)
         assert env["status"] == "error" and "not found" in env["error"], env
         assert env["attempts"] == 0 and env["attempt_status"] == "not_run", env
@@ -4295,7 +4303,7 @@ def test_receipt_on_missing_agent_and_preflight():
         env_clean["PATH"] = ""
         r2 = sp.run([sys.executable, script, "--agent", "gm", "--prompt", "p",
                      "--cwd", os.getcwd(), "--agents-dir", d],
-                    capture_output=True, text=True, encoding="utf-8", env=env_clean)
+                    capture_output=True, text=True, encoding="utf-8", env=env_clean, **_spawn.run_flags())
         env2 = _json.loads(r2.stdout)
         assert env2["status"] == "error" and env2["exit_code"] == 127, env2
         assert env2["attempts"] == 0 and env2["attempt_status"] == "not_run", env2
@@ -4311,7 +4319,7 @@ def test_receipt_on_missing_agent_and_preflight():
             "api_key_env:\nmodel: m\n---\n# oc\nrole.\n")
         r3 = sp.run([sys.executable, script, "--agent", "oc", "--prompt", "p",
                      "--cwd", os.getcwd(), "--agents-dir", d, "--effort", "bogus"],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env3 = _json.loads(r3.stdout)
         assert env3["status"] == "error" and "invalid effort" in env3["error"], env3
         assert len(env3["summon"]["scripts_sha256"]) == 64, env3
@@ -4684,12 +4692,12 @@ def test_council_facade_subcommands_and_matrix():
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
     # council resume needs an id
     r = sp.run([sys.executable, script, "council", "resume"],
-               capture_output=True, text=True, encoding="utf-8")
+               capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
     assert r.returncode != 0 and "needs a run id" in (r.stdout + r.stderr)
     # resume rejects the flags that would change the run's identity
     r2 = sp.run([sys.executable, script, "--council", "--resume-run", "x",
                  "--members", "a,b", "--cwd", os.getcwd()],
-                capture_output=True, text=True, encoding="utf-8")
+                capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
     env2 = _json.loads(r2.stdout)
     assert env2["status"] == "error" and "--members" in env2["error"]
     assert "silently ignored" in env2["error"]
@@ -4698,18 +4706,18 @@ def test_council_facade_subcommands_and_matrix():
     try:
         r3 = sp.run([sys.executable, script, "council", "status", "missing-run",
                      "--run-dir", d, "--json"],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env3 = _json.loads(r3.stdout)
         assert r3.returncode == 1 and env3["mode"] == "council-status"
         assert "unknown council run" in env3["error"]
         # status rejects a dispatch flag
         r4 = sp.run([sys.executable, script, "--council-status", "x", "--members", "a,b"],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env4 = _json.loads(r4.stdout)
         assert env4["status"] == "error" and "--members" in env4["error"]
         # a bogus run id is rejected before any filesystem access
         r5 = sp.run([sys.executable, script, "--council-status", "../evil", "--run-dir", d],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env5 = _json.loads(r5.stdout)
         assert env5["status"] == "error" and "invalid run id" in env5["error"]
     finally:
@@ -6117,18 +6125,18 @@ def test_council_b2_flags_matrix():
           "--member-timeout", "30s", "--chair-timeout", "2m"]
     # accepted on a fresh council (fails later on missing question, NOT on a flag)
     r = sp.run([sys.executable, script, "--council", "--cwd", os.getcwd(), *b2],
-               capture_output=True, text=True, encoding="utf-8")
+               capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
     assert "silently ignored" not in (_json.loads(r.stdout).get("error") or ""), r.stdout
     # accepted on a resume (fails on the unknown run, NOT on a flag)
     r2 = sp.run([sys.executable, script, "--council", "--resume-run", "nope-run",
-                 "--cwd", os.getcwd(), *b2], capture_output=True, text=True, encoding="utf-8")
+                 "--cwd", os.getcwd(), *b2], capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
     err2 = _json.loads(r2.stdout).get("error") or ""
     assert "silently ignored" not in err2 and "unknown council run" in err2, r2.stdout
     # each of the four rejected on status
     for flag, val in (("--quorum", "2"), ("--chairman-fallback", "x"),
                       ("--member-timeout", "30s"), ("--chair-timeout", "2m")):
         r3 = sp.run([sys.executable, script, "--council-status", "x", flag, val],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env3 = _json.loads(r3.stdout)
         assert env3["status"] == "error" and flag in env3["error"], (flag, env3)
 
@@ -6550,27 +6558,27 @@ def test_jobs_facade_and_matrix():
     try:
         # jobs list on an empty dir: ok, empty
         r = sp.run([sys.executable, script, "jobs", "list", "--job-dir", d, "--json"],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env = _json.loads(r.stdout)
         assert r.returncode == 0 and env["jobs"] == []
         # jobs status needs an id
         r2 = sp.run([sys.executable, script, "jobs", "status"], capture_output=True,
-                    text=True, encoding="utf-8")
+                    text=True, encoding="utf-8", **_spawn.run_flags())
         assert r2.returncode != 0 and "needs a job id" in (r2.stdout + r2.stderr)
         # unknown 'jobs' action is an error
         r3 = sp.run([sys.executable, script, "jobs", "bogus"], capture_output=True,
-                    text=True, encoding="utf-8")
+                    text=True, encoding="utf-8", **_spawn.run_flags())
         assert r3.returncode != 0
         # bad id rejected; unknown id -> exit 1
         r4 = sp.run([sys.executable, script, "--jobs-status", "nothex", "--job-dir", d],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert _json.loads(r4.stdout)["status"] == "error" and "invalid job id" in _json.loads(r4.stdout)["error"]
         r5 = sp.run([sys.executable, script, "--jobs-status", "a" * 32, "--job-dir", d],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r5.returncode == 1 and "no such job" in _json.loads(r5.stdout)["error"]
         # matrix: a stray dispatch flag on a jobs query is rejected
         r6 = sp.run([sys.executable, script, "--jobs-list", "--model", "x"],
-                    capture_output=True, text=True, encoding="utf-8")
+                    capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         env6 = _json.loads(r6.stdout)
         assert env6["status"] == "error" and "--model" in env6["error"]
     finally:
@@ -6594,7 +6602,7 @@ def test_jobs_background_end_to_end():
         r = sp.run([sys.executable, script, "--agent", "dead", "--prompt", "hello",
                     "--cwd", d, "--agents-dir", d, "--job-dir", jobs,
                     "--background", "--timeout", "8s", "--allow-text-only"],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         handle = _json.loads(r.stdout)
         assert handle["status"] == "background" and os.path.isfile(handle["record_file"])
         jid = handle["job_id"]
@@ -6604,7 +6612,7 @@ def test_jobs_background_end_to_end():
         # the detached child can terminalize. Keep this integration wait bounded,
         # but leave enough room for a slow/antivirus-scanned host.
         r2 = sp.run([sys.executable, script, "jobs", "wait", jid, "--job-dir", jobs,
-                     "--timeout", "60s"], capture_output=True, text=True, encoding="utf-8")
+                     "--timeout", "60s"], capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         waited = _json.loads(r2.stdout)
         assert waited["status"] == "error" and "job_nonce" in waited
         st = _jobs.job_status(jobs, jid)
@@ -6674,7 +6682,7 @@ def test_jobs_corrupt_and_symlink_classification():
         try:
             os.symlink(victim, _jobs.result_path(root, sjid))
         except (OSError, NotImplementedError):
-            pass                              # OS refuses symlink creation: skip this leg
+            raise unittest.SkipTest("Symlink assertion unavailable")
         else:
             sst = _jobs.job_status(root, sjid)
             assert sst["state"] == "corrupt", sst
@@ -6921,11 +6929,38 @@ def test_jobs_cli_wait_timeout_and_bare():
         _jobs.write_prepared(d, jid, nonce="t" * 32, agent="a", prompt_sha256=None,
                              cwd="/w", flags={}, summon={})   # prepared, no result ever
         r = sp.run([sys.executable, script, "jobs", "wait", jid, "--job-dir", d,
-                    "--timeout", "300"], capture_output=True, text=True, encoding="utf-8")
+                    "--timeout", "300"], capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r.returncode == 124, (r.returncode, r.stdout, r.stderr)
+        # An expired WAIT is not a failed job, but a prepared record with no pid is not
+        # "running" either: the envelope says exactly what is known.
+        waited = json.loads(r.stdout)
+        assert waited["status"] == "prepared" and waited["terminal"] is False
+        assert waited["wait_outcome"] == "timeout" and waited["job_id"] == jid
+        # A job id that does not exist in this directory is an error, never "wait again".
+        missing = sp.run([sys.executable, script, "jobs", "wait", _jobs.new_job_id(),
+                          "--job-dir", d, "--timeout", "300"], capture_output=True,
+                         text=True, encoding="utf-8", **_spawn.run_flags())
+        assert missing.returncode == 1, (missing.returncode, missing.stdout)
+        assert json.loads(missing.stdout)["status"] == "error"
+        assert "not found" in missing.stdout
+        # Only an observed-alive pid is reported as running.
+        live = _jobs.new_job_id()
+        _jobs.write_prepared(d, live, nonce="u" * 32, agent="a", prompt_sha256=None,
+                             cwd="/w", flags={}, summon={})
+        rec_path = _jobs.record_path(d, live)
+        with open(rec_path, encoding="utf-8") as fh:
+            rec = json.load(fh)
+        rec["pid"] = os.getpid()
+        with open(rec_path, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh)
+        alive = sp.run([sys.executable, script, "jobs", "wait", live, "--job-dir", d,
+                        "--timeout", "300"], capture_output=True, text=True,
+                       encoding="utf-8", **_spawn.run_flags())
+        assert alive.returncode == 124, (alive.returncode, alive.stdout, alive.stderr)
+        assert json.loads(alive.stdout)["status"] == "running", alive.stdout
         # bare `jobs` -> usage, exit 0
         rb = sp.run([sys.executable, script, "jobs"], capture_output=True, text=True,
-                    encoding="utf-8")
+                    encoding="utf-8", **_spawn.run_flags())
         assert rb.returncode == 0 and "Usage:" in rb.stdout and "jobs list" in rb.stdout
     finally:
         import shutil as _sh
@@ -6949,6 +6984,18 @@ def _mk_summon_install(home, host_dir, py_files, *, installed_at=1000, manifest=
     return scripts
 
 
+def _complete_v6_skill_payload(scripts):
+    """Add the non-script roots required for full-payload convergence fixtures."""
+    summon_dir = os.path.dirname(scripts)
+    with open(os.path.join(summon_dir, "SKILL.md"), "w", encoding="utf-8") as fh:
+        fh.write("---\nname: summon\n---\n")
+    for directory in ("references", "agents", "examples"):
+        root = os.path.join(summon_dir, directory)
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "fixture.txt"), "w", encoding="utf-8") as fh:
+            fh.write("fixture\n")
+
+
 def test_v6_installs_enumerate_and_converged():
     # every host copy identical -> all present, versions read from run_subagent.py,
     # drift converged, and the copy we "run from" is tagged (not double-listed).
@@ -6957,7 +7004,8 @@ def test_v6_installs_enumerate_and_converged():
     try:
         files = {"run_subagent.py": '__version__ = "1.2.3"\n', "_x.py": "x = 1\n"}
         for hd in _installs.HOST_DIRS.values():
-            _mk_summon_install(home, hd, files)
+            scripts = _mk_summon_install(home, hd, files)
+            _complete_v6_skill_payload(scripts)
         run = os.path.join(home, ".claude", "skills", "summon", "scripts")
         recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
         present = [r for r in recs if r["present"]]
@@ -7072,7 +7120,7 @@ def test_v6_duplicate_merge_survives_symlink_alias_collapse():
             os.symlink(os.path.join(home, ".claude", "skills", "summon"),
                        codex_summon, target_is_directory=True)
         except (OSError, NotImplementedError, AttributeError):
-            return                                                    # no symlink privilege -> skip
+            raise unittest.SkipTest('Directory symlinks are unavailable')                                                    # no symlink privilege -> skip
         _w_skill_md(os.path.join(home, ".codex", "skills", "summon.pre-refresh-1"), "summon")
         recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
         dr = _installs.drift_report(recs)
@@ -7207,7 +7255,7 @@ def test_v6_alias_collapse_preserves_truncation():
             os.symlink(os.path.join(home, ".claude", "skills", "summon"),
                        codex_summon, target_is_directory=True)
         except (OSError, NotImplementedError, AttributeError):
-            return
+            raise unittest.SkipTest('Directory symlinks are unavailable')
         _installs._MAX_SKILLS_SCAN = 2                                # .codex/skills overflows this
         for i in range(5):
             os.makedirs(os.path.join(home, ".codex", "skills", "filler-%d" % i))
@@ -7237,7 +7285,7 @@ def test_v6_duplicate_symlink_reports_lexical_path_not_target():
             os.symlink(os.path.join(skills, "summon"),
                        os.path.join(skills, "aliaslink"), target_is_directory=True)  # diff-named -> canonical
         except (OSError, NotImplementedError, AttributeError):
-            return
+            raise unittest.SkipTest('Directory symlinks are unavailable')
         dirs, trunc = _installs.duplicate_summon_skills(skills)
         assert any(p.endswith("summon.pre-refresh-link") for p in dirs), dirs      # lexical link path
         assert not any(os.path.basename(p) == "elsewhere" for p in dirs), dirs     # NOT the target
@@ -7296,7 +7344,7 @@ def test_v6_staging_symlink_is_not_exempted():
         try:
             os.symlink(canon, os.path.join(skills, "summon.staging-link"), target_is_directory=True)
         except (OSError, NotImplementedError, AttributeError):
-            return
+            raise unittest.SkipTest('Directory symlinks are unavailable')
         dirs, trunc = _installs.duplicate_summon_skills(skills)
         assert any(p.endswith("summon.staging-link") for p in dirs), dirs   # symlink NOT exempted
     finally:
@@ -7390,7 +7438,7 @@ def test_v6_installs_hosts_match_installer():
     root = os.path.dirname(os.path.dirname(os.path.dirname(scripts_dir)))
     install_py = os.path.join(root, "install.py")
     if not os.path.isfile(install_py):
-        return
+        raise unittest.SkipTest('Installer source is unavailable')
     spec = importlib.util.spec_from_file_location("_summon_install_probe", install_py)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -7460,7 +7508,7 @@ def test_install_profile_t3_resolve_hosts():
     root = os.path.dirname(os.path.dirname(os.path.dirname(scripts_dir)))
     install_py = os.path.join(root, "install.py")
     if not os.path.isfile(install_py):
-        return
+        raise unittest.SkipTest('Installer source is unavailable')
     spec = importlib.util.spec_from_file_location("_summon_install_t3", install_py)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -7617,8 +7665,10 @@ def test_v6_enumerate_dedups_symlink_aliases():
     import _installs
     home = tempfile.mkdtemp(prefix="summon-v6sym-")
     try:
-        _mk_summon_install(home, ".claude",
-                           {"run_subagent.py": '__version__ = "2.0.0"\n', "_x.py": "x = 1\n"})
+        scripts = _mk_summon_install(
+            home, ".claude",
+            {"run_subagent.py": '__version__ = "2.0.0"\n', "_x.py": "x = 1\n"})
+        _complete_v6_skill_payload(scripts)
         codex_summon = os.path.join(home, ".codex", "skills", "summon")
         os.makedirs(os.path.dirname(codex_summon), exist_ok=True)
         try:
@@ -7629,7 +7679,7 @@ def test_v6_enumerate_dedups_symlink_aliases():
             # (not a silent pass) -- the canonical de-dup logic is still covered
             # deterministically by test_v6_enumerate_dedups_by_canonical_key.
             print("  [v6-skip] live symlinks unavailable; de-dup covered by canonical-key test")
-            return
+            raise unittest.SkipTest('Directory symlinks are unavailable')
         run = os.path.join(codex_summon, "scripts")   # invoke THROUGH the .codex alias
         recs = _installs.enumerate_installs(running_scripts_dir=run, home=home)
         present = [r for r in recs if r["present"]]
@@ -7653,7 +7703,7 @@ def test_v6_fifo_in_scripts_dir_does_not_hang():
     import _receipt
     if not hasattr(os, "mkfifo"):
         print("  [v6-skip] os.mkfifo unavailable (non-POSIX); FIFO hang test not applicable")
-        return
+        raise unittest.SkipTest('FIFO support is unavailable')
     import threading
     home = tempfile.mkdtemp(prefix="summon-v6fifo-")
     try:
@@ -7723,7 +7773,7 @@ def test_v5_council_doc_has_large_file_pattern_and_timeout_budget():
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
     doc = os.path.join(os.path.dirname(scripts_dir), "references", "fan-out.md")
     if not os.path.isfile(doc):
-        return   # references/ not present in this layout -> skip (never fail out of it)
+        raise unittest.SkipTest('Required documentation is unavailable')   # references/ not present in this layout -> skip (never fail out of it)
     with open(doc, encoding="utf-8") as fh:
         text = fh.read()
     low = text.lower()
@@ -7751,7 +7801,7 @@ def test_v5_codex_doc_timeout_is_consistent_with_skill():
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
     refs = os.path.join(os.path.dirname(scripts_dir), "references", "codex.md")
     if not os.path.isfile(refs):
-        return
+        raise unittest.SkipTest('Required documentation is unavailable')
     with open(refs, encoding="utf-8") as fh:
         cx = fh.read().lower()
     # assert the RELATIONAL rule explicitly, not just that "above" appears somewhere (which a
@@ -8830,7 +8880,7 @@ def test_v7_out_skip_requires_matching_request():
     def _run(prompt, agent="whatever", extra=()):
         r = sp.run([sys.executable, script, "--agent", agent, "--prompt", prompt,
                     "--cwd", cwd, "--out", out, "--agents-dir", roster, *extra],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         return _json.loads(r.stdout), r.stderr
 
     def _seed(**over):
@@ -9235,7 +9285,7 @@ def test_v7_manifest_parent_uses_the_legacy_fallback_too():
                                   "prompt": "NEW prompt", "cwd": work}]}, fh)
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
         r = sp.run([sys.executable, script, "--manifest", mf, "--cwd", work,
-                    "--results-dir", results], capture_output=True, text=True, encoding="utf-8")
+                    "--results-dir", results], capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         job = _json.loads(r.stdout)["jobs"][0]
         assert job.get("skipped") is not True, ("the parent reused a provably stale "
                                                 "legacy envelope", job)
@@ -9430,22 +9480,22 @@ def test_v7_bare_worktree_never_resumes():
         # production-repo `git worktree add` take minutes or wait on a reset,
         # turning a bounded test into a release-runner timeout.
         sp.run(["git", "-C", project, "init", "-q"], check=True,
-               capture_output=True, text=True)
+               capture_output=True, text=True, **_spawn.run_flags())
         sp.run(["git", "-C", project, "config", "user.email", "summon-test@example.invalid"],
-               check=True, capture_output=True, text=True)
+               check=True, capture_output=True, text=True, **_spawn.run_flags())
         sp.run(["git", "-C", project, "config", "user.name", "Summon Test"],
-               check=True, capture_output=True, text=True)
+               check=True, capture_output=True, text=True, **_spawn.run_flags())
         with open(os.path.join(project, "seed.txt"), "w", encoding="utf-8") as fh:
             fh.write("seed\n")
         sp.run(["git", "-C", project, "add", "seed.txt"], check=True,
-               capture_output=True, text=True)
+               capture_output=True, text=True, **_spawn.run_flags())
         sp.run(["git", "-C", project, "commit", "-qm", "seed"], check=True,
-               capture_output=True, text=True)
+               capture_output=True, text=True, **_spawn.run_flags())
         def _run(extra):
             r = sp.run([sys.executable, script, "--agent", "cheap", "--prompt", "p",
                         "--cwd", project, "--out", out, "--agents-dir", roster,
                         "--timeout", "5s", *extra],
-                       capture_output=True, text=True, encoding="utf-8")
+                       capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
             return _json.loads(r.stdout)
 
         # seed a success envelope whose fingerprint matches a BARE --worktree run
@@ -10140,7 +10190,7 @@ def test_v7_superseded_result_is_moved_aside_not_destroyed():
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
         r = sp.run([sys.executable, script, "--manifest", mf, "--cwd", work,
                     "--results-dir", results], capture_output=True, text=True,
-                   encoding="utf-8")
+                   encoding="utf-8", **_spawn.run_flags())
         job_status = _json.loads(r.stdout)["jobs"][0]["status"]
         kept = out_file + ".superseded"
         assert os.path.isfile(kept), "the refused-but-completed answer was destroyed"
@@ -10867,7 +10917,7 @@ def test_v7_credential_never_reaches_an_artifact():
                            "--cwd", work, "--agents-dir", roster, "--out", out,
                            "--debug-dir", debug, "--timeout", "20s"],
                           capture_output=True, text=True, encoding="utf-8",
-                          env=dict(os.environ, LEAKCHECK_TOKEN=tok))
+                          env=dict(os.environ, LEAKCHECK_TOKEN=tok), **_spawn.run_flags())
 
         r = _run(token)
         surfaces = {"stdout": r.stdout or "", "stderr": r.stderr or ""}
@@ -11104,7 +11154,7 @@ def test_v7_refused_out_success_is_archived_before_a_failing_run():
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
         r = sp.run([sys.executable, script, "--agent", "missing-agent", "--prompt", "new",
                     "--cwd", work, "--agents-dir", roster, "--out", out],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r.returncode != 0, r.stdout
         # the stale success must NOT still be the authoritative result...
         if os.path.isfile(out):
@@ -11288,7 +11338,7 @@ def test_v7_pre_dispatch_failure_lands_at_the_out_path():
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
         r = sp.run([sys.executable, script, "--agent", "missing-agent", "--prompt", "new",
                     "--cwd", work, "--agents-dir", roster, "--out", out],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r.returncode != 0
         assert os.path.isfile(out), "the authoritative path was left EMPTY after a failure"
         with open(out, encoding="utf-8") as fh:
@@ -11354,7 +11404,7 @@ def test_v7_agy_dispatch_verifies_the_copied_account_bytes():
     block left it green. It covers BOTH the fresh-copy and the resume branch, and the
     "cannot attest" case."""
     if os.name != "nt":
-        return                  # ConPTY wrapper is Windows-only (see docstring above)
+        raise unittest.SkipTest('Windows-only ConPTY contract')                  # ConPTY wrapper is Windows-only (see docstring above)
     import _builder
     from _builder import _AGY_AUTH_FILES, AgentInvocation, agy_profile_account_sha
     d = tempfile.mkdtemp(prefix="summon-agyatt-")
@@ -11571,7 +11621,7 @@ def test_v7_die_never_destroys_a_stored_success():
         # --resume with --worktree is rejected by an EARLY validation _die()
         r = sp.run([sys.executable, script, "--agent", "a", "--prompt", "p", "--cwd", work,
                     "--out", out, "--resume", "session-x", "--worktree", "tree-x"],
-                   capture_output=True, text=True, encoding="utf-8")
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
         assert r.returncode != 0, r.stdout
         # the failure is recorded at the authoritative path...
         with open(out, encoding="utf-8") as fh:
@@ -13751,7 +13801,7 @@ def test_v8_every_public_flag_is_documented_in_skill_md():
     scripts = os.path.dirname(os.path.abspath(__file__))
     skill = os.path.join(os.path.dirname(scripts), "SKILL.md")
     if not os.path.isfile(skill):     # installed copies may omit docs; skip gracefully
-        return
+        raise unittest.SkipTest('Required documentation is unavailable')
     doc = open(skill, encoding="utf-8").read()
 
     public, suppressed = set(), set()
@@ -13925,7 +13975,7 @@ def test_v8_orchestration_guide_version_stamp_is_current():
     scripts = os.path.dirname(os.path.abspath(__file__))
     guide = os.path.join(os.path.dirname(scripts), "references", "orchestration.md")
     if not os.path.isfile(guide):     # installed copies may omit references; skip
-        return
+        raise unittest.SkipTest('Required documentation is unavailable')
     src = open(os.path.join(scripts, "run_subagent.py"), encoding="utf-8").read()
     m = re.search(r'__version__ = "([0-9A-Za-z.-]+)"', src)
     assert m, "could not read __version__"
@@ -14627,6 +14677,106 @@ def test_v8_every_test_is_actually_collected_by_the_runner():
         sorted(name for name in set(names) if names.count(name) > 1))
 
 
+def test_test_runs_never_write_the_operators_real_summon_state():
+    """FIELD RECORD (2026-09-19..23): about a third of ~/.agents/summon-telemetry.jsonl was
+    test bursts and fixture models. Every test entry point must redirect home state."""
+    import _telemetry
+    import _builder
+    home = (Path.home() / ".agents").resolve()
+    for path in (_telemetry._events_path(), _telemetry._config_path(),
+                 _telemetry._reports_dir(), _builder._agy_capability_cache_path()):
+        assert home not in Path(path).resolve().parents, path
+
+
+def _oversized_dry_run(cli, prompt):
+    import run_subagent
+    from _builder import AgentInvocation
+    invocation = AgentInvocation(cli=cli, prompt=prompt, cwd=tempfile.gettempdir(),
+                                 permission="read-only")
+    args = types.SimpleNamespace(
+        agent="size-probe", _resolved_agent="size-probe", strict_agents_dir=False,
+        timeout=600_000, worktree=None, _role_provenance={}, agents_dir=None,
+        gate_with=None, allow_text_only=False, require_tools=False)
+    return run_subagent._dry_run_view(invocation, args, None, None)
+
+
+def test_dry_run_refuses_a_prompt_that_cannot_fit_the_command_line():
+    """FIELD RECORD (2026-09-22): oversized prompts were only refused on a real launch
+    (six agy prompts of 42-79k chars, a 52k Claude prompt). Preflight must say so."""
+    view = _oversized_dry_run("claude", "x" * 140_000)
+    assert view["would_refuse"] is True, view
+    assert view["error_kind"] == "prompt_too_long_for_argv", view
+    assert {"refusal": view["refusal"], "error_kind": "prompt_too_long_for_argv"} \
+        in view["refusals"]
+
+
+def test_dry_run_acp_reroute_matches_the_live_predicate():
+    """Review finding (2026-09-23): dry-run promised an ACP reroute for a gemini turn with
+    an agent file, which the live executor refuses (a declared system-file transport never
+    reroutes). Both paths must share one predicate."""
+    import _executor
+    import run_subagent
+    from _builder import AgentInvocation
+    saved = _executor._resolve_launch
+    _executor._resolve_launch = lambda command, args: (command, args)
+    try:
+        args = types.SimpleNamespace(
+            agent="size-probe", _resolved_agent="size-probe", strict_agents_dir=False,
+            timeout=600_000, worktree=None, _role_provenance={}, agents_dir=None,
+            gate_with=None, allow_text_only=False, require_tools=False)
+        agent_file = os.path.join(tempfile.mkdtemp(prefix="summon-acp-"), "a.md")
+        with open(agent_file, "w", encoding="utf-8") as fh:
+            fh.write("---\nname: a\n---\nbody\n")
+        with_file = AgentInvocation(cli="gemini", prompt="x" * 140_000,
+                                    cwd=tempfile.gettempdir(), permission="read-only",
+                                    agent_file=agent_file)
+        without_file = AgentInvocation(cli="gemini", prompt="x" * 140_000,
+                                       cwd=tempfile.gettempdir(), permission="read-only")
+        for inv in (with_file, without_file):
+            rerouted = _executor.argv_overflow_reroutes_to_acp(inv, [])
+            view = run_subagent._dry_run_view(inv, args, None, None)
+            size_refused = any(entry.get("error_kind") == "prompt_too_long_for_argv"
+                               for entry in view.get("refusals", []))
+            assert size_refused is (not rerouted), (inv.agent_file, view.get("refusals"))
+            if rerouted:
+                assert any("routed over ACP" in w for w in view.get("warnings", []))
+        assert _executor.argv_overflow_reroutes_to_acp(with_file, []) is False
+    finally:
+        _executor._resolve_launch = saved
+
+
+def test_dry_run_refuses_an_oversized_agy_prompt_without_building_a_profile():
+    import _builder
+    saved = _builder._ensure_agy_profile
+    _builder._ensure_agy_profile = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("dry-run built an agy profile"))
+    try:
+        view = _oversized_dry_run("agy", "x" * (_builder._AGY_MAX_PROMPT + 1))
+    finally:
+        _builder._ensure_agy_profile = saved
+    assert view["would_refuse"] is True, view
+    assert view["error_kind"] == "prompt_too_long_for_argv", view
+    assert "agy prompt is" in view["refusal"], view["refusal"]
+
+
+def test_oversized_agy_prompt_is_refused_before_the_capability_probe():
+    import _builder
+    saved_probe = _builder._require_agy_print_timeout_support
+    _builder._require_agy_print_timeout_support = lambda: (_ for _ in ()).throw(
+        AssertionError("capability probe ran for a prompt that can never dispatch"))
+    try:
+        inv = _builder.AgentInvocation(cli="agy", prompt="x" * (_builder._AGY_MAX_PROMPT + 1),
+                                       cwd=tempfile.gettempdir())
+        try:
+            _builder.build_invocation_args(inv, 600_000)
+        except _builder.BuildRefusal as exc:
+            assert exc.kind == "prompt_too_long_for_argv" and exc.retryable is False
+        else:
+            raise AssertionError("oversized agy prompt was not refused")
+    finally:
+        _builder._require_agy_print_timeout_support = saved_probe
+
+
 def test_v8_over_long_argv_is_diagnosed_as_argv_not_a_missing_cli():
     """Windows caps a command line at 32767 chars and reports the overflow as
     ERROR_FILE_NOT_FOUND -- so Python raised FileNotFoundError and summon reported
@@ -15284,7 +15434,7 @@ def test_v8_doctor_disclosure_reaches_the_human_output():
     report = _doctor.doctor(probe=False)
     entry = report["backends"].get("agy")
     if entry is None:
-        return                      # agy not present in this environment's backend table
+        raise unittest.SkipTest('Required backend table entry is unavailable')                      # agy not present in this environment's backend table
     entry.update({"found": True, "version": "1.1.7", "path": "/x/agy",
                   "probe_ran": True, "auth_ok": True, "account_eligible": True,
                   "model_access_verified": True, "probed_permission": "safe-edit",
@@ -15836,19 +15986,21 @@ def test_v9_job_object_kills_a_tree_through_a_dead_leader():
 
     Windows-only by nature; skipped elsewhere."""
     if os.name != "nt":
-        return
+        raise unittest.SkipTest('Windows-only Job Object contract')
     import subprocess as _sp
     import _jobobj
     from _spawn import popen_flags, run_flags
 
     if not _jobobj.available():
-        return                       # ctypes/Job Objects unavailable on this build
+        raise unittest.SkipTest('Job Object support is unavailable')                       # ctypes/Job Objects unavailable on this build
 
     leader_src = (
         "import subprocess, sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+        "from _spawn import run_flags\n"
         "gc = subprocess.Popen([sys.executable, '-c',\n"
         "    'import time,sys\\nopen(sys.argv[1],\"w\").write(\"alive\")\\n"
-        "time.sleep(120)', sys.argv[1]])\n"
+        "time.sleep(120)', sys.argv[1]], **run_flags())\n"
         "print(gc.pid, flush=True)\n")
 
     d = tempfile.mkdtemp(prefix="summon-job-")
@@ -15987,13 +16139,13 @@ def test_v9_a_completed_dispatch_releases_its_job_and_reaps_stragglers():
     Closing is not mere hygiene here: KILL_ON_JOB_CLOSE means releasing the handle also
     reaps whatever the finished dispatch left behind."""
     if os.name != "nt":
-        return
+        raise unittest.SkipTest('Windows-only Job Object contract')
     import subprocess as _sp
     import _jobobj
     from _spawn import popen_flags, run_flags
 
     if not _jobobj.available():
-        return
+        raise unittest.SkipTest('Job Object support is unavailable')
 
     # Drive execute_agent, NOT _jobobj.close directly. The first version of this test
     # called close() itself, so deleting the executor's cleanup left it green: it proved
@@ -16057,15 +16209,15 @@ def test_v9_lifecycle_fixture_blocks_late_grandchild_writes():
     marker = root / "late-write"
     helper.write_text(
         "import pathlib, subprocess, sys, time\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+        "from _spawn import run_flags\n"
         "mode = sys.argv[1]\n"
         "if mode == 'leader':\n"
         "    go, pid, ready, marker = map(pathlib.Path, sys.argv[2:6])\n"
         "    while not go.exists(): time.sleep(0.005)\n"
-        "    flags = {'creationflags': getattr(subprocess, 'CREATE_NO_WINDOW', 0)} if "
-        "sys.platform == 'win32' else {}\n"
         "    subprocess.Popen([sys.executable, __file__, 'grandchild', str(pid), "
         "str(ready), str(marker)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-        "stderr=subprocess.DEVNULL, **flags)\n"
+        "stderr=subprocess.DEVNULL, **run_flags())\n"
         "    while not ready.exists(): time.sleep(0.005)\n"
         "elif mode == 'grandchild':\n"
         "    pid, ready, marker = map(pathlib.Path, sys.argv[2:5])\n"
@@ -16145,7 +16297,7 @@ def test_v9_close_is_idempotent_and_reports_whether_it_released():
     assert _jobobj.close(p) is False
 
     if os.name != "nt" or not _jobobj.available():
-        return
+        raise unittest.SkipTest('Windows Job Object support is unavailable')
     # THE ORDERING, with a handle actually attached. The first version used an object with
     # no handle, so it never exercised the clear-then-close sequence at all and a mutant
     # that closed first survived it.
@@ -16178,11 +16330,11 @@ def test_v9_a_failed_terminate_falls_back_instead_of_claiming_success():
     terminate() now claims success only when the terminate OR the close actually reported
     it."""
     if os.name != "nt":
-        return
+        raise unittest.SkipTest('Windows-only Job Object contract')
     import _jobobj
 
     if not _jobobj.available():
-        return
+        raise unittest.SkipTest('Job Object support is unavailable')
 
     class _P:
         pass
@@ -16710,7 +16862,7 @@ def test_v9_a_denied_dispatch_leaves_no_worktree_behind():
         assert "worktree_preserved:true" in skill, (
             "public docs must tell an orchestrator when denial cleanup preserved work")
     except FileNotFoundError:
-        return                       # no git on PATH; nothing to assert
+        raise unittest.SkipTest('Git or required source is unavailable')                       # no git on PATH; nothing to assert
     finally:
         import shutil as _sh
         _sh.rmtree(d, ignore_errors=True)
@@ -16734,7 +16886,7 @@ def test_v9_worktree_cleanup_rejects_symlink_escape_before_git():
         try:
             os.symlink(outside, link, target_is_directory=True)
         except (OSError, NotImplementedError):
-            return  # platform/account cannot create directory symlinks
+            raise unittest.SkipTest('Directory symlinks are unavailable')  # platform/account cannot create directory symlinks
 
         def git_must_not_run(*_args, **_kwargs):
             raise AssertionError("git ran before the symlink escape was rejected")
@@ -16894,7 +17046,7 @@ def test_v9_the_roster_doc_matches_the_agents_it_describes():
     agents_dir = os.path.join(here, "..", "agents")
     doc = os.path.join(here, "..", "references", "models.md")
     if not (os.path.isdir(agents_dir) and os.path.isfile(doc)):
-        return                       # not an installed layout; nothing to bind
+        raise unittest.SkipTest('Required roster source is unavailable')                       # not an installed layout; nothing to bind
 
     pinned = set()
     for fn in os.listdir(agents_dir):
@@ -17149,10 +17301,10 @@ def test_v10_explicit_agents_dir_falling_back_to_bundled_is_never_silent():
 
     bundled = bundled_roster_dir()
     if not bundled:
-        return
+        raise unittest.SkipTest('Bundled roster is unavailable')
     served = os.path.join(bundled, "planner.md")
     if not os.path.isfile(served):
-        return
+        raise unittest.SkipTest('Required roster agent is unavailable')
 
     empty = tempfile.mkdtemp(prefix="summon-emptyroster-")
     try:
@@ -17180,7 +17332,7 @@ def test_v10_strict_agents_dir_refuses_bundled_and_pack_fallbacks():
 
     bundled = _loader.bundled_roster_dir()
     if not bundled or not os.path.isfile(os.path.join(bundled, "planner.md")):
-        return
+        raise unittest.SkipTest('Bundled roster agent is unavailable')
     empty = tempfile.mkdtemp(prefix="summon-strict-roster-")
     pack = tempfile.mkdtemp(prefix="summon-strict-pack-")
     try:
@@ -17526,6 +17678,75 @@ def test_v11_opencode_empty_timeout_is_typed_and_not_auto_retried():
     assert env["remediation_code"] == "opencode_output_timeout", env
     assert "opencode auth login" in env["error"], env
     assert env.get("model_served") is None
+
+
+def test_early_liveness_stop_reports_elapsed_and_stage_not_the_budget():
+    """FIELD REPORT (2026-09-17..23). OpenCode lanes that died 3-15 minutes into a
+    90-minute budget reported "Timeout after 5400000ms", so callers relaunched with a
+    LONGER budget. An early stop must name the elapsed time and the guard that fired;
+    a stop at the budget keeps the historical headline."""
+    from _executor import _timeout_payload
+
+    class _P:
+        def get_result(self):
+            return ""
+
+    early = _timeout_payload("opencode", _P(), 5_400_000, [],
+                             stage="generation_idle_timeout", elapsed_ms=312_000)
+    assert early["error"].startswith("Stopped after 312000ms of a 5400000ms budget"), early
+    assert "went idle" in early["error"] and "longer --timeout" in early["error"]
+    assert "Timeout after" not in early["error"]
+    assert early["timeout"] == {"budget_ms": 5_400_000, "stage": "generation_idle_timeout",
+                                "partial_output": False, "elapsed_ms": 312_000}
+
+    at_budget = _timeout_payload("claude", _P(), 360_000, [],
+                                 stage="overall_timeout", elapsed_ms=360_050)
+    assert at_budget["error"] == "Timeout after 360000ms", at_budget["error"]
+
+
+def test_plain_wall_clock_timeout_keeps_the_documented_stage():
+    """SKILL.md documents `backend-execution` for a subprocess wall-clock timeout."""
+    import subprocess as sp
+    import _executor
+    from _stream import StreamProcessor
+
+    child = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                     stdout=sp.PIPE, stderr=sp.PIPE, stdin=sp.DEVNULL,
+                     **_spawn.run_flags())
+    try:
+        resp = _executor._drive_process_loop(child, "claude", 800, StreamProcessor())
+    finally:
+        # The driver owns the pipes and has already reaped the child; a second
+        # communicate() would race its reader thread.
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+    assert resp["exit_code"] == 124, resp
+    assert resp["timeout"]["stage"] == "backend-execution", resp["timeout"]
+    assert resp["error"] == "Timeout after 800ms", resp["error"]
+
+
+def test_drive_loop_threads_elapsed_time_into_a_startup_stall():
+    """The read loop must hand the real elapsed time to the payload, not only the budget."""
+    import subprocess as sp
+    import _executor
+
+    child = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                     stdout=sp.PIPE, stderr=sp.PIPE, stdin=sp.DEVNULL,
+                     **_spawn.run_flags())
+    try:
+        resp = _executor._drive_process(child, "claude", 60_000, first_event_ms=500)
+    finally:
+        # The driver owns the pipes and has already reaped the child; a second
+        # communicate() would race its reader thread.
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+    assert resp["exit_code"] == 124, resp
+    assert resp["timeout"]["stage"] == "startup_timeout", resp["timeout"]
+    assert resp["timeout"]["elapsed_ms"] < 30_000, resp["timeout"]
+    assert resp["error"].startswith("Stopped after "), resp["error"]
+    assert "no first event" in resp["error"], resp["error"]
 
 
 def test_v10_roster_paths_are_emitted_normalised():
@@ -18771,7 +18992,7 @@ def test_text_seat_blocks_without_opt_in():
                if k not in ("SUMMON_ALLOW_TEXT_ONLY", "SUMMON_REQUIRE_TOOLS")}
         r = sp.run([sys.executable, script, "--agent", "t", "--prompt", "x",
                     "--cwd", d, "--agents-dir", d, "--timeout", "5s"],
-                   capture_output=True, text=True, encoding="utf-8", env=env)
+                   capture_output=True, text=True, encoding="utf-8", env=env, **_spawn.run_flags())
         out = _json.loads(r.stdout)
         assert out["status"] == "blocked", out
         assert out["blocked_reason"] == "text_seat_no_tools", out
@@ -18813,7 +19034,7 @@ def test_text_seat_capability_opts_in_but_warns():
                if k not in ("SUMMON_ALLOW_TEXT_ONLY", "SUMMON_REQUIRE_TOOLS")}
         r = sp.run([sys.executable, script, "--agent", "t", "--prompt", "x",
                     "--cwd", d, "--agents-dir", d, "--timeout", "20s"],
-                   capture_output=True, text=True, encoding="utf-8", env=env)
+                   capture_output=True, text=True, encoding="utf-8", env=env, **_spawn.run_flags())
         out = _json.loads(r.stdout)
         assert out["status"] == "success", out
         assert out["text_seat"]["allowed"] is True
@@ -18837,7 +19058,7 @@ def test_text_seat_require_tools_overrides_opt_in():
         r = sp.run([sys.executable, script, "--agent", "t", "--prompt", "x",
                     "--cwd", d, "--agents-dir", d, "--timeout", "5s",
                     "--allow-text-only", "--require-tools"],
-                   capture_output=True, text=True, encoding="utf-8", env=env)
+                   capture_output=True, text=True, encoding="utf-8", env=env, **_spawn.run_flags())
         out = _json.loads(r.stdout)
         assert out["status"] == "blocked", out
         assert out["blocked_reason"] == "text_seat_no_tools"
@@ -18925,7 +19146,7 @@ def test_text_seat_env_opt_in_and_require_tools():
         env["SUMMON_ALLOW_TEXT_ONLY"] = "1"
         r = sp.run([sys.executable, script, "--agent", "t", "--prompt", "x",
                     "--cwd", d, "--agents-dir", d, "--timeout", "20s"],
-                   capture_output=True, text=True, encoding="utf-8", env=env)
+                   capture_output=True, text=True, encoding="utf-8", env=env, **_spawn.run_flags())
         out = _json.loads(r.stdout)
         assert out["status"] == "success", out
         assert out["text_seat"]["allowed"] is True
@@ -18934,7 +19155,7 @@ def test_text_seat_env_opt_in_and_require_tools():
         env["SUMMON_REQUIRE_TOOLS"] = "1"
         r2 = sp.run([sys.executable, script, "--agent", "t", "--prompt", "x",
                      "--cwd", d, "--agents-dir", d, "--timeout", "5s"],
-                    capture_output=True, text=True, encoding="utf-8", env=env)
+                    capture_output=True, text=True, encoding="utf-8", env=env, **_spawn.run_flags())
         out2 = _json.loads(r2.stdout)
         assert out2["status"] == "blocked", out2
         assert out2["blocked_reason"] == "text_seat_no_tools"
@@ -18976,7 +19197,7 @@ def test_text_seat_background_refuses_in_parent():
         r = sp.run([sys.executable, script, "--agent", "t", "--prompt", "x",
                     "--cwd", d, "--agents-dir", d, "--job-dir", jobs,
                     "--background", "--timeout", "5s"],
-                   capture_output=True, text=True, encoding="utf-8", env=env)
+                   capture_output=True, text=True, encoding="utf-8", env=env, **_spawn.run_flags())
         out = _json.loads(r.stdout)
         assert out["status"] == "blocked", out
         assert out["blocked_reason"] == "text_seat_no_tools"
@@ -19258,10 +19479,11 @@ def test_payg_skipped_when_budget_exhausted():
 
 
 def test_banner_lists_kimi_and_modelark():
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))))
     banner = os.path.join(root, "assets", "banner.svg")
     if not os.path.isfile(banner):
-        return
+        raise unittest.SkipTest('Required banner source is unavailable')
     text = open(banner, encoding="utf-8").read()
     assert "kimi" in text and "modelark" in text
     for name in ("claude", "codex", "cursor", "gemini", "antigravity"):
@@ -19573,20 +19795,33 @@ if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
     failed = 0
+    skipped = 0
+    _collector = sys.modules.get("_summon_release_collector")
+    if _collector:
+        _collector.custom_start(__file__, [t.__name__ for t in tests])
     for t in tests:
         _before = _global_fingerprint()
         _raised = False
+        _outcome, _reason = "passed", None
         try:
             t()
             print(f"[PASS] {t.__name__}")
+        except unittest.SkipTest as e:
+            skipped += 1
+            _outcome, _reason = "skipped", str(e)
+            print(f"[SKIP] {t.__name__}")
         except Exception as e:  # noqa: BLE001 — test harness reports, doesn't raise
             _raised = True
+            _outcome = "failed"
             failed += 1
             print(f"[FAIL] {t.__name__}: {type(e).__name__}: {e}")
         _after = _global_fingerprint()
         _leaked = sorted(k for k in _before
                          if _before[k] is not _after[k] and _before[k] != _after[k])
         if _leaked:
+            if _outcome == "skipped":
+                skipped -= 1
+            _outcome = "failed"
             # Count the TEST, not its symptoms. A test that both raises AND leaks was
             # counted twice, so one broken test inflated `failed` and the printed totals
             # stopped matching the number of tests that ran.
@@ -19595,6 +19830,9 @@ if __name__ == "__main__":
             print(f"[FAIL] {t.__name__}: LEAKED PATCHED GLOBALS {_leaked} -- restore them "
                   f"in a finally, or every test after this one runs against them")
             _repair_global_leaks(_before, _leaked)  # one leak must not become N failures
+        if _collector:
+            _collector.custom_result(__file__, t.__name__, _outcome, _reason)
     print("")
-    print(f"{len(tests) - failed}/{len(tests)} passed")
+    print(f"{len(tests) - failed - skipped}/{len(tests)} passed")
+    print(f"{skipped} skipped")
     sys.exit(1 if failed else 0)

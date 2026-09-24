@@ -7,7 +7,10 @@ skipping it burned us at least once.
 ## The mental model
 
 Sub-agents are **stateless one-shots** (unless you `--resume`). Each dispatch must carry
-complete, self-contained context in `--prompt`. The dispatcher injects the agent
+complete, self-contained context. Through `summon.cmd`, put every dispatch prompt in
+a UTF-8 file and use `--prompt-file`; raw `--prompt` is refused even for simple text.
+This protects the batch input boundary, not every backend's argv transport. The dispatcher
+injects the agent
 definition and `{cwd}/.agents/memory.md` for you — everything else you must say
 explicitly. On any follow-up, pass forward what the previous call learned (its
 `report.handoff`).
@@ -16,15 +19,24 @@ explicitly. On any follow-up, pass forward what the previous call learned (its
 
 1. **Verify before trusting.** Never take `STATUS: DONE` at face value. Read the actual
    diff after every editing agent; rerun targeted tests. Use the parsed `report` /
-   `report_ok` fields and treat `suspect: true` as a re-dispatch signal, not a warning.
+   `report_ok` fields and treat `suspect: true` as unverified work requiring review.
+   Before another attempt, inspect the typed error, provider-contact and spend evidence,
+   and `retryable`. A `retryable: false` result or uncertain contact/spend is not a
+   retry cue; require explicit retry authority and reconcile the existing attempt first.
+   A non-null `model.served` is not sufficient proof: exact identity also requires
+   authoritative `reported` evidence and `named_model_verified: true`.
 2. **Cross-vendor review.** No agent's work is reviewed by its own vendor. A model
    reviewing its own output shares its blind spots. Codex-written code goes to a Claude
    reviewer; Claude/Cursor-written code goes to Codex (`reviewer` / `adversarial-reviewer`).
 3. **Substantive changes get adversarial review** before merge. Bundle small related
    changes and run one adversarial pass over the bundle.
-4. **Resume, don't re-prime.** For a genuine follow-up to the SAME agent, pass the prior
-   `resume.session_id` to `--resume` instead of a fresh call that re-sends the whole
-   agent definition. Parallel *editing* agents each get their own `--worktree`.
+4. **Continue only an eligible session.** A prior `resume.session_id` is a handle, not
+   permission to resume. Check the route, model/profile identity, permission ceiling,
+   and history for compatibility; governed continuation requires authenticated source
+   evidence and fresh spend consent. If that path is unavailable or incompatible,
+   preserve the history and handoff in an explicit fork where supported, or an
+   explicitly authorized fresh task. Do not claim that a fresh call resumed the old
+   session. Parallel *editing* agents each get their own `--worktree`.
 5. **Track every delegation** (agent, backend, model, branch, finding) in your task list.
 
 ## Review-first landing boundary
@@ -54,15 +66,18 @@ HANDOFF: <context the NEXT call needs to continue this work>
 
 The dispatcher parses this into `response["report"]` and sets `report_ok` when the
 bookends are present. **HANDOFF is the chain-link field** — feed it into the next
-dispatch's `--prompt`. A good HANDOFF names: the goal, files touched (+ commit SHA if
-committed), constraints/non-goals, acceptance criteria, and unresolved risks.
+dispatch's context (`--prompt-file` through `summon.cmd`). A good HANDOFF names: the
+goal, files touched (+ commit SHA if committed), constraints/non-goals, acceptance
+criteria, and unresolved risks.
 
 ## Named patterns
 
 **Debate** — two vendors argue, you synthesize.
 Dispatch the same design question to a Claude agent (`planner`) and a Codex agent
-(`reviewer`), 2 rounds each (use `--resume` for round 2, feeding the other side's
-argument). The orchestrator synthesizes; disagreement that survives round 2 is signal.
+(`reviewer`), 2 rounds each. Feed the other side's argument into round 2 and use
+`--resume` only when hard rule 4's eligibility and authority checks pass; otherwise
+make the fork or fresh task explicit. The orchestrator synthesizes; disagreement
+that survives round 2 is signal.
 
 **Async build** — spec → build → cross-review, hands-free.
 1. `planner` writes the spec (claude)
@@ -88,8 +103,10 @@ Put standing project context — conventions, constraints, durable decisions —
 
 ## Billing notes
 
-- The dispatcher strips `OPENAI_API_KEY` from codex children so delegations bill the
-  ChatGPT subscription, never a metered API key left in your env. Opt out with
-  `SUBAGENTS_ALLOW_OPENAI_KEY=1`.
-- `usage` / `cost_usd` come back in every response that the backend reports them for —
-  sum them across a chain to know what an orchestration actually cost.
+- The dispatcher strips `OPENAI_API_KEY` from Codex children by default, so the child
+  uses the selected Codex CLI login. That does not prove a subscription, allowance,
+  credit treatment, or invoice outcome; those remain provider/account facts. Opt out
+  with `SUBAGENTS_ALLOW_OPENAI_KEY=1` when an explicit API-key route is intended.
+- `usage` / `cost_usd` are included only when the backend reports them. They are
+  provider-reported usage or estimates, not a universal invoice or remaining-credit
+  measurement; retain the provider's billing records as authoritative.

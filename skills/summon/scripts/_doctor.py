@@ -761,6 +761,9 @@ def render(report: dict) -> str:
         dr = inst["drift"]
         ref = dr.get("reference_sha")
         managed_ref = dr.get("managed_reference_sha")
+        payload_tracking = bool(dr.get("payload_tracking"))
+        payload_drifted_labels = {item.get("label") for item in dr.get("payload_drifted", ())}
+        payload_unknown_labels = {item.get("label") for item in dr.get("payload_unknown", ())}
         lines += ["", "installs (this machine):"]
         for r in inst["records"]:
             run = " (running)" if r.get("running") else ""
@@ -785,13 +788,31 @@ def render(report: dict) -> str:
                     "unmanaged copy differs; installer will not modify it")
             else:
                 mark, sha, note = "[~?]", r["sha256"][:12], "unverified (no running reference)"
+            if payload_tracking and r.get("present"):
+                label = r.get("label")
+                if label in payload_unknown_labels:
+                    mark = "[~?]"
+                    if r.get("managed"):
+                        note = note + "; payload unknown (missing, linked, unreadable, or oversized)"
+                    else:
+                        note = note + "; unmanaged payload unknown; installer will not modify it"
+                elif label in payload_drifted_labels:
+                    mark = "[~?]"
+                    if r.get("managed"):
+                        note = note + "; DRIFT: installed payload differs from running source; re-run install.py"
+                    else:
+                        note = note + "; unmanaged payload differs; installer will not modify it"
             lines.append(f"  {mark} {r['label']:<10} {sha}  v{ver:<7} {note}{run}")
             lines.append(f"       {r['scripts_dir']}")
         managed_drift = (dr["managed_drifted"] if "managed_drifted" in dr else [
             d for d in (dr.get("drifted") or []) if d.get("managed")])
         managed_unknown = (dr["managed_unknown"] if "managed_unknown" in dr else [
             u for u in (dr.get("unknown") or []) if u.get("managed")])
-        if ref and (managed_drift or managed_unknown):
+        managed_payload_stale = dr.get("managed_payload_stale") or []
+        managed_payload_unknown = dr.get("managed_payload_unknown") or []
+        managed_script_stale = dr.get("managed_script_stale") or []
+        if ref and (managed_drift or managed_unknown or managed_payload_stale
+                    or managed_payload_unknown):
             bits = []
             if managed_drift:
                 bits.append(f"{len(managed_drift)} differ "
@@ -799,19 +820,35 @@ def render(report: dict) -> str:
             if managed_unknown:
                 bits.append(f"{len(managed_unknown)} unhashable "
                             f"({', '.join(u['label'] for u in managed_unknown)})")
+            if managed_script_stale:
+                bits.append(f"{len(managed_script_stale)} differ from running source "
+                            f"({', '.join(u['label'] for u in managed_script_stale)})")
+            if managed_payload_stale:
+                bits.append(f"{len(managed_payload_stale)} payload differ "
+                            f"({', '.join(u['label'] for u in managed_payload_stale)})")
+            if managed_payload_unknown:
+                bits.append(f"{len(managed_payload_unknown)} payload unknown "
+                            f"({', '.join(u['label'] for u in managed_payload_unknown)})")
             lines.append(f"  drift    : {'; '.join(bits)} - run  python install.py  to converge")
         elif dr.get("managed_converged"):
+            source_match = dr.get("managed_source_converged")
             suffix = (" and match the running install"
-                      if dr.get("running_matches_managed")
+                      if source_match
                       else "; the running unmanaged copy differs")
             lines.append("  drift    : all installer-managed copies agree" + suffix)
         unmanaged_drift = (dr["unmanaged_drifted"] if "unmanaged_drifted" in dr else [
             d for d in (dr.get("drifted") or []) if not d.get("managed")])
         unmanaged_unknown = (dr["unmanaged_unknown"] if "unmanaged_unknown" in dr else [
             u for u in (dr.get("unknown") or []) if not u.get("managed")])
-        if unmanaged_drift or unmanaged_unknown:
+        unmanaged_payload_drift = dr.get("unmanaged_payload_drifted") or []
+        unmanaged_payload_unknown = dr.get("unmanaged_payload_unknown") or []
+        if (unmanaged_drift or unmanaged_unknown or unmanaged_payload_drift
+                or unmanaged_payload_unknown):
             labels = [d["label"] for d in unmanaged_drift]
             labels += [u["label"] for u in unmanaged_unknown]
+            labels += [d["label"] for d in unmanaged_payload_drift]
+            labels += [u["label"] for u in unmanaged_payload_unknown]
+            labels = list(dict.fromkeys(labels))
             lines.append("  unmanaged : " + ", ".join(labels)
                          + " differ or cannot be hashed; install.py does not modify "
                            "project/plugin copies (update them only with an explicit owner decision)")
