@@ -70,6 +70,12 @@ def install(packet, *, child=False):
                 refuse(event)
             if command != expected and command != subprocess.list2cmdline(expected):
                 refuse(event)
+        elif event == "os.posix_spawn":
+            # CPython 3.13 on Linux may launch the single authorized child through
+            # posix_spawn; only that exact argv is allowed.
+            expected = launch["command"]
+            if child or expected is None or list(args[1]) != [str(item) for item in expected]:
+                refuse(event)
         elif event.startswith(("socket.", "os.exec", "os.spawn", "os.posix_spawn", "os.fork", "os.startfile")) or event in ("os.system", "pty.spawn"):
             refuse(event)
         elif event in ("ctypes.dlsym", "ctypes.dlsym/handle") or (event == "ctypes.dlopen" and args[0] is not None):

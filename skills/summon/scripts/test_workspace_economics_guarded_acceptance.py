@@ -63,6 +63,13 @@ def _audit(event, args):
     if event == 'open' and args and not isinstance(args[0], int):
         if os.fsdecode(args[0]).lower() == os.devnull.lower():
             return
+        if not Path(os.fsdecode(args[0])).is_absolute():
+            # POSIX descriptor-relative opens (openat with dir_fd, e.g. shutil.rmtree's
+            # safe walk) are audited without their dir_fd; the anchoring directory was
+            # itself opened and checked by absolute path.
+            if '..' in Path(os.fsdecode(args[0])).parts:
+                _denied()
+            return
         path = Path(os.fsdecode(args[0])).resolve()
         flags = args[2] if len(args) > 2 and isinstance(args[2], int) else 0
         writing = any(char in (args[1] or '') for char in 'wax+') or flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
@@ -72,8 +79,16 @@ def _audit(event, args):
             _denied()
     if event in {'os.remove', 'os.rmdir', 'os.mkdir', 'os.rename'}:
         paths = args[:2] if event == 'os.rename' else args[:1]
-        if any(not _inside(Path(os.fsdecode(path)).resolve(), _WRITABLE) for path in paths):
-            _denied()
+        anchored = any(isinstance(item, int) and item >= 0 for item in args[len(paths):])
+        for raw in paths:
+            candidate = Path(os.fsdecode(raw))
+            if candidate.is_absolute():
+                if not _inside(candidate.resolve(), _WRITABLE):
+                    _denied()
+            elif not anchored or '..' in candidate.parts:
+                # POSIX shutil.rmtree/openat work relative to a checked dir_fd;
+                # an unanchored relative path is refused.
+                _denied()
 
 
 sys.addaudithook(_audit)
@@ -138,7 +153,15 @@ def inert(tmp_path, monkeypatch):
             _PROCESSES.append(self)
     monkeypatch.setattr(subprocess, 'Popen', OwnedPopen)
     monkeypatch.setattr(socket.socket, 'connect', _denied)
-    monkeypatch.setattr(os, 'kill', _denied)
+    real_kill = os.kill
+
+    def owned_kill(pid, sig):
+        # POSIX Popen.kill()/terminate() signal through os.kill; only the owned
+        # synthetic children may be signalled.
+        if pid not in {process.pid for process in _PROCESSES}:
+            _denied()
+        return real_kill(pid, sig)
+    monkeypatch.setattr(os, 'kill', owned_kill)
     _HITS.clear(); _PROCESSES.clear(); _WRITABLE = tmp_path.resolve(); _ACTIVE = True
     try:
         yield

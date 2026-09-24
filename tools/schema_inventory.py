@@ -11,7 +11,7 @@ import copy
 import hashlib
 import json
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
 
 
@@ -349,6 +349,16 @@ def _canonical(value: Mapping[str, Any]) -> bytes:
         raise SchemaInventoryError("inventory is not canonical JSON") from exc
 
 
+def _not_portable_relative(value: str) -> bool:
+    """True for a path that is absolute or drive/root-qualified on ANY platform.
+
+    ``Path.is_absolute`` alone is host-specific: on POSIX ``C:/outside.py`` is a
+    "relative" path, so a drive-qualified entry escaped the unsafe-path refusal.
+    """
+    return (PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()
+            or bool(PureWindowsPath(value).drive) or value.startswith(("/", "\\")))
+
+
 def validate_inventory(root: Path = ROOT, value: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Validate source paths, schema literals, and named regression fixtures."""
     root = Path(root).resolve()
@@ -376,7 +386,7 @@ def validate_inventory(root: Path = ROOT, value: Mapping[str, Any] | None = None
                 type(schema) is not str or not schema.startswith("summon.") for schema in schemas):
             raise SchemaInventoryError(f"schema inventory schemas invalid for {name}")
         paths = tuple(entity["producers"]) + tuple(entity["consumers"])
-        if not paths or any(type(path) is not str or Path(path).is_absolute() for path in paths):
+        if not paths or any(type(path) is not str or _not_portable_relative(path) for path in paths):
             raise SchemaInventoryError(f"schema inventory source paths invalid for {name}")
         texts: dict[str, str] = {}
         for relative in paths:
@@ -396,7 +406,7 @@ def validate_inventory(root: Path = ROOT, value: Mapping[str, Any] | None = None
             if type(fixture) not in (tuple, list) or len(fixture) != 2:
                 raise SchemaInventoryError(f"fixture reference is malformed for {name}")
             relative, symbol = fixture
-            if type(relative) is not str or Path(relative).is_absolute() or type(symbol) is not str or not symbol:
+            if type(relative) is not str or _not_portable_relative(relative) or type(symbol) is not str or not symbol:
                 raise SchemaInventoryError(f"fixture reference is unsafe for {name}")
             path = root / relative
             if not path.is_file() or symbol not in path.read_text(encoding="utf-8"):
@@ -438,7 +448,7 @@ def validate_inventory(root: Path = ROOT, value: Mapping[str, Any] | None = None
         authority = reader["authority"]
         fixtures = reader["fixtures"]
         if (type(name) is not str or not name or name in reader_names or
-                type(relative) is not str or Path(relative).is_absolute() or
+                type(relative) is not str or _not_portable_relative(relative) or
                 type(authority) is not str or not authority):
             raise SchemaInventoryError("legacy reader identity is invalid")
         if not (root / relative).is_file():
@@ -449,7 +459,7 @@ def validate_inventory(root: Path = ROOT, value: Mapping[str, Any] | None = None
             if type(fixture) not in (tuple, list) or len(fixture) != 2:
                 raise SchemaInventoryError(f"legacy reader fixture is malformed: {name}")
             fixture_path, symbol = fixture
-            if (type(fixture_path) is not str or Path(fixture_path).is_absolute() or
+            if (type(fixture_path) is not str or _not_portable_relative(fixture_path) or
                     type(symbol) is not str or not symbol):
                 raise SchemaInventoryError(f"legacy reader fixture is unsafe: {name}")
             path = root / fixture_path

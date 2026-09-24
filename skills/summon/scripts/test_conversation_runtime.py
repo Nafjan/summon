@@ -230,8 +230,10 @@ class ConversationRuntimeTests(unittest.TestCase):
         # Inspecting an old session-wide record must not create the newer
         # participant-scoped directory or silently establish a second owner.
         self.assertFalse((legacy_dir / "worker").exists())
-        self.assertEqual(list((self.root / ".chat-runtime").glob("room-1/*")),
-                         [legacy_dir / "turn-turn-legacy.json"])
+        # Resolve both sides: CI temp roots can be 8.3 short names (RUNNER~1).
+        self.assertEqual(
+            [path.resolve() for path in (self.root / ".chat-runtime").glob("room-1/*")],
+            [(legacy_dir / "turn-turn-legacy.json").resolve()])
 
     def test_process_record_version_must_be_exact_integer_before_recovery_probe(self):
         path = self.base / "process-record.json"

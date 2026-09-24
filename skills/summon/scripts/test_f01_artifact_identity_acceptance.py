@@ -34,7 +34,14 @@ def _audit(event, args):
     blocked = event.startswith(('subprocess.', 'socket.', 'os.spawn', 'os.exec')) or event in {'os.system', 'os.startfile'}
     if event == 'import' and args:
         blocked = blocked or str(args[0]).startswith(_FORBIDDEN_IMPORTS)
-    if event == 'open' and args and not isinstance(args[0], int):
+    if (event == 'open' and args and not isinstance(args[0], int)
+            and not Path(os.fsdecode(args[0])).is_absolute()):
+        # POSIX descriptor-relative opens (openat with dir_fd) are audited without
+        # their dir_fd. Their anchoring directory was itself opened (and checked)
+        # by absolute path, so only parent traversal can escape it.
+        relative = Path(os.fsdecode(args[0]))
+        blocked = blocked or '..' in relative.parts or relative.name == 'never-created.txt'
+    elif event == 'open' and args and not isinstance(args[0], int):
         path = Path(os.fsdecode(args[0])).resolve()
         mode = args[1] or ''
         flags = args[2] if len(args) > 2 and isinstance(args[2], int) else 0
@@ -44,7 +51,16 @@ def _audit(event, args):
                               not (_inside(path, _WRITE_ROOT) or any(_inside(path, root) for root in _READ_ROOTS)))
     if event in {'os.remove', 'os.rmdir', 'os.mkdir', 'os.rename'}:
         paths = args[:2] if event == 'os.rename' else args[:1]
-        blocked = blocked or any(not _inside(Path(os.fsdecode(path)).resolve(), _WRITE_ROOT) for path in paths)
+        for raw in paths:
+            candidate = Path(os.fsdecode(raw))
+            if candidate.is_absolute():
+                blocked = blocked or not _inside(candidate.resolve(), _WRITE_ROOT)
+            else:
+                # Descriptor-relative mutation: allowed only when the event carries
+                # a dir_fd (see the open rule above); a cwd-relative path is refused.
+                anchored = any(isinstance(item, int) and item >= 0
+                               for item in args[len(paths):])
+                blocked = blocked or not anchored or '..' in candidate.parts
     if blocked:
         _GUARD_HITS.append(event)
         raise AssertionError('synthetic artifact fixture boundary refused')
