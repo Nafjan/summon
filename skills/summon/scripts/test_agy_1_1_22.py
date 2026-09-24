@@ -692,7 +692,7 @@ def test_lock_of_a_dead_owner_is_stolen_without_waiting_for_the_stale_window(
         monkeypatch, agy_probe_env):
     """An owner killed mid-probe must not hold every agy dispatch for ~150s."""
     import time
-    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child = subprocess.Popen([sys.executable, "-c", "pass"], **_spawn.popen_flags())
     child.wait()
     lock = Path(str(agy_probe_env) + ".lock")
     lock.write_text(f"{child.pid}:{'0' * 32}", encoding="ascii")  # fresh mtime
