@@ -72,7 +72,13 @@ def install(packet, *, child=False):
                 refuse(event)
         elif event.startswith(("socket.", "os.exec", "os.spawn", "os.posix_spawn", "os.fork", "os.startfile")) or event in ("os.system", "pty.spawn", "os.kill", "os.killpg"):
             refuse(event)
-        elif event in ("ctypes.dlsym", "ctypes.dlsym/handle") or (event == "ctypes.dlopen" and args[0] is not None):
+        elif event in ("ctypes.dlsym", "ctypes.dlsym/handle"):
+            # Linux no-replace workspace publication resolves exactly one libc
+            # symbol from the main program; every other lookup stays denied.
+            if not (event == "ctypes.dlsym" and len(args) > 1 and args[1] == "renameat2"
+                    and getattr(args[0], "_name", object()) is None):
+                refuse(event)
+        elif event == "ctypes.dlopen" and args[0] is not None:
             refuse(event)
         elif event.startswith("winreg."):
             refuse(event)

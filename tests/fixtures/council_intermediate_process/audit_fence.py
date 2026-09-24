@@ -90,6 +90,21 @@ def install(packet, *, child=False):
             descriptors.pop(fd, None)
     os.open, os.close = owned_open, owned_close
     sys.addaudithook(audit)
+    if os.name != "nt":
+        # POSIX counterpart of the CreatePipe/open_osfhandle wrap below: the only
+        # pipes this process may create are the ones subprocess makes for the single
+        # authorized launch, and they become owned descriptors.
+        real_os_pipe = os.pipe
+
+        def owned_pipe():
+            if child or launch["command"] is None:
+                refuse("os.pipe")
+            read_fd, write_fd = real_os_pipe()
+            descriptors[read_fd] = packet / "owned-child-pipe"
+            descriptors[write_fd] = packet / "owned-child-pipe"
+            return read_fd, write_fd
+
+        os.pipe = owned_pipe
     if os.name == "nt":
         import _winapi
         import msvcrt

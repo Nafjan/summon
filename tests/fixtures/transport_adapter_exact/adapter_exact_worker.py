@@ -20,6 +20,7 @@ def owned_popen(cmd,*args,**kwargs):
   AUDIT_LAUNCH['command']=cmd
   try:proc=REAL_POPEN(cmd,*args,**kwargs)
   finally:AUDIT_LAUNCH['command']=None
+ AUDIT_LAUNCH['pids'].add(proc.pid)
  CHILDREN.append(proc);return proc
 GUARDS.enter_context(mock.patch.object(subprocess,'Popen',side_effect=owned_popen))
 GUARDS.enter_context(mock.patch.object(os,'system',side_effect=forbidden))

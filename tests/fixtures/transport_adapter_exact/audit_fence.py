@@ -12,7 +12,7 @@ def install(packet, *, child=False):
     public = tuple({Path(sys.base_prefix).resolve(), Path(sys.prefix).resolve()})
     denied = []
     descriptors = {}
-    launch = {"command": None}
+    launch = {"command": None, "pids": set()}
 
     def refuse(event):
         denied.append(event)
@@ -70,7 +70,12 @@ def install(packet, *, child=False):
                 refuse(event)
             if command != expected and command != subprocess.list2cmdline(expected):
                 refuse(event)
-        elif event.startswith(("socket.", "os.exec", "os.spawn", "os.posix_spawn", "os.fork", "os.startfile")) or event in ("os.system", "pty.spawn", "os.kill", "os.killpg"):
+        elif event in ("os.kill", "os.killpg"):
+            # Only the owned children this fence authorized may be signalled (their
+            # process group id equals their pid under start_new_session).
+            if child or args[0] not in launch["pids"]:
+                refuse(event)
+        elif event.startswith(("socket.", "os.exec", "os.spawn", "os.posix_spawn", "os.fork", "os.startfile")) or event in ("os.system", "pty.spawn"):
             refuse(event)
         elif event in ("ctypes.dlsym", "ctypes.dlsym/handle") or (event == "ctypes.dlopen" and args[0] is not None):
             refuse(event)
@@ -90,6 +95,21 @@ def install(packet, *, child=False):
             descriptors.pop(fd, None)
     os.open, os.close = owned_open, owned_close
     sys.addaudithook(audit)
+    if os.name != "nt":
+        # POSIX counterpart of the CreatePipe/open_osfhandle wrap below: the only
+        # pipes this process may create are the ones subprocess makes for the single
+        # authorized launch, and they become owned descriptors.
+        real_os_pipe = os.pipe
+
+        def owned_pipe():
+            if child or launch["command"] is None:
+                refuse("os.pipe")
+            read_fd, write_fd = real_os_pipe()
+            descriptors[read_fd] = packet / "owned-child-pipe"
+            descriptors[write_fd] = packet / "owned-child-pipe"
+            return read_fd, write_fd
+
+        os.pipe = owned_pipe
     if os.name == "nt":
         import _winapi
         import msvcrt

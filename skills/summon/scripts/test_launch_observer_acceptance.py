@@ -113,6 +113,17 @@ def test_version_probe_environment_isolated_from_provider_credentials(tmp_path):
     assert env["SUMMON_VERSION_PROBE"] == "1"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows launch plumbing")
+def test_version_probe_environment_restores_windows_system_root(tmp_path):
+    """A caller environment without SYSTEMROOT must still start a child interpreter
+    (Python 3.10 cannot initialize without it; CI caught every probe failing)."""
+    env = _version_environment({"PATH": ""}, str(tmp_path))
+    assert env["SYSTEMROOT"] == os.environ["SYSTEMROOT"]
+    # An explicit caller value wins over the ambient one.
+    env = _version_environment({"SystemRoot": r"X:\custom"}, str(tmp_path))
+    assert env["SystemRoot"] == r"X:\custom" and "SYSTEMROOT" not in env
+
+
 def test_bounded_version_output_marks_overflow_without_unbounded_buffer():
     class Stream:
         def __init__(self):

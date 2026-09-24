@@ -215,8 +215,14 @@ def test_managed_background_launch_rechecks_install_lock_after_lease(monkeypatch
         checks = {"count": 0}
         original_lexists = _background.os.path.lexists
 
+        def same_path(left, right):
+            # CI temp roots can be 8.3 short names (RUNNER~1) that the dispatcher
+            # resolves to their long form before probing the lock.
+            return (os.path.normcase(os.path.realpath(left))
+                    == os.path.normcase(os.path.realpath(right)))
+
         def install_race(path):
-            if path == install_lock:
+            if same_path(path, install_lock):
                 checks["count"] += 1
                 if checks["count"] == 2:
                     with open(install_lock, "w", encoding="utf-8") as fh:

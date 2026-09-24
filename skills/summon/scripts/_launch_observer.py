@@ -195,6 +195,14 @@ def _version_environment(proc_env: Mapping[str, object] | None,
     env["XDG_DATA_HOME"] = isolated_home
     env["XDG_CACHE_HOME"] = isolated_home
     env["SUMMON_VERSION_PROBE"] = "1"
+    if os.name == "nt":
+        # Windows launch plumbing, never credentials: without SYSTEMROOT a child
+        # interpreter (Python <=3.10) cannot even initialize its RNG and exits
+        # before printing a version, which read as a failed probe.
+        present = {key.upper() for key in env}
+        for key in ("SYSTEMROOT", "WINDIR"):
+            if key not in present and os.environ.get(key):
+                env[key] = os.environ[key]
     return env
 
 
