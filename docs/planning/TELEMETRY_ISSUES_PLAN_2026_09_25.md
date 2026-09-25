@@ -92,3 +92,45 @@ model pins and unproven safe-edit).
   exact-model gate correctly refused (`AR350-07`).
 - No historical spend claims for the api-billed window (owner checks the
   console; telemetry records the exposure, not the charges).
+
+
+## Review revisions (5-seat panel, 2026-09-25)
+
+Reviewed by kimi-worker (Kimi K3, ACP), flash-reviewer + panel-skeptic (AGY
+Gemini Flash 3.8), deepseek-r8-review (Coding Plan V4 Pro), and
+panel-deepseek-flash-or (OpenRouter V4.1 Flash). All five returned CONCERNS
+with convergent findings; the plan is revised accordingly:
+
+1. **P0 addition (blocking, all five seats)**: the billing guard is not done
+   until it reaches executing copies — review+commit must be followed by
+   `python install.py` and the manual `.zcode` copy refresh. All managed
+   copies currently evaluate `/api/v3` as `requires_spend: false`.
+2. **P0 re-sequencing (kimi, r8, panel-or, skeptic)**: quarantine or
+   consent-gate the two platform seats FIRST (stop-loss); correlation and the
+   owner console check run in parallel (read-only); seat deletion comes last,
+   after a dependency audit (roster references, catalog pins, saved dispatch
+   configs) and only with an owner decision. Converting to `byteplus-coding`
+   may trip the exact-model gate (AR350-07 dated-vs-unversioned identity) —
+   test before converting.
+3. **Root-cause correction (all five)**: the claim that the kimi ACP flip
+   "removed the largest known hang" is contradicted by chronology — unknowns
+   peaked at 90 on Sep 23, the day AFTER the flip, on the heaviest ModelArk
+   day. Lead hypothesis is now: unknowns concentrate on metered-route heavy
+   usage; the ACP fix addresses approval hangs only (single 34s test).
+4. **P1 additions (all five)**: three dropped cohorts get triage actions —
+   111 blocked events (classify by refusal gate), 49 partial events (cut-off
+   and schema-failure analysis), and 67 `billing_source: unknown` events
+   (classify by endpoint; a hole in exactly the evidence surface the billing
+   guard depends on). Plus a dispatcher-level fix so interrupted dispatches
+   terminate with a typed envelope instead of `exit_code: None`.
+5. **TIME1 promoted**: 14 timeouts recorded no stage; the telemetry schema
+   gap itself gets an action, not just the seats.
+6. **Corrections**: missing_cli is "identified and pending", not resolved
+   (2 events on Sep 22; ~3 days of post-fix data); the api accounting is
+   151 success + 75 unknown + 29 error + 2 partial = 257 (reconciliation
+   includes partials); a residual bypass exists while
+   `SUMMON_ALLOW_BYTEPLUS_PAYG=1` or a saved operator preference is set;
+   success criterion for the unknown-rate re-measure: below 5% of dispatches
+   over a 7-day window.
+7. **ZCODE1 demoted** to the 3.5.1 backlog (over-weighted in this doc per
+   flash-reviewer); the investigation findings above stand.
