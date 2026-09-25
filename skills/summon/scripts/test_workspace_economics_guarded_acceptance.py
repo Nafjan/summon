@@ -187,6 +187,47 @@ def inert(tmp_path, monkeypatch):
 
 
 
+def test_snapshot_accepts_concurrent_append_after_caller_sampled_now(tmp_path):
+    """Field race (2026-09-25, ~1 in 14 WSL runs): a separate worker process
+    appends to the journal after the caller sampled now_ms; the snapshot must
+    treat that record as current activity, not a forged future event."""
+    from _workspace_demo import ConductorDemo
+    demo = ConductorDemo(tmp_path / "workspaces")
+    try:
+        setup = demo.supervisor_message_setup()
+        coordinator = demo.runtime._coordinator
+        state, torn, raw_map = coordinator._load_with_snapshot()
+        records, records_torn, records_raw = coordinator._read_records_snapshot()
+        assert not torn and not records_torn and records_raw == raw_map
+        _KINDS = {"workspace_message_admitted", "workspace_message_sent",
+                  "workspace_operator_message_sent", "workspace_supervisor_message_sent"}
+
+        def _rate_kind(record):
+            nested = record.get("workspace_event")
+            if not isinstance(nested, dict) or nested.get("event") not in _KINDS:
+                return False
+            payload = nested.get("payload")
+            message = payload.get("message") if isinstance(payload, dict) else None
+            content = message.get("content") if isinstance(message, dict) else None
+            return (isinstance(record.get("observed_at_ms"), int)
+                    and isinstance(content, dict)
+                    and isinstance(content.get("utf8_bytes"), int))
+
+        stamped = [r for r in records if _rate_kind(r)]
+        assert stamped
+        caller_now = max(r["observed_at_ms"] for r in stamped)
+        concurrent = copy.deepcopy(max(stamped, key=lambda r: r["observed_at_ms"]))
+        concurrent["observed_at_ms"] = caller_now + 5_000
+        records.append(concurrent)
+        snapshot = coordinator.workspace_budget_snapshot(
+            state=state, raw_map=raw_map, records=records, now_ms=caller_now)
+        assert snapshot["now_ms"] >= caller_now + 5_000
+        assert any(item["at_ms"] == caller_now + 5_000
+                   for item in snapshot["rate_events"])
+    finally:
+        demo.cleanup()
+
+
 @pytest.mark.parametrize('method', [
     'test_v2_economics_path_derives_policy_bound_reservation_and_settles',
     'test_v2_economics_covers_full_turn_settlement_reopen_and_indeterminate_hold',

@@ -2415,6 +2415,15 @@ class SwarmCoordinator:
                 continue
             rate_events.append({"at_ms": observed, "messages": 1,
                                 "bytes": content["utf8_bytes"]})
+        latest_observed = max((item["at_ms"] for item in rate_events), default=None)
+        if (now_ms is not None and latest_observed is not None
+                and latest_observed > captured_now):
+            # A concurrent worker process appended to the journal after the
+            # caller sampled its clock (field race 2026-09-25, ~1 in 14 WSL
+            # runs). The snapshot's bound moves to the newest journal activity
+            # this snapshot actually read; a rate event beyond that bound is
+            # still a forged future event and fails validation downstream.
+            captured_now = latest_observed
         snapshot = {
             "schema": budget.SNAPSHOT_SCHEMA,
             "now_ms": captured_now,
