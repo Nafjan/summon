@@ -221,9 +221,28 @@ def test_snapshot_accepts_concurrent_append_after_caller_sampled_now(tmp_path):
         records.append(concurrent)
         snapshot = coordinator.workspace_budget_snapshot(
             state=state, raw_map=raw_map, records=records, now_ms=caller_now)
-        assert snapshot["now_ms"] >= caller_now + 5_000
+        assert snapshot["now_ms"] == caller_now + 5_000
         assert any(item["at_ms"] == caller_now + 5_000
                    for item in snapshot["rate_events"])
+
+        # RX-01 negative pin: a concurrent append beyond the skew tolerance is
+        # NOT absorbed -- the bound stays at the caller's clock and the budget
+        # gate keeps refusing the record as a forged future event.
+        import _workspace_budget as budget
+        far = copy.deepcopy(concurrent)
+        far["observed_at_ms"] = caller_now + 60_000
+        records.append(far)
+        # The builder validates internally: a beyond-tolerance record refuses
+        # the whole snapshot (fail closed) instead of being absorbed. The
+        # refusal carries the field signature: SwarmBudgetRefusal wrapping the
+        # WorkspaceBudgetError cause (budget_binding_required).
+        from _swarm_coordinator import SwarmBudgetRefusal
+        with pytest.raises(SwarmBudgetRefusal, match="budget_binding_required"):
+            coordinator.workspace_budget_snapshot(
+                state=state, raw_map=raw_map, records=records, now_ms=caller_now)
+        with pytest.raises(budget.WorkspaceBudgetError, match="from the future"):
+            budget._rate_event({"at_ms": caller_now + 60_000, "messages": 1,
+                                "bytes": 1}, now_ms=caller_now)
     finally:
         demo.cleanup()
 
