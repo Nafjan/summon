@@ -123,6 +123,12 @@ with convergent findings; the plan is revised accordingly:
    (classify by endpoint; a hole in exactly the evidence surface the billing
    guard depends on). Plus a dispatcher-level fix so interrupted dispatches
    terminate with a typed envelope instead of `exit_code: None`.
+   The telemetry spool is bounded and trims oldest events: counts cited in
+   this plan are as of the 2026-09-25 analysis snapshot and the live file
+   already differs -- cite the aggregate export plus its capture time, never
+   re-derive totals from the rolling file later. `model_match: None` covers
+   ~77% of events (no authoritative served identity) -- governance backlog:
+   exact-evidence coverage before telemetry governs model spend.
 5. **TIME1 promoted**: 14 timeouts recorded no stage; the telemetry schema
    gap itself gets an action, not just the seats.
 6. **Corrections**: missing_cli is "identified and pending", not resolved
