@@ -231,6 +231,11 @@ def test_snapshot_accepts_concurrent_append_after_caller_sampled_now(tmp_path):
                              if item["at_ms"] >= caller_now]
         assert concurrent_events, "the clamped concurrent append vanished"
         assert all(item["at_ms"] <= caller_now for item in concurrent_events)
+        # R2-RR-04: the clamped event must carry its real count payload -- a
+        # regression that zeroed messages/bytes would slip a presence-only pin.
+        source_bytes = concurrent["workspace_event"]["payload"]["message"]["content"]["utf8_bytes"]
+        assert concurrent_events[0]["messages"] == 1
+        assert concurrent_events[0]["bytes"] == source_bytes
 
         # The low-level future gate still refuses detached fabricated events.
         import _workspace_budget as budget
