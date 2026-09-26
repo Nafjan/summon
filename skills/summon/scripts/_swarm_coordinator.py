@@ -2298,12 +2298,6 @@ class SwarmCoordinator:
         return {"phase": "observational", **copy.deepcopy(result),
                 "result_sha256": budget.result_sha256(result)}
 
-    # Concurrent-append skew absorbed by workspace_budget_snapshot before a
-    # stale caller clock turns current journal activity into a forged future
-    # event. Beyond this bound the snapshot keeps the caller's clock and the
-    # rate event fails validation (documented, not silent).
-    _BUDGET_NOW_SKEW_TOLERANCE_MS = 30_000
-
     def workspace_budget_snapshot(self, *, state=None, raw_map=None, records=None,
                                   now_ms: int | None = None,
                                   exclude_message_id: str | None = None,
@@ -2419,20 +2413,9 @@ class SwarmCoordinator:
                 continue
             if exclude_message_id is not None and isinstance(message, Mapping) and message.get("message_id") == exclude_message_id:
                 continue
-            rate_events.append({"at_ms": observed, "messages": 1,
+            rate_events.append({"at_ms": min(observed, captured_now),
+                                "messages": 1,
                                 "bytes": content["utf8_bytes"]})
-        latest_observed = max((item["at_ms"] for item in rate_events), default=None)
-        if (now_ms is not None and latest_observed is not None
-                and latest_observed > captured_now):
-            # A concurrent worker process appended to the journal after the
-            # caller sampled its clock (field race 2026-09-25, ~1 in 14 WSL
-            # runs). Skew within the tolerance is current activity: the
-            # snapshot's bound moves to the newest journal activity this
-            # snapshot actually read. Beyond the tolerance the record is not
-            # absorbed -- the unadvanced bound keeps it a forged future event
-            # and validation fails closed downstream.
-            if latest_observed - captured_now <= self._BUDGET_NOW_SKEW_TOLERANCE_MS:
-                captured_now = latest_observed
         snapshot = {
             "schema": budget.SNAPSHOT_SCHEMA,
             "now_ms": captured_now,
@@ -3453,6 +3436,11 @@ class SwarmCoordinator:
             event = admission.build_operator_send_event(checked, final, descriptor, current["workspace"])
             admission.validate_operator_send(event, coordinator_state=current,
                 workspace_state=current["workspace"], now_ms=now)
+
+            # Re-sample the clock after the trusted resolver callback: a slow
+            # resolver must not widen the sample-to-read gap enough to turn a
+            # genuinely concurrent append into a forged future event.
+            now = _now_ms(self.clock)
 
             def final_constraint(snapshot):
                 return resolve(snapshot) == final
