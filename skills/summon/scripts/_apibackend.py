@@ -276,17 +276,44 @@ def coding_plan_model_guidance(*, refresh_if_stale: bool = False) -> str:
     )
 
 
+def _byteplus_subscription_host(base_url: str | None) -> bool:
+    """True when the URL host is a documented BytePlus ModelArk host.
+
+    Hostnames are casefolded and a single trailing dot (the DNS root
+    spelling) is stripped before matching; the path is percent-decoded and
+    dot-segment-resolved so spelling variants cannot dodge classification
+    (R2-KM-02)."""
+    if not isinstance(base_url, str) or not base_url:
+        return False
+    from urllib.parse import urlsplit, unquote
+    import posixpath
+    try:
+        parts = urlsplit(base_url)
+        host = (parts.hostname or "").casefold().rstrip(".")
+        path = posixpath.normpath(unquote(parts.path or "/"))
+    except ValueError:
+        return False
+    if not path.startswith("/"):
+        path = "/" + path
+    host_ok = (host == "bytepluses.com" or host.endswith(".bytepluses.com")
+               or host == "volces.com" or host.endswith(".volces.com"))
+    path_ok = (path.casefold().rstrip("/") in ("/api/coding", "/api/coding/v3",
+                                               "/api/coding/paas/v4"))
+    return host_ok and path_ok
+
+
 def is_coding_plan_endpoint(base_url: str | None) -> bool:
     """True when the OpenAI-compat base URL is a BytePlus Coding Plan path.
 
     Matches on the URL *path* only (not query/fragment) so a PAYG URL cannot
-    spoof Coding Plan detection via ``?x=/api/coding``.
+    spoof Coding Plan detection via ``?x=/api/coding``. Restricted to
+    documented BytePlus ModelArk hosts: any other host carrying
+    ``/api/coding`` is untrusted spelling, not a Coding Plan endpoint
+    (R2-KM-03).
     """
     if not base_url:
         return False
-    from urllib.parse import urlsplit
-    path = (urlsplit(base_url).path or "").lower()
-    return "/api/coding" in path
+    return _byteplus_subscription_host(base_url)
 
 
 def is_zai_coding_plan_endpoint(base_url: str | None) -> bool:
@@ -321,6 +348,130 @@ def coding_plan_billing(base_url: str | None) -> dict | None:
         "source": "subscription",
         "note": "BytePlus Coding Plan (/api/coding/) - draws from subscription "
                 "quota, not per-token API credits",
+    }
+
+
+def _byteplus_route_parts(base_url: str | None) -> tuple[str, str] | None:
+    """Canonical (host, path) for BytePlus route classification.
+
+    One normalization shared by every BytePlus predicate (R3-KM-01): the
+    hostname is casefolded with DNS trailing dots stripped, and the path is
+    percent-decoded and dot-segment-resolved so spelling variants cannot dodge
+    classification. The path keeps its trailing slash."""
+    if not isinstance(base_url, str) or not base_url:
+        return None
+    from urllib.parse import urlsplit, unquote
+    import posixpath
+    try:
+        parts = urlsplit(base_url)
+        host = (parts.hostname or "").casefold().rstrip(".")
+        path = posixpath.normpath(unquote(parts.path or "/"))
+    except ValueError:
+        return None
+    if not path.startswith("/"):
+        path = "/" + path
+    path = path.casefold()
+    return host, path
+
+
+def _is_byteplus_modelark_host(base_url: str | None) -> bool:
+    """True when the URL host is a documented BytePlus ModelArk host."""
+    parts = _byteplus_route_parts(base_url)
+    if parts is None:
+        return False
+    host, _path = parts
+    return (host == "bytepluses.com" or host.endswith(".bytepluses.com")
+            or host == "volces.com" or host.endswith(".volces.com"))
+
+
+def is_byteplus_platform_endpoint(base_url: str | None) -> bool:
+    """Recognize documented BytePlus Platform PAYG chat endpoints."""
+    parts = _byteplus_route_parts(base_url)
+    if parts is None:
+        return False
+    host, path = parts
+    return (host == "bytepluses.com" or host.endswith(".bytepluses.com")
+            or host == "volces.com" or host.endswith(".volces.com")) and path.rstrip("/") == "/api/v3"
+
+
+def classify_openai_compat_route(base_url: str | None,
+                                 api_key_env: str | None = None, *,
+                                 payg_authorized: bool = False,
+                                 payg_source: str = "none") -> dict:
+    """Return provider-inert billing and spend facts for a direct API route.
+
+    A direct OpenAI-compatible endpoint is an explicit route choice, but its
+    billing class still needs to be visible to the decision receipt. Coding
+    Plan paths are subscription-backed; loopback endpoints are local; a
+    remote HTTP endpoint is metered API territory unless a reviewed billing
+    classification is available. A remote route without a declared key is
+    intentionally *not* authorized: unknown spend remains fail-closed.
+
+    This helper does not read credentials or contact a provider. For the
+    documented BytePlus Platform endpoint, selecting a route and declaring a
+    key do not grant PAYG consent; that route requires the operator-only
+    consent surface.
+    """
+    if coding_plan_billing(base_url):
+        return {
+            "source": "subscription",
+            "requires_spend": False,
+            "authorized": False,
+            "authorization_source": "none",
+        }
+    # Non-ModelArk hosts carrying /api/coding spellings fall through to the
+    # generic metered branch below: the subscription classification is
+    # host-gated (R2-KM-03), so untrusted spelling cannot project as
+    # subscription-backed.
+    if is_byteplus_platform_endpoint(base_url):
+        source = (payg_source if payg_source in {
+            "dispatch_flag", "operator_configuration"} else "none")
+        credential_declared = (isinstance(api_key_env, str)
+                               and bool(api_key_env.strip()))
+        authorized = bool(payg_authorized and source != "none"
+                          and credential_declared)
+        return {
+            "source": "api",
+            "requires_spend": True,
+            "authorized": authorized,
+            "authorization_source": source if authorized else "none",
+            "requires_payg_consent": True,
+        }
+    if not isinstance(base_url, str) or not base_url.strip():
+        return {
+            "source": "unknown",
+            "requires_spend": True,
+            "authorized": False,
+            "authorization_source": "none",
+        }
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(base_url)
+        scheme = (parts.scheme or "").casefold()
+        host = (parts.hostname or "").casefold()
+    except ValueError:
+        scheme, host = "", ""
+    if scheme not in {"http", "https"} or not host:
+        return {
+            "source": "unknown",
+            "requires_spend": True,
+            "authorized": False,
+            "authorization_source": "none",
+        }
+    if host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".localhost"):
+        return {
+            "source": "local",
+            "requires_spend": False,
+            "authorized": False,
+            "authorization_source": "none",
+        }
+    authorized = isinstance(api_key_env, str) and bool(api_key_env.strip())
+    return {
+        "source": "api",
+        "requires_spend": True,
+        "authorized": authorized,
+        "authorization_source": "explicit_endpoint" if authorized else "none",
+        "requires_payg_consent": False,
     }
 
 
@@ -394,6 +545,11 @@ _PAYG_CONSENT_SURFACES = (
     "set SUMMON_ALLOW_BYTEPLUS_PAYG=1, or add "
     '{"allow_byteplus_payg": true} to ~/.agents/summon.json, '
     "or pass --allow-payg (single dispatch only)"
+)
+
+_DIRECT_PAYG_CONSENT_ERROR = (
+    "BytePlus Platform /api/v3 is a per-token PAYG route and requires explicit "
+    f"operator consent. To authorize this route: {_PAYG_CONSENT_SURFACES}"
 )
 
 
@@ -596,6 +752,16 @@ def call(inv, timeout_ms: int, *, launch_control=None,
     _cp_model = coding_plan_model_error(inv.base_url, inv.model)
     if _cp_model:
         return _preflight_error(_cp_model)
+    if (is_byteplus_platform_endpoint(inv.base_url)
+            and not payg_consent_allowed(getattr(inv, "allow_payg", False))):
+        return _preflight_error(
+            _DIRECT_PAYG_CONSENT_ERROR, error_kind="payg_consent_missing")
+    if (is_byteplus_platform_endpoint(inv.base_url)
+            and (not isinstance(inv.api_key_env, str)
+                 or not inv.api_key_env.strip())):
+        return _preflight_error(
+            "BytePlus Platform /api/v3 requires a declared api_key_env",
+            error_kind="credential_missing")
 
     api_key, _key_source = resolve_api_credential(
         inv.api_key_env, inv.base_url)

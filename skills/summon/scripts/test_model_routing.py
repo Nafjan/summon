@@ -122,6 +122,9 @@ class ModelRoutingTests(unittest.TestCase):
     def test_dry_run_refuses_openai_compat_dispatch_with_missing_credential(self):
         # FF-01: pins the dry-run credential gate itself -- deleting the
         # _dry_run_view credential block must fail this test.
+        # This fixture deliberately models the metered Platform /api/v3 route.
+        # It is not a shipped Coding Plan seat; those definitions use the
+        # byteplus-coding provider and /api/coding/v3.
         import os as _os
         with tempfile.TemporaryDirectory() as cwd:
             invocation = AgentInvocation(
@@ -129,7 +132,8 @@ class ModelRoutingTests(unittest.TestCase):
                 permission="read-only",
                 model="deepseek-v4-1-flash-260910",
                 base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
-                api_key_env="SUMMON_TEST_MISSING_MODELARK_KEY")
+                api_key_env="SUMMON_TEST_MISSING_MODELARK_KEY",
+                allow_payg=True)
             args = SimpleNamespace(
                 agent="deepseek-41-flash", _resolved_agent="deepseek-41-flash",
                 strict_agents_dir=False, timeout=1000, worktree=None,
@@ -154,7 +158,8 @@ class ModelRoutingTests(unittest.TestCase):
                 permission="read-only",
                 model="deepseek-v4-1-flash-260910",
                 base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
-                api_key_env="SUMMON_TEST_MISSING_MODELARK_KEY")
+                api_key_env="SUMMON_TEST_MISSING_MODELARK_KEY",
+                allow_payg=True)
             env = {k: v for k, v in os.environ.items()
                    if k != "SUMMON_TEST_MISSING_MODELARK_KEY"}
             with mock.patch.dict(os.environ, env, clear=True),                     mock.patch("_apibackend._do_request") as request:
@@ -164,6 +169,122 @@ class ModelRoutingTests(unittest.TestCase):
             self.assertIn("SUMMON_TEST_MISSING_MODELARK_KEY",
                           str(response.get("error")))
             request.assert_not_called()
+
+    def test_direct_platform_payg_refuses_before_credential_or_provider_contact(self):
+        import _apibackend
+        invocation = AgentInvocation(
+            cli="openai-compat", prompt="probe", cwd=".",
+            permission="read-only", model="deepseek-v4-1-flash-260910",
+            base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
+            api_key_env="MODELARK_API_KEY", allow_payg=False)
+        with mock.patch.object(_apibackend, "payg_consent_allowed",
+                               return_value=False), \
+                mock.patch.object(_apibackend, "resolve_api_credential") as resolve, \
+                mock.patch.object(_apibackend, "_do_request") as request:
+            response = _apibackend.call(invocation, 1000)
+        self.assertEqual(response.get("error_kind"), "payg_consent_missing")
+        self.assertFalse(response.get("provider_contacted"))
+        self.assertEqual(response.get("submission_state"), "not_submitted")
+        resolve.assert_not_called()
+        request.assert_not_called()
+
+    def test_direct_platform_consent_still_requires_declared_key_boundary(self):
+        import _apibackend
+        invocation = AgentInvocation(
+            cli="openai-compat", prompt="probe", cwd=".",
+            permission="read-only", model="deepseek-v4-1-flash-260910",
+            base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
+            api_key_env="", allow_payg=True)
+        with mock.patch.object(_apibackend, "payg_consent_allowed",
+                               return_value=True), \
+                mock.patch.object(_apibackend, "resolve_api_credential") as resolve, \
+                mock.patch.object(_apibackend, "_do_request") as request:
+            response = _apibackend.call(invocation, 1000)
+        self.assertEqual(response.get("error_kind"), "credential_missing")
+        self.assertFalse(response.get("provider_contacted"))
+        self.assertEqual(response.get("submission_state"), "not_submitted")
+        resolve.assert_not_called()
+        request.assert_not_called()
+
+    def test_direct_platform_dry_run_shows_payg_gate_before_credential_probe(self):
+        import _apibackend
+        invocation = AgentInvocation(
+            cli="openai-compat", prompt="probe", cwd=".",
+            permission="read-only", model="deepseek-v4-1-flash-260910",
+            base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
+            api_key_env="MODELARK_API_KEY", allow_payg=False)
+        args = SimpleNamespace(
+            agent="deepseek-41-flash", _resolved_agent="deepseek-41-flash",
+            strict_agents_dir=False, timeout=1000, worktree=None,
+            _role_provenance={}, agents_dir=None, gate_with=None,
+            allow_text_only=True, allow_credit=False, allow_payg=False)
+        with mock.patch.object(_apibackend, "payg_consent_allowed",
+                               return_value=False), \
+                mock.patch.object(_apibackend, "api_key_available") as key_available:
+            view = run_subagent._dry_run_view(invocation, args, None, None)
+        self.assertTrue(view.get("would_refuse"))
+        self.assertEqual(view.get("error_kind"), "payg_consent_missing")
+        self.assertFalse(view.get("provider_contacted"))
+        self.assertEqual(view.get("payg_consent"), False)
+        self.assertIsNone(view.get("api_key_present"))
+        self.assertEqual(view["billing"]["source"], "api")
+        self.assertTrue(view["billing"]["payg_consent_required"])
+        decision = view["effective_decision"]
+        self.assertTrue(decision["candidates"][0]["requires_spend"])
+        self.assertFalse(decision["candidates"][0]["eligible"])
+        self.assertEqual(decision["authority"]["api"], {
+            "authorized": False, "source": "none",
+        })
+        key_available.assert_not_called()
+
+    def test_direct_platform_dry_run_accepts_explicit_payg_consent(self):
+        import _apibackend
+        invocation = AgentInvocation(
+            cli="openai-compat", prompt="probe", cwd=".",
+            permission="read-only", model="deepseek-v4-1-flash-260910",
+            base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
+            api_key_env="MODELARK_API_KEY", allow_payg=True)
+        args = SimpleNamespace(
+            agent="deepseek-41-flash", _resolved_agent="deepseek-41-flash",
+            strict_agents_dir=False, timeout=1000, worktree=None,
+            _role_provenance={}, agents_dir=None, gate_with=None,
+            allow_text_only=True, allow_credit=False, allow_payg=True)
+        with mock.patch.object(_apibackend, "payg_consent_allowed",
+                               side_effect=lambda flag=False: bool(flag)), \
+                mock.patch.object(_apibackend, "api_key_available",
+                                  return_value=True) as key_available:
+            view = run_subagent._dry_run_view(invocation, args, None, None)
+        self.assertFalse(view.get("would_refuse", False))
+        self.assertTrue(view.get("payg_consent"))
+        self.assertTrue(view["effective_decision"]["candidates"][0]["eligible"])
+        self.assertEqual(view["effective_decision"]["authority"]["api"], {
+            "authorized": True, "source": "dispatch_flag",
+        })
+        self.assertEqual(view["billing"]["source"], "api")
+        self.assertTrue(view["billing"]["payg_consent_required"])
+        key_available.assert_called()
+
+    def test_direct_platform_dry_run_requires_declared_key_after_consent(self):
+        import _apibackend
+        invocation = AgentInvocation(
+            cli="openai-compat", prompt="probe", cwd=".",
+            permission="read-only", model="deepseek-v4-1-flash-260910",
+            base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
+            api_key_env="", allow_payg=True)
+        args = SimpleNamespace(
+            agent="deepseek-41-flash", _resolved_agent="deepseek-41-flash",
+            strict_agents_dir=False, timeout=1000, worktree=None,
+            _role_provenance={}, agents_dir=None, gate_with=None,
+            allow_text_only=True, allow_credit=False, allow_payg=True)
+        with mock.patch.object(_apibackend, "payg_consent_allowed",
+                               return_value=True), \
+                mock.patch.object(_apibackend, "api_key_available") as key_available:
+            view = run_subagent._dry_run_view(invocation, args, None, None)
+        self.assertTrue(view.get("would_refuse"))
+        self.assertEqual(view.get("error_kind"), "credential_missing")
+        self.assertTrue(view.get("payg_consent"))
+        self.assertIsNone(view.get("api_key_present"))
+        key_available.assert_not_called()
 
     def test_credential_missing_is_typed_refusal_dry_and_live(self):
         import os as _os

@@ -379,8 +379,12 @@ model: deepseek-v4-pro
 
 Use your Platform / inference API key (not the Coding Plan key unless you
 intentionally accept PAYG). Region hosts differ (e.g. `ark.cn-beijing.volces.com`
-for CN). This path never goes through the Coding Plan guardrail or the
-consent-gated fallback — every successful call is `billing.source: api`.
+for CN). This direct route is always per-token PAYG and requires explicit
+operator consent through `--allow-payg`, `SUMMON_ALLOW_BYTEPLUS_PAYG=1`, or
+`~/.agents/summon.json`. Without consent, Summon refuses before resolving the
+credential or contacting the provider. Successful calls report
+`billing.source: api`; they do not become subscription-backed because the
+credential variable or model appears in a roster.
 
 ### Via `arkcli` (CLI)
 

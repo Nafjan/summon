@@ -1447,8 +1447,9 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "--manifest/--council (set the env var deliberately for "
                              "fan-out spend)")
     parser.add_argument("--allow-payg", dest="allow_payg", action="store_true",
-                        help="Authorize BytePlus PAYG (/api/v3) fallback if the Coding "
-                             "Plan endpoint fails with quota/plan-limit/unsupported-model. "
+                        help="Authorize BytePlus Platform PAYG (/api/v3), or a "
+                             "Coding Plan to PAYG fallback after quota/plan-limit/"
+                             "unsupported-model. "
                              "Single dispatch only: rejected for --manifest/--council "
                              "(set SUMMON_ALLOW_BYTEPLUS_PAYG=1 or ~/.agents/summon.json "
                              "for fan-out)")

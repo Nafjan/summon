@@ -324,6 +324,160 @@ def test_credit_only_name_on_api_transport_does_not_inherit_claude_policy(
     assert decision["resolution"]["seat"] == "api-reviewer"
 
 
+def test_openai_compat_route_billing_classification_is_provider_inert():
+    coding = _apibackend.classify_openai_compat_route(
+        "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        "BYTEPLUS_CODING_API_KEY")
+    assert coding == {
+        "source": "subscription", "requires_spend": False,
+        "authorized": False, "authorization_source": "none",
+    }
+    local = _apibackend.classify_openai_compat_route(
+        "http://localhost:11434/v1", "")
+    assert local["source"] == "local" and local["requires_spend"] is False
+    remote = _apibackend.classify_openai_compat_route(
+        "https://ark.ap-southeast.bytepluses.com/api/v3",
+        "MODELARK_API_KEY")
+    assert remote == {
+        "source": "api", "requires_spend": True,
+        "authorized": False, "authorization_source": "none",
+        "requires_payg_consent": True,
+    }
+    for variant in (
+            "http://ark.ap-southeast.bytepluses.com/api/v3?region=ap-southeast",
+            "https://user:pass@ark.ap-southeast.bytepluses.com/api/v3/",
+            "https://ark.cn-beijing.volces.com/api/v3"):
+        assert _apibackend.is_byteplus_platform_endpoint(variant)
+    consented = _apibackend.classify_openai_compat_route(
+        "https://ark.ap-southeast.bytepluses.com/api/v3",
+        "MODELARK_API_KEY", payg_authorized=True,
+        payg_source="operator_configuration")
+    assert consented["authorized"] is True
+    assert consented["authorization_source"] == "operator_configuration"
+    assert consented["requires_payg_consent"] is True
+    consent_without_key = _apibackend.classify_openai_compat_route(
+        "https://ark.ap-southeast.bytepluses.com/api/v3", "",
+        payg_authorized=True, payg_source="operator_configuration")
+    assert consent_without_key["authorized"] is False
+    assert consent_without_key["authorization_source"] == "none"
+    unknown = _apibackend.classify_openai_compat_route(
+        "https://ark.ap-southeast.bytepluses.com/api/v3", "")
+    assert unknown["source"] == "api"
+    assert unknown["requires_spend"] is True and unknown["authorized"] is False
+    generic = _apibackend.classify_openai_compat_route(
+        "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY")
+    assert generic["authorized"] is True
+    assert generic["authorization_source"] == "explicit_endpoint"
+    assert generic["requires_payg_consent"] is False
+
+
+def test_effective_decision_binds_metered_api_spend_to_explicit_route(monkeypatch):
+    monkeypatch.delenv("SUMMON_ALLOW_CREDIT", raising=False)
+    monkeypatch.delenv("SUMMON_ALLOW_FABLE", raising=False)
+    monkeypatch.delenv("SUMMON_ALLOW_BYTEPLUS_PAYG", raising=False)
+    monkeypatch.setattr(_apibackend, "payg_consent_allowed",
+                        lambda flag=False: bool(flag))
+    args = SimpleNamespace(
+        agent="deepseek-41-flash", _resolved_agent="deepseek-41-flash",
+        _role_provenance={}, max_permission="read-only", allow_credit=False,
+        allow_payg=False, strict_agents_dir=True, usage_cache=None,
+        no_contract_repair=False, json_schema=None,
+        _declared_provider="modelark", _provider_endpoint_mode="named_provider",
+    )
+    platform = AgentInvocation(
+        cli="openai-compat", prompt="review", cwd="C:/packet",
+        model="deepseek-v4-1-flash-260910", permission="read-only",
+        base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
+        api_key_env="MODELARK_API_KEY")
+    decision = run_subagent._effective_decision_view(platform, args)
+    candidate = decision["candidates"][0]
+    assert candidate["requires_spend"] is True
+    assert candidate["eligible"] is False
+    assert "paid_route_not_authorized" in candidate["losing_rules"]
+    assert decision["authority"]["spend_authorized"] is False
+    assert decision["authority"]["api"] == {
+        "authorized": False, "source": "none",
+    }
+    assert decision["candidates"][0]["provider"] == "modelark"
+    assert decision["resolution"]["provider"] is None  # no authorized winner
+
+    consented_args = SimpleNamespace(**{**vars(args), "allow_payg": True})
+    consented_platform = platform.__class__(**{
+        **platform.__dict__, "allow_payg": True,
+    })
+    authorized = run_subagent._effective_decision_view(
+        consented_platform, consented_args)
+    assert authorized["candidates"][0]["eligible"] is True
+    assert authorized["authority"]["spend_authorized"] is True
+    assert authorized["authority"]["payg"] == {
+        "authorized": True, "source": "dispatch_flag",
+    }
+    assert authorized["authority"]["api"] == {
+        "authorized": True, "source": "dispatch_flag",
+    }
+
+    consented_no_key = platform.__class__(**{
+        **platform.__dict__, "api_key_env": "", "allow_payg": True,
+    })
+    no_key_authorized = run_subagent._effective_decision_view(
+        consented_no_key, consented_args)
+    assert no_key_authorized["candidates"][0]["eligible"] is False
+    assert no_key_authorized["authority"]["api"] == {
+        "authorized": False, "source": "none",
+    }
+
+    no_key = platform.__class__(**{
+        **platform.__dict__, "api_key_env": "",
+    })
+    refused = run_subagent._effective_decision_view(no_key, args)
+    refused_candidate = refused["candidates"][0]
+    assert refused_candidate["requires_spend"] is True
+    assert refused_candidate["eligible"] is False
+    assert "paid_route_not_authorized" in refused_candidate["losing_rules"]
+    assert refused["authority"]["spend_authorized"] is False
+
+    coding = platform.__class__(**{
+        **platform.__dict__,
+        "base_url": "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        "api_key_env": "BYTEPLUS_CODING_API_KEY",
+    })
+    subscription = run_subagent._effective_decision_view(coding, args)
+    assert subscription["candidates"][0]["requires_spend"] is False
+    assert subscription["candidates"][0]["eligible"] is True
+    assert subscription["authority"]["api"] == {
+        "authorized": False, "source": "none",
+    }
+
+    unrelated_api = platform.__class__(**{
+        **platform.__dict__, "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "",
+    })
+    unrelated = run_subagent._effective_decision_view(
+        unrelated_api, consented_args)
+    assert unrelated["candidates"][0]["requires_spend"] is True
+    assert unrelated["candidates"][0]["eligible"] is False
+    assert unrelated["authority"]["api"] == {
+        "authorized": False, "source": "none",
+    }
+
+    generic_api = platform.__class__(**{
+        **platform.__dict__, "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY", "allow_payg": False,
+    })
+    generic_args = SimpleNamespace(
+        **{**vars(args), "_declared_provider": "openrouter",
+           "allow_payg": False})
+    generic_decision = run_subagent._effective_decision_view(
+        generic_api, generic_args)
+    assert generic_decision["candidates"][0]["eligible"] is True
+    assert generic_decision["authority"]["payg"] == {
+        "authorized": False, "source": "none",
+    }
+    assert generic_decision["authority"]["api"] == {
+        "authorized": True, "source": "explicit_endpoint",
+    }
+
+
 def test_dry_run_keeps_invalid_decision_evidence_private_without_false_refusal():
     invocation = AgentInvocation(
         cli="codex", prompt="review", cwd="C:/private/packet",

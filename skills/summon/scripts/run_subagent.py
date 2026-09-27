@@ -3235,10 +3235,11 @@ def _reseal_effective_decision(view: dict) -> dict:
 def _effective_decision_view(invocation, args) -> dict:
     """Public, provider-inert explanation of the authority that wins preflight.
 
-    Phase 1 starts with exact-agent parity only. Usage and future lane inputs are
-    explicitly not consulted here, so this additive receipt cannot alter routing.
+    The effective route is already resolved before this projection is built.
+    Usage and future lane inputs are not consulted here, and this receipt never
+    changes the selected route or launches a provider request.
     """
-    from _apibackend import payg_consent_allowed
+    from _apibackend import classify_openai_compat_route, payg_consent_allowed
     from _builder import (credit_spend_allowed, permission_enforcement,
                           selects_credit_only, unenforceable_permission_authorized)
     from _backend_policy import route_provider
@@ -3291,6 +3292,17 @@ def _effective_decision_view(invocation, args) -> dict:
     _provider, _provider_evidence = route_provider(
         invocation.cli, _declared_provider, invocation.model,
         getattr(args, "_provider_endpoint_mode", "none"))
+    _api_route = (
+        classify_openai_compat_route(
+            invocation.base_url, invocation.api_key_env,
+            payg_authorized=payg_allowed,
+            payg_source=("dispatch_flag" if payg_flag else
+                         "operator_configuration" if payg_allowed else "none"))
+        if invocation.cli == "openai-compat" and invocation.base_url else None)
+    _api_route_spend_authorized = bool(
+        _api_route and _api_route.get("authorized"))
+    _route_requires_spend = bool(
+        _api_route and _api_route.get("requires_spend"))
     _decision_provider = None if _provider == "unknown" else _provider
     _public_declared_provider = (
         _declared_provider if isinstance(_declared_provider, str)
@@ -3316,15 +3328,23 @@ def _effective_decision_view(invocation, args) -> dict:
             "requires_retry": False,
             "requires_fallback": False,
             # Credit-only classification is a Claude subscription-CLI policy.
-            # An identically named model on openai-compat is already governed by
-            # that route's API/PAYG boundary and must not inherit this refusal.
+            # Direct remote API routes carry their own explicit spend boundary;
+            # Coding Plan and loopback routes remain non-metered here.
             "requires_spend": bool(
-                invocation.cli == "claude" and selects_credit_only(
-                    invocation.model, invocation.extra_args)),
+                _route_requires_spend
+                or (invocation.cli == "claude" and selects_credit_only(
+                    invocation.model, invocation.extra_args))),
         }],
         constraints={
             "permission_ceiling": getattr(args, "max_permission", None),
-            "spend_authorized": bool(credit_allowed or payg_allowed),
+            # API routes carry route-specific authority. A global PAYG setting
+            # must not authorize an unrelated endpoint, and a configured
+            # BytePlus /api/v3 key must not substitute for operator consent.
+            "spend_authorized": bool(
+                _api_route_spend_authorized if _api_route is not None else
+                credit_allowed if invocation.cli == "claude" and
+                selects_credit_only(invocation.model, invocation.extra_args)
+                else False),
             "enforcement": enforcement,
             "unenforceable_authorized": unenforceable_authorized,
             "corrective_allowed": bool(
@@ -3358,6 +3378,11 @@ def _effective_decision_view(invocation, args) -> dict:
                       "operator_configuration" if payg_allowed else "none",
         },
     })
+    if _api_route is not None:
+        view["authority"]["api"] = {
+            "authorized": _api_route_spend_authorized,
+            "source": _api_route.get("authorization_source", "none"),
+        }
     view["usage"] = usage_view
     view["unknowns"] = ["policy_digest", "roster_digest", "usage_observation"]
     return _reseal_effective_decision(view)
@@ -3610,14 +3635,70 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 view["model_vendor"] = _compat["model_vendor"]
             view["compatible_backends"] = list(_compat["compatible_backends"])
             view["recommended_backend"] = _compat["recommended_backend"]
+    _direct_payg_route = False
+    _direct_payg_consented = False
+    if invocation.cli == "openai-compat":
+        try:
+            from _apibackend import (is_byteplus_platform_endpoint,
+                                     payg_consent_allowed)
+            _direct_payg_route = is_byteplus_platform_endpoint(invocation.base_url)
+            if _direct_payg_route:
+                _direct_payg_consented = payg_consent_allowed(
+                    getattr(invocation, "allow_payg", False))
+                view["payg_consent"] = _direct_payg_consented
+                view["billing_predicted"] = {
+                    "source": "api",
+                    "note": "BytePlus Platform /api/v3 is per-token PAYG",
+                }
+                if not _direct_payg_consented:
+                    from _apibackend import _DIRECT_PAYG_CONSENT_ERROR
+                    view["would_refuse"] = True
+                    view["error_kind"] = "payg_consent_missing"
+                    view["refusal"] = _DIRECT_PAYG_CONSENT_ERROR
+                    _note_refusal(view, "payg_consent_missing")
+                    view["provider_contacted"] = False
+                    view["result_usable"] = False
+                elif (not isinstance(getattr(invocation, "api_key_env", None), str)
+                      or not invocation.api_key_env.strip()):
+                    view["would_refuse"] = True
+                    view["error_kind"] = "credential_missing"
+                    view["refusal"] = (
+                        "BytePlus Platform /api/v3 requires a declared api_key_env")
+                    _note_refusal(view, "credential_missing")
+                    view["provider_contacted"] = False
+                    view["result_usable"] = False
+        except Exception:  # noqa: BLE001 - preview must remain renderable
+            # Consent uncertainty on a recognized direct PAYG route fails
+            # closed. Do not inspect credentials to make a refused preview.
+            _direct_payg_route = True
+            _direct_payg_consented = False
+            view["payg_consent"] = False
+            view["would_refuse"] = True
+            view["error_kind"] = "payg_consent_missing"
+            view["refusal"] = (
+                "BytePlus Platform /api/v3 requires explicit operator PAYG consent")
+            _note_refusal(view, "payg_consent_missing")
+            view["provider_contacted"] = False
+            view["result_usable"] = False
     if (invocation.cli == "openai-compat" and not view.get("would_refuse")
             and not _decision_projection_invalid
-            and getattr(invocation, "api_key_env", None)):
+            and (getattr(invocation, "api_key_env", None)
+                 or _direct_payg_route)):
         # Fail closed on a missing provider credential before anyone mistakes a
         # slow unauthenticated request for a hang (field report 2026-09-19).
         try:
             from _apibackend import api_key_available as _key_ok
-            if not _key_ok(invocation.api_key_env, invocation.base_url):
+            if (_direct_payg_route and
+                    (not isinstance(getattr(invocation, "api_key_env", None), str)
+                     or not invocation.api_key_env.strip())):
+                view["would_refuse"] = True
+                view["error_kind"] = "credential_missing"
+                view["refusal"] = (
+                    "BytePlus Platform /api/v3 requires a declared api_key_env")
+                _note_refusal(view, "credential_missing")
+                view["provider_contacted"] = False
+                view["result_usable"] = False
+            elif not _key_ok(invocation.api_key_env, invocation.base_url):
                 view["would_refuse"] = True
                 view["error_kind"] = "credential_missing"
                 view["refusal"] = (f"openai-compat: ${invocation.api_key_env} is not "
@@ -3738,14 +3819,27 @@ def _dry_run_view(invocation, args, agents_dir: str,
         view["base_url"] = invocation.base_url
         view["endpoint"] = (invocation.base_url or "?") + "/chat/completions"
         view["api_key_env"] = invocation.api_key_env
-        try:
-            from _apibackend import api_key_available
-            view["api_key_present"] = api_key_available(
-                invocation.api_key_env, invocation.base_url)
-        except Exception:  # noqa: BLE001 - preflight must never fail on diagnostics
-            view["api_key_present"] = bool(
-                invocation.api_key_env and os.environ.get(invocation.api_key_env))
-        view["billing"] = {"source": "api"}
+        if (_direct_payg_route and
+                (not _direct_payg_consented
+                 or not isinstance(getattr(invocation, "api_key_env", None), str)
+                 or not invocation.api_key_env.strip())):
+            # A refused direct PAYG preview does not need to resolve or reveal
+            # whether a local credential is present.
+            view["api_key_present"] = None
+        else:
+            try:
+                from _apibackend import api_key_available
+                view["api_key_present"] = api_key_available(
+                    invocation.api_key_env, invocation.base_url)
+            except Exception:  # noqa: BLE001 - preflight must never fail on diagnostics
+                view["api_key_present"] = bool(
+                    invocation.api_key_env and os.environ.get(invocation.api_key_env))
+        view["billing"] = {
+            "source": "api",
+            **({"payg_consent_required": True,
+                "payg_consent": _direct_payg_consented}
+               if _direct_payg_route else {}),
+        }
         # Coding Plan: honest quota note + refuse known-bad model ids in preflight.
         try:
             from _apibackend import coding_plan_billing, coding_plan_model_error, \
