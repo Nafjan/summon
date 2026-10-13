@@ -129,10 +129,17 @@ def _parse_agy_json_models(stdout: str) -> list[str] | None:
     ``None`` means the JSON contract was unavailable or malformed and permits
     the legacy text fallback.  An empty list is a valid machine response.
     """
+    payload = None
     try:
         payload = json.loads(stdout)
     except (json.JSONDecodeError, TypeError, ValueError):
-        return None
+        if isinstance(stdout, str):
+            brace = stdout.find("{")
+            if brace > 0:
+                try:
+                    payload = json.loads(stdout[brace:])
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    payload = None
     if not isinstance(payload, dict) or str(payload.get("status", "")).upper() != "SUCCESS":
         return None
     command = payload.get("command")

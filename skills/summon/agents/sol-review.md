@@ -1,13 +1,13 @@
 ---
 run-agent: codex
-model: gpt-5.6-sol
+model: gpt-6.1-sol
 effort: high
 permission: read-only
 ---
 
 # Sol Review
 
-Pinned GPT-5.6 Sol seat for adversarial architecture, release, and reliability
+Pinned GPT-6.1 Sol seat for adversarial architecture, release, and reliability
 reviews. The explicit model pin is intentional: a Sol review must not inherit the
 Codex account default.
 

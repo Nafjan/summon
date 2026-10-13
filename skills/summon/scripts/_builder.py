@@ -1571,14 +1571,15 @@ def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     # Codex config overrides such as model_reasoning_effort.
     model_flag = (["-m", selection["canonical"]]
                   if selection["canonical"] else [])
-    # Reasoning effort -> Codex config override. Astra supports the full public
-    # low..max range. Preserve the historical high ceiling for other/unknown
-    # Codex targets until their provider contracts are reviewed independently.
+    # Reasoning effort -> Codex config override. GPT-6 family models (Astra,
+    # Sol 6.1, Luna 6) support the full public low..max range. Preserve the
+    # historical high ceiling for older/unpinned Codex targets.
     # Global `-c` flags precede the subcommand.
     effort_flag = []
     if inv.effort:
         _e = inv.effort
-        if selection["canonical"] != "gpt-6-astra" and _e in ("xhigh", "max"):
+        _canon = (selection["canonical"] or "").lower()
+        if not _canon.startswith("gpt-6") and _e in ("xhigh", "max"):
             _e = "high"
         effort_flag = ["-c", f"model_reasoning_effort={_e}"]
     env = {**(env_override_for("codex") or {}), **profile_env} or None
@@ -2777,8 +2778,65 @@ class _agy_capability_probe_slot:
     def __init__(self, identity: tuple[str, object]) -> None:
         self._identity = identity
         self._lock = Path(str(_agy_capability_cache_path()) + ".lock")
+        self._stalled = Path(str(_agy_capability_cache_path()) + ".stalled")
         self._token = f"{os.getpid()}:{secrets.token_hex(16)}".encode("ascii")
         self._owned = False
+
+    def _raise_shared_stall_if_any(self) -> None:
+        key = _agy_capability_key(self._identity)
+        if key is None:
+            return
+        try:
+            with open(self._stalled, "rb") as fh:
+                data = json.loads(fh.read(16 * 1024).decode("utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict) or data.get("key") != key:
+            return
+        ts = data.get("ts")
+        if not isinstance(ts, (int, float)) or (time.time() - ts) > _AGY_PROBE_TIMEOUT_SEC:
+            return
+        kind = str(data.get("kind") or "agy_capability_probe_stalled")
+        message = str(data.get("message") or "agy capability probe stalled")
+        retryable = bool(data.get("retryable", True))
+        if self._owned:
+            self._release_owned_lock()
+        raise AgyCapabilityError(message, kind=kind, retryable=retryable)
+
+    def _clear_shared_stall(self) -> None:
+        try:
+            self._stalled.unlink()
+        except OSError:
+            pass
+
+    def _publish_shared_stall(self, exc: AgyCapabilityError) -> None:
+        key = _agy_capability_key(self._identity)
+        if key is None:
+            return
+        payload = json.dumps({
+            "key": key,
+            "ts": time.time(),
+            "kind": exc.kind,
+            "retryable": bool(exc.retryable),
+            "message": str(exc),
+        }, sort_keys=True).encode("utf-8")
+        try:
+            self._stalled.write_bytes(payload)
+        except OSError:
+            pass
+
+    def _release_owned_lock(self) -> None:
+        if not self._owned:
+            return
+        self._owned = False
+        try:
+            # Release only our own lock: after a steal the file belongs to a peer.
+            with open(self._lock, "rb") as fh:
+                if fh.read(128) != self._token:
+                    return
+            self._lock.unlink()
+        except OSError:
+            pass
 
     def __enter__(self) -> bool:
         if _agy_capability_key(self._identity) is None:
@@ -2788,14 +2846,17 @@ class _agy_capability_probe_slot:
         except OSError:
             return False  # e.g. the cache path sits under a regular file
         deadline = time.monotonic() + _AGY_PROBE_LOCK_STALE_SEC
+        waited = False
         while True:
             try:
                 fd = os.open(str(self._lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except FileExistsError:
-                pass
+                waited = True
             except OSError:
                 # e.g. Windows access-denied while a just-released lock is still being
                 # deleted: its owner may have published the answer a moment ago.
+                if waited:
+                    self._raise_shared_stall_if_any()
                 return _agy_capability_cached(self._identity)
             else:
                 try:
@@ -2810,9 +2871,16 @@ class _agy_capability_probe_slot:
                 os.close(fd)
                 self._owned = True
                 # A peer may have finished between our cache miss and the lock.
-                return _agy_capability_cached(self._identity)
+                if _agy_capability_cached(self._identity):
+                    return True
+                if waited:
+                    self._raise_shared_stall_if_any()
+                else:
+                    self._clear_shared_stall()
+                return False
             if _agy_capability_cached(self._identity):
                 return True
+            self._raise_shared_stall_if_any()
             if time.monotonic() >= deadline:
                 return False  # probe ourselves rather than wait any longer
             try:
@@ -2820,6 +2888,8 @@ class _agy_capability_probe_slot:
             except FileNotFoundError:
                 continue  # released between attempts; try to take it
             except OSError:
+                if waited:
+                    self._raise_shared_stall_if_any()
                 return _agy_capability_cached(self._identity)
             if age > _AGY_PROBE_LOCK_STALE_SEC or self._owner_exited():
                 try:
@@ -2852,17 +2922,14 @@ class _agy_capability_probe_slot:
             return False
         return _pid_liveness(pid) == "dead"
 
-    def __exit__(self, *_exc) -> None:
+    def __exit__(self, exc_type, exc_val, _exc_tb) -> None:
         if not self._owned:
             return
-        try:
-            # Release only our own lock: after a steal the file belongs to a peer.
-            with open(self._lock, "rb") as fh:
-                if fh.read(128) != self._token:
-                    return
-            self._lock.unlink()
-        except OSError:
-            pass
+        if isinstance(exc_val, AgyCapabilityError):
+            self._publish_shared_stall(exc_val)
+        else:
+            self._clear_shared_stall()
+        self._release_owned_lock()
 
 
 def _run_agy_help(command: list, timeout_sec: float) -> tuple[int, str]:

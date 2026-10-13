@@ -205,18 +205,6 @@ def _write_error_out(out_path: str, env: dict) -> None:
     archiving FAILS the error is not written at all -- a lost answer is worse than a failure
     that is only on stdout. Anything else there (an error, a partial, junk) is simply
     replaced, and an empty path is simply written.
-
-    That invariant holds for a SINGLE writer, which is the documented model for a result
-    path (see references/fan-out.md: one --results-dir belongs to one run). The read, the
-    archive and the write are not one atomic step, so a second process writing a success
-    into the same path between this read and this write can still lose it. Locking is not
-    added because the shared-result-path case is already outside what summon supports; the
-    limit is stated here rather than implied away.
-
-    This exists because the naive version -- write the error, full stop -- destroyed
-    completed work whenever the failure came before the resume block could preserve it, and
-    the next version archived first but ignored the archive's own failure and overwrote
-    anyway. Both were caught in review; hence the invariant up front.
     """
     from _executor import is_terminal_success
     from _manifest import _clear_out_file
@@ -230,6 +218,75 @@ def _write_error_out(out_path: str, env: dict) -> None:
         if _clear_out_file(out_path, archive=True):
             return                      # could not preserve it -> do not overwrite it
     _write_out(out_path, env)
+
+
+_ACTIVE_OUT_LOCKS: set[str] = set()
+_CURRENT_OUT_LOCK: tuple[str, str] | None = None
+
+
+def _acquire_out_lock(out_path: str) -> int | None:
+    """Acquire an exclusive active-writer lock for ``out_path``.
+
+    Returns ``None`` when acquired, or the live owner's integer PID when a
+    concurrent Summon process already holds the lock. Stale locks from dead
+    processes are reclaimed automatically.
+    """
+    global _CURRENT_OUT_LOCK
+    lock_path = os.path.abspath(out_path) + ".active.lock"
+    token = uuid.uuid4().hex
+    try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    except OSError:
+        return None
+    for _ in range(3):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"pid": os.getpid(), "token": token,
+                           "acquired_at": time.time()}, fh)
+                fh.flush()
+            _ACTIVE_OUT_LOCKS.add(lock_path)
+            _CURRENT_OUT_LOCK = (lock_path, token)
+            return None
+        except FileExistsError:
+            owner = None
+            for _ in range(3):
+                try:
+                    with open(lock_path, encoding="utf-8") as fh:
+                        owner = json.load(fh)
+                    break
+                except (OSError, ValueError, UnicodeDecodeError):
+                    time.sleep(0.01)
+            owner_pid = owner.get("pid") if isinstance(owner, dict) else None
+            if isinstance(owner_pid, int) and not isinstance(owner_pid, bool):
+                if owner_pid == os.getpid() and lock_path in _ACTIVE_OUT_LOCKS:
+                    return owner_pid
+                if owner_pid != os.getpid() and _jobs._pid_liveness(owner_pid) == "alive":
+                    return owner_pid
+            try:
+                os.unlink(lock_path)
+            except OSError:
+                return owner_pid if isinstance(owner_pid, int) else os.getpid()
+        except OSError:
+            return None
+    return None
+
+
+def _release_current_out_lock() -> None:
+    """Release the active-writer lock owned by this invocation, if any."""
+    global _CURRENT_OUT_LOCK
+    if _CURRENT_OUT_LOCK is None:
+        return
+    lock_path, token = _CURRENT_OUT_LOCK
+    _CURRENT_OUT_LOCK = None
+    _ACTIVE_OUT_LOCKS.discard(lock_path)
+    try:
+        with open(lock_path, encoding="utf-8") as fh:
+            owner = json.load(fh)
+        if isinstance(owner, dict) and owner.get("token") == token:
+            os.unlink(lock_path)
+    except (OSError, ValueError, UnicodeDecodeError):
+        pass
 
 
 def _request_identity(args) -> dict:
@@ -596,24 +653,27 @@ def _emit(obj: dict, *, operation: str | None = None,
     # Diagnostics are strictly opt-in and fail-soft. A malformed local telemetry
     # file must never change dispatch behavior or hide the real envelope.
     try:
-        # The executor's stream parser is the source of served-model evidence.
-        # Bind that result to a private telemetry capability here; raw envelope
-        # fields are intentionally ignored by the projector.  Keep the marker
-        # on a copy so it can never leak into the public JSON envelope or job
-        # file.
-        _telemetry_obj = dict(obj)
-        if trusted_executor_result:
-            # Only the in-process executor result may mint this marker.  A
-            # reused --out envelope, a --resume input, or a hand-built JSON
-            # object remains unverified even when it contains
-            # served_model_evidence="reported".
-            _marker = _executor.trusted_telemetry_model_evidence(obj)
-            if _marker is not None:
-                _telemetry_obj["_telemetry_model_evidence"] = _marker
-            _auth_marker = _executor.trusted_telemetry_auth_lifecycle(obj)
-            if _auth_marker is not None:
-                _telemetry_obj["_telemetry_auth_lifecycle"] = _auth_marker
-        _telemetry.record(_telemetry_obj, operation=operation or _EMIT_OPERATION)
+        # --dry-run is a provider-inert preview, not a terminal operation; do
+        # not emit it as an invalid_status / exit_code=None telemetry record.
+        if obj.get("status") != "dry_run":
+            # The executor's stream parser is the source of served-model evidence.
+            # Bind that result to a private telemetry capability here; raw envelope
+            # fields are intentionally ignored by the projector.  Keep the marker
+            # on a copy so it can never leak into the public JSON envelope or job
+            # file.
+            _telemetry_obj = dict(obj)
+            if trusted_executor_result:
+                # Only the in-process executor result may mint this marker.  A
+                # reused --out envelope, a --resume input, or a hand-built JSON
+                # object remains unverified even when it contains
+                # served_model_evidence="reported".
+                _marker = _executor.trusted_telemetry_model_evidence(obj)
+                if _marker is not None:
+                    _telemetry_obj["_telemetry_model_evidence"] = _marker
+                _auth_marker = _executor.trusted_telemetry_auth_lifecycle(obj)
+                if _auth_marker is not None:
+                    _telemetry_obj["_telemetry_auth_lifecycle"] = _auth_marker
+            _telemetry.record(_telemetry_obj, operation=operation or _EMIT_OPERATION)
     except Exception:  # noqa: BLE001 - observability cannot block a dispatch
         pass
     # The exact public object is the canonical terminal result.  Governed
@@ -887,7 +947,11 @@ def _apply_gemini_thinking(model: str, effort: str) -> str:
     # Live AGY rosters expose slugs as well as display names. Replace a slug's
     # effort suffix rather than appending an incompatible display-name suffix.
     slug = model.strip()
-    if re.fullmatch(r"gemini-[a-z0-9][a-z0-9.-]*", slug, re.IGNORECASE):
+    if re.fullmatch(
+        r"(?:gemini-[a-z0-9][a-z0-9.-]*|claude-(?:opus|sonnet)-5-5(?:-(?:low|medium|high))?)",
+        slug,
+        re.IGNORECASE,
+    ):
         base = re.sub(r"-(?:low|medium|high)$", "", slug, flags=re.IGNORECASE)
         return f"{base}-{suffix.lower()}"
     base = re.sub(r"\s*\([^)]*\)\s*$", "", model).strip()
@@ -900,10 +964,10 @@ def _unsupported_explicit_effort(cli: str | None, model: str | None,
 
     A roster ``effort:`` pin is part of the model identity, not a hint that a
     backend may silently ignore.  Kimi only exposes the reviewed effort
-    controls for K3, AGY maps effort only onto Gemini model variants, and the
-    remaining backends have no reviewed effort transport.  Ambient/default
-    effort remains best-effort; this guard applies only when the caller or
-    roster explicitly asked for a level.
+    controls for K3, AGY maps effort onto Gemini and tiered Claude 5.5 model
+    variants, and the remaining backends have no reviewed effort transport.
+    Ambient/default effort remains best-effort; this guard applies only when
+    the caller or roster explicitly asked for a level.
     """
     if not effort:
         return None
@@ -916,10 +980,11 @@ def _unsupported_explicit_effort(cli: str | None, model: str | None,
                 f"{model!r}; use kimi-code/k3 or kimi-code/k3-256k, or remove "
                 "the effort pin")
     if backend == "agy":
-        if selected.startswith("gemini"):
+        if (selected.startswith("gemini")
+                or re.fullmatch(r"claude-(?:opus|sonnet)-5-5(?:-(?:low|medium|high))?", selected)):
             return None
         return (f"explicit effort {effort!r} is unsupported for AGY model "
-                f"{model!r}; AGY effort requires a Gemini model variant")
+                f"{model!r}; AGY effort requires a Gemini or tiered Claude 5.5 model variant")
     if backend == "gemini":
         return (f"explicit effort {effort!r} is unsupported for the frozen "
                 "gemini CLI; use the agy Gemini route or remove the effort pin")
@@ -1078,6 +1143,13 @@ _USAGE = _cli.USAGE
 
 
 def main() -> None:
+    try:
+        _main_body()
+    finally:
+        _release_current_out_lock()
+
+
+def _main_body() -> None:
     # Windows consoles default to cp1252; sub-agent results often contain
     # non-ASCII (arrows, em-dashes, emoji). Emit UTF-8 so json.dumps never
     # raises UnicodeEncodeError on stdout.
@@ -1703,7 +1775,8 @@ def main() -> None:
         _print_error("bug-report options require the bug-report command")
         sys.exit(1)
     if (getattr(args, "telemetry_enable", False) or getattr(args, "telemetry_disable", False)
-            or getattr(args, "telemetry_status", False) or getattr(args, "telemetry_clear", False)):
+            or getattr(args, "telemetry_status", False) or getattr(args, "telemetry_clear", False)
+            or getattr(args, "telemetry_stats", False)):
         try:
             if args.telemetry_enable:
                 _diag = _telemetry.set_enabled(True)
@@ -1711,6 +1784,8 @@ def main() -> None:
                 _diag = _telemetry.set_enabled(False)
             elif args.telemetry_clear:
                 _diag = _telemetry.clear_events()
+            elif getattr(args, "telemetry_stats", False):
+                _diag = _telemetry.stats()
             else:
                 _diag = _telemetry.status()
             if args.json:
@@ -1869,6 +1944,7 @@ def main() -> None:
     # jobs list/status/wait: read-only registry queries; no dispatch. Answer and
     # exit before any agent/prompt/cwd validation.
     if (args.jobs_list or args.jobs_status or args.jobs_wait
+            or getattr(args, "jobs_wait_all", False)
             or args.jobs_extend or args.jobs_cancel or args.jobs_steer
             or args.jobs_resume or getattr(args, "jobs_revalidate", None)):
         sys.exit(_background.run_jobs_query(
@@ -1959,7 +2035,8 @@ def main() -> None:
 
     def _die(msg: str, exit_code: int = 1, *, error_kind: str | None = None,
              details: dict | None = None, extra: dict | None = None) -> None:
-        env = {"result": "", "exit_code": exit_code, "status": "error", "error": msg}
+        env = {"result": "", "exit_code": exit_code, "status": "error", "error": msg,
+               "refusal": True}
         _mark_not_run(env)
         finalize_exit_fields(env)
         if error_kind:
@@ -1982,11 +2059,13 @@ def main() -> None:
         # combination would be self-contradictory, and it littered a file into the caller's
         # cwd) and not under --dry-run (which promises to touch nothing).
         if (getattr(args, "out", None) and not getattr(args, "dry_run", False)
-                and not getattr(args, "background", False)):
+                and not getattr(args, "background", False)
+                and error_kind != "out_path_collision"):
             try:
                 _write_error_out(args.out, env)
             except Exception:  # noqa: BLE001 — reporting the original error matters more
                 pass
+        _release_current_out_lock()
         _emit(env, operation=_EMIT_OPERATION)
         sys.exit(exit_code)
 
@@ -2057,6 +2136,17 @@ def main() -> None:
     if args.council:
         from _council import run_council
         sys.exit(run_council(args))
+
+    if args.out and not args.dry_run and not args.background:
+        _lock_holder = _acquire_out_lock(args.out)
+        if _lock_holder is not None:
+            _die(
+                f"--out path {args.out!r} is already locked by an active Summon process (pid {_lock_holder})",
+                error_kind="out_path_collision",
+                extra={"provider_contacted": False, "retryable": True,
+                       "result_usable": False,
+                       "out_lock": {"lock_holder_pid": _lock_holder}},
+            )
 
     # --prompt-file: resolve to a prompt BEFORE the background handler (its
     # validation needs args.prompt). The public/external form retains the
@@ -2417,6 +2507,9 @@ def main() -> None:
         if getattr(args, "cli", None):
             agents = [a for a in agents
                       if (a.get("run_agent") or a.get("cli")) == args.cli]
+        if getattr(args, "list_for", None):
+            from _loader import filter_agents_for_task
+            agents = filter_agents_for_task(agents, args.list_for)
         if getattr(args, "format", "json") == "table":
             from _builder import roster_permission_lint
             sys.stdout.write(_format_agents_table(agents))
@@ -2429,6 +2522,8 @@ def main() -> None:
         # report, 2026-07-28 -- two of the offenders there were named reviewers).
         from _builder import roster_permission_lint
         _out = {"agents": agents, "agents_dir": agents_dir}
+        if getattr(args, "list_for", None):
+            _out["filter_for"] = args.list_for
         try:
             from _loader import discover_agent_packs
             _packs = discover_agent_packs()
@@ -2701,13 +2796,17 @@ def main() -> None:
         )
     if cli == "agy":
         # agy has no --effort flag; thinking is the model-name suffix. Apply an
-        # EXPLICIT effort to a Gemini model; the global default never rewrites an
-        # agy model (respects the variant chosen in `model:`).
-        if effort and _explicit_effort and final_model and final_model.strip().lower().startswith("gemini"):
+        # EXPLICIT effort to a Gemini or tiered Claude 5.5 model; the global
+        # default never rewrites an agy model (respects the variant chosen in `model:`).
+        _agy_sel = (final_model or "").strip().lower()
+        if effort and _explicit_effort and final_model and (
+            _agy_sel.startswith("gemini")
+            or re.fullmatch(r"claude-(?:opus|sonnet)-5-5(?:-(?:low|medium|high))?", _agy_sel)
+        ):
             final_model = _apply_gemini_thinking(final_model, effort)
         elif _explicit_effort:
-            print("note: agy thinking is a model-name suffix (e.g. 'Gemini 3.1 Pro (High)'); "
-                  "--effort maps only Gemini agy models — set it in `model:` / see --list-models",
+            print("note: agy thinking is a model-name suffix (e.g. 'gemini-4-argon-high'); "
+                  "--effort maps only Gemini and tiered Claude 5.5 agy models — set it in `model:` / see --list-models",
                   file=sys.stderr)
         effort = None
     elif cli == "kimi":
@@ -3049,6 +3148,13 @@ def main() -> None:
     # Effective-tree provenance: recompute HEAD after any worktree rewrite,
     # BEFORE the agent can commit anything.
     receipt["git_head_before"] = _receipt.git_head(args.cwd)
+
+    if (not any(tok.split("=", 1)[0] == "--timeout" for tok in argv)
+            and _telemetry.enabled()
+            and (os.environ.get("SUMMON_TELEMETRY_FILE")
+                 or _telemetry._default_cohort() == "live")):
+        args.timeout = _cli.Milliseconds(
+            _telemetry.recommended_timeout_ms(cli, int(args.timeout)))
 
     # Catch ValueError from build_invocation_args / permission_flags / TOML
     # escaping so unknown --cli values or unsafe agent paths surface as JSON
@@ -3469,7 +3575,8 @@ def _format_agents_table(rows: list[dict]) -> str:
 def _dry_run_view(invocation, args, agents_dir: str,
                   agent_file: str | None = None,
                   artifact_manifest: dict | None = None,
-                  text_seat_decision: dict | None = None) -> dict:
+                  text_seat_decision: dict | None = None,
+                  launch_control=None) -> dict:
     """The fully resolved dispatch, without executing. For agy the per-call
     profile is NOT built (that copies OAuth tokens = a mutation); the wrapper
     path is shown instead."""
@@ -3888,20 +3995,28 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 view["command"] = cmd
             view["args"] = [_dry_run_arg_preview(a) for a in argv]
             view["env_overrides"] = sorted(env) if env else []
-            # The live dispatch refuses an over-long command line before spawn; say
-            # so here, before anyone pays for a launch to learn it.
-            from _executor import argv_overflow_reroutes_to_acp, dry_run_argv_length_error
-            _argv_refusal = dry_run_argv_length_error(invocation, cmd, argv, env)
-            if _argv_refusal and argv_overflow_reroutes_to_acp(invocation, argv):
+            # The live dispatch refuses an over-long command line or transport budget
+            # violation before spawn; say so here, before anyone pays for a launch.
+            from _executor import dry_run_transport_and_argv_refusal
+            _eff_lc = launch_control
+            if _eff_lc is None:
+                if getattr(args, "fleet_approval", None) or getattr(args, "resume_job", None):
+                    from types import SimpleNamespace as _SNS
+                    _eff_lc = _SNS(allow_secondary=False)
+                else:
+                    _eff_lc = _chat_launch_control(invocation)
+            _refusal_kind, _argv_refusal, _acp_rerouted = dry_run_transport_and_argv_refusal(
+                invocation, cmd, argv, env, launch_control=_eff_lc)
+            if _acp_rerouted:
                 # Mirrors the executor: a native-ACP backend is rerouted, not refused.
                 view.setdefault("warnings", []).append(
                     "the prompt exceeds the OS command-line limit for the subprocess "
                     "transport; the dispatch would be routed over ACP instead")
-            elif _argv_refusal:
+            elif _argv_refusal and _refusal_kind:
                 view["would_refuse"] = True
-                view["error_kind"] = "prompt_too_long_for_argv"
+                view["error_kind"] = _refusal_kind
                 view["refusal"] = _argv_refusal
-                _note_refusal(view, "prompt_too_long_for_argv")
+                _note_refusal(view, _refusal_kind)
         except ValueError as e:
             view["error"] = str(e)
     _tags = _agent_tags_from_file(agent_file)
@@ -4842,6 +4957,9 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         # `report`/`report_ok` are the authoritative parsed view.
         result["report"] = retry.get("report")
         result["report_ok"] = True
+        result["report_source"] = retry.get("report_source", "structured")
+        if retry.get("report_text"):
+            result["report_text"] = retry.get("report_text")
         result["status"] = retry.get("status")    # DONE->success; PARTIAL/BLOCKED reflected
         result.pop("suspect", None)
         result["contract_repaired"] = True
@@ -4931,6 +5049,31 @@ def _crash_envelope(e: BaseException) -> dict:
     """The last-resort crash envelope. The exit-code-clarity fields are inlined
     (not via finalize_exit_fields) so a crash in the executor import path can't
     sink the net. A module-level function so the shape stays testable."""
+    if isinstance(e, KeyboardInterrupt):
+        return {
+            "result": "",
+            "status": "cancelled",
+            "exit_code": 130,
+            "error": "dispatch interrupted by KeyboardInterrupt",
+            "error_kind": "interrupted",
+            "failure_class": "cancelled",
+            "retryable": True,
+            "result_usable": False,
+            "backend_exit_code": 130,
+            "raw_backend_exit_code": 130,
+            "normalized_exit_code": 130,
+            "dispatcher_status": "cancelled",
+            "attempts": None,
+            "attempt_status": "unknown",
+            "execution_status": "cancelled",
+            "provider_contacted": None,
+            "model": {"requested": None, "targeted": None, "served": None,
+                      "resolved": None, "models_used": [], "evidence_source": None},
+            "served_model_evidence": "absent",
+            "model_match": None,
+            "named_model_verified": False,
+            "normalization_reason": "dispatch interrupted by KeyboardInterrupt before completion",
+        }
     return {"result": "", "status": "error", "exit_code": 1,
             "error": f"uncaught {type(e).__name__}: {e}",
             "backend_exit_code": 1, "dispatcher_status": "error",
@@ -5017,4 +5160,4 @@ if __name__ == "__main__":
                 pass
         else:
             print(json.dumps(err, ensure_ascii=False))
-        sys.exit(1)
+        sys.exit(int(err.get("exit_code") or 1))

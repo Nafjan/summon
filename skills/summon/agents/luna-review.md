@@ -1,6 +1,6 @@
 ---
 run-agent: codex
-model: gpt-5.6-luna
+model: gpt-6-luna
 effort: high
 permission: read-only
 ---
@@ -19,5 +19,5 @@ FOLLOW-UP: <one concrete next step, or none>
 HANDOFF: <durable resources intentionally left behind, or none>
 LEFT_BEHIND: none
 
-This seat is pinned to gpt-5.6-luna. A dispatch receipt must still prove the exact
+This seat is pinned to gpt-6-luna. A dispatch receipt must still prove the exact
 provider-served model; a roster pin or the effort label is not service evidence.

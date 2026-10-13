@@ -14,11 +14,10 @@ The current editorial bands are:
 
 | Band | Order | Models | Typical lane |
 |---|---:|---|---|
-| **Frontier** | 1–8 | Astra, Fable (current and previous), Sol, Opus, Kimi, DeepSeek V4 Pro, Gemini Flash 3.8 | escalation, architecture, synthesis, high-context research, deep reasoning, vision and frontend review |
-| **Near-frontier** | 1–7 | Grok 4.6, Gemini Flash 3.7, GLM 5.2, DeepSeek V4 Flash, Luna 5.6, Terra 5.6, Spark 5.3 | fast evidence, coding second opinions, and cost-efficient secondary work |
+| **Frontier** | 1–12 | Astra, Fable (5.1 and 5), Sol (6.1 and 5.6), Opus (5.5 and 5), Gemini 4 Argon, Kimi, DeepSeek V4 Pro, Gemini Flash 3.8 | escalation, architecture, synthesis, high-context research, deep reasoning, vision and frontend review |
+| **Near-frontier** | 1–15 | Luna (6 and 5.6), Sonnet (5.5 and 5), Grok (4.7 and 4.6), DeepSeek V4.1 Flash, GLM 5.3 Flash, Gemini Flash 3.7, GLM 5.2, DeepSeek V4 Flash, Terra 5.6, Spark 5.3 | fast evidence, coding second opinions, and cost-efficient secondary work |
 
-The Fable entry was refreshed on 2026-09-02, Flash 3.8 added on 2026-09-03, and Astra added on 2026-09-05; other bands retain their previous
-editorial assessment. These are Summon-curated labels, not benchmark, safety, cost,
+The lineup was refreshed on 2026-10-13 to add GPT-6.1 Sol, GPT-6 Luna, Gemini 4 Argon (`gemini-4-argon-high`), Claude Opus/Sonnet 5.5 (`claude` and `agy` routes), Grok 4.7, and un-suffixed ModelArk Coding Plan aliases alongside historical entries so older receipts keep their exact catalog display. These are Summon-curated labels, not benchmark, safety, cost,
 availability, or vendor claims. A tooltip may show the role, model name, version,
 recommendation lane, catalog status, and whether an exact served-model match was
 observed. It must not show profiles, accounts, paths, prompts, credentials, or raw
@@ -135,20 +134,22 @@ emit neither form still truthfully retain `model.served: null` and
 | `fable-api` | openai-compat | unavailable legacy route | retired: direct adapter lacks native Anthropic Messages support; explicitly select `fable` |
 | `pair`, `editor`, `quick-reviewer`, `pr-prep` | claude | `claude-sonnet-5` | balanced general work, prose, fast reviews, PR prep |
 | `reviewer`, `adversarial-reviewer`, `implementer`, `debugger`, `test-author` | codex | CLI config default (inspect `summon models --cli codex --refresh`) | code review, adversarial passes, implementation, tests |
-| `sol-review` | codex | `gpt-5.6-sol` (pinned) | adversarial architecture and release review |
+| `sol-review` | codex | `gpt-6.1-sol` (pinned) | adversarial architecture and release review |
 | `terra-review` | codex | `gpt-5.6-terra` (pinned candidate; require `model.served`) | balanced, cost-conscious review |
-| `luna-review` | codex | `gpt-5.6-luna` (pinned candidate; require `model.served`) | cheap, high-reasoning secondary review |
-| `luna` / explicit Codex candidate | codex | `gpt-5.6-luna` (config-observed; verify `model.served`) | cost-efficient, high-reasoning secondary lane |
+| `luna-review` | codex | `gpt-6-luna` (pinned candidate; require `model.served`) | cheap, high-reasoning secondary review |
+| `luna` / explicit Codex candidate | codex | `gpt-6-luna` / `gpt-5.6-luna` (config-observed; verify `model.served`) | cost-efficient, high-reasoning secondary lane |
 | `terra` / explicit Codex candidate | codex | `gpt-5.6-terra` (declared, unverified) | balanced secondary lane; do not pin until served evidence |
 | `spark` / explicit Codex candidate | codex | `gpt-5.3-spark` (declared, unverified) | fast/quota-isolated candidate; do not pin until served evidence |
 | `coder`, `bug-fixer` | cursor-agent | composer-2.5 | multi-step coding, bug fixing |
 | `kimi-worker` | kimi | `kimi-code/k3` + `effort: max` (pinned target; provider evidence may be absent) | maximum-thinking architecture, independent review, broad repository research, ambiguous multi-file work |
 | `kimi-coder` | kimi | `kimi-code/k3` + `effort: max` (pinned target; provider evidence may be absent) | maximum-thinking scoped implementation, refactoring, debugging, focused verification |
 | `kimi-k27-coder` | kimi | `kimi-code/kimi-for-coding` (explicit lower-context seat; provider evidence may be absent) | deliberate K2.7 implementation/debugging trade-off |
+| `argon-reviewer` | agy | `gemini-4-argon-high` (advisory target, not certified identity) | deep architecture, multimodal critique, and frontier advisory review |
 | `flash-reviewer` | agy | `gemini-3.8-flash-high` (advisory target, not certified identity) | vision, research, persona reviews, fast `/council` secondary |
 | `researcher` | agy | `gemini-3.8-flash-high` (exact policy; absent served proof blocks) | exact-model research; AGY currently cannot satisfy its identity gate |
 | `docs-writer`, `frontend`, `antigravity` | agy | `gemini-3.8-flash-high` (pinned target) | docs, frontend evaluation/design, scoped implementation |
-| explicit ArkCLI Coding Plan seat | arkcli | refreshable plan roster (for example `glm-5-2-260617`) | fast value/coding-plan secondary; verify `model.served` |
+| `deepseek-41-flash`, `glm-53-flash` | openai-compat | `deepseek-v4-1-flash-260910`, `glm-5-3-flash-260828` (BytePlus Coding Plan `byteplus-coding`) | text-only secondary review/coding opinions (`--allow-text-only`); verify `model.served` |
+| explicit ArkCLI Coding Plan seat | arkcli | refreshable plan roster (for example `deepseek-v4-1-flash-260910`, `glm-5-3-flash-260828`) | fast value/coding-plan secondary; verify `model.served` |
 
 Kimi's standard final-report contract is unchanged: `STATUS`, `SUMMARY`,
 `FOLLOW-UP`, and `HANDOFF` are all required. A response containing only

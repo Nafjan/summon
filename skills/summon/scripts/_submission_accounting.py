@@ -254,6 +254,10 @@ def public_summary(value: object) -> dict:
             "missing_submissions": len(attempts) - covered,
             "completeness": "complete" if covered == len(attempts) else "partial",
         }
+    # Top-level unknown_spend tracks missing total_tokens submissions (plus
+    # indeterminate contact, replay conflicts, or per-attempt unknown_spend);
+    # sub-metric gaps (e.g. cached_input_tokens) remain visible in
+    # reported[metric]["completeness"] without forcing summary unknown_spend.
     total_metric = reported_public["total_tokens"]
     unknown_spend = bool(
         states["possible"] or states["indeterminate"] or replay_conflicts

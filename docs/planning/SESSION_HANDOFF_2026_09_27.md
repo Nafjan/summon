@@ -53,7 +53,7 @@ metered and requires explicit spend authorization.
 - `docs/planning/ASTRA_HANDOVER.md` — the previous handover (accurate for
   scope/context where not superseded)
 - `docs/planning/RELEASE35_COVERAGE_MATRIX.md` — 63-row requirement matrix
-- Private ledger: `I:\Antigravity projects\summon-evidence-350\LOOP_LEDGER.md`
+- Private ledger: external release-evidence ledger (`LOOP_LEDGER.md`, retained outside the repository)
 
 ## Current state
 

@@ -75,6 +75,75 @@ def dry_run_argv_length_error(inv, command: str, args: list,
     return argv_length_error(inv.cli, command, args, _merge_env(env_override))
 
 
+def dry_run_transport_and_argv_refusal(
+    inv, command: str, args: list,
+    env_override: Mapping[str, object] | None, *,
+    launch_control=None,
+) -> tuple[str | None, str | None, bool]:
+    """Return ``(error_kind, message, rerouted_to_acp)`` matching live ``execute_agent``."""
+    try:
+        resolved_cmd, resolved_args = _resolve_launch(command, args)
+    except ValueError:
+        return None, None, False
+    proc_env = _merge_env(env_override)
+    budget_result = None
+    budget_error = None
+    declared_cap = _adapter_transport_capability(inv, resolved_args)
+    if declared_cap is not None:
+        try:
+            from _transport_budget import evaluate_invocation as _evaluate_transport_budget
+            if type(declared_cap) is not dict:
+                raise ValueError("transport capability must be an object")
+            capability = copy.deepcopy(declared_cap)
+            platform = capability.pop("platform", None)
+            if platform not in {"nt", "posix"}:
+                raise ValueError("transport capability requires an explicit platform")
+            if platform != os.name:
+                raise ValueError("transport capability platform does not match the host")
+            attachment_bytes = None
+            transport_content = inv.prompt
+            if capability.get("kind") in {"private_attachment", "system_file"}:
+                if capability.get("kind") == "private_attachment":
+                    if "--attach" not in resolved_args:
+                        raise ValueError("private attachment capability requires an attachment argument")
+                    attach_index = resolved_args.index("--attach") + 1
+                    attachment_path = resolved_args[attach_index]
+                else:
+                    attachment_path = (proc_env or {}).get("GEMINI_SYSTEM_MD")
+                    if not isinstance(attachment_path, str) or not attachment_path:
+                        raise ValueError("system file capability requires GEMINI_SYSTEM_MD")
+                if not os.path.isfile(attachment_path):
+                    raise ValueError("transport system file is unavailable")
+                with open(attachment_path, "rb") as attachment_file:
+                    attachment_file.seek(0, os.SEEK_END)
+                    attachment_bytes = attachment_file.tell()
+                    attachment_file.seek(0)
+                    transport_content = attachment_file.read(16 * 1024 * 1024 + 1)
+            budget_result = _evaluate_transport_budget(
+                operation_id=getattr(inv, "attempt_id", None) or "dry-run",
+                content=transport_content,
+                command=resolved_cmd, args=resolved_args, env=proc_env,
+                platform=platform, capability=capability,
+                attachment_bytes=attachment_bytes)
+        except Exception:  # noqa: BLE001 - fail closed like execute_agent
+            budget_error = "transport capability preflight refused"
+    argv_err = argv_length_error(inv.cli, resolved_cmd, resolved_args, proc_env)
+    if budget_result is not None and budget_result.get("status") == "blocked":
+        if budget_result.get("capability", {}).get("kind") == "private_attachment" or not argv_err:
+            argv_err = "transport budget refused the complete invocation before provider contact"
+    elif budget_error is not None:
+        argv_err = budget_error
+    if not argv_err:
+        return None, None, False
+    if argv_overflow_reroutes_to_acp(inv, resolved_args, launch_control):
+        return None, None, True
+    if budget_result is not None and budget_result.get("status") == "blocked":
+        return "transport_budget_exceeded", argv_err, False
+    if budget_error is not None:
+        return "transport_capability_invalid", argv_err, False
+    return "prompt_too_long_for_argv", argv_err, False
+
+
 def _adapter_transport_capability(inv, args: list[object]) -> Mapping[str, object] | None:
     """Resolve only adapter-owned transport facts for this exact operation.
 
@@ -445,23 +514,41 @@ _STATUS_VALUES = frozenset({"DONE", "PARTIAL", "BLOCKED", "SUCCESS", "ERROR"})
 _REPORT_FIELD_RE = re.compile(r"^([A-Z][A-Z0-9_-]{1,}):[ \t]?(.*)$")
 # Markdown-rendered backends (agy above all) bold the contract field names, with
 # the colon landing INSIDE or OUTSIDE the wrapper: `**STATUS:** v` / `**STATUS**: v`.
-_BOLD_FIELD_PREFIX = re.compile(r"^\*\*([A-Z][A-Z0-9_-]{1,})(?::\*\*|\*\*:)")
+_BOLD_FIELD_PREFIX = re.compile(r"^\*\*([A-Za-z][A-Za-z0-9_-]{1,})(?::\*\*|\*\*:)")
 # Some providers render a contract field as a Markdown heading.  Accept only a
 # bounded, line-start heading prefix; arbitrary `VERDICT:` prose must remain
 # non-structural.  The required whitespace after `#` is intentional: it keeps
 # shell comments and prompt text from becoming report fields accidentally.
 _HEADING_FIELD_PREFIX = re.compile(r"^\s{0,3}#{1,6}[ \t]+")
+_BULLET_FIELD_PREFIX = re.compile(r"^\s{0,3}[-*][ \t]+")
+_CASE_FIELD_PREFIX = re.compile(r"^([A-Za-z][A-Za-z0-9_-]{1,})(:.*)$")
 
 
 def _unbold_field_line(line: str) -> str:
     """Normalize one structured report line without broadening prose matching.
 
-    A provider may emit `**STATUS:** DONE` or `## VERDICT: BLOCK`.  Both are
-    accepted only at the beginning of a line and only the wrapper is removed;
-    field-name and status validation still happens in :func:`parse_report`.
+    A provider may emit `**STATUS:** DONE`, `## VERDICT: BLOCK`, `- STATUS: DONE`,
+    or `Status: DONE`. Heading and bold wrappers are accepted only at the
+    beginning of a line; leading bullets (`- ` / `* `) and mixed-case keys are
+    normalized only for known `_REPORT_FIELDS` names so bulleted prose or
+    arbitrary `Note:` lines inside multi-line fields stay untouched.
     """
     normalized = _HEADING_FIELD_PREFIX.sub("", line, count=1)
-    return _BOLD_FIELD_PREFIX.sub(lambda m: m.group(1) + ":", normalized, count=1)
+    candidate = _BULLET_FIELD_PREFIX.sub("", normalized, count=1)
+    had_bullet = candidate != normalized
+    candidate = _BOLD_FIELD_PREFIX.sub(lambda m: m.group(1) + ":", candidate, count=1)
+    m = _CASE_FIELD_PREFIX.match(candidate)
+    if m:
+        upper_key = m.group(1).upper()
+        if upper_key in _REPORT_FIELDS:
+            return upper_key + m.group(2)
+        if not had_bullet and m.group(1) == upper_key:
+            return candidate
+    return _BOLD_FIELD_PREFIX.sub(
+        lambda m: m.group(1) + ":" if m.group(1) == m.group(1).upper() else m.group(0),
+        normalized,
+        count=1,
+    )
 # A line begins a NEW field when its key is either a known field OR a well-formed
 # all-caps identifier (letters/digits/underscore, 2-30 chars) — so a third-party
 # agent's CUSTOM field (SCORE:, RUBRIC:, ...) is captured, not silently folded
@@ -748,6 +835,20 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     response["report_ok"] = bool(
         report and all(b.lower().replace("-", "_") in report for b in _REPORT_BOOKENDS)
     )
+    _raw_result = response.get("result")
+    _clean_result = _redact_output_secrets(_raw_result.strip()) if isinstance(_raw_result, str) and _raw_result.strip() else ""
+    if response["report_ok"]:
+        response["report_source"] = "structured"
+        response["report_text"] = (report.get("summary") or _clean_result).strip()
+    elif isinstance(report, dict) and report:
+        response["report_source"] = "partial_structured"
+        response["report_text"] = (report.get("summary") or _clean_result).strip()
+    elif _clean_result:
+        response["report_source"] = "raw"
+        response["report_text"] = _clean_result
+    else:
+        response["report_source"] = "none"
+        response["report_text"] = ""
     response["verdict"] = _review_verdict(report)
     # 1) Structured self-report wins over exit-0 "success" (never upgrades).
     if response.get("status") == "success" and report and report.get("status"):
@@ -4011,8 +4112,13 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                     }
                 else:
                     _after = workspace_snapshot(inv.cwd)
-                    resp["workspace_evidence"] = workspace_evidence(
-                        _workspace_before, _after, getattr(inv, "permission", None))
+                    try:
+                        resp["workspace_evidence"] = workspace_evidence(
+                            _workspace_before, _after, getattr(inv, "permission", None),
+                            cli=getattr(inv, "cli", None))
+                    except TypeError:
+                        resp["workspace_evidence"] = workspace_evidence(
+                            _workspace_before, _after, getattr(inv, "permission", None))
             except Exception:  # noqa: BLE001 — never hide the terminal response
                 resp["workspace_evidence"] = {
                     "before": None, "after": None, "coverage": "unavailable",

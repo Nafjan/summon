@@ -55,9 +55,9 @@ class ModelRoutingTests(unittest.TestCase):
         from _loader import bundled_roster_dir, load_agent
         roster = bundled_roster_dir()
         self.assertIsNotNone(roster)
-        for name, expected in (("sol-review", "gpt-5.6-sol"),
+        for name, expected in (("sol-review", "gpt-6.1-sol"),
                                ("terra-review", "gpt-5.6-terra"),
-                               ("luna-review", "gpt-5.6-luna")):
+                               ("luna-review", "gpt-6-luna")):
             loaded = load_agent(roster, name)
             self.assertEqual(loaded[0], "codex")
             self.assertEqual(loaded[4], "read-only")

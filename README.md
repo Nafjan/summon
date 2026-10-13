@@ -189,8 +189,10 @@ For a minimal provider-free workspace, save this synthetic plan as
 ```
 
 Replace `PRIVATE_RUNS_DIR` with a dedicated private directory outside the source
-checkout; use a new run ID. Run these from the directory containing the plan
-(`summon.cmd` on Windows):
+checkout (the directory must either not pre-exist—`workspace create` creates and
+secures it—or already carry owner-only permissions; shared temp directories such
+as Git Bash `mktemp -d` fail closed by design); use a new run ID. Run these from
+the directory containing the plan (`summon.cmd` on Windows):
 
 ```text
 summon workspace create preview-run --plan workspace-plan.json --runs-root PRIVATE_RUNS_DIR --json

@@ -502,3 +502,244 @@ def test_telemetry_preserves_opaque_attempt_id():
         operation_context=context,
     )
     assert event["attempt_id"] == attempt_id
+
+
+def test_keyboard_interrupt_crash_envelope_is_typed_cancelled():
+    env = run_subagent._crash_envelope(KeyboardInterrupt())
+    assert env["status"] == "cancelled"
+    assert env["dispatcher_status"] == "cancelled"
+    assert env["execution_status"] == "cancelled"
+    assert env["error_kind"] == "interrupted"
+    assert env["failure_class"] == "cancelled"
+    assert env["exit_code"] == 130
+    assert env["backend_exit_code"] == 130
+    assert env["raw_backend_exit_code"] == 130
+    assert env["normalized_exit_code"] == 130
+    assert env["retryable"] is True
+    assert env["result_usable"] is False
+    event = _telemetry.event_from_envelope(env)
+    assert event["status"] == "cancelled"
+    assert event["failure_class"] == "cancelled"
+    assert event["exit_code"] == 130
+
+
+def test_report_parsing_bullets_case_and_report_source_fallback():
+    bullet_report = _executor.parse_report(
+        "Analysis complete.\n"
+        "- **Status**: DONE\n"
+        "* Summary: Fixed the race condition\n"
+        "- Follow-up: None\n"
+        "- Handoff: Ready for merge\n"
+    )
+    assert bullet_report is not None
+    assert bullet_report["status"] == "DONE"
+    assert bullet_report["summary"] == "Fixed the race condition"
+    assert bullet_report["follow_up"] == "None"
+    assert bullet_report["handoff"] == "Ready for merge"
+
+    structured = _executor._enrich(
+        {"status": "success", "exit_code": 0, "cli": "claude",
+         "result": "STATUS: DONE\nSUMMARY: Structured summary\nFOLLOW-UP: None\nHANDOFF: Ready"},
+        None,
+    )
+    assert structured["report_ok"] is True
+    assert structured["report_source"] == "structured"
+    assert structured["report_text"] == "Structured summary"
+
+    raw_only = _executor._enrich(
+        {"status": "success", "exit_code": 0, "cli": "opencode",
+         "result": "Plain prose response without contract block."},
+        None,
+    )
+    assert raw_only["report"] is None
+    assert raw_only["report_ok"] is False
+    assert raw_only["report_source"] == "raw"
+    assert raw_only["report_text"] == "Plain prose response without contract block."
+
+
+def test_out_lock_refuses_active_collision_without_clobbering(tmp_path, monkeypatch, capsys):
+    out_file = tmp_path / "shared-out.json"
+    original_payload = {"status": "success", "result": "keep-me", "report_ok": True}
+    out_file.write_text(json.dumps(original_payload), encoding="utf-8")
+
+    # Acquire the lock for out_file in-process to simulate an active writer.
+    holder = run_subagent._acquire_out_lock(str(out_file))
+    assert holder is None
+    try:
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("inspect repo", encoding="utf-8")
+        monkeypatch.setattr(
+            sys, "argv",
+            ["run_subagent.py", "--agent", "reviewer-claude",
+             "--prompt-file", str(prompt_file), "--cwd", str(tmp_path),
+             "--out", str(out_file)],
+        )
+        # Keep the simulated lock active across the colliding call.
+        saved_lock = run_subagent._CURRENT_OUT_LOCK
+        run_subagent._CURRENT_OUT_LOCK = None
+        try:
+            with pytest.raises(SystemExit) as exc_info:
+                run_subagent.main()
+            assert exc_info.value.code == 1
+        finally:
+            run_subagent._CURRENT_OUT_LOCK = saved_lock
+        captured = json.loads(capsys.readouterr().out)
+        assert captured["status"] == "error"
+        assert captured["refusal"] is True
+        assert captured["error_kind"] == "out_path_collision"
+        assert captured["provider_contacted"] is False
+        # The existing --out file must not be overwritten or archived by the colliding call.
+        assert json.loads(out_file.read_text(encoding="utf-8")) == original_payload
+    finally:
+        run_subagent._release_current_out_lock()
+
+
+def test_wait_all_cli_returns_compact_summary(tmp_path):
+    import _jobs
+    job_dir = str(tmp_path / "jobs")
+    j1 = _jobs.new_job_id()
+    j2 = _jobs.new_job_id()
+    n1 = "a" * 32
+    n2 = "b" * 32
+    _jobs.write_prepared(job_dir, j1, nonce=n1, agent="explorer",
+                         prompt_sha256=None, cwd=str(tmp_path), flags={}, summon={})
+    _jobs.write_prepared(job_dir, j2, nonce=n2, agent="reviewer",
+                         prompt_sha256=None, cwd=str(tmp_path), flags={}, summon={})
+    Path(_jobs.result_path(job_dir, j1)).write_text(
+        json.dumps({"status": "success", "exit_code": 0, "agent": "explorer",
+                    "job_id": j1, "job_nonce": n1, "report_ok": True,
+                    "report_source": "structured",
+                    "report": {"summary": "explored module"}}),
+        encoding="utf-8",
+    )
+    Path(_jobs.result_path(job_dir, j2)).write_text(
+        json.dumps({"status": "success", "exit_code": 0, "agent": "reviewer",
+                    "job_id": j2, "job_nonce": n2, "report_ok": False,
+                    "report_source": "raw", "report_text": "raw review output",
+                    "result": "raw review output"}),
+        encoding="utf-8",
+    )
+    argv, err = run_subagent._cli.rewrite_subcommand(
+        ["wait", "--all", j1, j2, "--job-dir", job_dir, "--timeout", "1s"]
+    )
+    assert err is None
+    parser = run_subagent._cli.build_parser(run_subagent.__version__, 1)
+    args = parser.parse_args(argv)
+    errors = []
+    from io import StringIO
+    buf = StringIO()
+    old_stdout = sys.stdout
+    try:
+        sys.stdout = buf
+        rc = run_subagent._background.run_jobs_query(args, lambda m, c=1: errors.append((m, c)))
+    finally:
+        sys.stdout = old_stdout
+    assert rc == 0, errors
+    summary = json.loads(buf.getvalue())
+    assert summary["status"] == "success"
+    assert summary["all_terminal"] is True
+    assert summary["succeeded"] == 2
+    assert summary["failed"] == 0
+    assert len(summary["jobs"]) == 2
+    by_id = {item["job_id"]: item for item in summary["jobs"]}
+    assert by_id[j1]["summary"] == "explored module"
+    assert by_id[j2]["summary"] == "raw review output"
+
+
+def test_list_agents_enriches_capabilities_and_filters_for_task(tmp_path):
+    from _loader import list_agents, filter_agents_for_task
+    (tmp_path / "text-advisor.md").write_text(
+        "---\nrun-agent: openai-compat\npermission: read-only\nmodel: deepseek-v3-2-251201\n---\n# Text Advisor\nAdvisory text seat.\n",
+        encoding="utf-8",
+    )
+    agents = list_agents(str(tmp_path))
+    assert agents
+    by_name = {a["name"]: a for a in agents}
+    assert by_name["sol-review"]["capability_tier"] == "toolful"
+    assert by_name["sol-review"]["can_run_tests"] is False
+    assert by_name["sol-review"]["reports_served_model"] is True
+    assert by_name["coder"]["can_run_tests"] is True
+    assert by_name["text-advisor"]["capability_tier"] == "text-only"
+    assert by_name["text-advisor"]["can_run_tests"] is False
+
+    review_seats = filter_agents_for_task(agents, "review")
+    assert review_seats
+    assert ("review" in review_seats[0]["name"]
+            or review_seats[0]["name"] in {"astra", "architect"})
+    impl_seats = filter_agents_for_task(agents, "implement")
+    assert impl_seats
+    assert all(s["can_run_tests"] is True for s in impl_seats[:3])
+
+
+def test_skill_md_is_under_45kb_budget():
+    script_dir = Path(__file__).resolve().parent
+    skill_md = script_dir.parent / "SKILL.md"
+    ref_manual = script_dir.parent / "references" / "reference-manual.md"
+    assert skill_md.is_file()
+    assert ref_manual.is_file()
+    assert skill_md.stat().st_size <= 45_000
+
+
+def test_telemetry_spool_rotation_recommended_timeout_and_stats(tmp_path, monkeypatch):
+    import _telemetry
+    spool = tmp_path / "telemetry.jsonl"
+    cfg = tmp_path / "telemetry.json"
+    monkeypatch.setenv("SUMMON_TELEMETRY_FILE", str(spool))
+    monkeypatch.setenv("SUMMON_TELEMETRY_CONFIG", str(cfg))
+    monkeypatch.setenv("SUMMON_TELEMETRY", "1")
+    monkeypatch.setattr(_telemetry, "_MAX_EVENT_FILE_BYTES", 3000)
+
+    for idx in range(6):
+        _telemetry.record({
+            "status": "success",
+            "execution_status": "success",
+            "cli": "kimi",
+            "transport": "subprocess",
+            "permission": "yolo",
+            "elapsed_ms": 400_000 + idx * 10_000,
+            "attempts": 1,
+            "provider_contacted": True,
+            "result_usable": True,
+            "report_ok": True,
+        })
+    rotated = Path(str(spool) + ".1")
+    assert rotated.is_file()
+    rec = _telemetry.recommended_timeout_ms("kimi", 600_000, min_samples=3)
+    assert rec > 600_000
+    st = _telemetry.stats()
+    assert st["rotated_archive_present"] is True
+    assert st["total_events"] >= 4
+    assert st["by_backend"]["kimi"]["success"] >= 4
+    assert st["by_backend"]["kimi"]["p95_ms"] >= 400_000
+
+    argv, err = run_subagent._cli.rewrite_subcommand(["stats", "--json"])
+    assert err is None
+    assert argv == ["--telemetry-stats", "--json"]
+
+
+def test_workspace_evidence_suppresses_read_only_violation_for_text_only_seats():
+    import _receipt
+    before = {
+        "coverage": "complete", "head": "1" * 40, "branch": "main",
+        "staged": [], "unstaged": [],
+        "renamed": [], "untracked": [],
+    }
+    after = {
+        "coverage": "complete", "head": "1" * 40, "branch": "main",
+        "staged": [], "unstaged": ["dirty.py"],
+        "renamed": [], "untracked": [],
+    }
+    ev_text = _receipt.workspace_evidence(
+        before, after, permission="read-only", cli="openai-compat"
+    )
+    assert ev_text["mutation"] is True
+    assert ev_text["read_only_violation"] is False
+    assert ev_text["attribution"] == "external"
+
+    ev_toolful = _receipt.workspace_evidence(
+        before, after, permission="read-only", cli="claude"
+    )
+    assert ev_toolful["mutation"] is True
+    assert ev_toolful["read_only_violation"] is True
+    assert ev_toolful["attribution"] == "exact"
+

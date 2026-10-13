@@ -28,10 +28,13 @@ class GeminiRosterTests(unittest.TestCase):
                 definition = load_agent(str(agents), name)
                 self.assertEqual(definition[0], "agy")
                 self.assertEqual(definition[5], "gemini-3.8-flash-high")
+        argon = load_agent(str(agents), "argon-reviewer")
+        self.assertEqual(argon[0], "agy")
+        self.assertEqual(argon[5], "gemini-4-argon-high")
 
     def test_advisory_seat_does_not_weaken_researcher_exact_contract(self):
         self.assertEqual(model_exact_policy("researcher"), (True, "named-seat"))
-        for name in ("flash-reviewer", "frontend", "docs-writer", "antigravity"):
+        for name in ("argon-reviewer", "flash-reviewer", "frontend", "docs-writer", "antigravity"):
             with self.subTest(name=name):
                 self.assertEqual(model_exact_policy(name), (False, None))
                 self.assertEqual(model_exact_policy(name, explicit=True), (True, "cli"))
@@ -69,6 +72,12 @@ class GeminiRosterTests(unittest.TestCase):
                 self.assertEqual(
                     _apply_gemini_thinking("gemini-3.8-flash-high", effort),
                     "gemini-3.8-flash-" + effort)
+                self.assertEqual(
+                    _apply_gemini_thinking("gemini-4-argon-high", effort),
+                    "gemini-4-argon-" + effort)
+                self.assertEqual(
+                    _apply_gemini_thinking("claude-opus-5-5-high", effort),
+                    "claude-opus-5-5-" + effort)
         self.assertEqual(_apply_gemini_thinking("gemini-3.7-flash-high", "low"),
                          "gemini-3.7-flash-low")
         self.assertEqual(_apply_gemini_thinking("gemini-3.8-flash-medium", "max"),
@@ -89,6 +98,7 @@ class GeminiRosterTests(unittest.TestCase):
                 hashed = catalog.display_for_hash("agy", hashlib.sha256(model.encode()).hexdigest())
                 self.assertEqual(hashed["version"], version)
         self.assertEqual(catalog.display_for("agy", "gemini-3.8-flash-high")["label"], "frontier")
+        self.assertEqual(catalog.display_for("agy", "gemini-4-argon-high")["label"], "frontier")
         self.assertIsNone(catalog.display_for("agy", "gemini-3.9-flash-high"))
 
 

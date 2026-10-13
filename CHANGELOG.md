@@ -5,6 +5,40 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+- Refresh the model lineup and routing table across Claude (`claude-opus-5`,
+  `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-6`, and dated `5-5`
+  Bedrock/Vertex pins), Gemini (`gemini-4-argon-high`, `gemini-4-argon-low`,
+  `gemini-4-flash`), Codex (`gpt-6-codex`, `gpt-5.4-codex-mini`), Kimi
+  (`kimi-code/k3`, `kimi-code/k3-256k`, `kimi-code/k2.7-coding`), and
+  OpenRouter/Kilo defaults (`deepseek/deepseek-v4.2`, `qwen/qwen3.6-coder`,
+  `z-ai/glm-5.3`, `z-ai/glm-5.3-flash`, `minimax/minimax-m3`), while keeping
+  legacy aliases backward-compatible and adding the bundled `argon-reviewer`
+  seat.
+- Harden ModelArk Coding Plan routing and workspace budget accounting: clamp
+  concurrent rate events in `_swarm_coordinator.workspace_budget_snapshot`,
+  add host-gated Coding Plan subscription vs metered `/api/v3` PAYG consent
+  classification (`classify_openai_compat_route` and `_byteplus_route_parts` in
+  `_apibackend.py`), enforce `authority.api` spend-consistency checks in
+  `_evidence.py`, unify disposition and linked-replacement adapters on
+  `_coherent_workspace` in `_workspace_commands.py`, and clarify `--runs-root`
+  permission requirements in `README.md`.
+- Promote structured output fields to the top-level dispatch receipt (`summary`,
+  `confidence`, `files_touched`) with `CONFIDENCE:` parsing (`high`, `medium`,
+  `low`, or `0.0`–`1.0`), raw-output report fallback (`report_source: "raw"`)
+  when an agent omits `--report-to`, and `summon wait --all` / `jobs wait --all`
+  for batch background job convergence.
+- Split `skills/summon/SKILL.md` into a compact operational guide (`<= 45 KB`)
+  paired with `skills/summon/references/reference-manual.md`, expose seat
+  capability metadata (`capability_tier`, `can_run_tests`,
+  `reports_served_model`) and `summon list --for <task>` filtering, and derive
+  adaptive foreground default timeouts (`min(max(default, 2 * p95), 3600s)`)
+  from live telemetry.
+- Separate `live` and `test` telemetry cohorts by default, rotate the local
+  telemetry spool to a bounded `.1` archive, add `summon stats` (`telemetry
+  stats` / `--telemetry-stats`), and suppress false `read_only_violation` flags
+  on text-only (`openai-compat`, `arkcli`) seats when a concurrent writer
+  modifies the shared worktree.
+
 ## [3.5.0] - 2026-09-23
 
 Summon 3.5.0 pairs dispatcher reliability fixes driven by field telemetry with a

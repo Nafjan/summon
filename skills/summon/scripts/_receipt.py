@@ -422,7 +422,8 @@ def workspace_snapshot(cwd: str | None) -> dict:
 
 
 def workspace_evidence(before: dict | None, after: dict | None,
-                       permission: str | None = None) -> dict:
+                       permission: str | None = None,
+                       cli: str | None = None) -> dict:
     """Compare two snapshots without attributing a dirty baseline to the child."""
     before = before if isinstance(before, dict) else _workspace_empty()
     after = after if isinstance(after, dict) else _workspace_empty()
@@ -449,7 +450,13 @@ def workspace_evidence(before: dict | None, after: dict | None,
         # child commit proves mutation, otherwise the result is unknown.
         mutation = (True if state_changed else None) if baseline_dirty else state_changed
         attribution = "ambiguous" if baseline_dirty else "exact"
-        if permission == "read-only":
+        if cli in ("openai-compat", "arkcli"):
+            # Text-only seats have no filesystem or tool execution surface; any
+            # concurrent working-tree change came from outside this child.
+            read_only_violation = False
+            if state_changed:
+                attribution = "external"
+        elif permission == "read-only":
             read_only_violation = True if mutation is True else (None if mutation is None else False)
         else:
             read_only_violation = False

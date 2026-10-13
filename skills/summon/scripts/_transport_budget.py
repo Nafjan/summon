@@ -96,10 +96,7 @@ def _argv_measurement(command: str, args: list[str], env: Mapping[str, Any] | No
     longest = max((len(item) for item in encoded_args), default=0)
     total = (len(encoded_args[0])
              + sum(len(item) + 1 for item in encoded_args[1:])
-             + sum(len(key) + len(value) + 2
-                   for key, value in env_items) if env_items
-             else len(encoded_args[0])
-             + sum(len(item) + 1 for item in encoded_args[1:]))
+             + sum(len(key) + len(value) + 2 for key, value in env_items))
     return {"max_argument_bytes": longest, "limit_single_argument_bytes": max_argument,
             "serialized_arg_env_bytes": total, "limit_total_bytes": max_total}
 
