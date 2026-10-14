@@ -459,6 +459,152 @@ def read_allowlist(cli: str, permission: str, cwd: str,
     return policy
 
 
+_ORIG_SHUTIL_WHICH = shutil.which
+_CODEX_BIN_VERSION_CACHE: dict[tuple[str, int, int], tuple[int, int, int, int]] = {}
+_CODEX_SEMVER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?")
+
+
+def _codex_semver_key(path: str) -> tuple[int, int, int, int]:
+    """Return a comparable semver tuple for a codex binary candidate."""
+    try:
+        st = os.stat(path)
+        cache_key = (os.path.normcase(os.path.abspath(path)), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (0, 0, 0, 0)
+    cached = _CODEX_BIN_VERSION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    ver = (0, 0, 0, 0)
+    try:
+        proc = subprocess.run(
+            [path, "--version"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=2, stdin=subprocess.DEVNULL, **run_flags(),
+        )
+        out = f"{proc.stdout or ''} {proc.stderr or ''}".strip()
+        m = _codex_semver_RE_match(out)
+        if m is not None:
+            ver = m
+    except Exception:  # noqa: BLE001
+        ver = (0, 0, 0, 0)
+    _CODEX_BIN_VERSION_CACHE[cache_key] = ver
+    return ver
+
+
+def _codex_semver_RE_match(text: str) -> tuple[int, int, int, int] | None:
+    m = _CODEX_SEMVER_RE.search(text or "")
+    if not m:
+        return None
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    pre = m.group(4)
+    # Release builds rank above pre-release of the same X.Y.Z; pre-release ranks by trailing digits.
+    if not pre:
+        pre_rank = 10_000
+    else:
+        nums = re.findall(r"\d+", pre)
+        pre_rank = int(nums[-1]) if nums else 1
+    return (major, minor, patch, pre_rank)
+
+
+def _expand_codex_shim_exe(shim_path: str) -> list[str]:
+    """Expand a Windows npm .cmd/.bat shim into its vendor codex.exe candidates."""
+    import glob as _glob
+    shim_dir = os.path.dirname(shim_path)
+    if not shim_dir:
+        return []
+    patterns = [
+        os.path.join(shim_dir, "node_modules", "@openai", "codex", "node_modules",
+                     "@openai", "codex-*", "vendor", "*", "codex", "codex.exe"),
+        os.path.join(shim_dir, "node_modules", "@openai", "codex-*", "vendor",
+                     "*", "codex", "codex.exe"),
+    ]
+    out: list[str] = []
+    for pat in patterns:
+        for hit in sorted(_glob.glob(pat)):
+            if os.path.isfile(hit) and hit not in out:
+                out.append(hit)
+    return out
+
+
+def resolve_codex_binary(
+    *,
+    which_fn=None,
+    localappdata: str | None = None,
+    codex_home: str | None = None,
+) -> str | None:
+    """Resolve the best available Codex CLI executable.
+
+    Precedence:
+    1. Explicit ``SUMMON_CODEX_BIN`` environment variable (if pointing to a file).
+    2. Explicit ``CODEX_CLI`` environment variable (if pointing to a file, not ``1``).
+    3. ``CODEX_CLI_PATH`` in ``~/.codex/config.toml`` (if pointing to a file).
+    4. Highest-semver native binary across ``%LOCALAPPDATA%/OpenAI/Codex/bin/*/codex.exe``,
+       PATH ``codex.exe`` / ``codex``, and npm vendor binaries.
+    """
+    import glob as _glob
+    for env_key in ("SUMMON_CODEX_BIN", "CODEX_CLI"):
+        val = (os.environ.get(env_key) or "").strip()
+        if val and val != "1" and os.path.isfile(val):
+            return val
+
+    eff_which = which_fn or shutil.which
+    # Respect unit tests that monkeypatch shutil.which unless explicit test dirs are passed.
+    if (eff_which is not _ORIG_SHUTIL_WHICH or shutil.which is not _ORIG_SHUTIL_WHICH) and localappdata is None and codex_home is None:
+        hit = eff_which("codex")
+        if hit and os.name == "nt" and str(hit).lower().endswith((".cmd", ".bat")):
+            exes = _expand_codex_shim_exe(str(hit))
+            if exes:
+                return exes[0]
+        return hit
+
+    home_dir = codex_home or os.path.join(os.path.expanduser("~"), ".codex")
+    cfg_path = os.path.join(home_dir, "config.toml")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if s.startswith("CODEX_CLI_PATH") and "=" in s:
+                        rhs = s.split("=", 1)[1].strip().strip("'\"")
+                        if rhs and os.path.isfile(rhs):
+                            return rhs
+        except OSError:
+            pass
+
+    candidates: list[str] = []
+    la = localappdata if localappdata is not None else os.environ.get("LOCALAPPDATA")
+    if la:
+        bin_root = os.path.join(la, "OpenAI", "Codex", "bin")
+        if os.path.isdir(bin_root):
+            for entry in sorted(_glob.glob(os.path.join(bin_root, "*", "codex.exe"))):
+                if os.path.isfile(entry) and entry not in candidates:
+                    candidates.append(entry)
+            direct = os.path.join(bin_root, "codex.exe")
+            if os.path.isfile(direct) and direct not in candidates:
+                candidates.append(direct)
+
+    for name in (("codex.exe", "codex") if os.name == "nt" else ("codex",)):
+        hit = eff_which(name)
+        if hit:
+            if os.name == "nt" and str(hit).lower().endswith((".cmd", ".bat")):
+                for exe in _expand_codex_shim_exe(str(hit)):
+                    if exe not in candidates:
+                        candidates.append(exe)
+            if hit not in candidates:
+                candidates.append(hit)
+
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    def _rank(cand: str) -> tuple[tuple[int, int, int, int], int]:
+        is_exe = 1 if str(cand).lower().endswith(".exe") else 0
+        return (_codex_semver_key(cand), is_exe)
+
+    return max(candidates, key=_rank)
+
+
 # Authority ORDER, lowest first. Used only to clamp downward; nothing raises a tier.
 _PERMISSION_ORDER = ("read-only", "safe-edit", "yolo")
 

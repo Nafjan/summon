@@ -2413,6 +2413,8 @@ class SwarmCoordinator:
                 continue
             if exclude_message_id is not None and isinstance(message, Mapping) and message.get("message_id") == exclude_message_id:
                 continue
+            if observed > captured_now + 5000:
+                raise SwarmBudgetRefusal("budget_binding_required")
             rate_events.append({"at_ms": min(observed, captured_now),
                                 "messages": 1,
                                 "bytes": content["utf8_bytes"]})

@@ -148,8 +148,8 @@ emit neither form still truthfully retain `model.served: null` and
 | `flash-reviewer` | agy | `gemini-3.8-flash-high` (advisory target, not certified identity) | vision, research, persona reviews, fast `/council` secondary |
 | `researcher` | agy | `gemini-3.8-flash-high` (exact policy; absent served proof blocks) | exact-model research; AGY currently cannot satisfy its identity gate |
 | `docs-writer`, `frontend`, `antigravity` | agy | `gemini-3.8-flash-high` (pinned target) | docs, frontend evaluation/design, scoped implementation |
-| `deepseek-41-flash`, `glm-53-flash` | openai-compat | `deepseek-v4-1-flash-260910`, `glm-5-3-flash-260828` (BytePlus Coding Plan `byteplus-coding`) | text-only secondary review/coding opinions (`--allow-text-only`); verify `model.served` |
-| explicit ArkCLI Coding Plan seat | arkcli | refreshable plan roster (for example `deepseek-v4-1-flash-260910`, `glm-5-3-flash-260828`) | fast value/coding-plan secondary; verify `model.served` |
+| `deepseek-41-flash`, `glm-coder`, `byteplus-coder` | openai-compat | `deepseek-v4-1-flash`, `glm-5-3-flash` (BytePlus Coding Plan `byteplus-coding`; marketplace snapshots `deepseek-v4-1-flash-260910`, `glm-5-3-flash-260828`) | text-only secondary review/coding opinions (`--allow-text-only`); verify `model.served` |
+| explicit ArkCLI Coding Plan seat | arkcli | refreshable plan roster (for example `deepseek-v4-1-flash-260910`, `glm-5-3-flash-260828`) | fast value/coding-plan secondary; plain-text CLI does not emit `model.served` unless JSON envelope is returned |
 
 Kimi's standard final-report contract is unchanged: `STATUS`, `SUMMARY`,
 `FOLLOW-UP`, and `HANDOFF` are all required. A response containing only

@@ -902,6 +902,8 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
         return 0
     if getattr(args, "jobs_wait_all", False):
         target_ids = list(getattr(args, "jobs_wait_ids", None) or [])
+        active_only = bool(getattr(args, "jobs_active_only", False))
+        skipped_stale = 0
         if target_ids:
             for jid in target_ids:
                 if not _jobs.valid_job_id(jid):
@@ -914,6 +916,23 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
                     return 1
         else:
             rows = _jobs.list_jobs(root)
+            if active_only:
+                rows = [r for r in rows if r.get("state") in ("running", "prepared")]
+            else:
+                filtered_rows = []
+                now_epoch = time.time()
+                for r in rows:
+                    if r.get("state") in ("unverified", "stale"):
+                        rec_path = _jobs.record_path(root, r["job_id"])
+                        try:
+                            age_sec = now_epoch - os.path.getmtime(rec_path)
+                        except OSError:
+                            age_sec = 0.0
+                        if age_sec > 86400:
+                            skipped_stale += 1
+                            continue
+                    filtered_rows.append(r)
+                rows = filtered_rows
             target_ids = [r["job_id"] for r in rows]
         deadline = time.monotonic() + max(0.0, int(args.timeout) / 1000.0)
         summaries = []
@@ -928,11 +947,18 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
             if outcome == "done" and isinstance(result, dict):
                 report_dict = result.get("report") if isinstance(result.get("report"), dict) else {}
                 summary_text = (
-                    report_dict.get("summary")
+                    result.get("summary")
+                    or report_dict.get("summary")
                     or result.get("report_text")
                     or (result.get("result") or "")[:240]
                     or result.get("error")
                 )
+                if isinstance(summary_text, str):
+                    summary_text = summary_text.splitlines()[0].strip() or None
+                files_touched = result.get("files_touched")
+                if not isinstance(files_touched, list):
+                    we = result.get("workspace_evidence")
+                    files_touched = list(we.get("files_touched") or []) if isinstance(we, dict) else []
                 summaries.append({
                     "job_id": jid,
                     "agent": agent_name,
@@ -943,6 +969,8 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
                     "report_ok": bool(result.get("report_ok")),
                     "report_source": result.get("report_source") or ("structured" if result.get("report_ok") else "raw"),
                     "summary": summary_text,
+                    "confidence": result.get("confidence"),
+                    "files_touched": files_touched,
                 })
             elif outcome == "timeout":
                 pid = rec.get("pid") if isinstance(rec, dict) else None
@@ -958,6 +986,8 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
                     "report_ok": False,
                     "report_source": "none",
                     "summary": None,
+                    "confidence": None,
+                    "files_touched": [],
                 })
             else:
                 summaries.append({
@@ -970,6 +1000,8 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
                     "report_ok": False,
                     "report_source": "none",
                     "summary": f"background job {jid!r} ended with outcome {outcome!r}",
+                    "confidence": None,
+                    "files_touched": [],
                 })
         all_terminal = all(item["terminal"] for item in summaries)
         succeeded = sum(1 for item in summaries if item["status"] == "success")
@@ -983,6 +1015,7 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
             "succeeded": succeeded,
             "failed": failed,
             "running": running,
+            "skipped_stale": skipped_stale,
             "jobs": summaries,
         }
         print(json.dumps(payload, ensure_ascii=False))

@@ -27,6 +27,8 @@ import http.client
 import hashlib
 import json
 import os
+import re
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -118,11 +120,64 @@ _CODING_PLAN_PROVIDERS = frozenset({"byteplus-coding", "zai-coding-plan"})
 # of known-good models. Re-check with `arkcli plans model-list --plan coding-plan`
 # and validate an actual text call before promoting a model here.
 _CODING_PLAN_MODEL_GUIDANCE = (
+    "deepseek-v4-1-flash (fast coding/analysis), glm-5-3-flash (fast GLM 5.3 Flash), "
     "deepseek-v4-flash (fast terminal loops), deepseek-v4-pro (hard coding), "
     "glm-5.2 (long-horizon/large-repo work), dola-seed-2.0-code (agentic coding), "
     "or kimi-k2.5 (code/UI alternative). Avoid legacy/superseded roster entries "
     "such as glm-5.1, bytedance-seed-code, and gpt-oss-120b for new work"
 )
+
+# Preferred presentation order when a live roster is available.
+_CODING_PLAN_PREFERRED = (
+    "deepseek-v4-1-flash",
+    "glm-5-3-flash",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "glm-5.2",
+    "dola-seed-2.0-code",
+    "kimi-k2.5",
+    "dola-seed-2.0-pro",
+    "dola-seed-2.0-lite",
+)
+CODING_PLAN_KNOWN_GOOD = frozenset(_CODING_PLAN_PREFERRED)
+
+# Normalize common dotted spellings and dated snapshot IDs to exact BytePlus ModelArk Coding Plan IDs.
+_BYTEPLUS_CODING_MODEL_ALIASES: dict[str, str] = {
+    "glm-5.3-flash": "glm-5-3-flash",
+    "glm-5-3-flash-260828": "glm-5-3-flash",
+    "glm-5.3-flash-260828": "glm-5-3-flash",
+    "z-ai/glm-5.3-flash": "glm-5-3-flash",
+    "zai/glm-5.3-flash": "glm-5-3-flash",
+    "deepseek-4.1-flash": "deepseek-v4-1-flash",
+    "deepseek-v4.1-flash": "deepseek-v4-1-flash",
+    "deepseek-v4-1-flash-260910": "deepseek-v4-1-flash",
+    "deepseek-v4.1-flash-260910": "deepseek-v4-1-flash",
+    "deepseek/deepseek-v4.1-flash": "deepseek-v4-1-flash",
+}
+_CODING_PLAN_DATE_SUFFIX_RE = re.compile(r"-(?:20\d{6}|\d{6})$")
+
+
+def normalize_coding_plan_model(base_url: str | None, model: str | None) -> str | None:
+    """Normalize common dotted and dated model spellings for BytePlus ModelArk endpoints."""
+    if not isinstance(model, str) or not model.strip():
+        return model
+    cleaned = model.strip()
+    if (
+        is_coding_plan_endpoint(base_url)
+        or is_byteplus_platform_endpoint(base_url)
+        or (isinstance(base_url, str) and base_url.strip().lower() in _CODING_PLAN_PROVIDERS)
+    ):
+        low = cleaned.lower()
+        mapped = _BYTEPLUS_CODING_MODEL_ALIASES.get(low)
+        if mapped:
+            return mapped
+        stripped = _CODING_PLAN_DATE_SUFFIX_RE.sub("", low)
+        if stripped != low:
+            mapped_base = _BYTEPLUS_CODING_MODEL_ALIASES.get(stripped, stripped)
+            if mapped_base in CODING_PLAN_KNOWN_GOOD:
+                return mapped_base
+    return cleaned
+
 
 # Listed-but-discouraged / known-broken for new work (still may appear in roster).
 _CODING_PLAN_LEGACY_OR_BROKEN = frozenset({
@@ -132,17 +187,6 @@ _CODING_PLAN_LEGACY_OR_BROKEN = frozenset({
     "bytedance-seed-code",
     "gpt-oss-120b",
 })
-
-# Preferred presentation order when a live roster is available.
-_CODING_PLAN_PREFERRED = (
-    "deepseek-v4-flash",
-    "deepseek-v4-pro",
-    "glm-5.2",
-    "dola-seed-2.0-code",
-    "kimi-k2.5",
-    "dola-seed-2.0-pro",
-    "dola-seed-2.0-lite",
-)
 
 _ROSTER_CACHE_NAME = "byteplus-coding-roster.json"
 _ROSTER_MAX_AGE_S = 14 * 24 * 3600  # align with handoff refresh cadence
@@ -568,8 +612,20 @@ def payg_consent_allowed(allow_payg_flag: bool = False) -> bool:
         # claim-bound --allow-payg flag may authorize it; inherited environment
         # and standing preferences belong to the completed source job.
         return False
-    if os.environ.get("SUMMON_ALLOW_BYTEPLUS_PAYG") == "1":
+    env_payg = os.environ.get("SUMMON_ALLOW_BYTEPLUS_PAYG")
+    if env_payg == "1":
         return True
+    if env_payg is not None and env_payg.strip() != "":
+        safe_tok = env_payg.strip()
+        if (re.fullmatch(r"[A-Za-z0-9_.-]{1,12}", safe_tok)
+                and not safe_tok.lower().startswith(("sk-", "ark-", "ep-"))):
+            shown = repr(safe_tok)
+        else:
+            shown = "'<redacted>'"
+        sys.stderr.write(
+            f"warning: SUMMON_ALLOW_BYTEPLUS_PAYG={shown} is not recognized "
+            "(only '1' grants PAYG consent); ignoring\n"
+        )
     prefs_path = os.path.join(os.path.expanduser("~"), ".agents", "summon.json")
     try:
         with open(prefs_path, encoding="utf-8") as fh:
@@ -749,7 +805,8 @@ def call(inv, timeout_ms: int, *, launch_control=None,
     if not inv.base_url:
         return _preflight_error(
             "openai-compat: no base_url resolved (set provider: or base_url:)")
-    _cp_model = coding_plan_model_error(inv.base_url, inv.model)
+    effective_model = normalize_coding_plan_model(inv.base_url, inv.model) or inv.model
+    _cp_model = coding_plan_model_error(inv.base_url, effective_model)
     if _cp_model:
         return _preflight_error(_cp_model)
     if (is_byteplus_platform_endpoint(inv.base_url)
@@ -785,10 +842,10 @@ def call(inv, timeout_ms: int, *, launch_control=None,
 
     wall_deadline = time.monotonic() + max(1.0, timeout_ms / 1000.0)
     if launch_control is None:
-        resp = _do_request(inv.base_url, inv.model, inv.system_context, inv.prompt,
+        resp = _do_request(inv.base_url, effective_model, inv.system_context, inv.prompt,
                            api_key, timeout_ms, cli)
     else:
-        resp = _do_request(inv.base_url, inv.model, inv.system_context, inv.prompt,
+        resp = _do_request(inv.base_url, effective_model, inv.system_context, inv.prompt,
                            api_key, timeout_ms, cli, launch_control=launch_control)
     accounting_root_error = None
     if isinstance(submission_accounting, dict):
@@ -891,10 +948,10 @@ def call(inv, timeout_ms: int, *, launch_control=None,
                     "not be durably prepared; the first request evidence was retained.")
                 return resp
         if launch_control is None:
-            payg_resp = _do_request(payg_url, inv.model, inv.system_context,
+            payg_resp = _do_request(payg_url, effective_model, inv.system_context,
                                     inv.prompt, api_key, remaining_ms, cli)
         else:
-            payg_resp = _do_request(payg_url, inv.model, inv.system_context,
+            payg_resp = _do_request(payg_url, effective_model, inv.system_context,
                                     inv.prompt, api_key, remaining_ms, cli,
                                     launch_control=launch_control)
         if child_accounting is not None:
@@ -932,6 +989,7 @@ def _do_request(base_url: str, model: str, system_context: str | None,
                 prompt: str, api_key: str | None, timeout_ms: int,
                 cli: str, *, launch_control=None) -> dict:
     """Execute a single Chat Completions POST. Internal to call()."""
+    model = normalize_coding_plan_model(base_url, model) or model
     body = json.dumps({
         "model": model,
         "messages": [

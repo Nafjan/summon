@@ -44,7 +44,7 @@ Use Summon in a goal-directed loop: inspect, delegate, check evidence, then choo
 | Parameter | Source |
 |-----------|--------|
 | `--agent` | Agent name from user request (run `--list` or `--list --for <task>` first if unspecified) |
-| `--prompt` / `--prompt-file` | Task instruction part |
+| `--prompt` / `--prompt-file` | Task instruction part (prefer `--prompt-file` for multiline or large prompts; Windows caps `CreateProcess` command lines at `32,767` characters) |
 | `--cwd` | Current working directory (absolute path) |
 
 ## Important: Permission and Timeout
@@ -76,9 +76,10 @@ Each seat reports `run_agent`, `permission`, `model`, `effort`, `capability_tier
 
 ### Recommended cross-vendor roster lanes & decision leads
 
-- **Gemini 4 (`gemini-4-argon-high`, `gemini-4-flash`)**: `flash-reviewer`, `researcher`, `frontend`, `docs-writer`, and `antigravity` target Gemini 4 via `agy`. Because `agy` cannot enforce `read-only`, Summon refuses `agy` at `read-only` and fails closed rather than imply a boundary that does not exist (unless `SUMMON_ALLOW_UNENFORCED_READONLY=1` is set). Run `agy` in a disposable clone/`--worktree` with `yolo`.
-- **OpenAI Codex (`gpt-6-codex`, `gpt-6-astra`, `gpt-5.4-codex-mini`)**: `astra` pins `gpt-6-astra` and `sol-review`/`coder`/`planner` pin `gpt-6-codex` at high effort with exact-model verification.
-- **Claude (`claude-opus-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-6`)**: `architect`/`reviewer` pin `claude-opus-5`; `fable` pins `claude-fable-6` (`--profile fable`) as the escalation decision lead.
+- **Gemini (`gemini-4-argon-high`, `gemini-3.8-flash-high`)**: `argon-reviewer` targets Gemini 4 Argon (`gemini-4-argon-high`); `flash-reviewer`, `researcher`, `frontend`, `docs-writer`, and `antigravity` target Gemini 3.8 Flash (`gemini-3.8-flash-high`) via `agy`. Because `agy` cannot enforce `read-only`, Summon refuses `agy` at `read-only` and fails closed rather than imply a boundary that does not exist (unless `SUMMON_ALLOW_UNENFORCED_READONLY=1` is set). Run `agy` in a disposable clone/`--worktree` with `yolo`.
+- **OpenAI Codex (`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-codex`, `gpt-5.4-codex-mini`)**: `astra` pins `gpt-6-astra`, `sol-review` pins `gpt-6.1-sol`, and `luna-review` pins `gpt-6-luna` at high effort with exact-model verification.
+- **Claude (`claude-opus-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`)**: `architect`/`planner`/`deep-debugger`/`security-auditor` pin `claude-opus-5`; `fable` pins `claude-fable-5-1` (`--profile fable`) as the escalation decision lead.
+- **BytePlus ModelArk Coding Plan (`deepseek-v4-1-flash`, `glm-5-3-flash`)**: `deepseek-41-flash` (`deepseek-v4-1-flash`), `glm-coder` (`glm-5-3-flash`), and `byteplus-coder` run over the subscription `byteplus-coding` route (`/api/coding/v3`, text-only).
 
 ### Step 2: Execute Agent & Capability Boundary
 
@@ -126,7 +127,7 @@ Use an explicit unit in every invocation: `ms` for milliseconds, `s` for seconds
 | `--transport {subprocess,acp}`, `--no-acp-fallback`, `--allow-kimi-acp-fallback` | Select dispatch transport or control automatic ACP recovery fallback. |
 | `--worktree [NAME]`, `--isolated-lane`, `--allow-tool-credentials` | Run in an isolated git worktree or acknowledge a disposable OS boundary for broad-authority turns. On gate denial, Summon preserves dirty worktrees (`worktree_preserved:true`) with no force-removal or force branch deletion. |
 | `--background`, `--adaptive-timeout`, `--hard-timeout`, `--max-runtime DURATION`, `--job-dir DIR` | Detached background execution and activity-aware lease controls. |
-| `--jobs-list`, `--jobs-status ID`, `--jobs-wait ID`, `--jobs-wait-all`, `--jobs-wait-ids ID` | Inspect or wait on background jobs (`jobs wait`, `wait --all` / `--jobs-wait-all` for fan-in across running jobs). |
+| `--jobs-list`, `--jobs-status ID`, `--jobs-wait ID`, `--jobs-wait-all`, `--jobs-wait-ids ID`, `--active-only`, `--jobs-active-only` | Inspect or wait on background jobs (`jobs wait`, `wait --all` / `--jobs-wait-all` for fan-in across running jobs; `--active-only` / `--jobs-active-only` waits only for running/prepared jobs). |
 | `--jobs-extend ID`, `--job-duration DURATION`, `--jobs-cancel ID`, `--jobs-steer ID`, `--job-message TEXT` | Extend deadline, cancel, or queue steering for a background job. |
 | `--jobs-resume ID`, `--job-message-file FILE`, `--job-request-id ID`, `--jobs-revalidate ID`, `--job-revalidation-file FILE` | Authenticated background continuation for eligible Claude jobs and legacy job revalidation. |
 | `--dry-run`, `--out FILE`, `--debug-dir DIR`, `--max-tool-output-bytes N` | Preview without executing, atomically write/reuse terminal envelope, dump debug artifacts, or cap binary output tail. |

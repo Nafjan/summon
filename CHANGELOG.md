@@ -6,38 +6,53 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 ## [Unreleased]
 
 - Refresh the model lineup and routing table across Claude (`claude-opus-5`,
-  `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-6`, and dated `5-5`
+  `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`, and dated `5-5`
   Bedrock/Vertex pins), Gemini (`gemini-4-argon-high`, `gemini-4-argon-low`,
-  `gemini-4-flash`), Codex (`gpt-6-codex`, `gpt-5.4-codex-mini`), Kimi
-  (`kimi-code/k3`, `kimi-code/k3-256k`, `kimi-code/k2.7-coding`), and
-  OpenRouter/Kilo defaults (`deepseek/deepseek-v4.2`, `qwen/qwen3.6-coder`,
-  `z-ai/glm-5.3`, `z-ai/glm-5.3-flash`, `minimax/minimax-m3`), while keeping
-  legacy aliases backward-compatible and adding the bundled `argon-reviewer`
-  seat.
-- Harden ModelArk Coding Plan routing and workspace budget accounting: clamp
-  concurrent rate events in `_swarm_coordinator.workspace_budget_snapshot`,
-  add host-gated Coding Plan subscription vs metered `/api/v3` PAYG consent
-  classification (`classify_openai_compat_route` and `_byteplus_route_parts` in
-  `_apibackend.py`), enforce `authority.api` spend-consistency checks in
-  `_evidence.py`, unify disposition and linked-replacement adapters on
-  `_coherent_workspace` in `_workspace_commands.py`, and clarify `--runs-root`
-  permission requirements in `README.md`.
+  `gemini-3.8-flash-high`, `gemini-4-flash`), Codex (`gpt-6-astra`,
+  `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-codex`, `gpt-5.4-codex-mini`), Kimi
+  (`kimi-code/k3`, `kimi-code/k3-256k`, `kimi-code/k2.7-coding`), BytePlus
+  Coding Plan (`deepseek-v4-1-flash`, `glm-5-3-flash`), and OpenRouter/Kilo
+  defaults (`deepseek/deepseek-v4.2`, `qwen/qwen3.6-coder`, `z-ai/glm-5.3`,
+  `z-ai/glm-5.3-flash`, `minimax/minimax-m3`), while keeping legacy aliases
+  backward-compatible and adding the bundled `argon-reviewer`, `glm-coder`, and
+  `deepseek-41-flash` seats.
+- Harden ModelArk Coding Plan routing, CLI binary discovery, and workspace
+  budget accounting: normalize dated BytePlus Coding Plan snapshot IDs to their
+  canonical Coding Plan model names (`normalize_coding_plan_model`), add
+  `openai-compat` provider model discovery (`summon models --cli openai-compat`),
+  clamp minor clock skew (`<= 5s`) while refusing future-dated rate events (`> 5s`)
+  in `_swarm_coordinator.workspace_budget_snapshot`, add host-gated Coding Plan
+  subscription vs metered `/api/v3` PAYG consent classification with bounded
+  `SUMMON_ALLOW_BYTEPLUS_PAYG` diagnostics in `_apibackend.py`, enforce
+  `authority.api` spend-consistency checks in `_evidence.py`, unify disposition
+  and linked-replacement adapters on `_coherent_workspace` (with
+  `linked_snapshot_unavailable` translation) in `_workspace_commands.py`, prefer
+  the highest semver Codex binary when a global shim lags a newer bundled extension
+  binary (`resolve_codex_binary`), and report user-level `~/.agents/*.md` files
+  that shadow bundled seats in `summon doctor` (`shadowed_bundled_agents`).
 - Promote structured output fields to the top-level dispatch receipt (`summary`,
-  `confidence`, `files_touched`) with `CONFIDENCE:` parsing (`high`, `medium`,
-  `low`, or `0.0`–`1.0`), raw-output report fallback (`report_source: "raw"`)
-  when an agent omits `--report-to`, and `summon wait --all` / `jobs wait --all`
-  for batch background job convergence.
+  `confidence`, `files_touched`) with fenced-code-block-safe `parse_report()`,
+  strict finite `CONFIDENCE:` parsing (`high`, `medium`, `low`, or finite
+  `0.0`–`1.0`), pre/post dispatch `files_touched` worktree delta tracking,
+  advisory `--out` sibling `.lock` protection against concurrent clobbering,
+  raw-output report fallback (`report_source: "raw"`) when an agent omits
+  `--report-to`, and `summon wait --all` / `jobs wait --all` (with
+  `--active-only` and automatic `>24h` stale/unverified job skipping) for batch
+  background job convergence.
 - Split `skills/summon/SKILL.md` into a compact operational guide (`<= 45 KB`)
-  paired with `skills/summon/references/reference-manual.md`, expose seat
+  paired with `skills/summon/references/reference-manual.md`, expose honest seat
   capability metadata (`capability_tier`, `can_run_tests`,
-  `reports_served_model`) and `summon list --for <task>` filtering, and derive
-  adaptive foreground default timeouts (`min(max(default, 2 * p95), 3600s)`)
-  from live telemetry.
-- Separate `live` and `test` telemetry cohorts by default, rotate the local
-  telemetry spool to a bounded `.1` archive, add `summon stats` (`telemetry
-  stats` / `--telemetry-stats`), and suppress false `read_only_violation` flags
-  on text-only (`openai-compat`, `arkcli`) seats when a concurrent writer
-  modifies the shared worktree.
+  `reports_served_model`) and `summon list --for <task>` filtering (requiring
+  `read-only` for `review` and warning on unknown `--for` intents), canonicalize
+  exact-model comparison keys across provider prefixes and dated snapshot
+  suffixes (`_canonical_model_key`), and derive adaptive foreground default
+  timeouts (`min(max(default, 2 * p95), 3600s)`, `min_samples=5`, live cohort
+  only, stat-cached) when `--timeout` is omitted or set to `--timeout auto`.
+- Separate `live` and `test` telemetry cohorts by default (preserving `live` for
+  custom non-temp `SUMMON_TELEMETRY_FILE` paths), rotate only evicted events to
+  a bounded `.1` telemetry archive, add `summon stats` (`--format json|table`),
+  and suppress false `read_only_violation` flags on text-only (`openai-compat`,
+  `arkcli`) seats when a concurrent writer modifies the shared worktree.
 
 ## [3.5.0] - 2026-09-23
 

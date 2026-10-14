@@ -366,7 +366,7 @@ class _Handler(BaseHTTPRequestHandler):
                        "message_outcome_uncertain", "message_snapshot_unavailable", "message_runtime_unavailable",
                        "message_key_unavailable", "command_refresh_unavailable",
                        "command_refresh_request_invalid", "workspace_snapshot_unavailable",
-                       "linked_outcome_uncertain", "detail_snapshot_unavailable", "detail_unavailable",
+                       "linked_outcome_uncertain", "linked_snapshot_unavailable", "detail_snapshot_unavailable", "detail_unavailable",
                        "detail_body_unavailable", "canonical_snapshot_unavailable",
                        "canonical_detail_unavailable", "canonical_binding_unavailable",
                        "canonical_scope_empty"}:

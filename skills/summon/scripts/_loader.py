@@ -558,7 +558,7 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
                 )
                 _reports_served_model = bool(
                     run_agent in ("claude", "codex", "kimi", "opencode",
-                                  "openai-compat", "arkcli")
+                                  "openai-compat")
                 )
                 # Keep the roster listing useful for humans and provider-safe for
                 # callers: a model pin and reasoning effort are harmless display
@@ -632,6 +632,25 @@ def list_agents(agents_dir: str) -> list[dict]:
     return sorted(agents, key=lambda a: a["name"])
 
 
+KNOWN_TASK_INTENTS = frozenset({
+    "review", "audit", "critique",
+    "implement", "edit", "build", "write", "code",
+    "verify", "test", "qa",
+    "debug", "fix",
+    "design", "architect", "architecture", "advisory", "plan",
+    "fast", "cheap", "explore", "quick",
+})
+
+
+def _is_dispatchable_toolful(a: dict) -> bool:
+    """Return True if a toolful seat's declared permission can actually run."""
+    if a.get("capability_tier") != "toolful":
+        return False
+    if a.get("run_agent") == "agy" and a.get("permission") != "yolo":
+        return False
+    return True
+
+
 def filter_agents_for_task(agents: list[dict], task: str) -> list[dict]:
     """Filter and rank roster seats for a specific task intent (`--for`)."""
     q = str(task or "").strip().lower()
@@ -649,19 +668,18 @@ def filter_agents_for_task(agents: list[dict], task: str) -> list[dict]:
         matched = [
             a for a in active
             if a.get("permission") == "read-only"
-            or "review" in str(a.get("name") or "").lower()
-            or "review" in str(a.get("description") or "").lower()
-            or "adversarial" in str(a.get("name") or "").lower()
+            and not (a.get("run_agent") == "agy" and a.get("permission") != "yolo")
         ]
         return sorted(matched, key=lambda a: (
-            0 if "review" in str(a.get("name") or "").lower() else 1,
-            0 if a.get("permission") == "read-only" else 1,
+            0 if any(w in str(a.get("name") or "").lower()
+                     for w in ("review", "audit", "adversarial", "astra", "architect", "fable")) else 1,
+            0 if a.get("reports_served_model") else 1,
             str(a.get("name") or ""),
         ))
     if q in ("implement", "edit", "build", "write", "code"):
         matched = [
             a for a in active
-            if a.get("capability_tier") == "toolful"
+            if _is_dispatchable_toolful(a)
             and a.get("permission") in ("safe-edit", "yolo")
         ]
         return sorted(matched, key=lambda a: (
@@ -670,7 +688,11 @@ def filter_agents_for_task(agents: list[dict], task: str) -> list[dict]:
             str(a.get("name") or ""),
         ))
     if q in ("verify", "test", "qa"):
-        matched = [a for a in active if a.get("can_run_tests") is True]
+        matched = [
+            a for a in active
+            if a.get("can_run_tests") is True
+            and _is_dispatchable_toolful(a)
+        ]
         return sorted(matched, key=lambda a: (
             0 if any(w in str(a.get("name") or "").lower()
                      for w in ("verif", "test", "qa", "debug")) else 1,
@@ -679,7 +701,7 @@ def filter_agents_for_task(agents: list[dict], task: str) -> list[dict]:
     if q in ("debug", "fix"):
         matched = [
             a for a in active
-            if a.get("capability_tier") == "toolful"
+            if _is_dispatchable_toolful(a)
             and (a.get("permission") in ("safe-edit", "yolo")
                  or "debug" in _haystack(a))
         ]
@@ -691,8 +713,9 @@ def filter_agents_for_task(agents: list[dict], task: str) -> list[dict]:
     if q in ("design", "architect", "architecture", "advisory", "plan"):
         matched = [
             a for a in active
-            if any(w in _haystack(a) for w in ("architect", "design", "fable", "advisor", "plan"))
-            or a.get("permission") == "read-only"
+            if (any(w in _haystack(a) for w in ("architect", "design", "fable", "advisor", "plan"))
+                or a.get("permission") == "read-only")
+            and not (a.get("run_agent") == "agy" and a.get("permission") != "yolo")
         ]
         return sorted(matched, key=lambda a: (
             0 if any(w in str(a.get("name") or "").lower()
@@ -703,6 +726,7 @@ def filter_agents_for_task(agents: list[dict], task: str) -> list[dict]:
         matched = [
             a for a in active
             if any(w in _haystack(a) for w in ("fast", "flash", "mini", "haiku", "explore"))
+            and not (a.get("run_agent") == "agy" and a.get("permission") != "yolo")
         ]
         return sorted(matched, key=lambda a: (
             0 if any(w in str(a.get("name") or "").lower()

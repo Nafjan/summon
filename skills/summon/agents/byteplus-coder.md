@@ -1,9 +1,10 @@
 ---
 run-agent: openai-compat
 provider: byteplus-coding
-model: deepseek-v4-pro
+model: deepseek-v4-1-flash
 permission: read-only
 capability: text-only
+billing: subscription
 ---
 
 # BytePlus ModelArk Coding Plan coder (openai-compat)
@@ -17,13 +18,14 @@ Uses your BytePlus ModelArk Coding Plan subscription via the OpenAI-compatible
 endpoint. Bills against your **Coding Plan subscription quota** (not per-token
 API credits). Set `BYTEPLUS_CODING_API_KEY` in your environment.
 
-Pin a current Coding Plan model by task: `deepseek-v4-flash` for fast terminal loops,
+Pin a current Coding Plan model by task: `deepseek-v4-1-flash` for fast coding and
+analysis (`deepseek-41-flash`), `glm-5-3-flash` for fast GLM 5.3 Flash (`glm-coder`),
 `deepseek-v4-pro` for hard coding, `glm-5.2` for long-horizon/large-repo work,
 or `dola-seed-2.0-code` for agentic coding. The separate Ark marketplace currently
-lists exact GA IDs `deepseek-v4-flash-ga-260731`, `deepseek-v4-pro-ga-260813`, and
-`glm-5-2-260617`; those are cataloged for explicit `arkcli +chat` routes, but are not
-silently substituted into this Coding Plan agent until plan eligibility and a minimal
-text smoke are verified. `kimi-k2.5` is a useful code/UI
+lists exact GA IDs `deepseek-v4-1-flash-260910`, `glm-5-3-flash-260828`,
+`deepseek-v4-flash-ga-260731`, `deepseek-v4-pro-ga-260813`, and
+`glm-5-2-260617`; the Coding Plan serves the unversioned plan IDs (`deepseek-v4-1-flash`,
+`glm-5-3-flash`, etc.). `kimi-k2.5` is a useful code/UI
 alternative; the Seed Pro/Lite variants are general-purpose choices.
 
 Strongly avoid legacy or superseded roster entries for new work: `glm-5.1`,

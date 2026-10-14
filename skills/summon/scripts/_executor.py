@@ -7,6 +7,7 @@ import copy
 import hashlib
 import inspect
 import json
+import math
 import os
 import queue
 import re
@@ -616,27 +617,103 @@ def _review_verdict(report: dict | None) -> str | None:
     return _REVIEW_VERDICTS.get(first)
 
 
+_FENCED_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
+_FALLBACK_SUMMARY_RE = re.compile(
+    r"(?im)^[ \t]*(?:\*\*|#+\s+|[-*]\s+)*SUMMARY\s*:\s*\*?\*?[ \t]*(.+)$"
+)
+_FALLBACK_CONFIDENCE_RE = re.compile(
+    r"(?im)^[ \t]*(?:\*\*|#+\s+|[-*]\s+)*CONFIDENCE\s*:\s*\*?\*?[ \t]*([^\r\n]+)$"
+)
+
+
+def _strip_fenced_code_blocks(text: str) -> str:
+    """Remove triple-backtick fenced code blocks so quoted examples cannot spoof report fields."""
+    if not text:
+        return ""
+    return _FENCED_CODE_BLOCK_RE.sub("", text)
+
+
+_SYMBOLIC_CONFIDENCE: dict[str, float | None] = {
+    "very high": 0.95,
+    "very-high": 0.95,
+    "high": 0.9,
+    "medium": 0.6,
+    "med": 0.6,
+    "moderate": 0.6,
+    "low": 0.3,
+    "none": None,
+    "n/a": None,
+    "na": None,
+    "unknown": None,
+}
+
+
+def _parse_confidence(raw: object) -> float | None:
+    """Parse a finite confidence score in [0.0, 1.0] or symbolic level, rejecting NaN/Inf/out-of-bounds."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+        return round(val, 4) if (math.isfinite(val) and 0.0 <= val <= 1.0) else None
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    cleaned = raw.strip().lower()
+    head = re.split(r"[|,:;(\[-]", cleaned, maxsplit=1)[0].strip()
+    if head in _SYMBOLIC_CONFIDENCE:
+        return _SYMBOLIC_CONFIDENCE[head]
+    token = cleaned.split()[0].rstrip("|,:;-")
+    if token in _SYMBOLIC_CONFIDENCE:
+        return _SYMBOLIC_CONFIDENCE[token]
+    is_pct = token.endswith("%")
+    if is_pct:
+        token = token[:-1].strip()
+    try:
+        val = float(token)
+    except ValueError:
+        return None
+    if not math.isfinite(val):
+        return None
+    if is_pct:
+        val = val / 100.0
+    if 0.0 <= val <= 1.0:
+        return round(val, 4)
+    return None
+
+
 def parse_report(text: str) -> dict | None:
     """Extract the trailing report-contract block from an agent's result text.
 
-    Anchors on the LAST ``STATUS:`` line whose value begins with a real status
-    token (DONE/PARTIAL/BLOCKED/...) — so a quoted contract example or narration
-    that merely mentions ``STATUS:`` can't spoof or displace the real block. A line
-    begins a new field when its key is a known field OR a well-formed all-caps
-    identifier (so third-party agents' custom fields are captured, not folded);
-    any other line continues the current value (multi-line safe). Keys are
-    lowercased with ``-`` mapped to ``_`` (e.g. ``follow_up``). Markdown-bold
-    field names (``**STATUS:**``) are accepted — backends that render markdown
-    wrap the contract typographically; the status-value and template guards
-    apply unchanged after the wrapper is stripped.
+    Anchors on the LAST ``STATUS:`` line (outside fenced code blocks) whose value
+    begins with a real status token (DONE/PARTIAL/BLOCKED/...) — so a quoted
+    contract example or narration that merely mentions ``STATUS:`` can't spoof or
+    displace the real block. A line begins a new field when its key is a known
+    field OR a well-formed all-caps identifier (so third-party agents' custom
+    fields are captured, not folded); any other line continues the current value
+    (multi-line safe, except single-line scalar fields like ``summary`` and
+    ``confidence``). Keys are lowercased with ``-`` mapped to ``_`` (e.g.
+    ``follow_up``). Markdown-bold field names (``**STATUS:**``) are accepted.
 
     Returns None when no genuine ``STATUS:`` line exists.
     """
     if not text:
         return None
     lines = text.splitlines()
+    # Mark lines inside closed ```...``` fenced code blocks so trailing code
+    # examples cannot spoof STATUS:/SUMMARY:/CONFIDENCE:.
+    fenced_lines: set[int] = set()
+    open_fence_idx: int | None = None
+    for idx, raw_line in enumerate(lines):
+        if raw_line.lstrip().startswith("```"):
+            if open_fence_idx is None:
+                open_fence_idx = idx
+            else:
+                for f_idx in range(open_fence_idx, idx + 1):
+                    fenced_lines.add(f_idx)
+                open_fence_idx = None
     start = None
     for i in range(len(lines) - 1, -1, -1):
+        if i in fenced_lines:
+            continue
         anchor = _unbold_field_line(lines[i])
         if anchor.startswith("STATUS:"):
             value = anchor[len("STATUS:"):].strip()
@@ -656,12 +733,15 @@ def parse_report(text: str) -> dict | None:
 
     fields: dict = {}
     current_key = None
-    for line in lines[start:]:
+    for idx in range(start, len(lines)):
+        if idx in fenced_lines:
+            continue
+        line = lines[idx]
         m = _REPORT_FIELD_RE.match(_unbold_field_line(line))
         if m and _is_field_key(m.group(1)):
             current_key = m.group(1).lower().replace("-", "_")
             fields[current_key] = m.group(2).strip()
-        elif current_key is not None:
+        elif current_key is not None and current_key not in ("summary", "confidence", "status", "verdict"):
             fields[current_key] = (fields[current_key] + "\n" + line).strip()
     return fields or None
 
@@ -695,6 +775,100 @@ def normalize_empty_success(response: dict) -> dict:
         "error",
         "provider reported success but returned no usable result")
     return response
+
+
+_CODEX_SESSION_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _codex_rollout_model_evidence(
+    session_id: str | None,
+    *,
+    codex_home: str | None = None,
+) -> tuple[str | None, str | None, list[str]]:
+    """Read authoritative turn_context model metadata from a local Codex session rollout file.
+
+    Codex 0.121+ ``exec --json`` omits ``model`` from ``thread.started`` and
+    ``turn.completed`` stdout events, while writing ``session_meta`` and
+    ``turn_context.payload.model`` to ``~/.codex/sessions/YYYY/MM/DD/rollout-*-<session_id>.jsonl``.
+    Returns ``(targeted_model, served_model, models_used)`` only when ``session_meta``
+    matches ``session_id`` and a turn activity/completion event was recorded.
+    """
+    if not isinstance(session_id, str):
+        return None, None, []
+    sid = session_id.strip()
+    if not _CODEX_SESSION_UUID_RE.fullmatch(sid):
+        return None, None, []
+    home = codex_home or os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    sessions_root = os.path.join(home, "sessions")
+    if not os.path.isdir(sessions_root):
+        return None, None, []
+    suffix = f"-{sid}.jsonl"
+    rollout_file: str | None = None
+    try:
+        for dirpath, _dirnames, filenames in os.walk(sessions_root):
+            for fn in filenames:
+                if fn.startswith("rollout-") and fn.endswith(suffix):
+                    rollout_file = os.path.join(dirpath, fn)
+                    break
+            if rollout_file:
+                break
+    except OSError:
+        return None, None, []
+    if not rollout_file or not os.path.isfile(rollout_file):
+        return None, None, []
+    try:
+        if os.path.getsize(rollout_file) > 8 * 1024 * 1024:
+            return None, None, []
+        session_verified = False
+        models_seen: list[str] = []
+        last_turn_model: str | None = None
+        last_turn_id: str | None = None
+        last_turn_active = False
+        with open(rollout_file, "r", encoding="utf-8", errors="replace") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                rtype = rec.get("type")
+                payload = rec.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if rtype == "session_meta":
+                    meta_sid = payload.get("session_id") or payload.get("id")
+                    if isinstance(meta_sid, str) and meta_sid.strip() == sid:
+                        session_verified = True
+                elif rtype == "turn_context":
+                    m = _safe_model_id(payload.get("model"))
+                    last_turn_model = m
+                    tid = payload.get("turn_id")
+                    last_turn_id = tid.strip() if isinstance(tid, str) and tid.strip() else None
+                    last_turn_active = False
+                    if m:
+                        models_seen.append(m)
+                elif last_turn_model is not None:
+                    ev_tid = payload.get("turn_id")
+                    if isinstance(ev_tid, str) and ev_tid.strip() and last_turn_id and ev_tid.strip() != last_turn_id:
+                        continue
+                    if rtype in ("token_usage_record", "response_item"):
+                        last_turn_active = True
+                    elif rtype == "event_msg" and payload.get("type") in (
+                        "task_complete", "token_count", "item_completed"
+                    ):
+                        last_turn_active = True
+        if session_verified and last_turn_model and last_turn_active:
+            deduped = list(dict.fromkeys(models_seen))
+            return last_turn_model, last_turn_model, deduped
+    except OSError:
+        return None, None, []
+    return None, None, []
 
 
 def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
@@ -743,6 +917,20 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
         "model_evidence_source",
         getattr(processor, "model_evidence_source", None) if processor else None,
     )
+    if (response.get("cli") == "codex"
+            and not response.get("model_resolved")
+            and response.get("status") == "success"):
+        _r_target, _r_served, _r_used = _codex_rollout_model_evidence(
+            response.get("session_id")
+        )
+        if _r_served:
+            response["model_resolved"] = _r_served
+            if not response.get("model_targeted") and _r_target:
+                response["model_targeted"] = _r_target
+            if not response.get("models_used") and _r_used:
+                response["models_used"] = _r_used
+            if not response.get("model_evidence_source"):
+                response["model_evidence_source"] = "codex_rollout_turn_context"
     # Kimi has no terminal-success event. If the dispatcher deadline wins
     # after assistant text was captured, retain a bounded diagnostic snapshot
     # in its own namespace. It is deliberately never fed to parse_report,
@@ -850,6 +1038,26 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
         response["report_source"] = "none"
         response["report_text"] = ""
     response["verdict"] = _review_verdict(report)
+    _stripped_for_fallback = _strip_fenced_code_blocks(_clean_result) if _clean_result else ""
+    if report and report.get("summary"):
+        response["summary"] = report["summary"].splitlines()[0].strip() or None
+    elif _stripped_for_fallback:
+        _sum_m = _FALLBACK_SUMMARY_RE.search(_stripped_for_fallback)
+        if _sum_m and _sum_m.group(1).strip():
+            response["summary"] = _sum_m.group(1).strip()
+        else:
+            _first_nonempty = next((ln.strip() for ln in _stripped_for_fallback.splitlines() if ln.strip()), "")
+            response["summary"] = _first_nonempty[:240] if _first_nonempty else None
+    else:
+        response["summary"] = None
+    if report and "confidence" in report:
+        response["confidence"] = _parse_confidence(report.get("confidence"))
+    elif _stripped_for_fallback:
+        _conf_m = _FALLBACK_CONFIDENCE_RE.search(_stripped_for_fallback)
+        response["confidence"] = _parse_confidence(_conf_m.group(1)) if _conf_m else None
+    else:
+        response["confidence"] = None
+    response.setdefault("files_touched", [])
     # 1) Structured self-report wins over exit-0 "success" (never upgrades).
     if response.get("status") == "success" and report and report.get("status"):
         first = report["status"].split()[0].rstrip("|,").upper()
@@ -2670,15 +2878,83 @@ def _normalized_exit_code(status: object, raw_backend_exit_code: object) -> int 
     return raw
 
 
+_PROVIDER_NAMESPACE_PREFIXES = (
+    "openrouter/", "zai/", "nous/", "kimi-code/", "openai/",
+    "anthropic/", "google/", "x-ai/", "z-ai/", "deepseek/", "moonshotai/",
+)
+_DETERMINISTIC_MODEL_SYNONYMS: dict[str, str] = {
+    "glm-5.3-flash": "glm-5-3-flash",
+    "deepseek-4.1-flash": "deepseek-v4-1-flash",
+    "deepseek-v4.1-flash": "deepseek-v4-1-flash",
+    "k3": "kimi-k3",
+}
+_DATE_SNAPSHOT_SUFFIX_RE = re.compile(r"-(?:ga-)?(?:20\d{6}|\d{6})$")
+
+
+def _canonical_model_key(model_id: str | None, *,
+                         strip_date_suffix: bool = True) -> str | None:
+    """Normalize deterministic provider-prefix, punctuation, and optional
+    date-snapshot variants of a concrete model ID without collapsing
+    floating aliases."""
+    if not isinstance(model_id, str):
+        return None
+    s = model_id.strip().lower()
+    if not s:
+        return None
+    for _ in range(2):
+        matched = False
+        for pfx in _PROVIDER_NAMESPACE_PREFIXES:
+            if s.startswith(pfx) and len(s) > len(pfx):
+                s = s[len(pfx):]
+                matched = True
+                break
+        if not matched:
+            break
+    if strip_date_suffix:
+        s = _DATE_SNAPSHOT_SUFFIX_RE.sub("", s)
+        s = _DETERMINISTIC_MODEL_SYNONYMS.get(s, s)
+    else:
+        m = _DATE_SNAPSHOT_SUFFIX_RE.search(s)
+        if m:
+            base = s[:m.start()]
+            suffix = m.group(0)
+            base = _DETERMINISTIC_MODEL_SYNONYMS.get(base, base)
+            s = base + suffix
+        else:
+            s = _DETERMINISTIC_MODEL_SYNONYMS.get(s, s)
+    return s
+
+
+def _canonical_models_equal(expected: str | None, actual: str | None) -> bool:
+    """Compare an expected model pin against an observed/targeted model ID.
+
+    When ``expected`` carries an explicit ``-YYMMDD``/``-YYYYMMDD`` snapshot
+    suffix, ``actual`` must carry the exact same snapshot suffix. Only an
+    un-dated ``expected`` model ID allows a provider-appended snapshot suffix
+    on ``actual``.
+    """
+    exp_exact = _canonical_model_key(expected, strip_date_suffix=False)
+    act_exact = _canonical_model_key(actual, strip_date_suffix=False)
+    if not exp_exact or not act_exact:
+        return False
+    if _DATE_SNAPSHOT_SUFFIX_RE.search(exp_exact):
+        return exp_exact == act_exact
+    act_base = _canonical_model_key(actual, strip_date_suffix=True)
+    return exp_exact == act_base
+
+
 def _model_mismatch(requested, ran) -> bool:
     """True when an EXPLICIT model request differs from the model that ran, EXCEPT
-    for a known floating-alias expansion (opus/sonnet/haiku -> their latest id).
+    for a known floating-alias expansion (opus/sonnet/haiku -> their latest id)
+    or a deterministic provider/date/punctuation variant of the same model.
     Both must be non-empty strings; a None/empty request never warns."""
     if not (isinstance(requested, str) and requested.strip()
             and isinstance(ran, str) and ran.strip()):
         return False
     r, s = requested.strip().lower(), ran.strip().lower()
     if r == s:
+        return False
+    if _canonical_models_equal(r, s):
         return False
     try:
         from _resolver import _CLAUDE_ALIASES
@@ -2706,12 +2982,16 @@ def model_match_state(requested, targeted, served,
         return None
     if not requested or not targeted:
         return None
-    # This is a certification bit, not the looser warning/alias comparison
-    # used by ``_model_mismatch``.  A named-model review is verified only when
-    # the provider reported the exact same identifier for requested, targeted,
-    # and served.  Floating aliases may still avoid a warning, but they never
-    # become a named-model proof.
-    return requested.strip() == targeted.strip() == served.strip()
+    # This is a certification bit, not the looser floating-alias comparison
+    # used by ``_model_mismatch``. Deterministic provider prefixes and
+    # provider-appended date snapshot suffixes on an un-dated pin are
+    # canonicalized, while explicit snapshot pins and floating aliases
+    # ('opus' vs 'claude-opus-5') never collapse across distinct versions.
+    return (
+        _canonical_models_equal(requested, targeted)
+        and _canonical_models_equal(requested, served)
+        and _canonical_models_equal(targeted, served)
+    )
 
 
 # These seats are governance-facing named-model claims rather than ordinary
@@ -3819,6 +4099,14 @@ def _resolve_launch(command, args):
                 "native executable could not be resolved; reinstall OpenCode so "
                 "Summon can pass prompt argv without cmd.exe reparsing")
         return _oc, args
+    if command == "codex":
+        try:
+            from _builder import resolve_codex_binary
+            _best_codex = resolve_codex_binary(which_fn=shutil.which)
+        except Exception:  # noqa: BLE001
+            _best_codex = None
+        if _best_codex and os.name == "nt" and str(_best_codex).lower().endswith(".exe"):
+            return _best_codex, args
     resolved = shutil.which(command) or command
     if os.name != "nt" or not resolved.lower().endswith((".cmd", ".bat")):
         return resolved, args
@@ -4109,6 +4397,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                         "before": None, "after": None, "coverage": "unavailable",
                         "child_commit": None, "mutation": None,
                         "read_only_violation": None, "attribution": "unavailable",
+                        "files_touched": [],
                     }
                 else:
                     _after = workspace_snapshot(inv.cwd)
@@ -4124,7 +4413,13 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                     "before": None, "after": None, "coverage": "unavailable",
                     "child_commit": None, "mutation": None,
                     "read_only_violation": None, "attribution": "unavailable",
+                    "files_touched": [],
                 }
+        _we = resp.get("workspace_evidence")
+        if isinstance(_we, dict) and isinstance(_we.get("files_touched"), list):
+            resp["files_touched"] = list(_we["files_touched"])
+        else:
+            resp.setdefault("files_touched", [])
         # Trust fields, split by EVIDENCE (field case: a failed Fable dispatch
         # reported the handshake model as `resolved` with all-zero usage):
         #   requested  what the caller asked for (unchanged).
@@ -4262,7 +4557,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # retry/fallback path. The provider may already have spent; preserve
         # that fact. Codex pins use the same gate as custom/frontmatter seats.
         if _exact_required and resp.get("status") == "success":
-            if _handshake and _requested_model != _handshake:
+            if _handshake and not _canonical_models_equal(_requested_model, _handshake):
                 _trust_kind = "target_model_mismatch"
                 _trust_message = (
                     f"requested model {_requested_model!r}, but the provider "
@@ -4275,7 +4570,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                     f"exact model {_requested_model!r} completed without "
                     "an authoritative terminal served-model receipt; the result "
                     "is blocked and cannot be treated as verified")
-            elif _requested_model != _terminal_model:
+            elif not _canonical_models_equal(_requested_model, _terminal_model):
                 _trust_kind = "served_model_mismatch"
                 _trust_message = (
                     f"requested model {_requested_model!r}, but the provider "

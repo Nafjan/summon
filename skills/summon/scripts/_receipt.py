@@ -366,6 +366,34 @@ def _parse_git_status_porcelain(payload: bytes) -> dict | None:
     return out
 
 
+class _WorkspaceSnapshot(dict):
+    """Dict subclass carrying non-serialized root and dirty-file digests."""
+    _root: str | None = None
+    _dirty_digests: dict[str, str] | None = None
+
+
+def _capture_dirty_digests(root: str, status: dict) -> dict[str, str]:
+    """Capture bounded content digests for dirty/untracked files in ``status``."""
+    digests: dict[str, str] = {}
+    candidates: set[str] = set()
+    for bucket in ("staged", "unstaged", "untracked"):
+        for p in status.get(bucket) or ():
+            if isinstance(p, str) and p:
+                candidates.add(p)
+    for p in sorted(candidates)[:128]:
+        full = os.path.join(root, p)
+        try:
+            payload, note = _read_regular_bounded(full, 262_144)
+            if payload is not None and note is None:
+                digests[p] = hashlib.sha256(payload).hexdigest()
+            elif note is not None:
+                st = os.stat(full)
+                digests[p] = f"{note}:{st.st_size}:{st.st_mtime_ns}"
+        except OSError:
+            digests[p] = "missing"
+    return digests
+
+
 def workspace_snapshot(cwd: str | None) -> dict:
     """Capture bounded Git identity/status around the effective dispatch cwd."""
     if not cwd or not isinstance(cwd, str) or not os.path.isdir(cwd):
@@ -418,7 +446,12 @@ def workspace_snapshot(cwd: str | None) -> dict:
     status = _parse_git_status_porcelain(status_raw)
     if status is None:
         return _workspace_empty("incomplete", "invalid git status output")
-    return {"head": head, "branch": branch, **status, "coverage": "complete", "error": None}
+    snap = _WorkspaceSnapshot(
+        {"head": head, "branch": branch, **status, "coverage": "complete", "error": None}
+    )
+    snap._root = root
+    snap._dirty_digests = _capture_dirty_digests(root, status)
+    return snap
 
 
 def workspace_evidence(before: dict | None, after: dict | None,
@@ -439,15 +472,23 @@ def workspace_evidence(before: dict | None, after: dict | None,
     proven = coverage == "complete"
     child_commit = mutation = read_only_violation = None
     attribution = "unavailable"
+    files_touched: list[str] = []
     if proven:
         child_commit = before.get("head") != after.get("head")
         before_state = tuple(b_view[k] for k in ("branch", "staged", "unstaged", "renamed", "untracked"))
         after_state = tuple(a_view[k] for k in ("branch", "staged", "unstaged", "renamed", "untracked"))
         baseline_dirty = any(before.get(k) for k in ("staged", "unstaged", "renamed", "untracked"))
-        state_changed = bool(child_commit or before_state != after_state)
-        # Git status cannot distinguish a same-status content rewrite in a dirty
-        # baseline. Never report that case as clean; only a new observable state or
-        # child commit proves mutation, otherwise the result is unknown.
+        b_digests = getattr(before, "_dirty_digests", None) or before.get("_dirty_digests")
+        a_digests = getattr(after, "_dirty_digests", None) or after.get("_dirty_digests")
+        dirty_rewritten: set[str] = set()
+        if isinstance(b_digests, dict) and isinstance(a_digests, dict):
+            for p, b_dig in b_digests.items():
+                if p not in a_digests or a_digests[p] != b_dig:
+                    dirty_rewritten.add(p)
+        state_changed = bool(child_commit or before_state != after_state or dirty_rewritten)
+        # Git status and bounded dirty-file digests cannot prove zero mutation across an
+        # arbitrarily large dirty baseline. Only a new observable state, digest change,
+        # or child commit proves mutation; otherwise a dirty baseline remains unknown.
         mutation = (True if state_changed else None) if baseline_dirty else state_changed
         attribution = "ambiguous" if baseline_dirty else "exact"
         if cli in ("openai-compat", "arkcli"):
@@ -456,10 +497,61 @@ def workspace_evidence(before: dict | None, after: dict | None,
             read_only_violation = False
             if state_changed:
                 attribution = "external"
-        elif permission == "read-only":
-            read_only_violation = True if mutation is True else (None if mutation is None else False)
         else:
-            read_only_violation = False
+            if permission == "read-only":
+                read_only_violation = True if mutation is True else (None if mutation is None else False)
+            else:
+                read_only_violation = False
+            touched_set: set[str] = set(dirty_rewritten)
+            for bucket in ("staged", "unstaged", "untracked"):
+                b_items = set(before.get(bucket) or ())
+                for p in (after.get(bucket) or ()):
+                    if isinstance(p, str) and p and p not in b_items:
+                        touched_set.add(p)
+            b_renames = {
+                (r.get("from"), r.get("to")) if isinstance(r, dict) else (str(r), str(r))
+                for r in (before.get("renamed") or ())
+            }
+            for r in (after.get("renamed") or ()):
+                key = (r.get("from"), r.get("to")) if isinstance(r, dict) else (str(r), str(r))
+                if key not in b_renames:
+                    dst = key[1]
+                    if isinstance(dst, str) and dst:
+                        touched_set.add(dst)
+            if child_commit and after.get("head"):
+                root = (
+                    getattr(after, "_root", None)
+                    or after.get("_root")
+                    or getattr(before, "_root", None)
+                    or before.get("_root")
+                )
+                if isinstance(root, str) and root and os.path.isdir(root):
+                    try:
+                        if before.get("head"):
+                            diff_cmd = [
+                                "git", "-C", root, "diff", "--name-only", "-z",
+                                str(before["head"]), str(after["head"]),
+                            ]
+                        else:
+                            diff_cmd = [
+                                "git", "-C", root, "diff-tree", "--no-commit-id",
+                                "--name-only", "-r", "-z", "--root", str(after["head"]),
+                            ]
+                        diff_raw, diff_rc, diff_err = _run_git_bounded(
+                            diff_cmd,
+                            root,
+                            time.monotonic() + _WORKSPACE_CALL_TIMEOUT_S,
+                        )
+                        if diff_rc == 0 and diff_raw and not diff_err:
+                            for raw_p in diff_raw.split(b"\0"):
+                                if not raw_p:
+                                    continue
+                                safe_p = _safe_repo_path(raw_p)
+                                if safe_p:
+                                    touched_set.add(safe_p)
+                    except Exception:  # noqa: BLE001
+                        pass
+            files_touched = sorted(touched_set)
     return {
         "before": b_view,
         "after": a_view,
@@ -468,4 +560,5 @@ def workspace_evidence(before: dict | None, after: dict | None,
         "mutation": mutation,
         "read_only_violation": read_only_violation,
         "attribution": attribution,
+        "files_touched": files_touched,
     }

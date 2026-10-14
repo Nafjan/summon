@@ -254,7 +254,19 @@ def _check_backends() -> dict:
     except Exception:  # noqa: BLE001 - doctor remains usable if optional discovery fails
         zcode_targets["zcode"] = None
         zcode_version = None
-    paths = {n: (None if n == "zcode" else shutil.which(n)) for n in names}
+    try:
+        from _builder import resolve_codex_binary
+    except Exception:  # noqa: BLE001
+        resolve_codex_binary = None
+    paths = {
+        n: (
+            None if n == "zcode"
+            else (resolve_codex_binary(which_fn=shutil.which)
+                  if n == "codex" and resolve_codex_binary is not None
+                  else shutil.which(n))
+        )
+        for n in names
+    }
     with ThreadPoolExecutor(max_workers=len(names)) as pool:
         versions = dict(zip(names, pool.map(
             lambda n: (zcode_version(zcode_targets[n]) if n == "zcode"
@@ -464,6 +476,28 @@ def _check_agents_dir(agents_dir: str | None, cwd: str | None) -> dict:
         if not found and bundled and agents:
             entry["note"] = (f"project roster {resolved} not present — dispatching "
                              f"the skill's bundled starter roster ({bundled})")
+        elif found and bundled and os.path.normcase(os.path.abspath(resolved)) != os.path.normcase(os.path.abspath(bundled)):
+            try:
+                bundled_agents = {a.get("name"): a for a in list_agents(bundled) if a.get("name")}
+                shadowed = []
+                for a in agents:
+                    aname = a.get("name")
+                    b_agent = bundled_agents.get(aname)
+                    if b_agent and (
+                        a.get("model") != b_agent.get("model")
+                        or a.get("run_agent") != b_agent.get("run_agent")
+                    ):
+                        shadowed.append({
+                            "name": aname,
+                            "active_model": a.get("model"),
+                            "bundled_model": b_agent.get("model"),
+                            "active_cli": a.get("run_agent"),
+                            "bundled_cli": b_agent.get("run_agent"),
+                        })
+                if shadowed:
+                    entry["shadowed_bundled_agents"] = shadowed
+            except Exception:  # noqa: BLE001
+                pass
         return entry
     except Exception as e:  # noqa: BLE001 - doctor never raises
         return {"path": agents_dir, "found": False, "agent_count": 0,
@@ -691,6 +725,13 @@ def render(report: dict) -> str:
         f"agents   : {'[OK]' if ad['found'] else '[--]'} {ad.get('path')}  "
         f"({ad.get('agent_count', 0)} agent definitions)",
     ]
+    if ad.get("shadowed_bundled_agents"):
+        names_str = ", ".join(
+            f"{s['name']} ({s.get('active_model')} vs bundled {s.get('bundled_model')})"
+            for s in ad["shadowed_bundled_agents"][:8]
+        )
+        lines.append(f"  shadow : [!!] active roster shadows bundled agent pins: {names_str} "
+                     "(re-run `python install.py --target agents --force` to sync)")
     rr = report.get("read_root_capabilities") or {}
     if rr:
         lines.append("read roots: only %s enforce extra roots at read-only; %s"

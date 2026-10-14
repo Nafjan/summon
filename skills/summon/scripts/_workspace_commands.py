@@ -527,7 +527,12 @@ class OperatorLinkedReplacementAdapter:
     def perform(self, body, *, view_scope, lookup=False, authorization_constraint=None):
         if type(lookup) is not bool or view_scope.audience != "operator":
             _refuse("invalid_linked_request")
-        workspace = _coherent_workspace(self.coordinator)
+        try:
+            workspace = _coherent_workspace(self.coordinator)
+        except WorkspaceCommandError as exc:
+            if str(exc) == "command_snapshot_unavailable":
+                raise WorkspaceCommandError("linked_snapshot_unavailable") from None
+            raise
         proposal, _targets = self._bind(workspace, view_scope, body)
         try:
             method = (self._runtime.reconcile_operator_linked_replacement if lookup

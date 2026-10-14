@@ -28,6 +28,7 @@ class Milliseconds(int):
     """
 
     bare_sub_second = False
+    is_auto = False
 
     def __str__(self) -> str:
         """Serialize WITH the unit, always.
@@ -41,13 +42,21 @@ class Milliseconds(int):
         return "%dms" % int(self)
 
 
+def _default_timeout_ms() -> Milliseconds:
+    out = Milliseconds(600000)
+    out.is_auto = True
+    return out
+
+
 def parse_timeout(value: str) -> int:
     """--timeout accepts bare milliseconds (backward compatible) or a human
-    suffix: '90s', '10m', '4h', '600000ms'. Returns whole milliseconds (>= 1;
+    suffix: '90s', '10m', '4h', '600000ms', or 'auto'. Returns whole milliseconds (>= 1;
     fractional input rounds). Zero, negative, and non-finite durations are
     rejected here so they fail as argparse errors, not as instantly-killed
     agents or an OverflowError from the executor."""
     s = str(value).strip().lower()
+    if s == "auto":
+        return _default_timeout_ms()
     try:
         if s.endswith("ms"):
             ms = float(s[:-2])
@@ -62,7 +71,7 @@ def parse_timeout(value: str) -> int:
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"invalid --timeout {value!r}: use milliseconds or a suffix, "
-            "e.g. 600000, 600s, 10m, 4h")
+            "e.g. 600000, 600s, 10m, 4h, auto")
     if not math.isfinite(ms) or ms <= 0:
         raise argparse.ArgumentTypeError(
             f"invalid --timeout {value!r}: must be a positive finite duration")
@@ -177,7 +186,7 @@ MODE_FLAGS = {
     # jobs read commands: registry query only.
     "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
     "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
-    "jobs-wait": {"jobs_wait", "jobs_wait_all", "jobs_wait_ids", "job_dir", "timeout", "json", "job_file"},
+    "jobs-wait": {"jobs_wait", "jobs_wait_all", "jobs_wait_ids", "jobs_active_only", "job_dir", "timeout", "json", "job_file"},
     "jobs-extend": {"jobs_extend", "job_duration", "job_dir", "json", "job_file"},
     "jobs-cancel": {"jobs_cancel", "job_dir", "json", "job_file"},
     "jobs-steer": {"jobs_steer", "job_message", "job_dir", "json", "job_file"},
@@ -190,7 +199,7 @@ MODE_FLAGS = {
     # Diagnostics are local management commands. They never dispatch an agent;
     # bug-report submission is an explicit, user-authenticated gh invocation.
     "telemetry": {"telemetry_enable", "telemetry_disable", "telemetry_status",
-                   "telemetry_clear", "telemetry_stats", "json", "job_file"},
+                   "telemetry_clear", "telemetry_stats", "format", "json", "job_file"},
     "usage": {"usage_action", "usage_from", "usage_cache", "usage_live_store",
               "usage_providers", "allow_account_usage_read", "dry_run", "out",
               "json", "job_file"},
@@ -294,11 +303,13 @@ MODE_HINTS = {
 FLAG_NAMES = {
     "sets": "--set",
     "list_for": "--for",
+    "jobs_active_only": "--active-only",
     # Never expose the private parser destination in user-facing whitelist
     # errors. It is only the rewritten representation of `dispatch --lane`.
     "fleet_dispatch_lane": "--lane",
 }  # dests whose public spelling isn't dest.replace('_','-')
 TOKEN_DESTS = {"set": "sets", "from": "bug_report_from", "for": "list_for",
+               "active-only": "jobs_active_only",
                # private parser spelling produced only by `dispatch --lane`;
                # mapping it here makes every fan-out whitelist reject a lane
                # before entering its handler.
@@ -929,12 +940,16 @@ def rewrite_subcommand(argv: list) -> tuple:
             return argv, "help"       # bare `summon jobs` -> usage, not a silent list
         if rest[0] == "list":
             return ["--jobs-list", *rest[1:]], None
-        if rest[0] == "wait" and "--all" in rest[1:]:
+        if rest[0] == "wait" and ("--all" in rest[1:] or "--active-only" in rest[1:] or "--jobs-active-only" in rest[1:]):
             translated = ["--jobs-wait-all"]
             idx = 1
             while idx < len(rest):
                 tok = rest[idx]
                 if tok == "--all":
+                    idx += 1
+                    continue
+                if tok in ("--active-only", "--jobs-active-only"):
+                    translated.append("--jobs-active-only")
                     idx += 1
                     continue
                 if tok in ("--job-dir", "--timeout", "--job-file") and idx + 1 < len(rest):
@@ -1385,9 +1400,9 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Fail closed when an agent is absent from the selected roster; "
                              "do not fall back to bundled or plugin definitions")
     parser.add_argument(
-        "--timeout", type=parse_timeout, default=600000,
-        help="Timeout: bare ms, or with suffix — 600s, 10m, 4h "
-             "(default: 600000 ms = 10m)"
+        "--timeout", type=parse_timeout, default=_default_timeout_ms(),
+        help="Timeout: bare ms, or with suffix — 600s, 10m, 4h, auto "
+             "(default: auto / 600000 ms = 10m)"
     )
     parser.add_argument("--cli", help="Force specific CLI (claude, cursor-agent, codex, gemini)")
     parser.add_argument("--model", help="Override the agent's frontmatter model for this call")
@@ -1769,6 +1784,8 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Wait for all active/specified background jobs and return a compact summary")
     parser.add_argument("--jobs-wait-ids", dest="jobs_wait_ids", action="append", default=[],
                         metavar="JOB_ID", help="With --jobs-wait-all: specific job IDs to wait for")
+    parser.add_argument("--jobs-active-only", "--active-only", dest="jobs_active_only", action="store_true",
+                        help="With --jobs-wait-all: wait only for currently running/prepared jobs")
     parser.add_argument("--jobs-extend", dest="jobs_extend", metavar="JOB_ID",
                         help="Queue a bounded extension for an adaptive background job")
     parser.add_argument("--jobs-cancel", dest="jobs_cancel", metavar="JOB_ID",

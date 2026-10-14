@@ -22,6 +22,7 @@ Implementation is split into sibling modules:
 from __future__ import annotations
 
 import argparse
+import atexit
 import copy
 from dataclasses import replace
 import hashlib
@@ -261,7 +262,7 @@ def _acquire_out_lock(out_path: str) -> int | None:
             if isinstance(owner_pid, int) and not isinstance(owner_pid, bool):
                 if owner_pid == os.getpid() and lock_path in _ACTIVE_OUT_LOCKS:
                     return owner_pid
-                if owner_pid != os.getpid() and _jobs._pid_liveness(owner_pid) == "alive":
+                if owner_pid != os.getpid() and _jobs._pid_liveness(owner_pid) in ("alive", "unknown"):
                     return owner_pid
             try:
                 os.unlink(lock_path)
@@ -287,6 +288,9 @@ def _release_current_out_lock() -> None:
             os.unlink(lock_path)
     except (OSError, ValueError, UnicodeDecodeError):
         pass
+
+
+atexit.register(_release_current_out_lock)
 
 
 def _request_identity(args) -> dict:
@@ -1143,13 +1147,6 @@ _USAGE = _cli.USAGE
 
 
 def main() -> None:
-    try:
-        _main_body()
-    finally:
-        _release_current_out_lock()
-
-
-def _main_body() -> None:
     # Windows consoles default to cp1252; sub-agent results often contain
     # non-ASCII (arrows, em-dashes, emoji). Emit UTF-8 so json.dumps never
     # raises UnicodeEncodeError on stdout.
@@ -1790,6 +1787,18 @@ def _main_body() -> None:
                 _diag = _telemetry.status()
             if args.json:
                 print(json.dumps(_diag, ensure_ascii=False))
+            elif getattr(args, "telemetry_stats", False) and getattr(args, "format", "json") == "table":
+                _by_b = _diag.get("by_backend") or {}
+                print(f"Total events: {_diag.get('total_events', 0)} (rotated archive: {_diag.get('rotated_archive_present', False)})")
+                print(f"{'BACKEND':<16} {'CALLS':>6} {'OK%':>7} {'P50_MS':>9} {'P95_MS':>9} {'TIMEOUT':>7}")
+                print("-" * 60)
+                for _bname, _bstat in sorted(_by_b.items()):
+                    _tot = _bstat.get("total", 0)
+                    _rate = f"{float(_bstat.get('success_rate') or 0.0) * 100:.1f}%"
+                    _p50 = str(_bstat.get("p50_ms") if _bstat.get("p50_ms") is not None else "-")
+                    _p95 = str(_bstat.get("p95_ms") if _bstat.get("p95_ms") is not None else "-")
+                    _to = str(_bstat.get("timeout", 0))
+                    print(f"{_bname:<16} {_tot:>6} {_rate:>7} {_p50:>9} {_p95:>9} {_to:>7}")
             else:
                 print(json.dumps(_diag, ensure_ascii=False, indent=2))
             sys.exit(0)
@@ -2060,7 +2069,8 @@ def _main_body() -> None:
         # cwd) and not under --dry-run (which promises to touch nothing).
         if (getattr(args, "out", None) and not getattr(args, "dry_run", False)
                 and not getattr(args, "background", False)
-                and error_kind != "out_path_collision"):
+                and error_kind != "out_path_collision"
+                and _CURRENT_OUT_LOCK is not None):
             try:
                 _write_error_out(args.out, env)
             except Exception:  # noqa: BLE001 — reporting the original error matters more
@@ -2086,13 +2096,6 @@ def _main_body() -> None:
             "kind": "immutable_per_job_snapshot",
             "scripts_sha256": _actual_scripts_sha,
         }
-
-    if args.resume and args.worktree is not None:
-        _die("--resume and --worktree are incompatible: a session lives in the "
-             "original project dir, not a fresh worktree")
-    if args.worktree is not None and getattr(args, "artifacts", None):
-        _die("--artifact and --worktree are incompatible: loose files are measured under "
-             "the original --cwd but an isolated worktree may not contain them")
 
     # --dry-run is a SINGLE-dispatch preview only. Combining it with modes that
     # fan out or detach would otherwise slip past the dry-run exit and run real
@@ -2147,6 +2150,13 @@ def _main_body() -> None:
                        "result_usable": False,
                        "out_lock": {"lock_holder_pid": _lock_holder}},
             )
+
+    if args.resume and args.worktree is not None:
+        _die("--resume and --worktree are incompatible: a session lives in the "
+             "original project dir, not a fresh worktree")
+    if args.worktree is not None and getattr(args, "artifacts", None):
+        _die("--artifact and --worktree are incompatible: loose files are measured under "
+             "the original --cwd but an isolated worktree may not contain them")
 
     # --prompt-file: resolve to a prompt BEFORE the background handler (its
     # validation needs args.prompt). The public/external form retains the
@@ -2396,6 +2406,7 @@ def _main_body() -> None:
                     _pw = _pw if isinstance(_pw, list) else ([] if _pw is None else [str(_pw)])
                     prior["warnings"] = _pw + [_note]
                 prior["skipped"] = True
+                _release_current_out_lock()
                 _emit(prior, operation=_EMIT_OPERATION)
                 sys.exit(0 if is_terminal_success(prior) else 1)
 
@@ -2508,11 +2519,22 @@ def _main_body() -> None:
             agents = [a for a in agents
                       if (a.get("run_agent") or a.get("cli")) == args.cli]
         if getattr(args, "list_for", None):
-            from _loader import filter_agents_for_task
+            from _loader import KNOWN_TASK_INTENTS, filter_agents_for_task
             agents = filter_agents_for_task(agents, args.list_for)
+            _q_for = str(args.list_for).strip().lower()
+            _for_warn = (
+                f"unknown task intent {args.list_for!r}; known intents: "
+                "review, implement, verify, debug, design, fast"
+                if _q_for and _q_for not in KNOWN_TASK_INTENTS and not agents
+                else None
+            )
+        else:
+            _for_warn = None
         if getattr(args, "format", "json") == "table":
             from _builder import roster_permission_lint
             sys.stdout.write(_format_agents_table(agents))
+            if _for_warn:
+                print(f"warning: {_for_warn}", file=sys.stderr)
             for _w in roster_permission_lint(agents):
                 print(f"warning: {_w}", file=sys.stderr)
             sys.exit(0)
@@ -2524,6 +2546,8 @@ def _main_body() -> None:
         _out = {"agents": agents, "agents_dir": agents_dir}
         if getattr(args, "list_for", None):
             _out["filter_for"] = args.list_for
+            if _for_warn:
+                _out["filter_warning"] = _for_warn
         try:
             from _loader import discover_agent_packs
             _packs = discover_agent_packs()
@@ -3149,12 +3173,15 @@ def _main_body() -> None:
     # BEFORE the agent can commit anything.
     receipt["git_head_before"] = _receipt.git_head(args.cwd)
 
-    if (not any(tok.split("=", 1)[0] == "--timeout" for tok in argv)
+    if ((getattr(args.timeout, "is_auto", False)
+         or not any(tok.split("=", 1)[0] == "--timeout" for tok in argv))
             and _telemetry.enabled()
             and (os.environ.get("SUMMON_TELEMETRY_FILE")
                  or _telemetry._default_cohort() == "live")):
-        args.timeout = _cli.Milliseconds(
+        _rec_ms = _cli.Milliseconds(
             _telemetry.recommended_timeout_ms(cli, int(args.timeout)))
+        _rec_ms.is_auto = True
+        args.timeout = _rec_ms
 
     # Catch ValueError from build_invocation_args / permission_flags / TOML
     # escaping so unknown --cli values or unsafe agent paths surface as JSON
@@ -4960,6 +4987,10 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         result["report_source"] = retry.get("report_source", "structured")
         if retry.get("report_text"):
             result["report_text"] = retry.get("report_text")
+        if retry.get("summary") is not None:
+            result["summary"] = retry.get("summary")
+        if retry.get("confidence") is not None:
+            result["confidence"] = retry.get("confidence")
         result["status"] = retry.get("status")    # DONE->success; PARTIAL/BLOCKED reflected
         result.pop("suspect", None)
         result["contract_repaired"] = True
@@ -5028,6 +5059,8 @@ def _write_out(path: str, result: dict) -> None:
         _jobs._replace_with_retry(tmp, path)
     except OSError as e:
         result["out_error"] = f"failed to write --out {path}: {e}"
+    finally:
+        _release_current_out_lock()
 
 
 def _resolve_job_file() -> str | None:
@@ -5161,3 +5194,5 @@ if __name__ == "__main__":
         else:
             print(json.dumps(err, ensure_ascii=False))
         sys.exit(int(err.get("exit_code") or 1))
+    finally:
+        _release_current_out_lock()

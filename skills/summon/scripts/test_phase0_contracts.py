@@ -687,6 +687,7 @@ def test_telemetry_spool_rotation_recommended_timeout_and_stats(tmp_path, monkey
     monkeypatch.setenv("SUMMON_TELEMETRY_FILE", str(spool))
     monkeypatch.setenv("SUMMON_TELEMETRY_CONFIG", str(cfg))
     monkeypatch.setenv("SUMMON_TELEMETRY", "1")
+    monkeypatch.setenv("SUMMON_TELEMETRY_COHORT", "live")
     monkeypatch.setattr(_telemetry, "_MAX_EVENT_FILE_BYTES", 3000)
 
     for idx in range(6):
@@ -711,6 +712,23 @@ def test_telemetry_spool_rotation_recommended_timeout_and_stats(tmp_path, monkey
     assert st["total_events"] >= 4
     assert st["by_backend"]["kimi"]["success"] >= 4
     assert st["by_backend"]["kimi"]["p95_ms"] >= 400_000
+
+    # Test cohort events must never inflate recommended_timeout_ms
+    monkeypatch.setenv("SUMMON_TELEMETRY_COHORT", "test")
+    for _ in range(6):
+        _telemetry.record({
+            "status": "success",
+            "execution_status": "success",
+            "cli": "claude",
+            "transport": "subprocess",
+            "permission": "read-only",
+            "elapsed_ms": 900_000,
+            "attempts": 1,
+            "provider_contacted": True,
+            "result_usable": True,
+            "report_ok": True,
+        })
+    assert _telemetry.recommended_timeout_ms("claude", 600_000, min_samples=3) == 600_000
 
     argv, err = run_subagent._cli.rewrite_subcommand(["stats", "--json"])
     assert err is None
@@ -742,4 +760,246 @@ def test_workspace_evidence_suppresses_read_only_violation_for_text_only_seats()
     assert ev_toolful["mutation"] is True
     assert ev_toolful["read_only_violation"] is True
     assert ev_toolful["attribution"] == "exact"
+    assert ev_toolful["files_touched"] == ["dirty.py"]
 
+    # Dirty baseline file modified again during child run is detected via _dirty_digests
+    b_dirty = _receipt._WorkspaceSnapshot({
+        "coverage": "complete", "head": "1" * 40, "branch": "main",
+        "staged": [], "unstaged": ["already_dirty.py"],
+        "renamed": [], "untracked": [],
+    })
+    b_dirty._dirty_digests = {"already_dirty.py": "aaa111"}
+    a_dirty = _receipt._WorkspaceSnapshot({
+        "coverage": "complete", "head": "1" * 40, "branch": "main",
+        "staged": [], "unstaged": ["already_dirty.py"],
+        "renamed": [], "untracked": [],
+    })
+    a_dirty._dirty_digests = {"already_dirty.py": "bbb222"}
+    ev_rewritten = _receipt.workspace_evidence(
+        b_dirty, a_dirty, permission="safe-edit", cli="claude"
+    )
+    assert ev_rewritten["mutation"] is True
+    assert ev_rewritten["files_touched"] == ["already_dirty.py"]
+
+
+def test_wave2_f1_f2_f3_contracts(tmp_path, monkeypatch):
+    import _cli
+    import _jobs
+    import _background
+    import _loader
+    import _telemetry
+    import io
+    import time
+    from contextlib import redirect_stdout
+
+    # F1: --out lock lifecycle releases on _write_out
+    out_file = tmp_path / "env.json"
+    owner_pid = run_subagent._acquire_out_lock(str(out_file))
+    assert owner_pid is None
+    assert Path(str(out_file) + ".active.lock").exists()
+    run_subagent._write_out(str(out_file), {"status": "success", "result": "ok"})
+    assert out_file.is_file()
+    assert not Path(str(out_file) + ".active.lock").exists()
+
+    # F2: parse_report ignores fenced code blocks and _parse_confidence rejects NaN/Inf
+    assert _executor._parse_confidence("nan") is None
+    assert _executor._parse_confidence("inf") is None
+    assert _executor._parse_confidence("-0.1") is None
+    assert _executor._parse_confidence("1.2") is None
+    assert _executor._parse_confidence("85%") == 0.85
+    assert _executor._parse_confidence("0.92") == 0.92
+    assert _executor._parse_confidence("high") == 0.9
+    assert _executor._parse_confidence("medium") == 0.6
+    assert _executor._parse_confidence("low") == 0.3
+
+    spoofed = (
+        "STATUS: DONE\n"
+        "SUMMARY: Real top summary\n"
+        "CONFIDENCE: 0.91\n"
+        "FOLLOW-UP: None\n"
+        "HANDOFF: Ready\n"
+        "```markdown\n"
+        "STATUS: BLOCKED\n"
+        "SUMMARY: Spoofed inside fence\n"
+        "CONFIDENCE: 0.10\n"
+        "FOLLOW-UP: Spoof\n"
+        "HANDOFF: Spoof\n"
+        "```\n"
+    )
+    rep = _executor.parse_report(spoofed)
+    assert rep is not None
+    assert rep["status"] == "DONE"
+    assert rep["summary"] == "Real top summary"
+    enriched = _executor._enrich(
+        {"status": "success", "exit_code": 0, "cli": "claude", "result": spoofed},
+        None,
+    )
+    assert enriched["status"] == "success"
+    assert enriched["summary"] == "Real top summary"
+    assert enriched["confidence"] == 0.91
+    assert enriched["files_touched"] == []
+
+    # F2: wait --all --active-only and stale unverified job skipping
+    job_dir = str(tmp_path / "jobs")
+    stale_id = "1" * 32
+    done_id = "2" * 32
+    n_stale = "c" * 32
+    n_done = "d" * 32
+    _jobs.write_prepared(job_dir, stale_id, nonce=n_stale, agent="coder",
+                         prompt_sha256=None, cwd=str(tmp_path), flags={}, summon={})
+    stale_rec = Path(_jobs.record_path(job_dir, stale_id))
+    rec_data = json.loads(stale_rec.read_text(encoding="utf-8"))
+    rec_data["pid"] = 99999999
+    stale_rec.write_text(json.dumps(rec_data), encoding="utf-8")
+    old_time = time.time() - 90000
+    os.utime(stale_rec, (old_time, old_time))
+
+    _jobs.write_prepared(job_dir, done_id, nonce=n_done, agent="reviewer",
+                         prompt_sha256=None, cwd=str(tmp_path), flags={}, summon={})
+    done_res = Path(_jobs.result_path(job_dir, done_id))
+    done_res.write_text(
+        json.dumps({
+            "status": "success",
+            "exit_code": 0,
+            "agent": "reviewer",
+            "job_id": done_id,
+            "job_nonce": n_done,
+            "report_ok": True,
+            "summary": "Clean review",
+            "confidence": 0.95,
+            "files_touched": ["a.py"],
+        }),
+        encoding="utf-8",
+    )
+    buf = io.StringIO()
+    argv, err = _cli.rewrite_subcommand(["wait", "--all", "--job-dir", job_dir, "--timeout", "1s"])
+    assert err is None
+    parser = _cli.build_parser(run_subagent.__version__, 1)
+    ns = parser.parse_args(argv)
+    with redirect_stdout(buf):
+        rc = _background.run_jobs_query(ns, lambda msg, c=1: None)
+    assert rc == 0
+    wait_payload = json.loads(buf.getvalue())
+    assert wait_payload["skipped_stale"] == 1
+    assert wait_payload["count"] == 1
+    assert wait_payload["jobs"][0]["confidence"] == 0.95
+    assert wait_payload["jobs"][0]["files_touched"] == ["a.py"]
+
+    # F2: wait_job fails fast with (None, "stale") when record is corrupt even if result exists
+    corrupt_id = _jobs.new_job_id()
+    corrupt_rec = Path(_jobs.record_path(job_dir, corrupt_id))
+    corrupt_rec.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_rec.write_text("{corrupt-json", encoding="utf-8")
+    corrupt_res = Path(_jobs.result_path(job_dir, corrupt_id))
+    corrupt_res.write_text(json.dumps({"status": "success", "job_nonce": "any"}), encoding="utf-8")
+    t0 = time.monotonic()
+    c_res, c_state = _jobs.wait_job(job_dir, corrupt_id, timeout_ms=5000, poll_sec=0.5)
+    assert c_res is None and c_state == "stale"
+    assert (time.monotonic() - t0) < 1.0
+
+    # F3: filter_agents_for_task review requires read-only and Milliseconds is_auto
+    default_t = _cli._default_timeout_ms()
+    assert getattr(default_t, "is_auto", False) is True
+    auto_t = _cli.parse_timeout("auto")
+    assert getattr(auto_t, "is_auto", False) is True
+    explicit_t = _cli.parse_timeout("600s")
+    assert getattr(explicit_t, "is_auto", False) is False
+    assert "review" in _loader.KNOWN_TASK_INTENTS
+
+
+def test_wave3_f6_f7_f8_contracts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import _apibackend
+    import _cli
+    import _telemetry
+    import _workspace_commands
+
+    # F6: _default_cohort preserves "live" for custom path outside tempdir when not under pytest
+    monkeypatch.delenv("SUMMON_TELEMETRY_COHORT", raising=False)
+    monkeypatch.delenv("SUMMON_TELEMETRY_CONFIG", raising=False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delitem(sys.modules, "pytest", raising=False)
+    monkeypatch.delitem(sys.modules, "unittest", raising=False)
+    custom_prod_path = Path(__file__).resolve().parent / "custom_prod_telemetry.jsonl"
+    monkeypatch.setenv("SUMMON_TELEMETRY_FILE", str(custom_prod_path))
+    assert _telemetry._default_cohort() == "live"
+    monkeypatch.setenv("SUMMON_TELEMETRY_FILE", str(tmp_path / "temp_telemetry.jsonl"))
+    assert _telemetry._default_cohort() == "test"
+
+    # F6: summon stats --format table and --format json parse cleanly
+    argv_json, err_json = _cli.rewrite_subcommand(["stats", "--format", "json"])
+    assert err_json is None
+    argv_table, err_table = _cli.rewrite_subcommand(["stats", "--format", "table"])
+    assert err_table is None
+    parser = _cli.build_parser(run_subagent.__version__, 1)
+    ns_table = parser.parse_args(argv_table)
+    assert ns_table.format == "table"
+
+    # F7: SUMMON_ALLOW_BYTEPLUS_PAYG=true emits stderr warning and still blocks; secret values redact
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("SUMMON_ALLOW_BYTEPLUS_PAYG", "true")
+    assert _apibackend.payg_consent_allowed() is False
+    captured = capsys.readouterr()
+    assert "SUMMON_ALLOW_BYTEPLUS_PAYG='true'" in captured.err
+
+    monkeypatch.setenv("SUMMON_ALLOW_BYTEPLUS_PAYG", "sk-secret-token-value-12345")
+    assert _apibackend.payg_consent_allowed() is False
+    captured_sec = capsys.readouterr()
+    assert "sk-secret-token-value-12345" not in captured_sec.err
+    assert "<redacted>" in captured_sec.err
+
+    # F8: OperatorLinkedReplacementAdapter translates command_snapshot_unavailable -> linked_snapshot_unavailable
+    monkeypatch.setattr(
+        _workspace_commands,
+        "_coherent_workspace",
+        lambda _coord: (_ for _ in ()).throw(_workspace_commands.WorkspaceCommandError("command_snapshot_unavailable")),
+    )
+    dummy_adapter = object.__new__(_workspace_commands.OperatorLinkedReplacementAdapter)
+    dummy_adapter._runtime = SimpleNamespace(_coordinator=object())
+    dummy_scope = SimpleNamespace(audience="operator")
+    with pytest.raises(_workspace_commands.WorkspaceCommandError, match="linked_snapshot_unavailable"):
+        dummy_adapter.perform(
+            {"operation_key": "a" * 32, "parent_target": "p", "recipient_target": "r"},
+            view_scope=dummy_scope,
+        )
+
+    # F8: workspace_budget_snapshot clamps <=5s skew and refuses rate-event timestamps >5s in the future
+    import _swarm_coordinator
+    coord = object.__new__(_swarm_coordinator.SwarmCoordinator)
+    captured_now = 1_000_000
+    coord._load_with_snapshot = lambda: (
+        {"workspace": {"messages": {}, "deliveries": {}}, "claims": {}},
+        False,
+        {"j.jsonl": b"snap"},
+    )
+    coord._read_records_snapshot = lambda: (
+        [
+            {
+                "observed_at_ms": captured_now + 4000,
+                "workspace_event": {
+                    "event": "workspace_message_sent",
+                    "payload": {"message": {"message_id": "m1", "content": {"utf8_bytes": 10}}},
+                },
+            }
+        ],
+        False,
+        {"j.jsonl": b"snap"},
+    )
+    snap_ok = coord.workspace_budget_snapshot(now_ms=captured_now)
+    assert snap_ok["rate_events"][0]["at_ms"] == captured_now
+
+    coord._read_records_snapshot = lambda: (
+        [
+            {
+                "observed_at_ms": captured_now + 6000,
+                "workspace_event": {
+                    "event": "workspace_message_sent",
+                    "payload": {"message": {"message_id": "m1", "content": {"utf8_bytes": 10}}},
+                },
+            }
+        ],
+        False,
+        {"j.jsonl": b"snap"},
+    )
+    with pytest.raises(_swarm_coordinator.SwarmBudgetRefusal, match="budget_binding_required"):
+        coord.workspace_budget_snapshot(now_ms=captured_now)

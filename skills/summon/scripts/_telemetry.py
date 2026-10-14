@@ -193,10 +193,15 @@ def _default_cohort() -> str:
         return env_val.strip().lower()
     if ("PYTEST_CURRENT_TEST" in os.environ
             or "unittest" in sys.modules
-            or "pytest" in sys.modules
-            or os.environ.get("SUMMON_TELEMETRY_FILE")
-            or os.environ.get("SUMMON_TELEMETRY_CONFIG")):
+            or "pytest" in sys.modules):
         return "test"
+    for env_key in ("SUMMON_TELEMETRY_FILE", "SUMMON_TELEMETRY_CONFIG"):
+        custom_path = os.environ.get(env_key)
+        if custom_path:
+            norm = os.path.normcase(os.path.abspath(os.path.expanduser(custom_path)))
+            tmp_root = os.path.normcase(os.path.abspath(tempfile.gettempdir())).rstrip(os.sep)
+            if norm == tmp_root or norm.startswith(tmp_root + os.sep) or "pytest" in norm or "unittest" in norm:
+                return "test"
     return "live"
 
 
@@ -1273,38 +1278,12 @@ def _trim_event_file(path: Path) -> None:
     try:
         if path.stat().st_size <= _MAX_EVENT_FILE_BYTES:
             return
+        scan_bytes = max(_MAX_SOURCE_BYTES, _MAX_EVENT_FILE_BYTES * 2)
         with path.open("rb") as fh:
             size = path.stat().st_size
-            fh.seek(max(0, size - _MAX_SOURCE_BYTES))
-            raw = fh.read(_MAX_SOURCE_BYTES)
+            fh.seek(max(0, size - scan_bytes))
+            raw = fh.read(scan_bytes)
         events = _parse_event_lines(raw)
-        try:
-            rot_path = Path(str(path) + ".1")
-            prior_raw = b""
-            if rot_path.is_file():
-                with rot_path.open("rb") as rfh:
-                    rsize = rot_path.stat().st_size
-                    rfh.seek(max(0, rsize - _MAX_SOURCE_BYTES))
-                    prior_raw = rfh.read(_MAX_SOURCE_BYTES)
-            merged_events = _parse_event_lines(prior_raw + b"\n" + raw)
-            rot_kept = []
-            rot_total = 0
-            seen_ids: set[str] = set()
-            for ev in reversed(merged_events):
-                eid = ev.get("event_id")
-                if isinstance(eid, str) and eid:
-                    if eid in seen_ids:
-                        continue
-                    seen_ids.add(eid)
-                rline = json.dumps(ev, ensure_ascii=True, separators=(",", ":")).encode("utf-8") + b"\n"
-                if rot_kept and rot_total + len(rline) > _MAX_EVENT_FILE_BYTES * 2:
-                    break
-                rot_kept.append(rline)
-                rot_total += len(rline)
-            if rot_kept:
-                _atomic_write(rot_path, b"".join(reversed(rot_kept)))
-        except OSError:
-            pass
         kept = []
         total = 0
         for event in reversed(events):
@@ -1313,6 +1292,37 @@ def _trim_event_file(path: Path) -> None:
                 break
             kept.append(line)
             total += len(line)
+        evicted_count = max(0, len(events) - len(kept))
+        evicted_events = events[:evicted_count]
+        if evicted_events:
+            try:
+                rot_path = Path(str(path) + ".1")
+                prior_raw = b""
+                if rot_path.is_file():
+                    with rot_path.open("rb") as rfh:
+                        rsize = rot_path.stat().st_size
+                        rfh.seek(max(0, rsize - _MAX_SOURCE_BYTES))
+                        prior_raw = rfh.read(_MAX_SOURCE_BYTES)
+                prior_events = _parse_event_lines(prior_raw) if prior_raw else []
+                merged_events = prior_events + evicted_events
+                rot_kept = []
+                rot_total = 0
+                seen_ids: set[str] = set()
+                for ev in reversed(merged_events):
+                    eid = ev.get("event_id")
+                    if isinstance(eid, str) and eid:
+                        if eid in seen_ids:
+                            continue
+                        seen_ids.add(eid)
+                    rline = json.dumps(ev, ensure_ascii=True, separators=(",", ":")).encode("utf-8") + b"\n"
+                    if rot_kept and rot_total + len(rline) > _MAX_EVENT_FILE_BYTES:
+                        break
+                    rot_kept.append(rline)
+                    rot_total += len(rline)
+                if rot_kept:
+                    _atomic_write(rot_path, b"".join(reversed(rot_kept)))
+            except OSError:
+                pass
         if kept:
             _atomic_write(path, b"".join(reversed(kept)))
         else:
@@ -1373,8 +1383,11 @@ def _percentile_int(values: list[int], q: float) -> int | None:
     return int(ordered[idx])
 
 
+_RECOMMENDED_TIMEOUT_CACHE: dict[tuple, int] = {}
+
+
 def recommended_timeout_ms(backend: str | None, default_ms: int = 600_000,
-                           *, min_samples: int = 3) -> int:
+                           *, min_samples: int = 5) -> int:
     """Compute an adaptive foreground timeout from local telemetry p95 latency.
 
     Never lowers the caller's ``default_ms`` floor; when p95 latency for the
@@ -1383,22 +1396,46 @@ def recommended_timeout_ms(backend: str | None, default_ms: int = 600_000,
     """
     if not backend:
         return int(default_ms)
+    path = _events_path()
+    rot_path = Path(str(path) + ".1")
+    try:
+        st = path.stat()
+        p_mtime, p_size = st.st_mtime_ns, st.st_size
+    except OSError:
+        p_mtime, p_size = 0, 0
+    try:
+        rst = rot_path.stat()
+        r_mtime, r_size = rst.st_mtime_ns, rst.st_size
+    except OSError:
+        r_mtime, r_size = 0, 0
+    cache_key = (str(path), p_mtime, p_size, str(rot_path), r_mtime, r_size,
+                 backend, int(default_ms), int(min_samples))
+    cached = _RECOMMENDED_TIMEOUT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     events = _read_recent_events()
     latencies = [
         int(ev["elapsed_ms"])
         for ev in events
         if ev.get("backend") == backend
         and ev.get("status") == "success"
+        and ev.get("operation") in ("dispatch", None)
         and isinstance(ev.get("elapsed_ms"), int)
         and ev["elapsed_ms"] > 0
+        and ev.get("cohort") in ("live", None)
     ]
     if len(latencies) < min_samples:
-        return int(default_ms)
-    p95 = _percentile_int(latencies, 0.95)
-    if p95 is None:
-        return int(default_ms)
-    adaptive = min(max(int(default_ms), int(p95 * 2)), 3_600_000)
-    return adaptive
+        result_ms = int(default_ms)
+    else:
+        p95 = _percentile_int(latencies, 0.95)
+        if p95 is None:
+            result_ms = int(default_ms)
+        else:
+            result_ms = min(max(int(default_ms), int(p95 * 2)), 3_600_000)
+    if len(_RECOMMENDED_TIMEOUT_CACHE) >= 32:
+        _RECOMMENDED_TIMEOUT_CACHE.clear()
+    _RECOMMENDED_TIMEOUT_CACHE[cache_key] = result_ms
+    return result_ms
 
 
 def stats(*, cohort: str | None = None) -> dict:
