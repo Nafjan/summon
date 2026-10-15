@@ -11,15 +11,16 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
   `gemini-3.8-flash-high`, `gemini-4-flash`), Codex (`gpt-6-astra`,
   `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-codex`, `gpt-5.4-codex-mini`), Kimi
   (`kimi-code/k3`, `kimi-code/k3-256k`, `kimi-code/k2.7-coding`), BytePlus
-  Coding Plan (`deepseek-v4-1-flash`, `glm-5-3-flash`), and OpenRouter/Kilo
+  Coding Plan (`deepseek-v4-pro`, `glm-5-3-flash`), and OpenRouter/Kilo
   defaults (`deepseek/deepseek-v4.2`, `qwen/qwen3.6-coder`, `z-ai/glm-5.3`,
   `z-ai/glm-5.3-flash`, `minimax/minimax-m3`), while keeping legacy aliases
-  backward-compatible and adding the bundled `argon-reviewer`, `glm-coder`, and
-  `deepseek-41-flash` seats.
+  backward-compatible and adding the bundled `argon-reviewer` and
+  `byteplus-glm-5-3-flash` seats.
 - Harden ModelArk Coding Plan routing, CLI binary discovery, and workspace
-  budget accounting: normalize dated BytePlus Coding Plan snapshot IDs to their
-  canonical Coding Plan model names (`normalize_coding_plan_model`), add
-  `openai-compat` provider model discovery (`summon models --cli openai-compat`),
+  budget accounting: normalize dotted/prefixed BytePlus Coding Plan spellings
+  (`glm-5.3-flash`, `z-ai/glm-5.3-flash`) to `glm-5-3-flash` on Coding Plan
+  endpoints while preserving explicit dated snapshot pins (`normalize_coding_plan_model`), add
+  explicit `openai-compat` provider model discovery (`summon models --cli openai-compat`),
   clamp minor clock skew (`<= 5s`) while refusing future-dated rate events (`> 5s`)
   in `_swarm_coordinator.workspace_budget_snapshot`, add host-gated Coding Plan
   subscription vs metered `/api/v3` PAYG consent classification with bounded

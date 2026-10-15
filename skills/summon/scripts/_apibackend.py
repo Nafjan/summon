@@ -120,7 +120,7 @@ _CODING_PLAN_PROVIDERS = frozenset({"byteplus-coding", "zai-coding-plan"})
 # of known-good models. Re-check with `arkcli plans model-list --plan coding-plan`
 # and validate an actual text call before promoting a model here.
 _CODING_PLAN_MODEL_GUIDANCE = (
-    "deepseek-v4-1-flash (fast coding/analysis), glm-5-3-flash (fast GLM 5.3 Flash), "
+    "glm-5-3-flash (fast GLM 5.3 Flash), "
     "deepseek-v4-flash (fast terminal loops), deepseek-v4-pro (hard coding), "
     "glm-5.2 (long-horizon/large-repo work), dola-seed-2.0-code (agentic coding), "
     "or kimi-k2.5 (code/UI alternative). Avoid legacy/superseded roster entries "
@@ -129,7 +129,6 @@ _CODING_PLAN_MODEL_GUIDANCE = (
 
 # Preferred presentation order when a live roster is available.
 _CODING_PLAN_PREFERRED = (
-    "deepseek-v4-1-flash",
     "glm-5-3-flash",
     "deepseek-v4-flash",
     "deepseek-v4-pro",
@@ -141,41 +140,29 @@ _CODING_PLAN_PREFERRED = (
 )
 CODING_PLAN_KNOWN_GOOD = frozenset(_CODING_PLAN_PREFERRED)
 
-# Normalize common dotted spellings and dated snapshot IDs to exact BytePlus ModelArk Coding Plan IDs.
+# Normalize common dotted/prefixed spellings to exact BytePlus ModelArk Coding Plan IDs.
+# Explicit dated snapshot IDs (e.g., *-260910) are preserved verbatim so Platform PAYG
+# and exact-model pins are never silently rewritten.
 _BYTEPLUS_CODING_MODEL_ALIASES: dict[str, str] = {
     "glm-5.3-flash": "glm-5-3-flash",
-    "glm-5-3-flash-260828": "glm-5-3-flash",
-    "glm-5.3-flash-260828": "glm-5-3-flash",
     "z-ai/glm-5.3-flash": "glm-5-3-flash",
     "zai/glm-5.3-flash": "glm-5-3-flash",
-    "deepseek-4.1-flash": "deepseek-v4-1-flash",
-    "deepseek-v4.1-flash": "deepseek-v4-1-flash",
-    "deepseek-v4-1-flash-260910": "deepseek-v4-1-flash",
-    "deepseek-v4.1-flash-260910": "deepseek-v4-1-flash",
-    "deepseek/deepseek-v4.1-flash": "deepseek-v4-1-flash",
 }
-_CODING_PLAN_DATE_SUFFIX_RE = re.compile(r"-(?:20\d{6}|\d{6})$")
 
 
 def normalize_coding_plan_model(base_url: str | None, model: str | None) -> str | None:
-    """Normalize common dotted and dated model spellings for BytePlus ModelArk endpoints."""
+    """Normalize common dotted/prefixed spellings for BytePlus Coding Plan endpoints only."""
     if not isinstance(model, str) or not model.strip():
         return model
     cleaned = model.strip()
     if (
-        is_coding_plan_endpoint(base_url)
-        or is_byteplus_platform_endpoint(base_url)
-        or (isinstance(base_url, str) and base_url.strip().lower() in _CODING_PLAN_PROVIDERS)
+        _is_byteplus_coding_plan_endpoint(base_url)
+        or (isinstance(base_url, str) and base_url.strip().lower() == "byteplus-coding")
     ):
         low = cleaned.lower()
         mapped = _BYTEPLUS_CODING_MODEL_ALIASES.get(low)
         if mapped:
             return mapped
-        stripped = _CODING_PLAN_DATE_SUFFIX_RE.sub("", low)
-        if stripped != low:
-            mapped_base = _BYTEPLUS_CODING_MODEL_ALIASES.get(stripped, stripped)
-            if mapped_base in CODING_PLAN_KNOWN_GOOD:
-                return mapped_base
     return cleaned
 
 
@@ -320,29 +307,56 @@ def coding_plan_model_guidance(*, refresh_if_stale: bool = False) -> str:
     )
 
 
-def _byteplus_subscription_host(base_url: str | None) -> bool:
-    """True when the URL host is a documented BytePlus ModelArk host.
+def _byteplus_route_parts(base_url: str | None) -> tuple[str, str] | None:
+    """Canonical (host, path) for BytePlus route classification.
 
-    Hostnames are casefolded and a single trailing dot (the DNS root
-    spelling) is stripped before matching; the path is percent-decoded and
-    dot-segment-resolved so spelling variants cannot dodge classification
-    (R2-KM-02)."""
+    One normalization shared by every BytePlus predicate (R3-KM-01): the
+    hostname is casefolded with DNS trailing dots stripped, and the path is
+    percent-decoded, multi-slash-collapsed, and dot-segment-checked so spelling
+    variants cannot dodge classification."""
     if not isinstance(base_url, str) or not base_url:
-        return False
+        return None
     from urllib.parse import urlsplit, unquote
     import posixpath
     try:
         parts = urlsplit(base_url)
         host = (parts.hostname or "").casefold().rstrip(".")
-        path = posixpath.normpath(unquote(parts.path or "/"))
+        raw_path = unquote(parts.path or "/")
     except ValueError:
-        return False
+        return None
+    collapsed = re.sub(r"/+", "/", raw_path)
+    segments = [seg for seg in collapsed.split("/") if seg]
+    if ".." in segments:
+        # Dot-segment traversal on a ModelArk URL is never a valid Coding Plan
+        # subscription path; classify the path as untrusted traversal.
+        path = "/__traversal__"
+    else:
+        path = posixpath.normpath(collapsed)
     if not path.startswith("/"):
         path = "/" + path
+    path = path.casefold()
+    return host, path
+
+
+def _is_byteplus_modelark_host(base_url: str | None) -> bool:
+    """True when the URL host is a documented BytePlus ModelArk host."""
+    parts = _byteplus_route_parts(base_url)
+    if parts is None:
+        return False
+    host, _path = parts
+    return (host == "bytepluses.com" or host.endswith(".bytepluses.com")
+            or host == "volces.com" or host.endswith(".volces.com"))
+
+
+def _byteplus_subscription_host(base_url: str | None) -> bool:
+    """True when the URL is a documented BytePlus ModelArk Coding Plan endpoint."""
+    parts = _byteplus_route_parts(base_url)
+    if parts is None:
+        return False
+    host, path = parts
     host_ok = (host == "bytepluses.com" or host.endswith(".bytepluses.com")
                or host == "volces.com" or host.endswith(".volces.com"))
-    path_ok = (path.casefold().rstrip("/") in ("/api/coding", "/api/coding/v3",
-                                               "/api/coding/paas/v4"))
+    path_ok = path.rstrip("/") in ("/api/coding", "/api/coding/v3")
     return host_ok and path_ok
 
 
@@ -395,47 +409,11 @@ def coding_plan_billing(base_url: str | None) -> dict | None:
     }
 
 
-def _byteplus_route_parts(base_url: str | None) -> tuple[str, str] | None:
-    """Canonical (host, path) for BytePlus route classification.
-
-    One normalization shared by every BytePlus predicate (R3-KM-01): the
-    hostname is casefolded with DNS trailing dots stripped, and the path is
-    percent-decoded and dot-segment-resolved so spelling variants cannot dodge
-    classification. The path keeps its trailing slash."""
-    if not isinstance(base_url, str) or not base_url:
-        return None
-    from urllib.parse import urlsplit, unquote
-    import posixpath
-    try:
-        parts = urlsplit(base_url)
-        host = (parts.hostname or "").casefold().rstrip(".")
-        path = posixpath.normpath(unquote(parts.path or "/"))
-    except ValueError:
-        return None
-    if not path.startswith("/"):
-        path = "/" + path
-    path = path.casefold()
-    return host, path
-
-
-def _is_byteplus_modelark_host(base_url: str | None) -> bool:
-    """True when the URL host is a documented BytePlus ModelArk host."""
-    parts = _byteplus_route_parts(base_url)
-    if parts is None:
-        return False
-    host, _path = parts
-    return (host == "bytepluses.com" or host.endswith(".bytepluses.com")
-            or host == "volces.com" or host.endswith(".volces.com"))
-
-
 def is_byteplus_platform_endpoint(base_url: str | None) -> bool:
-    """Recognize documented BytePlus Platform PAYG chat endpoints."""
-    parts = _byteplus_route_parts(base_url)
-    if parts is None:
+    """Recognize BytePlus ModelArk Platform PAYG endpoints (any non-Coding-Plan path on a ModelArk host)."""
+    if not _is_byteplus_modelark_host(base_url):
         return False
-    host, path = parts
-    return (host == "bytepluses.com" or host.endswith(".bytepluses.com")
-            or host == "volces.com" or host.endswith(".volces.com")) and path.rstrip("/") == "/api/v3"
+    return not _byteplus_subscription_host(base_url)
 
 
 def classify_openai_compat_route(base_url: str | None,

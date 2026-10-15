@@ -230,16 +230,18 @@ def _acquire_out_lock(out_path: str) -> int | None:
 
     Returns ``None`` when acquired, or the live owner's integer PID when a
     concurrent Summon process already holds the lock. Stale locks from dead
-    processes are reclaimed automatically.
+    processes are reclaimed under an atomic companion mutex so two waiters
+    cannot race to unlink a newly acquired replacement lock.
     """
     global _CURRENT_OUT_LOCK
     lock_path = os.path.abspath(out_path) + ".active.lock"
+    reap_dir = lock_path + ".reap"
     token = uuid.uuid4().hex
     try:
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     except OSError:
         return None
-    for _ in range(3):
+    for _ in range(8):
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -251,7 +253,7 @@ def _acquire_out_lock(out_path: str) -> int | None:
             return None
         except FileExistsError:
             owner = None
-            for _ in range(3):
+            for _ in range(5):
                 try:
                     with open(lock_path, encoding="utf-8") as fh:
                         owner = json.load(fh)
@@ -259,18 +261,79 @@ def _acquire_out_lock(out_path: str) -> int | None:
                 except (OSError, ValueError, UnicodeDecodeError):
                     time.sleep(0.01)
             owner_pid = owner.get("pid") if isinstance(owner, dict) else None
-            if isinstance(owner_pid, int) and not isinstance(owner_pid, bool):
+            owner_tok = owner.get("token") if isinstance(owner, dict) else None
+            acquired_at = owner.get("acquired_at") if isinstance(owner, dict) else None
+            is_expired = (
+                isinstance(acquired_at, (int, float))
+                and not isinstance(acquired_at, bool)
+                and (time.time() - float(acquired_at)) > 86400
+            )
+            if isinstance(owner_pid, int) and not isinstance(owner_pid, bool) and not is_expired:
                 if owner_pid == os.getpid() and lock_path in _ACTIVE_OUT_LOCKS:
                     return owner_pid
                 if owner_pid != os.getpid() and _jobs._pid_liveness(owner_pid) in ("alive", "unknown"):
                     return owner_pid
+            # Stale or unreadable lock: serialize reaping via atomic mkdir(reap_dir)
+            # and verify the lock token has not changed before unlinking.
+            reap_acquired = False
             try:
-                os.unlink(lock_path)
+                os.mkdir(reap_dir)
+                reap_acquired = True
+            except FileExistsError:
+                try:
+                    if (time.time() - os.path.getmtime(reap_dir)) > 5.0:
+                        os.rmdir(reap_dir)
+                        os.mkdir(reap_dir)
+                        reap_acquired = True
+                except OSError:
+                    pass
+                if not reap_acquired:
+                    time.sleep(0.015)
+                    continue
             except OSError:
                 return owner_pid if isinstance(owner_pid, int) else os.getpid()
+            try:
+                current = None
+                try:
+                    with open(lock_path, encoding="utf-8") as fh:
+                        current = json.load(fh)
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError, UnicodeDecodeError):
+                    current = None
+                cur_tok = current.get("token") if isinstance(current, dict) else None
+                cur_pid = current.get("pid") if isinstance(current, dict) else None
+                if cur_tok != owner_tok:
+                    # Another waiter already replaced the stale lock.
+                    continue
+                if (isinstance(cur_pid, int) and not isinstance(cur_pid, bool)
+                        and not is_expired
+                        and cur_pid != os.getpid()
+                        and _jobs._pid_liveness(cur_pid) in ("alive", "unknown")):
+                    return cur_pid
+                try:
+                    os.unlink(lock_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return owner_pid if isinstance(owner_pid, int) else os.getpid()
+            finally:
+                if reap_acquired:
+                    try:
+                        os.rmdir(reap_dir)
+                    except OSError:
+                        pass
         except OSError:
             return None
-    return None
+    # Contended after retries: read current live holder PID if present.
+    try:
+        with open(lock_path, encoding="utf-8") as fh:
+            final_owner = json.load(fh)
+        if isinstance(final_owner, dict) and isinstance(final_owner.get("pid"), int):
+            return final_owner["pid"]
+    except (OSError, ValueError, UnicodeDecodeError):
+        pass
+    return os.getpid()
 
 
 def _release_current_out_lock() -> None:
@@ -2859,6 +2922,11 @@ def main() -> None:
             base_url, api_key_env = _endpoint_for_dispatch(_identity, agent_file, agents_dir)
         except (OSError, ValueError) as e:
             _die(f"openai-compat agent {getattr(args, '_resolved_agent', args.agent)!r}: {e}")
+        try:
+            from _apibackend import normalize_coding_plan_model
+            final_model = normalize_coding_plan_model(base_url, final_model)
+        except Exception:  # noqa: BLE001
+            pass
 
     # Transport: --transport flag > agent `transport:` frontmatter > subprocess.
     # ACP requires NATIVE backend support; asking for it anywhere else is a
@@ -3026,6 +3094,31 @@ def main() -> None:
         agent_file=agent_file,
     )
 
+    # Resolve adaptive foreground timeout BEFORE --dry-run so preflight previews
+    # the exact timeout_ms and timeout_source that live execution will use.
+    _explicit_timeout = any(tok.split("=", 1)[0] == "--timeout" for tok in argv)
+    _is_auto_timeout = getattr(args.timeout, "is_auto", False)
+    _base_timeout_ms = int(args.timeout)
+    if ((_is_auto_timeout or not _explicit_timeout)
+            and _telemetry.enabled()
+            and (os.environ.get("SUMMON_TELEMETRY_FILE")
+                 or _telemetry._default_cohort() == "live")):
+        _rec_ms = _cli.Milliseconds(
+            _telemetry.recommended_timeout_ms(cli, _base_timeout_ms))
+        _rec_ms.is_auto = True
+        args.timeout = _rec_ms
+        args._timeout_source = (
+            "adaptive_telemetry"
+            if int(_rec_ms) != _base_timeout_ms or _is_auto_timeout
+            else "default"
+        )
+    else:
+        args._timeout_source = (
+            "adaptive_telemetry" if _is_auto_timeout
+            else "explicit" if _explicit_timeout
+            else "default"
+        )
+
     if args.dry_run:
         _dry_view = _dry_run_view(
             invocation, args, agents_dir, agent_file,
@@ -3172,16 +3265,6 @@ def main() -> None:
     # Effective-tree provenance: recompute HEAD after any worktree rewrite,
     # BEFORE the agent can commit anything.
     receipt["git_head_before"] = _receipt.git_head(args.cwd)
-
-    if ((getattr(args.timeout, "is_auto", False)
-         or not any(tok.split("=", 1)[0] == "--timeout" for tok in argv))
-            and _telemetry.enabled()
-            and (os.environ.get("SUMMON_TELEMETRY_FILE")
-                 or _telemetry._default_cohort() == "live")):
-        _rec_ms = _cli.Milliseconds(
-            _telemetry.recommended_timeout_ms(cli, int(args.timeout)))
-        _rec_ms.is_auto = True
-        args.timeout = _rec_ms
 
     # Catch ValueError from build_invocation_args / permission_flags / TOML
     # escaping so unknown --cli values or unsafe agent paths surface as JSON
@@ -3675,6 +3758,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
                              if invocation.cli in _PERMISSION_MAPPING else None),
         "extra_args": list(invocation.extra_args),
         "timeout_ms": args.timeout,
+        "timeout_source": getattr(args, "_timeout_source", "default"),
         "worktree": ("would create" if args.worktree is not None else None),
         "isolated_lane": bool(getattr(args, "isolated_lane", False)),
         "allow_tool_credentials": bool(getattr(args, "allow_tool_credentials", False)),

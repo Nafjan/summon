@@ -501,7 +501,7 @@ def discover_models(cli: str | None = None, *, refresh: bool = False) -> dict:
                                   "arkcli --refresh` after `arkcli auth login`."),
             }, "arkcli")
 
-    if want("openai-compat"):
+    if key == "openai-compat":
         catalog_models = [
             "deepseek-v4-1-flash",
             "glm-5-3-flash",

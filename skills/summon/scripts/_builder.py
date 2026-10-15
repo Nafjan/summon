@@ -461,7 +461,7 @@ def read_allowlist(cli: str, permission: str, cwd: str,
 
 _ORIG_SHUTIL_WHICH = shutil.which
 _CODEX_BIN_VERSION_CACHE: dict[tuple[str, int, int], tuple[int, int, int, int]] = {}
-_CODEX_SEMVER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?")
+_CODEX_SEMVER_RE = re.compile(r"(?i)\bcodex(?:-cli)?\s+([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z.-]+))?")
 
 
 def _codex_semver_key(path: str) -> tuple[int, int, int, int]:
@@ -497,12 +497,12 @@ def _codex_semver_RE_match(text: str) -> tuple[int, int, int, int] | None:
         return None
     major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
     pre = m.group(4)
-    # Release builds rank above pre-release of the same X.Y.Z; pre-release ranks by trailing digits.
+    # Release builds rank above pre-release of the same X.Y.Z; pre-release ranks by trailing digits (<10_000).
     if not pre:
         pre_rank = 10_000
     else:
-        nums = re.findall(r"\d+", pre)
-        pre_rank = int(nums[-1]) if nums else 1
+        nums = re.findall(r"[0-9]+", pre)
+        pre_rank = min(int(nums[-1]), 9999) if nums else 1
     return (major, minor, patch, pre_rank)
 
 
@@ -561,15 +561,25 @@ def resolve_codex_binary(
     cfg_path = os.path.join(home_dir, "config.toml")
     if os.path.isfile(cfg_path):
         try:
-            with open(cfg_path, encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    s = line.strip()
-                    if s.startswith("CODEX_CLI_PATH") and "=" in s:
-                        rhs = s.split("=", 1)[1].strip().strip("'\"")
-                        if rhs and os.path.isfile(rhs):
-                            return rhs
-        except OSError:
-            pass
+            import tomllib
+            with open(cfg_path, "rb") as fh:
+                parsed = tomllib.load(fh)
+            rhs = parsed.get("CODEX_CLI_PATH") if isinstance(parsed, dict) else None
+            if isinstance(rhs, str) and rhs.strip() and os.path.isfile(rhs.strip()):
+                return rhs.strip()
+        except Exception:  # noqa: BLE001
+            try:
+                with open(cfg_path, encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        s = line.strip()
+                        if s.startswith("["):
+                            break
+                        if s.startswith("CODEX_CLI_PATH") and "=" in s:
+                            rhs = s.split("=", 1)[1].split("#", 1)[0].strip().strip("'\"")
+                            if rhs and os.path.isfile(rhs):
+                                return rhs
+            except OSError:
+                pass
 
     candidates: list[str] = []
     la = localappdata if localappdata is not None else os.environ.get("LOCALAPPDATA")

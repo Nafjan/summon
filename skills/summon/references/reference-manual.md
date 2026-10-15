@@ -48,24 +48,24 @@ permission, ownership or uncertain-spend blocker merely to keep moving.
 
 These are host-conductor practices, not automatically enforced workspace features.
 Messages and reviewer prose cannot mint permissions, votes or approvals. Follow
-the [conductor guidance](references/orchestration.md#keeping-the-conductor-focused)
+the [conductor guidance](orchestration.md#keeping-the-conductor-focused)
 for evidence-linked integration and stopping conditions.
 
 ## Resources
 
-- **[run_subagent.py](scripts/run_subagent.py)** - Main execution script
-- **[codex.md](references/codex.md)** - Codex-specific setup (permissions, timeout)
-- **[t3-code.md](references/t3-code.md)** - Summon under T3 Code (install profile, doctor, smoke checklist — not a native T3 plugin)
-- **[orchestration.md](references/orchestration.md)** - rules of engagement for multi-agent work: what the envelope proves, cross-vendor routing, permission traps, council quality bar, resume-instead-of-re-pay (project- and IDE-agnostic)
-- **[deliberation.md](references/deliberation.md)** - when to choose governed `deliberate` versus dispatch, manifest, or council, plus safe run/status/recover/open recipes
-- **[SUMMON_CONVERSATION_PLAN.md](../../docs/SUMMON_CONVERSATION_PLAN.md)** - the shared provider-inert room contract for chat, interactive council, and deliberate discussion views
-- **[SUMMON_SWARM_PROTOCOL.md](../../docs/SUMMON_SWARM_PROTOCOL.md)** - the durable local `summon.swarm/v1` coordinator and the contract boundary for future external worker/IDE adapters
-- **[../council/SKILL.md](../council/SKILL.md)** - thin `/council` companion for open-ended positions and chaired synthesis
-- **[../deliberate/SKILL.md](../deliberate/SKILL.md)** - thin `/deliberate` companion for fixed-option governed decisions
-- **[effort.md](references/effort.md)** - reasoning effort / thinking levels: who honors `--effort`, defaults, agy Gemini suffixes, envelope fields
-- **[examples/](examples/)** - document-audit schema, manifest, question, and role-specialized council agents
-- **[VERSIONING_AND_1.0_CRITERIA.md](../../docs/VERSIONING_AND_1.0_CRITERIA.md)** - the stable public contract, the criteria 1.0.0 met, and the evidence behind it
-- **[references/](references/)** - deep-dive docs: models, backends, effort, customizing agents, fan-out & council (read on demand)
+- **[run_subagent.py](../scripts/run_subagent.py)** - Main execution script
+- **[codex.md](codex.md)** - Codex-specific setup (permissions, timeout)
+- **[t3-code.md](t3-code.md)** - Summon under T3 Code (install profile, doctor, smoke checklist — not a native T3 plugin)
+- **[orchestration.md](orchestration.md)** - rules of engagement for multi-agent work: what the envelope proves, cross-vendor routing, permission traps, council quality bar, resume-instead-of-re-pay (project- and IDE-agnostic)
+- **[deliberation.md](deliberation.md)** - when to choose governed `deliberate` versus dispatch, manifest, or council, plus safe run/status/recover/open recipes
+- **[SUMMON_CONVERSATION_PLAN.md](../../../docs/SUMMON_CONVERSATION_PLAN.md)** - the shared provider-inert room contract for chat, interactive council, and deliberate discussion views
+- **[SUMMON_SWARM_PROTOCOL.md](../../../docs/SUMMON_SWARM_PROTOCOL.md)** - the durable local `summon.swarm/v1` coordinator and the contract boundary for future external worker/IDE adapters
+- **[../council/SKILL.md](../../council/SKILL.md)** - thin `/council` companion for open-ended positions and chaired synthesis
+- **[../deliberate/SKILL.md](../../deliberate/SKILL.md)** - thin `/deliberate` companion for fixed-option governed decisions
+- **[effort.md](effort.md)** - reasoning effort / thinking levels: who honors `--effort`, defaults, agy Gemini suffixes, envelope fields
+- **[examples/](../examples/)** - document-audit schema, manifest, question, and role-specialized council agents
+- **[VERSIONING_AND_1.0_CRITERIA.md](../../../docs/VERSIONING_AND_1.0_CRITERIA.md)** - the stable public contract, the criteria 1.0.0 met, and the evidence behind it
+- **[references/]()** - deep-dive docs: models, backends, effort, customizing agents, fan-out & council (read on demand)
 
 **Script Path**: On Windows, use `{SKILL_DIR}\scripts\summon.cmd`; it selects a
 compatible Python through the Windows launcher and must be preferred over invoking
@@ -136,7 +136,7 @@ adapters remain separately gated.
 ## CLI-Specific Notes
 
 Check the corresponding reference for your environment:
-- **Codex**: Read [references/codex.md](references/codex.md) BEFORE first execution
+- **Codex**: Read [references/codex.md](codex.md) BEFORE first execution
 
 ## Interpreting User Requests
 
@@ -168,13 +168,13 @@ This script executes external CLIs that require elevated permissions.
    seconds of overhead. A host timeout at or below the child's deadline kills the
    script before it can report (see Common Mistakes)
 
-**For Codex CLI** (most common permission issues): See [references/codex.md](references/codex.md) for exact JSON parameter format.
+**For Codex CLI** (most common permission issues): See [references/codex.md](codex.md) for exact JSON parameter format.
 
 ## Workflow
 
 ### Step 0: Read CLI-Specific Setup (if applicable)
 
-If you are running on Codex, read [references/codex.md](references/codex.md) first.
+If you are running on Codex, read [references/codex.md](codex.md) first.
 
 ### Step 1: Check Health (first run) and List Agents
 
@@ -358,7 +358,7 @@ and final technical escalation for consequential work. It defaults to read-only 
 high effort; other agents collect evidence, implement, and test. Use compact decision
 packets and finding-ID resubmissions, not repeated whole-codebase reviews. Keep ordinary
 work on the balanced seats. Approval covers only the reviewed revision and never
-broadens user authority. See [the decision-lead workflow](references/orchestration.md#fable-51-lead-decisions-delegate-execution).
+broadens user authority. See [the decision-lead workflow](orchestration.md#fable-51-lead-decisions-delegate-execution).
 
 Claude Code 2.1.250+ is required for Fable 5.1 according to the vendor. A catalog entry
 or dry run is not a live availability or served-model receipt.
@@ -485,7 +485,7 @@ remain `integration_pending` until their own coordinator gates pass. `status`,
 `replay`, `recover`, `cancel`, and `open` remain safe management operations;
 `resume` treats an unmatched physical start as `uncertain_spend` and makes no
 provider call unless `--retry-indeterminate` is explicit. Read
-[references/deliberation.md](references/deliberation.md) before constructing a
+[references/deliberation.md](deliberation.md) before constructing a
 run or recommending it to a user.
 
 **By exit_code** (when status is `error`):
@@ -588,7 +588,7 @@ not bypass or rewrite the authenticated store.
 | `--model` | No | Override the agent's frontmatter model for this call. Summon performs a side-effect-free backend/model namespace preflight first: a known cross-vendor pairing such as `--cli codex --model claude-opus-5` is returned as `status:blocked`, `error_kind:backend_model_incompatible`, with explicit compatible reroutes; it never builds a profile or spawns a provider. Unknown/future IDs are passed through rather than guessed. `--dry-run` reports the same refusal. |
 | `--require-exact-model` | No | Require provider-authored terminal evidence for the exact requested model. A mismatch or missing receipt becomes `status:blocked` with a non-retryable model-trust error; no fallback, resume, or contract repair is attempted. Built-in governance seats (for example `astra`, `architect`, `fable`, `sol-review`, and `researcher`) enable this policy automatically; custom seats can declare `model-policy: exact`. |
 | `--profile` | No | Select a named private Claude or Codex account/profile from `~/.agents/summon-profiles.json`. Names are visible metadata; the registry keeps config/auth paths out of agent definitions and receipts. `--profile` overrides frontmatter `profile:` |
-| `--effort` | No | Reasoning / thinking intensity: `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none`/`default`/`off` = leave the backend alone). **Honored by claude + codex** (default **`high`**); **agy Gemini only when set explicitly** (rewrites model to `… (Low\|Medium\|High)`); **Kimi supported models via the isolated `config.toml` profile** (K3 maps `max` directly); **OpenCode maps the tier to its provider `variant`**; ignored for cursor-agent / gemini CLI / openai-compat / arkcli. Precedence: `--effort` > frontmatter `effort:` > `SUMMON_DEFAULT_EFFORT` > built-in `high`. Full matrix: [references/effort.md](references/effort.md) |
+| `--effort` | No | Reasoning / thinking intensity: `low`\|`medium`\|`high`\|`xhigh`\|`max` (`none`/`default`/`off` = leave the backend alone). **Honored by claude + codex** (default **`high`**); **agy Gemini only when set explicitly** (rewrites model to `… (Low\|Medium\|High)`); **Kimi supported models via the isolated `config.toml` profile** (K3 maps `max` directly); **OpenCode maps the tier to its provider `variant`**; ignored for cursor-agent / gemini CLI / openai-compat / arkcli. Precedence: `--effort` > frontmatter `effort:` > `SUMMON_DEFAULT_EFFORT` > built-in `high`. Full matrix: [references/effort.md](effort.md) |
 | `--resume` | No | Continue a prior session: pass its `resume.session_id` (claude/codex/cursor) or `latest` for agy. Resume for implementation continuity; use a fresh context for final adversarial adjudication so a reviewer is not grading its own prior work. The envelope records `resumed:true|false` |
 | `--resume-profile` | No | agy only: the `resume.profile` path returned by the prior agy call |
 | `--context-input-file FILE` | No | Append one typed `summon.context-input/v1` packet to an ordinary dispatch. Summon reads and compiles it before request identity, gating, background launch, dry-run, or provider contact. Use with `--dry-run` for the provider-inert mapping and token estimate. The file must be under `--cwd` or an explicit `--read-root` |
@@ -622,7 +622,7 @@ not bypass or rewrite the authenticated store.
 | `--no-acp-fallback` | No | Disable the automatic ACP recovery attempt when a subprocess dispatch fails, and the oversized-prompt ACP routing. Env form: `SUMMON_ACP_FALLBACK=0` |
 | `--allow-kimi-acp-fallback` | No | Explicitly allow one ACP recovery turn after a Kimi subprocess timeout/stream failure. Off by default because Summon's native Kimi ACP adapter has no host filesystem/terminal tool bridge; use only when a deliberate second provider turn is wanted. Env form: `SUMMON_KIMI_ACP_FALLBACK=1` (also inherited by manifest/council children) |
 | `--allow-credit` | No | Authorize spending ACCOUNT CREDIT on an unconditionally credit-only model for this one dispatch (no model meets that definition today; Fable billing is plan-dependent and handled separately, so this currently authorizes nothing and is kept for compatibility); flag form of `SUMMON_ALLOW_CREDIT=1`. Single dispatch only: rejected for `--manifest`/`--council`, where env inheritance would silently authorize every child (set the env var deliberately for fan-out spend) |
-| `--allow-payg` | No | Authorize BytePlus PAYG (`/api/v3`) fallback if the Coding Plan endpoint fails with quota/plan-limit/unsupported-model. Flag form of `SUMMON_ALLOW_BYTEPLUS_PAYG=1`. Requires `BYTEPLUS_CODING_API_KEY` for Coding Plan (`provider: byteplus-coding` / `byteplus-coder`). Single dispatch only: rejected for `--manifest`/`--council` (set the env var or `~/.agents/summon.json` `{"allow_byteplus_payg": true}` for fan-out). The PAYG retry fires once and bills **per-token Platform credits**, not plan quota. See [references/backends.md](references/backends.md#byteplus-modelark-coding-plan--platform-payg) |
+| `--allow-payg` | No | Authorize BytePlus PAYG (`/api/v3`) fallback if the Coding Plan endpoint fails with quota/plan-limit/unsupported-model. Flag form of `SUMMON_ALLOW_BYTEPLUS_PAYG=1`. Requires `BYTEPLUS_CODING_API_KEY` for Coding Plan (`provider: byteplus-coding` / `byteplus-coder`). Single dispatch only: rejected for `--manifest`/`--council` (set the env var or `~/.agents/summon.json` `{"allow_byteplus_payg": true}` for fan-out). The PAYG retry fires once and bills **per-token Platform credits**, not plan quota. See [references/backends.md](backends.md#byteplus-modelark-coding-plan--platform-payg) |
 | `--allow-text-only` | No | Authorize a **text-seat** dispatch (`openai-compat` / Summon `arkcli +chat`: no filesystem or tool loop) for this one call. Flag form of `SUMMON_ALLOW_TEXT_ONLY=1`. Agent frontmatter `capability: text-only` also opts in for **single** dispatch (house chat agents); every allowed run still emits a loud TEXT SEAT warning. **Council/manifest auto-reject** text-seat members unless `SUMMON_ALLOW_TEXT_ONLY=1` (capability / this flag alone are not enough for fan-out). On `status:blocked` with `blocked_reason: text_seat_no_tools`, hosts must get fresh consent — **never auto-retry with this flag** |
 | `--require-tools` | No | Refuse text seats even when `--allow-text-only` / `capability: text-only` / `SUMMON_ALLOW_TEXT_ONLY=1` is set. Flag form of `SUMMON_REQUIRE_TOOLS=1` |
 | `--json-schema FILE` | No | Structured output contract: extract the agent's final JSON, validate against the schema, attach `parsed`/`parse_ok`/`parse_errors`; ONE corrective retry via resume on mismatch |
@@ -635,7 +635,7 @@ not bypass or rewrite the authenticated store.
 | `--bug-report --output FILE` | No | Write the report to an explicit path; otherwise it goes under `~/.agents/summon-reports` |
 | `--bug-report --bug-description TEXT` | No | Add a short, manually supplied description to the generated report. It is not automatic telemetry; review it for private content before sharing |
 | `--bug-report --submit-github` | No | Submit an existing reviewed Markdown report from `--from REVIEWED_REPORT.md` through `gh issue create`; no report regeneration, direct HTTP, or token access. Optional `--github-repo OWNER/REPO` and `--bug-title` |
-| `--manifest FILE` | - | Batch fan-out: run all jobs in a JSON manifest (see [references/fan-out.md](references/fan-out.md)). Combine with `--concurrency` and `--results-dir` |
+| `--manifest FILE` | - | Batch fan-out: run all jobs in a JSON manifest (see [references/fan-out.md](fan-out.md)). Combine with `--concurrency` and `--results-dir` |
 | `--concurrency` | No | With `--manifest`: per-backend caps, e.g. `agy=2,codex=3,default=3` |
 | `--results-dir` | No | With `--manifest`: where job envelopes land (default `{cwd}/.agents/results`) |
 | `--council` | - | Consensus deliberation: dispatch `--question` to diverse members, chairman synthesizes. See "Council mode" |
@@ -753,7 +753,7 @@ council you cannot afford to lose.
 missing, failed, or input-changed stages and **carries the rest forward without
 re-paying**; `council status <run-id>` shows its state read-only. This is the durable
 path for expensive councils — prefer it over re-running from scratch. See
-[references/fan-out.md](references/fan-out.md) for the run-directory layout, the
+[references/fan-out.md](fan-out.md) for the run-directory layout, the
 carry-forward/invalidation rules, and the one documented single-machine lock limitation.
 
 The integrated provider-inert workflow is documented in
@@ -967,7 +967,7 @@ Honest edges — plan around these, don't be surprised by them:
   `openai-compat` and `arkcli +chat` seats remain text-only by design; use `opencode` when
   a tool loop is required. OpenRouter's `auto`, `free`, and `fusion` aliases can also run
    through OpenCode; Fusion presets use the bounded `openrouter_options` field documented in
-   [references/backends.md](references/backends.md#openrouter-routers-through-opencode).
+   [references/backends.md](backends.md#openrouter-routers-through-opencode).
   OpenCode seats pinned to `nous/<model>` receive the same child-only Nous provider overlay.
 - Headless OpenCode read-only and safe-edit seats pass `--auto` only alongside Summon's
   deny-by-default `OPENCODE_PERMISSION` policy. This lets explicitly allowed read/list/
@@ -1061,18 +1061,18 @@ fields, and safety guards this document then describes.
 The dispatch essentials are above. Deeper capabilities live in focused reference files
 (read the one you need — they're not loaded into every call):
 
-- **[Model discovery & roster](references/models.md)** — `--list-models`, alias-lag vs
+- **[Model discovery & roster](models.md)** — `--list-models`, alias-lag vs
   `model.resolved`, the bundled agent roster, and the cross-vendor review rule.
-- **[Effort & thinking](references/effort.md)** — who honors `--effort`, defaults,
+- **[Effort & thinking](effort.md)** — who honors `--effort`, defaults,
   agy Gemini suffixes, what the envelope reports.
-- **[Custom & API backends](references/backends.md)** — `run-agent: opencode` for a
+- **[Custom & API backends](backends.md)** — `run-agent: opencode` for a
   toolful OpenCode gateway (including OpenRouter) or `run-agent: openai-compat` to reach
   a configured endpoint implementing Summon's supported OpenAI-compatible
   `/chat/completions` subset (including common cloud providers and local Ollama/LM Studio)
   through `providers.json`.
-- **[Customizing agents & the roster](references/customizing.md)** — override model/
+- **[Customizing agents & the roster](customizing.md)** — override model/
   effort per call, and `--new-agent`/`--set-agent` to scaffold and retune definitions.
-- **[Fan-out & council](references/fan-out.md)** — `--manifest` swarms (per-backend
+- **[Fan-out & council](fan-out.md)** — `--manifest` swarms (per-backend
   concurrency, skip-if-done resume) and `--council` (decide by consensus of diverse
   models, chairman synthesis).
 
@@ -1126,8 +1126,8 @@ permissions.
 | `permission` | `read-only`, `safe-edit` (default), `yolo` | Approval/sandbox level the sub-agent runs with |
 | `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.served` |
 | `model-policy` | `exact` (optional) | Require provider-authored terminal evidence for the pinned model. A mismatch or missing served-model receipt blocks the result without fallback, resume, or contract repair. Built-in governance seats use this policy automatically. |
-| `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning / thinking for this agent. Honored by **claude + codex**; on **agy** + Gemini, counts as *explicit* and rewrites the model suffix; on supported **Kimi** models, writes the isolated profile config; on **OpenCode**, maps to its `variant`. Ignored on other CLIs. `--effort` at dispatch overrides it. See [references/effort.md](references/effort.md) |
-| `openrouter_options` | JSON object (OpenCode only, optional) | Bounded OpenRouter `fusion`/`auto-router` plugin settings. Unknown fields, arbitrary request-body overrides, and mismatched router aliases are rejected. See [references/backends.md](references/backends.md#openrouter-routers-through-opencode) |
+| `effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max`\|`none` (optional) | Reasoning / thinking for this agent. Honored by **claude + codex**; on **agy** + Gemini, counts as *explicit* and rewrites the model suffix; on supported **Kimi** models, writes the isolated profile config; on **OpenCode**, maps to its `variant`. Ignored on other CLIs. `--effort` at dispatch overrides it. See [references/effort.md](effort.md) |
+| `openrouter_options` | JSON object (OpenCode only, optional) | Bounded OpenRouter `fusion`/`auto-router` plugin settings. Unknown fields, arbitrary request-body overrides, and mismatched router aliases are rejected. See [references/backends.md](backends.md#openrouter-routers-through-opencode) |
 | `args` | shell-style string (optional) | Arbitrary extra backend flags. Codex model-bearing `-m`/`--model`/`-c model=...` selectors are parsed, compared, and collapsed into one canonical selector; other flags remain subject to the permission boundary |
 | `profile` | private registry name (optional) | Select a named vendor login/config profile. The registry is local to the operator; do not put paths, credentials, or account identifiers in a public agent definition. `--profile` overrides this field |
 | `transport` | `subprocess` (default), `acp` (optional) | Dispatch transport. `acp` runs the turn over the Agent Client Protocol (native: gemini, kimi, cursor-agent); `--transport` at dispatch overrides it |
@@ -1186,7 +1186,7 @@ or auth failures, apply personal usage evidence to a work profile, or switch a s
 between accounts. Named Codex account resume is not certified; use a fresh context handoff.
 These config homes are not OS sandboxes or provider account attestation. Existing custom
 provider profiles keep their semantics when `auth_mode` is omitted. See
-[multi-account setup and limitations](references/customizing.md#multiple-claude-and-codex-accounts).
+[multi-account setup and limitations](customizing.md#multiple-claude-and-codex-accounts).
 
 Default Claude dispatches are deliberately isolated from ambient Claude Code settings:
 Summon passes `--setting-sources ""` unless a named Claude profile was explicitly selected.
@@ -1231,7 +1231,7 @@ For an explicit Codex pin, Summon emits one canonical `-m` selector and refuses
   prove a fallback. Summon does not retry, resume, contract-repair, or silently
   switch an exact request. Inspect `model.requested`, `model.targeted`,
   `model.served`, `model.models_used`, `served_model_evidence`, `error_kind`, and
-  `result_usable` together. See [`docs/SUMMON_3.2_PLAN.md`](../../docs/SUMMON_3.2_PLAN.md)
+  `result_usable` together. See [`docs/SUMMON_3.2_PLAN.md`](../../../docs/SUMMON_3.2_PLAN.md)
   for the live-evidence contract.
 
   Ordinary best-effort dispatch remains supported for seats without this policy.

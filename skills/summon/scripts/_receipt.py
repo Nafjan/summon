@@ -388,7 +388,7 @@ def _capture_dirty_digests(root: str, status: dict) -> dict[str, str]:
                 digests[p] = hashlib.sha256(payload).hexdigest()
             elif note is not None:
                 st = os.stat(full)
-                digests[p] = f"{note}:{st.st_size}:{st.st_mtime_ns}"
+                digests[p] = f"{note}:{st.st_size}"
         except OSError:
             digests[p] = "missing"
     return digests

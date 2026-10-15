@@ -619,10 +619,10 @@ def _review_verdict(report: dict | None) -> str | None:
 
 _FENCED_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
 _FALLBACK_SUMMARY_RE = re.compile(
-    r"(?im)^[ \t]*(?:\*\*|#+\s+|[-*]\s+)*SUMMARY\s*:\s*\*?\*?[ \t]*(.+)$"
+    r"(?im)^[ \t]*(?:\*\*|#+[ \t]+|[-*][ \t]+)*SUMMARY[ \t]*:[ \t]*\*?\*?[ \t]*([^\r\n]+)$"
 )
 _FALLBACK_CONFIDENCE_RE = re.compile(
-    r"(?im)^[ \t]*(?:\*\*|#+\s+|[-*]\s+)*CONFIDENCE\s*:\s*\*?\*?[ \t]*([^\r\n]+)$"
+    r"(?im)^[ \t]*(?:\*\*|#+[ \t]+|[-*][ \t]+)*CONFIDENCE[ \t]*:[ \t]*\*?\*?[ \t]*([^\r\n]+)$"
 )
 
 
@@ -683,17 +683,13 @@ def _parse_confidence(raw: object) -> float | None:
 def parse_report(text: str) -> dict | None:
     """Extract the trailing report-contract block from an agent's result text.
 
-    Anchors on the LAST ``STATUS:`` line (outside fenced code blocks) whose value
-    begins with a real status token (DONE/PARTIAL/BLOCKED/...) — so a quoted
-    contract example or narration that merely mentions ``STATUS:`` can't spoof or
-    displace the real block. A line begins a new field when its key is a known
-    field OR a well-formed all-caps identifier (so third-party agents' custom
-    fields are captured, not folded); any other line continues the current value
-    (multi-line safe, except single-line scalar fields like ``summary`` and
-    ``confidence``). Keys are lowercased with ``-`` mapped to ``_`` (e.g.
-    ``follow_up``). Markdown-bold field names (``**STATUS:**``) are accepted.
-
-    Returns None when no genuine ``STATUS:`` line exists.
+    Anchors on the LAST ``STATUS:`` line (outside fenced code blocks when one
+    exists, falling back to fenced lines if the entire report block is wrapped
+    in a markdown code fence) whose value begins with a real status token
+    (DONE/PARTIAL/BLOCKED/...) — so a quoted contract example or narration that
+    merely mentions ``STATUS:`` can't spoof or displace the real block. Fenced
+    code blocks inside multiline fields (``COMMANDS``, ``HANDOFF``, ``FINDINGS``)
+    are preserved while ignoring field-header lookalikes inside fences.
     """
     if not text:
         return None
@@ -701,43 +697,50 @@ def parse_report(text: str) -> dict | None:
     # Mark lines inside closed ```...``` fenced code blocks so trailing code
     # examples cannot spoof STATUS:/SUMMARY:/CONFIDENCE:.
     fenced_lines: set[int] = set()
+    fence_delimiters: set[int] = set()
     open_fence_idx: int | None = None
     for idx, raw_line in enumerate(lines):
         if raw_line.lstrip().startswith("```"):
             if open_fence_idx is None:
                 open_fence_idx = idx
             else:
+                fence_delimiters.add(open_fence_idx)
+                fence_delimiters.add(idx)
                 for f_idx in range(open_fence_idx, idx + 1):
                     fenced_lines.add(f_idx)
                 open_fence_idx = None
-    start = None
-    for i in range(len(lines) - 1, -1, -1):
-        if i in fenced_lines:
-            continue
-        anchor = _unbold_field_line(lines[i])
-        if anchor.startswith("STATUS:"):
-            value = anchor[len("STATUS:"):].strip()
-            first = value.split()[0].rstrip("|,").upper() if value else ""
-            # Skip ONLY the echoed contract TEMPLATE ("DONE | PARTIAL | BLOCKED"):
-            # a value whose pipe-separated tokens are ALL status keywords. A real
-            # status like "BLOCKED | waiting on approval" is kept (its second token
-            # isn't a status word), so the guard can't swallow a genuine block.
-            if first in _STATUS_VALUES:
-                parts = [p.strip().split()[0].upper() for p in value.split("|") if p.strip()]
-                is_template = len(parts) > 1 and all(p in _STATUS_VALUES for p in parts)
-                if not is_template:
-                    start = i
-                    break
+
+    def _find_anchor(*, skip_fences: bool) -> int | None:
+        for i in range(len(lines) - 1, -1, -1):
+            if skip_fences and i in fenced_lines:
+                continue
+            anchor = _unbold_field_line(lines[i])
+            if anchor.startswith("STATUS:"):
+                value = anchor[len("STATUS:"):].strip()
+                first = value.split()[0].rstrip("|,").upper() if value else ""
+                if first in _STATUS_VALUES:
+                    parts = [p.strip().split()[0].upper() for p in value.split("|") if p.strip()]
+                    is_template = len(parts) > 1 and all(p in _STATUS_VALUES for p in parts)
+                    if not is_template:
+                        return i
+        return None
+
+    start = _find_anchor(skip_fences=True)
+    anchor_in_fence = False
+    if start is None and fenced_lines:
+        start = _find_anchor(skip_fences=False)
+        anchor_in_fence = start is not None
     if start is None:
         return None
 
     fields: dict = {}
     current_key = None
     for idx in range(start, len(lines)):
-        if idx in fenced_lines:
-            continue
         line = lines[idx]
-        m = _REPORT_FIELD_RE.match(_unbold_field_line(line))
+        if anchor_in_fence and idx in fence_delimiters:
+            continue
+        is_fenced_content = (not anchor_in_fence) and (idx in fenced_lines)
+        m = None if is_fenced_content else _REPORT_FIELD_RE.match(_unbold_field_line(line))
         if m and _is_field_key(m.group(1)):
             current_key = m.group(1).lower().replace("-", "_")
             fields[current_key] = m.group(2).strip()
@@ -786,28 +789,30 @@ def _codex_rollout_model_evidence(
     session_id: str | None,
     *,
     codex_home: str | None = None,
-) -> tuple[str | None, str | None, list[str]]:
-    """Read authoritative turn_context model metadata from a local Codex session rollout file.
+) -> tuple[str | None, list[str]]:
+    """Read local Codex turn_context model metadata from a session rollout file.
 
     Codex 0.121+ ``exec --json`` omits ``model`` from ``thread.started`` and
     ``turn.completed`` stdout events, while writing ``session_meta`` and
     ``turn_context.payload.model`` to ``~/.codex/sessions/YYYY/MM/DD/rollout-*-<session_id>.jsonl``.
-    Returns ``(targeted_model, served_model, models_used)`` only when ``session_meta``
-    matches ``session_id`` and a turn activity/completion event was recorded.
+    Because ``turn_context.payload.model`` is constructed from the client's
+    selected turn configuration rather than a provider response header, this
+    helper returns ``(targeted_model, models_used)`` only and NEVER certifies
+    ``model.served``.
     """
     if not isinstance(session_id, str):
-        return None, None, []
+        return None, []
     sid = session_id.strip()
     if not _CODEX_SESSION_UUID_RE.fullmatch(sid):
-        return None, None, []
+        return None, []
     home = codex_home or os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
     sessions_root = os.path.join(home, "sessions")
-    if not os.path.isdir(sessions_root):
-        return None, None, []
+    if not os.path.isdir(sessions_root) or os.path.islink(sessions_root):
+        return None, []
     suffix = f"-{sid}.jsonl"
     rollout_file: str | None = None
     try:
-        for dirpath, _dirnames, filenames in os.walk(sessions_root):
+        for dirpath, _dirnames, filenames in os.walk(sessions_root, followlinks=False):
             for fn in filenames:
                 if fn.startswith("rollout-") and fn.endswith(suffix):
                     rollout_file = os.path.join(dirpath, fn)
@@ -815,25 +820,26 @@ def _codex_rollout_model_evidence(
             if rollout_file:
                 break
     except OSError:
-        return None, None, []
-    if not rollout_file or not os.path.isfile(rollout_file):
-        return None, None, []
+        return None, []
+    if not rollout_file or os.path.islink(rollout_file) or not os.path.isfile(rollout_file):
+        return None, []
     try:
         if os.path.getsize(rollout_file) > 8 * 1024 * 1024:
-            return None, None, []
+            return None, []
         session_verified = False
-        models_seen: list[str] = []
         last_turn_model: str | None = None
         last_turn_id: str | None = None
         last_turn_active = False
         with open(rollout_file, "r", encoding="utf-8", errors="replace") as fh:
             for raw_line in fh:
+                if len(raw_line) > 65536:
+                    continue
                 line = raw_line.strip()
                 if not line:
                     continue
                 try:
                     rec = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):
                     continue
                 if not isinstance(rec, dict):
                     continue
@@ -851,8 +857,6 @@ def _codex_rollout_model_evidence(
                     tid = payload.get("turn_id")
                     last_turn_id = tid.strip() if isinstance(tid, str) and tid.strip() else None
                     last_turn_active = False
-                    if m:
-                        models_seen.append(m)
                 elif last_turn_model is not None:
                     ev_tid = payload.get("turn_id")
                     if isinstance(ev_tid, str) and ev_tid.strip() and last_turn_id and ev_tid.strip() != last_turn_id:
@@ -864,11 +868,10 @@ def _codex_rollout_model_evidence(
                     ):
                         last_turn_active = True
         if session_verified and last_turn_model and last_turn_active:
-            deduped = list(dict.fromkeys(models_seen))
-            return last_turn_model, last_turn_model, deduped
+            return last_turn_model, [last_turn_model]
     except OSError:
-        return None, None, []
-    return None, None, []
+        return None, []
+    return None, []
 
 
 def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
@@ -920,12 +923,11 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     if (response.get("cli") == "codex"
             and not response.get("model_resolved")
             and response.get("status") == "success"):
-        _r_target, _r_served, _r_used = _codex_rollout_model_evidence(
+        _r_target, _r_used = _codex_rollout_model_evidence(
             response.get("session_id")
         )
-        if _r_served:
-            response["model_resolved"] = _r_served
-            if not response.get("model_targeted") and _r_target:
+        if _r_target:
+            if not response.get("model_targeted"):
                 response["model_targeted"] = _r_target
             if not response.get("models_used") and _r_used:
                 response["models_used"] = _r_used
@@ -1039,12 +1041,14 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
         response["report_text"] = ""
     response["verdict"] = _review_verdict(report)
     _stripped_for_fallback = _strip_fenced_code_blocks(_clean_result) if _clean_result else ""
+    _fallback_tail = "\n".join(_stripped_for_fallback.splitlines()[-200:]) if _stripped_for_fallback else ""
     if report and report.get("summary"):
-        response["summary"] = report["summary"].splitlines()[0].strip() or None
-    elif _stripped_for_fallback:
-        _sum_m = _FALLBACK_SUMMARY_RE.search(_stripped_for_fallback)
+        _raw_sum = report["summary"].splitlines()[0].strip()
+        response["summary"] = _raw_sum[:500] if _raw_sum else None
+    elif _fallback_tail:
+        _sum_m = _FALLBACK_SUMMARY_RE.search(_fallback_tail)
         if _sum_m and _sum_m.group(1).strip():
-            response["summary"] = _sum_m.group(1).strip()
+            response["summary"] = _sum_m.group(1).strip()[:500]
         else:
             _first_nonempty = next((ln.strip() for ln in _stripped_for_fallback.splitlines() if ln.strip()), "")
             response["summary"] = _first_nonempty[:240] if _first_nonempty else None
@@ -1052,8 +1056,8 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
         response["summary"] = None
     if report and "confidence" in report:
         response["confidence"] = _parse_confidence(report.get("confidence"))
-    elif _stripped_for_fallback:
-        _conf_m = _FALLBACK_CONFIDENCE_RE.search(_stripped_for_fallback)
+    elif _fallback_tail:
+        _conf_m = _FALLBACK_CONFIDENCE_RE.search(_fallback_tail)
         response["confidence"] = _parse_confidence(_conf_m.group(1)) if _conf_m else None
     else:
         response["confidence"] = None
@@ -4105,9 +4109,13 @@ def _resolve_launch(command, args):
             _best_codex = resolve_codex_binary(which_fn=shutil.which)
         except Exception:  # noqa: BLE001
             _best_codex = None
+        if _best_codex and os.name != "nt":
+            return _best_codex, args
         if _best_codex and os.name == "nt" and str(_best_codex).lower().endswith(".exe"):
             return _best_codex, args
-    resolved = shutil.which(command) or command
+        resolved = _best_codex or shutil.which(command) or command
+    else:
+        resolved = shutil.which(command) or command
     if os.name != "nt" or not resolved.lower().endswith((".cmd", ".bat")):
         return resolved, args
     shim_dir = os.path.dirname(resolved)

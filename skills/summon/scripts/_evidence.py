@@ -451,21 +451,20 @@ def _validate_schema_value(schema: str, value: Any) -> None:
                     or item.get("source") not in allowed_sources
                     or item["authorized"] != (item["source"] != "none")):
                 raise EvidenceError(f"decision authority.{field} is malformed")
-        # Credit and PAYG describe operator consents, which can be present on
-        # a request whose resolved route does not consume that billing class.
-        # `api` is route-specific evidence and therefore must agree with the
-        # selected dispatch's effective spend authorization.
+        projected_spend = [authority[field]["authorized"]
+                           for field in ("credit", "payg", "api")
+                           if field in authority]
         api_spend = (authority.get("api", {}).get("authorized", False)
                      if isinstance(authority.get("api"), dict) else False)
         if api_spend and not authority["spend_authorized"]:
             raise EvidenceError(
                 "decision spend projection contradicts authorization")
-        # Accepted risk (R2 review): the reverse implication is deliberately
-        # NOT enforced -- subscription seats authorize spend via their plan
-        # without a per-route authority object, so spend_authorized=true with
-        # no credit/payg/api source is a valid subscription receipt. This
-        # weakens fabricated-receipt detection only; the producer never emits
-        # that shape.
+        if "api" in authority and authority["spend_authorized"] != api_spend:
+            raise EvidenceError(
+                "decision spend projection contradicts authorization")
+        if projected_spend and authority["spend_authorized"] and not any(projected_spend):
+            raise EvidenceError(
+                "decision spend projection contradicts authorization")
         selected = resolution.get("seat")
         source = resolution.get("source")
         resolved_agent = request.get("resolved_agent")

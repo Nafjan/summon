@@ -402,31 +402,39 @@ class ModelRoutingTests(unittest.TestCase):
         from _resolver import discover_models
 
         bp_url = "https://ark.ap-southeast.bytepluses.com/api/coding/v3"
+        bp_payg_url = "https://ark.ap-southeast.bytepluses.com/api/v3"
         or_url = "https://openrouter.ai/api/v1"
         self.assertEqual(normalize_coding_plan_model(bp_url, "glm-5.3-flash"), "glm-5-3-flash")
-        self.assertEqual(normalize_coding_plan_model(bp_url, "deepseek-4.1-flash"), "deepseek-v4-1-flash")
-        self.assertEqual(normalize_coding_plan_model(bp_url, "deepseek-v4.1-flash"), "deepseek-v4-1-flash")
+        self.assertEqual(normalize_coding_plan_model(bp_url, "glm-5-3-flash-260828"), "glm-5-3-flash-260828")
+        self.assertEqual(normalize_coding_plan_model(bp_url, "deepseek-v4-1-flash-260910"), "deepseek-v4-1-flash-260910")
+        self.assertEqual(normalize_coding_plan_model(bp_payg_url, "glm-5.3-flash"), "glm-5.3-flash")
+        self.assertEqual(normalize_coding_plan_model(bp_payg_url, "deepseek-v4-1-flash-260910"), "deepseek-v4-1-flash-260910")
         self.assertEqual(normalize_coding_plan_model(or_url, "z-ai/glm-5.3-flash"), "z-ai/glm-5.3-flash")
 
         bdir = bundled_roster_dir()
-        glm = load_agent(bdir, "glm-coder")
-        ds = load_agent(bdir, "deepseek-41-flash")
+        glm = load_agent(bdir, "byteplus-glm-5-3-flash")
+        bpc = load_agent(bdir, "byteplus-coder")
         self.assertEqual((glm[0], glm[5]), ("openai-compat", "glm-5-3-flash"))
-        self.assertEqual((ds[0], ds[5]), ("openai-compat", "deepseek-v4-1-flash"))
+        self.assertEqual((bpc[0], bpc[5]), ("openai-compat", "deepseek-v4-pro"))
 
+        default_disc = discover_models()
+        self.assertNotIn("openai-compat", default_disc)
         disc = discover_models("openai-compat")
         self.assertIn("openai-compat", disc)
-        self.assertIn("deepseek-v4-1-flash", disc["openai-compat"]["models"])
         self.assertIn("glm-5-3-flash", disc["openai-compat"]["models"])
 
         roster = {a["name"]: a for a in list_agents(bdir)}
-        self.assertTrue(roster["glm-coder"]["reports_served_model"])
+        self.assertTrue(roster["byteplus-glm-5-3-flash"]["reports_served_model"])
         with tempfile.TemporaryDirectory() as tmp:
             ark_md = os.path.join(tmp, "ark-test.md")
             with open(ark_md, "w", encoding="utf-8") as fh:
                 fh.write("---\nrun-agent: arkcli\nmodel: deepseek-v4-1-flash-260910\npermission: read-only\n---\nArk\n")
+            kimi_md = os.path.join(tmp, "kimi-test.md")
+            with open(kimi_md, "w", encoding="utf-8") as fh:
+                fh.write("---\nrun-agent: kimi\nmodel: k2.6\npermission: read-only\n---\nKimi\n")
             tmp_roster = {a["name"]: a for a in list_agents(tmp)}
-            self.assertFalse(tmp_roster["ark-test"]["reports_served_model"])
+            self.assertTrue(tmp_roster["ark-test"]["reports_served_model"])
+            self.assertFalse(tmp_roster["kimi-test"]["reports_served_model"])
 
     def test_doctor_detects_shadowed_bundled_agents(self):
         import _doctor
@@ -456,7 +464,7 @@ class ModelRoutingTests(unittest.TestCase):
                 fh.write("new")
 
             def _fake_semver(p: str):
-                return (0, 162, 0, 2) if "bbbb" in p else (0, 118, 0, 10000)
+                return (0, 162, 0, 2) if "bbbb" in p else (0, 118, 0, 9999)
 
             with mock.patch("_builder._codex_semver_key", side_effect=_fake_semver), \
                  mock.patch.dict(os.environ, {"SUMMON_CODEX_BIN": "", "CODEX_CLI": ""}, clear=False):
@@ -476,8 +484,13 @@ class ModelRoutingTests(unittest.TestCase):
             cli="arkcli", model="deepseek-v4-1-flash-260910",
             prompt="ping", cwd=tempfile.gettempdir(), permission="read-only",
         )
+        with mock.patch("_arkcli_backend.shutil.which", return_value=None):
+            missing_resp = _arkcli_backend.call(inv, timeout_ms=5000)
+        self.assertEqual(missing_resp["status"], "error")
+
         fake_plain = SimpleNamespace(returncode=0, stdout="STATUS: DONE\nSUMMARY: ok", stderr="")
-        with mock.patch("_arkcli_backend._arkcli_cmd", return_value=["arkcli"]), \
+        with mock.patch("_arkcli_backend.shutil.which", return_value="/usr/bin/arkcli"), \
+             mock.patch("_arkcli_backend._arkcli_cmd", return_value=["arkcli"]), \
              mock.patch("subprocess.run", return_value=fake_plain):
             plain_resp = _arkcli_backend.call(inv, timeout_ms=5000)
         self.assertIsNone(plain_resp["model"]["served"])
@@ -489,7 +502,8 @@ class ModelRoutingTests(unittest.TestCase):
             stdout=json.dumps({"content": "STATUS: DONE", "model": "deepseek-v4-1-flash-260910"}),
             stderr="",
         )
-        with mock.patch("_arkcli_backend._arkcli_cmd", return_value=["arkcli"]), \
+        with mock.patch("_arkcli_backend.shutil.which", return_value="/usr/bin/arkcli"), \
+             mock.patch("_arkcli_backend._arkcli_cmd", return_value=["arkcli"]), \
              mock.patch("subprocess.run", return_value=fake_json):
             json_resp = _arkcli_backend.call(inv, timeout_ms=5000)
         self.assertEqual(json_resp["model"]["served"], "deepseek-v4-1-flash-260910")
@@ -530,14 +544,14 @@ class ModelRoutingTests(unittest.TestCase):
         )
         self.assertEqual(
             normalize_coding_plan_model("byteplus-coding", "deepseek-v4-1-flash-260910"),
-            "deepseek-v4-1-flash",
+            "deepseek-v4-1-flash-260910",
         )
         self.assertEqual(
             normalize_coding_plan_model("byteplus-coding", "glm-5-3-flash-260828"),
-            "glm-5-3-flash",
+            "glm-5-3-flash-260828",
         )
         self.assertEqual(
-            normalize_coding_plan_model("byteplus-coding", "glm-5-3-flash-261001"),
+            normalize_coding_plan_model("byteplus-coding", "glm-5.3-flash"),
             "glm-5-3-flash",
         )
         self.assertEqual(
@@ -548,6 +562,10 @@ class ModelRoutingTests(unittest.TestCase):
             _executor.model_match_state("opus", "opus", "claude-opus-5", "reported"),
             False,
         )
+
+    def test_codex_rollout_turn_context_populates_targeted_only_and_fails_closed(self):
+        import json
+        import _executor
         with tempfile.TemporaryDirectory() as tmp:
             sid = "01a13946-662e-7292-a577-1c549685d8e7"
             sdir = os.path.join(tmp, "sessions", "2026", "10", "14")
@@ -559,15 +577,35 @@ class ModelRoutingTests(unittest.TestCase):
                 fh.write(json.dumps({"type": "event_msg", "payload": {"turn_id": "t1", "type": "task_complete"}}) + "\n")
                 fh.write(json.dumps({"type": "turn_context", "payload": {"turn_id": "t2", "model": "gpt-6.1-sol"}}) + "\n")
                 fh.write(json.dumps({"type": "event_msg", "payload": {"turn_id": "t2", "type": "task_complete"}}) + "\n")
-            t_mod, s_mod, used_mods = _executor._codex_rollout_model_evidence(sid, codex_home=tmp)
+            t_mod, used_mods = _executor._codex_rollout_model_evidence(sid, codex_home=tmp)
             self.assertEqual(t_mod, "gpt-6.1-sol")
-            self.assertEqual(s_mod, "gpt-6.1-sol")
-            self.assertEqual(used_mods, ["gpt-6-luna", "gpt-6.1-sol"])
+            self.assertEqual(used_mods, ["gpt-6.1-sol"])
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}, clear=False):
+                enriched = _executor._enrich(
+                    {
+                        "status": "success",
+                        "exit_code": 0,
+                        "cli": "codex",
+                        "session_id": sid,
+                        "result": (
+                            "STATUS: DONE\nSUMMARY: ok\nCONFIDENCE: 0.9\n"
+                            "FOLLOW-UP: None\nHANDOFF: None\n"
+                        ),
+                    },
+                    None,
+                )
+            self.assertEqual(enriched["model_targeted"], "gpt-6.1-sol")
+            self.assertIsNone(enriched["model_resolved"])
+            self.assertEqual(enriched["models_used"], ["gpt-6.1-sol"])
+            self.assertEqual(enriched["model_evidence_source"], "codex_rollout_turn_context")
+
             # An unexecuted trailing turn_context must not inherit earlier turn activity
             with open(rfile, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"type": "turn_context", "payload": {"turn_id": "t3", "model": "gpt-6-astra"}}) + "\n")
-            self.assertEqual(_executor._codex_rollout_model_evidence(sid, codex_home=tmp), (None, None, []))
+            self.assertEqual(_executor._codex_rollout_model_evidence(sid, codex_home=tmp), (None, []))
 
 
 if __name__ == "__main__":
     unittest.main()
+

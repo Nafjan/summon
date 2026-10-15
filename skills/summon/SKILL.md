@@ -74,12 +74,16 @@ Each seat reports `run_agent`, `permission`, `model`, `effort`, `capability_tier
 3. **Strict roster governance**: `--strict-agents-dir` fails closed with `error_kind: strict_agents_dir_miss` and no fallback to bundled or plugin definitions.
 4. **Private role aliases**: operator-owned aliases in `~/.claude/summon/roles.json` require `--enable-roles` to activate (`role propose`, `role approve`, `role list`, `role resolve`; flat flags `--role-propose`, `--role-approve`, `--role-list`, `--role-resolve`). Exact roster names always win over role aliases.
 
+### Private backend profiles
+
+Define secondary local account/config profiles in `~/.agents/summon-profiles.json` and select one with `--profile <name>` (or `profile: <name>` in an agent definition). Receipts record only the profile `name`, `cli`, and `sha256` digests (`path_sha256`, `registry_sha256`, `command_sha256`), never raw filesystem paths or credentials.
+
 ### Recommended cross-vendor roster lanes & decision leads
 
 - **Gemini (`gemini-4-argon-high`, `gemini-3.8-flash-high`)**: `argon-reviewer` targets Gemini 4 Argon (`gemini-4-argon-high`); `flash-reviewer`, `researcher`, `frontend`, `docs-writer`, and `antigravity` target Gemini 3.8 Flash (`gemini-3.8-flash-high`) via `agy`. Because `agy` cannot enforce `read-only`, Summon refuses `agy` at `read-only` and fails closed rather than imply a boundary that does not exist (unless `SUMMON_ALLOW_UNENFORCED_READONLY=1` is set). Run `agy` in a disposable clone/`--worktree` with `yolo`.
 - **OpenAI Codex (`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-codex`, `gpt-5.4-codex-mini`)**: `astra` pins `gpt-6-astra`, `sol-review` pins `gpt-6.1-sol`, and `luna-review` pins `gpt-6-luna` at high effort with exact-model verification.
 - **Claude (`claude-opus-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`)**: `architect`/`planner`/`deep-debugger`/`security-auditor` pin `claude-opus-5`; `fable` pins `claude-fable-5-1` (`--profile fable`) as the escalation decision lead.
-- **BytePlus ModelArk Coding Plan (`deepseek-v4-1-flash`, `glm-5-3-flash`)**: `deepseek-41-flash` (`deepseek-v4-1-flash`), `glm-coder` (`glm-5-3-flash`), and `byteplus-coder` run over the subscription `byteplus-coding` route (`/api/coding/v3`, text-only).
+- **BytePlus ModelArk Coding Plan (`deepseek-v4-pro`, `glm-5-3-flash`)**: `byteplus-coder` (`deepseek-v4-pro`) and `byteplus-glm-5-3-flash` (`glm-5-3-flash`) run over the subscription `byteplus-coding` route (`/api/coding/v3`, text-only).
 
 ### Step 2: Execute Agent & Capability Boundary
 
@@ -132,9 +136,9 @@ Use an explicit unit in every invocation: `ms` for milliseconds, `s` for seconds
 | `--jobs-resume ID`, `--job-message-file FILE`, `--job-request-id ID`, `--jobs-revalidate ID`, `--job-revalidation-file FILE` | Authenticated background continuation for eligible Claude jobs and legacy job revalidation. |
 | `--dry-run`, `--out FILE`, `--debug-dir DIR`, `--max-tool-output-bytes N` | Preview without executing, atomically write/reuse terminal envelope, dump debug artifacts, or cap binary output tail. |
 | `--retries N`, `--transient-retries`, `--retry-nonretryable`, `--no-contract-repair` | Retry and one-shot report-contract repair controls. |
-| `--max-permission {read-only,safe-edit}`, `--gate-with AGENT` | Downward-only permission clamp and fail-closed read-only pre-dispatch gate adjudicator. |
-| `--allow-credit`, `--allow-payg`, `--allow-text-only`, `--require-tools` | Explicit per-dispatch spend and text-seat (`openai-compat` / `arkcli`) consent gates. |
-| `--json-schema FILE`, `--artifact FILE` | Validate final JSON against a schema or record loose-file provenance (`--artifact FILE`) under `--cwd`. |
+| `--max-permission {read-only,safe-edit}`, `--gate-with AGENT` | Downward-only permission clamp (drops agent `extra_args` to prevent flag escalation) and fail-closed `read-only` pre-dispatch gate adjudicator (re-gated on every retry, schema correction, and contract repair). |
+| `--allow-credit`, `--allow-payg`, `--allow-text-only`, `--require-tools` | Explicit per-dispatch spend (`--allow-credit` / `SUMMON_ALLOW_CREDIT_SPEND=1` for credit-only Claude models; `--allow-payg` / `SUMMON_ALLOW_BYTEPLUS_PAYG=1` / `~/.agents/summon.json` `{"allow_byteplus_payg": true}` for BytePlus `/api/v3` PAYG) and text-seat (`openai-compat` / `arkcli`) consent gates. |
+| `--json-schema FILE`, `--artifact FILE` | Validate final JSON against a schema or record loose-file provenance (`--artifact FILE`: regular non-symlink files inside `--cwd`, hashed directly up to `256 KiB` or streamed up to `64 MiB`). |
 | `--context-input-file FILE`, `--context-profile {safe,off}`, `--context-reference SHA256_REF=FILE` | Compile a typed `summon.context-input/v1` packet and hash-read externalized references before dispatch. |
 | `--telemetry-enable`, `--telemetry-disable`, `--telemetry-status`, `--telemetry-clear`, `--telemetry-stats` (`stats`) | Manage opt-in local diagnostics (`~/.agents/summon-telemetry.jsonl`, rotated to `.1` on trim) and view reliability/latency percentiles (`summon stats`). |
 | `--bug-report`, `--from FILE`, `--output FILE`, `--submit-github`, `--github-repo OWNER/REPO`, `--bug-title TEXT`, `--bug-description TEXT` | Generate a sanitized local Markdown bug report or submit a reviewed report via `gh`. |

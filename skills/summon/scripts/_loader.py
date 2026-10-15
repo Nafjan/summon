@@ -557,8 +557,8 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
                     and run_agent not in ("zcode",)
                 )
                 _reports_served_model = bool(
-                    run_agent in ("claude", "codex", "kimi", "opencode",
-                                  "openai-compat")
+                    run_agent in ("claude", "codex", "opencode",
+                                  "openai-compat", "arkcli")
                 )
                 # Keep the roster listing useful for humans and provider-safe for
                 # callers: a model pin and reasoning effort are harmless display
@@ -665,10 +665,11 @@ def filter_agents_for_task(agents: list[dict], task: str) -> list[dict]:
         )).lower()
 
     if q in ("review", "audit", "critique"):
+        from _builder import permission_enforcement
         matched = [
             a for a in active
             if a.get("permission") == "read-only"
-            and not (a.get("run_agent") == "agy" and a.get("permission") != "yolo")
+            and permission_enforcement(a.get("run_agent"), "read-only") == "enforced"
         ]
         return sorted(matched, key=lambda a: (
             0 if any(w in str(a.get("name") or "").lower()

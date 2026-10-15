@@ -1422,7 +1422,7 @@ def recommended_timeout_ms(backend: str | None, default_ms: int = 600_000,
         and ev.get("operation") in ("dispatch", None)
         and isinstance(ev.get("elapsed_ms"), int)
         and ev["elapsed_ms"] > 0
-        and ev.get("cohort") in ("live", None)
+        and ev.get("cohort") == "live"
     ]
     if len(latencies) < min_samples:
         result_ms = int(default_ms)

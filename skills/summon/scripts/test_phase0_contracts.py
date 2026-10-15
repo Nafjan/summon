@@ -792,7 +792,7 @@ def test_wave2_f1_f2_f3_contracts(tmp_path, monkeypatch):
     import time
     from contextlib import redirect_stdout
 
-    # F1: --out lock lifecycle releases on _write_out
+    # F1: --out lock lifecycle releases on _write_out and serializes stale-lock reclamation
     out_file = tmp_path / "env.json"
     owner_pid = run_subagent._acquire_out_lock(str(out_file))
     assert owner_pid is None
@@ -801,7 +801,30 @@ def test_wave2_f1_f2_f3_contracts(tmp_path, monkeypatch):
     assert out_file.is_file()
     assert not Path(str(out_file) + ".active.lock").exists()
 
-    # F2: parse_report ignores fenced code blocks and _parse_confidence rejects NaN/Inf
+    # Concurrent stale-lock reclamation admits exactly 1 winner
+    race_out = tmp_path / "race.json"
+    race_lock = Path(str(race_out) + ".active.lock")
+    race_lock.write_text("99999999\nstale-token-0\n", encoding="utf-8")
+    import threading
+    barrier = threading.Barrier(8)
+    results = []
+    results_lock = threading.Lock()
+
+    def _contend():
+        barrier.wait()
+        res = run_subagent._acquire_out_lock(str(race_out))
+        with results_lock:
+            results.append(res)
+
+    threads = [threading.Thread(target=_contend) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert results.count(None) == 1
+    run_subagent._release_current_out_lock()
+
+    # F2: parse_report preserves fenced snippets in COMMANDS/HANDOFF while ignoring spoofed headers inside fences
     assert _executor._parse_confidence("nan") is None
     assert _executor._parse_confidence("inf") is None
     assert _executor._parse_confidence("-0.1") is None
@@ -816,8 +839,14 @@ def test_wave2_f1_f2_f3_contracts(tmp_path, monkeypatch):
         "STATUS: DONE\n"
         "SUMMARY: Real top summary\n"
         "CONFIDENCE: 0.91\n"
+        "COMMANDS:\n"
+        "```bash\n"
+        "pytest -q\n"
+        "STATUS: BLOCKED\n"
+        "```\n"
         "FOLLOW-UP: None\n"
-        "HANDOFF: Ready\n"
+        "HANDOFF:\n"
+        "Ready:\n"
         "```markdown\n"
         "STATUS: BLOCKED\n"
         "SUMMARY: Spoofed inside fence\n"
@@ -830,6 +859,9 @@ def test_wave2_f1_f2_f3_contracts(tmp_path, monkeypatch):
     assert rep is not None
     assert rep["status"] == "DONE"
     assert rep["summary"] == "Real top summary"
+    assert "pytest -q" in rep["commands"]
+    assert "```bash" in rep["commands"]
+    assert "```markdown" in rep["handoff"]
     enriched = _executor._enrich(
         {"status": "success", "exit_code": 0, "cli": "claude", "result": spoofed},
         None,
@@ -838,6 +870,35 @@ def test_wave2_f1_f2_f3_contracts(tmp_path, monkeypatch):
     assert enriched["summary"] == "Real top summary"
     assert enriched["confidence"] == 0.91
     assert enriched["files_touched"] == []
+
+    # Entire report wrapped in a markdown code fence still parses and downgrades STATUS: BLOCKED
+    fenced_blocked = (
+        "```text\n"
+        "STATUS: BLOCKED\n"
+        "SUMMARY: Blocked inside outer fence\n"
+        "CONFIDENCE: 0.40\n"
+        "FOLLOW-UP: Fix credentials\n"
+        "HANDOFF: Stopped\n"
+        "```\n"
+    )
+    rep_fenced = _executor.parse_report(fenced_blocked)
+    assert rep_fenced is not None
+    assert rep_fenced["status"] == "BLOCKED"
+    enriched_fenced = _executor._enrich(
+        {"status": "success", "exit_code": 0, "cli": "claude", "result": fenced_blocked},
+        None,
+    )
+    assert enriched_fenced["status"] == "blocked"
+    assert enriched_fenced["report"]["status"] == "BLOCKED"
+
+    # F8: Pathological 50 KB whitespace/hash string does not trigger O(n^2) fallback regex hang
+    t_regex = time.monotonic()
+    pathological = "prose\n\n" + ("#   " * 6000) + "!\n"
+    _executor._enrich(
+        {"status": "success", "exit_code": 0, "cli": "claude", "result": pathological},
+        None,
+    )
+    assert (time.monotonic() - t_regex) < 0.25
 
     # F2: wait --all --active-only and stale unverified job skipping
     job_dir = str(tmp_path / "jobs")
@@ -885,7 +946,7 @@ def test_wave2_f1_f2_f3_contracts(tmp_path, monkeypatch):
     assert wait_payload["jobs"][0]["confidence"] == 0.95
     assert wait_payload["jobs"][0]["files_touched"] == ["a.py"]
 
-    # F2: wait_job fails fast with (None, "stale") when record is corrupt even if result exists
+    # F2: wait_job fails fast with (None, "stale") when record is persistently corrupt even if result exists
     corrupt_id = _jobs.new_job_id()
     corrupt_rec = Path(_jobs.record_path(job_dir, corrupt_id))
     corrupt_rec.parent.mkdir(parents=True, exist_ok=True)
@@ -897,7 +958,7 @@ def test_wave2_f1_f2_f3_contracts(tmp_path, monkeypatch):
     assert c_res is None and c_state == "stale"
     assert (time.monotonic() - t0) < 1.0
 
-    # F3: filter_agents_for_task review requires read-only and Milliseconds is_auto
+    # F3: filter_agents_for_task review requires enforced read-only and Milliseconds is_auto
     default_t = _cli._default_timeout_ms()
     assert getattr(default_t, "is_auto", False) is True
     auto_t = _cli.parse_timeout("auto")
@@ -905,13 +966,27 @@ def test_wave2_f1_f2_f3_contracts(tmp_path, monkeypatch):
     explicit_t = _cli.parse_timeout("600s")
     assert getattr(explicit_t, "is_auto", False) is False
     assert "review" in _loader.KNOWN_TASK_INTENTS
+    rev_agents = _loader.filter_agents_for_task(_loader.list_agents(_loader.bundled_roster_dir()), "review")
+    assert all(a["run_agent"] != "kimi" for a in rev_agents)
 
 
 def test_wave3_f6_f7_f8_contracts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import re
     import _apibackend
     import _cli
     import _telemetry
     import _workspace_commands
+
+    # F15: Relative markdown links in SKILL.md and references/reference-manual.md resolve on disk
+    skill_dir = Path(__file__).resolve().parent.parent
+    link_re = re.compile(r"\[[^\]]+\]\(([^)#\s]+)(?:#[^)]*)?\)")
+    for doc in (skill_dir / "SKILL.md", skill_dir / "references" / "reference-manual.md"):
+        doc_text = doc.read_text(encoding="utf-8")
+        for match in link_re.finditer(doc_text):
+            target = match.group(1)
+            if target.startswith(("http://", "https://", "mailto:", "file://")):
+                continue
+            assert (doc.parent / target).resolve().exists(), f"Broken relative link {target!r} in {doc.name}"
 
     # F6: _default_cohort preserves "live" for custom path outside tempdir when not under pytest
     monkeypatch.delenv("SUMMON_TELEMETRY_COHORT", raising=False)
@@ -1003,3 +1078,4 @@ def test_wave3_f6_f7_f8_contracts(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     )
     with pytest.raises(_swarm_coordinator.SwarmBudgetRefusal, match="budget_binding_required"):
         coord.workspace_budget_snapshot(now_ms=captured_now)
+

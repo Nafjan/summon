@@ -2158,7 +2158,7 @@ def test_byteplus_coder_agent_loads():
             fm[k.strip()] = v.strip()
     assert fm["run-agent"] == "openai-compat"
     assert fm["provider"] == "byteplus-coding"
-    assert fm["model"] == "deepseek-v4-1-flash"
+    assert fm["model"] == "deepseek-v4-pro"
     bu, key = _apibackend.resolve_endpoint(fm, agents_dir)
     assert "/api/coding/" in bu
 
