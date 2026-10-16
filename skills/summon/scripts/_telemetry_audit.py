@@ -14,7 +14,7 @@ import re
 
 SCHEMA_VERSION = 2
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
-_COHORTS = {"test", "review", "preflight", "orchestration"}
+_COHORTS = {"live", "test", "review", "preflight", "orchestration"}
 _OPERATIONS = {
     "dispatch", "chat_turn", "council", "deliberate", "manifest",
     "resume", "swarm", "doctor", "onboarding",

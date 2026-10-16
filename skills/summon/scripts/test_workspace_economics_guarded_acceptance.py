@@ -187,6 +187,65 @@ def inert(tmp_path, monkeypatch):
 
 
 
+def test_snapshot_accepts_concurrent_append_after_caller_sampled_now(tmp_path):
+    """Field race (2026-09-25, ~1 in 14 WSL runs): a separate worker process
+    appends to the journal after the caller sampled now_ms; the snapshot must
+    treat that record as current activity, not a forged future event."""
+    from _workspace_demo import ConductorDemo
+    demo = ConductorDemo(tmp_path / "workspaces")
+    try:
+        setup = demo.supervisor_message_setup()
+        coordinator = demo.runtime._coordinator
+        state, torn, raw_map = coordinator._load_with_snapshot()
+        records, records_torn, records_raw = coordinator._read_records_snapshot()
+        assert not torn and not records_torn and records_raw == raw_map
+        _KINDS = {"workspace_message_admitted", "workspace_message_sent",
+                  "workspace_operator_message_sent", "workspace_supervisor_message_sent"}
+
+        def _rate_kind(record):
+            nested = record.get("workspace_event")
+            if not isinstance(nested, dict) or nested.get("event") not in _KINDS:
+                return False
+            payload = nested.get("payload")
+            message = payload.get("message") if isinstance(payload, dict) else None
+            content = message.get("content") if isinstance(message, dict) else None
+            return (isinstance(record.get("observed_at_ms"), int)
+                    and isinstance(content, dict)
+                    and isinstance(content.get("utf8_bytes"), int))
+
+        stamped = [r for r in records if _rate_kind(r)]
+        assert stamped
+        caller_now = max(r["observed_at_ms"] for r in stamped)
+        concurrent = copy.deepcopy(max(stamped, key=lambda r: r["observed_at_ms"]))
+        concurrent["observed_at_ms"] = caller_now + 5_000
+        records.append(concurrent)
+        snapshot = coordinator.workspace_budget_snapshot(
+            state=state, raw_map=raw_map, records=records, now_ms=caller_now)
+        # Consensus design (KM-01/RX-01): a concurrent append stamped after the
+        # caller's clock is clamped into the snapshot bound and counted at age
+        # zero -- accepted, rate-limiting applies maximally, and the window's
+        # trailing edge never moves. The snapshot bound stays at the caller's
+        # clock; the low-level future gate survives for detached snapshots.
+        assert snapshot["now_ms"] == caller_now
+        concurrent_events = [item for item in snapshot["rate_events"]
+                             if item["at_ms"] >= caller_now]
+        assert concurrent_events, "the clamped concurrent append vanished"
+        assert all(item["at_ms"] <= caller_now for item in concurrent_events)
+        # R2-RR-04: the clamped event must carry its real count payload -- a
+        # regression that zeroed messages/bytes would slip a presence-only pin.
+        source_bytes = concurrent["workspace_event"]["payload"]["message"]["content"]["utf8_bytes"]
+        assert concurrent_events[0]["messages"] == 1
+        assert concurrent_events[0]["bytes"] == source_bytes
+
+        # The low-level future gate still refuses detached fabricated events.
+        import _workspace_budget as budget
+        with pytest.raises(budget.WorkspaceBudgetError, match="from the future"):
+            budget._rate_event({"at_ms": caller_now + 60_000, "messages": 1,
+                                "bytes": 1}, now_ms=caller_now)
+    finally:
+        demo.cleanup()
+
+
 @pytest.mark.parametrize('method', [
     'test_v2_economics_path_derives_policy_bound_reservation_and_settles',
     'test_v2_economics_covers_full_turn_settlement_reopen_and_indeterminate_hold',

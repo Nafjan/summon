@@ -972,11 +972,22 @@ def wait_job(root: str, job_id: str, timeout_ms: int, poll_sec: float = 0.5):
                 return result, "done"
             # unverifiable/corrupt/nonce-not-yet-matching: keep waiting for the
             # child's own write (deterministic: never returns an untrusted result)
-        if rec is not None and rec.get("pid") is not None \
-                and _pid_liveness(rec.get("pid")) == "dead":
+        if rec_state == _CORRUPT:
+            # On Windows, an atomic record replacement (e.g. PID publication) can
+            # briefly surface a sharing violation as _CORRUPT. Retry a few times
+            # before treating the record as permanently corrupt.
+            for _ in range(3):
+                time.sleep(min(0.05, max(0.01, poll_sec / 4.0)))
+                rec, rec_state = _read(record_path(root, job_id))
+                if rec_state != _CORRUPT:
+                    break
+        if rec_state == _CORRUPT or (
+                rec is not None and rec.get("pid") is not None
+                and _pid_liveness(rec.get("pid")) == "dead"):
             # The child can publish its atomic result and exit between the read
             # above and this liveness probe. Re-read once after observing death
-            # so that a verified terminal result wins that unavoidable race.
+            # or persistent record corruption so that a verified terminal result
+            # wins that unavoidable race.
             result, res_state = _read(rpath)
             if result is not None:
                 observed_state, trusted = _classify(rec, rec_state, result, res_state)

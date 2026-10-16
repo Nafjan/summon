@@ -2413,7 +2413,10 @@ class SwarmCoordinator:
                 continue
             if exclude_message_id is not None and isinstance(message, Mapping) and message.get("message_id") == exclude_message_id:
                 continue
-            rate_events.append({"at_ms": observed, "messages": 1,
+            if observed > captured_now + 5000:
+                raise SwarmBudgetRefusal("budget_binding_required")
+            rate_events.append({"at_ms": min(observed, captured_now),
+                                "messages": 1,
                                 "bytes": content["utf8_bytes"]})
         snapshot = {
             "schema": budget.SNAPSHOT_SCHEMA,
@@ -3435,6 +3438,11 @@ class SwarmCoordinator:
             event = admission.build_operator_send_event(checked, final, descriptor, current["workspace"])
             admission.validate_operator_send(event, coordinator_state=current,
                 workspace_state=current["workspace"], now_ms=now)
+
+            # Re-sample the clock after the trusted resolver callback: a slow
+            # resolver must not widen the sample-to-read gap enough to turn a
+            # genuinely concurrent append into a forged future event.
+            now = _now_ms(self.clock)
 
             def final_constraint(snapshot):
                 return resolve(snapshot) == final

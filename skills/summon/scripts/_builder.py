@@ -459,6 +459,162 @@ def read_allowlist(cli: str, permission: str, cwd: str,
     return policy
 
 
+_ORIG_SHUTIL_WHICH = shutil.which
+_CODEX_BIN_VERSION_CACHE: dict[tuple[str, int, int], tuple[int, int, int, int]] = {}
+_CODEX_SEMVER_RE = re.compile(r"(?i)\bcodex(?:-cli)?\s+([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z.-]+))?")
+
+
+def _codex_semver_key(path: str) -> tuple[int, int, int, int]:
+    """Return a comparable semver tuple for a codex binary candidate."""
+    try:
+        st = os.stat(path)
+        cache_key = (os.path.normcase(os.path.abspath(path)), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (0, 0, 0, 0)
+    cached = _CODEX_BIN_VERSION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    ver = (0, 0, 0, 0)
+    try:
+        proc = subprocess.run(
+            [path, "--version"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=2, stdin=subprocess.DEVNULL, **run_flags(),
+        )
+        out = f"{proc.stdout or ''} {proc.stderr or ''}".strip()
+        m = _codex_semver_RE_match(out)
+        if m is not None:
+            ver = m
+    except Exception:  # noqa: BLE001
+        ver = (0, 0, 0, 0)
+    _CODEX_BIN_VERSION_CACHE[cache_key] = ver
+    return ver
+
+
+def _codex_semver_RE_match(text: str) -> tuple[int, int, int, int] | None:
+    m = _CODEX_SEMVER_RE.search(text or "")
+    if not m:
+        return None
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    pre = m.group(4)
+    # Release builds rank above pre-release of the same X.Y.Z; pre-release ranks by trailing digits (<10_000).
+    if not pre:
+        pre_rank = 10_000
+    else:
+        nums = re.findall(r"[0-9]+", pre)
+        pre_rank = min(int(nums[-1]), 9999) if nums else 1
+    return (major, minor, patch, pre_rank)
+
+
+def _expand_codex_shim_exe(shim_path: str) -> list[str]:
+    """Expand a Windows npm .cmd/.bat shim into its vendor codex.exe candidates."""
+    import glob as _glob
+    shim_dir = os.path.dirname(shim_path)
+    if not shim_dir:
+        return []
+    patterns = [
+        os.path.join(shim_dir, "node_modules", "@openai", "codex", "node_modules",
+                     "@openai", "codex-*", "vendor", "*", "codex", "codex.exe"),
+        os.path.join(shim_dir, "node_modules", "@openai", "codex-*", "vendor",
+                     "*", "codex", "codex.exe"),
+    ]
+    out: list[str] = []
+    for pat in patterns:
+        for hit in sorted(_glob.glob(pat)):
+            if os.path.isfile(hit) and hit not in out:
+                out.append(hit)
+    return out
+
+
+def resolve_codex_binary(
+    *,
+    which_fn=None,
+    localappdata: str | None = None,
+    codex_home: str | None = None,
+) -> str | None:
+    """Resolve the best available Codex CLI executable.
+
+    Precedence:
+    1. Explicit ``SUMMON_CODEX_BIN`` environment variable (if pointing to a file).
+    2. Explicit ``CODEX_CLI`` environment variable (if pointing to a file, not ``1``).
+    3. ``CODEX_CLI_PATH`` in ``~/.codex/config.toml`` (if pointing to a file).
+    4. Highest-semver native binary across ``%LOCALAPPDATA%/OpenAI/Codex/bin/*/codex.exe``,
+       PATH ``codex.exe`` / ``codex``, and npm vendor binaries.
+    """
+    import glob as _glob
+    for env_key in ("SUMMON_CODEX_BIN", "CODEX_CLI"):
+        val = (os.environ.get(env_key) or "").strip()
+        if val and val != "1" and os.path.isfile(val):
+            return val
+
+    eff_which = which_fn or shutil.which
+    # Respect unit tests that monkeypatch shutil.which unless explicit test dirs are passed.
+    if (eff_which is not _ORIG_SHUTIL_WHICH or shutil.which is not _ORIG_SHUTIL_WHICH) and localappdata is None and codex_home is None:
+        hit = eff_which("codex")
+        if hit and os.name == "nt" and str(hit).lower().endswith((".cmd", ".bat")):
+            exes = _expand_codex_shim_exe(str(hit))
+            if exes:
+                return exes[0]
+        return hit
+
+    home_dir = codex_home or os.path.join(os.path.expanduser("~"), ".codex")
+    cfg_path = os.path.join(home_dir, "config.toml")
+    if os.path.isfile(cfg_path):
+        try:
+            import tomllib
+            with open(cfg_path, "rb") as fh:
+                parsed = tomllib.load(fh)
+            rhs = parsed.get("CODEX_CLI_PATH") if isinstance(parsed, dict) else None
+            if isinstance(rhs, str) and rhs.strip() and os.path.isfile(rhs.strip()):
+                return rhs.strip()
+        except Exception:  # noqa: BLE001
+            try:
+                with open(cfg_path, encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        s = line.strip()
+                        if s.startswith("["):
+                            break
+                        if s.startswith("CODEX_CLI_PATH") and "=" in s:
+                            rhs = s.split("=", 1)[1].split("#", 1)[0].strip().strip("'\"")
+                            if rhs and os.path.isfile(rhs):
+                                return rhs
+            except OSError:
+                pass
+
+    candidates: list[str] = []
+    la = localappdata if localappdata is not None else os.environ.get("LOCALAPPDATA")
+    if la:
+        bin_root = os.path.join(la, "OpenAI", "Codex", "bin")
+        if os.path.isdir(bin_root):
+            for entry in sorted(_glob.glob(os.path.join(bin_root, "*", "codex.exe"))):
+                if os.path.isfile(entry) and entry not in candidates:
+                    candidates.append(entry)
+            direct = os.path.join(bin_root, "codex.exe")
+            if os.path.isfile(direct) and direct not in candidates:
+                candidates.append(direct)
+
+    for name in (("codex.exe", "codex") if os.name == "nt" else ("codex",)):
+        hit = eff_which(name)
+        if hit:
+            if os.name == "nt" and str(hit).lower().endswith((".cmd", ".bat")):
+                for exe in _expand_codex_shim_exe(str(hit)):
+                    if exe not in candidates:
+                        candidates.append(exe)
+            if hit not in candidates:
+                candidates.append(hit)
+
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    def _rank(cand: str) -> tuple[tuple[int, int, int, int], int]:
+        is_exe = 1 if str(cand).lower().endswith(".exe") else 0
+        return (_codex_semver_key(cand), is_exe)
+
+    return max(candidates, key=_rank)
+
+
 # Authority ORDER, lowest first. Used only to clamp downward; nothing raises a tier.
 _PERMISSION_ORDER = ("read-only", "safe-edit", "yolo")
 
@@ -1571,14 +1727,15 @@ def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     # Codex config overrides such as model_reasoning_effort.
     model_flag = (["-m", selection["canonical"]]
                   if selection["canonical"] else [])
-    # Reasoning effort -> Codex config override. Astra supports the full public
-    # low..max range. Preserve the historical high ceiling for other/unknown
-    # Codex targets until their provider contracts are reviewed independently.
+    # Reasoning effort -> Codex config override. GPT-6 family models (Astra,
+    # Sol 6.1, Luna 6) support the full public low..max range. Preserve the
+    # historical high ceiling for older/unpinned Codex targets.
     # Global `-c` flags precede the subcommand.
     effort_flag = []
     if inv.effort:
         _e = inv.effort
-        if selection["canonical"] != "gpt-6-astra" and _e in ("xhigh", "max"):
+        _canon = (selection["canonical"] or "").lower()
+        if not _canon.startswith("gpt-6") and _e in ("xhigh", "max"):
             _e = "high"
         effort_flag = ["-c", f"model_reasoning_effort={_e}"]
     env = {**(env_override_for("codex") or {}), **profile_env} or None
@@ -2777,8 +2934,65 @@ class _agy_capability_probe_slot:
     def __init__(self, identity: tuple[str, object]) -> None:
         self._identity = identity
         self._lock = Path(str(_agy_capability_cache_path()) + ".lock")
+        self._stalled = Path(str(_agy_capability_cache_path()) + ".stalled")
         self._token = f"{os.getpid()}:{secrets.token_hex(16)}".encode("ascii")
         self._owned = False
+
+    def _raise_shared_stall_if_any(self) -> None:
+        key = _agy_capability_key(self._identity)
+        if key is None:
+            return
+        try:
+            with open(self._stalled, "rb") as fh:
+                data = json.loads(fh.read(16 * 1024).decode("utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict) or data.get("key") != key:
+            return
+        ts = data.get("ts")
+        if not isinstance(ts, (int, float)) or (time.time() - ts) > _AGY_PROBE_TIMEOUT_SEC:
+            return
+        kind = str(data.get("kind") or "agy_capability_probe_stalled")
+        message = str(data.get("message") or "agy capability probe stalled")
+        retryable = bool(data.get("retryable", True))
+        if self._owned:
+            self._release_owned_lock()
+        raise AgyCapabilityError(message, kind=kind, retryable=retryable)
+
+    def _clear_shared_stall(self) -> None:
+        try:
+            self._stalled.unlink()
+        except OSError:
+            pass
+
+    def _publish_shared_stall(self, exc: AgyCapabilityError) -> None:
+        key = _agy_capability_key(self._identity)
+        if key is None:
+            return
+        payload = json.dumps({
+            "key": key,
+            "ts": time.time(),
+            "kind": exc.kind,
+            "retryable": bool(exc.retryable),
+            "message": str(exc),
+        }, sort_keys=True).encode("utf-8")
+        try:
+            self._stalled.write_bytes(payload)
+        except OSError:
+            pass
+
+    def _release_owned_lock(self) -> None:
+        if not self._owned:
+            return
+        self._owned = False
+        try:
+            # Release only our own lock: after a steal the file belongs to a peer.
+            with open(self._lock, "rb") as fh:
+                if fh.read(128) != self._token:
+                    return
+            self._lock.unlink()
+        except OSError:
+            pass
 
     def __enter__(self) -> bool:
         if _agy_capability_key(self._identity) is None:
@@ -2788,14 +3002,17 @@ class _agy_capability_probe_slot:
         except OSError:
             return False  # e.g. the cache path sits under a regular file
         deadline = time.monotonic() + _AGY_PROBE_LOCK_STALE_SEC
+        waited = False
         while True:
             try:
                 fd = os.open(str(self._lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except FileExistsError:
-                pass
+                waited = True
             except OSError:
                 # e.g. Windows access-denied while a just-released lock is still being
                 # deleted: its owner may have published the answer a moment ago.
+                if waited:
+                    self._raise_shared_stall_if_any()
                 return _agy_capability_cached(self._identity)
             else:
                 try:
@@ -2810,9 +3027,16 @@ class _agy_capability_probe_slot:
                 os.close(fd)
                 self._owned = True
                 # A peer may have finished between our cache miss and the lock.
-                return _agy_capability_cached(self._identity)
+                if _agy_capability_cached(self._identity):
+                    return True
+                if waited:
+                    self._raise_shared_stall_if_any()
+                else:
+                    self._clear_shared_stall()
+                return False
             if _agy_capability_cached(self._identity):
                 return True
+            self._raise_shared_stall_if_any()
             if time.monotonic() >= deadline:
                 return False  # probe ourselves rather than wait any longer
             try:
@@ -2820,6 +3044,8 @@ class _agy_capability_probe_slot:
             except FileNotFoundError:
                 continue  # released between attempts; try to take it
             except OSError:
+                if waited:
+                    self._raise_shared_stall_if_any()
                 return _agy_capability_cached(self._identity)
             if age > _AGY_PROBE_LOCK_STALE_SEC or self._owner_exited():
                 try:
@@ -2852,17 +3078,14 @@ class _agy_capability_probe_slot:
             return False
         return _pid_liveness(pid) == "dead"
 
-    def __exit__(self, *_exc) -> None:
+    def __exit__(self, exc_type, exc_val, _exc_tb) -> None:
         if not self._owned:
             return
-        try:
-            # Release only our own lock: after a steal the file belongs to a peer.
-            with open(self._lock, "rb") as fh:
-                if fh.read(128) != self._token:
-                    return
-            self._lock.unlink()
-        except OSError:
-            pass
+        if isinstance(exc_val, AgyCapabilityError):
+            self._publish_shared_stall(exc_val)
+        else:
+            self._clear_shared_stall()
+        self._release_owned_lock()
 
 
 def _run_agy_help(command: list, timeout_sec: float) -> tuple[int, str]:

@@ -319,7 +319,7 @@ def _validate_schema_value(schema: str, value: Any) -> None:
                     "unenforceable_authorized",
                     "corrective_allowed", "retry_allowed", "fallback_allowed",
                     "require_fresh",
-                    "effective_permission", "strict_roster", "credit", "payg"}):
+                    "effective_permission", "strict_roster", "credit", "payg", "api"}):
             raise EvidenceError("decision authority has malformed fields")
         if set(digests) != {"roster", "policy", "project", "approval"}:
             raise EvidenceError("decision digests have malformed fields")
@@ -436,26 +436,33 @@ def _validate_schema_value(schema: str, value: Any) -> None:
             raise EvidenceError("decision effective permission is invalid")
         if "strict_roster" in authority and not isinstance(authority["strict_roster"], bool):
             raise EvidenceError("decision strict_roster must be boolean")
-        for field in ("credit", "payg"):
+        for field in ("credit", "payg", "api"):
             if field not in authority:
                 continue
             item = authority[field]
-            allowed_sources = ({"none", "dispatch_flag", "environment"}
-                               if field == "credit" else
-                               {"none", "dispatch_flag", "operator_configuration"})
+            allowed_sources = {
+                "credit": {"none", "dispatch_flag", "environment"},
+                "payg": {"none", "dispatch_flag", "operator_configuration"},
+                "api": {"none", "dispatch_flag", "operator_configuration",
+                        "explicit_endpoint"},
+            }[field]
             if (not isinstance(item, dict) or set(item) != {"authorized", "source"}
                     or not isinstance(item.get("authorized"), bool)
                     or item.get("source") not in allowed_sources
                     or item["authorized"] != (item["source"] != "none")):
                 raise EvidenceError(f"decision authority.{field} is malformed")
         projected_spend = [authority[field]["authorized"]
-                           for field in ("credit", "payg")
+                           for field in ("credit", "payg", "api")
                            if field in authority]
-        if any(projected_spend) and not authority["spend_authorized"]:
+        api_spend = (authority.get("api", {}).get("authorized", False)
+                     if isinstance(authority.get("api"), dict) else False)
+        if api_spend and not authority["spend_authorized"]:
             raise EvidenceError(
                 "decision spend projection contradicts authorization")
-        if len(projected_spend) == 2 \
-                and authority["spend_authorized"] != any(projected_spend):
+        if "api" in authority and authority["spend_authorized"] != api_spend:
+            raise EvidenceError(
+                "decision spend projection contradicts authorization")
+        if projected_spend and authority["spend_authorized"] and not any(projected_spend):
             raise EvidenceError(
                 "decision spend projection contradicts authorization")
         selected = resolution.get("seat")

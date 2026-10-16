@@ -142,6 +142,7 @@ def call(inv, timeout_ms: int) -> dict:
     err = (proc.stderr or "").strip()
     text = out
     usage = None
+    served_model = None
     # Prefer JSON envelope from arkcli when present.
     if out.startswith("{"):
         try:
@@ -154,6 +155,9 @@ def call(inv, timeout_ms: int) -> dict:
                 if not isinstance(text, str):
                     text = json.dumps(text)
                 usage = payload.get("usage")
+                raw_served = payload.get("model") or payload.get("served_model")
+                if isinstance(raw_served, str) and raw_served.strip():
+                    served_model = raw_served.strip()
         except ValueError:
             pass
     if proc.returncode != 0 and not text:
@@ -163,8 +167,11 @@ def call(inv, timeout_ms: int) -> dict:
         "status": "success" if proc.returncode == 0 else "error",
         "exit_code": proc.returncode,
         "cli": cli,
+        "model_targeted": model,
+        "model_resolved": served_model,
+        "model_evidence_source": "arkcli_json_envelope" if served_model else None,
         "model": {"requested": model, "targeted": model,
-                  "served": model, "resolved": model, "models_used": []},
+                  "served": served_model, "resolved": served_model, "models_used": []},
         "backend_type": "arkcli_chat",
         "served_via": "arkcli_chat",
         "provider": {"driver": "arkcli"},

@@ -40,7 +40,7 @@ EVENT_SCHEMA_VERSION = 2
 # Keep the telemetry contract tied to the dispatcher release without importing
 # ``run_subagent`` (which would introduce a module cycle).  Release bumps must
 # update this alongside the dispatcher ``__version__``.
-SUMMON_VERSION = "3.5.0"
+SUMMON_VERSION = "3.6.0"
 # Backward-compatible name for callers that used the old event constant.  It
 # refers to event records, never the persisted opt-in configuration.
 SCHEMA_VERSION = EVENT_SCHEMA_VERSION
@@ -73,7 +73,7 @@ _OPERATIONS = {
     "dispatch", "chat_turn", "council", "deliberate", "manifest",
     "resume", "swarm", "doctor", "onboarding",
 }
-_COHORTS = {"test", "review", "preflight", "orchestration", "legacy_unknown"}
+_COHORTS = {"live", "test", "review", "preflight", "orchestration", "legacy_unknown"}
 _STATUSES = {"success", "error", "blocked", "partial", "cancelled", "unknown"}
 # A structural refusal did not execute a provider turn.  Keep this state on
 # ``execution_status`` only; the terminal operation status remains ``blocked``.
@@ -185,6 +185,26 @@ def _operation(value: object, default: str = "dispatch") -> str:
     return _bounded(value, _OPERATIONS, default) or default
 
 
+def _default_cohort() -> str:
+    """Return 'live' for real operator CLI runs and 'test' inside test harnesses."""
+    env_val = os.environ.get("SUMMON_TELEMETRY_COHORT")
+    if isinstance(env_val, str) and env_val.strip().lower() in (
+            "live", "test", "review", "preflight", "orchestration"):
+        return env_val.strip().lower()
+    if ("PYTEST_CURRENT_TEST" in os.environ
+            or "unittest" in sys.modules
+            or "pytest" in sys.modules):
+        return "test"
+    for env_key in ("SUMMON_TELEMETRY_FILE", "SUMMON_TELEMETRY_CONFIG"):
+        custom_path = os.environ.get(env_key)
+        if custom_path:
+            norm = os.path.normcase(os.path.abspath(os.path.expanduser(custom_path)))
+            tmp_root = os.path.normcase(os.path.abspath(tempfile.gettempdir())).rstrip(os.sep)
+            if norm == tmp_root or norm.startswith(tmp_root + os.sep) or "pytest" in norm or "unittest" in norm:
+                return "test"
+    return "live"
+
+
 def _cohort(value: object, default: str = "test", *, allow_legacy: bool = False) -> str:
     # ``production_like`` is intentionally not accepted here.  Only the later
     # signed-provenance integration may grant that cohort; ordinary callers and
@@ -224,11 +244,11 @@ class TelemetryOperation:
         raise AttributeError("TelemetryOperation is immutable")
 
     def __init__(self, operation: object = "dispatch", *, parent_operation_id: object = None,
-                 cohort: object = "test") -> None:
+                 cohort: object = None) -> None:
         self._operation = _operation(operation)
         self._operation_id = uuid.uuid4().hex
         self._parent_operation_id = _safe_opaque_id(parent_operation_id)
-        self._cohort = _cohort(cohort)
+        self._cohort = _default_cohort() if cohort is None else _cohort(cohort)
         self._sequence = 0
         self._terminal_closed = False
 
@@ -337,7 +357,7 @@ def _safe_opaque_id(value: object) -> str | None:
 
 
 def new_operation_context(operation: object = "dispatch", *, parent_operation_id: object = None,
-                          cohort: object = "test") -> TelemetryOperation:
+                          cohort: object = None) -> TelemetryOperation:
     return TelemetryOperation(operation, parent_operation_id=parent_operation_id, cohort=cohort)
 
 
@@ -501,6 +521,10 @@ def clear_events() -> dict:
                 removed = True
             except FileNotFoundError:
                 pass
+            try:
+                Path(str(path) + ".1").unlink(missing_ok=True)
+            except OSError:
+                pass
     _EPHEMERAL_SALT = None
     config = _read_config()
     if config.get("enabled") is True:
@@ -626,6 +650,8 @@ def _failure_class(envelope: dict) -> str:
     text = " ".join((kind, stage, str(envelope.get("error") or "").lower()))
     if status == "success":
         return "success"
+    if status == "cancelled" or kind in ("interrupted", "cancelled"):
+        return "cancelled"
     if status == "blocked":
         return "blocked"
     if status == "partial":
@@ -747,9 +773,9 @@ def event_from_envelope(envelope: dict, *, source: str = "dispatch",
         return None
     if not isinstance(operation_context, TelemetryOperation):
         # The public envelope is not a cohort/operation authority.  Dedicated
-        # orchestration code can pass a local context; ordinary records remain
-        # dispatch/test until a verified provenance integration exists.
-        operation_context = new_operation_context("dispatch", cohort="test")
+        # orchestration code can pass a local context; ordinary records use
+        # the runtime default cohort ("live" for CLI, "test" for test suites).
+        operation_context = new_operation_context("dispatch")
     # Invalid input before the first valid terminal is retained as a diagnostic
     # record, but once a valid terminal closes the operation no later projection
     # (valid or invalid) may mint another operation-terminal event.
@@ -877,7 +903,7 @@ def event_from_envelope(envelope: dict, *, source: str = "dispatch",
         "event_kind": _EVENT_KIND,
         "terminal_kind": "operation",
         "operation": _operation(operation_context.operation),
-        "cohort": _cohort(cohort if cohort is not None else operation_context.cohort),
+        "cohort": _cohort(cohort, default="test") if cohort is not None else _cohort(operation_context.cohort),
         "operation_id": _safe_opaque_id(operation_context.operation_id) or uuid.uuid4().hex,
         "parent_operation_id": _safe_opaque_id(operation_context.parent_operation_id),
         # The executor mints a UUID-shaped physical-attempt identity.  Preserve
@@ -1243,14 +1269,20 @@ def _parse_event_lines(raw: bytes) -> list[dict]:
 
 
 def _trim_event_file(path: Path) -> None:
-    """Keep the local spool bounded without making dispatch depend on it."""
+    """Keep the local spool bounded without making dispatch depend on it.
+
+    When trimming, preserve evicted events in a single rotated ``.1``
+    archive file (also bounded to ``_MAX_EVENT_FILE_BYTES``) so bursty
+    workflows do not silently discard the previous window before analysis.
+    """
     try:
         if path.stat().st_size <= _MAX_EVENT_FILE_BYTES:
             return
+        scan_bytes = max(_MAX_SOURCE_BYTES, _MAX_EVENT_FILE_BYTES * 2)
         with path.open("rb") as fh:
             size = path.stat().st_size
-            fh.seek(max(0, size - _MAX_SOURCE_BYTES))
-            raw = fh.read(_MAX_SOURCE_BYTES)
+            fh.seek(max(0, size - scan_bytes))
+            raw = fh.read(scan_bytes)
         events = _parse_event_lines(raw)
         kept = []
         total = 0
@@ -1260,6 +1292,37 @@ def _trim_event_file(path: Path) -> None:
                 break
             kept.append(line)
             total += len(line)
+        evicted_count = max(0, len(events) - len(kept))
+        evicted_events = events[:evicted_count]
+        if evicted_events:
+            try:
+                rot_path = Path(str(path) + ".1")
+                prior_raw = b""
+                if rot_path.is_file():
+                    with rot_path.open("rb") as rfh:
+                        rsize = rot_path.stat().st_size
+                        rfh.seek(max(0, rsize - _MAX_SOURCE_BYTES))
+                        prior_raw = rfh.read(_MAX_SOURCE_BYTES)
+                prior_events = _parse_event_lines(prior_raw) if prior_raw else []
+                merged_events = prior_events + evicted_events
+                rot_kept = []
+                rot_total = 0
+                seen_ids: set[str] = set()
+                for ev in reversed(merged_events):
+                    eid = ev.get("event_id")
+                    if isinstance(eid, str) and eid:
+                        if eid in seen_ids:
+                            continue
+                        seen_ids.add(eid)
+                    rline = json.dumps(ev, ensure_ascii=True, separators=(",", ":")).encode("utf-8") + b"\n"
+                    if rot_kept and rot_total + len(rline) > _MAX_EVENT_FILE_BYTES:
+                        break
+                    rot_kept.append(rline)
+                    rot_total += len(rline)
+                if rot_kept:
+                    _atomic_write(rot_path, b"".join(reversed(rot_kept)))
+            except OSError:
+                pass
         if kept:
             _atomic_write(path, b"".join(reversed(kept)))
         else:
@@ -1281,6 +1344,160 @@ def latest_event() -> dict | None:
         return None
     parsed = _parse_event_lines(raw)
     return parsed[-1] if parsed else None
+
+
+def _read_recent_events() -> list[dict]:
+    """Read recent telemetry events across both the active spool and .1 archive."""
+    path = _events_path()
+    chunks: list[bytes] = []
+    for candidate in (Path(str(path) + ".1"), path):
+        try:
+            if not candidate.is_file():
+                continue
+            size = candidate.stat().st_size
+            with candidate.open("rb") as fh:
+                fh.seek(max(0, size - _MAX_SOURCE_BYTES))
+                chunks.append(fh.read(_MAX_SOURCE_BYTES))
+        except OSError:
+            continue
+    if not chunks:
+        return []
+    combined = b"\n".join(chunks)
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for item in _parse_event_lines(combined):
+        eid = item.get("event_id")
+        if isinstance(eid, str) and eid:
+            if eid in seen:
+                continue
+            seen.add(eid)
+        deduped.append(item)
+    return deduped
+
+
+def _percentile_int(values: list[int], q: float) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * q))))
+    return int(ordered[idx])
+
+
+_RECOMMENDED_TIMEOUT_CACHE: dict[tuple, int] = {}
+
+
+def recommended_timeout_ms(backend: str | None, default_ms: int = 600_000,
+                           *, min_samples: int = 5) -> int:
+    """Compute an adaptive foreground timeout from local telemetry p95 latency.
+
+    Never lowers the caller's ``default_ms`` floor; when p95 latency for the
+    backend indicates longer healthy turns, scales up to ``max(default_ms,
+    min(2 * p95, 3_600_000))``.
+    """
+    if not backend:
+        return int(default_ms)
+    path = _events_path()
+    rot_path = Path(str(path) + ".1")
+    try:
+        st = path.stat()
+        p_mtime, p_size = st.st_mtime_ns, st.st_size
+    except OSError:
+        p_mtime, p_size = 0, 0
+    try:
+        rst = rot_path.stat()
+        r_mtime, r_size = rst.st_mtime_ns, rst.st_size
+    except OSError:
+        r_mtime, r_size = 0, 0
+    cache_key = (str(path), p_mtime, p_size, str(rot_path), r_mtime, r_size,
+                 backend, int(default_ms), int(min_samples))
+    cached = _RECOMMENDED_TIMEOUT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    events = _read_recent_events()
+    latencies = [
+        int(ev["elapsed_ms"])
+        for ev in events
+        if ev.get("backend") == backend
+        and ev.get("status") == "success"
+        and ev.get("operation") in ("dispatch", None)
+        and isinstance(ev.get("elapsed_ms"), int)
+        and ev["elapsed_ms"] > 0
+        and (ev.get("cohort") or "live") == "live"
+    ]
+    if len(latencies) < min_samples:
+        result_ms = int(default_ms)
+    else:
+        p95 = _percentile_int(latencies, 0.95)
+        if p95 is None:
+            result_ms = int(default_ms)
+        else:
+            result_ms = min(max(int(default_ms), int(p95 * 2)), 3_600_000)
+    if len(_RECOMMENDED_TIMEOUT_CACHE) >= 32:
+        _RECOMMENDED_TIMEOUT_CACHE.clear()
+    _RECOMMENDED_TIMEOUT_CACHE[cache_key] = result_ms
+    return result_ms
+
+
+def stats(*, cohort: str | None = None) -> dict:
+    """Aggregate local telemetry into per-backend reliability, latency, and failure stats."""
+    path = _events_path()
+    archive = Path(str(path) + ".1")
+    events = _read_recent_events()
+    if cohort:
+        events = [ev for ev in events if (ev.get("cohort") or "live") == cohort]
+    by_cohort: dict[str, int] = {}
+    by_failure: dict[str, int] = {}
+    backends: dict[str, dict] = {}
+    read_only_violations = 0
+    for ev in events:
+        c = str(ev.get("cohort") or "unknown")
+        by_cohort[c] = by_cohort.get(c, 0) + 1
+        fc = str(ev.get("failure_class") or "unknown")
+        by_failure[fc] = by_failure.get(fc, 0) + 1
+        ws = ev.get("workspace")
+        if isinstance(ws, dict) and ws.get("read_only_violation") is True:
+            read_only_violations += 1
+        b = str(ev.get("backend") or "unknown")
+        b_entry = backends.setdefault(b, {
+            "total": 0,
+            "success": 0,
+            "error": 0,
+            "timeout": 0,
+            "_latencies": [],
+        })
+        b_entry["total"] += 1
+        if ev.get("status") == "success":
+            b_entry["success"] += 1
+            if isinstance(ev.get("elapsed_ms"), int) and ev["elapsed_ms"] >= 0:
+                b_entry["_latencies"].append(int(ev["elapsed_ms"]))
+        else:
+            b_entry["error"] += 1
+            if fc == "timeout":
+                b_entry["timeout"] += 1
+    backend_summary: dict[str, dict] = {}
+    for b, data in sorted(backends.items()):
+        lats = data.pop("_latencies", [])
+        total = data["total"]
+        succ = data["success"]
+        backend_summary[b] = {
+            **data,
+            "success_rate": round(succ / total, 4) if total else None,
+            "p50_ms": _percentile_int(lats, 0.50),
+            "p95_ms": _percentile_int(lats, 0.95),
+            "recommended_timeout_ms": recommended_timeout_ms(b) if b != "unknown" else None,
+        }
+    return {
+        "schema": CONFIG_SCHEMA_VERSION,
+        "enabled": enabled(),
+        "event_file": _display_path(path),
+        "rotated_archive_present": archive.is_file(),
+        "cohort_filter": cohort,
+        "total_events": len(events),
+        "by_cohort": dict(sorted(by_cohort.items())),
+        "by_failure_class": dict(sorted(by_failure.items())),
+        "read_only_violations": read_only_violations,
+        "by_backend": backend_summary,
+    }
 
 
 def _load_json_source(path: Path) -> dict | None:

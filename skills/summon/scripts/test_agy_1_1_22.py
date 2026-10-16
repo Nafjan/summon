@@ -153,6 +153,24 @@ def test_json_model_discovery_is_one_bounded_hidden_utility_call(monkeypatch):
     assert kwargs["creationflags"] == 123 and kwargs["startupinfo"] == "hidden"
 
 
+def test_json_model_discovery_tolerates_leading_progress_line(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Fetching available models...\n" + _json_models("gemini-4-argon-high", "claude-opus-5-5-high"),
+            stderr="",
+        )
+
+    monkeypatch.setattr(_resolver.shutil, "which", lambda _name: "C:/agy/bin/agy.exe")
+    monkeypatch.setattr(_resolver.subprocess, "run", fake_run)
+    source, models, note = _resolver._agy_live_models()
+    assert (source, models, note) == ("live", ["gemini-4-argon-high", "claude-opus-5-5-high"], None)
+    assert len(calls) == 1
+
+
 def test_malformed_json_uses_one_legacy_text_fallback(monkeypatch):
     responses = iter([
         SimpleNamespace(returncode=0, stdout="not json", stderr=""),
@@ -633,6 +651,39 @@ def test_concurrent_agy_dispatches_share_one_capability_probe(
         monkeypatch.setattr(_builder, "_probe_agy_print_timeout",
                             lambda path: pytest.fail("waiter probed instead of sharing"))
         _builder._require_agy_print_timeout_support()
+    finally:
+        timer.cancel()
+
+
+def test_concurrent_agy_waiters_share_stalled_capability_probe(
+        monkeypatch, agy_probe_env):
+    import threading
+    import time
+
+    identity = ("C:/bin/agy.exe", 7)
+    lock = Path(str(agy_probe_env) + ".lock")
+    lock.write_text("peer-token", encoding="utf-8")
+
+    def peer_stalls():
+        slot = _builder._agy_capability_probe_slot(identity)
+        slot._publish_shared_stall(
+            _builder.AgyCapabilityError(
+                "agy capability probe (`agy --help`) did not answer within 60s",
+                kind="agy_capability_probe_stalled",
+                retryable=True,
+            )
+        )
+        lock.unlink()
+
+    timer = threading.Timer(0.3, peer_stalls)
+    timer.start()
+    try:
+        monkeypatch.setattr(_builder, "_probe_agy_print_timeout",
+                            lambda path: pytest.fail("waiter started a second probe after stall"))
+        with pytest.raises(_builder.AgyCapabilityError) as caught:
+            _builder._require_agy_print_timeout_support()
+        assert caught.value.kind == "agy_capability_probe_stalled"
+        assert caught.value.retryable is True
     finally:
         timer.cancel()
 

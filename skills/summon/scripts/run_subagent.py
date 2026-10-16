@@ -22,6 +22,7 @@ Implementation is split into sibling modules:
 from __future__ import annotations
 
 import argparse
+import atexit
 import copy
 from dataclasses import replace
 import hashlib
@@ -101,7 +102,7 @@ from _resolver import discover_models, resolve_cli  # noqa: E402
 # Keep a literal assignment: the release-contract parser uses the dispatcher
 # source as a machine-checkable companion.  `_telemetry.SUMMON_VERSION` must be
 # updated in the same release; the release contract checks both literals.
-__version__ = "3.5.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "3.6.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -205,18 +206,6 @@ def _write_error_out(out_path: str, env: dict) -> None:
     archiving FAILS the error is not written at all -- a lost answer is worse than a failure
     that is only on stdout. Anything else there (an error, a partial, junk) is simply
     replaced, and an empty path is simply written.
-
-    That invariant holds for a SINGLE writer, which is the documented model for a result
-    path (see references/fan-out.md: one --results-dir belongs to one run). The read, the
-    archive and the write are not one atomic step, so a second process writing a success
-    into the same path between this read and this write can still lose it. Locking is not
-    added because the shared-result-path case is already outside what summon supports; the
-    limit is stated here rather than implied away.
-
-    This exists because the naive version -- write the error, full stop -- destroyed
-    completed work whenever the failure came before the resume block could preserve it, and
-    the next version archived first but ignored the archive's own failure and overwrote
-    anyway. Both were caught in review; hence the invariant up front.
     """
     from _executor import is_terminal_success
     from _manifest import _clear_out_file
@@ -230,6 +219,154 @@ def _write_error_out(out_path: str, env: dict) -> None:
         if _clear_out_file(out_path, archive=True):
             return                      # could not preserve it -> do not overwrite it
     _write_out(out_path, env)
+
+
+_ACTIVE_OUT_LOCKS: set[str] = set()
+_CURRENT_OUT_LOCK: tuple[str, str] | None = None
+
+
+def _acquire_out_lock(out_path: str) -> int | None:
+    """Acquire an exclusive active-writer lock for ``out_path``.
+
+    Returns ``None`` when acquired, or the live owner's integer PID when a
+    concurrent Summon process already holds the lock. Stale locks from dead
+    processes are reclaimed under an atomic companion mutex so two waiters
+    cannot race to unlink a newly acquired replacement lock.
+    """
+    global _CURRENT_OUT_LOCK
+    lock_path = os.path.abspath(out_path) + ".active.lock"
+    reap_dir = lock_path + ".reap"
+    token = uuid.uuid4().hex
+    try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    except OSError:
+        return None
+    for _ in range(8):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"pid": os.getpid(), "token": token,
+                           "acquired_at": time.time()}, fh)
+                fh.flush()
+            _ACTIVE_OUT_LOCKS.add(lock_path)
+            _CURRENT_OUT_LOCK = (lock_path, token)
+            return None
+        except FileExistsError:
+            owner = None
+            for _ in range(5):
+                try:
+                    with open(lock_path, encoding="utf-8") as fh:
+                        owner = json.load(fh)
+                    break
+                except (OSError, ValueError, UnicodeDecodeError):
+                    time.sleep(0.01)
+            if owner is None:
+                try:
+                    if (time.time() - os.path.getmtime(lock_path)) < 2.0:
+                        time.sleep(0.05)
+                        continue
+                except OSError:
+                    continue
+            owner_pid = owner.get("pid") if isinstance(owner, dict) else None
+            owner_tok = owner.get("token") if isinstance(owner, dict) else None
+            acquired_at = owner.get("acquired_at") if isinstance(owner, dict) else None
+            is_expired = (
+                isinstance(acquired_at, (int, float))
+                and not isinstance(acquired_at, bool)
+                and (time.time() - float(acquired_at)) > 86400
+            )
+            if isinstance(owner_pid, int) and not isinstance(owner_pid, bool) and not is_expired:
+                if owner_pid == os.getpid() and lock_path in _ACTIVE_OUT_LOCKS:
+                    return owner_pid
+                if owner_pid != os.getpid() and _jobs._pid_liveness(owner_pid) in ("alive", "unknown"):
+                    return owner_pid
+            # Stale or unreadable lock: serialize reaping via atomic mkdir(reap_dir)
+            # and verify the lock token has not changed before unlinking.
+            reap_acquired = False
+            try:
+                os.mkdir(reap_dir)
+                reap_acquired = True
+            except FileExistsError:
+                try:
+                    if (time.time() - os.path.getmtime(reap_dir)) > 5.0:
+                        os.rmdir(reap_dir)
+                        os.mkdir(reap_dir)
+                        reap_acquired = True
+                except OSError:
+                    pass
+                if not reap_acquired:
+                    time.sleep(0.015)
+                    continue
+            except OSError:
+                return owner_pid if isinstance(owner_pid, int) else os.getpid()
+            try:
+                current = None
+                try:
+                    with open(lock_path, encoding="utf-8") as fh:
+                        current = json.load(fh)
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError, UnicodeDecodeError):
+                    current = None
+                if current is None:
+                    try:
+                        if (time.time() - os.path.getmtime(lock_path)) < 2.0:
+                            continue
+                    except OSError:
+                        continue
+                cur_tok = current.get("token") if isinstance(current, dict) else None
+                cur_pid = current.get("pid") if isinstance(current, dict) else None
+                if cur_tok != owner_tok:
+                    # Another waiter already replaced the stale lock.
+                    continue
+                if (isinstance(cur_pid, int) and not isinstance(cur_pid, bool)
+                        and not is_expired
+                        and cur_pid != os.getpid()
+                        and _jobs._pid_liveness(cur_pid) in ("alive", "unknown")):
+                    return cur_pid
+                try:
+                    os.unlink(lock_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return owner_pid if isinstance(owner_pid, int) else os.getpid()
+            finally:
+                if reap_acquired:
+                    try:
+                        os.rmdir(reap_dir)
+                    except OSError:
+                        pass
+        except OSError:
+            return None
+    # Contended after retries: read current live holder PID if present.
+    try:
+        with open(lock_path, encoding="utf-8") as fh:
+            final_owner = json.load(fh)
+        if isinstance(final_owner, dict) and isinstance(final_owner.get("pid"), int):
+            return final_owner["pid"]
+    except (OSError, ValueError, UnicodeDecodeError):
+        pass
+    return os.getpid()
+
+
+def _release_current_out_lock() -> None:
+    """Release the active-writer lock owned by this invocation, if any."""
+    global _CURRENT_OUT_LOCK
+    if _CURRENT_OUT_LOCK is None:
+        return
+    lock_path, token = _CURRENT_OUT_LOCK
+    _CURRENT_OUT_LOCK = None
+    _ACTIVE_OUT_LOCKS.discard(lock_path)
+    try:
+        with open(lock_path, encoding="utf-8") as fh:
+            owner = json.load(fh)
+        if isinstance(owner, dict) and owner.get("token") == token:
+            os.unlink(lock_path)
+    except (OSError, ValueError, UnicodeDecodeError):
+        pass
+
+
+atexit.register(_release_current_out_lock)
 
 
 def _request_identity(args) -> dict:
@@ -596,24 +733,27 @@ def _emit(obj: dict, *, operation: str | None = None,
     # Diagnostics are strictly opt-in and fail-soft. A malformed local telemetry
     # file must never change dispatch behavior or hide the real envelope.
     try:
-        # The executor's stream parser is the source of served-model evidence.
-        # Bind that result to a private telemetry capability here; raw envelope
-        # fields are intentionally ignored by the projector.  Keep the marker
-        # on a copy so it can never leak into the public JSON envelope or job
-        # file.
-        _telemetry_obj = dict(obj)
-        if trusted_executor_result:
-            # Only the in-process executor result may mint this marker.  A
-            # reused --out envelope, a --resume input, or a hand-built JSON
-            # object remains unverified even when it contains
-            # served_model_evidence="reported".
-            _marker = _executor.trusted_telemetry_model_evidence(obj)
-            if _marker is not None:
-                _telemetry_obj["_telemetry_model_evidence"] = _marker
-            _auth_marker = _executor.trusted_telemetry_auth_lifecycle(obj)
-            if _auth_marker is not None:
-                _telemetry_obj["_telemetry_auth_lifecycle"] = _auth_marker
-        _telemetry.record(_telemetry_obj, operation=operation or _EMIT_OPERATION)
+        # --dry-run is a provider-inert preview, not a terminal operation; do
+        # not emit it as an invalid_status / exit_code=None telemetry record.
+        if obj.get("status") != "dry_run":
+            # The executor's stream parser is the source of served-model evidence.
+            # Bind that result to a private telemetry capability here; raw envelope
+            # fields are intentionally ignored by the projector.  Keep the marker
+            # on a copy so it can never leak into the public JSON envelope or job
+            # file.
+            _telemetry_obj = dict(obj)
+            if trusted_executor_result:
+                # Only the in-process executor result may mint this marker.  A
+                # reused --out envelope, a --resume input, or a hand-built JSON
+                # object remains unverified even when it contains
+                # served_model_evidence="reported".
+                _marker = _executor.trusted_telemetry_model_evidence(obj)
+                if _marker is not None:
+                    _telemetry_obj["_telemetry_model_evidence"] = _marker
+                _auth_marker = _executor.trusted_telemetry_auth_lifecycle(obj)
+                if _auth_marker is not None:
+                    _telemetry_obj["_telemetry_auth_lifecycle"] = _auth_marker
+            _telemetry.record(_telemetry_obj, operation=operation or _EMIT_OPERATION)
     except Exception:  # noqa: BLE001 - observability cannot block a dispatch
         pass
     # The exact public object is the canonical terminal result.  Governed
@@ -687,7 +827,7 @@ def _write_job_file_text(text: str, job_file: str) -> None:
         # result, this call is an idempotent no-op.  Give the owner a short,
         # bounded window to finish its atomic replace; if it does not, preserve
         # the lock for diagnosis rather than racing an unknown writer.
-        for _ in range(25):
+        for _ in range(150):
             if _job_file_has_terminal_envelope(job_file):
                 return
             time.sleep(0.02)
@@ -887,7 +1027,11 @@ def _apply_gemini_thinking(model: str, effort: str) -> str:
     # Live AGY rosters expose slugs as well as display names. Replace a slug's
     # effort suffix rather than appending an incompatible display-name suffix.
     slug = model.strip()
-    if re.fullmatch(r"gemini-[a-z0-9][a-z0-9.-]*", slug, re.IGNORECASE):
+    if re.fullmatch(
+        r"(?:gemini-[a-z0-9][a-z0-9.-]*|claude-(?:opus|sonnet)-5-5(?:-(?:low|medium|high))?)",
+        slug,
+        re.IGNORECASE,
+    ):
         base = re.sub(r"-(?:low|medium|high)$", "", slug, flags=re.IGNORECASE)
         return f"{base}-{suffix.lower()}"
     base = re.sub(r"\s*\([^)]*\)\s*$", "", model).strip()
@@ -900,10 +1044,10 @@ def _unsupported_explicit_effort(cli: str | None, model: str | None,
 
     A roster ``effort:`` pin is part of the model identity, not a hint that a
     backend may silently ignore.  Kimi only exposes the reviewed effort
-    controls for K3, AGY maps effort only onto Gemini model variants, and the
-    remaining backends have no reviewed effort transport.  Ambient/default
-    effort remains best-effort; this guard applies only when the caller or
-    roster explicitly asked for a level.
+    controls for K3, AGY maps effort onto Gemini and tiered Claude 5.5 model
+    variants, and the remaining backends have no reviewed effort transport.
+    Ambient/default effort remains best-effort; this guard applies only when
+    the caller or roster explicitly asked for a level.
     """
     if not effort:
         return None
@@ -916,10 +1060,11 @@ def _unsupported_explicit_effort(cli: str | None, model: str | None,
                 f"{model!r}; use kimi-code/k3 or kimi-code/k3-256k, or remove "
                 "the effort pin")
     if backend == "agy":
-        if selected.startswith("gemini"):
+        if (selected.startswith("gemini")
+                or re.fullmatch(r"claude-(?:opus|sonnet)-5-5(?:-(?:low|medium|high))?", selected)):
             return None
         return (f"explicit effort {effort!r} is unsupported for AGY model "
-                f"{model!r}; AGY effort requires a Gemini model variant")
+                f"{model!r}; AGY effort requires a Gemini or tiered Claude 5.5 model variant")
     if backend == "gemini":
         return (f"explicit effort {effort!r} is unsupported for the frozen "
                 "gemini CLI; use the agy Gemini route or remove the effort pin")
@@ -1703,7 +1848,8 @@ def main() -> None:
         _print_error("bug-report options require the bug-report command")
         sys.exit(1)
     if (getattr(args, "telemetry_enable", False) or getattr(args, "telemetry_disable", False)
-            or getattr(args, "telemetry_status", False) or getattr(args, "telemetry_clear", False)):
+            or getattr(args, "telemetry_status", False) or getattr(args, "telemetry_clear", False)
+            or getattr(args, "telemetry_stats", False)):
         try:
             if args.telemetry_enable:
                 _diag = _telemetry.set_enabled(True)
@@ -1711,10 +1857,24 @@ def main() -> None:
                 _diag = _telemetry.set_enabled(False)
             elif args.telemetry_clear:
                 _diag = _telemetry.clear_events()
+            elif getattr(args, "telemetry_stats", False):
+                _diag = _telemetry.stats()
             else:
                 _diag = _telemetry.status()
             if args.json:
                 print(json.dumps(_diag, ensure_ascii=False))
+            elif getattr(args, "telemetry_stats", False) and getattr(args, "format", "json") == "table":
+                _by_b = _diag.get("by_backend") or {}
+                print(f"Total events: {_diag.get('total_events', 0)} (rotated archive: {_diag.get('rotated_archive_present', False)})")
+                print(f"{'BACKEND':<16} {'CALLS':>6} {'OK%':>7} {'P50_MS':>9} {'P95_MS':>9} {'TIMEOUT':>7}")
+                print("-" * 60)
+                for _bname, _bstat in sorted(_by_b.items()):
+                    _tot = _bstat.get("total", 0)
+                    _rate = f"{float(_bstat.get('success_rate') or 0.0) * 100:.1f}%"
+                    _p50 = str(_bstat.get("p50_ms") if _bstat.get("p50_ms") is not None else "-")
+                    _p95 = str(_bstat.get("p95_ms") if _bstat.get("p95_ms") is not None else "-")
+                    _to = str(_bstat.get("timeout", 0))
+                    print(f"{_bname:<16} {_tot:>6} {_rate:>7} {_p50:>9} {_p95:>9} {_to:>7}")
             else:
                 print(json.dumps(_diag, ensure_ascii=False, indent=2))
             sys.exit(0)
@@ -1869,6 +2029,7 @@ def main() -> None:
     # jobs list/status/wait: read-only registry queries; no dispatch. Answer and
     # exit before any agent/prompt/cwd validation.
     if (args.jobs_list or args.jobs_status or args.jobs_wait
+            or getattr(args, "jobs_wait_all", False)
             or args.jobs_extend or args.jobs_cancel or args.jobs_steer
             or args.jobs_resume or getattr(args, "jobs_revalidate", None)):
         sys.exit(_background.run_jobs_query(
@@ -1959,7 +2120,8 @@ def main() -> None:
 
     def _die(msg: str, exit_code: int = 1, *, error_kind: str | None = None,
              details: dict | None = None, extra: dict | None = None) -> None:
-        env = {"result": "", "exit_code": exit_code, "status": "error", "error": msg}
+        env = {"result": "", "exit_code": exit_code, "status": "error", "error": msg,
+               "refusal": True}
         _mark_not_run(env)
         finalize_exit_fields(env)
         if error_kind:
@@ -1982,11 +2144,14 @@ def main() -> None:
         # combination would be self-contradictory, and it littered a file into the caller's
         # cwd) and not under --dry-run (which promises to touch nothing).
         if (getattr(args, "out", None) and not getattr(args, "dry_run", False)
-                and not getattr(args, "background", False)):
+                and not getattr(args, "background", False)
+                and error_kind != "out_path_collision"
+                and _CURRENT_OUT_LOCK is not None):
             try:
                 _write_error_out(args.out, env)
             except Exception:  # noqa: BLE001 — reporting the original error matters more
                 pass
+        _release_current_out_lock()
         _emit(env, operation=_EMIT_OPERATION)
         sys.exit(exit_code)
 
@@ -2007,13 +2172,6 @@ def main() -> None:
             "kind": "immutable_per_job_snapshot",
             "scripts_sha256": _actual_scripts_sha,
         }
-
-    if args.resume and args.worktree is not None:
-        _die("--resume and --worktree are incompatible: a session lives in the "
-             "original project dir, not a fresh worktree")
-    if args.worktree is not None and getattr(args, "artifacts", None):
-        _die("--artifact and --worktree are incompatible: loose files are measured under "
-             "the original --cwd but an isolated worktree may not contain them")
 
     # --dry-run is a SINGLE-dispatch preview only. Combining it with modes that
     # fan out or detach would otherwise slip past the dry-run exit and run real
@@ -2057,6 +2215,24 @@ def main() -> None:
     if args.council:
         from _council import run_council
         sys.exit(run_council(args))
+
+    if args.out and not args.dry_run and not args.background:
+        _lock_holder = _acquire_out_lock(args.out)
+        if _lock_holder is not None:
+            _die(
+                f"--out path {args.out!r} is already locked by an active Summon process (pid {_lock_holder})",
+                error_kind="out_path_collision",
+                extra={"provider_contacted": False, "retryable": True,
+                       "result_usable": False,
+                       "out_lock": {"lock_holder_pid": _lock_holder}},
+            )
+
+    if args.resume and args.worktree is not None:
+        _die("--resume and --worktree are incompatible: a session lives in the "
+             "original project dir, not a fresh worktree")
+    if args.worktree is not None and getattr(args, "artifacts", None):
+        _die("--artifact and --worktree are incompatible: loose files are measured under "
+             "the original --cwd but an isolated worktree may not contain them")
 
     # --prompt-file: resolve to a prompt BEFORE the background handler (its
     # validation needs args.prompt). The public/external form retains the
@@ -2306,6 +2482,7 @@ def main() -> None:
                     _pw = _pw if isinstance(_pw, list) else ([] if _pw is None else [str(_pw)])
                     prior["warnings"] = _pw + [_note]
                 prior["skipped"] = True
+                _release_current_out_lock()
                 _emit(prior, operation=_EMIT_OPERATION)
                 sys.exit(0 if is_terminal_success(prior) else 1)
 
@@ -2417,9 +2594,23 @@ def main() -> None:
         if getattr(args, "cli", None):
             agents = [a for a in agents
                       if (a.get("run_agent") or a.get("cli")) == args.cli]
+        if getattr(args, "list_for", None):
+            from _loader import KNOWN_TASK_INTENTS, filter_agents_for_task
+            agents = filter_agents_for_task(agents, args.list_for)
+            _q_for = str(args.list_for).strip().lower()
+            _for_warn = (
+                f"unknown task intent {args.list_for!r}; known intents: "
+                "review, implement, verify, debug, design, fast"
+                if _q_for and _q_for not in KNOWN_TASK_INTENTS and not agents
+                else None
+            )
+        else:
+            _for_warn = None
         if getattr(args, "format", "json") == "table":
             from _builder import roster_permission_lint
             sys.stdout.write(_format_agents_table(agents))
+            if _for_warn:
+                print(f"warning: {_for_warn}", file=sys.stderr)
             for _w in roster_permission_lint(agents):
                 print(f"warning: {_w}", file=sys.stderr)
             sys.exit(0)
@@ -2429,6 +2620,10 @@ def main() -> None:
         # report, 2026-07-28 -- two of the offenders there were named reviewers).
         from _builder import roster_permission_lint
         _out = {"agents": agents, "agents_dir": agents_dir}
+        if getattr(args, "list_for", None):
+            _out["filter_for"] = args.list_for
+            if _for_warn:
+                _out["filter_warning"] = _for_warn
         try:
             from _loader import discover_agent_packs
             _packs = discover_agent_packs()
@@ -2701,13 +2896,17 @@ def main() -> None:
         )
     if cli == "agy":
         # agy has no --effort flag; thinking is the model-name suffix. Apply an
-        # EXPLICIT effort to a Gemini model; the global default never rewrites an
-        # agy model (respects the variant chosen in `model:`).
-        if effort and _explicit_effort and final_model and final_model.strip().lower().startswith("gemini"):
+        # EXPLICIT effort to a Gemini or tiered Claude 5.5 model; the global
+        # default never rewrites an agy model (respects the variant chosen in `model:`).
+        _agy_sel = (final_model or "").strip().lower()
+        if effort and _explicit_effort and final_model and (
+            _agy_sel.startswith("gemini")
+            or re.fullmatch(r"claude-(?:opus|sonnet)-5-5(?:-(?:low|medium|high))?", _agy_sel)
+        ):
             final_model = _apply_gemini_thinking(final_model, effort)
         elif _explicit_effort:
-            print("note: agy thinking is a model-name suffix (e.g. 'Gemini 3.1 Pro (High)'); "
-                  "--effort maps only Gemini agy models — set it in `model:` / see --list-models",
+            print("note: agy thinking is a model-name suffix (e.g. 'gemini-4-argon-high'); "
+                  "--effort maps only Gemini and tiered Claude 5.5 agy models — set it in `model:` / see --list-models",
                   file=sys.stderr)
         effort = None
     elif cli == "kimi":
@@ -2736,6 +2935,11 @@ def main() -> None:
             base_url, api_key_env = _endpoint_for_dispatch(_identity, agent_file, agents_dir)
         except (OSError, ValueError) as e:
             _die(f"openai-compat agent {getattr(args, '_resolved_agent', args.agent)!r}: {e}")
+        try:
+            from _apibackend import normalize_coding_plan_model
+            final_model = normalize_coding_plan_model(base_url, final_model)
+        except Exception:  # noqa: BLE001
+            pass
 
     # Transport: --transport flag > agent `transport:` frontmatter > subprocess.
     # ACP requires NATIVE backend support; asking for it anywhere else is a
@@ -2902,6 +3106,31 @@ def main() -> None:
         require_tools_flag=bool(getattr(args, "require_tools", False)),
         agent_file=agent_file,
     )
+
+    # Resolve adaptive foreground timeout BEFORE --dry-run so preflight previews
+    # the exact timeout_ms and timeout_source that live execution will use.
+    _explicit_timeout = any(tok.split("=", 1)[0] == "--timeout" for tok in argv)
+    _is_auto_timeout = getattr(args.timeout, "is_auto", False)
+    _base_timeout_ms = int(args.timeout)
+    if ((_is_auto_timeout or not _explicit_timeout)
+            and _telemetry.enabled()
+            and (os.environ.get("SUMMON_TELEMETRY_FILE")
+                 or _telemetry._default_cohort() == "live")):
+        _rec_ms = _cli.Milliseconds(
+            _telemetry.recommended_timeout_ms(cli, _base_timeout_ms))
+        _rec_ms.is_auto = True
+        args.timeout = _rec_ms
+        args._timeout_source = (
+            "adaptive_telemetry"
+            if int(_rec_ms) != _base_timeout_ms or _is_auto_timeout
+            else "default"
+        )
+    else:
+        args._timeout_source = (
+            "adaptive_telemetry" if _is_auto_timeout
+            else "explicit" if _explicit_timeout
+            else "default"
+        )
 
     if args.dry_run:
         _dry_view = _dry_run_view(
@@ -3235,10 +3464,11 @@ def _reseal_effective_decision(view: dict) -> dict:
 def _effective_decision_view(invocation, args) -> dict:
     """Public, provider-inert explanation of the authority that wins preflight.
 
-    Phase 1 starts with exact-agent parity only. Usage and future lane inputs are
-    explicitly not consulted here, so this additive receipt cannot alter routing.
+    The effective route is already resolved before this projection is built.
+    Usage and future lane inputs are not consulted here, and this receipt never
+    changes the selected route or launches a provider request.
     """
-    from _apibackend import payg_consent_allowed
+    from _apibackend import classify_openai_compat_route, payg_consent_allowed
     from _builder import (credit_spend_allowed, permission_enforcement,
                           selects_credit_only, unenforceable_permission_authorized)
     from _backend_policy import route_provider
@@ -3291,6 +3521,17 @@ def _effective_decision_view(invocation, args) -> dict:
     _provider, _provider_evidence = route_provider(
         invocation.cli, _declared_provider, invocation.model,
         getattr(args, "_provider_endpoint_mode", "none"))
+    _api_route = (
+        classify_openai_compat_route(
+            invocation.base_url, invocation.api_key_env,
+            payg_authorized=payg_allowed,
+            payg_source=("dispatch_flag" if payg_flag else
+                         "operator_configuration" if payg_allowed else "none"))
+        if invocation.cli == "openai-compat" and invocation.base_url else None)
+    _api_route_spend_authorized = bool(
+        _api_route and _api_route.get("authorized"))
+    _route_requires_spend = bool(
+        _api_route and _api_route.get("requires_spend"))
     _decision_provider = None if _provider == "unknown" else _provider
     _public_declared_provider = (
         _declared_provider if isinstance(_declared_provider, str)
@@ -3316,15 +3557,23 @@ def _effective_decision_view(invocation, args) -> dict:
             "requires_retry": False,
             "requires_fallback": False,
             # Credit-only classification is a Claude subscription-CLI policy.
-            # An identically named model on openai-compat is already governed by
-            # that route's API/PAYG boundary and must not inherit this refusal.
+            # Direct remote API routes carry their own explicit spend boundary;
+            # Coding Plan and loopback routes remain non-metered here.
             "requires_spend": bool(
-                invocation.cli == "claude" and selects_credit_only(
-                    invocation.model, invocation.extra_args)),
+                _route_requires_spend
+                or (invocation.cli == "claude" and selects_credit_only(
+                    invocation.model, invocation.extra_args))),
         }],
         constraints={
             "permission_ceiling": getattr(args, "max_permission", None),
-            "spend_authorized": bool(credit_allowed or payg_allowed),
+            # API routes carry route-specific authority. A global PAYG setting
+            # must not authorize an unrelated endpoint, and a configured
+            # BytePlus /api/v3 key must not substitute for operator consent.
+            "spend_authorized": bool(
+                _api_route_spend_authorized if _api_route is not None else
+                credit_allowed if invocation.cli == "claude" and
+                selects_credit_only(invocation.model, invocation.extra_args)
+                else False),
             "enforcement": enforcement,
             "unenforceable_authorized": unenforceable_authorized,
             "corrective_allowed": bool(
@@ -3358,6 +3607,11 @@ def _effective_decision_view(invocation, args) -> dict:
                       "operator_configuration" if payg_allowed else "none",
         },
     })
+    if _api_route is not None:
+        view["authority"]["api"] = {
+            "authorized": _api_route_spend_authorized,
+            "source": _api_route.get("authorization_source", "none"),
+        }
     view["usage"] = usage_view
     view["unknowns"] = ["policy_digest", "roster_digest", "usage_observation"]
     return _reseal_effective_decision(view)
@@ -3444,7 +3698,8 @@ def _format_agents_table(rows: list[dict]) -> str:
 def _dry_run_view(invocation, args, agents_dir: str,
                   agent_file: str | None = None,
                   artifact_manifest: dict | None = None,
-                  text_seat_decision: dict | None = None) -> dict:
+                  text_seat_decision: dict | None = None,
+                  launch_control=None) -> dict:
     """The fully resolved dispatch, without executing. For agy the per-call
     profile is NOT built (that copies OAuth tokens = a mutation); the wrapper
     path is shown instead."""
@@ -3516,6 +3771,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
                              if invocation.cli in _PERMISSION_MAPPING else None),
         "extra_args": list(invocation.extra_args),
         "timeout_ms": args.timeout,
+        "timeout_source": getattr(args, "_timeout_source", "default"),
         "worktree": ("would create" if args.worktree is not None else None),
         "isolated_lane": bool(getattr(args, "isolated_lane", False)),
         "allow_tool_credentials": bool(getattr(args, "allow_tool_credentials", False)),
@@ -3610,14 +3866,70 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 view["model_vendor"] = _compat["model_vendor"]
             view["compatible_backends"] = list(_compat["compatible_backends"])
             view["recommended_backend"] = _compat["recommended_backend"]
+    _direct_payg_route = False
+    _direct_payg_consented = False
+    if invocation.cli == "openai-compat":
+        try:
+            from _apibackend import (is_byteplus_platform_endpoint,
+                                     payg_consent_allowed)
+            _direct_payg_route = is_byteplus_platform_endpoint(invocation.base_url)
+            if _direct_payg_route:
+                _direct_payg_consented = payg_consent_allowed(
+                    getattr(invocation, "allow_payg", False))
+                view["payg_consent"] = _direct_payg_consented
+                view["billing_predicted"] = {
+                    "source": "api",
+                    "note": "BytePlus Platform /api/v3 is per-token PAYG",
+                }
+                if not _direct_payg_consented:
+                    from _apibackend import _DIRECT_PAYG_CONSENT_ERROR
+                    view["would_refuse"] = True
+                    view["error_kind"] = "payg_consent_missing"
+                    view["refusal"] = _DIRECT_PAYG_CONSENT_ERROR
+                    _note_refusal(view, "payg_consent_missing")
+                    view["provider_contacted"] = False
+                    view["result_usable"] = False
+                elif (not isinstance(getattr(invocation, "api_key_env", None), str)
+                      or not invocation.api_key_env.strip()):
+                    view["would_refuse"] = True
+                    view["error_kind"] = "credential_missing"
+                    view["refusal"] = (
+                        "BytePlus Platform /api/v3 requires a declared api_key_env")
+                    _note_refusal(view, "credential_missing")
+                    view["provider_contacted"] = False
+                    view["result_usable"] = False
+        except Exception:  # noqa: BLE001 - preview must remain renderable
+            # Consent uncertainty on a recognized direct PAYG route fails
+            # closed. Do not inspect credentials to make a refused preview.
+            _direct_payg_route = True
+            _direct_payg_consented = False
+            view["payg_consent"] = False
+            view["would_refuse"] = True
+            view["error_kind"] = "payg_consent_missing"
+            view["refusal"] = (
+                "BytePlus Platform /api/v3 requires explicit operator PAYG consent")
+            _note_refusal(view, "payg_consent_missing")
+            view["provider_contacted"] = False
+            view["result_usable"] = False
     if (invocation.cli == "openai-compat" and not view.get("would_refuse")
             and not _decision_projection_invalid
-            and getattr(invocation, "api_key_env", None)):
+            and (getattr(invocation, "api_key_env", None)
+                 or _direct_payg_route)):
         # Fail closed on a missing provider credential before anyone mistakes a
         # slow unauthenticated request for a hang (field report 2026-09-19).
         try:
             from _apibackend import api_key_available as _key_ok
-            if not _key_ok(invocation.api_key_env, invocation.base_url):
+            if (_direct_payg_route and
+                    (not isinstance(getattr(invocation, "api_key_env", None), str)
+                     or not invocation.api_key_env.strip())):
+                view["would_refuse"] = True
+                view["error_kind"] = "credential_missing"
+                view["refusal"] = (
+                    "BytePlus Platform /api/v3 requires a declared api_key_env")
+                _note_refusal(view, "credential_missing")
+                view["provider_contacted"] = False
+                view["result_usable"] = False
+            elif not _key_ok(invocation.api_key_env, invocation.base_url):
                 view["would_refuse"] = True
                 view["error_kind"] = "credential_missing"
                 view["refusal"] = (f"openai-compat: ${invocation.api_key_env} is not "
@@ -3738,14 +4050,27 @@ def _dry_run_view(invocation, args, agents_dir: str,
         view["base_url"] = invocation.base_url
         view["endpoint"] = (invocation.base_url or "?") + "/chat/completions"
         view["api_key_env"] = invocation.api_key_env
-        try:
-            from _apibackend import api_key_available
-            view["api_key_present"] = api_key_available(
-                invocation.api_key_env, invocation.base_url)
-        except Exception:  # noqa: BLE001 - preflight must never fail on diagnostics
-            view["api_key_present"] = bool(
-                invocation.api_key_env and os.environ.get(invocation.api_key_env))
-        view["billing"] = {"source": "api"}
+        if (_direct_payg_route and
+                (not _direct_payg_consented
+                 or not isinstance(getattr(invocation, "api_key_env", None), str)
+                 or not invocation.api_key_env.strip())):
+            # A refused direct PAYG preview does not need to resolve or reveal
+            # whether a local credential is present.
+            view["api_key_present"] = None
+        else:
+            try:
+                from _apibackend import api_key_available
+                view["api_key_present"] = api_key_available(
+                    invocation.api_key_env, invocation.base_url)
+            except Exception:  # noqa: BLE001 - preflight must never fail on diagnostics
+                view["api_key_present"] = bool(
+                    invocation.api_key_env and os.environ.get(invocation.api_key_env))
+        view["billing"] = {
+            "source": "api",
+            **({"payg_consent_required": True,
+                "payg_consent": _direct_payg_consented}
+               if _direct_payg_route else {}),
+        }
         # Coding Plan: honest quota note + refuse known-bad model ids in preflight.
         try:
             from _apibackend import coding_plan_billing, coding_plan_model_error, \
@@ -3794,20 +4119,28 @@ def _dry_run_view(invocation, args, agents_dir: str,
                 view["command"] = cmd
             view["args"] = [_dry_run_arg_preview(a) for a in argv]
             view["env_overrides"] = sorted(env) if env else []
-            # The live dispatch refuses an over-long command line before spawn; say
-            # so here, before anyone pays for a launch to learn it.
-            from _executor import argv_overflow_reroutes_to_acp, dry_run_argv_length_error
-            _argv_refusal = dry_run_argv_length_error(invocation, cmd, argv, env)
-            if _argv_refusal and argv_overflow_reroutes_to_acp(invocation, argv):
+            # The live dispatch refuses an over-long command line or transport budget
+            # violation before spawn; say so here, before anyone pays for a launch.
+            from _executor import dry_run_transport_and_argv_refusal
+            _eff_lc = launch_control
+            if _eff_lc is None:
+                if getattr(args, "fleet_approval", None) or getattr(args, "resume_job", None):
+                    from types import SimpleNamespace as _SNS
+                    _eff_lc = _SNS(allow_secondary=False)
+                else:
+                    _eff_lc = _chat_launch_control(invocation)
+            _refusal_kind, _argv_refusal, _acp_rerouted = dry_run_transport_and_argv_refusal(
+                invocation, cmd, argv, env, launch_control=_eff_lc)
+            if _acp_rerouted:
                 # Mirrors the executor: a native-ACP backend is rerouted, not refused.
                 view.setdefault("warnings", []).append(
                     "the prompt exceeds the OS command-line limit for the subprocess "
                     "transport; the dispatch would be routed over ACP instead")
-            elif _argv_refusal:
+            elif _argv_refusal and _refusal_kind:
                 view["would_refuse"] = True
-                view["error_kind"] = "prompt_too_long_for_argv"
+                view["error_kind"] = _refusal_kind
                 view["refusal"] = _argv_refusal
-                _note_refusal(view, "prompt_too_long_for_argv")
+                _note_refusal(view, _refusal_kind)
         except ValueError as e:
             view["error"] = str(e)
     _tags = _agent_tags_from_file(agent_file)
@@ -4748,7 +5081,18 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         # `report`/`report_ok` are the authoritative parsed view.
         result["report"] = retry.get("report")
         result["report_ok"] = True
+        result["report_source"] = retry.get("report_source", "structured")
+        if retry.get("report_text"):
+            result["report_text"] = retry.get("report_text")
+        result["summary"] = retry.get("summary")
+        result["confidence"] = retry.get("confidence")
+        if "verdict" in retry:
+            result["verdict"] = retry.get("verdict")
+        if "environment_handoff" in retry:
+            result["environment_handoff"] = retry.get("environment_handoff")
         result["status"] = retry.get("status")    # DONE->success; PARTIAL/BLOCKED reflected
+        if retry.get("status") != "success" and retry.get("error"):
+            result.setdefault("error", retry["error"])
         result.pop("suspect", None)
         result["contract_repaired"] = True
         result["repaired_report_text"] = retry.get("result")   # the corrected block, for reference
@@ -4816,6 +5160,8 @@ def _write_out(path: str, result: dict) -> None:
         _jobs._replace_with_retry(tmp, path)
     except OSError as e:
         result["out_error"] = f"failed to write --out {path}: {e}"
+    finally:
+        _release_current_out_lock()
 
 
 def _resolve_job_file() -> str | None:
@@ -4837,6 +5183,31 @@ def _crash_envelope(e: BaseException) -> dict:
     """The last-resort crash envelope. The exit-code-clarity fields are inlined
     (not via finalize_exit_fields) so a crash in the executor import path can't
     sink the net. A module-level function so the shape stays testable."""
+    if isinstance(e, KeyboardInterrupt):
+        return {
+            "result": "",
+            "status": "cancelled",
+            "exit_code": 130,
+            "error": "dispatch interrupted by KeyboardInterrupt",
+            "error_kind": "interrupted",
+            "failure_class": "cancelled",
+            "retryable": True,
+            "result_usable": False,
+            "backend_exit_code": 130,
+            "raw_backend_exit_code": 130,
+            "normalized_exit_code": 130,
+            "dispatcher_status": "cancelled",
+            "attempts": None,
+            "attempt_status": "unknown",
+            "execution_status": "cancelled",
+            "provider_contacted": None,
+            "model": {"requested": None, "targeted": None, "served": None,
+                      "resolved": None, "models_used": [], "evidence_source": None},
+            "served_model_evidence": "absent",
+            "model_match": None,
+            "named_model_verified": False,
+            "normalization_reason": "dispatch interrupted by KeyboardInterrupt before completion",
+        }
     return {"result": "", "status": "error", "exit_code": 1,
             "error": f"uncaught {type(e).__name__}: {e}",
             "backend_exit_code": 1, "dispatcher_status": "error",
@@ -4923,4 +5294,6 @@ if __name__ == "__main__":
                 pass
         else:
             print(json.dumps(err, ensure_ascii=False))
-        sys.exit(1)
+        sys.exit(int(err.get("exit_code") or 1))
+    finally:
+        _release_current_out_lock()

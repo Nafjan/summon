@@ -129,10 +129,17 @@ def _parse_agy_json_models(stdout: str) -> list[str] | None:
     ``None`` means the JSON contract was unavailable or malformed and permits
     the legacy text fallback.  An empty list is a valid machine response.
     """
+    payload = None
     try:
         payload = json.loads(stdout)
     except (json.JSONDecodeError, TypeError, ValueError):
-        return None
+        if isinstance(stdout, str):
+            brace = stdout.find("{")
+            if brace > 0:
+                try:
+                    payload = json.loads(stdout[brace:])
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    payload = None
     if not isinstance(payload, dict) or str(payload.get("status", "")).upper() != "SUCCESS":
         return None
     command = payload.get("command")
@@ -493,5 +500,40 @@ def discover_models(cli: str | None = None, *, refresh: bool = False) -> dict:
                 "note": note or ("No Coding Plan roster cache. Run `summon models --cli "
                                   "arkcli --refresh` after `arkcli auth login`."),
             }, "arkcli")
+
+    if key == "openai-compat":
+        catalog_models = [
+            "deepseek-v4-1-flash",
+            "glm-5-3-flash",
+            "z-ai/glm-5.3-flash",
+            "deepseek/deepseek-v4.1-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "glm-5.2",
+            "dola-seed-2.0-code",
+            "kimi-k2.5",
+        ]
+        try:
+            from _apibackend import BUILTIN_PROVIDERS, load_coding_plan_roster
+            roster = load_coding_plan_roster(refresh_if_stale=False)
+            if roster and isinstance(roster.get("models"), list):
+                for m in roster["models"]:
+                    if isinstance(m, dict):
+                        mid = (m.get("output_name") or m.get("id") or m.get("name") or "").strip()
+                        if mid and mid not in catalog_models:
+                            catalog_models.append(mid)
+            providers = sorted(BUILTIN_PROVIDERS.keys())
+        except Exception:  # noqa: BLE001
+            providers = ["byteplus-coding", "zai-coding-plan", "openrouter", "nous"]
+        info["openai-compat"] = stamp({
+            "source": "static",
+            "models": catalog_models,
+            "providers": providers,
+            "note": (
+                "OpenAI-compatible HTTP routes (byteplus-coding uses hyphenated IDs "
+                "deepseek-v4-1-flash and glm-5-3-flash; openrouter/zai-coding-plan use "
+                "z-ai/glm-5.3-flash and glm-5.3-flash)."
+            ),
+        }, "openai-compat")
 
     return info

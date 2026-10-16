@@ -43,3 +43,21 @@ payload names or private paths.
   no installation refresh was performed.
 
 These focused results do not replace a clean, current-HEAD full release capture.
+
+## Post-release ModelArk route and identity triage
+
+The installed-seat review found two source risks that are now tracked as
+separate findings. They concern roster and decision evidence only; they do not
+establish historical provider contact or billing.
+
+| ID | Severity | Finding | Evidence | Disposition |
+| --- | --- | --- | --- | --- |
+| AR350-06 | P1 | A stale handoff described a Platform `/api/v3` ModelArk route as a subscription lane, which could reintroduce misleading onboarding prose during install or seat regeneration. | `docs/planning/SUMMON_DEV_HANDOFF.md:76-84,103-116`; `skills/summon/references/backends.md:333-381`; `skills/summon/agents/byteplus-coder.md:1-18` | Handoff wording now separates Platform API billing from Coding Plan quota and names only `byteplus-coder` as the shipped Coding Plan seat. The shared provider registry remains unchanged. The provider-inert decision projection records metered remote API routes as requiring spend. ModelArk Platform `/api/v3` needs both explicit operator PAYG consent and a declared key boundary; generic API routes retain explicit endpoint/key authority. Subscription and loopback routes remain non-metered. |
+| AR350-07 | P1 | A dated requested model can receive an unversioned or different served identity. Treating that response as an alias would overstate exact-model evidence. | `skills/summon/references/model-catalog.json:341-360`; `skills/summon/scripts/test_model_routing.py:126-170`; `skills/summon/scripts/_executor.py` exact-model verification path | Exact-model verification remains fail-closed. The unversioned response is recorded as an identity qualification issue; no alias normalization, reroute, or second provider contact is authorized by this review. |
+
+The new API spend projection is advisory and provider-inert. It does not
+authorize a PAYG fallback, query usage, read a credential, or contact a
+provider. ModelArk Platform `/api/v3` cannot be authorized by endpoint/key
+declaration alone; it also requires explicit operator PAYG consent. A remote
+route without a declared credential boundary remains ineligible in the
+decision receipt, preserving fail-closed behavior for uncertain spend.

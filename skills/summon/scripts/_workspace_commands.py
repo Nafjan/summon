@@ -183,6 +183,20 @@ def present_lookup(binding, observation):
             "task_or_provider_action": False}
 
 
+def _coherent_workspace(coordinator):
+    try:
+        for _ in range(2):
+            state, torn, before = coordinator._load_with_snapshot()
+            _records, later_torn, after = coordinator._read_records_snapshot()
+            if not torn and not later_torn and before == after:
+                workspace = state.get("workspace") if isinstance(state, dict) else None
+                if isinstance(workspace, dict):
+                    return workspace
+    except Exception:
+        pass
+    raise WorkspaceCommandError("command_snapshot_unavailable")
+
+
 class OperatorCommandAdapter:
     """Trusted-host bridge to actual public runtime methods, never a grant issuer.
 
@@ -225,15 +239,7 @@ class OperatorCommandAdapter:
             raise WorkspaceCommandError("command_scope_required") from None
 
     def _workspace(self):
-        try:
-            for _ in range(2):
-                state, torn, before = self.coordinator._load_with_snapshot()
-                _records, later_torn, after = self.coordinator._read_records_snapshot()
-                if not torn and not later_torn and before == after:
-                    return state["workspace"]
-        except Exception:
-            pass
-        raise WorkspaceCommandError("command_snapshot_unavailable")
+        return _coherent_workspace(self.coordinator)
 
     def describe(self, workspace, view_scope):
         if view_scope.audience != "operator":
@@ -391,9 +397,7 @@ class OperatorDispositionAdapter:
     def perform(self, body, *, view_scope, lookup=False, authorization_constraint=None):
         if type(lookup) is not bool:
             _refuse("invalid_command_request")
-        workspace = self._runtime._coordinator._load()[0].get("workspace")
-        if not isinstance(workspace, dict):
-            _refuse("command_snapshot_unavailable")
+        workspace = _coherent_workspace(self.coordinator)
         request, item = self._bind(workspace, view_scope, body, for_lookup=lookup)
         try:
             method = (self._runtime.reconcile_operator_disposition if lookup
@@ -523,9 +527,12 @@ class OperatorLinkedReplacementAdapter:
     def perform(self, body, *, view_scope, lookup=False, authorization_constraint=None):
         if type(lookup) is not bool or view_scope.audience != "operator":
             _refuse("invalid_linked_request")
-        workspace = self._runtime._coordinator._load()[0].get("workspace")
-        if not isinstance(workspace, dict):
-            _refuse("command_snapshot_unavailable")
+        try:
+            workspace = _coherent_workspace(self.coordinator)
+        except WorkspaceCommandError as exc:
+            if str(exc) == "command_snapshot_unavailable":
+                raise WorkspaceCommandError("linked_snapshot_unavailable") from None
+            raise
         proposal, _targets = self._bind(workspace, view_scope, body)
         try:
             method = (self._runtime.reconcile_operator_linked_replacement if lookup

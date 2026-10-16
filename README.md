@@ -145,7 +145,7 @@ not installed or required.
 - **Route named local logins:** keep multiple Claude config directories behind private
   profile names, so a public agent definition never carries a machine path or credential.
 
-The workspace and roster changes above ship in **Summon 3.5.0**, whose workspace
+The workspace and roster changes above ship in **Summon 3.6.0**, whose workspace
 features are a preview: provider-free acceptance covers them, but live adapters are
 not stable-certified. See the
 [release gates](docs/planning/EXPECTED_NEXT_RELEASE.md) for what each profile
@@ -189,8 +189,10 @@ For a minimal provider-free workspace, save this synthetic plan as
 ```
 
 Replace `PRIVATE_RUNS_DIR` with a dedicated private directory outside the source
-checkout; use a new run ID. Run these from the directory containing the plan
-(`summon.cmd` on Windows):
+checkout (the directory must either not pre-exist—`workspace create` creates and
+secures it—or already carry owner-only permissions; shared temp directories such
+as Git Bash `mktemp -d` fail closed by design); use a new run ID. Run these from
+the directory containing the plan (`summon.cmd` on Windows):
 
 ```text
 summon workspace create preview-run --plan workspace-plan.json --runs-root PRIVATE_RUNS_DIR --json
@@ -354,7 +356,7 @@ python tools/release_gates.py --require-clean --output "${RUNNER_TEMP:-${TMPDIR:
 python tools/release_manifest.py \
   --evidence-file "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json" \
   --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" \
-  --expected-version 3.5.0 --check
+  --expected-version 3.6.0 --check
 ```
 
 The runner executes the fixed suites, records output digests, strips backend credentials and
@@ -752,7 +754,7 @@ vendors.
   "raw_backend_exit_code": null,
   "normalized_exit_code": null,
   "exit_code": null,
-  "summon":  { "version": "3.5.0", "scripts_sha256": "<sha256>" },
+  "summon":  { "version": "3.6.0", "scripts_sha256": "<sha256>" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },

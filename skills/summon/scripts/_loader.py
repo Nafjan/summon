@@ -142,7 +142,7 @@ def parse_read_roots(value) -> tuple[str, ...]:
     """Parse the bounded ``read-roots`` frontmatter value.
 
     Frontmatter is intentionally flat.  A JSON array is the unambiguous form for
-    Windows paths (for example ``["I:\\\\oracle", "I:\\\\board"]``); a
+    Windows paths (for example ``["C:\\\\repo\\\\service-a", "C:\\\\repo\\\\service-b"]``); a
     semicolon-separated string is accepted for hand-written definitions.  This
     function only parses and bounds the list; path existence and backend support
     are checked by the dispatcher before a child is launched.
@@ -545,6 +545,21 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
                 (run_agent, _body, description, _path, permission, model,
                  _extra_args, effort) = loaded
                 lifecycle, successor = effective_lifecycle(fm or {})
+                _raw_cap = str((fm or {}).get("capability") or "").strip().lower()
+                _cap_tier = (
+                    "text-only"
+                    if run_agent in ("openai-compat", "arkcli") or _raw_cap == "text-only"
+                    else "toolful"
+                )
+                _can_run_tests = bool(
+                    _cap_tier == "toolful"
+                    and permission in ("safe-edit", "yolo")
+                    and run_agent not in ("zcode",)
+                )
+                _reports_served_model = bool(
+                    run_agent in ("claude", "codex", "opencode",
+                                  "openai-compat", "arkcli")
+                )
                 # Keep the roster listing useful for humans and provider-safe for
                 # callers: a model pin and reasoning effort are harmless display
                 # metadata, while the actual served model still belongs to the
@@ -554,6 +569,9 @@ def _list_agents_in(agents_dir: str) -> list[dict]:
                 agents.append({"name": name, "description": description,
                                "run_agent": run_agent,
                                "permission": permission,
+                               "capability_tier": _cap_tier,
+                               "can_run_tests": _can_run_tests,
+                               "reports_served_model": _reports_served_model,
                                "provider": (fm or {}).get("provider"),
                                "provider_endpoint_mode": (
                                    "inline_endpoint" if (fm or {}).get("base_url")
@@ -612,6 +630,111 @@ def list_agents(agents_dir: str) -> list[dict]:
                 agents.append(a)
 
     return sorted(agents, key=lambda a: a["name"])
+
+
+KNOWN_TASK_INTENTS = frozenset({
+    "review", "audit", "critique",
+    "implement", "edit", "build", "write", "code",
+    "verify", "test", "qa",
+    "debug", "fix",
+    "design", "architect", "architecture", "advisory", "plan",
+    "fast", "cheap", "explore", "quick",
+})
+
+
+def _is_dispatchable_toolful(a: dict) -> bool:
+    """Return True if a toolful seat's declared permission can actually run."""
+    if a.get("capability_tier") != "toolful":
+        return False
+    if a.get("run_agent") == "agy" and a.get("permission") != "yolo":
+        return False
+    return True
+
+
+def filter_agents_for_task(agents: list[dict], task: str) -> list[dict]:
+    """Filter and rank roster seats for a specific task intent (`--for`)."""
+    q = str(task or "").strip().lower()
+    if not q:
+        return list(agents)
+    active = [a for a in agents if a.get("lifecycle", "active") != "retired"
+              and a.get("run_agent")]
+
+    def _haystack(a: dict) -> str:
+        return " ".join(str(a.get(k) or "") for k in (
+            "name", "description", "run_agent", "model", "permission", "capability_tier"
+        )).lower()
+
+    if q in ("review", "audit", "critique"):
+        from _builder import permission_enforcement
+        matched = [
+            a for a in active
+            if a.get("permission") == "read-only"
+            and permission_enforcement(a.get("run_agent"), "read-only") == "enforced"
+        ]
+        return sorted(matched, key=lambda a: (
+            0 if any(w in str(a.get("name") or "").lower()
+                     for w in ("review", "audit", "adversarial", "astra", "architect", "fable")) else 1,
+            0 if a.get("reports_served_model") else 1,
+            str(a.get("name") or ""),
+        ))
+    if q in ("implement", "edit", "build", "write", "code"):
+        matched = [
+            a for a in active
+            if _is_dispatchable_toolful(a)
+            and a.get("permission") in ("safe-edit", "yolo")
+        ]
+        return sorted(matched, key=lambda a: (
+            0 if any(w in str(a.get("name") or "").lower()
+                     for w in ("implement", "coder", "builder", "refactor", "fullstack")) else 1,
+            str(a.get("name") or ""),
+        ))
+    if q in ("verify", "test", "qa"):
+        matched = [
+            a for a in active
+            if a.get("can_run_tests") is True
+            and _is_dispatchable_toolful(a)
+        ]
+        return sorted(matched, key=lambda a: (
+            0 if any(w in str(a.get("name") or "").lower()
+                     for w in ("verif", "test", "qa", "debug")) else 1,
+            str(a.get("name") or ""),
+        ))
+    if q in ("debug", "fix"):
+        matched = [
+            a for a in active
+            if _is_dispatchable_toolful(a)
+            and (a.get("permission") in ("safe-edit", "yolo")
+                 or "debug" in _haystack(a))
+        ]
+        return sorted(matched, key=lambda a: (
+            0 if "debug" in str(a.get("name") or "").lower() else 1,
+            0 if a.get("can_run_tests") else 1,
+            str(a.get("name") or ""),
+        ))
+    if q in ("design", "architect", "architecture", "advisory", "plan"):
+        matched = [
+            a for a in active
+            if (any(w in _haystack(a) for w in ("architect", "design", "fable", "advisor", "plan"))
+                or a.get("permission") == "read-only")
+            and not (a.get("run_agent") == "agy" and a.get("permission") != "yolo")
+        ]
+        return sorted(matched, key=lambda a: (
+            0 if any(w in str(a.get("name") or "").lower()
+                     for w in ("architect", "fable", "design", "advisor")) else 1,
+            str(a.get("name") or ""),
+        ))
+    if q in ("fast", "cheap", "explore", "quick"):
+        matched = [
+            a for a in active
+            if any(w in _haystack(a) for w in ("fast", "flash", "mini", "haiku", "explore"))
+            and not (a.get("run_agent") == "agy" and a.get("permission") != "yolo")
+        ]
+        return sorted(matched, key=lambda a: (
+            0 if any(w in str(a.get("name") or "").lower()
+                     for w in ("fast", "explore", "mini", "flash")) else 1,
+            str(a.get("name") or ""),
+        ))
+    return [a for a in active if q in _haystack(a)]
 
 
 def explicit_dir_fallback_warning(agents_dir_arg, agent_file) -> str | None:

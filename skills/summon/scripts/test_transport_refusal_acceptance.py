@@ -82,3 +82,34 @@ def test_explicit_capability_platform_mismatch_refuses_before_secondary_route(tm
     assert response["provider_contacted"] is False
     assert response.get("attempt_status") == "not_run"
     assert "fallback" not in response
+
+
+def test_dry_run_matches_live_transport_budget_and_launch_control_acp_refusal(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import run_subagent
+
+    monkeypatch.setattr(executor, "_resolve_launch", lambda command, args: (command, args))
+    args = SimpleNamespace(
+        agent="size-probe", _resolved_agent="size-probe", strict_agents_dir=False,
+        timeout=600_000, worktree=None, _role_provenance={}, agents_dir=None,
+        gate_with=None, allow_text_only=False, require_tools=False,
+        fleet_approval=None, resume_job=None,
+    )
+    cap_inv = AgentInvocation(
+        cli="gemini", prompt="x" * 4000, cwd=str(tmp_path),
+        transport="subprocess", transport_capability=_capability(),
+    )
+    cap_view = run_subagent._dry_run_view(cap_inv, args, None, None)
+    assert cap_view.get("would_refuse") is True
+    assert cap_view.get("error_kind") == "transport_budget_exceeded"
+
+    oversized_inv = AgentInvocation(
+        cli="gemini", prompt="x" * 140_000, cwd=str(tmp_path),
+        transport="subprocess",
+    )
+    no_secondary_lc = SimpleNamespace(allow_secondary=False)
+    lc_view = run_subagent._dry_run_view(
+        oversized_inv, args, None, None, launch_control=no_secondary_lc)
+    assert lc_view.get("would_refuse") is True
+    assert lc_view.get("error_kind") == "prompt_too_long_for_argv"
+    assert not any("routed over ACP" in w for w in lc_view.get("warnings", []))

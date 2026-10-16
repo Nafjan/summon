@@ -7,6 +7,7 @@ import copy
 import hashlib
 import inspect
 import json
+import math
 import os
 import queue
 import re
@@ -73,6 +74,75 @@ def dry_run_argv_length_error(inv, command: str, args: list,
     except ValueError:
         return None
     return argv_length_error(inv.cli, command, args, _merge_env(env_override))
+
+
+def dry_run_transport_and_argv_refusal(
+    inv, command: str, args: list,
+    env_override: Mapping[str, object] | None, *,
+    launch_control=None,
+) -> tuple[str | None, str | None, bool]:
+    """Return ``(error_kind, message, rerouted_to_acp)`` matching live ``execute_agent``."""
+    try:
+        resolved_cmd, resolved_args = _resolve_launch(command, args)
+    except ValueError:
+        return None, None, False
+    proc_env = _merge_env(env_override)
+    budget_result = None
+    budget_error = None
+    declared_cap = _adapter_transport_capability(inv, resolved_args)
+    if declared_cap is not None:
+        try:
+            from _transport_budget import evaluate_invocation as _evaluate_transport_budget
+            if type(declared_cap) is not dict:
+                raise ValueError("transport capability must be an object")
+            capability = copy.deepcopy(declared_cap)
+            platform = capability.pop("platform", None)
+            if platform not in {"nt", "posix"}:
+                raise ValueError("transport capability requires an explicit platform")
+            if platform != os.name:
+                raise ValueError("transport capability platform does not match the host")
+            attachment_bytes = None
+            transport_content = inv.prompt
+            if capability.get("kind") in {"private_attachment", "system_file"}:
+                if capability.get("kind") == "private_attachment":
+                    if "--attach" not in resolved_args:
+                        raise ValueError("private attachment capability requires an attachment argument")
+                    attach_index = resolved_args.index("--attach") + 1
+                    attachment_path = resolved_args[attach_index]
+                else:
+                    attachment_path = (proc_env or {}).get("GEMINI_SYSTEM_MD")
+                    if not isinstance(attachment_path, str) or not attachment_path:
+                        raise ValueError("system file capability requires GEMINI_SYSTEM_MD")
+                if not os.path.isfile(attachment_path):
+                    raise ValueError("transport system file is unavailable")
+                with open(attachment_path, "rb") as attachment_file:
+                    attachment_file.seek(0, os.SEEK_END)
+                    attachment_bytes = attachment_file.tell()
+                    attachment_file.seek(0)
+                    transport_content = attachment_file.read(16 * 1024 * 1024 + 1)
+            budget_result = _evaluate_transport_budget(
+                operation_id=getattr(inv, "attempt_id", None) or "dry-run",
+                content=transport_content,
+                command=resolved_cmd, args=resolved_args, env=proc_env,
+                platform=platform, capability=capability,
+                attachment_bytes=attachment_bytes)
+        except Exception:  # noqa: BLE001 - fail closed like execute_agent
+            budget_error = "transport capability preflight refused"
+    argv_err = argv_length_error(inv.cli, resolved_cmd, resolved_args, proc_env)
+    if budget_result is not None and budget_result.get("status") == "blocked":
+        if budget_result.get("capability", {}).get("kind") == "private_attachment" or not argv_err:
+            argv_err = "transport budget refused the complete invocation before provider contact"
+    elif budget_error is not None:
+        argv_err = budget_error
+    if not argv_err:
+        return None, None, False
+    if argv_overflow_reroutes_to_acp(inv, resolved_args, launch_control):
+        return None, None, True
+    if budget_result is not None and budget_result.get("status") == "blocked":
+        return "transport_budget_exceeded", argv_err, False
+    if budget_error is not None:
+        return "transport_capability_invalid", argv_err, False
+    return "prompt_too_long_for_argv", argv_err, False
 
 
 def _adapter_transport_capability(inv, args: list[object]) -> Mapping[str, object] | None:
@@ -445,23 +515,41 @@ _STATUS_VALUES = frozenset({"DONE", "PARTIAL", "BLOCKED", "SUCCESS", "ERROR"})
 _REPORT_FIELD_RE = re.compile(r"^([A-Z][A-Z0-9_-]{1,}):[ \t]?(.*)$")
 # Markdown-rendered backends (agy above all) bold the contract field names, with
 # the colon landing INSIDE or OUTSIDE the wrapper: `**STATUS:** v` / `**STATUS**: v`.
-_BOLD_FIELD_PREFIX = re.compile(r"^\*\*([A-Z][A-Z0-9_-]{1,})(?::\*\*|\*\*:)")
+_BOLD_FIELD_PREFIX = re.compile(r"^\*\*([A-Za-z][A-Za-z0-9_-]{1,})(?::\*\*|\*\*:)")
 # Some providers render a contract field as a Markdown heading.  Accept only a
 # bounded, line-start heading prefix; arbitrary `VERDICT:` prose must remain
 # non-structural.  The required whitespace after `#` is intentional: it keeps
 # shell comments and prompt text from becoming report fields accidentally.
 _HEADING_FIELD_PREFIX = re.compile(r"^\s{0,3}#{1,6}[ \t]+")
+_BULLET_FIELD_PREFIX = re.compile(r"^\s{0,3}[-*][ \t]+")
+_CASE_FIELD_PREFIX = re.compile(r"^([A-Za-z][A-Za-z0-9_-]{1,})(:.*)$")
 
 
 def _unbold_field_line(line: str) -> str:
     """Normalize one structured report line without broadening prose matching.
 
-    A provider may emit `**STATUS:** DONE` or `## VERDICT: BLOCK`.  Both are
-    accepted only at the beginning of a line and only the wrapper is removed;
-    field-name and status validation still happens in :func:`parse_report`.
+    A provider may emit `**STATUS:** DONE`, `## VERDICT: BLOCK`, `- STATUS: DONE`,
+    or `Status: DONE`. Heading and bold wrappers are accepted only at the
+    beginning of a line; leading bullets (`- ` / `* `) and mixed-case keys are
+    normalized only for known `_REPORT_FIELDS` names so bulleted prose or
+    arbitrary `Note:` lines inside multi-line fields stay untouched.
     """
     normalized = _HEADING_FIELD_PREFIX.sub("", line, count=1)
-    return _BOLD_FIELD_PREFIX.sub(lambda m: m.group(1) + ":", normalized, count=1)
+    candidate = _BULLET_FIELD_PREFIX.sub("", normalized, count=1)
+    had_bullet = candidate != normalized
+    candidate = _BOLD_FIELD_PREFIX.sub(lambda m: m.group(1) + ":", candidate, count=1)
+    m = _CASE_FIELD_PREFIX.match(candidate)
+    if m:
+        upper_key = m.group(1).upper()
+        if upper_key in _REPORT_FIELDS:
+            return upper_key + m.group(2)
+        if not had_bullet and m.group(1) == upper_key:
+            return candidate
+    return _BOLD_FIELD_PREFIX.sub(
+        lambda m: m.group(1) + ":" if m.group(1) == m.group(1).upper() else m.group(0),
+        normalized,
+        count=1,
+    )
 # A line begins a NEW field when its key is either a known field OR a well-formed
 # all-caps identifier (letters/digits/underscore, 2-30 chars) — so a third-party
 # agent's CUSTOM field (SCORE:, RUBRIC:, ...) is captured, not silently folded
@@ -529,52 +617,134 @@ def _review_verdict(report: dict | None) -> str | None:
     return _REVIEW_VERDICTS.get(first)
 
 
+_FENCED_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
+_FALLBACK_SUMMARY_RE = re.compile(
+    r"(?im)^[ \t]*(?:\*\*|#+[ \t]+|[-*][ \t]+)*SUMMARY[ \t]*:[ \t]*\*?\*?[ \t]*([^\r\n]+)$"
+)
+_FALLBACK_CONFIDENCE_RE = re.compile(
+    r"(?im)^[ \t]*(?:\*\*|#+[ \t]+|[-*][ \t]+)*CONFIDENCE[ \t]*:[ \t]*\*?\*?[ \t]*([^\r\n]+)$"
+)
+
+
+def _strip_fenced_code_blocks(text: str) -> str:
+    """Remove triple-backtick fenced code blocks so quoted examples cannot spoof report fields."""
+    if not text:
+        return ""
+    return _FENCED_CODE_BLOCK_RE.sub("", text)
+
+
+_SYMBOLIC_CONFIDENCE: dict[str, float | None] = {
+    "very high": 0.95,
+    "very-high": 0.95,
+    "high": 0.9,
+    "medium": 0.6,
+    "med": 0.6,
+    "moderate": 0.6,
+    "low": 0.3,
+    "none": None,
+    "n/a": None,
+    "na": None,
+    "unknown": None,
+}
+
+
+def _parse_confidence(raw: object) -> float | None:
+    """Parse a finite confidence score in [0.0, 1.0] or symbolic level, rejecting NaN/Inf/out-of-bounds."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+        return round(val, 4) if (math.isfinite(val) and 0.0 <= val <= 1.0) else None
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    cleaned = raw.strip().lower()
+    head = re.split(r"[|,:;(\[-]", cleaned, maxsplit=1)[0].strip()
+    if head in _SYMBOLIC_CONFIDENCE:
+        return _SYMBOLIC_CONFIDENCE[head]
+    token = cleaned.split()[0].rstrip("|,:;-")
+    if token in _SYMBOLIC_CONFIDENCE:
+        return _SYMBOLIC_CONFIDENCE[token]
+    is_pct = token.endswith("%")
+    if is_pct:
+        token = token[:-1].strip()
+    try:
+        val = float(token)
+    except ValueError:
+        return None
+    if not math.isfinite(val):
+        return None
+    if is_pct:
+        val = val / 100.0
+    if 0.0 <= val <= 1.0:
+        return round(val, 4)
+    return None
+
+
 def parse_report(text: str) -> dict | None:
     """Extract the trailing report-contract block from an agent's result text.
 
-    Anchors on the LAST ``STATUS:`` line whose value begins with a real status
-    token (DONE/PARTIAL/BLOCKED/...) — so a quoted contract example or narration
-    that merely mentions ``STATUS:`` can't spoof or displace the real block. A line
-    begins a new field when its key is a known field OR a well-formed all-caps
-    identifier (so third-party agents' custom fields are captured, not folded);
-    any other line continues the current value (multi-line safe). Keys are
-    lowercased with ``-`` mapped to ``_`` (e.g. ``follow_up``). Markdown-bold
-    field names (``**STATUS:**``) are accepted — backends that render markdown
-    wrap the contract typographically; the status-value and template guards
-    apply unchanged after the wrapper is stripped.
-
-    Returns None when no genuine ``STATUS:`` line exists.
+    Anchors on the LAST ``STATUS:`` line (outside fenced code blocks when one
+    exists, falling back to fenced lines if the entire report block is wrapped
+    in a markdown code fence) whose value begins with a real status token
+    (DONE/PARTIAL/BLOCKED/...) — so a quoted contract example or narration that
+    merely mentions ``STATUS:`` can't spoof or displace the real block. Fenced
+    code blocks inside multiline fields (``COMMANDS``, ``HANDOFF``, ``FINDINGS``)
+    are preserved while ignoring field-header lookalikes inside fences.
     """
     if not text:
         return None
     lines = text.splitlines()
-    start = None
-    for i in range(len(lines) - 1, -1, -1):
-        anchor = _unbold_field_line(lines[i])
-        if anchor.startswith("STATUS:"):
-            value = anchor[len("STATUS:"):].strip()
-            first = value.split()[0].rstrip("|,").upper() if value else ""
-            # Skip ONLY the echoed contract TEMPLATE ("DONE | PARTIAL | BLOCKED"):
-            # a value whose pipe-separated tokens are ALL status keywords. A real
-            # status like "BLOCKED | waiting on approval" is kept (its second token
-            # isn't a status word), so the guard can't swallow a genuine block.
-            if first in _STATUS_VALUES:
-                parts = [p.strip().split()[0].upper() for p in value.split("|") if p.strip()]
-                is_template = len(parts) > 1 and all(p in _STATUS_VALUES for p in parts)
-                if not is_template:
-                    start = i
-                    break
+    # Mark lines inside closed ```...``` fenced code blocks so trailing code
+    # examples cannot spoof STATUS:/SUMMARY:/CONFIDENCE:.
+    fenced_lines: set[int] = set()
+    fence_delimiters: set[int] = set()
+    open_fence_idx: int | None = None
+    for idx, raw_line in enumerate(lines):
+        if raw_line.lstrip().startswith("```"):
+            if open_fence_idx is None:
+                open_fence_idx = idx
+            else:
+                fence_delimiters.add(open_fence_idx)
+                fence_delimiters.add(idx)
+                for f_idx in range(open_fence_idx, idx + 1):
+                    fenced_lines.add(f_idx)
+                open_fence_idx = None
+
+    def _find_anchor(*, skip_fences: bool) -> int | None:
+        for i in range(len(lines) - 1, -1, -1):
+            if skip_fences and i in fenced_lines:
+                continue
+            anchor = _unbold_field_line(lines[i])
+            if anchor.startswith("STATUS:"):
+                value = anchor[len("STATUS:"):].strip()
+                first = value.split()[0].rstrip("|,").upper() if value else ""
+                if first in _STATUS_VALUES:
+                    parts = [p.strip().split()[0].upper() for p in value.split("|") if p.strip()]
+                    is_template = len(parts) > 1 and all(p in _STATUS_VALUES for p in parts)
+                    if not is_template:
+                        return i
+        return None
+
+    start = _find_anchor(skip_fences=True)
+    anchor_in_fence = False
+    if start is None and fenced_lines:
+        start = _find_anchor(skip_fences=False)
+        anchor_in_fence = start is not None
     if start is None:
         return None
 
     fields: dict = {}
     current_key = None
-    for line in lines[start:]:
-        m = _REPORT_FIELD_RE.match(_unbold_field_line(line))
+    for idx in range(start, len(lines)):
+        line = lines[idx]
+        if anchor_in_fence and idx in fence_delimiters:
+            continue
+        is_fenced_content = (not anchor_in_fence) and (idx in fenced_lines)
+        m = None if is_fenced_content else _REPORT_FIELD_RE.match(_unbold_field_line(line))
         if m and _is_field_key(m.group(1)):
             current_key = m.group(1).lower().replace("-", "_")
             fields[current_key] = m.group(2).strip()
-        elif current_key is not None:
+        elif current_key is not None and current_key not in ("summary", "confidence", "status", "verdict"):
             fields[current_key] = (fields[current_key] + "\n" + line).strip()
     return fields or None
 
@@ -608,6 +778,100 @@ def normalize_empty_success(response: dict) -> dict:
         "error",
         "provider reported success but returned no usable result")
     return response
+
+
+_CODEX_SESSION_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _codex_rollout_model_evidence(
+    session_id: str | None,
+    *,
+    codex_home: str | None = None,
+) -> tuple[str | None, list[str]]:
+    """Read local Codex turn_context model metadata from a session rollout file.
+
+    Codex 0.121+ ``exec --json`` omits ``model`` from ``thread.started`` and
+    ``turn.completed`` stdout events, while writing ``session_meta`` and
+    ``turn_context.payload.model`` to ``~/.codex/sessions/YYYY/MM/DD/rollout-*-<session_id>.jsonl``.
+    Because ``turn_context.payload.model`` is constructed from the client's
+    selected turn configuration rather than a provider response header, this
+    helper returns ``(targeted_model, models_used)`` only and NEVER certifies
+    ``model.served``.
+    """
+    if not isinstance(session_id, str):
+        return None, []
+    sid = session_id.strip()
+    if not _CODEX_SESSION_UUID_RE.fullmatch(sid):
+        return None, []
+    home = codex_home or os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    sessions_root = os.path.join(home, "sessions")
+    if not os.path.isdir(sessions_root) or os.path.islink(sessions_root):
+        return None, []
+    suffix = f"-{sid}.jsonl"
+    rollout_file: str | None = None
+    try:
+        for dirpath, _dirnames, filenames in os.walk(sessions_root, followlinks=False):
+            for fn in filenames:
+                if fn.startswith("rollout-") and fn.endswith(suffix):
+                    rollout_file = os.path.join(dirpath, fn)
+                    break
+            if rollout_file:
+                break
+    except OSError:
+        return None, []
+    if not rollout_file or os.path.islink(rollout_file) or not os.path.isfile(rollout_file):
+        return None, []
+    try:
+        if os.path.getsize(rollout_file) > 8 * 1024 * 1024:
+            return None, []
+        session_verified = False
+        last_turn_model: str | None = None
+        last_turn_id: str | None = None
+        last_turn_active = False
+        with open(rollout_file, "r", encoding="utf-8", errors="replace") as fh:
+            for raw_line in fh:
+                if len(raw_line) > 65536:
+                    continue
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                rtype = rec.get("type")
+                payload = rec.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if rtype == "session_meta":
+                    meta_sid = payload.get("session_id") or payload.get("id")
+                    if isinstance(meta_sid, str) and meta_sid.strip() == sid:
+                        session_verified = True
+                elif rtype == "turn_context":
+                    m = _safe_model_id(payload.get("model"))
+                    last_turn_model = m
+                    tid = payload.get("turn_id")
+                    last_turn_id = tid.strip() if isinstance(tid, str) and tid.strip() else None
+                    last_turn_active = False
+                elif last_turn_model is not None:
+                    ev_tid = payload.get("turn_id")
+                    if isinstance(ev_tid, str) and ev_tid.strip() and last_turn_id and ev_tid.strip() != last_turn_id:
+                        continue
+                    if rtype in ("token_usage_record", "response_item"):
+                        last_turn_active = True
+                    elif rtype == "event_msg" and payload.get("type") in (
+                        "task_complete", "token_count", "item_completed"
+                    ):
+                        last_turn_active = True
+        if session_verified and last_turn_model and last_turn_active:
+            return last_turn_model, [last_turn_model]
+    except OSError:
+        return None, []
+    return None, []
 
 
 def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
@@ -656,6 +920,19 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
         "model_evidence_source",
         getattr(processor, "model_evidence_source", None) if processor else None,
     )
+    if (response.get("cli") == "codex"
+            and not response.get("model_resolved")
+            and response.get("status") == "success"):
+        _r_target, _r_used = _codex_rollout_model_evidence(
+            response.get("session_id")
+        )
+        if _r_target:
+            if not response.get("model_targeted"):
+                response["model_targeted"] = _r_target
+            if not response.get("models_used") and _r_used:
+                response["models_used"] = _r_used
+            if not response.get("model_evidence_source"):
+                response["model_evidence_source"] = "codex_rollout_turn_context"
     # Kimi has no terminal-success event. If the dispatcher deadline wins
     # after assistant text was captured, retain a bounded diagnostic snapshot
     # in its own namespace. It is deliberately never fed to parse_report,
@@ -748,7 +1025,48 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     response["report_ok"] = bool(
         report and all(b.lower().replace("-", "_") in report for b in _REPORT_BOOKENDS)
     )
+    _raw_result = response.get("result")
+    _clean_result = _redact_output_secrets(_raw_result.strip()) if isinstance(_raw_result, str) and _raw_result.strip() else ""
+    if response["report_ok"]:
+        response["report_source"] = "structured"
+        response["report_text"] = (report.get("summary") or _clean_result).strip()
+    elif isinstance(report, dict) and report:
+        response["report_source"] = "partial_structured"
+        response["report_text"] = (report.get("summary") or _clean_result).strip()
+    elif _clean_result:
+        response["report_source"] = "raw"
+        response["report_text"] = _clean_result
+    else:
+        response["report_source"] = "none"
+        response["report_text"] = ""
     response["verdict"] = _review_verdict(report)
+    _stripped_for_fallback = _strip_fenced_code_blocks(_clean_result) if _clean_result else ""
+    if _clean_result and not _stripped_for_fallback.strip():
+        _stripped_for_fallback = "\n".join(
+            ln for ln in _clean_result.splitlines()
+            if not re.match(r"^\s*(?:```|~~~)", ln)
+        )
+    _fallback_tail = "\n".join(_stripped_for_fallback.splitlines()[-200:]) if _stripped_for_fallback else ""
+    if report and report.get("summary"):
+        _raw_sum = report["summary"].splitlines()[0].strip()
+        response["summary"] = _raw_sum[:500] if _raw_sum else None
+    elif _fallback_tail:
+        _sum_m = _FALLBACK_SUMMARY_RE.search(_fallback_tail)
+        if _sum_m and _sum_m.group(1).strip():
+            response["summary"] = _sum_m.group(1).strip()[:500]
+        else:
+            _first_nonempty = next((ln.strip() for ln in _stripped_for_fallback.splitlines() if ln.strip()), "")
+            response["summary"] = _first_nonempty[:240] if _first_nonempty else None
+    else:
+        response["summary"] = None
+    if report and "confidence" in report:
+        response["confidence"] = _parse_confidence(report.get("confidence"))
+    elif _fallback_tail:
+        _conf_m = _FALLBACK_CONFIDENCE_RE.search(_fallback_tail)
+        response["confidence"] = _parse_confidence(_conf_m.group(1)) if _conf_m else None
+    else:
+        response["confidence"] = None
+    response.setdefault("files_touched", [])
     # 1) Structured self-report wins over exit-0 "success" (never upgrades).
     if response.get("status") == "success" and report and report.get("status"):
         first = report["status"].split()[0].rstrip("|,").upper()
@@ -2569,15 +2887,83 @@ def _normalized_exit_code(status: object, raw_backend_exit_code: object) -> int 
     return raw
 
 
+_PROVIDER_NAMESPACE_PREFIXES = (
+    "openrouter/", "zai/", "nous/", "kimi-code/", "openai/",
+    "anthropic/", "google/", "x-ai/", "z-ai/", "deepseek/", "moonshotai/",
+)
+_DETERMINISTIC_MODEL_SYNONYMS: dict[str, str] = {
+    "glm-5.3-flash": "glm-5-3-flash",
+    "deepseek-4.1-flash": "deepseek-v4-1-flash",
+    "deepseek-v4.1-flash": "deepseek-v4-1-flash",
+    "k3": "kimi-k3",
+}
+_DATE_SNAPSHOT_SUFFIX_RE = re.compile(r"-(?:ga-)?(?:20\d{6}|\d{6})$")
+
+
+def _canonical_model_key(model_id: str | None, *,
+                         strip_date_suffix: bool = True) -> str | None:
+    """Normalize deterministic provider-prefix, punctuation, and optional
+    date-snapshot variants of a concrete model ID without collapsing
+    floating aliases."""
+    if not isinstance(model_id, str):
+        return None
+    s = model_id.strip().lower()
+    if not s:
+        return None
+    for _ in range(2):
+        matched = False
+        for pfx in _PROVIDER_NAMESPACE_PREFIXES:
+            if s.startswith(pfx) and len(s) > len(pfx):
+                s = s[len(pfx):]
+                matched = True
+                break
+        if not matched:
+            break
+    if strip_date_suffix:
+        s = _DATE_SNAPSHOT_SUFFIX_RE.sub("", s)
+        s = _DETERMINISTIC_MODEL_SYNONYMS.get(s, s)
+    else:
+        m = _DATE_SNAPSHOT_SUFFIX_RE.search(s)
+        if m:
+            base = s[:m.start()]
+            suffix = m.group(0)
+            base = _DETERMINISTIC_MODEL_SYNONYMS.get(base, base)
+            s = base + suffix
+        else:
+            s = _DETERMINISTIC_MODEL_SYNONYMS.get(s, s)
+    return s
+
+
+def _canonical_models_equal(expected: str | None, actual: str | None) -> bool:
+    """Compare an expected model pin against an observed/targeted model ID.
+
+    When ``expected`` carries an explicit ``-YYMMDD``/``-YYYYMMDD`` snapshot
+    suffix, ``actual`` must carry the exact same snapshot suffix. Only an
+    un-dated ``expected`` model ID allows a provider-appended snapshot suffix
+    on ``actual``.
+    """
+    exp_exact = _canonical_model_key(expected, strip_date_suffix=False)
+    act_exact = _canonical_model_key(actual, strip_date_suffix=False)
+    if not exp_exact or not act_exact:
+        return False
+    if _DATE_SNAPSHOT_SUFFIX_RE.search(exp_exact):
+        return exp_exact == act_exact
+    act_base = _canonical_model_key(actual, strip_date_suffix=True)
+    return exp_exact == act_base
+
+
 def _model_mismatch(requested, ran) -> bool:
     """True when an EXPLICIT model request differs from the model that ran, EXCEPT
-    for a known floating-alias expansion (opus/sonnet/haiku -> their latest id).
+    for a known floating-alias expansion (opus/sonnet/haiku -> their latest id)
+    or a deterministic provider/date/punctuation variant of the same model.
     Both must be non-empty strings; a None/empty request never warns."""
     if not (isinstance(requested, str) and requested.strip()
             and isinstance(ran, str) and ran.strip()):
         return False
     r, s = requested.strip().lower(), ran.strip().lower()
     if r == s:
+        return False
+    if _canonical_models_equal(r, s):
         return False
     try:
         from _resolver import _CLAUDE_ALIASES
@@ -2605,12 +2991,16 @@ def model_match_state(requested, targeted, served,
         return None
     if not requested or not targeted:
         return None
-    # This is a certification bit, not the looser warning/alias comparison
-    # used by ``_model_mismatch``.  A named-model review is verified only when
-    # the provider reported the exact same identifier for requested, targeted,
-    # and served.  Floating aliases may still avoid a warning, but they never
-    # become a named-model proof.
-    return requested.strip() == targeted.strip() == served.strip()
+    # This is a certification bit, not the looser floating-alias comparison
+    # used by ``_model_mismatch``. Deterministic provider prefixes and
+    # provider-appended date snapshot suffixes on an un-dated pin are
+    # canonicalized, while explicit snapshot pins and floating aliases
+    # ('opus' vs 'claude-opus-5') never collapse across distinct versions.
+    return (
+        _canonical_models_equal(requested, targeted)
+        and _canonical_models_equal(requested, served)
+        and _canonical_models_equal(targeted, served)
+    )
 
 
 # These seats are governance-facing named-model claims rather than ordinary
@@ -3718,7 +4108,19 @@ def _resolve_launch(command, args):
                 "native executable could not be resolved; reinstall OpenCode so "
                 "Summon can pass prompt argv without cmd.exe reparsing")
         return _oc, args
-    resolved = shutil.which(command) or command
+    if command == "codex":
+        try:
+            from _builder import resolve_codex_binary
+            _best_codex = resolve_codex_binary(which_fn=shutil.which)
+        except Exception:  # noqa: BLE001
+            _best_codex = None
+        if _best_codex and os.name != "nt":
+            return _best_codex, args
+        if _best_codex and os.name == "nt" and str(_best_codex).lower().endswith(".exe"):
+            return _best_codex, args
+        resolved = _best_codex or shutil.which(command) or command
+    else:
+        resolved = shutil.which(command) or command
     if os.name != "nt" or not resolved.lower().endswith((".cmd", ".bat")):
         return resolved, args
     shim_dir = os.path.dirname(resolved)
@@ -4008,17 +4410,29 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                         "before": None, "after": None, "coverage": "unavailable",
                         "child_commit": None, "mutation": None,
                         "read_only_violation": None, "attribution": "unavailable",
+                        "files_touched": [],
                     }
                 else:
                     _after = workspace_snapshot(inv.cwd)
-                    resp["workspace_evidence"] = workspace_evidence(
-                        _workspace_before, _after, getattr(inv, "permission", None))
+                    try:
+                        resp["workspace_evidence"] = workspace_evidence(
+                            _workspace_before, _after, getattr(inv, "permission", None),
+                            cli=getattr(inv, "cli", None))
+                    except TypeError:
+                        resp["workspace_evidence"] = workspace_evidence(
+                            _workspace_before, _after, getattr(inv, "permission", None))
             except Exception:  # noqa: BLE001 — never hide the terminal response
                 resp["workspace_evidence"] = {
                     "before": None, "after": None, "coverage": "unavailable",
                     "child_commit": None, "mutation": None,
                     "read_only_violation": None, "attribution": "unavailable",
+                    "files_touched": [],
                 }
+        _we = resp.get("workspace_evidence")
+        if isinstance(_we, dict) and isinstance(_we.get("files_touched"), list):
+            resp["files_touched"] = list(_we["files_touched"])
+        else:
+            resp.setdefault("files_touched", [])
         # Trust fields, split by EVIDENCE (field case: a failed Fable dispatch
         # reported the handshake model as `resolved` with all-zero usage):
         #   requested  what the caller asked for (unchanged).
@@ -4156,7 +4570,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # retry/fallback path. The provider may already have spent; preserve
         # that fact. Codex pins use the same gate as custom/frontmatter seats.
         if _exact_required and resp.get("status") == "success":
-            if _handshake and _requested_model != _handshake:
+            if _handshake and not _canonical_models_equal(_requested_model, _handshake):
                 _trust_kind = "target_model_mismatch"
                 _trust_message = (
                     f"requested model {_requested_model!r}, but the provider "
@@ -4169,7 +4583,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                     f"exact model {_requested_model!r} completed without "
                     "an authoritative terminal served-model receipt; the result "
                     "is blocked and cannot be treated as verified")
-            elif _requested_model != _terminal_model:
+            elif not _canonical_models_equal(_requested_model, _terminal_model):
                 _trust_kind = "served_model_mismatch"
                 _trust_message = (
                     f"requested model {_requested_model!r}, but the provider "

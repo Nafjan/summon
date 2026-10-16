@@ -640,7 +640,17 @@ def test_decision_verifier_binds_spend_and_usage_projections():
     credit = copy.deepcopy(base)
     credit["authority"]["credit"] = {
         "authorized": True, "source": "dispatch_flag"}
-    mutations.append((credit, "spend projection"))
+    consent_only = _evidence.verify(_evidence.seal("summon.decision/v2", credit))
+    assert consent_only["authority"]["spend_authorized"] is False
+    payg_only = copy.deepcopy(base)
+    payg_only["authority"]["payg"] = {
+        "authorized": True, "source": "dispatch_flag"}
+    consent_only = _evidence.verify(_evidence.seal("summon.decision/v2", payg_only))
+    assert consent_only["authority"]["spend_authorized"] is False
+    api = copy.deepcopy(base)
+    api["authority"]["api"] = {
+        "authorized": True, "source": "explicit_endpoint"}
+    mutations.append((api, "spend projection"))
     source = copy.deepcopy(base)
     source["authority"]["credit"]["source"] = "arbitrary"
     mutations.append((source, "credit"))
