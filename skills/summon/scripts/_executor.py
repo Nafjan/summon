@@ -1041,6 +1041,11 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
         response["report_text"] = ""
     response["verdict"] = _review_verdict(report)
     _stripped_for_fallback = _strip_fenced_code_blocks(_clean_result) if _clean_result else ""
+    if _clean_result and not _stripped_for_fallback.strip():
+        _stripped_for_fallback = "\n".join(
+            ln for ln in _clean_result.splitlines()
+            if not re.match(r"^\s*(?:```|~~~)", ln)
+        )
     _fallback_tail = "\n".join(_stripped_for_fallback.splitlines()[-200:]) if _stripped_for_fallback else ""
     if report and report.get("summary"):
         _raw_sum = report["summary"].splitlines()[0].strip()

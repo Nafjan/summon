@@ -102,7 +102,7 @@ from _resolver import discover_models, resolve_cli  # noqa: E402
 # Keep a literal assignment: the release-contract parser uses the dispatcher
 # source as a machine-checkable companion.  `_telemetry.SUMMON_VERSION` must be
 # updated in the same release; the release contract checks both literals.
-__version__ = "3.5.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "3.6.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -260,6 +260,13 @@ def _acquire_out_lock(out_path: str) -> int | None:
                     break
                 except (OSError, ValueError, UnicodeDecodeError):
                     time.sleep(0.01)
+            if owner is None:
+                try:
+                    if (time.time() - os.path.getmtime(lock_path)) < 2.0:
+                        time.sleep(0.05)
+                        continue
+                except OSError:
+                    continue
             owner_pid = owner.get("pid") if isinstance(owner, dict) else None
             owner_tok = owner.get("token") if isinstance(owner, dict) else None
             acquired_at = owner.get("acquired_at") if isinstance(owner, dict) else None
@@ -301,6 +308,12 @@ def _acquire_out_lock(out_path: str) -> int | None:
                     continue
                 except (OSError, ValueError, UnicodeDecodeError):
                     current = None
+                if current is None:
+                    try:
+                        if (time.time() - os.path.getmtime(lock_path)) < 2.0:
+                            continue
+                    except OSError:
+                        continue
                 cur_tok = current.get("token") if isinstance(current, dict) else None
                 cur_pid = current.get("pid") if isinstance(current, dict) else None
                 if cur_tok != owner_tok:
@@ -814,7 +827,7 @@ def _write_job_file_text(text: str, job_file: str) -> None:
         # result, this call is an idempotent no-op.  Give the owner a short,
         # bounded window to finish its atomic replace; if it does not, preserve
         # the lock for diagnosis rather than racing an unknown writer.
-        for _ in range(25):
+        for _ in range(150):
             if _job_file_has_terminal_envelope(job_file):
                 return
             time.sleep(0.02)
@@ -5071,11 +5084,15 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         result["report_source"] = retry.get("report_source", "structured")
         if retry.get("report_text"):
             result["report_text"] = retry.get("report_text")
-        if retry.get("summary") is not None:
-            result["summary"] = retry.get("summary")
-        if retry.get("confidence") is not None:
-            result["confidence"] = retry.get("confidence")
+        result["summary"] = retry.get("summary")
+        result["confidence"] = retry.get("confidence")
+        if "verdict" in retry:
+            result["verdict"] = retry.get("verdict")
+        if "environment_handoff" in retry:
+            result["environment_handoff"] = retry.get("environment_handoff")
         result["status"] = retry.get("status")    # DONE->success; PARTIAL/BLOCKED reflected
+        if retry.get("status") != "success" and retry.get("error"):
+            result.setdefault("error", retry["error"])
         result.pop("suspect", None)
         result["contract_repaired"] = True
         result["repaired_report_text"] = retry.get("result")   # the corrected block, for reference

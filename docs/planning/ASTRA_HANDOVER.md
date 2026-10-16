@@ -88,7 +88,7 @@ source and are not reproduced here.
   response-fields dictionary (~13%) to `references/`. Target core ≤ ~45 KB.
   `test_discovery.py` pins exact SKILL.md strings — preserve or deliberately
   update them.
-- **FS-01..FS-04** (rseen-reviewer, INFO/NIT): unify two disposition adapters
+- **FS-01..FS-04** (code-reviewer, INFO/NIT): unify two disposition adapters
   on the coherent-snapshot helper (`_workspace_commands.py:394,526`); document
   that summary `unknown_spend` covers total-token coverage only
   (`_submission_accounting.py:257`); dead conditional in

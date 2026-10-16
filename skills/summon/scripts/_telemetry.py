@@ -40,7 +40,7 @@ EVENT_SCHEMA_VERSION = 2
 # Keep the telemetry contract tied to the dispatcher release without importing
 # ``run_subagent`` (which would introduce a module cycle).  Release bumps must
 # update this alongside the dispatcher ``__version__``.
-SUMMON_VERSION = "3.5.0"
+SUMMON_VERSION = "3.6.0"
 # Backward-compatible name for callers that used the old event constant.  It
 # refers to event records, never the persisted opt-in configuration.
 SCHEMA_VERSION = EVENT_SCHEMA_VERSION
@@ -1422,7 +1422,7 @@ def recommended_timeout_ms(backend: str | None, default_ms: int = 600_000,
         and ev.get("operation") in ("dispatch", None)
         and isinstance(ev.get("elapsed_ms"), int)
         and ev["elapsed_ms"] > 0
-        and ev.get("cohort") == "live"
+        and (ev.get("cohort") or "live") == "live"
     ]
     if len(latencies) < min_samples:
         result_ms = int(default_ms)
@@ -1444,7 +1444,7 @@ def stats(*, cohort: str | None = None) -> dict:
     archive = Path(str(path) + ".1")
     events = _read_recent_events()
     if cohort:
-        events = [ev for ev in events if ev.get("cohort") == cohort]
+        events = [ev for ev in events if (ev.get("cohort") or "live") == cohort]
     by_cohort: dict[str, int] = {}
     by_failure: dict[str, int] = {}
     backends: dict[str, dict] = {}

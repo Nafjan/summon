@@ -82,7 +82,7 @@ Define secondary local account/config profiles in `~/.agents/summon-profiles.jso
 
 - **Gemini (`gemini-4-argon-high`, `gemini-3.8-flash-high`)**: `argon-reviewer` targets Gemini 4 Argon (`gemini-4-argon-high`); `flash-reviewer`, `researcher`, `frontend`, `docs-writer`, and `antigravity` target Gemini 3.8 Flash (`gemini-3.8-flash-high`) via `agy`. Because `agy` cannot enforce `read-only`, Summon refuses `agy` at `read-only` and fails closed rather than imply a boundary that does not exist (unless `SUMMON_ALLOW_UNENFORCED_READONLY=1` is set). Run `agy` in a disposable clone/`--worktree` with `yolo`.
 - **OpenAI Codex (`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-codex`, `gpt-5.4-codex-mini`)**: `astra` pins `gpt-6-astra`, `sol-review` pins `gpt-6.1-sol`, and `luna-review` pins `gpt-6-luna` at high effort with exact-model verification.
-- **Claude (`claude-opus-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`)**: `architect`/`planner`/`deep-debugger`/`security-auditor` pin `claude-opus-5`; `fable` pins `claude-fable-5-1` (`--profile fable`) as the escalation decision lead.
+- **Claude (`claude-opus-5`, `claude-sonnet-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`)**: `architect`/`planner`/`deep-debugger`/`security-auditor` pin `claude-opus-5`; `pair`/`editor`/`quick-reviewer`/`pr-prep` pin `claude-sonnet-5`; `fable` pins `claude-fable-5-1` (`--profile fable`) as the escalation decision lead.
 - **BytePlus ModelArk Coding Plan (`deepseek-v4-pro`, `glm-5-3-flash`)**: `byteplus-coder` (`deepseek-v4-pro`) and `byteplus-glm-5-3-flash` (`glm-5-3-flash`) run over the subscription `byteplus-coding` route (`/api/coding/v3`, text-only).
 
 ### Step 2: Execute Agent & Capability Boundary

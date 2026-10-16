@@ -65,7 +65,7 @@ for evidence-linked integration and stopping conditions.
 - **[effort.md](effort.md)** - reasoning effort / thinking levels: who honors `--effort`, defaults, agy Gemini suffixes, envelope fields
 - **[examples/](../examples/)** - document-audit schema, manifest, question, and role-specialized council agents
 - **[VERSIONING_AND_1.0_CRITERIA.md](../../../docs/VERSIONING_AND_1.0_CRITERIA.md)** - the stable public contract, the criteria 1.0.0 met, and the evidence behind it
-- **[references/]()** - deep-dive docs: models, backends, effort, customizing agents, fan-out & council (read on demand)
+- **Reference docs** ([models.md](models.md), [backends.md](backends.md), [effort.md](effort.md), [customizing.md](customizing.md), [fan-out.md](fan-out.md)) - deep-dive docs: models, backends, effort, customizing agents, fan-out & council (read on demand)
 
 **Script Path**: On Windows, use `{SKILL_DIR}\scripts\summon.cmd`; it selects a
 compatible Python through the Windows launcher and must be preferred over invoking
@@ -757,7 +757,7 @@ path for expensive councils — prefer it over re-running from scratch. See
 carry-forward/invalidation rules, and the one documented single-machine lock limitation.
 
 The integrated provider-inert workflow is documented in
-`../../docs/PHASE1_OPERATOR_GUIDE.md` in a source checkout. Installed copies ship the
+`../../../docs/PHASE1_OPERATOR_GUIDE.md` in a source checkout. Installed copies ship the
 standalone `examples/phase1/consume_portable_result.py` interoperability golden. It
 imports no Summon modules and grants no execution, routing, or native-subagent authority.
 
@@ -1140,7 +1140,7 @@ than one local directory, add each directory explicitly with repeated `--read-ro
 persist them in the seat definition:
 
 ```yaml
-read-roots: '["D:\\project\\oracle", "D:\\project\\board"]'
+read-roots: '["C:\\repo\\service-a", "C:\\repo\\service-b"]'
 ```
 
 Run `--dry-run` first. It reports `read_allowlist.requested_paths`, the effective paths,

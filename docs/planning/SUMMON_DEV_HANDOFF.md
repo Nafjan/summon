@@ -17,7 +17,7 @@ the repo's conventions; every behavioral change needs a pinning test.
 
 ## Context
 
-Summon is a cross-vendor sub-agent dispatcher (72-seat operator roster +
+Summon is a cross-vendor sub-agent dispatcher (operator roster +
 bundled roster) with a 3.5.0 workspace preview. The 3.5.0 release candidate is
 committed and machine-accepted locally; publication is deliberately reserved
 to the owner. The last full clean-source capture binds `fb41dae` (27/27
@@ -50,10 +50,7 @@ before dispatching anything.
 - `skills/summon/scripts/test_model_routing.py` (routing/credential/list
   tests), `tests/test_release_*.py`, `tests/test_migration_gate.py`,
   `skills/summon/scripts/test_discovery.py` (doc/leak/version pins).
-- `install.py` — managed-install refresh (`python install.py`; does NOT cover
-  the `.zcode\skills\summon` host — refresh that copy manually).
-- `<local temp>\opencode\` — the only cwd OpenCode accepts for dispatches on
-  the operator's machine (restricted permission policy).
+- `install.py` — managed-install refresh (`python install.py`).
 
 ## Current state
 
@@ -64,10 +61,10 @@ before dispatching anything.
   evidence (catalog/routing 22, inventory/discovery 124, model-routing 20)
   but no full clean capture yet.
 - **Reviews**: the friction-fix commit was adversarially reviewed
-  (rseen-reviewer: 1 blocking + 3 review + 3 nit) and all findings were fixed
+  (code-reviewer: 1 blocking + 3 review + 3 nit) and all findings were fixed
   in `af9afc1` (real gate tests for `credential_missing` dry-run + live
   preflight; endpoint-gate parity; first-refusal-wins ordering; table column
-  removed; dead guard removed). Independently re-verified (rseen-verifier:
+  removed; dead guard removed). Independently re-verified (reviewer:
   CONFIRMED, 20/20 tests both modes, ruff clean on changed lines).
 - **Backend availability**: CLI discovery, model/account availability, and
   execution capabilities vary by environment. Validate availability with
@@ -144,8 +141,7 @@ before dispatching anything.
 - [ ] Any fresh full capture completes with zero unexplained failures and
       only reviewed-policy skips before a manifest check is claimed.
 - [ ] Installed copies refreshed (`python install.py`) and
-      `managed_converged: true` verified after any payload change; the
-      `.zcode` copy refreshed manually alongside.
+      `managed_converged: true` verified after any payload change.
 - [ ] U03/U07 device observations collected by a human operator before the
       accessibility gate is claimed.
 - [ ] No statement that 3.5.0 is published unless the owner executed the
@@ -165,9 +161,8 @@ before dispatching anything.
 - Privacy: never expose credentials, account details, private prompts, raw
   receipts, telemetry contents, or machine fingerprints in public documents;
   L06 scans before any publication.
-- Preserve: pending roster/seat state, uncommitted operator work, the
-  `.zcode` copy's manual-refresh requirement, the two vendored 3.4.0 copies
-  (owner curation, not yours to delete).
+- Preserve: pending roster/seat state, uncommitted operator work, and any
+  explicitly curated unmanaged copies outside the installer scope.
 
 ## Handoff prompt (paste into the receiving agent)
 

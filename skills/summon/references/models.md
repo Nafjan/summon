@@ -15,7 +15,7 @@ The current editorial bands are:
 | Band | Order | Models | Typical lane |
 |---|---:|---|---|
 | **Frontier** | 1–12 | Astra, Fable (5.1 and 5), Sol (6.1 and 5.6), Opus (5.5 and 5), Gemini 4 Argon, Kimi, DeepSeek V4 Pro, Gemini Flash 3.8 | escalation, architecture, synthesis, high-context research, deep reasoning, vision and frontend review |
-| **Near-frontier** | 1–15 | Luna (6 and 5.6), Sonnet (5.5 and 5), Grok (4.7 and 4.6), DeepSeek V4.1 Flash, GLM 5.3 Flash, Gemini Flash 3.7, GLM 5.2, DeepSeek V4 Flash, Terra 5.6, Spark 5.3 | fast evidence, coding second opinions, and cost-efficient secondary work |
+| **Near-frontier** | 1–16 | Luna (6 and 5.6), Sonnet (5.5 and 5), Grok (4.7 and 4.6), DeepSeek V4.1 Flash, GLM 5.3 Flash, Gemini Flash 3.7, GLM 5.2, DeepSeek V4 Flash, Terra 5.6, Spark 5.3 | fast evidence, coding second opinions, and cost-efficient secondary work |
 
 The lineup was refreshed on 2026-10-13 to add GPT-6.1 Sol, GPT-6 Luna, Gemini 4 Argon (`gemini-4-argon-high`), Claude Opus/Sonnet 5.5 (`claude` and `agy` routes), Grok 4.7, and un-suffixed ModelArk Coding Plan aliases alongside historical entries so older receipts keep their exact catalog display. These are Summon-curated labels, not benchmark, safety, cost,
 availability, or vendor claims. A tooltip may show the role, model name, version,

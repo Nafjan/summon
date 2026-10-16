@@ -5,8 +5,10 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+## [3.6.0] - 2026-10-16
+
 - Refresh the model lineup and routing table across Claude (`claude-opus-5`,
-  `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`, and dated `5-5`
+  `claude-sonnet-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`, and dated `5-5`
   Bedrock/Vertex pins), Gemini (`gemini-4-argon-high`, `gemini-4-argon-low`,
   `gemini-3.8-flash-high`, `gemini-4-flash`), Codex (`gpt-6-astra`,
   `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-codex`, `gpt-5.4-codex-mini`), Kimi

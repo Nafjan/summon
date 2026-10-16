@@ -804,7 +804,10 @@ def test_wave2_f1_f2_f3_contracts(tmp_path, monkeypatch):
     # Concurrent stale-lock reclamation admits exactly 1 winner
     race_out = tmp_path / "race.json"
     race_lock = Path(str(race_out) + ".active.lock")
-    race_lock.write_text("99999999\nstale-token-0\n", encoding="utf-8")
+    race_lock.write_text(
+        json.dumps({"pid": 99999999, "token": "stale-token-0", "acquired_at": time.time() - 10.0}),
+        encoding="utf-8",
+    )
     import threading
     barrier = threading.Barrier(8)
     results = []
@@ -823,6 +826,13 @@ def test_wave2_f1_f2_f3_contracts(tmp_path, monkeypatch):
         th.join()
     assert results.count(None) == 1
     run_subagent._release_current_out_lock()
+
+    # Whole-response closed code fence without STATUS anchor still extracts fallback summary
+    fenced_unstructured = _executor._enrich(
+        {"status": "success", "exit_code": 0, "cli": "claude", "result": "```text\nUnstructured fenced reply\n```\n"},
+        None,
+    )
+    assert fenced_unstructured["summary"] == "Unstructured fenced reply"
 
     # F2: parse_report preserves fenced snippets in COMMANDS/HANDOFF while ignoring spoofed headers inside fences
     assert _executor._parse_confidence("nan") is None
@@ -982,6 +992,7 @@ def test_wave3_f6_f7_f8_contracts(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     link_re = re.compile(r"\[[^\]]+\]\(([^)#\s]+)(?:#[^)]*)?\)")
     for doc in (skill_dir / "SKILL.md", skill_dir / "references" / "reference-manual.md"):
         doc_text = doc.read_text(encoding="utf-8")
+        assert "]()" not in doc_text, f"Empty markdown link target in {doc.name}"
         for match in link_re.finditer(doc_text):
             target = match.group(1)
             if target.startswith(("http://", "https://", "mailto:", "file://")):

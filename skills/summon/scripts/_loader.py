@@ -142,7 +142,7 @@ def parse_read_roots(value) -> tuple[str, ...]:
     """Parse the bounded ``read-roots`` frontmatter value.
 
     Frontmatter is intentionally flat.  A JSON array is the unambiguous form for
-    Windows paths (for example ``["I:\\\\oracle", "I:\\\\board"]``); a
+    Windows paths (for example ``["C:\\\\repo\\\\service-a", "C:\\\\repo\\\\service-b"]``); a
     semicolon-separated string is accepted for hand-written definitions.  This
     function only parses and bounds the list; path existence and backend support
     are checked by the dispatcher before a child is launched.

@@ -378,7 +378,7 @@ def test_effective_decision_binds_metered_api_spend_to_explicit_route(monkeypatc
     monkeypatch.setattr(_apibackend, "payg_consent_allowed",
                         lambda flag=False: bool(flag))
     args = SimpleNamespace(
-        agent="deepseek-41-flash", _resolved_agent="deepseek-41-flash",
+        agent="byteplus-coder", _resolved_agent="byteplus-coder",
         _role_provenance={}, max_permission="read-only", allow_credit=False,
         allow_payg=False, strict_agents_dir=True, usage_cache=None,
         no_contract_repair=False, json_schema=None,

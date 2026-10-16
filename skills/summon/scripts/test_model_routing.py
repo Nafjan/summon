@@ -135,7 +135,7 @@ class ModelRoutingTests(unittest.TestCase):
                 api_key_env="SUMMON_TEST_MISSING_MODELARK_KEY",
                 allow_payg=True)
             args = SimpleNamespace(
-                agent="deepseek-41-flash", _resolved_agent="deepseek-41-flash",
+                agent="byteplus-coder", _resolved_agent="byteplus-coder",
                 strict_agents_dir=False, timeout=1000, worktree=None,
                 _role_provenance={}, agents_dir=None, gate_with=None,
                 allow_text_only=True)
@@ -214,7 +214,7 @@ class ModelRoutingTests(unittest.TestCase):
             base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
             api_key_env="MODELARK_API_KEY", allow_payg=False)
         args = SimpleNamespace(
-            agent="deepseek-41-flash", _resolved_agent="deepseek-41-flash",
+            agent="byteplus-coder", _resolved_agent="byteplus-coder",
             strict_agents_dir=False, timeout=1000, worktree=None,
             _role_provenance={}, agents_dir=None, gate_with=None,
             allow_text_only=True, allow_credit=False, allow_payg=False)
@@ -245,7 +245,7 @@ class ModelRoutingTests(unittest.TestCase):
             base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
             api_key_env="MODELARK_API_KEY", allow_payg=True)
         args = SimpleNamespace(
-            agent="deepseek-41-flash", _resolved_agent="deepseek-41-flash",
+            agent="byteplus-coder", _resolved_agent="byteplus-coder",
             strict_agents_dir=False, timeout=1000, worktree=None,
             _role_provenance={}, agents_dir=None, gate_with=None,
             allow_text_only=True, allow_credit=False, allow_payg=True)
@@ -272,7 +272,7 @@ class ModelRoutingTests(unittest.TestCase):
             base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
             api_key_env="", allow_payg=True)
         args = SimpleNamespace(
-            agent="deepseek-41-flash", _resolved_agent="deepseek-41-flash",
+            agent="byteplus-coder", _resolved_agent="byteplus-coder",
             strict_agents_dir=False, timeout=1000, worktree=None,
             _role_provenance={}, agents_dir=None, gate_with=None,
             allow_text_only=True, allow_credit=False, allow_payg=True)
