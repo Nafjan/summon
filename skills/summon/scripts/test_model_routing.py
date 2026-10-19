@@ -577,8 +577,9 @@ class ModelRoutingTests(unittest.TestCase):
                 fh.write(json.dumps({"type": "event_msg", "payload": {"turn_id": "t1", "type": "task_complete"}}) + "\n")
                 fh.write(json.dumps({"type": "turn_context", "payload": {"turn_id": "t2", "model": "gpt-6.1-sol"}}) + "\n")
                 fh.write(json.dumps({"type": "event_msg", "payload": {"turn_id": "t2", "type": "task_complete"}}) + "\n")
-            t_mod, used_mods = _executor._codex_rollout_model_evidence(sid, codex_home=tmp)
+            t_mod, s_mod, used_mods = _executor._codex_rollout_model_evidence(sid, codex_home=tmp)
             self.assertEqual(t_mod, "gpt-6.1-sol")
+            self.assertIsNone(s_mod)
             self.assertEqual(used_mods, ["gpt-6.1-sol"])
 
             with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}, clear=False):
@@ -603,9 +604,57 @@ class ModelRoutingTests(unittest.TestCase):
             # An unexecuted trailing turn_context must not inherit earlier turn activity
             with open(rfile, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"type": "turn_context", "payload": {"turn_id": "t3", "model": "gpt-6-astra"}}) + "\n")
-            self.assertEqual(_executor._codex_rollout_model_evidence(sid, codex_home=tmp), (None, []))
+            self.assertEqual(_executor._codex_rollout_model_evidence(sid, codex_home=tmp), (None, None, []))
+
+    def test_codex_rollout_token_usage_record_certifies_served_model(self):
+        import json
+        import _executor
+        with tempfile.TemporaryDirectory() as tmp:
+            sid = "01a154e2-bb74-7a12-82c7-29b317c70f8a"
+            parent_sid = "01a06fbd-2ee3-7b53-af3a-8c4cebcb34ea"
+            sdir = os.path.join(tmp, "sessions", "2026", "10", "19")
+            os.makedirs(sdir, exist_ok=True)
+            rfile = os.path.join(sdir, f"rollout-2026-10-19T18-58-30-{sid}.jsonl")
+            with open(rfile, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "session_meta", "payload": {"id": sid, "session_id": parent_sid}}) + "\n")
+                fh.write(json.dumps({"type": "turn_context", "payload": {"turn_id": "t1", "model": "gpt-6.1-sol"}}) + "\n")
+                fh.write(json.dumps({
+                    "type": "token_usage_record",
+                    "payload": {
+                        "thread_id": sid,
+                        "session_id": parent_sid,
+                        "turn_id": "t1",
+                        "response_id": "resp_0f9199aaadfb53f6016ad63e2817e081919caf8ad992a67eb1",
+                        "usage": {"input_tokens": 40692, "output_tokens": 406},
+                    },
+                }) + "\n")
+                fh.write(json.dumps({"type": "event_msg", "payload": {"turn_id": "t1", "type": "task_complete"}}) + "\n")
+            t_mod, s_mod, used_mods = _executor._codex_rollout_model_evidence(sid, codex_home=tmp)
+            self.assertEqual(t_mod, "gpt-6.1-sol")
+            self.assertEqual(s_mod, "gpt-6.1-sol")
+            self.assertEqual(used_mods, ["gpt-6.1-sol"])
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}, clear=False):
+                enriched = _executor._enrich(
+                    {
+                        "status": "success",
+                        "exit_code": 0,
+                        "cli": "codex",
+                        "session_id": sid,
+                        "result": (
+                            "STATUS: DONE\nSUMMARY: ok\nCONFIDENCE: 0.9\n"
+                            "FOLLOW-UP: None\nHANDOFF: None\n"
+                        ),
+                    },
+                    None,
+                )
+            self.assertEqual(enriched["model_targeted"], "gpt-6.1-sol")
+            self.assertEqual(enriched["model_resolved"], "gpt-6.1-sol")
+            self.assertEqual(enriched["models_used"], ["gpt-6.1-sol"])
+            self.assertEqual(enriched["model_evidence_source"], "codex_rollout_token_usage_record")
 
 
 if __name__ == "__main__":
     unittest.main()
+
 

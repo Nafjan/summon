@@ -102,7 +102,7 @@ from _resolver import discover_models, resolve_cli  # noqa: E402
 # Keep a literal assignment: the release-contract parser uses the dispatcher
 # source as a machine-checkable companion.  `_telemetry.SUMMON_VERSION` must be
 # updated in the same release; the release contract checks both literals.
-__version__ = "3.6.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "3.6.1"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -733,9 +733,14 @@ def _emit(obj: dict, *, operation: str | None = None,
     # Diagnostics are strictly opt-in and fail-soft. A malformed local telemetry
     # file must never change dispatch behavior or hide the real envelope.
     try:
-        # --dry-run is a provider-inert preview, not a terminal operation; do
-        # not emit it as an invalid_status / exit_code=None telemetry record.
-        if obj.get("status") != "dry_run":
+        # --dry-run is a provider-inert preview and --out skip is a cached prior
+        # receipt, not a new terminal operation; do not emit either as an
+        # invalid_status / invalid_model_evidence telemetry record.
+        if (
+            not obj.get("dry_run")
+            and obj.get("status") != "dry_run"
+            and not obj.get("skipped")
+        ):
             # The executor's stream parser is the source of served-model evidence.
             # Bind that result to a private telemetry capability here; raw envelope
             # fields are intentionally ignored by the projector.  Keep the marker
@@ -743,10 +748,10 @@ def _emit(obj: dict, *, operation: str | None = None,
             # file.
             _telemetry_obj = dict(obj)
             if trusted_executor_result:
-                # Only the in-process executor result may mint this marker.  A
-                # reused --out envelope, a --resume input, or a hand-built JSON
-                # object remains unverified even when it contains
-                # served_model_evidence="reported".
+                # Only the in-process executor result or dispatcher-owned
+                # not_run refusal may mint this marker.  A reused --out envelope,
+                # a --resume input, or a hand-built JSON object remains unverified
+                # even when it contains served_model_evidence="reported".
                 _marker = _executor.trusted_telemetry_model_evidence(obj)
                 if _marker is not None:
                     _telemetry_obj["_telemetry_model_evidence"] = _marker
@@ -864,7 +869,7 @@ def _print_error(error: str, exit_code: int = 1) -> None:
     envelope = {"result": "", "exit_code": exit_code,
                 "status": "error", "error": error}
     _mark_not_run(envelope)
-    _emit(envelope, operation=_EMIT_OPERATION)
+    _emit(envelope, operation=_EMIT_OPERATION, trusted_executor_result=True)
 
 
 def _mark_not_run(env: dict) -> dict:
@@ -1312,7 +1317,7 @@ def main() -> None:
                 "summon": _receipt_base()["summon"],
             }
             _mark_not_run(_resume_error)
-            _emit(_resume_error, operation="resume")
+            _emit(_resume_error, operation="resume", trusted_executor_result=True)
             sys.exit(1)
     _EMIT_OPERATION = "resume" if args.resume else "dispatch"
 
@@ -1466,7 +1471,7 @@ def main() -> None:
                 "retryable": False, "result_usable": False,
             }
             _mark_not_run(_usage_error)
-            _emit(_usage_error, operation="usage")
+            _emit(_usage_error, operation="usage", trusted_executor_result=True)
             sys.exit(1)
     if getattr(args, "usage_from", None):
         _print_error("--usage-from is valid only with usage import")
@@ -1829,7 +1834,7 @@ def main() -> None:
                         "approval-") else "advisory_only"),
             }
             _mark_not_run(_fleet_error)
-            _emit(_fleet_error, operation="fleet")
+            _emit(_fleet_error, operation="fleet", trusted_executor_result=True)
             sys.exit(1)
 
     # Local diagnostics are management commands, not dispatches. Keep them
@@ -2152,7 +2157,7 @@ def main() -> None:
             except Exception:  # noqa: BLE001 — reporting the original error matters more
                 pass
         _release_current_out_lock()
-        _emit(env, operation=_EMIT_OPERATION)
+        _emit(env, operation=_EMIT_OPERATION, trusted_executor_result=True)
         sys.exit(exit_code)
 
     # A detached child is launched from an immutable scripts snapshot. Verify
@@ -2179,7 +2184,8 @@ def main() -> None:
     # loudly instead of silently executing.
     if args.dry_run and (args.background or args.manifest or args.council):
         _die("--dry-run cannot be combined with --background, --manifest, or "
-             "--council (it previews one resolved dispatch and never executes)")
+             "--council (it previews one resolved dispatch and never executes)",
+             error_kind="invalid_input")
 
     # --background and --out are two DIFFERENT completion contracts: background
     # signals done via its own result_file (job handle), while --out means
@@ -2190,7 +2196,8 @@ def main() -> None:
     if args.background and args.out:
         _die("--background and --out are incompatible: background reports "
              "completion via its own result_file; --out is the (manifest) "
-             "result-file mechanism. Use --manifest for fan-out with result files.")
+             "result-file mechanism. Use --manifest for fan-out with result files.",
+             error_kind="invalid_input")
 
     # --manifest: batch fan-out. Delegates to _manifest and exits.
     if args.manifest:
@@ -2582,8 +2589,9 @@ def main() -> None:
                     pass
                 if args.cwd:
                     _env["cwd"] = args.cwd
+                _mark_not_run(_env)
                 finalize_exit_fields(_env)
-                _emit(_env, operation=_EMIT_OPERATION)
+                _emit(_env, operation=_EMIT_OPERATION, trusted_executor_result=True)
                 sys.exit(0)
         print(json.dumps(_spawn_background(args), ensure_ascii=False))
         sys.exit(0)
@@ -2847,7 +2855,7 @@ def main() -> None:
                     _write_out(args.out, setup_error)
                 except Exception:  # noqa: BLE001 — reporting the error matters more
                     pass
-            _emit(setup_error, operation=_EMIT_OPERATION)
+            _emit(setup_error, operation=_EMIT_OPERATION, trusted_executor_result=True)
             sys.exit(setup_error.get("exit_code", 1))
 
     # --worktree: run the agent in an isolated git worktree instead of the cwd.
@@ -3212,7 +3220,7 @@ def main() -> None:
         finalize_exit_fields(_env)
         if args.out:
             _write_out(args.out, _env)
-        _emit(_env, operation=_EMIT_OPERATION)
+        _emit(_env, operation=_EMIT_OPERATION, trusted_executor_result=True)
         sys.exit(0)
 
     # --gate-with: another agent must APPROVE this dispatch before it runs. Placed
@@ -3272,7 +3280,7 @@ def main() -> None:
             finalize_exit_fields(_env)
             if args.out:
                 _write_out(args.out, _env)
-            _emit(_env, operation=_EMIT_OPERATION)
+            _emit(_env, operation=_EMIT_OPERATION, trusted_executor_result=True)
             sys.exit(0)
 
     # Effective-tree provenance: recompute HEAD after any worktree rewrite,
@@ -3321,7 +3329,7 @@ def main() -> None:
                 _fleet_failure = _fleet_runtime_state.failure(e)
                 finalize_exit_fields(_fleet_failure)
                 _fleet_failure.update(receipt)
-                _emit(_fleet_failure, operation="dispatch")
+                _emit(_fleet_failure, operation="dispatch", trusted_executor_result=True)
                 sys.exit(1)
             except SystemExit:
                 raise
@@ -3342,7 +3350,7 @@ def main() -> None:
                 }
                 finalize_exit_fields(_fleet_failure)
                 _fleet_failure.update(receipt)
-                _emit(_fleet_failure, operation="dispatch")
+                _emit(_fleet_failure, operation="dispatch", trusted_executor_result=True)
                 sys.exit(1)
         _die(str(e), error_kind=getattr(e, "kind", None))
     # Effort is request-level evidence. Kimi's builder applies it to the
@@ -5264,7 +5272,11 @@ def _record_background_system_exit(exc: SystemExit) -> None:
     envelope = _system_exit_envelope(exc)
     try:
         _stamp_job(envelope)
-        _telemetry.record(envelope)
+        _telemetry_env = dict(envelope)
+        _marker = _executor.trusted_telemetry_model_evidence(envelope)
+        if _marker is not None:
+            _telemetry_env["_telemetry_model_evidence"] = _marker
+        _telemetry.record(_telemetry_env)
     except Exception:  # noqa: BLE001 - reporting must not alter the exit
         pass
     try:
@@ -5283,7 +5295,11 @@ if __name__ == "__main__":
         err = _crash_envelope(e)
         try:
             _stamp_job(err)   # preserve background identity before telemetry projection
-            _telemetry.record(err)
+            _telemetry_err = dict(err)
+            _marker = _executor.trusted_telemetry_model_evidence(err)
+            if _marker is not None:
+                _telemetry_err["_telemetry_model_evidence"] = _marker
+            _telemetry.record(_telemetry_err)
         except Exception:  # noqa: BLE001 - crash reporting must remain fail-soft
             pass
         jf = _resolve_job_file()

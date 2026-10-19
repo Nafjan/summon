@@ -5,6 +5,26 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+## [3.6.1] - 2026-10-19
+
+- Certify Codex 0.162+/0.163+ served-model provenance from session rollout
+  `token_usage_record` provider response receipts (`response_id: "resp_..."` and
+  `usage.output_tokens > 0`) in `_executor._codex_rollout_model_evidence()`,
+  supporting both root and child-thread rollout IDs (`session_meta.id` and
+  `session_meta.session_id`) while keeping `turn_context`-only rollouts and
+  mixed-model sessions fail-closed (`test_codex_rollout_token_usage_record_certifies_served_model`).
+- Fix telemetry producer and classification edge cases: skip `--dry-run` preview
+  envelopes (`dry_run: true`) and `--out` cached skips (`skipped: true`) in
+  `run_subagent._emit()`, bind dispatcher-owned pre-dispatch `not_run` and crash
+  envelopes to the trusted telemetry capability marker so they record as
+  `validation_outcome: "valid"`, classify incompatible flag combinations
+  (`--background` + `--out`, `--dry-run` + fan-out) as `invalid_input` rather
+  than `report_contract`, preserve `opencode`, `zcode`, and `t3` backend names
+  in telemetry projections, and add `by_version` breakdown to `summon stats`.
+- Add AGY display model aliases for `Claude Opus 5.5 (Thinking)`,
+  `Claude Sonnet 5.5 (Thinking)`, `Gemini 3.8 Flash (High/Medium/Low)`, and
+  `Gemini 4 Argon (High/Low)` in `_builder._AGY_MODEL_ALIASES`.
+
 ## [3.6.0] - 2026-10-16
 
 - Refresh the model lineup and routing table across Claude (`claude-opus-5`,

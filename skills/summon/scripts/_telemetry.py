@@ -40,7 +40,7 @@ EVENT_SCHEMA_VERSION = 2
 # Keep the telemetry contract tied to the dispatcher release without importing
 # ``run_subagent`` (which would introduce a module cycle).  Release bumps must
 # update this alongside the dispatcher ``__version__``.
-SUMMON_VERSION = "3.6.0"
+SUMMON_VERSION = "3.6.1"
 # Backward-compatible name for callers that used the old event constant.  It
 # refers to event records, never the persisted opt-in configuration.
 SCHEMA_VERSION = EVENT_SCHEMA_VERSION
@@ -638,6 +638,7 @@ _FAILURE_CLASS_BY_KIND = {
     "agy_capability_probe_stalled": "dispatch",
     "agy_capability_probe_failed": "dispatch",
     "prompt_too_long_for_argv": "invalid_input",
+    "invalid_input": "invalid_input",
 }
 # "timeout" as a word, not inside a flag name such as "--print-timeout".
 _TIMEOUT_TEXT_RE = re.compile(r"(?<!-)timeout")
@@ -670,7 +671,7 @@ def _failure_class(envelope: dict) -> str:
         return "transport"
     if any(word in text for word in ("not found", "command not found", "cli not")):
         return "missing_cli"
-    if any(word in text for word in ("prompt", "argument", "invalid", "required")):
+    if any(word in text for word in ("prompt", "argument", "invalid", "required", "incompatible")):
         return "invalid_input"
     if any(word in text for word in ("report", "contract", "parse")):
         return "report_contract"
@@ -923,8 +924,8 @@ def event_from_envelope(envelope: dict, *, source: str = "dispatch",
         "failure_class": failure,
         "error_sha256": _digest(envelope.get("error")),
         "backend": _bounded(envelope.get("cli"), {
-            "claude", "codex", "cursor-agent", "gemini", "agy", "kimi", "arkcli",
-            "openai-compat", "summon"}),
+            "claude", "codex", "cursor-agent", "gemini", "agy", "kimi", "opencode",
+            "zcode", "t3", "arkcli", "openai-compat", "summon"}),
         "transport": _bounded(envelope.get("transport"), {
             "subprocess", "acp", "council", "manifest"}),
         "model_requested": requested_model,
@@ -1438,20 +1439,25 @@ def recommended_timeout_ms(backend: str | None, default_ms: int = 600_000,
     return result_ms
 
 
-def stats(*, cohort: str | None = None) -> dict:
+def stats(*, cohort: str | None = None, version: str | None = None) -> dict:
     """Aggregate local telemetry into per-backend reliability, latency, and failure stats."""
     path = _events_path()
     archive = Path(str(path) + ".1")
     events = _read_recent_events()
     if cohort:
         events = [ev for ev in events if (ev.get("cohort") or "live") == cohort]
+    if version:
+        events = [ev for ev in events if str(ev.get("summon_version") or "unknown") == version]
     by_cohort: dict[str, int] = {}
+    by_version: dict[str, int] = {}
     by_failure: dict[str, int] = {}
     backends: dict[str, dict] = {}
     read_only_violations = 0
     for ev in events:
         c = str(ev.get("cohort") or "unknown")
         by_cohort[c] = by_cohort.get(c, 0) + 1
+        v = str(ev.get("summon_version") or "unknown")
+        by_version[v] = by_version.get(v, 0) + 1
         fc = str(ev.get("failure_class") or "unknown")
         by_failure[fc] = by_failure.get(fc, 0) + 1
         ws = ev.get("workspace")
@@ -1492,8 +1498,10 @@ def stats(*, cohort: str | None = None) -> dict:
         "event_file": _display_path(path),
         "rotated_archive_present": archive.is_file(),
         "cohort_filter": cohort,
+        "version_filter": version,
         "total_events": len(events),
         "by_cohort": dict(sorted(by_cohort.items())),
+        "by_version": dict(sorted(by_version.items())),
         "by_failure_class": dict(sorted(by_failure.items())),
         "read_only_violations": read_only_violations,
         "by_backend": backend_summary,
@@ -1693,7 +1701,7 @@ def _validate_public_evidence(evidence: object) -> None:
     _enum_or_none("execution_status", _EXECUTION_STATUSES)
     _enum_or_none("failure_class", _FAILURE_CLASSES)
     _enum_or_none("backend", {"claude", "codex", "cursor-agent", "gemini", "agy", "kimi",
-                               "arkcli", "openai-compat", "summon"})
+                               "opencode", "zcode", "t3", "arkcli", "openai-compat", "summon"})
     _enum_or_none("transport", {"subprocess", "acp", "council", "manifest"})
     _enum_or_none("permission", {"read-only", "safe-edit", "yolo"})
     _enum_or_none("timeout_stage", _TIMEOUT_STAGES)

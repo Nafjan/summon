@@ -2456,11 +2456,14 @@ _AGY_AUTH_FILES = (
 )
 _AGY_MODEL_ALIASES = {
     # Common user-provided aliases that should map to agy's display model names.
+    "claude-opus-5-5-thinking": "Claude Opus 5.5 (Thinking)",
+    "claude opus 5 5 thinking": "Claude Opus 5.5 (Thinking)",
+    "claude-sonnet-5-5-thinking": "Claude Sonnet 5.5 (Thinking)",
+    "claude sonnet 5 5 thinking": "Claude Sonnet 5.5 (Thinking)",
     "claude-opus-4-6-thinking": "Claude Opus 4.6 (Thinking)",
     "claude-opus-4.6-thinking": "Claude Opus 4.6 (Thinking)",
     "claude opus 4 6 thinking": "Claude Opus 4.6 (Thinking)",
     "claude opus 4.6 thinking": "Claude Opus 4.6 (Thinking)",
-    "claude-opus-4.6-thinking": "Claude Opus 4.6 (Thinking)",
     "claude-sonnet-4-6-thinking": "Claude Sonnet 4.6 (Thinking)",
     "claude sonnet 4 6 thinking": "Claude Sonnet 4.6 (Thinking)",
     "claude sonnet 4.6 thinking": "Claude Sonnet 4.6 (Thinking)",
@@ -2469,12 +2472,17 @@ _AGY_MODEL_ALIASES = {
     "gpt-oss 120b medium": "GPT-OSS 120B (Medium)",
     "gpt_oss_120b_medium": "GPT-OSS 120B (Medium)",
     "gptoss120bmedium": "GPT-OSS 120B (Medium)",
+    "gemini 3 8 flash high": "Gemini 3.8 Flash (High)",
+    "gemini 3 8 flash medium": "Gemini 3.8 Flash (Medium)",
+    "gemini 3 8 flash low": "Gemini 3.8 Flash (Low)",
     "gemini 3 6 flash high": "Gemini 3.6 Flash (High)",
     "gemini 3 6 flash medium": "Gemini 3.6 Flash (Medium)",
     "gemini 3 6 flash low": "Gemini 3.6 Flash (Low)",
     "gemini 3 5 flash high": "Gemini 3.5 Flash (High)",
     "gemini 3 5 flash medium": "Gemini 3.5 Flash (Medium)",
     "gemini 3 5 flash low": "Gemini 3.5 Flash (Low)",
+    "gemini 4 argon high": "Gemini 4 Argon (High)",
+    "gemini 4 argon low": "Gemini 4 Argon (Low)",
     "gemini 3 1 pro high": "Gemini 3.1 Pro (High)",
     "gemini 3 1 pro low": "Gemini 3.1 Pro (Low)",
 }

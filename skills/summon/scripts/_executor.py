@@ -789,26 +789,28 @@ def _codex_rollout_model_evidence(
     session_id: str | None,
     *,
     codex_home: str | None = None,
-) -> tuple[str | None, list[str]]:
-    """Read local Codex turn_context model metadata from a session rollout file.
+) -> tuple[str | None, str | None, list[str]]:
+    """Read local Codex turn_context and token_usage_record evidence from a session rollout file.
 
     Codex 0.121+ ``exec --json`` omits ``model`` from ``thread.started`` and
-    ``turn.completed`` stdout events, while writing ``session_meta`` and
-    ``turn_context.payload.model`` to ``~/.codex/sessions/YYYY/MM/DD/rollout-*-<session_id>.jsonl``.
-    Because ``turn_context.payload.model`` is constructed from the client's
-    selected turn configuration rather than a provider response header, this
-    helper returns ``(targeted_model, models_used)`` only and NEVER certifies
-    ``model.served``.
+    ``turn.completed`` stdout events, while writing ``session_meta``,
+    ``turn_context.payload.model``, and ``token_usage_record`` entries to
+    ``~/.codex/sessions/YYYY/MM/DD/rollout-*-<session_id>.jsonl``.
+    ``turn_context.payload.model`` alone is client turn configuration and only
+    populates ``targeted_model``. ``served_model`` is certified only when the
+    active turn also records a ``token_usage_record`` carrying a provider
+    ``response_id`` (``resp_...``) and positive ``usage.output_tokens``, and a
+    single consistent model identity across all verified turns in the rollout.
     """
     if not isinstance(session_id, str):
-        return None, []
+        return None, None, []
     sid = session_id.strip()
     if not _CODEX_SESSION_UUID_RE.fullmatch(sid):
-        return None, []
+        return None, None, []
     home = codex_home or os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
     sessions_root = os.path.join(home, "sessions")
     if not os.path.isdir(sessions_root) or os.path.islink(sessions_root):
-        return None, []
+        return None, None, []
     suffix = f"-{sid}.jsonl"
     rollout_file: str | None = None
     try:
@@ -820,16 +822,19 @@ def _codex_rollout_model_evidence(
             if rollout_file:
                 break
     except OSError:
-        return None, []
+        return None, None, []
     if not rollout_file or os.path.islink(rollout_file) or not os.path.isfile(rollout_file):
-        return None, []
+        return None, None, []
     try:
         if os.path.getsize(rollout_file) > 8 * 1024 * 1024:
-            return None, []
+            return None, None, []
         session_verified = False
+        valid_session_ids: set[str] = {sid}
         last_turn_model: str | None = None
         last_turn_id: str | None = None
         last_turn_active = False
+        last_turn_verified = False
+        verified_turn_models: list[str] = []
         with open(rollout_file, "r", encoding="utf-8", errors="replace") as fh:
             for raw_line in fh:
                 if len(raw_line) > 65536:
@@ -848,30 +853,63 @@ def _codex_rollout_model_evidence(
                 if not isinstance(payload, dict):
                     continue
                 if rtype == "session_meta":
-                    meta_sid = payload.get("session_id") or payload.get("id")
-                    if isinstance(meta_sid, str) and meta_sid.strip() == sid:
+                    meta_ids = {
+                        v.strip()
+                        for v in (payload.get("id"), payload.get("session_id"))
+                        if isinstance(v, str) and v.strip()
+                    }
+                    if sid in meta_ids:
                         session_verified = True
+                        valid_session_ids.update(meta_ids)
                 elif rtype == "turn_context":
                     m = _safe_model_id(payload.get("model"))
                     last_turn_model = m
                     tid = payload.get("turn_id")
                     last_turn_id = tid.strip() if isinstance(tid, str) and tid.strip() else None
                     last_turn_active = False
+                    last_turn_verified = False
                 elif last_turn_model is not None:
                     ev_tid = payload.get("turn_id")
                     if isinstance(ev_tid, str) and ev_tid.strip() and last_turn_id and ev_tid.strip() != last_turn_id:
                         continue
-                    if rtype in ("token_usage_record", "response_item"):
+                    if rtype == "token_usage_record":
+                        last_turn_active = True
+                        rec_ids = {
+                            v.strip()
+                            for v in (payload.get("thread_id"), payload.get("session_id"))
+                            if isinstance(v, str) and v.strip()
+                        }
+                        resp_id = payload.get("response_id")
+                        usage = payload.get("usage")
+                        out_tokens = usage.get("output_tokens") if isinstance(usage, dict) else None
+                        if (
+                            (not rec_ids or bool(rec_ids & valid_session_ids))
+                            and isinstance(resp_id, str)
+                            and resp_id.strip().startswith("resp_")
+                            and isinstance(out_tokens, int)
+                            and not isinstance(out_tokens, bool)
+                            and out_tokens > 0
+                        ):
+                            last_turn_verified = True
+                            verified_turn_models.append(last_turn_model)
+                    elif rtype == "response_item":
                         last_turn_active = True
                     elif rtype == "event_msg" and payload.get("type") in (
                         "task_complete", "token_count", "item_completed"
                     ):
                         last_turn_active = True
         if session_verified and last_turn_model and last_turn_active:
-            return last_turn_model, [last_turn_model]
+            unique_verified = sorted(set(verified_turn_models))
+            served_model = (
+                unique_verified[0]
+                if last_turn_verified and len(unique_verified) == 1 and unique_verified[0] == last_turn_model
+                else None
+            )
+            used_models = unique_verified if unique_verified else [last_turn_model]
+            return last_turn_model, served_model, used_models
     except OSError:
-        return None, []
-    return None, []
+        return None, None, []
+    return None, None, []
 
 
 def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
@@ -923,7 +961,7 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     if (response.get("cli") == "codex"
             and not response.get("model_resolved")
             and response.get("status") == "success"):
-        _r_target, _r_used = _codex_rollout_model_evidence(
+        _r_target, _r_served, _r_used = _codex_rollout_model_evidence(
             response.get("session_id")
         )
         if _r_target:
@@ -931,7 +969,10 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
                 response["model_targeted"] = _r_target
             if not response.get("models_used") and _r_used:
                 response["models_used"] = _r_used
-            if not response.get("model_evidence_source"):
+            if _r_served:
+                response["model_resolved"] = _r_served
+                response["model_evidence_source"] = "codex_rollout_token_usage_record"
+            elif not response.get("model_evidence_source"):
                 response["model_evidence_source"] = "codex_rollout_turn_context"
     # Kimi has no terminal-success event. If the dispatcher deadline wins
     # after assistant text was captured, retain a bounded diagnostic snapshot

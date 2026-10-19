@@ -137,6 +137,47 @@ class TelemetryProducerTests(unittest.TestCase):
                 self.assertEqual(result["counts"]["accepted"], int(evidence != "reported"))
                 self.assertEqual(result["counts"]["invalid"], int(evidence == "reported"))
 
+    def test_dry_run_and_skipped_cached_envelopes_do_not_emit_telemetry(self):
+        for preview in (
+            {"dry_run": True, "cli": "codex"},
+            {"status": "dry_run", "cli": "codex"},
+            {"status": "success", "skipped": True, "cli": "codex"},
+        ):
+            with self.subTest(preview=preview):
+                with (
+                    mock.patch.object(run_subagent._telemetry, "record") as record,
+                    mock.patch("builtins.print"),
+                ):
+                    run_subagent._emit(dict(preview), operation="dispatch")
+                record.assert_not_called()
+
+    def test_incompatible_background_out_refusal_records_valid_invalid_input(self):
+        envelope = {
+            "status": "error",
+            "result": "",
+            "exit_code": 1,
+            "error": (
+                "--background and --out are incompatible: background reports "
+                "completion via its own result_file; --out is the (manifest) "
+                "result-file mechanism. Use --manifest for fan-out with result files."
+            ),
+            "error_kind": "invalid_input",
+        }
+        run_subagent._mark_not_run(envelope)
+        event, _ = self.emit_event(envelope, trusted=True)
+        self.assertEqual(event["validation_outcome"], "valid")
+        self.assertEqual(event["failure_class"], "invalid_input")
+        self.assertEqual(event["execution_status"], "not_run")
+
+    def test_opencode_zcode_t3_backends_are_preserved_in_telemetry(self):
+        for backend in ("opencode", "zcode", "t3"):
+            with self.subTest(backend=backend):
+                env = self.envelope("absent", served=None)
+                env["cli"] = backend
+                event, _ = self.emit_event(env, trusted=True)
+                self.assertEqual(event["backend"], backend)
+
 
 if __name__ == "__main__":
     unittest.main()
+
