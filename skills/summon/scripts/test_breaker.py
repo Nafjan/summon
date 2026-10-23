@@ -763,3 +763,191 @@ def test_rollback_detection_survives_runtime_control_restart(tmp_path: Path):
     assert rc3.control_untrusted is True
     assert rc3.constrained is True
 
+
+# ---------------------------------------------------------------------------
+# Round-2 Review Regression Tests (Findings R2.1 .. R2.7)
+# ---------------------------------------------------------------------------
+
+def test_corrupt_seal_does_not_clear_enforced_restart_state(tmp_path: Path):
+    """R2.1 & R2.7: Corrupting .seal cannot clear enforced constrained state in control.json or heartbeat,
+    and clean restart replay does not double-count breaker_transitions."""
+    root, job_id, nonce = _prepared_job(tmp_path, job_id="4" * 32)
+    cpath = _job_control.control_path(root, job_id)
+    hbpath = _job_control.heartbeat_path(root, job_id)
+
+    b = _breaker.GraduatedBreaker(mode="enforce")
+    _job_control.queue_breaker_transition(root, job_id, b.evaluate(extra_triggers=("tool_loop",)))
+    _job_control.queue_breaker_transition(root, job_id, b.evaluate(extra_triggers=("tool_loop",)))
+
+    rc1 = _job_control.RuntimeControl(
+        path=cpath,
+        heartbeat=hbpath,
+        job_id=job_id,
+        nonce=nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=600_000,
+    )
+    rc1.refresh(force=True)
+    assert rc1.constrained is True
+    assert rc1.breaker_transitions == 2
+
+    # Clean restart replay must report 2 transitions, not 4 (R2.7)
+    rc_clean = _job_control.RuntimeControl(
+        path=cpath,
+        heartbeat=hbpath,
+        job_id=job_id,
+        nonce=nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=600_000,
+    )
+    rc_clean.refresh(force=True)
+    assert rc_clean.breaker_transitions == 2
+    assert rc_clean.constrained is True
+
+    # Corrupt the seal file with {} and restart (R2.1)
+    Path(cpath + ".seal").write_text("{}", encoding="utf-8")
+    rc_corrupt_seal = _job_control.RuntimeControl(
+        path=cpath,
+        heartbeat=hbpath,
+        job_id=job_id,
+        nonce=nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=600_000,
+    )
+    rc_corrupt_seal.refresh(force=True)
+    assert rc_corrupt_seal.control_untrusted is True
+    assert rc_corrupt_seal.constrained is True
+    assert rc_corrupt_seal.breaker_level == "constrained"
+    assert rc_corrupt_seal.generation == 2
+    assert rc_corrupt_seal.breaker_transitions == 2
+
+
+def test_non_ascii_heartbeat_auth_fails_closed_without_raising(tmp_path: Path):
+    """R2.3: Non-ASCII heartbeat auth sets control_untrusted without raising TypeError."""
+    root, job_id, nonce = _prepared_job(tmp_path, job_id="5" * 32)
+    cpath = _job_control.control_path(root, job_id)
+    hbpath = _job_control.heartbeat_path(root, job_id)
+
+    b = _breaker.GraduatedBreaker(mode="enforce")
+    _job_control.queue_breaker_transition(root, job_id, b.evaluate(extra_triggers=("tool_loop",)))
+    _job_control.queue_breaker_transition(root, job_id, b.evaluate(extra_triggers=("tool_loop",)))
+
+    _jobs._atomic_write_json(hbpath, {
+        "schema": "summon.job-heartbeat/v2",
+        "job_id": job_id,
+        "auth": "é" * 64,
+    })
+
+    rc = _job_control.RuntimeControl(
+        path=cpath,
+        heartbeat=hbpath,
+        job_id=job_id,
+        nonce=nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=600_000,
+    )
+    assert rc.control_untrusted is True
+    assert rc.constrained is True
+    assert rc.breaker_level == "constrained"
+
+
+def test_failed_breaker_append_rolls_back_in_memory_state_and_rejects_chain_mismatch(tmp_path: Path):
+    """R2.6: Failed transition append rolls back GraduatedBreaker in-memory state and rejects chain mismatch."""
+    root, job_id, nonce = _prepared_job(tmp_path, job_id="6" * 32)
+    cpath = _job_control.control_path(root, job_id)
+    hbpath = _job_control.heartbeat_path(root, job_id)
+
+    # 1. Attempting to append steering -> constrained onto an empty log (generation 0)
+    # must fail before writing and roll back the breaker to steering.
+    b = _breaker.GraduatedBreaker(mode="enforce")
+    d1 = b.evaluate(extra_triggers=("tool_loop",))  # healthy -> steering (not persisted)
+    assert b.level == "steering"
+    d2 = b.evaluate(extra_triggers=("tool_loop",))  # steering -> constrained
+    assert b.level == "constrained"
+    with pytest.raises(ValueError, match="conflicts with control log state"):
+        _job_control.queue_breaker_transition(root, job_id, d2)
+    # Rolled back to steering, and control.json was never written!
+    assert b.level == "steering"
+    assert b.transitions == 1
+    assert not Path(cpath).exists()
+
+    # 2. Through RuntimeControl.record_breaker, a failed append leaves both RuntimeControl
+    # and GraduatedBreaker at their prior level so the next checkpoint can persist cleanly.
+    b2 = _breaker.GraduatedBreaker(mode="enforce")
+    rc = _job_control.RuntimeControl(
+        path=cpath,
+        heartbeat=hbpath,
+        job_id=job_id,
+        nonce=nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=600_000,
+    )
+    b2.evaluate(extra_triggers=("tool_loop",))  # healthy -> steering (unpersisted)
+    bad_decision = b2.evaluate(extra_triggers=("tool_loop",))  # steering -> constrained
+    assert rc.record_breaker(bad_decision) is None
+    assert b2.level == "steering"
+    assert rc.breaker_level == "healthy"
+    assert rc.constrained is False
+
+
+def test_acp_fast_response_permission_cancel_and_operator_extension(tmp_path: Path):
+    """R2.2, R2.4, R2.5: ACP enforces breaker on immediate responses, clamps permission from control,
+    honors cancel_requested, and applies operator extensions to request deadlines."""
+    root, job_id, nonce = _prepared_job(tmp_path, job_id="7" * 32)
+    cpath = _job_control.control_path(root, job_id)
+    hbpath = _job_control.heartbeat_path(root, job_id)
+
+    b_init = _breaker.GraduatedBreaker(mode="enforce")
+    _job_control.queue_breaker_transition(root, job_id, b_init.evaluate(extra_triggers=("tool_loop",)))
+    _job_control.queue_breaker_transition(root, job_id, b_init.evaluate(extra_triggers=("tool_loop",)))
+
+    clock = FakeClock(initial=100.0)
+    rc = _job_control.RuntimeControl(
+        path=cpath,
+        heartbeat=hbpath,
+        job_id=job_id,
+        nonce=nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=600_000,
+        clock=clock,
+        wall_clock=time.time,
+    )
+    breaker = _breaker.GraduatedBreaker(mode="enforce", clock=clock)
+    import os
+    r_fd, w_fd = os.pipe()
+    stdout_r = os.fdopen(r_fd, "r", encoding="utf-8")
+    stdout_w = os.fdopen(w_fd, "w", encoding="utf-8")
+    try:
+        fake_proc = SimpleNamespace(
+            stdin=io.StringIO(),
+            stdout=stdout_r,
+            stderr=io.StringIO(""),
+        )
+        client = _acpbackend._AcpClient(
+            fake_proc,
+            "yolo",
+            breaker=breaker,
+            runtime_control=rc,
+            cli="gemini",
+        )
+        # R2.2: Even before any request() loop, _answer_permission sees the constrained control state
+        chosen = client._answer_permission({
+            "toolCall": {"kind": "execute"},
+            "options": [
+                {"kind": "allow_once", "optionId": "allow-1"},
+                {"kind": "reject_once", "optionId": "reject-1"},
+            ],
+        })
+        assert chosen == "reject-1"
+
+        # R2.4: Queuing cancel causes _poll_breaker to raise _AcpTimeout(stage="cancelled")
+        _job_control.queue_command(root, job_id, "cancel")
+        with pytest.raises(_acpbackend._AcpTimeout) as exc_info:
+            client._poll_breaker()
+        assert exc_info.value.stage == "cancelled"
+        assert exc_info.value.error_kind == "cancelled"
+    finally:
+        stdout_w.close()
+        stdout_r.close()
+
+

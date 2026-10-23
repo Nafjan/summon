@@ -656,66 +656,76 @@ def _append_breaker_command(path: str, job_id: str, nonce: str,
     if not isinstance(decision, dict) or not decision.get("transitioned"):
         return None
     from _breaker import LEVELS as _BREAKER_LEVELS, fixed_steering_message, normalize_signals
-    from_level = decision.get("from_level")
-    to_level = decision.get("to_level")
-    mode = decision.get("mode")
-    signals = normalize_signals(decision.get("signals"))
-    if (from_level not in _BREAKER_LEVELS or to_level not in _BREAKER_LEVELS
-            or from_level == "stopped"
-            or from_level == to_level or mode not in {"shadow", "enforce"}
-            or not signals):
-        raise ValueError("breaker transition decision is malformed")
-    from_idx = _BREAKER_LEVELS.index(from_level)
-    to_idx = _BREAKER_LEVELS.index(to_level)
-    if abs(to_idx - from_idx) != 1:
-        raise ValueError("breaker transition must be single-step adjacent")
-    escalating = to_idx > from_idx
-    allow_stop = bool(decision.get("allow_stop"))
-    if to_level == "stopped" and not allow_stop:
-        raise ValueError("breaker stop transition requires allow_stop=True")
-    now_fn = wall_clock or time.time
-    with _exclusive_control_lock(path):
-        existing, state = _jobs._read(path)
-        if state == _jobs._CORRUPT:
-            raise ValueError("job control file is malformed")
-        if existing is None:
-            existing = {"schema": "summon.job-control/v2", "job_id": job_id,
-                        "generation": 0, "commands": []}
-        elif existing.get("schema") == "summon.job-control/v1":
-            raise ValueError(
-                "legacy job control cannot be upgraded while its job is live")
-        commands, integrity = _validated_commands(
-            existing, job_id, nonce, allow_stop=allow_stop or None)
-        if commands is None or integrity != "authenticated":
-            raise ValueError("job control identity mismatch")
-        if len(commands) >= MAX_COMMANDS:
-            raise ValueError("job control command limit reached")
-        generation = existing.get("generation", 0) + 1
-        queued_at = now_fn()
-        if not _is_finite_number(queued_at):
-            raise ValueError("system clock produced a non-finite control timestamp")
-        command: dict = {
-            "generation": generation,
-            "action": "breaker",
-            "queued_at": queued_at,
-            "from_level": from_level,
-            "to_level": to_level,
-            "signals": signals[:8],
-            "mode": mode,
-        }
-        if to_level == "stopped":
-            command["allow_stop"] = True
-        if to_level == "steering" and escalating:
-            msg = fixed_steering_message(signals[:8])
-            command["message"] = msg
-            command["message_sha256"] = hashlib.sha256(
-                msg.encode("utf-8")).hexdigest()
-        command["auth"] = command_auth(nonce, job_id, command)
-        if not _valid_command_shape(command, authenticated=True):
-            raise ValueError("breaker transition command failed validation")
-        commands.append(command)
-        existing["generation"] = generation
-        _write_control_json(path, existing)
+    try:
+        from_level = decision.get("from_level")
+        to_level = decision.get("to_level")
+        mode = decision.get("mode")
+        signals = normalize_signals(decision.get("signals"))
+        if (from_level not in _BREAKER_LEVELS or to_level not in _BREAKER_LEVELS
+                or from_level == "stopped"
+                or from_level == to_level or mode not in {"shadow", "enforce"}
+                or not signals):
+            raise ValueError("breaker transition decision is malformed")
+        from_idx = _BREAKER_LEVELS.index(from_level)
+        to_idx = _BREAKER_LEVELS.index(to_level)
+        if abs(to_idx - from_idx) != 1:
+            raise ValueError("breaker transition must be single-step adjacent")
+        escalating = to_idx > from_idx
+        allow_stop = bool(decision.get("allow_stop"))
+        if to_level == "stopped" and not allow_stop:
+            raise ValueError("breaker stop transition requires allow_stop=True")
+        now_fn = wall_clock or time.time
+        with _exclusive_control_lock(path):
+            existing, state = _jobs._read(path)
+            if state == _jobs._CORRUPT:
+                raise ValueError("job control file is malformed")
+            if existing is None:
+                existing = {"schema": "summon.job-control/v2", "job_id": job_id,
+                            "generation": 0, "commands": []}
+            elif existing.get("schema") == "summon.job-control/v1":
+                raise ValueError(
+                    "legacy job control cannot be upgraded while its job is live")
+            commands, integrity = _validated_commands(
+                existing, job_id, nonce, allow_stop=allow_stop or None)
+            if commands is None or integrity != "authenticated":
+                raise ValueError("job control identity mismatch")
+            if len(commands) >= MAX_COMMANDS:
+                raise ValueError("job control command limit reached")
+            generation = existing.get("generation", 0) + 1
+            queued_at = now_fn()
+            if not _is_finite_number(queued_at):
+                raise ValueError("system clock produced a non-finite control timestamp")
+            command: dict = {
+                "generation": generation,
+                "action": "breaker",
+                "queued_at": queued_at,
+                "from_level": from_level,
+                "to_level": to_level,
+                "signals": signals[:8],
+                "mode": mode,
+            }
+            if to_level == "stopped":
+                command["allow_stop"] = True
+            if to_level == "steering" and escalating:
+                msg = fixed_steering_message(signals[:8])
+                command["message"] = msg
+                command["message_sha256"] = hashlib.sha256(
+                    msg.encode("utf-8")).hexdigest()
+            command["auth"] = command_auth(nonce, job_id, command)
+            if not _valid_command_shape(command, authenticated=True):
+                raise ValueError("breaker transition command failed validation")
+            commands.append(command)
+            existing["generation"] = generation
+            checked, checked_integrity = _validated_commands(
+                existing, job_id, nonce, allow_stop=allow_stop or None)
+            if checked is None or checked_integrity != "authenticated":
+                raise ValueError("breaker transition command conflicts with control log state")
+            _write_control_json(path, existing)
+    except Exception:
+        rollback_fn = getattr(decision, "_rollback", None)
+        if callable(rollback_fn):
+            rollback_fn()
+        raise
     return {
         "status": "queued",
         "job_id": job_id,
@@ -914,15 +924,65 @@ class RuntimeControl:
         self.constrained: bool = False
         self.breaker_stopped: bool = False
         self._sealed_generation: int = 0
+        self._sealed_breaker_transitions: int = 0
         self._load_prior_high_water()
+
+    def _salvage_authenticated_control_state(self) -> None:
+        """Preserve enforced containment/cancellation from an authenticated control log even when seal/heartbeat is corrupt."""
+        data, state = _jobs._read(self.path)
+        if state != _jobs._OK or not isinstance(data, dict):
+            return
+        try:
+            commands, integrity = _validated_commands(data, self.job_id, self.nonce)
+        except (TypeError, ValueError, OverflowError, UnicodeError):
+            return
+        if commands is None or integrity != "authenticated":
+            return
+        declared_gen = data.get("generation", 0)
+        if isinstance(declared_gen, int) and not isinstance(declared_gen, bool):
+            self.generation = max(self.generation, declared_gen)
+        breaker_count = 0
+        log_constrained = False
+        log_stopped = False
+        log_level = "healthy"
+        for command in commands:
+            action = command.get("action")
+            if action == "cancel":
+                self.cancel_requested = True
+            elif action == "breaker":
+                breaker_count += 1
+                to_level = command.get("to_level")
+                mode = command.get("mode")
+                if isinstance(to_level, str):
+                    log_level = to_level
+                    if mode == "enforce":
+                        if to_level == "constrained":
+                            log_constrained = True
+                        elif to_level == "stopped":
+                            log_stopped = True
+                        elif to_level == "healthy":
+                            log_constrained = False
+        if log_constrained:
+            self.constrained = True
+        if log_stopped:
+            self.breaker_stopped = True
+        from _breaker import LEVELS as _BREAKER_LEVELS
+        if (isinstance(declared_gen, int) and not isinstance(declared_gen, bool)
+                and declared_gen >= self._sealed_generation
+                and log_level in _BREAKER_LEVELS):
+            self.breaker_level = log_level
+        elif (log_level in _BREAKER_LEVELS and self.breaker_level in _BREAKER_LEVELS
+              and _BREAKER_LEVELS.index(log_level) > _BREAKER_LEVELS.index(self.breaker_level)):
+            self.breaker_level = log_level
+        self.breaker_transitions = max(
+            self.breaker_transitions, self._sealed_breaker_transitions, breaker_count)
 
     def _load_prior_high_water(self) -> None:
         """Restore committed high-water marks so control rollback across restarts fails closed."""
         seal, seal_state = _load_control_seal(self.path, self.job_id, self.nonce)
         if seal_state == _jobs._CORRUPT:
             self.control_untrusted = True
-            return
-        if seal_state == _jobs._OK and isinstance(seal, dict):
+        elif seal_state == _jobs._OK and isinstance(seal, dict):
             self._sealed_generation = int(seal["generation"])
             self._command_digests.update(seal["parsed_digests"])
             if seal.get("constrained"):
@@ -935,32 +995,56 @@ class RuntimeControl:
                 self.breaker_level = seal["breaker_level"]
             if isinstance(seal.get("breaker_transitions"), int):
                 self.breaker_transitions = seal["breaker_transitions"]
+                self._sealed_breaker_transitions = seal["breaker_transitions"]
         # Cross-check authenticated prior heartbeat if available.
         hb, hb_state = _read_control_json(self.heartbeat)
-        if hb_state == _jobs._OK and isinstance(hb, dict) and hb.get("schema") == "summon.job-heartbeat/v2":
-            hb_auth = hb.get("auth")
-            hb_body = {k: v for k, v in hb.items() if k != "auth"}
-            try:
-                expected_hb_auth = heartbeat_auth(self.nonce, hb_body)
-            except (TypeError, ValueError, OverflowError, UnicodeError):
-                expected_hb_auth = None
-            if (isinstance(hb_auth, str) and expected_hb_auth is not None
-                    and hmac.compare_digest(hb_auth, expected_hb_auth)
-                    and hb.get("job_id") == self.job_id):
-                hb_gen = hb.get("control_generation")
-                if isinstance(hb_gen, int) and not isinstance(hb_gen, bool) and hb_gen > self._sealed_generation:
-                    self._sealed_generation = hb_gen
-                if hb.get("cancel_requested") is True:
-                    self.cancel_requested = True
-                if hb.get("control_untrusted") is True:
+        if hb_state == _jobs._CORRUPT:
+            self.control_untrusted = True
+        elif hb_state == _jobs._OK and isinstance(hb, dict):
+            if hb.get("schema") == "summon.job-heartbeat/v2":
+                hb_auth = hb.get("auth")
+                hb_body = {k: v for k, v in hb.items() if k != "auth"}
+                try:
+                    expected_hb_auth = heartbeat_auth(self.nonce, hb_body)
+                except (TypeError, ValueError, OverflowError, UnicodeError):
+                    expected_hb_auth = None
+                hb_verified = False
+                if (_is_sha256(hb_auth) and expected_hb_auth is not None
+                        and hb.get("job_id") == self.job_id):
+                    try:
+                        hb_verified = hmac.compare_digest(hb_auth, expected_hb_auth)
+                    except (TypeError, ValueError):
+                        hb_verified = False
+                if hb_verified:
+                    hb_gen = hb.get("control_generation")
+                    if isinstance(hb_gen, int) and not isinstance(hb_gen, bool) and hb_gen > self._sealed_generation:
+                        self._sealed_generation = hb_gen
+                    if hb.get("cancel_requested") is True:
+                        self.cancel_requested = True
+                    if hb.get("control_untrusted") is True:
+                        self.control_untrusted = True
+                    hb_breaker = hb.get("breaker")
+                    if isinstance(hb_breaker, dict):
+                        hb_trans = hb_breaker.get("transitions")
+                        if (isinstance(hb_trans, int) and not isinstance(hb_trans, bool)
+                                and hb_trans > self.breaker_transitions):
+                            self.breaker_transitions = hb_trans
+                            self._sealed_breaker_transitions = hb_trans
+                        if hb_breaker.get("enforced") is True:
+                            b_level = hb_breaker.get("level")
+                            if b_level == "constrained":
+                                self.constrained = True
+                            elif b_level == "stopped":
+                                self.breaker_stopped = True
+                            from _breaker import LEVELS as _BREAKER_LEVELS
+                            if (isinstance(b_level, str) and b_level in _BREAKER_LEVELS
+                                    and self.breaker_level in _BREAKER_LEVELS
+                                    and _BREAKER_LEVELS.index(b_level) > _BREAKER_LEVELS.index(self.breaker_level)):
+                                self.breaker_level = b_level
+                else:
                     self.control_untrusted = True
-                hb_breaker = hb.get("breaker")
-                if isinstance(hb_breaker, dict) and hb_breaker.get("enforced") is True:
-                    b_level = hb_breaker.get("level")
-                    if b_level == "constrained":
-                        self.constrained = True
-                    elif b_level == "stopped":
-                        self.breaker_stopped = True
+        if self.control_untrusted:
+            self._salvage_authenticated_control_state()
 
     def checkpoint_due(self) -> bool:
         """Whether ``checkpoint`` would act now (lets callers measure lazily)."""
@@ -1081,7 +1165,6 @@ class RuntimeControl:
                 mode = command.get("mode")
                 if isinstance(to_level, str):
                     self.breaker_level = to_level
-                    self.breaker_transitions += 1
                     if mode == "enforce":
                         if to_level == "steering" and isinstance(command.get("message"), str):
                             self.steers.append({
@@ -1097,8 +1180,14 @@ class RuntimeControl:
                             self.constrained = False
             self.generation = generation
             self._command_digests[generation] = command_digest
+        total_breaker_cmds = sum(
+            1 for cmd in commands
+            if isinstance(cmd, dict) and cmd.get("action") == "breaker"
+        )
+        self.breaker_transitions = max(self._sealed_breaker_transitions, total_breaker_cmds)
         if self.generation > self._sealed_generation:
             self._sealed_generation = self.generation
+            self._sealed_breaker_transitions = self.breaker_transitions
             _write_control_seal(
                 self.path, self.job_id, self.nonce,
                 generation=self.generation,
@@ -1142,6 +1231,19 @@ class RuntimeControl:
         sanitized = _sanitize_breaker(decision)
         if sanitized is None:
             return None
+        if decision.get("transitioned") and not self.control_untrusted:
+            try:
+                queued = _append_breaker_command(
+                    self.path, self.job_id, self.nonce, decision,
+                    wall_clock=self.wall_clock)
+            except Exception:  # noqa: BLE001 - a corrupt/legacy control log cannot be appended
+                rollback_fn = getattr(decision, "_rollback", None)
+                if callable(rollback_fn):
+                    rollback_fn()
+                return None
+            self.breaker = sanitized
+            self.refresh(force=True)
+            return queued
         self.breaker = sanitized
         self.breaker_level = str(sanitized.get("level") or self.breaker_level)
         if sanitized.get("enforced"):
@@ -1151,16 +1253,7 @@ class RuntimeControl:
                 self.breaker_stopped = True
             elif self.breaker_level == "healthy":
                 self.constrained = False
-        if not decision.get("transitioned") or self.control_untrusted:
-            return None
-        try:
-            queued = _append_breaker_command(
-                self.path, self.job_id, self.nonce, decision,
-                wall_clock=self.wall_clock)
-        except Exception:  # noqa: BLE001 - a corrupt/legacy control log cannot be appended
-            return None
-        self.refresh(force=True)
-        return queued
+        return None
 
     def expired(self) -> bool:
         now = self.clock()

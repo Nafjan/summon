@@ -211,18 +211,34 @@ class _AcpClient:
         self.turn = _TurnState()
         self.stderr_lines: list = []
         self._last_meaningful_events = 0
+        if self._runtime_control is not None:
+            try:
+                self._runtime_control.refresh(force=True)
+            except Exception:  # noqa: BLE001
+                pass
+            if self._breaker is not None:
+                try:
+                    sync_fn = getattr(self._breaker, "sync_from_control", None)
+                    if callable(sync_fn):
+                        sync_fn(self._runtime_control)
+                except Exception:  # noqa: BLE001
+                    pass
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._err_reader = threading.Thread(target=self._read_stderr, daemon=True)
         self._reader.start()
         self._err_reader.start()
 
-    def _poll_breaker(self) -> None:
-        """Evaluate runtime_control / breaker and raise _AcpTimeout on enforced containment."""
+    def _poll_breaker(self) -> int:
+        """Evaluate runtime_control / breaker, return newly applied operator extension ms,
+        and raise _AcpTimeout on cancellation, expiry, or enforced containment."""
         rc = self._runtime_control
         breaker = self._breaker
+        operator_added_ms = 0
         if rc is not None:
             try:
-                rc.refresh(force=True)
+                added = rc.refresh(force=True)
+                if isinstance(added, int) and not isinstance(added, bool) and added > 0:
+                    operator_added_ms = added
             except Exception:  # noqa: BLE001
                 pass
             if breaker is not None:
@@ -232,6 +248,9 @@ class _AcpClient:
                         sync_fn(rc)
                 except Exception:  # noqa: BLE001
                     pass
+            if getattr(rc, "cancel_requested", False):
+                raise _AcpTimeout("ACP session cancelled by job control",
+                                  stage="cancelled", error_kind="cancelled")
             due_fn = getattr(rc, "checkpoint_due", None)
             is_due = bool(callable(due_fn) and due_fn())
             with self.turn.lock:
@@ -283,6 +302,15 @@ class _AcpClient:
                 stage = "breaker_stopped" if enforced_stop else "breaker_constrained"
                 raise _AcpTimeout(f"ACP turn stopped by {stage}",
                                   stage=stage, error_kind=stage)
+            expired_fn = getattr(rc, "expired", None)
+            if callable(expired_fn) and expired_fn():
+                clock_fn = getattr(rc, "clock", None) or time.monotonic
+                hard_dl = getattr(rc, "hard_deadline", None)
+                is_hard = isinstance(hard_dl, (int, float)) and clock_fn() >= hard_dl
+                exp_stage = "adaptive_hard_timeout" if is_hard else "adaptive_attention_timeout"
+                exp_kind = "job_hard_timeout" if is_hard else "adaptive_attention_timeout"
+                raise _AcpTimeout(f"ACP turn expired at {exp_stage}",
+                                  stage=exp_stage, error_kind=exp_kind)
         elif breaker is not None:
             if getattr(breaker, "mode", None) == "enforce":
                 lvl = getattr(breaker, "level", None)
@@ -290,6 +318,7 @@ class _AcpClient:
                     stage = f"breaker_{lvl}"
                     raise _AcpTimeout(f"ACP turn stopped by {stage}",
                                       stage=stage, error_kind=stage)
+        return operator_added_ms
 
     # -- IO ---------------------------------------------------------------
 
@@ -375,6 +404,10 @@ class _AcpClient:
     def request(self, method: str, params: dict, timeout: float) -> dict:
         """Send a request and wait for its result. Raises _AcpError on a
         JSON-RPC error result, _AcpTimeout when the slice expires."""
+        clock_fn = getattr(self._runtime_control, "clock", None) or time.monotonic
+        pre_added_ms = self._poll_breaker()
+        if pre_added_ms > 0:
+            timeout += pre_added_ms / 1000.0
         with self._id_lock:
             rid = self._next_id
             self._next_id += 1
@@ -387,8 +420,8 @@ class _AcpClient:
             with self._id_lock:
                 self._pending.pop(rid, None)
             raise
-        deadline = time.monotonic() + max(0.05, timeout)
-        while not slot["event"].wait(min(0.1, max(0.0, deadline - time.monotonic()))):
+        deadline = clock_fn() + max(0.05, timeout)
+        while not slot["event"].wait(min(0.1, max(0.0, deadline - clock_fn()))):
             try:
                 cancelled = self._cancelled()
             except Exception as e:
@@ -413,17 +446,23 @@ class _AcpClient:
                 raise _AcpError(
                     f"{method} deadline check failed ({type(e).__name__})") from e
             try:
-                self._poll_breaker()
+                added_ms = self._poll_breaker()
             except _AcpTimeout:
                 with self._id_lock:
                     self._pending.pop(rid, None)
                 raise
-            if time.monotonic() >= deadline:
+            if added_ms > 0:
+                deadline += added_ms / 1000.0
+                timeout += added_ms / 1000.0
+            if clock_fn() >= deadline:
                 break
         if not slot["event"].is_set():
             with self._id_lock:
                 self._pending.pop(rid, None)
             raise _AcpTimeout(f"{method} did not answer within {timeout:.0f}s")
+        # Evaluate breaker/control even when the RPC response arrives before the
+        # first wait slice expires (fast responses must not bypass containment).
+        self._poll_breaker()
         resp = slot["response"]
         if "error" in resp:
             err = resp["error"] or {}
@@ -499,12 +538,39 @@ class _AcpClient:
         offered."""
         options = params.get("options") or []
         tool_kind = ((params.get("toolCall") or {}).get("kind") or "other")
+        rc = self._runtime_control
+        if rc is not None:
+            try:
+                rc.refresh(force=True)
+            except Exception:  # noqa: BLE001
+                pass
+            if self._breaker is not None:
+                try:
+                    sync_fn = getattr(self._breaker, "sync_from_control", None)
+                    if callable(sync_fn):
+                        sync_fn(rc)
+                except Exception:  # noqa: BLE001
+                    pass
+            if getattr(rc, "cancel_requested", False):
+                return None
+            if ((self._breaker is None or getattr(self._breaker, "mode", None) == "enforce")
+                    and getattr(rc, "breaker_stopped", False)):
+                return None
+        if (self._breaker is not None
+                and getattr(self._breaker, "mode", None) == "enforce"
+                and getattr(self._breaker, "level", None) == "stopped"):
+            return None
         effective_perm = (
             self._breaker.effective_permission(self._permission)
             if self._breaker is not None
             and callable(getattr(self._breaker, "effective_permission", None))
             else self._permission
         )
+        if (rc is not None
+                and (self._breaker is None or getattr(self._breaker, "mode", None) == "enforce")
+                and getattr(rc, "constrained", False)):
+            from _builder import clamp_permission
+            effective_perm = clamp_permission(effective_perm, "read-only")
         allowed = tool_kind in _ALLOWABLE_KINDS.get(str(effective_perm).lower(), set())
 
         def _find(*kinds: str) -> str | None:
@@ -767,8 +833,27 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
             attempt_kind=getattr(inv, "attempt_kind", "initial"),
             attempt_ordinal=getattr(inv, "attempt_ordinal", 1),
         )
-    except Exception:  # noqa: BLE001
-        runtime_control = None
+    except Exception as e:
+        _kill_tree(process)
+        try:
+            process.wait(timeout=_TEARDOWN_GRACE_SEC)
+        except Exception:
+            _kill_tree(process)
+        try:
+            from _jobobj import close as _job_close
+            _job_close(process)
+        except Exception:
+            pass
+        if launch_control is not None:
+            try:
+                launch_control.reaped(process)
+            except Exception:
+                pass
+        return _err(
+            cli, 1,
+            f"adaptive job control initialization failed ({type(e).__name__})",
+            error_kind="job_control_unavailable",
+        )
     if runtime_control is not None:
         try:
             from _breaker import (
@@ -785,8 +870,27 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
                     max_work_tokens=max_work_tokens_from_environment(),
                     clock=getattr(runtime_control, "clock", time.monotonic),
                 )
-        except Exception:  # noqa: BLE001
-            breaker = None
+        except Exception as e:
+            _kill_tree(process)
+            try:
+                process.wait(timeout=_TEARDOWN_GRACE_SEC)
+            except Exception:
+                _kill_tree(process)
+            try:
+                from _jobobj import close as _job_close
+                _job_close(process)
+            except Exception:
+                pass
+            if launch_control is not None:
+                try:
+                    launch_control.reaped(process)
+                except Exception:
+                    pass
+            return _err(
+                cli, 1,
+                f"adaptive circuit breaker initialization failed ({type(e).__name__})",
+                error_kind="job_control_unavailable",
+            )
 
     def _attach_control_projections(resp: dict) -> dict:
         if breaker is not None:
@@ -951,20 +1055,32 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
         eff_stage = getattr(e, "stage", None) or stage
         err_kind = getattr(e, "error_kind", None)
         text, diag, usage = client.turn.snapshot()
-        resp = {
-            "result": text,
-            "exit_code": 124,
-            "status": "partial" if text else "error",
-            "cli": cli,
-            "error": f"timed out after {timeout_budget_ms}ms over ACP during {eff_stage}"
-                     + ("; partial output preserved" if text else ""),
-            "normalization_reason": ("timed out; partial output preserved" if text
-                                     else "timed out before any usable output"),
-            "timeout": {"budget_ms": timeout_budget_ms, "stage": eff_stage,
-                        "partial_output": bool(text)},
-        }
-        if err_kind:
-            resp["error_kind"] = err_kind
+        if eff_stage == "cancelled" or err_kind == "cancelled":
+            resp = {
+                "result": text,
+                "exit_code": 130,
+                "status": "cancelled",
+                "cli": cli,
+                "error": "ACP session cancelled by job control"
+                         + ("; partial output preserved" if text else ""),
+                "normalization_reason": "cancelled by job control",
+                "error_kind": "cancelled",
+            }
+        else:
+            resp = {
+                "result": text,
+                "exit_code": 124,
+                "status": "partial" if text else "error",
+                "cli": cli,
+                "error": f"timed out after {timeout_budget_ms}ms over ACP during {eff_stage}"
+                         + ("; partial output preserved" if text else ""),
+                "normalization_reason": ("timed out; partial output preserved" if text
+                                         else "timed out before any usable output"),
+                "timeout": {"budget_ms": timeout_budget_ms, "stage": eff_stage,
+                            "partial_output": bool(text)},
+            }
+            if err_kind:
+                resp["error_kind"] = err_kind
         if usage:
             resp["usage"] = usage
         raw = diag + (["", "# stderr"] + client.stderr_lines

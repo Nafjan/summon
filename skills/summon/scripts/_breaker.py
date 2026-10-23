@@ -95,6 +95,27 @@ def _extract_work_tokens(work_tokens: object) -> int | None:
     return None
 
 
+class _BreakerDecision(dict):
+    """Decision mapping carrying a rollback hook if durable persistence fails."""
+
+    def __init__(self, data: Mapping[str, object], *,
+                 breaker: "GraduatedBreaker | None" = None,
+                 prev_state: tuple[str, int, dict | None] | None = None):
+        super().__init__(data)
+        self._breaker = breaker
+        self._prev_state = prev_state
+        self._rolled_back = False
+
+    def _rollback(self) -> None:
+        if self._rolled_back or self._breaker is None or self._prev_state is None:
+            return
+        prev_level, prev_transitions, prev_last = self._prev_state
+        self._breaker.level = prev_level
+        self._breaker.transitions = prev_transitions
+        self._breaker.last = prev_last
+        self._rolled_back = True
+
+
 class GraduatedBreaker:
     """Pure policy state machine for checkpoint-time circuit breaking."""
 
@@ -174,6 +195,8 @@ class GraduatedBreaker:
             signals=signals, progress_record=progress_record,
             work_tokens=work_tokens, extra_triggers=extra_triggers)
         prev = self.level
+        prev_transitions = self.transitions
+        prev_last = self.last
         prev_idx = LEVELS.index(prev)
         max_idx = 3 if self.allow_stop else 2
 
@@ -209,7 +232,7 @@ class GraduatedBreaker:
         steering_msg = (fixed_steering_message(recorded_signals)
                         if nxt == "steering" and (escalated or bool(triggers))
                         else None)
-        decision = {
+        decision = _BreakerDecision({
             "schema": SCHEMA,
             "mode": self.mode,
             "allow_stop": self.allow_stop,
@@ -227,7 +250,7 @@ class GraduatedBreaker:
             "compaction_grace": self.in_compaction_grace(),
             "constrained_permission": "read-only" if nxt == "constrained" else None,
             "steering_message": steering_msg,
-        }
+        }, breaker=self, prev_state=(prev, prev_transitions, prev_last))
         self.last = decision
         return decision
 
@@ -241,10 +264,10 @@ class GraduatedBreaker:
             ctrl_transitions = 0
         if ctrl_level not in LEVELS:
             return
-        if ctrl_transitions > self.transitions or ctrl_level != self.level:
+        if ctrl_transitions != self.transitions or ctrl_level != self.level:
             prev = self.level
             self.level = ctrl_level
-            self.transitions = max(self.transitions, ctrl_transitions)
+            self.transitions = ctrl_transitions
             action = (
                 "stop" if ctrl_level == "stopped"
                 else "constrain" if ctrl_level == "constrained"
