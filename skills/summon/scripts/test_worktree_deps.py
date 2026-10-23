@@ -745,6 +745,41 @@ def test_round2_pnpm_depth_incomplete_fingerprint_and_v2_rename_regressions(tmp_
             builtins.open = real_open
             if orig_open is not None:
                 _worktree_deps.open = orig_open
+
+        orig_is_link = _worktree_deps._is_link_or_junction
+        _worktree_deps._is_link_or_junction = lambda p: (
+            True if os.path.normcase(str(p)) == os.path.normcase(str(lock_path))
+            else orig_is_link(p)
+        )
+        try:
+            assert _worktree_deps.fingerprint_dep_target(str(repo), "node_modules") is None
+        finally:
+            _worktree_deps._is_link_or_junction = orig_is_link
+
+        orig_max_lock = _worktree_deps.MAX_LOCKFILE_BYTES
+        _worktree_deps.MAX_LOCKFILE_BYTES = 100
+
+        class _GrowingReader:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _size=65536):
+                return b"x" * 60
+
+        def _growing_lock(path, *a, **kw):
+            if os.path.normcase(str(path)) == os.path.normcase(str(lock_path)):
+                return _GrowingReader()
+            return real_open(path, *a, **kw)
+
+        builtins.open = _growing_lock
+        try:
+            assert _worktree_deps.fingerprint_dep_target(str(repo), "node_modules") is None
+        finally:
+            builtins.open = real_open
+            _worktree_deps.MAX_LOCKFILE_BYTES = orig_max_lock
     finally:
         if _worktree_deps._is_link_or_junction(os.path.join(wt_path, "node_modules")):
             _worktree_deps._remove_dir_link(os.path.join(wt_path, "node_modules"))

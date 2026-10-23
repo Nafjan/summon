@@ -351,25 +351,32 @@ _UNREADABLE_FILE = "__UNREADABLE__"
 
 def _hash_regular_file(path: str) -> str | None:
     try:
-        if _is_link_or_junction(path):
-            st = os.lstat(path)
-            return f"link:{st.st_size}:{st.st_mtime_ns}"
-        st = os.stat(path)
+        st = os.lstat(path)
     except FileNotFoundError:
         return None
     except OSError:
         return _UNREADABLE_FILE
-    if not stat.S_ISREG(st.st_mode):
+    if _is_link_or_junction(path) or not stat.S_ISREG(st.st_mode):
         return _UNREADABLE_FILE
     if st.st_size > MAX_LOCKFILE_BYTES:
         return _UNREADABLE_FILE
     h = hashlib.sha256()
+    total_read = 0
     try:
         with open(path, "rb") as fh:
+            try:
+                fst = os.fstat(fh.fileno())
+                if not stat.S_ISREG(fst.st_mode) or fst.st_size > MAX_LOCKFILE_BYTES:
+                    return _UNREADABLE_FILE
+            except (OSError, AttributeError, ValueError):
+                pass
             while True:
                 chunk = fh.read(65536)
                 if not chunk:
                     break
+                total_read += len(chunk)
+                if total_read > MAX_LOCKFILE_BYTES:
+                    return _UNREADABLE_FILE
                 h.update(chunk)
     except OSError:
         return _UNREADABLE_FILE
