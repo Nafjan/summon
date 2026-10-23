@@ -407,7 +407,11 @@ def _result_binding(result: dict) -> str:
         "gate", "status", "execution_status", "provider_contacted", "report_ok",
         "attempts", "permission", "permission_forced", "read_allowlist", "effort",
     )
-    return _digest({key: result.get(key) for key in keys})
+    bound = {key: result.get(key) for key in keys}
+    for optional_key in ("context_occupancy", "context_handoff", "handoff_note", "report"):
+        if optional_key in result:
+            bound[optional_key] = result.get(optional_key)
+    return _digest(bound)
 
 
 def result_binding_sha256(result: dict) -> str:

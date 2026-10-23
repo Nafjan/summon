@@ -500,6 +500,7 @@ class StreamProcessor:
             self._claude_identity_conflict = False
             if data.get("model"):
                 self.handshake_model = data["model"]
+            self._capture_live_window(data, model=self.handshake_model)
             return False
 
         if (data.get("type") == "system"
@@ -593,6 +594,7 @@ class StreamProcessor:
             self._bind_session(data.get("thread_id"), data)
             if data.get("model"):
                 self.handshake_model = data["model"]
+            self._capture_live_window(data, model=self.handshake_model)
             return False
 
         # Claude stream-json emits complete assistant messages between init and
@@ -625,6 +627,15 @@ class StreamProcessor:
                 self.last_request_usage = message["usage"]
                 if isinstance(message.get("model"), str):
                     self.last_request_model = message["model"]
+                self._capture_live_window(
+                    data, message, message.get("usage"),
+                    model=self.last_request_model or self.handshake_model,
+                )
+            elif data.get("parent_tool_use_id") is None:
+                self._capture_live_window(
+                    data, message,
+                    model=self.last_request_model or self.handshake_model,
+                )
             self._capture_claude_root(data, message, content)
             if isinstance(content, list):
                 for index, block in enumerate(content):
@@ -689,6 +700,15 @@ class StreamProcessor:
             info = data.get("info") if isinstance(data.get("info"), dict) else {}
             payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
             p_info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+            self._capture_live_window(data, info, p_info, payload, model=self.handshake_model)
+            last_req_usage = (
+                data.get("last_token_usage")
+                or info.get("last_token_usage")
+                or p_info.get("last_token_usage")
+                or payload.get("last_token_usage")
+            )
+            if isinstance(last_req_usage, dict):
+                self.last_request_usage = last_req_usage
             mid_usage = (
                 data.get("usage")
                 or info.get("total_token_usage")
@@ -697,6 +717,11 @@ class StreamProcessor:
             )
             if isinstance(mid_usage, dict):
                 self.progress_usage = mid_usage
+                if self.last_request_usage is None:
+                    self.last_request_usage = mid_usage
+                self._liveness("stream_event", data)
+                return False
+            if isinstance(last_req_usage, dict):
                 self._liveness("stream_event", data)
                 return False
 
@@ -1038,6 +1063,30 @@ class StreamProcessor:
             return True
 
         return False
+
+    def _capture_live_window(self, *containers, model: str | None = None) -> None:
+        """Extract provider-reported context window from live stream events when present."""
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
+            for key in ("contextWindow", "context_window", "model_context_window"):
+                val = container.get(key)
+                if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+                    self.context_window = val
+                    return
+            model_usage = container.get("modelUsage")
+            if isinstance(model_usage, dict):
+                entry = None
+                if model and model in model_usage:
+                    entry = model_usage[model]
+                elif len(model_usage) == 1:
+                    entry = next(iter(model_usage.values()))
+                if isinstance(entry, dict):
+                    for key in ("contextWindow", "context_window", "model_context_window"):
+                        val = entry.get(key)
+                        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+                            self.context_window = val
+                            return
 
     def _capture_telemetry(self, data: dict) -> None:
         """Pull session id / usage / cost from a terminal result object. Claude's

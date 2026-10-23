@@ -754,32 +754,22 @@ def test_round2_pnpm_depth_incomplete_fingerprint_and_v2_rename_regressions(tmp_
 
         orig_max_lock = _worktree_deps.MAX_LOCKFILE_BYTES
         _worktree_deps.MAX_LOCKFILE_BYTES = 100
-        real_fdopen = _worktree_deps.os.fdopen
+        real_os_read = _worktree_deps.os.read
+        physical_bytes_read = 0
 
-        class _GrowingReader:
-            def __init__(self, inner):
-                self._inner = inner
+        def _growing_os_read(fd, n):
+            nonlocal physical_bytes_read
+            chunk = b"x" * min(n, 60)
+            physical_bytes_read += len(chunk)
+            return chunk
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return self._inner.__exit__(*args)
-
-            def fileno(self):
-                return self._inner.fileno()
-
-            def read(self, size=65536):
-                return b"x" * min(size, 60)
-
-        def _growing_fdopen(fd, *a, **kw):
-            return _GrowingReader(real_fdopen(fd, *a, **kw))
-
-        _worktree_deps.os.fdopen = _growing_fdopen
+        _worktree_deps.os.read = _growing_os_read
         try:
+            assert _worktree_deps._hash_regular_file(str(lock_path)) == _worktree_deps._UNREADABLE_FILE
+            assert physical_bytes_read == 101
             assert _worktree_deps.fingerprint_dep_target(str(repo), "node_modules") is None
         finally:
-            _worktree_deps.os.fdopen = real_fdopen
+            _worktree_deps.os.read = real_os_read
             _worktree_deps.MAX_LOCKFILE_BYTES = orig_max_lock
     finally:
         if _worktree_deps._is_link_or_junction(os.path.join(wt_path, "node_modules")):

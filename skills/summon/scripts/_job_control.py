@@ -1302,7 +1302,12 @@ class RuntimeControl:
             if active:
                 extension = min(self.checkpoint_ms, remaining)
                 self.auto_extensions += 1
-                self.attention_required = False
+                if not (
+                    self.handoff_triggered
+                    and isinstance(self.context_handoff, dict)
+                    and self.context_handoff.get("mode") == "enforce"
+                ):
+                    self.attention_required = False
             else:
                 if self.attention_required:
                     return 0
@@ -1381,6 +1386,8 @@ class RuntimeControl:
             self.context_handoff = sanitized
             if sanitized.get("triggered"):
                 self.handoff_triggered = True
+                if sanitized.get("mode") == "enforce":
+                    self.attention_required = True
             if sanitized.get("enforced"):
                 self.attention_required = True
             return None

@@ -80,7 +80,7 @@ _SHORTNAME_RE = re.compile(r"^[^~]+~[0-9]+(?:\..+)?$")
 _SECRET_RE = re.compile(
     r"(?i)(?:sk-(?:or-|ant-|proj-)?[a-z0-9_-]{12,}|gh[pousr]_[a-z0-9]{20,}|"
     r"AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|"
-    r"(?:bearer|api[_-]?key|token|secret|password)\s*[=:]\s*[^\s,;\"']{6,})"
+    r"(?:bearer|api[_-]?key|access[_-]?token|auth[_-]?token|oauth[_-]?token|private[_-]?key|token|secret|password)\s*[=:]\s*[\"']?[A-Za-z0-9_./+=-]{6,}[\"']?)"
 )
 
 HANDOFF_STEERING_PROMPT = (
@@ -327,6 +327,12 @@ def evaluate_context_handoff(
         )
     )
     if eff_mode == "off":
+        is_reported = (
+            evidence == "reported"
+            and occupied is not None
+            and window is not None
+            and ratio is not None
+        )
         return {
             "schema": SCHEMA,
             "mode": "off",
@@ -338,17 +344,15 @@ def evaluate_context_handoff(
             "evidence": evidence,
             "occupied_tokens": occupied,
             "window_tokens": window,
-            "ratio": ratio,
+            "ratio": ratio if is_reported else None,
             "threshold": threshold,
             "headroom_tokens": (
-                max(0, window - occupied)
-                if occupied is not None and window is not None
-                else None
+                max(0, window - occupied) if is_reported else None
             ),
             "headroom_ratio": (
-                round(max(0.0, 1.0 - ratio), 4) if ratio is not None else None
+                round(max(0.0, 1.0 - ratio), 4) if is_reported else None
             ),
-            "trigger_count": min(1, trig_count),
+            "trigger_count": 0,
             "evaluations": ev_count,
             "handoff_note_present": note_sha is not None,
             "handoff_note_sha256": note_sha,
@@ -610,7 +614,20 @@ def validate_projection(value: Any) -> bool:
         if not (MIN_THRESHOLD <= float(threshold) <= MAX_THRESHOLD):
             return False
 
-    if evidence == "reported" and mode != "off":
+    if mode == "off":
+        if (
+            triggered
+            or newly_triggered
+            or enforced
+            or action != "none"
+            or reason != "mode_off"
+            or trig_count != 0
+        ):
+            return False
+    elif reason == "mode_off":
+        return False
+
+    if evidence == "reported":
         if occupied is None or window is None or threshold is None:
             return False
         if not _is_finite_number(ratio) or not _is_finite_number(headroom_ratio):
@@ -624,11 +641,12 @@ def validate_projection(value: Any) -> bool:
         if abs(float(headroom_ratio) - expected_headroom) > 0.01:
             return False
     else:
-        if mode != "off":
-            if ratio is not None or headroom_tokens is not None or headroom_ratio is not None:
-                return False
-            if newly_triggered or enforced or action != "none":
-                return False
+        if ratio is not None or headroom_tokens is not None or headroom_ratio is not None:
+            return False
+        if newly_triggered or enforced or action != "none":
+            return False
+        if mode != "off" and reason != "occupancy_evidence_unavailable":
+            return False
 
     note_sha = value.get("handoff_note_sha256")
     if note_present:

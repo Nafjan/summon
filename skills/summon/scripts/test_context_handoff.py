@@ -414,3 +414,195 @@ def test_executor_enrich_and_public_heartbeat_integration(tmp_path):
     pub_tampered = _job_control.public_heartbeat(hb_tampered, "authenticated")
     assert pub_tampered is not None
     assert "context_handoff" not in pub_tampered
+
+
+def test_round1_sol_review_regressions(tmp_path, monkeypatch):
+    # 1. Live stream events populate context_window and _enrich re-evaluates when
+    # terminal telemetry upgrades occupancy evidence to "reported".
+    proc_claude = StreamProcessor(cli="claude")
+    proc_claude.context_handoff_tracker = _context_handoff.ContextHandoffTracker(mode="shadow")
+    proc_claude.process_line(json.dumps({
+        "type": "system",
+        "subtype": "init",
+        "session_id": "s-live-1",
+        "model": "claude-opus-5",
+        "contextWindow": 200_000,
+    }))
+    assert proc_claude.context_window == 200_000
+    proc_claude.process_line(json.dumps({
+        "type": "assistant",
+        "parent_tool_use_id": None,
+        "session_id": "s-live-1",
+        "message": {
+            "id": "m-1",
+            "model": "claude-opus-5",
+            "usage": {"input_tokens": 160_000, "output_tokens": 5_000},
+            "content": [{"type": "text", "text": "working"}],
+        },
+    }))
+    live_occ = proc_claude.live_context_occupancy(cli="claude")
+    assert live_occ["evidence"] == "reported"
+    assert live_occ["ratio"] == 0.8
+
+    # Also verify terminal upgrade when live checkpoint had no window yet
+    proc_late = StreamProcessor(cli="claude")
+    proc_late.context_handoff_tracker = _context_handoff.ContextHandoffTracker(mode="shadow")
+    proc_late.last_request_usage = {"input_tokens": 160_000, "output_tokens": 5_000}
+    # Live checkpoint runs before terminal result supplies contextWindow
+    first_dec = proc_late.context_handoff_tracker.evaluate(proc_late.live_context_occupancy(cli="claude"))
+    assert first_dec["evidence"] == "occupied_without_window"
+    # Terminal result arrives with modelUsage[...].contextWindow
+    proc_late.context_window = 200_000
+    resp_late = {"status": "success", "cli": "claude", "exit_code": 0, "result": "done"}
+    _executor._enrich(resp_late, proc_late)
+    assert resp_late["context_handoff"]["evidence"] == "reported"
+    assert resp_late["context_handoff"]["triggered"] is True
+    assert resp_late["context_handoff"]["ratio"] == 0.8
+
+    # Codex live token_count event with model_context_window and last_token_usage
+    proc_codex = StreamProcessor(cli="codex")
+    proc_codex.process_line(json.dumps({"type": "thread.started", "thread_id": "t-1"}))
+    proc_codex.process_line(json.dumps({
+        "type": "token_count",
+        "info": {
+            "model_context_window": 200_000,
+            "last_token_usage": {"input_tokens": 150_000, "output_tokens": 2_000},
+        },
+    }))
+    codex_occ = proc_codex.live_context_occupancy(cli="codex")
+    assert codex_occ["evidence"] == "reported"
+    assert codex_occ["ratio"] == 0.75
+
+    # 2. mode="off" projection validation rejects arbitrary objects in ratio/headroom fields
+    off_valid = _context_handoff.evaluate_context_handoff(
+        {"evidence": "reported", "occupied_tokens": 150_000, "window_tokens": 200_000, "ratio": 0.75},
+        mode="off",
+    )
+    assert _context_handoff.validate_projection(off_valid) is True
+    for bad_field, bad_val in (
+        ("ratio", {"raw_prompt": "secret"}),
+        ("headroom_tokens", {"raw_prompt": "secret"}),
+        ("headroom_ratio", "leaked"),
+        ("triggered", True),
+        ("reason", "within_context_headroom"),
+    ):
+        forged = dict(off_valid, **{bad_field: bad_val})
+        assert _context_handoff.validate_projection(forged) is False
+
+    # 3 & 4. reserve_request auto-consumes source result handoff_note and enforces headroom
+    import hashlib
+    import time
+    from test_job_continuation import _fixture, _publish_result
+    from test_job_resume import _synthetic_launch_observation
+    import _job_continuation as continuation
+    import _launch_qualification as qualification
+
+    sub_dir = tmp_path / "auto_note"
+    sub_dir.mkdir()
+    root, job_id, job_file, invocation, args, result = _fixture(sub_dir)
+    profile_dir = sub_dir / "profile"
+    profile_dir.mkdir()
+    from dataclasses import replace
+    invocation = replace(
+        invocation, profile="review-profile",
+        profile_env={"CLAUDE_CONFIG_DIR": str(profile_dir.resolve())})
+    result["profile"] = {
+        "name": "review-profile", "cli": "claude",
+        "path_sha256": hashlib.sha256(
+            str(profile_dir.resolve()).encode("utf-8")).hexdigest()[:32],
+        "registry_sha256": "a" * 32, "command_sha256": None,
+    }
+    result["report"] = {
+        "status": "PARTIAL",
+        "summary": "Completed step 1",
+        "findings": "Need step 2",
+        "follow_up": "Run step 2",
+        "handoff": "Continue from step 1",
+        "left_behind": "none",
+    }
+    result["context_occupancy"] = {
+        "schema": "summon.context-occupancy/v1",
+        "evidence": "reported",
+        "occupied_tokens": 160_000,
+        "window_tokens": 200_000,
+        "ratio": 0.80,
+    }
+    result["_private_launch_observation"] = _synthetic_launch_observation()
+    continuation.write_private_source(job_file, result, invocation, args)
+    record = _jobs.read_json(_jobs.record_path(root, job_id))
+    obs = result["_private_launch_observation"]
+    qualified = qualification.issue(
+        source_job_id=job_id, source_attempt_id=record["attempt_id"],
+        operation="resume", backend=obs["backend"], transport=obs["transport"],
+        registry_generation=obs["registry_generation"], registry_digest=obs["registry_digest"],
+        adapter=obs["adapter"], adapter_version=obs["adapter_version"],
+        external_cli_version=obs["external_cli_version"],
+        material_contract="summon-claude-subprocess-material/v1",
+        executable_sha256=obs["executable_sha256"],
+        launch_material_sha256=obs["launch_material_sha256"],
+        expires_at=time.time() + 3600,
+        revocation_id=qualification.revocation_id_for({
+            "operation": "resume", "backend": obs["backend"],
+            "transport": obs["transport"],
+            "registry_generation": obs["registry_generation"],
+            "registry_digest": obs["registry_digest"],
+            "adapter": obs["adapter"], "adapter_version": obs["adapter_version"],
+            "external_cli_version": obs["external_cli_version"],
+            "material_contract": "summon-claude-subprocess-material/v1",
+            "executable_sha256": obs["executable_sha256"],
+            "launch_material_sha256": obs["launch_material_sha256"],
+        }), source_nonce=record["nonce"])
+    qualification.write(root, job_id, qualified)
+    _publish_result(job_file, result)
+
+    # In enforce mode, exhausted headroom refuses same-session resume
+    monkeypatch.setenv("SUMMON_CONTEXT_HANDOFF", "enforce")
+    with pytest.raises(_job_resume.ResumeError) as exc_info:
+        _job_resume.reserve_request(root, job_id, message="continue")
+    assert exc_info.value.kind == "resume_context_headroom_exhausted"
+
+    # In shadow mode, resume succeeds and auto-binds the structured handoff note from source result
+    monkeypatch.setenv("SUMMON_CONTEXT_HANDOFF", "shadow")
+    res_auto = _job_resume.reserve_request(root, job_id, message="continue")
+    assert "Structured context handoff:\n" in res_auto.prompt
+    assert "Prior handoff state: partial" in res_auto.prompt
+    assert "Completed step 1" in res_auto.prompt
+
+    # 5. Quoted token assignments are redacted in handoff notes
+    quoted_note = _context_handoff.normalize_handoff_note({
+        "state": "partial",
+        "completed": ['Used token="abcdef0123456789abcdef" and api_key=\'secret987654321\''],
+    })
+    assert quoted_note is not None
+    assert "abcdef0123456789abcdef" not in quoted_note["completed"][0]
+    assert "secret987654321" not in quoted_note["completed"][0]
+    assert "[REDACTED]" in quoted_note["completed"][0]
+
+    # 6. Handoff attention persists across subsequent active checkpoints in enforce mode
+    ctrl_dir = str(tmp_path / "jobs_ctrl")
+    c_job_id = "d" * 32
+    c_nonce = "nonce-handoff-persist-001"
+    _write_launch_record(ctrl_dir, c_job_id, c_nonce)
+    clock = ManualClock(1000.0)
+    rc = _job_control.RuntimeControl(
+        path=_job_control.control_path(ctrl_dir, c_job_id),
+        heartbeat=_job_control.heartbeat_path(ctrl_dir, c_job_id),
+        job_id=c_job_id,
+        nonce=c_nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=300_000,
+        job_started_at=1000.0,
+        clock=clock,
+        wall_clock=clock,
+    )
+    tracker = _context_handoff.ContextHandoffTracker(mode="enforce")
+    occ_high = {"evidence": "reported", "occupied_tokens": 160_000, "window_tokens": 200_000, "ratio": 0.80}
+    clock.advance(61.0)
+    rc.checkpoint(active=True)
+    rc.record_context_handoff(tracker.evaluate(occ_high))
+    assert rc.attention_required is True
+    # Next checkpoint is also active; attention_required must remain True while handoff is enforced
+    clock.advance(61.0)
+    rc.checkpoint(active=True)
+    rc.record_context_handoff(tracker.evaluate(occ_high))
+    assert rc.attention_required is True

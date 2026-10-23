@@ -365,8 +365,8 @@ def _hash_regular_file(path: str) -> str | None:
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
-        with os.fdopen(fd, "rb") as fh:
-            fst = os.fstat(fh.fileno())
+        try:
+            fst = os.fstat(fd)
             if (
                 _is_link_or_junction(path)
                 or not stat.S_ISREG(fst.st_mode)
@@ -380,13 +380,15 @@ def _hash_regular_file(path: str) -> str | None:
                 return _UNREADABLE_FILE
             while True:
                 remaining = (MAX_LOCKFILE_BYTES - total_read) + 1
-                chunk = fh.read(min(65536, max(1, remaining)))
+                chunk = os.read(fd, min(65536, max(1, remaining)))
                 if not chunk:
                     break
                 total_read += len(chunk)
                 if total_read > MAX_LOCKFILE_BYTES:
                     return _UNREADABLE_FILE
                 h.update(chunk)
+        finally:
+            os.close(fd)
     except OSError:
         return _UNREADABLE_FILE
     return h.hexdigest()

@@ -22,8 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import _jobs
-from _job_continuation import (ContinuationError, read_private_source,
-                               result_binding_sha256)
+from _job_continuation import (ContinuationError, MAX_JOB_BYTES,
+                               read_private_source, result_binding_sha256)
 from _job_control import (_exclusive_control_lock,
                           authenticated_steering_commands,
                           source_admission_lock)
@@ -666,6 +666,31 @@ def reserve_request(root: str, source_job_id: str, *, message: str | None = None
         except ValueError as exc:
             raise ResumeError("resume_steering_untrusted", str(exc)) from exc
         steering = control["steering"]
+        source_result, _sr_state = _read_strict_json(
+            _jobs.result_path(root, source_job_id),
+            max_bytes=MAX_JOB_BYTES,
+        )
+        if _sr_state == _jobs._OK and isinstance(source_result, dict):
+            from _context_handoff import (
+                evaluate_continuation_headroom,
+                extract_handoff_note_from_envelope,
+                mode_from_environment,
+                threshold_from_environment,
+            )
+            headroom = evaluate_continuation_headroom(
+                source_result.get("context_occupancy"),
+                threshold_override=threshold_from_environment(),
+            )
+            if (
+                mode_from_environment() == "enforce"
+                and headroom.get("prefer_fresh_lane") is True
+            ):
+                raise ResumeError(
+                    "resume_context_headroom_exhausted",
+                    "source session context occupancy exceeded threshold; start a fresh lane",
+                )
+            if handoff_note is None:
+                handoff_note = extract_handoff_note_from_envelope(source_result)
         handoff_sha = None
         if handoff_note is not None:
             from _context_handoff import handoff_note_digest

@@ -991,8 +991,17 @@ def _attach_long_horizon_metrics(response: dict, processor) -> None:
                 response.setdefault("breaker", breaker.projection())
             handoff_tracker = getattr(processor, "context_handoff_tracker", None)
             if handoff_tracker is not None:
-                if getattr(handoff_tracker, "evaluations", 0) == 0:
-                    handoff_tracker.evaluate(response.get("context_occupancy"))
+                term_occ = response.get("context_occupancy")
+                prev_proj = handoff_tracker.projection()
+                if (
+                    getattr(handoff_tracker, "evaluations", 0) == 0
+                    or (
+                        isinstance(term_occ, dict)
+                        and term_occ.get("evidence") == "reported"
+                        and prev_proj.get("evidence") != "reported"
+                    )
+                ):
+                    handoff_tracker.evaluate(term_occ)
                 response.setdefault("context_handoff", handoff_tracker.projection())
     except Exception:  # noqa: BLE001 - advisory metrics must never break a dispatch
         pass
@@ -1142,11 +1151,12 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
         }
     response["report"] = report
     try:
-        handoff_tracker = getattr(processor, "context_handoff_tracker", None) if processor else None
-        if handoff_tracker is not None:
-            from _context_handoff import extract_handoff_note_from_envelope
-            note = extract_handoff_note_from_envelope(response)
-            if note is not None:
+        from _context_handoff import extract_handoff_note_from_envelope
+        note = extract_handoff_note_from_envelope(response)
+        if note is not None:
+            response["handoff_note"] = note
+            handoff_tracker = getattr(processor, "context_handoff_tracker", None) if processor else None
+            if handoff_tracker is not None:
                 handoff_tracker.attach_handoff_note(note)
                 response["context_handoff"] = handoff_tracker.projection()
     except Exception:  # noqa: BLE001 - advisory handoff note extraction must never fail dispatch
