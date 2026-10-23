@@ -12,12 +12,17 @@ explicit request, applies) reclamation of worktrees that are provably safe:
 * its commits are integrated: ``base..HEAD`` is empty, or the trees are identical.
 
 Removal uses ``git worktree remove`` without ``--force`` and ``git branch -d``
-(never ``-D``), so git itself re-checks cleanliness and merge state. Applying is
-refused while any Summon background job is running unless explicitly overridden.
+(never ``-D``), so git itself re-checks cleanliness and merge state. ``apply``
+also recomputes a fresh plan and re-checks branch, HEAD and cleanliness right
+before each removal, so a stale plan cannot authorize deletion. Missing
+worktree directories are reported, never pruned (``git worktree prune`` is
+repository-wide). Applying is refused while any Summon background job is running
+or job activity cannot be established, unless explicitly overridden.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import time
@@ -107,9 +112,9 @@ def plan(repo: str, *, base: str = "HEAD", min_age_hours: float = DEFAULT_MIN_AG
          runner: Runner = subprocess.run, now: Callable[[], float] = time.time,
          caller_cwd: str | None = None) -> dict:
     """Return a dry-run plan. Never mutates anything."""
-    if not isinstance(min_age_hours, (int, float)) or isinstance(min_age_hours, bool) \
-            or min_age_hours < 0:
-        raise ValueError("min_age_hours must be a non-negative number")
+    if (not isinstance(min_age_hours, (int, float)) or isinstance(min_age_hours, bool)
+            or not math.isfinite(min_age_hours) or min_age_hours < 0):
+        raise ValueError("min_age_hours must be a finite, non-negative number")
     top = _git(runner, "-C", repo, "rev-parse", "--show-toplevel")
     if not _ok(top):
         raise ValueError(f"not inside a git repository: {repo}")
@@ -137,7 +142,9 @@ def plan(repo: str, *, base: str = "HEAD", min_age_hours: float = DEFAULT_MIN_AG
             item["reason"] = "locked"
             continue
         if wt.get("prunable") or not os.path.isdir(path):
-            item.update(action="prune", reason="missing_directory")
+            # Repository-wide `git worktree prune` would exceed this command's
+            # scope (it also prunes non-Summon metadata), so only report it.
+            item["reason"] = "missing_directory"
             continue
         if _inside(caller, path):
             item["reason"] = "in_use_by_caller"
@@ -174,18 +181,50 @@ def plan(repo: str, *, base: str = "HEAD", min_age_hours: float = DEFAULT_MIN_AG
             "counts": counts, "entries": entries}
 
 
+_SETTLED_JOB_STATES = frozenset({"stale", "success", "partial", "blocked", "error",
+                                 "cancelled"})
+_ACTIVE_JOB_STATES = frozenset({"running", "prepared"})
+
+
 def running_job_count(job_dir: str | None = None) -> int:
-    """Running Summon background jobs in the resolved jobs dir; -1 when unknown."""
+    """Possibly-active Summon background jobs; -1 whenever activity is uncertain.
+
+    Unreadable job state and states such as ``unverified`` or ``corrupt`` are
+    uncertain, never "idle": apply() refuses on -1 without an explicit override.
+    """
     try:
         import _jobs
         root = _jobs.resolve_jobs_dir(job_dir)
-        return sum(1 for row in _jobs.list_jobs(root) if row.get("state") == "running")
+        records = os.path.join(root, _jobs._RECORDS)
+        for directory in (root, records):
+            if os.path.exists(directory):
+                os.listdir(directory)     # raises when present but unreadable
+        active = 0
+        for row in _jobs.list_jobs(root):
+            state = row.get("state")
+            if state in _ACTIVE_JOB_STATES:
+                active += 1
+            elif state not in _SETTLED_JOB_STATES:
+                return -1
+        return active
     except Exception:  # noqa: BLE001 - unknown is treated as "not idle" by apply()
         return -1
 
 
+def _revalidate(item: dict, current: dict | None) -> str | None:
+    """Reason to skip a planned removal when the fresh plan no longer agrees."""
+    if current is None:
+        return "no_longer_listed"
+    if current.get("branch") != item.get("branch") or current.get("head") != item.get("head"):
+        return "changed_since_plan"
+    if current.get("action") != "remove":
+        return f"no_longer_eligible:{current.get('reason')}"
+    return None
+
+
 def apply(gc_plan: dict, *, runner: Runner = subprocess.run,
-          running_jobs: int = 0, ignore_running_jobs: bool = False) -> dict:
+          running_jobs: int = 0, ignore_running_jobs: bool = False,
+          now: Callable[[], float] = time.time, caller_cwd: str | None = None) -> dict:
     """Apply a plan produced by :func:`plan`. Uses only non-forcing git commands."""
     if not isinstance(gc_plan, dict) or gc_plan.get("schema") != SCHEMA:
         raise ValueError("not a worktree-gc plan")
@@ -197,24 +236,45 @@ def apply(gc_plan: dict, *, runner: Runner = subprocess.run,
         out["results"] = []
         return out
     repo = gc_plan["repo"]
+    # Revalidate: a stale plan must not authorize removal. Recompute the full
+    # eligibility (integration, age, cleanliness) now, then re-check branch,
+    # HEAD and cleanliness immediately before each individual removal.
+    fresh = plan(repo, base=gc_plan.get("base", "HEAD"),
+                 min_age_hours=gc_plan.get("min_age_hours", DEFAULT_MIN_AGE_HOURS),
+                 runner=runner, now=now, caller_cwd=caller_cwd)
+    current_by_path = {os.path.normcase(e["path"]): e for e in fresh["entries"]}
     results = []
-    pruned = False
     for item in gc_plan.get("entries", []):
-        action = item.get("action")
-        if action == "prune" and not pruned:
-            proc = _git(runner, "-C", repo, "worktree", "prune")
-            pruned = True
-            results.append({"branch": item["branch"], "action": "prune", "ok": _ok(proc)})
-        elif action == "remove":
-            removed = _git(runner, "-C", repo, "worktree", "remove", item["path"])
-            entry = {"branch": item["branch"], "action": "remove", "ok": _ok(removed)}
-            if _ok(removed):
-                deleted = _git(runner, "-C", repo, "branch", "-d", item["branch"])
-                entry["branch_deleted"] = _ok(deleted)
-            else:
-                entry["error"] = ((getattr(removed, "stderr", "") or "").strip()[:300]
-                                  if removed is not None else "git unavailable")
+        if item.get("action") != "remove":
+            continue
+        entry = {"branch": item["branch"], "action": "remove", "ok": False}
+        skip = _revalidate(item, current_by_path.get(os.path.normcase(item["path"])))
+        if skip is None:
+            head = _git(runner, "-C", item["path"], "rev-parse", "HEAD")
+            ref = _git(runner, "-C", item["path"], "symbolic-ref", "-q", "HEAD")
+            status = _git(runner, "-C", item["path"], "status", "--porcelain",
+                          "--untracked-files=normal")
+            if not (_ok(head) and _ok(ref) and _ok(status)):
+                skip = "recheck_unavailable"
+            elif (head.stdout.strip() != item.get("head")
+                  or ref.stdout.strip() != f"refs/heads/{item['branch']}"):
+                skip = "changed_since_plan"
+            elif status.stdout.strip():
+                skip = "dirty"
+        if skip is not None:
+            entry["skipped"] = skip
+            entry["ok"] = True          # a refusal to act is the safe, expected outcome
             results.append(entry)
+            continue
+        removed = _git(runner, "-C", repo, "worktree", "remove", item["path"])
+        entry["ok"] = _ok(removed)
+        if _ok(removed):
+            deleted = _git(runner, "-C", repo, "branch", "-d", item["branch"])
+            entry["branch_deleted"] = _ok(deleted)
+        else:
+            entry["error"] = ((getattr(removed, "stderr", "") or "").strip()[:300]
+                              if removed is not None else "git unavailable")
+        results.append(entry)
     out["results"] = results
     return out
 
@@ -231,7 +291,9 @@ def render(report: dict) -> str:
     if report.get("refused"):
         lines.append(f"refused: {report['refused']}")
     for result in report.get("results", []):
-        state = "ok" if result.get("ok") else f"FAILED: {result.get('error', '')}"
+        state = ("ok" if result.get("ok") and not result.get("skipped")
+                 else f"skipped ({result['skipped']})" if result.get("skipped")
+                 else f"FAILED: {result.get('error', '')}")
         lines.append(f"  {result.get('action')} {result.get('branch')}: {state}")
     if report.get("mode") == "plan" and report.get("counts", {}).get("remove"):
         lines.append("dry run: rerun with --apply to remove the planned worktrees")

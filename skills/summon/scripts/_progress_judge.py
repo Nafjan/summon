@@ -26,11 +26,13 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import threading
 from typing import Callable, Mapping
 
 SCHEMA = "summon.progress-judgement/v1"
 MODES = ("off", "shadow", "enforce")
 DEFAULT_MODE = "shadow"
+DEFAULT_PREFETCH_MS = 15_000
 MAX_PENDING_CREDIT_CHECKPOINTS = 3
 MAX_FINGERPRINT_ENTRIES = 4096
 MAX_PORCELAIN_BYTES = 4 * 1024 * 1024
@@ -90,12 +92,21 @@ def workspace_fingerprint(cwd: str | None, *,
     """
     if not isinstance(cwd, str) or not cwd or not os.path.isdir(cwd):
         return None
+    common = {"stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL,
+              "stdin": subprocess.DEVNULL, "timeout": FINGERPRINT_TIMEOUT_S, "check": False}
     try:
+        # Porcelain paths are relative to the repository root, not to ``cwd``
+        # (which may be a subdirectory), so resolve the root first.
+        top = runner(["git", "-C", cwd, "rev-parse", "--show-toplevel"], **common)
+        top_raw = getattr(top, "stdout", None)
+        if getattr(top, "returncode", 1) != 0 or not isinstance(top_raw, bytes):
+            return None
+        root = top_raw.decode("utf-8", errors="surrogateescape").strip()
+        if not root or not os.path.isdir(root):
+            return None
         proc = runner(
-            ["git", "-C", cwd, "status", "--porcelain=v2", "-z",
-             "--untracked-files=normal", "--ignore-submodules=all"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL, timeout=FINGERPRINT_TIMEOUT_S, check=False)
+            ["git", "-C", root, "status", "--porcelain=v2", "-z",
+             "--untracked-files=normal", "--ignore-submodules=all"], **common)
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
     raw = getattr(proc, "stdout", None)
@@ -111,7 +122,7 @@ def workspace_fingerprint(cwd: str | None, *,
     digest.update(hashlib.sha256(raw).digest())
     for rel in paths[:MAX_FINGERPRINT_ENTRIES]:
         try:
-            st = os.lstat(os.path.join(cwd, rel))
+            st = os.lstat(os.path.join(root, rel))
             stamp = f"{st.st_size}:{st.st_mtime_ns}"
         except OSError:
             stamp = "missing"
@@ -122,11 +133,19 @@ def workspace_fingerprint(cwd: str | None, *,
 
 
 class ProgressJudge:
-    """Checkpoint-time progress decision; call only when a checkpoint is due."""
+    """Checkpoint-time progress decision.
+
+    ``judge`` never blocks on git: workspace fingerprints are measured on a
+    background thread, started by :meth:`prefetch` shortly before a checkpoint
+    is due (and once at construction for the baseline). A checkpoint consumes
+    only a measurement that completed since the previous checkpoint; otherwise
+    the workspace leg reports ``unmeasured`` instead of waiting.
+    """
 
     def __init__(self, *, checkpoint_ms: int, mode: str = DEFAULT_MODE,
                  workspace_cwd: str | None = None,
-                 fingerprint_fn: Callable[[str | None], str | None] = workspace_fingerprint):
+                 fingerprint_fn: Callable[[str | None], str | None] = workspace_fingerprint,
+                 prefetch_ms: int = DEFAULT_PREFETCH_MS):
         if mode not in MODES or mode == "off":
             raise ValueError("ProgressJudge requires mode 'shadow' or 'enforce'")
         if not isinstance(checkpoint_ms, int) or isinstance(checkpoint_ms, bool) \
@@ -134,12 +153,20 @@ class ProgressJudge:
             raise ValueError("checkpoint_ms must be a positive integer")
         self.mode = mode
         self.checkpoint_ms = checkpoint_ms
+        self.prefetch_ms = prefetch_ms
         self._cwd = workspace_cwd
         self._fingerprint_fn = fingerprint_fn
-        self._baseline = self._measure()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._baseline: str | None = None
+        self._baseline_set = False
+        self._latest: str | None = None
+        self._latest_seq = 0
+        self._consumed_seq = 0
         self.checkpoints = 0
         self.disagreements = 0
         self.last: dict | None = None
+        self.prefetch()
 
     def _measure(self) -> str | None:
         try:
@@ -147,8 +174,40 @@ class ProgressJudge:
         except Exception:  # noqa: BLE001 - measurement is advisory evidence
             return None
 
+    def _worker(self) -> None:
+        value = self._measure()
+        with self._lock:
+            if not self._baseline_set:
+                self._baseline, self._baseline_set = value, True
+            else:
+                self._latest = value
+                self._latest_seq += 1
+            self._thread = None
+
+    def prefetch(self) -> bool:
+        """Start one background measurement unless one is running or unconsumed."""
+        with self._lock:
+            if self._thread is not None:
+                return False
+            if self._baseline_set and self._latest_seq != self._consumed_seq:
+                return False
+            thread = threading.Thread(target=self._worker, name="summon-progress-fingerprint",
+                                      daemon=True)
+            self._thread = thread
+        thread.start()
+        return True
+
+    def wait_idle(self, timeout: float = 10.0) -> bool:
+        """Test/diagnostic helper: wait for an in-flight measurement to finish."""
+        with self._lock:
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+            return not thread.is_alive()
+        return True
+
     def judge(self, *, stream_active: bool, signals=None) -> tuple[bool, dict]:
-        """Return ``(decision_to_apply, record)``.
+        """Return ``(decision_to_apply, record)`` without blocking.
 
         In shadow mode the applied decision is the legacy ``stream_active``.
         """
@@ -162,13 +221,17 @@ class ProgressJudge:
                 pending_ms = signals.oldest_pending_ms()
             except Exception:  # noqa: BLE001
                 loop, pending_ms = False, None
-        current = self._measure()
-        if current is not None and self._baseline is not None:
-            workspace = "changed" if current != self._baseline else "unchanged"
+        with self._lock:
+            fresh = self._latest_seq != self._consumed_seq
+            current = self._latest if fresh else None
+            self._consumed_seq = self._latest_seq
+            baseline = self._baseline
+            if fresh and current is not None:
+                self._baseline = current
+        if current is not None and baseline is not None:
+            workspace = "changed" if current != baseline else "unchanged"
         else:
             workspace = "unmeasured"
-        if current is not None:
-            self._baseline = current
 
         judged = False
         if workspace == "changed":

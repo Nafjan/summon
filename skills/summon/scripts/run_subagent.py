@@ -2125,6 +2125,10 @@ def main() -> None:
 
     if getattr(args, "worktree_gc", False):
         import _worktree_gc
+        if args.gc_apply and getattr(args, "dry_run", False):
+            _print_error("worktree gc: --apply and --dry-run are contradictory; "
+                         "omit --apply for a dry-run plan")
+            sys.exit(1)
         try:
             gc_report = _worktree_gc.plan(
                 args.cwd or os.getcwd(), base=args.gc_base,

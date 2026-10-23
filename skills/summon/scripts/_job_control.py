@@ -641,6 +641,10 @@ class RuntimeControl:
         now = self.clock()
         return self.deadline <= now < self.hard_deadline
 
+    def ms_until_checkpoint(self) -> int:
+        """Milliseconds until the soft checkpoint deadline (0 when due/past)."""
+        return max(0, int((self.deadline - self.clock()) * 1000))
+
     @classmethod
     def from_environment(cls, timeout_ms: int, *, attempt_id: str | None = None,
                          attempt_kind: str = "initial",

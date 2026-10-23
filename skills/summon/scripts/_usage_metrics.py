@@ -36,7 +36,7 @@ _CACHE_READ_KEYS = (
 )
 _CACHE_WRITE_KEYS = (
     "cache_creation_input_tokens", "cache_write_tokens", "cacheWriteTokens",
-    "cacheCreationInputTokens",
+    "cacheCreationInputTokens", "cache_write_input_tokens",
 )
 # Field spellings that identify a dialect regardless of which CLI produced it.
 _ANTHROPIC_MARKERS = ("cache_read_input_tokens", "cache_creation_input_tokens",

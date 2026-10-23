@@ -33,9 +33,26 @@ class Fingerprints:
         return self.values.pop(0) if self.values else None
 
 
+class SyncJudge:
+    """Drives the async judge deterministically: measure, wait, then judge."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        assert inner.wait_idle()
+
+    def judge(self, **kwargs):
+        self.inner.prefetch()
+        assert self.inner.wait_idle()
+        return self.inner.judge(**kwargs)
+
+    def projection(self):
+        return self.inner.projection()
+
+
 def judge(mode="enforce", *fps, checkpoint_ms=60_000):
-    return pj.ProgressJudge(checkpoint_ms=checkpoint_ms, mode=mode,
-                            workspace_cwd="unused", fingerprint_fn=Fingerprints(*fps))
+    return SyncJudge(pj.ProgressJudge(checkpoint_ms=checkpoint_ms, mode=mode,
+                                      workspace_cwd="unused",
+                                      fingerprint_fn=Fingerprints(*fps)))
 
 
 # --- decision rules ---------------------------------------------------------
@@ -119,9 +136,45 @@ def test_baseline_rolls_forward_so_one_change_counts_once():
 def test_fingerprint_errors_degrade_to_unmeasured():
     def broken(_cwd):
         raise RuntimeError("git exploded")
-    j = pj.ProgressJudge(checkpoint_ms=1000, mode="enforce", fingerprint_fn=broken)
+    j = SyncJudge(pj.ProgressJudge(checkpoint_ms=1000, mode="enforce", fingerprint_fn=broken))
     applied, rec = j.judge(stream_active=False)
     assert applied is False and rec["workspace"] == "unmeasured"
+
+
+def test_judge_never_blocks_on_a_slow_measurement():
+    import threading
+    release = threading.Event()
+    calls = []
+
+    def slow(_cwd):
+        calls.append(1)
+        if len(calls) > 1:
+            release.wait(10)
+        return "fp"
+
+    j = pj.ProgressJudge(checkpoint_ms=1000, mode="shadow", fingerprint_fn=slow)
+    assert j.wait_idle()                      # baseline measured
+    assert j.prefetch() is True               # slow measurement now in flight
+    started = time.monotonic()
+    applied, rec = j.judge(stream_active=True)
+    assert time.monotonic() - started < 0.5   # did not wait for git
+    assert applied is True and rec["workspace"] == "unmeasured"
+    assert j.prefetch() is False              # one measurement at a time
+    release.set()
+    assert j.wait_idle()
+
+
+def test_unconsumed_measurement_suppresses_duplicate_prefetch():
+    fps = Fingerprints("a", "b", "c")
+    j = pj.ProgressJudge(checkpoint_ms=1000, mode="enforce", fingerprint_fn=fps)
+    assert j.wait_idle()
+    assert j.prefetch() is True and j.wait_idle()
+    assert j.prefetch() is False              # "b" not yet consumed by a checkpoint
+    assert fps.calls == 2
+    applied, rec = j.judge(stream_active=False)
+    assert rec["workspace"] == "changed" and applied is True
+    assert j.prefetch() is True and j.wait_idle()
+    assert fps.calls == 3
 
 
 @pytest.mark.parametrize("mode", ["off", "bogus"])
@@ -172,6 +225,22 @@ def test_fingerprint_changes_when_an_already_modified_file_changes_again(repo):
 def test_fingerprint_is_stable_without_changes(repo):
     (repo / "u.txt").write_text("x", encoding="utf-8")
     assert pj.workspace_fingerprint(str(repo)) == pj.workspace_fingerprint(str(repo))
+
+
+def test_fingerprint_from_a_subdirectory_resolves_paths_at_the_repo_root(repo):
+    sub = repo / "pkg" / "inner"
+    sub.mkdir(parents=True)
+    tracked = sub / "m.py"
+    tracked.write_text("1", encoding="utf-8")
+    _git(repo, "add", "pkg/inner/m.py")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "m")
+    tracked.write_text("22", encoding="utf-8")            # already dirty ...
+    first = pj.workspace_fingerprint(str(sub))
+    tracked.write_text("333", encoding="utf-8")           # ... and modified again
+    second = pj.workspace_fingerprint(str(sub))
+    assert first and second and first != second
+    # Same state measured from the root and from the subdirectory must agree.
+    assert pj.workspace_fingerprint(str(sub)) == pj.workspace_fingerprint(str(repo))
 
 
 def test_fingerprint_unmeasurable_outside_a_repo_or_on_bad_input(tmp_path):

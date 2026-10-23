@@ -3952,6 +3952,15 @@ def _drive_process_loop(
                 checkpoint_active = stream_active
                 judge = getattr(processor, "progress_judge", None)
                 due_fn = getattr(runtime_control, "checkpoint_due", None)
+                until_fn = getattr(runtime_control, "ms_until_checkpoint", None)
+                if judge is not None and callable(until_fn):
+                    try:
+                        # Non-blocking: measure the workspace on a background
+                        # thread shortly before the checkpoint comes due.
+                        if until_fn() <= judge.prefetch_ms:
+                            judge.prefetch()
+                    except Exception:  # noqa: BLE001 - advisory measurement only
+                        pass
                 if judge is not None and callable(due_fn) and due_fn():
                     try:
                         checkpoint_active, runtime_control.progress = judge.judge(
