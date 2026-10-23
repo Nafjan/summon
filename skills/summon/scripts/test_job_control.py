@@ -1580,9 +1580,11 @@ def test_watch_jobs_snapshot_projects_authenticated_telemetry_and_rejects_tamper
     assert sanitized_live["observation_scope"] == "attempt_total"
     assert sanitized_live["evidence"] == "derived"
 
-    # Completed trusted result with submission_summary.unknown_spend=True and
-    # result telemetry must surface telemetry and render spend as "unknown".
-    os.unlink(hb_path)
+    # Completed trusted result with a retained authenticated v2 heartbeat on disk:
+    # terminal telemetry must take precedence over stale mid-run heartbeat telemetry.
+    control.usage_metrics["work_tokens"] = 100
+    control.context_occupancy["ratio"] = 0.2
+    control.publish({"phase": "generation"}, force=True)
     clean_record = _jobs.read_json(record_path)
     clean_record["agent"] = "sol"
     _jobs._atomic_write_json(record_path, clean_record)
@@ -1595,6 +1597,7 @@ def test_watch_jobs_snapshot_projects_authenticated_telemetry_and_rejects_tamper
         "cli": "claude",
         "elapsed_ms": 14500,
         "cost_usd": None,
+        "liveness": {"phase": "terminal", "elapsed_ms": 14500},
         "usage_metrics": {
             "schema": "summon.usage-metrics/v1",
             "work_tokens": 8192,
@@ -1636,6 +1639,8 @@ def test_watch_jobs_snapshot_projects_authenticated_telemetry_and_rejects_tamper
     snap_done = _background.watch_jobs_snapshot(root, active_only=False)
     row_done = snap_done["jobs"][0]
     assert row_done["state"] == "success"
+    assert row_done["phase"] == "terminal"
+    assert row_done["elapsed_ms"] == 14500
     assert row_done["agent"] == "sol"
     assert row_done["work_tokens"] == 8192
     assert row_done["context_ratio"] == 0.5
@@ -1643,7 +1648,20 @@ def test_watch_jobs_snapshot_projects_authenticated_telemetry_and_rejects_tamper
     assert row_done["unknown_spend"] is True
     assert "unknown" in _background.render_jobs_watch(snap_done)
 
-    # Malformed unhashable telemetry fields in a trusted result must never crash watch_jobs_snapshot.
+    # Settled submission_summary renders "settled" when cost_usd is None.
+    settled_res = _jobs.read_json(_jobs.result_path(root, job_id))
+    settled_res["submission_summary"] = {
+        "schema": "summon.submission-summary/v1",
+        "candidate_records": 1,
+        "unknown_spend": False,
+    }
+    _jobs._atomic_write_json(_jobs.result_path(root, job_id), settled_res)
+    snap_settled = _background.watch_jobs_snapshot(root, active_only=False)
+    assert snap_settled["jobs"][0]["unknown_spend"] is False
+    assert "settled" in _background.render_jobs_watch(snap_settled)
+
+    # Malformed unhashable telemetry fields and missing submission_summary in a
+    # trusted result must never crash watch_jobs_snapshot and must preserve unknown_spend=True.
     _jobs._atomic_write_json(_jobs.result_path(root, job_id), {
         "status": "success",
         "execution_status": "success",
@@ -1658,3 +1676,5 @@ def test_watch_jobs_snapshot_projects_authenticated_telemetry_and_rejects_tamper
     snap_malformed = _background.watch_jobs_snapshot(root, active_only=False)
     assert snap_malformed["count"] == 1
     assert snap_malformed["jobs"][0]["phase"] == "success"
+    assert snap_malformed["jobs"][0]["unknown_spend"] is True
+    assert "unknown" in _background.render_jobs_watch(snap_malformed)

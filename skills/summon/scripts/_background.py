@@ -1172,12 +1172,6 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
         if not isinstance(st, dict):
             continue
         raw_record = st.get("record") if isinstance(st.get("record"), dict) else {}
-        hb_raw = _read_authenticated_heartbeat(root, jid, raw_record)
-        hb_authenticated = (
-            isinstance(hb_raw, dict)
-            and hb_raw.get("integrity") == "payload_authenticated"
-        )
-        hb = hb_raw if hb_authenticated else None
         pub = _jobs.public_job_status(dict(st))
         state = str(pub.get("state") or "unknown")
         if state in ("running", "prepared"):
@@ -1185,6 +1179,13 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
         trusted = bool(pub.get("trusted"))
         res = pub.get("result") if (trusted and isinstance(pub.get("result"), dict)) else {}
         trusted_raw_res = st.get("result") if (trusted and isinstance(st.get("result"), dict)) else {}
+        has_trusted_terminal = bool(trusted and trusted_raw_res)
+        hb_raw = _read_authenticated_heartbeat(root, jid, raw_record)
+        hb_authenticated = (
+            isinstance(hb_raw, dict)
+            and hb_raw.get("integrity") == "payload_authenticated"
+        )
+        hb = hb_raw if (hb_authenticated and not has_trusted_terminal) else None
         rec = pub.get("record") if isinstance(pub.get("record"), dict) else {}
         rec_flags = rec.get("flags") if isinstance(rec.get("flags"), dict) else {}
         agent = res.get("agent") or rec.get("agent") or pub.get("agent")
@@ -1201,6 +1202,8 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
         )
         raw_res_phase = raw_res_live.get("phase")
         res_phase = raw_res_phase if isinstance(raw_res_phase, str) and raw_res_phase in _ALLOWED_PHASES else None
+        hb_phase = hb_live.get("phase")
+        valid_hb_phase = hb_phase if isinstance(hb_phase, str) and hb_phase in _ALLOWED_PHASES else None
         raw_res_live_elapsed = raw_res_live.get("elapsed_ms")
         res_live_elapsed = (
             raw_res_live_elapsed
@@ -1209,19 +1212,24 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
                 and 0 <= raw_res_live_elapsed <= 366 * 24 * 60 * 60 * 1000)
             else None
         )
-        phase = str(hb_live.get("phase") or res_phase or state)
+        phase = str(res_phase or valid_hb_phase or state)
         elapsed_ms = None
         raw_res_elapsed = trusted_raw_res.get("elapsed_ms")
-        if isinstance(hb, dict) and isinstance(hb.get("job_elapsed_ms"), int):
-            elapsed_ms = hb["job_elapsed_ms"]
-        elif isinstance(hb_live.get("elapsed_ms"), int):
-            elapsed_ms = hb_live["elapsed_ms"]
-        elif (isinstance(raw_res_elapsed, int)
-              and not isinstance(raw_res_elapsed, bool)
-              and 0 <= raw_res_elapsed <= 366 * 24 * 60 * 60 * 1000):
+        if (isinstance(raw_res_elapsed, int)
+                and not isinstance(raw_res_elapsed, bool)
+                and 0 <= raw_res_elapsed <= 366 * 24 * 60 * 60 * 1000):
             elapsed_ms = raw_res_elapsed
         elif res_live_elapsed is not None:
             elapsed_ms = res_live_elapsed
+        elif (isinstance(hb, dict)
+              and isinstance(hb.get("job_elapsed_ms"), int)
+              and not isinstance(hb.get("job_elapsed_ms"), bool)
+              and 0 <= hb["job_elapsed_ms"] <= 366 * 24 * 60 * 60 * 1000):
+            elapsed_ms = hb["job_elapsed_ms"]
+        elif (isinstance(hb_live.get("elapsed_ms"), int)
+              and not isinstance(hb_live.get("elapsed_ms"), bool)
+              and 0 <= hb_live["elapsed_ms"] <= 366 * 24 * 60 * 60 * 1000):
+            elapsed_ms = hb_live["elapsed_ms"]
         hb_breaker = (
             hb.get("breaker")
             if isinstance(hb, dict) and isinstance(hb.get("breaker"), dict)
@@ -1232,8 +1240,8 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
             _safe_sanitize(_sanitize_breaker, trusted_raw_res.get("breaker"))
             or _safe_sanitize(_sanitize_breaker, raw_rc.get("breaker"))
         )
-        breaker_level = hb_breaker.get("level") or res_breaker.get("level")
-        breaker_mode = hb_breaker.get("mode") or res_breaker.get("mode")
+        breaker_level = res_breaker.get("level") or hb_breaker.get("level")
+        breaker_mode = res_breaker.get("mode") or hb_breaker.get("mode")
         hb_occ = (
             hb.get("context_occupancy")
             if isinstance(hb, dict) and isinstance(hb.get("context_occupancy"), dict)
@@ -1254,10 +1262,10 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
         )
         context_ratio = None
         for candidate_ratio in (
-            hb_occ.get("ratio"),
-            hb_handoff.get("ratio"),
             res_occ.get("ratio"),
             res_handoff.get("ratio"),
+            hb_occ.get("ratio"),
+            hb_handoff.get("ratio"),
         ):
             if (isinstance(candidate_ratio, (int, float))
                     and not isinstance(candidate_ratio, bool)
@@ -1275,7 +1283,7 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
             _safe_sanitize(_sanitize_progress, trusted_raw_res.get("progress_judgement"))
             or _safe_sanitize(_sanitize_progress, raw_rc.get("progress"))
         )
-        progress_reason = _extract_progress_reason(hb_prog) or _extract_progress_reason(res_prog)
+        progress_reason = _extract_progress_reason(res_prog) or _extract_progress_reason(hb_prog)
         hb_um = (
             hb.get("usage_metrics")
             if isinstance(hb, dict) and isinstance(hb.get("usage_metrics"), dict)
@@ -1286,24 +1294,40 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
             or _safe_sanitize(_sanitize_usage_metrics, raw_rc.get("usage_metrics"))
         )
         work_tokens = None
-        for candidate_wt in (hb_um.get("work_tokens"), res_um.get("work_tokens")):
+        for candidate_wt in (res_um.get("work_tokens"), hb_um.get("work_tokens")):
             if isinstance(candidate_wt, int) and not isinstance(candidate_wt, bool) and candidate_wt >= 0:
                 work_tokens = candidate_wt
                 break
         attention_required = bool(
-            (hb.get("attention_required") if isinstance(hb, dict) else False)
-            or (raw_rc.get("attention_required") is True)
+            (raw_rc.get("attention_required") is True)
+            or (hb.get("attention_required") is True if isinstance(hb, dict) else False)
         )
         pub_sub_sum = pub.get("submission_summary")
         raw_sub_sum = trusted_raw_res.get("submission_summary")
-        sub_sum = (
-            pub_sub_sum
-            if isinstance(pub_sub_sum, dict)
-            else (raw_sub_sum if isinstance(raw_sub_sum, dict) else {})
+        summaries = [
+            s for s in (pub_sub_sum, raw_sub_sum)
+            if isinstance(s, dict)
+        ]
+        has_settled_accounting = bool(summaries) and all(
+            s.get("schema") == "summon.submission-summary/v1"
+            and s.get("unknown_spend") is False
+            and (
+                "candidate_records" not in s
+                or (
+                    isinstance(s.get("candidate_records"), int)
+                    and not isinstance(s.get("candidate_records"), bool)
+                    and s.get("candidate_records", 0) > 0
+                )
+            )
+            for s in summaries
         )
         unknown_spend = bool(
-            (sub_sum.get("unknown_spend") is True)
-            or state in ("running", "unverified", "stale", "corrupt", "identity_mismatch")
+            not has_settled_accounting
+            or not trusted
+            or state in (
+                "running", "prepared", "unverified", "stale",
+                "corrupt", "identity_mismatch", "unknown",
+            )
         )
         raw_cost = trusted_raw_res.get("cost_usd")
         cost_usd = None
