@@ -2368,7 +2368,9 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
                            strict_agents_dir=False, role_provenance=None,
                            read_roots=None, isolated_lane=False,
                            allow_tool_credentials=False,
-                           require_exact_model=False) -> dict:
+                           require_exact_model=False,
+                           link_deps=None,
+                           link_deps_allow_mutation=False) -> dict:
     """THE request identity, built in ONE place from RAW inputs.
 
     The dispatcher and the manifest parent each used to build their own dict, so a field
@@ -2524,6 +2526,14 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # that differ only by an unused profile argument re-pay for the same work.
         "resume_profile": (resume_profile or None) if resume else None,
         "worktree": ("<auto>" if worktree == "" else (worktree or None)),
+        "link_deps": (
+            ",".join(sorted({p.strip().replace("\\", "/").strip("/")
+                             for p in (link_deps.split(",") if isinstance(link_deps, str) else (link_deps or ()))
+                             if isinstance(p, str) and p.strip()})) or None
+        ) if link_deps else None,
+        "link_deps_allow_mutation": (
+            "1" if (link_deps_allow_mutation and link_deps) else None
+        ),
         # OpenCode yolo is an explicit isolated-lane operation.  These controls
         # are part of the identity so a cached unrestricted result cannot satisfy
         # a later request with a different credential/tool boundary.

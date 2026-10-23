@@ -1382,6 +1382,20 @@ next(item for item in _FORMATS if item["id"] == "breaker")["readers"].extend([
     _ref("_job_control", "public_heartbeat"),
     _ref("_executor", "_enrich"),
 ])
+_add("worktree-deps", "summon.worktree-deps/v1",
+     _ref("_worktree_deps", "bridge_worktree_deps"),
+     _ref("_worktree_deps", "validate_projection"),
+     authority="public_projection",
+     shape=["count", "paths", "strategy", "allow_mutation", "before_sha256", "after_sha256", "deps_mutated", "links_intact", "mutated_paths"],
+     fixtures=[_test("worktree_deps", "test_bridge_and_verify_linked_deps_round_trip"),
+               _test("worktree_deps", "test_post_dispatch_mutation_detected_and_fails_closed")],
+     gaps=["Worktree dependency records report link and fingerprint integrity, not OS-level filesystem isolation."])
+next(item for item in _FORMATS if item["id"] == "worktree-deps")["producers"].extend([
+    _ref("_worktree_deps", "preflight_link_deps"),
+    _ref("_worktree_deps", "verify_linked_deps"),
+])
+next(item for item in _FORMATS if item["id"] == "worktree-deps")["readers"].append(
+    _ref("_worktree_deps", "_read_metadata"))
 
 FORMAT_INVENTORY = {"schema": SCHEMA, "version": VERSION, "formats": _FORMATS}
 

@@ -446,6 +446,16 @@ def workspace_snapshot(cwd: str | None) -> dict:
     status = _parse_git_status_porcelain(status_raw)
     if status is None:
         return _workspace_empty("incomplete", "invalid git status output")
+    try:
+        from _worktree_deps import intact_linked_dep_paths, is_excluded_untracked_path
+        _intact_deps = intact_linked_dep_paths(root)
+        if _intact_deps and status.get("untracked"):
+            status["untracked"] = [
+                p for p in status["untracked"]
+                if not is_excluded_untracked_path(p, _intact_deps)
+            ]
+    except Exception:  # noqa: BLE001 - fall back to unfiltered status
+        pass
     snap = _WorkspaceSnapshot(
         {"head": head, "branch": branch, **status, "coverage": "complete", "error": None}
     )

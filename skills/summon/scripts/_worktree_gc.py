@@ -160,7 +160,13 @@ def plan(repo: str, *, base: str = "HEAD", min_age_hours: float = DEFAULT_MIN_AG
         if not _ok(status):
             item["reason"] = "status_unavailable"
             continue
-        if status.stdout.strip():
+        status_out = status.stdout
+        try:
+            from _worktree_deps import filter_porcelain_v1_text
+            status_out = filter_porcelain_v1_text(status_out, path)
+        except Exception:  # noqa: BLE001
+            pass
+        if status_out.strip():
             item["reason"] = "dirty"
             continue
         head = wt.get("head")
@@ -265,7 +271,22 @@ def apply(gc_plan: dict, *, runner: Runner = subprocess.run,
             elif (head.stdout.strip() != item.get("head")
                   or ref.stdout.strip() != f"refs/heads/{item['branch']}"):
                 skip = "changed_since_plan"
-            elif status.stdout.strip():
+            else:
+                status_out = status.stdout
+                try:
+                    from _worktree_deps import filter_porcelain_v1_text
+                    status_out = filter_porcelain_v1_text(status_out, item["path"])
+                except Exception:  # noqa: BLE001
+                    pass
+                if status_out.strip():
+                    skip = "dirty"
+        if skip is None:
+            try:
+                from _worktree_deps import teardown_linked_deps
+                td = teardown_linked_deps(item["path"])
+                if td.get("tampered") or td.get("errors"):
+                    skip = "dirty"
+            except Exception:  # noqa: BLE001
                 skip = "dirty"
         if skip is not None:
             entry["skipped"] = skip

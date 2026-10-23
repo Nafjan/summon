@@ -114,6 +114,11 @@ def workspace_fingerprint(cwd: str | None, *,
         return None
     if len(raw) > MAX_PORCELAIN_BYTES:
         return None
+    try:
+        from _worktree_deps import filter_porcelain_v2_raw
+        raw = filter_porcelain_v2_raw(raw, root)
+    except Exception:  # noqa: BLE001
+        pass
     paths = _porcelain_paths(raw)
     if paths is None:
         return None

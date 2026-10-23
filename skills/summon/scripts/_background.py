@@ -312,6 +312,10 @@ def child_argv(args: argparse.Namespace, result_file: str, *, private_resume: bo
         out += ["--gate-timeout", str(args.gate_timeout)]
     if args.worktree is not None:
         out += [f"--worktree={args.worktree}"]  # =form is unambiguous for the bare case
+    if getattr(args, "link_deps", None):
+        out += ["--link-deps", str(args.link_deps)]
+    if getattr(args, "link_deps_allow_mutation", False):
+        out += ["--link-deps-allow-mutation"]
     if getattr(args, "isolated_lane", False):
         out += ["--isolated-lane"]
     if getattr(args, "allow_tool_credentials", False):

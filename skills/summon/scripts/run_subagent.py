@@ -393,7 +393,9 @@ def _request_identity(args) -> dict:
         profile=getattr(args, "profile", None),
         strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)),
         role_provenance=getattr(args, "_role_provenance", None),
-        require_exact_model=bool(getattr(args, "require_exact_model", False)))
+        require_exact_model=bool(getattr(args, "require_exact_model", False)),
+        link_deps=getattr(args, "link_deps", None),
+        link_deps_allow_mutation=bool(getattr(args, "link_deps_allow_mutation", False)))
 
 
 def _context_bindings(values) -> dict[str, str]:
@@ -1246,7 +1248,9 @@ def _release_worktree_lock(lock_path: str, token: str) -> None:
         pass
 
 
-def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
+def _setup_worktree(cwd: str, name_arg: str, agent: str, *,
+                    link_deps: tuple[str, ...] = (),
+                    link_deps_allow_mutation: bool = False) -> dict:
     """Create an isolated git worktree so a (possibly parallel) editing agent
     can't collide with the main tree or other agents. Returns {path, branch}.
     Raises ValueError (surfaced as a clean JSON error) on any failure."""
@@ -1331,6 +1335,18 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
     if relocated:
         out_info["relocated"] = True
         out_info["requested_worktree_path"] = default_wt
+    if link_deps:
+        from _worktree_deps import bridge_worktree_deps
+        try:
+            out_info["linked_deps"] = bridge_worktree_deps(
+                repo, wt, link_deps, allow_mutation=bool(link_deps_allow_mutation))
+        except BaseException:
+            shutil.rmtree(wt, ignore_errors=True)
+            subprocess.run([*git_cmd, "-C", repo, "worktree", "prune"],
+                           capture_output=True, text=True, **run_flags())
+            subprocess.run([*git_cmd, "-C", repo, "branch", "-D", branch],
+                           capture_output=True, text=True, **run_flags())
+            raise
     return out_info
 
 
@@ -1341,9 +1357,23 @@ def _preflight_then_setup_worktree(invocation, cwd: str, name_arg: str | None,
     refusal = zcode_invocation_preflight(invocation)
     if refusal is not None:
         return None, refusal
+    link_deps = getattr(invocation, "link_deps", ()) or ()
+    allow_mutation = bool(getattr(invocation, "link_deps_allow_mutation", False))
+    if link_deps or allow_mutation:
+        from _worktree_deps import WorktreeDepsError, preflight_link_deps
+        try:
+            preflight_link_deps(
+                cwd, link_deps, worktree_arg=name_arg,
+                permission=getattr(invocation, "permission", None),
+                allow_mutation=allow_mutation)
+        except WorktreeDepsError as exc:
+            return None, {"error_kind": exc.kind, "message": str(exc)}
     if name_arg is None or dry_run:
         return None, None
-    return _setup_worktree(cwd, name_arg, agent), None
+    return _setup_worktree(
+        cwd, name_arg, agent,
+        link_deps=tuple(link_deps),
+        link_deps_allow_mutation=allow_mutation), None
 
 
 # --- Background dispatch + jobs queries (moved to _background.py) ---------------
@@ -1796,7 +1826,8 @@ def main() -> None:
                 "--agent", "--prompt", "--prompt-file", "--cli", "--model",
                 "--effort", "--max-permission", "--allow-payg", "--resume",
                 "--transport", "--require-exact-model", "--read-root",
-                "--worktree", "--background", "--gate-with",
+                "--worktree", "--link-deps", "--link-deps-allow-mutation",
+                "--background", "--gate-with",
                 "--isolated-lane", "--allow-tool-credentials",
             }
             _fleet_approval_only = {
@@ -2515,6 +2546,8 @@ def main() -> None:
                 ("--transport", bool(args.transport)),
                 ("--read-root", bool(args.read_root)),
                 ("--worktree", args.worktree is not None),
+                ("--link-deps", bool(getattr(args, "link_deps", None))),
+                ("--link-deps-allow-mutation", bool(getattr(args, "link_deps_allow_mutation", False))),
                 ("--background", bool(args.background)),
                 ("--job-file", bool(args.job_file)),
                 ("--adaptive-timeout", bool(args.adaptive_timeout)),
@@ -2599,6 +2632,21 @@ def main() -> None:
         args._read_roots_cli = normalize_read_roots(getattr(args, "read_root", None))
     except ValueError as exc:
         _die(str(exc), error_kind="read_allowlist")
+    try:
+        from _worktree_deps import WorktreeDepsError, parse_link_deps
+        args._link_deps_parsed = parse_link_deps(getattr(args, "link_deps", None))
+        if getattr(args, "link_deps_allow_mutation", False) and not args._link_deps_parsed:
+            raise WorktreeDepsError(
+                "link_deps_invalid_path",
+                "--link-deps-allow-mutation requires --link-deps")
+        if args._link_deps_parsed and args.worktree is None and not args.dry_run:
+            raise WorktreeDepsError(
+                "link_deps_requires_worktree",
+                "--link-deps requires --worktree")
+    except WorktreeDepsError as exc:
+        _die(str(exc), error_kind=exc.kind,
+             extra={"provider_contacted": False, "result_usable": False,
+                    "retryable": False})
     if getattr(args, "context_input_file", None) is not None and not isinstance(args.prompt, str):
         _die("--prompt is required with --context-input-file",
              error_kind="context_usage_invalid",
@@ -2922,7 +2970,7 @@ def main() -> None:
         except ValueError as exc:
             _die(str(exc), error_kind="read_allowlist")
     except ValueError as e:
-        _die(str(e))
+        _die(str(e), error_kind=getattr(e, "kind", None))
     except FileNotFoundError as e:
         if getattr(e, "kind", None) == "strict_agents_dir_miss":
             _die(str(e), error_kind=e.kind, details={
@@ -3156,7 +3204,7 @@ def main() -> None:
     try:
         transport = _transport_for_dispatch(agent_file, getattr(args, "transport", None))
     except ValueError as e:
-        _die(str(e))
+        _die(str(e), error_kind=getattr(e, "kind", None))
     if transport == "acp":
         from _builder import supports_acp as _supports_acp
         if not _supports_acp(cli):
@@ -3183,7 +3231,7 @@ def main() -> None:
         _openrouter_options = parse_openrouter_options(
             _agent_fm.get("openrouter_options"), final_model)
     except ValueError as e:
-        _die(str(e))
+        _die(str(e), error_kind=getattr(e, "kind", None))
 
     _model_source = "cli" if args.model else "frontmatter" if model else None
     _model_exact_required, _model_exact_source = _executor.model_exact_policy(
@@ -3258,6 +3306,8 @@ def main() -> None:
         openrouter_options=_openrouter_options,
         read_roots=_read_roots,
         worktree=getattr(args, "worktree", None),
+        link_deps=tuple(getattr(args, "_link_deps_parsed", ()) or ()),
+        link_deps_allow_mutation=bool(getattr(args, "link_deps_allow_mutation", False)),
         isolated_lane=bool(getattr(args, "isolated_lane", False)),
         allow_tool_credentials=bool(getattr(args, "allow_tool_credentials", False)),
         # A chat dispatcher receives the parent guard's physical attempt in
@@ -3374,7 +3424,7 @@ def main() -> None:
             invocation, args.cwd, args.worktree, args.agent,
             dry_run=bool(args.dry_run))
     except ValueError as e:
-        _die(str(e))
+        _die(str(e), error_kind=getattr(e, "kind", None))
     if _zcode_refusal:
         _die(_zcode_refusal["message"],
              error_kind=_zcode_refusal["error_kind"],
@@ -3616,6 +3666,31 @@ def main() -> None:
         pass
 
     if worktree_info:
+        if worktree_info.get("linked_deps"):
+            from _worktree_deps import verify_linked_deps
+            _ld_post = verify_linked_deps(worktree_info)
+            if isinstance(_ld_post, dict) and _ld_post.get("deps_mutated"):
+                _mutated_list = ", ".join(
+                    _ld_post.get("mutated_paths") or _ld_post.get("paths") or ())
+                if not _ld_post.get("allow_mutation"):
+                    _mut_msg = (
+                        f"linked dependency directories mutated during worktree dispatch "
+                        f"({_mutated_list}); pass --link-deps-allow-mutation if shared "
+                        f"dependency mutation is intentional"
+                    )
+                    result["status"] = "error"
+                    result["execution_status"] = "error"
+                    result["error_kind"] = "linked_deps_mutated"
+                    result["error"] = _mut_msg
+                    result["result_usable"] = False
+                    result["retryable"] = False
+                    result.setdefault("warnings", []).append(_mut_msg)
+                    finalize_exit_fields(result)
+                else:
+                    result.setdefault("warnings", []).append(
+                        f"linked dependency directories mutated during worktree dispatch "
+                        f"({_mutated_list}); allowed by --link-deps-allow-mutation"
+                    )
         result["worktree"] = worktree_info
     _tags = _agent_tags_from_file(agent_file)
     if _tags:
@@ -4209,6 +4284,28 @@ def _dry_run_view(invocation, args, agents_dir: str,
         _note_refusal(view, view["error_kind"])
         view["provider_contacted"] = False
         view["result_usable"] = False
+    _inv_link_deps = getattr(invocation, "link_deps", ()) or ()
+    _inv_link_mut = bool(getattr(invocation, "link_deps_allow_mutation", False))
+    if _inv_link_deps or _inv_link_mut:
+        from _worktree_deps import WorktreeDepsError, preflight_link_deps
+        try:
+            _ld_pf = preflight_link_deps(
+                invocation.cwd, _inv_link_deps,
+                worktree_arg=getattr(invocation, "worktree", None),
+                permission=getattr(invocation, "permission", None),
+                allow_mutation=_inv_link_mut)
+            if _ld_pf.get("enabled"):
+                view["worktree_deps"] = {
+                    k: _ld_pf[k]
+                    for k in ("schema", "count", "paths", "strategy", "allow_mutation")
+                }
+        except WorktreeDepsError as _ld_exc:
+            view["would_refuse"] = True
+            view["error_kind"] = _ld_exc.kind
+            view["refusal"] = str(_ld_exc)
+            _note_refusal(view, _ld_exc.kind)
+            view["provider_contacted"] = False
+            view["result_usable"] = False
     from _builder import agy_prompt_length_refusal
     try:
         _agy_size = agy_prompt_length_refusal(invocation)
@@ -4605,11 +4702,29 @@ def _remove_worktree(info) -> dict:
     if status.returncode != 0 or head.returncode != 0:
         result["reason"] = "could not verify worktree status/HEAD"
         return result
-    if status.stdout.strip():
+    status_out = status.stdout
+    try:
+        from _worktree_deps import filter_porcelain_v1_text
+        status_out = filter_porcelain_v1_text(status_out, target)
+    except Exception:  # noqa: BLE001
+        pass
+    if status_out.strip():
         result["reason"] = "uncommitted changes or untracked files appeared"
         return result
     if head.stdout.strip() != info["base_head"]:
         result["reason"] = "branch HEAD advanced after worktree creation"
+        return result
+    try:
+        from _worktree_deps import teardown_linked_deps
+        _td = teardown_linked_deps(target)
+        if _td.get("tampered"):
+            result["reason"] = "linked dependency was replaced with a non-link directory"
+            return result
+        if _td.get("errors"):
+            result["reason"] = "could not unlink bridged dependency directory"
+            return result
+    except Exception as e:  # noqa: BLE001
+        result["reason"] = "could not unlink bridged dependency directory: %s" % e
         return result
 
     # No force flags. If work appears after the checks, git's own clean-worktree

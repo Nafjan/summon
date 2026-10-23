@@ -1474,6 +1474,13 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "adapter (env: SUMMON_KIMI_ACP_FALLBACK=1)")
     parser.add_argument("--worktree", nargs="?", const="", default=None,
                         help="Run in an isolated git worktree (optional name; auto-named if bare)")
+    parser.add_argument("--link-deps", dest="link_deps", default=None,
+                        help="Comma-separated repo-relative dependency directories to bridge "
+                             "into --worktree via junctions/symlinks (e.g. node_modules,.venv)")
+    parser.add_argument("--link-deps-allow-mutation", dest="link_deps_allow_mutation",
+                        action="store_true",
+                        help="Explicitly allow --link-deps with permission=yolo and permit "
+                             "shared dependency directory mutations during dispatch")
     parser.add_argument("--isolated-lane", dest="isolated_lane", action="store_true",
                         help="Acknowledge that this broad-authority turn runs in a disposable "
                              "copy or separate OS boundary; required for OpenCode yolo "

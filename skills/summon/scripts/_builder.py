@@ -102,6 +102,8 @@ class AgentInvocation:
     # acknowledgement that a disposable clone/OS boundary is being used.  Neither
     # is a claim that a Git worktree is a security sandbox.
     worktree: str | None = None
+    link_deps: tuple[str, ...] = ()
+    link_deps_allow_mutation: bool = False
     isolated_lane: bool = False
     allow_tool_credentials: bool = False
     # Optional authoritative transport capability for the operation-specific
