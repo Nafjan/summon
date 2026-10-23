@@ -1680,6 +1680,14 @@ class SwarmCoordinator:
             task = state["tasks"].get(claim["task_id"])
             if task is None or not task["attempts"] or task["attempts"][-1] != claim["claim_id"]:
                 raise ValueError("terminal event references superseded claim")
+            if task.get("terminal") in {"completed", "failed", "cancelled"}:
+                raise ValueError("terminal event references already terminal task")
+            if event == "task_blocked":
+                if (claim["status"] not in {"active", "indeterminate"}
+                        or task.get("terminal") not in {None, "indeterminate"}):
+                    raise ValueError("task_blocked requires active or indeterminate claim")
+            elif claim["status"] != "active" or task.get("terminal") is not None:
+                raise ValueError("terminal event references non-active claim")
             status = {
                 "claim_released": "released",
                 "claim_indeterminate": "indeterminate",
@@ -1712,7 +1720,9 @@ class SwarmCoordinator:
             if not task["attempts"] or task["attempts"][-1] != claim_id:
                 raise ValueError("retry authorization references superseded claim")
             claim = state["claims"].get(claim_id)
-            if claim is None or claim["status"] not in {"indeterminate", "blocked"}:
+            if (claim is None
+                    or claim["status"] not in {"indeterminate", "blocked"}
+                    or task.get("terminal") not in {"indeterminate", "blocked"}):
                 raise ValueError("retry authorization requires indeterminate or blocked claim")
             task["retry_authorized"] = True
             task["terminal"] = None

@@ -532,6 +532,56 @@ def _room_subject(records: Iterable[Mapping[str, Any]]) -> str | None:
 _MEMORY_PROMOTE_LOCK = threading.Lock()
 
 
+_RECLAIM_THREAD_LOCK = threading.Lock()
+
+
+def _try_reclaim_lock(reclaim_lock: Path) -> int | None:
+    if not _RECLAIM_THREAD_LOCK.acquire(blocking=False):
+        return None
+    rfd: int | None = None
+    try:
+        rfd = os.open(str(reclaim_lock), os.O_CREAT | os.O_RDWR, 0o600)
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(rfd, 0, os.SEEK_SET)
+            os.write(rfd, b"\x00")
+            os.lseek(rfd, 0, os.SEEK_SET)
+            msvcrt.locking(rfd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(rfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return rfd
+    except BaseException:
+        if rfd is not None:
+            try:
+                os.close(rfd)
+            except OSError:
+                pass
+        _RECLAIM_THREAD_LOCK.release()
+        return None
+
+
+def _release_reclaim_lock(rfd: int) -> None:
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(rfd, 0, os.SEEK_SET)
+                msvcrt.locking(rfd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(rfd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(rfd)
+            except OSError:
+                pass
+    finally:
+        _RECLAIM_THREAD_LOCK.release()
+
+
 @contextmanager
 def _exclusive_file_lock(lock: Path, busy_message: str):
     """Claim a short-lived cross-process lock with stale-owner reclamation."""
@@ -574,37 +624,33 @@ def _exclusive_file_lock(lock: Path, busy_message: str):
                         owner_token = marker.get("token") if isinstance(marker, dict) else None
                         if (isinstance(owner_token, str) and len(owner_token) == 32
                                 and not pid_alive(owner_pid)):
-                            reclaim_fd: int | None = None
-                            try:
-                                reclaim_fd = os.open(
-                                    str(reclaim_lock),
-                                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                                    0o600,
-                                )
-                                current_stat = lock.stat()
-                                current_raw = lock.read_bytes()
-                                if (current_raw == raw
-                                        and current_stat.st_mtime_ns == observed.st_mtime_ns
-                                        and time.time() - current_stat.st_mtime > APPEND_LOCK_STALE_SECONDS):
-                                    lock.unlink()
-                                    continue
-                            except (FileExistsError, PermissionError):
+                            reclaim_fd = _try_reclaim_lock(reclaim_lock)
+                            if reclaim_fd is not None:
                                 try:
-                                    if time.time() - reclaim_lock.stat().st_mtime > APPEND_LOCK_STALE_SECONDS:
-                                        reclaim_lock.unlink()
-                                except OSError:
-                                    pass
-                            except FileNotFoundError:
-                                continue
-                            finally:
-                                if reclaim_fd is not None:
-                                    try:
-                                        os.close(reclaim_fd)
-                                    finally:
-                                        try:
-                                            reclaim_lock.unlink()
-                                        except FileNotFoundError:
-                                            pass
+                                    current_stat = lock.stat()
+                                    current_raw = lock.read_bytes()
+                                    current_marker = json.loads(current_raw.decode("ascii"))
+                                    current_pid = (
+                                        current_marker.get("pid")
+                                        if isinstance(current_marker, dict)
+                                        else None
+                                    )
+                                    current_token = (
+                                        current_marker.get("token")
+                                        if isinstance(current_marker, dict)
+                                        else None
+                                    )
+                                    if (current_raw == raw
+                                            and current_token == owner_token
+                                            and not pid_alive(current_pid)
+                                            and current_stat.st_mtime_ns == observed.st_mtime_ns
+                                            and time.time() - current_stat.st_mtime > APPEND_LOCK_STALE_SECONDS):
+                                        lock.unlink()
+                                        continue
+                                except FileNotFoundError:
+                                    continue
+                                finally:
+                                    _release_reclaim_lock(reclaim_fd)
                 except (OSError, UnicodeError, ValueError, TypeError):
                     pass
                 if time.monotonic() >= deadline:

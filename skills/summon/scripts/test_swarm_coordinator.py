@@ -1099,6 +1099,26 @@ class SwarmCoordinatorTests(unittest.TestCase):
         self.assertEqual(blocked["status"], "blocked")
         self.assertEqual(coord2.status()["tasks"][0]["human_question"], "Approve deployment window?")
 
+        # Replay validation rejects recovery events against any completed/failed/cancelled claim
+        state, _ = self.coordinator._load()
+        latest_claim_id = state["tasks"]["task-a"]["attempts"][-1]
+        for terminal_state in ("completed", "failed", "cancelled"):
+            for recovery_event in ("claim_indeterminate", "task_blocked", "human_question", "retry_authorized"):
+                probe = copy.deepcopy(state)
+                probe["tasks"]["task-a"]["terminal"] = terminal_state
+                probe["claims"][latest_claim_id]["status"] = terminal_state
+                with self.assertRaises(ValueError):
+                    SwarmCoordinator._apply_record(
+                        probe,
+                        {
+                            "event": recovery_event,
+                            "task_id": "task-a",
+                            "claim_id": latest_claim_id,
+                            "reason": "late replay",
+                            "question": "late question?",
+                        },
+                    )
+
 
 def json_text(value):
     import json
