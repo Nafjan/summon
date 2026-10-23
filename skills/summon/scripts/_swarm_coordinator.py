@@ -39,6 +39,7 @@ import _submission_accounting
 
 
 MAX_TASKS = 1024
+MAX_TASK_DEPS = 64
 MAX_ATTEMPTS = 32
 MAX_LEASE_MS = 24 * 60 * 60 * 1000
 MAX_CLOCK_SKEW_MS = 5 * 60 * 1000
@@ -151,7 +152,8 @@ def _bound_record(event: str) -> dict[str, Any]:
             "project_root_sha256": _BOUND_SHA,
             "roster_definition_sha256": _BOUND_SHA,
             "max_attempts": MAX_ATTEMPTS,
-            "tasks": [{"task_id": _BOUND_ID, "request_sha256": _BOUND_SHA}
+            "tasks": [{"task_id": _BOUND_ID, "request_sha256": _BOUND_SHA,
+                       "depends_on": [_BOUND_ID] * MAX_TASK_DEPS}
                       for _ in range(MAX_TASKS)],
         })
     elif event == "worker_registered":
@@ -178,6 +180,16 @@ def _bound_record(event: str) -> dict[str, Any]:
                        "request_sha256": _BOUND_SHA,
                        "envelope_sha256": _BOUND_SHA,
                        "reason": _BOUND_REASON, "human_confirmed": True})
+        if event == "task_blocked":
+            record["human_question"] = _BOUND_REASON
+    elif event == "human_question":
+        record.update({"task_id": _BOUND_ID, "claim_id": _BOUND_ID,
+                       "worker_id": _BOUND_ID, "attempt": MAX_ATTEMPTS,
+                       "lease_generation": _BOUND_INTEGER,
+                       "request_sha256": _BOUND_SHA,
+                       "envelope_sha256": _BOUND_SHA,
+                       "question": _BOUND_REASON,
+                       "reason": _BOUND_REASON})
     elif event == "retry_authorized":
         record.update({"task_id": _BOUND_ID, "claim_id": _BOUND_ID,
                        "reason": _BOUND_REASON, "human_confirmed": True})
@@ -364,8 +376,8 @@ _EVENT_BOUND_BYTES = {
     for event in (
         "swarm_prepared", "worker_registered", "claim_granted", "claim_reclaimed",
         "claim_renewed", "claim_released", "claim_indeterminate", "task_completed",
-        "task_failed", "task_cancelled", "task_blocked", "retry_authorized",
-        "cancel_requested", "cancel_acknowledged", "message_posted",
+        "task_failed", "task_cancelled", "task_blocked", "human_question",
+        "retry_authorized", "cancel_requested", "cancel_acknowledged", "message_posted",
         "artifact_published", "journal_repaired", "run_closed",
         _WORKSPACE_TURN_EVENT, _WORKSPACE_TURN_BUDGET_CONSUMED,
         _WORKSPACE_TURN_ECONOMICS_SETTLED,
@@ -379,11 +391,12 @@ _BOUND_TASK_CANCELLED = _EVENT_BOUND_BYTES["task_cancelled"]
 _BOUND_CLAIM_INDETERMINATE = _EVENT_BOUND_BYTES["claim_indeterminate"]
 _BOUND_RETRY_AUTHORIZED = _EVENT_BOUND_BYTES["retry_authorized"]
 _BOUND_TASK_BLOCKED = _EVENT_BOUND_BYTES["task_blocked"]
+_BOUND_HUMAN_QUESTION = _EVENT_BOUND_BYTES["human_question"]
 _BOUND_TASK_COMPLETED = _EVENT_BOUND_BYTES["task_completed"]
 _BOUND_TASK_FAILED = _EVENT_BOUND_BYTES["task_failed"]
 _BOUND_CLAIM_RELEASED = _EVENT_BOUND_BYTES["claim_released"]
 _RECOVERY_HEADROOM = _BOUND_CLAIM_INDETERMINATE + max(
-    _BOUND_RETRY_AUTHORIZED, _BOUND_TASK_BLOCKED)
+    _BOUND_RETRY_AUTHORIZED, _BOUND_TASK_BLOCKED, _BOUND_HUMAN_QUESTION)
 _RUN_CLOSE_BOUND = _EVENT_BOUND_BYTES["run_closed"]
 # ``MAX_RECORD_BYTES`` bounds the canonical nested workspace envelope.  A
 # wrapper adds only fixed metadata, generation, timestamp, and checksum; keep
@@ -807,10 +820,13 @@ def _bounded_reason(value: Any, label: str = "reason") -> str:
     # credential boundary as the conversation atlas. Secret-bearing output
     # belongs in a provider's private receipt.
     text = re.sub(r"(?i)\b[A-Z]:[\\/][^\r\n,;]*", "[path]", value)
+    text = re.sub(r"(?i)\\\\[^\r\n,;]*", "[path]", text)
     text = re.sub(r"(?<![\w])/(?:[^\r\n,;]*)", "[path]", text)
     text = re.sub(r"(?<![\w])(?:[A-Za-z0-9_.-]+/){1,}[A-Za-z0-9_.-]+", "[path]", text)
-    text = re.sub(r"(?i)(?:token|password|secret|api[_-]?key)\s*[=:]\s*[^\s,;]+",
-                  "[redacted]", text)
+    text = re.sub(
+        r"(?i)(?:token|password|secret|api[_-]?key)\s*[=:]\s*"
+        r'(?:"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|[^\s\'"<>|]+)',
+        "[redacted]", text)
     text = re.sub(r"(?i)\b(?:bearer\s+)?(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16})\b",
                   "[redacted]", text)
     text = re.sub(r"(?i)(?:\bauthorization\s*:\s*)?\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{16,}",
@@ -852,20 +868,56 @@ def _materialize_tasks(tasks: Iterable[Mapping[str, Any]], *, max_attempts: int)
             break
         if not isinstance(item, Mapping):
             raise SwarmProtocolError("task must be an object")
-        if set(item) - {"task_id", "request_sha256"}:
+        if set(item) - {"task_id", "request_sha256", "depends_on"}:
             raise SwarmProtocolError("unknown task field")
         task_id = _id(item.get("task_id"), "task id")
         request_sha = _digest(item.get("request_sha256"), "request digest")
         if task_id in seen:
             raise SwarmProtocolError("duplicate task id")
+        deps: list[str] = []
+        if "depends_on" in item:
+            raw_deps = item.get("depends_on")
+            if not isinstance(raw_deps, list) or len(raw_deps) > MAX_TASK_DEPS:
+                raise SwarmProtocolError("invalid task dependencies")
+            for dep in raw_deps:
+                dep_id = _id(dep, "task dependency id")
+                if dep_id == task_id:
+                    raise SwarmProtocolError("task cannot depend on itself")
+                if dep_id in deps:
+                    raise SwarmProtocolError("duplicate task dependency")
+                deps.append(dep_id)
         seen.add(task_id)
-        materialized.append({"task_id": task_id, "request_sha256": request_sha})
+        entry: dict[str, Any] = {"task_id": task_id, "request_sha256": request_sha}
+        if deps:
+            entry["depends_on"] = deps
+        materialized.append(entry)
     else:
         raise SwarmProtocolError("too many tasks")
     if not materialized:
         raise SwarmProtocolError("swarm must contain at least one task")
     if max_attempts < 1 or max_attempts > MAX_ATTEMPTS:
         raise SwarmProtocolError("invalid max attempts")
+    # Validate all dependency references exist and the graph is a DAG.
+    indegree: dict[str, int] = {entry["task_id"]: 0 for entry in materialized}
+    dependents: dict[str, list[str]] = {entry["task_id"]: [] for entry in materialized}
+    for entry in materialized:
+        tid = entry["task_id"]
+        for dep_id in entry.get("depends_on", ()):
+            if dep_id not in seen:
+                raise SwarmProtocolError("unknown task dependency")
+            indegree[tid] += 1
+            dependents[dep_id].append(tid)
+    ready = [tid for tid, deg in indegree.items() if deg == 0]
+    visited = 0
+    while ready:
+        current = ready.pop()
+        visited += 1
+        for child in dependents[current]:
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+    if visited != len(materialized):
+        raise SwarmProtocolError("cyclic task dependency")
     return materialized
 
 
@@ -1621,7 +1673,7 @@ class SwarmCoordinator:
             claim["lease_expires_at_ms"] = _positive_int(record.get("lease_expires_at_ms"), "lease expiry")
             return
         if event in {"claim_released", "claim_indeterminate", "task_completed", "task_failed",
-                     "task_cancelled", "task_blocked"}:
+                     "task_cancelled", "task_blocked", "human_question"}:
             claim_id = record.get("claim_id")
             claim = state["claims"].get(_id(claim_id, "claim id")) if claim_id is not None else None
             if claim is None:
@@ -1633,15 +1685,22 @@ class SwarmCoordinator:
                 "task_failed": "failed",
                 "task_cancelled": "cancelled",
                 "task_blocked": "blocked",
+                "human_question": "blocked",
             }[event]
             claim["status"] = status
-            if event in {"task_completed", "task_failed", "task_cancelled", "task_blocked"}:
+            if event in {"task_completed", "task_failed", "task_cancelled", "task_blocked", "human_question"}:
                 state["tasks"][claim["task_id"]]["terminal"] = status
             if event == "claim_indeterminate":
                 state["tasks"][claim["task_id"]]["terminal"] = "indeterminate"
                 state["tasks"][claim["task_id"]]["uncertain_spend"] = True
-            if event == "task_blocked":
+            if event in {"task_blocked", "human_question"}:
                 state["tasks"][claim["task_id"]]["uncertain_spend"] = True
+            if event == "task_blocked" and record.get("human_question") is not None:
+                state["tasks"][claim["task_id"]]["human_question"] = _bounded_reason(
+                    record["human_question"], "human question")
+            if event == "human_question":
+                state["tasks"][claim["task_id"]]["human_question"] = _bounded_reason(
+                    record.get("question"), "human question")
             return
         if event == "retry_authorized":
             task = state["tasks"].get(task_id)
@@ -1649,6 +1708,7 @@ class SwarmCoordinator:
                 raise ValueError("retry authorization references unknown task")
             task["retry_authorized"] = True
             task["terminal"] = None
+            task.pop("human_question", None)
             return
         if event == "cancel_requested":
             claim = state["claims"].get(_id(record.get("claim_id"), "claim id"))
@@ -1782,11 +1842,11 @@ class SwarmCoordinator:
                 (0 if claim.get("cancel_requested") else _BOUND_CANCEL_REQUESTED)
                 + (0 if claim.get("cancel_acknowledged") else _BOUND_CANCEL_ACKNOWLEDGED)
                 + _BOUND_TASK_CANCELLED + _BOUND_CLAIM_INDETERMINATE
-                + max(_BOUND_RETRY_AUTHORIZED, _BOUND_TASK_BLOCKED)
+                + max(_BOUND_RETRY_AUTHORIZED, _BOUND_TASK_BLOCKED, _BOUND_HUMAN_QUESTION)
                 + _BOUND_TASK_COMPLETED + _BOUND_TASK_FAILED + _BOUND_CLAIM_RELEASED
             )
         if status == "indeterminate" and not task.get("retry_authorized"):
-            return max(_BOUND_RETRY_AUTHORIZED, _BOUND_TASK_BLOCKED)
+            return max(_BOUND_RETRY_AUTHORIZED, _BOUND_TASK_BLOCKED, _BOUND_HUMAN_QUESTION)
         return 0
 
     @staticmethod
@@ -1990,17 +2050,19 @@ class SwarmCoordinator:
         elif event == "cancel_acknowledged" and claim is not None:
             claim["cancel_acknowledged"] = True
         elif event in {"claim_released", "claim_indeterminate", "task_completed",
-                       "task_failed", "task_cancelled", "task_blocked"} and claim is not None:
+                       "task_failed", "task_cancelled", "task_blocked",
+                       "human_question"} and claim is not None:
             claim["status"] = {
                 "claim_released": "released", "claim_indeterminate": "indeterminate",
                 "task_completed": "completed", "task_failed": "failed",
                 "task_cancelled": "cancelled", "task_blocked": "blocked",
+                "human_question": "blocked",
             }[event]
             if event in {"task_completed", "task_failed", "task_cancelled", "task_blocked",
-                         "claim_indeterminate"}:
+                         "human_question", "claim_indeterminate"}:
                 task = tasks.setdefault(claim.get("task_id"), {})
                 task["terminal"] = "indeterminate" if event == "claim_indeterminate" else claim["status"]
-                if event in {"claim_indeterminate", "task_blocked"}:
+                if event in {"claim_indeterminate", "task_blocked", "human_question"}:
                     task["uncertain_spend"] = True
         elif event == "retry_authorized" and isinstance(task_id, str):
             task = tasks.setdefault(task_id, {})
@@ -3023,7 +3085,8 @@ class SwarmCoordinator:
                 return self._apply_message(owner, state, parsed, worker_id)
             if frame_type in {"publish_artifact", "artifact_published"}:
                 return self._apply_artifact(owner, state, parsed, worker_id)
-            if frame_type in {"complete", "task_completed", "fail", "task_failed", "task_blocked"}:
+            if frame_type in {"complete", "task_completed", "fail", "task_failed",
+                              "block", "task_blocked", "human_question"}:
                 return self._apply_terminal(owner, state, parsed, worker_id)
             if frame_type == "ack_cancel":
                 return self._apply_cancel_ack(owner, state, parsed, worker_id)
@@ -3042,6 +3105,10 @@ class SwarmCoordinator:
         request_sha = _digest(payload.get("request_sha256"), "request digest")
         if request_sha != task["request_sha256"]:
             raise SwarmConflictError("request digest does not match the task")
+        for dep_id in task.get("depends_on", ()):
+            dep_task = state["tasks"].get(dep_id)
+            if dep_task is None or dep_task.get("terminal") != "completed":
+                raise SwarmConflictError(f"task dependency {dep_id!r} is not complete")
         active = [state["claims"][claim_id] for claim_id in task["attempts"]
                   if state["claims"][claim_id]["status"] == "active"]
         now = _now_ms(self.clock) if now_ms is None else _positive_int(now_ms, "admission time")
@@ -3178,16 +3245,23 @@ class SwarmCoordinator:
             event, status = "task_completed", "completed"
         elif frame["type"] in {"fail", "task_failed"}:
             event, status = "task_failed", "failed"
+        elif frame["type"] == "human_question":
+            event, status = "human_question", "blocked"
         else:
             event, status = "task_blocked", "blocked"
         event_data: dict[str, Any] = {"event": event, "task_id": claim["task_id"],
                                       "claim_id": claim["claim_id"], "worker_id": worker_id,
                                       "attempt": claim["attempt"],
                                       "lease_generation": claim["lease_generation"],
-                                      "request_sha256": claim["request_sha256"],
-                                      "envelope_sha256": payload.get("envelope_sha256")}
+                                      "request_sha256": claim["request_sha256"]}
+        if payload.get("envelope_sha256") is not None or event != "human_question":
+            event_data["envelope_sha256"] = payload.get("envelope_sha256")
         if payload.get("reason") is not None:
             event_data["reason"] = _bounded_reason(payload["reason"])
+        if event == "task_blocked" and payload.get("human_question") is not None:
+            event_data["human_question"] = _bounded_reason(payload["human_question"], "human question")
+        if event == "human_question":
+            event_data["question"] = _bounded_reason(payload["question"], "human question")
         response = self._response(status, task_id=claim["task_id"], claim_id=claim["claim_id"])
         return self._remembered_append(owner, state, frame, response, event_data)
 
@@ -3965,6 +4039,40 @@ class SwarmCoordinator:
                                     "envelope_sha256": envelope_sha256, "reason": reason})
         return self.apply_frame(frame, worker_id=worker_id)
 
+    def block(self, worker_id: str, *, task_id: str, claim_id: str, attempt: int,
+              lease_generation: int, request_sha256: str, envelope_sha256: str,
+              reason: str = "worker_blocked", human_question: str | None = None,
+              message_id: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"task_id": task_id, "claim_id": claim_id,
+                                   "attempt": attempt, "lease_generation": lease_generation,
+                                   "request_sha256": request_sha256,
+                                   "envelope_sha256": envelope_sha256, "reason": reason}
+        if human_question is not None:
+            payload["human_question"] = human_question
+        frame = make_frame("task_blocked", run_id=self.run_id,
+                           message_id=message_id or _message_id("block"),
+                           sent_at_ms=_now_ms(self.clock),
+                           payload=payload)
+        return self.apply_frame(frame, worker_id=worker_id)
+
+    def ask_human(self, worker_id: str, *, task_id: str, claim_id: str, attempt: int,
+                  lease_generation: int, request_sha256: str, question: str,
+                  envelope_sha256: str | None = None, reason: str | None = None,
+                  message_id: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"task_id": task_id, "claim_id": claim_id,
+                                   "attempt": attempt, "lease_generation": lease_generation,
+                                   "request_sha256": request_sha256,
+                                   "question": question}
+        if envelope_sha256 is not None:
+            payload["envelope_sha256"] = envelope_sha256
+        if reason is not None:
+            payload["reason"] = reason
+        frame = make_frame("human_question", run_id=self.run_id,
+                           message_id=message_id or _message_id("question"),
+                           sent_at_ms=_now_ms(self.clock),
+                           payload=payload)
+        return self.apply_frame(frame, worker_id=worker_id)
+
     def cancel(self, task_id: str, *, reason: str = "operator_requested",
                message_id: str | None = None) -> dict[str, Any]:
         state, _ = self._load()
@@ -4083,16 +4191,23 @@ class SwarmCoordinator:
                                                 "claimed" if latest and latest["status"] == "active" else "pending")
             if task_status in {"expired", "indeterminate"}:
                 uncertain = True
-            tasks.append({"task_id": task["task_id"],
-                          "request_sha256": task["request_sha256"],
-                          "status": task_status,
-                          "attempts": len(claims),
-                          "active_claim": ({"claim_id": latest["claim_id"],
-                                             "worker_id": latest["worker_id"],
-                                             "lease_generation": latest["lease_generation"],
-                                             "lease_expires_at_ms": latest["lease_expires_at_ms"],
-                                             "cancel_requested": latest["cancel_requested"]}
-                                            if latest and latest["status"] == "active" else None)})
+            task_entry: dict[str, Any] = {
+                "task_id": task["task_id"],
+                "request_sha256": task["request_sha256"],
+                "status": task_status,
+                "attempts": len(claims),
+                "active_claim": ({"claim_id": latest["claim_id"],
+                                  "worker_id": latest["worker_id"],
+                                  "lease_generation": latest["lease_generation"],
+                                  "lease_expires_at_ms": latest["lease_expires_at_ms"],
+                                  "cancel_requested": latest["cancel_requested"]}
+                                 if latest and latest["status"] == "active" else None),
+            }
+            if task.get("depends_on"):
+                task_entry["depends_on"] = list(task["depends_on"])
+            if task.get("human_question"):
+                task_entry["human_question"] = task["human_question"]
+            tasks.append(task_entry)
         workspace_report = None
         workspace = state.get("workspace")
         if workspace is not None:
@@ -4188,6 +4303,7 @@ class SwarmCoordinator:
                 "request_sha256", "project_root_sha256", "roster_definition_sha256",
                 "artifact_id", "sha256", "bytes", "media_type", "content_sha256",
                 "content_chars", "preview", "to", "from", "status", "reason",
+                "question", "human_question",
                 "admission_id", "workspace_event_sha256")
                      if key in projected}
             public.append(value)

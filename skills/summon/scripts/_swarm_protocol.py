@@ -34,11 +34,11 @@ _PERMISSIONS = frozenset({"read-only", "safe-edit"})
 _ARTIFACT_URI_SCHEMES = frozenset({"artifact", "https", "http", "ipfs", "s3", "gs"})
 _FRAME_TYPES = frozenset({
     "hello", "hello_ack", "register_worker", "poll", "claim", "renew",
-    "send_message", "publish_artifact", "complete", "fail", "ack_cancel",
+    "send_message", "publish_artifact", "complete", "fail", "block", "ack_cancel",
     "shutdown", "claim_requested", "task_claimed", "lease_renewed",
     "claim_released", "message_posted", "artifact_published",
     "cancel_requested", "cancelled", "indeterminate", "task_completed",
-    "task_failed", "task_blocked",
+    "task_failed", "task_blocked", "human_question",
 })
 _FRAME_KEYS = frozenset({"protocol", "run_id", "message_id", "type", "sent_at_ms", "payload"})
 
@@ -217,11 +217,14 @@ def _validate_payload(frame_type: str, payload: Mapping[str, Any]) -> None:
                 raise SwarmProtocolError("artifact opaque uri is invalid")
         else:
             raise SwarmProtocolError("artifact needs relative_path or opaque_uri")
-    elif frame_type in {"complete", "task_completed", "fail", "task_failed", "task_blocked"}:
+    elif frame_type in {"complete", "task_completed", "fail", "task_failed", "block", "task_blocked"}:
         _require(payload, "task_id", "claim_id", "attempt", "lease_generation",
                  "request_sha256", "envelope_sha256")
-        _reject_unknown(payload, {"task_id", "claim_id", "attempt", "lease_generation",
-                                   "request_sha256", "envelope_sha256", "reason"})
+        allowed = {"task_id", "claim_id", "attempt", "lease_generation",
+                   "request_sha256", "envelope_sha256", "reason"}
+        if frame_type in {"block", "task_blocked"}:
+            allowed = allowed | {"human_question"}
+        _reject_unknown(payload, allowed)
         _id(payload["task_id"], "task id")
         _id(payload["claim_id"], "claim id")
         _positive_int(payload["attempt"], "attempt", 1024)
@@ -230,6 +233,23 @@ def _validate_payload(frame_type: str, payload: Mapping[str, Any]) -> None:
         _digest(payload["envelope_sha256"], "envelope digest")
         if "reason" in payload:
             _text(payload["reason"], "completion reason")
+        if "human_question" in payload:
+            _text(payload["human_question"], "human question")
+    elif frame_type == "human_question":
+        _require(payload, "task_id", "claim_id", "attempt", "lease_generation",
+                 "request_sha256", "question")
+        _reject_unknown(payload, {"task_id", "claim_id", "attempt", "lease_generation",
+                                   "request_sha256", "envelope_sha256", "question", "reason"})
+        _id(payload["task_id"], "task id")
+        _id(payload["claim_id"], "claim id")
+        _positive_int(payload["attempt"], "attempt", 1024)
+        _positive_int(payload["lease_generation"], "lease generation")
+        _digest(payload["request_sha256"], "request digest")
+        if "envelope_sha256" in payload and payload["envelope_sha256"] is not None:
+            _digest(payload["envelope_sha256"], "envelope digest")
+        _text(payload["question"], "human question")
+        if "reason" in payload:
+            _text(payload["reason"], "question reason")
     elif frame_type in {"cancel_requested", "cancelled", "indeterminate"}:
         _require(payload, "claim_id", "lease_generation")
         _reject_unknown(payload, {"claim_id", "lease_generation", "reason"})

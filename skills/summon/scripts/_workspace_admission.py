@@ -1453,6 +1453,10 @@ def _prospective_claim(claim: Mapping[str, Any], state: Mapping[str, Any]) -> tu
         _fail("terminal task cannot admit a claim")
     if task.get("terminal") == "indeterminate" and not task.get("retry_authorized"):
         _fail("uncertain spend requires explicit retry authorization")
+    for dep_id in task.get("depends_on", ()):
+        dep_task = state["tasks"].get(dep_id)
+        if type(dep_task) is not dict or dep_task.get("terminal") != "completed":
+            _fail("task dependencies are not complete")
     expected_attempt = len(attempts) + 1
     if checked["attempt"] != expected_attempt:
         _fail("claim attempt does not match the prospective task state")

@@ -283,7 +283,8 @@ def _validate(workspace, coordinator):
         _fail("snapshot_bound_exceeded")
     tasks = state_protocol._tasks(coordinator, workspace["run_id"])
     for task in tasks.values():
-        _object(task, {"task_id", "request_sha256", "status", "attempts", "active_claim"})
+        _object(task, {"task_id", "request_sha256", "status", "attempts", "active_claim"},
+                {"depends_on", "human_question"})
         if ((task["status"] in {"claimed", "expired"}) != (task["active_claim"] is not None)
                 or task["status"] != "pending" and task["attempts"] < 1):
             _fail("contradictory_task_snapshot")

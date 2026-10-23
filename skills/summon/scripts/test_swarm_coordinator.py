@@ -983,6 +983,94 @@ class SwarmCoordinatorTests(unittest.TestCase):
         self.assertEqual(status.returncode, 0, status.stderr)
         self.assertEqual(json.loads(status.stdout)["run_id"], "cli-run")
 
+    def test_task_dag_rejects_cycles_unknown_and_self_dependencies(self):
+        req_b = hashlib.sha256(b"task-b").hexdigest()
+        with self.assertRaises(SwarmProtocolError):
+            SwarmCoordinator.create(
+                self.temp.name, "dag-self", project_root_sha256=self.project,
+                roster_definition_sha256=self.roster,
+                tasks=[{"task_id": "task-a", "request_sha256": self.request,
+                        "depends_on": ["task-a"]}],
+                clock=self.clock)
+        with self.assertRaises(SwarmProtocolError):
+            SwarmCoordinator.create(
+                self.temp.name, "dag-unknown", project_root_sha256=self.project,
+                roster_definition_sha256=self.roster,
+                tasks=[{"task_id": "task-a", "request_sha256": self.request,
+                        "depends_on": ["task-missing"]}],
+                clock=self.clock)
+        with self.assertRaises(SwarmProtocolError):
+            SwarmCoordinator.create(
+                self.temp.name, "dag-cycle", project_root_sha256=self.project,
+                roster_definition_sha256=self.roster,
+                tasks=[
+                    {"task_id": "task-a", "request_sha256": self.request, "depends_on": ["task-b"]},
+                    {"task_id": "task-b", "request_sha256": req_b, "depends_on": ["task-a"]},
+                ],
+                clock=self.clock)
+
+    def test_task_dag_blocks_claim_until_dependencies_complete(self):
+        req_b = hashlib.sha256(b"task-b").hexdigest()
+        dag = SwarmCoordinator.create(
+            self.temp.name, "dag-run", project_root_sha256=self.project,
+            roster_definition_sha256=self.roster,
+            tasks=[
+                {"task_id": "task-a", "request_sha256": self.request},
+                {"task_id": "task-b", "request_sha256": req_b, "depends_on": ["task-a"]},
+            ],
+            max_attempts=2, clock=self.clock)
+        dag.register_worker("worker-a", worker_instance_id="inst-a")
+        with self.assertRaises(SwarmConflictError):
+            dag.claim("worker-a", "task-b", request_sha256=req_b)
+        claim_a = dag.claim("worker-a", "task-a", request_sha256=self.request)
+        with self.assertRaises(SwarmConflictError):
+            dag.claim("worker-a", "task-b", request_sha256=req_b)
+        dag.complete(
+            "worker-a", task_id="task-a", claim_id=claim_a["claim_id"],
+            attempt=claim_a["attempt"], lease_generation=claim_a["lease_generation"],
+            request_sha256=self.request, envelope_sha256="e" * 64)
+        claim_b = dag.claim("worker-a", "task-b", request_sha256=req_b)
+        self.assertEqual(claim_b["status"], "claimed")
+        status = dag.status()
+        task_b_view = next(t for t in status["tasks"] if t["task_id"] == "task-b")
+        self.assertEqual(task_b_view["depends_on"], ["task-a"])
+
+    def test_task_blocked_and_human_question_record_redacted_questions_and_clear_on_retry(self):
+        claim = self.coordinator.claim("worker-a", "task-a", request_sha256=self.request)
+        asked = self.coordinator.ask_human(
+            "worker-a", task_id="task-a", claim_id=claim["claim_id"],
+            attempt=claim["attempt"], lease_generation=claim["lease_generation"],
+            request_sha256=self.request,
+            question=r"Which schema for C:\private\repo with api_key=sk-1234567890abcdef1234?",
+            reason="needs_schema_decision",
+        )
+        self.assertEqual(asked["status"], "blocked")
+        status = self.coordinator.status()
+        task_view = status["tasks"][0]
+        self.assertEqual(task_view["status"], "blocked")
+        self.assertIn("human_question", task_view)
+        self.assertNotIn(r"C:\private\repo", task_view["human_question"])
+        self.assertNotIn("sk-1234567890abcdef1234", task_view["human_question"])
+        events = self.coordinator.events()
+        self.assertEqual(events[-1]["event"], "human_question")
+        self.assertIn("question", events[-1])
+        self.assertNotIn("sk-1234567890abcdef1234", json_text(events[-1]))
+        # Also test direct block() helper on a second run
+        coord2 = SwarmCoordinator.create(
+            self.temp.name, "swarm-block", project_root_sha256=self.project,
+            roster_definition_sha256=self.roster,
+            tasks=[{"task_id": "task-a", "request_sha256": self.request}],
+            max_attempts=2, clock=self.clock)
+        coord2.register_worker("worker-a", worker_instance_id="instance-a")
+        claim2 = coord2.claim("worker-a", "task-a", request_sha256=self.request)
+        blocked = coord2.block(
+            "worker-a", task_id="task-a", claim_id=claim2["claim_id"],
+            attempt=claim2["attempt"], lease_generation=claim2["lease_generation"],
+            request_sha256=self.request, envelope_sha256="e" * 64,
+            reason="awaiting_input", human_question="Approve deployment window?")
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(coord2.status()["tasks"][0]["human_question"], "Approve deployment window?")
+
 
 def json_text(value):
     import json

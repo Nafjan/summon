@@ -46,6 +46,7 @@ MAX_CROSS_EXAMS = 64
 MAX_RECOMMENDATION_ITEMS = 16
 MAX_REASON_CHARS = 512
 MAX_ROOM_FILES = MAX_ROOMS * 4
+MAX_AGENT_MESSAGE_HOPS = 12
 APPEND_LOCK_STALE_SECONDS = 30.0
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -54,12 +55,14 @@ _PATHISH_RE = re.compile(r"(?:^[A-Za-z]:[\\/]|^\\\\|^/|\b[A-Za-z]:[\\/])")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MODES = frozenset({"chat", "council", "deliberate"})
 _ACTOR_KINDS = frozenset({"human", "agent", "system"})
+SPEECH_ACTS = frozenset({"request", "query", "propose", "inform", "ack"})
+REPLY_OBLIGATING_ACTS = frozenset({"request", "query", "propose"})
 _EVENTS = frozenset({
     "session_created", "message_posted", "human_message", "turn_started",
     "turn_finished", "turn_cancel_requested", "council_round_started", "position_submitted",
     "cross_exam", "chair_synthesis", "deliberation_policy_bound",
     "ballot_accepted", "state_transition", "cleanup_receipt", "fork_created",
-    "agent_message",
+    "agent_message", "memory_proposal",
 })
 _CONTROL_EVENTS = frozenset({"ballot_accepted", "state_transition", "cleanup_receipt"})
 
@@ -125,8 +128,11 @@ def _redact_text(value: str) -> str:
     text = re.sub(r"(?i)\\\\[^\r\n,;]*", "[path]", text)
     text = re.sub(r"(?<![\w])/(?:[^\r\n,;]*)", "[path]", text)
     text = re.sub(r"(?<![\w])(?:[A-Za-z0-9_.-]+/){1,}[A-Za-z0-9_.-]+", "[path]", text)
-    text = re.sub(r"(?i)(?:token|password|secret|api[_-]?key)\s*[=:]\s*[^\s,;]+",
-                  "[redacted]", text)
+    text = re.sub(
+        r"""(?i)(?:token|password|secret|api[_-]?key)\s*[=:]\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s'"<>|]+)""",
+        "[redacted]",
+        text,
+    )
     # Common provider/token shapes are sensitive even when a pasted log does
     # not label them.  Keep the patterns conservative so ordinary prose and
     # model names remain readable while bearer/API material cannot enter a
@@ -236,6 +242,67 @@ def _public_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, An
             value = data.get(key)
             if value is not None:
                 out[key] = _safe_display(value, key)
+        speech_act = data.get("speech_act")
+        if speech_act is not None:
+            if not isinstance(speech_act, str) or speech_act not in SPEECH_ACTS:
+                raise ConversationError("invalid speech act")
+            out["speech_act"] = speech_act
+        hops = data.get("hops")
+        if hops is not None:
+            if (not isinstance(hops, int) or isinstance(hops, bool)
+                    or not 0 <= hops <= MAX_AGENT_MESSAGE_HOPS):
+                raise ConversationError("invalid message hop count")
+            out["hops"] = hops
+        requires_reply = data.get("requires_reply")
+        if requires_reply is not None:
+            if not isinstance(requires_reply, bool):
+                raise ConversationError("invalid requires_reply flag")
+            effective_act = speech_act if speech_act is not None else "inform"
+            if requires_reply and effective_act not in REPLY_OBLIGATING_ACTS:
+                raise ConversationError("speech act cannot obligate a reply")
+            out["requires_reply"] = requires_reply
+        escalated = data.get("escalated_to_human")
+        if escalated is not None:
+            if not isinstance(escalated, bool):
+                raise ConversationError("invalid escalated_to_human flag")
+            out["escalated_to_human"] = escalated
+        for key in ("original_recipient", "reply_to"):
+            value = data.get(key)
+            if value is not None:
+                out[key] = _safe_id(value, key.replace("_", " "))
+        return out
+    if event_type == "memory_proposal":
+        proposal_id = _safe_id(data.get("proposal_id"), "proposal id")
+        proposer = _safe_id(data.get("proposer"), "proposer")
+        if data.get("authority") != "context-only":
+            raise ConversationError("memory proposal must be context-only")
+        summary = _redacted_bounded_text(data.get("summary"), "memory proposal summary")
+        proposed_entry = _redacted_bounded_text(data.get("proposed_entry"), "proposed memory entry")
+        entry_sha = data.get("proposed_entry_sha256")
+        if not isinstance(entry_sha, str) or not _SHA256_RE.fullmatch(entry_sha):
+            raise ConversationError("invalid proposed_entry_sha256")
+        if entry_sha != _text_sha256(proposed_entry):
+            raise ConversationError("proposed_entry_sha256 mismatch")
+        artifact_sha = data.get("artifact_sha256")
+        if not isinstance(artifact_sha, str) or not _SHA256_RE.fullmatch(artifact_sha):
+            raise ConversationError("invalid artifact_sha256")
+        out = {
+            "proposal_id": proposal_id,
+            "proposer": proposer,
+            "authority": "context-only",
+            "summary": summary,
+            "proposed_entry": proposed_entry,
+            "proposed_entry_sha256": entry_sha,
+            "artifact_sha256": artifact_sha,
+        }
+        base_sha = data.get("base_memory_sha256")
+        if base_sha is not None:
+            if not isinstance(base_sha, str) or not _SHA256_RE.fullmatch(base_sha):
+                raise ConversationError("invalid base_memory_sha256")
+            out["base_memory_sha256"] = base_sha
+        if data.get("rationale"):
+            out["rationale"] = _redact_text(
+                _bounded_text(data.get("rationale"), "memory proposal rationale", required=False))
         return out
     if event_type == "session_created":
         out["project_id"] = _safe_id(data.get("project_id"), "project id")
@@ -869,7 +936,11 @@ class ConversationJournal:
 
     def append_agent_message(self, sender: str, recipient: str, text: str, *,
                              message_id: str | None = None,
-                             expected_cursor: int | None = None) -> dict[str, Any]:
+                             expected_cursor: int | None = None,
+                             speech_act: str = "inform",
+                             requires_reply: bool | None = None,
+                             hops: int | None = None,
+                             reply_to: str | None = None) -> dict[str, Any]:
         """Append a durable context-only message addressed to one room member.
 
         This is a delivery record, not a control channel: recipient text cannot
@@ -887,20 +958,115 @@ class ConversationJournal:
             raise ConversationError("message recipient is not a room participant")
         if not isinstance(text, str) or not text.strip():
             raise ConversationError("agent message must be non-empty text")
+        if not isinstance(speech_act, str) or speech_act not in SPEECH_ACTS:
+            raise ConversationError("invalid speech act")
+        if requires_reply is None:
+            effective_requires_reply = speech_act in REPLY_OBLIGATING_ACTS
+        elif isinstance(requires_reply, bool):
+            effective_requires_reply = requires_reply
+        else:
+            raise ConversationError("invalid requires_reply flag")
+        if effective_requires_reply and speech_act not in REPLY_OBLIGATING_ACTS:
+            raise ConversationError("speech act cannot obligate a reply")
+        if hops is not None and (not isinstance(hops, int) or isinstance(hops, bool) or hops < 0):
+            raise ConversationError("invalid message hop count")
+        reply_to_id = _safe_id(reply_to, "reply_to id") if reply_to is not None else None
+        if self._records:
+            self._refresh_records()
+        chain_hops = 0
+        if reply_to_id is not None:
+            parent = next(
+                (rec for rec in reversed(self._records)
+                 if rec.get("event") == "agent_message"
+                 and (rec.get("payload", {}).get("message_id") == reply_to_id
+                      or rec.get("event_id") == reply_to_id)),
+                None,
+            )
+            if parent is None:
+                raise ConversationError("reply_to references unknown agent message")
+            parent_hops = parent.get("payload", {}).get("hops", 0)
+            chain_hops = (int(parent_hops) if isinstance(parent_hops, int) else 0) + 1
+        elif recipient_id != "human":
+            for rec in reversed(self._records):
+                if rec.get("event") == "human_message":
+                    break
+                if rec.get("event") == "agent_message":
+                    rec_payload = rec.get("payload", {})
+                    if rec_payload.get("recipient") != "human" or rec_payload.get("escalated_to_human"):
+                        prev_hops = rec_payload.get("hops", 0)
+                        chain_hops = (int(prev_hops) if isinstance(prev_hops, int) else 0) + 1
+                        break
+        actual_recipient = recipient_id
+        original_recipient: str | None = None
+        escalated_to_human = False
+        if recipient_id == "human":
+            effective_hops = min(MAX_AGENT_MESSAGE_HOPS,
+                                 hops if hops is not None else chain_hops)
+        else:
+            effective_hops = max(hops if hops is not None else 0, chain_hops)
+            if effective_hops >= MAX_AGENT_MESSAGE_HOPS:
+                actual_recipient = "human"
+                original_recipient = recipient_id
+                escalated_to_human = True
+                effective_hops = MAX_AGENT_MESSAGE_HOPS
+                effective_requires_reply = False
         mid = message_id or uuid.uuid4().hex
         seat = next((item for item in self._header.get("participants", [])
                      if item.get("agent") == sender_id), {})
-        identity_fields = {}
+        identity_fields: dict[str, Any] = {}
         for key in ("provider", "model"):
             value = seat.get(key)
             if isinstance(value, str) and value:
                 identity_fields["provider" if key == "provider" else "model_target"] = value
-        return self.append("agent_message", "agent", sender_id,
-                           {"message_id": mid, "sender": sender_id,
-                            "recipient": recipient_id, "text": text,
-                            **identity_fields},
+        payload: dict[str, Any] = {
+            "message_id": mid,
+            "sender": sender_id,
+            "recipient": actual_recipient,
+            "text": text,
+            "speech_act": speech_act,
+            "hops": effective_hops,
+            "requires_reply": effective_requires_reply,
+            **identity_fields,
+        }
+        if reply_to_id is not None:
+            payload["reply_to"] = reply_to_id
+        if escalated_to_human and original_recipient is not None:
+            payload["original_recipient"] = original_recipient
+            payload["escalated_to_human"] = True
+        return self.append("agent_message", "agent", sender_id, payload,
                            expected_cursor=expected_cursor,
                            event_id=f"agent-message-{mid}")
+
+    def append_memory_proposal(self, proposer: str, *, summary: str,
+                               proposed_entry: str, rationale: str = "",
+                               base_memory_sha256: str | None = None,
+                               proposal_id: str | None = None,
+                               expected_cursor: int | None = None) -> dict[str, Any]:
+        """Append a context-only memory proposal to the room journal.
+
+        Workers may propose memory additions, but never mutate .agents/memory.md
+        directly.  Promotion requires an explicit human-confirmed call to
+        ``promote_memory_proposal``.
+        """
+        proposer_id = _safe_id(proposer, "proposer")
+        participant_ids = {item["agent"] for item in self._header.get("participants", [])}
+        if proposer_id not in participant_ids:
+            raise ConversationError("memory proposer is not a room participant")
+        if self._records:
+            self._refresh_records()
+        artifact = memory_proposal(
+            session_id=self.room.session_id,
+            source_cursor=max(1, len(self._records)),
+            proposer=proposer_id,
+            summary=summary,
+            proposed_entry=proposed_entry,
+            rationale=rationale,
+            base_memory_sha256=base_memory_sha256,
+            proposal_id=proposal_id,
+        )
+        return self.append("memory_proposal", "agent", proposer_id, artifact,
+                           expected_cursor=expected_cursor,
+                           event_id=f"memory-proposal-{artifact['proposal_id']}")
 
     def agent_inbox(self, recipient: str, *, after_cursor: int = 0,
                     native: bool = True) -> list[dict[str, Any]]:
@@ -1051,6 +1217,146 @@ def promote_recommendation(artifact: Mapping[str, Any], *, human_confirmed: bool
             "deadline_unix_ms": deadline_unix_ms,
             "require_human_approval": require_human_approval,
             "provider_calls": 0}
+
+
+def memory_proposal(*, session_id: str, source_cursor: int, proposer: str,
+                    summary: str, proposed_entry: str, rationale: str = "",
+                    base_memory_sha256: str | None = None,
+                    proposal_id: str | None = None) -> dict[str, Any]:
+    """Create a bounded context-only memory proposal artifact."""
+    session = _safe_id(session_id, "session id")
+    proposer_id = _safe_id(proposer, "proposer")
+    pid = _safe_id(proposal_id or f"memprop-{uuid.uuid4().hex[:16]}", "proposal id")
+    if not isinstance(source_cursor, int) or isinstance(source_cursor, bool) or source_cursor < 1:
+        raise ConversationError("invalid memory proposal cursor")
+    summary_text = _redacted_bounded_text(summary, "memory proposal summary")
+    entry_text = _redacted_bounded_text(proposed_entry, "proposed memory entry")
+    rationale_text = (
+        _redact_text(_bounded_text(rationale, "memory proposal rationale", required=False))
+        if rationale else ""
+    )
+    if base_memory_sha256 is not None:
+        if not isinstance(base_memory_sha256, str) or not _SHA256_RE.fullmatch(base_memory_sha256):
+            raise ConversationError("invalid base_memory_sha256")
+    artifact: dict[str, Any] = {
+        "kind": "memory_proposal",
+        "authority": "context-only",
+        "proposal_id": pid,
+        "session_id": session,
+        "source_cursor": source_cursor,
+        "proposer": proposer_id,
+        "summary": summary_text,
+        "proposed_entry": entry_text,
+        "proposed_entry_sha256": _text_sha256(entry_text),
+        "rationale": rationale_text,
+        "base_memory_sha256": base_memory_sha256,
+    }
+    artifact["artifact_sha256"] = _sha256(artifact)
+    return artifact
+
+
+def _check_not_reparse(path: Path, label: str) -> None:
+    try:
+        if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+            raise ConversationError(f"{label} may not be a symlink or junction")
+    except OSError as exc:
+        raise ConversationError(f"{label} cannot be inspected") from exc
+
+
+def promote_memory_proposal(artifact: Mapping[str, Any], *,
+                            project_root: str | os.PathLike[str],
+                            human_confirmed: bool,
+                            expected_memory_sha256: str | None = None) -> dict[str, Any]:
+    """Promote a human-confirmed memory proposal into .agents/memory.md with CAS attestation."""
+    if human_confirmed is not True:
+        raise ConversationError("memory promotion requires explicit human confirmation")
+    source = _snapshot(dict(artifact))
+    if source.get("kind") != "memory_proposal" or source.get("authority") != "context-only":
+        raise ConversationError("invalid memory proposal")
+    digest = source.get("artifact_sha256")
+    copy_without_digest = dict(source)
+    copy_without_digest.pop("artifact_sha256", None)
+    if not isinstance(digest, str) or digest != _sha256(copy_without_digest):
+        raise ConversationError("memory proposal digest mismatch")
+    proposal_id = _safe_id(source.get("proposal_id"), "proposal id")
+    _safe_id(source.get("session_id"), "session id")
+    _safe_id(source.get("proposer"), "proposer")
+    raw_entry = source.get("proposed_entry")
+    entry_text = _bounded_text(raw_entry, "proposed memory entry")
+    if entry_text != _redact_text(entry_text):
+        raise ConversationError("proposed memory entry contains unredacted path or secret material")
+    if source.get("proposed_entry_sha256") != _text_sha256(entry_text):
+        raise ConversationError("proposed_entry_sha256 mismatch")
+    base_sha = source.get("base_memory_sha256")
+    if base_sha is not None and (not isinstance(base_sha, str) or not _SHA256_RE.fullmatch(base_sha)):
+        raise ConversationError("invalid base_memory_sha256")
+    if expected_memory_sha256 is not None and (
+            not isinstance(expected_memory_sha256, str) or not _SHA256_RE.fullmatch(expected_memory_sha256)):
+        raise ConversationError("invalid expected_memory_sha256")
+
+    raw_root = Path(project_root).expanduser()
+    for candidate in (raw_root, *raw_root.parents):
+        _check_not_reparse(candidate, "project root")
+    try:
+        resolved_root = raw_root.resolve()
+    except OSError as exc:
+        raise ConversationError("project root cannot be resolved") from exc
+    _check_not_reparse(resolved_root, "project root")
+    if not resolved_root.is_dir():
+        raise ConversationError("project root does not exist")
+    agents_dir = resolved_root / ".agents"
+    if agents_dir.exists():
+        _check_not_reparse(agents_dir, ".agents directory")
+        if not agents_dir.is_dir():
+            raise ConversationError(".agents path is not a directory")
+    else:
+        agents_dir.mkdir(parents=True, exist_ok=True)
+    memory_path = agents_dir / "memory.md"
+    current_text = ""
+    current_sha256: str | None = None
+    if memory_path.exists() or memory_path.is_symlink():
+        _check_not_reparse(memory_path, "memory.md")
+        if not memory_path.is_file():
+            raise ConversationError("memory.md is not a regular file")
+        try:
+            raw_bytes = memory_path.read_bytes()
+            current_text = raw_bytes.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ConversationError("memory.md cannot be read") from exc
+        current_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+
+    if expected_memory_sha256 is not None and current_sha256 != expected_memory_sha256:
+        raise ConversationError("memory.md digest does not match expected_memory_sha256")
+    if base_sha is not None and current_sha256 != base_sha:
+        raise ConversationError("memory.md digest changed since proposal base_memory_sha256")
+
+    separator = "" if not current_text or current_text.endswith("\n") else "\n"
+    updated_text = f"{current_text}{separator}- [{proposal_id}] {entry_text}\n"
+    updated_bytes = updated_text.encode("utf-8")
+    new_sha256 = hashlib.sha256(updated_bytes).hexdigest()
+    tmp_path = agents_dir / f".memory.md.{uuid.uuid4().hex}.tmp"
+    try:
+        fd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(updated_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, memory_path)
+    except OSError as exc:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ConversationError("memory.md cannot be updated") from exc
+
+    return {
+        "status": "promoted",
+        "authority": "human-confirmed-memory-promotion",
+        "proposal_id": proposal_id,
+        "source_artifact_sha256": digest,
+        "previous_memory_sha256": current_sha256,
+        "memory_sha256": new_sha256,
+    }
 
 
 def continuation_decision(parent_session_id: str, existing: Mapping[str, Any],
@@ -1433,4 +1739,6 @@ def run_command(args: Any) -> int:
 __all__ = ["ConversationError", "ConversationJournal", "ConversationRoom",
            "ContinuationDecision", "continuation_decision", "group_rooms",
            "council_recommendation", "promote_recommendation",
+           "memory_proposal", "promote_memory_proposal",
+           "MAX_AGENT_MESSAGE_HOPS", "SPEECH_ACTS", "REPLY_OBLIGATING_ACTS",
            "list_rooms", "run_command", "MAX_EVENTS", "MAX_EVENT_BYTES"]

@@ -16,10 +16,11 @@ if str(HERE) not in os.sys.path:
     os.sys.path.insert(0, str(HERE))
 
 from _conversation import (ConversationError, ConversationJournal,
-                           MAX_JOURNAL_BYTES, council_recommendation,
+                           MAX_AGENT_MESSAGE_HOPS, MAX_JOURNAL_BYTES,
+                           council_recommendation, memory_proposal,
                            SCHEMA_VERSION, HISTORICAL_SCHEMA_VERSION,
                            continuation_decision, group_rooms, list_rooms,
-                           promote_recommendation)
+                           promote_memory_proposal, promote_recommendation)
 from _conversation import run_command
 from _spawn import run_flags
 
@@ -495,6 +496,94 @@ class ConversationJournalTests(unittest.TestCase):
         self.assertEqual(participant["version"], "3.7")
         self.assertEqual(participant["model"], "gemini-3.7-flash-high")
         self.assertEqual(participant["provider"], "agy")
+
+    def test_agent_message_speech_act_rules_and_hop_cap_escalation_to_human(self):
+        room = ConversationJournal.create(
+            self.root, session_id="ping-pong", project_id="summon",
+            project_root=self.project, initiator_host="codex",
+            initiator_agent="sol",
+            participants=[
+                {"agent": "sol", "role": "architect", "name": "Sol", "version": "5.6"},
+                {"agent": "fable", "role": "reviewer", "name": "Fable", "version": "5.4"},
+            ],
+        )
+        # Non-obligating speech acts cannot require a reply
+        with self.assertRaises(ConversationError):
+            room.append_agent_message(
+                "sol", "fable", "ack note", speech_act="ack", requires_reply=True)
+        with self.assertRaises(ConversationError):
+            room.append_agent_message(
+                "sol", "fable", "inform note", speech_act="inform", requires_reply=True)
+        # Obligating speech acts default to requires_reply=True
+        prev_id = None
+        events = []
+        for idx in range(MAX_AGENT_MESSAGE_HOPS + 1):
+            sender = "sol" if idx % 2 == 0 else "fable"
+            recipient = "fable" if idx % 2 == 0 else "sol"
+            msg_id = f"hop-{idx}"
+            evt = room.append_agent_message(
+                sender, recipient, f"ping {idx}",
+                message_id=msg_id, speech_act="request", reply_to=prev_id)
+            events.append(evt)
+            prev_id = msg_id
+        self.assertEqual(events[0]["payload"]["hops"], 0)
+        self.assertTrue(events[0]["payload"]["requires_reply"])
+        self.assertEqual(events[0]["payload"]["recipient"], "fable")
+        # At hop == MAX_AGENT_MESSAGE_HOPS, message escalates to human
+        escalated = events[-1]
+        self.assertEqual(escalated["payload"]["hops"], MAX_AGENT_MESSAGE_HOPS)
+        self.assertEqual(escalated["payload"]["recipient"], "human")
+        self.assertEqual(escalated["payload"]["original_recipient"], "fable")
+        self.assertTrue(escalated["payload"]["escalated_to_human"])
+        self.assertFalse(escalated["payload"]["requires_reply"])
+
+    def test_memory_proposal_is_context_only_and_requires_human_confirmed_cas_promotion(self):
+        agents_dir = self.project / ".agents"
+        agents_dir.mkdir(exist_ok=True)
+        memory_file = agents_dir / "memory.md"
+        initial_content = "# Project Memory\n"
+        memory_file.write_text(initial_content, encoding="utf-8")
+        import hashlib
+        base_sha = hashlib.sha256(memory_file.read_bytes()).hexdigest()
+
+        room = self._room()
+        event = room.append_memory_proposal(
+            "sol",
+            summary="Record retry backoff policy",
+            proposed_entry="Always cap background retry loops at 3 attempts.",
+            rationale="Observed during swarm testing",
+            base_memory_sha256=base_sha,
+            proposal_id="prop-retry-cap",
+        )
+        self.assertEqual(event["event"], "memory_proposal")
+        self.assertEqual(event["payload"]["authority"], "context-only")
+        # .agents/memory.md must be completely untouched by append_memory_proposal
+        self.assertEqual(memory_file.read_text(encoding="utf-8"), initial_content)
+
+        native_artifact = room.events(native=True)[-1]["payload"]
+        # Unconfirmed promotion fails closed
+        with self.assertRaises(ConversationError):
+            promote_memory_proposal(
+                native_artifact, project_root=self.project, human_confirmed=False)
+        # Stale expected_memory_sha256 fails closed
+        with self.assertRaises(ConversationError):
+            promote_memory_proposal(
+                native_artifact, project_root=self.project, human_confirmed=True,
+                expected_memory_sha256="0" * 64)
+        # Human-confirmed promotion with matching CAS digest updates .agents/memory.md
+        promoted = promote_memory_proposal(
+            native_artifact, project_root=self.project, human_confirmed=True,
+            expected_memory_sha256=base_sha)
+        self.assertEqual(promoted["status"], "promoted")
+        self.assertEqual(promoted["previous_memory_sha256"], base_sha)
+        updated_bytes = memory_file.read_bytes()
+        self.assertEqual(promoted["memory_sha256"], hashlib.sha256(updated_bytes).hexdigest())
+        self.assertIn("Always cap background retry loops at 3 attempts.",
+                      updated_bytes.decode("utf-8"))
+        # Re-applying the same proposal now fails CAS check against base_memory_sha256
+        with self.assertRaises(ConversationError):
+            promote_memory_proposal(
+                native_artifact, project_root=self.project, human_confirmed=True)
 
 
 class ConversationPolicyTests(unittest.TestCase):
