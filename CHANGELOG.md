@@ -5,6 +5,45 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+## [3.6.2] - 2026-10-23
+
+- Eliminate concurrent `--background` (`--bg`) and `--worktree` startup races on
+  Windows: retry `summon.execution.lock` acquisition with bounded jittered
+  backoff in `_background._acquire_execution_lease()` (handling both
+  `FileExistsError` and Windows `PermissionError` delete-pending locks), wrap
+  `_spawn_background()` in `run_subagent.py` so lock contention produces a
+  structured `background_launch_failed` error instead of an unhandled crash, and
+  serialize `git worktree add` per repository via `<git-common-dir>/summon-worktree.lock`
+  with `_jobs._pid_liveness` stale-lock recovery.
+- Prevent Windows `MAX_PATH` (`> 260` characters) checkout failures in nested
+  worktrees: pass `-c core.longpaths=true` on Windows `git` worktree operations
+  and automatically relocate `--worktree` checkouts to a short per-user root
+  (`%LOCALAPPDATA%\summon-wt\<agent>-<hash>` or `SUMMON_WORKTREE_ROOT`) when the
+  default `.claude/worktrees/<name>` path plus the longest tracked relative path
+  exceeds the safe Windows path budget or is already nested inside a worktree.
+- Add bundled Antigravity Claude 5.5 seats (`opus-agy-reviewer`,
+  `opus-agy-coder`, and `sonnet-agy-reviewer`) pinned to `claude-opus-5-5-high`
+  and `claude-sonnet-5-5-high` on `agy`, and include advisory `agy` `*-reviewer`
+  seats in `summon list --for review` after enforced `read-only` reviewers.
+- Add `resolve_agy_binary()` in `_builder.py` and wire it across
+  `_require_agy_print_timeout_support()`, `agy_stream_proxy.py`,
+  `agy_pty_pyte.py`, `_doctor.py`, `_resolver.py`, and `run_subagent.py` so
+  Antigravity (`agy.exe`) is discovered in standard Windows install directories
+  (`%LOCALAPPDATA%\agy\bin\agy.exe`, `%LOCALAPPDATA%\Programs\Antigravity\bin\agy.exe`)
+  even when absent from the shell's ambient `PATH`.
+- Broaden `verdict` extraction and relax report bookend checking in
+  `_executor.py`: parse Markdown heading/bold verdict lines (`## Verdict: PASS`,
+  `**Verdict**: 0 blockers`, `PASS WITH CONCERNS`, `DO NOT APPROVE`) into the
+  canonical `("pass", "conditional", "block")` enum while rejecting multi-option
+  template lines (`PASS | CONCERNS | BLOCK`), and accept reports that provide
+  valid `STATUS`, `HANDOFF`, and (`SUMMARY` or `verdict`) when `FOLLOW-UP` is
+  omitted (`report_relaxed_bookends: true`).
+- Attach `partial_worktree_summary` to timeout (`exit_code: 124`) envelopes and
+  record dual raw + LF-normalized SHA-256 digests (`sha256` and `sha256_lf`) on
+  `--artifact` manifests and `files_touched_digests` so Windows `CRLF` vs `LF`
+  line endings and timed-out builder progress are inspectable directly from the
+  receipt (`test_v3_6_2_field_feedback_contracts`).
+
 ## [3.6.1] - 2026-10-19
 
 - Certify Codex 0.162+/0.163+ served-model provenance from session rollout

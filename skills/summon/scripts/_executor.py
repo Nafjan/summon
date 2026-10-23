@@ -592,9 +592,12 @@ _BLOCKED_TAIL = 800
 # success leak again, on the MOST compliant path). Only ever downgrades.
 _REPORT_TO_ENVELOPE = {"BLOCKED": "blocked", "PARTIAL": "partial", "ERROR": "error"}
 _REVIEW_VERDICTS = {
-    "BLOCK": "block", "DENY": "block",
+    "BLOCK": "block", "DENY": "block", "REJECT": "block", "REJECTED": "block",
+    "FAIL": "block", "FAILED": "block",
     "CONCERNS": "conditional", "CONDITIONAL": "conditional", "UNCERTAIN": "conditional",
-    "CLEAN": "pass", "PASS": "pass", "APPROVE": "pass",
+    "REVISE": "conditional", "WARNING": "conditional",
+    "CLEAN": "pass", "PASS": "pass", "PASSED": "pass", "APPROVE": "pass",
+    "APPROVED": "pass", "LGTM": "pass",
 }
 
 # Envelope schema version — bumped only on a breaking change to the response
@@ -608,13 +611,54 @@ def _detect_blocked(text: str) -> list:
     return [m for m in _BLOCKED_MARKERS if m in tail]
 
 
+def _normalize_verdict_value(raw: object) -> str | None:
+    """Map a raw verdict phrase to canonical ``('block', 'conditional', 'pass')``."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    line = raw.strip().splitlines()[0].strip()
+    if not line:
+        return None
+    line_clean = re.sub(r"[*_`~]+", "", line).strip()
+    if not line_clean:
+        return None
+    # Reject template/option strings such as "PASS | CONCERNS | BLOCK" or "APPROVE / REJECT".
+    head_clause = re.split(r"[.;—–-]", line_clean, maxsplit=1)[0]
+    if re.search(
+        r"\b(?:PASS|APPROVE|CLEAN|BLOCK|DENY|REJECT|CONCERNS|CONDITIONAL|FAIL)\b"
+        r"\s*[/|]\s*"
+        r"\b(?:PASS|APPROVE|CLEAN|BLOCK|DENY|REJECT|CONCERNS|CONDITIONAL|FAIL)\b",
+        head_clause,
+        re.IGNORECASE,
+    ):
+        return None
+    up = re.sub(r"\s+", " ", line_clean.upper()).strip()
+    # Negated approval phrases ("DO NOT APPROVE", "NOT APPROVED", "CANNOT PASS") -> block
+    if re.match(r"^(?:DO\s+NOT|DON'T|NOT|CANNOT|CAN'T|NEVER)\s+(?:APPROVE|APPROVED|PASS|MERGE|SHIP)\b", up):
+        return "block"
+    # Multi-word phrases checked before single-token split
+    if re.match(r"^(?:PASS|APPROVE|APPROVED)\s+WITH\s+(?:CONCERNS|CHANGES|COMMENTS|NITS|CONDITIONS|RESERVATIONS)\b", up):
+        return "conditional"
+    if re.match(r"^(?:NEEDS\s+WORK|NEEDS\s+CHANGES|NEEDS\s+REVISION)\b", up):
+        return "conditional"
+    if re.match(r"^(?:CHANGES\s+REQUESTED|REQUEST\s+CHANGES)\b", up):
+        return "block"
+    if re.match(r"^(?:0|NO|ZERO|NONE)\s+BLOCKERS?\b", up):
+        if re.search(r"\b(?:WITH\s+CONCERNS|WITH\s+CHANGES|BUT\b)\b", up):
+            return "conditional"
+        return "pass"
+    if re.match(r"^[1-9]\d*\s+BLOCKERS?\b", up):
+        return "block"
+    first = up.split()[0].rstrip("|,:;-.!?)")
+    mapped = _REVIEW_VERDICTS.get(first)
+    if mapped == "pass" and re.search(r"\b(?:WITH\s+CONCERNS|WITH\s+CHANGES|CONDITIONAL)\b", up):
+        return "conditional"
+    return mapped
+
+
 def _review_verdict(report: dict | None) -> str | None:
     """Normalize a review decision without conflating it with execution state."""
     raw = report.get("verdict") if isinstance(report, dict) else None
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    first = raw.strip().split()[0].rstrip("|,:;-").upper()
-    return _REVIEW_VERDICTS.get(first)
+    return _normalize_verdict_value(raw)
 
 
 _FENCED_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
@@ -623,6 +667,10 @@ _FALLBACK_SUMMARY_RE = re.compile(
 )
 _FALLBACK_CONFIDENCE_RE = re.compile(
     r"(?im)^[ \t]*(?:\*\*|#+[ \t]+|[-*][ \t]+)*CONFIDENCE[ \t]*:[ \t]*\*?\*?[ \t]*([^\r\n]+)$"
+)
+_FALLBACK_VERDICT_RE = re.compile(
+    r"(?im)^[ \t]*(?:\*\*|#+[ \t]+|[-*][ \t]+)*(?:FINAL[ \t]+|OVERALL[ \t]+|REVIEW[ \t]+)?VERDICT"
+    r"(?:[ \t]*\*?\*?[ \t]*:[ \t]*\*?\*?[ \t]*([^\r\n]+)|[ \t]*\*?\*?[ \t]*\r?\n+[ \t]*([^\r\n#]+))"
 )
 
 
@@ -1063,11 +1111,42 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
         "declared": bool(report and "left_behind" in report),
         "left_behind": report.get("left_behind") if report else None,
     }
-    response["report_ok"] = bool(
-        report and all(b.lower().replace("-", "_") in report for b in _REPORT_BOOKENDS)
-    )
     _raw_result = response.get("result")
     _clean_result = _redact_output_secrets(_raw_result.strip()) if isinstance(_raw_result, str) and _raw_result.strip() else ""
+    _stripped_for_fallback = _strip_fenced_code_blocks(_clean_result) if _clean_result else ""
+    if _clean_result and not _stripped_for_fallback.strip():
+        _stripped_for_fallback = "\n".join(
+            ln for ln in _clean_result.splitlines()
+            if not re.match(r"^\s*(?:```|~~~)", ln)
+        )
+    _fallback_tail = "\n".join(_stripped_for_fallback.splitlines()[-200:]) if _stripped_for_fallback else ""
+    _parsed_verdict = _review_verdict(report)
+    if _parsed_verdict is None and _stripped_for_fallback:
+        for _vm in _FALLBACK_VERDICT_RE.finditer(_stripped_for_fallback):
+            _cand_v = _normalize_verdict_value(_vm.group(1) or _vm.group(2))
+            if _cand_v is not None:
+                _parsed_verdict = _cand_v
+    response["verdict"] = _parsed_verdict
+
+    _strict_bookends = bool(
+        report and all(
+            b.lower().replace("-", "_") in report and str(report.get(b.lower().replace("-", "_")) or "").strip()
+            for b in _REPORT_BOOKENDS
+        )
+    )
+    _relaxed_bookends = False
+    if not _strict_bookends and isinstance(report, dict) and report:
+        _st_raw = str(report.get("status") or "").strip()
+        _st_first = _st_raw.split()[0].rstrip("|,:;-").upper() if _st_raw else ""
+        _ho_raw = str(report.get("handoff") or "").strip()
+        _sum_raw = str(report.get("summary") or "").strip()
+        if _st_first in _STATUS_VALUES and _ho_raw and (_sum_raw or _parsed_verdict is not None):
+            _relaxed_bookends = True
+            if not _sum_raw and report.get("verdict"):
+                report.setdefault("summary", f"VERDICT: {str(report['verdict']).splitlines()[0].strip()}")
+    response["report_ok"] = _strict_bookends or _relaxed_bookends
+    if _relaxed_bookends:
+        response["report_relaxed_bookends"] = True
     if response["report_ok"]:
         response["report_source"] = "structured"
         response["report_text"] = (report.get("summary") or _clean_result).strip()
@@ -1080,14 +1159,6 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     else:
         response["report_source"] = "none"
         response["report_text"] = ""
-    response["verdict"] = _review_verdict(report)
-    _stripped_for_fallback = _strip_fenced_code_blocks(_clean_result) if _clean_result else ""
-    if _clean_result and not _stripped_for_fallback.strip():
-        _stripped_for_fallback = "\n".join(
-            ln for ln in _clean_result.splitlines()
-            if not re.match(r"^\s*(?:```|~~~)", ln)
-        )
-    _fallback_tail = "\n".join(_stripped_for_fallback.splitlines()[-200:]) if _stripped_for_fallback else ""
     if report and report.get("summary"):
         _raw_sum = report["summary"].splitlines()[0].strip()
         response["summary"] = _raw_sum[:500] if _raw_sum else None
@@ -1666,6 +1737,57 @@ def content_sha(path) -> str | None:
     return _content_sha_ex(path)[0] if path else None
 
 
+def content_hashes(path) -> tuple[str | None, str | None]:
+    """Return ``(sha256_raw, sha256_lf)`` in one bounded streaming pass, or ``(None, None)``."""
+    if not path:
+        return None, None
+    import stat as _stat
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None, None
+    try:
+        before = os.fstat(fd)
+        if not _stat.S_ISREG(before.st_mode):
+            return None, None
+        deadline = time.monotonic() + _CONTENT_SHA_TIMEOUT_S
+        h_raw, h_lf, read_total = hashlib.sha256(), hashlib.sha256(), 0
+        carry_cr = False
+        while True:
+            chunk = os.read(fd, _CONTENT_SHA_CHUNK)
+            if not chunk:
+                if carry_cr:
+                    h_lf.update(b"\r")
+                break
+            h_raw.update(chunk)
+            read_total += len(chunk)
+            if carry_cr:
+                if chunk.startswith(b"\n"):
+                    # Previous chunk's trailing \r + this chunk's leading \n -> \n
+                    pass
+                else:
+                    h_lf.update(b"\r")
+                carry_cr = False
+            if chunk.endswith(b"\r"):
+                carry_cr = True
+                body = chunk[:-1]
+            else:
+                body = chunk
+            if body:
+                h_lf.update(body.replace(b"\r\n", b"\n"))
+            if time.monotonic() > deadline and read_total > before.st_size:
+                return None, None
+        after = os.fstat(fd)
+        if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+            return None, None
+        return h_raw.hexdigest(), h_lf.hexdigest()
+    except OSError:
+        return None, None
+    finally:
+        os.close(fd)
+
+
 class _DefnSnapshot:
     """One load of an agent definition, so every identity field derived from it sees the
     SAME bytes. Scattered load_agent() calls across the identity builder let an A -> B -> A
@@ -1808,7 +1930,7 @@ _BACKEND_ENV_PREFIXES = {
     "gemini": ("GEMINI_", "GOOGLE_"),
     # AGY_* too: the PTY wrapper, the headless-profile root and the interpreter all change
     # how (and as whom) agy runs.
-    "agy": ("GEMINI_", "GOOGLE_", "AGY_"),
+    "agy": ("GEMINI_", "GOOGLE_", "AGY_", "SUMMON_AGY_"),
     "opencode": ("OPENCODE_", "OPENROUTER_"),
     # openai-compat is deliberately ABSENT: it spawns no child and reads only the endpoint
     # and credential its provider resolves to, both already in the identity. Hashing every
@@ -1826,7 +1948,7 @@ _BACKEND_ENV_DEFAULTS = {"agy": (("AGY_PTY_QUIET", "20"),)}
 _BACKEND_ENV_OVERWRITTEN = {
     # AGY_PTY_QUIET is NOT here: the builder forwards whatever is set, so it does reach
     # the child and two values are two different requests.
-    "agy": ("AGY_PTY_DEADLINE",),
+    "agy": ("AGY_PTY_DEADLINE", "AGY_RESOLVED_BIN"),
     "gemini": ("GEMINI_SYSTEM_MD",),
     # The builder supplies a per-tier inline JSON policy; an ambient value must
     # never change the child while leaving the request identity looking equal.
@@ -4441,6 +4563,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         # build their own response and never touch build_final_response). The
         # response builders set the detailed reason first; this preserves it.
         finalize_exit_fields(resp)
+        _after = None
         if "workspace_evidence" not in resp:
             try:
                 if _workspace_before is None:
@@ -4451,7 +4574,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                         "before": None, "after": None, "coverage": "unavailable",
                         "child_commit": None, "mutation": None,
                         "read_only_violation": None, "attribution": "unavailable",
-                        "files_touched": [],
+                        "files_touched": [], "files_touched_digests": [],
                     }
                 else:
                     _after = workspace_snapshot(inv.cwd)
@@ -4467,13 +4590,24 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                     "before": None, "after": None, "coverage": "unavailable",
                     "child_commit": None, "mutation": None,
                     "read_only_violation": None, "attribution": "unavailable",
-                    "files_touched": [],
+                    "files_touched": [], "files_touched_digests": [],
                 }
         _we = resp.get("workspace_evidence")
         if isinstance(_we, dict) and isinstance(_we.get("files_touched"), list):
             resp["files_touched"] = list(_we["files_touched"])
         else:
             resp.setdefault("files_touched", [])
+        if isinstance(_we, dict) and isinstance(_we.get("files_touched_digests"), list):
+            resp["files_touched_digests"] = list(_we["files_touched_digests"])
+        else:
+            resp.setdefault("files_touched_digests", [])
+        if (resp.get("exit_code") == 124 or resp.get("raw_backend_exit_code") == 124) and _workspace_before is not None and _after is not None:
+            try:
+                from _receipt import partial_worktree_summary
+                resp["partial_worktree_summary"] = partial_worktree_summary(
+                    _workspace_before, _after, _we if isinstance(_we, dict) else {})
+            except Exception:  # noqa: BLE001
+                pass
         # Trust fields, split by EVIDENCE (field case: a failed Fable dispatch
         # reported the handshake model as `resolved` with all-zero usage):
         #   requested  what the caller asked for (unchanged).

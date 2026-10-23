@@ -102,7 +102,7 @@ from _resolver import discover_models, resolve_cli  # noqa: E402
 # Keep a literal assignment: the release-contract parser uses the dispatcher
 # source as a machine-checkable companion.  `_telemetry.SUMMON_VERSION` must be
 # updated in the same release; the release contract checks both literals.
-__version__ = "3.6.1"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "3.6.2"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -594,8 +594,12 @@ def _complete_artifact_provenance(env: dict, args, before: dict | None) -> dict:
     after, error = build_manifest(getattr(args, "artifacts", None), args.cwd)
     evidence = dict(before)
     stable = bool(after and not error and after.get("sha256") == before.get("sha256"))
+    stable_lf = bool(after and not error and after.get("sha256_lf") == before.get("sha256_lf"))
     evidence["stable_during_dispatch"] = stable
+    evidence["stable_lf_during_dispatch"] = stable_lf
+    evidence["before_sha256_lf"] = before.get("sha256_lf")
     evidence["after_sha256"] = after.get("sha256") if after else None
+    evidence["after_sha256_lf"] = after.get("sha256_lf") if after else None
     # If the after-read failed, the changed set is UNKNOWN rather than "every
     # input changed". Keep the result suspect, but do not manufacture a change
     # claim that the failed read cannot support.
@@ -950,6 +954,22 @@ def _preflight_backend(cli: str, command_override: str | None = None) -> dict | 
             _zcode_rejected_shim = rejected_zcode_path_shim()
         except Exception:  # noqa: BLE001 - fall through to safe setup guidance
             _zcode_rejected_shim = False
+    elif cli == "agy":
+        try:
+            from _builder import resolve_agy_binary
+            if resolve_agy_binary(which_fn=shutil.which) is not None:
+                return None
+        except Exception:  # noqa: BLE001
+            if shutil.which(cli):
+                return None
+    elif cli == "codex":
+        try:
+            from _builder import resolve_codex_binary
+            if resolve_codex_binary(which_fn=shutil.which) is not None:
+                return None
+        except Exception:  # noqa: BLE001
+            if shutil.which(cli):
+                return None
     elif shutil.which(cli):
         return None
     # Enrichment is best-effort: an incomplete install missing _doctor.py must
@@ -1109,12 +1129,130 @@ def _initial_system_context(system_context: str, cwd: str,
     return environment_handoff_context(_inject_memory(system_context, cwd, memory_raw))
 
 
+_WORKTREE_LOCK_TIMEOUT_SEC = 10.0
+_WORKTREE_LOCK_STALE_SEC = 60.0
+_WINDOWS_SAFE_PATH_BUDGET = 235
+
+
+def _git_win_prefix() -> list[str]:
+    """Git config flags that prevent MAX_PATH checkout failures on Windows."""
+    return ["git", "-c", "core.longpaths=true"] if os.name == "nt" else ["git"]
+
+
+def _resolve_git_common_dir(repo: str) -> str:
+    """Resolve the shared .git directory even when ``repo`` is already a worktree."""
+    from _spawn import run_flags
+    try:
+        r = subprocess.run([*_git_win_prefix(), "-C", repo, "rev-parse", "--git-common-dir"],
+                           capture_output=True, text=True, timeout=10, **run_flags())
+        if r.returncode == 0 and (r.stdout or "").strip():
+            return os.path.abspath(os.path.join(repo, r.stdout.strip()))
+    except Exception:  # noqa: BLE001
+        pass
+    dot_git = os.path.join(repo, ".git")
+    return dot_git if os.path.isdir(dot_git) else repo
+
+
+def _per_user_worktree_root() -> str:
+    """Short per-user directory for relocated Windows worktrees."""
+    override = (os.environ.get("SUMMON_WORKTREE_ROOT") or "").strip()
+    if override:
+        return os.path.abspath(override)
+    base = (os.environ.get("LOCALAPPDATA") or "").strip()
+    if base and os.path.isdir(base):
+        return os.path.join(base, "summon-wt")
+    return os.path.join(os.path.expanduser("~"), ".summon-wt")
+
+
+def _max_tracked_relpath_len(repo: str) -> int:
+    """Return the longest tracked relative path length in ``repo`` (bounded)."""
+    from _spawn import run_flags
+    try:
+        r = subprocess.run([*_git_win_prefix(), "-C", repo, "ls-files", "-z"],
+                           capture_output=True, timeout=10, **run_flags())
+        if r.returncode == 0 and r.stdout:
+            return max((len(p) for p in r.stdout.split(b"\x00") if p), default=80)
+    except Exception:  # noqa: BLE001
+        pass
+    return 120
+
+
+def _should_relocate_worktree(repo: str, default_wt: str, max_rel_len: int) -> bool:
+    """True when a Windows worktree path risks exceeding MAX_PATH or is doubly nested."""
+    if os.name != "nt" and not (os.environ.get("SUMMON_WORKTREE_ROOT") or "").strip():
+        return False
+    norm_repo = os.path.normpath(repo).lower().replace("/", "\\")
+    nested_markers = ("\\.claude\\worktrees\\", "\\.worktrees\\", "\\.summon-wt\\", "\\summon-wt\\")
+    if any(m in (norm_repo + "\\") for m in nested_markers):
+        return True
+    return (len(default_wt) + 1 + max_rel_len) > _WINDOWS_SAFE_PATH_BUDGET
+
+
+def _acquire_worktree_lock(common_dir: str) -> tuple[str, str]:
+    """Acquire a short-lived per-repository lock around ``git worktree add``."""
+    os.makedirs(common_dir, exist_ok=True)
+    lock_path = os.path.join(common_dir, "summon-worktree.lock")
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + _WORKTREE_LOCK_TIMEOUT_SEC
+    sleep_s = 0.05
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({"pid": os.getpid(), "ts": time.time(), "token": token}, fh)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            except OSError:
+                try:
+                    os.unlink(lock_path)
+                except OSError:
+                    pass
+                raise
+            return lock_path, token
+        except (FileExistsError, PermissionError) as exc:
+            try:
+                with open(lock_path, encoding="utf-8") as fh:
+                    meta = json.load(fh)
+                age = time.time() - float(meta.get("ts") or 0.0)
+                owner_pid = meta.get("pid")
+                owner_token = meta.get("token")
+                if age > _WORKTREE_LOCK_STALE_SEC and owner_token:
+                    from _jobs import _pid_liveness
+                    if _pid_liveness(owner_pid) == "dead":
+                        with open(lock_path, encoding="utf-8") as fh2:
+                            meta2 = json.load(fh2)
+                        if meta2.get("token") == owner_token:
+                            os.unlink(lock_path)
+                            continue
+            except (OSError, ValueError, TypeError):
+                pass
+            if time.monotonic() >= deadline:
+                raise ValueError(
+                    f"timed out waiting for repository worktree lock ({lock_path}); retry shortly"
+                ) from exc
+            jitter = (int(uuid.uuid4().hex[:4], 16) % 30) / 1000.0
+            time.sleep(min(0.20, sleep_s + jitter))
+            sleep_s = min(0.18, sleep_s * 1.35)
+
+
+def _release_worktree_lock(lock_path: str, token: str) -> None:
+    try:
+        with open(lock_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and data.get("token") == token:
+            os.unlink(lock_path)
+    except (OSError, ValueError):
+        pass
+
+
 def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
     """Create an isolated git worktree so a (possibly parallel) editing agent
     can't collide with the main tree or other agents. Returns {path, branch}.
     Raises ValueError (surfaced as a clean JSON error) on any failure."""
     from _spawn import run_flags
-    r = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+    git_cmd = _git_win_prefix()
+    r = subprocess.run([*git_cmd, "-C", cwd, "rev-parse", "--show-toplevel"],
                        capture_output=True, text=True, **run_flags())
     if r.returncode != 0:
         raise ValueError(f"--worktree requires a git repo; {cwd} is not inside one")
@@ -1127,19 +1265,49 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name) or ".." in name:
         raise ValueError(f"invalid worktree name: {name!r} (letters/digits/._- , no '..', no leading dot)")
     branch = f"agents/{name}"
-    wt = os.path.join(repo, ".claude", "worktrees", name)
-    if os.path.exists(wt):
-        raise ValueError(f"worktree path already exists: {wt}")
-    # Don't clobber an existing branch: `-b` (not `-B`) fails if agents/<name>
-    # already exists, so prior committed agent work is never force-reset away.
-    if subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet",
-                       f"refs/heads/{branch}"], capture_output=True, text=True, **run_flags()).returncode == 0:
-        raise ValueError(f"branch {branch} already exists; pick a different --worktree name "
-                         "(its commits would otherwise be at risk)")
-    r2 = subprocess.run(["git", "-C", repo, "worktree", "add", "-b", branch, wt, "HEAD"],
-                        capture_output=True, text=True, **run_flags())
-    if r2.returncode != 0:
-        raise ValueError(f"git worktree add failed: {(r2.stderr or r2.stdout).strip()}")
+    default_wt = os.path.join(repo, ".claude", "worktrees", name)
+    max_rel_len = _max_tracked_relpath_len(repo) if (os.name == "nt" or os.environ.get("SUMMON_WORKTREE_ROOT")) else 80
+    relocated = _should_relocate_worktree(repo, default_wt, max_rel_len)
+    if relocated:
+        short_root = _per_user_worktree_root()
+        os.makedirs(short_root, exist_ok=True)
+        short_hash = hashlib.sha256(f"{repo}:{name}".encode("utf-8")).hexdigest()[:10]
+        short_prefix = re.sub(r"[^A-Za-z0-9_-]", "", agent)[:10] or "wt"
+        wt = os.path.join(short_root, f"{short_prefix}-{short_hash}")
+    else:
+        wt = default_wt
+
+    common_dir = _resolve_git_common_dir(repo)
+    lock_path, lock_token = _acquire_worktree_lock(common_dir)
+    try:
+        if os.path.exists(wt):
+            raise ValueError(f"worktree path already exists: {wt}")
+        # Don't clobber an existing branch: `-b` (not `-B`) fails if agents/<name>
+        # already exists, so prior committed agent work is never force-reset away.
+        if subprocess.run([*git_cmd, "-C", repo, "rev-parse", "--verify", "--quiet",
+                           f"refs/heads/{branch}"], capture_output=True, text=True, **run_flags()).returncode == 0:
+            raise ValueError(f"branch {branch} already exists; pick a different --worktree name "
+                             "(its commits would otherwise be at risk)")
+        r2 = None
+        for attempt in range(3):
+            r2 = subprocess.run([*git_cmd, "-C", repo, "worktree", "add", "-b", branch, wt, "HEAD"],
+                                capture_output=True, text=True, **run_flags())
+            if r2.returncode == 0:
+                break
+            err_lower = ((r2.stderr or "") + "\n" + (r2.stdout or "")).lower()
+            if attempt < 2 and ("index.lock" in err_lower or "unable to create" in err_lower or "another git process" in err_lower):
+                shutil.rmtree(wt, ignore_errors=True)
+                subprocess.run([*git_cmd, "-C", repo, "worktree", "prune"],
+                               capture_output=True, text=True, **run_flags())
+                subprocess.run([*git_cmd, "-C", repo, "branch", "-D", branch],
+                               capture_output=True, text=True, **run_flags())
+                time.sleep(0.12 * (attempt + 1))
+                continue
+            break
+        if r2 is None or r2.returncode != 0:
+            raise ValueError(f"git worktree add failed: {((r2.stderr if r2 else '') or (r2.stdout if r2 else '')).strip()}")
+    finally:
+        _release_worktree_lock(lock_path, lock_token)
     # If --cwd was a SUBDIRECTORY of the repo, run inside the matching subdir of
     # the worktree to preserve the caller's intended working directory — BUT only
     # if it actually exists in the fresh checkout. An untracked/ignored/empty
@@ -1149,7 +1317,7 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
     rel = os.path.relpath(os.path.abspath(cwd), repo)
     sub = os.path.join(wt, rel)
     effective = sub if rel not in (".", "") and not rel.startswith("..") and os.path.isdir(sub) else wt
-    _head = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"],
+    _head = subprocess.run([*git_cmd, "-C", wt, "rev-parse", "HEAD"],
                            capture_output=True, text=True, **run_flags())
     # Cleanup fails closed when this evidence is unavailable: without the exact
     # commit the new branch began at, a later clean status cannot distinguish
@@ -1158,8 +1326,12 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str) -> dict:
     # `repo` so a later teardown can run `git -C <repo> worktree remove`: git rejects
     # a bare path outside the repository context, which is how the first attempt at
     # denial cleanup silently failed.
-    return {"path": wt, "cwd": effective, "branch": branch, "repo": repo,
-            "base_head": base_head}
+    out_info = {"path": wt, "cwd": effective, "branch": branch, "repo": repo,
+                "base_head": base_head}
+    if relocated:
+        out_info["relocated"] = True
+        out_info["requested_worktree_path"] = default_wt
+    return out_info
 
 
 def _preflight_then_setup_worktree(invocation, cwd: str, name_arg: str | None,
@@ -2593,7 +2765,11 @@ def main() -> None:
                 finalize_exit_fields(_env)
                 _emit(_env, operation=_EMIT_OPERATION, trusted_executor_result=True)
                 sys.exit(0)
-        print(json.dumps(_spawn_background(args), ensure_ascii=False))
+        try:
+            _bg_resp = _spawn_background(args)
+        except (OSError, ValueError) as e:
+            _die(str(e), error_kind=getattr(e, "kind", None) or "background_launch_failed")
+        print(json.dumps(_bg_resp, ensure_ascii=False))
         sys.exit(0)
 
     if args.list:
@@ -4364,16 +4540,27 @@ def _remove_worktree(info) -> dict:
     # and back slashes on Windows.
     target = os.path.normpath(str(path))
     result["path"] = target
-    base = ["git"] + (["-C", str(repo)] if repo else [])
+    git_cmd = _git_win_prefix()
+    base = [*git_cmd] + (["-C", str(repo)] if repo else [])
     if not repo or not branch or not info.get("base_head"):
         return result
     # The helper receives only internal metadata, but keep the destructive target
-    # bounded to the directory _setup_worktree owns.
+    # bounded to the directories _setup_worktree owns (default .claude/worktrees or relocated root).
     try:
-        owned_root = os.path.realpath(os.path.abspath(
-            os.path.join(str(repo), ".claude", "worktrees")))
+        owned_roots = [
+            os.path.realpath(os.path.abspath(os.path.join(str(repo), ".claude", "worktrees"))),
+            os.path.realpath(os.path.abspath(_per_user_worktree_root())),
+        ]
         resolved_target = os.path.realpath(os.path.abspath(target))
-        if os.path.commonpath((owned_root, resolved_target)) != owned_root:
+        in_owned = False
+        for root_cand in owned_roots:
+            try:
+                if os.path.commonpath((root_cand, resolved_target)) == root_cand and resolved_target != root_cand:
+                    in_owned = True
+                    break
+            except ValueError:
+                continue
+        if not in_owned:
             result["reason"] = "worktree path is outside summon's owned worktree directory"
             return result
     except ValueError:
@@ -4381,10 +4568,10 @@ def _remove_worktree(info) -> dict:
         return result
 
     try:
-        status = subprocess.run(["git", "-C", target, "status", "--porcelain=v1",
+        status = subprocess.run([*git_cmd, "-C", target, "status", "--porcelain=v1",
                                  "--untracked-files=all"], capture_output=True, text=True,
                                 timeout=30, **run_flags())
-        head = subprocess.run(["git", "-C", target, "rev-parse", "HEAD"],
+        head = subprocess.run([*git_cmd, "-C", target, "rev-parse", "HEAD"],
                               capture_output=True, text=True, timeout=30, **run_flags())
     except Exception as e:  # noqa: BLE001
         result["reason"] = "could not verify worktree identity: %s: %s" % (

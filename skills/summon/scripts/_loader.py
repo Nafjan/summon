@@ -668,10 +668,14 @@ def filter_agents_for_task(agents: list[dict], task: str) -> list[dict]:
         from _builder import permission_enforcement
         matched = [
             a for a in active
-            if a.get("permission") == "read-only"
-            and permission_enforcement(a.get("run_agent"), "read-only") == "enforced"
+            if (a.get("permission") == "read-only"
+                and permission_enforcement(a.get("run_agent"), "read-only") == "enforced")
+            or (a.get("run_agent") == "agy"
+                and a.get("permission") == "yolo"
+                and str(a.get("name") or "").lower().endswith("-reviewer"))
         ]
         return sorted(matched, key=lambda a: (
+            0 if a.get("permission") == "read-only" else 1,
             0 if any(w in str(a.get("name") or "").lower()
                      for w in ("review", "audit", "adversarial", "astra", "architect", "fable")) else 1,
             0 if a.get("reports_served_model") else 1,

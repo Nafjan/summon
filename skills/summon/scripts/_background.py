@@ -136,12 +136,25 @@ def _acquire_execution_lease(entry_path: str) -> tuple[str, str] | None:
         raise ValueError("managed Summon install is in progress; retry the background dispatch shortly")
     lease = os.path.join(host_root, _EXECUTION_LOCK)
     token = uuid.uuid4().hex
-    try:
-        fd = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError as exc:
-        raise ValueError("another managed Summon background launch is preparing an immutable bundle; retry shortly") from exc
-    except OSError as exc:
-        raise ValueError(f"cannot create managed Summon execution lease: {exc}") from exc
+    deadline = time.monotonic() + 15.0
+    sleep_s = 0.05
+    fd = None
+    while True:
+        if os.path.lexists(install_lock):
+            raise ValueError("managed Summon install is in progress; retry the background dispatch shortly")
+        try:
+            fd = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except (FileExistsError, PermissionError) as exc:
+            if time.monotonic() >= deadline:
+                raise ValueError(
+                    "another managed Summon background launch is preparing an immutable bundle; retry shortly"
+                ) from exc
+            jitter = (int(uuid.uuid4().hex[:4], 16) % 30) / 1000.0
+            time.sleep(min(0.20, sleep_s + jitter))
+            sleep_s = min(0.18, sleep_s * 1.35)
+        except OSError as exc:
+            raise ValueError(f"cannot create managed Summon execution lease: {exc}") from exc
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump({"installed_by": "summon", "purpose": "background_snapshot",

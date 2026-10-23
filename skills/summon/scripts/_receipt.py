@@ -454,6 +454,115 @@ def workspace_snapshot(cwd: str | None) -> dict:
     return snap
 
 
+_TOUCHED_DIGEST_MAX_FILES = 64
+_TOUCHED_DIGEST_MAX_FILE_BYTES = 2 * 1024 * 1024
+_TOUCHED_DIGEST_MAX_TOTAL_BYTES = 16 * 1024 * 1024
+_TOUCHED_DIGEST_TIMEOUT_S = 2.0
+
+
+def _compute_files_touched_digests(root: str | None, files_touched: list[str]) -> list[dict]:
+    """Compute bounded ``sha256`` and ``sha256_lf`` digests for ``files_touched``."""
+    if not root or not isinstance(root, str) or not os.path.isdir(root) or not files_touched:
+        return []
+    root_real = os.path.realpath(root)
+    deadline = time.monotonic() + _TOUCHED_DIGEST_TIMEOUT_S
+    total_bytes = 0
+    out: list[dict] = []
+    for rel in files_touched[:_TOUCHED_DIGEST_MAX_FILES]:
+        if time.monotonic() >= deadline or total_bytes >= _TOUCHED_DIGEST_MAX_TOTAL_BYTES:
+            break
+        if not isinstance(rel, str) or not rel:
+            continue
+        candidate = os.path.abspath(os.path.normpath(os.path.join(root, rel)))
+        try:
+            st = os.lstat(candidate)
+            if _stat.S_ISLNK(st.st_mode):
+                continue
+            reparse_attr = getattr(st, "st_file_attributes", 0)
+            if reparse_attr & getattr(_stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+                continue
+            cand_real = os.path.realpath(candidate)
+            if os.path.commonpath((root_real, cand_real)) != root_real:
+                continue
+        except (OSError, ValueError):
+            out.append({"path": rel, "status": "deleted", "bytes": None,
+                        "sha256": None, "sha256_lf": None})
+            continue
+        try:
+            payload, note = _read_regular_bounded(cand_real, _TOUCHED_DIGEST_MAX_FILE_BYTES)
+        except OSError:
+            out.append({"path": rel, "status": "deleted", "bytes": None,
+                        "sha256": None, "sha256_lf": None})
+            continue
+        if note == "nonfile":
+            continue
+        if note is not None or payload is None or len(payload) > _TOUCHED_DIGEST_MAX_FILE_BYTES:
+            try:
+                sz = os.stat(cand_real).st_size
+            except OSError:
+                sz = None
+            out.append({"path": rel, "status": "oversize", "bytes": sz,
+                        "sha256": None, "sha256_lf": None})
+            continue
+        total_bytes += len(payload)
+        sha_raw = hashlib.sha256(payload).hexdigest()
+        sha_lf = hashlib.sha256(payload.replace(b"\r\n", b"\n")).hexdigest()
+        out.append({
+            "path": rel,
+            "status": "present",
+            "bytes": len(payload),
+            "sha256": sha_raw,
+            "sha256_lf": sha_lf,
+        })
+    return out
+
+
+def partial_worktree_summary(before: dict | None, after: dict | None,
+                             ws_evidence: dict | None) -> dict:
+    """Summarize partial working-tree progress when a toolful turn times out (exit 124)."""
+    before = before if isinstance(before, dict) else {}
+    after = after if isinstance(after, dict) else {}
+    ws_evidence = ws_evidence if isinstance(ws_evidence, dict) else {}
+    touched = list(ws_evidence.get("files_touched") or [])
+    digests = list(ws_evidence.get("files_touched_digests") or [])
+    staged = list(after.get("staged") or [])
+    unstaged = list(after.get("unstaged") or [])
+    untracked = list(after.get("untracked") or [])
+    child_commit = bool(ws_evidence.get("child_commit"))
+    diff_stat = None
+    root = (
+        getattr(after, "_root", None)
+        or after.get("_root")
+        or getattr(before, "_root", None)
+        or before.get("_root")
+    )
+    if isinstance(root, str) and root and os.path.isdir(root):
+        try:
+            stat_raw, stat_rc, stat_err = _run_git_bounded(
+                ["git", "--no-optional-locks", "-C", root, "diff", "--stat", "HEAD"],
+                root,
+                time.monotonic() + min(_WORKSPACE_CALL_TIMEOUT_S, 2.0),
+            )
+            if stat_rc == 0 and stat_raw and not stat_err:
+                diff_stat = stat_raw.decode("utf-8", errors="replace").strip()[:4000] or None
+        except Exception:  # noqa: BLE001
+            diff_stat = None
+    return {
+        "timed_out": True,
+        "has_partial_work": bool(touched or child_commit or staged or unstaged or untracked),
+        "child_commit": child_commit,
+        "head_before": before.get("head"),
+        "head_after": after.get("head"),
+        "files_touched_count": len(touched),
+        "files_touched": touched,
+        "files_touched_digests": digests,
+        "staged": staged,
+        "unstaged": unstaged,
+        "untracked": untracked,
+        "diff_stat": diff_stat,
+    }
+
+
 def workspace_evidence(before: dict | None, after: dict | None,
                        permission: str | None = None,
                        cli: str | None = None) -> dict:
@@ -473,6 +582,7 @@ def workspace_evidence(before: dict | None, after: dict | None,
     child_commit = mutation = read_only_violation = None
     attribution = "unavailable"
     files_touched: list[str] = []
+    files_touched_digests: list[dict] = []
     if proven:
         child_commit = before.get("head") != after.get("head")
         before_state = tuple(b_view[k] for k in ("branch", "staged", "unstaged", "renamed", "untracked"))
@@ -518,13 +628,13 @@ def workspace_evidence(before: dict | None, after: dict | None,
                     dst = key[1]
                     if isinstance(dst, str) and dst:
                         touched_set.add(dst)
+            root = (
+                getattr(after, "_root", None)
+                or after.get("_root")
+                or getattr(before, "_root", None)
+                or before.get("_root")
+            )
             if child_commit and after.get("head"):
-                root = (
-                    getattr(after, "_root", None)
-                    or after.get("_root")
-                    or getattr(before, "_root", None)
-                    or before.get("_root")
-                )
                 if isinstance(root, str) and root and os.path.isdir(root):
                     try:
                         if before.get("head"):
@@ -552,6 +662,7 @@ def workspace_evidence(before: dict | None, after: dict | None,
                     except Exception:  # noqa: BLE001
                         pass
             files_touched = sorted(touched_set)
+            files_touched_digests = _compute_files_touched_digests(root, files_touched)
     return {
         "before": b_view,
         "after": a_view,
@@ -561,4 +672,5 @@ def workspace_evidence(before: dict | None, after: dict | None,
         "read_only_violation": read_only_violation,
         "attribution": attribution,
         "files_touched": files_touched,
+        "files_touched_digests": files_touched_digests,
     }

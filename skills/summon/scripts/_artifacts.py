@@ -91,7 +91,7 @@ def build_manifest(paths, cwd: str | None) -> tuple[dict | None, str | None]:
 
     # Imported lazily to avoid a module cycle: _executor calls build_manifest from
     # build_request_identity after _executor itself has finished importing.
-    from _executor import content_sha
+    from _executor import content_hashes
 
     files = []
     seen = set()
@@ -106,11 +106,11 @@ def build_manifest(paths, cwd: str | None) -> tuple[dict | None, str | None]:
         seen.add(key)
         try:
             before = os.stat(path)
-            sha = content_sha(path)
+            sha, sha_lf = content_hashes(path)
             after = os.stat(path)
         except OSError as e:
             return None, f"cannot read artifact {raw_path}: {e}"
-        if not sha or (before.st_size, before.st_mtime_ns) != (
+        if not sha or not sha_lf or (before.st_size, before.st_mtime_ns) != (
                 after.st_size, after.st_mtime_ns):
             return None, f"artifact changed or became unreadable while hashing: {raw_path}"
         pages, page_source = _page_count(path)
@@ -123,18 +123,28 @@ def build_manifest(paths, cwd: str | None) -> tuple[dict | None, str | None]:
         files.append({
             "path": rel,
             "sha256": sha,
+            "sha256_lf": sha_lf,
             "bytes": final.st_size,
             "page_count": pages,
             "page_count_source": page_source,
         })
 
-    canonical = json.dumps(files, sort_keys=True, separators=(",", ":"),
+    canonical_files = [{k: v for k, v in f.items() if k != "sha256_lf"} for f in files]
+    canonical = json.dumps(canonical_files, sort_keys=True, separators=(",", ":"),
                            ensure_ascii=True).encode("ascii")
+    canonical_lf_files = [
+        {"path": f["path"], "sha256_lf": f["sha256_lf"], "page_count": f["page_count"],
+         "page_count_source": f["page_count_source"]}
+        for f in files
+    ]
+    canonical_lf = json.dumps(canonical_lf_files, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=True).encode("ascii")
     return {
         "version": 1,
         "root": root,
         "files": files,
         "sha256": hashlib.sha256(canonical).hexdigest(),
+        "sha256_lf": hashlib.sha256(canonical_lf).hexdigest(),
     }, None
 
 

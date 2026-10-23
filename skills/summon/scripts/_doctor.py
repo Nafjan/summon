@@ -255,15 +255,18 @@ def _check_backends() -> dict:
         zcode_targets["zcode"] = None
         zcode_version = None
     try:
-        from _builder import resolve_codex_binary
+        from _builder import resolve_agy_binary, resolve_codex_binary
     except Exception:  # noqa: BLE001
         resolve_codex_binary = None
+        resolve_agy_binary = None
     paths = {
         n: (
             None if n == "zcode"
             else (resolve_codex_binary(which_fn=shutil.which)
                   if n == "codex" and resolve_codex_binary is not None
-                  else shutil.which(n))
+                  else (resolve_agy_binary(which_fn=shutil.which)
+                        if n == "agy" and resolve_agy_binary is not None
+                        else shutil.which(n)))
         )
         for n in names
     }

@@ -238,7 +238,11 @@ def _agy_live_models() -> tuple[str, list, str | None]:
     Fails soft: a missing/slow/erroring AGY yields ``unavailable`` rather than
     raising.  Discovery is advisory and never becomes served-model evidence.
     """
-    exe = shutil.which("agy")
+    try:
+        from _builder import resolve_agy_binary
+        exe = resolve_agy_binary(which_fn=shutil.which)
+    except Exception:  # noqa: BLE001
+        exe = shutil.which("agy")
     if not exe:
         return "unavailable", [], "agy not on PATH"
     from _spawn import run_flags

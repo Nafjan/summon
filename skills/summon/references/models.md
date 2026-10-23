@@ -145,18 +145,20 @@ emit neither form still truthfully retain `model.served: null` and
 | `kimi-coder` | kimi | `kimi-code/k3` + `effort: max` (pinned target; provider evidence may be absent) | maximum-thinking scoped implementation, refactoring, debugging, focused verification |
 | `kimi-k27-coder` | kimi | `kimi-code/kimi-for-coding` (explicit lower-context seat; provider evidence may be absent) | deliberate K2.7 implementation/debugging trade-off |
 | `argon-reviewer` | agy | `gemini-4-argon-high` (advisory target, not certified identity) | deep architecture, multimodal critique, and frontier advisory review |
+| `opus-agy-reviewer`, `opus-agy-coder` | agy | `claude-opus-5-5-high` (advisory target, not certified identity) | Antigravity Claude Opus 5.5 secondary review and scoped implementation |
+| `sonnet-agy-reviewer` | agy | `claude-sonnet-5-5-high` (advisory target, not certified identity) | Antigravity Claude Sonnet 5.5 fast secondary review |
 | `flash-reviewer` | agy | `gemini-3.8-flash-high` (advisory target, not certified identity) | vision, research, persona reviews, fast `/council` secondary |
 | `researcher` | agy | `gemini-3.8-flash-high` (exact policy; absent served proof blocks) | exact-model research; AGY currently cannot satisfy its identity gate |
 | `docs-writer`, `frontend`, `antigravity` | agy | `gemini-3.8-flash-high` (pinned target) | docs, frontend evaluation/design, scoped implementation |
 | `byteplus-coder`, `byteplus-glm-5-3-flash` | openai-compat | `deepseek-v4-pro`, `glm-5-3-flash` (BytePlus Coding Plan `byteplus-coding`; marketplace snapshots `deepseek-v4-pro-ga-260813`, `glm-5-3-flash-260828`, `deepseek-v4-1-flash-260910`) | text-only secondary review/coding opinions (`--allow-text-only`); verify `model.served` |
 | explicit ArkCLI Coding Plan seat | arkcli | refreshable plan roster (for example `deepseek-v4-1-flash-260910`, `glm-5-3-flash-260828`) | fast value/coding-plan secondary; plain-text CLI does not emit `model.served` unless JSON envelope is returned |
 
-Kimi's standard final-report contract is unchanged: `STATUS`, `SUMMARY`,
-`FOLLOW-UP`, and `HANDOFF` are all required. A response containing only
-`STATUS`, `VERDICT`, and `HANDOFF` is preserved and may be useful, but it is
-`report_ok: false` and `suspect: true` because it omitted the required bookends.
-Summon does not manufacture missing model evidence or silently relax that
-contract.
+Kimi's standard final-report contract asks for `STATUS`, `SUMMARY`,
+`FOLLOW-UP`, and `HANDOFF`. When a reviewer emits valid `STATUS`, `HANDOFF`,
+and (`SUMMARY` or `VERDICT`) while omitting `FOLLOW-UP`, Summon marks
+`report_ok: true` and `report_relaxed_bookends: true` so complete reviews are
+not rejected solely for omitting an empty follow-up line. Summon still does not
+manufacture missing model evidence.
 
 The `astra` seat pins the exact OpenAI model instead of inheriting the Codex default.
 It is the normal OpenAI ceiling for difficult planning and review, while Fable remains

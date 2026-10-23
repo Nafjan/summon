@@ -1090,3 +1090,175 @@ def test_wave3_f6_f7_f8_contracts(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     with pytest.raises(_swarm_coordinator.SwarmBudgetRefusal, match="budget_binding_required"):
         coord.workspace_budget_snapshot(now_ms=captured_now)
 
+
+def test_v3_6_2_field_feedback_contracts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import hashlib
+    import threading
+    import time
+    import _artifacts
+    import _background
+    import _builder
+    import _loader
+    import _receipt
+
+    # Item 3: Bundled Antigravity Claude seats and review task filtering
+    roster = _loader.list_agents(_loader.bundled_roster_dir())
+    by_name = {a["name"]: a for a in roster}
+    assert "opus-agy-reviewer" in by_name
+    assert by_name["opus-agy-reviewer"]["run_agent"] == "agy"
+    assert by_name["opus-agy-reviewer"]["model"] == "claude-opus-5-5-high"
+    assert by_name["opus-agy-reviewer"]["permission"] == "yolo"
+    assert "opus-agy-coder" in by_name
+    assert by_name["opus-agy-coder"]["model"] == "claude-opus-5-5-high"
+    assert "sonnet-agy-reviewer" in by_name
+    assert by_name["sonnet-agy-reviewer"]["model"] == "claude-sonnet-5-5-high"
+
+    rev_agents = _loader.filter_agents_for_task(roster, "review")
+    rev_names = [a["name"] for a in rev_agents]
+    assert "opus-agy-reviewer" in rev_names
+    assert "sonnet-agy-reviewer" in rev_names
+    assert "argon-reviewer" in rev_names
+    assert "opus-agy-coder" not in rev_names
+    # Enforced read-only seats appear before advisory agy seats
+    first_agy_idx = min(i for i, a in enumerate(rev_agents) if a["run_agent"] == "agy")
+    last_ro_idx = max(i for i, a in enumerate(rev_agents) if a["permission"] == "read-only")
+    assert last_ro_idx < first_agy_idx
+
+    # Item 4: resolve_agy_binary probes Windows standard paths when not on PATH
+    fake_la = tmp_path / "LocalAppData"
+    fake_agy = fake_la / "Programs" / "Antigravity" / "bin" / "agy.exe"
+    fake_agy.parent.mkdir(parents=True, exist_ok=True)
+    fake_agy.write_bytes(b"MZ-fake-agy")
+    monkeypatch.delenv("SUMMON_AGY_BIN", raising=False)
+    monkeypatch.delenv("AGY_BIN", raising=False)
+    resolved = _builder.resolve_agy_binary(which_fn=lambda _n: None, localappdata=str(fake_la))
+    assert resolved == str(fake_agy)
+
+    # Item 1: _acquire_execution_lease retries on contention and succeeds once released
+    host_root = tmp_path / "managed_host"
+    skill_scripts = host_root / "skills" / "summon" / "scripts"
+    skill_scripts.mkdir(parents=True, exist_ok=True)
+    fake_entry = skill_scripts / "run_subagent.py"
+    fake_entry.write_text("# entry\n", encoding="utf-8")
+    (host_root / "skills" / "summon" / ".summon-install.json").write_text(
+        json.dumps({"installed_by": "summon", "skill_dir": str(host_root / "skills" / "summon")}),
+        encoding="utf-8",
+    )
+    lease_1, token_1 = _background._acquire_execution_lease(str(fake_entry))
+    assert lease_1 is not None
+
+    def _delayed_release() -> None:
+        time.sleep(0.15)
+        _background._release_execution_lease(lease_1, token_1)
+
+    t_rel = threading.Thread(target=_delayed_release, daemon=True)
+    t_rel.start()
+    lease_2, token_2 = _background._acquire_execution_lease(str(fake_entry))
+    t_rel.join(timeout=2.0)
+    assert lease_2 == lease_1
+    _background._release_execution_lease(lease_2, token_2)
+
+    # Item 1 & 2: _setup_worktree per-repo lock and Windows relocation under SUMMON_WORKTREE_ROOT
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    from _spawn import run_flags
+    subprocess.run(["git", "-C", str(repo_dir), "init"], check=True, capture_output=True, **run_flags())
+    subprocess.run(["git", "-C", str(repo_dir), "config", "user.email", "test@example.com"], check=True, capture_output=True, **run_flags())
+    subprocess.run(["git", "-C", str(repo_dir), "config", "user.name", "Test"], check=True, capture_output=True, **run_flags())
+    deep_rel = Path("frontend/src/components/workspace/__tests__/" + ("a" * 160) + ".tsx")
+    deep_file = repo_dir / deep_rel
+    deep_file.parent.mkdir(parents=True, exist_ok=True)
+    deep_file.write_text("export const x = 1;\n", encoding="utf-8")
+    subprocess.run(["git", "-c", "core.longpaths=true", "-C", str(repo_dir), "add", "."], check=True, capture_output=True, **run_flags())
+    subprocess.run(["git", "-c", "core.longpaths=true", "-C", str(repo_dir), "commit", "-m", "init"], check=True, capture_output=True, **run_flags())
+
+    short_wt_root = tmp_path / "short-wt"
+    monkeypatch.setenv("SUMMON_WORKTREE_ROOT", str(short_wt_root))
+    wt_info = run_subagent._setup_worktree(str(repo_dir), "deep-lane-test", "argon-reviewer")
+    assert wt_info.get("relocated") is True
+    assert Path(wt_info["path"]).is_dir()
+    assert str(short_wt_root) in wt_info["path"]
+    removed_info = run_subagent._remove_worktree(wt_info)
+    assert removed_info["worktree_removed"] is True
+    assert removed_info["branch_removed"] is True
+    monkeypatch.delenv("SUMMON_WORKTREE_ROOT", raising=False)
+
+    # Item 5: Verdict normalization and relaxed bookend parsing
+    r_md = _executor._enrich(
+        {
+            "status": "success",
+            "exit_code": 0,
+            "result": "STATUS: DONE\n## Verdict: PASS WITH CONCERNS\nHANDOFF: Fix edge case before merge.",
+        },
+        None,
+    )
+    assert r_md["verdict"] == "conditional"
+    assert r_md["report_ok"] is True
+    assert r_md.get("report_relaxed_bookends") is True
+    assert r_md.get("suspect") is not True
+
+    r_zero = _executor._enrich(
+        {
+            "status": "success",
+            "exit_code": 0,
+            "result": "STATUS: DONE\nSUMMARY: All checks clean.\n**Verdict**: 0 blockers\nHANDOFF: Ready to merge.",
+        },
+        None,
+    )
+    assert r_zero["verdict"] == "pass"
+    assert r_zero["report_ok"] is True
+
+    r_neg = _executor._enrich(
+        {
+            "status": "success",
+            "exit_code": 0,
+            "result": "STATUS: DONE\nSUMMARY: Security regression found.\nVERDICT: DO NOT APPROVE\nFOLLOW-UP: Fix auth\nHANDOFF: Blocked.",
+        },
+        None,
+    )
+    assert r_neg["verdict"] == "block"
+
+    r_tmpl = _executor._enrich(
+        {
+            "status": "success",
+            "exit_code": 0,
+            "result": "STATUS: DONE\nSUMMARY: Template test.\nVERDICT: PASS | CONCERNS | BLOCK\nFOLLOW-UP: none\nHANDOFF: none",
+        },
+        None,
+    )
+    assert r_tmpl["verdict"] is None
+
+    # Item 7: Dual sha256 + sha256_lf on --artifact and files_touched_digests without changing manifest["sha256"]
+    crlf_dir = tmp_path / "crlf_dir"
+    lf_dir = tmp_path / "lf_dir"
+    crlf_dir.mkdir()
+    lf_dir.mkdir()
+    (crlf_dir / "sample.txt").write_bytes(b"line1\r\nline2\r\n")
+    (lf_dir / "sample.txt").write_bytes(b"line1\nline2\n")
+    m_crlf, err1 = _artifacts.build_manifest(["sample.txt"], str(crlf_dir))
+    m_lf, err2 = _artifacts.build_manifest(["sample.txt"], str(lf_dir))
+    assert err1 is None and err2 is None
+    assert m_crlf["files"][0]["sha256"] != m_lf["files"][0]["sha256"]
+    assert m_crlf["files"][0]["sha256_lf"] == m_lf["files"][0]["sha256_lf"]
+    assert m_crlf["sha256_lf"] == m_lf["sha256_lf"]
+
+    # Item 6 & 7: workspace_evidence files_touched_digests and partial_worktree_summary
+    snap_before = _receipt.workspace_snapshot(str(repo_dir))
+    (repo_dir / "new_partial.txt").write_bytes(b"partial\r\ncontent\r\n")
+    snap_after = _receipt.workspace_snapshot(str(repo_dir))
+    ws_ev = _receipt.workspace_evidence(snap_before, snap_after, permission="yolo", cli="codex")
+    assert "new_partial.txt" in ws_ev["files_touched"]
+    assert len(ws_ev["files_touched_digests"]) == 1
+    dig = ws_ev["files_touched_digests"][0]
+    assert dig["path"] == "new_partial.txt"
+    assert dig["status"] == "present"
+    assert dig["sha256"] != dig["sha256_lf"]
+    assert dig["sha256_lf"] == hashlib.sha256(b"partial\ncontent\n").hexdigest()
+
+    pw_sum = _receipt.partial_worktree_summary(snap_before, snap_after, ws_ev)
+    assert pw_sum["timed_out"] is True
+    assert pw_sum["has_partial_work"] is True
+    assert pw_sum["files_touched_count"] == 1
+    assert "new_partial.txt" in pw_sum["files_touched"]
+
+

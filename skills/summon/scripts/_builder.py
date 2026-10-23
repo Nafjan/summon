@@ -615,6 +615,64 @@ def resolve_codex_binary(
     return max(candidates, key=_rank)
 
 
+def resolve_agy_binary(
+    *,
+    which_fn=None,
+    localappdata: str | None = None,
+) -> str | None:
+    """Resolve the best available Antigravity (`agy`) CLI executable.
+
+    Precedence:
+    1. Explicit ``SUMMON_AGY_BIN`` or ``AGY_BIN`` environment variable (if pointing to a file).
+    2. ``shutil.which("agy")`` (if pointing to a file; on Windows ``.cmd``/``.bat`` shims are
+       resolved to a sibling ``agy.exe`` when present).
+    3. Standard Windows install locations (``%LOCALAPPDATA%\\agy\\bin\\agy.exe``,
+       ``%LOCALAPPDATA%\\Programs\\Antigravity\\bin\\agy.exe``,
+       ``%USERPROFILE%\\AppData\\Local\\agy\\bin\\agy.exe``).
+    """
+    for env_key in ("SUMMON_AGY_BIN", "AGY_BIN"):
+        val = (os.environ.get(env_key) or "").strip()
+        if val and os.path.isfile(val):
+            return val
+
+    eff_which = which_fn or shutil.which
+    # Respect unit tests that monkeypatch shutil.which unless explicit localappdata is passed.
+    if (eff_which is not _ORIG_SHUTIL_WHICH or shutil.which is not _ORIG_SHUTIL_WHICH) and localappdata is None:
+        hit = eff_which("agy")
+        if hit and os.name == "nt" and str(hit).lower().endswith((".cmd", ".bat")):
+            sibling_exe = os.path.join(os.path.dirname(str(hit)), "agy.exe")
+            if os.path.isfile(sibling_exe):
+                return sibling_exe
+        return hit
+
+    hit = eff_which("agy")
+    if hit and os.path.isfile(hit):
+        if os.name == "nt" and str(hit).lower().endswith((".cmd", ".bat")):
+            sibling_exe = os.path.join(os.path.dirname(str(hit)), "agy.exe")
+            if os.path.isfile(sibling_exe):
+                return sibling_exe
+        return hit
+
+    if os.name == "nt" or localappdata is not None:
+        la = localappdata if localappdata is not None else os.environ.get("LOCALAPPDATA")
+        win_candidates: list[str] = []
+        if la:
+            win_candidates.extend([
+                os.path.join(la, "agy", "bin", "agy.exe"),
+                os.path.join(la, "Programs", "Antigravity", "bin", "agy.exe"),
+            ])
+        user_prof = os.environ.get("USERPROFILE")
+        if user_prof:
+            win_candidates.extend([
+                os.path.join(user_prof, "AppData", "Local", "agy", "bin", "agy.exe"),
+                os.path.join(user_prof, "AppData", "Local", "Programs", "Antigravity", "bin", "agy.exe"),
+            ])
+        for cand in win_candidates:
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
 # Authority ORDER, lowest first. Used only to clamp downward; nothing raises a tier.
 _PERMISSION_ORDER = ("read-only", "safe-edit", "yolo")
 
@@ -2796,13 +2854,7 @@ def _agy_release_profile_lease(profile: str) -> bool:
 
 def _require_agy_print_timeout_support() -> None:
     """Fail before profile creation when AGY lacks the bounded-print contract."""
-    path = shutil.which("agy")
-    if not path and os.name == "nt":
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        fallback = (os.path.join(local_app_data, "agy", "bin", "agy.exe")
-                    if local_app_data else None)
-        if fallback and os.path.isfile(fallback):
-            path = fallback
+    path = resolve_agy_binary()
     if not path:
         raise ValueError("agy executable not found; install AGY 1.1.22 or newer")
     identity = _agy_binary_identity(path)
@@ -4068,6 +4120,9 @@ def _build_agy_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
         "AGY_PTY_DEADLINE": repr(deadline_sec),
         "AGY_PTY_QUIET": os.environ.get("AGY_PTY_QUIET", "20"),
     }
+    resolved_agy = resolve_agy_binary()
+    if resolved_agy:
+        env["AGY_RESOLVED_BIN"] = resolved_agy
     if _agy_wrapper_is_stream(wrapper):
         # The stream wrapper strips boundary flags to reduce accidental bypass risk when
         # used directly; summon already performs shared boundary stripping itself, so keep

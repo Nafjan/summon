@@ -31,10 +31,19 @@ class GeminiRosterTests(unittest.TestCase):
         argon = load_agent(str(agents), "argon-reviewer")
         self.assertEqual(argon[0], "agy")
         self.assertEqual(argon[5], "gemini-4-argon-high")
+        opus_agy_rev = load_agent(str(agents), "opus-agy-reviewer")
+        self.assertEqual(opus_agy_rev[0], "agy")
+        self.assertEqual(opus_agy_rev[5], "claude-opus-5-5-high")
+        opus_agy_cod = load_agent(str(agents), "opus-agy-coder")
+        self.assertEqual(opus_agy_cod[0], "agy")
+        self.assertEqual(opus_agy_cod[5], "claude-opus-5-5-high")
+        sonnet_agy_rev = load_agent(str(agents), "sonnet-agy-reviewer")
+        self.assertEqual(sonnet_agy_rev[0], "agy")
+        self.assertEqual(sonnet_agy_rev[5], "claude-sonnet-5-5-high")
 
     def test_advisory_seat_does_not_weaken_researcher_exact_contract(self):
         self.assertEqual(model_exact_policy("researcher"), (True, "named-seat"))
-        for name in ("argon-reviewer", "flash-reviewer", "frontend", "docs-writer", "antigravity"):
+        for name in ("argon-reviewer", "flash-reviewer", "opus-agy-reviewer", "opus-agy-coder", "sonnet-agy-reviewer", "frontend", "docs-writer", "antigravity"):
             with self.subTest(name=name):
                 self.assertEqual(model_exact_policy(name), (False, None))
                 self.assertEqual(model_exact_policy(name, explicit=True), (True, "cli"))

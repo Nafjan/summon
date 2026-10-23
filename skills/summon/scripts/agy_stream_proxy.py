@@ -19,14 +19,28 @@ import sys
 from _spawn import popen_flags
 
 def _find_agy() -> str | None:
+    for env_key in ("AGY_RESOLVED_BIN", "SUMMON_AGY_BIN", "AGY_BIN"):
+        env_bin = (os.environ.get(env_key) or "").strip()
+        if env_bin and os.path.isfile(env_bin):
+            return env_bin
+    try:
+        from _builder import resolve_agy_binary
+        resolved = resolve_agy_binary()
+        if resolved and os.path.isfile(resolved):
+            return resolved
+    except Exception:
+        pass
     p = shutil.which("agy")
     if p and os.path.isfile(p):
         return p
     local = os.environ.get("LOCALAPPDATA")
     if local:
-        cand = os.path.join(local, "agy", "bin", "agy.exe")
-        if os.path.isfile(cand):
-            return cand
+        for cand in (
+            os.path.join(local, "agy", "bin", "agy.exe"),
+            os.path.join(local, "Programs", "Antigravity", "bin", "agy.exe"),
+        ):
+            if os.path.isfile(cand):
+                return cand
     return None
 
 
