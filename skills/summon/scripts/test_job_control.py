@@ -1658,4 +1658,3 @@ def test_watch_jobs_snapshot_projects_authenticated_telemetry_and_rejects_tamper
     snap_malformed = _background.watch_jobs_snapshot(root, active_only=False)
     assert snap_malformed["count"] == 1
     assert snap_malformed["jobs"][0]["phase"] == "success"
-
