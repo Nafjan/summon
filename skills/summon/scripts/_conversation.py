@@ -18,6 +18,7 @@ import os
 import re
 import secrets
 import stat
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -129,7 +130,7 @@ def _redact_text(value: str) -> str:
     text = re.sub(r"(?<![\w])/(?:[^\r\n,;]*)", "[path]", text)
     text = re.sub(r"(?<![\w])(?:[A-Za-z0-9_.-]+/){1,}[A-Za-z0-9_.-]+", "[path]", text)
     text = re.sub(
-        r"""(?i)(?:token|password|secret|api[_-]?key)\s*[=:]\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s'"<>|]+)""",
+        r"""(?i)["']?(?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s'"<>|]+)""",
         "[redacted]",
         text,
     )
@@ -528,6 +529,72 @@ def _room_subject(records: Iterable[Mapping[str, Any]]) -> str | None:
     return None
 
 
+_MEMORY_PROMOTE_LOCK = threading.Lock()
+
+
+@contextmanager
+def _exclusive_file_lock(lock: Path, busy_message: str):
+    """Claim a short-lived cross-process lock with stale-owner reclamation."""
+    deadline = time.monotonic() + 2.0
+    fd = None
+    token = secrets.token_hex(16)
+
+    def pid_alive(pid: object) -> bool:
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+        return True
+
+    try:
+        while fd is None:
+            try:
+                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                marker = json.dumps({"pid": os.getpid(), "token": token,
+                                     "started_at": time.time()},
+                                    sort_keys=True, separators=(",", ":")).encode("ascii")
+                os.write(fd, marker)
+                try:
+                    os.fsync(fd)
+                except OSError:
+                    pass
+            except FileExistsError:
+                try:
+                    observed = lock.stat()
+                    if time.time() - observed.st_mtime > APPEND_LOCK_STALE_SECONDS:
+                        raw = lock.read_bytes()
+                        marker = json.loads(raw.decode("ascii"))
+                        owner_pid = marker.get("pid") if isinstance(marker, dict) else None
+                        owner_token = marker.get("token") if isinstance(marker, dict) else None
+                        if (isinstance(owner_token, str) and len(owner_token) == 32
+                                and not pid_alive(owner_pid)
+                                and lock.stat().st_mtime_ns == observed.st_mtime_ns):
+                            try:
+                                lock.unlink()
+                                continue
+                            except FileNotFoundError:
+                                continue
+                except (OSError, UnicodeError, ValueError, TypeError):
+                    pass
+                if time.monotonic() >= deadline:
+                    raise ConversationError(busy_message)
+                time.sleep(0.01)
+        yield
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            finally:
+                try:
+                    os.unlink(lock)
+                except FileNotFoundError:
+                    pass
+
+
 class ConversationJournal:
     """A small JSONL room journal with cursor/idempotency checks."""
 
@@ -719,71 +786,9 @@ class ConversationJournal:
 
     @contextmanager
     def _append_lock(self):
-        """Claim a short-lived cross-process append lock without a dependency.
-
-        A crashed writer must not brick a room forever.  The marker binds a
-        stale-lock reclaim to the original PID/token and an unchanged inode
-        timestamp, so a late owner cannot delete a replacement lock.
-        """
         lock = self.path.with_name(self.path.name + ".lock")
-        deadline = time.monotonic() + 2.0
-        fd = None
-        token = secrets.token_hex(16)
-
-        def pid_alive(pid: object) -> bool:
-            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-                return False
-            try:
-                os.kill(pid, 0)
-            except PermissionError:
-                return True
-            except (OSError, ProcessLookupError):
-                return False
-            return True
-
-        try:
-            while fd is None:
-                try:
-                    fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                    marker = json.dumps({"pid": os.getpid(), "token": token,
-                                         "started_at": time.time()},
-                                        sort_keys=True, separators=(",", ":")).encode("ascii")
-                    os.write(fd, marker)
-                    try:
-                        os.fsync(fd)
-                    except OSError:
-                        pass
-                except FileExistsError:
-                    try:
-                        observed = lock.stat()
-                        if time.time() - observed.st_mtime > APPEND_LOCK_STALE_SECONDS:
-                            raw = lock.read_bytes()
-                            marker = json.loads(raw.decode("ascii"))
-                            owner_pid = marker.get("pid") if isinstance(marker, dict) else None
-                            owner_token = marker.get("token") if isinstance(marker, dict) else None
-                            if (isinstance(owner_token, str) and len(owner_token) == 32
-                                    and not pid_alive(owner_pid)
-                                    and lock.stat().st_mtime_ns == observed.st_mtime_ns):
-                                try:
-                                    lock.unlink()
-                                    continue
-                                except FileNotFoundError:
-                                    continue
-                    except (OSError, UnicodeError, ValueError, TypeError):
-                        pass
-                    if time.monotonic() >= deadline:
-                        raise ConversationError("conversation journal is busy")
-                    time.sleep(0.01)
+        with _exclusive_file_lock(lock, "conversation journal is busy"):
             yield
-        finally:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                finally:
-                    try:
-                        os.unlink(lock)
-                    except FileNotFoundError:
-                        pass
 
     def _refresh_records(self) -> None:
         # ``create`` writes the header before the first session_created event.
@@ -831,6 +836,52 @@ class ConversationJournal:
             raise ConversationError(
                 "historical conversation room is read-only; fork or create a new room")
 
+    def _append_unlocked(self, event: str, actor_kind: str, actor: str,
+                         item: dict[str, Any], *, expected_cursor: int | None = None,
+                         eid: str, generation: int | None = None) -> dict[str, Any]:
+        _public_payload(event, item)
+        if generation is None:
+            generation = max(
+                [int(record.get("generation", 1)) for record in self._records
+                 if isinstance(record.get("generation", 1), int)] or [1]
+            )
+        if (not isinstance(generation, int) or isinstance(generation, bool)
+                or generation < 1):
+            raise ConversationError("invalid event generation")
+        if any(record.get("event_id") == eid for record in self._records):
+            existing = next(record for record in self._records if record.get("event_id") == eid)
+            if (existing.get("payload_sha256") != _sha256(item)
+                    or existing.get("event") != event
+                    or existing.get("actor_kind") != actor_kind
+                    or existing.get("actor_id") != actor):
+                raise ConversationError("event id was reused with different payload")
+            return self._public_record(existing)
+        if expected_cursor is not None and expected_cursor != len(self._records):
+            raise ConversationError("conversation cursor conflict")
+        if self._records and generation < int(self._records[-1].get("generation", 1)):
+            raise ConversationError("conversation generation regressed")
+        if len(self._records) >= MAX_EVENTS:
+            raise ConversationError("conversation room event limit reached")
+        record = {"record": "conversation_event", "schema_version": SCHEMA_VERSION,
+                  "session_id": self._header["session_id"], "cursor": len(self._records) + 1,
+                  "generation": generation, "created_at_ms": int(time.time() * 1000),
+                  "event_id": eid, "event": event,
+                  "actor_kind": actor_kind, "actor_id": actor,
+                  "payload_sha256": _sha256(item), "payload": item}
+        encoded = (json.dumps(record, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":")) + "\n").encode("utf-8")
+        if len(encoded) > MAX_EVENT_BYTES:
+            raise ConversationError("conversation event is too large")
+        try:
+            with open(self.path, "ab") as fh:
+                fh.write(encoded)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError as exc:
+            raise ConversationError("conversation event cannot be appended") from exc
+        self._records.append(record)
+        return self._public_record(record)
+
     def append(self, event: str, actor_kind: str, actor_id: str,
                payload: Mapping[str, Any], *, expected_cursor: int | None = None,
                event_id: str | None = None, generation: int | None = None) -> dict[str, Any]:
@@ -851,51 +902,13 @@ class ConversationJournal:
         # dedicated, receipt-bound seam rather than letting chat append ballots.
         if event in _CONTROL_EVENTS:
             raise ConversationError("control events must come from a verified kernel projection")
-        public = _public_payload(event, item)
+        _public_payload(event, item)
         eid = _safe_id(event_id or uuid.uuid4().hex, "event id")
         with self._append_lock():
             self._refresh_records()
-            if generation is None:
-                generation = max(
-                    [int(record.get("generation", 1)) for record in self._records
-                     if isinstance(record.get("generation", 1), int)] or [1]
-                )
-            if (not isinstance(generation, int) or isinstance(generation, bool)
-                    or generation < 1):
-                raise ConversationError("invalid event generation")
-            if any(record.get("event_id") == eid for record in self._records):
-                existing = next(record for record in self._records if record.get("event_id") == eid)
-                if (existing.get("payload_sha256") != _sha256(item)
-                        or existing.get("event") != event
-                        or existing.get("actor_kind") != actor_kind
-                        or existing.get("actor_id") != actor):
-                    raise ConversationError("event id was reused with different payload")
-                return self._public_record(existing)
-            if expected_cursor is not None and expected_cursor != len(self._records):
-                raise ConversationError("conversation cursor conflict")
-            if self._records and generation < int(self._records[-1].get("generation", 1)):
-                raise ConversationError("conversation generation regressed")
-            if len(self._records) >= MAX_EVENTS:
-                raise ConversationError("conversation room event limit reached")
-            record = {"record": "conversation_event", "schema_version": SCHEMA_VERSION,
-                      "session_id": self.room.session_id, "cursor": len(self._records) + 1,
-                      "generation": generation, "created_at_ms": int(time.time() * 1000),
-                      "event_id": eid, "event": event,
-                      "actor_kind": actor_kind, "actor_id": actor,
-                      "payload_sha256": _sha256(item), "payload": item}
-            encoded = (json.dumps(record, ensure_ascii=False, sort_keys=True,
-                                   separators=(",", ":")) + "\n").encode("utf-8")
-            if len(encoded) > MAX_EVENT_BYTES:
-                raise ConversationError("conversation event is too large")
-            try:
-                with open(self.path, "ab") as fh:
-                    fh.write(encoded)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-            except OSError as exc:
-                raise ConversationError("conversation event cannot be appended") from exc
-            self._records.append(record)
-            return self._public_record(record)
+            return self._append_unlocked(
+                event, actor_kind, actor, item,
+                expected_cursor=expected_cursor, eid=eid, generation=generation)
 
     @staticmethod
     def _public_record(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -948,6 +961,7 @@ class ConversationJournal:
         private journal; public/browser projections expose only a redacted
         preview and digest.
         """
+        self.ensure_mutable()
         sender_id = _safe_id(sender, "message sender")
         recipient_id = _safe_id(recipient, "message recipient")
         participant_ids = {item["agent"] for item in self._header.get("participants", [])}
@@ -961,56 +975,18 @@ class ConversationJournal:
         if not isinstance(speech_act, str) or speech_act not in SPEECH_ACTS:
             raise ConversationError("invalid speech act")
         if requires_reply is None:
-            effective_requires_reply = speech_act in REPLY_OBLIGATING_ACTS
+            base_requires_reply = speech_act in REPLY_OBLIGATING_ACTS
         elif isinstance(requires_reply, bool):
-            effective_requires_reply = requires_reply
+            base_requires_reply = requires_reply
         else:
             raise ConversationError("invalid requires_reply flag")
-        if effective_requires_reply and speech_act not in REPLY_OBLIGATING_ACTS:
+        if base_requires_reply and speech_act not in REPLY_OBLIGATING_ACTS:
             raise ConversationError("speech act cannot obligate a reply")
         if hops is not None and (not isinstance(hops, int) or isinstance(hops, bool) or hops < 0):
             raise ConversationError("invalid message hop count")
         reply_to_id = _safe_id(reply_to, "reply_to id") if reply_to is not None else None
-        if self._records:
-            self._refresh_records()
-        chain_hops = 0
-        if reply_to_id is not None:
-            parent = next(
-                (rec for rec in reversed(self._records)
-                 if rec.get("event") == "agent_message"
-                 and (rec.get("payload", {}).get("message_id") == reply_to_id
-                      or rec.get("event_id") == reply_to_id)),
-                None,
-            )
-            if parent is None:
-                raise ConversationError("reply_to references unknown agent message")
-            parent_hops = parent.get("payload", {}).get("hops", 0)
-            chain_hops = (int(parent_hops) if isinstance(parent_hops, int) else 0) + 1
-        elif recipient_id != "human":
-            for rec in reversed(self._records):
-                if rec.get("event") == "human_message":
-                    break
-                if rec.get("event") == "agent_message":
-                    rec_payload = rec.get("payload", {})
-                    if rec_payload.get("recipient") != "human" or rec_payload.get("escalated_to_human"):
-                        prev_hops = rec_payload.get("hops", 0)
-                        chain_hops = (int(prev_hops) if isinstance(prev_hops, int) else 0) + 1
-                        break
-        actual_recipient = recipient_id
-        original_recipient: str | None = None
-        escalated_to_human = False
-        if recipient_id == "human":
-            effective_hops = min(MAX_AGENT_MESSAGE_HOPS,
-                                 hops if hops is not None else chain_hops)
-        else:
-            effective_hops = max(hops if hops is not None else 0, chain_hops)
-            if effective_hops >= MAX_AGENT_MESSAGE_HOPS:
-                actual_recipient = "human"
-                original_recipient = recipient_id
-                escalated_to_human = True
-                effective_hops = MAX_AGENT_MESSAGE_HOPS
-                effective_requires_reply = False
-        mid = message_id or uuid.uuid4().hex
+        mid = _safe_id(message_id or uuid.uuid4().hex, "message id")
+        eid = _safe_id(f"agent-message-{mid}", "event id")
         seat = next((item for item in self._header.get("participants", [])
                      if item.get("agent") == sender_id), {})
         identity_fields: dict[str, Any] = {}
@@ -1018,24 +994,73 @@ class ConversationJournal:
             value = seat.get(key)
             if isinstance(value, str) and value:
                 identity_fields["provider" if key == "provider" else "model_target"] = value
-        payload: dict[str, Any] = {
-            "message_id": mid,
-            "sender": sender_id,
-            "recipient": actual_recipient,
-            "text": text,
-            "speech_act": speech_act,
-            "hops": effective_hops,
-            "requires_reply": effective_requires_reply,
-            **identity_fields,
-        }
-        if reply_to_id is not None:
-            payload["reply_to"] = reply_to_id
-        if escalated_to_human and original_recipient is not None:
-            payload["original_recipient"] = original_recipient
-            payload["escalated_to_human"] = True
-        return self.append("agent_message", "agent", sender_id, payload,
-                           expected_cursor=expected_cursor,
-                           event_id=f"agent-message-{mid}")
+        with self._append_lock():
+            self._refresh_records()
+            existing_idx = next(
+                (idx for idx, rec in enumerate(self._records) if rec.get("event_id") == eid),
+                None,
+            )
+            history = self._records[:existing_idx] if existing_idx is not None else self._records
+            non_human_count = 0
+            max_prev_hops = -1
+            for rec in reversed(history):
+                if rec.get("event") == "human_message":
+                    break
+                if rec.get("event") == "agent_message":
+                    rec_payload = rec.get("payload", {})
+                    if rec_payload.get("recipient") != "human" or rec_payload.get("escalated_to_human"):
+                        non_human_count += 1
+                        prev_hops = rec_payload.get("hops", 0)
+                        if isinstance(prev_hops, int) and not isinstance(prev_hops, bool):
+                            max_prev_hops = max(max_prev_hops, prev_hops)
+            room_hops = max(non_human_count, max_prev_hops + 1) if non_human_count > 0 else 0
+            chain_hops = room_hops if recipient_id != "human" else 0
+            if reply_to_id is not None:
+                parent = next(
+                    (rec for rec in reversed(history)
+                     if rec.get("event") == "agent_message"
+                     and (rec.get("payload", {}).get("message_id") == reply_to_id
+                          or rec.get("event_id") == reply_to_id)),
+                    None,
+                )
+                if parent is None:
+                    raise ConversationError("reply_to references unknown agent message")
+                parent_hops = parent.get("payload", {}).get("hops", 0)
+                reply_hops = (int(parent_hops) if isinstance(parent_hops, int) else 0) + 1
+                chain_hops = max(reply_hops, room_hops) if recipient_id != "human" else reply_hops
+            actual_recipient = recipient_id
+            original_recipient: str | None = None
+            escalated_to_human = False
+            effective_requires_reply = base_requires_reply
+            if recipient_id == "human":
+                effective_hops = min(MAX_AGENT_MESSAGE_HOPS,
+                                     hops if hops is not None else chain_hops)
+            else:
+                effective_hops = max(hops if hops is not None else 0, chain_hops)
+                if effective_hops >= MAX_AGENT_MESSAGE_HOPS:
+                    actual_recipient = "human"
+                    original_recipient = recipient_id
+                    escalated_to_human = True
+                    effective_hops = MAX_AGENT_MESSAGE_HOPS
+                    effective_requires_reply = False
+            payload: dict[str, Any] = {
+                "message_id": mid,
+                "sender": sender_id,
+                "recipient": actual_recipient,
+                "text": text,
+                "speech_act": speech_act,
+                "hops": effective_hops,
+                "requires_reply": effective_requires_reply,
+                **identity_fields,
+            }
+            if reply_to_id is not None:
+                payload["reply_to"] = reply_to_id
+            if escalated_to_human and original_recipient is not None:
+                payload["original_recipient"] = original_recipient
+                payload["escalated_to_human"] = True
+            return self._append_unlocked(
+                "agent_message", "agent", sender_id, payload,
+                expected_cursor=expected_cursor, eid=eid)
 
     def append_memory_proposal(self, proposer: str, *, summary: str,
                                proposed_entry: str, rationale: str = "",
@@ -1048,25 +1073,33 @@ class ConversationJournal:
         directly.  Promotion requires an explicit human-confirmed call to
         ``promote_memory_proposal``.
         """
+        self.ensure_mutable()
         proposer_id = _safe_id(proposer, "proposer")
         participant_ids = {item["agent"] for item in self._header.get("participants", [])}
         if proposer_id not in participant_ids:
             raise ConversationError("memory proposer is not a room participant")
-        if self._records:
+        pid = _safe_id(proposal_id or f"memprop-{uuid.uuid4().hex[:16]}", "proposal id")
+        eid = _safe_id(f"memory-proposal-{pid}", "event id")
+        with self._append_lock():
             self._refresh_records()
-        artifact = memory_proposal(
-            session_id=self.room.session_id,
-            source_cursor=max(1, len(self._records)),
-            proposer=proposer_id,
-            summary=summary,
-            proposed_entry=proposed_entry,
-            rationale=rationale,
-            base_memory_sha256=base_memory_sha256,
-            proposal_id=proposal_id,
-        )
-        return self.append("memory_proposal", "agent", proposer_id, artifact,
-                           expected_cursor=expected_cursor,
-                           event_id=f"memory-proposal-{artifact['proposal_id']}")
+            existing_idx = next(
+                (idx for idx, rec in enumerate(self._records) if rec.get("event_id") == eid),
+                None,
+            )
+            history = self._records[:existing_idx] if existing_idx is not None else self._records
+            artifact = memory_proposal(
+                session_id=self._header["session_id"],
+                source_cursor=max(1, len(history)),
+                proposer=proposer_id,
+                summary=summary,
+                proposed_entry=proposed_entry,
+                rationale=rationale,
+                base_memory_sha256=base_memory_sha256,
+                proposal_id=pid,
+            )
+            return self._append_unlocked(
+                "memory_proposal", "agent", proposer_id, artifact,
+                expected_cursor=expected_cursor, eid=eid)
 
     def agent_inbox(self, recipient: str, *, after_cursor: int = 0,
                     native: bool = True) -> list[dict[str, Any]]:
@@ -1312,42 +1345,44 @@ def promote_memory_proposal(artifact: Mapping[str, Any], *,
     else:
         agents_dir.mkdir(parents=True, exist_ok=True)
     memory_path = agents_dir / "memory.md"
-    current_text = ""
-    current_sha256: str | None = None
-    if memory_path.exists() or memory_path.is_symlink():
-        _check_not_reparse(memory_path, "memory.md")
-        if not memory_path.is_file():
-            raise ConversationError("memory.md is not a regular file")
-        try:
-            raw_bytes = memory_path.read_bytes()
-            current_text = raw_bytes.decode("utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise ConversationError("memory.md cannot be read") from exc
-        current_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    lock_path = agents_dir / ".memory.md.lock"
+    with _MEMORY_PROMOTE_LOCK, _exclusive_file_lock(lock_path, "memory.md is busy"):
+        current_text = ""
+        current_sha256: str | None = None
+        if memory_path.exists() or memory_path.is_symlink():
+            _check_not_reparse(memory_path, "memory.md")
+            if not memory_path.is_file():
+                raise ConversationError("memory.md is not a regular file")
+            try:
+                raw_bytes = memory_path.read_bytes()
+                current_text = raw_bytes.decode("utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise ConversationError("memory.md cannot be read") from exc
+            current_sha256 = hashlib.sha256(raw_bytes).hexdigest()
 
-    if expected_memory_sha256 is not None and current_sha256 != expected_memory_sha256:
-        raise ConversationError("memory.md digest does not match expected_memory_sha256")
-    if base_sha is not None and current_sha256 != base_sha:
-        raise ConversationError("memory.md digest changed since proposal base_memory_sha256")
+        if expected_memory_sha256 is not None and current_sha256 != expected_memory_sha256:
+            raise ConversationError("memory.md digest does not match expected_memory_sha256")
+        if base_sha is not None and current_sha256 != base_sha:
+            raise ConversationError("memory.md digest changed since proposal base_memory_sha256")
 
-    separator = "" if not current_text or current_text.endswith("\n") else "\n"
-    updated_text = f"{current_text}{separator}- [{proposal_id}] {entry_text}\n"
-    updated_bytes = updated_text.encode("utf-8")
-    new_sha256 = hashlib.sha256(updated_bytes).hexdigest()
-    tmp_path = agents_dir / f".memory.md.{uuid.uuid4().hex}.tmp"
-    try:
-        fd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(updated_bytes)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, memory_path)
-    except OSError as exc:
+        separator = "" if not current_text or current_text.endswith("\n") else "\n"
+        updated_text = f"{current_text}{separator}- [{proposal_id}] {entry_text}\n"
+        updated_bytes = updated_text.encode("utf-8")
+        new_sha256 = hashlib.sha256(updated_bytes).hexdigest()
+        tmp_path = agents_dir / f".memory.md.{uuid.uuid4().hex}.tmp"
         try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise ConversationError("memory.md cannot be updated") from exc
+            fd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(updated_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, memory_path)
+        except OSError as exc:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise ConversationError("memory.md cannot be updated") from exc
 
     return {
         "status": "promoted",

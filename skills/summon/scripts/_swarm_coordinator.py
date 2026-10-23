@@ -824,8 +824,7 @@ def _bounded_reason(value: Any, label: str = "reason") -> str:
     text = re.sub(r"(?<![\w])/(?:[^\r\n,;]*)", "[path]", text)
     text = re.sub(r"(?<![\w])(?:[A-Za-z0-9_.-]+/){1,}[A-Za-z0-9_.-]+", "[path]", text)
     text = re.sub(
-        r"(?i)(?:token|password|secret|api[_-]?key)\s*[=:]\s*"
-        r'(?:"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|[^\s\'"<>|]+)',
+        r"""(?i)["']?(?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s'"<>|]+)""",
         "[redacted]", text)
     text = re.sub(r"(?i)\b(?:bearer\s+)?(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16})\b",
                   "[redacted]", text)
@@ -1842,11 +1841,16 @@ class SwarmCoordinator:
                 (0 if claim.get("cancel_requested") else _BOUND_CANCEL_REQUESTED)
                 + (0 if claim.get("cancel_acknowledged") else _BOUND_CANCEL_ACKNOWLEDGED)
                 + _BOUND_TASK_CANCELLED + _BOUND_CLAIM_INDETERMINATE
-                + max(_BOUND_RETRY_AUTHORIZED, _BOUND_TASK_BLOCKED, _BOUND_HUMAN_QUESTION)
+                + _BOUND_RETRY_AUTHORIZED
+                + max(_BOUND_TASK_BLOCKED, _BOUND_HUMAN_QUESTION)
                 + _BOUND_TASK_COMPLETED + _BOUND_TASK_FAILED + _BOUND_CLAIM_RELEASED
             )
         if status == "indeterminate" and not task.get("retry_authorized"):
             return max(_BOUND_RETRY_AUTHORIZED, _BOUND_TASK_BLOCKED, _BOUND_HUMAN_QUESTION)
+        if (status == "blocked"
+                and task.get("terminal") == "blocked"
+                and not task.get("retry_authorized")):
+            return _BOUND_RETRY_AUTHORIZED
         return 0
 
     @staticmethod
@@ -4107,16 +4111,17 @@ class SwarmCoordinator:
             if task is None:
                 raise SwarmCoordinatorError("unknown task")
             claims = [state["claims"][claim_id] for claim_id in task["attempts"]]
-            uncertain = [claim for claim in claims if claim["status"] in {"active", "indeterminate"}]
+            uncertain = [claim for claim in claims
+                         if claim["status"] in {"active", "indeterminate", "blocked"}]
             if not uncertain:
                 raise SwarmConflictError("task has no indeterminate claim")
             latest = uncertain[-1]
             event = "retry_authorized" if allow_retry else "task_blocked"
             # A recovery decision is not permission to append the same
             # uncertainty marker repeatedly.  Once the claim is indeterminate
-            # the durable prefix already records that possible spend; only the
-            # explicit human decision is new evidence.
-            if latest["status"] == "indeterminate":
+            # or blocked the durable prefix already records that possible
+            # spend; only the explicit human decision is new evidence.
+            if latest["status"] in {"indeterminate", "blocked"}:
                 if (allow_retry and task.get("retry_authorized")) or (
                         not allow_retry and task.get("terminal") == "blocked"):
                     return self._response(
@@ -4155,6 +4160,12 @@ class SwarmCoordinator:
                 return self._response("retry_authorized", task_id=task_id,
                                       previous_claim_id=latest["claim_id"])
             return self._response("blocked", task_id=task_id, uncertain_spend=True)
+
+    def resolve_blocked(self, task_id: str, *, allow_retry: bool = True,
+                        reason: str, human_confirmed: bool = False) -> dict[str, Any]:
+        return self.acknowledge_indeterminate(
+            task_id, allow_retry=allow_retry, reason=reason,
+            human_confirmed=human_confirmed)
 
     def close(self) -> dict[str, Any]:
         with self._mutation() as (owner, state, _torn):

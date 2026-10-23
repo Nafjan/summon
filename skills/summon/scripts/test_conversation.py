@@ -526,6 +526,16 @@ class ConversationJournalTests(unittest.TestCase):
                 message_id=msg_id, speech_act="request", reply_to=prev_id)
             events.append(evt)
             prev_id = msg_id
+        # Retrying the same message_id with identical arguments is idempotent
+        retry_first = room.append_agent_message(
+            "sol", "fable", "ping 0",
+            message_id="hop-0", speech_act="request", reply_to=None)
+        self.assertEqual(retry_first, events[0])
+        with self.assertRaises(ConversationError):
+            room.append_agent_message(
+                "sol", "fable", "different text",
+                message_id="hop-0", speech_act="request", reply_to=None)
+
         self.assertEqual(events[0]["payload"]["hops"], 0)
         self.assertTrue(events[0]["payload"]["requires_reply"])
         self.assertEqual(events[0]["payload"]["recipient"], "fable")
@@ -536,6 +546,25 @@ class ConversationJournalTests(unittest.TestCase):
         self.assertEqual(escalated["payload"]["original_recipient"], "fable")
         self.assertTrue(escalated["payload"]["escalated_to_human"])
         self.assertFalse(escalated["payload"]["requires_reply"])
+
+        # Referencing an old reply_to cannot reset or bypass accumulated room hops
+        room.append_human_message("reset hop window")
+        first_after = room.append_agent_message(
+            "sol", "fable", "root message", message_id="root-msg", speech_act="request")
+        self.assertEqual(first_after["payload"]["hops"], 0)
+        stale_reply_events = []
+        for idx in range(1, MAX_AGENT_MESSAGE_HOPS + 1):
+            sender = "fable" if idx % 2 == 1 else "sol"
+            recipient = "sol" if idx % 2 == 1 else "fable"
+            stale_reply_events.append(
+                room.append_agent_message(
+                    sender, recipient, f"stale reply {idx}",
+                    message_id=f"stale-{idx}", speech_act="request",
+                    reply_to="root-msg")
+            )
+        self.assertEqual(stale_reply_events[-1]["payload"]["hops"], MAX_AGENT_MESSAGE_HOPS)
+        self.assertEqual(stale_reply_events[-1]["payload"]["recipient"], "human")
+        self.assertTrue(stale_reply_events[-1]["payload"]["escalated_to_human"])
 
     def test_memory_proposal_is_context_only_and_requires_human_confirmed_cas_promotion(self):
         agents_dir = self.project / ".agents"
@@ -549,7 +578,7 @@ class ConversationJournalTests(unittest.TestCase):
         room = self._room()
         event = room.append_memory_proposal(
             "sol",
-            summary="Record retry backoff policy",
+            summary='Record retry backoff policy {"password": "secret meadow 42"}',
             proposed_entry="Always cap background retry loops at 3 attempts.",
             rationale="Observed during swarm testing",
             base_memory_sha256=base_sha,
@@ -557,10 +586,29 @@ class ConversationJournalTests(unittest.TestCase):
         )
         self.assertEqual(event["event"], "memory_proposal")
         self.assertEqual(event["payload"]["authority"], "context-only")
+        self.assertNotIn("secret meadow 42", json.dumps(event))
+        # Idempotent retry of the same proposal_id succeeds
+        retry_event = room.append_memory_proposal(
+            "sol",
+            summary='Record retry backoff policy {"password": "secret meadow 42"}',
+            proposed_entry="Always cap background retry loops at 3 attempts.",
+            rationale="Observed during swarm testing",
+            base_memory_sha256=base_sha,
+            proposal_id="prop-retry-cap",
+        )
+        self.assertEqual(retry_event, event)
         # .agents/memory.md must be completely untouched by append_memory_proposal
         self.assertEqual(memory_file.read_text(encoding="utf-8"), initial_content)
 
         native_artifact = room.events(native=True)[-1]["payload"]
+        second_artifact = room.append_memory_proposal(
+            "sol",
+            summary="Second concurrent proposal",
+            proposed_entry="Never bypass the circuit breaker.",
+            base_memory_sha256=base_sha,
+            proposal_id="prop-breaker",
+        )
+        native_second = room.events(native=True)[-1]["payload"]
         # Unconfirmed promotion fails closed
         with self.assertRaises(ConversationError):
             promote_memory_proposal(
@@ -570,20 +618,27 @@ class ConversationJournalTests(unittest.TestCase):
             promote_memory_proposal(
                 native_artifact, project_root=self.project, human_confirmed=True,
                 expected_memory_sha256="0" * 64)
-        # Human-confirmed promotion with matching CAS digest updates .agents/memory.md
-        promoted = promote_memory_proposal(
-            native_artifact, project_root=self.project, human_confirmed=True,
-            expected_memory_sha256=base_sha)
+        # Concurrent promotions against the same base_memory_sha256 serialize under lock:
+        # exactly one succeeds and the other fails CAS
+        outcomes = []
+        def try_promote(art):
+            try:
+                return ("ok", promote_memory_proposal(
+                    art, project_root=self.project, human_confirmed=True,
+                    expected_memory_sha256=base_sha))
+            except ConversationError as exc:
+                return ("err", str(exc))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(try_promote, [native_artifact, native_second]))
+        successes = [val for tag, val in outcomes if tag == "ok"]
+        errors = [val for tag, val in outcomes if tag == "err"]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(errors), 1)
+        promoted = successes[0]
         self.assertEqual(promoted["status"], "promoted")
         self.assertEqual(promoted["previous_memory_sha256"], base_sha)
         updated_bytes = memory_file.read_bytes()
         self.assertEqual(promoted["memory_sha256"], hashlib.sha256(updated_bytes).hexdigest())
-        self.assertIn("Always cap background retry loops at 3 attempts.",
-                      updated_bytes.decode("utf-8"))
-        # Re-applying the same proposal now fails CAS check against base_memory_sha256
-        with self.assertRaises(ConversationError):
-            promote_memory_proposal(
-                native_artifact, project_root=self.project, human_confirmed=True)
 
 
 class ConversationPolicyTests(unittest.TestCase):

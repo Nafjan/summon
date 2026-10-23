@@ -1041,7 +1041,10 @@ class SwarmCoordinatorTests(unittest.TestCase):
             "worker-a", task_id="task-a", claim_id=claim["claim_id"],
             attempt=claim["attempt"], lease_generation=claim["lease_generation"],
             request_sha256=self.request,
-            question=r"Which schema for C:\private\repo with api_key=sk-1234567890abcdef1234?",
+            question=(
+                r'Which schema for C:\private\repo with api_key=sk-1234567890abcdef1234 '
+                r'and {"password": "secret meadow 42"}?'
+            ),
             reason="needs_schema_decision",
         )
         self.assertEqual(asked["status"], "blocked")
@@ -1051,10 +1054,27 @@ class SwarmCoordinatorTests(unittest.TestCase):
         self.assertIn("human_question", task_view)
         self.assertNotIn(r"C:\private\repo", task_view["human_question"])
         self.assertNotIn("sk-1234567890abcdef1234", task_view["human_question"])
+        self.assertNotIn("secret meadow 42", task_view["human_question"])
         events = self.coordinator.events()
         self.assertEqual(events[-1]["event"], "human_question")
         self.assertIn("question", events[-1])
         self.assertNotIn("sk-1234567890abcdef1234", json_text(events[-1]))
+        self.assertNotIn("secret meadow 42", json_text(events[-1]))
+
+        # Human operator authorizes retry after answering question
+        recovered = self.coordinator.resolve_blocked(
+            "task-a", allow_retry=True, reason="schema v2 approved", human_confirmed=True)
+        self.assertEqual(recovered["status"], "retry_authorized")
+        status_after = self.coordinator.status()
+        self.assertNotIn("human_question", status_after["tasks"][0])
+        claim_retry = self.coordinator.claim("worker-a", "task-a", request_sha256=self.request)
+        self.assertEqual(claim_retry["attempt"], 2)
+        self.coordinator.complete(
+            "worker-a", task_id="task-a", claim_id=claim_retry["claim_id"],
+            attempt=claim_retry["attempt"], lease_generation=claim_retry["lease_generation"],
+            request_sha256=self.request, envelope_sha256="e" * 64)
+        self.assertEqual(self.coordinator.status()["tasks"][0]["status"], "completed")
+
         # Also test direct block() helper on a second run
         coord2 = SwarmCoordinator.create(
             self.temp.name, "swarm-block", project_root_sha256=self.project,
