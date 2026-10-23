@@ -13,6 +13,7 @@ import json
 import math
 import os
 import stat
+import threading
 import time
 from contextlib import contextmanager
 
@@ -908,9 +909,11 @@ class RuntimeControl:
         self.attention_required = False
         self.auto_extensions = 0
         self.operator_extensions = 0
+        self.operator_extension_ms = 0
         self.extension_ms = 0
         self.steers: list[dict] = []
         self._last_publish = 0.0
+        self._lock = threading.RLock()
         # Latched for the attempt: a later heartbeat cannot restore a missed
         # observation. This is diagnostics, never command/launch authority.
         self.heartbeat_unavailable = False
@@ -1079,6 +1082,10 @@ class RuntimeControl:
 
     def refresh(self, *, force: bool = False) -> int:
         """Read new commands; return newly authorized extension milliseconds."""
+        with self._lock:
+            return self._refresh_locked(force=force)
+
+    def _refresh_locked(self, *, force: bool = False) -> int:
         if self.control_untrusted:
             return 0
         now = self.clock()
@@ -1154,6 +1161,7 @@ class RuntimeControl:
                             self.hard_deadline += applied / 1000
                             self.deadline += applied / 1000
                             self.operator_extensions += 1
+                            self.operator_extension_ms += applied
             elif action == "steer" and isinstance(command.get("message"), str):
                 message = command["message"]
                 if 0 < len(message) <= MAX_STEER_CHARS:
@@ -1206,54 +1214,62 @@ class RuntimeControl:
 
     def checkpoint(self, *, active: bool) -> int:
         """At the soft deadline, extend active work or open an attention grace."""
-        now = self.clock()
-        if now < self.deadline or now >= self.hard_deadline:
-            return 0
-        remaining = max(0, int((self.hard_deadline - self.deadline) * 1000))
-        if remaining <= 0:
-            return 0
-        if active:
-            extension = min(self.checkpoint_ms, remaining)
-            self.auto_extensions += 1
-            self.attention_required = False
-        else:
-            if self.attention_required:
+        with self._lock:
+            now = self.clock()
+            if now < self.deadline or now >= self.hard_deadline:
                 return 0
-            extension = min(max(60_000, self.checkpoint_ms // 2), remaining)
-            self.attention_required = True
-        self.deadline += extension / 1000
-        self.extension_ms += extension
-        return extension
+            remaining = max(0, int((self.hard_deadline - self.deadline) * 1000))
+            if remaining <= 0:
+                return 0
+            if active:
+                extension = min(self.checkpoint_ms, remaining)
+                self.auto_extensions += 1
+                self.attention_required = False
+            else:
+                if self.attention_required:
+                    return 0
+                extension = min(max(60_000, self.checkpoint_ms // 2), remaining)
+                self.attention_required = True
+            self.deadline += extension / 1000
+            self.extension_ms += extension
+            return extension
 
     def record_breaker(self, decision: dict) -> dict | None:
         """Persist a breaker transition into the authenticated control log and update state."""
         from _breaker import sanitize_record as _sanitize_breaker
-        sanitized = _sanitize_breaker(decision)
-        if sanitized is None:
-            return None
-        if decision.get("transitioned") and not self.control_untrusted:
-            try:
-                queued = _append_breaker_command(
-                    self.path, self.job_id, self.nonce, decision,
-                    wall_clock=self.wall_clock)
-            except Exception:  # noqa: BLE001 - a corrupt/legacy control log cannot be appended
-                rollback_fn = getattr(decision, "_rollback", None)
-                if callable(rollback_fn):
-                    rollback_fn()
+        with self._lock:
+            sanitized = _sanitize_breaker(decision)
+            if sanitized is None:
                 return None
+            if decision.get("transitioned") and not self.control_untrusted:
+                try:
+                    queued = _append_breaker_command(
+                        self.path, self.job_id, self.nonce, decision,
+                        wall_clock=self.wall_clock)
+                except Exception:  # noqa: BLE001 - a corrupt/legacy control log cannot be appended
+                    rollback_fn = getattr(decision, "_rollback", None)
+                    if callable(rollback_fn):
+                        rollback_fn()
+                    return None
+                commit_fn = getattr(decision, "_commit", None)
+                if callable(commit_fn):
+                    commit_fn()
+                self.breaker = sanitized
+                self._refresh_locked(force=True)
+                return queued
+            commit_fn = getattr(decision, "_commit", None)
+            if callable(commit_fn):
+                commit_fn()
             self.breaker = sanitized
-            self.refresh(force=True)
-            return queued
-        self.breaker = sanitized
-        self.breaker_level = str(sanitized.get("level") or self.breaker_level)
-        if sanitized.get("enforced"):
-            if self.breaker_level == "constrained":
-                self.constrained = True
-            elif self.breaker_level == "stopped":
-                self.breaker_stopped = True
-            elif self.breaker_level == "healthy":
-                self.constrained = False
-        return None
+            self.breaker_level = str(sanitized.get("level") or self.breaker_level)
+            if sanitized.get("enforced"):
+                if self.breaker_level == "constrained":
+                    self.constrained = True
+                elif self.breaker_level == "stopped":
+                    self.breaker_stopped = True
+                elif self.breaker_level == "healthy":
+                    self.constrained = False
+            return None
 
     def expired(self) -> bool:
         now = self.clock()

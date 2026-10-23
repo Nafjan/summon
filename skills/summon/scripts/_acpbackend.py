@@ -405,9 +405,13 @@ class _AcpClient:
         """Send a request and wait for its result. Raises _AcpError on a
         JSON-RPC error result, _AcpTimeout when the slice expires."""
         clock_fn = getattr(self._runtime_control, "clock", None) or time.monotonic
+        seen_op_ext_ms = int(getattr(self._runtime_control, "operator_extension_ms", 0) or 0)
         pre_added_ms = self._poll_breaker()
-        if pre_added_ms > 0:
-            timeout += pre_added_ms / 1000.0
+        cur_op_ext_ms = int(getattr(self._runtime_control, "operator_extension_ms", 0) or 0)
+        delta_pre = max(pre_added_ms, max(0, cur_op_ext_ms - seen_op_ext_ms))
+        if delta_pre > 0:
+            timeout += delta_pre / 1000.0
+            seen_op_ext_ms = max(seen_op_ext_ms + delta_pre, cur_op_ext_ms)
         with self._id_lock:
             rid = self._next_id
             self._next_id += 1
@@ -451,9 +455,12 @@ class _AcpClient:
                 with self._id_lock:
                     self._pending.pop(rid, None)
                 raise
-            if added_ms > 0:
-                deadline += added_ms / 1000.0
-                timeout += added_ms / 1000.0
+            cur_op_ext_ms = int(getattr(self._runtime_control, "operator_extension_ms", 0) or 0)
+            delta_ms = max(added_ms, max(0, cur_op_ext_ms - seen_op_ext_ms))
+            if delta_ms > 0:
+                deadline += delta_ms / 1000.0
+                timeout += delta_ms / 1000.0
+                seen_op_ext_ms = max(seen_op_ext_ms + delta_ms, cur_op_ext_ms)
             if clock_fn() >= deadline:
                 break
         if not slot["event"].is_set():

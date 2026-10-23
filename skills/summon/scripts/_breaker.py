@@ -106,6 +106,10 @@ class _BreakerDecision(dict):
         self._prev_state = prev_state
         self._rolled_back = False
 
+    def _commit(self) -> None:
+        self._breaker = None
+        self._prev_state = None
+
     def _rollback(self) -> None:
         if self._rolled_back or self._breaker is None or self._prev_state is None:
             return
@@ -113,7 +117,21 @@ class _BreakerDecision(dict):
         self._breaker.level = prev_level
         self._breaker.transitions = prev_transitions
         self._breaker.last = prev_last
+        self["to_level"] = prev_level
+        self["level"] = prev_level
+        self["transitioned"] = False
+        self["escalated"] = False
+        self["recovered"] = False
+        self["action"] = "none"
+        self["enforced"] = False
+        self["transitions"] = prev_transitions
+        self["constrained_permission"] = (
+            "read-only" if prev_level == "constrained" else None
+        )
+        self["steering_message"] = None
         self._rolled_back = True
+        self._breaker = None
+        self._prev_state = None
 
 
 class GraduatedBreaker:
@@ -196,7 +214,7 @@ class GraduatedBreaker:
             work_tokens=work_tokens, extra_triggers=extra_triggers)
         prev = self.level
         prev_transitions = self.transitions
-        prev_last = self.last
+        prev_last = dict(self.last) if isinstance(self.last, dict) else None
         prev_idx = LEVELS.index(prev)
         max_idx = 3 if self.allow_stop else 2
 
@@ -232,7 +250,7 @@ class GraduatedBreaker:
         steering_msg = (fixed_steering_message(recorded_signals)
                         if nxt == "steering" and (escalated or bool(triggers))
                         else None)
-        decision = _BreakerDecision({
+        plain_decision = {
             "schema": SCHEMA,
             "mode": self.mode,
             "allow_stop": self.allow_stop,
@@ -250,9 +268,13 @@ class GraduatedBreaker:
             "compaction_grace": self.in_compaction_grace(),
             "constrained_permission": "read-only" if nxt == "constrained" else None,
             "steering_message": steering_msg,
-        }, breaker=self, prev_state=(prev, prev_transitions, prev_last))
-        self.last = decision
-        return decision
+        }
+        self.last = plain_decision
+        return _BreakerDecision(
+            plain_decision,
+            breaker=self if transitioned else None,
+            prev_state=(prev, prev_transitions, prev_last) if transitioned else None,
+        )
 
     def sync_from_control(self, control: object) -> None:
         """Restore breaker state from a replayed RuntimeControl log."""

@@ -888,6 +888,35 @@ def test_failed_breaker_append_rolls_back_in_memory_state_and_rejects_chain_mism
     assert b2.level == "steering"
     assert rc.breaker_level == "healthy"
     assert rc.constrained is False
+    # R3: bad_decision itself is rolled back in-place so _executor cannot enforce it!
+    assert bad_decision["enforced"] is False
+    assert bad_decision["action"] == "none"
+    assert bad_decision["transitioned"] is False
+    assert bad_decision["level"] == "steering"
+
+
+def test_claude_work_tokens_above_4096_messages_and_zero_history_retention():
+    """R3: Claude work-token accounting folds evicted messages above 4,096 IDs,
+    and breaker.last retains zero rollback chain references."""
+    claude_proc = _stream.StreamProcessor(cli="claude")
+    for idx in range(4100):
+        claude_proc.process_line(json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": f"msg_{idx}",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        }))
+    assert len(claude_proc._live_claude_usage) == 4096
+    wt = claude_proc.live_work_tokens(cli="claude")
+    assert wt is not None
+    assert wt["work_tokens"] == 8200
+
+    b = _breaker.GraduatedBreaker(mode="enforce")
+    for _ in range(100):
+        b.evaluate()
+    assert type(b.last) is dict
+    assert not hasattr(b.last, "_prev_state")
 
 
 def test_acp_fast_response_permission_cancel_and_operator_extension(tmp_path: Path):
@@ -940,6 +969,15 @@ def test_acp_fast_response_permission_cancel_and_operator_extension(tmp_path: Pa
         })
         assert chosen == "reject-1"
 
+        # R3: Operator extension consumed during _answer_permission is still tracked on rc.operator_extension_ms
+        _job_control.queue_command(root, job_id, "extend", duration_ms=10_000)
+        client._answer_permission({
+            "toolCall": {"kind": "read"},
+            "options": [{"kind": "allow_once", "optionId": "allow-r"}],
+        })
+        assert rc.operator_extensions == 1
+        assert rc.operator_extension_ms == 10_000
+
         # R2.4: Queuing cancel causes _poll_breaker to raise _AcpTimeout(stage="cancelled")
         _job_control.queue_command(root, job_id, "cancel")
         with pytest.raises(_acpbackend._AcpTimeout) as exc_info:
@@ -949,5 +987,3 @@ def test_acp_fast_response_permission_cancel_and_operator_extension(tmp_path: Pa
     finally:
         stdout_w.close()
         stdout_r.close()
-
-

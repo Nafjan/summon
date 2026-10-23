@@ -260,6 +260,7 @@ class StreamProcessor:
         self.last_request_model = None
         self.context_window = None       # provider-reported window for that model, if any
         self._live_claude_usage: dict[str, dict] = {}
+        self._live_claude_evicted_work_tokens: int = 0
         self._live_claude_anon_seq: int = 0
 
     def live_work_tokens(self, cli: str | None = None) -> dict | None:
@@ -277,7 +278,7 @@ class StreamProcessor:
                 effective_cli = "opencode"
             elif self.is_kimi:
                 effective_cli = "kimi"
-            elif self._claude_session_id or self._live_claude_usage:
+            elif self._claude_session_id or self._live_claude_usage or self._live_claude_evicted_work_tokens:
                 effective_cli = "claude"
         best_tokens: int | None = None
         best_record: dict | None = None
@@ -289,9 +290,9 @@ class StreamProcessor:
                     if best_tokens is None or wt > best_tokens:
                         best_tokens = wt
                         best_record = rec
-        if self._live_claude_usage:
-            claude_sum = 0
-            claude_any = False
+        if self._live_claude_usage or self._live_claude_evicted_work_tokens:
+            claude_sum = self._live_claude_evicted_work_tokens
+            claude_any = self._live_claude_evicted_work_tokens > 0
             for u in self._live_claude_usage.values():
                 rec = _calc_work_tokens(u, cli="claude")
                 wt = rec.get("work_tokens")
@@ -586,8 +587,15 @@ class StreamProcessor:
                 else:
                     self._live_claude_anon_seq += 1
                     msg_key = f"_anon_{self._live_claude_anon_seq}"
-                if msg_key in self._live_claude_usage or len(self._live_claude_usage) < 4096:
-                    self._live_claude_usage[msg_key] = message["usage"]
+                if msg_key not in self._live_claude_usage and len(self._live_claude_usage) >= 4096:
+                    oldest_key, oldest_usage = next(iter(self._live_claude_usage.items()))
+                    del self._live_claude_usage[oldest_key]
+                    from _usage_metrics import work_tokens as _calc_work_tokens
+                    ev_rec = _calc_work_tokens(oldest_usage, cli="claude")
+                    ev_wt = ev_rec.get("work_tokens")
+                    if isinstance(ev_wt, int) and not isinstance(ev_wt, bool) and ev_wt > 0:
+                        self._live_claude_evicted_work_tokens += ev_wt
+                self._live_claude_usage[msg_key] = message["usage"]
             if data.get("parent_tool_use_id") is None and isinstance(message.get("usage"), dict):
                 # Per-request usage of the root conversation: the context-occupancy
                 # input. Sub-agent requests have their own, separate windows.
