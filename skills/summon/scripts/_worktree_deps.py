@@ -59,10 +59,15 @@ INNER_STATE_FILES = (
     "pyvenv.cfg",
 )
 MAX_LOCKFILE_BYTES = 16 * 1024 * 1024
-MAX_TREE_DEPTH = 4
-MAX_TREE_VISITED_ENTRIES = 50_000
+MAX_TREE_DEPTH = 32
+MAX_TREE_VISITED_ENTRIES = 100_000
 _FORBIDDEN_SEGMENTS = frozenset({"", ".", "..", ".git", ".claude"})
+_STRATEGIES = frozenset({"junction", "symlink"})
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _valid_strategy(value: Any) -> bool:
+    return isinstance(value, str) and value in _STRATEGIES
 
 
 class WorktreeDepsError(ValueError):
@@ -366,9 +371,12 @@ def _scandir_digest(
     *,
     depth: int = MAX_TREE_DEPTH,
     budget: list[int] | None = None,
-) -> str:
+    incomplete: list[bool] | None = None,
+) -> str | None:
     if budget is None:
         budget = [MAX_TREE_VISITED_ENTRIES]
+    if incomplete is None:
+        incomplete = [False]
     h = hashlib.sha256()
     try:
         entries = []
@@ -379,8 +387,8 @@ def _scandir_digest(
         h.update(f"total:{len(entries)}\0".encode("utf-8"))
         for entry in entries:
             if budget[0] <= 0:
-                h.update(b"truncated:budget_exhausted\0")
-                break
+                incomplete[0] = True
+                return None
             budget[0] -= 1
             try:
                 is_sym = entry.is_symlink()
@@ -390,32 +398,47 @@ def _scandir_digest(
                     # asynchronously when background indexers/scanners inspect a
                     # newly created folder. Hash directory names/structure and
                     # regular-file stats across the bounded tree instead.
+                    if depth <= 0:
+                        incomplete[0] = True
+                        return None
                     rec = f"D\0{entry.name}\n"
                     h.update(rec.encode("utf-8", errors="surrogateescape"))
-                    if depth > 0:
-                        sub_digest = _scandir_digest(
-                            entry.path, depth=depth - 1, budget=budget
+                    sub_digest = _scandir_digest(
+                        entry.path,
+                        depth=depth - 1,
+                        budget=budget,
+                        incomplete=incomplete,
+                    )
+                    if sub_digest is None or incomplete[0]:
+                        incomplete[0] = True
+                        return None
+                    h.update(
+                        f"S\0{entry.name}\0{sub_digest}\n".encode(
+                            "utf-8", errors="surrogateescape"
                         )
-                        h.update(
-                            f"S\0{entry.name}\0{sub_digest}\n".encode(
-                                "utf-8", errors="surrogateescape"
-                            )
-                        )
+                    )
                 else:
                     st = entry.stat(follow_symlinks=False)
                     rec = f"F\0{entry.name}\0{int(is_sym)}\0{st.st_size}\0{st.st_mtime_ns}\n"
                     h.update(rec.encode("utf-8", errors="surrogateescape"))
             except OSError:
-                rec = f"{entry.name}\0err\n"
-                h.update(rec.encode("utf-8", errors="surrogateescape"))
+                incomplete[0] = True
+                return None
     except OSError:
-        h.update(b"missing")
-    return h.hexdigest()
+        incomplete[0] = True
+        return None
+    return None if incomplete[0] else h.hexdigest()
 
 
-def fingerprint_dep_target(repo_root: str, rel: str) -> str:
-    """Compute a bounded SHA-256 fingerprint of a dependency directory and nearby lockfiles."""
+def fingerprint_dep_target(repo_root: str, rel: str) -> str | None:
+    """Compute a bounded SHA-256 fingerprint of a dependency directory and nearby lockfiles.
+
+    Returns ``None`` (fail-closed) if the directory is missing, unreadable, or
+    exceeds ``MAX_TREE_DEPTH`` or ``MAX_TREE_VISITED_ENTRIES``.
+    """
     target = os.path.join(repo_root, *rel.split("/"))
+    if not os.path.isdir(target) or _is_link_or_junction(target):
+        return None
     parent = os.path.dirname(target) or repo_root
     h = hashlib.sha256()
     h.update(f"rel:{rel}\0".encode("utf-8"))
@@ -438,28 +461,13 @@ def fingerprint_dep_target(repo_root: str, rel: str) -> str:
             h.update(f"inner:{inner_name}:{digest}\0".encode("utf-8"))
 
     budget = [MAX_TREE_VISITED_ENTRIES]
-    h.update(f"top:{_scandir_digest(target, depth=MAX_TREE_DEPTH, budget=budget)}\0".encode("utf-8"))
-
-    for sub_rel in (".bin", "Lib/site-packages", "Scripts", "bin"):
-        sub_path = os.path.join(target, *sub_rel.split("/"))
-        if os.path.isdir(sub_path) and not _is_link_or_junction(sub_path):
-            h.update(
-                f"sub:{sub_rel}:{_scandir_digest(sub_path, depth=MAX_TREE_DEPTH, budget=budget)}\0".encode("utf-8")
-            )
-    lib_dir = os.path.join(target, "lib")
-    if os.path.isdir(lib_dir) and not _is_link_or_junction(lib_dir):
-        try:
-            with os.scandir(lib_dir) as it:
-                py_dirs = sorted(e.name for e in it if e.is_dir(follow_symlinks=False))[:8]
-            for py_name in py_dirs:
-                sp = os.path.join(lib_dir, py_name, "site-packages")
-                if os.path.isdir(sp) and not _is_link_or_junction(sp):
-                    h.update(
-                        f"sub:lib/{py_name}/site-packages:"
-                        f"{_scandir_digest(sp, depth=MAX_TREE_DEPTH, budget=budget)}\0".encode("utf-8")
-                    )
-        except OSError:
-            pass
+    incomplete = [False]
+    top_digest = _scandir_digest(
+        target, depth=MAX_TREE_DEPTH, budget=budget, incomplete=incomplete
+    )
+    if top_digest is None or incomplete[0]:
+        return None
+    h.update(f"top:{top_digest}\0".encode("utf-8"))
     return h.hexdigest()
 
 
@@ -563,7 +571,7 @@ def _validate_private_metadata(data: Any) -> dict[str, Any] | None:
             or not isinstance(repo_root, str) or not repo_root
             or not isinstance(before_sha256, str) or not _HEX64_RE.fullmatch(before_sha256)
             or type(allow_mutation) is not bool
-            or strategy not in {"junction", "symlink"}):
+            or not _valid_strategy(strategy)):
         return None
     try:
         canonical_paths = list(parse_link_deps(raw_paths))
@@ -578,8 +586,10 @@ def _validate_private_metadata(data: Any) -> dict[str, Any] | None:
             return None
         target_real = tinfo.get("target_realpath")
         before_fp = tinfo.get("before_sha256")
+        t_strategy = tinfo.get("strategy")
         if (not isinstance(target_real, str) or not target_real
-                or not isinstance(before_fp, str) or not _HEX64_RE.fullmatch(before_fp)):
+                or not isinstance(before_fp, str) or not _HEX64_RE.fullmatch(before_fp)
+                or (t_strategy is not None and not _valid_strategy(t_strategy))):
             return None
         try:
             common = os.path.commonpath([os.path.normcase(repo_real), os.path.normcase(target_real)])
@@ -607,7 +617,7 @@ def _read_metadata_with_digest(worktree_path: str) -> tuple[str | None, dict[str
         if validated is None:
             return wt_root, None, digest
         return wt_root, validated, digest
-    except (OSError, ValueError, UnicodeDecodeError):
+    except (OSError, ValueError, TypeError, UnicodeDecodeError):
         return wt_root, None, None
 
 
@@ -691,6 +701,12 @@ def bridge_worktree_deps(
         for rel in parsed:
             src, src_real = _validate_repo_target(repo_root, rel)
             fp = fingerprint_dep_target(repo_root, rel)
+            if fp is None or not _HEX64_RE.fullmatch(fp):
+                raise WorktreeDepsError(
+                    "link_deps_fingerprint_incomplete",
+                    f"--link-deps target {rel!r} could not be completely fingerprinted "
+                    f"(exceeded {MAX_TREE_VISITED_ENTRIES} entries or depth {MAX_TREE_DEPTH}, or unreadable)",
+                )
             before_per_path[rel] = fp
 
             segments = rel.split("/")
@@ -893,7 +909,16 @@ def filter_porcelain_v2_raw(raw: bytes, worktree_path: str) -> bytes:
         return raw
     tokens = raw.split(b"\0")
     kept: list[bytes] = []
+    expect_rename_source = False
     for token in tokens:
+        if expect_rename_source:
+            expect_rename_source = False
+            kept.append(token)
+            continue
+        if token.startswith(b"2 "):
+            expect_rename_source = True
+            kept.append(token)
+            continue
         if token.startswith(b"? "):
             rel = token[2:].decode("utf-8", errors="surrogateescape")
             if is_excluded_untracked_path(rel, intact):
@@ -928,11 +953,12 @@ def verify_linked_deps(worktree_info: dict[str, Any] | None) -> dict[str, Any] |
     if not isinstance(source_meta, dict):
         if isinstance(existing, dict):
             fallback_paths = [p for p in (existing.get("paths") or ()) if isinstance(p, str)]
+            raw_strat = existing.get("strategy")
             failed_proj = {
                 "schema": SCHEMA,
                 "count": len(fallback_paths),
                 "paths": list(fallback_paths),
-                "strategy": existing.get("strategy") if existing.get("strategy") in {"junction", "symlink"} else (
+                "strategy": raw_strat if _valid_strategy(raw_strat) else (
                     "junction" if os.name == "nt" else "symlink"
                 ),
                 "allow_mutation": bool(existing.get("allow_mutation", False)),
@@ -951,7 +977,8 @@ def verify_linked_deps(worktree_info: dict[str, Any] | None) -> dict[str, Any] |
     targets = source_meta.get("targets") if isinstance(source_meta.get("targets"), dict) else {}
     before_sha256 = source_meta.get("before_sha256")
     allow_mutation = bool(source_meta.get("allow_mutation", False))
-    strategy = source_meta.get("strategy") if source_meta.get("strategy") in {"junction", "symlink"} else (
+    raw_strat = source_meta.get("strategy")
+    strategy = raw_strat if _valid_strategy(raw_strat) else (
         "junction" if os.name == "nt" else "symlink"
     )
 
@@ -981,14 +1008,27 @@ def verify_linked_deps(worktree_info: dict[str, Any] | None) -> dict[str, Any] |
         if not intact:
             links_intact = False
         after_fp = (fingerprint_dep_target(str(repo_root), rel)
-                    if isinstance(repo_root, str) and repo_root else "missing")
-        after_per_path[rel] = after_fp
-        if after_fp != before_fp or not intact or not metadata_intact:
+                    if isinstance(repo_root, str) and repo_root else None)
+        if isinstance(after_fp, str) and _HEX64_RE.fullmatch(after_fp):
+            after_per_path[rel] = after_fp
+        else:
+            after_fp = None
+        if (after_fp is None
+                or not isinstance(before_fp, str)
+                or not _HEX64_RE.fullmatch(before_fp)
+                or after_fp != before_fp
+                or not intact
+                or not metadata_intact):
             mutated_paths.append(rel)
 
-    after_sha256 = _overall_fingerprint(after_per_path)
+    after_sha256 = (
+        _overall_fingerprint(after_per_path)
+        if paths and len(after_per_path) == len(paths)
+        else None
+    )
     deps_mutated = bool(
         not metadata_intact
+        or after_sha256 is None
         or after_sha256 != before_sha256
         or not links_intact
         or mutated_paths
@@ -1037,7 +1077,7 @@ def validate_projection(record: Any) -> dict[str, Any]:
         raise WorktreeDepsError("link_deps_projection_invalid", "paths must be a list of strings matching count")
     if paths and list(parse_link_deps(paths)) != paths:
         raise WorktreeDepsError("link_deps_projection_invalid", "paths must be canonical sorted relative paths")
-    if strategy not in {"junction", "symlink"}:
+    if not _valid_strategy(strategy):
         raise WorktreeDepsError("link_deps_projection_invalid", "strategy must be 'junction' or 'symlink'")
     if (type(allow_mutation) is not bool
             or type(deps_mutated) is not bool

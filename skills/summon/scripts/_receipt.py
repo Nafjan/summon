@@ -301,7 +301,13 @@ def _run_git_bounded(argv: list[str], cwd: str, deadline: float) -> tuple[bytes 
 
 
 def _safe_repo_path(raw: bytes) -> str | None:
-    """Decode a raw -z path and accept only a repo-relative, non-escaping name."""
+    """Decode a raw -z path and accept only a repo-relative, non-escaping name.
+
+    Git porcelain -z always uses '/' as its directory separator on all platforms.
+    Preserve literal '\\' characters inside path segments (valid in POSIX filenames)
+    while still rejecting Windows drive letters, UNC paths, and '..' traversal
+    under either '/' or '\\' splitting.
+    """
     try:
         name = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -311,7 +317,9 @@ def _safe_repo_path(raw: bytes) -> str | None:
     slash_name = name.replace("\\", "/")
     if slash_name.startswith("/") or ntpath.isabs(name) or ntpath.splitdrive(name)[0]:
         return None
-    parts = slash_name.split("/")
+    if any(part == ".." for part in slash_name.split("/")):
+        return None
+    parts = name.split("/")
     if any(part == ".." for part in parts):
         return None
     return "/".join(part for part in parts if part not in ("", ".")) or None

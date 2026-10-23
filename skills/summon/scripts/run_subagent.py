@@ -3670,8 +3670,27 @@ def main() -> None:
 
     if worktree_info:
         if worktree_info.get("linked_deps") or worktree_info.get("_linked_deps_authority"):
-            from _worktree_deps import verify_linked_deps
-            _ld_post = verify_linked_deps(worktree_info)
+            from _worktree_deps import WORKTREE_DEPS_SCHEMA, verify_linked_deps
+            try:
+                _ld_post = verify_linked_deps(worktree_info)
+            except Exception:  # noqa: BLE001 - fail closed if verification raises unexpectedly
+                _ld_existing = worktree_info.get("linked_deps")
+                _ld_paths = [
+                    p for p in ((_ld_existing.get("paths") if isinstance(_ld_existing, dict) else None) or ())
+                    if isinstance(p, str)
+                ]
+                _ld_post = {
+                    "schema": WORKTREE_DEPS_SCHEMA,
+                    "count": len(_ld_paths),
+                    "paths": _ld_paths,
+                    "strategy": "junction" if os.name == "nt" else "symlink",
+                    "allow_mutation": bool(getattr(invocation, "link_deps_allow_mutation", False)),
+                    "before_sha256": (_ld_existing.get("before_sha256") if isinstance(_ld_existing, dict) else None),
+                    "after_sha256": None,
+                    "deps_mutated": True,
+                    "links_intact": False,
+                    "mutated_paths": list(_ld_paths),
+                }
             if isinstance(_ld_post, dict):
                 worktree_info["linked_deps"] = dict(_ld_post)
             if isinstance(_ld_post, dict) and _ld_post.get("deps_mutated"):

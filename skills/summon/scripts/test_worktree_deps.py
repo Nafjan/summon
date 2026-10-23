@@ -611,6 +611,8 @@ def test_posix_backslash_filenames_and_strict_projection_validation():
         dict(valid, count=2),
         dict(valid, allow_mutation="false"),
         dict(valid, strategy="copy"),
+        dict(valid, strategy=[]),
+        dict(valid, strategy={}),
         dict(valid, before_sha256="not-hex"),
         dict(valid, mutated_paths=["other"]),
         dict(valid, links_intact=False, deps_mutated=False),
@@ -619,4 +621,91 @@ def test_posix_backslash_filenames_and_strict_projection_validation():
     ):
         with pytest.raises(_worktree_deps.WorktreeDepsError):
             _worktree_deps.validate_projection(invalid)
+
+
+def test_round2_pnpm_depth_incomplete_fingerprint_and_v2_rename_regressions(tmp_path, monkeypatch):
+    import json
+    import _progress_judge
+    import _receipt
+
+    repo = _init_repo(tmp_path / "repo")
+    nm = repo / "node_modules"
+    pnpm_leaf = nm / ".pnpm" / "@scope+pkg@1.0.0" / "node_modules" / "@scope" / "pkg"
+    pnpm_leaf.mkdir(parents=True, exist_ok=True)
+    pnpm_idx = pnpm_leaf / "index.js"
+    pnpm_idx.write_text("module.exports = 'v1';\n", encoding="utf-8")
+
+    fp1 = _worktree_deps.fingerprint_dep_target(str(repo), "node_modules")
+    assert fp1 is not None
+    pnpm_idx.write_text("module.exports = 'v2-changed';\n", encoding="utf-8")
+    fp2 = _worktree_deps.fingerprint_dep_target(str(repo), "node_modules")
+    assert fp2 is not None and fp2 != fp1
+
+    wt_info = run_subagent._setup_worktree(
+        str(repo), "wt-round2", "reviewer",
+        link_deps=("node_modules",),
+        link_deps_allow_mutation=False,
+    )
+    wt_path = wt_info["path"]
+    meta_path = _worktree_deps._metadata_path(wt_path)
+    assert meta_path is not None
+    try:
+        # 1. Incomplete fingerprint (entry budget or depth exceeded) fails closed
+        with monkeypatch.context() as m:
+            m.setattr(_worktree_deps, "MAX_TREE_VISITED_ENTRIES", 2)
+            assert _worktree_deps.fingerprint_dep_target(str(repo), "node_modules") is None
+            verified_budget = _worktree_deps.verify_linked_deps(dict(wt_info))
+            assert verified_budget is not None
+            assert verified_budget["after_sha256"] is None
+            assert verified_budget["deps_mutated"] is True
+            assert verified_budget["mutated_paths"] == ["node_modules"]
+
+        with monkeypatch.context() as m:
+            m.setattr(_worktree_deps, "MAX_TREE_DEPTH", 2)
+            assert _worktree_deps.fingerprint_dep_target(str(repo), "node_modules") is None
+
+        # 2. Malformed strategy=[] in on-disk metadata does not raise TypeError
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            orig_meta = json.load(fh)
+        bad_strat_meta = dict(orig_meta, strategy=[])
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(bad_strat_meta, fh)
+        verified_bad_strat = _worktree_deps.verify_linked_deps(dict(wt_info))
+        assert verified_bad_strat is not None
+        assert verified_bad_strat["deps_mutated"] is True
+        assert verified_bad_strat["links_intact"] is False
+
+        # Restore valid metadata for porcelain v2 rename test
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(orig_meta, fh)
+
+        # 3. Receipt _parse_git_status_porcelain preserves POSIX backslash filename
+        raw_v1 = b"?? node_modules\0?? node_modules\\unrelated.txt\0"
+        parsed_v1 = _receipt._parse_git_status_porcelain(raw_v1)
+        assert parsed_v1 is not None
+        intact_set = _worktree_deps.intact_linked_dep_paths(wt_path)
+        assert "node_modules" in intact_set
+        filtered_untracked = [
+            p for p in parsed_v1["untracked"]
+            if not _worktree_deps.is_excluded_untracked_path(p, intact_set)
+        ]
+        assert filtered_untracked == [r"node_modules\unrelated.txt"]
+
+        # 4. Porcelain v2 rename record with origPath starting with '? node_modules'
+        raw_v2 = (
+            b"2 R. N... 100644 100644 100644 " + (b"a" * 40) + b" " + (b"b" * 40)
+            + b" R100 renamed.txt\0? node_modules\0"
+            + b"1 .M N... 100644 100644 100644 " + (b"c" * 40) + b" " + (b"d" * 40)
+            + b" working.txt\0? node_modules\0"
+        )
+        filtered_v2 = _worktree_deps.filter_porcelain_v2_raw(raw_v2, wt_path)
+        paths_v2 = _progress_judge._porcelain_paths(filtered_v2)
+        assert paths_v2 == ["renamed.txt", "working.txt"]
+    finally:
+        if _worktree_deps._is_link_or_junction(os.path.join(wt_path, "node_modules")):
+            _worktree_deps._remove_dir_link(os.path.join(wt_path, "node_modules"))
+        shutil.rmtree(wt_path, ignore_errors=True)
+        subprocess.run(["git", "-C", str(repo), "worktree", "prune"],
+                       capture_output=True, text=True, check=False)
+
 
