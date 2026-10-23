@@ -134,8 +134,8 @@ def public_heartbeat(value: dict, integrity: str) -> dict | None:
         if live.get("schema") == "summon.liveness/v1":
             safe_live["schema"] = live["schema"]
         phase = live.get("phase")
-        if phase in {"startup", "generation", "reconnect", "finalization",
-                     "terminal", "cancelled", "timed_out"}:
+        if isinstance(phase, str) and phase in {"startup", "generation", "reconnect", "finalization",
+                                                "terminal", "cancelled", "timed_out"}:
             safe_live["phase"] = phase
         for key in ("elapsed_ms", "first_trusted_event_ms", "last_meaningful_event_ms"):
             item = live.get(key)
@@ -143,16 +143,17 @@ def public_heartbeat(value: dict, integrity: str) -> dict | None:
                                 and 0 <= item <= 2 ** 63 - 1):
                 safe_live[key] = item
         expired = live.get("expired")
-        if expired is None or expired in {"startup_timeout", "overall_timeout",
-                                          "generation_idle_timeout", "finalization_timeout"}:
+        if expired is None or (isinstance(expired, str) and expired in {
+                "startup_timeout", "overall_timeout",
+                "generation_idle_timeout", "finalization_timeout"}):
             safe_live["expired"] = expired
         trusted_kind = live.get("last_trusted_kind")
-        if trusted_kind is None or trusted_kind in {
+        if trusted_kind is None or (isinstance(trusted_kind, str) and trusted_kind in {
                 "transport_started", "stream_event", "output_text", "tool_activity",
-                "reconnect", "finalizing", "terminal", "cancelled"}:
+                "reconnect", "finalizing", "terminal", "cancelled"}):
             safe_live["last_trusted_kind"] = trusted_kind
         activity_kind = live.get("last_activity_kind")
-        if activity_kind is None or activity_kind in {"tool", "generation"}:
+        if activity_kind is None or (isinstance(activity_kind, str) and activity_kind in {"tool", "generation"}):
             safe_live["last_activity_kind"] = activity_kind
         counts = live.get("counts")
         if isinstance(counts, dict):
@@ -209,10 +210,10 @@ def _sanitize_usage_metrics(value: object) -> dict | None:
         else:
             return None
     semantics = value.get("input_semantics")
-    if semantics in {"includes_cache", "excludes_cache", "unknown"}:
+    if isinstance(semantics, str) and semantics in {"includes_cache", "excludes_cache", "unknown"}:
         out["input_semantics"] = semantics
     scope = value.get("observation_scope")
-    if scope is None or scope in {
+    if scope is None or (isinstance(scope, str) and scope in {
         "attempt_total",
         "last_step_snapshot",
         "unestablished",
@@ -220,10 +221,10 @@ def _sanitize_usage_metrics(value: object) -> dict | None:
         "accumulated",
         "unknown",
         "single_request",
-    }:
+    }):
         out["observation_scope"] = scope
     evidence = value.get("evidence")
-    if evidence in {
+    if isinstance(evidence, str) and evidence in {
         "absent",
         "incomplete",
         "derived",
@@ -259,10 +260,10 @@ def _sanitize_context_occupancy(value: object) -> dict | None:
     if over_window is None or isinstance(over_window, bool):
         out["over_window"] = over_window
     semantics = value.get("input_semantics")
-    if semantics in {"includes_cache", "excludes_cache", "unknown"}:
+    if isinstance(semantics, str) and semantics in {"includes_cache", "excludes_cache", "unknown"}:
         out["input_semantics"] = semantics
     evidence = value.get("evidence")
-    if evidence in {
+    if isinstance(evidence, str) and evidence in {
         "absent",
         "incomplete",
         "ambiguous_cache_semantics",

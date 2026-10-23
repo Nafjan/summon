@@ -1611,6 +1611,23 @@ def test_watch_jobs_snapshot_projects_authenticated_telemetry_and_rejects_tamper
             "input_semantics": "includes_cache",
             "evidence": "reported",
         },
+        "progress_judgement": {
+            "schema": "summon.progress-judgement/v1",
+            "mode": "shadow",
+            "checkpoints": 1,
+            "disagreements": 0,
+            "last": {
+                "schema": "summon.progress-judgement/v1",
+                "mode": "shadow",
+                "legacy_active": True,
+                "judged_active": True,
+                "applied_active": True,
+                "reasons": ["workspace_changed", "stream_activity"],
+                "workspace": "changed",
+                "tool_loop": False,
+                "oldest_pending_tool_ms": None,
+            },
+        },
         "submission_summary": {
             "schema": "summon.submission-summary/v1",
             "unknown_spend": True,
@@ -1622,8 +1639,23 @@ def test_watch_jobs_snapshot_projects_authenticated_telemetry_and_rejects_tamper
     assert row_done["agent"] == "sol"
     assert row_done["work_tokens"] == 8192
     assert row_done["context_ratio"] == 0.5
+    assert row_done["progress_reason"] == "workspace_changed,stream_activity"
     assert row_done["unknown_spend"] is True
     assert "unknown" in _background.render_jobs_watch(snap_done)
 
-
+    # Malformed unhashable telemetry fields in a trusted result must never crash watch_jobs_snapshot.
+    _jobs._atomic_write_json(_jobs.result_path(root, job_id), {
+        "status": "success",
+        "execution_status": "success",
+        "job_nonce": "nonce",
+        "summon": {"version": "3.6.2", "scripts_sha256": "c" * 64},
+        "liveness": {"phase": []},
+        "usage_metrics": {"schema": "summon.usage-metrics/v1", "input_semantics": [], "evidence": {}},
+        "context_occupancy": {"schema": "summon.context-occupancy/v1", "input_semantics": [], "evidence": []},
+        "progress_judgement": {"schema": "summon.progress-judgement/v1", "mode": [], "reasons": [[]], "workspace": []},
+        "breaker": {"schema": "summon.breaker/v1", "mode": [], "level": [], "action": []},
+    })
+    snap_malformed = _background.watch_jobs_snapshot(root, active_only=False)
+    assert snap_malformed["count"] == 1
+    assert snap_malformed["jobs"][0]["phase"] == "success"
 

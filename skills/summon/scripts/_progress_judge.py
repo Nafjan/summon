@@ -291,21 +291,26 @@ class ProgressJudge:
 
 
 def sanitize_record(value: object) -> dict | None:
-    """Strict allowlist copy for public heartbeat projections."""
+    """Strict allowlist copy for public heartbeat and terminal projections."""
     if not isinstance(value, dict) or value.get("schema") != SCHEMA:
         return None
+    target = value
+    if "reasons" not in value and isinstance(value.get("last"), dict):
+        target = value["last"]
     out: dict = {"schema": SCHEMA}
-    if value.get("mode") in MODES:
-        out["mode"] = value["mode"]
+    mode = target.get("mode", value.get("mode"))
+    if isinstance(mode, str) and mode in MODES:
+        out["mode"] = mode
     for key in ("legacy_active", "judged_active", "applied_active", "tool_loop"):
-        if isinstance(value.get(key), bool):
-            out[key] = value[key]
-    reasons = value.get("reasons")
+        if isinstance(target.get(key), bool):
+            out[key] = target[key]
+    reasons = target.get("reasons")
     if isinstance(reasons, list):
-        out["reasons"] = [r for r in reasons if r in _REASONS][:8]
-    if value.get("workspace") in {"changed", "unchanged", "unmeasured"}:
-        out["workspace"] = value["workspace"]
-    pending = value.get("oldest_pending_tool_ms")
+        out["reasons"] = [r for r in reasons if isinstance(r, str) and r in _REASONS][:8]
+    workspace = target.get("workspace")
+    if isinstance(workspace, str) and workspace in {"changed", "unchanged", "unmeasured"}:
+        out["workspace"] = workspace
+    pending = target.get("oldest_pending_tool_ms")
     if pending is None or (isinstance(pending, int) and not isinstance(pending, bool)
                            and 0 <= pending <= 2 ** 63 - 1):
         out["oldest_pending_tool_ms"] = pending

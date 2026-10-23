@@ -1138,6 +1138,24 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
         "terminal", "cancelled", "timed_out",
     }
 
+    def _safe_sanitize(fn, val) -> dict:
+        try:
+            res = fn(val)
+            return res if isinstance(res, dict) else {}
+        except Exception:
+            return {}
+
+    def _extract_progress_reason(prog: dict) -> str | None:
+        if not isinstance(prog, dict):
+            return None
+        reasons = prog.get("reasons")
+        if isinstance(reasons, list):
+            clean = [r for r in reasons if isinstance(r, str) and r]
+            if clean:
+                return ",".join(clean[:4])
+        reason = prog.get("reason")
+        return reason if isinstance(reason, str) and reason else None
+
     rows = _jobs.list_jobs(root)
     if active_only:
         rows = [row for row in rows if row.get("state") in ("running", "prepared")]
@@ -1181,7 +1199,8 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
             if isinstance(trusted_raw_res.get("liveness"), dict)
             else {}
         )
-        res_phase = raw_res_live.get("phase") if raw_res_live.get("phase") in _ALLOWED_PHASES else None
+        raw_res_phase = raw_res_live.get("phase")
+        res_phase = raw_res_phase if isinstance(raw_res_phase, str) and raw_res_phase in _ALLOWED_PHASES else None
         raw_res_live_elapsed = raw_res_live.get("elapsed_ms")
         res_live_elapsed = (
             raw_res_live_elapsed
@@ -1210,9 +1229,8 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
         )
         raw_rc = trusted_raw_res.get("runtime_control") if isinstance(trusted_raw_res.get("runtime_control"), dict) else {}
         res_breaker = (
-            _sanitize_breaker(trusted_raw_res.get("breaker"))
-            or _sanitize_breaker(raw_rc.get("breaker"))
-            or {}
+            _safe_sanitize(_sanitize_breaker, trusted_raw_res.get("breaker"))
+            or _safe_sanitize(_sanitize_breaker, raw_rc.get("breaker"))
         )
         breaker_level = hb_breaker.get("level") or res_breaker.get("level")
         breaker_mode = hb_breaker.get("mode") or res_breaker.get("mode")
@@ -1227,14 +1245,12 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
             else {}
         )
         res_occ = (
-            _sanitize_context_occupancy(trusted_raw_res.get("context_occupancy"))
-            or _sanitize_context_occupancy(raw_rc.get("context_occupancy"))
-            or {}
+            _safe_sanitize(_sanitize_context_occupancy, trusted_raw_res.get("context_occupancy"))
+            or _safe_sanitize(_sanitize_context_occupancy, raw_rc.get("context_occupancy"))
         )
         res_handoff = (
-            _sanitize_context_handoff(trusted_raw_res.get("context_handoff"))
-            or _sanitize_context_handoff(raw_rc.get("context_handoff"))
-            or {}
+            _safe_sanitize(_sanitize_context_handoff, trusted_raw_res.get("context_handoff"))
+            or _safe_sanitize(_sanitize_context_handoff, raw_rc.get("context_handoff"))
         )
         context_ratio = None
         for candidate_ratio in (
@@ -1256,20 +1272,18 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
             else {}
         )
         res_prog = (
-            _sanitize_progress(trusted_raw_res.get("progress_judgement"))
-            or _sanitize_progress(raw_rc.get("progress"))
-            or {}
+            _safe_sanitize(_sanitize_progress, trusted_raw_res.get("progress_judgement"))
+            or _safe_sanitize(_sanitize_progress, raw_rc.get("progress"))
         )
-        progress_reason = hb_prog.get("reason") or res_prog.get("reason")
+        progress_reason = _extract_progress_reason(hb_prog) or _extract_progress_reason(res_prog)
         hb_um = (
             hb.get("usage_metrics")
             if isinstance(hb, dict) and isinstance(hb.get("usage_metrics"), dict)
             else {}
         )
         res_um = (
-            _sanitize_usage_metrics(trusted_raw_res.get("usage_metrics"))
-            or _sanitize_usage_metrics(raw_rc.get("usage_metrics"))
-            or {}
+            _safe_sanitize(_sanitize_usage_metrics, trusted_raw_res.get("usage_metrics"))
+            or _safe_sanitize(_sanitize_usage_metrics, raw_rc.get("usage_metrics"))
         )
         work_tokens = None
         for candidate_wt in (hb_um.get("work_tokens"), res_um.get("work_tokens")):

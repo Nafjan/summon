@@ -355,17 +355,20 @@ def sanitize_record(value: object) -> dict | None:
     if not isinstance(value, dict) or value.get("schema") != SCHEMA:
         return None
     out: dict = {"schema": SCHEMA}
-    if value.get("mode") in MODES:
-        out["mode"] = value["mode"]
+    mode = value.get("mode")
+    if isinstance(mode, str) and mode in MODES:
+        out["mode"] = mode
     for key in ("allow_stop", "transitioned", "escalated", "recovered",
                 "enforced", "compaction_grace"):
         if isinstance(value.get(key), bool):
             out[key] = value[key]
     for key in ("from_level", "to_level", "level"):
-        if value.get(key) in LEVELS:
-            out[key] = value[key]
-    if value.get("action") in ACTIONS:
-        out["action"] = value["action"]
+        lvl = value.get(key)
+        if isinstance(lvl, str) and lvl in LEVELS:
+            out[key] = lvl
+    action = value.get("action")
+    if isinstance(action, str) and action in ACTIONS:
+        out["action"] = action
     signals = normalize_signals(value.get("signals"))
     if signals:
         out["signals"] = signals[:8]
@@ -374,7 +377,7 @@ def sanitize_record(value: object) -> dict | None:
         if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= _MAX_INT:
             out[key] = item
     perm = value.get("constrained_permission")
-    if perm in {None, "read-only"}:
+    if perm is None or (isinstance(perm, str) and perm == "read-only"):
         out["constrained_permission"] = perm
     return out
 
