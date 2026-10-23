@@ -40,6 +40,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Iterable
 
 SCHEMA = "summon.worktree-deps/v1"
+WORKTREE_DEPS_SCHEMA = SCHEMA
 METADATA_FILENAME = "summon-linked-deps.json"
 LOCKFILES = (
     "package-lock.json",
@@ -345,25 +346,34 @@ def preflight_link_deps(
     }
 
 
+_UNREADABLE_FILE = "__UNREADABLE__"
+
+
 def _hash_regular_file(path: str) -> str | None:
     try:
         if _is_link_or_junction(path):
-            return "link"
+            st = os.lstat(path)
+            return f"link:{st.st_size}:{st.st_mtime_ns}"
         st = os.stat(path)
-        if not stat.S_ISREG(st.st_mode):
-            return None
-        if st.st_size > MAX_LOCKFILE_BYTES:
-            return f"oversize:{st.st_size}:{st.st_mtime_ns}"
-        h = hashlib.sha256()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _UNREADABLE_FILE
+    if not stat.S_ISREG(st.st_mode):
+        return _UNREADABLE_FILE
+    if st.st_size > MAX_LOCKFILE_BYTES:
+        return _UNREADABLE_FILE
+    h = hashlib.sha256()
+    try:
         with open(path, "rb") as fh:
             while True:
                 chunk = fh.read(65536)
                 if not chunk:
                     break
                 h.update(chunk)
-        return h.hexdigest()
     except OSError:
-        return None
+        return _UNREADABLE_FILE
+    return h.hexdigest()
 
 
 def _scandir_digest(
@@ -382,14 +392,14 @@ def _scandir_digest(
         entries = []
         with os.scandir(directory) as it:
             for entry in it:
+                if budget[0] <= 0:
+                    incomplete[0] = True
+                    return None
+                budget[0] -= 1
                 entries.append(entry)
         entries.sort(key=lambda e: e.name)
         h.update(f"total:{len(entries)}\0".encode("utf-8"))
         for entry in entries:
-            if budget[0] <= 0:
-                incomplete[0] = True
-                return None
-            budget[0] -= 1
             try:
                 is_sym = entry.is_symlink()
                 is_dir = entry.is_dir(follow_symlinks=False)
@@ -451,12 +461,16 @@ def fingerprint_dep_target(repo_root: str, rel: str) -> str | None:
         for lock_name in LOCKFILES:
             lpath = os.path.join(ldir, lock_name)
             digest = _hash_regular_file(lpath)
+            if digest == _UNREADABLE_FILE:
+                return None
             if digest is not None:
                 h.update(f"lock:{label}:{lock_name}:{digest}\0".encode("utf-8"))
 
     for inner_name in INNER_STATE_FILES:
         ipath = os.path.join(target, inner_name)
         digest = _hash_regular_file(ipath)
+        if digest == _UNREADABLE_FILE:
+            return None
         if digest is not None:
             h.update(f"inner:{inner_name}:{digest}\0".encode("utf-8"))
 

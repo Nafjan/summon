@@ -701,11 +701,54 @@ def test_round2_pnpm_depth_incomplete_fingerprint_and_v2_rename_regressions(tmp_
         filtered_v2 = _worktree_deps.filter_porcelain_v2_raw(raw_v2, wt_path)
         paths_v2 = _progress_judge._porcelain_paths(filtered_v2)
         assert paths_v2 == ["renamed.txt", "working.txt"]
+
+        # 5. WORKTREE_DEPS_SCHEMA export, early scandir budget stop, and unreadable lockfile fail-closed
+        from _worktree_deps import WORKTREE_DEPS_SCHEMA
+        assert WORKTREE_DEPS_SCHEMA == "summon.worktree-deps/v1"
+
+        yielded = 0
+
+        class _FakeScandir:
+            def __enter__(self):
+                def _gen():
+                    nonlocal yielded
+                    for idx in range(100_005):
+                        yielded += 1
+                        yield type("E", (), {"name": f"f{idx}"})()
+                return _gen()
+
+            def __exit__(self, *args):
+                return False
+
+        orig_scandir = _worktree_deps.os.scandir
+        _worktree_deps.os.scandir = lambda _d: _FakeScandir()
+        try:
+            assert _worktree_deps._scandir_digest(str(repo), budget=[2]) is None
+            assert yielded == 3
+        finally:
+            _worktree_deps.os.scandir = orig_scandir
+
+        lock_path = repo / "package-lock.json"
+        orig_open = _worktree_deps.open if hasattr(_worktree_deps, "open") else None
+        real_open = open
+
+        def _deny_lock(path, *a, **kw):
+            if os.path.normcase(str(path)) == os.path.normcase(str(lock_path)):
+                raise PermissionError("lockfile unreadable")
+            return real_open(path, *a, **kw)
+
+        import builtins
+        builtins.open = _deny_lock
+        try:
+            assert _worktree_deps.fingerprint_dep_target(str(repo), "node_modules") is None
+        finally:
+            builtins.open = real_open
+            if orig_open is not None:
+                _worktree_deps.open = orig_open
     finally:
         if _worktree_deps._is_link_or_junction(os.path.join(wt_path, "node_modules")):
             _worktree_deps._remove_dir_link(os.path.join(wt_path, "node_modules"))
         shutil.rmtree(wt_path, ignore_errors=True)
         subprocess.run(["git", "-C", str(repo), "worktree", "prune"],
                        capture_output=True, text=True, check=False)
-
 
