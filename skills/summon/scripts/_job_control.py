@@ -180,6 +180,13 @@ def public_heartbeat(value: dict, integrity: str) -> dict | None:
         breaker = None
     if breaker is not None:
         out["breaker"] = breaker
+    try:
+        from _context_handoff import sanitize_record as _sanitize_handoff
+        context_handoff = _sanitize_handoff(value.get("context_handoff"))
+    except Exception:  # noqa: BLE001 - optional advisory field
+        context_handoff = None
+    if context_handoff is not None:
+        out["context_handoff"] = context_handoff
     return out
 
 
@@ -750,6 +757,58 @@ def queue_breaker_transition(root: str, job_id: str, decision: dict, *,
         wall_clock=wall_clock)
 
 
+def _append_handoff_steer_command(path: str, job_id: str, nonce: str, *,
+                                  wall_clock=None) -> dict | None:
+    """Append the deterministic context-handoff steering directive at most once."""
+    from _context_handoff import HANDOFF_STEERING_PROMPT
+    now_fn = wall_clock or time.time
+    with _exclusive_control_lock(path):
+        existing, state = _jobs._read(path)
+        if state == _jobs._CORRUPT:
+            raise ValueError("job control file is malformed")
+        if existing is None:
+            existing = {"schema": "summon.job-control/v2", "job_id": job_id,
+                        "generation": 0, "commands": []}
+        elif existing.get("schema") == "summon.job-control/v1":
+            raise ValueError(
+                "legacy job control cannot be upgraded while its job is live")
+        commands, integrity = _validated_commands(existing, job_id, nonce)
+        if commands is None or integrity != "authenticated":
+            raise ValueError("job control identity mismatch")
+        for prior in commands:
+            if (isinstance(prior, dict) and prior.get("action") == "steer"
+                    and prior.get("message") == HANDOFF_STEERING_PROMPT):
+                return None
+        if len(commands) >= MAX_COMMANDS:
+            raise ValueError("job control command limit reached")
+        generation = existing.get("generation", 0) + 1
+        queued_at = now_fn()
+        if not _is_finite_number(queued_at):
+            raise ValueError("system clock produced a non-finite control timestamp")
+        command: dict = {
+            "generation": generation,
+            "action": "steer",
+            "queued_at": queued_at,
+            "message": HANDOFF_STEERING_PROMPT,
+            "message_sha256": hashlib.sha256(
+                HANDOFF_STEERING_PROMPT.encode("utf-8")).hexdigest(),
+        }
+        command["auth"] = command_auth(nonce, job_id, command)
+        if not _valid_command_shape(command, authenticated=True):
+            raise ValueError("context handoff steering command failed validation")
+        commands.append(command)
+        existing["generation"] = generation
+        _write_control_json(path, existing)
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "action": "steer",
+        "generation": generation,
+        "steering_mode": "queued_for_resume",
+        "provider_contacted": False,
+    }
+
+
 def control_summary(root: str, job_id: str) -> dict | None:
     data, state = _jobs._read(control_path(root, job_id))
     if state == _jobs._CORRUPT:
@@ -926,6 +985,9 @@ class RuntimeControl:
         self.breaker_transitions: int = 0
         self.constrained: bool = False
         self.breaker_stopped: bool = False
+        # Context-aware handoff state (Phase 5).
+        self.context_handoff: dict | None = None
+        self.handoff_triggered: bool = False
         self._sealed_generation: int = 0
         self._sealed_breaker_transitions: int = 0
         self._load_prior_high_water()
@@ -952,6 +1014,13 @@ class RuntimeControl:
             action = command.get("action")
             if action == "cancel":
                 self.cancel_requested = True
+            elif action == "steer" and isinstance(command.get("message"), str):
+                try:
+                    from _context_handoff import HANDOFF_STEERING_PROMPT
+                    if command["message"] == HANDOFF_STEERING_PROMPT:
+                        self.handoff_triggered = True
+                except Exception:  # noqa: BLE001
+                    pass
             elif action == "breaker":
                 breaker_count += 1
                 to_level = command.get("to_level")
@@ -1044,6 +1113,9 @@ class RuntimeControl:
                                     and self.breaker_level in _BREAKER_LEVELS
                                     and _BREAKER_LEVELS.index(b_level) > _BREAKER_LEVELS.index(self.breaker_level)):
                                 self.breaker_level = b_level
+                    hb_handoff = hb.get("context_handoff")
+                    if isinstance(hb_handoff, dict) and hb_handoff.get("triggered") is True:
+                        self.handoff_triggered = True
                 else:
                     self.control_untrusted = True
         if self.control_untrusted:
@@ -1168,6 +1240,12 @@ class RuntimeControl:
                     self.steers.append({"generation": generation,
                                         "message": message,
                                         "message_sha256": command.get("message_sha256")})
+                    try:
+                        from _context_handoff import HANDOFF_STEERING_PROMPT
+                        if message == HANDOFF_STEERING_PROMPT:
+                            self.handoff_triggered = True
+                    except Exception:  # noqa: BLE001
+                        pass
             elif action == "breaker":
                 to_level = command.get("to_level")
                 mode = command.get("mode")
@@ -1271,6 +1349,42 @@ class RuntimeControl:
                     self.constrained = False
             return None
 
+    def record_context_handoff(self, decision: dict) -> dict | None:
+        """Persist an enforced context-handoff steering directive and update state."""
+        from _context_handoff import sanitize_record as _sanitize_handoff
+        with self._lock:
+            sanitized = _sanitize_handoff(decision)
+            if sanitized is None:
+                return None
+            if (decision.get("newly_triggered") and decision.get("enforced")
+                    and not self.control_untrusted):
+                try:
+                    queued = _append_handoff_steer_command(
+                        self.path, self.job_id, self.nonce,
+                        wall_clock=self.wall_clock)
+                except Exception:  # noqa: BLE001
+                    rollback_fn = getattr(decision, "_rollback", None)
+                    if callable(rollback_fn):
+                        rollback_fn()
+                    return None
+                commit_fn = getattr(decision, "_commit", None)
+                if callable(commit_fn):
+                    commit_fn()
+                self.context_handoff = sanitized
+                self.handoff_triggered = True
+                self.attention_required = True
+                self._refresh_locked(force=True)
+                return queued
+            commit_fn = getattr(decision, "_commit", None)
+            if callable(commit_fn):
+                commit_fn()
+            self.context_handoff = sanitized
+            if sanitized.get("triggered"):
+                self.handoff_triggered = True
+            if sanitized.get("enforced"):
+                self.attention_required = True
+            return None
+
     def expired(self) -> bool:
         now = self.clock()
         return now >= self.deadline or now >= self.hard_deadline
@@ -1308,6 +1422,8 @@ class RuntimeControl:
             payload["progress"] = self.progress
         if self.breaker is not None:
             payload["breaker"] = self.breaker
+        if self.context_handoff is not None:
+            payload["context_handoff"] = self.context_handoff
         payload["auth"] = heartbeat_auth(self.nonce, payload)
         try:
             _write_control_json(self.heartbeat, payload)
@@ -1333,4 +1449,6 @@ class RuntimeControl:
                             "mode": "queued_for_resume"}}
         if self.breaker is not None:
             out["breaker"] = self.breaker
+        if self.context_handoff is not None:
+            out["context_handoff"] = self.context_handoff
         return out

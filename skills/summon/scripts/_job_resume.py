@@ -448,12 +448,20 @@ def _bounded_duration(value, name: str) -> int:
     return value
 
 
-def _compose_prompt(message: str | None, steering: list[dict]) -> str:
+def _compose_prompt(message: str | None, steering: list[dict], *,
+                    handoff_note: dict | None = None) -> str:
     parts = [
         "Continue the authenticated prior session and complete the original task. ",
         "Treat the following as new operator guidance, preserve prior constraints, ",
         "and finish with the required report contract.",
     ]
+    if handoff_note is not None:
+        from _context_handoff import format_handoff_for_resume
+        formatted = format_handoff_for_resume(handoff_note)
+        if not formatted:
+            raise ResumeError("resume_handoff_invalid",
+                              "structured context handoff note is invalid")
+        parts.extend(("\n\nStructured context handoff:\n", formatted))
     for item in steering:
         parts.extend(("\n\nQueued steering:\n", item["message"]))
     if isinstance(message, str) and message.strip():
@@ -474,8 +482,9 @@ def _semantic_request(*, source: dict, prompt_sha256: str,
                       permission: str, gate_with: str | None,
                       allow_credit: bool, allow_payg: bool,
                       timeout_ms: int, gate_timeout_ms: int,
-                      max_runtime_ms: int) -> dict:
-    return {
+                      max_runtime_ms: int,
+                      handoff_note_sha256: str | None = None) -> dict:
+    req = {
         "source_result_binding_sha256": source["result_binding_sha256"],
         "source_sha256": _digest(source),
         "prompt_contract": PROMPT_CONTRACT,
@@ -495,6 +504,9 @@ def _semantic_request(*, source: dict, prompt_sha256: str,
         "gate_timeout_ms": gate_timeout_ms,
         "max_runtime_ms": max_runtime_ms,
     }
+    if handoff_note_sha256 is not None:
+        req["handoff_note_sha256"] = handoff_note_sha256
+    return req
 
 
 def _validate_ledger(value: dict, source_job_id: str, source: dict) -> None:
@@ -606,7 +618,8 @@ def reserve_request(root: str, source_job_id: str, *, message: str | None = None
                     allow_credit: bool = False, allow_payg: bool = False,
                     timeout_ms: int = 600_000,
                     gate_timeout_ms: int | None = None,
-                    max_runtime_ms: int = 24 * 60 * 60 * 1000) -> Reservation:
+                    max_runtime_ms: int = 24 * 60 * 60 * 1000,
+                    handoff_note: dict | None = None) -> Reservation:
     """Reserve one idempotent successor without contacting a provider.
 
     The source-resume lock is always acquired before the source control lock.
@@ -653,7 +666,16 @@ def reserve_request(root: str, source_job_id: str, *, message: str | None = None
         except ValueError as exc:
             raise ResumeError("resume_steering_untrusted", str(exc)) from exc
         steering = control["steering"]
-        prompt = _compose_prompt(message, steering)
+        handoff_sha = None
+        if handoff_note is not None:
+            from _context_handoff import handoff_note_digest
+            handoff_sha = handoff_note_digest(handoff_note)
+            if handoff_sha is None:
+                raise ResumeError("resume_handoff_invalid",
+                                  "structured context handoff note is invalid")
+            prompt = _compose_prompt(message, steering, handoff_note=handoff_note)
+        else:
+            prompt = _compose_prompt(message, steering)
         prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         semantic = _semantic_request(
             source=source, prompt_sha256=prompt_sha,
@@ -663,7 +685,8 @@ def reserve_request(root: str, source_job_id: str, *, message: str | None = None
             permission=permission, gate_with=effective_gate,
             allow_credit=allow_credit, allow_payg=allow_payg,
             timeout_ms=timeout_ms, gate_timeout_ms=gate_timeout_ms,
-            max_runtime_ms=max_runtime_ms)
+            max_runtime_ms=max_runtime_ms,
+            handoff_note_sha256=handoff_sha)
         request_sha = _digest(semantic)
         stable_id = request_id or request_sha[:32]
         ledger = _read_authenticated(path, nonce, _ledger_domain(source_job_id),

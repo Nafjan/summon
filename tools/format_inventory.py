@@ -1396,6 +1396,23 @@ next(item for item in _FORMATS if item["id"] == "worktree-deps")["producers"].ex
 ])
 next(item for item in _FORMATS if item["id"] == "worktree-deps")["readers"].append(
     _ref("_worktree_deps", "_read_metadata"))
+_add("context-handoff", "summon.context-handoff/v1",
+     _ref("_context_handoff", "evaluate_context_handoff"),
+     _ref("_context_handoff", "sanitize_record"),
+     authority="public_projection",
+     shape=["mode", "triggered", "newly_triggered", "enforced", "action", "reason", "evidence", "occupied_tokens", "window_tokens", "ratio", "threshold", "headroom_tokens", "headroom_ratio", "trigger_count", "evaluations", "handoff_note_present", "handoff_note_sha256"],
+     fixtures=[_test("context_handoff", "test_window_scaled_thresholds_and_failsafe_missing_evidence"),
+               _test("context_handoff", "test_enforce_mode_latches_at_most_once_and_queues_steering")],
+     gaps=["Context handoff projections are redacted status summaries; live steering directives require HMAC-authenticated summon.job-control/v2 entries."])
+next(item for item in _FORMATS if item["id"] == "context-handoff")["producers"].extend([
+    _ref("_context_handoff", "ContextHandoffTracker.evaluate"),
+    _ref("_context_handoff", "ContextHandoffTracker.projection"),
+])
+next(item for item in _FORMATS if item["id"] == "context-handoff")["readers"].extend([
+    _ref("_context_handoff", "validate_projection"),
+    _ref("_job_control", "public_heartbeat"),
+    _ref("_executor", "_enrich"),
+])
 
 FORMAT_INVENTORY = {"schema": SCHEMA, "version": VERSION, "formats": _FORMATS}
 

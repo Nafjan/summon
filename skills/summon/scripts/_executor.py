@@ -989,6 +989,11 @@ def _attach_long_horizon_metrics(response: dict, processor) -> None:
             breaker = getattr(processor, "breaker", None)
             if breaker is not None:
                 response.setdefault("breaker", breaker.projection())
+            handoff_tracker = getattr(processor, "context_handoff_tracker", None)
+            if handoff_tracker is not None:
+                if getattr(handoff_tracker, "evaluations", 0) == 0:
+                    handoff_tracker.evaluate(response.get("context_occupancy"))
+                response.setdefault("context_handoff", handoff_tracker.projection())
     except Exception:  # noqa: BLE001 - advisory metrics must never break a dispatch
         pass
 
@@ -1136,6 +1141,16 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
             for key, value in report.items()
         }
     response["report"] = report
+    try:
+        handoff_tracker = getattr(processor, "context_handoff_tracker", None) if processor else None
+        if handoff_tracker is not None:
+            from _context_handoff import extract_handoff_note_from_envelope
+            note = extract_handoff_note_from_envelope(response)
+            if note is not None:
+                handoff_tracker.attach_handoff_note(note)
+                response["context_handoff"] = handoff_tracker.projection()
+    except Exception:  # noqa: BLE001 - advisory handoff note extraction must never fail dispatch
+        pass
     # Kept distinct from report_ok for compatibility with older/project-local definitions.
     # New bundled definitions and initial dispatch context require LEFT_BEHIND, while a
     # legacy report stays mechanically valid but tells callers it made no environmental
@@ -3863,6 +3878,21 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
                 )
         except Exception:  # noqa: BLE001 - advisory unless enforce mode succeeds
             pass
+        # Phase 5: context-aware handoff tracker (shadow by default).
+        try:
+            from _context_handoff import (
+                ContextHandoffTracker,
+                mode_from_environment as _handoff_mode_from_environment,
+                threshold_from_environment as _handoff_threshold_from_environment,
+            )
+            _handoff_mode = _handoff_mode_from_environment()
+            if _handoff_mode != "off":
+                processor.context_handoff_tracker = ContextHandoffTracker(
+                    mode=_handoff_mode,
+                    threshold_override=_handoff_threshold_from_environment(),
+                )
+        except Exception:  # noqa: BLE001 - advisory unless enforce mode succeeds
+            pass
     try:
         from _stream_partials import emit_partial as _emit_partial
         _emit_partial("started", cli=cli, message="subprocess started")
@@ -3878,6 +3908,14 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
     enriched = _enrich(response, processor)
     enriched["liveness"] = tracker.snapshot()
     if runtime_control is not None:
+        if isinstance(enriched.get("context_handoff"), dict):
+            try:
+                from _context_handoff import sanitize_record as _sanitize_handoff
+                _clean_h = _sanitize_handoff(enriched["context_handoff"])
+                if _clean_h is not None:
+                    runtime_control.context_handoff = _clean_h
+            except Exception:  # noqa: BLE001
+                pass
         runtime_control.publish(enriched["liveness"], force=True)
         enriched["runtime_control"] = runtime_control.projection()
     return enriched
@@ -3985,11 +4023,19 @@ def _drive_process_loop(
                 checkpoint_active = stream_active
                 judge = getattr(processor, "progress_judge", None)
                 breaker = getattr(processor, "breaker", None)
+                handoff_tracker = getattr(processor, "context_handoff_tracker", None)
                 if breaker is not None:
                     try:
                         sync_fn = getattr(breaker, "sync_from_control", None)
                         if callable(sync_fn):
                             sync_fn(runtime_control)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if handoff_tracker is not None:
+                    try:
+                        h_sync_fn = getattr(handoff_tracker, "sync_from_control", None)
+                        if callable(h_sync_fn):
+                            h_sync_fn(runtime_control)
                     except Exception:  # noqa: BLE001
                         pass
                 due_fn = getattr(runtime_control, "checkpoint_due", None)
@@ -4044,6 +4090,28 @@ def _drive_process_loop(
                 if isinstance(breaker_decision, dict) and breaker_decision.get("enforced"):
                     if breaker_decision.get("action") == "steer":
                         runtime_control.attention_required = True
+                if handoff_tracker is not None and is_due:
+                    try:
+                        _live_occ = None
+                        try:
+                            live_occ_fn = getattr(processor, "live_context_occupancy", None)
+                            if callable(live_occ_fn):
+                                _live_occ = live_occ_fn(cli=cli)
+                            else:
+                                from _usage_metrics import context_occupancy as _calc_occ
+                                _live_occ = _calc_occ(
+                                    getattr(processor, "last_request_usage", None),
+                                    getattr(processor, "context_window", None),
+                                    cli=cli,
+                                )
+                        except Exception:  # noqa: BLE001
+                            _live_occ = None
+                        handoff_decision = handoff_tracker.evaluate(_live_occ)
+                        rec_handoff_fn = getattr(runtime_control, "record_context_handoff", None)
+                        if callable(rec_handoff_fn):
+                            rec_handoff_fn(handoff_decision)
+                    except Exception:  # noqa: BLE001
+                        pass
                 _enforced_stop = bool(
                     (isinstance(breaker_decision, dict)
                      and breaker_decision.get("enforced")

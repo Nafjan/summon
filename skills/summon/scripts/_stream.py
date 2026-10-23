@@ -304,6 +304,29 @@ class StreamProcessor:
                 best_record = {"work_tokens": claude_sum, "evidence": "derived"}
         return best_record
 
+    def live_context_occupancy(self, cli: str | None = None) -> dict | None:
+        """Return live root-request context occupancy, if available."""
+        from _usage_metrics import context_occupancy as _calc_context_occupancy
+        effective_cli = cli or self._declared_cli
+        if effective_cli is None:
+            if self.is_codex:
+                effective_cli = "codex"
+            elif self.is_gemini:
+                effective_cli = "gemini"
+            elif self.is_agy:
+                effective_cli = "agy"
+            elif self.is_opencode:
+                effective_cli = "opencode"
+            elif self.is_kimi:
+                effective_cli = "kimi"
+            elif self._claude_session_id or self._live_claude_usage or self._live_claude_evicted_work_tokens:
+                effective_cli = "claude"
+        return _calc_context_occupancy(
+            self.last_request_usage,
+            self.context_window,
+            cli=effective_cli,
+        )
+
     def _signal_tool(self, name, payload, call_id=None) -> None:
         try:
             self.progress_signals.tool_call(name, payload)
