@@ -265,7 +265,11 @@ class StreamProcessor:
 
     def live_work_tokens(self, cli: str | None = None) -> dict | None:
         """Return deduplicated live or terminal work-token accounting, if available."""
-        from _usage_metrics import work_tokens as _calc_work_tokens
+        from _usage_metrics import (
+            EXCLUDES_CACHE,
+            USAGE_SCHEMA,
+            work_tokens as _calc_work_tokens,
+        )
         effective_cli = cli or self._declared_cli
         if effective_cli is None:
             if self.is_codex:
@@ -301,7 +305,17 @@ class StreamProcessor:
                     claude_any = True
             if claude_any and (best_tokens is None or claude_sum > best_tokens):
                 best_tokens = claude_sum
-                best_record = {"work_tokens": claude_sum, "evidence": "derived"}
+                best_record = {
+                    "schema": USAGE_SCHEMA,
+                    "work_tokens": claude_sum,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "cache_read_tokens": None,
+                    "cache_write_tokens": None,
+                    "input_semantics": EXCLUDES_CACHE,
+                    "observation_scope": "attempt_total",
+                    "evidence": "derived",
+                }
         return best_record
 
     def live_context_occupancy(self, cli: str | None = None) -> dict | None:

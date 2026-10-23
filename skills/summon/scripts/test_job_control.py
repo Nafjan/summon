@@ -1533,3 +1533,97 @@ def test_watch_jobs_snapshot_projects_authenticated_telemetry_and_rejects_tamper
     assert row_tampered["context_ratio"] is None
     assert row_tampered["breaker_level"] is None
 
+    # Legacy v1 heartbeat: MAC only binds job_id + attempt_id, not body fields.
+    # watch_jobs_snapshot must NOT label it heartbeat_authenticated or trust its telemetry.
+    legacy_hb = {
+        "schema": "summon.job-heartbeat/v1",
+        "job_id": job_id,
+        "attempt_id": job_id,
+        "auth": _job_control.legacy_heartbeat_auth("nonce", job_id),
+        "usage_metrics": {
+            "schema": "summon.usage-metrics/v1",
+            "work_tokens": 999999,
+            "evidence": "derived",
+        },
+    }
+    _jobs._atomic_write_json(hb_path, legacy_hb)
+    snap_legacy = _background.watch_jobs_snapshot(root, active_only=False)
+    row_legacy = snap_legacy["jobs"][0]
+    assert row_legacy["heartbeat_authenticated"] is False
+    assert row_legacy["work_tokens"] is None
+
+    # Rejected agent value in record must not escape via raw row["agent"] fallback.
+    bad_record = _jobs.read_json(record_path)
+    bad_record["agent"] = "sk-REVIEW_SYNTHETIC_SECRET/bad spaces"
+    _jobs._atomic_write_json(record_path, bad_record)
+    snap_bad_agent = _background.watch_jobs_snapshot(root, active_only=False)
+    assert "sk-REVIEW_SYNTHETIC_SECRET" not in json.dumps(snap_bad_agent)
+    assert snap_bad_agent["jobs"][0]["agent"] is None
+
+    # Live Claude stream producer shape is accepted by _sanitize_usage_metrics.
+    proc = StreamProcessor(cli="claude")
+    proc.process_line(json.dumps({
+        "type": "assistant",
+        "session_id": "s1",
+        "message": {
+            "id": "msg-1",
+            "content": [{"type": "text", "text": "hello"}],
+            "usage": {"input_tokens": 15, "output_tokens": 10, "cache_read_input_tokens": 100},
+        },
+    }))
+    live_um = proc.live_work_tokens(cli="claude")
+    assert live_um is not None
+    sanitized_live = _job_control._sanitize_usage_metrics(live_um)
+    assert sanitized_live is not None
+    assert sanitized_live["work_tokens"] == 25
+    assert sanitized_live["input_semantics"] == "excludes_cache"
+    assert sanitized_live["observation_scope"] == "attempt_total"
+    assert sanitized_live["evidence"] == "derived"
+
+    # Completed trusted result with submission_summary.unknown_spend=True and
+    # result telemetry must surface telemetry and render spend as "unknown".
+    os.unlink(hb_path)
+    clean_record = _jobs.read_json(record_path)
+    clean_record["agent"] = "sol"
+    _jobs._atomic_write_json(record_path, clean_record)
+    _jobs._atomic_write_json(_jobs.result_path(root, job_id), {
+        "status": "success",
+        "execution_status": "success",
+        "job_nonce": "nonce",
+        "summon": {"version": "3.6.2", "scripts_sha256": "c" * 64},
+        "agent": "sol",
+        "cli": "claude",
+        "elapsed_ms": 14500,
+        "cost_usd": None,
+        "usage_metrics": {
+            "schema": "summon.usage-metrics/v1",
+            "work_tokens": 8192,
+            "input_semantics": "includes_cache",
+            "observation_scope": "attempt_total",
+            "evidence": "derived",
+        },
+        "context_occupancy": {
+            "schema": "summon.context-occupancy/v1",
+            "occupied_tokens": 64000,
+            "window_tokens": 128000,
+            "ratio": 0.5,
+            "over_window": False,
+            "input_semantics": "includes_cache",
+            "evidence": "reported",
+        },
+        "submission_summary": {
+            "schema": "summon.submission-summary/v1",
+            "unknown_spend": True,
+        },
+    })
+    snap_done = _background.watch_jobs_snapshot(root, active_only=False)
+    row_done = snap_done["jobs"][0]
+    assert row_done["state"] == "success"
+    assert row_done["agent"] == "sol"
+    assert row_done["work_tokens"] == 8192
+    assert row_done["context_ratio"] == 0.5
+    assert row_done["unknown_spend"] is True
+    assert "unknown" in _background.render_jobs_watch(snap_done)
+
+
+

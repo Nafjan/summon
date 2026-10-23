@@ -120,7 +120,7 @@ def _extract_turn_telemetry_summary(envelope: Mapping[str, Any]) -> dict[str, An
             "breaker_enforced": breaker_enforced,
             "handoff_triggered": handoff_triggered,
         })
-    except ConversationError:
+    except (ConversationError, OverflowError, ValueError, TypeError):
         return None
 
 

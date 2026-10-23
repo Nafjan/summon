@@ -215,11 +215,16 @@ def _validate_turn_telemetry_summary(value: Any) -> dict[str, Any]:
         if (
             not isinstance(ratio, (int, float))
             or isinstance(ratio, bool)
-            or not math.isfinite(float(ratio))
-            or not 0.0 <= float(ratio) <= 10.0
+            or (isinstance(ratio, int) and not 0 <= ratio <= 10)
         ):
             raise ConversationError("invalid turn telemetry summary")
-        norm_ratio = round(float(ratio), 6)
+        try:
+            f_ratio = float(ratio)
+        except (OverflowError, ValueError, TypeError) as exc:
+            raise ConversationError("invalid turn telemetry summary") from exc
+        if not math.isfinite(f_ratio) or not 0.0 <= f_ratio <= 10.0:
+            raise ConversationError("invalid turn telemetry summary")
+        norm_ratio = round(f_ratio, 6)
     breaker_level = raw.get("breaker_level")
     if breaker_level is not None and (
         not isinstance(breaker_level, str)

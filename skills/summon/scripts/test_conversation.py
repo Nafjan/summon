@@ -806,6 +806,27 @@ class ConversationPolicyTests(unittest.TestCase):
                 )
             self.assertIn("telemetryBadges", _conversation_page._JS)
             self.assertIn("telemetry-badges", _conversation_page._CSS)
+            # Oversized integer ratios must not raise OverflowError in _extract_turn_telemetry_summary
+            # and must raise ConversationError in _validate_turn_telemetry_summary.
+            self.assertIsNone(
+                _conversation_runtime._extract_turn_telemetry_summary({
+                    "context_occupancy": {"ratio": 10**400},
+                })
+            )
+            with self.assertRaises(ConversationError):
+                room.append(
+                    "turn_finished",
+                    actor_kind="system",
+                    actor_id="owner",
+                    payload={
+                        "turn_id": "turn-4",
+                        "participant": "sol",
+                        "status": "success",
+                        "turn_telemetry_summary": {
+                            "context_occupancy_ratio": 10**400,
+                        },
+                    },
+                )
 
     def test_cli_subcommand_is_provider_inert_and_grouped(self):
         script = HERE / "run_subagent.py"

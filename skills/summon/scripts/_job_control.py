@@ -212,11 +212,27 @@ def _sanitize_usage_metrics(value: object) -> dict | None:
     if semantics in {"includes_cache", "excludes_cache", "unknown"}:
         out["input_semantics"] = semantics
     scope = value.get("observation_scope")
-    if scope is None or scope in {"attempt_total", "last_turn", "accumulated",
-                                  "unknown", "single_request"}:
+    if scope is None or scope in {
+        "attempt_total",
+        "last_step_snapshot",
+        "unestablished",
+        "last_turn",
+        "accumulated",
+        "unknown",
+        "single_request",
+    }:
         out["observation_scope"] = scope
     evidence = value.get("evidence")
-    if evidence in {"derived", "partial", "absent"}:
+    if evidence in {
+        "absent",
+        "incomplete",
+        "derived",
+        "inconsistent_cache_fields",
+        "derived_no_cache_fields",
+        "ambiguous_cache_semantics",
+        "partial",
+        "reported",
+    }:
         out["evidence"] = evidence
     return out
 
@@ -234,7 +250,8 @@ def _sanitize_context_occupancy(value: object) -> dict | None:
             return None
     ratio = value.get("ratio")
     if ratio is None or (isinstance(ratio, (int, float)) and not isinstance(ratio, bool)
-                         and math.isfinite(ratio) and 0.0 <= ratio <= 10.0):
+                         and not (isinstance(ratio, int) and not (0 <= ratio <= 10))
+                         and math.isfinite(float(ratio)) and 0.0 <= float(ratio) <= 10.0):
         out["ratio"] = float(ratio) if ratio is not None else None
     else:
         return None
@@ -245,7 +262,15 @@ def _sanitize_context_occupancy(value: object) -> dict | None:
     if semantics in {"includes_cache", "excludes_cache", "unknown"}:
         out["input_semantics"] = semantics
     evidence = value.get("evidence")
-    if evidence in {"reported", "window_only", "occupied_only", "absent"}:
+    if evidence in {
+        "absent",
+        "incomplete",
+        "ambiguous_cache_semantics",
+        "occupied_without_window",
+        "reported",
+        "window_only",
+        "occupied_only",
+    }:
         out["evidence"] = evidence
     return out
 

@@ -1125,6 +1125,19 @@ def _read_authenticated_heartbeat(root: str, job_id: str,
 
 def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
     """Return a redacted, HMAC-verified operator snapshot of background jobs."""
+    from _breaker import sanitize_record as _sanitize_breaker
+    from _context_handoff import sanitize_record as _sanitize_context_handoff
+    from _job_control import (
+        _sanitize_context_occupancy,
+        _sanitize_usage_metrics,
+    )
+    from _progress_judge import sanitize_record as _sanitize_progress
+
+    _ALLOWED_PHASES = {
+        "startup", "generation", "reconnect", "finalization",
+        "terminal", "cancelled", "timed_out",
+    }
+
     rows = _jobs.list_jobs(root)
     if active_only:
         rows = [row for row in rows if row.get("state") in ("running", "prepared")]
@@ -1141,42 +1154,66 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
         if not isinstance(st, dict):
             continue
         raw_record = st.get("record") if isinstance(st.get("record"), dict) else {}
-        hb = _read_authenticated_heartbeat(root, jid, raw_record)
+        hb_raw = _read_authenticated_heartbeat(root, jid, raw_record)
+        hb_authenticated = (
+            isinstance(hb_raw, dict)
+            and hb_raw.get("integrity") == "payload_authenticated"
+        )
+        hb = hb_raw if hb_authenticated else None
         pub = _jobs.public_job_status(dict(st))
-        state = str(pub.get("state") or row.get("state") or "unknown")
+        state = str(pub.get("state") or "unknown")
         if state in ("running", "prepared"):
             active_count += 1
         trusted = bool(pub.get("trusted"))
         res = pub.get("result") if (trusted and isinstance(pub.get("result"), dict)) else {}
+        trusted_raw_res = st.get("result") if (trusted and isinstance(st.get("result"), dict)) else {}
         rec = pub.get("record") if isinstance(pub.get("record"), dict) else {}
-        agent = res.get("agent") or rec.get("agent") or row.get("agent")
-        cli = res.get("cli") or rec.get("cli")
+        rec_flags = rec.get("flags") if isinstance(rec.get("flags"), dict) else {}
+        agent = res.get("agent") or rec.get("agent") or pub.get("agent")
+        cli = res.get("cli") or rec_flags.get("cli")
         hb_live = (
             hb.get("liveness")
             if isinstance(hb, dict) and isinstance(hb.get("liveness"), dict)
             else {}
         )
-        res_live = res.get("liveness") if isinstance(res.get("liveness"), dict) else {}
-        phase = str(hb_live.get("phase") or res_live.get("phase") or state)
+        raw_res_live = (
+            trusted_raw_res.get("liveness")
+            if isinstance(trusted_raw_res.get("liveness"), dict)
+            else {}
+        )
+        res_phase = raw_res_live.get("phase") if raw_res_live.get("phase") in _ALLOWED_PHASES else None
+        raw_res_live_elapsed = raw_res_live.get("elapsed_ms")
+        res_live_elapsed = (
+            raw_res_live_elapsed
+            if (isinstance(raw_res_live_elapsed, int)
+                and not isinstance(raw_res_live_elapsed, bool)
+                and 0 <= raw_res_live_elapsed <= 366 * 24 * 60 * 60 * 1000)
+            else None
+        )
+        phase = str(hb_live.get("phase") or res_phase or state)
         elapsed_ms = None
+        raw_res_elapsed = trusted_raw_res.get("elapsed_ms")
         if isinstance(hb, dict) and isinstance(hb.get("job_elapsed_ms"), int):
             elapsed_ms = hb["job_elapsed_ms"]
         elif isinstance(hb_live.get("elapsed_ms"), int):
             elapsed_ms = hb_live["elapsed_ms"]
-        elif isinstance(res.get("elapsed_ms"), int) and not isinstance(res.get("elapsed_ms"), bool):
-            elapsed_ms = res["elapsed_ms"]
-        elif isinstance(res_live.get("elapsed_ms"), int) and not isinstance(res_live.get("elapsed_ms"), bool):
-            elapsed_ms = res_live["elapsed_ms"]
+        elif (isinstance(raw_res_elapsed, int)
+              and not isinstance(raw_res_elapsed, bool)
+              and 0 <= raw_res_elapsed <= 366 * 24 * 60 * 60 * 1000):
+            elapsed_ms = raw_res_elapsed
+        elif res_live_elapsed is not None:
+            elapsed_ms = res_live_elapsed
         hb_breaker = (
             hb.get("breaker")
             if isinstance(hb, dict) and isinstance(hb.get("breaker"), dict)
             else {}
         )
-        res_breaker = res.get("breaker") if isinstance(res.get("breaker"), dict) else {}
-        if not res_breaker and isinstance(res.get("runtime_control"), dict):
-            rc_breaker = res["runtime_control"].get("breaker")
-            if isinstance(rc_breaker, dict):
-                res_breaker = rc_breaker
+        raw_rc = trusted_raw_res.get("runtime_control") if isinstance(trusted_raw_res.get("runtime_control"), dict) else {}
+        res_breaker = (
+            _sanitize_breaker(trusted_raw_res.get("breaker"))
+            or _sanitize_breaker(raw_rc.get("breaker"))
+            or {}
+        )
         breaker_level = hb_breaker.get("level") or res_breaker.get("level")
         breaker_mode = hb_breaker.get("mode") or res_breaker.get("mode")
         hb_occ = (
@@ -1189,12 +1226,28 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
             if isinstance(hb, dict) and isinstance(hb.get("context_handoff"), dict)
             else {}
         )
-        res_occ = res.get("context_occupancy") if isinstance(res.get("context_occupancy"), dict) else {}
+        res_occ = (
+            _sanitize_context_occupancy(trusted_raw_res.get("context_occupancy"))
+            or _sanitize_context_occupancy(raw_rc.get("context_occupancy"))
+            or {}
+        )
+        res_handoff = (
+            _sanitize_context_handoff(trusted_raw_res.get("context_handoff"))
+            or _sanitize_context_handoff(raw_rc.get("context_handoff"))
+            or {}
+        )
         context_ratio = None
-        for candidate_ratio in (hb_occ.get("ratio"), hb_handoff.get("ratio"), res_occ.get("ratio")):
+        for candidate_ratio in (
+            hb_occ.get("ratio"),
+            hb_handoff.get("ratio"),
+            res_occ.get("ratio"),
+            res_handoff.get("ratio"),
+        ):
             if (isinstance(candidate_ratio, (int, float))
                     and not isinstance(candidate_ratio, bool)
-                    and math.isfinite(candidate_ratio)):
+                    and not (isinstance(candidate_ratio, int) and not (0 <= candidate_ratio <= 10))
+                    and math.isfinite(float(candidate_ratio))
+                    and 0.0 <= float(candidate_ratio) <= 10.0):
                 context_ratio = float(candidate_ratio)
                 break
         hb_prog = (
@@ -1202,38 +1255,53 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
             if isinstance(hb, dict) and isinstance(hb.get("progress"), dict)
             else {}
         )
-        res_prog = res.get("progress_judgement") if isinstance(res.get("progress_judgement"), dict) else {}
+        res_prog = (
+            _sanitize_progress(trusted_raw_res.get("progress_judgement"))
+            or _sanitize_progress(raw_rc.get("progress"))
+            or {}
+        )
         progress_reason = hb_prog.get("reason") or res_prog.get("reason")
         hb_um = (
             hb.get("usage_metrics")
             if isinstance(hb, dict) and isinstance(hb.get("usage_metrics"), dict)
             else {}
         )
-        res_um = res.get("usage_metrics") if isinstance(res.get("usage_metrics"), dict) else {}
+        res_um = (
+            _sanitize_usage_metrics(trusted_raw_res.get("usage_metrics"))
+            or _sanitize_usage_metrics(raw_rc.get("usage_metrics"))
+            or {}
+        )
         work_tokens = None
         for candidate_wt in (hb_um.get("work_tokens"), res_um.get("work_tokens")):
             if isinstance(candidate_wt, int) and not isinstance(candidate_wt, bool) and candidate_wt >= 0:
                 work_tokens = candidate_wt
                 break
-        rc_proj = res.get("runtime_control") if isinstance(res.get("runtime_control"), dict) else {}
         attention_required = bool(
             (hb.get("attention_required") if isinstance(hb, dict) else False)
-            or rc_proj.get("attention_required")
+            or (raw_rc.get("attention_required") is True)
         )
-        sub_sum = res.get("submission_summary") if isinstance(res.get("submission_summary"), dict) else {}
+        pub_sub_sum = pub.get("submission_summary")
+        raw_sub_sum = trusted_raw_res.get("submission_summary")
+        sub_sum = (
+            pub_sub_sum
+            if isinstance(pub_sub_sum, dict)
+            else (raw_sub_sum if isinstance(raw_sub_sum, dict) else {})
+        )
         unknown_spend = bool(
-            sub_sum.get("unknown_spend")
-            or state in ("running", "unverified", "stale")
+            (sub_sum.get("unknown_spend") is True)
+            or state in ("running", "unverified", "stale", "corrupt", "identity_mismatch")
         )
-        raw_cost = res.get("cost_usd")
-        cost_usd = (
-            float(raw_cost)
-            if (isinstance(raw_cost, (int, float))
+        raw_cost = trusted_raw_res.get("cost_usd")
+        cost_usd = None
+        if (isinstance(raw_cost, (int, float))
                 and not isinstance(raw_cost, bool)
-                and math.isfinite(raw_cost)
-                and raw_cost >= 0.0)
-            else None
-        )
+                and not (isinstance(raw_cost, int) and not (0 <= raw_cost <= 10**9))):
+            try:
+                f_cost = float(raw_cost)
+                if math.isfinite(f_cost) and 0.0 <= f_cost <= 10**9:
+                    cost_usd = f_cost
+            except (OverflowError, ValueError, TypeError):
+                cost_usd = None
         watched.append({
             "job_id": jid,
             "state": state,
@@ -1250,7 +1318,7 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
             "attention_required": attention_required,
             "unknown_spend": unknown_spend,
             "cost_usd": cost_usd,
-            "heartbeat_authenticated": hb is not None,
+            "heartbeat_authenticated": hb_authenticated,
         })
     return {
         "schema": "summon.jobs-watch/v1",
