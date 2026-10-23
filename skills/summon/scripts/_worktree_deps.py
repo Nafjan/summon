@@ -11,22 +11,28 @@ Safety invariants:
 * Strictly opt-in via ``--link-deps``; requires ``--worktree``.
 * Refused under ``permission=yolo`` unless ``--link-deps-allow-mutation`` is
   explicitly supplied.
-* Path validation rejects absolute paths, drive letters, ``..`` traversal, and
-  ``.git`` / ``.claude`` segments. Base targets must exist as real directories
-  (never symlinks or junctions) inside the repository root.
+* Path validation rejects absolute paths, drive letters, ``..`` traversal,
+  Windows trailing-dot/space and 8.3 aliases, and ``.git`` / ``.claude``
+  segments. Base targets must exist as real directories (never symlinks or
+  junctions) inside the repository root.
 * Pre- and post-dispatch fingerprints cover nearby lockfiles and bounded
-  directory metadata. Unacknowledged mutation after dispatch fails closed
-  (``error_kind="linked_deps_mutated"``).
+  multi-level directory trees (including scoped packages ``@scope/pkg``).
+  Authoritative baseline state is retained in dispatcher memory; missing or
+  tampered on-disk metadata or unacknowledged dependency mutation after
+  dispatch fails closed (``error_kind="linked_deps_mutated"``).
 * Intact Summon-created dependency links are excluded from untracked file lists
   in workspace snapshots, progress fingerprints, and worktree GC, and are
-  cleanly unlinked before worktree removal.
+  cleanly unlinked before worktree removal only after verifying ancestor
+  containment and target binding.
 """
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import uuid
@@ -53,8 +59,10 @@ INNER_STATE_FILES = (
     "pyvenv.cfg",
 )
 MAX_LOCKFILE_BYTES = 16 * 1024 * 1024
-MAX_SCANDIR_ENTRIES = 512
+MAX_TREE_DEPTH = 4
+MAX_TREE_VISITED_ENTRIES = 50_000
 _FORBIDDEN_SEGMENTS = frozenset({"", ".", "..", ".git", ".claude"})
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class WorktreeDepsError(ValueError):
@@ -64,6 +72,12 @@ class WorktreeDepsError(ValueError):
         super().__init__(message)
         self.kind = kind
         self.details = details or {}
+
+
+class _BridgedDepsProjection(dict):
+    """Public projection dict carrying non-serialized dispatcher authority."""
+
+    _authority: dict[str, Any] | None = None
 
 
 def _is_link_or_junction(path: str) -> bool:
@@ -117,6 +131,15 @@ def _remove_dir_link(path: str) -> None:
     os.unlink(path)
 
 
+def _is_forbidden_segment(seg: str) -> bool:
+    if seg in _FORBIDDEN_SEGMENTS:
+        return True
+    if seg.endswith((".", " ")) or "~" in seg:
+        return True
+    stripped = seg.rstrip(". ").lower()
+    return stripped in _FORBIDDEN_SEGMENTS
+
+
 def parse_link_deps(raw: str | Iterable[str] | None) -> tuple[str, ...]:
     """Validate and canonicalize ``--link-deps`` into a sorted tuple of relative POSIX paths."""
     if raw is None or raw == "":
@@ -167,10 +190,10 @@ def parse_link_deps(raw: str | Iterable[str] | None) -> tuple[str, ...]:
             )
         segments = norm.split("/")
         for seg in segments:
-            if seg in _FORBIDDEN_SEGMENTS or seg.lower() in {".git", ".claude"}:
+            if _is_forbidden_segment(seg):
                 raise WorktreeDepsError(
                     "link_deps_invalid_path",
-                    f"--link-deps path {token!r} contains forbidden segment {seg!r}",
+                    f"--link-deps path {token!r} contains forbidden or aliased segment {seg!r}",
                 )
         cleaned.add("/".join(segments))
     items = sorted(cleaned)
@@ -216,6 +239,12 @@ def _git_toplevel(cwd: str) -> str:
 
 
 def _validate_repo_target(repo_root: str, rel: str) -> tuple[str, str]:
+    parsed = parse_link_deps([rel])
+    if len(parsed) != 1 or parsed[0] != rel:
+        raise WorktreeDepsError(
+            "link_deps_invalid_path",
+            f"--link-deps path {rel!r} is not in canonical repo-relative form",
+        )
     repo_real = os.path.realpath(repo_root)
     if _is_link_or_junction(repo_root):
         raise WorktreeDepsError(
@@ -224,6 +253,11 @@ def _validate_repo_target(repo_root: str, rel: str) -> tuple[str, str]:
         )
     cur = repo_root
     for seg in rel.split("/"):
+        if _is_forbidden_segment(seg):
+            raise WorktreeDepsError(
+                "link_deps_invalid_path",
+                f"--link-deps path {rel!r} contains forbidden segment {seg!r}",
+            )
         cur = os.path.join(cur, seg)
         if not os.path.lexists(cur):
             raise WorktreeDepsError(
@@ -253,6 +287,13 @@ def _validate_repo_target(repo_root: str, rel: str) -> tuple[str, str]:
             "link_deps_invalid_target",
             f"--link-deps target {rel!r} resolves outside repository root",
         )
+    rel_resolved = os.path.relpath(target_real, repo_real).replace("\\", "/")
+    for rseg in rel_resolved.split("/"):
+        if _is_forbidden_segment(rseg):
+            raise WorktreeDepsError(
+                "link_deps_invalid_path",
+                f"--link-deps target {rel!r} resolves to forbidden path {rel_resolved!r}",
+            )
     return cur, target_real
 
 
@@ -320,18 +361,27 @@ def _hash_regular_file(path: str) -> str | None:
         return None
 
 
-def _scandir_digest(directory: str, *, depth: int = 1) -> str:
+def _scandir_digest(
+    directory: str,
+    *,
+    depth: int = MAX_TREE_DEPTH,
+    budget: list[int] | None = None,
+) -> str:
+    if budget is None:
+        budget = [MAX_TREE_VISITED_ENTRIES]
     h = hashlib.sha256()
     try:
         entries = []
-        total = 0
         with os.scandir(directory) as it:
             for entry in it:
-                total += 1
                 entries.append(entry)
         entries.sort(key=lambda e: e.name)
-        h.update(f"total:{total}\0".encode("utf-8"))
-        for entry in entries[:MAX_SCANDIR_ENTRIES]:
+        h.update(f"total:{len(entries)}\0".encode("utf-8"))
+        for entry in entries:
+            if budget[0] <= 0:
+                h.update(b"truncated:budget_exhausted\0")
+                break
+            budget[0] -= 1
             try:
                 is_sym = entry.is_symlink()
                 is_dir = entry.is_dir(follow_symlinks=False)
@@ -339,12 +389,18 @@ def _scandir_digest(directory: str, *, depth: int = 1) -> str:
                     # Directory st_size/st_mtime_ns on Windows NTFS can update
                     # asynchronously when background indexers/scanners inspect a
                     # newly created folder. Hash directory names/structure and
-                    # regular-file stats instead.
+                    # regular-file stats across the bounded tree instead.
                     rec = f"D\0{entry.name}\n"
                     h.update(rec.encode("utf-8", errors="surrogateescape"))
                     if depth > 0:
-                        sub_digest = _scandir_digest(entry.path, depth=depth - 1)
-                        h.update(f"S\0{entry.name}\0{sub_digest}\n".encode("utf-8", errors="surrogateescape"))
+                        sub_digest = _scandir_digest(
+                            entry.path, depth=depth - 1, budget=budget
+                        )
+                        h.update(
+                            f"S\0{entry.name}\0{sub_digest}\n".encode(
+                                "utf-8", errors="surrogateescape"
+                            )
+                        )
                 else:
                     st = entry.stat(follow_symlinks=False)
                     rec = f"F\0{entry.name}\0{int(is_sym)}\0{st.st_size}\0{st.st_mtime_ns}\n"
@@ -381,12 +437,15 @@ def fingerprint_dep_target(repo_root: str, rel: str) -> str:
         if digest is not None:
             h.update(f"inner:{inner_name}:{digest}\0".encode("utf-8"))
 
-    h.update(f"top:{_scandir_digest(target)}\0".encode("utf-8"))
+    budget = [MAX_TREE_VISITED_ENTRIES]
+    h.update(f"top:{_scandir_digest(target, depth=MAX_TREE_DEPTH, budget=budget)}\0".encode("utf-8"))
 
     for sub_rel in (".bin", "Lib/site-packages", "Scripts", "bin"):
         sub_path = os.path.join(target, *sub_rel.split("/"))
         if os.path.isdir(sub_path) and not _is_link_or_junction(sub_path):
-            h.update(f"sub:{sub_rel}:{_scandir_digest(sub_path)}\0".encode("utf-8"))
+            h.update(
+                f"sub:{sub_rel}:{_scandir_digest(sub_path, depth=MAX_TREE_DEPTH, budget=budget)}\0".encode("utf-8")
+            )
     lib_dir = os.path.join(target, "lib")
     if os.path.isdir(lib_dir) and not _is_link_or_junction(lib_dir):
         try:
@@ -395,7 +454,10 @@ def fingerprint_dep_target(repo_root: str, rel: str) -> str:
             for py_name in py_dirs:
                 sp = os.path.join(lib_dir, py_name, "site-packages")
                 if os.path.isdir(sp) and not _is_link_or_junction(sp):
-                    h.update(f"sub:lib/{py_name}/site-packages:{_scandir_digest(sp)}\0".encode("utf-8"))
+                    h.update(
+                        f"sub:lib/{py_name}/site-packages:"
+                        f"{_scandir_digest(sp, depth=MAX_TREE_DEPTH, budget=budget)}\0".encode("utf-8")
+                    )
         except OSError:
             pass
     return h.hexdigest()
@@ -427,7 +489,6 @@ def _find_worktree_root_and_gitdir(path: str) -> tuple[str, str] | None:
                         return cur, gitdir
                 return None
             if os.path.isdir(dot_git):
-                # Main repository checkout, not a linked worktree.
                 return None
         except OSError:
             return None
@@ -460,10 +521,11 @@ def _metadata_path(worktree_path: str) -> str | None:
     return None
 
 
-def _write_metadata_atomic(meta_path: str, payload: dict[str, Any]) -> None:
+def _write_metadata_atomic(meta_path: str, payload: dict[str, Any]) -> str:
     os.makedirs(os.path.dirname(meta_path), exist_ok=True)
     tmp_path = f"{meta_path}.{uuid.uuid4().hex}.tmp"
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
     fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb") as fh:
@@ -482,24 +544,129 @@ def _write_metadata_atomic(meta_path: str, payload: dict[str, Any]) -> None:
             pass
         raise
     os.replace(tmp_path, meta_path)
+    return digest
 
 
-def _read_metadata(worktree_path: str) -> tuple[str | None, dict[str, Any] | None]:
+def _validate_private_metadata(data: Any) -> dict[str, Any] | None:
+    if not isinstance(data, dict) or data.get("schema") != SCHEMA:
+        return None
+    raw_paths = data.get("paths")
+    targets = data.get("targets")
+    repo_root = data.get("repo_root")
+    before_sha256 = data.get("before_sha256")
+    allow_mutation = data.get("allow_mutation")
+    strategy = data.get("strategy")
+    if (not isinstance(raw_paths, list)
+            or not raw_paths
+            or any(not isinstance(p, str) for p in raw_paths)
+            or not isinstance(targets, dict)
+            or not isinstance(repo_root, str) or not repo_root
+            or not isinstance(before_sha256, str) or not _HEX64_RE.fullmatch(before_sha256)
+            or type(allow_mutation) is not bool
+            or strategy not in {"junction", "symlink"}):
+        return None
+    try:
+        canonical_paths = list(parse_link_deps(raw_paths))
+    except WorktreeDepsError:
+        return None
+    if canonical_paths != raw_paths or set(targets.keys()) != set(canonical_paths):
+        return None
+    repo_real = os.path.realpath(repo_root)
+    for rel in canonical_paths:
+        tinfo = targets.get(rel)
+        if not isinstance(tinfo, dict):
+            return None
+        target_real = tinfo.get("target_realpath")
+        before_fp = tinfo.get("before_sha256")
+        if (not isinstance(target_real, str) or not target_real
+                or not isinstance(before_fp, str) or not _HEX64_RE.fullmatch(before_fp)):
+            return None
+        try:
+            common = os.path.commonpath([os.path.normcase(repo_real), os.path.normcase(target_real)])
+        except ValueError:
+            return None
+        if common != os.path.normcase(repo_real) or os.path.normcase(target_real) == os.path.normcase(repo_real):
+            return None
+    return data
+
+
+def _read_metadata_with_digest(worktree_path: str) -> tuple[str | None, dict[str, Any] | None, str | None]:
     found = _find_worktree_root_and_gitdir(worktree_path)
     if found is None:
-        return None, None
+        return None, None, None
     wt_root, gitdir = found
     meta_path = os.path.join(gitdir, METADATA_FILENAME)
     if not os.path.isfile(meta_path) or _is_link_or_junction(meta_path):
-        return wt_root, None
+        return wt_root, None, None
     try:
-        with open(meta_path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if not isinstance(data, dict) or data.get("schema") != SCHEMA:
-            return wt_root, None
-        return wt_root, data
-    except (OSError, ValueError):
-        return wt_root, None
+        with open(meta_path, "rb") as fh:
+            raw = fh.read(MAX_LOCKFILE_BYTES)
+        digest = hashlib.sha256(raw).hexdigest()
+        data = json.loads(raw.decode("utf-8"))
+        validated = _validate_private_metadata(data)
+        if validated is None:
+            return wt_root, None, digest
+        return wt_root, validated, digest
+    except (OSError, ValueError, UnicodeDecodeError):
+        return wt_root, None, None
+
+
+def _read_metadata(worktree_path: str) -> tuple[str | None, dict[str, Any] | None]:
+    wt_root, data, _ = _read_metadata_with_digest(worktree_path)
+    return wt_root, data
+
+
+def _resolve_contained_worktree_link(
+    wt_root: str,
+    rel: str,
+    *,
+    expected_target_realpath: str | None = None,
+    repo_root: str | None = None,
+) -> tuple[str, str | None]:
+    """Resolve ``rel`` inside ``wt_root`` while rejecting traversal or ancestor link hops."""
+    try:
+        parsed = parse_link_deps([rel])
+    except WorktreeDepsError:
+        return "", "invalid_rel_path"
+    if len(parsed) != 1 or parsed[0] != rel:
+        return "", "invalid_rel_path"
+    if not wt_root or _is_link_or_junction(wt_root) or not os.path.isdir(wt_root):
+        return "", "invalid_worktree_root"
+    wt_real = os.path.realpath(wt_root)
+
+    if expected_target_realpath is not None:
+        if not isinstance(expected_target_realpath, str) or not expected_target_realpath:
+            return "", "invalid_expected_target"
+        if repo_root:
+            repo_real = os.path.realpath(repo_root)
+            try:
+                common_repo = os.path.commonpath(
+                    [os.path.normcase(repo_real), os.path.normcase(expected_target_realpath)]
+                )
+            except ValueError:
+                return "", "expected_target_outside_repo"
+            if (common_repo != os.path.normcase(repo_real)
+                    or os.path.normcase(expected_target_realpath) == os.path.normcase(repo_real)):
+                return "", "expected_target_outside_repo"
+
+    segments = rel.split("/")
+    cur = wt_root
+    for seg in segments[:-1]:
+        cur = os.path.join(cur, seg)
+        if not os.path.lexists(cur) and not _is_link_or_junction(cur):
+            return os.path.join(wt_root, *segments), "missing_ancestor"
+        if _is_link_or_junction(cur) or not os.path.isdir(cur):
+            return "", "ancestor_not_real_dir"
+        cur_real = os.path.realpath(cur)
+        try:
+            common = os.path.commonpath([os.path.normcase(wt_real), os.path.normcase(cur_real)])
+        except ValueError:
+            return "", "ancestor_outside_worktree"
+        if common != os.path.normcase(wt_real) or os.path.normcase(cur_real) == os.path.normcase(wt_real):
+            return "", "ancestor_outside_worktree"
+
+    dst = os.path.join(cur, segments[-1])
+    return dst, None
 
 
 def bridge_worktree_deps(
@@ -583,7 +750,7 @@ def bridge_worktree_deps(
             "before_sha256": before_sha256,
             "targets": targets_meta,
         }
-        _write_metadata_atomic(meta_path, private_meta)
+        meta_sha256 = _write_metadata_atomic(meta_path, private_meta)
     except BaseException as exc:
         for link_path in reversed(created_links):
             try:
@@ -598,7 +765,7 @@ def bridge_worktree_deps(
             f"failed to bridge dependency directories into worktree: {exc}",
         ) from exc
 
-    return {
+    projection = _BridgedDepsProjection({
         "schema": SCHEMA,
         "count": len(parsed),
         "paths": list(parsed),
@@ -609,7 +776,9 @@ def bridge_worktree_deps(
         "deps_mutated": False,
         "links_intact": True,
         "mutated_paths": [],
-    }
+    })
+    projection._authority = copy.deepcopy(private_meta) | {"meta_sha256": meta_sha256}
+    return projection
 
 
 def _link_points_to_expected(dst: str, expected_realpath: str) -> bool:
@@ -629,6 +798,7 @@ def intact_linked_dep_paths(cwd: str | None) -> frozenset[str]:
     wt_root, data = _read_metadata(cwd)
     if not wt_root or not isinstance(data, dict):
         return frozenset()
+    repo_root = data.get("repo_root")
     targets = data.get("targets")
     if not isinstance(targets, dict):
         return frozenset()
@@ -639,17 +809,58 @@ def intact_linked_dep_paths(cwd: str | None) -> frozenset[str]:
         expected_real = info.get("target_realpath")
         if not isinstance(expected_real, str) or not expected_real:
             continue
-        dst = os.path.join(wt_root, *rel.split("/"))
+        dst, problem = _resolve_contained_worktree_link(
+            wt_root, rel, expected_target_realpath=expected_real,
+            repo_root=repo_root if isinstance(repo_root, str) else None,
+        )
+        if problem is not None or not dst:
+            continue
         if _link_points_to_expected(dst, expected_real):
             intact.add(rel)
     return frozenset(intact)
 
 
+def _unescape_git_quoted_path(raw: str) -> str:
+    """Decode Git C-style quoted path from porcelain v1 line without altering backslashes."""
+    if not (raw.startswith('"') and raw.endswith('"') and len(raw) >= 2):
+        return raw
+    inner = raw[1:-1]
+    out_bytes = bytearray()
+    i = 0
+    n = len(inner)
+    escape_map = {
+        "a": 0x07, "b": 0x08, "t": 0x09, "n": 0x0A,
+        "v": 0x0B, "f": 0x0C, "r": 0x0D, '"': 0x22, "\\": 0x5C,
+    }
+    while i < n:
+        ch = inner[i]
+        if ch != "\\" or i + 1 >= n:
+            out_bytes.extend(ch.encode("utf-8", errors="surrogateescape"))
+            i += 1
+            continue
+        nxt = inner[i + 1]
+        if nxt in "01234567" and i + 3 < n and all(c in "01234567" for c in inner[i + 1:i + 4]):
+            out_bytes.append(int(inner[i + 1:i + 4], 8) & 0xFF)
+            i += 4
+        elif nxt in escape_map:
+            out_bytes.append(escape_map[nxt])
+            i += 2
+        else:
+            out_bytes.extend(nxt.encode("utf-8", errors="surrogateescape"))
+            i += 2
+    return out_bytes.decode("utf-8", errors="surrogateescape")
+
+
 def is_excluded_untracked_path(rel_path: str, intact_deps: frozenset[str]) -> bool:
-    """True when ``rel_path`` (from git status porcelain) is an intact bridged dependency link."""
+    """True when ``rel_path`` (from git status porcelain) is an intact bridged dependency link.
+
+    Git porcelain always uses forward slashes ``/`` as directory separators on both
+    POSIX and Windows. Literal backslashes in ``rel_path`` are preserved so POSIX
+    filenames containing ``\\`` are never mistaken for directory separators.
+    """
     if not intact_deps or not rel_path:
         return False
-    norm = rel_path.replace("\\", "/").rstrip("/")
+    norm = rel_path.rstrip("/")
     for dep in intact_deps:
         if norm == dep or norm.startswith(dep + "/"):
             return True
@@ -666,9 +877,7 @@ def filter_porcelain_v1_text(porcelain_text: str, worktree_path: str) -> str:
     kept: list[str] = []
     for line in porcelain_text.splitlines():
         if line.startswith("?? "):
-            raw_path = line[3:].strip()
-            if raw_path.startswith('"') and raw_path.endswith('"') and len(raw_path) >= 2:
-                raw_path = raw_path[1:-1]
+            raw_path = _unescape_git_quoted_path(line[3:].strip())
             if is_excluded_untracked_path(raw_path, intact):
                 continue
         kept.append(line)
@@ -694,36 +903,79 @@ def filter_porcelain_v2_raw(raw: bytes, worktree_path: str) -> bytes:
 
 
 def verify_linked_deps(worktree_info: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Re-verify linked dependency fingerprints and link integrity after dispatch."""
+    """Re-verify linked dependency fingerprints and link integrity after dispatch.
+
+    Uses dispatcher-owned in-memory authority whenever present, and fails closed
+    if on-disk metadata was deleted, corrupted, or modified during the run.
+    """
     if not isinstance(worktree_info, dict):
         return None
     wt_path = worktree_info.get("path") or worktree_info.get("cwd")
     if not isinstance(wt_path, str) or not wt_path:
         return None
-    wt_root, meta = _read_metadata(wt_path)
-    if not wt_root or not isinstance(meta, dict):
-        existing = worktree_info.get("linked_deps")
-        return existing if isinstance(existing, dict) else None
 
-    repo_root = meta.get("repo_root") or worktree_info.get("repo")
-    paths = [p for p in (meta.get("paths") or ()) if isinstance(p, str)]
-    targets = meta.get("targets") if isinstance(meta.get("targets"), dict) else {}
-    before_sha256 = meta.get("before_sha256")
-    allow_mutation = bool(meta.get("allow_mutation", False))
-    strategy = meta.get("strategy") if isinstance(meta.get("strategy"), str) else (
+    existing = worktree_info.get("linked_deps")
+    auth = worktree_info.get("_linked_deps_authority")
+    if not isinstance(auth, dict):
+        auth = getattr(existing, "_authority", None)
+
+    wt_root, disk_meta, disk_digest = _read_metadata_with_digest(wt_path)
+    if not wt_root:
+        found = _find_worktree_root_and_gitdir(wt_path)
+        wt_root = found[0] if found else os.path.abspath(wt_path)
+
+    source_meta = auth if isinstance(auth, dict) else disk_meta
+    if not isinstance(source_meta, dict):
+        if isinstance(existing, dict):
+            fallback_paths = [p for p in (existing.get("paths") or ()) if isinstance(p, str)]
+            failed_proj = {
+                "schema": SCHEMA,
+                "count": len(fallback_paths),
+                "paths": list(fallback_paths),
+                "strategy": existing.get("strategy") if existing.get("strategy") in {"junction", "symlink"} else (
+                    "junction" if os.name == "nt" else "symlink"
+                ),
+                "allow_mutation": bool(existing.get("allow_mutation", False)),
+                "before_sha256": existing.get("before_sha256"),
+                "after_sha256": None,
+                "deps_mutated": True,
+                "links_intact": False,
+                "mutated_paths": list(fallback_paths),
+            }
+            worktree_info["linked_deps"] = failed_proj
+            return failed_proj
+        return None
+
+    repo_root = source_meta.get("repo_root") or worktree_info.get("repo")
+    paths = [p for p in (source_meta.get("paths") or ()) if isinstance(p, str)]
+    targets = source_meta.get("targets") if isinstance(source_meta.get("targets"), dict) else {}
+    before_sha256 = source_meta.get("before_sha256")
+    allow_mutation = bool(source_meta.get("allow_mutation", False))
+    strategy = source_meta.get("strategy") if source_meta.get("strategy") in {"junction", "symlink"} else (
         "junction" if os.name == "nt" else "symlink"
     )
 
+    metadata_intact = disk_meta is not None
+    if isinstance(auth, dict) and auth.get("meta_sha256"):
+        if disk_digest != auth.get("meta_sha256"):
+            metadata_intact = False
+
     after_per_path: dict[str, str] = {}
     mutated_paths: list[str] = []
-    links_intact = True
+    links_intact = bool(metadata_intact and paths)
 
     for rel in paths:
         tinfo = targets.get(rel) if isinstance(targets.get(rel), dict) else {}
         expected_real = tinfo.get("target_realpath")
         before_fp = tinfo.get("before_sha256")
-        dst = os.path.join(wt_root, *rel.split("/"))
-        intact = (isinstance(expected_real, str)
+        dst, problem = _resolve_contained_worktree_link(
+            wt_root, rel,
+            expected_target_realpath=expected_real if isinstance(expected_real, str) else None,
+            repo_root=str(repo_root) if isinstance(repo_root, str) else None,
+        )
+        intact = (problem is None
+                  and bool(dst)
+                  and isinstance(expected_real, str)
                   and bool(expected_real)
                   and _link_points_to_expected(dst, expected_real))
         if not intact:
@@ -731,12 +983,17 @@ def verify_linked_deps(worktree_info: dict[str, Any] | None) -> dict[str, Any] |
         after_fp = (fingerprint_dep_target(str(repo_root), rel)
                     if isinstance(repo_root, str) and repo_root else "missing")
         after_per_path[rel] = after_fp
-        if after_fp != before_fp or not intact:
+        if after_fp != before_fp or not intact or not metadata_intact:
             mutated_paths.append(rel)
 
     after_sha256 = _overall_fingerprint(after_per_path)
-    deps_mutated = bool(after_sha256 != before_sha256 or not links_intact or mutated_paths)
-    projection = {
+    deps_mutated = bool(
+        not metadata_intact
+        or after_sha256 != before_sha256
+        or not links_intact
+        or mutated_paths
+    )
+    projection = _BridgedDepsProjection({
         "schema": SCHEMA,
         "count": len(paths),
         "paths": list(paths),
@@ -747,9 +1004,11 @@ def verify_linked_deps(worktree_info: dict[str, Any] | None) -> dict[str, Any] |
         "deps_mutated": deps_mutated,
         "links_intact": links_intact,
         "mutated_paths": mutated_paths,
-    }
+    })
+    if isinstance(auth, dict):
+        projection._authority = copy.deepcopy(auth)
     worktree_info["linked_deps"] = projection
-    return projection
+    return dict(projection)
 
 
 def validate_projection(record: Any) -> dict[str, Any]:
@@ -760,29 +1019,93 @@ def validate_projection(record: Any) -> dict[str, Any]:
         "schema", "count", "paths", "strategy", "allow_mutation",
         "before_sha256", "after_sha256", "deps_mutated", "links_intact", "mutated_paths",
     }
-    if not required.issubset(record.keys()):
-        raise WorktreeDepsError("link_deps_projection_invalid", "missing required summon.worktree-deps/v1 fields")
+    if set(record.keys()) != required:
+        raise WorktreeDepsError("link_deps_projection_invalid", "exact summon.worktree-deps/v1 fields required")
+    count = record["count"]
+    paths = record["paths"]
+    strategy = record["strategy"]
+    allow_mutation = record["allow_mutation"]
+    before_sha256 = record["before_sha256"]
+    after_sha256 = record["after_sha256"]
+    deps_mutated = record["deps_mutated"]
+    links_intact = record["links_intact"]
+    mutated_paths = record["mutated_paths"]
+
+    if type(count) is not int or count < 0:
+        raise WorktreeDepsError("link_deps_projection_invalid", "count must be a non-negative integer")
+    if not isinstance(paths, list) or len(paths) != count or any(not isinstance(p, str) for p in paths):
+        raise WorktreeDepsError("link_deps_projection_invalid", "paths must be a list of strings matching count")
+    if paths and list(parse_link_deps(paths)) != paths:
+        raise WorktreeDepsError("link_deps_projection_invalid", "paths must be canonical sorted relative paths")
+    if strategy not in {"junction", "symlink"}:
+        raise WorktreeDepsError("link_deps_projection_invalid", "strategy must be 'junction' or 'symlink'")
+    if (type(allow_mutation) is not bool
+            or type(deps_mutated) is not bool
+            or type(links_intact) is not bool):
+        raise WorktreeDepsError("link_deps_projection_invalid", "boolean fields must be strict bools")
+    if not isinstance(before_sha256, str) or not _HEX64_RE.fullmatch(before_sha256):
+        raise WorktreeDepsError("link_deps_projection_invalid", "before_sha256 must be a 64-char hex digest")
+    if after_sha256 is not None and (not isinstance(after_sha256, str) or not _HEX64_RE.fullmatch(after_sha256)):
+        raise WorktreeDepsError("link_deps_projection_invalid", "after_sha256 must be None or a 64-char hex digest")
+    if (not isinstance(mutated_paths, list)
+            or any(not isinstance(p, str) for p in mutated_paths)
+            or not set(mutated_paths).issubset(set(paths))):
+        raise WorktreeDepsError("link_deps_projection_invalid", "mutated_paths must be a subset of paths")
+    if (not links_intact
+            or bool(mutated_paths)
+            or (after_sha256 is not None and after_sha256 != before_sha256)) and not deps_mutated:
+        raise WorktreeDepsError(
+            "link_deps_projection_invalid",
+            "deps_mutated must be True when links_intact is False, mutated_paths is non-empty, or digests differ",
+        )
     return dict(record)
 
 
 def teardown_linked_deps(worktree_path: str) -> dict[str, Any]:
     """Safely unlink Summon-created dependency junctions/symlinks before worktree removal.
 
-    Never deletes a real directory if an agent replaced a link with a real directory;
-    reports ``tampered`` instead so the caller can preserve the worktree.
+    Re-validates stored metadata, checks every ancestor directory for containment
+    and symlink/junction hops, and binds each link to its expected target realpath.
+    Never deletes a real directory or a redirected link; reports ``tampered`` instead
+    so the caller preserves the worktree.
     """
-    wt_root, meta = _read_metadata(worktree_path)
-    if not wt_root or not isinstance(meta, dict):
+    found = _find_worktree_root_and_gitdir(worktree_path)
+    if found is None:
         return {"present": False, "removed": [], "tampered": [], "errors": []}
+    wt_root, gitdir = found
+    meta_path = os.path.join(gitdir, METADATA_FILENAME)
+    if not os.path.lexists(meta_path):
+        return {"present": False, "removed": [], "tampered": [], "errors": []}
+    if _is_link_or_junction(meta_path) or not os.path.isfile(meta_path):
+        return {"present": True, "removed": [], "tampered": ["<metadata>"], "errors": []}
+
+    _, meta, _ = _read_metadata_with_digest(worktree_path)
+    if not isinstance(meta, dict):
+        return {"present": True, "removed": [], "tampered": ["<metadata>"], "errors": []}
+
+    repo_root = meta.get("repo_root")
     paths = [p for p in (meta.get("paths") or ()) if isinstance(p, str)]
+    targets = meta.get("targets") if isinstance(meta.get("targets"), dict) else {}
     removed: list[str] = []
     tampered: list[str] = []
     errors: list[str] = []
+
     for rel in paths:
-        dst = os.path.join(wt_root, *rel.split("/"))
+        tinfo = targets.get(rel) if isinstance(targets.get(rel), dict) else {}
+        expected_real = tinfo.get("target_realpath")
+        dst, problem = _resolve_contained_worktree_link(
+            wt_root, rel,
+            expected_target_realpath=expected_real if isinstance(expected_real, str) else None,
+            repo_root=str(repo_root) if isinstance(repo_root, str) else None,
+        )
+        if problem == "missing_ancestor":
+            continue
+        if problem is not None or not dst:
+            tampered.append(rel)
+            continue
         if not os.path.lexists(dst) and not _is_link_or_junction(dst):
             continue
-        if _is_link_or_junction(dst):
+        if _is_link_or_junction(dst) and isinstance(expected_real, str) and _link_points_to_expected(dst, expected_real):
             try:
                 _remove_dir_link(dst)
                 removed.append(rel)
@@ -790,9 +1113,9 @@ def teardown_linked_deps(worktree_path: str) -> dict[str, Any]:
                 errors.append(f"{rel}: {exc}")
         else:
             tampered.append(rel)
+
     if not tampered and not errors:
-        meta_path = _metadata_path(wt_root)
-        if meta_path and os.path.isfile(meta_path):
+        if os.path.isfile(meta_path) and not _is_link_or_junction(meta_path):
             try:
                 os.unlink(meta_path)
             except OSError:

@@ -1338,8 +1338,11 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str, *,
     if link_deps:
         from _worktree_deps import bridge_worktree_deps
         try:
-            out_info["linked_deps"] = bridge_worktree_deps(
+            _bridged = bridge_worktree_deps(
                 repo, wt, link_deps, allow_mutation=bool(link_deps_allow_mutation))
+            out_info["linked_deps"] = _bridged
+            if getattr(_bridged, "_authority", None) is not None:
+                out_info["_linked_deps_authority"] = _bridged._authority
         except BaseException:
             shutil.rmtree(wt, ignore_errors=True)
             subprocess.run([*git_cmd, "-C", repo, "worktree", "prune"],
@@ -3666,13 +3669,15 @@ def main() -> None:
         pass
 
     if worktree_info:
-        if worktree_info.get("linked_deps"):
+        if worktree_info.get("linked_deps") or worktree_info.get("_linked_deps_authority"):
             from _worktree_deps import verify_linked_deps
             _ld_post = verify_linked_deps(worktree_info)
+            if isinstance(_ld_post, dict):
+                worktree_info["linked_deps"] = dict(_ld_post)
             if isinstance(_ld_post, dict) and _ld_post.get("deps_mutated"):
                 _mutated_list = ", ".join(
                     _ld_post.get("mutated_paths") or _ld_post.get("paths") or ())
-                if not _ld_post.get("allow_mutation"):
+                if not bool(getattr(invocation, "link_deps_allow_mutation", False)):
                     _mut_msg = (
                         f"linked dependency directories mutated during worktree dispatch "
                         f"({_mutated_list}); pass --link-deps-allow-mutation if shared "
@@ -3691,6 +3696,9 @@ def main() -> None:
                         f"linked dependency directories mutated during worktree dispatch "
                         f"({_mutated_list}); allowed by --link-deps-allow-mutation"
                     )
+        worktree_info.pop("_linked_deps_authority", None)
+        if isinstance(worktree_info.get("linked_deps"), dict):
+            worktree_info["linked_deps"] = dict(worktree_info["linked_deps"])
         result["worktree"] = worktree_info
     _tags = _agent_tags_from_file(agent_file)
     if _tags:

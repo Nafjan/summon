@@ -74,6 +74,11 @@ def test_parse_link_deps_validates_and_normalizes():
         ".git/hooks",
         ".claude/worktrees",
         "packages/.git/deps",
+        ".claude.",
+        ".claude./agents",
+        ".git./objects",
+        "packages/.claude./deps",
+        "CLAUDE~1/deps",
         "node_modules,node_modules/sub",
     ):
         with pytest.raises(_worktree_deps.WorktreeDepsError) as exc_info:
@@ -440,4 +445,178 @@ def test_run_subagent_dry_run_and_live_mutation_enforcement(tmp_path, monkeypatc
     assert env_live_allow["worktree"]["linked_deps"]["deps_mutated"] is True
     assert env_live_allow["worktree"]["linked_deps"]["allow_mutation"] is True
     assert any("allowed by --link-deps-allow-mutation" in w for w in env_live_allow.get("warnings", []))
+
+
+def test_scoped_packages_and_513th_entry_mutations_detected(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    nm = repo / "node_modules"
+    scoped = nm / "@scope" / "pkg" / "lib"
+    scoped.mkdir(parents=True, exist_ok=True)
+    scoped_idx = nm / "@scope" / "pkg" / "index.js"
+    scoped_idx.write_text("module.exports = 1;\n", encoding="utf-8")
+    (scoped / "deep.js").write_text("module.exports = 'deep-v1';\n", encoding="utf-8")
+
+    for i in range(530):
+        pdir = nm / f"pkg_{i:04d}"
+        pdir.mkdir(parents=True, exist_ok=True)
+        (pdir / "index.js").write_text(f"module.exports = {i};\n", encoding="utf-8")
+
+    fp_base = _worktree_deps.fingerprint_dep_target(str(repo), "node_modules")
+    scoped_idx.write_text("module.exports = 2;\n", encoding="utf-8")
+    fp_scoped = _worktree_deps.fingerprint_dep_target(str(repo), "node_modules")
+    assert fp_scoped != fp_base
+
+    (scoped / "deep.js").write_text("module.exports = 'deep-v2';\n", encoding="utf-8")
+    fp_deep = _worktree_deps.fingerprint_dep_target(str(repo), "node_modules")
+    assert fp_deep != fp_scoped
+
+    (nm / "pkg_0525" / "index.js").write_text("module.exports = 'changed-525';\n", encoding="utf-8")
+    fp_525 = _worktree_deps.fingerprint_dep_target(str(repo), "node_modules")
+    assert fp_525 != fp_deep
+
+
+def test_metadata_deletion_or_tampering_fails_closed(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    _populate_deps(repo)
+
+    wt_info = run_subagent._setup_worktree(
+        str(repo), "wt-meta-tamper", "reviewer",
+        link_deps=("node_modules",),
+        link_deps_allow_mutation=False,
+    )
+    wt_path = wt_info["path"]
+    meta_path = _worktree_deps._metadata_path(wt_path)
+    assert meta_path is not None and os.path.isfile(meta_path)
+    try:
+        import json
+        # 1. Tamper on-disk metadata to claim allow_mutation=True and paths=[]
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            forged = json.load(fh)
+        forged["allow_mutation"] = True
+        forged["paths"] = []
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(forged, fh)
+
+        verified = _worktree_deps.verify_linked_deps(wt_info)
+        assert verified is not None
+        assert verified["allow_mutation"] is False
+        assert verified["paths"] == ["node_modules"]
+        assert verified["links_intact"] is False
+        assert verified["deps_mutated"] is True
+        assert verified["mutated_paths"] == ["node_modules"]
+
+        # 2. Delete on-disk metadata completely
+        os.unlink(meta_path)
+        verified_missing = _worktree_deps.verify_linked_deps(wt_info)
+        assert verified_missing is not None
+        assert verified_missing["links_intact"] is False
+        assert verified_missing["deps_mutated"] is True
+        assert verified_missing["mutated_paths"] == ["node_modules"]
+    finally:
+        if _worktree_deps._is_link_or_junction(os.path.join(wt_path, "node_modules")):
+            _worktree_deps._remove_dir_link(os.path.join(wt_path, "node_modules"))
+        shutil.rmtree(wt_path, ignore_errors=True)
+        subprocess.run(["git", "-C", str(repo), "worktree", "prune"],
+                       capture_output=True, text=True, check=False)
+
+
+def test_teardown_refuses_outside_paths_redirected_links_and_ancestor_hops(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    nested_dep = repo / "packages" / "web" / "node_modules"
+    nested_dep.mkdir(parents=True, exist_ok=True)
+    (nested_dep / "pkg.js").write_text("1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-f", "package.json"], check=True)
+
+    outside_target = tmp_path / "outside_real"
+    outside_target.mkdir()
+    outside_link = tmp_path / "victim_link"
+    _worktree_deps._create_dir_link(str(outside_target), str(outside_link))
+
+    wt_info = run_subagent._setup_worktree(
+        str(repo), "wt-teardown-guard", "reviewer",
+        link_deps=("packages/web/node_modules",),
+    )
+    wt_path = Path(wt_info["path"])
+    meta_path = _worktree_deps._metadata_path(str(wt_path))
+    assert meta_path is not None
+    try:
+        import json
+        # 1. Tamper metadata with ../victim_link traversal
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            orig_meta = json.load(fh)
+        bad_meta = dict(orig_meta, paths=["../victim_link"], targets={
+            "../victim_link": {
+                "target_realpath": str(outside_target),
+                "before_sha256": "a" * 64,
+                "strategy": "junction",
+            }
+        })
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(bad_meta, fh)
+        td_bad = _worktree_deps.teardown_linked_deps(str(wt_path))
+        assert td_bad["tampered"] == ["<metadata>"]
+        assert _worktree_deps._is_link_or_junction(str(outside_link))
+
+        # Restore valid metadata, then redirect the link inside the worktree to outside_target
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(orig_meta, fh)
+        wt_dep_link = wt_path / "packages" / "web" / "node_modules"
+        _worktree_deps._remove_dir_link(str(wt_dep_link))
+        _worktree_deps._create_dir_link(str(outside_target), str(wt_dep_link))
+
+        td_redirected = _worktree_deps.teardown_linked_deps(str(wt_path))
+        assert td_redirected["tampered"] == ["packages/web/node_modules"]
+        assert _worktree_deps._is_link_or_junction(str(wt_dep_link))
+
+        # Replace ancestor packages/web with a link to outside_target
+        _worktree_deps._remove_dir_link(str(wt_dep_link))
+        (wt_path / "packages" / "web").rmdir()
+        _worktree_deps._create_dir_link(str(outside_target), str(wt_path / "packages" / "web"))
+        td_anc = _worktree_deps.teardown_linked_deps(str(wt_path))
+        assert td_anc["tampered"] == ["packages/web/node_modules"]
+        assert _worktree_deps._is_link_or_junction(str(wt_path / "packages" / "web"))
+    finally:
+        for p in (wt_path / "packages" / "web", outside_link):
+            if _worktree_deps._is_link_or_junction(str(p)):
+                _worktree_deps._remove_dir_link(str(p))
+        shutil.rmtree(str(wt_path), ignore_errors=True)
+        subprocess.run(["git", "-C", str(repo), "worktree", "prune"],
+                       capture_output=True, text=True, check=False)
+
+
+def test_posix_backslash_filenames_and_strict_projection_validation():
+    intact = frozenset({"node_modules"})
+    assert _worktree_deps.is_excluded_untracked_path("node_modules", intact) is True
+    assert _worktree_deps.is_excluded_untracked_path("node_modules/", intact) is True
+    assert _worktree_deps.is_excluded_untracked_path("node_modules/pkg/index.js", intact) is True
+    assert _worktree_deps.is_excluded_untracked_path(r"node_modules\unrelated.txt", intact) is False
+    assert _worktree_deps._unescape_git_quoted_path(r'"node_modules\\unrelated.txt"') == r"node_modules\unrelated.txt"
+
+    valid = {
+        "schema": _worktree_deps.SCHEMA,
+        "count": 1,
+        "paths": ["node_modules"],
+        "strategy": "junction",
+        "allow_mutation": False,
+        "before_sha256": "a" * 64,
+        "after_sha256": "a" * 64,
+        "deps_mutated": False,
+        "links_intact": True,
+        "mutated_paths": [],
+    }
+    assert _worktree_deps.validate_projection(valid) == valid
+
+    for invalid in (
+        dict(valid, count=-1),
+        dict(valid, count=2),
+        dict(valid, allow_mutation="false"),
+        dict(valid, strategy="copy"),
+        dict(valid, before_sha256="not-hex"),
+        dict(valid, mutated_paths=["other"]),
+        dict(valid, links_intact=False, deps_mutated=False),
+        dict(valid, after_sha256="b" * 64, deps_mutated=False),
+        dict(valid, extra_field=1),
+    ):
+        with pytest.raises(_worktree_deps.WorktreeDepsError):
+            _worktree_deps.validate_projection(invalid)
 
