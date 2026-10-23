@@ -1319,6 +1319,56 @@ for identifier, producer in (
                "No literal-specific behavioral fixture established in this bounded source audit; references establish source ownership, not historical-version acceptance.",
                "Runtime fixtures were inspected only as source and were not executed."])
 
+# Long-horizon Phase 1-2 advisory usage metrics, shadow progress signals,
+# checkpoint progress judgement, and conservative worktree GC reports.
+_add("usage-metrics", "summon.usage-metrics/v1",
+     _ref("_usage_metrics", "work_tokens"),
+     _ref("_executor", "_enrich"),
+     authority="public_projection",
+     shape=["work_tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "input_semantics", "observation_scope", "evidence"],
+     fixtures=[_test("long_horizon_signals", "test_claude_shape_excludes_cache_reads_from_work_tokens"),
+               _test("long_horizon_signals", "test_openai_shape_subtracts_cached_input_that_is_already_inside_input")],
+     gaps=["Derived work tokens are advisory accounting projections, not provider billing invoices or spend authorization."])
+_add("context-occupancy", "summon.context-occupancy/v1",
+     _ref("_usage_metrics", "context_occupancy"),
+     _ref("_executor", "_enrich"),
+     authority="public_projection",
+     shape=["occupied_tokens", "window_tokens", "ratio", "over_window", "input_semantics", "evidence"],
+     fixtures=[_test("long_horizon_signals", "test_claude_context_occupancy_counts_cache_reads"),
+               _test("long_horizon_signals", "test_absent_last_request_yields_absent_occupancy")],
+     gaps=["Occupancy is derived from reported single-request input usage and declared window size; absent provider fields remain unestablished."])
+_add("progress-signals", "summon.progress-signals/v1",
+     _ref("_progress_signals", "ProgressSignals.snapshot"),
+     _ref("_executor", "_enrich"),
+     authority="public_projection",
+     shape=["mode", "coverage", "tool_calls", "distinct_tool_calls", "current_repeat", "max_repeat", "current_error_streak", "active", "observed"],
+     fixtures=[_test("long_horizon_signals", "test_claude_shape_excludes_cache_reads_from_work_tokens")],
+     gaps=["Shadow progress signals carry counts only and never grant or revoke execution authority."])
+_add("progress-judgement", "summon.progress-judgement/v1",
+     _ref("_progress_judge", "ProgressJudge.judge"),
+     _ref("_progress_judge", "sanitize_record"),
+     authority="public_projection",
+     shape=["mode", "legacy_active", "judged_active", "applied_active", "reasons", "workspace", "tool_loop", "oldest_pending_tool_ms"],
+     fixtures=[_test("progress_judge", "test_stream_activity_without_loop_extends"),
+               _test("progress_judge", "test_tool_loop_discounts_stream_activity")],
+     gaps=["Progress judgement records checkpoint extension evidence; hard runtime ceilings remain governed by RuntimeControl."])
+next(item for item in _FORMATS if item["id"] == "progress-judgement")["producers"].append(
+    _ref("_progress_judge", "ProgressJudge.projection"))
+next(item for item in _FORMATS if item["id"] == "progress-judgement")["readers"].append(
+    _ref("_job_control", "public_heartbeat"))
+_add("worktree-gc", "summon.worktree-gc/v1",
+     _ref("_worktree_gc", "plan"),
+     _ref("_worktree_gc", "render"),
+     authority="public_projection",
+     shape=["mode", "repo", "base", "min_age_hours", "entries", "counts"],
+     fixtures=[_test("worktree_gc", "test_plan_classifies_every_safety_condition"),
+               _test("worktree_gc", "test_apply_skips_worktrees_whose_branch_changed_after_planning")],
+     gaps=["Worktree GC reports are operator maintenance summaries, not execution receipts or launch authority."])
+next(item for item in _FORMATS if item["id"] == "worktree-gc")["producers"].append(
+    _ref("_worktree_gc", "apply"))
+next(item for item in _FORMATS if item["id"] == "worktree-gc")["readers"].append(
+    _ref("_worktree_gc", "apply"))
+
 FORMAT_INVENTORY = {"schema": SCHEMA, "version": VERSION, "formats": _FORMATS}
 
 
