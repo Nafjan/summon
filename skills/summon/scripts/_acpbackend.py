@@ -155,9 +155,11 @@ class _AcpClient:
 
     def __init__(self, process: subprocess.Popen, permission: str,
                  cancelled=None, deadline_reached=None,
-                 max_frame_bytes: int = _MAX_ACP_FRAME_BYTES) -> None:
+                 max_frame_bytes: int = _MAX_ACP_FRAME_BYTES,
+                 breaker=None) -> None:
         self._proc = process
         self._permission = permission
+        self._breaker = breaker
         self._cancelled = cancelled or (lambda: False)
         self._deadline_reached = deadline_reached or (lambda: False)
         self._write_lock = threading.Lock()
@@ -373,7 +375,13 @@ class _AcpClient:
         offered."""
         options = params.get("options") or []
         tool_kind = ((params.get("toolCall") or {}).get("kind") or "other")
-        allowed = tool_kind in _ALLOWABLE_KINDS.get(str(self._permission).lower(), set())
+        effective_perm = (
+            self._breaker.effective_permission(self._permission)
+            if self._breaker is not None
+            and callable(getattr(self._breaker, "effective_permission", None))
+            else self._permission
+        )
+        allowed = tool_kind in _ALLOWABLE_KINDS.get(str(effective_perm).lower(), set())
 
         def _find(*kinds: str) -> str | None:
             for opt in options:
@@ -392,12 +400,12 @@ class _AcpClient:
             chosen = _find("reject_once", "reject_always")
         if chosen is None:
             self.turn.add_diag(
-                f"permission {self._permission}: tool kind {tool_kind!r} has no "
+                f"permission {effective_perm}: tool kind {tool_kind!r} has no "
                 f"safely classifiable option; cancelling the turn (fail closed)")
         else:
             decision = "allow" if _find("allow_once") == chosen else "reject"
             self.turn.add_diag(
-                f"permission {self._permission}: tool kind {tool_kind!r} -> "
+                f"permission {effective_perm}: tool kind {tool_kind!r} -> "
                 f"{decision} (option {chosen!r})")
         return chosen
 

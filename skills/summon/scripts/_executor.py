@@ -986,6 +986,9 @@ def _attach_long_horizon_metrics(response: dict, processor) -> None:
             judge = getattr(processor, "progress_judge", None)
             if judge is not None:
                 response.setdefault("progress_judgement", judge.projection())
+            breaker = getattr(processor, "breaker", None)
+            if breaker is not None:
+                response.setdefault("breaker", breaker.projection())
     except Exception:  # noqa: BLE001 - advisory metrics must never break a dispatch
         pass
 
@@ -3603,6 +3606,8 @@ _TIMEOUT_STAGE_TEXT = {
     "finalization_timeout": "the backend closed its output but never exited",
     "adaptive_attention_timeout": "no meaningful activity at the adaptive checkpoint",
     "adaptive_hard_timeout": "the adaptive max runtime was reached",
+    "breaker_constrained": "the graduated circuit breaker clamped the lane to read-only",
+    "breaker_stopped": "the graduated circuit breaker stopped the lane",
     "overall_timeout": "the overall budget was reached",
     "deliberation_deadline": "the deliberation's attempt deadline was reached",
 }
@@ -3830,6 +3835,24 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
                     workspace_cwd=workspace_cwd)
         except Exception:  # noqa: BLE001 - advisory; the legacy rule still applies
             pass
+        # Phase 3: graduated circuit breaker (shadow by default).
+        try:
+            from _breaker import (
+                GraduatedBreaker,
+                allow_stop_from_environment,
+                max_work_tokens_from_environment,
+                mode_from_environment as _breaker_mode_from_environment,
+            )
+            _breaker_mode = _breaker_mode_from_environment()
+            if _breaker_mode != "off":
+                processor.breaker = GraduatedBreaker(
+                    mode=_breaker_mode,
+                    allow_stop=allow_stop_from_environment(),
+                    max_work_tokens=max_work_tokens_from_environment(),
+                    clock=getattr(runtime_control, "clock", time.monotonic),
+                )
+        except Exception:  # noqa: BLE001 - advisory unless enforce mode succeeds
+            pass
     try:
         from _stream_partials import emit_partial as _emit_partial
         _emit_partial("started", cli=cli, message="subprocess started")
@@ -3951,8 +3974,10 @@ def _drive_process_loop(
                 stream_active = liveness.meaningful_within(runtime_control.checkpoint_ms)
                 checkpoint_active = stream_active
                 judge = getattr(processor, "progress_judge", None)
+                breaker = getattr(processor, "breaker", None)
                 due_fn = getattr(runtime_control, "checkpoint_due", None)
                 until_fn = getattr(runtime_control, "ms_until_checkpoint", None)
+                is_due = bool(callable(due_fn) and due_fn())
                 if judge is not None and callable(until_fn):
                     try:
                         # Non-blocking: measure the workspace on a background
@@ -3961,7 +3986,7 @@ def _drive_process_loop(
                             judge.prefetch()
                     except Exception:  # noqa: BLE001 - advisory measurement only
                         pass
-                if judge is not None and callable(due_fn) and due_fn():
+                if judge is not None and is_due:
                     try:
                         checkpoint_active, runtime_control.progress = judge.judge(
                             stream_active=stream_active,
@@ -3969,6 +3994,38 @@ def _drive_process_loop(
                     except Exception:  # noqa: BLE001 - fall back to the legacy rule
                         checkpoint_active = stream_active
                 runtime_control.checkpoint(active=checkpoint_active)
+                breaker_decision = None
+                if breaker is not None and is_due:
+                    try:
+                        from _usage_metrics import work_tokens as _calc_work_tokens
+                        _wt = (_calc_work_tokens(processor.usage, cli=cli)
+                               if getattr(processor, "usage", None) else None)
+                        breaker_decision = breaker.evaluate(
+                            signals=getattr(processor, "progress_signals", None),
+                            progress_record=getattr(runtime_control, "progress", None),
+                            work_tokens=_wt,
+                            extra_triggers=("no_progress",) if not checkpoint_active else (),
+                        )
+                        record_fn = getattr(runtime_control, "record_breaker", None)
+                        if callable(record_fn):
+                            record_fn(breaker_decision)
+                    except Exception:  # noqa: BLE001
+                        breaker_decision = None
+                if isinstance(breaker_decision, dict) and breaker_decision.get("enforced"):
+                    _b_action = breaker_decision.get("action")
+                    if _b_action == "steer":
+                        runtime_control.attention_required = True
+                    elif _b_action in {"constrain", "stop"} and not saw_terminal:
+                        _b_stage = f"breaker_{breaker_decision.get('to_level')}"
+                        runtime_control.publish(liveness.snapshot())
+                        _kill_tree(process)
+                        _drain_to_eof(line_q)
+                        _safe_communicate(process)
+                        timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                                 stage=_b_stage,
+                                                 elapsed_ms=_elapsed_ms())
+                        timed["error_kind"] = _b_stage
+                        return timed
                 runtime_control.publish(liveness.snapshot())
                 if runtime_control.cancel_requested and not saw_terminal:
                     if liveness_emitter is not None:

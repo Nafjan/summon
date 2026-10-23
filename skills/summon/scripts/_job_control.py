@@ -172,6 +172,13 @@ def public_heartbeat(value: dict, integrity: str) -> dict | None:
         progress = None
     if progress is not None:
         out["progress"] = progress
+    try:
+        from _breaker import sanitize_record as _sanitize_breaker
+        breaker = _sanitize_breaker(value.get("breaker"))
+    except Exception:  # noqa: BLE001 - optional advisory field
+        breaker = None
+    if breaker is not None:
+        out["breaker"] = breaker
     return out
 
 
@@ -266,6 +273,14 @@ def _valid_command_shape(command: dict, *, authenticated: bool) -> bool:
         expected.add("duration_ms")
     elif action == "steer":
         expected.update({"message", "message_sha256"})
+    elif action == "breaker":
+        if not authenticated:
+            return False
+        expected.update({"from_level", "to_level", "signals", "mode"})
+        if "message" in command or "message_sha256" in command:
+            if command.get("to_level") != "steering":
+                return False
+            expected.update({"message", "message_sha256"})
     elif action != "cancel":
         return False
     if authenticated:
@@ -294,6 +309,39 @@ def _valid_command_shape(command: dict, *, authenticated: bool) -> bool:
         if (not _is_sha256(claimed_digest)
                 or not hmac.compare_digest(claimed_digest, expected_digest)):
             return False
+    elif action == "breaker":
+        try:
+            from _breaker import (LEVELS as _BREAKER_LEVELS,
+                                  fixed_steering_message as _fixed_steer,
+                                  normalize_signals as _norm_signals)
+        except Exception:
+            return False
+        from_level = command.get("from_level")
+        to_level = command.get("to_level")
+        mode = command.get("mode")
+        signals = command.get("signals")
+        if (from_level not in _BREAKER_LEVELS
+                or to_level not in _BREAKER_LEVELS
+                or from_level == to_level
+                or mode not in {"shadow", "enforce"}
+                or not isinstance(signals, list)
+                or not (1 <= len(signals) <= 8)
+                or signals != _norm_signals(signals)):
+            return False
+        if "message" in command:
+            message = command.get("message")
+            expected_msg = _fixed_steer(signals)
+            if not isinstance(message, str) or message != expected_msg:
+                return False
+            try:
+                expected_digest = hashlib.sha256(
+                    message.encode("utf-8")).hexdigest()
+            except UnicodeError:
+                return False
+            claimed_digest = command.get("message_sha256")
+            if (not _is_sha256(claimed_digest)
+                    or not hmac.compare_digest(claimed_digest, expected_digest)):
+                return False
     return not authenticated or _is_sha256(command.get("auth"))
 
 
@@ -484,6 +532,81 @@ def queue_command(root: str, job_id: str, action: str, *,
             "provider_contacted": False}
 
 
+def _append_breaker_command(path: str, job_id: str, nonce: str,
+                            decision: dict, *, wall_clock=None) -> dict | None:
+    """Append one authenticated breaker transition to a v2 control log."""
+    if not isinstance(decision, dict) or not decision.get("transitioned"):
+        return None
+    from _breaker import LEVELS as _BREAKER_LEVELS, fixed_steering_message, normalize_signals
+    from_level = decision.get("from_level")
+    to_level = decision.get("to_level")
+    mode = decision.get("mode")
+    signals = normalize_signals(decision.get("signals"))
+    if (from_level not in _BREAKER_LEVELS or to_level not in _BREAKER_LEVELS
+            or from_level == to_level or mode not in {"shadow", "enforce"}
+            or not signals):
+        raise ValueError("breaker transition decision is malformed")
+    now_fn = wall_clock or time.time
+    with _exclusive_control_lock(path):
+        existing, state = _jobs._read(path)
+        if state == _jobs._CORRUPT:
+            raise ValueError("job control file is malformed")
+        if existing is None:
+            existing = {"schema": "summon.job-control/v2", "job_id": job_id,
+                        "generation": 0, "commands": []}
+        elif existing.get("schema") == "summon.job-control/v1":
+            raise ValueError(
+                "legacy job control cannot be upgraded while its job is live")
+        commands, integrity = _validated_commands(existing, job_id, nonce)
+        if commands is None or integrity != "authenticated":
+            raise ValueError("job control identity mismatch")
+        if len(commands) >= MAX_COMMANDS:
+            raise ValueError("job control command limit reached")
+        generation = existing.get("generation", 0) + 1
+        queued_at = now_fn()
+        if not _is_finite_number(queued_at):
+            raise ValueError("system clock produced a non-finite control timestamp")
+        command: dict = {
+            "generation": generation,
+            "action": "breaker",
+            "queued_at": queued_at,
+            "from_level": from_level,
+            "to_level": to_level,
+            "signals": signals[:8],
+            "mode": mode,
+        }
+        if to_level == "steering":
+            msg = fixed_steering_message(signals[:8])
+            command["message"] = msg
+            command["message_sha256"] = hashlib.sha256(
+                msg.encode("utf-8")).hexdigest()
+        command["auth"] = command_auth(nonce, job_id, command)
+        commands.append(command)
+        existing["generation"] = generation
+        _write_control_json(path, existing)
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "action": "breaker",
+        "generation": generation,
+        "from_level": from_level,
+        "to_level": to_level,
+        "mode": mode,
+        "provider_contacted": False,
+    }
+
+
+def queue_breaker_transition(root: str, job_id: str, decision: dict, *,
+                             wall_clock=None) -> dict | None:
+    """Append one authenticated breaker transition for a live job in ``root``."""
+    if not isinstance(decision, dict) or not decision.get("transitioned"):
+        return None
+    record = _record(root, job_id)
+    return _append_breaker_command(
+        control_path(root, job_id), job_id, record["nonce"], decision,
+        wall_clock=wall_clock)
+
+
 def control_summary(root: str, job_id: str) -> dict | None:
     data, state = _jobs._read(control_path(root, job_id))
     if state == _jobs._CORRUPT:
@@ -505,7 +628,7 @@ def control_summary(root: str, job_id: str) -> dict | None:
         # rewritten in place and status must not promote nonce-bound
         # observations into an authenticated queued-command claim.
         return _invalid_summary(integrity)
-    return {
+    summary = {
         "state": "queued" if commands else "empty",
         "integrity": integrity,
         "generation": data.get("generation"),
@@ -513,6 +636,19 @@ def control_summary(root: str, job_id: str) -> dict | None:
                    for action in ("extend", "cancel", "steer")},
         "steering_mode": "queued_for_resume",
     }
+    breaker_cmds = [item for item in commands if item.get("action") == "breaker"]
+    if breaker_cmds:
+        last_b = breaker_cmds[-1]
+        summary["breaker"] = {
+            "level": last_b["to_level"],
+            "from_level": last_b["from_level"],
+            "to_level": last_b["to_level"],
+            "mode": last_b["mode"],
+            "signals": list(last_b["signals"]),
+            "transitions": len(breaker_cmds),
+            "last_generation": last_b["generation"],
+        }
+    return summary
 
 
 def authenticated_steering_commands(root: str, job_id: str) -> dict:
@@ -554,6 +690,10 @@ def authenticated_steering_commands(root: str, job_id: str) -> dict:
             }
             for command in commands
             if command.get("action") == "steer"
+            or (command.get("action") == "breaker"
+                and command.get("mode") == "enforce"
+                and command.get("to_level") == "steering"
+                and isinstance(command.get("message"), str))
         ]}
 
 
@@ -635,6 +775,12 @@ class RuntimeControl:
         self._last_refresh = float("-inf")
         # Latest advisory progress judgement (Phase 2); published, never authority.
         self.progress: dict | None = None
+        # Graduated circuit breaker state (Phase 3).
+        self.breaker: dict | None = None
+        self.breaker_level: str = "healthy"
+        self.breaker_transitions: int = 0
+        self.constrained: bool = False
+        self.breaker_stopped: bool = False
 
     def checkpoint_due(self) -> bool:
         """Whether ``checkpoint`` would act now (lets callers measure lazily)."""
@@ -746,6 +892,25 @@ class RuntimeControl:
                     self.steers.append({"generation": generation,
                                         "message": message,
                                         "message_sha256": command.get("message_sha256")})
+            elif action == "breaker":
+                to_level = command.get("to_level")
+                mode = command.get("mode")
+                if isinstance(to_level, str):
+                    self.breaker_level = to_level
+                    self.breaker_transitions += 1
+                    if mode == "enforce":
+                        if to_level == "steering" and isinstance(command.get("message"), str):
+                            self.steers.append({
+                                "generation": generation,
+                                "message": command["message"],
+                                "message_sha256": command.get("message_sha256"),
+                            })
+                        elif to_level == "constrained":
+                            self.constrained = True
+                        elif to_level == "stopped":
+                            self.breaker_stopped = True
+                        elif to_level == "healthy":
+                            self.constrained = False
             self.generation = generation
             self._command_digests[generation] = command_digest
         if added:
@@ -774,6 +939,32 @@ class RuntimeControl:
         self.deadline += extension / 1000
         self.extension_ms += extension
         return extension
+
+    def record_breaker(self, decision: dict) -> dict | None:
+        """Persist a breaker transition into the authenticated control log and update state."""
+        from _breaker import sanitize_record as _sanitize_breaker
+        sanitized = _sanitize_breaker(decision)
+        if sanitized is None:
+            return None
+        self.breaker = sanitized
+        self.breaker_level = str(sanitized.get("level") or self.breaker_level)
+        if sanitized.get("enforced"):
+            if self.breaker_level == "constrained":
+                self.constrained = True
+            elif self.breaker_level == "stopped":
+                self.breaker_stopped = True
+            elif self.breaker_level == "healthy":
+                self.constrained = False
+        if not decision.get("transitioned") or self.control_untrusted:
+            return None
+        try:
+            queued = _append_breaker_command(
+                self.path, self.job_id, self.nonce, decision,
+                wall_clock=self.wall_clock)
+        except Exception:  # noqa: BLE001 - a corrupt/legacy control log cannot be appended
+            return None
+        self.refresh(force=True)
+        return queued
 
     def expired(self) -> bool:
         now = self.clock()
@@ -810,6 +1001,8 @@ class RuntimeControl:
         }
         if self.progress is not None:
             payload["progress"] = self.progress
+        if self.breaker is not None:
+            payload["breaker"] = self.breaker
         payload["auth"] = heartbeat_auth(self.nonce, payload)
         try:
             _write_control_json(self.heartbeat, payload)
@@ -819,17 +1012,20 @@ class RuntimeControl:
             self.heartbeat_unavailable = True
 
     def projection(self) -> dict:
-        return {"enabled": True, "attention_required": self.attention_required,
-                "heartbeat_unavailable": self.heartbeat_unavailable,
-                "auto_extensions": self.auto_extensions,
-                "operator_extensions": self.operator_extensions,
-                "extension_ms": self.extension_ms,
-                "hard_runtime_ms": self.max_runtime_ms,
-                "control_generation": self.generation,
-                "cancel_requested": self.cancel_requested,
-                "control_untrusted": self.control_untrusted,
-                "attempt_id": self.attempt_id,
-                "attempt_kind": self.attempt_kind,
-                "attempt_ordinal": self.attempt_ordinal,
-                "steering": {"queued": len(self.steers),
-                             "mode": "queued_for_resume"}}
+        out = {"enabled": True, "attention_required": self.attention_required,
+               "heartbeat_unavailable": self.heartbeat_unavailable,
+               "auto_extensions": self.auto_extensions,
+               "operator_extensions": self.operator_extensions,
+               "extension_ms": self.extension_ms,
+               "hard_runtime_ms": self.max_runtime_ms,
+               "control_generation": self.generation,
+               "cancel_requested": self.cancel_requested,
+               "control_untrusted": self.control_untrusted,
+               "attempt_id": self.attempt_id,
+               "attempt_kind": self.attempt_kind,
+               "attempt_ordinal": self.attempt_ordinal,
+               "steering": {"queued": len(self.steers),
+                            "mode": "queued_for_resume"}}
+        if self.breaker is not None:
+            out["breaker"] = self.breaker
+        return out

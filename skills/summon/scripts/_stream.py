@@ -435,6 +435,18 @@ class StreamProcessor:
                 self.handshake_model = data["model"]
             return False
 
+        if (data.get("type") == "system"
+                and data.get("subtype") in {"compact_boundary", "compaction"}
+                and self._declared_cli in (None, "claude")):
+            breaker = getattr(self, "breaker", None)
+            if breaker is not None and callable(getattr(breaker, "note_compaction", None)):
+                try:
+                    breaker.note_compaction()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._liveness("stream_event", data)
+            return False
+
         # Agy stream-json emits session events under `event` instead of `type`.
         # Current releases put run configuration under the matching `init`
         # payload and step details under `step_update`; older releases also put

@@ -1368,6 +1368,20 @@ next(item for item in _FORMATS if item["id"] == "worktree-gc")["producers"].appe
     _ref("_worktree_gc", "apply"))
 next(item for item in _FORMATS if item["id"] == "worktree-gc")["readers"].append(
     _ref("_worktree_gc", "apply"))
+_add("breaker", "summon.breaker/v1",
+     _ref("_breaker", "GraduatedBreaker.evaluate"),
+     _ref("_breaker", "sanitize_record"),
+     authority="public_projection",
+     shape=["mode", "allow_stop", "from_level", "to_level", "level", "transitioned", "escalated", "recovered", "action", "enforced", "signals", "transitions", "checkpoints", "compaction_grace", "constrained_permission"],
+     fixtures=[_test("breaker", "test_ladder_escalates_one_step_per_checkpoint_and_recovers"),
+               _test("breaker", "test_sanitize_record_strips_steering_message")],
+     gaps=["Breaker projections are redacted status summaries; live control transitions require HMAC-authenticated summon.job-control/v2 entries."])
+next(item for item in _FORMATS if item["id"] == "breaker")["producers"].append(
+    _ref("_breaker", "GraduatedBreaker.projection"))
+next(item for item in _FORMATS if item["id"] == "breaker")["readers"].extend([
+    _ref("_job_control", "public_heartbeat"),
+    _ref("_executor", "_enrich"),
+])
 
 FORMAT_INVENTORY = {"schema": SCHEMA, "version": VERSION, "formats": _FORMATS}
 
