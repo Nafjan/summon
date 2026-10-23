@@ -362,16 +362,25 @@ def _hash_regular_file(path: str) -> str | None:
         return _UNREADABLE_FILE
     h = hashlib.sha256()
     total_read = 0
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        with open(path, "rb") as fh:
-            try:
-                fst = os.fstat(fh.fileno())
-                if not stat.S_ISREG(fst.st_mode) or fst.st_size > MAX_LOCKFILE_BYTES:
-                    return _UNREADABLE_FILE
-            except (OSError, AttributeError, ValueError):
-                pass
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as fh:
+            fst = os.fstat(fh.fileno())
+            if (
+                _is_link_or_junction(path)
+                or not stat.S_ISREG(fst.st_mode)
+                or fst.st_size > MAX_LOCKFILE_BYTES
+                or (
+                    getattr(st, "st_ino", 0)
+                    and getattr(fst, "st_ino", 0)
+                    and (fst.st_ino != st.st_ino or fst.st_dev != st.st_dev)
+                )
+            ):
+                return _UNREADABLE_FILE
             while True:
-                chunk = fh.read(65536)
+                remaining = (MAX_LOCKFILE_BYTES - total_read) + 1
+                chunk = fh.read(min(65536, max(1, remaining)))
                 if not chunk:
                     break
                 total_read += len(chunk)

@@ -729,22 +729,18 @@ def test_round2_pnpm_depth_incomplete_fingerprint_and_v2_rename_regressions(tmp_
             _worktree_deps.os.scandir = orig_scandir
 
         lock_path = repo / "package-lock.json"
-        orig_open = _worktree_deps.open if hasattr(_worktree_deps, "open") else None
-        real_open = open
+        real_os_open = _worktree_deps.os.open
 
         def _deny_lock(path, *a, **kw):
             if os.path.normcase(str(path)) == os.path.normcase(str(lock_path)):
                 raise PermissionError("lockfile unreadable")
-            return real_open(path, *a, **kw)
+            return real_os_open(path, *a, **kw)
 
-        import builtins
-        builtins.open = _deny_lock
+        _worktree_deps.os.open = _deny_lock
         try:
             assert _worktree_deps.fingerprint_dep_target(str(repo), "node_modules") is None
         finally:
-            builtins.open = real_open
-            if orig_open is not None:
-                _worktree_deps.open = orig_open
+            _worktree_deps.os.open = real_os_open
 
         orig_is_link = _worktree_deps._is_link_or_junction
         _worktree_deps._is_link_or_junction = lambda p: (
@@ -758,27 +754,32 @@ def test_round2_pnpm_depth_incomplete_fingerprint_and_v2_rename_regressions(tmp_
 
         orig_max_lock = _worktree_deps.MAX_LOCKFILE_BYTES
         _worktree_deps.MAX_LOCKFILE_BYTES = 100
+        real_fdopen = _worktree_deps.os.fdopen
 
         class _GrowingReader:
+            def __init__(self, inner):
+                self._inner = inner
+
             def __enter__(self):
                 return self
 
             def __exit__(self, *args):
-                return False
+                return self._inner.__exit__(*args)
 
-            def read(self, _size=65536):
-                return b"x" * 60
+            def fileno(self):
+                return self._inner.fileno()
 
-        def _growing_lock(path, *a, **kw):
-            if os.path.normcase(str(path)) == os.path.normcase(str(lock_path)):
-                return _GrowingReader()
-            return real_open(path, *a, **kw)
+            def read(self, size=65536):
+                return b"x" * min(size, 60)
 
-        builtins.open = _growing_lock
+        def _growing_fdopen(fd, *a, **kw):
+            return _GrowingReader(real_fdopen(fd, *a, **kw))
+
+        _worktree_deps.os.fdopen = _growing_fdopen
         try:
             assert _worktree_deps.fingerprint_dep_target(str(repo), "node_modules") is None
         finally:
-            builtins.open = real_open
+            _worktree_deps.os.fdopen = real_fdopen
             _worktree_deps.MAX_LOCKFILE_BYTES = orig_max_lock
     finally:
         if _worktree_deps._is_link_or_junction(os.path.join(wt_path, "node_modules")):
