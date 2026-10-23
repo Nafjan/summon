@@ -1512,6 +1512,7 @@ def main() -> None:
                 ("list", bool(args.list)),
                 ("models", bool(args.list_models)),
                 ("doctor", bool(args.doctor)),
+                ("worktree gc", bool(getattr(args, "worktree_gc", False))),
                 ("onboard", bool(getattr(args, "onboard", False))),
                 ("agents validate", bool(getattr(args, "validate_agents", False))),
                 ("telemetry", any(getattr(args, name, False) for name in (
@@ -2121,6 +2122,26 @@ def main() -> None:
         report = doctor(args.agents_dir, args.cwd, probe=getattr(args, "probe", False))
         print(json.dumps(report, ensure_ascii=False) if args.json else render(report))
         sys.exit(0 if report["ok"] else 1)
+
+    if getattr(args, "worktree_gc", False):
+        import _worktree_gc
+        try:
+            gc_report = _worktree_gc.plan(
+                args.cwd or os.getcwd(), base=args.gc_base,
+                min_age_hours=args.gc_min_age_hours)
+            if args.gc_apply:
+                gc_report = _worktree_gc.apply(
+                    gc_report,
+                    running_jobs=_worktree_gc.running_job_count(getattr(args, "job_dir", None)),
+                    ignore_running_jobs=bool(args.gc_ignore_running_jobs))
+        except ValueError as exc:
+            _print_error(str(exc))
+            sys.exit(1)
+        print(json.dumps(gc_report, ensure_ascii=False) if args.json
+              else _worktree_gc.render(gc_report))
+        failed = bool(gc_report.get("refused")) or any(
+            not item.get("ok") for item in gc_report.get("results", []))
+        sys.exit(1 if failed else 0)
 
     if getattr(args, "onboard", False):
         from _onboard import parse_subscription_list, run_onboard

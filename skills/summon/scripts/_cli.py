@@ -430,7 +430,7 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
                "onboard", "manifest", "council", "deliberate", "agent", "jobs", "wait",
                "version", "chat", "swarm", "role", "telemetry", "stats", "usage", "bug-report",
-               "auth", "fleet", "result", "workspace", "help", "--help", "-h"}
+               "auth", "fleet", "result", "workspace", "worktree", "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -486,6 +486,8 @@ Commands:
   role list|resolve ALIAS                         inspect approved/proposed aliases
   jobs list|status [ID] [--job-dir D] [--json]      inspect background jobs
   jobs wait ID [--job-dir D] [--timeout T]          wait for one background job
+  worktree gc [--cwd DIR] [--base REV] [--min-age-hours N] [--apply] [--json]
+                                                  reclaim clean, merged, idle agent worktrees
   telemetry enable|disable|status|clear|stats [--json]  manage opt-in local diagnostics
   stats     [--json]                              summarize local telemetry reliability/latency
   usage status [--json] | usage import --from FILE [--json]
@@ -685,6 +687,16 @@ Generate a sanitized local Markdown report from the latest event or SOURCE (enve
 telemetry JSONL, debug directory). Review the existing REPORT.md, then submit that exact
 file in the separate `--submit-github` form; submission never regenerates it.
 """,
+    "worktree": """summon worktree gc [--cwd DIR] [--base REV] [--min-age-hours N] [--json]
+summon worktree gc --apply [--ignore-running-jobs] [--job-dir DIR]
+
+Plan, then optionally reclaim, Summon agent worktrees (branches `agents/*`). A
+worktree is removed only when it is unlocked, not the current directory, idle for
+the minimum age (default 24h), clean, and integrated into the base (no commits
+beyond it, or an identical tree). Removal uses `git worktree remove` without
+--force and `git branch -d`, so git re-checks both. --apply refuses while any
+background job is running unless --ignore-running-jobs is given. Provider-inert.
+""",
     "auth": """summon auth status [--cli BACKEND] [--profile NAME] [--probe] [--json]
 summon auth repair BACKEND [--profile NAME] [--allow-auth-repair] [--auth-timeout 5m] [--json]
 
@@ -749,6 +761,21 @@ def rewrite_subcommand(argv: list) -> tuple:
         return ["--list-models", *translated], None
     if head == "doctor":
         return ["--doctor", *rest], None
+    if head == "worktree":
+        if not rest:
+            return argv, "help:worktree"
+        if rest[0] != "gc":
+            return argv, f"error: unknown 'worktree' action {rest[0]!r} (use gc)"
+        aliases = {"--base": "--gc-base", "--min-age-hours": "--gc-min-age-hours",
+                   "--apply": "--gc-apply", "--ignore-running-jobs": "--gc-ignore-running-jobs"}
+        translated = []
+        for item in rest[1:]:
+            if "=" in item and item.split("=", 1)[0] in aliases:
+                name, value = item.split("=", 1)
+                translated.append(aliases[name] + "=" + value)
+            else:
+                translated.append(aliases.get(item, item))
+        return ["--worktree-gc", *translated], None
     if head == "onboard":
         return ["--onboard", *rest], None
     if head == "auth":
@@ -1361,6 +1388,20 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
     parser.add_argument("--doctor", action="store_true",
                         help="Check backend CLIs, agy wrapper deps, agents dir, and git; "
                              "human-readable (add --json for machines)")
+    parser.add_argument("--worktree-gc", dest="worktree_gc", action="store_true",
+                        help="Plan reclamation of clean, merged, idle Summon agent "
+                             "worktrees (dry run unless --gc-apply)")
+    parser.add_argument("--gc-base", dest="gc_base", default="HEAD", metavar="REV",
+                        help="With --worktree-gc: integration base revision (default HEAD)")
+    parser.add_argument("--gc-min-age-hours", dest="gc_min_age_hours", type=float,
+                        default=24.0, metavar="N",
+                        help="With --worktree-gc: skip worktrees active within N hours")
+    parser.add_argument("--gc-apply", dest="gc_apply", action="store_true",
+                        help="With --worktree-gc: remove planned worktrees using "
+                             "non-forcing git commands")
+    parser.add_argument("--gc-ignore-running-jobs", dest="gc_ignore_running_jobs",
+                        action="store_true",
+                        help="With --gc-apply: proceed even while background jobs run")
     parser.add_argument("--new-agent", dest="new_agent", metavar="NAME",
                         help="Scaffold a new agent definition (house template: report "
                              "contract + untrusted-content guard); customize with --set")

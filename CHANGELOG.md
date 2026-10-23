@@ -5,6 +5,27 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+- Long-horizon hardening, Phase 1 (advisory, no behavior change): every dispatch
+  envelope gains `usage_metrics` (budget-grade `work_tokens` that exclude cache
+  reads, with explicit `input_semantics` for Anthropic- vs OpenAI-shaped usage),
+  `context_occupancy` (input-side fill of the latest root Claude request against
+  the served model's reported context window), and `progress_signals`
+  (shadow-mode consecutive identical tool calls and consecutive tool failures for
+  Claude, Codex and Gemini streams; counts only, no tool names or inputs).
+- Long-horizon hardening, Phase 2: adaptive background jobs record a
+  checkpoint-time `progress_judgement` that discounts stream activity during a
+  detected tool loop, credits a still-running tool for up to three checkpoint
+  intervals, and treats a working-tree change (git porcelain plus stat tuples) as
+  progress. `SUMMON_PROGRESS_JUDGE=shadow` (default) publishes the judgement in the
+  authenticated heartbeat while the legacy rule still decides; `enforce` applies
+  it; `off` disables it.
+- Add `summon worktree gc` (flat: `--worktree-gc`): a dry-run-by-default plan for
+  reclaiming Summon `agents/*` worktrees that are unlocked, idle for
+  `--min-age-hours` (default 24), clean, and integrated into `--base` (no commits
+  beyond it, or an identical tree). `--apply` uses `git worktree remove` without
+  `--force` and `git branch -d`, and refuses while background jobs run unless
+  `--ignore-running-jobs` is given.
+
 ## [3.6.2] - 2026-10-23
 
 - Eliminate concurrent `--background` (`--bg`) and `--worktree` startup races on

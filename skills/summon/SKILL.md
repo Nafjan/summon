@@ -33,7 +33,7 @@ Use Summon in a goal-directed loop: inspect, delegate, check evidence, then choo
 
 **Script Path**: On Windows, use `{SKILL_DIR}\scripts\summon.cmd` (requires `--prompt-file` for dispatches). On macOS/Linux, use `python3 {SKILL_DIR}/scripts/run_subagent.py` (Python 3.10+).
 
-**Command surface**: accepts git-style subcommands — `dispatch` (default), `list [--for TASK]`, `agents validate`, `models`, `doctor`, `onboard`, `auth status|repair`, `manifest FILE`, `council`, `deliberate`, `workspace`, `chat`, `swarm`, `agent new|set NAME`, `role propose|approve|list|resolve`, `jobs list|status|wait|extend|cancel|steer|resume|revalidate`, `wait [--all]`, `telemetry enable|disable|status|clear|stats`, `stats`, `usage status|import|refresh|export|example`, `result project|validate|consume`, `fleet propose|validate|inspect|explain|approval`, `bug-report`, `version`. Legacy flat flags work unchanged.
+**Command surface**: accepts git-style subcommands — `dispatch` (default), `list [--for TASK]`, `agents validate`, `models`, `doctor`, `onboard`, `auth status|repair`, `manifest FILE`, `council`, `deliberate`, `workspace`, `chat`, `swarm`, `agent new|set NAME`, `role propose|approve|list|resolve`, `jobs list|status|wait|extend|cancel|steer|resume|revalidate`, `wait [--all]`, `worktree gc`, `telemetry enable|disable|status|clear|stats`, `stats`, `usage status|import|refresh|export|example`, `result project|validate|consume`, `fleet propose|validate|inspect|explain|approval`, `bug-report`, `version`. Legacy flat flags work unchanged.
 
 ## CLI-Specific Notes
 
@@ -118,6 +118,7 @@ Use an explicit unit in every invocation: `ms` for milliseconds, `s` for seconds
 | `--validate-agents` (`agents validate`) | Provider-inert validation of custom agent manifests under `.agents/agents/<slug>/agent.md`. |
 | `--list-models`, `--refresh-models` (`models [--refresh]`) | Report invocable models per backend; `--refresh-models` refreshes live provider rosters where supported. |
 | `--doctor`, `--probe`, `--json`, `--version`, `--help` | Check backend CLIs, wrapper deps, git, and install drift (`doctor --json`); `--probe` runs a minimal live check. |
+| `--worktree-gc`, `--gc-base REV`, `--gc-min-age-hours N`, `--gc-apply`, `--gc-ignore-running-jobs` | `worktree gc`: plan (dry run) or apply reclamation of Summon `agents/*` worktrees that are unlocked, idle, clean, and integrated into the base; removal never forces. |
 | `--onboard`, `--subscriptions LIST`, `--reset`, `--no-write` | Detect CLIs and write merge-safe preferences to `~/.agents/summon.json` without storing secrets. |
 | `--auth-action {status,repair}`, `--auth-backend BACKEND`, `--allow-auth-repair`, `--auth-timeout DURATION` | Inspect auth status or run one allowlisted vendor login flow with explicit authorization. |
 | `--new-agent NAME`, `--set-agent NAME`, `--set KEY=VALUE` | Scaffold or edit an agent definition frontmatter (`run-agent`, `model`, `model-policy`, `permission`, `args`, `profile`, `lifecycle`, `successor`). |
@@ -165,6 +166,7 @@ Every dispatch envelope emits a single JSON object on stdout with top-level orch
 - **`resume`, `resumed`, `attempts`, `attempt_status`, `attempt_id`**: session continuity and physical launch tracking.
 - **`timeout`**: `{budget_ms, stage, partial_output}`; subprocess wall-clock expiry reports `stage: "backend-execution"`.
 - **`summon`, `agent_def`, `prompt_sha256`, `git_head_before`, `workspace_evidence`, `artifacts`**: full provenance and mutation receipt (`read_only_violation` is suppressed for text-only seats `openai-compat`/`arkcli` that cannot touch the filesystem).
+- **`usage_metrics`, `context_occupancy`, `progress_signals`, `progress_judgement`** (advisory; never change `status`): budget-grade `work_tokens` (input + output + cache writes, excluding cache reads, with `input_semantics` and `evidence`); the latest root request's context-window fill (`ratio`, `evidence: reported|occupied_without_window|absent`); shadow-mode tool-loop and error-storm counts (no tool names or inputs); and, for adaptive background jobs, the checkpoint progress judgement (`SUMMON_PROGRESS_JUDGE=off|shadow|enforce`, default `shadow`).
 
 See [references/reference-manual.md](references/reference-manual.md) for the complete field-by-field dictionary.
 
