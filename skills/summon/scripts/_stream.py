@@ -252,6 +252,39 @@ class StreamProcessor:
         self._claude_final_candidate = None
         self._claude_identity_conflict = False
         self.is_error = False   # the terminal event itself reported an error (claude is_error / result status)
+        # Long-horizon Phase 1 (shadow): advisory signals only. They never feed
+        # liveness, status, or report parsing.
+        from _progress_signals import ProgressSignals
+        self.progress_signals = ProgressSignals()
+        self.last_request_usage = None   # latest ROOT per-request usage (not cumulative)
+        self.last_request_model = None
+        self.context_window = None       # provider-reported window for that model, if any
+
+    def _signal_tool(self, name, payload, call_id=None) -> None:
+        try:
+            self.progress_signals.tool_call(name, payload)
+            if call_id is not None:
+                self.progress_signals.tool_started(call_id)
+        except Exception:  # advisory evidence must never break stream parsing
+            pass
+
+    def _signal_result(self, is_error: bool, call_id=None) -> None:
+        try:
+            self.progress_signals.tool_result(is_error=bool(is_error))
+            if call_id is not None:
+                self.progress_signals.tool_finished(call_id)
+        except Exception:
+            pass
+
+    def progress_snapshot(self) -> dict | None:
+        """Shadow progress signals; ``coverage`` says whether this dialect is parsed."""
+        try:
+            self.progress_signals.instrumented = bool(
+                self._declared_cli in {"claude", "codex", "gemini"}
+                or self.is_codex or self.is_gemini or self._claude_session_id)
+            return self.progress_signals.snapshot()
+        except Exception:
+            return None
 
     def _remember_semantic_activity(self, kind: str, identity: object) -> str | None:
         """Return a new activity digest, or ``None`` for a semantic replay.
@@ -491,6 +524,12 @@ class StreamProcessor:
                 and self._declared_cli in (None, "claude")):
             message = data["message"]
             content = message.get("content")
+            if data.get("parent_tool_use_id") is None and isinstance(message.get("usage"), dict):
+                # Per-request usage of the root conversation: the context-occupancy
+                # input. Sub-agent requests have their own, separate windows.
+                self.last_request_usage = message["usage"]
+                if isinstance(message.get("model"), str):
+                    self.last_request_model = message["model"]
             self._capture_claude_root(data, message, content)
             if isinstance(content, list):
                 for index, block in enumerate(content):
@@ -502,6 +541,8 @@ class StreamProcessor:
                                        semantic_identity=("claude_text", message.get("id"),
                                                           index, block["text"]))
                     elif block.get("type") in {"tool_use", "server_tool_use"}:
+                        self._signal_tool(block.get("name"), block.get("input"),
+                                          call_id=block.get("id"))
                         self._tool_progress += 1
                         self._liveness("tool_activity", data, tool_id="claude_tool",
                                        progress=self._tool_progress,
@@ -517,6 +558,9 @@ class StreamProcessor:
                             and block.get("type") == "tool_result"] \
                 if isinstance(content, list) else []
             if tool_results:
+                for block in tool_results:
+                    self._signal_result(block.get("is_error") is True,
+                                        call_id=block.get("tool_use_id"))
                 self._tool_progress += 1
                 self._liveness("tool_activity", data, tool_id="claude_tool_result",
                                progress=self._tool_progress,
@@ -535,6 +579,17 @@ class StreamProcessor:
                                semantic_identity=("gemini_text", content))
             return False
 
+        if self.is_codex and data.get("type") == "item.started":
+            # Advisory only and deliberately non-returning: in-flight tracking
+            # must not change how the existing parser treats this record.
+            started = data.get("item")
+            if isinstance(started, dict) and started.get("type") not in {
+                    "agent_message", "reasoning"}:
+                try:
+                    self.progress_signals.tool_started(started.get("id"))
+                except Exception:
+                    pass
+
         if self.is_codex and data.get("type") == "item.completed":
             item = data.get("item", {})
             if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
@@ -544,6 +599,20 @@ class StreamProcessor:
                                semantic_identity=("codex_text", item.get("id"),
                                                   item["text"]))
             elif isinstance(item, dict):
+                if item.get("type") != "reasoning":
+                    # Identity excludes ids and outputs so a re-run of the same
+                    # command reads as a repeat; completion carries the outcome.
+                    self._signal_tool(item.get("type"), {
+                        k: v for k, v in item.items()
+                        if k not in {"id", "aggregated_output", "output", "exit_code",
+                                     "status", "result", "error", "text"}})
+                    exit_code = item.get("exit_code")
+                    self._signal_result(item.get("status") == "failed"
+                                        or (isinstance(exit_code, int)
+                                            and not isinstance(exit_code, bool)
+                                            and exit_code != 0)
+                                        or bool(item.get("error")),
+                                        call_id=item.get("id"))
                 self._tool_progress += 1
                 self._liveness("tool_activity", data, tool_id="codex_item",
                                progress=self._tool_progress,
@@ -551,6 +620,15 @@ class StreamProcessor:
             return False
 
         if self.is_gemini and data.get("type") in {"tool_call", "tool_result"}:
+            gemini_call_id = data.get("tool_call_id") or data.get("tool_use_id")
+            if data.get("type") == "tool_call":
+                self._signal_tool(data.get("name") or data.get("tool_name"),
+                                  data.get("args") or data.get("arguments")
+                                  or data.get("parameters"),
+                                  call_id=gemini_call_id)
+            else:
+                self._signal_result(data.get("status") == "error" or bool(data.get("error")),
+                                    call_id=gemini_call_id)
             self._tool_progress += 1
             self._liveness("tool_activity", data, tool_id="gemini_tool",
                            progress=self._tool_progress,
@@ -865,6 +943,16 @@ class StreamProcessor:
         model_usage = data.get("modelUsage")
         if isinstance(model_usage, dict):
             self.models_used = sorted(k for k in model_usage if isinstance(k, str))
+            # Window for the model that served the latest root request. Never pick
+            # another model's window: a sub-agent model can differ.
+            entry = None
+            if self.last_request_model in model_usage:
+                entry = model_usage[self.last_request_model]
+            elif self.last_request_model is None and len(model_usage) == 1:
+                entry = next(iter(model_usage.values()))
+            window = entry.get("contextWindow") if isinstance(entry, dict) else None
+            if (isinstance(window, int) and not isinstance(window, bool) and window > 0):
+                self.context_window = window
         self.model = None
         self.model_evidence_source = None
         if (self._claude_identity_conflict

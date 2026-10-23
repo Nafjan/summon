@@ -960,6 +960,36 @@ def _codex_rollout_model_evidence(
     return None, None, []
 
 
+def _attach_long_horizon_metrics(response: dict, processor) -> None:
+    """Attach derived, advisory long-horizon metrics (never alters status).
+
+    ``usage_metrics`` separates budget-grade work tokens from cache reads,
+    ``context_occupancy`` reports the latest root request's window fill, and
+    ``progress_signals`` carries shadow-mode loop/error-storm counts. Each block
+    labels its own evidence; absent inputs produce explicit ``absent`` values.
+    """
+    try:
+        from _usage_metrics import context_occupancy, work_tokens
+        observation = response.get("usage_observation")
+        scope = observation.get("scope") if isinstance(observation, dict) else None
+        response.setdefault("usage_metrics", work_tokens(
+            response.get("usage"), cli=response.get("cli"), observation_scope=scope))
+        if processor is not None:
+            response.setdefault("context_occupancy", context_occupancy(
+                getattr(processor, "last_request_usage", None),
+                getattr(processor, "context_window", None),
+                cli=response.get("cli")))
+            snapshot_fn = getattr(processor, "progress_snapshot", None)
+            snapshot = snapshot_fn() if callable(snapshot_fn) else None
+            if snapshot is not None:
+                response.setdefault("progress_signals", snapshot)
+            judge = getattr(processor, "progress_judge", None)
+            if judge is not None:
+                response.setdefault("progress_judgement", judge.projection())
+    except Exception:  # noqa: BLE001 - advisory metrics must never break a dispatch
+        pass
+
+
 def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     """Attach telemetry + parsed report to a response (all return paths).
 
@@ -1006,6 +1036,7 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
         "model_evidence_source",
         getattr(processor, "model_evidence_source", None) if processor else None,
     )
+    _attach_long_horizon_metrics(response, processor)
     if (response.get("cli") == "codex"
             and not response.get("model_resolved")
             and response.get("status") == "success"):
@@ -3758,7 +3789,8 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
                    idle_ms: int | None = None,
                    finalization_ms: int | None = None,
                    attempt_kind: str = "initial",
-                   attempt_ordinal: int = 1) -> dict:
+                   attempt_ordinal: int = 1,
+                   workspace_cwd: str | None = None) -> dict:
     """Drive the subprocess and enrich whatever response path it takes.
 
     Single choke point: every return from the read loop (success, timeout,
@@ -3787,6 +3819,17 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
     )
     emitter = tracker.emitter()
     processor = StreamProcessor(event_observer=emitter, cli=cli)
+    if runtime_control is not None:
+        # Phase 2: checkpoint-time progress judgement (shadow by default).
+        try:
+            from _progress_judge import ProgressJudge, mode_from_environment
+            _judge_mode = mode_from_environment()
+            if _judge_mode != "off":
+                processor.progress_judge = ProgressJudge(
+                    checkpoint_ms=runtime_control.checkpoint_ms, mode=_judge_mode,
+                    workspace_cwd=workspace_cwd)
+        except Exception:  # noqa: BLE001 - advisory; the legacy rule still applies
+            pass
     try:
         from _stream_partials import emit_partial as _emit_partial
         _emit_partial("started", cli=cli, message="subprocess started")
@@ -3905,8 +3948,18 @@ def _drive_process_loop(
                 operator_extension = runtime_control.refresh(force=True)
                 if operator_extension and not saw_terminal:
                     liveness.extend_overall(operator_extension)
-                runtime_control.checkpoint(
-                    active=liveness.meaningful_within(runtime_control.checkpoint_ms))
+                stream_active = liveness.meaningful_within(runtime_control.checkpoint_ms)
+                checkpoint_active = stream_active
+                judge = getattr(processor, "progress_judge", None)
+                due_fn = getattr(runtime_control, "checkpoint_due", None)
+                if judge is not None and callable(due_fn) and due_fn():
+                    try:
+                        checkpoint_active, runtime_control.progress = judge.judge(
+                            stream_active=stream_active,
+                            signals=getattr(processor, "progress_signals", None))
+                    except Exception:  # noqa: BLE001 - fall back to the legacy rule
+                        checkpoint_active = stream_active
+                runtime_control.checkpoint(active=checkpoint_active)
                 runtime_control.publish(liveness.snapshot())
                 if runtime_control.cancel_requested and not saw_terminal:
                     if liveness_emitter is not None:
@@ -5475,6 +5528,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                                   attempt_id=_attempt_id,
                                   attempt_kind=getattr(inv, "attempt_kind", "initial"),
                                   attempt_ordinal=getattr(inv, "attempt_ordinal", 1),
+                                  workspace_cwd=getattr(inv, "cwd", None),
                                   expected_model=(
                                       _requested_model
                                       if inv.cli == "codex"

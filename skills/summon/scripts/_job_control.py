@@ -165,6 +165,13 @@ def public_heartbeat(value: dict, integrity: str) -> dict | None:
                 safe_live["counts"] = safe_counts
         if safe_live:
             out["liveness"] = safe_live
+    try:
+        from _progress_judge import sanitize_record
+        progress = sanitize_record(value.get("progress"))
+    except Exception:  # noqa: BLE001 - optional advisory field
+        progress = None
+    if progress is not None:
+        out["progress"] = progress
     return out
 
 
@@ -626,6 +633,13 @@ class RuntimeControl:
         # observation. This is diagnostics, never command/launch authority.
         self.heartbeat_unavailable = False
         self._last_refresh = float("-inf")
+        # Latest advisory progress judgement (Phase 2); published, never authority.
+        self.progress: dict | None = None
+
+    def checkpoint_due(self) -> bool:
+        """Whether ``checkpoint`` would act now (lets callers measure lazily)."""
+        now = self.clock()
+        return self.deadline <= now < self.hard_deadline
 
     @classmethod
     def from_environment(cls, timeout_ms: int, *, attempt_id: str | None = None,
@@ -790,6 +804,8 @@ class RuntimeControl:
             "steering": {"queued": len(self.steers),
                          "mode": "queued_for_resume"},
         }
+        if self.progress is not None:
+            payload["progress"] = self.progress
         payload["auth"] = heartbeat_auth(self.nonce, payload)
         try:
             _write_control_json(self.heartbeat, payload)
