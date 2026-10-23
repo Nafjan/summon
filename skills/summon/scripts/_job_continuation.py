@@ -408,7 +408,13 @@ def _result_binding(result: dict) -> str:
         "attempts", "permission", "permission_forced", "read_allowlist", "effort",
     )
     bound = {key: result.get(key) for key in keys}
-    for optional_key in ("context_occupancy", "context_handoff", "handoff_note", "report"):
+    for optional_key in (
+        "context_occupancy",
+        "context_handoff",
+        "handoff_note",
+        "report",
+        "files_touched",
+    ):
         if optional_key in result:
             bound[optional_key] = result.get(optional_key)
     return _digest(bound)

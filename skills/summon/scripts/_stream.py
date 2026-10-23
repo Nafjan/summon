@@ -717,8 +717,6 @@ class StreamProcessor:
             )
             if isinstance(mid_usage, dict):
                 self.progress_usage = mid_usage
-                if self.last_request_usage is None:
-                    self.last_request_usage = mid_usage
                 self._liveness("stream_event", data)
                 return False
             if isinstance(last_req_usage, dict):

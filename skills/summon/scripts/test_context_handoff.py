@@ -606,3 +606,51 @@ def test_round1_sol_review_regressions(tmp_path, monkeypatch):
     rc.checkpoint(active=True)
     rc.record_context_handoff(tracker.evaluate(occ_high))
     assert rc.attention_required is True
+
+    # 7. Round-2 regressions: punctuation inside quoted/unquoted tokens, cumulative codex usage,
+    # files_touched receipt binding, and second-read result_binding_sha256 verification.
+    punct_note = _context_handoff.normalize_handoff_note({
+        "state": "partial",
+        "completed": [
+            'token="abcd!efgh123456" and secret=\'abcdef!ghijk1234\' and password=unquoted!secret99',
+        ],
+    })
+    assert punct_note is not None
+    assert "abcd!efgh123456" not in punct_note["completed"][0]
+    assert "ghijk1234" not in punct_note["completed"][0]
+    assert "unquoted!secret99" not in punct_note["completed"][0]
+
+    # Codex cumulative total_token_usage without last_token_usage does NOT populate last_request_usage
+    proc_codex_cum = StreamProcessor(cli="codex")
+    proc_codex_cum.process_line(json.dumps({"type": "thread.started", "thread_id": "t-cum"}))
+    proc_codex_cum.process_line(json.dumps({
+        "type": "token_count",
+        "info": {
+            "model_context_window": 200_000,
+            "total_token_usage": {"input_tokens": 160_000, "output_tokens": 5_000},
+        },
+    }))
+    assert proc_codex_cum.last_request_usage is None
+    assert proc_codex_cum.live_context_occupancy(cli="codex")["evidence"] == "absent"
+
+    # files_touched is bound in result_binding_sha256
+    r_ft_1 = dict(result, files_touched=["skills/summon/scripts/_context_handoff.py"])
+    r_ft_2 = dict(result, files_touched=["skills/summon/scripts/_job_resume.py"])
+    assert continuation.result_binding_sha256(r_ft_1) != continuation.result_binding_sha256(r_ft_2)
+
+    # Snapshot swap between read_private_source and _read_strict_json in reserve_request fails closed
+    real_read_strict_json = _job_resume._read_strict_json
+
+    def _tampered_second_read(path, *a, **kw):
+        doc, st = real_read_strict_json(path, *a, **kw)
+        if isinstance(doc, dict) and os.path.normcase(str(path)) == os.path.normcase(str(job_file)):
+            swapped = dict(doc)
+            swapped["report"] = dict(doc.get("report") or {}, summary="INJECTED SUMMARY")
+            return swapped, st
+        return doc, st
+
+    with monkeypatch.context() as m:
+        m.setattr(_job_resume, "_read_strict_json", _tampered_second_read)
+        with pytest.raises(_job_resume.ResumeError) as swap_exc:
+            _job_resume.reserve_request(root, job_id, message="continue")
+        assert swap_exc.value.kind == "source_result_changed"

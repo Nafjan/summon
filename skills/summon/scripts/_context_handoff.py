@@ -80,7 +80,7 @@ _SHORTNAME_RE = re.compile(r"^[^~]+~[0-9]+(?:\..+)?$")
 _SECRET_RE = re.compile(
     r"(?i)(?:sk-(?:or-|ant-|proj-)?[a-z0-9_-]{12,}|gh[pousr]_[a-z0-9]{20,}|"
     r"AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|"
-    r"(?:bearer|api[_-]?key|access[_-]?token|auth[_-]?token|oauth[_-]?token|private[_-]?key|token|secret|password)\s*[=:]\s*[\"']?[A-Za-z0-9_./+=-]{6,}[\"']?)"
+    r"(?:bearer|api[_-]?key|access[_-]?token|auth[_-]?token|oauth[_-]?token|private[_-]?key|token|secret|password)\s*[=:]\s*(?:\"[^\"\r\n]{6,}\"|'[^'\r\n]{6,}'|[^\s,;\"']{6,}))"
 )
 
 HANDOFF_STEERING_PROMPT = (
